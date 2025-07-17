@@ -27,3 +27,13 @@ Makefile
 
 # macOS specific
 .DS_Store
+# Generated data
+*.bin
+*.dat
+output/
+results/
+build/
+
+# Large map files
+data/maps/*.fits
+data/kernels/
