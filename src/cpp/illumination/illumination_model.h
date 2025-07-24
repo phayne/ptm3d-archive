@@ -143,14 +143,75 @@ public:
     // New setter method for controlling progress bar visibility
     void setShowProgress(bool show) { show_progress_ = show; }
 
-private:
+    // Accessor methods that work with chunked storage
+    double getIlluminationValue(size_t face_idx, size_t time_idx) const;
+    double getDirectSolarValue(size_t face_idx, size_t time_idx) const;
+    double getPrimaryReflectedValue(size_t face_idx, size_t time_idx) const;
+    double getPrimaryIRValue(size_t face_idx, size_t time_idx) const;
 
+private:
+    // Thread-local ray batch structure
+    struct RayBatch {
+        std::vector<std::array<double, 3>> origins;
+        std::vector<std::array<double, 3>> directions;
+        std::vector<int> results;
+        std::vector<size_t> indices;
+        size_t current_size = 0;
+        bool processed = false;
+    };
+    
+    // Thread-local batch storage
+    static thread_local RayBatch tls_batch;
+    
+    // Thread-local batching vectors for optimized ray tracing
+    static thread_local std::vector<std::array<double, 3>> tls_ray_origins;
+    static thread_local std::vector<std::array<double, 3>> tls_ray_directions;
+    static thread_local std::vector<int> tls_ray_results;
+    static thread_local size_t tls_batch_size;
+    
+    // Batch collection parameters
+    static constexpr size_t COLLECTION_BATCH_SIZE = 64;   // Size to collect before processing
+    static constexpr size_t MAX_BATCH_SIZE = 16;          // Optimal for AVX-512
+
+    // Chunked storage for very large meshes
+    bool using_chunked_storage_ = false;
+    size_t chunk_size_ = 1000000; // 1 million faces per chunk
+    std::vector<std::vector<double>> illumination_chunks_;
+    std::vector<std::vector<double>> direct_solar_chunks_;
+    std::vector<std::vector<double>> primary_reflected_chunks_;
+    std::vector<std::vector<double>> primary_ir_chunks_;
+    
+    // Helper methods for chunked storage
+    void initializeChunkedStorage(size_t total_faces, int time_steps);
+    void storeChunkedValue(std::vector<std::vector<double>>& chunks, size_t face_idx, size_t time_idx, double value);
+    double getChunkedValue(const std::vector<std::vector<double>>& chunks, size_t face_idx, size_t time_idx) const;
+    
+    // Mutex for thread synchronization when processing batches
+    std::mutex batch_mutex_;
+    std::vector<RayBatch*> shared_batches_;
+    bool batches_being_processed_ = false;
+    
+    // Ray batch handling methods (ensure each appears only once)
+    void initRayBatch();
+    void initRayBatchCollection();
+    size_t addRayToBatch(const std::array<double, 3>& origin, const std::array<double, 3>& direction);
+    void processRayBatches();
+    void processRayBatch();
+    bool getRayHitResult(size_t batch_index);
+    
+    // Add missing prototype for SIMD debugging
+    void printSIMDInfoTemporary();
+    
     // Set default target body and primary body
     std::string target_body_name_ = "EUROPA";       // Default target body
     std::string primary_body_name_ = "JUPITER";     // Default primary body
     std::string target_body_frame_ = "IAU_EUROPA";  // Default reference frame
     std::string target_body_id_ = "502";            // Default SPICE ID for Europa
     std::string meta_kernel_filename_ = "europa.tm";  // Default meta-kernel
+
+    // Primary body; flag to indicate if primary is the Sun
+    bool primary_is_sun_ = false;
+    double primary_radius_ = constants::JUPITER_RADIUS;  // Default, updated when body changes
 
     // Embree ray tracing methods
     bool initializeEmbree();
@@ -285,7 +346,7 @@ private:
             rayhit.ray.dir_y = direction[1];
             rayhit.ray.dir_z = direction[2];
             rayhit.ray.tnear = 0.0001f;
-            rayhit.ray.tfar = std::numeric_limits<float>::infinity();
+            rayhit.ray.tfar = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
             rayhit.ray.mask = 0;
             rayhit.ray.flags = 0;
             rayhit.ray.time = 0.0f;

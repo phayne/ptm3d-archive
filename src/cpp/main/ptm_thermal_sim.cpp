@@ -44,7 +44,7 @@ namespace {
     constexpr double DEFAULT_IR_ALBEDO = 0.1;
 }
 
-// Add this class at the top of ptm_thermal_sim.cpp after the includes
+// Thread-safe output suppressor class
 class OutputSuppressor {
 private:
     std::streambuf* original_buffer;
@@ -94,7 +94,7 @@ std::ofstream OutputSuppressor::null_stream;
 int OutputSuppressor::ref_count = 0;
 std::mutex OutputSuppressor::mtx;
 
-// Replace the StderrProgressBar class with this thread-safe implementation
+// Thread-safe stderr progress bar class
 class StderrProgressBar {
 private:
     int total;
@@ -238,7 +238,39 @@ std::vector<double> calculateAbsorbedFlux(
     
     // Size of output array (same as input)
     size_t n_values = direct_solar_values.size();
+    
+    // Validate input arrays have expected size
+    if (n_values == 0 || primary_reflected_values.size() != n_values || primary_ir_values.size() != n_values) {
+        std::cerr << "Error: Input arrays must have matching sizes in calculateAbsorbedFlux" << std::endl;
+        std::cerr << "direct_solar: " << direct_solar_values.size() 
+                  << ", primary_reflected: " << primary_reflected_values.size()
+                  << ", primary_ir: " << primary_ir_values.size() << std::endl;
+        return std::vector<double>(); // Return empty vector to signal error
+    }
+    
     size_t num_faces = n_values / time_steps;
+    
+    // Validate face count makes sense
+    if (num_faces * time_steps != n_values) {
+        std::cerr << "Error: Input array size not divisible by time_steps in calculateAbsorbedFlux" << std::endl;
+        return std::vector<double>();
+    }
+    
+    // Validate mesh has expected face count
+    if (mesh->faces.size() < num_faces) {
+        std::cerr << "Error: Mesh has fewer faces (" << mesh->faces.size() 
+                  << ") than expected (" << num_faces << ")" << std::endl;
+        return std::vector<double>();
+    }
+    
+    // Safety check: ensure latitude/longitude arrays are correctly sized
+    if (mesh->latitudes.size() < num_faces || mesh->longitudes.size() < num_faces) {
+        std::cerr << "Error: Mesh latitude/longitude arrays too small. "
+                  << "Expected: " << num_faces 
+                  << ", Got: " << mesh->latitudes.size() << "/" << mesh->longitudes.size() << std::endl;
+        return std::vector<double>();
+    }
+    
     std::vector<double> absorbed_flux(n_values);
     
     // Pre-calculate albedo for each face
@@ -295,28 +327,37 @@ std::vector<double> calculateAbsorbedFlux(
         }
         
         // Calculate average albedo from the mesh center if global map is available
-        if (global_albedo_map) {
+        if (global_albedo_map && global_albedo_map->isValid()) {
             // Quick calculation - just calculate mesh center once
             double avg_lat = 0.0, avg_lon = 0.0;
             size_t count = 0;
             
             // Sample points to calculate center (use max ~1000 points for efficiency)
             size_t stride = std::max(size_t(1), mesh->faces.size() / 1000);
-            for (size_t f = 0; f < mesh->faces.size(); f += stride) {
-                avg_lat += mesh->latitudes[f];
-                avg_lon += mesh->longitudes[f];
-                count++;
+            for (size_t f = 0; f < std::min(mesh->faces.size(), num_faces); f += stride) {
+                // Bounds check for both arrays
+                if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
+                    avg_lat += mesh->latitudes[f];
+                    avg_lon += mesh->longitudes[f];
+                    count++;
+                }
             }
             
             if (count > 0) {
                 avg_lat /= count;
                 avg_lon /= count;
                 
+                // Normalize longitude to 0-360 range for map lookup
+                while (avg_lon < 0)
+                    avg_lon += 360.0;
+                while (avg_lon >= 360.0)
+                    avg_lon -= 360.0;
+                
                 // Get albedo from the global map at this point (note lat sign flip for map)
                 double mesh_center_albedo = global_albedo_map->getValue(avg_lon, -avg_lat);
                 
                 if (mesh_center_albedo != global_albedo_map->getMissingValue() && 
-                    mesh_center_albedo >= 0.05 && mesh_center_albedo <= 1.0) {
+                    mesh_center_albedo >= MIN_VALID_ALBEDO && mesh_center_albedo <= MAX_VALID_ALBEDO) {
                     // Valid albedo value - use it for all faces
                     std::fill(face_albedos.begin(), face_albedos.end(), mesh_center_albedo);
                     
@@ -416,22 +457,41 @@ std::vector<double> calculateAbsorbedFlux(
         }
         
         // If pre-computed map failed, try to use global albedo map
-        if (!albedo_loaded && albedo_map) {
+        if (!albedo_loaded && albedo_map && albedo_map->isValid()) {
             std::cout << "Using global albedo map for standard mesh" << std::endl;
             
             // Map each face to its corresponding albedo from the global map
+            #pragma omp parallel for schedule(dynamic, 1000)
             for (size_t f = 0; f < num_faces; f++) {
-                double lat = mesh->latitudes[f];
-                double lon = mesh->longitudes[f];
-                
-                // Note: Albedo map typically uses opposite latitude convention (north is positive)
-                double albedo_value = albedo_map->getValue(lon, -lat);
-                
-                // Check if the value is valid
-                if (albedo_value != albedo_map->getMissingValue() && 
-                    albedo_value >= MIN_VALID_ALBEDO && 
-                    albedo_value <= MAX_VALID_ALBEDO) {
-                    face_albedos[f] = albedo_value;
+                // Add explicit bounds checking
+                if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
+                    double lat = mesh->latitudes[f];
+                    double lon = mesh->longitudes[f];
+                    
+                    // Normalize longitude to 0-360 range for map lookup
+                    while (lon < 0.0) lon += 360.0;
+                    while (lon >= 360.0) lon -= 360.0;
+                    
+                    try {
+                        // Note: Albedo map typically uses opposite latitude convention (north is positive)
+                        double albedo_value = albedo_map->getValue(lon, -lat);
+                        
+                        // Check if the value is valid
+                        if (albedo_value != albedo_map->getMissingValue() && 
+                            albedo_value >= MIN_VALID_ALBEDO && 
+                            albedo_value <= MAX_VALID_ALBEDO) {
+                            face_albedos[f] = albedo_value;
+                        }
+                    } catch (const std::exception& e) {
+                        // If any error occurs during map lookup, just use the default value
+                        // (face_albedos already initialized with default_visible_albedo)
+                        #pragma omp critical
+                        {
+                            std::cerr << "Error getting albedo for face " << f 
+                                    << " (lat=" << lat << ", lon=" << lon << "): " 
+                                    << e.what() << std::endl;
+                        }
+                    }
                 }
             }
             
@@ -452,22 +512,41 @@ std::vector<double> calculateAbsorbedFlux(
         goto albedo_calculation_complete;
     }
     // Otherwise, check if an explicit albedo map was provided
-    else if (explicit_albedo_map && albedo_map) {
+    else if (explicit_albedo_map && albedo_map && albedo_map->isValid()) {
         std::cout << "Using provided albedo map" << std::endl;
         
         // Apply albedo map to each face
+        #pragma omp parallel for schedule(dynamic, 1000)
         for (size_t f = 0; f < num_faces; f++) {
-            double lat = mesh->latitudes[f];
-            double lon = mesh->longitudes[f];
-            
-            // Note: Albedo map typically uses opposite latitude convention (north is positive)
-            double albedo_value = albedo_map->getValue(lon, -lat);
-            
-            // Check if the value is valid
-            if (albedo_value != albedo_map->getMissingValue() && 
-                albedo_value >= MIN_VALID_ALBEDO && 
-                albedo_value <= MAX_VALID_ALBEDO) {
-                face_albedos[f] = albedo_value;
+            // Add explicit bounds checking
+            if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
+                double lat = mesh->latitudes[f];
+                double lon = mesh->longitudes[f];
+                
+                // Normalize longitude to 0-360 range for map lookup
+                while (lon < 0.0) lon += 360.0;
+                while (lon >= 360.0) lon -= 360.0;
+                
+                try {
+                    // Note: Albedo map typically uses opposite latitude convention (north is positive)
+                    double albedo_value = albedo_map->getValue(lon, -lat);
+                    
+                    // Check if the value is valid
+                    if (albedo_value != albedo_map->getMissingValue() && 
+                        albedo_value >= MIN_VALID_ALBEDO && 
+                        albedo_value <= MAX_VALID_ALBEDO) {
+                        face_albedos[f] = albedo_value;
+                    }
+                } catch (const std::exception& e) {
+                    // If any error occurs during map lookup, just use the default value
+                    // (face_albedos already initialized with default_visible_albedo)
+                    #pragma omp critical
+                    {
+                        std::cerr << "Error getting albedo for face " << f 
+                                << " (lat=" << lat << ", lon=" << lon << "): " 
+                                << e.what() << std::endl;
+                    }
+                }
             }
         }
         
@@ -480,12 +559,40 @@ std::vector<double> calculateAbsorbedFlux(
     std::cout << "Using constant albedo " << default_visible_albedo << " for all faces" << std::endl;
 
 albedo_calculation_complete:
+    // Final validation to ensure all albedo values are valid
+    int invalid_count = 0;
+    for (size_t f = 0; f < num_faces; f++) {
+        if (std::isnan(face_albedos[f]) || 
+            std::isinf(face_albedos[f]) || 
+            face_albedos[f] < MIN_VALID_ALBEDO || 
+            face_albedos[f] > MAX_VALID_ALBEDO) {
+            
+            face_albedos[f] = default_visible_albedo;
+            invalid_count++;
+        }
+    }
+    
+    if (invalid_count > 0) {
+        std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
+    }
+    
     // Apply albedo to calculate absorbed flux for each face at each time step
+    #pragma omp parallel for schedule(dynamic, 1000)
     for (size_t f = 0; f < num_faces; f++) {
         double visible_albedo = face_albedos[f];
         
         for (size_t t = 0; t < time_steps; t++) {
             size_t idx = f * time_steps + t;
+            
+            // Add explicit bounds checking
+            if (idx >= n_values) {
+                #pragma omp critical
+                {
+                    std::cerr << "Error: Index out of bounds in calculateAbsorbedFlux: " 
+                              << idx << " >= " << n_values << std::endl;
+                }
+                continue;
+            }
             
             // Apply appropriate albedo to each component
             double absorbed_direct = direct_solar_values[idx] * (1.0 - visible_albedo);
@@ -1059,9 +1166,9 @@ bool runThermalModel(
         
         // Write header
         outfile << "Time(hours),";
-        for (int i = 0; i < thermalModel.profile.z.size(); i++) {
-            outfile << "T_" << thermalModel.profile.z[i] << "m";
-            if (i < thermalModel.profile.z.size() - 1) outfile << ",";
+        for (int i = 0; i < thermalModel.profile.z().size(); i++) {
+            outfile << "T_" << thermalModel.profile.z()[i] << "m";
+            if (i < thermalModel.profile.z().size() - 1) outfile << ",";
         }
         outfile << std::endl;
         
@@ -1080,7 +1187,7 @@ bool runThermalModel(
         double min_temp = thermalModel.T.col(0).minCoeff();
         double max_temp = thermalModel.T.col(0).maxCoeff();
         double avg_temp = thermalModel.T.col(0).mean();
-        
+
         std::cout << "Surface Temperature Summary for " << location_name << ":" << std::endl;
         std::cout << "  Minimum: " << min_temp << " K" << std::endl;
         std::cout << "  Maximum: " << max_temp << " K" << std::endl;
@@ -1131,7 +1238,7 @@ std::vector<double> runThermalModelForFace(
     }
 }
 
-// Fix for runThermalModelsForAllFaces function to address the bus error
+// Function to run thermal models for all mesh faces
 bool runThermalModelsForAllFaces(
     const std::string& thermal_output_dir,
     const std::shared_ptr<Mesh>& mesh,
@@ -1167,8 +1274,8 @@ bool runThermalModelsForAllFaces(
                 std::cout << "  - Coordinate range: Lon [" << albedo_map->getLonMin() << "," << albedo_map->getLonMax() 
                           << "], Lat [" << albedo_map->getLatMin() << "," << albedo_map->getLatMax() << "]" << std::endl;
             } else {
-                std::cerr << "Warning: Failed to load albedo map: " << albedo_map_path << std::endl;
-                std::cerr << "Error: " << albedo_map->getLastError() << std::endl;
+                std::cout << "Warning: Failed to load albedo map: " << albedo_map_path << std::endl;
+                std::cout << "Error: " << albedo_map->getLastError() << std::endl;
                 albedo_map.reset();
             }
         }
@@ -1192,35 +1299,69 @@ bool runThermalModelsForAllFaces(
     
     size_t n_faces = mesh->faces.size();
     
-    // Print initial message to stderr
-    std::cerr << "Running thermal models for " << n_faces << " mesh faces..." << std::endl << std::endl;
+    // Print initial message
+    std::cerr << "\nRunning thermal models for " << n_faces << " mesh faces..." << std::endl;
     
-    // Create our stderr progress bar
-    StderrProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
+    // Start timing - Add timer here
+    auto start_time = std::chrono::high_resolution_clock::now();
     
-    // Arrays to store results - PRE-ALLOCATE THE FULL SIZE INCLUDING EQUILIBRATION
-    std::vector<std::vector<double>> all_surface_temps(n_faces);
-    for (size_t f = 0; f < n_faces; f++) {
-        all_surface_temps[f].resize(total_time_steps, 50.0); // Use total_time_steps, not times.size() - equilibration_steps
+    // CHUNKED PROCESSING - for large meshes
+    // Process faces in chunks to limit peak memory usage
+    const size_t CHUNK_SIZE = 100000; // Process 100k faces at a time 
+    const size_t NUM_CHUNKS = (n_faces + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    
+    // Initialize results container if output is requested
+    if (surface_temps_out) {
+        surface_temps_out->clear();
+        surface_temps_out->resize(n_faces);
     }
     
-    // Setup parallel processing with atomic counter
+    // Atomic counter for progress tracking
     std::atomic<int> completed_faces_atomic(0);
-
-    // Process faces in smaller batches to reduce memory pressure
-    const int BATCH_SIZE = std::max(64, 4096 / thermal_threads);  // Adjust batch size based on thread count
-
-    for (int batch_start = 0; batch_start < n_faces; batch_start += BATCH_SIZE) {
-        int batch_end = std::min(batch_start + BATCH_SIZE, (int)n_faces);
+    
+    // Process in chunks to reduce memory pressure
+    bool success = true;
+    
+    // Create progress bar for thermal calculation - using cerr for output
+    thermal::ProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
+    
+    for (size_t chunk = 0; chunk < NUM_CHUNKS; chunk++) {
+        size_t start_face = chunk * CHUNK_SIZE;
+        size_t end_face = std::min((chunk + 1) * CHUNK_SIZE, n_faces);
+        size_t chunk_size = end_face - start_face;
         
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int f = batch_start; f < batch_end; f++) {
+        // Show chunk info only if there are multiple chunks
+        if (NUM_CHUNKS > 1) {
+            std::cerr << "Processing chunk " << (chunk + 1) << " of " << NUM_CHUNKS 
+                      << " (faces " << start_face << " to " << (end_face - 1) << ")" << std::endl;
+        }
+        
+        // Temporary storage for this chunk
+        std::vector<std::vector<double>> chunk_results(chunk_size);
+        
+        // Initialize each temperature array with default value of 50.0K (same as original code)
+        for (size_t i = 0; i < chunk_size; i++) {
+            chunk_results[i].resize(total_time_steps, 50.0);
+        }
+        
+        // Reset counter for this chunk
+        completed_faces_atomic.store(0);
+        
+        // Process faces in this chunk in parallel
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(thermal_threads)
+        for (size_t local_idx = 0; local_idx < chunk_size; local_idx++) {
+            size_t f = start_face + local_idx;
+            
             try {
                 // Process each face
                 std::vector<double> face_flux(total_time_steps);
                 for (int t = 0; t < total_time_steps; t++) {
                     size_t idx = f * total_time_steps + t;
-                    face_flux[t] = absorbed_flux[idx];
+                    if (idx < absorbed_flux.size()) {
+                        face_flux[t] = absorbed_flux[idx];
+                    } else {
+                        face_flux[t] = 0.0; // Safety fallback
+                    }
                 }
 
                 // Run thermal model for this face
@@ -1232,37 +1373,67 @@ bool runThermalModelsForAllFaces(
                     equilibration_steps
                 );
 
-                // Store results
-                all_surface_temps[f] = temps;
-
-                // Update progress counter atomically, but limit update frequency
+                // Store results locally in the chunk
+                chunk_results[local_idx] = std::move(temps);
+                
+                // Update progress
                 int completed = ++completed_faces_atomic;
-
-                // Only update progress every 1% or so to reduce contention
-                if (completed == n_faces || completed % std::max(1, (int)(n_faces/100)) == 0) {
-                    progressBar.update(completed);
+                if (completed % 100 == 0 || completed == static_cast<int>(chunk_size)) {
+                    // Update the progress bar with global progress
+                    progressBar.update(start_face + completed);
                 }
-            }
-            catch (const std::exception& e) {
+            } catch (const std::exception& e) {
                 #pragma omp critical
                 {
                     std::cerr << "Error processing face " << f << ": " << e.what() << std::endl;
+                    success = false;
+                }
+            } catch (...) {
+                #pragma omp critical
+                {
+                    std::cerr << "Unknown exception in thermal model for face " << f << std::endl;
+                    success = false;
                 }
             }
         }
-        // Force cleanup between batches
-        #pragma omp barrier
+        
+        // Copy chunk results to main output if requested
+        if (surface_temps_out) {
+            for (size_t local_idx = 0; local_idx < chunk_size; local_idx++) {
+                size_t f = start_face + local_idx;
+                (*surface_temps_out)[f] = std::move(chunk_results[local_idx]);
+            }
+        }
+        
+        // Force cleanup of chunk memory before starting next chunk
+        chunk_results.clear();
+        chunk_results.shrink_to_fit();
+        
+        // Add a newline between chunks if there are multiple
+        if (NUM_CHUNKS > 1 && chunk < NUM_CHUNKS - 1) {
+            std::cerr << std::endl;
+        }
     }
     
+    // Ensure progress bar is completed
     progressBar.finish();
     
-    // Store the surface temperatures in the output parameter if provided
-    if (surface_temps_out) {
-        *surface_temps_out = all_surface_temps;
+    // End timing and calculate duration
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double seconds = duration.count() / 1000.0;
+    
+    // Print timing information using cerr to match illumination code
+    std::cerr << "Thermal computation completed in " << std::fixed << std::setprecision(3) 
+              << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
+    
+    if (success) {
+        std::cerr << "\nThermal models completed successfully!" << std::endl;
+    } else {
+        std::cerr << "\nThermal models completed with errors!" << std::endl;
     }
     
-    std::cerr << "Thermal models completed successfully!" << std::endl;
-    return true;
+    return success;
 }
 
 // Function to export thermal results to VTK format - complete rewrite
@@ -1553,7 +1724,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     const thermal::Config& config,
     int equilibration_steps);
 
-// Create a new function to write a complete VTK file with both illumination and thermal data
+// Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
     const std::string& output_file,
     const std::shared_ptr<Mesh>& mesh,
@@ -1563,7 +1734,8 @@ bool writeCompleteVTK(
     const std::vector<double>& times,
     const std::vector<std::string>& time_strings,
     int time_steps,
-    const std::string& source_mesh_file) {
+    const std::string& source_mesh_file,
+    bool include_primary_ir = false) {
     
     std::ofstream file(output_file);
     if (!file.is_open()) {
@@ -1646,15 +1818,17 @@ bool writeCompleteVTK(
             }
         }
 
-        // Primary IR
-        file << "SCALARS primary_ir_" << t << " float 1\n";
-        file << "LOOKUP_TABLE default\n";
-        for (size_t f = 0; f < mesh->faces.size(); f++) {
-            size_t idx = f * time_steps + t;
-            if (idx < primary_ir_values.size()) {
-                file << primary_ir_values[idx] << "\n";
-            } else {
-                file << "0.0\n";
+        // Only write primary IR data if explicitly requested
+        if (include_primary_ir) {
+            file << "SCALARS primary_ir_" << t << " float 1\n";
+            file << "LOOKUP_TABLE default\n";
+            for (size_t f = 0; f < mesh->faces.size(); f++) {
+                size_t idx = f * time_steps + t;
+                if (idx < primary_ir_values.size()) {
+                    file << primary_ir_values[idx] << "\n";
+                } else {
+                    file << "0.0\n";
+                }
             }
         }
         
@@ -1684,10 +1858,17 @@ bool writeThermalVTK(
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<double>& times,
     const std::vector<std::string>& time_strings,
-    int time_steps) {
+    int time_steps,
+    bool include_equilibration = false) {
+
+    // Determine actual number of time steps to write
+    int start_idx = include_equilibration ? 0 : (times.size() - time_steps);
+    int output_time_steps = include_equilibration ? times.size() : time_steps;
     
-    // Add this status message - no verbose check, always print
+    // Status message - no verbose check, always print
     std::cout << "Generating thermal VTK file: " << output_file << std::endl;
+    std::cout << "Writing " << output_time_steps << " time steps" 
+              << (include_equilibration ? " (including equilibration)" : " (excluding equilibration)") << std::endl;
     
     std::ofstream file(output_file);
     if (!file.is_open()) {
@@ -1722,16 +1903,16 @@ bool writeThermalVTK(
     // Write FIELD data for time values
     file << "FIELD FieldData 2\n";
     
-    // Write time values
-    file << "TIME_STEPS " << 1 << " " << time_steps << " float\n";
-    for (int t = 0; t < time_steps; t++) {
-        file << times[t] << "\n"; 
+    // Write time values - use output_time_steps and start_idx for correct selection
+    file << "TIME_STEPS " << 1 << " " << output_time_steps << " float\n";
+    for (int t = 0; t < output_time_steps; t++) {
+        file << times[start_idx + t] << "\n"; 
     }
     
-    // Write time strings
-    file << "TIME_STRINGS " << 1 << " " << time_steps << " string\n";
-    for (int t = 0; t < time_steps; t++) {
-        file << time_strings[t] << "\n";
+    // Write time strings - use output_time_steps and start_idx for correct selection
+    file << "TIME_STRINGS " << 1 << " " << output_time_steps << " string\n";
+    for (int t = 0; t < output_time_steps; t++) {
+        file << time_strings[start_idx + t] << "\n";
     }
     
     // Write cell data
@@ -1756,8 +1937,11 @@ bool writeThermalVTK(
     int valid_temp_count = 0;
     int nan_inf_count = 0;
     
-    // For each time step, write a temperature array
-    for (int t = 0; t < time_steps; t++) {
+    // For each time step, write a temperature array - use output_time_steps and start_idx
+    for (int t = 0; t < output_time_steps; t++) {
+        // Calculate the actual time index using start_idx
+        int time_idx = start_idx + t;
+        
         // Temperature for this time step
         file << "SCALARS temperature_" << t << " float 1\n";
         file << "LOOKUP_TABLE default\n";
@@ -1765,8 +1949,8 @@ bool writeThermalVTK(
             // Use -1.0 as marker for invalid data
             double temp = -1.0;  
             
-            if (f < surface_temps.size() && t < surface_temps[f].size()) {
-                temp = surface_temps[f][t];
+            if (f < surface_temps.size() && time_idx < surface_temps[f].size()) {
+                temp = surface_temps[f][time_idx];
                 
                 // Only filter out non-numeric values
                 if (std::isnan(temp) || std::isinf(temp)) {
@@ -1968,6 +2152,11 @@ void showUsage(const char* programName) {
     
     std::cout << "\nOutput Options:\n";
     std::cout << "  --output DIR          : Output directory (default: ./output)\n";
+    std::cout << "  --output-format FORMAT  : Output format: 'binary' (default) or 'vtk'" << std::endl;
+    std::cout << "  --include-primary-ir    : Include primary IR data in VTK files (increases file size)" << std::endl;
+    std::cout << "  --vtk-mode MODE        : VTK output mode: 'both' (default), 'thermal', or 'complete'" << std::endl;
+    std::cout << "  --thermal-vtk-file FILE  : Custom filename for thermal VTK output\n";
+    std::cout << "  --complete-vtk-file FILE : Custom filename for complete VTK output\n";    
     std::cout << "  --positions FILE      : Export body positions to specified file\n";
     std::cout << "  --locations FILE      : Extract illumination for specific lat/lon points\n";
     std::cout << "  --location-data FILE  : Specify custom location data file for visualization\n";  // Add this line
@@ -1990,26 +2179,400 @@ void showUsage(const char* programName) {
     std::cout << "  --help                : Display this help message and exit\n";
 }
 
-std::string createDefaultLocationsFile() {
-    std::string temp_file = "./output/default_locations.txt";
-    std::ofstream out(temp_file);
-    if (out.is_open()) {
-        out << "# lat lon name\n";
-        out << "0.0 0.0 Equator_0\n";
-        out << "0.0 90.0 Equator_90\n";
-        out << "0.0 180.0 Equator_180\n";
-        out << "0.0 270.0 Equator_270\n";
-        out << "90.0 0.0 North_Pole\n";
-        out << "-90.0 0.0 South_Pole\n";
-        out.close();
+std::string createDefaultLocationsFile(const std::string& output_dir) {
+    // Ensure output directory exists
+    try {
+        if (!std::filesystem::exists(output_dir)) {
+            std::filesystem::create_directories(output_dir);
+        }
+        
+        // Create a default locations file with some useful points
+        std::string filename = output_dir + "/default_locations.txt";
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            return "";
+        }
+        
+        // Format: latitude longitude location_name (space-separated)
+        file << "# lat lon name\n";
+        file << "0.0 0.0 Sub_Jupiter\n";      // Equator at 0° longitude (sub-Jupiter point)
+        file << "0.0 90.0 Trailing\n";        // Equator at 90°E (trailing hemisphere)
+        file << "0.0 180.0 Anti_Jupiter\n";   // Equator at 180° (anti-Jupiter point)
+        file << "0.0 270.0 Leading\n";        // Equator at 270°E (leading hemisphere)
+        file << "45.0 0.0 North_45\n";        // 45°N at 0° longitude
+        file << "-45.0 0.0 South_45\n";       // 45°S at 0° longitude
+        file << "85.0 0.0 North_Pole\n";      // Near North Pole
+        file << "-85.0 0.0 South_Pole\n";     // Near South Pole
+        
+        file.close();
+        return filename;
+    } catch (const std::exception& e) {
+        std::cerr << "Error creating default locations file: " << e.what() << std::endl;
+        return "";
     }
-    return temp_file;
+}
+
+std::string generateSimulationFilename(
+    const std::string& output_dir,
+    const std::string& body_name,
+    const std::string& start_time,
+    const std::string& suffix) {
+    
+    // Clean the start time to be filesystem-friendly
+    std::string clean_time = start_time;
+    std::replace(clean_time.begin(), clean_time.end(), ':', '-');
+    std::replace(clean_time.begin(), clean_time.end(), ' ', '_');
+    std::replace(clean_time.begin(), clean_time.end(), 'T', '_');
+    
+    // Trim to a reasonable length (first 10 chars)
+    if (clean_time.length() > 10) {
+        clean_time = clean_time.substr(0, 10);
+    }
+    
+    // Format: output_dir/ptm_BODY_STARTTIME_suffix.vtk
+    return output_dir + "/ptm_" + body_name + "_" + clean_time + "_" + suffix + ".vtk";
+}
+
+// Function to write binary data for a single time step
+bool writeBinaryTimeStepFile(
+    const std::string& filename,
+    const std::vector<float>& data) {
+    
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write number of elements as header (4-byte uint32)
+    uint32_t num_elements = static_cast<uint32_t>(data.size());
+    file.write(reinterpret_cast<char*>(&num_elements), sizeof(uint32_t));
+    
+    // Write data as 32-bit floats
+    file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+    
+    return file.good();
+}
+
+// Function to write time steps metadata file
+bool writeTimeStepsFile(
+    const std::string& filename,
+    const std::vector<double>& times,
+    const std::vector<std::string>& time_strings) {
+    
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open time steps file for writing: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write header
+    file << "# Time steps metadata\n";
+    file << "# Column 1: Time elapsed from start (seconds)\n";
+    file << "# Column 2: UTC time\n";
+    
+    // Write time data
+    for (size_t i = 0; i < times.size(); i++) {
+        file << std::fixed << std::setprecision(1) << times[i] << "\t" 
+             << time_strings[i] << std::endl;
+    }
+    
+    return file.good();
+}
+
+// Function to export mesh to binary PLY format
+bool exportMeshToPLY(
+    const std::string& filename,
+    const std::shared_ptr<Mesh>& mesh) {
+    
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open PLY file for writing: " << filename << std::endl;
+        return false;
+    }
+    
+    // Write PLY header (ASCII part)
+    file << "ply\n";
+    file << "format binary_little_endian 1.0\n";
+    file << "element vertex " << mesh->vertices.size() << "\n";
+    file << "property float x\n";
+    file << "property float y\n";
+    file << "property float z\n";
+    file << "element face " << mesh->faces.size() << "\n";
+    file << "property list uchar int vertex_indices\n";
+    file << "property float nx\n";
+    file << "property float ny\n";
+    file << "property float nz\n";
+    file << "property float latitude\n";
+    file << "property float longitude\n";
+    file << "end_header\n";
+    
+    // Write vertex data
+    for (const auto& vertex : mesh->vertices) {
+        float x = static_cast<float>(vertex[0]);
+        float y = static_cast<float>(vertex[1]);
+        float z = static_cast<float>(vertex[2]);
+        file.write(reinterpret_cast<char*>(&x), sizeof(float));
+        file.write(reinterpret_cast<char*>(&y), sizeof(float));
+        file.write(reinterpret_cast<char*>(&z), sizeof(float));
+    }
+    
+    // Write face data
+    for (size_t i = 0; i < mesh->faces.size(); i++) {
+        const auto& face = mesh->faces[i];
+        const auto& normal = mesh->face_normals[i];
+        
+        // Number of vertices in the face (always 3 for triangles)
+        unsigned char num_vertices = 3;
+        file.write(reinterpret_cast<char*>(&num_vertices), sizeof(unsigned char));
+        
+        // Vertex indices
+        int v1 = face[0];
+        int v2 = face[1];
+        int v3 = face[2];
+        file.write(reinterpret_cast<char*>(&v1), sizeof(int));
+        file.write(reinterpret_cast<char*>(&v2), sizeof(int));
+        file.write(reinterpret_cast<char*>(&v3), sizeof(int));
+        
+        // Face normal
+        float nx = static_cast<float>(normal[0]);
+        float ny = static_cast<float>(normal[1]);
+        float nz = static_cast<float>(normal[2]);
+        file.write(reinterpret_cast<char*>(&nx), sizeof(float));
+        file.write(reinterpret_cast<char*>(&ny), sizeof(float));
+        file.write(reinterpret_cast<char*>(&nz), sizeof(float));
+        
+        // Latitude and longitude
+        float lat = static_cast<float>(mesh->latitudes[i]);
+        float lon = static_cast<float>(mesh->longitudes[i]);
+        file.write(reinterpret_cast<char*>(&lat), sizeof(float));
+        file.write(reinterpret_cast<char*>(&lon), sizeof(float));
+    }
+    
+    return file.good();
+}
+
+bool exportDataAsBinary(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& illumination_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<std::vector<double>>& surface_temps,
+    const std::vector<double>& times,
+    const std::vector<std::string>& time_strings,
+    int time_steps,
+    bool is_custom_mesh,
+    bool include_equilibration = false) {
+    
+    // Determine actual number of time steps to write
+    int start_idx = include_equilibration ? 0 : (times.size() - time_steps);
+    int output_time_steps = include_equilibration ? times.size() : time_steps;
+    
+    // Status message
+    std::cout << "Generating binary output in: " << output_dir << std::endl;
+    std::cout << "Writing " << output_time_steps << " time steps" 
+              << (include_equilibration ? " (including equilibration)" : " (excluding equilibration)") << std::endl;
+    
+    // Calculate total number of files to be written for progress tracking
+    int total_files = 2; // Mesh and time steps files
+    total_files += output_time_steps * 3; // Illumination, primary IR, and temperature files for each time step
+    
+    // Create progress bar for file writing
+    thermal::ProgressBar progressBar(total_files, "Writing output files", 50, true);
+    int files_written = 0;
+    
+    // Create output directories
+    std::string illum_dir = output_dir + "/illumination";
+    std::string ir_dir = output_dir + "/primary_ir";
+    std::string temp_dir = output_dir + "/temperature";
+    
+    std::filesystem::create_directories(illum_dir);
+    std::filesystem::create_directories(ir_dir);
+    std::filesystem::create_directories(temp_dir);
+    
+    // Export mesh if using global model (not custom mesh)
+    if (!is_custom_mesh) {
+        std::string mesh_file = output_dir + "/mesh.ply";
+        std::cout << "Exporting mesh to " << mesh_file << std::endl;
+        if (!exportMeshToPLY(mesh_file, mesh)) {
+            std::cerr << "Failed to export mesh" << std::endl;
+            return false;
+        }
+    }
+    progressBar.update(++files_written);
+    
+    // Always export mesh in VTK-compatible format for the converter
+    std::string vtk_mesh_file = output_dir + "/mesh.ply";
+    if (is_custom_mesh || !std::filesystem::exists(vtk_mesh_file)) {
+        std::cout << "Exporting mesh in VTK-compatible format: " << vtk_mesh_file << std::endl;
+        
+        try {
+            std::ofstream file(vtk_mesh_file, std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Failed to open file for writing: " << vtk_mesh_file << std::endl;
+                // Continue even if this fails - it's just for visualization
+            }
+            else {
+                // Write header (8 bytes of identifier)
+                const char* header = "EUROPMSH";
+                file.write(header, 8);
+                
+                // Write vertex count (4-byte integer)
+                int vertex_count = static_cast<int>(mesh->vertices.size());
+                file.write(reinterpret_cast<const char*>(&vertex_count), sizeof(int));
+                
+                // Write vertices (each vertex is 3 floats = 12 bytes)
+                for (const auto& vertex : mesh->vertices) {
+                    float x = static_cast<float>(vertex[0]);
+                    float y = static_cast<float>(vertex[1]);
+                    float z = static_cast<float>(vertex[2]);
+                    file.write(reinterpret_cast<const char*>(&x), sizeof(float));
+                    file.write(reinterpret_cast<const char*>(&y), sizeof(float));
+                    file.write(reinterpret_cast<const char*>(&z), sizeof(float));
+                }
+                
+                // Write face count (4-byte integer)
+                int face_count = static_cast<int>(mesh->faces.size());
+                file.write(reinterpret_cast<const char*>(&face_count), sizeof(int));
+                
+                // Write faces (each face is 3 integers = 12 bytes)
+                for (const auto& face : mesh->faces) {
+                    int v1 = face[0];
+                    int v2 = face[1];
+                    int v3 = face[2];
+                    file.write(reinterpret_cast<const char*>(&v1), sizeof(int));
+                    file.write(reinterpret_cast<const char*>(&v2), sizeof(int));
+                    file.write(reinterpret_cast<const char*>(&v3), sizeof(int));
+                }
+                
+                // Write additional data needed by vtk_converter.py
+                // Write normals
+                for (const auto& normal : mesh->face_normals) {
+                    float nx = static_cast<float>(normal[0]);
+                    float ny = static_cast<float>(normal[1]);
+                    float nz = static_cast<float>(normal[2]);
+                    file.write(reinterpret_cast<const char*>(&nx), sizeof(float));
+                    file.write(reinterpret_cast<const char*>(&ny), sizeof(float));
+                    file.write(reinterpret_cast<const char*>(&nz), sizeof(float));
+                }
+                
+                // Write latitudes and longitudes
+                for (const auto& lat : mesh->latitudes) {
+                    float lat_f = static_cast<float>(lat);
+                    file.write(reinterpret_cast<const char*>(&lat_f), sizeof(float));
+                }
+                
+                for (const auto& lon : mesh->longitudes) {
+                    float lon_f = static_cast<float>(lon);
+                    file.write(reinterpret_cast<const char*>(&lon_f), sizeof(float));
+                }
+                
+                file.close();
+                std::cout << "Mesh exported successfully in VTK-compatible format" << std::endl;
+            }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Error exporting mesh: " << e.what() << std::endl;
+            // Continue even if this fails - it's just for visualization
+        }
+    }
+    
+    // Export filtered time steps metadata
+    std::string time_file = output_dir + "/time_steps.txt";
+    std::cout << "Writing time steps metadata to " << time_file << std::endl;
+    
+    // Use only the relevant time steps
+    std::vector<double> filtered_times(times.begin() + start_idx, times.begin() + start_idx + output_time_steps);
+    std::vector<std::string> filtered_time_strings(time_strings.begin() + start_idx, 
+                                                 time_strings.begin() + start_idx + output_time_steps);
+    
+    if (!writeTimeStepsFile(time_file, filtered_times, filtered_time_strings)) {
+        std::cerr << "Failed to write time steps file" << std::endl;
+        return false;
+    }
+    progressBar.update(++files_written);
+    
+    // Get number of faces
+    size_t num_faces = mesh->faces.size();
+    
+    // Process each time step
+    for (int t = 0; t < output_time_steps; t++) {
+        // Format time step number with leading zeros
+        std::ostringstream time_str;
+        time_str << std::setw(4) << std::setfill('0') << (t + 1);
+        std::string time_step_str = time_str.str();
+        
+        // Get the actual time index
+        int actual_time_idx = start_idx + t;
+        
+        // Convert illumination data to float
+        std::vector<float> illum_data(num_faces);
+        for (size_t f = 0; f < num_faces; f++) {
+            size_t idx = f * times.size() + actual_time_idx;
+            if (idx < illumination_values.size()) {
+                illum_data[f] = static_cast<float>(illumination_values[idx]);
+            } else {
+                illum_data[f] = 0.0f;
+            }
+        }
+        
+        // Export illumination data
+        std::string illum_file = illum_dir + "/illumination_" + time_step_str + ".bin";
+        if (!writeBinaryTimeStepFile(illum_file, illum_data)) {
+            std::cerr << "Failed to write illumination data for time step " << t << std::endl;
+            return false;
+        }
+        progressBar.update(++files_written);
+        
+        // Convert primary IR data to float
+        std::vector<float> ir_data(num_faces);
+        for (size_t f = 0; f < num_faces; f++) {
+            size_t idx = f * times.size() + actual_time_idx;
+            if (idx < primary_ir_values.size()) {
+                ir_data[f] = static_cast<float>(primary_ir_values[idx]);
+            } else {
+                ir_data[f] = 0.0f;
+            }
+        }
+        
+        // Export primary IR data
+        std::string ir_file = ir_dir + "/primary_ir_" + time_step_str + ".bin";
+        if (!writeBinaryTimeStepFile(ir_file, ir_data)) {
+            std::cerr << "Failed to write primary IR data for time step " << t << std::endl;
+            return false;
+        }
+        progressBar.update(++files_written);
+        
+        // Convert temperature data to float
+        std::vector<float> temp_data(num_faces);
+        for (size_t f = 0; f < num_faces; f++) {
+            if (f < surface_temps.size() && actual_time_idx < surface_temps[f].size()) {
+                temp_data[f] = static_cast<float>(surface_temps[f][actual_time_idx]);
+            } else {
+                temp_data[f] = 0.0f;
+            }
+        }
+        
+        // Export temperature data
+        std::string temp_file = temp_dir + "/temperature_" + time_step_str + ".bin";
+        if (!writeBinaryTimeStepFile(temp_file, temp_data)) {
+            std::cerr << "Failed to write temperature data for time step " << t << std::endl;
+            return false;
+        }
+        progressBar.update(++files_written);
+    }
+    
+    // Ensure progress bar is completed
+    progressBar.finish();
+    
+    std::cout << "Successfully exported all data in binary format" << std::endl;
+    return true;
 }
 
 int main(int argc, char** argv) {
     std::cout << "Planetary Thermal-Illumination Coupled Model" << std::endl;
 
-    // Parse command line arguments
+    // Simulation parameters
     std::string start_time = "2025-01-01T00:00:00";
     double duration_days = 3.55; // Body's orbital period
     int mesh_resolution = 4;     // Resolution level for icosphere
@@ -2025,6 +2588,9 @@ int main(int argc, char** argv) {
     bool include_primary_reflection = true;  // Default to true (include reflection)
     bool no_maps = false;  
     bool save_frames = false;
+    bool include_primary_ir_in_vtk = false;  // Default to excluding primary IR data
+    std::string vtk_output_mode = "both";    // Default to both thermal and complete VTK files
+    std::string output_format = "binary";  // Default to binary format for better performance and smaller files
 
     // Create the thermal config instance
     thermal::Config config;
@@ -2033,26 +2599,28 @@ int main(int argc, char** argv) {
     std::string mesh_file = "";
     double mesh_scale_factor = 1.0;
     
-    // Add a new parameter
+    // Parameter to control verbosity 
     bool verbose = false;
 
-    // Add thermal model parameters
+    // Thermal model parameters
     bool run_thermal_mesh = false;  // Flag to run thermal model for entire mesh
 
-    // Add thermal multiprocessing parameters
+    // Thermal multiprocessing parameters
     int thermal_threads = 0;  // 0 means use OMP default (usually all cores)
 
     // Command-line parameter for equilibration orbits
     int equilibration_orbits = 10;  // Default to 10 Body orbits for equilibration
 
-    // Add command line options for maps
+    // Command line options for maps
     std::string albedo_map_file = "";
     std::string thermal_inertia_map_file = "";
-
-    // Add this parameter with the others
     std::string albedo_maps_directory = "data/albedo_maps";
 
-    // Add these variables before the argument processing loop
+    // VTK files
+    std::string thermal_vtk_file = "";    // Custom thermal VTK filename
+    std::string complete_vtk_file = "";   // Custom complete VTK filename
+
+    // Camera settings
     double camera_distance = 5.0;
     double camera_latitude = 30.0;
     double camera_longitude = 0.0;
@@ -2084,6 +2652,34 @@ int main(int argc, char** argv) {
             time_steps = std::stoi(argv[++i]);
         } else if (arg == "--output" && i + 1 < argc) {
             output_dir = argv[++i];
+        } else if (arg == "--include-primary-ir") {
+            include_primary_ir_in_vtk = true;
+            std::cout << "Including primary IR data in VTK files" << std::endl;
+        } else if (arg == "--vtk-mode" && i + 1 < argc) {
+            vtk_output_mode = argv[++i];
+            // Validate the mode
+            if (vtk_output_mode != "both" && vtk_output_mode != "thermal" && vtk_output_mode != "complete") {
+                std::cerr << "Error: vtk-mode must be 'both', 'thermal', or 'complete'" << std::endl;
+                showUsage(argv[0]);
+                return 1;
+            }
+            std::cout << "VTK output mode set to: " << vtk_output_mode << std::endl;
+        } else if (arg == "--output-format" && i + 1 < argc) {
+            std::string format = argv[++i];
+            if (format == "binary" || format == "vtk") {
+                output_format = format;
+                std::cout << "Output format set to: " << output_format << std::endl;
+            } else {
+                std::cerr << "Error: output-format must be 'binary' or 'vtk'" << std::endl;
+                showUsage(argv[0]);
+                return 1;
+            }
+        } else if (arg == "--thermal-vtk-file" && i + 1 < argc) {
+            thermal_vtk_file = argv[++i];
+            std::cout << "Using custom thermal VTK file: " << thermal_vtk_file << std::endl;
+        } else if (arg == "--complete-vtk-file" && i + 1 < argc) {
+            complete_vtk_file = argv[++i];
+            std::cout << "Using custom complete VTK file: " << complete_vtk_file << std::endl;
         } else if (arg == "--positions" && i + 1 < argc) {
             positions_file = argv[++i];
         } else if (arg == "--no-batch") {
@@ -2409,24 +3005,73 @@ int main(int argc, char** argv) {
             std::cout << " - mesh_resolution: " << mesh_resolution << std::endl;
             std::cout << " - Standard mesh: " << (mesh_file.empty() ? "YES" : "NO") << std::endl;
         }
+        std::vector<double> direct_solar_values_full;
+        std::vector<double> primary_reflected_values_full;
+        std::vector<double> primary_ir_values_full;
 
-        double default_visible_albedo = illumination_model->getAlbedo();
-        // Run thermal models with FULL dataset (unfiltered)
+        // Check if illumination model is using chunked storage by checking if any of the arrays are empty
+        bool using_chunked_storage = illumination_model->getDirectSolarValues().empty() || 
+                                    illumination_model->getPrimaryReflectedValues().empty() || 
+                                    illumination_model->getPrimaryIRFlux().empty();
+
+        if (using_chunked_storage) {
+            std::cout << "Detected chunked storage in illumination model. Extracting data for thermal calculations..." << std::endl;
+            
+            // Get the number of faces and time steps
+            size_t num_faces = mesh->faces.size();
+            size_t total_values = num_faces * total_time_steps;
+            
+            // Allocate space for the extracted values
+            direct_solar_values_full.resize(total_values);
+            primary_reflected_values_full.resize(total_values);
+            primary_ir_values_full.resize(total_values);
+            
+            // Calculate reporting interval for progress updates
+            size_t report_interval = std::max(size_t(1), num_faces / 20); // Report ~20 times
+            
+            // Extract values from chunked storage with progress reporting
+            for (size_t f = 0; f < num_faces; f++) {
+                // Show progress periodically
+                if (f % report_interval == 0 || f == num_faces - 1) {
+                    std::cout << "\rExtracting data from chunked storage: " 
+                            << std::fixed << std::setprecision(1) 
+                            << (100.0 * f / num_faces) << "%" << std::flush;
+                }
+                
+                for (size_t t = 0; t < total_time_steps; t++) {
+                    size_t idx = f * total_time_steps + t;
+                    
+                    // Use accessor methods to get values from chunked storage
+                    // These methods handle chunking internally
+                    direct_solar_values_full[idx] = illumination_model->getDirectSolarValue(f, t);
+                    primary_reflected_values_full[idx] = illumination_model->getPrimaryReflectedValue(f, t);
+                    primary_ir_values_full[idx] = illumination_model->getPrimaryIRValue(f, t);
+                }
+            }
+            std::cout << std::endl; // End the progress line
+        } else {
+            // If not using chunked storage, use the regular arrays
+            direct_solar_values_full = illumination_model->getDirectSolarValues();
+            primary_reflected_values_full = illumination_model->getPrimaryReflectedValues();
+            primary_ir_values_full = illumination_model->getPrimaryIRFlux();
+        }
+
+        // Now use our extracted values instead of the direct accessors
         bool thermal_success = runThermalModelsForAllFaces(
             output_dir,
             mesh,
-            direct_solar_values,         // Use FULL values
-            primary_reflected_values,    // Use FULL values
-            primary_ir_values,           // Use FULL values
-            times,                       // Use FULL times
-            total_time_steps,            // Use FULL time step count
+            direct_solar_values_full,         // Use our extracted values
+            primary_reflected_values_full,    // Use our extracted values 
+            primary_ir_values_full,           // Use our extracted values
+            times,                           // Use FULL times
+            total_time_steps,                // Use FULL time step count
             thermal_config,
             default_visible_albedo,
             0.02,
             &surface_temps,
             equilibration_steps,
             total_time_steps,
-            thermal_threads              // Pass thermal_threads as the last parameter
+            thermal_threads                  // Pass thermal_threads as the last parameter
         );
         
         if (!thermal_success) {
@@ -2445,62 +3090,128 @@ int main(int argc, char** argv) {
     std::vector<std::array<double, 3>> filtered_sun_positions;
     std::vector<std::array<double, 3>> filtered_primary_positions;
 
-    // Pre-allocate all filtered arrays
-    size_t filtered_array_size = num_faces * time_steps;
-    filtered_illumination_values.resize(filtered_array_size);
-    filtered_direct_solar_values.resize(filtered_array_size);
-    filtered_primary_reflected_values.resize(filtered_array_size);
-    filtered_primary_ir_values.resize(filtered_array_size);
+    // Properly calculate array sizes and time step counts
+    const int filtered_time_steps = time_steps;
+    const size_t filtered_array_size = num_faces * filtered_time_steps;
 
-    // Extract only the values for the main simulation period (not equilibration)
-    std::cout << "Filtering " << total_time_steps << " time steps to " << time_steps 
+    // First allocate arrays to appropriate sizes with proper initialization
+    filtered_illumination_values.resize(filtered_array_size, 0.0);
+    filtered_direct_solar_values.resize(filtered_array_size, 0.0);
+    filtered_primary_reflected_values.resize(filtered_array_size, 0.0);
+    filtered_primary_ir_values.resize(filtered_array_size, 0.0);
+
+    // Clear time-related arrays
+    filtered_times.clear();
+    filtered_time_strings.clear();
+    filtered_sun_positions.clear();
+    filtered_primary_positions.clear();
+
+    // Reserve capacity for better performance
+    filtered_times.reserve(filtered_time_steps);
+    filtered_time_strings.reserve(filtered_time_steps);
+    filtered_sun_positions.reserve(filtered_time_steps);
+    filtered_primary_positions.reserve(filtered_time_steps);
+
+    // Process time arrays first
+    std::cout << "Filtering " << total_time_steps << " time steps to " << filtered_time_steps 
             << " output time steps (skipping " << equilibration_steps << " equilibration steps)" << std::endl;
 
-    // Filter illumination data
-    for (int t = equilibration_steps; t < total_time_steps; t++) {
-        // Calculate new time index relative to filtered arrays
-        int new_t = t - equilibration_steps;
+    // Extract the time-related arrays safely
+    for (int t = equilibration_steps; t < total_time_steps && t < times.size(); t++) {
+        filtered_times.push_back(times[t]);
         
-        // Calculate base index for each face's data
-        for (size_t f = 0; f < num_faces; f++) {
-            // Calculate indices correctly for both input and output arrays
-            size_t input_idx = f * total_time_steps + t;
-            size_t output_idx = f * time_steps + new_t;
-            
-            // Bounds check
-            if (input_idx >= illumination_values.size() || output_idx >= filtered_array_size) {
-                std::cerr << "Error: Array index out of bounds during filtering." << std::endl;
-                continue;
-            }
-            
-            // Copy values from the main simulation period
-            filtered_illumination_values[output_idx] = illumination_values[input_idx];
-            filtered_direct_solar_values[output_idx] = direct_solar_values[input_idx];
-            filtered_primary_reflected_values[output_idx] = primary_reflected_values[input_idx];
-            filtered_primary_ir_values[output_idx] = primary_ir_values[input_idx];
+        if (t < time_strings.size()) {
+            filtered_time_strings.push_back(time_strings[t]);
         }
         
-        // Also filter time-related arrays
-        filtered_times.push_back(times[t]);
-        filtered_time_strings.push_back(time_strings[t]);
-        filtered_sun_positions.push_back(sun_positions[t]);
-        filtered_primary_positions.push_back(primary_positions[t]);
+        if (t < sun_positions.size()) {
+            filtered_sun_positions.push_back(sun_positions[t]);
+        }
+        
+        if (t < primary_positions.size()) {
+            filtered_primary_positions.push_back(primary_positions[t]);
+        }
     }
 
-    // Filter thermal data using the exact same approach 
+    // For large meshes, process in batches to avoid excessive logging
+    const size_t reporting_interval = std::max(size_t(1), num_faces / 20); // Report ~20 times
+    std::cout << "Filtering illumination data..." << std::endl;
+
+    // Filter illumination data with robust bounds checking
+    for (size_t f = 0; f < num_faces; f++) {
+        // Report progress periodically
+        if (f % reporting_interval == 0 || f == num_faces - 1) {
+            std::cout << "\rFiltering face " << f + 1 << "/" << num_faces << " (" 
+                    << std::fixed << std::setprecision(1) << (100.0 * f / num_faces) 
+                    << "%)" << std::flush;
+        }
+        
+        // Process each time step for this face
+        for (int t = equilibration_steps; t < total_time_steps; t++) {
+            // New time index relative to filtered data
+            int new_t = t - equilibration_steps;
+            
+            // Calculate source and destination indices
+            size_t src_idx = f * total_time_steps + t;
+            size_t dst_idx = f * filtered_time_steps + new_t;
+            
+            // Get direct illumination model references for consistency
+            const auto& illumination_values = illumination_model->getIllumination();
+            const auto& direct_solar_values = illumination_model->getDirectSolarValues();
+            const auto& primary_reflected_values = illumination_model->getPrimaryReflectedValues();
+            const auto& primary_ir_values = illumination_model->getPrimaryIRFlux();
+            
+            // Robust bounds checking for both source and destination arrays
+            if (src_idx >= direct_solar_values.size() || dst_idx >= filtered_array_size) {
+                continue; // Skip this index safely
+            }
+            
+            // Now we can safely copy values with verified indices
+            filtered_direct_solar_values[dst_idx] = direct_solar_values[src_idx];
+            filtered_primary_reflected_values[dst_idx] = primary_reflected_values[src_idx];
+            filtered_primary_ir_values[dst_idx] = primary_ir_values[src_idx];
+            
+            // Illumination is the sum of direct and reflected
+            filtered_illumination_values[dst_idx] = 
+                direct_solar_values[src_idx] + primary_reflected_values[src_idx];
+                
+            // Add additional bounds check for illumination values if they're separate from
+            // the direct and reflected components
+            if (illumination_values.size() > 0 && src_idx < illumination_values.size()) {
+                // Override with actual illumination if available 
+                // (in case it's not just the sum of direct and reflected)
+                filtered_illumination_values[dst_idx] = illumination_values[src_idx];
+            }
+        }
+    }
+    std::cout << std::endl; // End progress line
+
+    // Now filter thermal data with the same careful approach
     if (run_thermal_mesh && !surface_temps.empty()) {
+        std::cout << "Filtering thermal data..." << std::endl;
         filtered_surface_temps.resize(surface_temps.size());
+        
         for (size_t f = 0; f < surface_temps.size(); f++) {
-            filtered_surface_temps[f].resize(time_steps);
-            for (int t = 0; t < time_steps; t++) {
-                // Surface temps now include equilibration, so we can directly extract
-                if (t + equilibration_steps < surface_temps[f].size()) {
-                    filtered_surface_temps[f][t] = surface_temps[f][t + equilibration_steps];
-                } else {
-                    filtered_surface_temps[f][t] = 50.0; // Default safe value
+            if (f % reporting_interval == 0 || f == surface_temps.size() - 1) {
+                std::cout << "\rFiltering thermal face " << f + 1 << "/" << surface_temps.size() 
+                        << " (" << std::fixed << std::setprecision(1) 
+                        << (100.0 * f / surface_temps.size()) << "%)" << std::flush;
+            }
+            
+            // Initialize with safe default temperature
+            filtered_surface_temps[f].resize(filtered_time_steps, 50.0); 
+            
+            // Only copy valid indices
+            for (int t = 0; t < filtered_time_steps; t++) {
+                int src_t = t + equilibration_steps;
+                
+                // Check array bounds before accessing
+                if (src_t < surface_temps[f].size()) {
+                    filtered_surface_temps[f][t] = surface_temps[f][src_t];
                 }
             }
         }
+        std::cout << std::endl; // End progress line
     }
 
     // Now write body positions file with filtered data
@@ -2514,61 +3225,151 @@ int main(int argc, char** argv) {
 
     // Update the VTK output section with this more efficient approach
     std::string illumination_vtk_file = output_dir + "/ptm_illumination.vtk";
-    std::string thermal_vtk_file = output_dir + "/ptm_thermal.vtk";
-    std::string complete_vtk_file = output_dir + "/ptm_complete.vtk";
+    if (thermal_vtk_file.empty()) {
+        thermal_vtk_file = output_dir + "/ptm_thermal.vtk";
+    }
+    if (complete_vtk_file.empty()) {
+        complete_vtk_file = output_dir + "/ptm_complete.vtk";
+    }
 
-    bool thermal_write_success = false;
+    bool data_write_success = false;
 
-    // Only write one VTK file for the main output
-    if (!run_thermal_mesh) {
-        // For illumination-only runs, write just the illumination VTK
-        std::cout << "Writing illumination data to " << illumination_vtk_file << "..." << std::endl;
-        MeshUtils mesh_utils;
-        mesh_utils.exportIlluminationToVTK(
-            illumination_vtk_file,
-            mesh,
-            filtered_illumination_values,
-            filtered_primary_ir_values,
-            filtered_times,
-            filtered_time_strings,
-            time_steps);
-    } else {
-        // For thermal runs, write the combined VTK file
-        std::cout << "Writing combined illumination and thermal data to " << complete_vtk_file << "..." << std::endl;
-        writeCompleteVTK(
-            complete_vtk_file,
-            mesh,
-            filtered_illumination_values,
-            filtered_primary_ir_values,
-            filtered_surface_temps,
-            filtered_times,
-            filtered_time_strings,
-            time_steps,
-            mesh_file);
-        
-        // Also write separate thermal VTK if we have thermal data
-        if (!filtered_surface_temps.empty()) {
-            std::cout << "Writing thermal data to " << thermal_vtk_file << "..." << std::endl;
-            thermal_write_success = writeThermalVTK(
-                thermal_vtk_file,
+    // Handle output based on format selection (binary vs VTK)
+    if (output_format == "vtk") {
+        // VTK format output - use existing code paths
+        if (!run_thermal_mesh) {
+            // For illumination-only runs, write just the illumination VTK
+            std::cout << "Writing illumination data to " << illumination_vtk_file << "..." << std::endl;
+            MeshUtils mesh_utils;
+            data_write_success = mesh_utils.exportIlluminationToVTK(
+                illumination_vtk_file,
                 mesh,
-                filtered_surface_temps,
+                filtered_illumination_values,
+                filtered_primary_ir_values,
                 filtered_times,
                 filtered_time_strings,
                 time_steps);
+        } else {
+            // Generate dynamic filenames if not specified by user
+            if (thermal_vtk_file.empty()) {
+                thermal_vtk_file = generateSimulationFilename(
+                    output_dir, 
+                    planet.name,
+                    start_time, 
+                    "thermal"
+                );
+            }
+
+            if (complete_vtk_file.empty()) {
+                complete_vtk_file = generateSimulationFilename(
+                    output_dir, 
+                    planet.name,
+                    start_time, 
+                    "complete"
+                );
+            }
+
+            // Conditionally write VTK files based on the selected mode
+            if (vtk_output_mode == "both" || vtk_output_mode == "complete") {
+                if (!writeCompleteVTK(
+                    complete_vtk_file, mesh, 
+                    illumination_values, primary_ir_values, surface_temps, 
+                    times, time_strings, total_time_steps, mesh_file,
+                    include_primary_ir_in_vtk)) {
+                    std::cerr << "Failed to write complete VTK file" << std::endl;
+                } else {
+                    std::cout << "Complete data written to: " << complete_vtk_file << std::endl;
+                    data_write_success = true;
+                }
+            }
+
+            if (vtk_output_mode == "both" || vtk_output_mode == "thermal") {
+                if (!writeThermalVTK(
+                    thermal_vtk_file, mesh, surface_temps, 
+                    times, time_strings, time_steps, false)) {
+                    std::cerr << "Failed to write thermal VTK file" << std::endl;
+                } else {
+                    std::cout << "Thermal data written to: " << thermal_vtk_file << std::endl;
+                    data_write_success = true;
+                }
+            }
         }
+    } else {
+        // Binary output format (default)
+        std::cout << "Using binary output format for data files" << std::endl;
+
+        // Determine which data to write based on simulation type
+        if (!run_thermal_mesh) {
+            // For illumination-only runs, we still export the mesh and illumination data
+            data_write_success = exportDataAsBinary(
+                output_dir,
+                mesh,
+                filtered_illumination_values,
+                filtered_primary_ir_values,
+                std::vector<std::vector<double>>(), // Empty temperature data
+                filtered_times,
+                filtered_time_strings,
+                time_steps,
+                !mesh_file.empty(), // is_custom_mesh if mesh_file is provided
+                false // explicitly exclude equilibration steps
+            );
+        } else {
+            // For thermal runs, export filtered data (excluding equilibration steps)
+            data_write_success = exportDataAsBinary(
+                output_dir,
+                mesh,
+                filtered_illumination_values, // Use filtered illumination values
+                filtered_primary_ir_values,   // Use filtered primary IR values
+                filtered_surface_temps,       // Use filtered surface temperatures
+                filtered_times,               // Use filtered times
+                filtered_time_strings,        // Use filtered time strings
+                time_steps,                   // Use main simulation time steps only
+                !mesh_file.empty(),           // is_custom_mesh if mesh_file is provided
+                false                         // explicitly exclude equilibration steps
+            );
+        }
+
+        if (data_write_success) {
+            std::cout << "Data successfully written in binary format to: " << output_dir << std::endl;
+        }
+    }
+
+    // Common error message for both formats
+    if (!data_write_success) {
+        std::cerr << "Warning: Failed to write output data files" << std::endl;
     }
 
     // Set the location data file path for visualization
     std::string location_data_file = "";
     if (export_locations) {
-        // When using --locations, pass the *generated* CSV file to the visualization script
-        location_data_file = output_dir + "/" + series_output;  // This is the illumination_series.csv
-        std::cout << "Using location data from extracted file: " << location_data_file << std::endl;
-    } else if (!location_data_arg.empty()) {
-        // If --location-data was explicitly provided, use that
-        location_data_file = location_data_arg;
-        std::cout << "Using explicitly provided location data: " << location_data_file << std::endl;
+        // Use the provided location file or the default
+        std::string locations_file = config.getProperty("locations_file", output_dir + "/default_locations.txt");
+        
+        // Check if the file exists
+        if (!std::filesystem::exists(locations_file)) {
+            // Create a default locations file with a few representative points
+            locations_file = createDefaultLocationsFile(output_dir);
+            if (locations_file.empty()) {
+                std::cout << "Note: No locations file provided and unable to create default. Skipping location-specific data export." << std::endl;
+                export_locations = false;
+            } else {
+                std::cout << "Created default locations file: " << locations_file << std::endl;
+            }
+        }
+        
+        if (export_locations) {
+            // Only export if we have a valid locations file
+            std::string series_output = config.getProperty("series_output", output_dir + "/illumination_series.csv");
+            if (exportLocationIlluminationAndTemperature(
+                    series_output, locations_file, mesh,
+                    illumination_values, direct_solar_values, primary_reflected_values, primary_ir_values,
+                    surface_temps, time_strings, time_steps)) {
+                std::cout << "Location illumination and temperature data exported to " << series_output << std::endl;
+                location_data_file = series_output;
+            } else {
+                std::cout << "Note: Location data export was skipped." << std::endl;
+            }
+        }
     }
 
     // Now run visualization with the appropriate VTK file
@@ -2584,7 +3385,7 @@ int main(int argc, char** argv) {
             vtk_for_visualization,  // Use the appropriate file
             output_dir + "/body_solar_flux.mp4",
             output_dir + "/body_primary_ir.mp4",
-            thermal_write_success ? thermal_vtk_file : "",  
+            data_write_success ? thermal_vtk_file : "",  
             output_dir + "/body_surface_temp.mp4",
             output_dir + "/maps",
             output_dir + "/body_positions.csv",
@@ -2692,7 +3493,7 @@ int main(int argc, char** argv) {
         // Check if we've already exported location data
         if (!export_locations) {
             // Only export here if not already exported above
-            std::string default_locations = createDefaultLocationsFile();
+            std::string default_locations = createDefaultLocationsFile(output_dir);
             std::cout << "Exporting location data to: " << series_output << std::endl;
             bool export_success = exportLocationIlluminationAndTemperature(
                 series_output,

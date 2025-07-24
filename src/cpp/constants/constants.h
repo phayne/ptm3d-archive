@@ -34,6 +34,28 @@ extern const double JUPITER_TEMPERATURE;  // Effective temperature (K)
 extern const double JUPITER_BOND_ALBEDO;  // Bond albedo
 extern const double JUPITER_IR_FLUX;      // IR flux from Jupiter
 
+// ---- Earth Constants ----
+extern const double EARTH_RADIUS;               // km
+extern const double EARTH_MASS;                 // kg
+extern const double EARTH_TEMPERATURE;          // K (effective temperature)
+extern const double EARTH_BOND_ALBEDO;          // Bond albedo
+extern const double EARTH_IR_FLUX;              // W/m^2 at Earth distance from Sun
+
+// ---- Mars Constants ----
+extern const double MARS_RADIUS;                // km
+extern const double MARS_MASS;                  // kg
+extern const double MARS_TEMPERATURE;           // K (effective temperature)
+extern const double MARS_BOND_ALBEDO;           // Bond albedo
+extern const double MARS_IR_FLUX;               // W/m^2 at Mars distance from Sun
+
+// ---- Saturn Constants ----
+extern const double SATURN_RADIUS;             // km
+extern const double SATURN_MASS;               // kg
+extern const double SATURN_TEMPERATURE;        // K (effective temperature)
+extern const double SATURN_BOND_ALBEDO;        // Bond albedo
+extern const double SATURN_IR_FLUX;            // W/m^2 at Saturn distance from Sun
+
+
 // ---- Europa Constants ----
 extern const double EUROPA_RADIUS;        // Mean radius of Europa (km)
 extern const double EUROPA_MASS;          // Mass of Europa (kg)

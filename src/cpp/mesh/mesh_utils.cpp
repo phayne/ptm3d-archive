@@ -193,7 +193,8 @@ void MeshUtils::setupMesh() {
     createIcosphereMesh(resolution_, *mesh_);
     
     // Calculate face centers and normals
-    calculateFaceProperties();
+    // For standard mesh, we don't need auto-orientation as normals are already correct
+    calculateFaceProperties(false);
     
     // Map faces to lat/lon coordinates
     mapFacesToLatLon();
@@ -310,10 +311,70 @@ int MeshUtils::getMidpoint(int a, int b,
     return idx;
 }
 
-void MeshUtils::calculateFaceProperties() {
+void MeshUtils::mapFacesToLatLon() {
+    mesh_->latitudes.resize(mesh_->faces.size());
+    mesh_->longitudes.resize(mesh_->faces.size());
+    
+    for (size_t i = 0; i < mesh_->faces.size(); i++) {
+        const auto& center = mesh_->face_centers[i];
+        double r = std::sqrt(center[0] * center[0] + center[1] * center[1] + center[2] * center[2]);
+        
+        // Simpler implementation
+        double lat = std::asin(center[2] / r) * constants::RAD_TO_DEG;
+        double lon = std::atan2(center[1], center[0]) * constants::RAD_TO_DEG;
+        
+        mesh_->latitudes[i] = lat;
+        mesh_->longitudes[i] = lon;
+    }
+}
+
+bool MeshUtils::determineMeshHemisphere() {
+    if (!mesh_ || mesh_->face_centers.empty()) {
+        return true; // Default to northern hemisphere if no data
+    }
+    
+    // Calculate average latitude of all face centers
+    double total_latitude = 0.0;
+    int valid_points = 0;
+    
+    for (size_t i = 0; i < mesh_->face_centers.size(); i++) {
+        const auto& center = mesh_->face_centers[i];
+        double r = std::sqrt(center[0] * center[0] + center[1] * center[1] + center[2] * center[2]);
+        
+        // Calculate latitude in degrees
+        double lat = std::asin(center[2] / r) * constants::RAD_TO_DEG;
+        
+        // Only count valid latitudes
+        if (!std::isnan(lat) && std::abs(lat) <= 90.0) {
+            total_latitude += lat;
+            valid_points++;
+        }
+    }
+    
+    // Return true for north hemisphere (positive average latitude)
+    // Return false for south hemisphere (negative average latitude)
+    bool is_north = true;
+    
+    if (valid_points > 0) {
+        double avg_latitude = total_latitude / valid_points;
+        is_north = (avg_latitude >= 0.0);
+        
+        std::cout << "Mesh hemisphere detection: Average latitude is " 
+                  << std::fixed << std::setprecision(2) << avg_latitude 
+                  << "° (" << (is_north ? "Northern" : "Southern") << " hemisphere)" << std::endl;
+    } else {
+        std::cout << "Warning: Could not determine mesh hemisphere (no valid points)" << std::endl;
+    }
+    
+    return is_north;
+}
+
+// Add a flag to handle hemisphere detection
+void MeshUtils::calculateFaceProperties(bool auto_orient_normals) {
     mesh_->face_normals.resize(mesh_->faces.size());
     mesh_->face_centers.resize(mesh_->faces.size());
     
+    // First calculate face centers and basic normals
     #pragma omp parallel for
     for (size_t i = 0; i < mesh_->faces.size(); i++) {
         const auto& face = mesh_->faces[i];
@@ -344,22 +405,23 @@ void MeshUtils::calculateFaceProperties() {
         
         mesh_->face_normals[i] = normal;
     }
-}
-
-void MeshUtils::mapFacesToLatLon() {
-    mesh_->latitudes.resize(mesh_->faces.size());
-    mesh_->longitudes.resize(mesh_->faces.size());
     
-    for (size_t i = 0; i < mesh_->faces.size(); i++) {
-        const auto& center = mesh_->face_centers[i];
-        double r = std::sqrt(center[0] * center[0] + center[1] * center[1] + center[2] * center[2]);
+    // If auto-orient is requested, check which hemisphere the mesh is in
+    if (auto_orient_normals) {
+        bool is_north_hemisphere = determineMeshHemisphere();
         
-        // Simpler implementation
-        double lat = std::asin(center[2] / r) * constants::RAD_TO_DEG;
-        double lon = std::atan2(center[1], center[0]) * constants::RAD_TO_DEG;
-        
-        mesh_->latitudes[i] = lat;
-        mesh_->longitudes[i] = lon;
+        // For southern hemisphere meshes, we need to flip the normals
+        if (!is_north_hemisphere) {
+            std::cout << "Southern hemisphere mesh detected: Flipping face normals" << std::endl;
+            
+            #pragma omp parallel for
+            for (size_t i = 0; i < mesh_->face_normals.size(); i++) {
+                // Flip the normal by negating all components
+                mesh_->face_normals[i][0] = -mesh_->face_normals[i][0];
+                mesh_->face_normals[i][1] = -mesh_->face_normals[i][1];
+                mesh_->face_normals[i][2] = -mesh_->face_normals[i][2];
+            }
+        }
     }
 }
 
@@ -435,16 +497,20 @@ bool MeshUtils::importTriangulatedMesh(const std::string& filename, double scale
     
     // Apply scale factor if needed
     if (scale_factor != 1.0) {
-        std::cout << "Applying scale factor: " << scale_factor << std::endl;
         for (auto& vertex : mesh_->vertices) {
             vertex[0] *= scale_factor;
             vertex[1] *= scale_factor;
             vertex[2] *= scale_factor;
         }
+        std::cout << "Applied scale factor of " << scale_factor << " to mesh" << std::endl;
     }
     
+    // Set a property to indicate this is a custom mesh
+    mesh_->setProperty("is_custom_mesh", "true");
+    
     // Calculate face properties and map to lat/lon coordinates
-    calculateFaceProperties();
+    // This will now automatically detect the hemisphere and flip normals if needed
+    calculateFaceProperties(true);
     mapFacesToLatLon();
     
     std::cout << "Successfully imported mesh with " << mesh_->vertices.size() << " vertices and " 
@@ -1065,7 +1131,7 @@ bool MeshUtils::loadMeshFromFile(const std::string& filename) {
               << mesh_->faces.size() << " faces from " << filename << std::endl;
     
     // Update face normals, centers, etc.
-    calculateFaceProperties();
+    calculateFaceProperties(true);
     mapFacesToLatLon();
     
     return true;

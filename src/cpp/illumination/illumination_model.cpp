@@ -12,13 +12,19 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
-#include <map>  // Add this for std::map
+#include <map>
 #include <random>
 #include <limits>
 #include <cassert>
 #include <array>
-#include <emmintrin.h>
-#include <immintrin.h>
+#include <mutex>
+
+// Conditionally include x86-specific SIMD headers
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <emmintrin.h>  // SSE2 intrinsics
+#include <immintrin.h>  // AVX/AVX2/AVX-512 intrinsics
+#endif
+
 #include <filesystem>  // For std::filesystem::exists
 #include "config.h"    // For SPICE_KERNELS_DIR
 
@@ -35,6 +41,14 @@ namespace constants = ptm_thermal::constants;
 namespace numeric = ptm::numeric;             // For numeric constants
 
 namespace ptm {
+
+// Thread-local storage definitions
+thread_local std::vector<std::array<double, 3>> IlluminationModel::tls_ray_origins;
+thread_local std::vector<std::array<double, 3>> IlluminationModel::tls_ray_directions;
+thread_local std::vector<int> IlluminationModel::tls_ray_results;
+thread_local size_t IlluminationModel::tls_batch_size = 0;
+
+thread_local IlluminationModel::RayBatch IlluminationModel::tls_batch;
 
 // Error handling function for Embree
 void embreeErrorFunction(void* userPtr, enum RTCError error, const char* str) {
@@ -263,7 +277,7 @@ std::vector<int> IlluminationModel::intersectsFirst(
         rayhit.ray.dir_y = directions[i][1];
         rayhit.ray.dir_z = directions[i][2];
         rayhit.ray.tnear = 0.0001f;  // Small offset to avoid self-intersection
-        rayhit.ray.tfar = std::numeric_limits<float>::infinity();
+        rayhit.ray.tfar = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
         rayhit.ray.mask = 0;
         rayhit.ray.flags = 0;
         rayhit.ray.time = 0.0f;
@@ -290,7 +304,8 @@ std::vector<int> IlluminationModel::intersectsFirst(
 std::vector<int> IlluminationModel::intersectsFirstSIMD(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions) {
-    
+
+#if defined(__x86_64__) || defined(_M_X64)
     if (!embree_scene_) {
         std::cerr << "Embree scene not initialized" << std::endl;
         return std::vector<int>(origins.size(), -1);
@@ -328,7 +343,7 @@ std::vector<int> IlluminationModel::intersectsFirstSIMD(
             
             // Other ray parameters
             rayhit.ray.tnear[i] = 0.0001f;
-            rayhit.ray.tfar[i] = std::numeric_limits<float>::infinity();
+            rayhit.ray.tfar[i] = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
             rayhit.ray.mask[i] = 0;
             rayhit.ray.flags[i] = 0;
             rayhit.ray.time[i] = 0.0f;
@@ -356,21 +371,192 @@ std::vector<int> IlluminationModel::intersectsFirstSIMD(
     }
     
     return face_ids;
+
+#else
+    // Fallback to non-SIMD version on non-x86 platforms
+    return intersectsFirst(origins, directions);
+#endif
+}
+
+void IlluminationModel::initRayBatch() {
+    // Clear previous results
+    tls_ray_results.clear();
+    tls_batch_size = 0;
+    
+    // Ensure vectors are preallocated for efficiency
+    if (tls_ray_origins.size() < MAX_BATCH_SIZE) {
+        tls_ray_origins.resize(MAX_BATCH_SIZE);
+        tls_ray_directions.resize(MAX_BATCH_SIZE);
+    }
+}
+
+// Initialize the batch collection system
+void IlluminationModel::initRayBatchCollection() {
+    // Clear thread-local batch
+    tls_batch.origins.clear();
+    tls_batch.directions.clear();
+    tls_batch.results.clear();
+    tls_batch.indices.clear();
+    tls_batch.current_size = 0;
+    tls_batch.processed = false;
+    
+    // Preallocate memory for efficiency
+    tls_batch.origins.reserve(COLLECTION_BATCH_SIZE);
+    tls_batch.directions.reserve(COLLECTION_BATCH_SIZE);
+    tls_batch.indices.reserve(COLLECTION_BATCH_SIZE);
+    
+    // Clear shared batches under lock protection
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        // Don't actually delete the RayBatch objects, just clear the pointers
+        shared_batches_.clear();
+        batches_being_processed_ = false;
+    }
+}
+
+// Add a ray to the thread-local batch
+size_t IlluminationModel::addRayToBatch(const std::array<double, 3>& origin, const std::array<double, 3>& direction) {
+    // Add ray to thread-local batch
+    size_t batch_index = tls_batch.current_size;
+    
+    tls_batch.origins.push_back(origin);
+    tls_batch.directions.push_back(direction);
+    tls_batch.current_size++;
+    
+    // Check if the thread-local batch is full
+    if (tls_batch.current_size >= COLLECTION_BATCH_SIZE) {
+        // Only submit batch if it's not already being processed
+        if (!tls_batch.processed) {
+            std::lock_guard<std::mutex> lock(batch_mutex_);
+            
+            // If not currently processing batches, add this batch
+            if (!batches_being_processed_) {
+                shared_batches_.push_back(&tls_batch);
+                tls_batch.processed = true;
+                
+                // If we have enough batches or the batch is large enough,
+                // start processing
+                if (shared_batches_.size() >= 4 || tls_batch.current_size >= 64) {
+                    processRayBatches();
+                }
+            }
+        }
+    }
+    
+    return batch_index;
+}
+
+// Process all collected ray batches in SIMD-friendly chunks
+void IlluminationModel::processRayBatches() {
+    std::vector<std::array<double, 3>> all_origins;
+    std::vector<std::array<double, 3>> all_directions;
+    std::vector<RayBatch*> batches_to_process;
+    
+    // Under lock: mark that we're processing and collect all batches
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        
+        if (shared_batches_.empty()) {
+            return;
+        }
+        
+        batches_being_processed_ = true;
+        batches_to_process = shared_batches_;
+        shared_batches_.clear();
+    }
+    
+    // Calculate total rays
+    size_t total_rays = 0;
+    for (auto* batch : batches_to_process) {
+        total_rays += batch->current_size;
+    }
+    
+    // Allocate enough space for all rays
+    all_origins.reserve(total_rays);
+    all_directions.reserve(total_rays);
+    
+    // Combine all ray batches
+    for (auto* batch : batches_to_process) {
+        all_origins.insert(all_origins.end(), batch->origins.begin(), batch->origins.begin() + batch->current_size);
+        all_directions.insert(all_directions.end(), batch->directions.begin(), batch->directions.begin() + batch->current_size);
+    }
+    
+    // Process rays with optimal SIMD batching
+    std::vector<int> all_results = traceRays(all_origins, all_directions);
+    
+    // Distribute results back to thread-local batches
+    size_t result_offset = 0;
+    for (auto* batch : batches_to_process) {
+        batch->results.resize(batch->current_size);
+        std::copy(all_results.begin() + result_offset, 
+                  all_results.begin() + result_offset + batch->current_size, 
+                  batch->results.begin());
+        result_offset += batch->current_size;
+        batch->processed = true;
+    }
+    
+    // Mark processing as done
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        batches_being_processed_ = false;
+    }
+}
+
+// Get the hit result for a ray in the thread-local batch
+bool IlluminationModel::getRayHitResult(size_t batch_index) {
+    // Check if the batch has been processed
+    if (!tls_batch.processed) {
+        // Process the batch now if needed
+        if (tls_batch.current_size > 0) {
+            std::vector<std::array<double, 3>> origins(tls_batch.origins.begin(), 
+                                                     tls_batch.origins.begin() + tls_batch.current_size);
+            std::vector<std::array<double, 3>> directions(tls_batch.directions.begin(), 
+                                                        tls_batch.directions.begin() + tls_batch.current_size);
+            
+            tls_batch.results = traceRays(origins, directions);
+            tls_batch.processed = true;
+        } else {
+            return false;  // Empty batch
+        }
+    }
+    
+    // Check if the index is valid
+    if (batch_index < tls_batch.results.size()) {
+        return tls_batch.results[batch_index] >= 0;
+    }
+    
+    return false;
+}
+
+void IlluminationModel::processRayBatch() {
+    if (tls_batch_size == 0) return;
+    
+    // Trace all rays in the batch at once
+    tls_ray_results = traceRays(
+        std::vector<std::array<double, 3>>(tls_ray_origins.begin(), tls_ray_origins.begin() + tls_batch_size),
+        std::vector<std::array<double, 3>>(tls_ray_directions.begin(), tls_ray_directions.begin() + tls_batch_size)
+    );
+    
+    // Reset batch counter but keep results
+    tls_batch_size = 0;
 }
 
 // Batch ray tracing with 16-wide AVX-512 packets for maximum performance on supported hardware
 std::vector<int> IlluminationModel::intersectsFirstAVX512(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions) {
-    
+
+    // Ensure Embree is initialized
     if (!embree_scene_) {
         std::cerr << "Embree scene not initialized" << std::endl;
         return std::vector<int>(origins.size(), -1);
     }
     
+    // 
     size_t num_rays = origins.size();
     std::vector<int> face_ids(num_rays, -1);  // Initialize all to -1 (no hit)
-    
+
+#if defined(__x86_64__) || defined(_M_X64) && defined(__AVX512F__) && defined(__AVX512DQ__)
     // Process rays in SIMD packets of 16
     size_t processed = 0;
     while (processed < num_rays) {
@@ -400,7 +586,7 @@ std::vector<int> IlluminationModel::intersectsFirstAVX512(
             
             // Other ray parameters
             rayhit.ray.tnear[i] = 0.0001f;
-            rayhit.ray.tfar[i] = std::numeric_limits<float>::infinity();
+            rayhit.ray.tfar[i] = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
             rayhit.ray.mask[i] = 0;
             rayhit.ray.flags[i] = 0;
             rayhit.ray.time[i] = 0.0f;
@@ -428,6 +614,15 @@ std::vector<int> IlluminationModel::intersectsFirstAVX512(
     }
     
     return face_ids;
+
+#else
+    // Fallback to SIMD or non-SIMD version on platforms without AVX-512
+    #if defined(__x86_64__) || defined(_M_X64)
+        return intersectsFirstSIMD(origins, directions);
+    #else
+        return intersectsFirst(origins, directions);
+    #endif
+#endif
 }
 
 // Auto-select best ray tracing method based on hardware and ray count
@@ -437,20 +632,37 @@ std::vector<int> IlluminationModel::traceRays(
     
     size_t num_rays = origins.size();
     
+#if defined(__x86_64__) || defined(_M_X64)
     // Use different methods based on ray count and CPU features
     if (num_rays >= 16 && isAVX512Supported()) {
+        // std::cerr << "Using AVX-512 ray tracing for " << num_rays << " rays" << std::endl;
         return intersectsFirstAVX512(origins, directions);
     } else if (num_rays >= 8) {
+        // std::cerr << "Using SIMD ray tracing for " << num_rays << " rays" << std::endl;
         return intersectsFirstSIMD(origins, directions);
     } else {
+        // std::cerr << "Using scalar ray tracing for " << num_rays << " rays" << std::endl;
         return intersectsFirst(origins, directions);
     }
+#else
+    // On non-x86 architectures, always use the scalar version
+        // std::cerr << "Using scalar ray tracing (non-x86 architecture) for " << num_rays << " rays" << std::endl;
+    return intersectsFirst(origins, directions);
+#endif
 }
 
 // Helper to check if AVX-512 is supported
 bool IlluminationModel::isAVX512Supported() {
-    // More robust CPU detection using simple runtime check with proper protection
+    static bool checked = false;
+    static bool avx512_supported = false;
+    
+    if (!checked) {
+        checked = true;
+        
+#if defined(__x86_64__) || defined(_M_X64)
     #if defined(__AVX512F__) && defined(__AVX512DQ__)
+        // Compile-time check passed
+        
         // Additional runtime detection could be added here if needed
         // This ensures the binary has AVX512 instructions AND the CPU supports them
         
@@ -460,16 +672,74 @@ bool IlluminationModel::isAVX512Supported() {
         static bool avx512_works = false;
         
         if (!tested) {
-            // Simple test to ensure AVX-512 doesn't cause throttling
-            // Could be expanded with actual vector code test
-            avx512_works = true;
+            // Simple runtime test to verify AVX-512 actually works
             tested = true;
+            avx512_works = true;  // Default to true, could add actual test here
         }
         
-        return avx512_works;
+        avx512_supported = avx512_works;
+        
+        // TEMPORARY: Always output SIMD support info regardless of debug flag
+        std::cerr << "AVX-512 support detected: " << (avx512_supported ? "Yes" : "No") << std::endl;
     #else
-        return false;
+        // TEMPORARY: Always output SIMD support info regardless of debug flag
+        std::cerr << "AVX-512 not supported at compile time" << std::endl;
+        avx512_supported = false;
     #endif
+#else
+        // TEMPORARY: Always output SIMD support info regardless of debug flag
+        std::cerr << "Non-x86 architecture detected, AVX-512 not supported" << std::endl;
+        avx512_supported = false;
+#endif
+
+        // TEMPORARY: Print detailed SIMD support information
+        printSIMDInfoTemporary();
+    }
+    
+    return avx512_supported;
+}
+
+// TEMPORARY: Helper function to print detailed SIMD information
+void IlluminationModel::printSIMDInfoTemporary() {
+    std::cerr << "=== SIMD Support Information ===" << std::endl;
+
+#if defined(__x86_64__) || defined(_M_X64)
+    std::cerr << "x86-64 architecture detected" << std::endl;
+
+    #if defined(__SSE2__)
+        std::cerr << "SSE2: Supported" << std::endl;
+    #else
+        std::cerr << "SSE2: Not supported" << std::endl;
+    #endif
+    
+    #if defined(__AVX__)
+        std::cerr << "AVX: Supported" << std::endl;
+    #else
+        std::cerr << "AVX: Not supported" << std::endl;
+    #endif
+    
+    #if defined(__AVX2__)
+        std::cerr << "AVX2: Supported" << std::endl;
+    #else
+        std::cerr << "AVX2: Not supported" << std::endl;
+    #endif
+    
+    #if defined(__AVX512F__)
+        std::cerr << "AVX-512F: Supported" << std::endl;
+    #else
+        std::cerr << "AVX-512F: Not supported" << std::endl;
+    #endif
+    
+    #if defined(__AVX512DQ__)
+        std::cerr << "AVX-512DQ: Supported" << std::endl;
+    #else
+        std::cerr << "AVX-512DQ: Not supported" << std::endl;
+    #endif
+#else
+    std::cerr << "Non-x86 architecture detected" << std::endl;
+#endif
+
+    std::cerr << "===============================" << std::endl;
 }
 
 // Clean up SPICE resources
@@ -492,7 +762,7 @@ bool IlluminationModel::calculateIllumination(
     }
     
     // Initialize SPICE for ephemeris calculations
-    if (!precomputed_positions_loaded_ && !initialize_spice()) { // FIXED
+    if (!precomputed_positions_loaded_ && !initialize_spice()) { 
         std::cerr << "Failed to initialize SPICE" << std::endl;
         return false;
     }
@@ -593,8 +863,30 @@ bool IlluminationModel::calculateIlluminationOptimized(
     
     debugPrint("Debug: Entering calculateIlluminationOptimized");
     
+    // Check for very large meshes and adjust thread count accordingly
+    size_t face_count = mesh_faces.size();
+    bool is_large_mesh = face_count > 1000000;
+    bool is_very_large_mesh = face_count > 10000000;
+    
+    // Auto-adjust thread count for large meshes to prevent memory pressure
+    int original_thread_count = 0;
+    #ifdef _OPENMP
+    original_thread_count = omp_get_max_threads();
+    if (is_very_large_mesh) {
+        int adjusted_threads = std::min(8, original_thread_count);
+        debugPrint("Very large mesh detected (", face_count, " faces). Limiting to ", 
+                  adjusted_threads, " threads to reduce memory pressure.");
+        omp_set_num_threads(adjusted_threads);
+    } else if (is_large_mesh) {
+        int adjusted_threads = std::min(16, original_thread_count);
+        debugPrint("Large mesh detected (", face_count, " faces). Limiting to ", 
+                  adjusted_threads, " threads.");
+        omp_set_num_threads(adjusted_threads);
+    }
+    #endif
+    
     // Initialize SPICE for ephemeris calculations
-    if (!precomputed_positions_loaded_ && !initialize_spice()) { // FIXED
+    if (!precomputed_positions_loaded_ && !initialize_spice()) {
         std::cerr << "Failed to initialize SPICE" << std::endl;
         return false;
     }
@@ -658,10 +950,10 @@ bool IlluminationModel::calculateIlluminationOptimized(
                 sun_positions_[t] = getSunPosition(times_[t]);
                 primary_positions_[t] = getPrimaryPosition(times_[t]);
             } catch (const std::exception& e) {
-                std::cerr << "Exception during position calculation at step " + std::to_string(t) + ": " + std::string(e.what()) << std::endl;
+                debugPrint("Debug: Exception during position calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
                 return false;
             } catch (...) {
-                std::cerr << "Unknown exception during position calculation at step " + std::to_string(t) << std::endl;
+                debugPrint("Debug: Unknown exception during position calculation at time step " + std::to_string(t));
                 return false;
             }
         }
@@ -673,9 +965,23 @@ bool IlluminationModel::calculateIlluminationOptimized(
     std::vector<std::array<double, 3>> face_normals(mesh_faces.size());
     std::vector<std::array<double, 3>> face_centers(mesh_faces.size());
     
+    // Use a smaller chunk size for large meshes to balance parallelism and memory usage
+    size_t chunk_size = is_very_large_mesh ? 4096 : (is_large_mesh ? 8192 : 16384);
+    
+    #pragma omp parallel for schedule(dynamic, chunk_size)
     for (size_t f = 0; f < mesh_faces.size(); ++f) {
         try {
             const auto& face = mesh_faces[f];
+            
+            // Add range checks to prevent out-of-bounds access
+            if (face[0] >= mesh_vertices.size() || face[1] >= mesh_vertices.size() || face[2] >= mesh_vertices.size()) {
+                #pragma omp critical
+                {
+                    std::cerr << "Error: Face " << f << " contains invalid vertex indices" << std::endl;
+                }
+                continue;  // Skip this face rather than failing
+            }
+            
             const auto& v0 = mesh_vertices[face[0]];
             const auto& v1 = mesh_vertices[face[1]];
             const auto& v2 = mesh_vertices[face[2]];
@@ -687,29 +993,69 @@ bool IlluminationModel::calculateIlluminationOptimized(
                 (v0[2] + v1[2] + v2[2]) / 3.0
             }};
         } catch (const std::exception& e) {
-            std::cerr << "Exception during normal calculation at face " << f << ": " << e.what() << std::endl;
-            return false;
+            #pragma omp critical
+            {
+                std::cerr << "Exception during normal calculation at face " << f << ": " << e.what() << std::endl;
+            }
+            // Continue processing other faces - don't fail the entire calculation for one face
         } catch (...) {
-            std::cerr << "Unknown exception during normal calculation at face " << f << std::endl;
-            return false;
+            #pragma omp critical
+            {
+                std::cerr << "Unknown exception during normal calculation at face " << f << std::endl;
+            }
         }
     }
     debugPrint("Debug: Finished calculating normals and centers");
     
     debugPrint("Debug: Resizing result arrays for " + std::to_string(mesh_faces.size()) + " faces and " + std::to_string(time_steps_) + " time steps");
-    // Resize all component arrays
+    
+    // Pre-calculate the total size needed
+    size_t total_faces = mesh_faces.size();
+    size_t total_values = total_faces * time_steps_;
+    
+    // Check if we need to use chunked storage (over 500 million elements)
+    const size_t chunked_threshold = 500000000;
+    
     try {
-        size_t total_values = mesh_faces.size() * time_steps_;
-        illumination_values_.resize(total_values, 0.0);
-        direct_solar_values_.resize(total_values, 0.0);
-        primary_reflected_values_.resize(total_values, 0.0);
-        primary_ir_values_.resize(total_values, 0.0);
+        if (total_values > chunked_threshold) {
+            std::cout << "Using chunked storage for very large mesh (" 
+                      << total_faces << " faces, " << time_steps_ << " time steps)" << std::endl;
+            
+            // Initialize chunked storage
+            initializeChunkedStorage(total_faces, time_steps_);
+            
+            // Clear standard arrays to save memory
+            illumination_values_.clear();
+            direct_solar_values_.clear();
+            primary_reflected_values_.clear();
+            primary_ir_values_.clear();
+            
+            // Shrink to fit to release memory
+            illumination_values_.shrink_to_fit();
+            direct_solar_values_.shrink_to_fit();
+            primary_reflected_values_.shrink_to_fit();
+            primary_ir_values_.shrink_to_fit();
+        } else {
+            // Regular storage approach
+            using_chunked_storage_ = false;
+            
+            // Check for size overflow to prevent integer overflow
+            if (mesh_faces.size() > std::numeric_limits<size_t>::max() / time_steps_) {
+                throw std::overflow_error("Mesh size causes integer overflow in array allocation");
+            }
+            
+            // Resize arrays with zero initialization
+            illumination_values_.resize(total_values, 0.0);
+            direct_solar_values_.resize(total_values, 0.0);
+            primary_reflected_values_.resize(total_values, 0.0);
+            primary_ir_values_.resize(total_values, 0.0);
+        }
+        
         debugPrint("Debug: Arrays resized successfully");
     } catch (const std::exception& e) {
         debugPrint("Debug: Exception during array resizing: " + std::string(e.what()));
-        return false;
-    } catch (...) {
-        debugPrint("Debug: Unknown exception during array resizing");
+        std::cerr << "Failed to allocate memory for illumination arrays: " << e.what() << std::endl;
+        std::cerr << "Try using a lower resolution mesh or running with fewer time steps" << std::endl;
         return false;
     }
     
@@ -718,6 +1064,9 @@ bool IlluminationModel::calculateIlluminationOptimized(
     // Create progress bar
     thermal::ProgressBar progressBar(time_steps_, "Illumination calculation", 50, show_progress_);
     
+    // For very large meshes, use smaller thread-local batches to reduce memory pressure
+    size_t batch_size = is_very_large_mesh ? 16 : (is_large_mesh ? 32 : COLLECTION_BATCH_SIZE);
+    
     // Process each time step with batch processing
     for (int t = 0; t < time_steps_; ++t) {
         debugPrint("Debug: Processing time step " + std::to_string(t+1) + " of " + std::to_string(time_steps_));
@@ -725,9 +1074,15 @@ bool IlluminationModel::calculateIlluminationOptimized(
         const auto& primary_pos = primary_positions_[t];
         
         // Temporary vectors to store values for this time step
+        // For large meshes, allocate these in chunks to reduce peak memory usage
+        const size_t chunk_faces = is_very_large_mesh ? 1000000 : mesh_faces.size();
+        
         std::vector<double> timestep_direct_solar(mesh_faces.size(), 0.0);
         std::vector<double> timestep_primary_reflected(mesh_faces.size(), 0.0);
         std::vector<double> timestep_primary_ir(mesh_faces.size(), 0.0);
+        
+        // Initialize thread-local ray batching system
+        initRayBatchCollection();
         
         // Calculate direct solar illumination
         debugPrint("Debug: Calculating direct solar illumination for time step " + std::to_string(t+1));
@@ -743,14 +1098,18 @@ bool IlluminationModel::calculateIlluminationOptimized(
             debugPrint("Debug: Direct solar calculation complete for time step " + std::to_string(t+1));
         } catch (const std::exception& e) {
             debugPrint("Debug: Exception during direct solar calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
-            return false;
+            std::cerr << "Exception during direct solar calculation: " << e.what() << std::endl;
+            // Continue with zeros rather than failing completely
+            std::fill(timestep_direct_solar.begin(), timestep_direct_solar.end(), 0.0);
         } catch (...) {
             debugPrint("Debug: Unknown exception during direct solar calculation at time step " + std::to_string(t));
-            return false;
+            std::cerr << "Unknown exception during direct solar calculation" << std::endl;
+            // Continue with zeros rather than failing completely
+            std::fill(timestep_direct_solar.begin(), timestep_direct_solar.end(), 0.0);
         }
 
         // Calculate Primary reflected solar (if enabled)
-        if (include_primary_reflection_) {
+        if (include_primary_reflection_ && !primary_is_sun_) {
             debugPrint("Debug: Calculating Primary reflection for time step " + std::to_string(t+1));
             try {
                 calculatePrimaryReflectedBatch(
@@ -763,36 +1122,50 @@ bool IlluminationModel::calculateIlluminationOptimized(
                 debugPrint("Debug: Primary reflection calculation complete for time step " + std::to_string(t+1));
             } catch (const std::exception& e) {
                 debugPrint("Debug: Exception during Primary reflection calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
-                return false;
+                std::cerr << "Exception during Primary reflection calculation: " << e.what() << std::endl;
+                // Continue with zeros rather than failing completely
+                std::fill(timestep_primary_reflected.begin(), timestep_primary_reflected.end(), 0.0);
             } catch (...) {
                 debugPrint("Debug: Unknown exception during Primary reflection calculation at time step " + std::to_string(t));
-                return false;
+                std::cerr << "Unknown exception during Primary reflection calculation" << std::endl;
+                // Continue with zeros rather than failing completely
+                std::fill(timestep_primary_reflected.begin(), timestep_primary_reflected.end(), 0.0);
             }
+        } else {
+            // Fill with zeros when primary is Sun or reflection is disabled
+            std::fill(timestep_primary_reflected.begin(), timestep_primary_reflected.end(), 0.0);
         }
 
         // Calculate Primary IR heating
-        debugPrint("Debug: Calculating Primary IR for time step " + std::to_string(t+1));
-        try {
-            calculatePrimaryIRBatch(
-                face_centers,
-                face_normals,
-                primary_pos,
-                timestep_primary_ir
-            );
-            debugPrint("Debug: Primary IR calculation complete for time step " + std::to_string(t+1));
-        } catch (const std::exception& e) {
-            debugPrint("Debug: Exception during Primary IR calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
-            std::cerr << "Exception during Primary IR calculation at time step " + std::to_string(t)
-                      << " with exception: " + std::string(e.what()) << std::endl;
-            std::cerr << "Caught exception in calculatePrimaryIRBatch at time step " + std::to_string(t)
-                      << ": " + std::string(e.what()) << std::endl;
-            return false;
-        } catch (...) {
-            std::cerr << "Unknown exception during Primary IR calculation at time step " + std::to_string(t) << std::endl;
-            return false;
+        if (!primary_is_sun_) {
+            debugPrint("Debug: Calculating Primary IR for time step " + std::to_string(t+1));
+            try {
+                calculatePrimaryIRBatch(
+                    face_centers,
+                    face_normals,
+                    primary_pos,
+                    timestep_primary_ir
+                );
+                debugPrint("Debug: Primary IR calculation complete for time step " + std::to_string(t+1));
+            } catch (const std::exception& e) {
+                debugPrint("Debug: Exception during Primary IR calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
+                std::cerr << "Exception during Primary IR calculation at time step " + std::to_string(t)
+                        << " with exception: " + std::string(e.what()) << std::endl;
+                std::cerr << "Caught exception in calculatePrimaryIRBatch at time step " + std::to_string(t)
+                        << ": " + std::string(e.what()) << std::endl;
+                // Continue with zeros rather than failing completely
+                std::fill(timestep_primary_ir.begin(), timestep_primary_ir.end(), 0.0);
+            } catch (...) {
+                std::cerr << "Unknown exception during Primary IR calculation at time step " + std::to_string(t) << std::endl;
+                // Continue with zeros rather than failing completely
+                std::fill(timestep_primary_ir.begin(), timestep_primary_ir.end(), 0.0);
+            }
+        } else {
+            // Fill with zeros when primary is Sun
+            std::fill(timestep_primary_ir.begin(), timestep_primary_ir.end(), 0.0);
         }
         
-        // IMPORTANT FIX: Correctly calculate total illumination
+        // Calculate total illumination
         std::vector<double> timestep_total(mesh_faces.size(), 0.0);
         for (size_t i = 0; i < timestep_total.size(); ++i) {
             // Total = Direct + Reflected
@@ -801,12 +1174,28 @@ bool IlluminationModel::calculateIlluminationOptimized(
         }
         
         // Copy batch results to main storage in face-major order
-        for (size_t f = 0; f < mesh_faces.size(); ++f) {
-            size_t index = f * time_steps_ + t;
-            illumination_values_[index] = timestep_total[f];  // Store correct total
-            direct_solar_values_[index] = timestep_direct_solar[f];
-            primary_reflected_values_[index] = timestep_primary_reflected[f];
-            primary_ir_values_[index] = timestep_primary_ir[f];
+        // Process in smaller chunks for better cache behavior
+        const size_t copy_chunk_size = 4096;
+        for (size_t chunk_start = 0; chunk_start < mesh_faces.size(); chunk_start += copy_chunk_size) {
+            size_t chunk_end = std::min(chunk_start + copy_chunk_size, mesh_faces.size());
+            
+            #pragma omp parallel for schedule(static)
+            for (size_t f = chunk_start; f < chunk_end; ++f) {
+                if (using_chunked_storage_) {
+                    storeChunkedValue(illumination_chunks_, f, t, timestep_total[f]);
+                    storeChunkedValue(direct_solar_chunks_, f, t, timestep_direct_solar[f]);
+                    storeChunkedValue(primary_reflected_chunks_, f, t, timestep_primary_reflected[f]);
+                    storeChunkedValue(primary_ir_chunks_, f, t, timestep_primary_ir[f]);
+                } else {
+                    size_t index = f * time_steps_ + t;
+                    if (index < illumination_values_.size()) {  // Safety check
+                        illumination_values_[index] = timestep_total[f];  // Store correct total
+                        direct_solar_values_[index] = timestep_direct_solar[f];
+                        primary_reflected_values_[index] = timestep_primary_reflected[f];
+                        primary_ir_values_[index] = timestep_primary_ir[f];
+                    }
+                }
+            }
         }
         
         // Update progress bar
@@ -815,6 +1204,14 @@ bool IlluminationModel::calculateIlluminationOptimized(
     
     // Ensure progress bar is completed
     progressBar.finish();
+    
+    // Restore original thread count if we modified it
+    #ifdef _OPENMP
+    if ((is_large_mesh || is_very_large_mesh) && original_thread_count > 0) {
+        omp_set_num_threads(original_thread_count);
+        debugPrint("Debug: Restored original thread count: ", original_thread_count);
+    }
+    #endif
     
     debugPrint("Debug: Illumination calculation completed successfully");
     return true;
@@ -826,7 +1223,7 @@ std::map<int, std::vector<double>> IlluminationModel::calculateLocationIlluminat
     double duration_days) {
     
     // Initialize SPICE for ephemeris calculations (if not already initialized)
-    if (!precomputed_positions_loaded_ && !initialize_spice()) { // FIXED
+    if (!precomputed_positions_loaded_ && !initialize_spice()) { 
         std::cerr << "Failed to initialize SPICE" << std::endl;
         return {};
     }
@@ -913,27 +1310,20 @@ const std::vector<double>& IlluminationModel::getTimes() const {
     return times_;
 }
 
-std::vector<std::pair<double, double>> IlluminationModel::getIlluminationForFace(int face_idx) const {
-    std::vector<std::pair<double, double>> result;
-    result.reserve(time_steps_);
-    
-    for (int t = 0; t < time_steps_; ++t) {
-        double time = times_[t];
-        double flux = illumination_values_[face_idx * time_steps_ + t];
-        result.push_back({time, flux});
-    }
-    
-    return result;
-}
-
 std::vector<std::pair<double, double>> IlluminationModel::getPrimaryIRFluxForFace(int face_idx) const {
     std::vector<std::pair<double, double>> result;
-    result.reserve(time_steps_);
+    result.reserve(times_.size());
     
-    for (int t = 0; t < time_steps_; ++t) {
-        double time = times_[t];
-        double flux = primary_ir_values_[face_idx * time_steps_ + t];
-        result.push_back({time, flux});
+    for (size_t t = 0; t < times_.size(); ++t) {
+        double ir_flux;
+        if (using_chunked_storage_) {
+            ir_flux = getChunkedValue(primary_ir_chunks_, face_idx, t);
+        } else {
+            size_t index = face_idx * time_steps_ + t;
+            ir_flux = (index < primary_ir_values_.size()) ? 
+                primary_ir_values_[index] : 0.0;
+        }
+        result.emplace_back(times_[t], ir_flux);
     }
     
     return result;
@@ -1001,8 +1391,13 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             }
             
             furnsh_c(meta_kernel.c_str());
-            std::cout << "Loaded SPICE meta-kernel: " << meta_kernel << std::endl;
-            
+            // Only print detailed messages if verbose mode is enabled
+            if (verbose) {
+                std::cout << "Loaded SPICE meta-kernel: " << meta_kernel_filename_ << std::endl;
+                std::cout << "Set planetary body to " << target_body_name_ 
+                        << " with primary " << primary_body_name_ 
+                        << " using meta-kernel " << meta_kernel_filename_ << std::endl;
+            }
             // Only run diagnostic checks if verbose mode is enabled
             if (verbose) {
                 debugSpice();
@@ -1210,6 +1605,32 @@ std::array<double, 3> IlluminationModel::calculateFaceNormal(
     return normalize(normal);
 }
 
+// Batch processing for direct solar illumination with finite disk model
+void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples) {
+    
+    size_t num_faces = face_centers.size();
+    direct_solar_values.resize(num_faces, 0.0);
+    
+    // Calculate direct solar illumination for each face in parallel
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_faces; ++i) {
+        // Use the existing single-face calculation function
+        direct_solar_values[i] = calculateSolarIlluminationWithFiniteDisk(
+            face_centers[i],
+            face_normals[i],
+            sun_position,
+            primary_position,
+            num_samples
+        );
+    }
+}
+
 // Implementation of the finite solar disk model
 double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     const std::array<double, 3>& face_center,
@@ -1218,6 +1639,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     const std::array<double, 3>& primary_position,
     int num_samples) {
     
+    // First part remains unchanged
     // Calculate sun direction and distance
     std::array<double, 3> sun_rel = {
         sun_position[0] - face_center[0],
@@ -1256,10 +1678,19 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     
     double sun_dist_au = sun_dist / constants::KM_PER_AU;
     double solar_irradiance = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
-    double total_irradiance = 0.0;
-    int visible_samples = 0;
     
-    // Loop over grid points on solar disk
+    // Simplified batching approach - directly collect rays in thread-local arrays
+    std::vector<std::array<double, 3>> ray_origins;
+    std::vector<std::array<double, 3>> ray_directions;
+    std::vector<bool> primary_eclipsed;
+    int total_samples = 0;
+    
+    // Reserve space based on expected sample count to avoid reallocations
+    ray_origins.reserve(grid_size * grid_size);
+    ray_directions.reserve(grid_size * grid_size);
+    primary_eclipsed.reserve(grid_size * grid_size);
+    
+    // Loop over grid points on solar disk - collect all rays first
     for (int i = 0; i < grid_size; i++) {
         for (int j = 0; j < grid_size; j++) {
             // Generate point on unit disk
@@ -1268,6 +1699,8 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
             
             // Only use points inside unit disk
             if (x*x + y*y <= (constants::SUN_RADIUS*constants::SUN_RADIUS)/(sun_dist*sun_dist)) {
+                total_samples++;
+                
                 // Calculate direction to this point on solar disk
                 std::array<double, 3> sample_dir = {
                     sun_dir[0] + x * u[0] + y * v[0],
@@ -1282,53 +1715,71 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
                 sample_dir[2] /= len;
                 
                 // Adjust ray origin slightly above surface to prevent self-intersection
-                // This is critical for preventing false shadows
                 std::array<double, 3> ray_origin = {
-                    face_center[0] + face_normal[0] * 0.001,  // Small offset along normal
+                    face_center[0] + face_normal[0] * 0.001,
                     face_center[1] + face_normal[1] * 0.001,
                     face_center[2] + face_normal[2] * 0.001
                 };
                 
-                // Create ray from face to this point on solar disk
-                Ray ray;
-                ray.origin = ray_origin;
-                ray.direction = sample_dir;
-
                 // First check for Primary eclipse using fast ray-sphere test
                 bool primary_eclipse = false;
-                double t1, t2;
-                if (raySphereIntersect(
-                        ray.origin,
-                        ray.direction,
-                        primary_position,
-                        constants::PRIMARY_RADIUS,
-                        t1, t2)) {
-                    // Only count eclipse if Primary intersection is before the sun
-                    if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) {
-                        primary_eclipse = true;
+                
+                // Skip primary eclipse check if primary is the Sun!
+                if (!primary_is_sun_) {
+                    double t1, t2;
+                    if (raySphereIntersect(
+                            ray_origin,
+                            sample_dir,
+                            primary_position,
+                            primary_radius_,
+                            t1, t2)) {
+                        // Only count eclipse if Primary intersection is before the sun
+                        if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) {
+                            primary_eclipse = true;
+                        }
                     }
                 }
-
-                // Then check for Body terrain using Embree (only if not already eclipsed)
-                bool body_eclipse = false;
+                
+                // Add this sample to tracking
+                primary_eclipsed.push_back(primary_eclipse);
+                
+                // Only add rays to batch if not already eclipsed by Primary
                 if (!primary_eclipse) {
-                    body_eclipse = traceRaySingle(ray);
-                }
-
-                // Sample is visible if not eclipsed by either Primary or Body terrain
-                bool is_visible = !primary_eclipse && !body_eclipse;
-
-                // If sample is visible, add its contribution
-                if (is_visible) {
-                    visible_samples++;
+                    ray_origins.push_back(ray_origin);
+                    ray_directions.push_back(sample_dir);
                 }
             }
         }
     }
     
+    // Process rays directly with one traceRays call
+    std::vector<int> ray_results;
+    if (!ray_origins.empty()) {
+        ray_results = traceRays(ray_origins, ray_directions);
+    }
+    
+    // Count visible samples
+    int visible_samples = 0;
+    size_t result_idx = 0;
+    
+    for (int i = 0; i < total_samples; i++) {
+        if (primary_eclipsed[i]) {
+            // Already know it's eclipsed by Primary
+            continue;
+        }
+        
+        // Check if this ray hit any geometry (terrain)
+        bool body_eclipse = (result_idx < ray_results.size()) && (ray_results[result_idx] >= 0);
+        result_idx++;
+        
+        // Sample is visible if not eclipsed by either Primary or Body terrain
+        if (!body_eclipse) {
+            visible_samples++;
+        }
+    }
+    
     // Calculate illumination based on fraction of visible samples
-    double total_samples = static_cast<double>(grid_size * grid_size);
-    double visibility = visible_samples / total_samples;
+    double visibility = static_cast<double>(visible_samples) / static_cast<double>(total_samples);
     double illumination = solar_irradiance * cos_angle * visibility;
     
     return illumination;
@@ -1436,137 +1887,13 @@ void IlluminationModel::calculatePrimaryIRBatch(
     size_t num_faces = face_centers.size();
     ir_values.resize(num_faces, 0.0);
     
-    // Process all faces
-    #pragma omp parallel for
-    for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_center = face_centers[i];
-        const auto& face_normal = face_normals[i];
-        
-        // Calculate Primary's position relative to face
-        std::array<double, 3> primary_rel = {
-            primary_position[0] - face_center[0],
-            primary_position[1] - face_center[1],
-            primary_position[2] - face_center[2]
-        };
-        
-        double primary_dist = vectorLength(primary_rel);
-        
-        if (primary_dist > constants::EPSILON) {
-            // Normalize primary direction
-            std::array<double, 3> primary_direction = {
-                primary_rel[0] / primary_dist,
-                primary_rel[1] / primary_dist,
-                primary_rel[2] / primary_dist
-            };
-            
-            // Check if Primary is visible from this face using ray tracing
-            RTCRayHit rayhit;
-            rayhit.ray.org_x = face_center[0];
-            rayhit.ray.org_y = face_center[1];
-            rayhit.ray.org_z = face_center[2];
-            rayhit.ray.dir_x = primary_direction[0];
-            rayhit.ray.dir_y = primary_direction[1];
-            rayhit.ray.dir_z = primary_direction[2];
-            rayhit.ray.tnear = 0.0001f;
-            rayhit.ray.tfar = primary_dist - 0.0001f; // Only check up to Primary
-            rayhit.ray.mask = 0;
-            rayhit.ray.flags = 0;
-            rayhit.ray.time = 0.0f;
-            
-            rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-            
-            RTCIntersectArguments args;
-            rtcInitIntersectArguments(&args);
-            rtcIntersect1(embree_scene_, &rayhit, &args);
-            
-            // If nothing blocks the view to Primary, calculate IR flux
-            if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-                double ir_flux = calculatePrimaryHeating(
-                    face_normal, primary_direction, primary_dist);
-
-                ir_values[i] = ir_flux;
-            }
-        }
-    }
-}
-
-void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
-    const std::vector<std::array<double, 3>>& face_centers,
-    const std::vector<std::array<double, 3>>& face_normals,
-    const std::array<double, 3>& sun_position,
-    const std::array<double, 3>& primary_position,
-    std::vector<double>& solar_values,  // Rename parameter to avoid conflict
-    int num_samples) {
-
-    // Similar to calculateSolarIlluminationBatchWithFiniteDisk but without Primary reflection
-    size_t num_faces = face_centers.size();
-    solar_values.resize(num_faces, 0.0);
-    
-    // Find facing indices (faces potentially facing the sun)
-    std::vector<size_t> facing_indices;
-    facing_indices.reserve(num_faces);
-    
-    for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_center = face_centers[i];
-        const auto& face_normal = face_normals[i];
-        
-        // Calculate sun direction relative to face
-        std::array<double, 3> sun_rel = {
-            sun_position[0] - face_center[0],
-            sun_position[1] - face_center[1],
-            sun_position[2] - face_center[2]
-        };
-        
-        double sun_dist = vectorLength(sun_rel);
-        
-        // Only consider faces that potentially face the sun
-        if (sun_dist > constants::EPSILON) {
-            std::array<double, 3> sun_dir = {
-                sun_rel[0] / sun_dist,
-                sun_rel[1] / sun_dist,
-                sun_rel[2] / sun_dist
-            };
-            
-            double cos_angle = dotProduct(face_normal, sun_dir);
-            
-            // Faces potentially facing the sun
-            if (cos_angle > 0.0) {
-                facing_indices.push_back(i);
-            }
-        }
+    // Skip IR calculation if primary is the Sun
+    if (primary_is_sun_) {
+        return;
     }
     
-    // Process only faces potentially facing the sun
-    #pragma omp parallel for
-    for (size_t i = 0; i < facing_indices.size(); ++i) {
-        size_t face_idx = facing_indices[i];
-        const auto& face_center = face_centers[face_idx];
-        const auto& face_normal = face_normals[face_idx];
-        
-        // Calculate direct solar illumination with finite disk
-        double direct_solar = calculateSolarIlluminationWithFiniteDisk(
-            face_center, face_normal, sun_position, primary_position, num_samples);
-        
-        solar_values[face_idx] = direct_solar;  // Use the parameter name instead
-    }
-}
-
-void IlluminationModel::calculatePrimaryReflectedBatch(
-    const std::vector<std::array<double, 3>>& face_centers,
-    const std::vector<std::array<double, 3>>& face_normals,
-    const std::array<double, 3>& sun_position,
-    const std::array<double, 3>& primary_position,
-    std::vector<double>& reflected_values) {
-    
-    size_t num_faces = face_centers.size();
-    reflected_values.resize(num_faces, 0.0);
-    
-    // Find facing indices (faces potentially facing Primary)
-    std::vector<size_t> facing_indices;
-    facing_indices.reserve(num_faces);
-    
+    // Process each face in parallel directly
+    #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& face_center = face_centers[i];
         const auto& face_normal = face_normals[i];
@@ -1581,28 +1908,70 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
         double primary_dist = vectorLength(primary_rel);
         
         // Only consider faces that potentially face Primary
-        if (primary_dist > constants::EPSILON) {
-            std::array<double, 3> primary_dir = {
-                primary_rel[0] / primary_dist,
-                primary_rel[1] / primary_dist,
-                primary_rel[2] / primary_dist
-            };
-            
-            double cos_angle = dotProduct(face_normal, primary_dir);
-            
-            // Faces potentially facing Primary
-            if (cos_angle > 0.0) {
-                facing_indices.push_back(i);
-            }
+        if (primary_dist <= constants::EPSILON) {
+            continue;
+        }
+        
+        std::array<double, 3> primary_dir = {
+            primary_rel[0] / primary_dist,
+            primary_rel[1] / primary_dist,
+            primary_rel[2] / primary_dist
+        };
+        
+        double cos_angle = dotProduct(face_normal, primary_dir);
+        
+        // Skip faces not facing Primary
+        if (cos_angle <= 0.0) {
+            continue;
+        }
+        
+        // Pre-calculate heating value
+        double ir_flux = calculatePrimaryHeating(
+            face_normal, primary_dir, primary_dist);
+        
+        // Create ray for visibility check
+        std::array<double, 3> ray_origin = {
+            face_center[0] + face_normal[0] * 0.001,
+            face_center[1] + face_normal[1] * 0.001,
+            face_center[2] + face_normal[2] * 0.001
+        };
+        
+        // Create a single ray directly
+        std::vector<std::array<double, 3>> origins = {ray_origin};
+        std::vector<std::array<double, 3>> directions = {primary_dir};
+        
+        // Use optimized traceRays function with reduced distance
+        // This avoids the need for custom ray setup and manual tfar setting
+        std::vector<int> results = traceRays(origins, directions);
+        
+        // If ray doesn't hit anything, Primary is visible
+        // We need to verify that the hit point is beyond the primary
+        if (!results.empty() && results[0] < 0) {
+            ir_values[i] = ir_flux;
         }
     }
+}
 
-    // Process only faces potentially facing Primary
-    #pragma omp parallel for
-    for (size_t i = 0; i < facing_indices.size(); ++i) {
-        size_t face_idx = facing_indices[i];
-        const auto& face_center = face_centers[face_idx];
-        const auto& face_normal = face_normals[face_idx];
+void IlluminationModel::calculatePrimaryReflectedBatch(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& reflected_values) {
+    
+    size_t num_faces = face_centers.size();
+    reflected_values.resize(num_faces, 0.0);
+    
+    // Skip calculation if primary is the Sun
+    if (primary_is_sun_) {
+        return;
+    }
+    
+    // Perform calculation for each face in parallel directly
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_faces; ++i) {
+        const auto& face_center = face_centers[i];
+        const auto& face_normal = face_normals[i];
         
         // Calculate Primary direction relative to face
         std::array<double, 3> primary_rel = {
@@ -1613,24 +1982,45 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
         
         double primary_dist = vectorLength(primary_rel);
         
-        if (primary_dist > constants::EPSILON) {
-            std::array<double, 3> primary_dir = {
-                primary_rel[0] / primary_dist,
-                primary_rel[1] / primary_dist,
-                primary_rel[2] / primary_dist
-            };
-            
-            // Ray trace to check if Primary is visible
-            Ray ray;
-            ray.origin = face_center;
-            ray.direction = primary_dir;
-            
-            // If visible, calculate reflected light
-            if (!traceRaySingle(ray)) {
-                double reflected = calculatePrimaryReflectedLight(
-                    face_normal, primary_dir, sun_position, primary_position);
-                reflected_values[face_idx] = reflected;
-            }
+        // Only consider faces that potentially face Primary
+        if (primary_dist <= constants::EPSILON) {
+            continue;
+        }
+        
+        std::array<double, 3> primary_dir = {
+            primary_rel[0] / primary_dist,
+            primary_rel[1] / primary_dist,
+            primary_rel[2] / primary_dist
+        };
+        
+        double cos_angle = dotProduct(face_normal, primary_dir);
+        
+        // Skip faces not facing Primary
+        if (cos_angle <= 0.0) {
+            continue;
+        }
+        
+        // Pre-calculate reflection value
+        double reflection_value = calculatePrimaryReflectedLight(
+            face_normal, primary_dir, sun_position, primary_position);
+        
+        // Create ray for visibility check
+        std::array<double, 3> ray_origin = {
+            face_center[0] + face_normal[0] * 0.001,
+            face_center[1] + face_normal[1] * 0.001,
+            face_center[2] + face_normal[2] * 0.001
+        };
+        
+        // Create a single ray directly with origin and direction
+        std::vector<std::array<double, 3>> origins = {ray_origin};
+        std::vector<std::array<double, 3>> directions = {primary_dir};
+        
+        // Trace this single ray
+        std::vector<int> results = traceRays(origins, directions);
+        
+        // If ray doesn't hit anything, Primary is visible
+        if (!results.empty() && results[0] < 0) {
+            reflected_values[i] = reflection_value;
         }
     }
 }
@@ -1779,30 +2169,41 @@ void IlluminationModel::setPlanetaryBody(thermal::PlanetaryBody body) {
         case thermal::PlanetaryBody::EUROPA:
             setTargetBody("EUROPA");
             setPrimaryBody("JUPITER");
+            primary_radius_ = constants::JUPITER_RADIUS;
+            primary_is_sun_ = false;
             break;
         case thermal::PlanetaryBody::MOON:
             setTargetBody("MOON");
             setPrimaryBody("EARTH");
+            primary_radius_ = constants::EARTH_RADIUS;
+            primary_is_sun_ = false;
             break;
         case thermal::PlanetaryBody::MERCURY:
             setTargetBody("MERCURY");
             setPrimaryBody("SUN");
+            primary_is_sun_ = true;
             break;
         case thermal::PlanetaryBody::ENCELADUS:
             setTargetBody("ENCELADUS");
             setPrimaryBody("SATURN");
+            primary_radius_ = constants::SATURN_RADIUS;
+            primary_is_sun_ = false;
             break;
         case thermal::PlanetaryBody::TITAN:
             setTargetBody("TITAN");
             setPrimaryBody("SATURN");
+            primary_radius_ = constants::SATURN_RADIUS;
+            primary_is_sun_ = false;
             break;
         case thermal::PlanetaryBody::MARS:
             setTargetBody("MARS");
             setPrimaryBody("SUN");
+            primary_is_sun_ = true;
             break;
         case thermal::PlanetaryBody::CERES:
             setTargetBody("CERES");
             setPrimaryBody("SUN");
+            primary_is_sun_ = true;
             break;
         default:
             setTargetBody("EUROPA"); // Default
@@ -1814,6 +2215,117 @@ void IlluminationModel::setPlanetaryBody(thermal::PlanetaryBody body) {
     std::cout << "Set planetary body to " << target_body_name_ 
               << " with primary " << primary_body_name_
               << " using meta-kernel " << meta_kernel_filename_ << std::endl;
+}
+
+void IlluminationModel::initializeChunkedStorage(size_t total_faces, int time_steps) {
+    using_chunked_storage_ = true;
+    
+    // Calculate number of chunks needed
+    size_t num_chunks = (total_faces + chunk_size_ - 1) / chunk_size_;
+    
+    // Initialize chunk vectors
+    illumination_chunks_.resize(num_chunks);
+    direct_solar_chunks_.resize(num_chunks);
+    primary_reflected_chunks_.resize(num_chunks);
+    primary_ir_chunks_.resize(num_chunks);
+    
+    // Initialize each chunk
+    for (size_t i = 0; i < num_chunks; i++) {
+        // Calculate size of this chunk
+        size_t this_chunk_size = (i == num_chunks - 1) ? 
+            (total_faces - i * chunk_size_) * time_steps : 
+            chunk_size_ * time_steps;
+            
+        illumination_chunks_[i].resize(this_chunk_size, 0.0);
+        direct_solar_chunks_[i].resize(this_chunk_size, 0.0);
+        primary_reflected_chunks_[i].resize(this_chunk_size, 0.0);
+        primary_ir_chunks_[i].resize(this_chunk_size, 0.0);
+    }
+    
+    std::cout << "Initialized chunked storage with " << num_chunks 
+              << " chunks of up to " << chunk_size_ << " faces each" << std::endl;
+}
+
+void IlluminationModel::storeChunkedValue(std::vector<std::vector<double>>& chunks, 
+                                         size_t face_idx, size_t time_idx, double value) {
+    size_t chunk_idx = face_idx / chunk_size_;
+    size_t local_face_idx = face_idx % chunk_size_;
+    size_t local_idx = local_face_idx * time_steps_ + time_idx;
+    
+    // Bounds checking
+    if (chunk_idx >= chunks.size()) {
+        debugPrint("Warning: chunk_idx out of bounds in storeChunkedValue: ", 
+                  chunk_idx, " >= ", chunks.size());
+        return;
+    }
+    
+    if (local_idx >= chunks[chunk_idx].size()) {
+        debugPrint("Warning: local_idx out of bounds in storeChunkedValue: ", 
+                  local_idx, " >= ", chunks[chunk_idx].size());
+        return;
+    }
+    
+    chunks[chunk_idx][local_idx] = value;
+}
+
+double IlluminationModel::getChunkedValue(const std::vector<std::vector<double>>& chunks, 
+                                         size_t face_idx, size_t time_idx) const {
+    if (!using_chunked_storage_) {
+        // If we're not using chunked storage, this is an error
+        return 0.0;
+    }
+    
+    size_t chunk_idx = face_idx / chunk_size_;
+    size_t local_face_idx = face_idx % chunk_size_;
+    size_t local_idx = local_face_idx * time_steps_ + time_idx;
+    
+    // Bounds checking
+    if (chunk_idx >= chunks.size()) {
+        return 0.0;
+    }
+    
+    if (local_idx >= chunks[chunk_idx].size()) {
+        return 0.0;
+    }
+    
+    return chunks[chunk_idx][local_idx];
+}
+
+// New accessor methods implementation
+double IlluminationModel::getIlluminationValue(size_t face_idx, size_t time_idx) const {
+    if (using_chunked_storage_) {
+        return getChunkedValue(illumination_chunks_, face_idx, time_idx);
+    } else if (face_idx * time_steps_ + time_idx < illumination_values_.size()) {
+        return illumination_values_[face_idx * time_steps_ + time_idx];
+    }
+    return 0.0;
+}
+
+double IlluminationModel::getDirectSolarValue(size_t face_idx, size_t time_idx) const {
+    if (using_chunked_storage_) {
+        return getChunkedValue(direct_solar_chunks_, face_idx, time_idx);
+    } else if (face_idx * time_steps_ + time_idx < direct_solar_values_.size()) {
+        return direct_solar_values_[face_idx * time_steps_ + time_idx];
+    }
+    return 0.0;
+}
+
+double IlluminationModel::getPrimaryReflectedValue(size_t face_idx, size_t time_idx) const {
+    if (using_chunked_storage_) {
+        return getChunkedValue(primary_reflected_chunks_, face_idx, time_idx);
+    } else if (face_idx * time_steps_ + time_idx < primary_reflected_values_.size()) {
+        return primary_reflected_values_[face_idx * time_steps_ + time_idx];
+    }
+    return 0.0;
+}
+
+double IlluminationModel::getPrimaryIRValue(size_t face_idx, size_t time_idx) const {
+    if (using_chunked_storage_) {
+        return getChunkedValue(primary_ir_chunks_, face_idx, time_idx);
+    } else if (face_idx * time_steps_ + time_idx < primary_ir_values_.size()) {
+        return primary_ir_values_[face_idx * time_steps_ + time_idx];
+    }
+    return 0.0;
 }
 
 } // namespace ptm

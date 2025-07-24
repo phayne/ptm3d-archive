@@ -108,8 +108,9 @@ private:
     int getMidpoint(int a, int b, 
                     std::vector<std::array<double, 3>>& vertices, 
                     std::map<std::pair<int, int>, int>& cache);
-    void calculateFaceProperties();
+    void calculateFaceProperties(bool auto_orient_normals = true);
     void mapFacesToLatLon();
+    bool determineMeshHemisphere();
     
     void normalizeVector(std::array<double, 3>& vec);
 

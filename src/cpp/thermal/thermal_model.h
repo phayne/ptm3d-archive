@@ -6,7 +6,7 @@
 #include <string>
 #include <memory>
 #include <iostream>  // Add this for std::cout
-#include <Eigen/Dense>
+#include "eigen_config.h"
 #include <map>       // Add this for std::map
 #include "planetary_properties.h"  // Add this include
 #include "../maps/spatial_map.h"  // Add this include for SpatialMap class
@@ -25,7 +25,7 @@ private:
     int barWidth;
     std::string prefix;
     bool enabled;
-    bool completed; // Add this flag to track completion
+    bool completed;
     
 public:
     ProgressBar(int total, const std::string& prefix = "Progress", int barWidth = 50, bool enabled = true) 
@@ -43,20 +43,20 @@ public:
         int filledWidth = static_cast<int>(barWidth * percent);
         
         // Build progress bar string
-        std::cout << "\r" << prefix << " [";
+        std::cerr << "\r" << prefix << " [";  // Change to std::cerr
         for (int i = 0; i < barWidth; ++i) {
-            if (i < filledWidth) std::cout << "=";
-            else if (i == filledWidth) std::cout << ">";
-            else std::cout << " ";
+            if (i < filledWidth) std::cerr << "=";  // Change to std::cerr
+            else if (i == filledWidth) std::cerr << ">";  // Change to std::cerr
+            else std::cerr << " ";  // Change to std::cerr
         }
         
         // Add percentage at the end
-        std::cout << "] " << static_cast<int>(percent * 100) << "%";
-        std::cout.flush();
+        std::cerr << "] " << static_cast<int>(percent * 100) << "%";  // Change to std::cerr
+        std::cerr.flush();  // Change to std::cerr
         
         // Mark as completed and add newline when reaching 100%
         if (current >= total) {
-            std::cout << std::endl;
+            std::cerr << std::endl;  // Change to std::cerr
             completed = true;
         }
     }
@@ -218,21 +218,105 @@ public:
     double emissivity;
     double chi;
     double R350_val;
-    
-    // Vectors for spatial grid and thermal properties
-    std::vector<double> z;
-    std::vector<double> dz;
-    std::vector<double> d3z;
-    std::vector<double> g1;
-    std::vector<double> g2;
-    std::vector<double> kc;
-    std::vector<double> rho;
-    std::vector<double> T;
-    std::vector<double> cp;
-    std::vector<double> k;
-    
     int nlayers;
     double day;  // Add day length for time step calculation
+    const Config* config;
+    
+private:
+    // Structure for aligned thermal grid data with cache-friendly layout
+    struct ThermalGrid {
+        // Ensure memory alignment for SIMD operations (AVX-512 requires 64-byte alignment)
+        alignas(64) std::vector<double> z;     // Depth values
+        alignas(64) std::vector<double> dz;    // Layer thicknesses
+        alignas(64) std::vector<double> d3z;   // Derived grid coefficients
+        alignas(64) std::vector<double> g1;    // Grid coefficient 1
+        alignas(64) std::vector<double> g2;    // Grid coefficient 2
+        alignas(64) std::vector<double> kc;    // Conduction component
+        alignas(64) std::vector<double> rho;   // Density
+        alignas(64) std::vector<double> T;     // Temperature
+        alignas(64) std::vector<double> cp;    // Heat capacity
+        alignas(64) std::vector<double> k;     // Thermal conductivity
+        
+        // Methods to ensure proper allocation
+        void resize(size_t size) {
+            // Resize all arrays at once
+            z.resize(size);
+            dz.resize(size > 0 ? size - 1 : 0);
+            d3z.resize(size > 0 ? size - 2 : 0);
+            g1.resize(size > 0 ? size - 2 : 0);
+            g2.resize(size > 0 ? size - 2 : 0);
+            kc.resize(size);
+            rho.resize(size);
+            T.resize(size);
+            cp.resize(size);
+            k.resize(size);
+        }
+        
+        // Custom memory allocation for aligned vectors
+        void reserve(size_t capacity) {
+            z.reserve(capacity);
+            dz.reserve(capacity > 0 ? capacity - 1 : 0);
+            d3z.reserve(capacity > 0 ? capacity - 2 : 0);
+            g1.reserve(capacity > 0 ? capacity - 2 : 0);
+            g2.reserve(capacity > 0 ? capacity - 2 : 0);
+            kc.reserve(capacity);
+            rho.reserve(capacity);
+            T.reserve(capacity);
+            cp.reserve(capacity);
+            k.reserve(capacity);
+        }
+    };
+
+    // Memory pool for temporary arrays used in calculations
+    struct MemoryPool {
+        alignas(64) std::vector<double> a_buffer;
+        alignas(64) std::vector<double> b_buffer;
+        alignas(64) std::vector<double> c_buffer;
+        alignas(64) std::vector<double> d_buffer;
+        
+        void ensure_capacity(size_t n) {
+            if (a_buffer.size() < n) {
+                a_buffer.resize(n);
+                b_buffer.resize(n);
+                c_buffer.resize(n);
+                d_buffer.resize(n);
+            }
+        }
+        
+        double* a() { return a_buffer.data(); }
+        double* b() { return b_buffer.data(); }
+        double* c() { return c_buffer.data(); }
+        double* d() { return d_buffer.data(); }
+    };
+    
+    // Replace individual vectors with the structure
+    ThermalGrid grid;
+    MemoryPool memory_pool;
+    
+public:
+    // Add accessors to maintain API compatibility
+    std::vector<double>& z() { return grid.z; }
+    std::vector<double>& dz() { return grid.dz; }
+    std::vector<double>& d3z() { return grid.d3z; }
+    std::vector<double>& g1() { return grid.g1; }
+    std::vector<double>& g2() { return grid.g2; }
+    std::vector<double>& kc() { return grid.kc; }
+    std::vector<double>& rho() { return grid.rho; }
+    std::vector<double>& T() { return grid.T; }
+    std::vector<double>& cp() { return grid.cp; }
+    std::vector<double>& k() { return grid.k; }
+    
+    // Const accessors for read-only operations
+    const std::vector<double>& z() const { return grid.z; }
+    const std::vector<double>& dz() const { return grid.dz; }
+    const std::vector<double>& d3z() const { return grid.d3z; }
+    const std::vector<double>& g1() const { return grid.g1; }
+    const std::vector<double>& g2() const { return grid.g2; }
+    const std::vector<double>& kc() const { return grid.kc; }
+    const std::vector<double>& rho() const { return grid.rho; }
+    const std::vector<double>& T() const { return grid.T; }
+    const std::vector<double>& cp() const { return grid.cp; }
+    const std::vector<double>& k() const { return grid.k; }
     
     // Constructor
     Profile(const Planet& planet = Planet(), double lat = 0.0, 
@@ -243,9 +327,6 @@ public:
     void update_cp();
     void update_k();
     void update_T(double dt, double Qs = 0, double Qb = 0);
-    
-    // Reference to config
-    const Config* config;
 };
 
 // Model class

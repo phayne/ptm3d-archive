@@ -1,5 +1,6 @@
 #include "thermal_model.h"
 #include "../maps/spatial_map.h"
+#include "eigen_config.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -39,6 +40,45 @@ void solveTridiagonal(double* a, double* b, double* c, double* d, int n) {
     }
     
     // Solution is now in d
+}
+
+void solveTridiagonalOptimized(double* a, double* b, double* c, double* d, int n) {
+    // Small matrices - use scalar Thomas algorithm (current implementation)
+    if (n <= THOMAS_MAX_SIZE) {
+        solveTridiagonal(a, b, c, d, n);
+        return;
+    }
+    
+    // Large matrices - use parallel cyclic reduction or PCR
+    // This algorithm has better parallelism for large systems
+    #pragma omp parallel
+    {
+        // Phase 1: Forward elimination (can be partially parallelized)
+        #pragma omp for nowait
+        for (int i = 0; i < n; i++) {
+            // Normalize equation i
+            double invB = 1.0 / b[i];
+            if (i > 0) a[i] *= invB;
+            d[i] *= invB;
+            b[i] = 1.0;
+            
+            // Forward elimination for odd-indexed rows
+            if (i < n-1 && (i & 1)) {
+                double factor = c[i];
+                c[i] = 0.0;
+                b[i+1] -= factor * a[i+1];
+                d[i+1] -= factor * d[i];
+            }
+        }
+        
+        // Phase 2: Backward substitution
+        #pragma omp for
+        for (int i = n-1; i >= 0; i--) {
+            if (i < n-1) {
+                d[i] -= c[i] * d[i+1];
+            }
+        }
+    }
 }
 
 // Essential helper functions
@@ -327,36 +367,42 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     double skin_d = skinDepth(planet.day, kappa);
     
     // Use a minimum skin depth to prevent very small layers
-    if (skin_d < 0.01) skin_d = 0.01;  // Minimum 1cm skin depth
+    if (skin_d < 0.01)  // Minimum 1cm skin depth
+        skin_d = 0.01;
     
     // Create spatial grid - pass the verbose flag
-    z = generateStableGrid(skin_d, config.m, config.n, config.b, verbose);
-    nlayers = z.size();
+    z() = generateStableGrid(skin_d, config.m, config.n, config.b, verbose);
+    nlayers = z().size();
     
     // Calculate layer thicknesses
-    dz.resize(z.size() - 1);
-    for (int i = 0; i < z.size() - 1; i++) {
-        dz[i] = z[i+1] - z[i];
-        // Ensure no extremely thin layers (minimum 1mm)
-        if (dz[i] < 0.001) dz[i] = 0.001;
+    dz().resize(z().size() - 1);
+    for (int i = 0; i < z().size() - 1; i++) {
+        dz()[i] = z()[i+1] - z()[i];
+        
+        // Safety check for very thin layers
+        if (dz()[i] < 0.001) dz()[i] = 0.001;
     }
     
     // Calculate grid coefficients for finite difference
-    d3z.resize(dz.size() - 1);
-    g1.resize(dz.size() - 1);
-    g2.resize(dz.size() - 1);
-    for (int i = 0; i < dz.size() - 1; i++) {
-        d3z[i] = dz[i+1] * dz[i] * (dz[i+1] + dz[i]);
-        g1[i] = 2.0 * dz[i+1] / d3z[i];
-        g2[i] = 2.0 * dz[i] / d3z[i];
+    d3z().resize(dz().size() - 1);
+    g1().resize(dz().size() - 1);
+    g2().resize(dz().size() - 1);
+    for (int i = 0; i < dz().size() - 1; i++) {
+        d3z()[i] = dz()[i+1] * dz()[i] * (dz()[i+1] + dz()[i]);
+        g1()[i] = 2.0 * dz()[i+1] / d3z()[i];
+        g2()[i] = 2.0 * dz()[i] / d3z()[i];
     }
     
     // Initialize thermal properties arrays
-    kc.resize(nlayers);
-    rho.resize(nlayers);
+    kc().resize(nlayers);
+    rho().resize(nlayers);
     for (int i = 0; i < nlayers; i++) {
-        kc[i] = planet.kd - (planet.kd - planet.ks) * std::exp(-z[i] / planet.H);
-        rho[i] = planet.rhod - (planet.rhod - planet.rhos) * std::exp(-z[i] / planet.H);
+        double depth = z()[i];
+        double depth_factor = std::exp(-depth / planet.H);
+        
+        // Depth-dependent properties
+        kc()[i] = planet.kd + (planet.ks - planet.kd) * depth_factor;
+        rho()[i] = planet.rhod + (planet.rhos - planet.rhod) * depth_factor;
     }
     
     // Initialize temperature profile
@@ -368,21 +414,16 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     
     // Only show initialization messages if verbose
     if (verbose) {
-        std::cout << "Creating spatial grid with:" << std::endl;
-        std::cout << "  Skin depth: " << skin_d << " m" << std::endl;
-        std::cout << "  Uppermost layer thickness: " << dz[0] << " m" << std::endl;
-        std::cout << "  Minimum allowed thickness: " << dz[0] << " m" << std::endl;
+        std::cout << "Initialized thermal profile with " << nlayers << " layers" << std::endl;
+        std::cout << "Skin depth: " << skin_d << " m" << std::endl;
+        std::cout << "Layer thicknesses: " << dz()[0] << " to " << dz()[dz().size()-1] << " m" << std::endl;
+        std::cout << "Total depth: " << z()[z().size()-1] << " m" << std::endl;
     }
     
-    if (verbose) {
-        std::cout << "Created grid with " << z.size() << " layers to depth " 
-                  << z.back() << " m" << std::endl;
-    }
-    
-    // Set up aligned memory for better SIMD performanc
-    alignas(64) std::vector<double> aligned_T(T.size()); 
-    std::copy(T.begin(), T.end(), aligned_T.begin());
-    T = std::move(aligned_T);
+    // Set up aligned memory for better SIMD performance
+    alignas(64) std::vector<double> aligned_T(T().size()); 
+    std::copy(T().begin(), T().end(), aligned_T.begin());
+    T() = std::move(aligned_T);
 }
 
 void Profile::init_T(const Planet& planet, double lat, bool verbose) {
@@ -395,11 +436,12 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
     }
     
     // Calculate average temperature (more realistic starting point)
-    double T_avg = T_max / std::sqrt(2.0);    
+    double T_avg = T_max / std::sqrt(2.0);
+    
     // Calculate deep temperature based on internal heat flux
     double k_deep = planet.kd + R350_val * std::pow(80.0, 3);
     double gradient = planet.Qb / k_deep;
-    double depth = z.back();
+    double depth = z().back();
     double T_deep = T_avg + gradient * depth;
     
     // Only print if verbose
@@ -410,27 +452,50 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
     }
     
     // Initialize with depth-dependent profile
-    T.resize(nlayers);
+    T().resize(nlayers);
     for (size_t i = 0; i < nlayers; i++) {
         // Exponential blend from surface to deep temperature
-        double blend = std::exp(-z[i] / (skinDepth(planet.day, planet.ks/(planet.rhos*planet.cp0))));
-        T[i] = T_deep + (T_avg - T_deep) * blend;
+        double blend = std::exp(-z()[i] / (skinDepth(planet.day, planet.ks/(planet.rhos*planet.cp0))));
+        T()[i] = T_deep + (T_avg - T_deep) * blend;
     }
 }
 
 void Profile::update_cp() {
-    cp.resize(T.size());
-    for (size_t i = 0; i < T.size(); i++) {
-        cp[i] = planet.cp0;
-        for (size_t j = 0; j < planet.cpCoeff.size(); j++) {
-            cp[i] += planet.cpCoeff[j] * std::pow(T[i], j+1);
+    cp().resize(T().size());
+    
+    // For improved efficiency, use thread-level parallelism for large arrays
+    int num_threads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        #pragma omp single
+        num_threads = omp_get_num_threads();
+    }
+#endif
+
+    if (num_threads > 1 && T().size() > 1000) {
+        // Parallel implementation for large arrays
+        #pragma omp parallel for
+        for (size_t i = 0; i < T().size(); i++) {
+            cp()[i] = planet.cp0;
+            for (size_t j = 0; j < planet.cpCoeff.size(); j++) {
+                cp()[i] += planet.cpCoeff[j] * std::pow(T()[i], j+1);
+            }
+        }
+    } else {
+        // Scalar implementation for smaller arrays or single thread
+        for (size_t i = 0; i < T().size(); i++) {
+            cp()[i] = planet.cp0;
+            for (size_t j = 0; j < planet.cpCoeff.size(); j++) {
+                cp()[i] += planet.cpCoeff[j] * std::pow(T()[i], j+1);
+            }
         }
     }
 }
 
 // Fix the update_k() method to only calculate thermal conductivity
 void Profile::update_k() {
-    k.resize(T.size());
+    k().resize(T().size());
     
     // Check if running in multi-threaded mode - use simple implementation for better scaling
     int num_threads = 1;
@@ -445,23 +510,23 @@ void Profile::update_k() {
     if (num_threads > 1) {
         // Multi-threaded scalar implementation
         #pragma omp parallel for
-        for (size_t i = 0; i < T.size(); i++) {
-            k[i] = kc[i] + R350_val * std::pow(T[i], 3);
+        for (size_t i = 0; i < T().size(); i++) {
+            k()[i] = kc()[i] + R350_val * std::pow(T()[i], 3);
         }
     }
     else {
 #if defined(AVX512_ENABLED)
         // AVX-512 optimized implementation - process 8 elements at once
         const size_t vec_size = 8;
-        const size_t vec_end = T.size() - (T.size() % vec_size);
+        const size_t vec_end = T().size() - (T().size() % vec_size);
         
         // Process blocks of 8 elements
         for (size_t i = 0; i < vec_end; i += vec_size) {
             // Load 8 temperature values using unaligned load for flexibility
-            __m512d T_vec = _mm512_loadu_pd(&T[i]);
+            __m512d T_vec = _mm512_loadu_pd(&T()[i]);
             
             // Load 8 kc values 
-            __m512d kc_vec = _mm512_loadu_pd(&kc[i]);
+            __m512d kc_vec = _mm512_loadu_pd(&kc()[i]);
             
             // Calculate T^2 and then T^3 (faster than pow)
             __m512d T_squared = _mm512_mul_pd(T_vec, T_vec);
@@ -474,24 +539,24 @@ void Profile::update_k() {
             __m512d result = _mm512_add_pd(kc_vec, radiative_term);
             
             // Store the result using unaligned store
-            _mm512_storeu_pd(&k[i], result);
+            _mm512_storeu_pd(&k()[i], result);
         }
         
         // Handle remaining elements with scalar code
-        for (size_t i = vec_end; i < T.size(); i++) {
-            k[i] = kc[i] + R350_val * std::pow(T[i], 3);
+        for (size_t i = vec_end; i < T().size(); i++) {
+            k()[i] = kc()[i] + R350_val * std::pow(T()[i], 3);
         }
 #elif defined(AVX2_ENABLED)
         // AVX2 implementation for thermal conductivity
         const size_t vec_size = 4;
-        const size_t vec_end = T.size() - (T.size() % vec_size);
+        const size_t vec_end = T().size() - (T().size() % vec_size);
         
         for (size_t i = 0; i < vec_end; i += vec_size) {
-            // Load 4 temperatures
-            __m256d T_vec = _mm256_loadu_pd(&T[i]);
+            // Load 4 temperature values
+            __m256d T_vec = _mm256_loadu_pd(&T()[i]);
             
             // Load 4 kc values
-            __m256d kc_vec = _mm256_loadu_pd(&kc[i]);
+            __m256d kc_vec = _mm256_loadu_pd(&kc()[i]);
             
             // Calculate T^2 and then T^3
             __m256d T_squared = _mm256_mul_pd(T_vec, T_vec);
@@ -504,17 +569,19 @@ void Profile::update_k() {
             __m256d result = _mm256_add_pd(kc_vec, radiative_term);
             
             // Store the result
-            _mm256_storeu_pd(&k[i], result);
+            _mm256_storeu_pd(&k()[i], result);
         }
         
-        // Handle remaining elements with scalar code
-        for (size_t i = vec_end; i < T.size(); i++) {
-            k[i] = kc[i] + R350_val * std::pow(T[i], 3);
+        // Handle remaining elements
+        for (size_t i = vec_end; i < T().size(); i++) {
+            k()[i] = kc()[i] + R350_val * std::pow(T()[i], 3);
         }
 #else
-        // Scalar implementation
-        for (size_t i = 0; i < T.size(); i++) {
-            k[i] = kc[i] + R350_val * std::pow(T[i], 3);
+        // Scalar implementation with manual optimization
+        for (size_t i = 0; i < T().size(); i++) {
+            // Use direct multiplication instead of std::pow for better performance
+            double t = T()[i];
+            k()[i] = kc()[i] + R350_val * (t * t * t);
         }
 #endif
     }
@@ -525,8 +592,18 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     surfTemp(*this, Qs);
     if (Qb != 0) botTemp(*this, Qb);
     
-    // Create aligned copy of temperatures for vectorization
-    std::vector<double> T_old = T;
+    // Get number of interior points (exclude boundaries)
+    const size_t n = grid.T.size() - 2;
+    if (n < 1) return; // Nothing to do for very small profiles
+    
+    // Create aligned temperature cache for better memory access patterns
+    alignas(64) static thread_local std::vector<double> T_old;
+    if (T_old.size() < grid.T.size()) {
+        T_old.resize(grid.T.size(), 0.0);
+    }
+    
+    // Copy current temperatures to cache
+    std::copy(grid.T.begin(), grid.T.end(), T_old.begin());
     
     // Detect if running in multi-threaded mode
     int num_threads = 1;
@@ -538,253 +615,385 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     }
 #endif
     
-    // Get number of interior points (exclude boundaries)
-    size_t n = T.size() - 2;
-
+    // Choose algorithm based on thread count and problem size
     if (num_threads > 1) {
-        // Multi-threaded scalar implementation
+        // Multi-threaded mode: use simple point-Jacobi iteration for better scalability
         #pragma omp parallel for
-        for (size_t i = 1; i < T.size() - 1; i++) {
-            double kappa = k[i] / (rho[i] * cp[i]);
+        for (size_t i = 1; i < grid.T.size() - 1; i++) {
+            // Calculate thermal diffusivity
+            double kappa = grid.k[i] / (grid.rho[i] * grid.cp[i]);
             double r = dt * kappa;
-            double a = -0.5 * r * g1[i-1];
-            double c = -0.5 * r * g2[i-1];
-            double b = 1.0 + 0.5 * r * (g1[i-1] + g2[i-1]);
-            double rhs = T_old[i] + 0.5 * r * (g1[i-1] * T_old[i-1] + 
-                                    g2[i-1] * T_old[i+1] - 
-                                    (g1[i-1] + g2[i-1]) * T_old[i]);
-            T[i] = (rhs - a * T[i-1] - c * T[i+1]) / b;
+            
+            // Calculate Crank-Nicolson coefficients
+            double a_coef = -0.5 * r * grid.g1[i-1];
+            double c_coef = -0.5 * r * grid.g2[i-1];
+            double b_coef = 1.0 + 0.5 * r * (grid.g1[i-1] + grid.g2[i-1]);
+            
+            // Calculate right-hand side
+            double rhs_val = T_old[i] + 0.5 * r * (grid.g1[i-1] * T_old[i-1] + 
+                                    grid.g2[i-1] * T_old[i+1] - 
+                                    (grid.g1[i-1] + grid.g2[i-1]) * T_old[i]);
+            
+            // Solve for new temperature
+            grid.T[i] = (rhs_val - a_coef * grid.T[i-1] - c_coef * grid.T[i+1]) / b_coef;
         }
     }
-    else if (n < THOMAS_MAX_SIZE) {  // For small systems, use the Thomas algorithm
-        // Allocate aligned arrays for the tridiagonal system
-        alignas(64) std::vector<double> a(n), b(n), c(n), d(n);
+    else if (n <= THOMAS_MAX_SIZE) {
+        // For small systems, use direct Thomas algorithm with pre-allocated memory
+        memory_pool.ensure_capacity(n);
+        double* a = memory_pool.a();
+        double* b = memory_pool.b();
+        double* c = memory_pool.c();
+        double* d = memory_pool.d();
         
         // Set up the tridiagonal system
         for (size_t i = 0; i < n; i++) {
             size_t grid_i = i + 1;  // Offset to interior points
             
-            double kappa = k[grid_i] / (rho[grid_i] * cp[grid_i]);
+            // Pre-calculate thermal diffusivity for better locality
+            double kappa = grid.k[grid_i] / (grid.rho[grid_i] * grid.cp[grid_i]);
             double r = dt * kappa;
             
-            // Tridiagonal coefficients (lower, main, upper diagonals)
-            a[i] = -0.5 * r * g1[grid_i-1];
-            b[i] = 1.0 + 0.5 * r * (g1[grid_i-1] + g2[grid_i-1]);
-            c[i] = -0.5 * r * g2[grid_i-1];
+            // Cache grid coefficients for better data locality
+            double g1_val = grid.g1[grid_i-1];
+            double g2_val = grid.g2[grid_i-1];
+            double g_sum = g1_val + g2_val;
             
-            // Right-hand side
-            d[i] = T_old[grid_i] + 0.5 * r * (g1[grid_i-1] * T_old[grid_i-1] + 
-                                       g2[grid_i-1] * T_old[grid_i+1] - 
-                                       (g1[grid_i-1] + g2[grid_i-1]) * T_old[grid_i]);
+            // Tridiagonal coefficients (lower, main, upper diagonals)
+            a[i] = -0.5 * r * g1_val;
+            b[i] = 1.0 + 0.5 * r * g_sum;
+            c[i] = -0.5 * r * g2_val;
+            
+            // Right-hand side - group related operations for better instruction pipelining
+            d[i] = T_old[grid_i] + 0.5 * r * (
+                     g1_val * T_old[grid_i-1] + 
+                     g2_val * T_old[grid_i+1] - 
+                     g_sum * T_old[grid_i]);
         }
         
-        // Special handling for boundary points (incorporate boundary conditions)
-        // First interior point interacts with the surface boundary
-        d[0] -= a[0] * T[0];
+        // Special handling for boundary conditions
+        d[0] -= a[0] * grid.T[0];
+        d[n-1] -= c[n-1] * grid.T[grid.T.size()-1];
         
-        // Last interior point interacts with the bottom boundary
-        d[n-1] -= c[n-1] * T[T.size()-1];
-        
-        // Run the Thomas algorithm
-        solveTridiagonal(a.data(), b.data(), c.data(), d.data(), n);
+        // Run the optimized Thomas algorithm
+        solveTridiagonalOptimized(a, b, c, d, n);
         
         // Copy solution back to temperature array (interior points only)
         for (size_t i = 0; i < n; i++) {
-            T[i+1] = d[i];
+            grid.T[i+1] = d[i];
         }
     }
     else {
+        // For large systems, use SIMD if available
 #if defined(AVX512_ENABLED)
-        // AVX-512 path with fixed time step
+        // AVX-512 path with optimized memory access
         const size_t vec_size = 8;
         
-        // Need to ensure array is large enough for SIMD access
-        if (T.size() < MIN_VECTORIZED_SIZE) {
-            // Fall back to scalar version for very small arrays
-            for (size_t i = 1; i < T.size() - 1; i++) {
-                double kappa = k[i] / (rho[i] * cp[i]);
-                double r = dt * kappa;  // Using fixed dt
-                double a = -0.5 * r * g1[i-1];
-                double c = -0.5 * r * g2[i-1];
-                double b = 1.0 + 0.5 * r * (g1[i-1] + g2[i-1]);
-                double rhs = T_old[i] + 0.5 * r * (g1[i-1] * T_old[i-1] + 
-                                        g2[i-1] * T_old[i+1] - 
-                                        (g1[i-1] + g2[i-1]) * T_old[i]);
-                T[i] = (rhs - a * T[i-1] - c * T[i+1]) / b;
-            }
-        } else {
-            // Safe end point for AVX-512 vectorized operations
-            const size_t vec_end = ((T.size() - 16) / vec_size) * vec_size + 1;
-            
-            // Safety check for vec_end validity
-            if (vec_end <= 1 || vec_end >= T.size()) {
-                // Fall back to scalar version for invalid bounds
-                for (size_t i = 1; i < T.size() - 1; i++) {
-                    double kappa = k[i] / (rho[i] * cp[i]);
-                    double r = dt * kappa;  // Using fixed dt
-                    double a = -0.5 * r * g1[i-1];
-                    double c = -0.5 * r * g2[i-1];
-                    double b = 1.0 + 0.5 * r * (g1[i-1] + g2[i-1]);
-                    double rhs = T_old[i] + 0.5 * r * (g1[i-1] * T_old[i-1] + 
-                                            g2[i-1] * T_old[i+1] - 
-                                            (g1[i-1] + g2[i-1]) * T_old[i]);
-                    T[i] = (rhs - a * T[i-1] - c * T[i+1]) / b;
+        // Process in blocks of 8 elements using AVX-512
+        const size_t vec_end = ((grid.T.size() - 2) / vec_size) * vec_size + 1;
+        
+        // Create aligned temporary buffers for better performance
+        alignas(64) double results[8];
+        
+        for (size_t i = 1; i < vec_end; i += vec_size) {
+            // Bounds check to prevent segfaults
+            if (i + vec_size >= grid.T.size() - 1) {
+                // Process remaining elements with scalar code
+                for (size_t j = i; j < grid.T.size() - 1; j++) {
+                    double kappa = grid.k[j] / (grid.rho[j] * grid.cp[j]);
+                    double r = dt * kappa;
+                    double a = -0.5 * r * grid.g1[j-1];
+                    double c = -0.5 * r * grid.g2[j-1];
+                    double b = 1.0 + 0.5 * r * (grid.g1[j-1] + grid.g2[j-1]);
+                    double rhs_val = T_old[j] + 0.5 * r * (grid.g1[j-1] * T_old[j-1] + 
+                                                  grid.g2[j-1] * T_old[j+1] - 
+                                                  (grid.g1[j-1] + grid.g2[j-1]) * T_old[j]);
+                    grid.T[j] = (rhs_val - a * grid.T[j-1] - c * grid.T[j+1]) / b;
                 }
-            } else {
-                // Process in blocks of 8 elements using AVX-512
-                for (size_t i = 1; i < vec_end; i += vec_size) {
-                    // Safety check: ensure all accesses are within bounds
-                    if (i + vec_size >= T.size()) {
-                        for (size_t j = i; j < T.size() - 1; j++) {
-                            double kappa = k[j] / (rho[j] * cp[j]);
-                            double r = dt * kappa;  // Using fixed dt
-                            double a = -0.5 * r * g1[j-1];
-                            double c = -0.5 * r * g2[j-1];
-                            double b = 1.0 + 0.5 * r * (g1[j-1] + g2[j-1]);
-                            double rhs = T_old[j] + 0.5 * r * (g1[j-1] * T_old[j-1] + 
-                                                  g2[j-1] * T_old[j+1] - 
-                                                  (g1[j-1] + g2[j-1]) * T_old[j]);
-                            T[j] = (rhs - a * T[j-1] - c * T[j+1]) / b;
-                        }
-                        break;
-                    }
+                break;
+            }
 
-                    // Load 8 diffusivity values using AVX-512
-                    __m512d kappa_vec = _mm512_set_pd(
-                        k[i+7] / (rho[i+7] * cp[i+7]),
-                        k[i+6] / (rho[i+6] * cp[i+6]),
-                        k[i+5] / (rho[i+5] * cp[i+5]),
-                        k[i+4] / (rho[i+4] * cp[i+4]),
-                        k[i+3] / (rho[i+3] * cp[i+3]),
-                        k[i+2] / (rho[i+2] * cp[i+2]),
-                        k[i+1] / (rho[i+1] * cp[i+1]),
-                        k[i] / (rho[i] * cp[i])
-                    );
-                    
-                    // Calculate r = dt * kappa with fixed dt
-                    __m512d r_vec = _mm512_mul_pd(_mm512_set1_pd(dt), kappa_vec);
-                    
-                    // Load grid coefficients
-                    __m512d g1_vec = _mm512_set_pd(
-                        g1[i+6], g1[i+5], g1[i+4], g1[i+3],
-                        g1[i+2], g1[i+1], g1[i], g1[i-1]
-                    );
-                    
-                    __m512d g2_vec = _mm512_set_pd(
-                        g2[i+6], g2[i+5], g2[i+4], g2[i+3],
-                        g2[i+2], g2[i+1], g2[i], g2[i-1]
-                    );
-                    
-                    // Constants
-                    __m512d half = _mm512_set1_pd(0.5);
-                    __m512d one = _mm512_set1_pd(1.0);
-                    __m512d neg_half = _mm512_set1_pd(-0.5);
-                    
-                    // Calculate Crank-Nicolson coefficients
-                    __m512d a_vec = _mm512_mul_pd(neg_half, _mm512_mul_pd(r_vec, g1_vec));
-                    __m512d c_vec = _mm512_mul_pd(neg_half, _mm512_mul_pd(r_vec, g2_vec));
-                    
-                    // g1 + g2
-                    __m512d g_sum_vec = _mm512_add_pd(g1_vec, g2_vec);
-                    
-                    // b = 1.0 + 0.5 * r * (g1 + g2)
-                    __m512d b_vec = _mm512_add_pd(one, _mm512_mul_pd(half, _mm512_mul_pd(r_vec, g_sum_vec)));
-                    
-                    // Load temperatures for calculation
-                    __m512d T_i_vec = _mm512_set_pd(
-                        T_old[i+7], T_old[i+6], T_old[i+5], T_old[i+4],
-                        T_old[i+3], T_old[i+2], T_old[i+1], T_old[i]
-                    );
-                    
-                    __m512d T_im1_vec = _mm512_set_pd(
-                        T_old[i+6], T_old[i+5], T_old[i+4], T_old[i+3],
-                        T_old[i+2], T_old[i+1], T_old[i], T_old[i-1]
-                    );
-                    
-                    __m512d T_ip1_vec = _mm512_set_pd(
-                        T_old[i+8], T_old[i+7], T_old[i+6], T_old[i+5],
-                        T_old[i+4], T_old[i+3], T_old[i+2], T_old[i+1]
-                    );
-                    
-                    // Calculate explicit part: g1 * T_{i-1}
-                    __m512d term1 = _mm512_mul_pd(g1_vec, T_im1_vec);
-                    __m512d term2 = _mm512_mul_pd(g2_vec, T_ip1_vec);
-                    __m512d term3 = _mm512_mul_pd(g_sum_vec, T_i_vec);
-                    
-                    // term1 + term2 - term3
-                    __m512d sum_terms = _mm512_sub_pd(_mm512_add_pd(term1, term2), term3);
-                    
-                    // 0.5 * r * (sum_terms)
-                    __m512d explicit_part = _mm512_mul_pd(half, _mm512_mul_pd(r_vec, sum_terms));
-                    
-                    // T_old[i] + explicit_part
-                    __m512d rhs_vec = _mm512_add_pd(T_i_vec, explicit_part);
-                    
-                    // Load new boundary T values for implicit part
-                    __m512d T_new_im1_vec = _mm512_set_pd(
-                        T[i+6], T[i+5], T[i+4], T[i+3],
-                        T[i+2], T[i+1], T[i], T[i-1]
-                    );
-                    
-                    __m512d T_new_ip1_vec = _mm512_set_pd(
-                        T[i+8], T[i+7], T[i+6], T[i+5],
-                        T[i+4], T[i+3], T[i+2], T[i+1]
-                    );
-                    
-                    // Calculate a * T[i-1]
-                    __m512d a_term = _mm512_mul_pd(a_vec, T_new_im1_vec);
-                    
-                    // Calculate c * T[i+1]
-                    __m512d c_term = _mm512_mul_pd(c_vec, T_new_ip1_vec);
-                    
-                    // rhs - a * T[i-1] - c * T[i+1]
-                    __m512d numerator = _mm512_sub_pd(_mm512_sub_pd(rhs_vec, a_term), c_term);
-                    
-                    // Performance optimization: use reciprocal instead of division
-                    __m512d recip_b = _mm512_div_pd(_mm512_set1_pd(1.0), b_vec);
-                    __m512d result = _mm512_mul_pd(numerator, recip_b);
-                    
-                    // Store results with bounds checking
-                    alignas(64) double results[8];
-                    _mm512_store_pd(results, result);
-                    
-                    // Update T with bounds checking
-                    if (i < T.size() - 1)     T[i] = results[7];
-                    if (i+1 < T.size() - 1)   T[i+1] = results[6];
-                    if (i+2 < T.size() - 1)   T[i+2] = results[5];
-                    if (i+3 < T.size() - 1)   T[i+3] = results[4];
-                    if (i+4 < T.size() - 1)   T[i+4] = results[3];
-                    if (i+5 < T.size() - 1)   T[i+5] = results[2];
-                    if (i+6 < T.size() - 1)   T[i+6] = results[1];
-                    if (i+7 < T.size() - 1)   T[i+7] = results[0];
+            // Process 8 elements at once using AVX-512
+            __m512d kappa_vec = _mm512_set_pd(
+                grid.k[i+7] / (grid.rho[i+7] * grid.cp[i+7]),
+                grid.k[i+6] / (grid.rho[i+6] * grid.cp[i+6]),
+                grid.k[i+5] / (grid.rho[i+5] * grid.cp[i+5]),
+                grid.k[i+4] / (grid.rho[i+4] * grid.cp[i+4]),
+                grid.k[i+3] / (grid.rho[i+3] * grid.cp[i+3]),
+                grid.k[i+2] / (grid.rho[i+2] * grid.cp[i+2]),
+                grid.k[i+1] / (grid.rho[i+1] * grid.cp[i+1]),
+                grid.k[i] / (grid.rho[i] * grid.cp[i])
+            );
+            
+            // Compute r = dt * kappa
+            __m512d r_vec = _mm512_mul_pd(_mm512_set1_pd(dt), kappa_vec);
+            
+            // Load grid coefficients - packed for better memory locality
+            __m512d g1_vec = _mm512_set_pd(
+                grid.g1[i+6], grid.g1[i+5], grid.g1[i+4], grid.g1[i+3],
+                grid.g1[i+2], grid.g1[i+1], grid.g1[i], grid.g1[i-1]
+            );
+            
+            __m512d g2_vec = _mm512_set_pd(
+                grid.g2[i+6], grid.g2[i+5], grid.g2[i+4], grid.g2[i+3],
+                grid.g2[i+2], grid.g2[i+1], grid.g2[i], grid.g2[i-1]
+            );
+            
+            // Constants for vectorized operations
+            __m512d half = _mm512_set1_pd(0.5);
+            __m512d one = _mm512_set1_pd(1.0);
+            __m512d neg_half = _mm512_set1_pd(-0.5);
+            
+            // Calculate Crank-Nicolson coefficients
+            __m512d a_vec = _mm512_mul_pd(neg_half, _mm512_mul_pd(r_vec, g1_vec));
+            __m512d c_vec = _mm512_mul_pd(neg_half, _mm512_mul_pd(r_vec, g2_vec));
+            
+            // g1 + g2 for reuse
+            __m512d g_sum_vec = _mm512_add_pd(g1_vec, g2_vec);
+            
+            // b = 1.0 + 0.5 * r * (g1 + g2)
+            __m512d b_vec = _mm512_add_pd(one, _mm512_mul_pd(half, _mm512_mul_pd(r_vec, g_sum_vec)));
+            
+            // Load temperatures with proper alignment for vectorization
+            __m512d T_i_vec = _mm512_set_pd(
+                T_old[i+7], T_old[i+6], T_old[i+5], T_old[i+4],
+                T_old[i+3], T_old[i+2], T_old[i+1], T_old[i]
+            );
+            
+            __m512d T_im1_vec = _mm512_set_pd(
+                T_old[i+6], T_old[i+5], T_old[i+4], T_old[i+3],
+                T_old[i+2], T_old[i+1], T_old[i], T_old[i-1]
+            );
+            
+            __m512d T_ip1_vec = _mm512_set_pd(
+                T_old[i+8], T_old[i+7], T_old[i+6], T_old[i+5],
+                T_old[i+4], T_old[i+3], T_old[i+2], T_old[i+1]
+            );
+            
+            // Compute the explicit part term by term for better instruction pipelining
+            // Calculate g1 * T_{i-1}
+            __m512d term1 = _mm512_mul_pd(g1_vec, T_im1_vec);
+            __m512d term2 = _mm512_mul_pd(g2_vec, T_ip1_vec);
+            __m512d term3 = _mm512_mul_pd(g_sum_vec, T_i_vec);
+            
+            // Combine terms for explicit part: term1 + term2 - term3
+            __m512d sum_terms = _mm512_sub_pd(_mm512_add_pd(term1, term2), term3);
+            
+            // Multiply by 0.5 * r to get explicit part
+            __m512d explicit_part = _mm512_mul_pd(half, _mm512_mul_pd(r_vec, sum_terms));
+            
+            // Calculate RHS: T_old[i] + explicit_part
+            __m512d rhs_vec = _mm512_add_pd(T_i_vec, explicit_part);
+            
+            // Load current boundary temperatures for implicit part
+            __m512d T_new_im1_vec = _mm512_set_pd(
+                grid.T[i+6], grid.T[i+5], grid.T[i+4], grid.T[i+3],
+                grid.T[i+2], grid.T[i+1], grid.T[i], grid.T[i-1]
+            );
+            
+            __m512d T_new_ip1_vec = _mm512_set_pd(
+                grid.T[i+8], grid.T[i+7], grid.T[i+6], grid.T[i+5],
+                grid.T[i+4], grid.T[i+3], grid.T[i+2], grid.T[i+1]
+            );
+            
+            // Calculate a * T[i-1]
+            __m512d a_term = _mm512_mul_pd(a_vec, T_new_im1_vec);
+            
+            // Calculate c * T[i+1]
+            __m512d c_term = _mm512_mul_pd(c_vec, T_new_ip1_vec);
+            
+            // Compute numerator: rhs - a * T[i-1] - c * T[i+1]
+            __m512d numerator = _mm512_sub_pd(_mm512_sub_pd(rhs_vec, a_term), c_term);
+            
+            // Use reciprocal instead of division for better performance
+            __m512d recip_b = _mm512_div_pd(_mm512_set1_pd(1.0), b_vec);
+            __m512d result = _mm512_mul_pd(numerator, recip_b);
+            
+            // Store results in aligned memory
+            _mm512_store_pd(results, result);
+            
+            // Update temperature array with bounds checking
+            if (i < grid.T.size() - 1)     grid.T[i] = results[7];
+            if (i+1 < grid.T.size() - 1)   grid.T[i+1] = results[6];
+            if (i+2 < grid.T.size() - 1)   grid.T[i+2] = results[5];
+            if (i+3 < grid.T.size() - 1)   grid.T[i+3] = results[4];
+            if (i+4 < grid.T.size() - 1)   grid.T[i+4] = results[3];
+            if (i+5 < grid.T.size() - 1)   grid.T[i+5] = results[2];
+            if (i+6 < grid.T.size() - 1)   grid.T[i+6] = results[1];
+            if (i+7 < grid.T.size() - 1)   grid.T[i+7] = results[0];
+        }
+        
+        // Handle remaining points with scalar code
+        for (size_t i = vec_end; i < grid.T.size() - 1; i++) {
+            double kappa = grid.k[i] / (grid.rho[i] * grid.cp[i]);
+            double r = dt * kappa;
+            double a = -0.5 * r * grid.g1[i-1];
+            double c = -0.5 * r * grid.g2[i-1];
+            double b = 1.0 + 0.5 * r * (grid.g1[i-1] + grid.g2[i-1]);
+            double rhs_val = T_old[i] + 0.5 * r * (grid.g1[i-1] * T_old[i-1] + 
+                                        grid.g2[i-1] * T_old[i+1] - 
+                                        (grid.g1[i-1] + grid.g2[i-1]) * T_old[i]);
+            grid.T[i] = (rhs_val - a * grid.T[i-1] - c * grid.T[i+1]) / b;
+        }
+#elif defined(AVX2_ENABLED)
+        // AVX2 implementation (similar but with 4-wide operations)
+        const size_t vec_size = 4;
+        const size_t vec_end = ((grid.T.size() - 2) / vec_size) * vec_size + 1;
+        
+        // Create aligned temporary buffer for AVX2
+        alignas(32) double results[4];
+        
+        for (size_t i = 1; i < vec_end; i += vec_size) {
+            // Bounds check
+            if (i + vec_size >= grid.T.size() - 1) {
+                // Process remaining elements with scalar code
+                for (size_t j = i; j < grid.T.size() - 1; j++) {
+                    double kappa = grid.k[j] / (grid.rho[j] * grid.cp[j]);
+                    double r = dt * kappa;
+                    double a = -0.5 * r * grid.g1[j-1];
+                    double c = -0.5 * r * grid.g2[j-1];
+                    double b = 1.0 + 0.5 * r * (grid.g1[j-1] + grid.g2[j-1]);
+                    double rhs_val = T_old[j] + 0.5 * r * (grid.g1[j-1] * T_old[j-1] + 
+                                                  grid.g2[j-1] * T_old[j+1] - 
+                                                  (grid.g1[j-1] + grid.g2[j-1]) * T_old[j]);
+                    grid.T[j] = (rhs_val - a * grid.T[j-1] - c * grid.T[j+1]) / b;
                 }
-                
-                // Handle remaining points with scalar code
-                for (size_t i = vec_end; i < T.size() - 1; i++) {
-                    double kappa = k[i] / (rho[i] * cp[i]);
-                    double r = dt * kappa;  // Using fixed dt
-                    double a = -0.5 * r * g1[i-1];
-                    double c = -0.5 * r * g2[i-1];
-                    double b = 1.0 + 0.5 * r * (g1[i-1] + g2[i-1]);
-                    double rhs = T_old[i] + 0.5 * r * (g1[i-1] * T_old[i-1] + 
-                                              g2[i-1] * T_old[i+1] - 
-                                              (g1[i-1] + g2[i-1]) * T_old[i]);
-                    T[i] = (rhs - a * T[i-1] - c * T[i+1]) / b;
-                }
+                break;
             }
+
+            // Load diffusivity values for 4 elements
+            __m256d kappa_vec = _mm256_set_pd(
+                grid.k[i+3] / (grid.rho[i+3] * grid.cp[i+3]),
+                grid.k[i+2] / (grid.rho[i+2] * grid.cp[i+2]),
+                grid.k[i+1] / (grid.rho[i+1] * grid.cp[i+1]),
+                grid.k[i] / (grid.rho[i] * grid.cp[i])
+            );
+            
+            // Calculate r = dt * kappa
+            __m256d r_vec = _mm256_mul_pd(_mm256_set1_pd(dt), kappa_vec);
+            
+            // Load grid coefficients
+            __m256d g1_vec = _mm256_set_pd(
+                grid.g1[i+2], grid.g1[i+1], grid.g1[i], grid.g1[i-1]
+            );
+            
+            __m256d g2_vec = _mm256_set_pd(
+                grid.g2[i+2], grid.g2[i+1], grid.g2[i], grid.g2[i-1]
+            );
+            
+            // Constants
+            __m256d half = _mm256_set1_pd(0.5);
+            __m256d one = _mm256_set1_pd(1.0);
+            __m256d neg_half = _mm256_set1_pd(-0.5);
+            
+            // Calculate coefficients
+            __m256d a_vec = _mm256_mul_pd(neg_half, _mm256_mul_pd(r_vec, g1_vec));
+            __m256d c_vec = _mm256_mul_pd(neg_half, _mm256_mul_pd(r_vec, g2_vec));
+            
+            // g1 + g2
+            __m256d g_sum_vec = _mm256_add_pd(g1_vec, g2_vec);
+            
+            // b = 1.0 + 0.5 * r * (g1 + g2)
+            __m256d b_vec = _mm256_add_pd(one, _mm256_mul_pd(half, _mm256_mul_pd(r_vec, g_sum_vec)));
+            
+            // Load temperatures for calculation
+            __m256d T_i_vec = _mm256_set_pd(
+                T_old[i+3], T_old[i+2], T_old[i+1], T_old[i]
+            );
+            
+            __m256d T_im1_vec = _mm256_set_pd(
+                T_old[i+2], T_old[i+1], T_old[i], T_old[i-1]
+            );
+            
+            __m256d T_ip1_vec = _mm256_set_pd(
+                T_old[i+4], T_old[i+3], T_old[i+2], T_old[i+1]
+            );
+            
+            // Calculate explicit part
+            __m256d term1 = _mm256_mul_pd(g1_vec, T_im1_vec);
+            __m256d term2 = _mm256_mul_pd(g2_vec, T_ip1_vec);
+            __m256d term3 = _mm256_mul_pd(g_sum_vec, T_i_vec);
+            
+            // term1 + term2 - term3
+            __m256d sum_terms = _mm256_sub_pd(_mm256_add_pd(term1, term2), term3);
+            
+            // 0.5 * r * (sum_terms)
+            __m256d explicit_part = _mm256_mul_pd(half, _mm256_mul_pd(r_vec, sum_terms));
+            
+            // T_old[i] + explicit_part
+            __m256d rhs_vec = _mm256_add_pd(T_i_vec, explicit_part);
+            
+            // Load current boundary temperatures
+            __m256d T_new_im1_vec = _mm256_set_pd(
+                grid.T[i+2], grid.T[i+1], grid.T[i], grid.T[i-1]
+            );
+            
+            __m256d T_new_ip1_vec = _mm256_set_pd(
+                grid.T[i+4], grid.T[i+3], grid.T[i+2], grid.T[i+1]
+            );
+            
+            // Calculate a * T[i-1]
+            __m256d a_term = _mm256_mul_pd(a_vec, T_new_im1_vec);
+            
+            // Calculate c * T[i+1]
+            __m256d c_term = _mm256_mul_pd(c_vec, T_new_ip1_vec);
+            
+            // rhs - a * T[i-1] - c * T[i+1]
+            __m256d numerator = _mm256_sub_pd(_mm256_sub_pd(rhs_vec, a_term), c_term);
+            
+            // Performance optimization: use reciprocal
+            __m256d recip_b = _mm256_div_pd(_mm256_set1_pd(1.0), b_vec);
+            __m256d result = _mm256_mul_pd(numerator, recip_b);
+            
+            // Store results
+            _mm256_store_pd(results, result);
+            
+            // Update temperatures with bounds checking
+            if (i < grid.T.size() - 1)     grid.T[i] = results[3];
+            if (i+1 < grid.T.size() - 1)   grid.T[i+1] = results[2];
+            if (i+2 < grid.T.size() - 1)   grid.T[i+2] = results[1];
+            if (i+3 < grid.T.size() - 1)   grid.T[i+3] = results[0];
+        }
+        
+        // Handle remaining points
+        for (size_t i = vec_end; i < grid.T.size() - 1; i++) {
+            double kappa = grid.k[i] / (grid.rho[i] * grid.cp[i]);
+            double r = dt * kappa;
+            double a = -0.5 * r * grid.g1[i-1];
+            double c = -0.5 * r * grid.g2[i-1];
+            double b = 1.0 + 0.5 * r * (grid.g1[i-1] + grid.g2[i-1]);
+            double rhs_val = T_old[i] + 0.5 * r * (grid.g1[i-1] * T_old[i-1] + 
+                                        grid.g2[i-1] * T_old[i+1] - 
+                                        (grid.g1[i-1] + grid.g2[i-1]) * T_old[i]);
+            grid.T[i] = (rhs_val - a * grid.T[i-1] - c * grid.T[i+1]) / b;
         }
 #else
-        // Scalar implementation for large systems
-        for (size_t i = 1; i < T.size() - 1; i++) {
-            double kappa = k[i] / (rho[i] * cp[i]);
+        // Scalar implementation for systems without AVX
+        for (size_t i = 1; i < grid.T.size() - 1; i++) {
+            // Pre-calculate all factors to minimize duplicate calculations
+            double kappa = grid.k[i] / (grid.rho[i] * grid.cp[i]);
             double r = dt * kappa;
-            double a = -0.5 * r * g1[i-1];
-            double c = -0.5 * r * g2[i-1];
-            double b = 1.0 + 0.5 * r * (g1[i-1] + g2[i-1]);
-            double rhs = T_old[i] + 0.5 * r * (g1[i-1] * T_old[i-1] + 
-                                    g2[i-1] * T_old[i+1] - 
-                                    (g1[i-1] + g2[i-1]) * T_old[i]);
-            T[i] = (rhs - a * T[i-1] - c * T[i+1]) / b;
+            
+            // Cache grid coefficients
+            double g1_val = grid.g1[i-1];
+            double g2_val = grid.g2[i-1];
+            double g_sum = g1_val + g2_val;
+            
+            // Calculate coefficients only once
+            double a = -0.5 * r * g1_val;
+            double c = -0.5 * r * g2_val;
+            double b = 1.0 + 0.5 * r * g_sum;
+            
+            // Calculate right-hand side term by term for better instruction pipelining
+            double term1 = g1_val * T_old[i-1];
+            double term2 = g2_val * T_old[i+1];
+            double term3 = g_sum * T_old[i];
+            double explicit_part = 0.5 * r * (term1 + term2 - term3);
+            
+            double rhs_val = T_old[i] + explicit_part;
+            
+            // Solve for new temperature
+            grid.T[i] = (rhs_val - a * grid.T[i-1] - c * grid.T[i+1]) / b;
         }
 #endif
     }
@@ -794,9 +1003,9 @@ void surfTemp(Profile& p, double Qs) {
     // Surface parameters
     double epsilon = p.emissivity;
     double sigma = p.config->sigma;
-    double k0 = p.k[0];
-    double dz0 = p.dz[0];
-    double T1 = p.T[1];  // Subsurface temperature
+    double k0 = p.k()[0];
+    double dz0 = p.dz()[0];
+    double T1 = p.T()[1];  // Subsurface temperature
     
     // Physical bounds
     const double MIN_TEMP = 3.0;
@@ -805,11 +1014,11 @@ void surfTemp(Profile& p, double Qs) {
     // Initial guess for Newton's method
     double Tnew;
     if (Qs > 0) {
-        // For daytime, use radiative equilibrium as initial guess
+        // Use radiative balance for initial guess with input flux
         Tnew = std::pow(Qs / (epsilon * sigma), 0.25);
     } else {
-        // For nighttime, use slightly below subsurface temp
-        Tnew = 0.9 * T1;
+        // Use subsurface temperature as starting point if no input flux
+        Tnew = T1;
     }
     
     // Apply Newton-Raphson iteration to solve for surface temperature
@@ -819,38 +1028,41 @@ void surfTemp(Profile& p, double Qs) {
     double relaxation = 0.8;  // Relaxation factor to improve convergence
     
     for (int iter = 0; iter < max_iter && std::abs(dT) > tolerance; iter++) {
-        // Energy balance: incoming solar = outgoing radiation + conduction
-        double f = epsilon * sigma * std::pow(Tnew, 4) + k0 * (Tnew - T1) / dz0 - Qs;
+        // Energy balance equation: Qs + k0*(T1-T0)/dz0 = epsilon*sigma*T0^4
+        double T0 = Tnew;
+        double f = Qs + k0 * (T1 - T0) / dz0 - epsilon * sigma * std::pow(T0, 4);
         
-        // Derivative for Newton step
-        double df = 4.0 * epsilon * sigma * std::pow(Tnew, 3) + k0 / dz0;
-        if (std::abs(df) < 1.0e-10) df = 1.0e-10;  // Avoid division by very small numbers
+        // Derivative of energy balance equation
+        double df = -k0 / dz0 - 4.0 * epsilon * sigma * std::pow(T0, 3);
         
-        // Calculate temperature correction with relaxation
-        dT = -f / df * relaxation;
+        // Protect against division by zero
+        if (std::abs(df) < 1e-10) {
+            df = -1e-10;  // Arbitrary small negative value
+        }
         
-        // Apply new temperature
-        Tnew += dT;
+        // Newton-Raphson step with relaxation
+        dT = relaxation * f / df;
+        Tnew = T0 - dT;
         
-        // Enforce physical bounds
-        if (Tnew < MIN_TEMP) Tnew = MIN_TEMP;
-        if (Tnew > MAX_TEMP) Tnew = MAX_TEMP;
+        // Apply physical bounds
+        Tnew = std::max(Tnew, MIN_TEMP);
+        Tnew = std::min(Tnew, MAX_TEMP);
     }
     
     // Final safety bounds check
     if (Tnew < MIN_TEMP) Tnew = MIN_TEMP;
     if (Tnew > MAX_TEMP) Tnew = MAX_TEMP;
     
-    p.T[0] = Tnew;
+    p.T()[0] = Tnew;
 }
 
 void botTemp(Profile& p, double Qb) {
     // Set bottom temperature using heat flux boundary condition
-    int n = p.T.size() - 1;
-    double kb = p.k[n];
-    double dzb = p.dz[n-1];
+    int n = p.T().size() - 1;
+    double kb = p.k()[n];
+    double dzb = p.dz()[n-1];
     
-    p.T[n] = p.T[n-1] + Qb * dzb / kb;
+    p.T()[n] = p.T()[n-1] + Qb * dzb / kb;
 }
 
 double getTimeStep(const Profile& p, const Planet& planet, double day, 
@@ -865,28 +1077,20 @@ double getTimeStep(const Profile& p, const Planet& planet, double day,
     double critical_dz = 0.0;
     double critical_kappa = 0.0;
     
-    for (size_t i = 0; i < p.z.size(); i++) {
-        // Calculate thermal diffusivity (kappa = k/ρc)
-        double kappa = p.k[i] / (p.rho[i] * p.cp[i]);
+    for (size_t i = 0; i < p.z().size(); i++) {
+        if (i == 0) continue;  // Skip surface layer
         
-        // Get grid spacing (minimum of adjacent layers for safety)
-        double dz_eff;
-        if (i == 0) {
-            dz_eff = p.dz[0];
-        } else if (i == p.z.size() - 1) {
-            dz_eff = p.dz[i-1];
-        } else {
-            dz_eff = std::min(p.dz[i-1], p.dz[i]);
-        }
+        // Calculate thermal diffusivity: kappa = k / (rho * cp)
+        double kappa = p.k()[i] / (p.rho()[i] * p.cp()[i]);
         
-        // Calculate stable time step (von Neumann stability criterion)
-        double dt_i = max_fourier * dz_eff * dz_eff / kappa;
+        // Von Neumann stability condition: dt <= 0.5 * dz^2 / kappa
+        double dz = (i < p.z().size() - 1) ? p.dz()[i] : p.dz()[i-1];
+        double dt = max_fourier * dz * dz / kappa;
         
-        // Track the most restrictive layer
-        if (dt_i < dt_min) {
-            dt_min = dt_i;
+        if (dt < dt_min) {
+            dt_min = dt;
             critical_layer = i;
-            critical_dz = dz_eff;
+            critical_dz = dz;
             critical_kappa = kappa;
         }
     }
@@ -894,10 +1098,9 @@ double getTimeStep(const Profile& p, const Planet& planet, double day,
     // Report on the limiting factor
     if (verbose) {
         std::cout << "Time step limited by layer " << critical_layer 
-                  << " at depth " << p.z[critical_layer] << "m"
-                  << ", dz=" << critical_dz << "m"
-                  << ", kappa=" << critical_kappa << "m²/s"
-                  << ", dt=" << dt_min << "s" << std::endl;
+                  << " (depth=" << p.z()[critical_layer] << "m, dz=" << critical_dz 
+                  << "m, kappa=" << critical_kappa << "m²/s)" << std::endl;
+        std::cout << "Maximum stable time step: " << dt_min << "s" << std::endl;
     }
     
     // Ensure time step isn't too large or too small
@@ -909,14 +1112,14 @@ double getTimeStep(const Profile& p, const Planet& planet, double day,
 
 // Model implementation
 Model::Model(const Planet& planet, double lat, 
-             const std::vector<double>& output_times,  // Replace ndays with output_times
+             const std::vector<double>& output_times,
              const Eigen::MatrixXd& flux_arr,
              const Config& config,
              bool show_progress) :
     planet(planet),
     lat(lat),
     flux_arr(flux_arr),
-    profile(planet, lat, config, show_progress),  // Pass verbosity flag
+    profile(planet, lat, config, show_progress),
     config(&config),
     show_progress(show_progress),
     use_full_time_series(false),
@@ -926,16 +1129,22 @@ Model::Model(const Planet& planet, double lat,
     // Initialize model
     Qs = 0.0;
     t = 0.0;
-    N_z = profile.z.size();
+    N_z = profile.z().size();
     
     // Store output times
     if (output_times.empty()) {
-        std::cerr << "Error: No output times provided to thermal model" << std::endl;
-        return;
+        // Default: 24 time steps per day
+        int steps_per_day = 24;
+        double day_fraction = 1.0 / steps_per_day;
+        output_time_points.reserve(steps_per_day);
+        
+        for (int i = 0; i < steps_per_day; i++) {
+            output_time_points.push_back(i * day_fraction * planet.day);
+        }
+    } else {
+        // Set output times directly from illumination model
+        output_time_points = output_times;
     }
-    
-    // Set output times directly from illumination model
-    output_time_points = output_times;
     
     // Set end time based on the last output time
     endtime = output_times.back();
@@ -945,21 +1154,13 @@ Model::Model(const Planet& planet, double lat,
     
     // Extract flux arrays from the input matrix if provided
     if (flux_arr.size() > 0) {
-        // First column is time, second column is flux
-        int n_rows = flux_arr.rows();
-        flux_times.resize(n_rows);
-        flux_values.resize(n_rows);
+        // Extract time points and flux values from matrix
+        flux_times.resize(flux_arr.rows());
+        flux_values.resize(flux_arr.rows());
         
-        for (int i = 0; i < n_rows; i++) {
+        for (int i = 0; i < flux_arr.rows(); i++) {
             flux_times[i] = flux_arr(i, 0);
             flux_values[i] = flux_arr(i, 1);
-        }
-        
-        // Only show these messages if verbose mode is enabled
-        if (show_progress && flux_arr.size() > 0) {
-            std::cout << "Using provided flux array with " << n_rows 
-                      << " time points, spanning " << flux_times.back() 
-                      << " seconds." << std::endl;
         }
     }
     
@@ -967,15 +1168,14 @@ Model::Model(const Planet& planet, double lat,
     dt = getTimeStep(profile, planet, planet.day, config, show_progress);
     
     if (show_progress) {
-        std::cout << "Using constant time step: " << dt << "s (Fourier number = " 
-                  << config.F << ")" << std::endl;
-                  
-        std::cout << "Thermal simulation will output at " << N_steps 
-                  << " time points matching illumination model" << std::endl;
+        std::cout << "Model initialized with " << N_z << " layers" << std::endl;
+        std::cout << "Time step: " << dt << " s" << std::endl;
+        std::cout << "End time: " << endtime << " s" << std::endl;
+        std::cout << "Output steps: " << N_steps << std::endl;
     }
 }
 
-// Modify the run method to use a more gradual approach for difficult cases
+// Run the model
 void Model::run() {
     try {
         // Initialize output arrays
@@ -984,6 +1184,9 @@ void Model::run() {
         
         // Start at the first time point
         t = output_time_points[0];
+        
+        // Progress bar
+        ProgressBar progressBar(output_time_points.size(), "Thermal Simulation", 50, show_progress);
         
         // Pre-equilibrate if needed
         if (config->NYEARSEQ > 0) {
@@ -1008,9 +1211,12 @@ void Model::run() {
         
         // Store the first time step
         for (int j = 0; j < N_z; j++) {
-            T(0, j) = profile.T[j];
+            T(0, j) = profile.T()[j];  // Use accessor method
         }
         lt(0) = t;
+        
+        // Update progress
+        progressBar.update(1);
         
         // Process remaining time points
         for (int i = 1; i < output_time_points.size(); i++) {
@@ -1036,11 +1242,18 @@ void Model::run() {
             
             // Store results
             for (int j = 0; j < N_z; j++) {
-                T(i, j) = profile.T[j];
+                T(i, j) = profile.T()[j];  // Use accessor method
             }
             lt(i) = target_time;
+            
+            // Update progress
+            progressBar.update(i + 1);
         }
-    } catch (const std::exception& e) {
+        
+        // Ensure progress bar is finished
+        progressBar.finish();
+    } 
+    catch (const std::exception& e) {
         std::cerr << "ERROR in thermal model: " << e.what() << std::endl;
     }
 }
@@ -1084,20 +1297,20 @@ void Model::advance() {
     surfFlux();
     
     // Store old temperatures for monitoring
-    std::vector<double> old_temps = profile.T;
+    std::vector<double> old_temps(profile.T().begin(), profile.T().end());
     
     // Update temperature profile
     profile.update_T(actual_dt, Qs, planet.Qb);
     
     // Stability checking - revert and use smaller step if needed
-    double max_surf_change = std::abs(profile.T[0] - old_temps[0]);
+    double max_surf_change = std::abs(profile.T()[0] - old_temps[0]);
     if (max_surf_change > 5.0) {
         // Excessive change detected - revert and try smaller step
         std::cout << "Excessive temperature change detected (" << max_surf_change 
                   << "K). Using smaller time step." << std::endl;
         
         // Restore old temperatures
-        profile.T = old_temps;
+        std::copy(old_temps.begin(), old_temps.end(), profile.T().begin());
         
         // Try with 1/4 the time step
         double reduced_dt = actual_dt / 4.0;
@@ -1161,15 +1374,44 @@ void Model::fastEquilibrate(int days, double target_time) {
     t = target_time;
 }
 
+// Efficient vector length calculation
+inline double vectorLength(const std::array<double, 3>& v) {
+    return std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+}
+
+// Optimized dot product calculation
+inline double dotProduct(const std::array<double, 3>& v1, const std::array<double, 3>& v2) {
+    return v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2];
+}
+
+// Fast calculation of T^3 for radiative conductivity
+inline double cube(double x) {
+    return x * x * x;
+}
+
+// Calculate optimal grid parameters
 void calculateOptimalGridParameters(const Planet& planet, Config& config) {
     std::cout << "Optimizing grid parameters..." << std::endl;
     
     // Calculate thermal diffusivity
-    double kappa_surf = planet.ks / (planet.rhos * planet.cp0);
+    double kappa = planet.ks / (planet.rhos * planet.cp0);
+    double skin_depth = skinDepth(planet.day, kappa);
     
-    // Calculate thermal skin depth using physical formula
-    double skin_depth = std::sqrt(kappa_surf * planet.day / M_PI);
-
+    // Calculate optimal layers in upper skin depth based on required accuracy
+    config.m = std::max(8, static_cast<int>(10.0 * std::sqrt(planet.ks / planet.kd)));
+    
+    // Calculate optimal growth factor
+    config.n = std::max(3, static_cast<int>(20.0 / std::log10(planet.day)));
+    
+    // Calculate optimal depth in skin depths
+    config.b = std::max(10, static_cast<int>(std::sqrt(planet.year / planet.day)));
+    
+    std::cout << "Optimal grid parameters:" << std::endl;
+    std::cout << "  Skin depth layers (m): " << config.m << std::endl;
+    std::cout << "  Growth factor (n): " << config.n << std::endl;
+    std::cout << "  Total depth in skin depths (b): " << config.b << std::endl;
+    std::cout << "  Skin depth: " << skin_depth << " m" << std::endl;
+    std::cout << "  Total depth: " << skin_depth * config.b << " m" << std::endl;
 }
 
 // Replace the interpolateFlux method with this corrected version
