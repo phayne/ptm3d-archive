@@ -25,21 +25,31 @@ PTM3D (Planetary Thermophysical Model - 3D) is a comprehensive computational fra
 
 ### Building from Source
 1. Clone the repository:
-```git clone https://github.com/username/ptm.git
-cd ptm```
+```
+git clone https://github.com/username/ptm.git
+cd ptm
+```
 
 2. Create a build directory:
-```mkdir build
-cd build```
+```
+mkdir build
+cd build
+```
 
 3. Configure with CMake:
-```cmake ..```
+```
+cmake ..
+```
 
 4. Build the project:
-```make -j$(nproc)```
+```
+make -j$(nproc)
+```
 
 5. Install (optional):
-```make install```
+```
+make install
+```
 
 ## Project Structure
 The PTM codebase is organized into several key modules:
@@ -63,9 +73,11 @@ The PTM codebase is organized into several key modules:
 ## Usage
 ### Basic Thermal Simulation
 
-```./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
+```
+./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
     --albedo-maps-directory /path/to/albedo_maps --thermal-mesh \
-    --thermal-threads 48 --output /path/to/output --resolution 6```
+    --thermal-threads 48 --output /path/to/output --resolution 6
+```
 
 ### Command-Line Options
 * --body: Target planetary body (Europa, Moon, Mercury, etc.)
@@ -115,23 +127,31 @@ Handles spatial data like albedo maps:
 ## Example Workflow
 1. Generate or import an albedo map:
 
-```./bin/albedo_map_generator input_albedo.fits output_dir 3 8```
+```
+./bin/albedo_map_generator input_albedo.fits output_dir 3 8
+```
 
 2. Run a thermal simulation:
 
-```./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
+```
+./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
     --albedo-maps-directory /path/to/albedo_maps --thermal-mesh \
-    --output /path/to/output --resolution 6```
+    --output /path/to/output --resolution 6
+```
 
 3. Convert results to ParaView format:
 
-```python src/python/ptm_paraview_converter.py --input-dir /path/to/output \
-    --output-dir /path/to/paraview_output```
+```
+python src/python/ptm_paraview_converter.py --input-dir /path/to/output \
+    --output-dir /path/to/paraview_output
+```
 
 4. Visualize specific locations:
 
-```python src/python/illumination_to_thermal.py --vtk /path/to/output/thermal.vtk \
-    --locations locations.txt --output thermal_locations```
+```
+python src/python/illumination_to_thermal.py --vtk /path/to/output/thermal.vtk \
+    --locations locations.txt --output thermal_locations
+```
 
 ## License
 This project is licensed under the MIT License.
@@ -140,9 +160,9 @@ This project is licensed under the MIT License.
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 1. Fork the repository
-2. Create your feature branch (```git checkout -b feature/amazing-feature```)
-3. Commit your changes (```git commit -m 'Add some amazing feature'```)
-4. Push to the branch (```git push origin feature/amazing-feature```)
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
 ## Acknowledgments
