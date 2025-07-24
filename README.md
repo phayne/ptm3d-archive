@@ -52,7 +52,7 @@ make install
 ```
 
 ## Project Structure
-The PTM codebase is organized into several key modules:
+The PTM3D codebase is organized into several key modules:
 
 ### Core Modules
 * Illumination Model: Ray-traced solar illumination with shadowing effects
@@ -104,9 +104,8 @@ The thermal module simulates heat transfer and temperature evolution, including:
 
 * Surface and subsurface temperatures
 * Variable material properties with depth
-* Internal heat flux
-* Detailed boundary conditions
-* Heat capacity variation with temperature
+* Surface (radiative-conductive equilibrium) and subsurface (heat flux) boundary conditions
+* Thermal conductivity and heat capacity variation with temperature
 
 ### Mesh Utilities
 Handles mesh generation and processing:
@@ -168,7 +167,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Acknowledgments
 * NASA NAIF team for the SPICE toolkit
 * Intel for the Embree ray tracing kernels
-* The Lunar Vulkan Imaging and Spectroscopy Explorer
+* The NASA Lunar Vulkan Imaging and Spectroscopy Explorer (Lunar-VISE), Lunar Reconnaissance Orbiter (LRO), and Europa Clipper for support of model development and mission-specific applications.
+* NASA Precursor Science Investigations for Europa (PSIE)
 
 ## Contact
 For questions or feedback, please open an issue on GitHub or contact the maintainers.
