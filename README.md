@@ -431,6 +431,24 @@ If you use PTM3D in your research, please cite:
 }
 ```
 
+### Heritage References
+
+The thermal model implemented in PTM3D is based on methods described in:
+
+- Hayne, P. O., Bandfield, J. L., Siegler, M. A., Vasavada, A. R., Ghent, R. R., Williams, J.-P., Greenhagen, B. T., Aharonson, O., Elder, C. M., Lucey, P. G., & Paige, D. A. (2017). Global regolith thermophysical properties of the Moon from the Diviner Lunar Radiometer Experiment. *Journal of Geophysical Research: Planets*, 122(12), 2371–2400. https://doi.org/10.1002/2017JE005387
+
+- Hayne, P. O., & Aharonson, O. (2015). Thermal stability of ice on Ceres with rough topography. *Journal of Geophysical Research: Planets*, 120(9), 1567–1584. https://doi.org/10.1002/2015JE004887
+
+- Vasavada, A. R., Bandfield, J. L., Greenhagen, B. T., Hayne, P. O., Siegler, M. A., Williams, J.-P., & Paige, D. A. (2012). Lunar equatorial surface temperatures and regolith properties from the Diviner Lunar Radiometer Experiment. *Journal of Geophysical Research: Planets*, 117(E12). https://doi.org/10.1029/2011JE003987
+
+- Paige, D. A., Siegler, M. A., Zhang, J. A., Hayne, P. O., Foote, E. J., Bennett, K. A., Vasavada, A. R., Greenhagen, B. T., Schofield, J. T., McCleese, D. J., Foote, M. C., DeJong, E., Bills, B. G., Hartford, W., Murray, B. C., Allen, C. C., Snook, K., Soderblom, L. A., Calcutt, S., ... Lucey, P. G. (2010). Diviner lunar radiometer observations of cold traps in the Moon's south polar region. *Science*, 330(6003), 479–482. https://doi.org/10.1126/science.1187726
+
+- Hayne, P. O., Greenhagen, B. T., Foote, M. C., Siegler, M. A., Vasavada, A. R., & Paige, D. A. (2010). Diviner lunar radiometer observations of the LCROSS impact. *Science*, 330(6003), 477–479. https://doi.org/10.1126/science.1197135
+
+The H-matrix view factor compression is based on:
+
+- Potter, S. F., Bertone, S., Schörghofer, N., & Mazarico, E. (2023). Fast hierarchical low-rank view factor matrices for thermal irradiance on planetary surfaces. *Journal of Computational Physics: X*, 17, 100130. https://doi.org/10.1016/j.jcpx.2023.100130
+
 ---
 
 ## License

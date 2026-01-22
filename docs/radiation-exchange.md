@@ -80,5 +80,4 @@ Iterative solver for coupled problems:
 
 ## References
 
-- Potter et al. (2023) - H-matrix implementation
-- Modest (2013) - Radiative Heat Transfer
+Potter, S. F., Bertone, S., Schörghofer, N., & Mazarico, E. (2023). Fast hierarchical low-rank view factor matrices for thermal irradiance on planetary surfaces. *Journal of Computational Physics: X*, 17, 100130. https://doi.org/10.1016/j.jcpx.2023.100130
