@@ -218,7 +218,7 @@ class SimulationTab(BaseConfigTab):
         body_layout = QGridLayout()
         body_layout.setColumnStretch(1, 1)
 
-        bodies = ["Europa", "Moon", "Mercury", "Enceladus", "Titan", "Mars", "Ceres"]
+        bodies = ["Europa", "Moon", "Mercury"]
         self.add_combo_field(body_layout, 0, "Target Body:", "simulation.body", bodies,
                              "Select the planetary body to simulate")
 
@@ -337,24 +337,11 @@ class ThermalTab(BaseConfigTab):
         gpu_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(gpu_layout, 0, "Use GPU for Thermal Solver", "thermal.use_gpu",
-                            "Use OpenCL GPU acceleration (experimental)")
-        self.add_bool_field(gpu_layout, 1, "Use GPU for Ray Tracing", "thermal.use_gpu_illumination",
-                            "Use OpenCL GPU for shadow rays (experimental)")
+                            "Use OpenCL GPU acceleration for thermal solver")
 
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
 
-        # Depth Grid
-        grid_group = QGroupBox("Depth Grid")
-        grid_layout = QGridLayout()
-        grid_layout.setColumnStretch(1, 1)
-
-        self.add_combo_field(grid_layout, 0, "Grid Quality:", "thermal.grid_quality",
-                             ["auto", "coarse", "standard", "fine"],
-                             "Depth discretization quality")
-
-        grid_group.setLayout(grid_layout)
-        layout.addWidget(grid_group)
 
         # Integration Window
         integ_group = QGroupBox("Integration Window")
@@ -390,14 +377,9 @@ class ThermalTab(BaseConfigTab):
 
         self.widgets["thermal.run_thermal_mesh"].setChecked(thermal["run_thermal_mesh"])
         self.widgets["thermal.threads"].setValue(thermal["threads"])
-        self.widgets["thermal.equilibration_orbits"].setValue(thermal.get("equilibration_orbits", 2))
+        self.widgets["thermal.equilibration_orbits"].setValue(thermal.get("equilibration_orbits", 10))
         self.widgets["thermal.compute_statistics"].setChecked(thermal["compute_statistics"])
         self.widgets["thermal.use_gpu"].setChecked(thermal.get("use_gpu", False))
-        self.widgets["thermal.use_gpu_illumination"].setChecked(thermal.get("use_gpu_illumination", False))
-
-        idx = self.widgets["thermal.grid_quality"].findText(thermal.get("grid_quality", "auto"))
-        if idx >= 0:
-            self.widgets["thermal.grid_quality"].setCurrentIndex(idx)
 
         self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
         self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
@@ -423,38 +405,38 @@ class RadiationTab(BaseConfigTab):
         self.add_bool_field(enable_layout, 1, "Verbose Progress", "radiation.verbose",
                             "Print detailed progress")
         self.add_bool_field(enable_layout, 2, "Use GPU for Radiosity", "radiation.use_gpu",
-                            "Use OpenCL GPU acceleration")
+                            "Use OpenCL GPU acceleration for radiosity solver")
 
         enable_group.setLayout(enable_layout)
         layout.addWidget(enable_group)
 
         # Face Selection
-        face_group = QGroupBox("Face Selection Criteria")
+        face_group = QGroupBox("Face Selection")
         face_layout = QGridLayout()
         face_layout.setColumnStretch(1, 1)
 
         self.add_double_field(face_layout, 0, "Min Shadow Fraction:", "radiation.min_shadow_fraction",
-                              0.0, 1.0, 2, "Minimum shadow fraction for inclusion")
-        self.add_double_field(face_layout, 1, "Min Terrain View Angle:", "radiation.min_terrain_view_angle",
-                              0.0, 90.0, 1, "Minimum terrain view angle (degrees)")
+                              0.0, 1.0, 2, "Minimum shadow fraction for inclusion in radiation exchange")
 
         face_group.setLayout(face_layout)
         layout.addWidget(face_group)
 
-        # Solver
-        solver_group = QGroupBox("Radiosity Solver")
-        solver_layout = QGridLayout()
-        solver_layout.setColumnStretch(1, 1)
+        # Coupling Parameters
+        coupling_group = QGroupBox("Thermal-Radiation Coupling")
+        coupling_layout = QGridLayout()
+        coupling_layout.setColumnStretch(1, 1)
 
-        self.add_int_field(solver_layout, 0, "Max Neighbors:", "radiation.max_neighbors",
-                           10, 10000, "Maximum neighbors per face")
-        self.add_int_field(solver_layout, 1, "Max Iterations:", "radiation.max_iterations",
-                           1, 1000, "Maximum solver iterations")
-        self.add_double_field(solver_layout, 2, "Convergence Tolerance:", "radiation.convergence_tolerance",
-                              0.0001, 1.0, 4, "Solver convergence threshold")
+        self.add_int_field(coupling_layout, 0, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
+                           1, 50, "Maximum thermal-radiation coupling iterations")
+        self.add_double_field(coupling_layout, 1, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
+                              0.1, 10.0, 1, "Temperature convergence threshold")
+        self.add_double_field(coupling_layout, 2, "Flux Tolerance (W/m²):", "radiation.coupling_flux_threshold",
+                              0.01, 10.0, 2, "Flux change threshold")
+        self.add_double_field(coupling_layout, 3, "Face Fraction:", "radiation.coupling_face_fraction",
+                              0.001, 0.1, 3, "Fraction of faces still changing to stop")
 
-        solver_group.setLayout(solver_layout)
-        layout.addWidget(solver_group)
+        coupling_group.setLayout(coupling_layout)
+        layout.addWidget(coupling_group)
 
         # Caching
         cache_group = QGroupBox("View Factor Caching")
@@ -468,20 +450,22 @@ class RadiationTab(BaseConfigTab):
         cache_group.setLayout(cache_layout)
         layout.addWidget(cache_group)
 
-        # H-Matrix
-        hmatrix_group = QGroupBox("H-Matrix Compression (Large Meshes)")
-        hmatrix_layout = QGridLayout()
-        hmatrix_layout.setColumnStretch(1, 1)
+        # H-Matrix / ACA Compression
+        compression_group = QGroupBox("View Factor Compression (Large Meshes)")
+        compression_layout = QGridLayout()
+        compression_layout.setColumnStretch(1, 1)
 
-        self.add_bool_field(hmatrix_layout, 0, "Enable H-Matrix Compression", "radiation.use_hmatrix",
-                            "Use hierarchical matrix compression")
-        self.add_double_field(hmatrix_layout, 1, "SVD Tolerance:", "radiation.hmatrix_tolerance",
-                              0.0001, 0.5, 4, "Low-rank approximation tolerance")
-        self.add_int_field(hmatrix_layout, 2, "Max Rank:", "radiation.hmatrix_max_rank",
-                           1, 500, "Maximum rank for low-rank blocks")
+        self.add_bool_field(compression_layout, 0, "Enable H-Matrix Compression", "radiation.use_hmatrix",
+                            "Use hierarchical matrix compression (recommended for >50K faces)")
+        self.add_bool_field(compression_layout, 1, "Use ACA (Adaptive Cross Approximation)", "radiation.use_aca",
+                            "Use ACA for faster compression (default: enabled)")
+        self.add_double_field(compression_layout, 2, "ACA Tolerance:", "radiation.aca_tolerance",
+                              0.0001, 0.1, 4, "ACA relative tolerance")
+        self.add_int_field(compression_layout, 3, "ACA Max Rank:", "radiation.aca_max_rank",
+                           1, 200, "Maximum rank before falling back to sparse")
 
-        hmatrix_group.setLayout(hmatrix_layout)
-        layout.addWidget(hmatrix_group)
+        compression_group.setLayout(compression_layout)
+        layout.addWidget(compression_group)
 
         layout.addStretch()
         self.create_scroll_area(content)
@@ -494,14 +478,15 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.verbose"].setChecked(rad.get("verbose", False))
         self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", True))
         self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
-        self.widgets["radiation.min_terrain_view_angle"].setValue(rad.get("min_terrain_view_angle", 5.0))
-        self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 2000))
-        self.widgets["radiation.max_iterations"].setValue(rad.get("max_iterations", 100))
-        self.widgets["radiation.convergence_tolerance"].setValue(rad.get("convergence_tolerance", 0.01))
+        self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 10))
+        self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 2.0))
+        self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
+        self.widgets["radiation.coupling_face_fraction"].setValue(rad.get("coupling_face_fraction", 0.01))
         self.widgets["radiation.view_factor_file"].setText(rad.get("view_factor_file", ""))
         self.widgets["radiation.use_hmatrix"].setChecked(rad.get("use_hmatrix", False))
-        self.widgets["radiation.hmatrix_tolerance"].setValue(rad.get("hmatrix_tolerance", 0.01))
-        self.widgets["radiation.hmatrix_max_rank"].setValue(rad.get("hmatrix_max_rank", 50))
+        self.widgets["radiation.use_aca"].setChecked(rad.get("use_aca", True))
+        self.widgets["radiation.aca_tolerance"].setValue(rad.get("aca_tolerance", 0.001))
+        self.widgets["radiation.aca_max_rank"].setValue(rad.get("aca_max_rank", 50))
 
 
 class IlluminationTab(BaseConfigTab):

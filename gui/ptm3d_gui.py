@@ -572,9 +572,13 @@ class PTM3DMainWindow(QMainWindow):
             # Save current state
             self.save_project()
 
-        # Create simulation thread
+        # Create simulation thread with config dict for radiation/GPU command-line args
         try:
-            self.simulation_thread = SimulationThread(self.current_project_file)
+            config_dict = self.config_manager.get_config()
+            self.simulation_thread = SimulationThread(
+                self.current_project_file,
+                config_dict=config_dict
+            )
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
             self.simulation_thread.error_ready.connect(self.on_simulation_error)
             self.simulation_thread.progress_update.connect(self.on_simulation_progress)

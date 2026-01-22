@@ -19,12 +19,85 @@ class SimulationThread(QThread):
     progress_update = pyqtSignal(float)
     finished = pyqtSignal(int)  # Exit code
 
-    def __init__(self, config_file, working_dir=None):
+    def __init__(self, config_file, working_dir=None, config_dict=None):
         super().__init__()
         self.config_file = config_file
         self.working_dir = working_dir
+        self.config_dict = config_dict  # Full config for extracting radiation options
         self.process = None
         self._stop_requested = False
+
+    def _build_radiation_args(self):
+        """Build command-line arguments for radiation options (not in YAML parser)"""
+        args = []
+        if not self.config_dict:
+            return args
+
+        rad = self.config_dict.get("radiation", {})
+        if not rad.get("enabled", False):
+            return args
+
+        # Enable radiation exchange
+        args.append("--radiation-exchange")
+
+        # H-matrix compression
+        if rad.get("use_hmatrix", False):
+            args.append("--rad-hmatrix")
+
+        # GPU radiosity
+        if rad.get("use_gpu", False):
+            args.append("--rad-use-gpu")
+
+        # Verbose output
+        if rad.get("verbose", False):
+            args.append("--rad-verbose")
+
+        # View factor file
+        vf_file = rad.get("view_factor_file", "")
+        if vf_file:
+            args.extend(["--rad-view-factor-file", str(vf_file)])
+
+        # Coupling parameters
+        max_iter = rad.get("max_coupling_iterations", 10)
+        if max_iter != 10:
+            args.extend(["--rad-coupling-iter", str(max_iter)])
+
+        temp_tol = rad.get("coupling_temp_threshold", 0.5)
+        if temp_tol != 0.5:
+            args.extend(["--rad-coupling-temp-tol", str(temp_tol)])
+
+        flux_tol = rad.get("coupling_flux_threshold", 0.1)
+        if flux_tol != 0.1:
+            args.extend(["--rad-coupling-flux-tol", str(flux_tol)])
+
+        face_frac = rad.get("coupling_face_fraction", 0.01)
+        if face_frac != 0.01:
+            args.extend(["--rad-coupling-face-frac", str(face_frac)])
+
+        # ACA parameters (if not using ACA, use SVD)
+        if not rad.get("use_aca", True):
+            args.append("--rad-use-svd")
+        else:
+            aca_tol = rad.get("aca_tolerance", 0.001)
+            if aca_tol != 0.001:
+                args.extend(["--rad-aca-tolerance", str(aca_tol)])
+            aca_rank = rad.get("aca_max_rank", 50)
+            if aca_rank != 50:
+                args.extend(["--rad-aca-max-rank", str(aca_rank)])
+
+        return args
+
+    def _build_gpu_thermal_args(self):
+        """Build command-line arguments for GPU thermal options (not in YAML parser)"""
+        args = []
+        if not self.config_dict:
+            return args
+
+        thermal = self.config_dict.get("thermal", {})
+        if thermal.get("use_gpu", False):
+            args.append("--use-gpu-thermal")
+
+        return args
 
     def run(self):
         """Execute the simulation and emit output"""
@@ -35,7 +108,10 @@ class SimulationThread(QThread):
                 self.finished.emit(-1)
                 return
 
+            # Build command with config file and additional CLI args for radiation/GPU
             command = [str(executable), "--config", str(self.config_file)]
+            command.extend(self._build_radiation_args())
+            command.extend(self._build_gpu_thermal_args())
 
             self.process = subprocess.Popen(
                 command,

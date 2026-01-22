@@ -104,10 +104,8 @@ class ConfigManager:
         "thermal": {
             "run_thermal_mesh": True,
             "threads": 0,
-            "equilibration_orbits": 2,
+            "equilibration_orbits": 10,
             "use_gpu": False,
-            "use_gpu_illumination": False,
-            "grid_quality": "auto",
             "compute_statistics": True,
             "thermal_inertia_map": "",
             "enable_shadow_flux": False,
@@ -120,23 +118,17 @@ class ConfigManager:
         "radiation": {
             "enabled": False,
             "min_shadow_fraction": 0.3,
-            "min_terrain_view_angle": 5.0,
-            "max_neighbors": 2000,
-            "search_radius_factor": 10.0,
-            "max_iterations": 100,
-            "convergence_tolerance": 0.01,
             "verbose": False,
             "use_gpu": True,
             "view_factor_file": "",
             "max_coupling_iterations": 10,
-            "coupling_temp_threshold": 0.5,
+            "coupling_temp_threshold": 2.0,
             "coupling_flux_threshold": 0.1,
             "coupling_face_fraction": 0.01,
             "use_hmatrix": False,
-            "hmatrix_tolerance": 0.01,
-            "hmatrix_max_depth": 10,
-            "hmatrix_min_block_size": 64,
-            "hmatrix_max_rank": 50
+            "use_aca": True,
+            "aca_tolerance": 0.001,
+            "aca_max_rank": 50
         },
         "illumination": {
             "include_primary_reflection": True,
@@ -290,23 +282,17 @@ class ConfigManager:
         if self.config["thermal"]["equilibration_orbits"] < 0:
             errors.append("Equilibration orbits cannot be negative")
 
-        valid_grid_qualities = ["coarse", "standard", "fine", "auto"]
-        if self.config["thermal"].get("grid_quality", "auto") not in valid_grid_qualities:
-            errors.append(f"Grid quality must be one of: {', '.join(valid_grid_qualities)}")
-
         # Radiation parameters
         rad = self.config.get("radiation", {})
         if rad.get("enabled", False):
             if not (0 <= rad.get("min_shadow_fraction", 0) <= 1):
                 errors.append("Radiation: min_shadow_fraction must be between 0 and 1")
-            if not (0 <= rad.get("min_terrain_view_angle", 0) <= 90):
-                errors.append("Radiation: min_terrain_view_angle must be 0-90 degrees")
-            if rad.get("max_neighbors", 0) < 10:
-                errors.append("Radiation: max_neighbors should be at least 10")
-            if rad.get("convergence_tolerance", 0) <= 0:
-                errors.append("Radiation: convergence_tolerance must be positive")
-            if rad.get("max_iterations", 0) < 1:
-                errors.append("Radiation: max_iterations must be at least 1")
+            if rad.get("max_coupling_iterations", 0) < 1:
+                errors.append("Radiation: max_coupling_iterations must be at least 1")
+            if rad.get("coupling_temp_threshold", 0) <= 0:
+                errors.append("Radiation: coupling_temp_threshold must be positive")
+            if rad.get("aca_tolerance", 0) <= 0:
+                errors.append("Radiation: aca_tolerance must be positive")
 
         # Output validation
         valid_formats = ["binary", "vtk"]
@@ -325,7 +311,7 @@ class ConfigManager:
 
         # GPU warnings
         thermal = self.config.get("thermal", {})
-        gpu_requested = (thermal.get("use_gpu") or thermal.get("use_gpu_illumination") or rad.get("use_gpu"))
+        gpu_requested = thermal.get("use_gpu") or rad.get("use_gpu")
         if gpu_requested:
             caps = detect_hardware_capabilities()
             if not caps["opencl_available"]:
