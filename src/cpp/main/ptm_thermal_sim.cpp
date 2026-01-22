@@ -983,13 +983,14 @@ std::vector<double> calculateAbsorbedFlux(
         }
     }
 
-    // Now interpolate the albedo map to each face if we have one
-    if (albedo_successfully_loaded && albedo_map_to_use && albedo_map_to_use->isValid()) {
-        std::cout << "Interpolating albedo map to " << num_faces << " mesh faces..." << std::endl;
-        
+    // Now interpolate the albedo map to each face if we have a FITS map to interpolate
+    // (Binary albedo files are already loaded directly into face_albedos above)
+    if (albedo_map_to_use && albedo_map_to_use->isValid()) {
+        std::cout << "Interpolating FITS albedo map to " << num_faces << " mesh faces..." << std::endl;
+
         size_t valid_interpolations = 0;
         size_t invalid_interpolations = 0;
-        
+
         // Use OpenMP for parallel processing
         #pragma omp parallel for reduction(+:valid_interpolations,invalid_interpolations)
         for (size_t f = 0; f < num_faces; f++) {
@@ -997,19 +998,19 @@ std::vector<double> calculateAbsorbedFlux(
             if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
                 double face_lat = mesh->latitudes[f];
                 double face_lon = mesh->longitudes[f];
-                
+
                 // Normalize longitude to 0-360 range for map lookup
                 while (face_lon < 0) face_lon += 360.0;
                 while (face_lon >= 360.0) face_lon -= 360.0;
-                
+
                 try {
                     // Get albedo from the map at THIS FACE's location
                     // Note: Some maps use opposite latitude convention
                     double map_albedo = albedo_map_to_use->getValue(face_lon, -face_lat);
-                    
+
                     // Check if we got a valid value
-                    if (map_albedo != albedo_map_to_use->getMissingValue() && 
-                        map_albedo >= MIN_VALID_ALBEDO && 
+                    if (map_albedo != albedo_map_to_use->getMissingValue() &&
+                        map_albedo >= MIN_VALID_ALBEDO &&
                         map_albedo <= MAX_VALID_ALBEDO) {
                         face_albedos[f] = map_albedo;
                         valid_interpolations++;
@@ -1025,15 +1026,24 @@ std::vector<double> calculateAbsorbedFlux(
                 invalid_interpolations++;
             }
         }
-        
+
         // Report statistics
         double min_albedo = *std::min_element(face_albedos.begin(), face_albedos.end());
         double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
         double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / face_albedos.size();
-        
-        std::cout << "Albedo interpolation complete:" << std::endl;
+
+        std::cout << "FITS albedo interpolation complete:" << std::endl;
         std::cout << "  Valid interpolations: " << valid_interpolations << " faces" << std::endl;
         std::cout << "  Invalid/default values: " << invalid_interpolations << " faces" << std::endl;
+        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
+        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+        albedo_successfully_loaded = true;
+    } else if (albedo_successfully_loaded) {
+        // Binary albedo file was already loaded - just report statistics
+        double min_albedo = *std::min_element(face_albedos.begin(), face_albedos.end());
+        double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
+        double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / face_albedos.size();
+        std::cout << "Using binary albedo map:" << std::endl;
         std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
         std::cout << "  Average albedo: " << avg_albedo << std::endl;
     } else {
@@ -1175,7 +1185,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     }
 
     try {
-        const std::string planet_name = config.getProperty("planet", "Moon");  // Should be Moon not Europa!
+        const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
 
         // Create thermal model
@@ -2387,7 +2397,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     // Create reference profile for grid parameters
-    thermal::Planet planet("Moon");  // TODO: Make configurable from config
+    thermal::Planet planet(config.getProperty("planet", "Moon"));
     thermal::Profile ref_profile(planet, 0.0, config, false);
     const int n_layers = ref_profile.nlayers;
 
@@ -2692,9 +2702,71 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
               << " (n_layers=" << n_layers << ")" << std::endl;
 
-    // Prepare face albedos
+    // Prepare face albedos - try to load from binary albedo map
     std::vector<double> face_albedos(n_faces, default_visible_albedo);
-    // Could use spatial albedo map here if available
+
+    // Get body name and mesh resolution from config to load appropriate albedo map
+    std::string body_name = config.getProperty("target_body_name");
+    if (!body_name.empty()) {
+        // Convert to proper case
+        std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
+        body_name[0] = std::toupper(body_name[0]);
+
+        // Get mesh resolution from config
+        int mesh_resolution = 5; // Default
+        try {
+            auto it = config.custom_properties.find("mesh_resolution");
+            if (it != config.custom_properties.end()) {
+                mesh_resolution = std::stoi(it->second);
+            }
+        } catch (const std::exception& e) {
+            // Use default
+        }
+
+        // Get albedo maps directory from config
+        std::string albedo_maps_dir = "data/albedo_maps";
+        if (config.custom_properties.count("albedo_maps_directory") > 0) {
+            albedo_maps_dir = config.getProperty("albedo_maps_directory");
+        }
+        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+            albedo_maps_dir += '/';
+        }
+
+        // Construct binary albedo file name: e.g., "Europa_Albedo_res6.bin"
+        std::string albedo_filename = body_name + "_Albedo_res" + std::to_string(mesh_resolution) + ".bin";
+
+        // Try multiple paths for the albedo file
+        std::vector<std::string> search_paths = {
+            albedo_maps_dir + albedo_filename,
+            "../data/albedo_maps/" + albedo_filename,
+            "data/albedo_maps/" + albedo_filename
+        };
+
+        std::vector<double> loaded_albedos;
+        for (const auto& path : search_paths) {
+            loaded_albedos = importAlbedoMapFromFile(path);
+            if (!loaded_albedos.empty()) {
+                if (loaded_albedos.size() == n_faces) {
+                    std::cout << "[GPU Thermal] Loaded albedo map from: " << path << std::endl;
+                    std::cout << "[GPU Thermal] Albedo range: "
+                              << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
+                              << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+                    face_albedos = std::move(loaded_albedos);
+                } else {
+                    std::cout << "[GPU Thermal] Albedo file size mismatch: expected " << n_faces
+                              << ", got " << loaded_albedos.size() << std::endl;
+                }
+                break;
+            }
+        }
+
+        if (loaded_albedos.empty()) {
+            std::cout << "[GPU Thermal] No binary albedo map found for " << body_name
+                      << " res" << mesh_resolution << ", using default albedo " << default_visible_albedo << std::endl;
+        }
+    } else {
+        std::cout << "[GPU Thermal] No body name in config, using default albedo " << default_visible_albedo << std::endl;
+    }
 
     // Process faces in batches
     size_t n_batches = (n_faces + BATCH_SIZE - 1) / BATCH_SIZE;
@@ -2788,14 +2860,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         std::vector<float> T_initial(batch_n * n_layers);
         for (size_t f = 0; f < batch_n; ++f) {
             // Get initial flux to estimate equilibrium temperature
+            // Include ALL flux components (direct, reflected, IR) for accurate initialization
             size_t global_f = batch_start + f;
             double albedo = face_albedos[global_f];
             double avg_flux = 0.0;
-            for (int t = 0; t < std::min(10, total_time_steps); ++t) {
+            int n_samples = std::min(10, total_time_steps);
+            for (int t = 0; t < n_samples; ++t) {
                 size_t flux_idx = global_f * total_time_steps + t;
-                avg_flux += direct_solar_values[flux_idx] * (1.0 - albedo);
+                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
+                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
             }
-            avg_flux /= std::min(10, total_time_steps);
+            avg_flux /= n_samples;
 
             // Equilibrium temperature from Stefan-Boltzmann
             double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
@@ -2863,7 +2941,30 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        // Run persistent kernel
+        // Equilibration phase: Run the solver for multiple orbital periods before output
+        // This matches CPU behavior (config->NYEARSEQ * year/day cycles in Model::run)
+        // For bodies with day=year (e.g., Europa), we need several full cycles
+        int equil_cycles = 5;  // Number of equilibration day/night cycles
+        if (equil_cycles > 0 && total_time_steps > 1) {
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Running " << equil_cycles
+                          << " equilibration cycles before output phase..." << std::endl;
+            }
+
+            // Run equilibration: cycle through flux pattern multiple times without storing output
+            std::vector<float> equil_output_dummy;
+            for (int eq_cycle = 0; eq_cycle < equil_cycles; ++eq_cycle) {
+                // Run solver for one full period using the flux_all pattern
+                // Output is discarded; only the internal state (temperature profile) is kept
+                solver.solvePersistentAllTimesteps(flux_all, equil_output_dummy, total_time_steps, dt);
+            }
+
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Equilibration complete." << std::endl;
+            }
+        }
+
+        // Run persistent kernel for output phase (temperatures now equilibrated)
         std::vector<float> output_temps;
         solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
 
@@ -4555,17 +4656,6 @@ static FilteredData filterFaceMajorStable(
     // Temperatures
     fd.temps.resize(face_count);
 
-    // Debug: Check source temps before filtering
-    if (verbose && !temps_full.empty() && !temps_full[0].empty()) {
-        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0].size() = " << temps_full[0].size() << "\n";
-        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0][" << start << "] = " << temps_full[0][start] << "\n";
-        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0] first 5 from start: ";
-        for (int i = 0; i < 5 && start + i < static_cast<int>(temps_full[0].size()); ++i) {
-            std::cerr << temps_full[0][start + i] << " ";
-        }
-        std::cerr << "\n";
-    }
-
     #pragma omp parallel for schedule(static)
     for (size_t f = 0; f < face_count; ++f) {
         if (f >= temps_full.size()) continue;
@@ -4577,16 +4667,6 @@ static FilteredData filterFaceMajorStable(
                 dst[ot] = src[st];
         }
         fd.temps[f].swap(dst);
-    }
-
-    // Debug: Check output temps after filtering
-    if (verbose && !fd.temps.empty() && !fd.temps[0].empty()) {
-        std::cerr << "[filterFaceMajorStable DEBUG] fd.temps[0] size: " << fd.temps[0].size() << "\n";
-        std::cerr << "[filterFaceMajorStable DEBUG] fd.temps[0] first 5: ";
-        for (size_t i = 0; i < 5 && i < fd.temps[0].size(); ++i) {
-            std::cerr << fd.temps[0][i] << " ";
-        }
-        std::cerr << "\n";
     }
 
     return fd;
@@ -6543,8 +6623,10 @@ int main(int argc, char** argv) {
         thermal_config.DEBUG_OUTPUT_DIR = output_dir;
 
 
-        // Set body name in configuration
-        thermal_config.setProperty("target_body_name", illumination_model->getTargetBodyName());
+        // Set body name in configuration (both property names for compatibility)
+        std::string body_name_for_config = illumination_model->getTargetBodyName();
+        thermal_config.setProperty("target_body_name", body_name_for_config);
+        thermal_config.setProperty("planet", body_name_for_config);  // GPU solver uses this property
 
         // Add albedo maps directory to config properties
         thermal_config.setProperty("albedo_maps_directory", albedo_maps_directory);
@@ -6786,24 +6868,6 @@ int main(int argc, char** argv) {
                 if (!validateTemperatureMatrix(surface_temps, mesh->faces.size(), total_time_steps)) {
                     std::cerr << "[FATAL] Invalid temperature matrix shape after non-streamed thermal solve; aborting.\n";
                     return 1;
-                }
-
-                // Debug: Check surface_temps data validity
-                std::cerr << "[DEBUG] After thermal solver (extracted path), surface_temps check:\n";
-                std::cerr << "  surface_temps.size() = " << surface_temps.size() << "\n";
-                if (!surface_temps.empty() && !surface_temps[0].empty()) {
-                    std::cerr << "  surface_temps[0].size() = " << surface_temps[0].size() << "\n";
-                    double min_val = surface_temps[0][0], max_val = surface_temps[0][0];
-                    for (size_t t = 0; t < surface_temps[0].size(); ++t) {
-                        if (surface_temps[0][t] < min_val) min_val = surface_temps[0][t];
-                        if (surface_temps[0][t] > max_val) max_val = surface_temps[0][t];
-                    }
-                    std::cerr << "  Face 0 temp range: " << min_val << " to " << max_val << " K\n";
-                    std::cerr << "  Face 0, first 5 temps: ";
-                    for (size_t t = 0; t < std::min((size_t)5, surface_temps[0].size()); ++t) {
-                        std::cerr << surface_temps[0][t] << " ";
-                    }
-                    std::cerr << "\n";
                 }
             }
 

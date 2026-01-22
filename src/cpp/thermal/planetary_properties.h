@@ -98,17 +98,22 @@ private:
         props.emissivity = 0.9;          // Thermal emissivity
         props.Qb = 0.03;                 // Internal heat flux (W/m²)
         
-        // Thermal properties
-        props.ks = 0.002;                // Surface thermal conductivity (W/m/K)
-        props.kd = 0.01;                 // Deep thermal conductivity (W/m/K)
-        props.rhos = 100.0;              // Surface density (kg/m³)
-        props.rhod = 450.0;              // Deep density (kg/m³)
+        // Thermal properties for Europa icy regolith
+        // Target TI ~ 60 SI units: TI = sqrt(k * rho * cp)
+        // At T=100K with cp~750 J/kg/K: TI = sqrt(0.0096 * 500 * 750) ≈ 60 SI
+        props.ks = 0.0096;               // Surface thermal conductivity (W/m/K) - porous ice
+        props.kd = 0.05;                 // Deep thermal conductivity (W/m/K)
+        props.rhos = 500.0;              // Surface density (kg/m³) - porous ice regolith
+        props.rhod = 700.0;              // Deep density (kg/m³)
         props.H = 0.07;                  // Scale height (m)
-        props.cp0 = 900.0;               // Reference heat capacity (J/kg/K)
-        
-        // Variable property coefficients
-        props.cpCoeff = {90.0, 7.49};    // Heat capacity temperature coefficients
-        props.albedoCoef = {0.1, 0.05};  // Albedo variation coefficients
+        props.cp0 = 0.0;                 // Reference heat capacity (J/kg/K) - using linear T model
+
+        // Variable property coefficients for water ice
+        // Ice heat capacity: cp ≈ 7.49*T for T < ~270K (Giauque & Stout 1936)
+        // This gives cp(100K) ≈ 749 J/kg/K, cp(130K) ≈ 974 J/kg/K
+        // Empty cpCoeff means constant cp; single value means cp = cp0 + c0*T
+        props.cpCoeff = {7.49};          // Linear temperature coefficient for ice (J/kg/K²)
+        props.albedoCoef = {};           // No incidence-dependent albedo for Europa
         
         // SPICE configuration
         props.spice_metakernel = "europa.tm";

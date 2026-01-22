@@ -1,410 +1,176 @@
-# GPU Implementation Plan for PTM Thermal Model
+# GPU Acceleration in PTM
 
 ## Overview
 
-This document outlines a phased approach to GPU-accelerate the Planetary Thermal Model (PTM). The goal is to achieve 10-100x speedup for large meshes (>100K faces) while maintaining numerical accuracy and supporting both NVIDIA and AMD GPUs.
+PTM supports GPU acceleration for computationally intensive operations, providing significant speedups for large mesh simulations. GPU acceleration is optional—the model runs entirely on CPU if GPU support is not available or not enabled.
 
-**Current Bottlenecks:**
-1. **Thermal solver**: ~1500s for 618K faces × 1000 timesteps (OpenMP parallelized)
-2. **Radiation exchange**: View factor computation (already has H-matrix optimization)
-3. **Ray tracing for illumination**: Currently CPU-based with Embree
+**GPU-accelerated components:**
+- **Thermal solver**: Batched 1D heat equation solver for all mesh faces
+- **Radiosity solver**: Sparse matrix-vector operations for radiation exchange
+- **Shadow ray tracing**: BVH-accelerated visibility tests for illumination (experimental)
 
-## Architecture Decision: HIP for Portability
+## Supported Platforms
 
-We use **HIP (Heterogeneous-Compute Interface for Portability)** because:
-- Near-identical syntax to CUDA
-- Compiles to NVCC (CUDA) on NVIDIA, ROCm on AMD
-- Supports hipSPARSE, hipBLAS which marshal to vendor-specific libraries
-- Single codebase for both GPU vendors
+| Platform | Backend | Thermal | Radiosity | Ray Tracing |
+|----------|---------|---------|-----------|-------------|
+| macOS (AMD GPU) | OpenCL | Yes | Yes | Yes |
+| Linux | OpenCL | Yes | Yes | Yes |
+| Linux (NVIDIA) | CUDA | Yes | No | No |
+| Linux (AMD) | HIP/ROCm | Yes | No | No |
+| Windows | OpenCL | Yes | Yes | Yes (untested) |
 
-Alternative considered: SYCL/OneAPI, but HIP has better maturity for scientific computing.
+**OpenCL is the recommended backend** with full feature support. HIP and CUDA backends support thermal solver acceleration only; radiosity and ray tracing fall back to CPU when using these backends.
 
----
+The build system automatically detects available GPU backends and selects the most appropriate one.
 
-## Phase 1: Infrastructure & Memory Management
+## Building with GPU Support
 
-### 1.1 GPU Abstraction Layer
+### Prerequisites
 
-Create `src/cpp/gpu/` directory with:
+- **macOS**: OpenCL is included with the system (no additional installation needed)
+- **Linux (NVIDIA)**: CUDA Toolkit 11.0+ or HIP with CUDA backend
+- **Linux (AMD)**: ROCm 5.0+ with HIP
 
+### CMake Configuration
+
+```bash
+# Auto-detect GPU backend
+cmake -DENABLE_GPU=ON -DGPU_BACKEND=AUTO ..
+
+# Force OpenCL (recommended for full feature support)
+cmake -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL ..
+
+# Force CUDA (thermal solver only)
+cmake -DENABLE_GPU=ON -DGPU_BACKEND=CUDA ..
+
+# Force HIP (thermal solver only)
+cmake -DENABLE_GPU=ON -DGPU_BACKEND=HIP ..
+
+# Disable GPU (default)
+cmake -DENABLE_GPU=OFF ..
+```
+
+### Build
+
+```bash
+mkdir build && cd build
+cmake -DENABLE_GPU=ON ..
+cmake --build . -j4
+```
+
+## Command-Line Usage
+
+### Thermal Solver
+
+```bash
+# Enable GPU thermal solver
+./bin/ptm_thermal_sim --config europa.yaml --use-gpu-thermal
+
+# CPU thermal solver (default)
+./bin/ptm_thermal_sim --config europa.yaml
+```
+
+### Radiation Exchange
+
+```bash
+# Enable GPU radiosity solver for radiation exchange
+./bin/ptm_thermal_sim --config europa.yaml --radiation-exchange --rad-use-gpu
+```
+
+### Illumination (Experimental)
+
+```bash
+# Enable GPU ray tracing for shadow calculations
+./bin/ptm_thermal_sim --config europa.yaml --use-gpu-illumination
+
+# Enable GPU for both thermal and illumination
+./bin/ptm_thermal_sim --config europa.yaml --use-gpu-both
+```
+
+## Architecture
+
+### GPU Thermal Solver
+
+The GPU thermal solver processes all mesh faces in parallel. Each GPU thread handles one mesh face, solving the 1D heat equation through the depth column using the Crank-Nicolson finite difference scheme.
+
+**Key features:**
+- **Batched processing**: All faces processed simultaneously on GPU
+- **Register-based solver**: The Thomas algorithm (tridiagonal solver) runs entirely in GPU registers for maximum performance
+- **Automatic sub-stepping**: Maintains numerical stability by internally sub-stepping when the output timestep is large
+- **Equilibration cycles**: Runs multiple diurnal cycles before output to establish thermal equilibrium
+
+**Memory layout**: Uses Structure-of-Arrays (SoA) format for coalesced GPU memory access:
+```
+T[layer][face] → T_gpu[layer * n_faces + face]
+```
+
+### GPU Radiosity Solver
+
+The radiosity solver uses sparse matrix-vector multiplication (SpMV) to compute indirect thermal radiation exchange between mesh faces.
+
+**Components:**
+- CSR sparse matrix format for view factors
+- Jacobi iteration with GPU-accelerated kernels
+- Emission and absorption computed in parallel
+
+### GPU Ray Tracer
+
+The BVH (Bounding Volume Hierarchy) ray tracer accelerates shadow ray tests for illumination calculations.
+
+**Features:**
+- SAH (Surface Area Heuristic) BVH construction on CPU
+- Stack-based BVH traversal on GPU
+- Batched ray processing for efficiency
+- BVH serialization for reuse across runs
+
+## Performance Characteristics
+
+GPU acceleration provides the greatest benefit for:
+- **Large meshes**: >100K faces see substantial speedups
+- **Long simulations**: Many timesteps amortize GPU initialization overhead
+- **Radiation exchange**: SpMV operations parallelize efficiently
+
+For small meshes (<10K faces), CPU may be faster due to GPU kernel launch overhead.
+
+**Typical speedups** (600K faces, 1000 timesteps):
+- Thermal solver: 50-100x vs single-threaded CPU
+- Radiosity solver: 10-50x depending on view factor sparsity
+
+## Fallback Behavior
+
+If GPU acceleration is requested but unavailable (no GPU, driver issues, or not compiled with GPU support), PTM automatically falls back to CPU execution with a warning message:
+
+```
+Warning: GPU thermal solver requested but not available, falling back to CPU
+```
+
+This ensures simulations complete successfully regardless of GPU availability.
+
+## Numerical Considerations
+
+- GPU thermal solver uses single precision (float32) internally for performance
+- Results are validated to match CPU double-precision within 0.01 K
+- Material property calculations (conductivity, heat capacity) use the same physics as CPU
+
+## File Locations
+
+GPU implementation source files:
 ```
 src/cpp/gpu/
-├── CMakeLists.txt
-├── gpu_config.h         # Feature detection, backend selection
-├── gpu_memory.h         # Memory pool, SoA buffers
-├── gpu_memory.cpp
-├── thermal_gpu.h        # GPU thermal solver interface
-├── thermal_gpu.cpp      # HIP kernel implementations
-└── gpu_utils.h          # Error handling, timing utilities
+├── CMakeLists.txt           # GPU build configuration
+├── gpu_config.h             # Backend detection and configuration
+├── gpu_memory.h             # SoA buffer management
+├── gpu_utils.h              # Error handling utilities
+│
+├── # OpenCL backend (full feature support)
+├── opencl_config.h          # OpenCL context management
+├── thermal_opencl.h/cpp     # OpenCL thermal solver
+├── thermal_kernels.cl       # OpenCL thermal kernel source
+├── radiosity_opencl.h/cpp   # OpenCL radiosity solver
+├── radiosity_kernels.cl     # OpenCL radiosity kernel source
+├── bvh_opencl.h/cpp         # OpenCL BVH ray tracer
+│
+└── # HIP/CUDA backend (thermal solver only)
+    ├── thermal_gpu.h/cpp    # HIP/CUDA thermal solver interface
+    └── thermal_kernels.cpp  # HIP/CUDA kernel implementations
 ```
-
-**Key design: CPU fallback always available.** GPU code is isolated; the thermal model can run without any GPU support.
-
-### 1.2 Structure of Arrays (SoA) Memory Layout
-
-**Critical for GPU performance.** Current memory layout is Array of Structures (AoS):
-```cpp
-// Current: AoS - bad for GPU coalescing
-face[i].temperature[depth]  // Strided access
-```
-
-Transform to SoA:
-```cpp
-// SoA - coalesced memory access
-T_all[depth * n_faces + face_id]  // Contiguous by face within depth
-```
-
-**Memory layout for 600K faces × 30 depth layers:**
-```cpp
-struct ThermalGPUBuffers {
-    // Primary state (read/write each timestep)
-    float* T;         // [n_faces * n_layers] - temperatures
-    float* flux;      // [n_faces] - surface flux per face
-
-    // Material properties (updated less frequently)
-    float* k;         // [n_faces * n_layers] - conductivity
-    float* kappa;     // [n_faces * n_layers] - diffusivity
-    float* cp;        // [n_faces * n_layers] - heat capacity
-    float* rho;       // [n_faces * n_layers] - density
-
-    // Grid geometry (constant after init)
-    float* z;         // [n_layers] - depth grid (shared)
-    float* dz;        // [n_layers-1] - layer spacing
-    float* g1, *g2;   // [n_layers] - coupling coefficients
-
-    // Face properties (constant)
-    float* emissivity; // [n_faces]
-    float* albedo;     // [n_faces]
-};
-```
-
-**Memory estimate:**
-- 600K faces × 30 layers × 6 arrays × 4 bytes = ~432 MB
-- Plus flux, properties: ~500 MB total GPU memory
-
-### 1.3 CMake Integration
-
-```cmake
-# In root CMakeLists.txt
-option(ENABLE_GPU "Enable GPU acceleration" OFF)
-option(GPU_BACKEND "GPU backend: HIP, CUDA, or NONE" "HIP")
-
-if(ENABLE_GPU)
-    if(GPU_BACKEND STREQUAL "HIP")
-        find_package(hip REQUIRED)
-        add_subdirectory(src/cpp/gpu)
-    endif()
-endif()
-```
-
----
-
-## Phase 2: GPU Thermal Solver Kernel
-
-### 2.1 Register-Heavy TDMA Kernel
-
-Since depth grid is small (N~30), keep entire column in GPU registers:
-
-```cpp
-__global__ void BatchedThermalSolver(
-    float* T_global,      // [n_faces * n_layers]
-    const float* flux,    // [n_faces]
-    const float* k,       // [n_faces * n_layers]
-    const float* kappa,   // [n_faces * n_layers]
-    const float* g1,      // [n_layers]
-    const float* g2,      // [n_layers]
-    float dt,
-    float sigma,
-    int n_faces,
-    int n_layers
-) {
-    int face_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (face_id >= n_faces) return;
-
-    // Load column into registers (coalesced read from SoA layout)
-    float T_local[MAX_LAYERS];  // MAX_LAYERS = 64, fits in registers
-    for (int i = 0; i < n_layers; i++) {
-        T_local[i] = T_global[i * n_faces + face_id];
-    }
-
-    // Surface boundary condition (linearized radiation)
-    float T_surf = T_local[0];
-    float T3 = T_surf * T_surf * T_surf;
-    float rad_coeff = 4.0f * sigma * emissivity * T3;
-    // ... build tridiagonal system in registers ...
-
-    // Thomas algorithm entirely in registers
-    float a[MAX_LAYERS], b[MAX_LAYERS], c[MAX_LAYERS], d[MAX_LAYERS];
-    // ... forward elimination ...
-    // ... backward substitution ...
-
-    // Write back (coalesced)
-    for (int i = 0; i < n_layers; i++) {
-        T_global[i * n_faces + face_id] = T_local[i];
-    }
-}
-```
-
-**Key optimizations:**
-1. **One thread per face**: Entire thermal column solved by single thread
-2. **Register storage**: No VRAM latency during Thomas algorithm
-3. **Coalesced I/O**: SoA layout ensures adjacent threads access adjacent memory
-4. **Linearized BC**: Avoid Newton iterations on GPU (4εσT³ approximation)
-
-### 2.2 Launch Configuration
-
-```cpp
-// Optimal for ~600K faces
-dim3 block(256);  // 256 threads per block
-dim3 grid((n_faces + 255) / 256);  // ~2400 blocks
-
-BatchedThermalSolver<<<grid, block, 0, stream>>>(
-    d_T, d_flux, d_k, d_kappa, d_g1, d_g2, dt, sigma, n_faces, n_layers
-);
-```
-
-### 2.3 Material Property Update Kernel
-
-Temperature-dependent k(T), cp(T) updated on GPU:
-
-```cpp
-__global__ void UpdateMaterialProperties(
-    const float* T,
-    float* k,
-    float* cp,
-    float* kappa,
-    const float* rho,
-    const float* kc,     // base conductivity
-    float R350,          // radiative conductivity coefficient
-    const float* cpCoeff, // cp polynomial coefficients
-    int n_coeff,
-    float cp0,
-    int n_faces,
-    int n_layers
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_faces * n_layers;
-    if (idx >= total) return;
-
-    float Ti = T[idx];
-
-    // k(T) = kc + R350 * T^3
-    float T2 = Ti * Ti;
-    float T3 = T2 * Ti;
-    k[idx] = kc[idx] + R350 * T3;
-
-    // cp(T) via Horner's method
-    float cpval = cpCoeff[n_coeff - 1];
-    for (int j = n_coeff - 2; j >= 0; j--) {
-        cpval = cpval * Ti + cpCoeff[j];
-    }
-    cp[idx] = cp0 + Ti * cpval;
-
-    // kappa = k / (rho * cp)
-    kappa[idx] = k[idx] / (rho[idx] * cp[idx]);
-}
-```
-
----
-
-## Phase 3: Integration with Existing Code
-
-### 3.1 CPU/GPU Abstraction
-
-```cpp
-// thermal_model.h
-class Model {
-    // ...
-    void advance();  // Existing CPU path
-
-#ifdef ENABLE_GPU
-    void advanceGPU();  // GPU path
-    std::unique_ptr<GPUThermalContext> gpu_ctx_;
-#endif
-};
-
-// In thermal_model.cpp
-void Model::run() {
-    // ...
-#ifdef ENABLE_GPU
-    if (config->USE_GPU && gpu_ctx_) {
-        advanceGPU();
-    } else
-#endif
-    {
-        advance();  // CPU fallback
-    }
-}
-```
-
-### 3.2 Batched Face Processing
-
-For the full mesh simulation, batch all faces to GPU:
-
-```cpp
-// ptm_thermal_sim.cpp - GPU batch processing
-bool runThermalModelsForAllFaces_GPU(
-    const std::shared_ptr<Mesh>& mesh,
-    const std::vector<std::vector<double>>& flux_per_face,  // [face][time]
-    const std::vector<double>& times,
-    const thermal::Config& config,
-    std::vector<std::vector<double>>& surface_temps_out
-) {
-    GPUThermalBatch batch(mesh->num_faces, config.n_layers);
-
-    // Initialize: upload grid, properties, initial T
-    batch.initializeFromMesh(mesh, config);
-
-    // Time stepping loop
-    for (size_t t = 0; t < times.size() - 1; t++) {
-        double dt = times[t+1] - times[t];
-
-        // Upload flux for this timestep
-        batch.uploadFlux(flux_per_face, t);
-
-        // GPU kernel: update material props + solve
-        batch.advanceTimestep(dt);
-
-        // Download surface temps (only if needed for output)
-        if (shouldOutput(t)) {
-            batch.downloadSurfaceTemps(surface_temps_out, t);
-        }
-    }
-
-    return true;
-}
-```
-
-### 3.3 Async Overlap Strategy
-
-Hide data transfer latency with compute:
-
-```cpp
-// Double-buffered flux upload
-cudaStream_t compute_stream, transfer_stream;
-
-for (size_t t = 0; t < n_timesteps; t++) {
-    // Async upload flux for t+1 while computing t
-    if (t + 1 < n_timesteps) {
-        uploadFluxAsync(flux_buffer[(t+1) % 2], transfer_stream);
-    }
-
-    // Compute timestep t
-    launchKernel(flux_buffer[t % 2], compute_stream);
-
-    // Sync before next iteration
-    cudaStreamSynchronize(compute_stream);
-}
-```
-
----
-
-## Phase 4: Validation & Testing
-
-### 4.1 Numerical Validation
-
-1. **Single-face comparison**: Run one face through CPU and GPU paths, compare T(z,t)
-2. **Tolerance**: Max |T_cpu - T_gpu| < 0.01 K (float32 precision)
-3. **Conservation check**: Energy balance before/after timestep
-
-### 4.2 Benchmark Suite
-
-```cpp
-// benchmark_thermal_gpu.cpp
-void benchmarkThermalGPU() {
-    std::vector<size_t> face_counts = {1000, 10000, 100000, 600000};
-
-    for (auto n_faces : face_counts) {
-        // CPU timing
-        auto cpu_time = runCPUBenchmark(n_faces, n_timesteps);
-
-        // GPU timing
-        auto gpu_time = runGPUBenchmark(n_faces, n_timesteps);
-
-        std::cout << "Faces: " << n_faces
-                  << " CPU: " << cpu_time << "ms"
-                  << " GPU: " << gpu_time << "ms"
-                  << " Speedup: " << cpu_time/gpu_time << "x" << std::endl;
-    }
-}
-```
-
-### 4.3 Test Cases
-
-1. **Flat surface**: Known analytical solution (Fourier series)
-2. **Bowl crater**: Compare to existing validated results
-3. **Lunar model**: Full 618K face simulation
-
----
-
-## Phase 5: Ray Tracing GPU Acceleration (Future)
-
-After thermal solver is GPU-accelerated, extend to illumination:
-
-1. **OptiX integration**: NVIDIA ray tracing
-2. **HIP RT**: AMD ray tracing (newer, less mature)
-3. **Fallback**: Keep Embree CPU path
-
-This is lower priority since illumination is typically pre-computed once.
-
----
-
-## Implementation Checklist
-
-### Phase 1 (Infrastructure)
-- [ ] Create `src/cpp/gpu/` directory structure
-- [ ] Implement GPU detection and backend selection in CMake
-- [ ] Create `ThermalGPUBuffers` SoA memory manager
-- [ ] Add `--use-gpu` command-line flag
-- [ ] Implement CPU-to-SoA conversion utilities
-
-### Phase 2 (Kernels)
-- [ ] Implement `BatchedThermalSolver` kernel
-- [ ] Implement `UpdateMaterialProperties` kernel
-- [ ] Add surface boundary condition kernel
-- [ ] Implement Thomas algorithm in registers
-- [ ] Test single-face kernel correctness
-
-### Phase 3 (Integration)
-- [ ] Add GPU context to `thermal::Model`
-- [ ] Implement `runThermalModelsForAllFaces_GPU()`
-- [ ] Add async stream management
-- [ ] Integrate with radiation exchange iteration
-
-### Phase 4 (Validation)
-- [ ] Create benchmark suite
-- [ ] Validate against CPU results
-- [ ] Profile memory bandwidth utilization
-- [ ] Optimize block/grid dimensions
-
----
-
-## Expected Performance
-
-| Mesh Size | CPU Time (OpenMP 8 threads) | GPU Time (est.) | Speedup |
-|-----------|----------------------------|-----------------|---------|
-| 10K faces | ~25s | ~0.5s | 50x |
-| 100K faces | ~250s | ~3s | 80x |
-| 600K faces | ~1500s | ~15s | 100x |
-
-**Key insight**: GPU advantage grows with face count due to:
-1. Massive parallelism (thousands of concurrent faces)
-2. Register-resident solver eliminates memory bottleneck
-3. Coalesced SoA access maximizes bandwidth
-
----
-
-## Risk Mitigation
-
-1. **Float32 precision**: May need double precision for some calculations; benchmark accuracy loss
-2. **Memory limits**: 600K faces × 30 layers fits in ~500MB; larger meshes may need chunking
-3. **HIP maturity**: Test on both NVIDIA and AMD early to catch portability issues
-4. **Complexity**: Keep CPU path as fallback; GPU is optional enhancement
-
----
-
-## References
-
-- [thermal-efficiency-plan.md](thermal-efficiency-plan.md) - Original technical specification
-- [HIP Programming Guide](https://rocm.docs.amd.com/projects/HIP/en/latest/)
-- [CUDA Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/)

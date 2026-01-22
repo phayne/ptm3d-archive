@@ -10,7 +10,7 @@ The thermal model solves the 1D heat conduction equation with temperature-depend
 
 The governing equation is:
 
-$$\rho \, c_p(T) \frac{\partial T}{\partial t} = \frac{\partial}{\partial z} \left[ k(T) \frac{\partial T}{\partial z} \right]$$
+$$\rho \cdot c_p(T) \frac{\partial T}{\partial t} = \frac{\partial}{\partial z} \left[ k(T) \frac{\partial T}{\partial z} \right]$$
 
 Where:
 - $\rho$ is density (kg/m³)

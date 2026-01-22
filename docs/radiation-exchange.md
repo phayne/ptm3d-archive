@@ -43,10 +43,11 @@ View factors are computed using ray casting with Intel Embree:
 ### H-Matrix Compression
 
 For large meshes (>50K faces), view factors are compressed using hierarchical matrices:
-- Quadtree spatial partitioning
-- Low-rank SVD or ACA (Adaptive Cross Approximation) for far-field blocks
-- Sparse storage for near-field
+- **3D octree spatial partitioning** (better than quadtree for crater geometry where Z variation matters)
+- Low-rank SVD with randomized approximation for far-field blocks
+- Sparse storage for near-field interactions
 - $O(N \log N)$ storage vs $O(N^2)$ for dense
+- Ray-packet optimization with AVX-512/AVX2 SIMD
 
 The low-rank approximation exploits the fact that view factors between distant clusters decay smoothly:
 
@@ -77,6 +78,27 @@ Iterative solver for coupled problems:
 --rad-coupling-iter      Max coupling iterations
 --rad-coupling-temp-tol  Temperature convergence threshold
 ```
+
+## GPU Acceleration
+
+The radiosity solver can be accelerated on GPU using OpenCL:
+- Sparse matrix-vector multiply (SpMV) for view factor operations
+- CSR format for efficient GPU memory access
+- Jacobi iteration with parallel convergence tracking
+
+Enable with `--rad-use-gpu` (requires OpenCL build).
+
+## File Formats
+
+### Sparse View Factor Format (.vfm)
+- Magic number: `0x5646464D` ("VFFM")
+- CSR sparse matrix storage
+- Auto-detected on load
+
+### H-Matrix Format (.hmat)
+- Magic number: `0x484D4154` ("HMAT")
+- Hierarchical block structure with low-rank and sparse blocks
+- Binary serialization for save/load
 
 ## References
 

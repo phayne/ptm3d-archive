@@ -1,4 +1,12 @@
-# PTM3D - Planetary Thermophysical Model 3D
+```
+ ____  _____ __  __ _____ ____
+|  _ \|_   _|  \/  |___ /|  _ \
+| |_) | | | | |\/| | |_ \| | | |
+|  __/  | | | |  | |___) | |_| |
+|_|     |_| |_|  |_|____/|____/
+
+Planetary Thermophysical Model 3D
+```
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/std/the-standard)
@@ -10,7 +18,7 @@
 
 ## Key Features
 
-- **Multi-body support**: Moon, Mercury, and Europa with pre-defined thermophysical properties
+- **Multi-body support**: Moon, Mercury, Europa, and other bodies with calibrated thermophysical properties
 - **Ray-traced illumination**: Intel Embree 4 with SIMD optimization (AVX-512/AVX2)
 - **SPICE ephemeris integration**: Accurate planetary positions via NASA NAIF kernels
 - **1D thermal conduction**: Crank-Nicolson solver with temperature-dependent properties
@@ -37,10 +45,10 @@
 - [Architecture](#architecture)
 - [Command-Line Reference](#command-line-reference)
 - [Output Formats](#output-formats)
+- [Graphical User Interface](#graphical-user-interface)
 - [Python Tools](#python-tools)
 - [Examples](#examples)
 - [Documentation](#documentation)
-- [Contributing](#contributing)
 - [Citation](#citation)
 - [License](#license)
 
@@ -113,10 +121,13 @@ ls bin/
 
 **GPU Support (Optional)**:
 ```bash
-# Enable OpenCL GPU acceleration (currently the only fully implemented backend)
-cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL
+# Enable GPU acceleration (auto-detects available backend)
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=AUTO
+
+# Or specify backend explicitly
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL  # Recommended: full feature support
 ```
-Note: OpenCL is the recommended GPU backend and works on macOS (AMD GPUs) and Linux. HIP and CUDA backends have framework support but are not fully implemented.
+OpenCL is the primary GPU backend with full support for thermal solver, radiosity, and ray tracing on macOS and Linux. HIP/CUDA backends have thermal solver support only. See [GPU Acceleration](docs/gpu-implementation-plan.md) for details.
 
 ---
 
@@ -164,6 +175,8 @@ output:
 
 ### 3. Full Europa Simulation
 
+Europa is tidally locked to Jupiter (day = orbital period = 3.55 days), receives Jupiter IR and reflected sunlight, and has ice surface properties calibrated to thermal inertia ~60 SI units.
+
 ```bash
 ./bin/ptm_thermal_sim \
     --body Europa \
@@ -172,11 +185,21 @@ output:
     --timesteps 144 \
     --thermal-mesh \
     --thermal-threads 8 \
-    --equilibration-orbits 20 \
-    --radiation-exchange \
-    --rad-hmatrix \
+    --equilibration-orbits 10 \
     --output ../output/europa_full \
     --verbose
+```
+
+For GPU acceleration (recommended for high-resolution meshes):
+```bash
+./bin/ptm_thermal_sim \
+    --body Europa \
+    --resolution 6 \
+    --duration 3.55 \
+    --timesteps 144 \
+    --thermal-mesh \
+    --use-gpu-thermal \
+    --output ../output/europa_gpu
 ```
 
 ### 4. Visualize Results
@@ -189,8 +212,8 @@ python src/python/vtk_converter.py output/europa_full output/paraview
 # File → Open → output/paraview/statistics.pvd
 ```
 
-![Example Output](docs/figures/temperature_map_placeholder.png)
-*Figure 2: Surface temperature distribution on a lunar mesh at local noon.*
+![Example Output](docs/figures/mons_mouton_temperature.gif)
+*Figure 2: Surface temperature evolution on Mons Mouton (lunar south polar region) over one lunation.*
 
 ---
 
@@ -223,7 +246,7 @@ PTM3D uses a modular architecture with coupled physics engines:
 
 **Thermal Model**:
 - Temperature-dependent thermal conductivity: $k(T) = k_c \cdot \left(1 + \chi \cdot (T/350)^3\right)$
-- Heat capacity polynomial: $c_p(T) = c_0 + c_1 T + c_2 T^2 + c_3 T^3$
+- Heat capacity: polynomial for lunar regolith, linear $c_p(T) = 7.49 \cdot T$ for water ice (Europa)
 - Adaptive depth grid with logarithmic spacing
 - Validated against Lunar Diviner data (RMS error <4K)
 
@@ -306,6 +329,33 @@ output/
 **VTK conversion**: Use `python src/python/vtk_converter.py` to create ParaView-compatible files.
 
 **NetCDF export**: Use `python src/python/netcdf_converter.py` for cross-platform analysis.
+
+---
+
+## Graphical User Interface
+
+PTM3D includes a modern PyQt6-based GUI for configuring simulations and visualizing results.
+
+![PTM3D GUI](docs/figures/gui_screenshot.png)
+*Figure: PTM3D GUI with 3D visualization and configuration panels.*
+
+### Quick Start
+
+```bash
+cd gui/
+pip install -r requirements.txt
+python run_gui.py
+```
+
+### Features
+
+- **Tabbed configuration**: Simulation, mesh, thermal, radiation, and output settings
+- **3D visualization**: Interactive PyVista-based mesh rendering with temperature colormap
+- **2D analysis**: Histograms, latitude plots, and time series
+- **Live preview**: Real-time YAML configuration preview
+- **Console output**: Color-coded simulation progress and logging
+
+See [gui/README.md](gui/README.md) for detailed GUI documentation.
 
 ---
 
@@ -398,22 +448,9 @@ For more detailed information, see the documentation in [`docs/`](docs/):
 |----------|-------------|
 | [Thermal Model](docs/thermal-model.md) | Physics and algorithms for 1D heat conduction |
 | [Radiation Exchange](docs/radiation-exchange.md) | View factors, H-matrix compression, radiosity solver |
-| [GPU Acceleration](docs/gpu-implementation-plan.md) | GPU backend architecture and performance |
+| [GPU Acceleration](docs/gpu-implementation-plan.md) | OpenCL/CUDA/HIP backend usage and architecture |
 | [API Reference](docs/api-reference.md) | C++ class and function documentation |
 | [Configuration Guide](docs/configuration.md) | Complete YAML configuration reference |
-
----
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/new-feature`)
-3. Make your changes with tests
-4. Submit a pull request
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
 ---
 
@@ -425,7 +462,7 @@ If you use PTM3D in your research, please cite:
 @software{ptm3d,
   author = {Hayne, Paul O.},
   title = {PTM3D: Planetary Thermophysical Model 3D},
-  year = {2025},
+  year = {2026},
   institution = {University of Colorado Boulder},
   url = {https://github.com/phayne/ptm3d}
 }
@@ -459,6 +496,7 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 ## Acknowledgments
 
+- [Sam Potter](https://github.com/sampotter/fluxpy) for H-matrix view factor algorithms and [fluxpy](https://github.com/sampotter/fluxpy)
 - NASA NAIF for SPICE toolkit and ephemeris data
 - Intel for Embree ray tracing library
 - Lunar Reconnaissance Orbiter Diviner team for validation data
