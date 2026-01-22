@@ -10,31 +10,27 @@ The thermal model solves the 1D heat conduction equation with temperature-depend
 
 The governing equation is:
 
-```
-ρ cp(T) ∂T/∂t = ∂/∂z [k(T) ∂T/∂z]
-```
+$$\rho \, c_p(T) \frac{\partial T}{\partial t} = \frac{\partial}{\partial z} \left[ k(T) \frac{\partial T}{\partial z} \right]$$
 
 Where:
-- `ρ` is density (kg/m³)
-- `cp(T)` is temperature-dependent heat capacity (J/kg/K)
-- `k(T)` is temperature-dependent thermal conductivity (W/m/K)
-- `T` is temperature (K)
-- `z` is depth (m)
-- `t` is time (s)
+- $\rho$ is density (kg/m³)
+- $c_p(T)$ is temperature-dependent heat capacity (J/kg/K)
+- $k(T)$ is temperature-dependent thermal conductivity (W/m/K)
+- $T$ is temperature (K)
+- $z$ is depth (m)
+- $t$ is time (s)
 
 ## Boundary Conditions
 
-### Surface (z = 0)
+### Surface ($z = 0$)
 Radiative equilibrium:
-```
-k ∂T/∂z|₀ = ε σ T⁴ - (1-A) Q_solar - Q_indirect
-```
 
-### Bottom (z = z_max)
+$$k \left. \frac{\partial T}{\partial z} \right|_0 = \varepsilon \sigma T^4 - (1-A) Q_{\text{solar}} - Q_{\text{indirect}}$$
+
+### Bottom ($z = z_{\max}$)
 Fixed heat flux:
-```
-k ∂T/∂z|_bottom = Q_geo
-```
+
+$$k \left. \frac{\partial T}{\partial z} \right|_{\text{bottom}} = Q_{\text{geo}}$$
 
 ## Numerical Method
 
@@ -52,19 +48,19 @@ k ∂T/∂z|_bottom = Q_geo
 
 ### Thermal Conductivity
 The total thermal conductivity includes both solid conduction and radiative transfer:
-```
-k(T) = k_c · (1 + χ · (T/350)³)
-```
+
+$$k(T) = k_c \cdot \left(1 + \chi \cdot \left(\frac{T}{350}\right)^3\right)$$
+
 Where:
-- `k_c` is the contact (solid) conductivity at the reference temperature
-- `χ` is the radiative conductivity parameter (default: 2.7 from Mitchell & de Pater 1994)
-- The T³ term accounts for radiative heat transfer through pore spaces
+- $k_c$ is the contact (solid) conductivity at the reference temperature
+- $\chi$ is the radiative conductivity parameter (default: 2.7 from Mitchell & de Pater 1994)
+- The $T^3$ term accounts for radiative heat transfer through pore spaces
 
 ### Heat Capacity
 Polynomial fit:
-```
-cp(T) = c₀ + c₁T + c₂T² + c₃T³
-```
+
+$$c_p(T) = c_0 + c_1 T + c_2 T^2 + c_3 T^3$$
+
 Evaluated using Horner's method for efficiency.
 
 ## Thermal Equilibration
@@ -80,18 +76,17 @@ The number of equilibration cycles depends on the thermal inertia: low inertia s
 ## Depth-Dependent Properties
 
 Density varies with depth following an exponential profile:
-```
-ρ(z) = ρ_s + (ρ_d - ρ_s) · exp(-z/H)
-```
+
+$$\rho(z) = \rho_s + (\rho_d - \rho_s) \cdot \exp(-z/H)$$
+
 Where:
-- `ρ_s` is surface density
-- `ρ_d` is deep density
-- `H` is the e-folding depth scale
+- $\rho_s$ is surface density
+- $\rho_d$ is deep density
+- $H$ is the e-folding depth scale
 
 Thermal conductivity also varies with depth through the density dependence:
-```
-k_c(z) = k_c0 · (ρ(z) / ρ_s)
-```
+
+$$k_c(z) = k_{c0} \cdot \frac{\rho(z)}{\rho_s}$$
 
 ## References
 

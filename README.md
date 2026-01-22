@@ -222,8 +222,8 @@ PTM3D uses a modular architecture with coupled physics engines:
 ### Physics Overview
 
 **Thermal Model**:
-- Temperature-dependent thermal conductivity: `k(T) = k_c + k_r·T³`
-- Heat capacity polynomial: `cp(T) = c₀ + c₁T + c₂T² + ...`
+- Temperature-dependent thermal conductivity: $k(T) = k_c \cdot \left(1 + \chi \cdot (T/350)^3\right)$
+- Heat capacity polynomial: $c_p(T) = c_0 + c_1 T + c_2 T^2 + c_3 T^3$
 - Adaptive depth grid with logarithmic spacing
 - Validated against Lunar Diviner data (RMS error <4K)
 
