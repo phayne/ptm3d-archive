@@ -37,6 +37,18 @@ public:
               MapProjection proj = MapProjection::EQUIRECTANGULAR,
               double missing_val = -9999.0);
     
+    // Initialize the map with data
+    bool initializeFromData(
+        const float* data,
+        int width,
+        int height,
+        double lon_min,
+        double lon_max,
+        double lat_min,
+        double lat_max,
+        MapProjection proj = MapProjection::EQUIRECTANGULAR,
+        double missing_val = -9999.0);
+    
     // Load from file
     bool loadFromFITS(const std::string& filename);
     bool loadFromBinary(const std::string& filename);

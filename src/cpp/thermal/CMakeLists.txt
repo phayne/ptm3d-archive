@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
 
-# Collect source files (excluding bindings)
+# Collect source files (excluding bindings and backup files)
 file(GLOB THERMAL_SOURCES "*.cpp")
 list(REMOVE_ITEM THERMAL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/thermal_model_bindings.cpp")
+# Remove any backup/temp files (e.g., -MacL4864.cpp patterns)
+list(FILTER THERMAL_SOURCES EXCLUDE REGEX ".*-Mac[A-Z][0-9]+\\.cpp$")
 
 add_library(thermal ${THERMAL_SOURCES})
 
@@ -31,6 +33,14 @@ elseif(COMPILER_SUPPORTS_AVX2)
     target_compile_definitions(thermal PRIVATE AVX2_ENABLED)
 endif()
 
+# Add optimized adaptive header to installation
+install(FILES 
+    thermal_model.h
+    thermal_adaptive.h
+    thermal_adaptive_optimized.h 
+    DESTINATION include/thermal
+)
+
 # Apply additional optimization flags for thermal calculations
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(thermal PRIVATE -O3 -ffast-math -ftree-vectorize)
@@ -44,7 +54,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     endif()
 endif()
 
-# Add this to the thermal module's CMakeLists.txt
+# Suppress specific warnings for thermal calculations
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-nan-infinity-disabled")
 
 # For Python bindings - create a separate target

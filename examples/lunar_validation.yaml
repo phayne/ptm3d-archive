@@ -1,0 +1,69 @@
+# PTM3D Lunar Validation Configuration
+# Reproduces baseline model from Hayne et al. (2017) JGR Planets
+# "Global Regolith Thermophysical Properties of the Moon From the
+#  Diviner Lunar Radiometer Experiment"
+
+simulation:
+  start_time: "2025-01-01T00:00:00"
+  duration_days: 29.53            # One full lunar day (synodic month)
+  timesteps: 360                  # 10 steps per lunar hour (~2 hr resolution)
+  body: "Moon"
+
+mesh:
+  resolution: 4                   # Low resolution icosahedron
+  use_topographic: false          # Flat surface for validation
+  import_file: ""
+  scale_factor: 1.0
+  export_basic: false
+
+thermal:
+  run_thermal_mesh: true
+  threads: 0                      # Auto-detect
+  equilibration_orbits: 10        # 10 lunar days for equilibration
+  compute_statistics: true
+  thermal_inertia_map: ""
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: 29.53
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  # Grid parameters for thermal model
+  thermal_m: 10                   # Layers in upper skin depth
+  thermal_n: 15                   # Layer growth factor
+  thermal_b: 8                    # Skin depths to bottom
+
+illumination:
+  include_primary_reflection: false   # No reflected solar for 1D validation
+  use_batch_processing: true
+  albedo_map: ""
+  albedo_maps_directory: ""
+  positions_file: ""
+
+output:
+  directory: "output/lunar_validation"
+  format: "binary"
+  vtk_mode: "thermal"
+  include_primary_ir: false
+  thermal_vtk_file: ""
+  complete_vtk_file: ""
+  no_maps: false
+  locations_file: ""
+  series_output: ""
+  location_data: ""
+
+visualization:
+  create: false
+  width: 1024
+  height: 768
+  fps: 30
+  camera_distance: 5.0
+  camera_latitude: 30.0
+  camera_longitude: 0.0
+  emission_angle: -1.0
+  azimuth: -1.0
+  save_frames: false
+
+advanced:
+  verbose: true
+  default_visible_albedo: -1.0

@@ -64,6 +64,65 @@ SpatialMap::SpatialMap(int width, int height,
     }
 }
 
+namespace {
+
+// Seam heal helper: replace both edge columns by the cross-seam average
+// of their immediate neighbors (col 1 and col width-2). This removes
+// prime-meridian stripes caused by a depressed/bad col 0.
+inline void heal_cylindrical_seam_3col(std::vector<double>& data,
+                                       int width, int height,
+                                       double missing_value) {
+    if (width < 3 || height <= 0) return;
+    const int W = width;
+
+    auto valid = [&](double v)->bool {
+        return std::isfinite(v) && v != missing_value;
+    };
+
+    for (int y = 0; y < height; ++y) {
+        const int i0   = y * W + 0;          // first column
+        const int i1   = y * W + 1;          // neighbor after seam
+        const int iLm1 = y * W + (W - 2);    // neighbor before last
+        const int iL   = y * W + (W - 1);    // last column
+
+        const double v1   = data[i1];
+        const double vLm1 = data[iLm1];
+        const double v0   = data[i0];
+        const double vL   = data[iL];
+
+        bool v1_ok   = valid(v1);
+        bool vLm1_ok = valid(vLm1);
+        bool v0_ok   = valid(v0);
+        bool vL_ok   = valid(vL);
+
+        // Preferred: cross‑seam average of neighbors col(1) and col(W-2)
+        if (v1_ok && vLm1_ok) {
+            const double seam_avg = 0.5 * (v1 + vLm1);
+            data[i0] = seam_avg;
+            data[iL] = seam_avg;
+        } else if (v1_ok && !vLm1_ok) {
+            // Fall back toward the only valid neighbor on the right side
+            data[i0] = v1;
+            if (!vL_ok) data[iL] = v1;
+        } else if (!v1_ok && vLm1_ok) {
+            // Fall back toward the only valid neighbor on the left side
+            data[iL] = vLm1;
+            if (!v0_ok) data[i0] = vLm1;
+        } else {
+            // As a last resort, keep previous values (downstream sampling copes)
+            // but if both edge columns are valid while both neighbors are invalid,
+            // average the edges to ensure continuity.
+            if (v0_ok && vL_ok) {
+                const double avg = 0.5 * (v0 + vL);
+                data[i0] = avg;
+                data[iL] = avg;
+            }
+        }
+    }
+}
+
+} // anonymous namespace
+
 bool SpatialMap::loadFromFITS(const std::string& filename) {
     try {
         // Use the FITS reader to load data
@@ -117,6 +176,15 @@ bool SpatialMap::loadFromFITS(const std::string& filename) {
         
         // Default to equirectangular projection unless specified otherwise
         projection_ = MapProjection::EQUIRECTANGULAR;
+
+        // UPDATED: robust seam heal using cross‑seam neighbors (col 1 and col W-2)
+        {
+            const double period = std::abs(lon_max_ - lon_min_);
+            const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
+            if (is_cyl && width_ >= 3 && height_ > 0) {
+                heal_cylindrical_seam_3col(data_, width_, height_, missing_value_);
+            }
+        }
         
         std::cout << "Loaded map: " << width_ << "x" << height_ << " pixels" << std::endl;
         std::cout << "Longitude range: " << lon_min_ << " to " << lon_max_ << " degrees" << std::endl;
@@ -209,28 +277,34 @@ double SpatialMap::getValue(double lon, double lat) const {
     if (!isValid()) {
         return missing_value_;
     }
-    
-    // Normalize coordinates
+
+    // Normalize (handles cylindrical wrap)
     normalizeCoordinates(lon, lat);
-    
-    // Check if coordinates are within bounds
-    if (!isValidCoordinate(lon, lat)) {
-        return missing_value_;
+
+    // Cylindrical check
+    const double period = std::abs(lon_max_ - lon_min_);
+    const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
+
+    // Map to pixel coordinates (x: column index in [0, width))
+    double x;
+    if (is_cyl) {
+        // Use center-based mapping with strict wrap into [0,width)
+        const double W = static_cast<double>(width_);
+        x = (lon - lon_min_) / period * W;
+        x = std::fmod(x, W);
+        if (x < 0.0) x += W;  // ensure non-negative
+    } else {
+        // x in [0, width-1] for non-cylindrical
+        x = (lon - lon_min_) / (lon_max_ - lon_min_) * static_cast<double>(width_ - 1);
+        if (x < 0.0) x = 0.0;
+        if (x > static_cast<double>(width_ - 1)) x = static_cast<double>(width_ - 1);
     }
-    
-    // Special handling for longitude at exactly 360° (map to 0°)
-    if (lon == 360.0) {
-        lon = 0.0;
-    }
-    
-    // Map to pixel coordinates
-    double x = (lon - lon_min_) / (lon_max_ - lon_min_) * (width_ - 1);
-    
-    // STANDARD LATITUDE MAPPING: 
-    // lat_max corresponds to y=0, lat_min corresponds to y=height-1
-    double y = (lat_max_ - lat) / (lat_max_ - lat_min_) * (height_ - 1);
-    
-    // Bilinear interpolation
+
+    // y in [0, height-1] with standard latitude mapping
+    double y = (lat_max_ - lat) / (lat_max_ - lat_min_) * static_cast<double>(height_ - 1);
+    if (y < 0.0) y = 0.0;
+    if (y > height_ - 1.0) y = height_ - 1.0;
+
     return bilinearInterpolate(x, y);
 }
 
@@ -493,39 +567,105 @@ bool isPointInSphericalTriangle(
     return areaDiff < epsilon;
 }
 
+bool SpatialMap::initializeFromData(
+    const float* data,
+    int width,
+    int height,
+    double lon_min,
+    double lon_max,
+    double lat_min,
+    double lat_max,
+    MapProjection proj,
+    double missing_val) {
+    
+    // Update member variables
+    width_ = width;
+    height_ = height;
+    lon_min_ = lon_min;
+    lon_max_ = lon_max;
+    lat_min_ = lat_min;
+    lat_max_ = lat_max;
+    projection_ = proj;
+    missing_value_ = missing_val;
+    
+    // Resize and copy the data, converting from float to double
+    data_.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    for (int i = 0; i < width * height; ++i) {
+        float v = data[i];
+        data_[static_cast<size_t>(i)] = static_cast<double>(v);
+    }
+
+    // UPDATED: robust seam heal (works for direct CFITSIO path too)
+    {
+        const double period = std::abs(lon_max_ - lon_min_);
+        const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
+        if (is_cyl && width_ >= 3 && height_ > 0) {
+            heal_cylindrical_seam_3col(data_, width_, height_, missing_value_);
+        }
+    }
+    
+    return true;
+}
+
 double SpatialMap::getAverageValueInTriangle(
     double lat1, double lon1,
     double lat2, double lon2,
     double lat3, double lon3) const {
-    
-    // Calculate triangle centroid in lat/lon space
-    double centroid_lat = (lat1 + lat2 + lat3) / 3.0;
-    double centroid_lon = (lon1 + lon2 + lon3) / 3.0;
-    
-    // Handle longitude wrapping for triangles crossing prime meridian
-    // Simple heuristic: if longitude span > 180°, we're crossing the meridian
-    double lon_min = std::min({lon1, lon2, lon3});
-    double lon_max = std::max({lon1, lon2, lon3});
-    
-    if (lon_max - lon_min > 180.0) {
-        // Crossing prime meridian - convert to [-180, 180) and recalculate
-        auto adjustLon = [](double lon) {
-            if (lon > 180.0) return lon - 360.0;
-            return lon;
-        };
-        
-        double adj_lon1 = adjustLon(lon1);
-        double adj_lon2 = adjustLon(lon2);
-        double adj_lon3 = adjustLon(lon3);
-        
-        centroid_lon = (adj_lon1 + adj_lon2 + adj_lon3) / 3.0;
-        
-        // Convert back to [0, 360) for map lookup
-        if (centroid_lon < 0.0) centroid_lon += 360.0;
+
+    // Seam-aware unwrapping around lon1
+    auto unwrap = [](double base, double& l) {
+        double d = l - base;
+        while (d > 180.0) d -= 360.0;
+        while (d < -180.0) d += 360.0;
+        l = base + d;
+    };
+    double L1 = lon1, L2 = lon2, L3 = lon3;
+    unwrap(L1, L2);
+    unwrap(L1, L3);
+
+    // Barycentric multi-sample (7-point) inside the spherical triangle
+    // We linearly interpolate lat/lon in the locally unwrapped space (small triangles -> good approx)
+    struct Bary { double a,b,c; }; // weights sum to 1
+    static const Bary samples[] = {
+        {1.0/3.0, 1.0/3.0, 1.0/3.0},  // centroid
+        {0.5, 0.5, 0.0}, {0.5, 0.0, 0.5}, {0.0, 0.5, 0.5}, // edge midpoints
+        {0.6, 0.2, 0.2}, {0.2, 0.6, 0.2}, {0.2, 0.2, 0.6}  // interior points
+    };
+
+    auto interp = [&](const Bary& w, double& lat, double& lon) {
+        // Interpolate in unwrapped lon space (L1,L2,L3)
+        lon = w.a*L1 + w.b*L2 + w.c*L3;
+        lat = w.a*lat1 + w.b*lat2 + w.c*lat3;
+        // Wrap lon back into map domain (normalizeCoordinates handles cylindrical)
+        double lon_norm = lon, lat_norm = lat;
+        normalizeCoordinates(lon_norm, lat_norm);
+        lon = lon_norm; lat = lat_norm;
+    };
+
+    double sum = 0.0;
+    int n = 0;
+    for (const auto& w : samples) {
+        double slat, slon;
+        interp(w, slat, slon);
+        double v = getValue(slon, slat);
+        if (v != missing_value_ && std::isfinite(v)) {
+            sum += v;
+            ++n;
+        }
     }
-    
-    // Use standard getValue method with bilinear interpolation
-    return getValue(centroid_lon, centroid_lat);
+
+    if (n == 0) {
+        // Fallback to (wrapped) centroid as before
+        double centroid_lat = (lat1 + lat2 + lat3) / 3.0;
+        double centroid_lon = (L1 + L2 + L3) / 3.0;
+
+        // Wrap back into map domain
+        double lon_c = centroid_lon, lat_c = centroid_lat;
+        normalizeCoordinates(lon_c, lat_c);
+        return getValue(lon_c, lat_c);
+    }
+
+    return sum / static_cast<double>(n);
 }
 
 bool SpatialMap::isPointInTriangle3D(
@@ -569,12 +709,29 @@ bool SpatialMap::isValidCoordinate(double lon, double lat) const {
 }
 
 void SpatialMap::normalizeCoordinates(double& lon, double& lat) const {
-    // Keep longitude in [0, 360) range
-    while (lon < 0) lon += 360.0;
-    while (lon >= 360.0) lon -= 360.0;
-    
-    // No need to wrap latitude - it should be within [-90, 90]
+    // Treat near-360° longitude spans as cylindrical
+    const double period = std::abs(lon_max_ - lon_min_);
+    const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
+
+    if (is_cyl) {
+        // Bring lon into [lon_min_, lon_min_ + period)
+        if (period > 0.0) {
+            const double k = std::floor((lon - lon_min_) / period);
+            lon = lon - k * period;
+            // Guard numerical edge hitting upper bound
+            if (lon >= lon_min_ + period) lon = std::nextafter(lon_min_ + period, lon_min_);
+            if (lon < lon_min_) lon += period;
+        }
+    } else {
+        // Clamp for non-cylindrical ranges
+        if (lon < lon_min_) lon = lon_min_;
+        if (lon > lon_max_) lon = lon_max_;
+    }
+
+    // Clamp latitude to physical range and map bounds
     lat = std::max(-90.0, std::min(90.0, lat));
+    if (lat < lat_min_) lat = lat_min_;
+    if (lat > lat_max_) lat = lat_max_;
 }
 
 int SpatialMap::getIndex(int x, int y) const {
@@ -587,55 +744,59 @@ int SpatialMap::getIndex(int x, int y) const {
 }
 
 double SpatialMap::bilinearInterpolate(double x, double y) const {
-    // Make sure coordinates are within map bounds
-    if (x < 0 || x > width_ - 1 || y < 0 || y > height_ - 1) {
-        return missing_value_;
-    }
-    
-    // Get integer parts
-    int x0 = static_cast<int>(x);
-    int y0 = static_cast<int>(y);
-    
-    // Get fractional parts
-    double xd = x - x0;
-    double yd = y - y0;
-    
-    // Check if we're interpolating across the prime meridian
-    bool is_crossing_meridian = false;
-    if (x0 == width_ - 1 && xd > 0) {
-        // We're at the right edge of the map and need to wrap to the left edge
-        is_crossing_meridian = true;
-    }
-    
-    // Get four neighboring pixels with special handling for longitude wrap-around
-    int x1;
-    if (is_crossing_meridian) {
-        x1 = 0; // Wrap to the left side of the map
+    // Clamp y into [0, H-1]
+    if (y < 0.0) y = 0.0;
+    if (y > height_ - 1.0) y = height_ - 1.0;
+
+    // Periodicity in x
+    const double period = std::abs(lon_max_ - lon_min_);
+    const bool is_cylindrical = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
+
+    if (is_cylindrical) {
+        // Wrap x robustly into [0, width)
+        const double W = static_cast<double>(width_);
+        x = std::fmod(x, W);
+        if (x < 0.0) x += W;
     } else {
-        x1 = std::min(x0 + 1, width_ - 1);
+        if (x < 0.0) x = 0.0;
+        if (x > width_ - 1.0) x = width_ - 1.0;
     }
-    
+
+    // Integer/fractional parts
+    int x0 = static_cast<int>(std::floor(x));
+    int y0 = static_cast<int>(std::floor(y));
+    double xd = x - static_cast<double>(x0);
+    double yd = y - static_cast<double>(y0);
+
+    // Neighbor indices (wrap x1 in cylindrical case)
+    int x1 = is_cylindrical ? ((x0 + 1) % width_) : std::min(x0 + 1, width_ - 1);
     int y1 = std::min(y0 + 1, height_ - 1);
-    
-    // Get values at four corners
+
+    // Sample four corners directly (integer overload)
     double v00 = getValue(x0, y0);
-    double v01 = getValue(x0, y1);
     double v10 = getValue(x1, y0);
+    double v01 = getValue(x0, y1);
     double v11 = getValue(x1, y1);
-    
-    // Check if any value is missing
-    if (v00 == missing_value_ || v01 == missing_value_ ||
-        v10 == missing_value_ || v11 == missing_value_) {
-        // If any corner is missing, fall back to nearest neighbor
-        return getValue(x0, y0);
+
+    // Standard bilinear if all valid
+    if (v00 != missing_value_ && v10 != missing_value_ &&
+        v01 != missing_value_ && v11 != missing_value_) {
+        double i1 = v00 * (1.0 - xd) + v10 * xd;
+        double i2 = v01 * (1.0 - xd) + v11 * xd;
+        return i1 * (1.0 - yd) + i2 * yd;
     }
-    
-    // Perform bilinear interpolation
-    double v0 = v00 * (1 - xd) + v10 * xd;
-    double v1 = v01 * (1 - xd) + v11 * xd;
-    double v = v0 * (1 - yd) + v1 * yd;
-    
-    return v;
+
+    // Graceful fallback: weighted average of available neighbors
+    int nvalid = 0;
+    double acc = 0.0;
+    auto add_if = [&](double v, double w) {
+        if (v != missing_value_ && std::isfinite(v)) { acc += v * w; ++nvalid; }
+    };
+    add_if(v00, (1.0 - xd) * (1.0 - yd));
+    add_if(v10, xd * (1.0 - yd));
+    add_if(v01, (1.0 - xd) * yd);
+    add_if(v11, xd * yd);
+    return (nvalid > 0) ? acc : missing_value_;
 }
 
 size_t SpatialMap::hashTriangle(double lat1, double lon1, 

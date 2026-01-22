@@ -6,17 +6,42 @@
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <thread>
 #include <iomanip>
 #include <sstream> 
 #include <filesystem>
+#include <numeric>
 #include "config.h"
 #include <cstdlib>
 #include <string>
 #include <SpiceUsr.h>  // Include SPICE functions
+#include <functional>
+#include <atomic>
+#include <mutex>
+#include <tuple>
+#include <cctype>
+#include <algorithm>
 
+// DEBUGGING INCLUDES
+#include <csignal>
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <unistd.h>   // for STDERR_FILENO
+
+#include "../tools/config_parser.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/planetary_properties.h"
 #include "../maps/spatial_map.h"
+#include "../ice/ice_table.h"
+
+// Radiation exchange module
+#include "../radiation/radiation_config.h"
+#include "../radiation/radiation_exchange.h"
+
+// GPU thermal solver (optional)
+#ifdef PTM_GPU_OPENCL
+#include "../gpu/thermal_opencl.h"
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -27,6 +52,329 @@ using namespace ptm_thermal::constants;
 using namespace ptm_thermal::config;
 
 using namespace thermal;
+
+// ================= CRASH HANDLING UTILITIES =====================
+namespace {
+// Minimal backtrace printer
+void print_backtrace() {
+    void* buf[128];
+    int n = backtrace(buf, 128);
+    backtrace_symbols_fd(buf, n, STDERR_FILENO);
+}
+
+void on_signal(int sig) {
+    std::cerr << "\n[FATAL] Caught signal " << sig << " — backtrace:\n";
+    print_backtrace();
+    std::_Exit(128 + sig);
+}
+
+void on_terminate() {
+    if (auto ep = std::current_exception()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            std::cerr << "\n[FATAL] Unhandled exception: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "\n[FATAL] Unhandled non-std exception\n";
+        }
+    } else {
+        std::cerr << "\n[FATAL] std::terminate() without active exception\n";
+    }
+    std::cerr << "[FATAL] Backtrace:\n";
+    print_backtrace();
+    std::_Exit(1);
+}
+
+// RAII joiner for std::thread (C++17)
+struct JoiningThread {
+    std::thread t;
+    template <class F>
+    explicit JoiningThread(F&& f) : t(std::forward<F>(f)) {}
+    JoiningThread(JoiningThread&&) = default;
+    JoiningThread& operator=(JoiningThread&&) = default;
+    ~JoiningThread() { if (t.joinable()) t.join(); }
+    void join() { if (t.joinable()) t.join(); }
+};
+
+// OpenMP-safe barrier helper: only barrier if inside a parallel region
+#ifdef _OPENMP
+inline void barrier_if_parallel() {
+    if (omp_in_parallel()) {
+        #pragma omp barrier
+    }
+}
+#else
+inline void barrier_if_parallel() {}
+#endif
+
+struct CrashGuard {
+    CrashGuard() {
+        std::set_terminate(on_terminate);
+        std::signal(SIGABRT, on_signal);
+        std::signal(SIGSEGV, on_signal);
+        std::signal(SIGBUS,  on_signal);
+        std::signal(SIGILL,  on_signal);
+    }
+} crash_guard;
+} // namespace
+// ================================================================
+
+// ================= PLY ASCII FALLBACK LOADER (DTM meshes) =====================
+// Supports PLY files produced by dtm_to_ply_converter.cpp:
+//  format ascii 1.0
+//  element vertex N
+//    properties (at least x y z; may include nx ny nz latitude longitude elevation)
+//  element face M
+//    property list uchar int vertex_indices
+//  faces: "3 v0 v1 v2"
+static bool loadAsciiDTMPLY(
+    const std::string& filename,
+    std::shared_ptr<Mesh>& mesh_out)
+{
+    std::ifstream in(filename);
+    if (!in.is_open()) {
+        std::cerr << "[PLY-Fallback] Cannot open file: " << filename << "\n";
+        return false;
+    }
+
+    auto trim = [](const std::string& s) -> std::string {
+        size_t a = 0, b = s.size();
+        while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+        while (b > a && std::isspace(static_cast<unsigned char>(s[b-1]))) --b;
+        return s.substr(a, b - a);
+    };
+
+    std::string line;
+    bool header_done = false;
+    size_t num_vertices = 0;
+    size_t num_faces = 0;
+    std::vector<std::string> vprops;
+    bool format_ascii = false;
+    std::string current_element;
+
+    while (!header_done && std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+
+        std::istringstream ls(line);
+        std::string tok;
+        ls >> tok;
+
+        if (tok == "ply") continue;
+        if (tok == "comment") continue;
+
+        if (tok == "format") {
+            std::string fmt; ls >> fmt;
+            if (fmt.rfind("ascii", 0) == 0) format_ascii = true;
+            else {
+                std::cerr << "[PLY-Fallback] Non-ASCII format (" << fmt << ") unsupported by fallback\n";
+                return false;
+            }
+        } else if (tok == "element") {
+            std::string name; size_t count = 0;
+            ls >> name >> count;
+            current_element = name;
+            if (name == "vertex") num_vertices = count;
+            else if (name == "face") num_faces = count;
+        } else if (tok == "property") {
+            if (current_element == "vertex") {
+                std::string type, name;
+                ls >> type >> name;
+                if (!name.empty()) vprops.push_back(name);
+            } else if (current_element == "face") {
+                // property list uchar int vertex_indices (ignore extras)
+            }
+        } else if (tok == "end_header") {
+            header_done = true;
+            break;
+        }
+    }
+
+    if (!format_ascii || num_vertices == 0 || num_faces == 0) {
+        std::cerr << "[PLY-Fallback] Invalid header (format_ascii=" << format_ascii
+                  << ", vertices=" << num_vertices << ", faces=" << num_faces << ")\n";
+        return false;
+    }
+
+    auto findProp = [&](const std::string& name)->int {
+        for (size_t i=0;i<vprops.size();++i)
+            if (vprops[i]==name) return static_cast<int>(i);
+        return -1;
+    };
+
+    int ix = findProp("x"), iy = findProp("y"), iz = findProp("z");
+    if (ix < 0 || iy < 0 || iz < 0) {
+        std::cerr << "[PLY-Fallback] Missing required x/y/z properties\n";
+        return false;
+    }
+
+    // Read vertices
+    std::vector<std::array<double,3>> vertices;
+    vertices.reserve(num_vertices);
+
+    size_t v_read = 0;
+    while (v_read < num_vertices && std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+
+        std::istringstream ls(line);
+        std::vector<double> vals(vprops.size());
+        for (size_t k=0;k<vprops.size();++k) {
+            if (!(ls >> vals[k])) {
+                std::cerr << "[PLY-Fallback] Malformed vertex line " << v_read << "\n";
+                return false;
+            }
+        }
+        vertices.push_back({ vals[ix], vals[iy], vals[iz] });
+        ++v_read;
+    }
+
+    if (v_read != num_vertices) {
+        std::cerr << "[PLY-Fallback] Vertex count mismatch read=" << v_read
+                  << " expected=" << num_vertices << "\n";
+        return false;
+    }
+
+    // Read faces
+    std::vector<std::array<int,3>> faces;
+    faces.reserve(num_faces);
+    size_t f_read = 0;
+    while (f_read < num_faces && std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+
+        std::istringstream ls(line);
+        int n;
+        if (!(ls >> n)) {
+            std::cerr << "[PLY-Fallback] Malformed face line " << f_read << "\n";
+            return false;
+        }
+        if (n != 3) {
+            for (int k = 0; k < n; ++k) { int dummy; ls >> dummy; }
+            continue;
+        }
+        int a,b,c;
+        if (!(ls >> a >> b >> c)) {
+            std::cerr << "[PLY-Fallback] Face indices parse error at face " << f_read << "\n";
+            return false;
+        }
+        if (a<0||b<0||c<0||a>=static_cast<int>(num_vertices)||b>=static_cast<int>(num_vertices)||c>=static_cast<int>(num_vertices)) {
+            std::cerr << "[PLY-Fallback] Face index out of range at face " << f_read << "\n";
+            return false;
+        }
+        faces.push_back({a,b,c});
+        ++f_read;
+    }
+
+    if (faces.size() < num_faces * 0.9) {
+        std::cerr << "[PLY-Fallback] Parsed only " << faces.size() << "/" << num_faces
+                  << " faces (<90%) aborting\n";
+        return false;
+    }
+
+    // Build mesh
+    mesh_out = std::make_shared<Mesh>();
+    mesh_out->vertices = std::move(vertices);
+    mesh_out->faces    = std::move(faces);
+
+    // Compute face centers & normals and lat/lon
+    const size_t F = mesh_out->faces.size();
+    mesh_out->face_centers.resize(F);
+    mesh_out->face_normals.resize(F);
+    mesh_out->latitudes.resize(F);
+    mesh_out->longitudes.resize(F);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i=0; i<F; ++i) {
+        const auto& tri = mesh_out->faces[i];
+        const auto& v1 = mesh_out->vertices[tri[0]];
+        const auto& v2 = mesh_out->vertices[tri[1]];
+        const auto& v3 = mesh_out->vertices[tri[2]];
+
+        std::array<double,3> c = {
+            (v1[0]+v2[0]+v3[0])/3.0,
+            (v1[1]+v2[1]+v3[1])/3.0,
+            (v1[2]+v2[2]+v3[2])/3.0
+        };
+        mesh_out->face_centers[i] = c;
+
+        std::array<double,3> e1 = { v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2] };
+        std::array<double,3> e2 = { v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2] };
+        std::array<double,3> n = {
+            e1[1]*e2[2]-e1[2]*e2[1],
+            e1[2]*e2[0]-e1[0]*e2[2],
+            e1[0]*e2[1]-e1[1]*e2[0]
+        };
+        double L = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+        if (L>0) { n[0]/=L; n[1]/=L; n[2]/=L; }
+        // outward
+        double dot = c[0]*n[0]+c[1]*n[1]+c[2]*n[2];
+        if (dot < 0) { n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; }
+        mesh_out->face_normals[i] = n;
+
+        double r = std::sqrt(c[0]*c[0]+c[1]*c[1]+c[2]*c[2]);
+        double lat = (r > 0) ? std::asin(c[2]/r) * RAD_TO_DEG : 0.0;
+        double lon = std::atan2(c[1], c[0]) * RAD_TO_DEG;
+        mesh_out->latitudes[i]  = lat;
+        mesh_out->longitudes[i] = lon;
+    }
+
+    mesh_out->setProperty("is_custom_mesh", "true");
+    mesh_out->setProperty("source_file", filename);
+    std::cout << "[PLY-Fallback] Loaded ASCII PLY: vertices=" << mesh_out->vertices.size()
+              << " faces=" << mesh_out->faces.size() << "\n";
+    return true;
+}
+
+// Wrapper: try standard MeshUtils import; if it fails and file is .ply ASCII DTM, use fallback
+static bool importMeshWithFallback(const std::string& filename,
+                                   std::shared_ptr<Mesh>& mesh_out,
+                                   double scale_factor = 1.0)
+{
+    MeshUtils mu;
+    if (mu.importTriangulatedMesh(filename, scale_factor)) {
+        mesh_out = mu.getMesh();
+        return true;
+    }
+
+    // fallback only for .ply
+    std::string ext;
+    auto p = filename.find_last_of('.');
+    if (p != std::string::npos) {
+        ext = filename.substr(p + 1);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    }
+    if (ext == "ply") {
+        std::cerr << "[Mesh Import] Standard loader failed; attempting ASCII fallback...\n";
+        if (loadAsciiDTMPLY(filename, mesh_out)) {
+            if (scale_factor != 1.0 && mesh_out) {
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < mesh_out->vertices.size(); ++i) {
+                    mesh_out->vertices[i][0] *= scale_factor;
+                    mesh_out->vertices[i][1] *= scale_factor;
+                    mesh_out->vertices[i][2] *= scale_factor;
+                }
+                // recompute centers only (normals unchanged length-1)
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < mesh_out->faces.size(); ++i) {
+                    const auto& f = mesh_out->faces[i];
+                    const auto& a = mesh_out->vertices[f[0]];
+                    const auto& b = mesh_out->vertices[f[1]];
+                    const auto& c = mesh_out->vertices[f[2]];
+                    mesh_out->face_centers[i] = {
+                        (a[0]+b[0]+c[0])/3.0,
+                        (a[1]+b[1]+c[1])/3.0,
+                        (a[2]+b[2]+c[2])/3.0
+                    };
+                }
+            }
+            return true;
+        }
+        std::cerr << "[Mesh Import] Fallback also failed.\n";
+    }
+    return false;
+}
+// ================= END PLY ASCII FALLBACK LOADER =====================
 
 // Constants for albedo processing
 namespace {
@@ -93,6 +441,8 @@ public:
 std::ofstream OutputSuppressor::null_stream;
 int OutputSuppressor::ref_count = 0;
 std::mutex OutputSuppressor::mtx;
+std::string topo_meshes_dir = "";
+bool use_topography = false;
 
 // Thread-safe stderr progress bar class
 class StderrProgressBar {
@@ -153,13 +503,66 @@ public:
     }
 };
 
-// Function declarations (prototypes)
+// ================= FUNCTION DECLARATIONS =====================
+
+static std::vector<std::tuple<std::string,double,double>> readLocationsCSV(const std::string& filename);
+static std::vector<double> readDepthsFile(const std::string& filename);
+static int findNearestFaceIndexByLatLon(const std::shared_ptr<Mesh>& mesh, double lat_deg, double lon_deg);
+static bool writeLocationDepthCSV(const std::string& out_path,
+                           const std::string& location_name,
+                           const std::vector<std::string>& time_strings,
+                           const std::vector<double>& depths_m,
+                           const std::vector<std::vector<double>>& T_depths);
+static std::vector<std::vector<double>> runThermalModelDepthSeries(
+    const std::vector<double>& flux_values,
+    const std::vector<double>& times,
+    double latitude_deg,
+    const thermal::Config& config,
+    const std::vector<double>& depths_m,
+    int equilibration_steps,
+    const thermal::Planet& planet);
+static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
+
+bool exportLocationTemperatureOnly(const std::string& output_file,
+    const std::string& locations_file,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<std::vector<double>>& surface_temps,
+    const std::vector<std::string>& time_strings,
+    int time_steps);
+
 bool exportLocationIllumination(const std::string&, const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
     const std::vector<double>&, const std::vector<std::string>&, int);
     
 bool exportBodyPositions(const std::string&, const std::vector<std::array<double, 3>>&,
     const std::vector<std::array<double, 3>>&, const std::vector<std::string>&);
+
+bool exportDataAsBinary(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& illumination_values,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<std::vector<double>>& surface_temps,
+    const std::vector<double>& times,
+    const std::vector<std::string>& time_strings,
+    int time_steps,
+    bool is_custom_mesh);
+    
+struct Statistics;
+bool writeStatisticsBinary(
+    const std::string& output_dir,
+    const std::string& data_type,
+    const Statistics& stats,
+    size_t num_faces);
+
+bool exportIlluminationStatisticsStreamed(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    ptm::IlluminationModel& model,
+    int start_step,
+    int steps);
     
 bool runVisualization(const std::string&, const std::string&, const std::string&, 
     const std::string&, const std::string&, const std::string&, const std::string&,
@@ -173,26 +576,87 @@ bool runThermalModel(const std::string&, const std::vector<double>&, const std::
 std::vector<double> runThermalModelForFace(const std::vector<double>&, const std::vector<double>&,
     double, const thermal::Config&, int);
     
-bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&, 
+bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
     const std::vector<double>&, int, const thermal::Config&, double, double,
-    std::vector<std::vector<double>>*, int, int, int);  // Add int parameter for thermal_threads
-    
-void saveCheckpoint(const std::string&, const std::vector<size_t>&, 
+    std::vector<std::vector<double>>*, int, int, int,
+    const thermal::Planet* = nullptr);  // Optional planet for incidence-dependent albedo
+
+// SIMD batch thermal solver (SIMD-over-pixels)
+bool runThermalModelsForAllFacesBatchSoA(
+    const std::string& thermal_output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<double>& times,
+    int time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    std::vector<std::vector<double>>* surface_temps_out,
+    int equilibration_steps,
+    int total_time_steps,
+    int thermal_threads);
+
+// GPU persistent kernel thermal solver
+bool runThermalModelsForAllFaces_GPU_Persistent(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    std::vector<std::vector<double>>* surface_temps_out);
+
+// GPU thermal solver for selected faces with pre-combined flux arrays
+// Used in radiation-thermal coupling iterations where flux includes indirect radiation
+bool runThermalForSelectedFaces_GPU(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<int>& face_indices,           // Faces to process
+    const std::vector<std::vector<double>>& flux,   // Pre-combined flux per face [face_idx][timestep]
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    std::vector<std::vector<double>>& surface_temps); // In/out: updated for selected faces
+
+void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
     
 bool addThermalDataToVTK(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<std::vector<double>>&, const std::vector<double>&);
+
+using FluxFn = std::function<double(size_t,int)>;
+bool runThermalModelsForAllFacesStreamed(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    int thermal_threads,
+    FluxFn get_direct,
+    FluxFn get_reflected,
+    FluxFn get_ir,
+    std::vector<std::vector<double>>* surface_temps_out);
+
+std::vector<double> computeFaceAlbedos(
+    const std::shared_ptr<Mesh>& mesh,
+    std::shared_ptr<ptm::SpatialMap> albedo_map,
+    double default_visible_albedo);
 
 void fixOutOfRangeAlbedos(
     std::vector<double>& face_albedos,
     const std::shared_ptr<Mesh>& mesh,
     double default_visible_albedo);
 
-// Add to function declarations section
 std::string calculateAdjustedStartTime(const std::string& iso_time, double days_offset);
 
-// Add this class near the top of the file, after the includes
+// ================= FUNCTION DEFINITIONS =====================
+
 class StdoutRedirector {
 private:
     std::streambuf* original_buffer;
@@ -222,22 +686,97 @@ public:
     }
 }; 
 
+double getSynodicDayFromPlanet(const thermal::Planet& planet) {
+    // The planet object stores the rotational period in seconds in the 'day' field
+    double rotation_period_seconds = planet.day;
+    double rotation_period_days = rotation_period_seconds / (24.0 * 3600.0);
+    
+    return rotation_period_days;
+}
+
+std::vector<double> importAlbedoMapFromFile(const std::string& filename) {
+    try {
+        // Check if file exists
+        if (!std::filesystem::exists(filename)) {
+            std::cerr << "File does not exist: " << filename << std::endl;
+            return {};
+        }
+        
+        // Get file size for validation
+        std::uintmax_t fileSize = std::filesystem::file_size(filename);
+        if (fileSize < sizeof(size_t)) {
+            std::cerr << "File too small to be valid: " << filename << std::endl;
+            return {};
+        }
+        
+        // Open file with explicit error checking
+        std::ifstream file(filename, std::ios::binary);
+        if (!file) {
+            std::cerr << "Failed to open file for reading: " << filename << std::endl;
+            return {};
+        }
+        
+        // Read the number of elements
+        size_t num_faces = 0;
+        file.read(reinterpret_cast<char*>(&num_faces), sizeof(num_faces));
+        
+        // Validate num_faces against file size
+        size_t expected_size = sizeof(size_t) + num_faces * sizeof(double);
+        if (expected_size != fileSize) {
+            std::cerr << "File size mismatch. Expected: " << expected_size 
+                      << ", Actual: " << fileSize << std::endl;
+            return {};
+        }
+        
+        // Allocate memory for albedo values
+        std::vector<double> albedos(num_faces);
+        
+        // Read all albedo values
+        file.read(reinterpret_cast<char*>(albedos.data()), num_faces * sizeof(double));
+        
+        // Check if read succeeded
+        if (!file.good() && !file.eof()) {
+            std::cerr << "Error reading data from file: " << filename << std::endl;
+            return {};
+        }
+        
+        std::cout << "Successfully read " << num_faces << " albedo values from " << filename << std::endl;
+        return albedos;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Exception during file import: " << e.what() << std::endl;
+        return {};
+    }
+}
+
 std::vector<double> calculateAbsorbedFlux(
     const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values, 
+    const std::vector<double>& primary_reflected_values,
     const std::vector<double>& primary_ir_values,
     int time_steps,
     const std::shared_ptr<ptm::SpatialMap>& albedo_map,
     const std::shared_ptr<Mesh>& mesh,
     double default_visible_albedo,
     double default_ir_albedo,
-    const thermal::Config& config) {
+    const thermal::Config& config,
+    const thermal::Planet* planet = nullptr,  // Optional planet for incidence-dependent albedo
+    double solar_constant = 0.0) {            // Solar constant for computing incidence angle
     
     // Calculate IR emissivity from IR albedo
     double ir_emissivity = 1.0 - default_ir_albedo;
     
-    // Size of output array (same as input)
-    size_t n_values = direct_solar_values.size();
+    // Derive time_steps if the provided value doesnâ€™t match array sizes
+    const size_t n_values = direct_solar_values.size();
+    const size_t face_count = mesh ? mesh->faces.size() : 0;
+    if (face_count > 0 && n_values % face_count == 0) {
+        int inferred_ts = static_cast<int>(n_values / face_count);
+        if (inferred_ts != time_steps) {
+            std::cout << "Warning: time_steps=" << time_steps
+                      << " mismatches illumination arrays (inferred=" << inferred_ts
+                      << "). Using inferred value." << std::endl;
+            time_steps = inferred_ts;
+        }
+    }
     
     // Validate input arrays have expected size
     if (n_values == 0 || primary_reflected_values.size() != n_values || primary_ir_values.size() != n_values) {
@@ -274,8 +813,8 @@ std::vector<double> calculateAbsorbedFlux(
     std::vector<double> absorbed_flux(n_values);
     
     // Pre-calculate albedo for each face
-    std::vector<double> face_albedos(num_faces, default_visible_albedo);
-    
+    std::vector<double> face_albedos(num_faces);
+
     // Check if we're using a custom mesh
     bool is_custom_mesh = false;
     try {
@@ -286,279 +825,235 @@ std::vector<double> calculateAbsorbedFlux(
     } catch (const std::exception& e) {
         std::cout << "WARNING: Error checking custom mesh status: " << e.what() << std::endl;
     }
-    
-    std::cout << "Using " << (is_custom_mesh ? "custom" : "standard") << " mesh mode" << std::endl;
-    
-    // If user explicitly provided an albedo map file, always try to use it first
-    bool explicit_albedo_map = config.custom_properties.count("albedo_map") > 0;
-    bool using_precomputed = false;
-    
-    // For custom mesh without explicit albedo map, use global albedo map or default value
-    if (is_custom_mesh && !explicit_albedo_map) {
-        // Try to load global albedo map if not already provided
-        std::shared_ptr<ptm::SpatialMap> global_albedo_map = albedo_map;
-        
-        // If no albedo map was provided, try to load the global map
-        if (!global_albedo_map) {
-            // Get the albedo maps directory
-            std::string albedo_maps_dir = "data/albedo_maps";
-            if (config.custom_properties.count("albedo_maps_directory") > 0) {
-                albedo_maps_dir = config.getProperty("albedo_maps_directory");
-            } else if (const char* env_dir = std::getenv("EUROPA_ALBEDO_MAPS_DIR")) {
-                albedo_maps_dir = env_dir;
-            }
-            
-            // Ensure directory has trailing slash
-            if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
-                albedo_maps_dir += '/';
-            }
-            
-            // Try loading the global albedo map
-            std::string global_map_path = albedo_maps_dir + "Europa-0.5deg-BondAlbedo.fits";
-            std::cout << "Loading global albedo map from: " << global_map_path << std::endl;
 
-            global_albedo_map = std::make_shared<ptm::SpatialMap>();
-            if (!global_albedo_map->loadFromFITS(global_map_path)) {
-                std::cout << "Failed to load global albedo map, falling back to default value" << std::endl;
-                global_albedo_map = nullptr;
-            } else {
-                std::cout << "Successfully loaded global albedo map" << std::endl;
-            }
-        }
-        
-        // Calculate average albedo from the mesh center if global map is available
-        if (global_albedo_map && global_albedo_map->isValid()) {
-            // Quick calculation - just calculate mesh center once
-            double avg_lat = 0.0, avg_lon = 0.0;
-            size_t count = 0;
-            
-            // Sample points to calculate center (use max ~1000 points for efficiency)
-            size_t stride = std::max(size_t(1), mesh->faces.size() / 1000);
-            for (size_t f = 0; f < std::min(mesh->faces.size(), num_faces); f += stride) {
-                // Bounds check for both arrays
-                if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
-                    avg_lat += mesh->latitudes[f];
-                    avg_lon += mesh->longitudes[f];
-                    count++;
-                }
-            }
-            
-            if (count > 0) {
-                avg_lat /= count;
-                avg_lon /= count;
-                
-                // Normalize longitude to 0-360 range for map lookup
-                while (avg_lon < 0)
-                    avg_lon += 360.0;
-                while (avg_lon >= 360.0)
-                    avg_lon -= 360.0;
-                
-                // Get albedo from the global map at this point (note lat sign flip for map)
-                double mesh_center_albedo = global_albedo_map->getValue(avg_lon, -avg_lat);
-                
-                if (mesh_center_albedo != global_albedo_map->getMissingValue() && 
-                    mesh_center_albedo >= MIN_VALID_ALBEDO && mesh_center_albedo <= MAX_VALID_ALBEDO) {
-                    // Valid albedo value - use it for all faces
-                    std::fill(face_albedos.begin(), face_albedos.end(), mesh_center_albedo);
-                    
-                    std::cout << "Using global map albedo: " << mesh_center_albedo 
-                              << " for custom mesh based on center location ("
-                              << avg_lat << "°N, " << avg_lon << "°E)" << std::endl;
-                    
-                    // Skip all other albedo processing steps
-                    goto albedo_calculation_complete;
-                } else {
-                    std::cout << "Invalid albedo value from global map: " << mesh_center_albedo 
-                              << ", falling back to default" << std::endl;
-                }
-            }
-        }
-        
-        // If we get here, we couldn't use the global map, so use the default albedo
-        std::cout << "Using constant albedo " << default_visible_albedo 
-                  << " for custom mesh (no valid global albedo found)" << std::endl;
-    } 
-    else if (!is_custom_mesh) {
-        // Standard mesh - try to load pre-computed albedo map first
-        int mesh_resolution = 4; // Default value
-        try {
-            // Get mesh resolution from configuration
-            auto it = config.custom_properties.find("mesh_resolution");
-            if (it != config.custom_properties.end()) {
-                mesh_resolution = std::stoi(it->second);
-            }
-        } catch (const std::exception& e) {
-            std::cout << "WARNING: Error reading mesh_resolution: " << e.what() 
-                    << ", using default value 4" << std::endl;
-        }
-        
-        // Get albedo map directory from config/environment
+    std::cout << "Using " << (is_custom_mesh ? "custom" : "standard") << " mesh mode" << std::endl;
+    std::cout << "Default albedo: " << default_visible_albedo << std::endl;
+
+    // Initialize all faces with default albedo
+    std::fill(face_albedos.begin(), face_albedos.end(), default_visible_albedo);
+
+    // Create a local non-const pointer for the albedo map to use
+    std::shared_ptr<ptm::SpatialMap> albedo_map_to_use = albedo_map;  // Copy the const pointer
+
+    // Check if user explicitly provided an albedo map file
+    bool explicit_albedo_map = (albedo_map_to_use && albedo_map_to_use->isValid());
+    bool albedo_successfully_loaded = false;
+
+    if (explicit_albedo_map) {
+        std::cout << "Using provided albedo map" << std::endl;
+        albedo_successfully_loaded = true;
+    }
+    // For custom mesh without explicit albedo map, try to load global albedo map
+    else if (is_custom_mesh) {
+        // Get the albedo maps directory
         std::string albedo_maps_dir = "data/albedo_maps";
-        
-        // Check if a custom path is provided in configuration
         if (config.custom_properties.count("albedo_maps_directory") > 0) {
             albedo_maps_dir = config.getProperty("albedo_maps_directory");
-        } 
-        // Otherwise check environment variable
-        else if (const char* env_dir = std::getenv("EUROPA_ALBEDO_MAPS_DIR")) {
+        } else if (const char* env_dir = std::getenv("PTM_ALBEDO_MAPS_DIR")) {
+            albedo_maps_dir = env_dir;
+        } else if (const char* env_dir = std::getenv("EUROPA_ALBEDO_MAPS_DIR")) {
+            // Backward compatibility
             albedo_maps_dir = env_dir;
         }
         
-        // Ensure the directory path ends with a separator if needed
+        // Ensure directory has trailing slash
         if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
             albedo_maps_dir += '/';
         }
         
-        std::string body_name = config.getProperty("target_body_name", "Europa");
-        // Convert to proper case (first letter uppercase, rest lowercase)
+        // Get the target body name from config
+        std::string body_name = config.getProperty("target_body_name");
+        if (body_name.empty()) {
+            std::cerr << "ERROR: Target body name is not specified in config." << std::endl;
+            return std::vector<double>();
+        }
+
+        // Convert to proper case
         if (!body_name.empty()) {
             std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
             body_name[0] = std::toupper(body_name[0]);
         }
-
-        std::string precomputed_albedo_path = albedo_maps_dir + "/" + body_name + "_Albedo_res" + 
-                                    std::to_string(mesh_resolution) + ".bin";
-                                            
-        std::cout << "Looking for pre-computed albedo map: " << precomputed_albedo_path << std::endl;
         
-        // Try to load the pre-computed albedo map
-        bool albedo_loaded = false;
-        if (std::filesystem::exists(precomputed_albedo_path)) {
+        // Try loading the global albedo map for THIS BODY (not hardcoded Europa!)
+        // Try multiple paths (supports running from build/ directory)
+        std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
+        std::vector<std::string> search_paths = {
+            albedo_maps_dir + albedo_fits_name,           // User-specified or default path
+            "../data/albedo_maps/" + albedo_fits_name,    // Relative from build/ directory
+            "data/albedo_maps/" + albedo_fits_name        // Relative from project root
+        };
+
+        auto global_albedo_map = std::make_shared<ptm::SpatialMap>();
+        bool found = false;
+        for (const auto& path : search_paths) {
+            std::cout << "Loading global albedo map from: " << path << std::endl;
+            if (global_albedo_map->loadFromFITS(path)) {
+                std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
+                std::cout << "Map dimensions: " << global_albedo_map->getWidth()
+                        << "x" << global_albedo_map->getHeight() << std::endl;
+                std::cout << "Albedo range in map: " << global_albedo_map->getMin()
+                        << " to " << global_albedo_map->getMax() << std::endl;
+                albedo_map_to_use = global_albedo_map;
+                albedo_successfully_loaded = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std::cout << "No global albedo map found for " << body_name
+                    << ", using default albedo " << default_visible_albedo << std::endl;
+        }
+    }
+    else {
+        // For standard icosphere meshes, try to load pre-computed binary albedo files
+        
+        // Get the albedo maps directory
+        std::string albedo_maps_dir = "data/albedo_maps";
+        if (config.custom_properties.count("albedo_maps_directory") > 0) {
+            albedo_maps_dir = config.getProperty("albedo_maps_directory");
+        } else if (const char* env_dir = std::getenv("PTM_ALBEDO_MAPS_DIR")) {
+            albedo_maps_dir = env_dir;
+        } else if (const char* env_dir = std::getenv("EUROPA_ALBEDO_MAPS_DIR")) {
+            // Backward compatibility
+            albedo_maps_dir = env_dir;
+        }
+        
+        // Ensure directory has trailing slash
+        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+            albedo_maps_dir += '/';
+        }
+        
+        // Get the target body name from config
+        std::string body_name = config.getProperty("target_body_name");
+        if (!body_name.empty()) {
+            // Convert to proper case
+            std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
+            body_name[0] = std::toupper(body_name[0]);
+            
+            // Get mesh resolution from config
+            int mesh_resolution = 5; // Default
             try {
-                std::ifstream albedo_file(precomputed_albedo_path, std::ios::binary);
-                
-                if (albedo_file.is_open()) {
-                    // First read the number of faces from header
-                    size_t stored_num_faces = 0;
-                    albedo_file.read(reinterpret_cast<char*>(&stored_num_faces), sizeof(stored_num_faces));
-                    
-                    // Verify the number of faces matches what we expect
-                    if (stored_num_faces == num_faces) {
-                        // Read albedo values directly into face_albedos array
-                        albedo_file.read(reinterpret_cast<char*>(face_albedos.data()), 
-                                      num_faces * sizeof(double));
-                        
-                        std::cout << "Successfully loaded pre-computed albedo map for "
-                                << num_faces << " faces" << std::endl;
-                        albedo_loaded = true;
-                        using_precomputed = true;
-                    } else {
-                        std::cout << "Pre-computed albedo map has incorrect face count: expected " 
-                                << num_faces << ", got " << stored_num_faces << std::endl;
-                    }
-                    
-                    albedo_file.close();
+                auto it = config.custom_properties.find("mesh_resolution");
+                if (it != config.custom_properties.end()) {
+                    mesh_resolution = std::stoi(it->second);
                 }
             } catch (const std::exception& e) {
-                std::cout << "Error loading pre-computed albedo map: " << e.what() << std::endl;
+                std::cout << "Warning: Could not parse mesh resolution, using default 5" << std::endl;
             }
-        } else {
-            std::cout << "Pre-computed albedo map not found at: " << precomputed_albedo_path << std::endl;
-        }
-        
-        // If pre-computed map failed, try to use global albedo map
-        if (!albedo_loaded && albedo_map && albedo_map->isValid()) {
-            std::cout << "Using global albedo map for standard mesh" << std::endl;
             
-            // Map each face to its corresponding albedo from the global map
-            #pragma omp parallel for schedule(dynamic, 1000)
-            for (size_t f = 0; f < num_faces; f++) {
-                // Add explicit bounds checking
-                if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
-                    double lat = mesh->latitudes[f];
-                    double lon = mesh->longitudes[f];
-                    
-                    // Normalize longitude to 0-360 range for map lookup
-                    while (lon < 0.0) lon += 360.0;
-                    while (lon >= 360.0) lon -= 360.0;
-                    
-                    try {
-                        // Note: Albedo map typically uses opposite latitude convention (north is positive)
-                        double albedo_value = albedo_map->getValue(lon, -lat);
-                        
-                        // Check if the value is valid
-                        if (albedo_value != albedo_map->getMissingValue() && 
-                            albedo_value >= MIN_VALID_ALBEDO && 
-                            albedo_value <= MAX_VALID_ALBEDO) {
-                            face_albedos[f] = albedo_value;
-                        }
-                    } catch (const std::exception& e) {
-                        // If any error occurs during map lookup, just use the default value
-                        // (face_albedos already initialized with default_visible_albedo)
-                        #pragma omp critical
-                        {
-                            std::cerr << "Error getting albedo for face " << f 
-                                    << " (lat=" << lat << ", lon=" << lon << "): " 
-                                    << e.what() << std::endl;
-                        }
-                    }
+            // Construct binary albedo file name: e.g., "Moon_Albedo_res6.bin"
+            std::string albedo_filename = body_name + "_Albedo_res" + std::to_string(mesh_resolution) + ".bin";
+
+            // Try multiple paths for the albedo file (supports running from build/ directory)
+            std::vector<std::string> search_paths = {
+                albedo_maps_dir + albedo_filename,           // User-specified or default path
+                "../data/albedo_maps/" + albedo_filename,    // Relative from build/ directory
+                "data/albedo_maps/" + albedo_filename        // Relative from project root
+            };
+
+            std::vector<double> loaded_albedos;
+            std::string found_path;
+
+            for (const auto& path : search_paths) {
+                std::cout << "Attempting to load binary albedo file: " << path << std::endl;
+                loaded_albedos = importAlbedoMapFromFile(path);
+                if (!loaded_albedos.empty()) {
+                    found_path = path;
+                    break;
                 }
             }
-            
-            // Fix any invalid albedo values by interpolating from neighbors
-            fixOutOfRangeAlbedos(face_albedos, mesh, default_visible_albedo);
-        }
-        // If neither pre-computed nor global map worked, use default albedo
-        else if (!albedo_loaded) {
-            std::cout << "No albedo map available for standard mesh, using constant albedo: " 
-                    << default_visible_albedo << std::endl;
-            // face_albedos already initialized with default_visible_albedo
+
+            if (!loaded_albedos.empty() && loaded_albedos.size() == num_faces) {
+                std::cout << "Successfully loaded " << loaded_albedos.size() << " albedo values from: " << found_path << std::endl;
+                std::cout << "Albedo range: " << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
+                        << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+
+                // Copy the loaded albedo values to face_albedos
+                std::copy(loaded_albedos.begin(), loaded_albedos.end(), face_albedos.begin());
+                albedo_successfully_loaded = true;
+            } else {
+                if (loaded_albedos.empty()) {
+                    std::cout << "Failed to load binary albedo file from any of the search paths" << std::endl;
+                } else {
+                    std::cout << "Binary albedo file size mismatch: expected " << num_faces
+                            << " faces, got " << loaded_albedos.size() << " values" << std::endl;
+                }
+                std::cout << "Using default albedo " << default_visible_albedo << " for all faces" << std::endl;
+            }
         }
     }
 
-    // If we already have valid albedo values (from any source), we can skip the rest
-    if (using_precomputed) {
-        std::cout << "Using pre-computed albedo map" << std::endl;
-        goto albedo_calculation_complete;
-    }
-    // Otherwise, check if an explicit albedo map was provided
-    else if (explicit_albedo_map && albedo_map && albedo_map->isValid()) {
-        std::cout << "Using provided albedo map" << std::endl;
+    // Now interpolate the albedo map to each face if we have one
+    if (albedo_successfully_loaded && albedo_map_to_use && albedo_map_to_use->isValid()) {
+        std::cout << "Interpolating albedo map to " << num_faces << " mesh faces..." << std::endl;
         
-        // Apply albedo map to each face
-        #pragma omp parallel for schedule(dynamic, 1000)
+        size_t valid_interpolations = 0;
+        size_t invalid_interpolations = 0;
+        
+        // Use OpenMP for parallel processing
+        #pragma omp parallel for reduction(+:valid_interpolations,invalid_interpolations)
         for (size_t f = 0; f < num_faces; f++) {
-            // Add explicit bounds checking
+            // Ensure we have valid lat/lon data
             if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
-                double lat = mesh->latitudes[f];
-                double lon = mesh->longitudes[f];
+                double face_lat = mesh->latitudes[f];
+                double face_lon = mesh->longitudes[f];
                 
                 // Normalize longitude to 0-360 range for map lookup
-                while (lon < 0.0) lon += 360.0;
-                while (lon >= 360.0) lon -= 360.0;
+                while (face_lon < 0) face_lon += 360.0;
+                while (face_lon >= 360.0) face_lon -= 360.0;
                 
                 try {
-                    // Note: Albedo map typically uses opposite latitude convention (north is positive)
-                    double albedo_value = albedo_map->getValue(lon, -lat);
+                    // Get albedo from the map at THIS FACE's location
+                    // Note: Some maps use opposite latitude convention
+                    double map_albedo = albedo_map_to_use->getValue(face_lon, -face_lat);
                     
-                    // Check if the value is valid
-                    if (albedo_value != albedo_map->getMissingValue() && 
-                        albedo_value >= MIN_VALID_ALBEDO && 
-                        albedo_value <= MAX_VALID_ALBEDO) {
-                        face_albedos[f] = albedo_value;
+                    // Check if we got a valid value
+                    if (map_albedo != albedo_map_to_use->getMissingValue() && 
+                        map_albedo >= MIN_VALID_ALBEDO && 
+                        map_albedo <= MAX_VALID_ALBEDO) {
+                        face_albedos[f] = map_albedo;
+                        valid_interpolations++;
+                    } else {
+                        // Keep default value for this face
+                        invalid_interpolations++;
                     }
                 } catch (const std::exception& e) {
-                    // If any error occurs during map lookup, just use the default value
-                    // (face_albedos already initialized with default_visible_albedo)
-                    #pragma omp critical
-                    {
-                        std::cerr << "Error getting albedo for face " << f 
-                                << " (lat=" << lat << ", lon=" << lon << "): " 
-                                << e.what() << std::endl;
-                    }
+                    // Keep default value on error
+                    invalid_interpolations++;
                 }
+            } else {
+                invalid_interpolations++;
             }
         }
         
-        // Fix any invalid albedo values by interpolating from neighbors
-        fixOutOfRangeAlbedos(face_albedos, mesh, default_visible_albedo);
-        goto albedo_calculation_complete;
+        // Report statistics
+        double min_albedo = *std::min_element(face_albedos.begin(), face_albedos.end());
+        double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
+        double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / face_albedos.size();
+        
+        std::cout << "Albedo interpolation complete:" << std::endl;
+        std::cout << "  Valid interpolations: " << valid_interpolations << " faces" << std::endl;
+        std::cout << "  Invalid/default values: " << invalid_interpolations << " faces" << std::endl;
+        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
+        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+    } else {
+        std::cout << "Using constant albedo " << default_visible_albedo << " for all faces" << std::endl;
     }
 
-    // If we get here, we're using the default constant albedo for all faces
-    std::cout << "Using constant albedo " << default_visible_albedo << " for all faces" << std::endl;
+    // Final validation
+    size_t corrected_faces = 0;
+    for (size_t f = 0; f < num_faces; f++) {
+        if (std::isnan(face_albedos[f]) || std::isinf(face_albedos[f]) || 
+            face_albedos[f] < MIN_VALID_ALBEDO || face_albedos[f] > MAX_VALID_ALBEDO) {
+            face_albedos[f] = default_visible_albedo;
+            corrected_faces++;
+        }
+    }
 
-albedo_calculation_complete:
+    if (corrected_faces > 0) {
+        std::cout << "Corrected " << corrected_faces << " invalid albedo values" << std::endl;
+    }
+
     // Final validation to ensure all albedo values are valid
     int invalid_count = 0;
     for (size_t f = 0; f < num_faces; f++) {
@@ -576,97 +1071,151 @@ albedo_calculation_complete:
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
     
+    // Check if we should use incidence-dependent albedo
+    bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
+                                 !planet->using_albedo_map &&
+                                 planet->albedoCoef.size() >= 2);
+
+    if (use_incidence_albedo) {
+        std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
+        std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
+        std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
+                  << ", b = " << planet->albedoCoef[1] << std::endl;
+    }
+
     // Apply albedo to calculate absorbed flux for each face at each time step
     #pragma omp parallel for schedule(dynamic, 1000)
     for (size_t f = 0; f < num_faces; f++) {
-        double visible_albedo = face_albedos[f];
-        
+        double base_albedo = face_albedos[f];
+        double face_lat = mesh->latitudes[f];
+        double face_lon = mesh->longitudes[f];
+
         for (size_t t = 0; t < time_steps; t++) {
             size_t idx = f * time_steps + t;
-            
+
             // Add explicit bounds checking
             if (idx >= n_values) {
                 #pragma omp critical
                 {
-                    std::cerr << "Error: Index out of bounds in calculateAbsorbedFlux: " 
+                    std::cerr << "Error: Index out of bounds in calculateAbsorbedFlux: "
                               << idx << " >= " << n_values << std::endl;
                 }
                 continue;
             }
-            
+
+            double direct_flux = direct_solar_values[idx];
+            double visible_albedo = base_albedo;
+
+            // Compute incidence-dependent albedo if enabled and face is illuminated
+            if (use_incidence_albedo && direct_flux > 0.0) {
+                // Compute incidence angle from direct flux
+                // direct_flux = S * cos(theta), so cos(theta) = direct_flux / S
+                double cos_theta = direct_flux / solar_constant;
+                // Clamp to valid range [0, 1] to handle numerical issues
+                cos_theta = std::min(1.0, std::max(0.0, cos_theta));
+                double incidence_angle = std::acos(cos_theta);
+
+                // Get incidence-dependent albedo
+                visible_albedo = planet->getAlbedoWithIncidence(
+                    face_lon * M_PI / 180.0,  // Convert to radians
+                    face_lat * M_PI / 180.0,
+                    incidence_angle);
+            }
+
             // Apply appropriate albedo to each component
-            double absorbed_direct = direct_solar_values[idx] * (1.0 - visible_albedo);
+            double absorbed_direct = direct_flux * (1.0 - visible_albedo);
             double absorbed_reflected = primary_reflected_values[idx] * (1.0 - visible_albedo);
             double absorbed_ir = primary_ir_values[idx] * ir_emissivity;
-            
+
             // Sum all components
             absorbed_flux[idx] = absorbed_direct + absorbed_reflected + absorbed_ir;
         }
     }
-    
+
     return absorbed_flux;
 }
 
-// Function to run the thermal model with matched times
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
     double latitude,
     const thermal::Config& config,
     int equilibration_steps) {
+
+    // Validate inputs
+    std::vector<double> temps_out;
+    if (times.empty() || flux_values.empty()) {
+        std::cerr << "runThermalModelWithMatchedTimes: empty input" << std::endl;
+        return temps_out;
+    }
+
+    const int N = static_cast<int>(times.size());
     
+    // CRITICAL FIX: Create matrix with correct dimensions (2 rows, N columns)
+    // Row 0: times, Row 1: flux values
+    Eigen::MatrixXd flux_arr(2, N);  // NOT (N, 2)!
+    
+    // Check size matching
+    if (flux_values.size() != times.size()) {
+        std::cerr << "WARNING: flux_values size (" << flux_values.size() 
+                  << ") != times size (" << times.size() << ")" << std::endl;
+        // Use the minimum size
+        int min_size = std::min(static_cast<int>(flux_values.size()), N);
+        flux_arr.resize(2, min_size);
+        for (int i = 0; i < min_size; ++i) {
+            flux_arr(0, i) = times[i];      // Row 0: times
+            flux_arr(1, i) = flux_values[i]; // Row 1: flux
+        }
+    } else {
+        // Sizes match, fill the matrix correctly
+        for (int i = 0; i < N; ++i) {
+            flux_arr(0, i) = times[i];      // Row 0: times
+            flux_arr(1, i) = flux_values[i]; // Row 1: flux
+        }
+    }
+
     try {
-        // Replace StdoutRedirector with thread-safe OutputSuppressor
-        OutputSuppressor suppressor;
-        // No need to explicitly call suppress() as constructor does it
-        
-        // Create thermal model with proper parameters
-        thermal::Planet europa = thermal::Planet(thermal::PlanetaryBody::EUROPA);
-        
-        // Create local arrays to avoid sharing across threads
-        Eigen::MatrixXd flux_arr(flux_values.size(), 2);
-        for (size_t i = 0; i < flux_values.size(); i++) {
-            flux_arr(i, 0) = times[i];
-            flux_arr(i, 1) = flux_values[i];
-        }
-        
-        // Restrict critical section to just check for empty arrays
-        #pragma omp critical (thermal_model_creation)
-        {
-            if (flux_values.empty() || times.empty()) {
-                throw std::runtime_error("Empty flux or time arrays");
-            }
-        }
-        
-        // Create the model with correct constructor parameters
-        thermal::Model thermalModel(europa, latitude * M_PI/180.0, times, flux_arr, config, false);
-        
+        const std::string planet_name = config.getProperty("planet", "Moon");  // Should be Moon not Europa!
+        thermal::Planet planet(planet_name);
+
+        // Create thermal model
+        thermal::Model model(planet,
+                            latitude * M_PI/180.0,  // Convert to radians
+                            times,
+                            flux_arr,
+                            config,
+                            false);
+
+        // CRITICAL: Don't use internal equilibration - it messes up time alignment
+        model.use_full_time_series = true;
+        // Don't set equilibration_steps in the model - handle it externally
+        model.setStartTime(times.front());
+
         // Run the model
-        thermalModel.run();
+        model.run();
+
+        // Extract surface temperatures
+        temps_out.resize(N, 0.0);
         
-        // Extract surface temperatures (thread-local)
-        std::vector<double> surface_temps(thermalModel.T.rows());
-        for (int i = 0; i < thermalModel.T.rows(); i++) {
-            surface_temps[i] = thermalModel.T(i, 0);
+        // The model's T matrix should be N_steps x N_z (time steps x depth layers)
+        if (model.T.rows() == N && model.T.cols() > 0) {
+            for (int i = 0; i < N; ++i) {
+                temps_out[i] = model.T(i, 0);  // Column 0 is surface
+            }
+        } else {
+            std::cerr << "ERROR: Unexpected thermal model output size: " 
+                      << model.T.rows() << "x" << model.T.cols() 
+                      << " (expected " << N << "xN_z)" << std::endl;
+            // Fill with default values
+            std::fill(temps_out.begin(), temps_out.end(), 200.0);
         }
         
-        // OutputSuppressor will automatically resume output in its destructor
-        return surface_temps;
-    }
-    catch (const std::exception& e) {
-        #pragma omp critical
-        {
-            std::cerr << "Exception in runThermalModelWithMatchedTimes: " << e.what() << std::endl;
-        }
-        // Create a fallback temperature array instead of failing
-        return std::vector<double>(flux_values.size(), 100.0);  // Default 100K temperature
-    }
-    catch (...) {
-        #pragma omp critical
-        {
-            std::cerr << "Unknown exception in runThermalModelWithMatchedTimes" << std::endl;
-        }
-        return std::vector<double>(flux_values.size(), 100.0);
+        return temps_out;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in thermal model: " << e.what() << std::endl;
+        temps_out.resize(N, 200.0);  // Default temperature
+        return temps_out;
     }
 }
 
@@ -675,99 +1224,138 @@ bool exportLocationIllumination(
     const std::string& locations_file,
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<double>& illumination_values,
-    const std::vector<double>& direct_solar_values,      // Added component
-    const std::vector<double>& primary_reflected_values, // Added component
-    const std::vector<double>& primary_ir_values,        // Added IR component
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
     const std::vector<std::string>& time_strings,
     int time_steps) {
-    
-    // Read locations from file
-    std::cout << "Attempting to open locations file: " << locations_file << std::endl;
-    std::ifstream input(locations_file);
-    if (!input.is_open()) {
-        std::cerr << "Failed to open locations file: " << locations_file << std::endl;
+    // Basic validations
+    if (!mesh) {
+        std::cerr << "exportLocationIllumination: mesh is null" << std::endl;
         return false;
     }
-    std::cout << "Successfully opened locations file" << std::endl;
-    
-    // Parse locations
-    std::vector<std::pair<double, double>> locations;
-    std::vector<std::string> location_names;
-    
-    std::string line;
-    while (std::getline(input, line)) {
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-        
-        std::istringstream iss(line);
-        double lat, lon;
-        std::string name;
-        
-        if (!(iss >> lat >> lon)) {
-            std::cerr << "Error parsing location: " << line << std::endl;
-            continue;
-        }
-        
-        // Get name if present, otherwise use coordinates
-        std::getline(iss >> std::ws, name);
-        if (name.empty()) {
-            std::ostringstream name_ss;
-            name_ss << "Location_" << lat << "_" << lon;
-            name = name_ss.str();
-        }
-        
-        locations.emplace_back(lat, lon);
-        location_names.push_back(name);
+    const size_t F = mesh->faces.size();
+    if (F == 0) {
+        std::cerr << "exportLocationIllumination: mesh has no faces" << std::endl;
+        return false;
     }
-    
+    if (time_steps <= 0) {
+        std::cerr << "exportLocationIllumination: invalid time_steps" << std::endl;
+        return false;
+    }
+
+    // Read locations (try CSV first: name,lat,lon)
+    std::vector<std::string> location_names;
+    std::vector<std::pair<double,double>> locations;
+    std::cout << "Attempting to open locations file: " << locations_file << std::endl;
+
+    auto loc_csv = readLocationsCSV(locations_file);
+    if (!loc_csv.empty()) {
+        for (const auto& tup : loc_csv) {
+            const std::string& name = std::get<0>(tup);
+            double lat = std::get<1>(tup);
+            double lon = std::get<2>(tup);
+            location_names.push_back(name);
+            locations.emplace_back(lat, lon);
+        }
+    } else {
+        // Fallback: space-delimited "lat lon [name…]"
+        std::ifstream input(locations_file);
+        if (!input.is_open()) {
+            std::cerr << "Failed to open locations file: " << locations_file << std::endl;
+            return false;
+        }
+        std::cout << "Successfully opened locations file" << std::endl;
+
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.empty()) continue;
+            // Trim leading spaces
+            size_t start = line.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
+            if (line[start] == '#') continue;
+
+            std::istringstream iss(line);
+            double lat = 0.0, lon = 0.0;
+            if (!(iss >> lat >> lon)) {
+                // Try CSV style in this line: name,lat,lon
+                // Very permissive fallback
+                std::string token;
+                std::vector<std::string> parts;
+                std::istringstream iss2(line);
+                while (std::getline(iss2, token, ',')) {
+                    // trim token
+                    size_t a = token.find_first_not_of(" \t\r\n");
+                    size_t b = token.find_last_not_of(" \t\r\n");
+                    parts.push_back((a == std::string::npos) ? "" : token.substr(a, b - a + 1));
+                }
+                if (parts.size() >= 3) {
+                    try {
+                        const std::string name = parts[0];
+                        lat = std::stod(parts[1]);
+                        lon = std::stod(parts[2]);
+                        locations.emplace_back(lat, lon);
+                        location_names.push_back(name);
+                        continue;
+                    } catch (...) {
+                        std::cerr << "Error parsing location: " << line << std::endl;
+                        continue;
+                    }
+                }
+                std::cerr << "Error parsing location: " << line << std::endl;
+                continue;
+            }
+            // Rest of line is name (optional)
+            std::string name;
+            std::getline(iss >> std::ws, name);
+            if (name.empty()) {
+                std::ostringstream name_ss;
+                name_ss << "Location_" << std::fixed << std::setprecision(6) << lat << "_" << lon;
+                name = name_ss.str();
+            }
+            locations.emplace_back(lat, lon);
+            location_names.push_back(name);
+        }
+    }
+
     if (locations.empty()) {
         std::cerr << "No valid locations found in file" << std::endl;
         return false;
     }
-    
-    // Find closest mesh facet for each location
-    std::vector<size_t> facet_indices(locations.size());
-    
-    for (size_t i = 0; i < locations.size(); i++) {
-        const auto& location = locations[i];
-        double min_distance = std::numeric_limits<double>::max();
-        size_t closest_facet = 0;
-        
-        // Find the facet with the closest center to our location
-        for (size_t f = 0; f < mesh->faces.size(); f++) {
-            double facet_lat = mesh->latitudes[f];
-            double facet_lon = mesh->longitudes[f];
-            
-            // Simple spherical distance calculation
-            double dlat = facet_lat - location.first;
-            double dlon = facet_lon - location.second;
-            while (dlon > 180.0) dlon -= 360.0;
-            while (dlon < -180.0) dlon += 360.0;
-            
-            double distance = std::sqrt(dlat*dlat + dlon*dlon);
-            
-            if (distance < min_distance) {
-                min_distance = distance;
-                closest_facet = f;
-            }
+
+    // Map each location to nearest face (robust helper)
+    std::vector<size_t> facet_indices;
+    facet_indices.reserve(locations.size());
+    for (size_t i = 0; i < locations.size(); ++i) {
+        const auto& ll = locations[i];
+        int face_idx = findNearestFaceIndexByLatLon(mesh, ll.first, ll.second);
+        if (face_idx < 0 || static_cast<size_t>(face_idx) >= F) {
+            std::cerr << "Warning: Could not map location '" << location_names[i]
+                      << "' (" << std::fixed << std::setprecision(9) << ll.first
+                      << ", " << ll.second << ") to a mesh face; skipping." << std::endl;
+            continue;
         }
-        
-        facet_indices[i] = closest_facet;
-        std::cout << "Location " << location_names[i] << " (" << location.first << ", " << location.second 
-                  << ") mapped to facet " << closest_facet << " at (" 
-                  << mesh->latitudes[closest_facet] << ", " << mesh->longitudes[closest_facet] << ")" << std::endl;
+        facet_indices.push_back(static_cast<size_t>(face_idx));
+        std::cout << "Location " << location_names[i] << " (" << std::fixed << std::setprecision(9)
+                  << ll.first << ", " << ll.second << ") mapped to facet " << face_idx << " at ("
+                  << std::fixed << std::setprecision(12)
+                  << mesh->latitudes[static_cast<size_t>(face_idx)] << ", "
+                  << mesh->longitudes[static_cast<size_t>(face_idx)] << ")" << std::endl;
     }
-    
+
+    if (facet_indices.empty()) {
+        std::cerr << "No locations could be mapped to faces" << std::endl;
+        return false;
+    }
+
     // Open output file
     std::ofstream output(output_file);
     if (!output.is_open()) {
         std::cerr << "Failed to open output file: " << output_file << std::endl;
         return false;
     }
-    
-    // Modify the CSV header section
+
+    // Header
     output << "Time";
     for (const auto& name : location_names) {
         output << "," << name << "_Total";
@@ -775,33 +1363,38 @@ bool exportLocationIllumination(
         output << "," << name << "_PrimaryReflected";
         output << "," << name << "_PrimaryIR";
     }
-    output << std::endl;
-    
-    // Modify the data output section
-    for (int t = 0; t < time_steps; t++) {
-        // Write time
-        output << time_strings[t];
-        
-        // Write illumination components for each location
-        for (size_t i = 0; i < locations.size(); i++) {
-            size_t facet_idx = facet_indices[i];
-            size_t idx = facet_idx * time_steps + t;
-            
-            // Write total illumination (solar direct + reflected)
-            output << "," << illumination_values[idx];
-            
-            // Write direct solar component
-            output << "," << direct_solar_values[idx];
-            
-            // Write Primary reflected solar component
-            output << "," << primary_reflected_values[idx];
-            
-            // Write Primary IR component
-            output << "," << primary_ir_values[idx];
+    output << "\n";
+
+    // Safe value fetcher
+    auto get_val = [&](const std::vector<double>& v, size_t f, int t) -> double {
+        if (v.empty()) return 0.0;
+        const size_t stride = static_cast<size_t>(time_steps);
+        const size_t idx = f * stride + static_cast<size_t>(t);
+        return (idx < v.size()) ? v[idx] : 0.0;
+    };
+
+    // Rows
+    for (int t = 0; t < time_steps; ++t) {
+        const std::string ts = (static_cast<size_t>(t) < time_strings.size())
+                               ? time_strings[static_cast<size_t>(t)]
+                               : std::to_string(t);
+        output << ts;
+
+        for (size_t i = 0; i < facet_indices.size(); ++i) {
+            const size_t f = facet_indices[i];
+            if (f >= F) {
+                output << ",0,0,0,0";
+                continue;
+            }
+            const double tot = get_val(illumination_values, f, t);
+            const double dir = get_val(direct_solar_values, f, t);
+            const double rfl = get_val(primary_reflected_values, f, t);
+            const double pir = get_val(primary_ir_values, f, t);
+            output << "," << tot << "," << dir << "," << rfl << "," << pir;
         }
-        output << std::endl;
+        output << "\n";
     }
-    
+
     std::cout << "Location illumination data written to " << output_file << std::endl;
     return true;
 }
@@ -839,15 +1432,17 @@ bool exportBodyPositions(
 
 std::vector<double> calculateAbsorbedFlux(
     const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values, 
+    const std::vector<double>& primary_reflected_values,
     const std::vector<double>& primary_ir_values,
     int time_steps,
     const std::shared_ptr<ptm::SpatialMap>& albedo_map,
     const std::shared_ptr<Mesh>& mesh,
     double default_visible_albedo,
     double default_ir_albedo,
-    const thermal::Config& config); // Default param for backward compatibility
-    
+    const thermal::Config& config,
+    const thermal::Planet* planet,
+    double solar_constant);
+
 bool runVisualization(
     const std::string& illumination_vtk_file, 
     const std::string& output_video,
@@ -871,8 +1466,8 @@ bool runVisualization(
     
     // Debug output to verify parameters are received correctly
     std::cout << "Starting visualization with camera: lat=" << camera_latitude
-              << "°, lon=" << camera_longitude 
-              << "°, distance=" << camera_distance << std::endl;
+              << "Â°, lon=" << camera_longitude 
+              << "Â°, distance=" << camera_distance << std::endl;
     
     // Check if thermal VTK file exists
     bool thermal_file_exists = !thermal_vtk_file.empty() && std::filesystem::exists(thermal_vtk_file);
@@ -1049,6 +1644,107 @@ bool runVisualization(
     return true;
 }
 
+bool exportLocationTemperatureOnly(
+    const std::string& output_file,
+    const std::string& locations_file,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<std::vector<double>>& surface_temps,   // filtered temps (faces x steps)
+    const std::vector<std::string>& time_strings,            // filtered times (size = steps)
+    int time_steps)
+{
+    // Validate inputs
+    if (!mesh || mesh->faces.empty() || surface_temps.empty() || time_strings.size() < static_cast<size_t>(time_steps)) {
+        std::cerr << "exportLocationTemperatureOnly: invalid inputs\n";
+        return false;
+    }
+
+    // Read locations
+    std::ifstream input(locations_file);
+    if (!input.is_open()) {
+        std::cerr << "Failed to open locations file: " << locations_file << std::endl;
+        return false;
+    }
+
+    std::vector<std::pair<double,double>> locations;
+    std::vector<std::string> names;
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        double lat, lon;
+        std::string name;
+        if (!(iss >> lat >> lon)) continue;
+        std::getline(iss >> std::ws, name);
+        if (name.empty()) {
+            std::ostringstream os; os << std::fixed << std::setprecision(6) << lat << "_" << lon;
+            name = os.str();
+        }
+        locations.emplace_back(lat, lon);
+        names.push_back(name);
+    }
+    if (locations.empty()) {
+        std::cerr << "No valid locations found in " << locations_file << "\n";
+        return false;
+    }
+
+    // Map each location to nearest face center by lat/lon
+    const size_t F = mesh->faces.size();
+    std::vector<size_t> face_idx(locations.size(), 0);
+    for (size_t i = 0; i < locations.size(); ++i) {
+        double qlat = locations[i].first;
+        double qlon = locations[i].second;
+        // Normalize longitude diffs to [-180,180]
+        auto dlon = [](double a, double b)->double {
+            double d = a - b;
+            while (d > 180.0) d -= 360.0;
+            while (d < -180.0) d += 360.0;
+            return d;
+        };
+        double best = std::numeric_limits<double>::max();
+        size_t best_f = 0;
+        for (size_t f = 0; f < F; ++f) {
+            double dlat = mesh->latitudes[f] - qlat;
+            double dl = dlon(mesh->longitudes[f], qlon);
+            double dist2 = dlat*dlat + dl*dl;
+            if (dist2 < best) { best = dist2; best_f = f; }
+        }
+        face_idx[i] = best_f;
+        std::cout << "Location " << names[i] << " (" << std::fixed << std::setprecision(9)
+                  << locations[i].first << ", " << locations[i].second << ") mapped to facet "
+                  << best_f << " at (" << mesh->latitudes[best_f] << ", "
+                  << mesh->longitudes[best_f] << ")\n";
+    }
+
+    // Open output CSV and write temperature only
+    std::ofstream out(output_file);
+    if (!out.is_open()) {
+        std::cerr << "Failed to open output file: " << output_file << std::endl;
+        return false;
+    }
+
+    out << "Time";
+    for (const auto& n : names) out << "," << n << "_Temperature";
+    out << "\n";
+
+    // Write per-step temps
+    for (int t = 0; t < time_steps; ++t) {
+        out << time_strings[t];
+        for (size_t i = 0; i < face_idx.size(); ++i) {
+            const size_t f = face_idx[i];
+            double val = 0.0;
+            if (f < surface_temps.size() && static_cast<size_t>(t) < surface_temps[f].size()) {
+                val = surface_temps[f][t];
+            }
+            out << "," << std::fixed << std::setprecision(6) << val;
+        }
+        out << "\n";
+    }
+
+    std::cout << "Location temperatures written to " << output_file << std::endl;
+    return true;
+}
+
 // Example of using the improved function with a location file
 bool processLocations(const std::string& location_file, 
                        const std::string& output_file,
@@ -1142,10 +1838,10 @@ bool runThermalModel(
         Eigen::MatrixXd flux_arr(flux_values.size(), 2);
         for (size_t i = 0; i < flux_values.size(); i++) {
             flux_arr(i, 0) = times[i];           // Time (seconds)
-            flux_arr(i, 1) = flux_values[i];      // Flux (W/m²)
+            flux_arr(i, 1) = flux_values[i];      // Flux (W/mÂ²)
         }
         
-        // FIXED: Use vector of times instead of integer days parameter
+        // Use vector of times instead of integer days parameter
         Model thermalModel(europa, latitude * M_PI/180.0, times, flux_arr, config, verbose);
         
         // Run the thermal model
@@ -1238,6 +1934,122 @@ std::vector<double> runThermalModelForFace(
     }
 }
 
+// Streamed thermal path: read illumination on demand; no giant buffers
+bool runThermalModelsForAllFacesStreamed(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    int thermal_threads,
+    FluxFn get_direct,
+    FluxFn get_reflected,
+    FluxFn get_ir,
+    std::vector<std::vector<double>>* surface_temps_out)
+{
+    if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
+        std::cerr << "Streamed thermal: invalid mesh or time steps\n";
+        return false;
+    }
+
+    // Optional albedo map from config (same semantics as existing code)
+    std::shared_ptr<ptm::SpatialMap> albedo_map;
+    if (config.custom_properties.count("albedo_map")) {
+        const std::string path = config.getProperty("albedo_map");
+        if (!path.empty()) {
+            auto m = std::make_shared<ptm::SpatialMap>();
+            if (m->loadFromFITS(path)) {
+                albedo_map = m;
+            } else {
+                std::cout << "Streamed thermal: failed to load albedo map " << path
+                          << " (" << m->getLastError() << "), using default albedo\n";
+            }
+        }
+    }
+
+    // Precompute per-face visible albedo once
+    std::vector<double> face_albedos = computeFaceAlbedos(mesh, albedo_map, default_visible_albedo);
+    const double emiss_ir = 1.0 - ir_albedo;
+
+    const size_t n_faces = mesh->faces.size();
+    const size_t CHUNK_SIZE = 100000;
+    const size_t NUM_CHUNKS = (n_faces + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    if (surface_temps_out) {
+        surface_temps_out->clear();
+        surface_temps_out->resize(n_faces);
+    }
+
+    std::cerr << "\n[Streamed] Running thermal models for " << n_faces
+              << " faces over " << total_time_steps << " steps..." << std::endl;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    thermal::ProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
+
+    std::atomic<int> completed_faces{0};
+    std::atomic<bool> progress_done{false};
+    JoiningThread progress_thread([&](){
+        using namespace std::chrono_literals;
+        int last = -1;
+        while (!progress_done.load(std::memory_order_relaxed)) {
+            int cur = completed_faces.load(std::memory_order_relaxed);
+            if (cur != last) {
+                progressBar.update(std::min(cur, static_cast<int>(n_faces)));
+                last = cur;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        progressBar.update(static_cast<int>(n_faces));
+    });
+
+    for (size_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
+        size_t f0 = chunk * CHUNK_SIZE;
+        size_t f1 = std::min(f0 + CHUNK_SIZE, n_faces);
+        size_t localN = f1 - f0;
+
+        #pragma omp parallel for schedule(dynamic,1) num_threads(thermal_threads)
+        for (size_t i = 0; i < localN; ++i) {
+            size_t f = f0 + i;
+
+            // Build on-the-fly absorbed flux for this face across all times
+            std::vector<double> face_flux(total_time_steps);
+            const double A_vis = face_albedos[f];
+
+            for (int t = 0; t < total_time_steps; ++t) {
+                const double Fd  = get_direct(f, t);
+                const double Fr  = get_reflected(f, t);
+                const double Fir = get_ir(f, t);
+                face_flux[t] = (1.0 - A_vis) * (Fd + Fr) + emiss_ir * Fir;
+            }
+
+            // Solve thermal for this face with matched times
+            std::vector<double> temps = runThermalModelWithMatchedTimes(
+                face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0);
+
+            if (surface_temps_out) {
+                (*surface_temps_out)[f].swap(temps);
+            }
+
+            // Increment atomic counter (no direct progress bar writes in parallel region)
+            completed_faces.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Stop poller and finish bar
+    progress_done.store(true, std::memory_order_relaxed);
+    progress_thread.join();
+    progressBar.finish();
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    std::cerr << "[Streamed] Thermal computation completed in "
+              << std::fixed << std::setprecision(3)
+              << (ms/1000.0) << " s (" << ms << " ms)" << std::endl;
+
+    return true;
+}
+
 // Function to run thermal models for all mesh faces
 bool runThermalModelsForAllFaces(
     const std::string& thermal_output_dir,
@@ -1253,7 +2065,8 @@ bool runThermalModelsForAllFaces(
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
-    int thermal_threads) {
+    int thermal_threads,
+    const thermal::Planet* planet) {
     
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -1286,16 +2099,20 @@ bool runThermalModelsForAllFaces(
     ir_albedo = DEFAULT_IR_ALBEDO;
 
     // Calculate total absorbed flux at each face and time
+    // Pass planet for incidence-dependent albedo if available
+    double solar_constant = planet ? planet->S : 0.0;
     std::vector<double> absorbed_flux = calculateAbsorbedFlux(
-        direct_solar_values,            // Use parameter instead of illumination_model->getDirectSolarValues()
-        primary_reflected_values,       // Use parameter instead of illumination_model->getPrimaryReflectedValues()
-        primary_ir_values,              // Use parameter instead of illumination_model->getPrimaryIRFlux()
-        time_steps,
+        direct_solar_values,            // from illumination_model or extracted accessors
+        primary_reflected_values,
+        primary_ir_values,
+        total_time_steps,               // FIX: use total_time_steps, not filtered time_steps
         albedo_map,
         mesh,
-        default_visible_albedo,         // Use parameter instead of illumination_model->getAlbedo()
-        ir_albedo,                      // Use parameter as is (don't redefine)
-        config);
+        default_visible_albedo,
+        ir_albedo,
+        config,
+        planet,                         // Pass planet for incidence-dependent albedo
+        solar_constant);
     
     size_t n_faces = mesh->faces.size();
     
@@ -1317,14 +2134,30 @@ bool runThermalModelsForAllFaces(
     }
     
     // Atomic counter for progress tracking
-    std::atomic<int> completed_faces_atomic(0);
+    std::atomic<int> completed_faces_total(0);
     
     // Process in chunks to reduce memory pressure
     bool success = true;
     
     // Create progress bar for thermal calculation - using cerr for output
     thermal::ProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
-    
+
+    std::atomic<bool> progress_done{false};
+    JoiningThread progress_thread([&](){
+        using namespace std::chrono_literals;
+        int last = -1;
+        while (!progress_done.load(std::memory_order_relaxed)) {
+            int cur = completed_faces_total.load(std::memory_order_relaxed);
+            if (cur != last) {
+                progressBar.update(std::min(cur, static_cast<int>(n_faces)));
+                last = cur;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        // Final update to 100%
+        progressBar.update(static_cast<int>(n_faces));
+    });
+
     for (size_t chunk = 0; chunk < NUM_CHUNKS; chunk++) {
         size_t start_face = chunk * CHUNK_SIZE;
         size_t end_face = std::min((chunk + 1) * CHUNK_SIZE, n_faces);
@@ -1345,7 +2178,7 @@ bool runThermalModelsForAllFaces(
         }
         
         // Reset counter for this chunk
-        completed_faces_atomic.store(0);
+        // completed_faces_atomic.store(0);
         
         // Process faces in this chunk in parallel
         #pragma omp parallel for schedule(dynamic, 1) num_threads(thermal_threads)
@@ -1376,12 +2209,21 @@ bool runThermalModelsForAllFaces(
                 // Store results locally in the chunk
                 chunk_results[local_idx] = std::move(temps);
                 
+                // Update global progress (one face completed)
+                completed_faces_total.fetch_add(1, std::memory_order_relaxed);
+                
                 // Update progress
-                int completed = ++completed_faces_atomic;
-                if (completed % 100 == 0 || completed == static_cast<int>(chunk_size)) {
-                    // Update the progress bar with global progress
-                    progressBar.update(start_face + completed);
-                }
+                // int completed = ++completed_faces_atomic;
+                // if (completed % 100 == 0 || completed == static_cast<int>(chunk_size)) {
+                //     // Update the progress bar with global progress
+                //     progressBar.update(start_face + completed);
+                // }
+
+                // Stop poller and finish bar
+                // progress_done.store(true, std::memory_order_relaxed);
+                // progress_thread.join();
+                // progressBar.finish();
+
             } catch (const std::exception& e) {
                 #pragma omp critical
                 {
@@ -1402,6 +2244,35 @@ bool runThermalModelsForAllFaces(
             for (size_t local_idx = 0; local_idx < chunk_size; local_idx++) {
                 size_t f = start_face + local_idx;
                 (*surface_temps_out)[f] = std::move(chunk_results[local_idx]);
+                
+                // Verify the data was copied correctly
+                if ((*surface_temps_out)[f].size() != total_time_steps) {
+                    std::cerr << "Warning: Face " << f << " has " 
+                            << (*surface_temps_out)[f].size() 
+                            << " time steps instead of " << total_time_steps << std::endl;
+                }
+            }
+            
+            // Additional verification: Check for constant temperatures
+            if (chunk == 0 && start_face == 0) {  // Only check first chunk's first few faces
+                for (size_t check_idx = 0; check_idx < std::min(size_t(5), chunk_size); check_idx++) {
+                    const auto& temps = (*surface_temps_out)[check_idx];
+                    if (temps.size() > 1) {
+                        bool all_same = true;
+                        double first_temp = temps[0];
+                        for (size_t t = 1; t < temps.size(); t++) {
+                            if (std::abs(temps[t] - first_temp) > 0.01) {
+                                all_same = false;
+                                break;
+                            }
+                        }
+                        if (all_same) {
+                            std::cerr << "Warning: Face " << check_idx 
+                                    << " has constant temperature across all time steps: " 
+                                    << first_temp << " K" << std::endl;
+                        }
+                    }
+                }
             }
         }
         
@@ -1415,7 +2286,9 @@ bool runThermalModelsForAllFaces(
         }
     }
     
-    // Ensure progress bar is completed
+    // Stop poller and finish bar AFTER all chunks complete
+    progress_done.store(true, std::memory_order_relaxed);
+    progress_thread.join();
     progressBar.finish();
     
     // End timing and calculate duration
@@ -1432,7 +2305,223 @@ bool runThermalModelsForAllFaces(
     } else {
         std::cerr << "\nThermal models completed with errors!" << std::endl;
     }
-    
+
+    return success;
+}
+
+// =============================================================================
+// SIMD Batch Thermal Solver (SIMD-over-pixels)
+// Processes 8 faces at once using AVX-512 (or 4 with AVX2)
+// =============================================================================
+bool runThermalModelsForAllFacesBatchSoA(
+    const std::string& thermal_output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<double>& times,
+    int time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    std::vector<std::vector<double>>* surface_temps_out,
+    int equilibration_steps,
+    int total_time_steps,
+    int thermal_threads)
+{
+    const size_t n_faces = mesh->faces.size();
+    constexpr int BS = thermal::THERMAL_BATCH_SIZE;
+    const size_t n_batches = (n_faces + BS - 1) / BS;
+
+    std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels) ===" << std::endl;
+    std::cerr << "Processing " << n_faces << " faces in " << n_batches << " batches of " << BS << std::endl;
+#if defined(__AVX512F__)
+    std::cerr << "Using AVX-512 (8 faces per SIMD operation)" << std::endl;
+#elif defined(__AVX2__)
+    std::cerr << "Using AVX2 (4 faces per SIMD operation)" << std::endl;
+#else
+    std::cerr << "Using scalar fallback" << std::endl;
+#endif
+
+    // Calculate absorbed flux in COLUMN-MAJOR layout for SIMD efficiency
+    // Layout: flux_column_major[t * n_faces + f] - timestep-major ordering
+    // This allows contiguous SIMD loads of 8 faces at each timestep
+    std::vector<double> flux_column_major(n_faces * total_time_steps, 0.0);
+
+    std::cerr << "Computing absorbed flux in column-major layout for SIMD efficiency..." << std::endl;
+
+    // Use cache-blocked transpose to avoid cache thrashing
+    // Block size chosen to fit in L1 cache (~32KB = 4096 doubles)
+    constexpr size_t BLOCK_F = 64;   // Block size for faces dimension
+    constexpr size_t BLOCK_T = 64;   // Block size for timesteps dimension
+
+    #pragma omp parallel for schedule(static) collapse(2)
+    for (size_t f_block = 0; f_block < n_faces; f_block += BLOCK_F) {
+        for (int t_block = 0; t_block < total_time_steps; t_block += static_cast<int>(BLOCK_T)) {
+            // Process one block
+            size_t f_end = std::min(f_block + BLOCK_F, n_faces);
+            int t_end = std::min(t_block + static_cast<int>(BLOCK_T), total_time_steps);
+
+            for (size_t f = f_block; f < f_end; ++f) {
+                double face_albedo = default_visible_albedo;
+                for (int t = t_block; t < t_end; ++t) {
+                    size_t src_idx = f * total_time_steps + t;
+                    size_t dst_idx = t * n_faces + f;  // Column-major: [timestep][face]
+                    double direct = direct_solar_values[src_idx];
+                    double reflected = primary_reflected_values[src_idx];
+                    double ir = primary_ir_values[src_idx];
+
+                    // Absorbed flux = (1-albedo)*solar + (1-ir_albedo)*ir
+                    flux_column_major[dst_idx] = (1.0 - face_albedo) * (direct + reflected) + (1.0 - ir_albedo) * ir;
+                }
+            }
+        }
+    }
+
+    // Initialize output
+    if (surface_temps_out) {
+        surface_temps_out->resize(n_faces);
+        for (auto& v : *surface_temps_out) {
+            v.resize(total_time_steps, 0.0);
+        }
+    }
+
+    // Create reference profile for grid parameters
+    thermal::Planet planet("Moon");  // TODO: Make configurable from config
+    thermal::Profile ref_profile(planet, 0.0, config, false);
+    const int n_layers = ref_profile.nlayers;
+
+    std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
+
+    // Progress tracking
+    std::atomic<size_t> completed_batches{0};
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Create progress bar
+    thermal::ProgressBar progressBar(static_cast<int>(n_faces), "SIMD Batch thermal", 50, true);
+
+    bool success = true;
+
+    #pragma omp parallel num_threads(thermal_threads)
+    {
+        // Thread-local batch buffer
+        thermal::ThermalBatchSoA batch;
+        batch.initialize(n_layers, BS, planet, config);
+        batch.copyGridFromProfile(ref_profile);
+
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+            size_t start_face = batch_idx * BS;
+            size_t end_face = std::min(start_face + BS, n_faces);
+            int faces_in_batch = static_cast<int>(end_face - start_face);
+
+            batch.n_faces = faces_in_batch;
+
+            // Initialize temperatures for equilibration
+            // Use average expected temperature based on solar flux
+            for (int f = 0; f < faces_in_batch; ++f) {
+                size_t global_f = start_face + f;
+                // Estimate initial temperature from average flux
+                // Access flux_column_major[t * n_faces + f] for column-major layout
+                double avg_flux = 0.0;
+                for (int t = 0; t < std::min(100, total_time_steps); ++t) {
+                    avg_flux += flux_column_major[t * n_faces + global_f];
+                }
+                avg_flux /= std::min(100, total_time_steps);
+
+                double T_init = 200.0;  // Default
+                if (avg_flux > 0) {
+                    // Radiative equilibrium: eps*sigma*T^4 = Q
+                    double ratio = avg_flux / (planet.emissivity * SIGMA_SB);
+                    T_init = std::sqrt(std::sqrt(ratio));
+                    T_init = std::max(50.0, std::min(400.0, T_init));
+                }
+
+                batch.T_eq_init[f] = T_init;
+
+                // Initialize all layers to this temperature
+                for (int layer = 0; layer < n_layers; ++layer) {
+                    batch.T[layer * BS + f] = T_init;
+                }
+            }
+
+            // Zero-pad unused face slots
+            for (int f = faces_in_batch; f < BS; ++f) {
+                batch.T_eq_init[f] = 200.0;
+                for (int layer = 0; layer < n_layers; ++layer) {
+                    batch.T[layer * BS + f] = 200.0;
+                }
+            }
+
+            // Equilibration phase
+            if (equilibration_steps > 0) {
+                int steps_per_cycle = std::min(total_time_steps, 100);
+                int cycles = equilibration_steps / steps_per_cycle;
+
+                for (int cycle = 0; cycle < cycles; ++cycle) {
+                    for (int t = 0; t < steps_per_cycle - 1 && t < total_time_steps - 1; ++t) {
+                        double dt = times[t + 1] - times[t];
+
+                        // OPTIMIZED: Direct pointer to contiguous flux values in column-major layout
+                        // flux_column_major[t * n_faces + start_face] points to 8 contiguous doubles
+                        const double* flux_ptr = &flux_column_major[t * n_faces + start_face];
+                        batch.setFluxContiguous(flux_ptr, faces_in_batch);
+
+                        batch.advanceTimestep(dt);
+                    }
+                }
+            }
+
+            // Main simulation time-stepping loop
+            for (int t = 0; t < total_time_steps - 1; ++t) {
+                double dt = times[t + 1] - times[t];
+
+                // OPTIMIZED: Direct pointer to contiguous flux values in column-major layout
+                // This is a single cache-line read instead of 8 scattered reads
+                const double* flux_ptr = &flux_column_major[t * n_faces + start_face];
+                batch.setFluxContiguous(flux_ptr, faces_in_batch);
+
+                // Advance timestep for all faces in batch
+                batch.advanceTimestep(dt);
+
+                // Store surface temperatures
+                if (surface_temps_out) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        (*surface_temps_out)[start_face + f][t] = batch.getSurfaceTemp(f);
+                    }
+                }
+            }
+
+            // Store final timestep temperature
+            if (surface_temps_out) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    (*surface_temps_out)[start_face + f][total_time_steps - 1] = batch.getSurfaceTemp(f);
+                }
+            }
+
+            // Update progress
+            size_t done = ++completed_batches;
+            #pragma omp critical
+            {
+                progressBar.update(static_cast<int>(done * BS));
+            }
+        }
+    }
+
+    progressBar.finish();
+
+    // End timing
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double seconds = duration.count() / 1000.0;
+
+    std::cerr << "SIMD Batch thermal computation completed in " << std::fixed << std::setprecision(3)
+              << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
+
+    if (success) {
+        std::cerr << "\nSIMD Batch thermal models completed successfully!" << std::endl;
+    }
+
     return success;
 }
 
@@ -1442,14 +2531,14 @@ bool addThermalDataToVTK(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<double>& times) {
-    
+
     // Read the entire original file
     std::ifstream infile(vtk_file);
     if (!infile.is_open()) {
         std::cerr << "Failed to open VTK file: " << vtk_file << std::endl;
         return false;
     }
-    
+
     std::vector<std::string> content;
     std::string line;
     bool found_cell_data = false;
@@ -1539,6 +2628,507 @@ bool addThermalDataToVTK(
     return true;
 }
 
+// ========== GPU PERSISTENT THERMAL SOLVER ==========
+#ifdef PTM_GPU_OPENCL
+/**
+ * @brief GPU-accelerated thermal solver using persistent kernel
+ *
+ * Processes ALL timesteps in a single GPU kernel launch for maximum efficiency.
+ * Data transfer is minimized: upload flux once, download surface temps once.
+ *
+ * For large meshes (>100K faces), processes faces in batches to fit in GPU memory.
+ */
+bool runThermalModelsForAllFaces_GPU_Persistent(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    double default_visible_albedo,
+    double ir_albedo,
+    std::vector<std::vector<double>>* surface_temps_out)
+{
+    using namespace gpu::opencl;
+
+    // Debug output control - set to true for troubleshooting
+    constexpr bool GPU_DEBUG_OUTPUT = false;
+
+    const size_t n_faces = mesh->faces.size();
+    std::cout << "[GPU Thermal] Starting persistent kernel solver for " << n_faces
+              << " faces, " << total_time_steps << " timesteps" << std::endl;
+
+    auto start_total = std::chrono::high_resolution_clock::now();
+
+    // Initialize output
+    if (surface_temps_out) {
+        surface_temps_out->resize(n_faces);
+        for (auto& v : *surface_temps_out) {
+            v.resize(total_time_steps, 0.0);
+        }
+    }
+
+    // Get thermal model parameters
+    thermal::Planet planet(config.getProperty("planet", "Moon"));
+    thermal::Profile reference_profile(planet, 0.0, config, false);
+    const auto& z_grid = reference_profile.z();
+    const size_t n_layers = z_grid.size();
+
+    // Calculate dt from times array
+    float dt = 0.0f;
+    if (total_time_steps > 1) {
+        dt = static_cast<float>(times[1] - times[0]);
+    }
+
+    // GPU memory constraint: estimate ~50 bytes per face per layer for arrays
+    // Plus flux and output: ~8 bytes per face per timestep * 2
+    // Conservative batch size based on 8GB GPU memory
+    const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
+    const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;  // 6 GB conservative
+    const size_t max_batch_size = std::min(n_faces, gpu_memory_limit / bytes_per_face);
+    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(100000));
+
+    std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
+              << " (n_layers=" << n_layers << ")" << std::endl;
+
+    // Prepare face albedos
+    std::vector<double> face_albedos(n_faces, default_visible_albedo);
+    // Could use spatial albedo map here if available
+
+    // Process faces in batches
+    size_t n_batches = (n_faces + BATCH_SIZE - 1) / BATCH_SIZE;
+    std::cout << "[GPU Thermal] Processing " << n_faces << " faces in " << n_batches << " batch(es)..." << std::endl;
+
+    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * BATCH_SIZE;
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_faces);
+        size_t batch_n = batch_end - batch_start;
+
+        // Progress bar
+        double progress = 100.0 * static_cast<double>(batch_start) / static_cast<double>(n_faces);
+        std::cout << "\r[GPU Thermal] Progress: " << std::fixed << std::setprecision(1)
+                  << progress << "% (batch " << (batch_idx + 1) << "/" << n_batches << ")" << std::flush;
+
+        auto batch_start_time = std::chrono::high_resolution_clock::now();
+
+        // Initialize solver for this batch
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
+        if (!solver.initialize()) {
+            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver" << std::endl;
+            return false;
+        }
+
+        // Prepare mesh data for this batch (SoA layout: [layer * batch_n + face_in_batch])
+        std::vector<float> z_grid_f(n_layers);
+        for (size_t i = 0; i < n_layers; ++i) {
+            z_grid_f[i] = static_cast<float>(z_grid[i]);
+        }
+
+        // Material properties - use reference profile values for now
+        // These are depth-dependent but uniform across faces (could be extended for spatially-varying)
+        std::vector<float> rho_batch(batch_n * n_layers);
+        std::vector<float> kc_batch(batch_n * n_layers);
+        std::vector<float> emissivity_batch(batch_n);
+        std::vector<float> T_deep_batch(batch_n);
+        std::vector<float> Qb_batch(batch_n);
+
+        // Get reference values from profile
+        const auto& rho_ref = reference_profile.rho();
+        const auto& kc_ref = reference_profile.kc();
+        const auto& T_ref = reference_profile.T();
+        double T_deep_val = T_ref.back();  // Deep temperature from initialized profile
+        double R350_val = reference_profile.R350_val;
+
+        for (size_t f = 0; f < batch_n; ++f) {
+            size_t global_f = batch_start + f;
+            emissivity_batch[f] = static_cast<float>(planet.emissivity);
+            T_deep_batch[f] = static_cast<float>(T_deep_val);
+            Qb_batch[f] = static_cast<float>(planet.Qb);
+
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                size_t idx = layer * batch_n + f;
+                rho_batch[idx] = static_cast<float>(rho_ref[layer]);
+                kc_batch[idx] = static_cast<float>(kc_ref[layer]);
+            }
+        }
+
+        solver.uploadMeshData(z_grid_f, rho_batch, kc_batch, emissivity_batch, T_deep_batch, Qb_batch);
+
+        // Debug: print z grid
+        if (GPU_DEBUG_OUTPUT && batch_idx == 0) {
+            std::cerr << "[GPU Thermal DEBUG] z_grid (first 10): ";
+            for (size_t i = 0; i < std::min(n_layers, (size_t)10); ++i) {
+                std::cerr << z_grid_f[i] << " ";
+            }
+            std::cerr << "\n";
+            std::cerr << "[GPU Thermal DEBUG] rho[0] (first face): " << rho_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] kc[0] (first face): " << kc_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] emissivity (first face): " << emissivity_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] T_deep (first face): " << T_deep_batch[0] << "\n";
+        }
+
+        // Set material parameters
+        std::vector<float> cp_coeffs_f;
+        for (double c : planet.cpCoeff) {
+            cp_coeffs_f.push_back(static_cast<float>(c));
+        }
+        solver.setMaterialParams(
+            static_cast<float>(planet.cp0),
+            cp_coeffs_f,
+            static_cast<float>(R350_val),
+            static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
+        );
+
+        // Initialize temperature (equilibrium temperature for all layers)
+        std::vector<float> T_initial(batch_n * n_layers);
+        for (size_t f = 0; f < batch_n; ++f) {
+            // Get initial flux to estimate equilibrium temperature
+            size_t global_f = batch_start + f;
+            double albedo = face_albedos[global_f];
+            double avg_flux = 0.0;
+            for (int t = 0; t < std::min(10, total_time_steps); ++t) {
+                size_t flux_idx = global_f * total_time_steps + t;
+                avg_flux += direct_solar_values[flux_idx] * (1.0 - albedo);
+            }
+            avg_flux /= std::min(10, total_time_steps);
+
+            // Equilibrium temperature from Stefan-Boltzmann
+            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+            if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
+            if (T_eq > 400.0) T_eq = 400.0;
+
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                size_t idx = layer * batch_n + f;
+                // Linear interpolation between surface and deep temperature
+                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+            }
+        }
+        solver.uploadInitialTemperature(T_initial);
+
+        // Debug: show initial temperature profile
+        if (GPU_DEBUG_OUTPUT && batch_idx == 0) {
+            std::cerr << "[GPU Thermal DEBUG] Initial T profile for face 0: ";
+            for (size_t layer = 0; layer < std::min(n_layers, (size_t)10); ++layer) {
+                std::cerr << T_initial[layer * batch_n + 0] << " ";
+            }
+            std::cerr << "\n";
+            std::cerr << "[GPU Thermal DEBUG] T_deep_val = " << T_deep_val << ", R350_val = " << R350_val << "\n";
+            std::cerr << "[GPU Thermal DEBUG] dt = " << dt << " seconds\n";
+
+            // Check stability: Fourier number Fo = kappa * dt / dz^2 should be < 0.5
+            // Use representative values
+            double T_repr = 200.0;
+            double kc = kc_batch[0];
+            double k_repr = kc * (1.0 + R350_val * T_repr * T_repr * T_repr);
+            double cp_repr = planet.cp0;
+            for (size_t c = 0; c < planet.cpCoeff.size(); ++c) {
+                cp_repr += planet.cpCoeff[c] * std::pow(T_repr, c + 1);
+            }
+            double rho_repr = rho_batch[0];
+            double kappa_repr = k_repr / (rho_repr * cp_repr);
+            double dz_min = z_grid[1] - z_grid[0];
+            double Fo = kappa_repr * dt / (dz_min * dz_min);
+            std::cerr << "[GPU Thermal DEBUG] Stability check: k=" << k_repr << ", cp=" << cp_repr
+                      << ", rho=" << rho_repr << ", kappa=" << kappa_repr
+                      << ", dz_min=" << dz_min << ", Fo=" << Fo << "\n";
+            if (Fo > 0.5) {
+                std::cerr << "[GPU Thermal WARNING] Fourier number " << Fo << " > 0.5, solver may be unstable!\n";
+            }
+        }
+
+        // Prepare flux data in timestep-major layout: [timestep * batch_n + face_in_batch]
+        std::vector<float> flux_all(static_cast<size_t>(total_time_steps) * batch_n);
+
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < total_time_steps; ++t) {
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t global_f = batch_start + f;
+                size_t flux_idx = global_f * total_time_steps + t;
+
+                double albedo = face_albedos[global_f];
+                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+
+                // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
+                double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+
+                flux_all[t * batch_n + f] = static_cast<float>(absorbed);
+            }
+        }
+
+        // Run persistent kernel
+        std::vector<float> output_temps;
+        solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
+
+        // Debug: verify output_temps matches kernel output
+        if (GPU_DEBUG_OUTPUT) {
+            std::cerr << "[GPU Thermal DEBUG] output_temps size: " << output_temps.size()
+                      << ", expected: " << (static_cast<size_t>(total_time_steps) * batch_n) << "\n";
+            if (!output_temps.empty()) {
+                std::cerr << "[GPU Thermal DEBUG] Host output_temps[0..4]: ";
+                for (size_t i = 0; i < std::min(size_t(5), output_temps.size()); ++i) {
+                    std::cerr << output_temps[i] << " ";
+                }
+                std::cerr << "\n";
+
+                // Check several timesteps to see temperature evolution
+                for (int check_t : {0, 10, 100, 500, 832}) {
+                    size_t idx = check_t * batch_n;
+                    if (idx < output_temps.size()) {
+                        std::cerr << "[GPU Thermal DEBUG] output_temps at t=" << check_t << " (face 0): "
+                                  << output_temps[idx] << " K\n";
+                    }
+                }
+            }
+        }
+
+        // Copy results to output (transpose from timestep-major to face-major)
+        if (surface_temps_out) {
+            if (GPU_DEBUG_OUTPUT) {
+                std::cerr << "[GPU Thermal DEBUG] Copying batch " << (batch_idx + 1)
+                          << " results to surface_temps_out (batch_n=" << batch_n
+                          << ", output_temps.size=" << output_temps.size() << ")\n";
+
+                // Debug: verify output_temps has valid data before copy
+                if (!output_temps.empty()) {
+                    float sample_val = output_temps[0];
+                    std::cerr << "[GPU Thermal DEBUG] output_temps[0] = " << sample_val << "\n";
+                }
+            }
+
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t global_f = batch_start + f;
+                for (int t = 0; t < total_time_steps; ++t) {
+                    (*surface_temps_out)[global_f][t] = static_cast<double>(output_temps[t * batch_n + f]);
+                }
+            }
+
+            if (GPU_DEBUG_OUTPUT) {
+                // Debug: verify copy worked
+                std::cerr << "[GPU Thermal DEBUG] After copy: surface_temps_out[0][0] = "
+                          << (*surface_temps_out)[batch_start][0] << "\n";
+            }
+        }
+
+        auto batch_end_time = std::chrono::high_resolution_clock::now();
+        auto batch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            batch_end_time - batch_start_time);
+        (void)batch_duration;  // Suppress unused warning when not in verbose mode
+    }
+
+    // Complete the progress bar
+    std::cout << "\r[GPU Thermal] Progress: 100.0% (complete)                    " << std::endl;
+
+    auto end_total = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(end_total - start_total);
+    std::cout << "[GPU Thermal] Completed " << n_faces << " faces x " << total_time_steps
+              << " timesteps in " << total_duration.count() << " seconds" << std::endl;
+
+    return true;
+}
+
+/**
+ * @brief GPU thermal solver for selected faces with pre-combined flux arrays
+ *
+ * Used in radiation-thermal coupling iterations where flux already includes
+ * direct solar, reflected, IR, and indirect radiation components.
+ *
+ * @param mesh Mesh with latitudes
+ * @param face_indices List of faces to process
+ * @param flux Pre-combined absorbed flux per face [idx in face_indices -> timesteps]
+ * @param times Time array
+ * @param total_time_steps Number of timesteps
+ * @param config Thermal configuration
+ * @param surface_temps In/out: temperature results (updated for selected faces only)
+ * @return true if successful
+ */
+bool runThermalForSelectedFaces_GPU(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<int>& face_indices,
+    const std::vector<std::vector<double>>& flux,
+    const std::vector<double>& times,
+    int total_time_steps,
+    const thermal::Config& config,
+    std::vector<std::vector<double>>& surface_temps)
+{
+    using namespace gpu::opencl;
+
+    const size_t n_selected = face_indices.size();
+    if (n_selected == 0) {
+        return true;  // Nothing to do
+    }
+
+    // Get thermal model parameters
+    thermal::Planet planet(config.getProperty("planet", "Moon"));
+    thermal::Profile reference_profile(planet, 0.0, config, false);
+    const auto& z_grid = reference_profile.z();
+    const size_t n_layers = z_grid.size();
+
+    // Calculate dt from times array
+    float dt = 0.0f;
+    if (total_time_steps > 1) {
+        dt = static_cast<float>(times[1] - times[0]);
+    }
+
+    // GPU memory constraint
+    const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
+    const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;
+    const size_t max_batch_size = std::min(n_selected, gpu_memory_limit / bytes_per_face);
+    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(50000));
+
+    // Get reference material properties
+    const auto& rho_ref = reference_profile.rho();
+    const auto& kc_ref = reference_profile.kc();
+    const auto& T_ref = reference_profile.T();
+    double T_deep_val = T_ref.back();
+    double R350_val = reference_profile.R350_val;
+
+    // Process faces in batches
+    size_t n_batches = (n_selected + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * BATCH_SIZE;
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
+        size_t batch_n = batch_end - batch_start;
+
+        // Initialize solver for this batch
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
+        if (!solver.initialize()) {
+            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver for selected faces" << std::endl;
+            return false;
+        }
+
+        // Prepare mesh data in SoA layout: [layer * batch_n + face_in_batch]
+        std::vector<float> z_grid_f(n_layers);
+        for (size_t i = 0; i < n_layers; ++i) {
+            z_grid_f[i] = static_cast<float>(z_grid[i]);
+        }
+
+        std::vector<float> rho_batch(batch_n * n_layers);
+        std::vector<float> kc_batch(batch_n * n_layers);
+        std::vector<float> emissivity_batch(batch_n);
+        std::vector<float> T_deep_batch(batch_n);
+        std::vector<float> Qb_batch(batch_n);
+
+        for (size_t f = 0; f < batch_n; ++f) {
+            emissivity_batch[f] = static_cast<float>(planet.emissivity);
+            T_deep_batch[f] = static_cast<float>(T_deep_val);
+            Qb_batch[f] = static_cast<float>(planet.Qb);
+
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                size_t idx = layer * batch_n + f;
+                rho_batch[idx] = static_cast<float>(rho_ref[layer]);
+                kc_batch[idx] = static_cast<float>(kc_ref[layer]);
+            }
+        }
+
+        solver.uploadMeshData(z_grid_f, rho_batch, kc_batch, emissivity_batch, T_deep_batch, Qb_batch);
+
+        // Set material parameters
+        std::vector<float> cp_coeffs_f;
+        for (double c : planet.cpCoeff) {
+            cp_coeffs_f.push_back(static_cast<float>(c));
+        }
+        solver.setMaterialParams(
+            static_cast<float>(planet.cp0),
+            cp_coeffs_f,
+            static_cast<float>(R350_val),
+            static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
+        );
+
+        // Initialize temperature from existing surface_temps (warm start)
+        std::vector<float> T_initial(batch_n * n_layers);
+        for (size_t f = 0; f < batch_n; ++f) {
+            size_t idx = batch_start + f;
+            int face_idx = face_indices[idx];
+
+            // Use existing surface temperature for initial estimate
+            double T_surface = (surface_temps[face_idx].empty()) ? T_deep_val : surface_temps[face_idx][0];
+            if (T_surface < 40.0) T_surface = 100.0;
+            if (T_surface > 400.0) T_surface = 400.0;
+
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                size_t tidx = layer * batch_n + f;
+                // Linear interpolation between surface and deep temperature
+                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                T_initial[tidx] = static_cast<float>(T_surface * (1.0 - depth_frac) + T_deep_val * depth_frac);
+            }
+        }
+        solver.uploadInitialTemperature(T_initial);
+
+        // Prepare flux data in timestep-major layout: [timestep * batch_n + face_in_batch]
+        std::vector<float> flux_all(static_cast<size_t>(total_time_steps) * batch_n);
+        for (int t = 0; t < total_time_steps; ++t) {
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t idx = batch_start + f;
+                // flux[idx] is the pre-combined flux for this face (indexed by position in face_indices)
+                flux_all[t * batch_n + f] = static_cast<float>(flux[idx][t]);
+            }
+        }
+
+        // Run persistent kernel
+        std::vector<float> output_temps;
+        solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
+
+        // Copy results back to surface_temps (transpose from timestep-major to face-major)
+        for (size_t f = 0; f < batch_n; ++f) {
+            size_t idx = batch_start + f;
+            int face_idx = face_indices[idx];
+            for (int t = 0; t < total_time_steps; ++t) {
+                surface_temps[face_idx][t] = static_cast<double>(output_temps[t * batch_n + f]);
+            }
+        }
+    }
+
+    return true;
+}
+
+#else
+// Stubs when OpenCL is not available
+bool runThermalModelsForAllFaces_GPU_Persistent(
+    const std::shared_ptr<Mesh>&,
+    const std::vector<double>&,
+    const std::vector<double>&,
+    const std::vector<double>&,
+    const std::vector<double>&,
+    int,
+    const thermal::Config&,
+    double,
+    double,
+    std::vector<std::vector<double>>*)
+{
+    std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
+              << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
+    return false;
+}
+
+bool runThermalForSelectedFaces_GPU(
+    const std::shared_ptr<Mesh>&,
+    const std::vector<int>&,
+    const std::vector<std::vector<double>>&,
+    const std::vector<double>&,
+    int,
+    const thermal::Config&,
+    std::vector<std::vector<double>>&)
+{
+    std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
+              << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
+    return false;
+}
+#endif  // PTM_GPU_OPENCL
+
 // Add checkpoint saving
 void saveCheckpoint(
     const std::string& checkpoint_file,
@@ -1570,6 +3160,275 @@ void saveCheckpoint(
     std::cout << "Checkpoint saved with " << count << " faces" << std::endl;
 }
 
+// ===== Helper implementations =====
+static std::vector<std::tuple<std::string,double,double>> readLocationsCSV(const std::string& filename) {
+    std::vector<std::tuple<std::string,double,double>> out;
+    std::ifstream in(filename);
+    if (!in.is_open()) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+        // normalize delimiters
+        for (char& c : line) { if (c=='\t') c = ','; }
+        std::stringstream ss(line);
+        std::string a,b,c;
+        if (!std::getline(ss,a,',')) continue;
+        if (!std::getline(ss,b,',')) {
+            // maybe "lat lon"
+            std::stringstream ws(line);
+            double lat, lon;
+            if (ws >> lat >> lon) out.emplace_back("", lat, lon);
+            continue;
+        }
+        if (!std::getline(ss,c,',')) {
+            // assume a=lat, b=lon
+            try {
+                double lat = std::stod(a);
+                double lon = std::stod(b);
+                out.emplace_back("", lat, lon);
+            } catch (...) {}
+            continue;
+        }
+        // a=name, b=lat, c=lon
+        try {
+            double lat = std::stod(b);
+            double lon = std::stod(c);
+            out.emplace_back(a, lat, lon);
+        } catch (...) {}
+    }
+    return out;
+}
+
+static std::vector<double> readDepthsFile(const std::string& filename) {
+    std::vector<double> d;
+    std::ifstream in(filename);
+    if (!in.is_open()) return d;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+        try {
+            double z = std::stod(line);
+            if (z >= 0.0) d.push_back(z);
+        } catch (...) {}
+    }
+    return d;
+}
+
+static int findNearestFaceIndexByLatLon(const std::shared_ptr<Mesh>& mesh, double lat_deg, double lon_deg) {
+    if (!mesh || mesh->faces.empty() || mesh->latitudes.size() != mesh->faces.size()) return -1;
+    auto normLon = [](double L) {
+        while (L >= 180.0) L -= 360.0;
+        while (L <  -180.0) L += 360.0;
+        return L;
+    };
+    lon_deg = normLon(lon_deg);
+    double best = 1e300; int best_idx = -1;
+    for (size_t i = 0; i < mesh->faces.size(); ++i) {
+        double dlat = (mesh->latitudes[i] - lat_deg);
+        double dlon = normLon(mesh->longitudes[i] - lon_deg);
+        double dist2 = dlat*dlat + dlon*dlon;
+        if (dist2 < best) { best = dist2; best_idx = static_cast<int>(i); }
+    }
+    return best_idx;
+}
+
+static std::vector<std::vector<double>> runThermalModelDepthSeries(
+    const std::vector<double>& flux_values,
+    const std::vector<double>& times,
+    double latitude_deg,
+    const thermal::Config& config,
+    const std::vector<double>& depths_m,
+    int equilibration_steps,
+    const thermal::Planet& planet)
+{
+    // Build flux array [2 x N]: times, flux
+    Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
+    for (int i = 0; i < static_cast<int>(times.size()); ++i) {
+        flux_arr(0, i) = times[i];
+        flux_arr(1, i) = (i < static_cast<int>(flux_values.size())) ? flux_values[i] : 0.0;
+    }
+    // Create and run model
+    thermal::Model mdl(
+        planet,
+        latitude_deg * M_PI / 180.0,
+        times,
+        flux_arr,
+        config,
+        /*show_progress=*/false
+    );
+    if (equilibration_steps > 0) {
+        mdl.setEquilibrationSteps(equilibration_steps);
+    }
+    mdl.run();
+
+    const auto& z_layers = mdl.profile.getGrid().z;
+    const int Nz = static_cast<int>(z_layers.size());
+    const int Nt = static_cast<int>(times.size());
+    const Eigen::MatrixXd& Tmat = mdl.T;
+    const bool rows_are_layers = (Tmat.rows() == Nz && Tmat.cols() == Nt);
+    const bool cols_are_layers = (Tmat.cols() == Nz && Tmat.rows() == Nt);
+
+    std::vector<std::vector<double>> T_depths;
+    T_depths.resize(depths_m.size(), std::vector<double>(Nt, 0.0));
+
+    if (!rows_are_layers && !cols_are_layers) {
+        // Unexpected shape; fallback to surface only
+        for (size_t k = 0; k < depths_m.size(); ++k) {
+            for (int t = 0; t < Nt; ++t) {
+                double Ts = rows_are_layers ? Tmat(0, t) : (cols_are_layers ? Tmat(t, 0) : 0.0);
+                T_depths[k][t] = Ts;
+            }
+        }
+        return T_depths;
+    }
+
+    // For each depth, interpolate between adjacent layers
+    for (size_t k = 0; k < depths_m.size(); ++k) {
+        const double zq = depths_m[k];
+        if (zq <= z_layers.front()) {
+            for (int t = 0; t < Nt; ++t) T_depths[k][t] = rows_are_layers ? Tmat(0, t) : Tmat(t, 0);
+            continue;
+        }
+        if (zq >= z_layers.back()) {
+            // Extrapolate using Fourier's law: dT/dz = Qb / k
+            // T(z) = T_bottom + Qb * (z - z_bottom) / k_bottom
+            int j = Nz - 1;
+            const double z_bottom = z_layers.back();
+            const double Qb = planet.Qb;  // Interior heat flux (W/m²)
+            const auto& k_vec = mdl.profile.getGrid().k;
+            const double k_bottom = (k_vec.size() > 0) ? k_vec.back() : planet.kd;
+            const double dz_extra = zq - z_bottom;
+            const double dT_extrapolate = (k_bottom > 0.0) ? (Qb * dz_extra / k_bottom) : 0.0;
+
+            for (int t = 0; t < Nt; ++t) {
+                double T_bottom = rows_are_layers ? Tmat(j, t) : Tmat(t, j);
+                T_depths[k][t] = T_bottom + dT_extrapolate;
+            }
+            continue;
+        }
+        int j = 0;
+        while (j + 1 < Nz && z_layers[j + 1] < zq) ++j;
+        int jp = std::min(j + 1, Nz - 1);
+        const double tfrac = (z_layers[jp] > z_layers[j]) ? ((zq - z_layers[j]) / (z_layers[jp] - z_layers[j])) : 0.0;
+        for (int t = 0; t < Nt; ++t) {
+            const double Tj  = rows_are_layers ? Tmat(j,  t) : Tmat(t, j);
+            const double Tjp = rows_are_layers ? Tmat(jp, t) : Tmat(t, jp);
+            T_depths[k][t] = Tj + (Tjp - Tj) * tfrac;
+        }
+    }
+    return T_depths;
+}
+
+static bool writeLocationDepthCSV(const std::string& out_path,
+                           const std::string& location_name,
+                           const std::vector<std::string>& time_strings,
+                           const std::vector<double>& depths_m,
+                           const std::vector<std::vector<double>>& T_depths)
+{
+    if (depths_m.size() != T_depths.size()) return false;
+    std::ofstream out(out_path);
+    if (!out.is_open()) return false;
+
+    out << "# Location: " << (location_name.empty() ? "unnamed" : location_name) << "\n";
+    out << "time";
+    out << std::fixed;
+    for (double z : depths_m) out << ",T(z=" << std::setprecision(3) << z << " m)";
+    out << "\n";
+
+    const size_t Nt = time_strings.size();
+    for (size_t t = 0; t < Nt; ++t) {
+        out << time_strings[t];
+        for (size_t k = 0; k < depths_m.size(); ++k) {
+            double Tv = (t < T_depths[k].size()) ? T_depths[k][t] : 0.0;
+            out << "," << std::setprecision(6) << Tv;
+        }
+        out << "\n";
+    }
+    out.flush();
+    return true;
+}
+
+// Helper: generate depth profile plots using Python script
+static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path) {
+    // Find the Python script relative to the executable
+    // Expected location: <project_root>/src/python/plot_depth_profiles.py
+    // The executable is typically in <project_root>/build/bin/
+
+    std::filesystem::path exe_path(executable_path);
+    std::filesystem::path project_root;
+
+    // Try to find project root by looking for src/python directory
+    std::filesystem::path search_path = exe_path.parent_path();
+    for (int i = 0; i < 5; ++i) {  // Search up to 5 levels
+        if (std::filesystem::exists(search_path / "src" / "python" / "plot_depth_profiles.py")) {
+            project_root = search_path;
+            break;
+        }
+        search_path = search_path.parent_path();
+        if (search_path.empty() || search_path == search_path.root_path()) break;
+    }
+
+    if (project_root.empty()) {
+        std::cerr << "Warning: Could not find plot_depth_profiles.py script" << std::endl;
+        return false;
+    }
+
+    std::filesystem::path script_path = project_root / "src" / "python" / "plot_depth_profiles.py";
+
+    // Check if Python is available
+    int python_check = std::system("python3 --version > /dev/null 2>&1");
+    std::string python_cmd = (python_check == 0) ? "python3" : "python";
+
+    // Build command
+    std::ostringstream cmd;
+    cmd << python_cmd << " \"" << script_path.string() << "\" "
+        << "--directory \"" << csv_dir << "\" "
+        << "--format png --dpi 150 --style paper";
+
+    std::cout << "Generating depth profile plots..." << std::endl;
+
+    int result = std::system(cmd.str().c_str());
+    if (result != 0) {
+        std::cerr << "Warning: Plot generation failed (exit code " << result << ")" << std::endl;
+        std::cerr << "  You can manually run: " << cmd.str() << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// Helper: compute per-face visible albedos once (uses map if available)
+std::vector<double> computeFaceAlbedos(
+    const std::shared_ptr<Mesh>& mesh,
+    std::shared_ptr<ptm::SpatialMap> albedo_map,
+    double default_visible_albedo)
+{
+    const size_t num_faces = mesh->faces.size();
+    std::vector<double> face_albedos(num_faces, default_visible_albedo);
+
+    if (albedo_map && albedo_map->isValid()
+        && mesh->latitudes.size() == num_faces
+        && mesh->longitudes.size() == num_faces)
+    {
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < num_faces; ++f) {
+            double lon = mesh->longitudes[f];
+            while (lon < 0) lon += 360.0;
+            while (lon >= 360.0) lon -= 360.0;
+            double lat = mesh->latitudes[f];
+            // Use same convention as elsewhere: maps expect -latitude
+            double v = albedo_map->getValue(lon, -lat);
+            if (v == albedo_map->getMissingValue() || !std::isfinite(v) || v <= 0.0 || v >= 1.0) {
+                v = default_visible_albedo;
+            }
+            face_albedos[f] = v;
+        }
+    }
+    return face_albedos;
+}
+
 // Helper function to adjust start time
 std::string calculateAdjustedStartTime(const std::string& iso_time, double days_offset) {
     // Parse the ISO time string to get seconds since J2000
@@ -1594,129 +3453,180 @@ bool exportLocationIlluminationAndTemperature(
     const std::vector<double>& direct_solar_values,
     const std::vector<double>& primary_reflected_values,
     const std::vector<double>& primary_ir_values,
-    const std::vector<std::vector<double>>& surface_temps,  // Add surface temperature data
+    const std::vector<std::vector<double>>& surface_temps,
     const std::vector<std::string>& time_strings,
     int time_steps) {
-    
-    // Reuse existing code to read locations and find facets
-    std::cout << "Attempting to open locations file: " << locations_file << std::endl;
-    std::ifstream input(locations_file);
-    if (!input.is_open()) {
-        std::cerr << "Failed to open locations file: " << locations_file << std::endl;
+    // Basic validations
+    if (!mesh) {
+        std::cerr << "exportLocationIlluminationAndTemperature: mesh is null" << std::endl;
         return false;
     }
-    
-    // Parse locations
-    std::vector<std::pair<double, double>> locations;
+    const size_t F = mesh->faces.size();
+    if (F == 0) {
+        std::cerr << "exportLocationIlluminationAndTemperature: mesh has no faces" << std::endl;
+        return false;
+    }
+    if (time_steps <= 0) {
+        std::cerr << "exportLocationIlluminationAndTemperature: invalid time_steps" << std::endl;
+        return false;
+    }
+
+    // Read locations first via CSV; fallback to whitespace format
     std::vector<std::string> location_names;
-    
-    std::string line;
-    while (std::getline(input, line)) {
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') {
-            continue;
+    std::vector<std::pair<double,double>> locations;
+    std::cout << "Attempting to open locations file: " << locations_file << std::endl;
+
+    auto loc_csv = readLocationsCSV(locations_file);
+    if (!loc_csv.empty()) {
+        for (const auto& tup : loc_csv) {
+            location_names.push_back(std::get<0>(tup));
+            locations.emplace_back(std::get<1>(tup), std::get<2>(tup));
         }
-        
-        std::istringstream iss(line);
-        double lat, lon;
-        std::string name;
-        
-        if (!(iss >> lat >> lon)) {
-            std::cerr << "Error parsing location: " << line << std::endl;
-            continue;
+    } else {
+        std::ifstream input(locations_file);
+        if (!input.is_open()) {
+            std::cerr << "Failed to open locations file: " << locations_file << std::endl;
+            return false;
         }
-        
-        // Get name if present, otherwise use coordinates
-        std::getline(iss >> std::ws, name);
-        if (name.empty()) {
-            std::ostringstream name_ss;
-            name_ss << "Location_" << lat << "_" << lon;
-            name = name_ss.str();
-        }
-        
-        locations.emplace_back(lat, lon);
-        location_names.push_back(name);
-    }
-    
-    // Find closest mesh facet for each location (same as before)
-    std::vector<size_t> facet_indices(locations.size());
-    for (size_t i = 0; i < locations.size(); i++) {
-        const auto& location = locations[i];
-        double min_distance = std::numeric_limits<double>::max();
-        size_t closest_facet = 0;
-        
-        // Find the facet with the closest center to our location
-        for (size_t f = 0; f < mesh->faces.size(); f++) {
-            double facet_lat = mesh->latitudes[f];
-            double facet_lon = mesh->longitudes[f];
-            
-            // Simple spherical distance calculation
-            double dlat = facet_lat - location.first;
-            double dlon = facet_lon - location.second;
-            while (dlon > 180.0) dlon -= 360.0;
-            while (dlon < -180.0) dlon += 360.0;
-            
-            double distance = std::sqrt(dlat*dlat + dlon*dlon);
-            
-            if (distance < min_distance) {
-                min_distance = distance;
-                closest_facet = f;
+        std::cout << "Successfully opened locations file" << std::endl;
+
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.empty()) continue;
+            size_t start = line.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
+            if (line[start] == '#') continue;
+
+            std::istringstream iss(line);
+            double lat = 0.0, lon = 0.0;
+            if (!(iss >> lat >> lon)) {
+                // Try CSV "name,lat,lon"
+                std::string token;
+                std::vector<std::string> parts;
+                std::istringstream iss2(line);
+                while (std::getline(iss2, token, ',')) {
+                    size_t a = token.find_first_not_of(" \t\r\n");
+                    size_t b = token.find_last_not_of(" \t\r\n");
+                    parts.push_back((a == std::string::npos) ? "" : token.substr(a, b - a + 1));
+                }
+                if (parts.size() >= 3) {
+                    try {
+                        const std::string name = parts[0];
+                        lat = std::stod(parts[1]);
+                        lon = std::stod(parts[2]);
+                        locations.emplace_back(lat, lon);
+                        location_names.push_back(name);
+                        continue;
+                    } catch (...) {
+                        std::cerr << "Error parsing location: " << line << std::endl;
+                        continue;
+                    }
+                }
+                std::cerr << "Error parsing location: " << line << std::endl;
+                continue;
             }
+            std::string name;
+            std::getline(iss >> std::ws, name);
+            if (name.empty()) {
+                std::ostringstream name_ss;
+                name_ss << "Location_" << std::fixed << std::setprecision(6) << lat << "_" << lon;
+                name = name_ss.str();
+            }
+            locations.emplace_back(lat, lon);
+            location_names.push_back(name);
         }
-        
-        facet_indices[i] = closest_facet;
-        std::cout << "Location " << location_names[i] << " (" << location.first << ", " << location.second 
-                  << ") mapped to facet " << closest_facet << " at (" 
-                  << mesh->latitudes[closest_facet] << ", " << mesh->longitudes[closest_facet] << ")" << std::endl;
     }
-    
-    // Open output file
+
+    if (locations.empty()) {
+        std::cerr << "No valid locations found in file" << std::endl;
+        return false;
+    }
+
+    // Map locations
+    std::vector<size_t> facet_indices;
+    facet_indices.reserve(locations.size());
+    for (size_t i = 0; i < locations.size(); ++i) {
+        const auto& ll = locations[i];
+        int face_idx = findNearestFaceIndexByLatLon(mesh, ll.first, ll.second);
+        if (face_idx < 0 || static_cast<size_t>(face_idx) >= F) {
+            std::cerr << "Warning: Could not map location '" << location_names[i]
+                      << "' (" << std::fixed << std::setprecision(9) << ll.first
+                      << ", " << ll.second << ") to a mesh face; skipping." << std::endl;
+            continue;
+        }
+        facet_indices.push_back(static_cast<size_t>(face_idx));
+        std::cout << "Location " << location_names[i] << " (" << std::fixed << std::setprecision(9)
+                  << ll.first << ", " << ll.second << ") mapped to facet " << face_idx << " at ("
+                  << std::fixed << std::setprecision(12)
+                  << mesh->latitudes[static_cast<size_t>(face_idx)] << ", "
+                  << mesh->longitudes[static_cast<size_t>(face_idx)] << ")" << std::endl;
+    }
+
+    if (facet_indices.empty()) {
+        std::cerr << "No locations could be mapped to faces" << std::endl;
+        return false;
+    }
+
+    // Open output
     std::ofstream output(output_file);
     if (!output.is_open()) {
         std::cerr << "Failed to open output file: " << output_file << std::endl;
         return false;
     }
-    
-    // Modified CSV header to include temperature
+
+    // Header
     output << "Time";
     for (const auto& name : location_names) {
         output << "," << name << "_Total";
         output << "," << name << "_DirectSolar";
         output << "," << name << "_PrimaryReflected";
         output << "," << name << "_PrimaryIR";
-        output << "," << name << "_Temperature";  // Add temperature column
+        output << "," << name << "_Ts";
     }
-    output << std::endl;
-    
-    // Write data including temperature
-    for (int t = 0; t < time_steps; t++) {
-        output << time_strings[t];
-        
-        for (size_t i = 0; i < locations.size(); i++) {
-            size_t facet_idx = facet_indices[i];
-            size_t idx = facet_idx * time_steps + t;
-            
-            // Write illumination data
-            output << "," << illumination_values[idx];
-            output << "," << direct_solar_values[idx];
-            output << "," << primary_reflected_values[idx];
-            output << "," << primary_ir_values[idx];
-            
-            // Add temperature data if available
-            if (facet_idx < surface_temps.size() && t < surface_temps[facet_idx].size()) {
-                output << "," << surface_temps[facet_idx][t];
-            } else {
-                output << ",50.0";  // Default temperature if not available
+    output << "\n";
+
+    auto get_val = [&](const std::vector<double>& v, size_t f, int t) -> double {
+        if (v.empty()) return 0.0;
+        const size_t stride = static_cast<size_t>(time_steps);
+        const size_t idx = f * stride + static_cast<size_t>(t);
+        return (idx < v.size()) ? v[idx] : 0.0;
+    };
+
+    // Rows
+    for (int t = 0; t < time_steps; ++t) {
+        const std::string ts = (static_cast<size_t>(t) < time_strings.size())
+                               ? time_strings[static_cast<size_t>(t)]
+                               : std::to_string(t);
+        output << ts;
+
+        for (size_t i = 0; i < facet_indices.size(); ++i) {
+            const size_t f = facet_indices[i];
+            if (f >= F) {
+                output << ",0,0,0,0,0";
+                continue;
             }
+            const double tot = get_val(illumination_values, f, t);
+            const double dir = get_val(direct_solar_values, f, t);
+            const double rfl = get_val(primary_reflected_values, f, t);
+            const double pir = get_val(primary_ir_values, f, t);
+
+            double Ts = 0.0;
+            if (!surface_temps.empty() && f < surface_temps.size()) {
+                const auto& row = surface_temps[f];
+                if (static_cast<size_t>(t) < row.size()) {
+                    Ts = row[static_cast<size_t>(t)];
+                }
+            }
+            output << "," << tot << "," << dir << "," << rfl << "," << pir << "," << Ts;
         }
-        output << std::endl;
+        output << "\n";
     }
-    
+
     std::cout << "Location illumination and temperature data written to " << output_file << std::endl;
     return true;
 }
 
-// Add this declaration to the function prototypes section
+// Run the thermal model for a face with matched times
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -1986,25 +3896,44 @@ bool writeThermalVTK(
     return true;
 }
 
+// Validate the temperature matrix dimensions
+static bool validateTemperatureMatrix(const std::vector<std::vector<double>>& temps,
+                                      size_t expected_faces,
+                                      int expected_steps)
+{
+    if (temps.size() != expected_faces) {
+        std::cerr << "[Error] surface_temps rows (" << temps.size()
+                  << ") != faces (" << expected_faces << ")\n";
+        return false;
+    }
+    for (size_t f = 0; f < temps.size(); ++f) {
+        if ((int)temps[f].size() != expected_steps) {
+            std::cerr << "[Error] surface_temps[" << f << "] length ("
+                      << temps[f].size() << ") != expected steps ("
+                      << expected_steps << ")\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 // Fix unreasonable albedo values
 void fixOutOfRangeAlbedos(
     std::vector<double>& face_albedos,
     const std::shared_ptr<Mesh>& mesh,
-    double default_visible_albedo) {
+    double default_visible_albedo) {  // This should be planet.albedo
     
     const size_t num_faces = face_albedos.size();
     if (num_faces == 0) return;
     
     // Define reasonable bounds for albedo
-    const double min_reasonable_albedo = 0.01;  // Minimum reasonable albedo for body's surface
-    const double max_reasonable_albedo = 0.99;  // Maximum reasonable albedo for body's surface
+    const double min_reasonable_albedo = MIN_VALID_ALBEDO;
+    const double max_reasonable_albedo = MAX_VALID_ALBEDO;
     
     // Identify faces with unreasonable albedo values
     std::vector<size_t> problematic_faces;
     for (size_t f = 0; f < num_faces; f++) {
-        // Check if albedo is outside reasonable range or set to default
-        if (face_albedos[f] == default_visible_albedo || 
-            face_albedos[f] < min_reasonable_albedo || 
+        if (face_albedos[f] < min_reasonable_albedo || 
             face_albedos[f] > max_reasonable_albedo) {
             problematic_faces.push_back(f);
         }
@@ -2018,81 +3947,14 @@ void fixOutOfRangeAlbedos(
     std::cout << "Found " << problematic_faces.size() << " faces with unreasonable albedo values ("
               << (100.0 * problematic_faces.size() / num_faces) << "%)." << std::endl;
     
-    // Fix each problematic face using valid neighbors
-    int fixed_count = 0;
-    
-    #pragma omp parallel for reduction(+:fixed_count)
-    for (size_t i = 0; i < problematic_faces.size(); i++) {
-        size_t f = problematic_faces[i];
-        
-        // Find valid neighbors with reasonable albedos
-        std::vector<std::pair<size_t, double>> valid_neighbors; // face_id, distance
-        
-        for (size_t other_f = 0; other_f < num_faces; other_f++) {
-            // Skip if it's the same face or another problematic face
-            if (other_f == f || 
-                face_albedos[other_f] == default_visible_albedo || 
-                face_albedos[other_f] < min_reasonable_albedo || 
-                face_albedos[other_f] > max_reasonable_albedo) {
-                continue;
-            }
-            
-            // Calculate spherical distance between face centers
-            double dlat = mesh->latitudes[f] - mesh->latitudes[other_f];
-            double dlon = mesh->longitudes[f] - mesh->longitudes[other_f];
-            
-            // Handle longitude wrapping
-            if (dlon > 180.0) dlon -= 360.0;
-            if (dlon < -180.0) dlon += 360.0;
-            
-            // Simple spherical distance approximation
-            double dist = std::sqrt(dlat*dlat + dlon*dlon);
-            
-            // Only consider neighbors within a reasonable distance (30 degrees)
-            if (dist <= 30.0) {
-                valid_neighbors.push_back({other_f, dist});
-            }
-        }
-        
-        // If we found valid neighbors, compute weighted average
-        if (!valid_neighbors.empty()) {
-            // Sort by distance (closest first)
-            std::sort(valid_neighbors.begin(), valid_neighbors.end(), 
-                    [](const auto& a, const auto& b) { return a.second < b.second; });
-            
-            // Take up to 12 closest neighbors
-            const size_t max_neighbors = 12;
-            if (valid_neighbors.size() > max_neighbors) {
-                valid_neighbors.resize(max_neighbors);
-            }
-            
-            // Calculate inverse-distance weighted average
-            double sum_weights = 0.0;
-            double weighted_sum = 0.0;
-            
-            for (const auto& [neighbor_f, dist] : valid_neighbors) {
-                // Add a small epsilon to avoid division by zero
-                double weight = 1.0 / (dist + 0.001);
-                sum_weights += weight;
-                weighted_sum += weight * face_albedos[neighbor_f];
-            }
-            
-            // Update albedo with weighted average
-            face_albedos[f] = weighted_sum / sum_weights;
-            fixed_count++;
-        }
+    // Fix by spatial interpolation from nearby valid faces
+    for (size_t idx : problematic_faces) {
+        // For now, just use the default albedo
+        // In future, could implement spatial interpolation from neighbors
+        face_albedos[idx] = default_visible_albedo;
     }
     
-    // Report results
-    std::cout << "Fixed " << fixed_count << " faces with unreasonable albedo values ("
-              << (100.0 * fixed_count / problematic_faces.size()) << "% of problematic faces)." << std::endl;
-    
-    // Check if any problematic faces remain
-    int remaining_bad = problematic_faces.size() - fixed_count;
-    if (remaining_bad > 0) {
-        std::cout << "Warning: " << remaining_bad << " faces still have unreasonable albedo values." << std::endl;
-        std::cout << "Consider increasing the search radius or using a different fixing strategy." << std::endl;
-    }
+    std::cout << "Fixed albedo values using planet default: " << default_visible_albedo << std::endl;
 }
 
 // Add this function to your declarations section
@@ -2122,61 +3984,125 @@ bool validateMesh(const std::shared_ptr<ptm::Mesh>& mesh) {
     return true;
 }
 
-// In your function that displays usage information
+// Display usage information
 void showUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n\n";
     
-    std::cout << "Time and Simulation Options:\n";
-    std::cout << "  --body, -b <name>      Set the planetary body (EUROPA, MOON, MERCURY, etc.)" << std::endl;
-    std::cout << "  --start TIME         : Start time in ISO format (default: 2025-01-01T00:00:00)\n";
-    std::cout << "  --duration DAYS      : Simulation duration in days (default: 3.55)\n";
-    std::cout << "  --timesteps N        : Number of time steps (default: 72)\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Configuration File Options (NEW!)\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --config FILE              Load parameters from YAML config file\n";
+    std::cout << "  --generate-template [FILE] Generate template config file\n";
+    std::cout << "                             (default: ptm_config_template.yaml)\n";
+    std::cout << "  --help                     Show this help message\n\n";
     
-    std::cout << "\nMesh Options:\n";
-    std::cout << "  --mesh-resolution <n> : Set mesh resolution (default: 5)\n";
-    std::cout << "  --mesh-file <file>    : Import triangulated mesh from file (OBJ, PLY, VTK)\n";
-    std::cout << "  --mesh-scale <factor> : Scale factor for imported mesh (default: 1.0)\n";
-    std::cout << "  --export-basic-mesh   : Export basic mesh to VTK format\n";
+    std::cout << "Note: Command-line arguments OVERRIDE config file values.\n";
+    std::cout << "Example usage:\n";
+    std::cout << "  " << programName << " --config my_sim.yaml\n";
+    std::cout << "  " << programName << " --config my_sim.yaml --duration 7.1 --timesteps 144\n";
+    std::cout << "  " << programName << " --generate-template europa_template.yaml\n\n";
     
-    std::cout << "\nThermal Model Options:\n";
-    std::cout << "  --thermal-mesh        : Run thermal model for all mesh faces\n";
-    std::cout << "  --thermal-threads N   : Number of parallel threads for thermal calculation (default: auto)\n";
-    std::cout << "  --equilibration-orbits N : Number of orbits for thermal equilibration (default: 10)\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Time and Simulation Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --body, -b <name>          Set planetary body (EUROPA, MOON, MERCURY, etc.)\n";
+    std::cout << "  --start TIME               Start time in ISO format (default: 2025-01-01T00:00:00)\n";
+    std::cout << "  --duration DAYS            Simulation duration in days (default: 3.55)\n";
+    std::cout << "  --timesteps N              Number of time steps (default: 72)\n\n";
     
-    std::cout << "\nIllumination Options:\n";
-    std::cout << "  --no-primary-reflection : Disable reflected solar radiation from primary body\n";
-    std::cout << "  --albedo-map FILE     : Path to albedo map file\n";
-    std::cout << "  --thermal-inertia-map FILE : Path to thermal inertia map file\n";
-    std::cout << "  --albedo-maps-directory DIR : Path to albedo maps directory (default: data/albedo_maps)\n";
-    std::cout << "  --no-batch            : Disable SIMD batch processing for illumination\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Mesh Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --resolution <n>           Set mesh resolution for global models (default: 5)\n";
+    std::cout << "  --topo                     Use topographic mesh (requires pre-generated meshes)\n";
+    std::cout << "  --topo-dir <dir>           Directory containing pre-computed topographic meshes\n";
+    std::cout << "  --mesh-file <file>         Import triangulated mesh from file (OBJ, PLY, VTK)\n";
+    std::cout << "  --mesh-scale <factor>      Scale factor for imported mesh (default: 1.0)\n";
+    std::cout << "  --export-basic-mesh        Export basic mesh to VTK format\n\n";
     
-    std::cout << "\nOutput Options:\n";
-    std::cout << "  --output DIR          : Output directory (default: ./output)\n";
-    std::cout << "  --output-format FORMAT  : Output format: 'binary' (default) or 'vtk'" << std::endl;
-    std::cout << "  --include-primary-ir    : Include primary IR data in VTK files (increases file size)" << std::endl;
-    std::cout << "  --vtk-mode MODE        : VTK output mode: 'both' (default), 'thermal', or 'complete'" << std::endl;
-    std::cout << "  --thermal-vtk-file FILE  : Custom filename for thermal VTK output\n";
-    std::cout << "  --complete-vtk-file FILE : Custom filename for complete VTK output\n";    
-    std::cout << "  --positions FILE      : Export body positions to specified file\n";
-    std::cout << "  --locations FILE      : Extract illumination for specific lat/lon points\n";
-    std::cout << "  --location-data FILE  : Specify custom location data file for visualization\n";  // Add this line
-    std::cout << "  --series-output FILE  : Output file for location illumination data (default: illumination_series.csv)\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Thermal Model Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --thermal-mesh             Run thermal model for all mesh faces\n";
+    std::cout << "  --thermal-threads N        Number of parallel threads (default: auto)\n";
+    std::cout << "  --use-simd-batch           Use SIMD batch solver (8 faces in parallel)\n";
+    std::cout << "  --use-gpu-thermal          Use GPU persistent kernel solver (OpenCL)\n";
+    std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
+    std::cout << "  --thermal-inertia-map FILE Path to thermal inertia map file\n";
+    std::cout << "  --no-statistics            Disable computation of statistics\n";
+    std::cout << "  --integration-days DAYS    Integration window in days\n";
+    std::cout << "  --integration-steps N      Integration steps override\n";
+    std::cout << "  --integration-offset-days  Offset for integration window (days)\n";
+    std::cout << "  --integration-offset-steps Offset for integration window (steps)\n";
+    std::cout << "  --thermal-debug            Enable thermal debug output for equatorial face\n";
+    std::cout << "  --thermal-debug-lat DEG    Max latitude for debug face selection (default: 10)\n";
+    std::cout << "  --thermal-m N              Layers in upper skin depth (default: 10)\n";
+    std::cout << "  --thermal-n N              Layer growth factor (default: 15)\n";
+    std::cout << "  --thermal-b N              Skin depths to bottom layer (default: 8)\n\n";
+
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Radiation Exchange Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --radiation-exchange       Enable inter-face radiation exchange\n";
+    std::cout << "  --rad-hmatrix              Use H-matrix compression for large meshes\n";
+    std::cout << "  --rad-use-gpu              Use GPU for radiosity solver (OpenCL)\n";
+    std::cout << "  --rad-verbose              Print detailed radiation progress\n";
+    std::cout << "  --rad-view-factor-file F   Save/load view factors from file\n";
+    std::cout << "  --rad-coupling-iter N      Max coupling iterations (default: 10)\n";
+    std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 2.0)\n";
+    std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] (default: 0.1)\n";
+    std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
+    std::cout << "  --rad-use-svd              Use SVD compression instead of ACA (slower)\n";
+    std::cout << "  --rad-aca-tolerance T      ACA relative tolerance (default: 0.001)\n";
+    std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n\n";
+
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Illumination Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --no-primary-reflection    Disable reflected solar radiation from primary\n";
+    std::cout << "  --no-batch                 Disable SIMD batch processing for illumination\n";
+    std::cout << "  --albedo-map <file>        Custom albedo FITS map file\n";
+    std::cout << "  --albedo-maps-directory    Directory containing albedo maps\n";
+    std::cout << "  --shadow-flux              Enable shadow/crater flux enhancement\n";
+    std::cout << "  --crater-dd-ratio          Crater diameter/depth ratio (default: 8.0)\n";
+    std::cout << "  --positions FILE           Export body positions to specified file\n\n";
     
-    std::cout << "\nVisualization Options:\n";
-    std::cout << "  --visualization       : Create visualization of the results\n";
-    std::cout << "  --camera-distance N   : Camera distance for visualization (default: 5.0)\n";
-    std::cout << "  --camera-lat N        : Camera latitude for visualization (default: 30.0)\n";
-    std::cout << "  --camera-lon N        : Camera longitude for visualization (default: 0.0)\n";
-    std::cout << "  --emission-angle N    : Alternative to camera position - set emission angle\n";
-    std::cout << "  --azimuth N           : Used with emission-angle - set azimuth angle\n";
-    std::cout << "  --animation-width N   : Set animation width in pixels (default: 1024)\n";
-    std::cout << "  --animation-height N  : Set animation height in pixels (default: 768)\n";
-    std::cout << "  --no-maps             : Don't generate cylindrical map projections\n";
-    std::cout << "  --save-frames         : Save individual frames during visualization\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Output Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --output DIR               Output directory (default: ./output)\n";
+    std::cout << "  --output-format FORMAT     Output format: 'binary' (default) or 'vtk'\n";
+    std::cout << "  --include-primary-ir       Include primary IR data in VTK files\n";
+    std::cout << "  --vtk-mode MODE            VTK mode: 'both', 'thermal', or 'complete'\n";
+    std::cout << "  --thermal-vtk-file FILE    Custom filename for thermal VTK output\n";
+    std::cout << "  --complete-vtk-file FILE   Custom filename for complete VTK output\n";
+    std::cout << "  --locations FILE           Extract illumination for specific lat/lon points\n";
+    std::cout << "  --depths FILE              Depths file for thermal profile output (meters, one per line)\n";
+    std::cout << "  --no-depth-plots           Skip automatic plot generation for depth profiles\n";
+    std::cout << "  --location-data FILE       Specify custom location data file\n";
+    std::cout << "  --series-output FILE       Location illumination time series output\n";
+    std::cout << "  --no-maps                  Disable map generation\n\n";
     
-    std::cout << "\nOther Options:\n";
-    std::cout << "  --verbose             : Enable verbose output\n";
-    std::cout << "  --help                : Display this help message and exit\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Visualization Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --visualization            Create visualization of the results\n";
+    std::cout << "  --animation-width N        Animation width in pixels (default: 1024)\n";
+    std::cout << "  --animation-height N       Animation height in pixels (default: 768)\n";
+    std::cout << "  --camera-distance N        Camera distance for visualization (default: 5.0)\n";
+    std::cout << "  --camera-lat N             Camera latitude in degrees (default: 30.0)\n";
+    std::cout << "  --camera-lon N             Camera longitude in degrees (default: 0.0)\n";
+    std::cout << "  --emission-angle N         Alternative: set emission angle\n";
+    std::cout << "  --azimuth N                Azimuth angle for emission angle mode\n";
+    std::cout << "  --save-frames              Save individual visualization frames\n\n";
+    
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  Advanced Options\n";
+    std::cout << "═══════════════════════════════════════════════════════════════\n";
+    std::cout << "  --verbose                  Enable verbose output\n\n";
+    
+    std::cout << "For detailed documentation and examples, see the README or run:\n";
+    std::cout << "  " << programName << " --generate-template\n\n";
 }
 
 std::string createDefaultLocationsFile(const std::string& output_dir) {
@@ -2195,12 +4121,12 @@ std::string createDefaultLocationsFile(const std::string& output_dir) {
         
         // Format: latitude longitude location_name (space-separated)
         file << "# lat lon name\n";
-        file << "0.0 0.0 Sub_Jupiter\n";      // Equator at 0° longitude (sub-Jupiter point)
-        file << "0.0 90.0 Trailing\n";        // Equator at 90°E (trailing hemisphere)
-        file << "0.0 180.0 Anti_Jupiter\n";   // Equator at 180° (anti-Jupiter point)
-        file << "0.0 270.0 Leading\n";        // Equator at 270°E (leading hemisphere)
-        file << "45.0 0.0 North_45\n";        // 45°N at 0° longitude
-        file << "-45.0 0.0 South_45\n";       // 45°S at 0° longitude
+        file << "0.0 0.0 Sub_Jupiter\n";      // Equator at 0Â° longitude (sub-Jupiter point)
+        file << "0.0 90.0 Trailing\n";        // Equator at 90Â°E (trailing hemisphere)
+        file << "0.0 180.0 Anti_Jupiter\n";   // Equator at 180Â° (anti-Jupiter point)
+        file << "0.0 270.0 Leading\n";        // Equator at 270Â°E (leading hemisphere)
+        file << "45.0 0.0 North_45\n";        // 45Â°N at 0Â° longitude
+        file << "-45.0 0.0 South_45\n";       // 45Â°S at 0Â° longitude
         file << "85.0 0.0 North_Pole\n";      // Near North Pole
         file << "-85.0 0.0 South_Pole\n";     // Near South Pole
         
@@ -2233,25 +4159,82 @@ std::string generateSimulationFilename(
     return output_dir + "/ptm_" + body_name + "_" + clean_time + "_" + suffix + ".vtk";
 }
 
-// Function to write binary data for a single time step
+// Helper function to write binary data for a single time step
 bool writeBinaryTimeStepFile(
     const std::string& filename,
-    const std::vector<float>& data) {
-    
-    std::ofstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file for writing: " << filename << std::endl;
+    const std::vector<float>& data,
+    bool write_header)
+{
+    try {
+        const uint32_t count = static_cast<uint32_t>(data.size());
+        const size_t payload_bytes = data.size() * sizeof(float);
+        const size_t expected_size = (write_header ? sizeof(uint32_t) : 0) + payload_bytes;
+
+        // Ensure directory exists
+        std::filesystem::create_directories(std::filesystem::path(filename).parent_path());
+
+        const int max_retries = 6;
+        for (int attempt = 1; attempt <= max_retries; ++attempt) {
+            std::string tmp = filename + ".tmp";
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                if (!out.is_open()) {
+                    std::cerr << "[writeBinaryTimeStepFile] open fail attempt " << attempt
+                              << " for " << tmp << " errno=" << errno
+                              << " (" << std::strerror(errno) << ")\n";
+                    goto retry;
+                }
+                if (write_header) {
+                    out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                }
+                if (payload_bytes) {
+                    out.write(reinterpret_cast<const char*>(data.data()),
+                              static_cast<std::streamsize>(payload_bytes));
+                }
+                out.flush();
+                if (!out.good()) {
+                    std::cerr << "[writeBinaryTimeStepFile] stream bad attempt " << attempt
+                              << " for " << tmp << "\n";
+                    goto retry;
+                }
+            }
+            {
+                std::error_code ec;
+                auto sz = std::filesystem::file_size(tmp, ec);
+                if (ec || sz != expected_size) {
+                    std::cerr << "[writeBinaryTimeStepFile] size mismatch attempt " << attempt
+                              << " got=" << (ec ? -1LL : (long long)sz)
+                              << " exp=" << expected_size << " file=" << tmp << "\n";
+                    std::filesystem::remove(tmp, ec);
+                    goto retry;
+                }
+                std::error_code rn;
+                std::filesystem::rename(tmp, filename, rn);
+                if (rn) {
+                    std::cerr << "[writeBinaryTimeStepFile] rename fail attempt " << attempt
+                              << " : " << rn.message() << "\n";
+                    std::filesystem::remove(tmp);
+                    goto retry;
+                }
+            }
+            // Final check
+            {
+                std::error_code ec;
+                auto sz = std::filesystem::file_size(filename, ec);
+                if (!ec && sz == expected_size) return true;
+            }
+        retry:
+            std::this_thread::sleep_for(std::chrono::milliseconds(40 * attempt));
+        }
+        std::cerr << "[writeBinaryTimeStepFile] FAIL writing " << filename << "\n";
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "[writeBinaryTimeStepFile] EXCEPTION: " << e.what() << "\n";
+        return false;
+    } catch (...) {
+        std::cerr << "[writeBinaryTimeStepFile] UNKNOWN EXCEPTION\n";
         return false;
     }
-    
-    // Write number of elements as header (4-byte uint32)
-    uint32_t num_elements = static_cast<uint32_t>(data.size());
-    file.write(reinterpret_cast<char*>(&num_elements), sizeof(uint32_t));
-    
-    // Write data as 32-bit floats
-    file.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
-    
-    return file.good();
 }
 
 // Function to write time steps metadata file
@@ -2262,19 +4245,21 @@ bool writeTimeStepsFile(
     
     std::ofstream file(filename);
     if (!file.is_open()) {
-        std::cerr << "Error: Could not open time steps file for writing: " << filename << std::endl;
+        std::cerr << "[writeTimeStepsFile] ERROR: Cannot open " << filename << "\n";
         return false;
     }
     
-    // Write header
+    if (times.size() != time_strings.size()) {
+        std::cerr << "[writeTimeStepsFile] ERROR: times/time_strings size mismatch\n";
+        return false;
+    }
+
     file << "# Time steps metadata\n";
     file << "# Column 1: Time elapsed from start (seconds)\n";
     file << "# Column 2: UTC time\n";
     
-    // Write time data
     for (size_t i = 0; i < times.size(); i++) {
-        file << std::fixed << std::setprecision(1) << times[i] << "\t" 
-             << time_strings[i] << std::endl;
+        file << std::fixed << std::setprecision(6) << times[i] << "\t" << time_strings[i] << "\n";
     }
     
     return file.good();
@@ -2283,365 +4268,1464 @@ bool writeTimeStepsFile(
 // Function to export mesh to binary PLY format
 bool exportMeshToPLY(
     const std::string& filename,
-    const std::shared_ptr<Mesh>& mesh) {
-    
-    std::ofstream file(filename, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open PLY file for writing: " << filename << std::endl;
+    const std::shared_ptr<Mesh>& mesh) 
+{
+    try {
+        if (!mesh || mesh->vertices.empty() || mesh->faces.empty()) {
+            std::cerr << "[exportMeshToPLY] ERROR: mesh invalid/empty\n";
+            return false;
+        }
+
+        // Ensure face centers exist for per-face lat/lon
+        if (mesh->face_centers.size() != mesh->faces.size()) {
+            auto& centers = const_cast<std::vector<std::array<double,3>>&>(mesh->face_centers);
+            centers.resize(mesh->faces.size());
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < mesh->faces.size(); ++i) {
+                const auto& f = mesh->faces[i];
+                const auto& a = mesh->vertices[f[0]];
+                const auto& b = mesh->vertices[f[1]];
+                const auto& c = mesh->vertices[f[2]];
+                centers[i] = {
+                    (a[0]+b[0]+c[0])/3.0,
+                    (a[1]+b[1]+c[1])/3.0,
+                    (a[2]+b[2]+c[2])/3.0
+                };
+            }
+        }
+
+        std::ofstream file(filename, std::ios::binary);
+        if (!file.is_open()) {
+            std::cerr << "[exportMeshToPLY] ERROR: Cannot open " << filename << "\n";
+            return false;
+        }
+
+        const size_t V = mesh->vertices.size();
+        const size_t F = mesh->faces.size();
+
+        // Header: binary_little_endian, vertices in double precision; faces keep float lat/lon for compatibility
+        file << "ply\n";
+        file << "format binary_little_endian 1.0\n";
+        file << "element vertex " << V << "\n";
+        file << "property double x\n";
+        file << "property double y\n";
+        file << "property double z\n";
+        file << "property double nx\n";
+        file << "property double ny\n";
+        file << "property double nz\n";
+        file << "element face " << F << "\n";
+        file << "property list uchar int vertex_indices\n";
+        file << "property float latitude\n";
+        file << "property float longitude\n";
+        file << "end_header\n";
+
+        // Vertices: write xyz and zero normals as float64 (double)
+        const double zero_normals_d[3] = {0.0, 0.0, 0.0};
+        for (size_t i = 0; i < V; ++i) {
+            const double xyz[3] = {
+                static_cast<double>(mesh->vertices[i][0]),
+                static_cast<double>(mesh->vertices[i][1]),
+                static_cast<double>(mesh->vertices[i][2])
+            };
+            file.write(reinterpret_cast<const char*>(xyz), sizeof(xyz));
+            file.write(reinterpret_cast<const char*>(zero_normals_d), sizeof(zero_normals_d));
+        }
+
+        // Faces: 3 indices + latitude/longitude as float (unchanged layout for the Python reader)
+        for (size_t i = 0; i < F; ++i) {
+            unsigned char count = 3;
+            uint32_t tri[3] = {
+                static_cast<uint32_t>(mesh->faces[i][0]),
+                static_cast<uint32_t>(mesh->faces[i][1]),
+                static_cast<uint32_t>(mesh->faces[i][2])
+            };
+
+            const auto& c = mesh->face_centers[i];
+            double r = std::sqrt(c[0]*c[0]+c[1]*c[1]+c[2]*c[2]);
+            float lat = (r > 0) ? static_cast<float>(std::asin(c[2]/r) * RAD_TO_DEG) : 0.0f;
+            float lon = static_cast<float>(std::atan2(c[1], c[0]) * RAD_TO_DEG);
+
+            file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            file.write(reinterpret_cast<const char*>(tri), sizeof(tri));
+            file.write(reinterpret_cast<const char*>(&lat), sizeof(lat));
+            file.write(reinterpret_cast<const char*>(&lon), sizeof(lon));
+        }
+
+        file.close();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[exportMeshToPLY] EXCEPTION: " << e.what() << "\n";
         return false;
     }
-    
-    // Write PLY header (ASCII part)
+}
+
+// Helper function to export mesh in binary PLY format
+void export_binary_mesh(const std::string& filename, const std::shared_ptr<Mesh>& mesh) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[export_binary_mesh] ERROR: Cannot open " << filename << "\n";
+        return;
+    }
+
+    const size_t V = mesh->vertices.size();
+    const size_t F = mesh->faces.size();
+
+    // Header (double precision vertices/normals; float lat/lon on faces)
     file << "ply\n";
     file << "format binary_little_endian 1.0\n";
-    file << "element vertex " << mesh->vertices.size() << "\n";
-    file << "property float x\n";
-    file << "property float y\n";
-    file << "property float z\n";
-    file << "element face " << mesh->faces.size() << "\n";
+    file << "element vertex " << V << "\n";
+    file << "property double x\n";
+    file << "property double y\n";
+    file << "property double z\n";
+    file << "property double nx\n";
+    file << "property double ny\n";
+    file << "property double nz\n";
+    file << "element face " << F << "\n";
     file << "property list uchar int vertex_indices\n";
-    file << "property float nx\n";
-    file << "property float ny\n";
-    file << "property float nz\n";
     file << "property float latitude\n";
     file << "property float longitude\n";
     file << "end_header\n";
-    
-    // Write vertex data
-    for (const auto& vertex : mesh->vertices) {
-        float x = static_cast<float>(vertex[0]);
-        float y = static_cast<float>(vertex[1]);
-        float z = static_cast<float>(vertex[2]);
-        file.write(reinterpret_cast<char*>(&x), sizeof(float));
-        file.write(reinterpret_cast<char*>(&y), sizeof(float));
-        file.write(reinterpret_cast<char*>(&z), sizeof(float));
+
+    // Vertices (double)
+    const double zero_normals_d[3] = {0.0, 0.0, 0.0};
+    for (size_t i = 0; i < V; ++i) {
+        const double xyz[3] = {
+            static_cast<double>(mesh->vertices[i][0]),
+            static_cast<double>(mesh->vertices[i][1]),
+            static_cast<double>(mesh->vertices[i][2])
+        };
+        file.write(reinterpret_cast<const char*>(xyz), sizeof(xyz));
+        file.write(reinterpret_cast<const char*>(zero_normals_d), sizeof(zero_normals_d));
     }
-    
-    // Write face data
-    for (size_t i = 0; i < mesh->faces.size(); i++) {
-        const auto& face = mesh->faces[i];
-        const auto& normal = mesh->face_normals[i];
-        
-        // Number of vertices in the face (always 3 for triangles)
-        unsigned char num_vertices = 3;
-        file.write(reinterpret_cast<char*>(&num_vertices), sizeof(unsigned char));
-        
-        // Vertex indices
-        int v1 = face[0];
-        int v2 = face[1];
-        int v3 = face[2];
-        file.write(reinterpret_cast<char*>(&v1), sizeof(int));
-        file.write(reinterpret_cast<char*>(&v2), sizeof(int));
-        file.write(reinterpret_cast<char*>(&v3), sizeof(int));
-        
-        // Face normal
-        float nx = static_cast<float>(normal[0]);
-        float ny = static_cast<float>(normal[1]);
-        float nz = static_cast<float>(normal[2]);
-        file.write(reinterpret_cast<char*>(&nx), sizeof(float));
-        file.write(reinterpret_cast<char*>(&ny), sizeof(float));
-        file.write(reinterpret_cast<char*>(&nz), sizeof(float));
-        
-        // Latitude and longitude
-        float lat = static_cast<float>(mesh->latitudes[i]);
-        float lon = static_cast<float>(mesh->longitudes[i]);
-        file.write(reinterpret_cast<char*>(&lat), sizeof(float));
-        file.write(reinterpret_cast<char*>(&lon), sizeof(float));
+
+    // Ensure face_centers exist
+    if (mesh->face_centers.size() != F) {
+        auto& centers = const_cast<std::vector<std::array<double,3>>&>(mesh->face_centers);
+        centers.resize(F);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < F; ++i) {
+            const auto& f = mesh->faces[i];
+            const auto& a = mesh->vertices[f[0]];
+            const auto& b = mesh->vertices[f[1]];
+            const auto& c = mesh->vertices[f[2]];
+            centers[i] = { (a[0]+b[0]+c[0])/3.0, (a[1]+b[1]+c[1])/3.0, (a[2]+b[2]+c[2])/3.0 };
+        }
     }
-    
-    return file.good();
+
+    // Faces (lat/lon float)
+    for (size_t i = 0; i < F; ++i) {
+        unsigned char count = 3;
+        uint32_t tri[3] = {
+            static_cast<uint32_t>(mesh->faces[i][0]),
+            static_cast<uint32_t>(mesh->faces[i][1]),
+            static_cast<uint32_t>(mesh->faces[i][2])
+        };
+
+        const auto& ctr = mesh->face_centers[i];
+        const double r = std::sqrt(ctr[0]*ctr[0] + ctr[1]*ctr[1] + ctr[2]*ctr[2]);
+        float lat = (r > 0.0) ? static_cast<float>(std::asin(ctr[2]/r) * RAD_TO_DEG) : 0.0f;
+        float lon = static_cast<float>(std::atan2(ctr[1], ctr[0]) * RAD_TO_DEG);
+
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        file.write(reinterpret_cast<const char*>(tri), sizeof(tri));
+        file.write(reinterpret_cast<const char*>(&lat), sizeof(lat));
+        file.write(reinterpret_cast<const char*>(&lon), sizeof(lon));
+    }
+
+    file.flush();
+    file.close();
 }
 
+// Helper function to write binary data file for a specific time step
+void write_binary_data_file(const std::string& filename, 
+                           const std::vector<double>& data_array,
+                           size_t num_faces,
+                           int time_step,
+                           int total_time_steps) {
+    // Always write a header with face count, then num_faces float32 values
+    std::filesystem::create_directories(std::filesystem::path(filename).parent_path());
+    std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        throw std::runtime_error("Could not open file for writing: " + filename);
+    }
+
+    // Header: uint32 count = num_faces
+    const uint32_t nfaces = static_cast<uint32_t>(num_faces);
+    file.write(reinterpret_cast<const char*>(&nfaces), sizeof(nfaces));
+
+    // Payload: one float32 per face for this time_step (face-major source layout)
+    for (size_t f = 0; f < num_faces; ++f) {
+        const size_t idx = f * static_cast<size_t>(total_time_steps) + static_cast<size_t>(time_step);
+        float value = 0.0f;
+        if (idx < data_array.size()) {
+            value = static_cast<float>(data_array[idx]);
+        }
+        file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+
+    file.flush();
+    file.close();
+}
+
+// Helper function for safe array indexing
+static inline size_t safeIndex(size_t face, int t, int stride, size_t total_size) {
+    size_t idx = face * static_cast<size_t>(stride) + static_cast<size_t>(t);
+    return (idx < total_size) ? idx : total_size; // returns total_size as sentinel
+}
+
+struct FilteredData {
+    std::vector<double> illumination;
+    std::vector<double> direct;
+    std::vector<double> reflected;
+    std::vector<double> ir;
+    std::vector<std::vector<double>> temps;
+    std::vector<double> times;
+    std::vector<std::string> time_strings;
+    std::vector<std::array<double,3>> sun_pos;
+    std::vector<std::array<double,3>> primary_pos;
+};
+
+static FilteredData filterFaceMajorStable(
+    const std::vector<double>& illum_full,
+    const std::vector<double>& direct_full,
+    const std::vector<double>& refl_full,
+    const std::vector<double>& ir_full,
+    const std::vector<std::vector<double>>& temps_full,
+    const std::vector<double>& times_full,
+    const std::vector<std::string>& time_str_full,
+    const std::vector<std::array<double,3>>& sun_pos_full,
+    const std::vector<std::array<double,3>>& primary_pos_full,
+    size_t face_count,
+    int total_time_steps,
+    int skip_equil_steps,
+    int output_time_steps,
+    bool verbose = false)
+{
+    FilteredData fd;
+
+    // Time/meta slice
+    int start = skip_equil_steps;
+    int end   = std::min(start + output_time_steps, total_time_steps);
+    fd.times.reserve(end - start);
+    fd.time_strings.reserve(end - start);
+    fd.sun_pos.reserve(end - start);
+    fd.primary_pos.reserve(end - start);
+    for (int t = start; t < end; ++t) {
+        fd.times.push_back(times_full[t]);
+        fd.time_strings.push_back(time_str_full[t]);
+        fd.sun_pos.push_back(sun_pos_full[t]);
+        fd.primary_pos.push_back(primary_pos_full[t]);
+    }
+    const int filtered_steps = static_cast<int>(fd.times.size());
+
+    // Allocate flattened face-major arrays
+    size_t out_size = face_count * static_cast<size_t>(filtered_steps);
+    fd.illumination.assign(out_size, 0.0);
+    fd.direct.assign(out_size, 0.0);
+    fd.reflected.assign(out_size, 0.0);
+    fd.ir.assign(out_size, 0.0);
+
+    // Copy (face-major stride)
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < face_count; ++f) {
+        size_t src_base = f * static_cast<size_t>(total_time_steps);
+        size_t dst_base = f * static_cast<size_t>(filtered_steps);
+        for (int ot = 0; ot < filtered_steps; ++ot) {
+            int st = start + ot;
+            size_t si = src_base + static_cast<size_t>(st);
+            size_t di = dst_base + static_cast<size_t>(ot);
+            if (si >= illum_full.size()) continue;
+
+            double ds = direct_full.empty() ? 0.0 : direct_full[si];
+            double rf = refl_full.empty()   ? 0.0 : refl_full[si];
+            double ir = ir_full.empty()     ? 0.0 : ir_full[si];
+            double il = illum_full.empty()  ? (ds + rf) : illum_full[si];
+
+            // Reconstruct illumination if zero but components exist
+            if (il == 0.0 && (ds > 0.0 || rf > 0.0))
+                il = ds + rf;
+
+            fd.direct[di]       = ds;
+            fd.reflected[di]    = rf;
+            fd.ir[di]           = ir;
+            fd.illumination[di] = il;
+        }
+    }
+
+    // Temperatures
+    fd.temps.resize(face_count);
+
+    // Debug: Check source temps before filtering
+    if (verbose && !temps_full.empty() && !temps_full[0].empty()) {
+        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0].size() = " << temps_full[0].size() << "\n";
+        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0][" << start << "] = " << temps_full[0][start] << "\n";
+        std::cerr << "[filterFaceMajorStable DEBUG] temps_full[0] first 5 from start: ";
+        for (int i = 0; i < 5 && start + i < static_cast<int>(temps_full[0].size()); ++i) {
+            std::cerr << temps_full[0][start + i] << " ";
+        }
+        std::cerr << "\n";
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < face_count; ++f) {
+        if (f >= temps_full.size()) continue;
+        const auto& src = temps_full[f];
+        std::vector<double> dst(filtered_steps, 50.0);
+        for (int ot = 0; ot < filtered_steps; ++ot) {
+            int st = start + ot;
+            if (st < static_cast<int>(src.size()))
+                dst[ot] = src[st];
+        }
+        fd.temps[f].swap(dst);
+    }
+
+    // Debug: Check output temps after filtering
+    if (verbose && !fd.temps.empty() && !fd.temps[0].empty()) {
+        std::cerr << "[filterFaceMajorStable DEBUG] fd.temps[0] size: " << fd.temps[0].size() << "\n";
+        std::cerr << "[filterFaceMajorStable DEBUG] fd.temps[0] first 5: ";
+        for (size_t i = 0; i < 5 && i < fd.temps[0].size(); ++i) {
+            std::cerr << fd.temps[0][i] << " ";
+        }
+        std::cerr << "\n";
+    }
+
+    return fd;
+}
+
+static void diagnosticsIlluminationCoverage(
+    const std::vector<double>& illum,
+    const std::vector<double>& direct,
+    size_t face_count,
+    int time_steps,
+    const std::string& label,
+    bool verbose = false)
+{
+    if (!verbose) return;  // Skip diagnostics unless verbose mode is enabled
+
+    std::cout << "\n[Diagnostics] " << label << " timestep illumination coverage:\n";
+    size_t all_zero_direct = 0;
+    for (int t = 0; t < time_steps; ++t) {
+        size_t illuminated = 0;
+        size_t direct_nonzero = 0;
+        double sum_direct = 0.0;
+        for (size_t f = 0; f < face_count; ++f) {
+            size_t idx = f * static_cast<size_t>(time_steps) + static_cast<size_t>(t);
+            if (illum[idx] > 0.0) illuminated++;
+            if (direct[idx] > 0.0) {
+                direct_nonzero++;
+                sum_direct += direct[idx];
+            }
+        }
+        if (direct_nonzero == 0) all_zero_direct++;
+
+        if (t % 10 == 0 || t == time_steps - 1) {
+            double avg_d = (direct_nonzero > 0) ? sum_direct / direct_nonzero : 0.0;
+            std::cout << "  Timestep " << std::setw(3) << t
+                      << ": illum_faces=" << std::setw(8) << illuminated
+                      << ", direct_faces=" << std::setw(8) << direct_nonzero
+                      << ", avg_direct=" << std::fixed << std::setprecision(2) << avg_d << "\n";
+        }
+    }
+    if (all_zero_direct > 0) {
+        std::cout << "[Diagnostics] Timesteps with zero direct solar on all faces: "
+                  << all_zero_direct << "/" << time_steps << "\n";
+    }
+    std::cout.flush();
+}
+
+// Corrected function to write time step data with proper stride handling
+bool writeTimeStepDataChunked(
+    const std::string& filename,
+    const std::vector<double>& data_array,
+    size_t num_faces,
+    int time_step,
+    int time_stride,  // This is the stride in the source array (filtered_time_steps)
+    const size_t CHUNK_SIZE = 100000)
+{
+    try {
+        std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            std::cerr << "[writeTimeStepDataChunked] ERROR: Cannot open " << filename << "\n";
+            return false;
+        }
+        
+        // Write header: number of faces
+        uint32_t nfaces = static_cast<uint32_t>(num_faces);
+        out.write(reinterpret_cast<const char*>(&nfaces), sizeof(uint32_t));
+        
+        const size_t total_size = data_array.size();
+        std::vector<float> buffer;
+        buffer.reserve(std::min(CHUNK_SIZE, num_faces));
+        
+        size_t zero_count = 0;
+        size_t valid_count = 0;
+        double sum_values = 0.0;
+        double max_value = 0.0;
+        
+        // Process in chunks
+        for (size_t start = 0; start < num_faces; start += CHUNK_SIZE) {
+            size_t end = std::min(start + CHUNK_SIZE, num_faces);
+            buffer.clear();
+            buffer.resize(end - start);
+            
+            #pragma omp parallel for reduction(+:zero_count,valid_count,sum_values) reduction(max:max_value)
+            for (size_t i = 0; i < (end - start); ++i) {
+                size_t f = start + i;
+                size_t idx = safeIndex(f, time_step, time_stride, total_size);
+                float v = 0.0f;
+                
+                if (idx < total_size) {
+                    v = static_cast<float>(data_array[idx]);
+                    if (v == 0.0f) {
+                        zero_count++;
+                    } else {
+                        valid_count++;
+                        sum_values += v;
+                        max_value = std::max(max_value, static_cast<double>(v));
+                    }
+                } else {
+                    zero_count++;
+                    // Debug message for out-of-bounds access
+                    if (f < 5 || f == num_faces - 1) {  // Log first few and last
+                        std::cerr << "[writeTimeStepDataChunked] WARNING: Out of bounds access for face " 
+                                  << f << " at timestep " << time_step 
+                                  << " (idx=" << idx << " >= " << total_size << ")\n";
+                    }
+                }
+                buffer[i] = v;
+            }
+            
+            // Write chunk to file
+            out.write(reinterpret_cast<const char*>(buffer.data()),
+                      buffer.size() * sizeof(float));
+                      
+            if (!out.good()) {
+                std::cerr << "[writeTimeStepDataChunked] ERROR: Write failed for " 
+                          << filename << "\n";
+                return false;
+            }
+        }
+        
+        out.flush();
+        if (!out.good()) {
+            std::cerr << "[writeTimeStepDataChunked] ERROR: Final flush failed for " 
+                      << filename << "\n";
+            return false;
+        }
+        
+        // Report statistics for debugging
+        if (valid_count == 0) {
+            std::cerr << "[writeTimeStepDataChunked] WARNING: Timestep " << time_step
+                      << " written with ALL ZEROS (" << filename << ")\n";
+        } else if (time_step % 10 == 0) {  // Report every 10th timestep
+            double avg = sum_values / valid_count;
+            std::cout << "  [Debug] Timestep " << time_step << ": " 
+                      << valid_count << " non-zero values, avg=" << avg 
+                      << ", max=" << max_value << "\n";
+        }
+        
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[writeTimeStepDataChunked] EXCEPTION: " << e.what() 
+                  << " for " << filename << "\n";
+        return false;
+    }
+}
+
+// Corrected temperature writer with proper bounds checking
+bool writeTemperatureTimeStepChunked(
+    const std::string& filename,
+    const std::vector<std::vector<double>>& surface_temps,
+    int time_step,
+    const size_t CHUNK_SIZE = 100000)
+{
+    try {
+        if (surface_temps.empty()) {
+            std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Empty temperature data\n";
+            return false;
+        }
+        if (time_step < 0) {
+            std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Negative time_step " << time_step << "\n";
+            return false;
+        }
+
+        // Ensure output directory exists and write atomically to .tmp then rename
+        const auto parent = std::filesystem::path(filename).parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Cannot create directories for "
+                          << parent << " : " << ec.message() << "\n";
+                return false;
+            }
+        }
+        const std::string tmpfile = filename + ".tmp";
+
+        std::ofstream out(tmpfile, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Cannot open " << tmpfile << "\n";
+            return false;
+        }
+        
+        const size_t num_faces = surface_temps.size();
+        const uint32_t nfaces = static_cast<uint32_t>(num_faces);
+        out.write(reinterpret_cast<const char*>(&nfaces), sizeof(uint32_t));
+        
+        size_t zero_count = 0;
+        size_t valid_count = 0;
+        double sum_temp = 0.0;
+        double min_temp = 1e10;
+        double max_temp = -1e10;
+        std::vector<float> buffer;
+        buffer.reserve(std::min(CHUNK_SIZE, num_faces));
+        
+        // Process in chunks
+        for (size_t start = 0; start < num_faces; start += CHUNK_SIZE) {
+            const size_t end = std::min(start + CHUNK_SIZE, num_faces);
+            buffer.clear();
+            buffer.resize(end - start);
+            
+            for (size_t i = 0; i < (end - start); ++i) {
+                const size_t f = start + i;
+                float val = 50.0f;  // Default temperature
+                
+                if (f < surface_temps.size() &&
+                    time_step < static_cast<int>(surface_temps[f].size())) {
+                    val = static_cast<float>(surface_temps[f][static_cast<size_t>(time_step)]);
+                    
+                    // Validate temperature value
+                    if (!std::isfinite(val) || val < 0.0f || val > 10000.0f) {
+                        val = 50.0f;
+                        zero_count++;
+                    } else if (val == 0.0f) {
+                        zero_count++;
+                    } else {
+                        valid_count++;
+                        sum_temp += val;
+                        min_temp = std::min(min_temp, static_cast<double>(val));
+                        max_temp = std::max(max_temp, static_cast<double>(val));
+                    }
+                } else {
+                    zero_count++;
+                    if (f < 5) {  // Log first few misses
+                        std::cerr << "[writeTemperatureTimeStepChunked] WARNING: No data for face " 
+                                  << f << " at timestep " << time_step << "\n";
+                    }
+                }
+                buffer[i] = val;
+            }
+            
+            // Write chunk
+            out.write(reinterpret_cast<const char*>(buffer.data()),
+                      static_cast<std::streamsize>(buffer.size() * sizeof(float)));
+                      
+            if (!out.good()) {
+                std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Write failed\n";
+                out.close();
+                std::error_code rm;
+                std::filesystem::remove(tmpfile, rm);
+                return false;
+            }
+        }
+        
+        out.flush();
+        out.close();
+
+        // Validate file size: header (u32) + num_faces * float32
+        const uint64_t expected = sizeof(uint32_t) + static_cast<uint64_t>(num_faces) * sizeof(float);
+        std::error_code szec;
+        const auto written = std::filesystem::file_size(tmpfile, szec);
+        if (szec || written != expected) {
+            std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Size mismatch for "
+                      << tmpfile << " got=" << (szec ? -1LL : static_cast<long long>(written))
+                      << " expected=" << static_cast<long long>(expected) << "\n";
+            std::error_code rm;
+            std::filesystem::remove(tmpfile, rm);
+            return false;
+        }
+
+        // Atomic rename to final path
+        {
+            std::error_code rm;
+            std::filesystem::remove(filename, rm); // ok if it doesn't exist
+        }
+        std::error_code rn;
+        std::filesystem::rename(tmpfile, filename, rn);
+        if (rn) {
+            std::cerr << "[writeTemperatureTimeStepChunked] ERROR: Rename failed: " << rn.message() << "\n";
+            std::error_code rm;
+            std::filesystem::remove(tmpfile, rm);
+            return false;
+        }
+        
+        // Report statistics
+        if (valid_count == 0) {
+            std::cerr << "[writeTemperatureTimeStepChunked] WARNING: Timestep " 
+                      << time_step << " all zeros/invalid\n";
+        } else if (time_step == 0 || time_step % 10 == 0) {
+            const double avg = sum_temp / static_cast<double>(valid_count);
+            std::cout << "  [Temp Debug] Timestep " << time_step << ": " 
+                      << valid_count << " valid temps, range=[" << min_temp 
+                      << "," << max_temp << "]K, avg=" << avg << "K\n";
+        }
+        
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[writeTemperatureTimeStepChunked] EXCEPTION: " << e.what() << "\n";
+        // Best-effort cleanup of temp file
+        std::error_code rm;
+        std::filesystem::remove(std::string(filename + ".tmp"), rm);
+        return false;
+    }
+}
+
+// Statistics computation structure
+struct Statistics {
+    std::vector<double> avg;  // Average across time
+    std::vector<double> max;  // Maximum across time
+    std::vector<double> min;  // Minimum across time
+};
+
+// Function to compute statistics for a data array
+Statistics computeStatistics(
+    const std::vector<double>& data_array,
+    size_t num_faces,
+    int time_steps) {
+    
+    Statistics stats;
+    stats.avg.resize(num_faces, 0.0);
+    stats.max.resize(num_faces, std::numeric_limits<double>::lowest());
+    stats.min.resize(num_faces, std::numeric_limits<double>::max());
+    
+    // If data array is empty, return zeros
+    if (data_array.empty()) {
+        std::fill(stats.max.begin(), stats.max.end(), 0.0);
+        std::fill(stats.min.begin(), stats.min.end(), 0.0);
+        return stats;
+    }
+    
+    // Compute statistics for each face
+    for (size_t f = 0; f < num_faces; f++) {
+        double sum = 0.0;
+        int valid_count = 0;
+        
+        for (int t = 0; t < time_steps; t++) {
+            size_t idx = f * time_steps + t;
+            if (idx < data_array.size()) {
+                double value = data_array[idx];
+                sum += value;
+                valid_count++;
+                
+                stats.max[f] = std::max(stats.max[f], value);
+                stats.min[f] = std::min(stats.min[f], value);
+            }
+        }
+        
+        if (valid_count > 0) {
+            stats.avg[f] = sum / valid_count;
+        }
+        
+        // Handle case where no valid data found
+        if (stats.max[f] == std::numeric_limits<double>::lowest()) {
+            stats.max[f] = 0.0;
+        }
+        if (stats.min[f] == std::numeric_limits<double>::max()) {
+            stats.min[f] = 0.0;
+        }
+    }
+    
+    return stats;
+}
+
+// Function to compute statistics for temperature data (different structure)
+Statistics computeTemperatureStatistics(
+    const std::vector<std::vector<double>>& surface_temps,
+    size_t num_faces,
+    int time_steps) {
+    
+    Statistics stats;
+    stats.avg.resize(num_faces, 0.0);
+    stats.max.resize(num_faces, std::numeric_limits<double>::lowest());
+    stats.min.resize(num_faces, std::numeric_limits<double>::max());
+    
+    // If temperature data is empty, return zeros
+    if (surface_temps.empty() || surface_temps.size() != num_faces) {
+        std::fill(stats.max.begin(), stats.max.end(), 0.0);
+        std::fill(stats.min.begin(), stats.min.end(), 0.0);
+        return stats;
+    }
+    
+    // Compute statistics for each face
+    for (size_t f = 0; f < num_faces; f++) {
+        double sum = 0.0;
+        int valid_count = 0;
+        
+        if (f < surface_temps.size()) {
+            const auto& face_temps = surface_temps[f];
+            
+            for (size_t t = 0; t < face_temps.size() && t < static_cast<size_t>(time_steps); t++) {
+                double value = face_temps[t];
+                sum += value;
+                valid_count++;
+                
+                stats.max[f] = std::max(stats.max[f], value);
+                stats.min[f] = std::min(stats.min[f], value);
+            }
+        }
+        
+        if (valid_count > 0) {
+            stats.avg[f] = sum / valid_count;
+        }
+        
+        // Handle case where no valid data found
+        if (stats.max[f] == std::numeric_limits<double>::lowest()) {
+            stats.max[f] = 0.0;
+        }
+        if (stats.min[f] == std::numeric_limits<double>::max()) {
+            stats.min[f] = 0.0;
+        }
+    }
+    
+    return stats;
+}
+
+// Function to write statistics binary files
+bool writeStatisticsBinary(
+    const std::string& output_dir,
+    const std::string& data_type,
+    const Statistics& stats,
+    size_t num_faces) {
+    
+    try {
+        // Create statistics subdirectory
+        std::string stats_dir = output_dir + "/statistics";
+        std::filesystem::create_directories(stats_dir);
+        
+        // Write average
+        std::string avg_file = stats_dir + "/" + data_type + "_avg.bin";
+        std::ofstream avg_out(avg_file, std::ios::binary);
+        if (!avg_out.is_open()) {
+            std::cerr << "Failed to open " << avg_file << std::endl;
+            return false;
+        }
+        uint32_t count = static_cast<uint32_t>(num_faces);
+        avg_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+        for (size_t f = 0; f < num_faces; f++) {
+            float val = static_cast<float>(stats.avg[f]);
+            avg_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
+        }
+        avg_out.close();
+        
+        // Write maximum
+        std::string max_file = stats_dir + "/" + data_type + "_max.bin";
+        std::ofstream max_out(max_file, std::ios::binary);
+        if (!max_out.is_open()) {
+            std::cerr << "Failed to open " << max_file << std::endl;
+            return false;
+        }
+        max_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+        for (size_t f = 0; f < num_faces; f++) {
+            float val = static_cast<float>(stats.max[f]);
+            max_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
+        }
+        max_out.close();
+        
+        // Write minimum
+        std::string min_file = stats_dir + "/" + data_type + "_min.bin";
+        std::ofstream min_out(min_file, std::ios::binary);
+        if (!min_out.is_open()) {
+            std::cerr << "Failed to open " << min_file << std::endl;
+            return false;
+        }
+        min_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+        for (size_t f = 0; f < num_faces; f++) {
+            float val = static_cast<float>(stats.min[f]);
+            min_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
+        }
+        min_out.close();
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception writing statistics: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// Implement streamed illumination statistics export (no large allocations)
+bool exportIlluminationStatisticsStreamed(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    ptm::IlluminationModel& model,
+    int start_step,
+    int steps)
+{
+    if (!mesh || mesh->faces.empty() || steps <= 0) {
+        std::cerr << "[Statistics] Streamed: invalid mesh or steps\n";
+        return false;
+    }
+    const size_t F = mesh->faces.size();
+
+    auto initStats = [&](Statistics& s){
+        s.avg.assign(F, 0.0);
+        s.max.assign(F, std::numeric_limits<double>::lowest());
+        s.min.assign(F, std::numeric_limits<double>::max());
+    };
+
+    Statistics s_il, s_ds, s_rf, s_ir;
+    initStats(s_il); initStats(s_ds); initStats(s_rf); initStats(s_ir);
+
+    std::cout << "[Statistics] Computing illumination stats in streamed mode (faces=" << F
+              << ", steps=" << steps << ", start=" << start_step << ")...\n";
+
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < F; ++f) {
+        double sum_il = 0.0, sum_ds = 0.0, sum_rf = 0.0, sum_ir = 0.0;
+        double max_il = std::numeric_limits<double>::lowest();
+        double max_ds = max_il, max_rf = max_il, max_ir = max_il;
+        double min_il = std::numeric_limits<double>::max();
+        double min_ds = min_il, min_rf = min_il, min_ir = min_il;
+
+        for (int k = 0; k < steps; ++k) {
+            int t = start_step + k;
+            const double ds = model.getDirectSolarValue(f, t);
+            const double rf = model.getPrimaryReflectedValue(f, t);
+            const double ir = model.getPrimaryIRValue(f, t);
+            const double il = ds + rf; // definition of illumination used elsewhere
+
+            sum_ds += ds; sum_rf += rf; sum_ir += ir; sum_il += il;
+
+            if (ds > max_ds) max_ds = ds;
+            if (rf > max_rf) max_rf = rf;
+            if (ir > max_ir) max_ir = ir;
+            if (il > max_il) max_il = il;
+
+            if (ds < min_ds) min_ds = ds;
+            if (rf < min_rf) min_rf = rf;
+            if (ir < min_ir) min_ir = ir;
+            if (il < min_il) min_il = il;
+        }
+
+        const double invN = 1.0 / static_cast<double>(steps);
+        s_ds.avg[f] = sum_ds * invN; s_ds.max[f] = max_ds; s_ds.min[f] = min_ds;
+        s_rf.avg[f] = sum_rf * invN; s_rf.max[f] = max_rf; s_rf.min[f] = min_rf;
+        s_ir.avg[f] = sum_ir * invN; s_ir.max[f] = max_ir; s_ir.min[f] = min_ir;
+        s_il.avg[f] = sum_il * invN; s_il.max[f] = max_il; s_il.min[f] = min_il;
+    }
+
+    bool ok = true;
+    ok &= writeStatisticsBinary(output_dir, "illumination",      s_il, F);
+    ok &= writeStatisticsBinary(output_dir, "direct_solar",      s_ds, F);
+    ok &= writeStatisticsBinary(output_dir, "primary_reflected", s_rf, F);
+    ok &= writeStatisticsBinary(output_dir, "primary_ir",        s_ir, F);
+    if (!ok) {
+        std::cerr << "[Statistics] Streamed write failed\n";
+    } else {
+        std::cout << "[Statistics] Streamed illumination statistics exported\n";
+    }
+    return ok;
+}
+
+// Function to export statistics for all data types
+bool exportStatisticsBinary(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<double>& illumination_values,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<std::vector<double>>& surface_temps,
+    int time_steps) {
+    
+    size_t face_count = mesh->faces.size();
+    
+    std::cout << "\n[exportStatisticsBinary] Computing and exporting statistics..." << std::endl;
+    std::cout << "  Face count: " << face_count << std::endl;
+    std::cout << "  Time steps: " << time_steps << std::endl;
+    
+    bool all_success = true;
+    
+    // Compute and write illumination statistics
+    if (!illumination_values.empty()) {
+        std::cout << "  Computing illumination statistics..." << std::endl;
+        Statistics illum_stats = computeStatistics(illumination_values, face_count, time_steps);
+        if (!writeStatisticsBinary(output_dir, "illumination", illum_stats, face_count)) {
+            std::cerr << "  Failed to write illumination statistics" << std::endl;
+            all_success = false;
+        }
+    }
+    
+    // Compute and write direct solar statistics
+    if (!direct_solar_values.empty()) {
+        std::cout << "  Computing direct solar statistics..." << std::endl;
+        Statistics direct_stats = computeStatistics(direct_solar_values, face_count, time_steps);
+        if (!writeStatisticsBinary(output_dir, "direct_solar", direct_stats, face_count)) {
+            std::cerr << "  Failed to write direct solar statistics" << std::endl;
+            all_success = false;
+        }
+    }
+    
+    // Compute and write primary reflected statistics
+    if (!primary_reflected_values.empty()) {
+        std::cout << "  Computing primary reflected statistics..." << std::endl;
+        Statistics reflected_stats = computeStatistics(primary_reflected_values, face_count, time_steps);
+        if (!writeStatisticsBinary(output_dir, "primary_reflected", reflected_stats, face_count)) {
+            std::cerr << "  Failed to write primary reflected statistics" << std::endl;
+            all_success = false;
+        }
+    }
+    
+    // Compute and write primary IR statistics
+    if (!primary_ir_values.empty()) {
+        std::cout << "  Computing primary IR statistics..." << std::endl;
+        Statistics ir_stats = computeStatistics(primary_ir_values, face_count, time_steps);
+        if (!writeStatisticsBinary(output_dir, "primary_ir", ir_stats, face_count)) {
+            std::cerr << "  Failed to write primary IR statistics" << std::endl;
+            all_success = false;
+        }
+    }
+    
+    // Compute and write temperature statistics
+    if (!surface_temps.empty()) {
+        std::cout << "  Computing temperature statistics..." << std::endl;
+        Statistics temp_stats = computeTemperatureStatistics(surface_temps, face_count, time_steps);
+        if (!writeStatisticsBinary(output_dir, "temperature", temp_stats, face_count)) {
+            std::cerr << "  Failed to write temperature statistics" << std::endl;
+            all_success = false;
+        }
+        
+        // Compute ice depth using mean and max temperatures
+        std::cout << "  Computing ice stability depths..." << std::endl;
+        try {
+            // Ice depth solver parameters (matching Python defaults)
+            const double J0 = 3e-14;      // vapor flux limit [kg m^-2 s^-1]
+            const double delta = 1e-4;    // convergence tolerance [m]
+            const double z0 = 0.0;        // initial depth guess [m]
+            const double l = 100e-6;      // mean free path [m]
+            const double zs = 0.1;        // thermal skin depth [m]
+            const double Q = 0.02;        // geothermal flux [W m^-2]
+            const double k = 1e-3;        // thermal conductivity [W m^-1 K^-1]
+            const int max_iter = 200;     // max Newton iterations
+            const double z_min = 0.0;     // minimum depth [m]
+            const double z_max = 5.0;     // maximum depth [m]
+            const bool use_openmp = true; // enable parallel computation
+            
+            // Call ice depth solver
+            std::vector<double> ice_depths = ice::computeIceDepths(
+                temp_stats.avg,  // mean temperature [K]
+                temp_stats.max,  // max temperature [K]
+                J0, delta, z0, l, zs, Q, k, max_iter, z_min, z_max,
+                nullptr,         // don't need iteration counts
+                use_openmp
+            );
+            
+            // Package ice depths as Statistics structure (only avg is meaningful)
+            Statistics ice_stats;
+            ice_stats.avg = ice_depths;
+            ice_stats.max.resize(face_count, std::numeric_limits<double>::quiet_NaN());
+            ice_stats.min.resize(face_count, std::numeric_limits<double>::quiet_NaN());
+            
+            if (!writeStatisticsBinary(output_dir, "ice_depth", ice_stats, face_count)) {
+                std::cerr << "  Failed to write ice depth statistics" << std::endl;
+                all_success = false;
+            } else {
+                // Report ice depth statistics
+                double valid_count = 0.0;
+                double sum = 0.0;
+                double min_depth = std::numeric_limits<double>::max();
+                double max_depth = std::numeric_limits<double>::lowest();
+                
+                for (size_t i = 0; i < ice_depths.size(); ++i) {
+                    if (!std::isnan(ice_depths[i])) {
+                        valid_count += 1.0;
+                        sum += ice_depths[i];
+                        if (ice_depths[i] < min_depth) min_depth = ice_depths[i];
+                        if (ice_depths[i] > max_depth) max_depth = ice_depths[i];
+                    }
+                }
+                
+                if (valid_count > 0) {
+                    double avg_depth = sum / valid_count;
+                    std::cout << "    Ice depth: valid=" << static_cast<int>(valid_count) 
+                              << "/" << face_count
+                              << ", mean=" << std::fixed << std::setprecision(6) << avg_depth << " m"
+                              << ", range=[" << min_depth << ", " << max_depth << "] m" << std::endl;
+                } else {
+                    std::cout << "    Ice depth: no stable solutions found" << std::endl;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "  Exception computing ice depths: " << e.what() << std::endl;
+            all_success = false;
+        }
+    }
+    
+    if (all_success) {
+        std::cout << "\n[exportStatisticsBinary] Statistics export completed successfully!" << std::endl;
+    } else {
+        std::cerr << "\n[exportStatisticsBinary] Some statistics failed to export!" << std::endl;
+    }
+    
+    return all_success;
+}
+
+// Main export function with improved temperature handling
 bool exportDataAsBinary(
     const std::string& output_dir,
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<double>& illumination_values,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
     const std::vector<double>& primary_ir_values,
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<double>& times,
     const std::vector<std::string>& time_strings,
     int time_steps,
     bool is_custom_mesh,
-    bool include_equilibration = false) {
-    
-    // Determine actual number of time steps to write
-    int start_idx = include_equilibration ? 0 : (times.size() - time_steps);
-    int output_time_steps = include_equilibration ? times.size() : time_steps;
-    
-    // Status message
-    std::cout << "Generating binary output in: " << output_dir << std::endl;
-    std::cout << "Writing " << output_time_steps << " time steps" 
-              << (include_equilibration ? " (including equilibration)" : " (excluding equilibration)") << std::endl;
-    
-    // Calculate total number of files to be written for progress tracking
-    int total_files = 2; // Mesh and time steps files
-    total_files += output_time_steps * 3; // Illumination, primary IR, and temperature files for each time step
-    
-    // Create progress bar for file writing
-    thermal::ProgressBar progressBar(total_files, "Writing output files", 50, true);
-    int files_written = 0;
-    
-    // Create output directories
-    std::string illum_dir = output_dir + "/illumination";
-    std::string ir_dir = output_dir + "/primary_ir";
-    std::string temp_dir = output_dir + "/temperature";
-    
-    std::filesystem::create_directories(illum_dir);
-    std::filesystem::create_directories(ir_dir);
-    std::filesystem::create_directories(temp_dir);
-    
-    // Export mesh if using global model (not custom mesh)
-    if (!is_custom_mesh) {
-        std::string mesh_file = output_dir + "/mesh.ply";
-        std::cout << "Exporting mesh to " << mesh_file << std::endl;
-        if (!exportMeshToPLY(mesh_file, mesh)) {
-            std::cerr << "Failed to export mesh" << std::endl;
-            return false;
-        }
-    }
-    progressBar.update(++files_written);
-    
-    // Always export mesh in VTK-compatible format for the converter
-    std::string vtk_mesh_file = output_dir + "/mesh.ply";
-    if (is_custom_mesh || !std::filesystem::exists(vtk_mesh_file)) {
-        std::cout << "Exporting mesh in VTK-compatible format: " << vtk_mesh_file << std::endl;
-        
-        try {
-            std::ofstream file(vtk_mesh_file, std::ios::binary);
-            if (!file.is_open()) {
-                std::cerr << "Failed to open file for writing: " << vtk_mesh_file << std::endl;
-                // Continue even if this fails - it's just for visualization
-            }
-            else {
-                // Write header (8 bytes of identifier)
-                const char* header = "EUROPMSH";
-                file.write(header, 8);
-                
-                // Write vertex count (4-byte integer)
-                int vertex_count = static_cast<int>(mesh->vertices.size());
-                file.write(reinterpret_cast<const char*>(&vertex_count), sizeof(int));
-                
-                // Write vertices (each vertex is 3 floats = 12 bytes)
-                for (const auto& vertex : mesh->vertices) {
-                    float x = static_cast<float>(vertex[0]);
-                    float y = static_cast<float>(vertex[1]);
-                    float z = static_cast<float>(vertex[2]);
-                    file.write(reinterpret_cast<const char*>(&x), sizeof(float));
-                    file.write(reinterpret_cast<const char*>(&y), sizeof(float));
-                    file.write(reinterpret_cast<const char*>(&z), sizeof(float));
-                }
-                
-                // Write face count (4-byte integer)
-                int face_count = static_cast<int>(mesh->faces.size());
-                file.write(reinterpret_cast<const char*>(&face_count), sizeof(int));
-                
-                // Write faces (each face is 3 integers = 12 bytes)
-                for (const auto& face : mesh->faces) {
-                    int v1 = face[0];
-                    int v2 = face[1];
-                    int v3 = face[2];
-                    file.write(reinterpret_cast<const char*>(&v1), sizeof(int));
-                    file.write(reinterpret_cast<const char*>(&v2), sizeof(int));
-                    file.write(reinterpret_cast<const char*>(&v3), sizeof(int));
-                }
-                
-                // Write additional data needed by vtk_converter.py
-                // Write normals
-                for (const auto& normal : mesh->face_normals) {
-                    float nx = static_cast<float>(normal[0]);
-                    float ny = static_cast<float>(normal[1]);
-                    float nz = static_cast<float>(normal[2]);
-                    file.write(reinterpret_cast<const char*>(&nx), sizeof(float));
-                    file.write(reinterpret_cast<const char*>(&ny), sizeof(float));
-                    file.write(reinterpret_cast<const char*>(&nz), sizeof(float));
-                }
-                
-                // Write latitudes and longitudes
-                for (const auto& lat : mesh->latitudes) {
-                    float lat_f = static_cast<float>(lat);
-                    file.write(reinterpret_cast<const char*>(&lat_f), sizeof(float));
-                }
-                
-                for (const auto& lon : mesh->longitudes) {
-                    float lon_f = static_cast<float>(lon);
-                    file.write(reinterpret_cast<const char*>(&lon_f), sizeof(float));
-                }
-                
-                file.close();
-                std::cout << "Mesh exported successfully in VTK-compatible format" << std::endl;
-            }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error exporting mesh: " << e.what() << std::endl;
-            // Continue even if this fails - it's just for visualization
-        }
-    }
-    
-    // Export filtered time steps metadata
-    std::string time_file = output_dir + "/time_steps.txt";
-    std::cout << "Writing time steps metadata to " << time_file << std::endl;
-    
-    // Use only the relevant time steps
-    std::vector<double> filtered_times(times.begin() + start_idx, times.begin() + start_idx + output_time_steps);
-    std::vector<std::string> filtered_time_strings(time_strings.begin() + start_idx, 
-                                                 time_strings.begin() + start_idx + output_time_steps);
-    
-    if (!writeTimeStepsFile(time_file, filtered_times, filtered_time_strings)) {
-        std::cerr << "Failed to write time steps file" << std::endl;
+    bool compute_statistics)
+{
+    using std::cerr;
+    using std::cout;
+    if (!mesh || mesh->faces.empty()) {
+        cerr << "[exportDataAsBinary] ERROR: mesh empty\n";
         return false;
     }
-    progressBar.update(++files_written);
-    
-    // Get number of faces
-    size_t num_faces = mesh->faces.size();
-    
-    // Process each time step
-    for (int t = 0; t < output_time_steps; t++) {
-        // Format time step number with leading zeros
-        std::ostringstream time_str;
-        time_str << std::setw(4) << std::setfill('0') << (t + 1);
-        std::string time_step_str = time_str.str();
-        
-        // Get the actual time index
-        int actual_time_idx = start_idx + t;
-        
-        // Convert illumination data to float
-        std::vector<float> illum_data(num_faces);
-        for (size_t f = 0; f < num_faces; f++) {
-            size_t idx = f * times.size() + actual_time_idx;
-            if (idx < illumination_values.size()) {
-                illum_data[f] = static_cast<float>(illumination_values[idx]);
-            } else {
-                illum_data[f] = 0.0f;
-            }
-        }
-        
-        // Export illumination data
-        std::string illum_file = illum_dir + "/illumination_" + time_step_str + ".bin";
-        if (!writeBinaryTimeStepFile(illum_file, illum_data)) {
-            std::cerr << "Failed to write illumination data for time step " << t << std::endl;
-            return false;
-        }
-        progressBar.update(++files_written);
-        
-        // Convert primary IR data to float
-        std::vector<float> ir_data(num_faces);
-        for (size_t f = 0; f < num_faces; f++) {
-            size_t idx = f * times.size() + actual_time_idx;
-            if (idx < primary_ir_values.size()) {
-                ir_data[f] = static_cast<float>(primary_ir_values[idx]);
-            } else {
-                ir_data[f] = 0.0f;
-            }
-        }
-        
-        // Export primary IR data
-        std::string ir_file = ir_dir + "/primary_ir_" + time_step_str + ".bin";
-        if (!writeBinaryTimeStepFile(ir_file, ir_data)) {
-            std::cerr << "Failed to write primary IR data for time step " << t << std::endl;
-            return false;
-        }
-        progressBar.update(++files_written);
-        
-        // Convert temperature data to float
-        std::vector<float> temp_data(num_faces);
-        for (size_t f = 0; f < num_faces; f++) {
-            if (f < surface_temps.size() && actual_time_idx < surface_temps[f].size()) {
-                temp_data[f] = static_cast<float>(surface_temps[f][actual_time_idx]);
-            } else {
-                temp_data[f] = 0.0f;
-            }
-        }
-        
-        // Export temperature data
-        std::string temp_file = temp_dir + "/temperature_" + time_step_str + ".bin";
-        if (!writeBinaryTimeStepFile(temp_file, temp_data)) {
-            std::cerr << "Failed to write temperature data for time step " << t << std::endl;
-            return false;
-        }
-        progressBar.update(++files_written);
+    if (time_steps <= 0) {
+        cerr << "[exportDataAsBinary] ERROR: time_steps invalid\n";
+        return false;
     }
+    if (times.size() < static_cast<size_t>(time_steps) ||
+        time_strings.size() < static_cast<size_t>(time_steps)) {
+        cerr << "[exportDataAsBinary] ERROR: insufficient time metadata\n";
+        return false;
+    }
+
+    const size_t F = mesh->faces.size();
+    const size_t expected_flat = F * static_cast<size_t>(time_steps);
+    auto chk = [&](const char* n, const std::vector<double>& v){
+        if (!v.empty() && v.size()!=expected_flat) {
+            cerr << "[exportDataAsBinary] WARNING: " << n << " size="
+                 << v.size() << " expected=" << expected_flat << "\n";
+        }
+    };
+    chk("illumination", illumination_values);
+    chk("direct_solar", direct_solar_values);
+    chk("primary_reflected", primary_reflected_values);
+    chk("primary_ir", primary_ir_values);
+
+    // Directories
+    try {
+        std::filesystem::create_directories(output_dir);
+        if (!illumination_values.empty())      std::filesystem::create_directories(output_dir + "/illumination");
+        if (!direct_solar_values.empty())      std::filesystem::create_directories(output_dir + "/direct_solar");
+        if (!primary_reflected_values.empty()) std::filesystem::create_directories(output_dir + "/primary_reflected");
+        if (!primary_ir_values.empty())        std::filesystem::create_directories(output_dir + "/primary_ir");
+        if (!surface_temps.empty())            std::filesystem::create_directories(output_dir + "/temperature");
+    } catch (const std::exception& e) {
+        cerr << "[exportDataAsBinary] ERROR mkdir: " << e.what() << "\n";
+        return false;
+    }
+
+    cout << "\n[exportDataAsBinary] Starting binary export\n"
+         << "  Faces=" << F << " time_steps=" << time_steps
+         << " components:"
+         << (illumination_values.empty()?"":" illumination")
+         << (direct_solar_values.empty()?"":" direct_solar")
+         << (primary_reflected_values.empty()?"":" primary_reflected")
+         << (primary_ir_values.empty()?"":" primary_ir")
+         << (surface_temps.empty()?"":" temperature") << "\n";
+
+    // Mesh PLY (binary with per-face lat/lon to satisfy downstream python)
+    if (!exportMeshToPLY(output_dir + "/mesh.ply", mesh)) {
+        cerr << "[exportDataAsBinary] ERROR exporting mesh\n";
+        return false;
+    }
+    if (!writeTimeStepsFile(output_dir + "/time_steps.txt", times, time_strings)) {
+        cerr << "[exportDataAsBinary] ERROR writing time metadata\n";
+        return false;
+    }
+
+    struct AWriter {
+        static bool write(const std::string& fn,
+                          uint32_t count,
+                          const float* data,
+                          size_t n,
+                          int retries=6)
+        {
+            namespace fs=std::filesystem;
+            const size_t expected = sizeof(uint32_t) + n*sizeof(float);
+            for (int a=1;a<=retries;++a) {
+                std::string tmp = fn + ".tmp";
+                {
+                    std::ofstream out(tmp, std::ios::binary|std::ios::trunc);
+                    if (!out.is_open()) {
+                        std::cerr << "[IO] open fail attempt " << a << " " << tmp << "\n";
+                        goto retry;
+                    }
+                    out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                    if (n) out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n*sizeof(float)));
+                    out.flush();
+                    if (!out.good()) {
+                        std::cerr << "[IO] stream bad attempt " << a << "\n";
+                        goto retry;
+                    }
+                }
+                {
+                    std::error_code ec;
+                    auto sz = fs::file_size(tmp, ec);
+                    if (ec || sz != expected) {
+                        std::cerr << "[IO] size mismatch attempt " << a
+                                  << " got=" << (ec?-1LL:(long long)sz)
+                                  << " exp=" << expected << "\n";
+                        fs::remove(tmp, ec);
+                        goto retry;
+                    }
+                    std::error_code rn;
+                    fs::rename(tmp, fn, rn);
+                    if (rn) {
+                        std::cerr << "[IO] rename fail attempt " << a << " : " << rn.message() << "\n";
+                        fs::remove(tmp);
+                        goto retry;
+                    }
+                }
+                return true;
+            retry:
+                std::this_thread::sleep_for(std::chrono::milliseconds(40*a));
+            }
+            std::cerr << "[IO] FAIL " << fn << "\n";
+            return false;
+        }
+    };
+
+    // Buffers
+    std::vector<float> bIllum, bDirect, bRefl, bIR, bTemp;
+    if (!illumination_values.empty())      bIllum.resize(F);
+    if (!direct_solar_values.empty())      bDirect.resize(F);
+    if (!primary_reflected_values.empty()) bRefl.resize(F);
+    if (!primary_ir_values.empty())        bIR.resize(F);
+    if (!surface_temps.empty())            bTemp.resize(F);
+
+    const uint32_t Fu32 = static_cast<uint32_t>(F);
+    int success_steps=0, fail_steps=0;
+    int report_interval = std::max(1, time_steps/20);
+
+    for (int t=0;t<time_steps;++t) {
+        if ((t%report_interval)==0 || t==time_steps-1) {
+            cout << "\r  Progress " << (t+1) << "/" << time_steps << std::flush;
+        }
+        size_t baseOffset = static_cast<size_t>(t);
+        // Fill component buffers
+        if (!illumination_values.empty()) {
+            #pragma omp parallel for schedule(static)
+            for (size_t f=0; f<F; ++f) {
+                size_t idx = f*static_cast<size_t>(time_steps)+baseOffset;
+                bIllum[f] = (idx < illumination_values.size()) ?
+                    static_cast<float>(illumination_values[idx]) : 0.0f;
+            }
+        }
+        if (!direct_solar_values.empty()) {
+            #pragma omp parallel for schedule(static)
+            for (size_t f=0; f<F; ++f) {
+                size_t idx = f*static_cast<size_t>(time_steps)+baseOffset;
+                bDirect[f] = (idx < direct_solar_values.size()) ?
+                    static_cast<float>(direct_solar_values[idx]) : 0.0f;
+            }
+        }
+        if (!primary_reflected_values.empty()) {
+            #pragma omp parallel for schedule(static)
+            for (size_t f=0; f<F; ++f) {
+                size_t idx = f*static_cast<size_t>(time_steps)+baseOffset;
+                bRefl[f] = (idx < primary_reflected_values.size()) ?
+                    static_cast<float>(primary_reflected_values[idx]) : 0.0f;
+            }
+        }
+        if (!primary_ir_values.empty()) {
+            #pragma omp parallel for schedule(static)
+            for (size_t f=0; f<F; ++f) {
+                size_t idx = f*static_cast<size_t>(time_steps)+baseOffset;
+                bIR[f] = (idx < primary_ir_values.size()) ?
+                    static_cast<float>(primary_ir_values[idx]) : 0.0f;
+            }
+        }
+        if (!surface_temps.empty()) {
+            #pragma omp parallel for schedule(static)
+            for (size_t f=0; f<F; ++f) {
+                float v=50.0f;
+                if (f<surface_temps.size() && t < static_cast<int>(surface_temps[f].size())) {
+                    double tv=surface_temps[f][t];
+                    if (std::isfinite(tv) && tv>0.0 && tv<10000.0) v = static_cast<float>(tv);
+                }
+                bTemp[f]=v;
+            }
+        }
+
+        std::ostringstream oss; oss << std::setw(4) << std::setfill('0') << t;
+        std::string ts=oss.str();
+        bool ok=true;
+        auto writeComp=[&](const char* name, const std::vector<float>& buf){
+            if (buf.empty()) return true;
+            std::string fn = output_dir + "/" + name + "/" + name + "_" + ts + ".bin";
+            return AWriter::write(fn, Fu32, buf.data(), buf.size());
+        };
+        if (!illumination_values.empty())      ok &= writeComp("illumination", bIllum);
+        if (!direct_solar_values.empty())      ok &= writeComp("direct_solar", bDirect);
+        if (!primary_reflected_values.empty()) ok &= writeComp("primary_reflected", bRefl);
+        if (!primary_ir_values.empty())        ok &= writeComp("primary_ir", bIR);
+        if (!surface_temps.empty())            ok &= writeComp("temperature", bTemp);
+
+        if (ok) ++success_steps; else { ++fail_steps; cerr << "\n[exportDataAsBinary] timestep " << t << " write failure\n"; }
+    }
+    cout << "\n  Export complete: " << success_steps << "/" << time_steps
+         << (fail_steps? " (failures)":"") << "\n";
+
+    // Metadata
+    {
+        std::ofstream meta(output_dir + "/metadata.txt");
+        if (meta.is_open()) {
+            meta << "faces=" << F << "\n";
+            meta << "time_steps=" << time_steps << "\n";
+            meta << "successful_timesteps=" << success_steps << "\n";
+            meta << "failed_timesteps=" << fail_steps << "\n";
+            meta << "is_custom_mesh=" << (is_custom_mesh?"true":"false") << "\n";
+            meta << "components=";
+            bool first=true;
+            auto add=[&](const char* n,const std::vector<double>& v){
+                if (v.empty()) return;
+                meta << (first?"":",") << n; first=false;
+            };
+            add("illumination", illumination_values);
+            add("direct_solar", direct_solar_values);
+            add("primary_reflected", primary_reflected_values);
+            add("primary_ir", primary_ir_values);
+            if (!surface_temps.empty()) meta << (first?"":",") << "temperature";
+            meta << "\n";
+        } else {
+            cerr << "[exportDataAsBinary] WARNING metadata write failed\n";
+        }
+    }
+
+    std::cout << "\nBinary export completed successfully!\n";
     
-    // Ensure progress bar is completed
-    progressBar.finish();
-    
-    std::cout << "Successfully exported all data in binary format" << std::endl;
-    return true;
+    // Export statistics if enabled
+    if (compute_statistics) {
+        bool stats_success = exportStatisticsBinary(
+            output_dir, mesh,
+            illumination_values, direct_solar_values,
+            primary_reflected_values, primary_ir_values,
+            surface_temps, time_steps
+        );
+        if (!stats_success) {
+            std::cerr << "Warning: Statistics export had errors\n";
+        }
+    }
+
+    return fail_steps==0;
+}
+
+void printBanner() {
+    std::cout << "\n";
+    std::cout << "    ╔═══════════════════════════════════════════════════════════════╗\n";
+    std::cout << "    ║    *      .    *     \\   ||    //      * .   .      *         ║\n";
+    std::cout << "    ║       .      *     \\  \\  ||   //    //       .             .  ║\n";
+    std::cout << "    ║  *      .       \\   \\  \\  ☀  //    //      .      *           ║\n";
+    std::cout << "    ║     .         *  \\   ...-'''''-...//    *         .           ║\n";
+    std::cout << "    ║           _ ... .-'''''   PTM3D     ``''-.....,__      .      ║\n";
+    std::cout << "    ║   __,.-''    Planetary Thermophysical Model 3D     `'-..., _  ║\n";
+    std::cout << "    ║  ═══════════════════════════════════════════════════════════  ║\n";
+    std::cout << "    ║      Coupled Thermal-Illumination for Planetary Bodies        ║\n";
+    std::cout << "    ╚═══════════════════════════════════════════════════════════════╝\n";
+    std::cout << "\n";
 }
 
 int main(int argc, char** argv) {
-    std::cout << "Planetary Thermal-Illumination Coupled Model" << std::endl;
+    printBanner();
 
-    // Simulation parameters
-    std::string start_time = "2025-01-01T00:00:00";
-    double duration_days = 3.55; // Body's orbital period
-    int mesh_resolution = 4;     // Resolution level for icosphere
-    int time_steps = 72;         // Number of time steps (every ~1.2 hours)
-    std::string output_dir = "./output";
-    std::string positions_file = "";
-    bool use_batch_processing = true;
-    bool export_locations = false;
-    std::string locations_file = "";
-    std::string series_output = "illumination_series.csv";
-    std::string location_plots_dir = ""; // Directory for location plots
-    bool create_visualization = false;
-    bool include_primary_reflection = true;  // Default to true (include reflection)
-    bool no_maps = false;  
-    bool save_frames = false;
-    bool include_primary_ir_in_vtk = false;  // Default to excluding primary IR data
-    std::string vtk_output_mode = "both";    // Default to both thermal and complete VTK files
-    std::string output_format = "binary";  // Default to binary format for better performance and smaller files
-
-    // Create the thermal config instance
-    thermal::Config config;
-
-    // Add mesh input options 
-    std::string mesh_file = "";
-    double mesh_scale_factor = 1.0;
+    // ========================================================================
+    // PHASE 1: Check for config file and template generation BEFORE anything else
+    // ========================================================================
+    std::string config_file = "";
+    bool has_config_file = false;
     
-    // Parameter to control verbosity 
-    bool verbose = false;
-
-    // Thermal model parameters
-    bool run_thermal_mesh = false;  // Flag to run thermal model for entire mesh
-
-    // Thermal multiprocessing parameters
-    int thermal_threads = 0;  // 0 means use OMP default (usually all cores)
-
-    // Command-line parameter for equilibration orbits
-    int equilibration_orbits = 10;  // Default to 10 Body orbits for equilibration
-
-    // Command line options for maps
-    std::string albedo_map_file = "";
-    std::string thermal_inertia_map_file = "";
-    std::string albedo_maps_directory = "data/albedo_maps";
-
-    // VTK files
-    std::string thermal_vtk_file = "";    // Custom thermal VTK filename
-    std::string complete_vtk_file = "";   // Custom complete VTK filename
-
-    // Camera settings
-    double camera_distance = 5.0;
-    double camera_latitude = 30.0;
-    double camera_longitude = 0.0;
-    double emission_angle = -1.0;  // -1 means not specified
-    double azimuth = -1.0;         // -1 means not specified
-
-    // New command line option:
-    bool export_basic_mesh = false;
-
-    // Add animation width and height parameters
-    int animation_width = 1024;  // Default width
-    int animation_height = 768;  // Default height
-
-    thermal::Planet planet("Europa");  // Default to Europa
-    std::shared_ptr<ptm::IlluminationModel> illumination_model;
-
-    // Add location data file argument
-    std::string location_data_arg = "";
-
+    // Quick scan for --config and --generate-template flags
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            config_file = argv[i + 1];
+            has_config_file = true;
+        } else if (arg == "--generate-template") {
+            // Handle template generation and exit
+            std::string template_file = "ptm_config_template.yaml";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                template_file = argv[i + 1];
+            }
+            ptm::ConfigParser::generateTemplate(template_file);
+            return 0;
+        } else if (arg == "--help") {
+            showUsage(argv[0]);
+            return 0;
+        }
+    }
+
+    // ========================================================================
+    // PHASE 2: Initialize configuration with defaults
+    // ========================================================================
+    ptm::SimulationConfig sim_config;  // Starts with default values
+    
+    // If config file specified, load it
+    if (has_config_file) {
+        try {
+            ptm::ConfigParser parser;
+            sim_config = parser.loadFromYAML(config_file);
+            std::cout << "✓ Configuration loaded from: " << config_file << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Failed to load config file: " << e.what() << std::endl;
+            std::cerr << "Continuing with default configuration..." << std::endl;
+            // Continue with defaults - don't exit
+        }
+    }
+
+    // ========================================================================
+    // PHASE 3: Map config to local variables (PRESERVED: All original variables)
+    // ========================================================================
+    // These maintain the exact same variable names and types as the original code
+    
+    // Simulation parameters (from config or defaults)
+    std::string start_time = sim_config.time.start_time;
+    double duration_days = sim_config.time.duration_days;
+    int mesh_resolution = sim_config.mesh.resolution;
+    int time_steps = sim_config.time.timesteps;
+    std::string output_dir = sim_config.output.directory;
+    double integration_days = sim_config.thermal.integration_days;
+    int integration_steps_cli = sim_config.thermal.integration_steps;
+    double integration_offset_days = sim_config.thermal.integration_offset_days;
+    int integration_offset_steps_cli = sim_config.thermal.integration_offset_steps;
+    std::string positions_file = sim_config.illumination.positions_file;
+    bool use_batch_processing = sim_config.illumination.use_batch_processing;
+    bool export_locations = !sim_config.output.locations_file.empty();
+    std::string locations_file = sim_config.output.locations_file;
+    std::string series_output = sim_config.output.series_output.empty()
+        ? "illumination_series.csv" : sim_config.output.series_output;
+    std::string depths_file = sim_config.output.depths_file;
+    if (!depths_file.empty()) {
+        std::cout << "Depths file configured: " << depths_file << std::endl;
+    }
+    std::string location_plots_dir = "";
+    bool generate_depth_plots = true;  // Generate plots for depth profiles by default
+    std::string executable_path = argv[0];  // Store for finding Python scripts
+    bool create_visualization = sim_config.visualization.create;
+    bool include_primary_reflection = sim_config.illumination.include_primary_reflection;
+    bool no_maps = sim_config.output.no_maps;
+    bool save_frames = sim_config.visualization.save_frames;
+    bool include_primary_ir_in_vtk = sim_config.output.include_primary_ir;
+    std::string vtk_output_mode = sim_config.output.vtk_mode;
+    std::string output_format = sim_config.output.format;
+    bool enable_shadow_flux = sim_config.thermal.enable_shadow_flux;
+    double crater_diameter_depth_ratio = sim_config.thermal.crater_dd_ratio;
+    
+    // Create the thermal config instance (used for non-mesh thermal runs)
+    // Note: thermal_debug settings are applied later after CLI parsing
+    thermal::Config config;
+
+    bool compute_statistics = sim_config.thermal.compute_statistics;
+    
+    // Mesh input options
+    std::string mesh_file = sim_config.mesh.import_file;
+    double mesh_scale_factor = sim_config.mesh.scale_factor;
+    
+    // Parameter to control verbosity
+    bool verbose = sim_config.advanced.verbose;
+    
+    // Thermal model parameters
+    bool run_thermal_mesh = sim_config.thermal.run_thermal_mesh;
+    bool thermal_debug = sim_config.thermal.debug;
+    double thermal_debug_lat = sim_config.thermal.debug_lat_threshold;
+
+    // Thermal multiprocessing parameters
+    int thermal_threads = sim_config.thermal.threads;
+
+    // Command-line parameter for equilibration orbits
+    int equilibration_orbits = sim_config.thermal.equilibration_orbits;
+
+    // Thermal grid parameters
+    int thermal_m = sim_config.thermal.grid_m;
+    int thermal_n = sim_config.thermal.grid_n;
+    int thermal_b = sim_config.thermal.grid_b;
+    
+    // Command line options for maps
+    std::string albedo_map_file = sim_config.illumination.albedo_map;
+    std::string thermal_inertia_map_file = sim_config.thermal.thermal_inertia_map;
+    std::string albedo_maps_directory = sim_config.illumination.albedo_maps_directory;
+    
+    // VTK files
+    std::string thermal_vtk_file = sim_config.output.thermal_vtk_file;
+    std::string complete_vtk_file = sim_config.output.complete_vtk_file;
+    
+    // Camera settings
+    double camera_distance = sim_config.visualization.camera_distance;
+    double camera_latitude = sim_config.visualization.camera_latitude;
+    double camera_longitude = sim_config.visualization.camera_longitude;
+    double emission_angle = sim_config.visualization.emission_angle;
+    double azimuth = sim_config.visualization.azimuth;
+    
+    // New command line option
+    bool export_basic_mesh = sim_config.mesh.export_basic;
+    
+    // Animation dimensions
+    int animation_width = sim_config.visualization.width;
+    int animation_height = sim_config.visualization.height;
+    
+    // Planet (default to Europa, but can be overridden)
+    thermal::Planet planet(sim_config.time.body);
+    std::shared_ptr<ptm::IlluminationModel> illumination_model;
+    
+    // Location data file argument
+    std::string location_data_arg = sim_config.output.location_data;
+    
+    // Topography flags (not in config yet, using defaults)
+    bool use_topography = sim_config.mesh.use_topographic;
+    std::string topo_meshes_dir = sim_config.mesh.topo_directory;
+
+    // Radiation exchange configuration
+    bool enable_radiation_exchange = false;
+    bool rad_use_hmatrix = false;
+    bool rad_use_gpu = false;
+    bool rad_verbose = false;
+    std::string rad_view_factor_file = "";
+    int rad_max_coupling_iter = 10;
+    double rad_coupling_temp_tol = 2.0;     // Temperature convergence threshold [K]
+    double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2]
+    double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
+
+    // ACA (Adaptive Cross Approximation) configuration for H-matrix
+    bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
+    double rad_aca_tolerance = 1e-3;        // ACA relative tolerance
+    int rad_aca_max_rank = 50;              // Maximum rank before falling back to sparse
+
+    // ========================================================================
+    // PHASE 4: Command-line argument parsing (PRESERVED: Exact original logic)
+    // Command-line arguments OVERRIDE config file values
+    // ========================================================================
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        // Skip --config and its argument (already processed)
+        if (arg == "--config") {
+            i++; // Skip the filename argument
+            continue;
+        }
+        
+        // Skip --generate-template (already handled)
+        if (arg == "--generate-template") {
+            // Skip optional filename if present
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                i++;
+            }
+            continue;
+        }
+        
+        // ===== ALL ORIGINAL COMMAND-LINE ARGUMENTS BELOW THIS LINE =====
+        
         if (arg == "--start" && i + 1 < argc) {
             start_time = argv[++i];
         } else if (arg == "--duration" && i + 1 < argc) {
@@ -2687,6 +5771,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--locations" && i + 1 < argc) {
             export_locations = true;
             locations_file = argv[++i];
+        } else if (arg == "--depths" && i + 1 < argc) {
+            depths_file = argv[++i];
+            std::cout << "Using depths file for thermal profiles: " << depths_file << std::endl;
+        } else if (arg == "--no-depth-plots") {
+            generate_depth_plots = false;
         } else if (arg == "--series-output" && i + 1 < argc) {
             series_output = argv[++i];
         } else if (arg == "--visualization") {
@@ -2701,19 +5790,37 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (arg == "--thermal-mesh") {
             run_thermal_mesh = true;
+        } else if (arg == "--thermal-debug") {
+            thermal_debug = true;
+        } else if (arg == "--thermal-debug-lat" && i + 1 < argc) {
+            thermal_debug_lat = std::stod(argv[++i]);
+        } else if (arg == "--thermal-m" && i + 1 < argc) {
+            thermal_m = std::stoi(argv[++i]);
+        } else if (arg == "--thermal-n" && i + 1 < argc) {
+            thermal_n = std::stoi(argv[++i]);
+        } else if (arg == "--thermal-b" && i + 1 < argc) {
+            thermal_b = std::stoi(argv[++i]);
         } else if (arg == "--thermal-threads" && i + 1 < argc) {
             thermal_threads = std::stoi(argv[++i]);
+        } else if (arg == "--use-simd-batch") {
+            config.setProperty("use_simd_batch", true);
+            std::cout << "Using SIMD batch thermal solver (SIMD-over-pixels)" << std::endl;
+        } else if (arg == "--use-gpu-thermal") {
+            config.setProperty("use_gpu_thermal", true);
+            std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
         } else if (arg == "--albedo-map" && i + 1 < argc) {
             albedo_map_file = argv[++i];
-            continue;
+            config.setProperty("albedo_map", albedo_map_file);
+            std::cout << "Using custom albedo map: " << albedo_map_file << std::endl;
+        } else if (arg == "--albedo-maps-directory" && i + 1 < argc) {
+            albedo_maps_directory = argv[++i];
+            config.setProperty("albedo_maps_directory", albedo_maps_directory);
+            std::cout << "Using albedo maps directory: " << albedo_maps_directory << std::endl;
         } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
             thermal_inertia_map_file = argv[++i];
             continue;
-        } else if (arg == "--albedo-maps-directory" && i + 1 < argc) {
-            albedo_maps_directory = argv[++i];
-            std::cout << "Using albedo maps directory: " << albedo_maps_directory << std::endl;
         } else if (arg == "--mesh-file" && i + 1 < argc) {
             mesh_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
@@ -2768,10 +5875,33 @@ int main(int argc, char** argv) {
                 if (!illumination_model) {
                     illumination_model = std::make_shared<ptm::IlluminationModel>();
                 }
+
+                // Enable shadow flux calculation if requested
+                if (enable_shadow_flux) {
+                    illumination_model->enableShadowFlux(true, crater_diameter_depth_ratio);
+                    
+                    // Pass the body's optical properties to the illumination model
+                    illumination_model->setBodyOpticalProperties(
+                        planet.albedo,       // Use the planet's albedo
+                        planet.emissivity    // Use the planet's emissivity
+                    );
+                    
+                    std::cout << "Shadow flux calculation enabled with:" << std::endl;
+                    std::cout << "  Diameter/depth ratio D = " << crater_diameter_depth_ratio << std::endl;
+                    std::cout << "  Body albedo = " << planet.albedo << std::endl;
+                    std::cout << "  Body emissivity = " << planet.emissivity << std::endl;
+                }
                 
                 // Set the planetary body in the illumination model
                 illumination_model->setPlanetaryBody(body_enum);
-                config.setProperty("target_body_name", illumination_model->getTargetBodyName());
+                std::string target_body_name = illumination_model->getTargetBodyName();
+                config.setProperty("target_body_name", target_body_name);
+                
+                // Convert to proper case (first letter uppercase, rest lowercase)
+                if (!target_body_name.empty()) {
+                    std::transform(target_body_name.begin(), target_body_name.end(), target_body_name.begin(), ::tolower);
+                    target_body_name[0] = std::toupper(target_body_name[0]);
+                }
                 config.setProperty("default_albedo", std::to_string(illumination_model->getAlbedo()));
 
                 std::cerr << "Using planetary body: " << body_name << std::endl;
@@ -2783,10 +5913,95 @@ int main(int argc, char** argv) {
                 showUsage(argv[0]);
                 return 1;
             }
+        } 
+        else if (arg == "--topo") {
+            use_topography = true;
+            std::cout << "Using topographic mesh for simulation" << std::endl;
+        }
+        else if (arg == "--topo-dir") {
+            if (i + 1 < argc) {
+                topo_meshes_dir = argv[++i];
+                std::cout << "Using topographic meshes directory: " << topo_meshes_dir << std::endl;
+            } else {
+                std::cerr << "Error: --topo-dir requires a directory path" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--shadow-flux") {
+            enable_shadow_flux = true;
+            std::cout << "Enabling shadow/crater flux enhancement (default D/h ratio=" 
+                      << crater_diameter_depth_ratio << ")\n";
+        } else if (arg == "--crater-dd-ratio" && i + 1 < argc) {
+            crater_diameter_depth_ratio = std::stod(argv[++i]);
+            if (crater_diameter_depth_ratio <= 0.1) crater_diameter_depth_ratio = 8.0;
+            std::cout << "Setting crater diameter/depth ratio to " 
+                      << crater_diameter_depth_ratio << std::endl;
+        } else if (arg == "--no-statistics") {
+            compute_statistics = false;
+            std::cout << "Statistics computation disabled" << std::endl;
+        } else if (arg == "--integration-days" && i + 1 < argc) {
+            integration_days = std::stod(argv[++i]);
+            std::cout << "Using integration window: " << integration_days << " days\n";
+        } else if (arg.rfind("--integration-days=", 0) == 0) {
+            integration_days = std::stod(arg.substr(std::string("--integration-days=").size()));
+            std::cout << "Using integration window: " << integration_days << " days\n";
+        } else if (std::string(argv[i]) == "--integration-steps" && i + 1 < argc) {
+            integration_steps_cli = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--integration-offset-days" && i + 1 < argc) {
+            integration_offset_days = std::stod(argv[++i]);
+        } else if (std::string(argv[i]) == "--integration-offset-steps" && i + 1 < argc) {
+            integration_offset_steps_cli = std::stoi(argv[++i]);
+        }
+        // ===== Radiation Exchange Options =====
+        else if (arg == "--radiation-exchange") {
+            enable_radiation_exchange = true;
+            std::cout << "Radiation exchange enabled" << std::endl;
+        } else if (arg == "--rad-hmatrix") {
+            rad_use_hmatrix = true;
+            std::cout << "Using H-matrix compression for view factors" << std::endl;
+        } else if (arg == "--rad-use-gpu") {
+            rad_use_gpu = true;
+            std::cout << "Using GPU for radiosity solver (OpenCL)" << std::endl;
+        } else if (arg == "--rad-verbose") {
+            rad_verbose = true;
+        } else if (arg == "--rad-view-factor-file" && i + 1 < argc) {
+            rad_view_factor_file = argv[++i];
+            std::cout << "View factor file: " << rad_view_factor_file << std::endl;
+        } else if (arg == "--rad-coupling-iter" && i + 1 < argc) {
+            rad_max_coupling_iter = std::stoi(argv[++i]);
+            std::cout << "Max radiation coupling iterations: " << rad_max_coupling_iter << std::endl;
+        } else if (arg == "--rad-coupling-temp-tol" && i + 1 < argc) {
+            rad_coupling_temp_tol = std::stod(argv[++i]);
+            std::cout << "Radiation coupling temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
+        } else if (arg == "--rad-coupling-flux-tol" && i + 1 < argc) {
+            rad_coupling_flux_tol = std::stod(argv[++i]);
+        } else if (arg == "--rad-coupling-face-frac" && i + 1 < argc) {
+            rad_coupling_face_frac = std::stod(argv[++i]);
+        } else if (arg == "--rad-use-svd") {
+            rad_use_aca = false;
+            std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
+        } else if (arg == "--rad-aca-tolerance" && i + 1 < argc) {
+            rad_aca_tolerance = std::stod(argv[++i]);
+            std::cout << "ACA tolerance: " << rad_aca_tolerance << std::endl;
+        } else if (arg == "--rad-aca-max-rank" && i + 1 < argc) {
+            rad_aca_max_rank = std::stoi(argv[++i]);
+            std::cout << "ACA max rank: " << rad_aca_max_rank << std::endl;
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
         }
+    }
+    
+    // ========================================================================
+    // PHASE 5: Configuration summary (optional, can be enabled with --verbose)
+    // ========================================================================
+    if (verbose && has_config_file) {
+        std::cout << "\n=== Configuration Summary ===" << std::endl;
+        std::cout << "Config file: " << config_file << std::endl;
+        std::cout << "Body: " << sim_config.time.body << std::endl;
+        std::cout << "Duration: " << duration_days << " days" << std::endl;
+        std::cout << "Time steps: " << time_steps << std::endl;
+        std::cout << "Thermal mesh: " << (run_thermal_mesh ? "enabled" : "disabled") << std::endl;
+        std::cout << "============================\n" << std::endl;
     }
     
     // Create output directory if it doesn't exist
@@ -2797,35 +6012,127 @@ int main(int argc, char** argv) {
     // Start timing
     auto start_time_point = std::chrono::high_resolution_clock::now();
     
-    // Create mesh
+    // ------------------------------------------------------------------
+    // Create / import mesh (with ASCII PLY fallback for large DTM exports)
+    // ------------------------------------------------------------------
     ptm::MeshUtils meshUtils;
+    std::shared_ptr<Mesh> fallback_mesh;
+    bool using_fallback_mesh = false;
 
     if (!mesh_file.empty()) {
         std::cout << "Importing triangulated mesh from: " << mesh_file << std::endl;
-        if (!meshUtils.importTriangulatedMesh(mesh_file, mesh_scale_factor)) {
-            std::cerr << "Failed to import mesh. Using default icosphere instead." << std::endl;
-            meshUtils.setMeshResolution(mesh_resolution);
+
+        bool imported = meshUtils.importTriangulatedMesh(mesh_file, mesh_scale_factor);
+        if (!imported) {
+            std::cerr << "Primary mesh import failed. Attempting ASCII PLY fallback..." << std::endl;
+
+            std::string ext;
+            if (auto p = mesh_file.find_last_of('.'); p != std::string::npos) {
+                ext = mesh_file.substr(p + 1);
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            }
+            if (ext == "ply") {
+                if (loadAsciiDTMPLY(mesh_file, fallback_mesh)) {
+                    using_fallback_mesh = true;
+                    std::cout << "Fallback PLY load succeeded: "
+                              << fallback_mesh->vertices.size() << " vertices, "
+                              << fallback_mesh->faces.size() << " faces" << std::endl;
+
+                    if (mesh_scale_factor != 1.0) {
+                        std::cout << "Applying scale factor to fallback mesh: "
+                                  << mesh_scale_factor << std::endl;
+                        #pragma omp parallel for schedule(static)
+                        for (size_t i = 0; i < fallback_mesh->vertices.size(); ++i) {
+                            fallback_mesh->vertices[i][0] *= mesh_scale_factor;
+                            fallback_mesh->vertices[i][1] *= mesh_scale_factor;
+                            fallback_mesh->vertices[i][2] *= mesh_scale_factor;
+                        }
+                        // Recompute centers after scaling
+                        #pragma omp parallel for schedule(static)
+                        for (size_t i = 0; i < fallback_mesh->faces.size(); ++i) {
+                            const auto& f = fallback_mesh->faces[i];
+                            const auto& a = fallback_mesh->vertices[f[0]];
+                            const auto& b = fallback_mesh->vertices[f[1]];
+                            const auto& c = fallback_mesh->vertices[f[2]];
+                            fallback_mesh->face_centers[i] = {
+                                (a[0]+b[0]+c[0])/3.0,
+                                (a[1]+b[1]+c[1])/3.0,
+                                (a[2]+b[2]+c[2])/3.0
+                            };
+                        }
+                    }
+
+                    if (!validateMesh(fallback_mesh)) {
+                        std::cerr << "Warning: Fallback mesh validation reported issues." << std::endl;
+                    }
+                } else {
+                    std::cerr << "Fallback ASCII PLY load failed. Reverting to default icosphere." << std::endl;
+                }
+            } else {
+                std::cerr << "File is not a PLY; skipping fallback loader." << std::endl;
+            }
         } else {
-            std::cout << "Successfully imported mesh with " << meshUtils.getMesh()->vertices.size() 
-                      << " vertices and " << meshUtils.getMesh()->faces.size() << " faces" << std::endl;
-            
-            // If scale factor was provided and is not 1.0, add a note about it
+            auto imported_mesh = meshUtils.getMesh();
+            /*
+            std::cout << "Successfully imported mesh with "
+                      << imported_mesh->vertices.size() << " vertices and "
+                      << imported_mesh->faces.size()    << " faces" << std::endl;
+            */
+
             if (mesh_scale_factor != 1.0) {
                 std::cout << "Applied scale factor: " << mesh_scale_factor << std::endl;
             }
-            
-            // Validate the mesh
-            if (!validateMesh(meshUtils.getMesh())) {
+            if (!validateMesh(imported_mesh)) {
                 std::cerr << "Warning: Imported mesh has issues that may affect simulation quality." << std::endl;
             }
         }
+
+        // If both primary + fallback failed → build default icosphere
+        if (!using_fallback_mesh && (!meshUtils.getMesh() || meshUtils.getMesh()->faces.empty())) {
+            std::cerr << "Using default icosphere mesh." << std::endl;
+            meshUtils.setMeshResolution(mesh_resolution);
+            meshUtils.setupMesh();
+        }
     } else {
-        // Use the standard icosphere mesh
-        meshUtils.setMeshResolution(mesh_resolution);
+        // Procedural / topography path
+        bool using_topography_mesh = false;
+
+        if (use_topography && !topo_meshes_dir.empty()) {
+            std::string body_name = illumination_model
+                                      ? illumination_model->getTargetBodyName()
+                                      : "EUROPA";
+            using_topography_mesh = meshUtils.checkForTopographicMesh(
+                                        topo_meshes_dir, mesh_resolution, body_name);
+        }
+
+        if (!using_topography_mesh) {
+            meshUtils.setMeshResolution(mesh_resolution);
+            meshUtils.setupMesh();
+        }
     }
 
-    // Rest of main() stays the same, using meshUtils.getMesh() to access the mesh
-    auto mesh = meshUtils.getMesh();
+    // Resolve final mesh pointer:
+    std::shared_ptr<Mesh> mesh = using_fallback_mesh ? fallback_mesh : meshUtils.getMesh();
+
+    if (!mesh || mesh->faces.empty()) {
+        std::cerr << "ERROR: No valid mesh available after import/setup." << std::endl;
+        return 1;
+    }
+
+    if (using_fallback_mesh) {
+        mesh->setProperty("is_custom_mesh", "true");
+        mesh->setProperty("source_file", mesh_file);
+    }
+    /*
+    std::cout << "Final mesh in use: "
+              << mesh->vertices.size() << " vertices, "
+              << mesh->faces.size()    << " faces"
+              << (using_fallback_mesh ? " (fallback loader)" : "") << std::endl;
+    */
+
+    if (!validateMesh(mesh)) {
+        std::cerr << "Warning: Final mesh validation failed; proceeding anyway." << std::endl;
+    }
     
     // Validate the mesh
     if (!validateMesh(mesh)) {
@@ -2843,12 +6150,87 @@ int main(int argc, char** argv) {
             std::cout << "Mesh exported to " << mesh_filename << std::endl;
         }
     }
-    
+
+    // ========================================================================
+    // EARLY VIEW FACTOR COMPUTATION (if radiation exchange enabled)
+    //
+    // IMPORTANT: Compute view factors BEFORE illumination to avoid OOM.
+    // View factor computation needs lots of working memory (for large meshes,
+    // H-matrix block building can use 2-4 GB per thread). The illumination
+    // arrays for large meshes can use 60+ GB. By computing view factors first:
+    //   1. Full system RAM is available for working memory
+    //   2. View factors are saved to disk immediately after computation
+    //   3. Working memory is freed before illumination starts
+    //   4. Later, only the compressed view factor file needs to be loaded
+    // ========================================================================
+    bool view_factors_precomputed = false;
+    if (enable_radiation_exchange && !rad_view_factor_file.empty()) {
+        // Check if view factor file already exists
+        std::ifstream vf_check(rad_view_factor_file, std::ios::binary);
+        bool vf_file_exists = vf_check.good();
+        vf_check.close();
+
+        if (!vf_file_exists) {
+            std::cout << "\n========== Early View Factor Computation ==========" << std::endl;
+            std::cout << "Computing view factors BEFORE illumination to avoid memory contention." << std::endl;
+            std::cout << "This allows full system RAM for view factor working memory." << std::endl;
+
+            // Configure radiation exchange for view factor computation only
+            radiation::RadiationConfig early_rad_config;
+            early_rad_config.enabled = true;
+            early_rad_config.use_hmatrix = rad_use_hmatrix;
+            early_rad_config.use_gpu = rad_use_gpu;
+            early_rad_config.verbose = rad_verbose;
+
+            // ACA configuration (Adaptive Cross Approximation - much faster)
+            early_rad_config.use_aca = rad_use_aca;
+            early_rad_config.aca_tolerance = rad_aca_tolerance;
+            early_rad_config.aca_max_rank = rad_aca_max_rank;
+
+            // Create temporary radiation exchange manager for view factor computation
+            radiation::RadiationExchangeManager early_rad_manager(mesh, early_rad_config);
+            early_rad_manager.setEmissivity(planet.emissivity);
+
+            // For early computation, we don't have illumination data yet.
+            // Use computeViewFactorsOnly() which doesn't need illumination.
+            // The face classification will be done later when illumination is available.
+            std::cout << "Computing view factors for " << mesh->faces.size() << " faces..." << std::endl;
+
+            bool vf_success = early_rad_manager.computeViewFactorsOnly();
+
+            if (vf_success) {
+                // Save view factors to disk immediately
+                // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
+                // auto-enabled by the manager for large meshes, even if --rad-hmatrix wasn't passed
+                if (early_rad_manager.getHMatrixViewFactors()) {
+                    early_rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
+                } else {
+                    early_rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
+                }
+                std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
+                view_factors_precomputed = true;
+            } else {
+                std::cerr << "Warning: Early view factor computation failed." << std::endl;
+                std::cerr << "Will retry during radiation coupling phase." << std::endl;
+            }
+
+            std::cout << "=================================================\n" << std::endl;
+
+            // The early_rad_manager goes out of scope here, freeing all working memory
+            // before the illumination model allocates its large arrays.
+        } else {
+            std::cout << "View factor file exists: " << rad_view_factor_file << std::endl;
+            std::cout << "Will load during radiation coupling phase." << std::endl;
+            view_factors_precomputed = true;  // Mark as available for later loading
+        }
+    }
+
     // Initialize illumination model
     std::cout << "Setting up illumination model..." << std::endl;
     if (!illumination_model) {
         illumination_model = std::make_shared<ptm::IlluminationModel>();
     }
+
     // If body was specified via command line, it's already set
     // Otherwise, initialize using the thermal::Planet that was created
     if (planet.name != "Custom") {
@@ -2866,13 +6248,19 @@ int main(int argc, char** argv) {
         // Set the illumination model to use the same body
         illumination_model->setPlanetaryBody(body_enum);
         
-        std::cout << "Illumination model using: " << illumination_model->getTargetBodyName() 
-              << " (Primary: " << illumination_model->getPrimaryBodyName() 
-              << ", Meta-kernel: " << illumination_model->getMetaKernel() << ")" << std::endl;
+        // std::cout << "Illumination model using: " << illumination_model->getTargetBodyName() 
+        //       << " (Primary: " << illumination_model->getPrimaryBodyName() 
+        //       << ", Meta-kernel: " << illumination_model->getMetaKernel() << ")" << std::endl;
     }
+
     double default_visible_albedo = illumination_model->getAlbedo();
+    // Ensure we're using the planet's albedo, not a hardcoded value
+    if (std::abs(default_visible_albedo - planet.albedo) > 0.001) {
+        std::cout << "Warning: Mismatch between illumination albedo (" << default_visible_albedo 
+                << ") and planet albedo (" << planet.albedo << "). Using planet value." << std::endl;
+        default_visible_albedo = planet.albedo;
+    }
     illumination_model->initialize_spice(verbose);
-    illumination_model->setTimeSteps(time_steps);
     illumination_model->setAlbedo(default_visible_albedo);
     illumination_model->setKernelsPath(SPICE_KERNELS_DIR);
     illumination_model->setIncludePrimaryReflection(include_primary_reflection);
@@ -2884,36 +6272,108 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    
-    // Calculate total simulation time including equilibration
-    double equilibration_days = equilibration_orbits * 3.55; // multiple of orbital period
-    double total_simulation_days = equilibration_days + duration_days;
+    double synodic_day = getSynodicDayFromPlanet(planet);
+
+    // Calculate equilibration period using the correct synodic day
+    // Note: equilibration_orbits represents number of day/night cycles for equilibration
+    double equilibration_days = std::max(0, equilibration_orbits) * synodic_day;
+
+    // The output (export) window is the user-requested duration
+    const double output_days = duration_days;
+
+    // Derive desired integration window (stats) in days from CLI
+    // Default: integrate over the output window length if not specified
+    double days_per_step_output = (time_steps > 0 && output_days > 0.0)
+        ? (output_days / static_cast<double>(time_steps))
+        : 0.0;
+
+    double requested_integ_days = output_days;
+    if (integration_steps_cli > 0 && days_per_step_output > 0.0) {
+        requested_integ_days = static_cast<double>(integration_steps_cli) * days_per_step_output;
+    } else if (integration_days > 0.0) {
+        requested_integ_days = integration_days;
+    }
+
+    double requested_integ_offset_days = 0.0;
+    if (integration_offset_steps_cli >= 0 && days_per_step_output > 0.0) {
+        requested_integ_offset_days = static_cast<double>(integration_offset_steps_cli) * days_per_step_output;
+    } else if (integration_offset_days > 0.0) {
+        requested_integ_offset_days = integration_offset_days;
+    }
+
+    // Post-equilibration days needed to cover BOTH output and integration windows
+    // We simulate at least max(output_days, integ_offset + integ_days) after equilibration.
+    const double post_eq_days_needed = std::max(output_days, requested_integ_offset_days + requested_integ_days);
+
+    // Final total simulated span (equilibration + max(output, integration))
+    double total_simulation_days = equilibration_days + post_eq_days_needed;
+
+    // Log the calculation for verification
+    std::cout << "\n========== Thermal Equilibration Configuration ==========" << std::endl;
+    std::cout << "Body: " << planet.name << std::endl;
+    std::cout << "Synodic day (solar day): " << synodic_day << " Earth days" << std::endl;
+    std::cout << "Equilibration cycles: " << equilibration_orbits << " day/night cycles" << std::endl;
+    std::cout << "Total equilibration period: " << equilibration_days << " Earth days" << std::endl;
+    std::cout << "Output window (for export): " << output_days << " Earth days" << std::endl;
+    std::cout << "Requested integration (stats): " << requested_integ_days << " days"
+            << " with offset " << requested_integ_offset_days << " days" << std::endl;
+    std::cout << "Post-equilibration simulated span: " << post_eq_days_needed << " Earth days" << std::endl;
+    std::cout << "Total simulation time: " << total_simulation_days << " Earth days" << std::endl;
+    std::cout << "=========================================================\n" << std::endl;
 
     // Calculate adjusted start time that includes equilibration period
     std::string adjustedStartTime = calculateAdjustedStartTime(start_time, -equilibration_days);
 
-    // Calculate time steps needed for proper temporal resolution
-    // This ensures requested time_steps applies ONLY to the main simulation duration
-    int equilibration_steps = static_cast<int>(time_steps * (equilibration_days / duration_days));
-    int total_time_steps = equilibration_steps + time_steps;
+    // Maintain constant temporal resolution based on the output window density
+    // steps_per_day = time_steps / output_days (if > 0)
+    const double steps_per_day = (output_days > 0.0 && time_steps > 0)
+        ? (static_cast<double>(time_steps) / output_days)
+        : 0.0;
+
+    // Total steps for the entire simulation (equil + post-eq)
+    int total_time_steps = static_cast<int>(std::llround(steps_per_day * total_simulation_days));
+    // Steps that belong to equilibration segment
+    int equilibration_steps = static_cast<int>(std::llround(steps_per_day * equilibration_days));
+    // For sanity, output_steps_expected should match user time_steps (modulo rounding)
+    int output_steps_expected = static_cast<int>(std::llround(steps_per_day * output_days));
+
+    // Verify the calculation
+    std::cout << "Time step calculation:" << std::endl;
+    std::cout << "  Requested output time steps: " << time_steps << std::endl;
+    std::cout << "  Output window (days): " << output_days << std::endl;
+    std::cout << "  Steps per day (from output window): " << std::fixed << std::setprecision(6) << steps_per_day << std::endl;
+    std::cout << "  Total simulation days: " << total_simulation_days << std::endl;
+    std::cout << "  Total time steps (including equilibration and integration coverage): " << total_time_steps << std::endl;
+    std::cout << "  Equilibration steps: " << equilibration_steps << std::endl;
+    if (output_steps_expected != time_steps) {
+        std::cout << "  Note: output steps after rounding: " << output_steps_expected << " (requested " << time_steps << ")\n";
+    }
+
+    // Sanity check
+    if (equilibration_steps < 0 || total_time_steps < 1) {
+        std::cerr << "ERROR: Invalid time step configuration! Check parameters." << std::endl;
+        // Fallback to original behavior
+        total_simulation_days = equilibration_days + output_days;
+        total_time_steps = std::max(1, time_steps + static_cast<int>(std::llround(steps_per_day * equilibration_days)));
+        equilibration_steps = std::max(0, total_time_steps - time_steps);
+    }
 
     // Update the illumination model with the total time steps
     illumination_model->setTimeSteps(total_time_steps);
 
     // Run illumination model for the full period but keep track of where the requested interval starts
     std::cout << "Running illumination simulation for " << total_simulation_days 
-              << " days (including " << equilibration_days << " days equilibration)" 
-              << " starting at " << adjustedStartTime << std::endl;
+            << " days (including " << equilibration_days << " days equilibration)"
+            << " starting at " << adjustedStartTime << std::endl;
 
     // Add ray tracing timer start
     auto ray_tracing_start = std::chrono::high_resolution_clock::now();
 
     bool success;
     if (use_batch_processing) {
-        // Use the batch optimized method - faster with SIMD
-        success = illumination_model->calculateIlluminationOptimized(
-            mesh->vertices,
-            mesh->faces,
+        // Use the mesh-based optimized method - avoids recalculating face properties
+        success = illumination_model->calculateIlluminationFromMesh(
+            mesh,
             adjustedStartTime,
             total_simulation_days
         );
@@ -2934,32 +6394,127 @@ int main(int argc, char** argv) {
     double ray_tracing_sec = ray_tracing_ms / 1000.0;
 
     std::cout << "Ray tracing computation completed in " << std::fixed << std::setprecision(3) 
-              << ray_tracing_sec << " seconds (" << ray_tracing_ms << " ms)" << std::endl;
+            << ray_tracing_sec << " seconds (" << ray_tracing_ms << " ms)" << std::endl;
 
     if (!success) {
         std::cerr << "Illumination simulation failed!" << std::endl;
         return 1;
     }
-    
-    // Get full results
-    const auto& illumination_values = illumination_model->getIllumination();
-    const auto& direct_solar_values = illumination_model->getDirectSolarValues();
-    const auto& primary_reflected_values = illumination_model->getPrimaryReflectedValues();
-    const auto& primary_ir_values = illumination_model->getPrimaryIRFlux();
+
+    // Get arrays from illumination model - may be empty if using chunked storage
+    std::vector<double> illumination_values = illumination_model->getIllumination();
+    std::vector<double> direct_solar_values = illumination_model->getDirectSolarValues();
+    std::vector<double> primary_reflected_values = illumination_model->getPrimaryReflectedValues();
+    std::vector<double> primary_ir_values = illumination_model->getPrimaryIRFlux();
+
+    // Get time arrays (these are never chunked)
     const auto& times = illumination_model->getTimes();
     const auto& time_strings = illumination_model->getTimeStrings();
     const auto& sun_positions = illumination_model->getSunPositions();
     const auto& primary_positions = illumination_model->getPrimaryPositions();
 
-    // Calculate the number of faces and other setup parameters
+    // Calculate the number of faces
     size_t num_faces = mesh->faces.size();
+
+    // Check if arrays are empty (indicates chunked storage is being used)
+    bool using_chunked_storage = direct_solar_values.empty() || 
+                                primary_reflected_values.empty() || 
+                                primary_ir_values.empty();
+
+    const size_t total_values_est = num_faces * static_cast<size_t>(total_time_steps);
+    const size_t bytes_per_value = sizeof(double);
+    const size_t arrays_count = 3; // direct, reflected, ir (illum is reconstructed as direct+reflected)
+    const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
+    const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
+    const double STREAM_THRESHOLD_GB = 10.0;
+    bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
+
+    // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
+    // Cannot use streaming mode when radiation exchange is enabled
+    if (enable_radiation_exchange && use_streamed_thermal) {
+        std::cout << "Warning: Radiation exchange requires ~" << std::fixed << std::setprecision(1)
+                  << memory_required_gb_est << " GB RAM" << std::endl;
+        std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
+        use_streamed_thermal = false;
+    }
+
+    // If using chunked storage, extract the data now (SKIP if we plan to stream)
+    if (using_chunked_storage && !use_streamed_thermal) {
+        std::cout << "Detected chunked storage. Extracting illumination data..." << std::endl;
+        
+        size_t total_values = num_faces * static_cast<size_t>(total_time_steps);
+        
+        // Resize arrays to hold the extracted data
+        illumination_values.resize(total_values);
+        direct_solar_values.resize(total_values);
+        primary_reflected_values.resize(total_values);
+        primary_ir_values.resize(total_values);
+        
+        // Extract from chunked storage
+        size_t report_interval = std::max(size_t(1), num_faces / size_t(20));
+        
+        for (size_t f = 0; f < num_faces; f++) {
+            if (f % report_interval == 0 || f == num_faces - 1) {
+                std::cout << "\rExtracting data: " 
+                        << std::fixed << std::setprecision(1) 
+                        << (100.0 * (f + 1) / num_faces) << "%" << std::flush;
+            }
+            
+            for (size_t t = 0; t < static_cast<size_t>(total_time_steps); t++) {
+                size_t idx = f * static_cast<size_t>(total_time_steps) + t;
+                
+                // Use the per-face/per-time accessor methods
+                direct_solar_values[idx] = illumination_model->getDirectSolarValue(f, t);
+                primary_reflected_values[idx] = illumination_model->getPrimaryReflectedValue(f, t);
+                primary_ir_values[idx] = illumination_model->getPrimaryIRValue(f, t);
+                
+                // Calculate total illumination (sum of direct and reflected)
+                illumination_values[idx] = direct_solar_values[idx] + primary_reflected_values[idx];
+            }
+        }
+        std::cout << std::endl;
+    } else if (use_streamed_thermal) {
+        std::cout << "Detected chunked storage. Skipping full illumination extraction (~"
+                  << std::fixed << std::setprecision(1) << memory_required_gb_est
+                  << " GB). Will stream illumination to the thermal solver." << std::endl;
+    }
+
+    // NOW verify the extracted data (only meaningful if we actually extracted)
+    if (!use_streamed_thermal) {
+        std::cout << "\nVerifying extracted illumination data:" << std::endl;
+        std::cout << "  Expected array size: " << num_faces << " * " << total_time_steps 
+                  << " = " << (num_faces * static_cast<size_t>(total_time_steps)) << std::endl;
+        std::cout << "  Illumination array size: " << illumination_values.size() << std::endl;
+        std::cout << "  Direct solar array size: " << direct_solar_values.size() << std::endl;
+        std::cout << "  Times array size: " << times.size() << std::endl;
+    } else {
+        std::cout << "\nStreaming mode: full illumination arrays are intentionally not allocated in RAM." << std::endl;
+        std::cout << "Values are accessed on-demand via getDirectSolarValue(f,t)/... during thermal solve." << std::endl;
+    }
+
+    // Check for non-zero data
+    size_t non_zero_illumination = 0; // FIX: use size_t for very large counts
+    double total_illumination = 0.0;
+    for (size_t i = 0; i < illumination_values.size(); i++) {
+        if (illumination_values[i] > 0.0) {
+            non_zero_illumination++;
+            total_illumination += illumination_values[i];
+        }
+    }
+
+    if (non_zero_illumination == 0 && !illumination_values.empty()) {
+        std::cerr << "WARNING: All illumination values are zero!" << std::endl;
+    } else if (!illumination_values.empty()) {
+        std::cout << "  Non-zero illumination values: " << non_zero_illumination << " out of " 
+                << illumination_values.size() << std::endl;
+        std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/mÂ²" << std::endl;
+    }
 
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
-    std::vector<std::vector<double>> filtered_surface_temps;
 
     if (run_thermal_mesh) {
-        // Configure OpenMP and setup thermal model as before
+        // Configure OpenMP and setup thermal model
         #ifdef _OPENMP
         if (thermal_threads > 0) {
             omp_set_num_threads(thermal_threads);
@@ -2973,14 +6528,23 @@ int main(int argc, char** argv) {
         
         // Set up thermal model configuration
         thermal::Config thermal_config;
-        thermal_config.m = 15;
-        thermal_config.n = 20;
-        thermal_config.b = 5;
+        thermal_config.m = thermal_m;   // Layers in upper skin depth (CLI: --thermal-m)
+        thermal_config.n = thermal_n;   // Layer growth factor (CLI: --thermal-n)
+        thermal_config.b = thermal_b;   // Skin depths to bottom (CLI: --thermal-b)
         thermal_config.F = 0.5;
         thermal_config.NPERDAY = 24;
         thermal_config.NYEARSEQ = 2;
         thermal_config.sigma = 5.67e-8;
-        thermal_config.chi = 2.7e-7;
+        thermal_config.chi = 2.7;  // Hayne et al. (2017) radiative conductivity parameter
+
+        // Set thermal debug options from CLI (use local variables set during arg parsing)
+        thermal_config.THERMAL_DEBUG = thermal_debug;
+        thermal_config.DEBUG_LAT_THRESHOLD = thermal_debug_lat;
+        thermal_config.DEBUG_OUTPUT_DIR = output_dir;
+
+
+        // Set body name in configuration
+        thermal_config.setProperty("target_body_name", illumination_model->getTargetBodyName());
 
         // Add albedo maps directory to config properties
         thermal_config.setProperty("albedo_maps_directory", albedo_maps_directory);
@@ -2989,7 +6553,6 @@ int main(int argc, char** argv) {
         if (!albedo_map_file.empty()) {
             thermal_config.setProperty("albedo_map", albedo_map_file);
         }
-        
         if (!thermal_inertia_map_file.empty()) {
             thermal_config.setProperty("thermal_inertia_map", thermal_inertia_map_file);
         }
@@ -2998,6 +6561,12 @@ int main(int argc, char** argv) {
         thermal_config.custom_properties["is_custom_mesh"] = (mesh_file.empty()) ? "0" : "1";
         thermal_config.custom_properties["mesh_resolution"] = std::to_string(mesh_resolution);
 
+        // Copy GPU thermal flag from CLI parsing config to thermal_config
+        if (config.getPropertyBool("use_gpu_thermal", false)) {
+            thermal_config.setProperty("use_gpu_thermal", true);
+            std::cout << "[GPU Thermal] Flag detected - GPU thermal solver enabled" << std::endl;
+        }
+
         // Debug output to verify properties were set correctly
         if (verbose) {
             std::cout << "Thermal config properties:" << std::endl;
@@ -3005,213 +6574,896 @@ int main(int argc, char** argv) {
             std::cout << " - mesh_resolution: " << mesh_resolution << std::endl;
             std::cout << " - Standard mesh: " << (mesh_file.empty() ? "YES" : "NO") << std::endl;
         }
+
+        bool thermal_success = false;
+
         std::vector<double> direct_solar_values_full;
         std::vector<double> primary_reflected_values_full;
         std::vector<double> primary_ir_values_full;
 
-        // Check if illumination model is using chunked storage by checking if any of the arrays are empty
+        // Detect chunked storage (arrays empty => chunked)
         bool using_chunked_storage = illumination_model->getDirectSolarValues().empty() || 
                                     illumination_model->getPrimaryReflectedValues().empty() || 
                                     illumination_model->getPrimaryIRFlux().empty();
 
-        if (using_chunked_storage) {
-            std::cout << "Detected chunked storage in illumination model. Extracting data for thermal calculations..." << std::endl;
+        const size_t total_values_est = num_faces * static_cast<size_t>(total_time_steps);
+        const size_t bytes_per_value = sizeof(double);
+        const size_t arrays_count = 3; // direct, reflected, ir
+        const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
+        const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
+        const double STREAM_THRESHOLD_GB = 10.0;
+        bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
+
+        // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
+        // Cannot use streaming mode when radiation exchange is enabled
+        if (enable_radiation_exchange && use_streamed_thermal) {
+            std::cout << "Warning: Radiation exchange requires ~" << std::fixed << std::setprecision(1)
+                      << memory_required_gb_est << " GB RAM" << std::endl;
+            std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
+            use_streamed_thermal = false;
+        }
+
+        // If using chunked storage, extract the data now (SKIP if we plan to stream)
+        if (using_chunked_storage && !use_streamed_thermal) {
+            std::cout << "Detected chunked storage. Extracting illumination data..." << std::endl;
             
-            // Get the number of faces and time steps
-            size_t num_faces = mesh->faces.size();
-            size_t total_values = num_faces * total_time_steps;
+            size_t total_values = num_faces * static_cast<size_t>(total_time_steps);
             
-            // Allocate space for the extracted values
+            // Resize arrays to hold the extracted data
+            illumination_values.resize(total_values);
+            direct_solar_values.resize(total_values);
+            primary_reflected_values.resize(total_values);
+            primary_ir_values.resize(total_values);
+            
+            // Extract from chunked storage
+            size_t report_interval = std::max(size_t(1), num_faces / size_t(20));
+            
+            for (size_t f = 0; f < num_faces; f++) {
+                if (f % report_interval == 0 || f == num_faces - 1) {
+                    std::cout << "\rExtracting data: " 
+                            << std::fixed << std::setprecision(1) 
+                            << (100.0 * (f + 1) / num_faces) << "%" << std::flush;
+                }
+                for (size_t t = 0; t < static_cast<size_t>(total_time_steps); t++) {
+                    size_t idx = f * static_cast<size_t>(total_time_steps) + t;
+                    direct_solar_values[idx]      = illumination_model->getDirectSolarValue(f, t);
+                    primary_reflected_values[idx] = illumination_model->getPrimaryReflectedValue(f, t);
+                    primary_ir_values[idx]        = illumination_model->getPrimaryIRValue(f, t);
+                    illumination_values[idx]      = direct_solar_values[idx] + primary_reflected_values[idx];
+                }
+            }
+            std::cout << std::endl;
+        } else if (use_streamed_thermal) {
+            std::cout << "Detected chunked storage. Skipping full illumination extraction (~"
+                    << std::fixed << std::setprecision(1) << memory_required_gb_est
+                    << " GB). Will stream illumination to the thermal solver." << std::endl;
+        }
+
+        // Verify extracted data (only meaningful if arrays exist)
+        if (!use_streamed_thermal) {
+            std::cout << "\nVerifying extracted illumination data:" << std::endl;
+            std::cout << "  Expected array size: " << num_faces << " * " << total_time_steps 
+                    << " = " << (num_faces * static_cast<size_t>(total_time_steps)) << std::endl;
+            std::cout << "  Illumination array size: " << illumination_values.size() << std::endl;
+            std::cout << "  Direct solar array size: " << direct_solar_values.size() << std::endl;
+            std::cout << "  Times array size: " << times.size() << std::endl;
+        } else {
+            std::cout << "\nStreaming mode: full illumination arrays are intentionally not allocated in RAM." << std::endl;
+            std::cout << "Values are accessed on-demand via getDirectSolarValue(f,t)/... during thermal solve." << std::endl;
+        }
+
+        // Non-zero check (safe for empty vectors)
+        size_t non_zero_illumination = 0;
+        double total_illumination = 0.0;
+        for (size_t i = 0; i < illumination_values.size(); i++) {
+            if (illumination_values[i] > 0.0) {
+                non_zero_illumination++;
+                total_illumination += illumination_values[i];
+            }
+        }
+        if (non_zero_illumination == 0 && !illumination_values.empty()) {
+            std::cerr << "WARNING: All illumination values are zero!" << std::endl;
+        } else if (!illumination_values.empty()) {
+            std::cout << "  Non-zero illumination values: " << non_zero_illumination << " out of " 
+                    << illumination_values.size() << std::endl;
+            std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/mÂ²" << std::endl;
+        }
+        
+        // Execute thermal path
+        if (using_chunked_storage && use_streamed_thermal) {
+            // On-demand getters from illumination model (no large buffers)
+            FluxFn get_direct = [&](size_t f, int t) {
+                return illumination_model->getDirectSolarValue(f, t);
+            };
+            FluxFn get_reflected = [&](size_t f, int t) {
+                return illumination_model->getPrimaryReflectedValue(f, t);
+            };
+            FluxFn get_ir = [&](size_t f, int t) {
+                return illumination_model->getPrimaryIRValue(f, t);
+            };
+
+            // Streamed thermal: no face×time allocations
+            bool thermal_success_streamed = runThermalModelsForAllFacesStreamed(
+                mesh,
+                times,
+                total_time_steps,
+                thermal_config,
+                default_visible_albedo,
+                /*ir_albedo*/0.02,
+                thermal_threads,
+                get_direct,
+                get_reflected,
+                get_ir,
+                &surface_temps
+            );
+
+            if (!thermal_success_streamed) {
+                std::cerr << "Streamed thermal mesh simulation failed" << std::endl;
+                return 1;
+            }
+            thermal_success = true;
+        } else if (using_chunked_storage) {
+            // Smaller dataset: extract to arrays and run standard path
+            size_t num_faces_local = mesh->faces.size();
+            size_t total_values    = num_faces_local * static_cast<size_t>(total_time_steps);
             direct_solar_values_full.resize(total_values);
             primary_reflected_values_full.resize(total_values);
             primary_ir_values_full.resize(total_values);
-            
-            // Calculate reporting interval for progress updates
-            size_t report_interval = std::max(size_t(1), num_faces / 20); // Report ~20 times
-            
-            // Extract values from chunked storage with progress reporting
-            for (size_t f = 0; f < num_faces; f++) {
-                // Show progress periodically
-                if (f % report_interval == 0 || f == num_faces - 1) {
+
+            size_t report_interval = std::max<size_t>(1, num_faces_local / 20);
+            for (size_t f = 0; f < num_faces_local; f++) {
+                if (f % report_interval == 0 || f == num_faces_local - 1) {
                     std::cout << "\rExtracting data from chunked storage: " 
                             << std::fixed << std::setprecision(1) 
-                            << (100.0 * f / num_faces) << "%" << std::flush;
+                            << (100.0 * f / num_faces_local) << "%" << std::flush;
                 }
-                
-                for (size_t t = 0; t < total_time_steps; t++) {
-                    size_t idx = f * total_time_steps + t;
-                    
-                    // Use accessor methods to get values from chunked storage
-                    // These methods handle chunking internally
-                    direct_solar_values_full[idx] = illumination_model->getDirectSolarValue(f, t);
+                for (size_t t = 0; t < static_cast<size_t>(total_time_steps); t++) {
+                    size_t idx = f * static_cast<size_t>(total_time_steps) + t;
+                    direct_solar_values_full[idx]      = illumination_model->getDirectSolarValue(f, t);
                     primary_reflected_values_full[idx] = illumination_model->getPrimaryReflectedValue(f, t);
-                    primary_ir_values_full[idx] = illumination_model->getPrimaryIRValue(f, t);
+                    primary_ir_values_full[idx]        = illumination_model->getPrimaryIRValue(f, t);
                 }
             }
-            std::cout << std::endl; // End the progress line
+            std::cout << std::endl;
+
+            // Check which thermal solver to use
+            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", false);
+            bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
+
+            if (use_gpu_thermal) {
+                thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps
+                );
+            } else if (use_simd_batch) {
+                thermal_success = runThermalModelsForAllFacesBatchSoA(
+                    output_dir,
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads
+                );
+            } else {
+                std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
+                thermal_success = runThermalModelsForAllFaces(
+                    output_dir,
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads,
+                    &planet  // Pass planet for incidence-dependent albedo
+                );
+            }
+
+            // Validate the returned temperature matrix shape (faces x total_time_steps)
+            if (thermal_success) {
+                if (!validateTemperatureMatrix(surface_temps, mesh->faces.size(), total_time_steps)) {
+                    std::cerr << "[FATAL] Invalid temperature matrix shape after non-streamed thermal solve; aborting.\n";
+                    return 1;
+                }
+
+                // Debug: Check surface_temps data validity
+                std::cerr << "[DEBUG] After thermal solver (extracted path), surface_temps check:\n";
+                std::cerr << "  surface_temps.size() = " << surface_temps.size() << "\n";
+                if (!surface_temps.empty() && !surface_temps[0].empty()) {
+                    std::cerr << "  surface_temps[0].size() = " << surface_temps[0].size() << "\n";
+                    double min_val = surface_temps[0][0], max_val = surface_temps[0][0];
+                    for (size_t t = 0; t < surface_temps[0].size(); ++t) {
+                        if (surface_temps[0][t] < min_val) min_val = surface_temps[0][t];
+                        if (surface_temps[0][t] > max_val) max_val = surface_temps[0][t];
+                    }
+                    std::cerr << "  Face 0 temp range: " << min_val << " to " << max_val << " K\n";
+                    std::cerr << "  Face 0, first 5 temps: ";
+                    for (size_t t = 0; t < std::min((size_t)5, surface_temps[0].size()); ++t) {
+                        std::cerr << surface_temps[0][t] << " ";
+                    }
+                    std::cerr << "\n";
+                }
+            }
+
+            if (!thermal_success) {
+                std::cerr << "Error during thermal mesh simulation (extracted arrays path)" << std::endl;
+                return 1;
+            }
         } else {
-            // If not using chunked storage, use the regular arrays
-            direct_solar_values_full = illumination_model->getDirectSolarValues();
+            // Not chunked: pull full arrays and run standard path
+            direct_solar_values_full      = illumination_model->getDirectSolarValues();
             primary_reflected_values_full = illumination_model->getPrimaryReflectedValues();
-            primary_ir_values_full = illumination_model->getPrimaryIRFlux();
+            primary_ir_values_full        = illumination_model->getPrimaryIRFlux();
+
+            // Check which thermal solver to use
+            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", false);
+            bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
+
+            if (use_gpu_thermal) {
+                thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps
+                );
+            } else if (use_simd_batch) {
+                thermal_success = runThermalModelsForAllFacesBatchSoA(
+                    output_dir,
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads
+                );
+            } else {
+                std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
+                thermal_success = runThermalModelsForAllFaces(
+                    output_dir,
+                    mesh,
+                    direct_solar_values_full,
+                    primary_reflected_values_full,
+                    primary_ir_values_full,
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    0.02,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads,
+                    &planet  // Pass planet for incidence-dependent albedo
+                );
+            }
+
+            // Validate the returned temperature matrix shape (faces x total_time_steps)
+            if (thermal_success) {
+                if (!validateTemperatureMatrix(surface_temps, mesh->faces.size(), total_time_steps)) {
+                    std::cerr << "[FATAL] Invalid temperature matrix shape after non-streamed thermal solve; aborting.\n";
+                    return 1;
+                }
+            }
+
+            if (!thermal_success) {
+                std::cerr << "Error during thermal mesh simulation" << std::endl;
+                return 1;
+            }
         }
 
-        // Now use our extracted values instead of the direct accessors
-        bool thermal_success = runThermalModelsForAllFaces(
-            output_dir,
-            mesh,
-            direct_solar_values_full,         // Use our extracted values
-            primary_reflected_values_full,    // Use our extracted values 
-            primary_ir_values_full,           // Use our extracted values
-            times,                           // Use FULL times
-            total_time_steps,                // Use FULL time step count
-            thermal_config,
-            default_visible_albedo,
-            0.02,
-            &surface_temps,
-            equilibration_steps,
-            total_time_steps,
-            thermal_threads                  // Pass thermal_threads as the last parameter
-        );
-        
-        if (!thermal_success) {
+        if (!thermal_success && surface_temps.empty()) {
             std::cerr << "Error during thermal mesh simulation" << std::endl;
             return 1;
         }
+
+        // ========================================================================
+        // RADIATION EXCHANGE COUPLING (Optional)
+        // ========================================================================
+        if (enable_radiation_exchange && thermal_success) {
+            std::cout << "\n========== Radiation Exchange Coupling ==========" << std::endl;
+
+            // Check memory requirements for radiation coupling
+            const double rad_memory_gb = (num_faces * total_time_steps * 24.0) / (1024.0 * 1024.0 * 1024.0);
+            if (rad_memory_gb > 16.0) {
+                std::cerr << "Warning: Radiation exchange requires ~" << std::fixed << std::setprecision(1)
+                          << rad_memory_gb << " GB RAM" << std::endl;
+            }
+
+            // Configure radiation exchange
+            radiation::RadiationConfig rad_config;
+            rad_config.enabled = true;
+            rad_config.use_hmatrix = rad_use_hmatrix;
+            rad_config.use_gpu = rad_use_gpu;
+            rad_config.verbose = rad_verbose;
+            rad_config.max_iterations = 100;           // Radiosity solver iterations
+            rad_config.convergence_tolerance = 0.001;  // Radiosity solver tolerance
+
+            // ACA configuration (Adaptive Cross Approximation - much faster)
+            rad_config.use_aca = rad_use_aca;
+            rad_config.aca_tolerance = rad_aca_tolerance;
+            rad_config.aca_max_rank = rad_aca_max_rank;
+
+            // Create radiation exchange manager
+            radiation::RadiationExchangeManager rad_manager(mesh, rad_config);
+
+            // Try to load pre-computed view factors
+            if (!rad_view_factor_file.empty()) {
+                if (rad_manager.loadViewFactors(rad_view_factor_file)) {
+                    std::cout << "Loaded view factors from: " << rad_view_factor_file << std::endl;
+                } else {
+                    std::cout << "View factors not found, will compute..." << std::endl;
+                }
+            }
+
+            // Set emissivity from planet properties
+            rad_manager.setEmissivity(planet.emissivity);
+
+            // Prepare illumination series for face classification
+            std::vector<std::vector<double>> illumination_series(num_faces);
+            for (size_t f = 0; f < num_faces; f++) {
+                illumination_series[f].resize(total_time_steps);
+                for (int t = 0; t < total_time_steps; t++) {
+                    size_t idx = f * static_cast<size_t>(total_time_steps) + t;
+                    illumination_series[f][t] = direct_solar_values[idx];
+                }
+            }
+
+            // Prepare (classify faces, compute view factors if needed)
+            if (!rad_manager.prepare(illumination_series)) {
+                std::cout << "No faces need radiation exchange - skipping coupling loop" << std::endl;
+            } else {
+                std::cout << "Faces requiring radiation exchange: " << rad_manager.numExchangeFaces()
+                          << " / " << num_faces << std::endl;
+
+                // Save view factors if computed (not loaded)
+                // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
+                // auto-enabled by the manager for large meshes, even if --rad-hmatrix wasn't passed
+                if (!rad_view_factor_file.empty() && !rad_manager.hasLoadedViewFactors()) {
+                    if (rad_manager.getHMatrixViewFactors()) {
+                        rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
+                    } else {
+                        rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
+                    }
+                    std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
+                }
+
+                std::cout << "\nStarting radiation-thermal coupling iterations..." << std::endl;
+                std::cout << "  Max iterations: " << rad_max_coupling_iter << std::endl;
+                std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
+
+                // Store previous iteration temperatures for convergence check
+                std::vector<std::vector<double>> prev_temps = surface_temps;
+
+                // Time-varying indirect flux per face [face][timestep]
+                // This is the key fix: indirect flux varies with time as wall temperatures change
+                std::vector<std::vector<double>> indirect_flux_series(num_faces);
+                for (size_t f = 0; f < num_faces; f++) {
+                    indirect_flux_series[f].resize(total_time_steps, 0.0);
+                }
+
+                for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
+                    std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
+
+                    // Step 1: Compute indirect flux at EVERY timestep
+                    // This captures time-varying thermal emission from illuminated walls
+                    double max_indirect = 0.0;
+                    double total_indirect_sum = 0.0;
+
+                    thermal::ProgressBar flux_progress(total_time_steps, "Computing indirect flux", 50, true);
+
+                    // Sequential timestep loop - each solve uses all threads for H-matrix matvec
+                    // The H-matrix matvec is parallelized over ~2M blocks internally
+                    for (int t = 0; t < total_time_steps; t++) {
+                        // Extract temperatures at timestep t
+                        std::vector<double> temps_t(num_faces);
+                        std::vector<double> solar_t(num_faces);
+
+                        #pragma omp parallel for schedule(static)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            temps_t[f] = surface_temps[f][t];
+                            solar_t[f] = direct_solar_values[f * total_time_steps + t];
+                        }
+
+                        // Compute indirect flux at this timestep
+                        std::vector<double> indirect_t = rad_manager.computeIndirectFlux(temps_t, solar_t);
+
+                        // Store time-varying indirect flux and accumulate statistics
+                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            indirect_flux_series[f][t] = indirect_t[f];
+                            if (indirect_t[f] > max_indirect) {
+                                max_indirect = indirect_t[f];
+                            }
+                            total_indirect_sum += indirect_t[f];
+                        }
+
+                        if ((t + 1) % 10 == 0 || t == total_time_steps - 1) {
+                            flux_progress.update(t + 1);
+                        }
+                    }
+                    flux_progress.finish();
+
+                    double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
+                    std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
+                    std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
+
+                    // Step 2: Identify faces that need thermal re-run
+                    // Include faces where max indirect flux over time exceeds threshold
+                    std::vector<int> faces_to_rerun;
+                    for (size_t f = 0; f < num_faces; f++) {
+                        double max_face_indirect = 0.0;
+                        for (int t = 0; t < total_time_steps; t++) {
+                            if (indirect_flux_series[f][t] > max_face_indirect) {
+                                max_face_indirect = indirect_flux_series[f][t];
+                            }
+                        }
+                        // Include face if max indirect flux over time exceeds threshold
+                        if (max_face_indirect > rad_coupling_flux_tol) {
+                            faces_to_rerun.push_back(static_cast<int>(f));
+                        }
+                    }
+
+                    std::cout << "  Faces with significant indirect flux: " << faces_to_rerun.size()
+                              << " / " << num_faces << std::endl;
+
+                    if (faces_to_rerun.empty()) {
+                        std::cout << "  No faces need re-run. Converged." << std::endl;
+                        break;
+                    }
+
+                    // Check convergence from previous iteration
+                    if (iter > 0) {
+                        double max_temp_change = 0.0;
+                        int faces_changed = 0;
+
+                        for (size_t f = 0; f < num_faces; f++) {
+                            for (int t = 0; t < total_time_steps; t++) {
+                                double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
+                                if (dT > max_temp_change) max_temp_change = dT;
+                                if (dT > rad_coupling_temp_tol) faces_changed++;
+                            }
+                        }
+
+                        double face_frac = static_cast<double>(faces_changed) / (num_faces * total_time_steps);
+                        std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
+                        std::cout << "  Samples still changing: " << (face_frac * 100) << "%" << std::endl;
+
+                        if (max_temp_change < rad_coupling_temp_tol && face_frac < rad_coupling_face_frac) {
+                            std::cout << "  Converged!" << std::endl;
+                            break;
+                        }
+                    }
+
+                    // Save previous temps for next iteration comparison
+                    prev_temps = surface_temps;
+
+                    // Step 3: Re-run thermal for selected faces with TIME-VARYING indirect flux
+                    std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
+
+                    // Build flux arrays with TIME-VARYING indirect contribution for all selected faces
+                    double absorbed_albedo = 1.0 - planet.albedo;
+                    std::vector<std::vector<double>> combined_flux(faces_to_rerun.size());
+                    for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
+                        int f = faces_to_rerun[idx];
+                        combined_flux[idx].resize(total_time_steps);
+                        for (int t = 0; t < total_time_steps; t++) {
+                            size_t flux_idx = static_cast<size_t>(f) * total_time_steps + t;
+                            // Direct + reflected solar (absorbed)
+                            double solar_absorbed = (direct_solar_values[flux_idx] +
+                                                    primary_reflected_values[flux_idx]) * absorbed_albedo;
+                            // Add absorbed IR
+                            double ir_absorbed = primary_ir_values[flux_idx] * planet.emissivity;
+                            // Add TIME-VARYING indirect radiation flux at this timestep
+                            combined_flux[idx][t] = solar_absorbed + ir_absorbed + indirect_flux_series[f][t];
+                        }
+                    }
+
+                    // Check if GPU thermal is enabled
+                    bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
+
+                    if (use_gpu_thermal_rerun && faces_to_rerun.size() >= 100) {
+                        // Use GPU thermal solver for radiation coupling re-runs
+                        std::cout << "  Using GPU thermal solver..." << std::endl;
+                        bool gpu_success = runThermalForSelectedFaces_GPU(
+                            mesh,
+                            faces_to_rerun,
+                            combined_flux,
+                            times,
+                            total_time_steps,
+                            thermal_config,
+                            surface_temps
+                        );
+                        if (!gpu_success) {
+                            std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
+                            use_gpu_thermal_rerun = false;
+                        }
+                    }
+
+                    if (!use_gpu_thermal_rerun) {
+                        // CPU path: OpenMP parallel loop
+                        thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
+                        std::atomic<int> rerun_completed{0};
+
+                        #pragma omp parallel for schedule(dynamic, 10) num_threads(thermal_threads > 0 ? thermal_threads : omp_get_max_threads())
+                        for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
+                            int f = faces_to_rerun[idx];
+
+                            // Run thermal model using the standard function
+                            double latitude = mesh->latitudes[f];
+                            std::vector<double> new_temps = runThermalModelWithMatchedTimes(
+                                combined_flux[idx],
+                                times,
+                                latitude,
+                                thermal_config,
+                                equilibration_steps
+                            );
+
+                            // Store results
+                            #pragma omp critical
+                            {
+                                if (!new_temps.empty()) {
+                                    surface_temps[f] = std::move(new_temps);
+                                }
+                            }
+
+                            int cur = ++rerun_completed;
+                            if (cur % 100 == 0) {
+                                #pragma omp critical
+                                rerun_progress.update(cur);
+                            }
+                        }
+                        rerun_progress.finish();
+                    }
+                }
+
+                // Print final statistics
+                auto stats = rad_manager.getStatistics();
+                std::cout << "\n=== Radiation Exchange Complete ===" << std::endl;
+                std::cout << "  Mean indirect flux: " << stats.mean_indirect_flux << " W/m2" << std::endl;
+                std::cout << "  Max indirect flux: " << stats.max_indirect_flux << " W/m2" << std::endl;
+            }
+
+            std::cout << "=================================================\n" << std::endl;
+        }
     }
 
-    // NOW filter BOTH illumination and thermal data together using the same approach 
+    // Full arrays exist iff not streaming or we explicitly extracted
+    const bool have_full_illum_arrays =
+        !(using_chunked_storage && use_streamed_thermal) &&
+        !direct_solar_values.empty() &&
+        !primary_reflected_values.empty() &&
+        !primary_ir_values.empty();
+
+    // ===== INTEGRATION (statistics) interval =====
+    int stats_start_step = 0;
+    int stats_steps = 0;
+    FilteredData stats_fd;
+    {
+        const double steps_per_day_full = total_simulation_days > 0.0
+            ? static_cast<double>(total_time_steps) / total_simulation_days
+            : 0.0;
+
+        double integ_days_used = (integration_days > 0.0 ? integration_days : output_days);
+        int integration_steps = (integration_steps_cli > 0)
+            ? integration_steps_cli
+            : static_cast<int>(std::llround(integ_days_used * steps_per_day_full));
+        if (integration_steps < 1) integration_steps = 1;
+
+        int integration_offset_steps = (integration_offset_steps_cli >= 0)
+            ? integration_offset_steps_cli
+            : static_cast<int>(std::llround(std::max(0.0, integration_offset_days) * steps_per_day_full));
+        if (integration_offset_steps < 0) integration_offset_steps = 0;
+
+        stats_start_step = equilibration_steps + integration_offset_steps;
+        if (stats_start_step >= total_time_steps) stats_start_step = std::max(0, total_time_steps - 1);
+
+        stats_steps = std::min(integration_steps, std::max(0, total_time_steps - stats_start_step));
+        if (stats_steps < 1) stats_steps = std::min(1, total_time_steps);
+
+        std::cout << "\n[Integration] Statistics interval\n"
+                << "  Start (abs step): " << stats_start_step << "\n"
+                << "  Duration (steps): " << stats_steps << "\n";
+
+        if (have_full_illum_arrays) {
+            // Normal path: slice all arrays
+            stats_fd = filterFaceMajorStable(
+                illumination_values,
+                direct_solar_values,
+                primary_reflected_values,
+                primary_ir_values,
+                surface_temps,
+                times,
+                time_strings,
+                sun_positions,
+                primary_positions,
+                num_faces,
+                total_time_steps,
+                stats_start_step,
+                stats_steps
+            );
+        } else {
+            // Meta-only slice for stats; illumination arrays remain empty (skipped)
+            stats_fd.times.assign(times.begin() + stats_start_step, times.begin() + stats_start_step + stats_steps);
+            stats_fd.time_strings.assign(time_strings.begin() + stats_start_step, time_strings.begin() + stats_start_step + stats_steps);
+            stats_fd.sun_pos.assign(sun_positions.begin() + stats_start_step, sun_positions.begin() + stats_start_step + stats_steps);
+            stats_fd.primary_pos.assign(primary_positions.begin() + stats_start_step, primary_positions.begin() + stats_start_step + stats_steps);
+
+            // Slice temperatures for the statistics interval
+            stats_fd.temps.resize(num_faces);
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < num_faces; ++f) {
+                const auto& src = surface_temps[f];
+                if (src.size() >= static_cast<size_t>(total_time_steps) &&
+                    stats_start_step + stats_steps <= static_cast<int>(src.size())) {
+                    stats_fd.temps[f].assign(
+                        src.begin() + stats_start_step,
+                        src.begin() + stats_start_step + stats_steps
+                    );
+                }
+            }
+        }
+    }
+
+    // ========== BEGIN DATA FILTERING SECTION ==========
+
+    // Filtered datasets (output interval)
     std::vector<double> filtered_illumination_values;
     std::vector<double> filtered_direct_solar_values;
     std::vector<double> filtered_primary_reflected_values;
     std::vector<double> filtered_primary_ir_values;
+    std::vector<std::vector<double>> filtered_surface_temps;
     std::vector<double> filtered_times;
     std::vector<std::string> filtered_time_strings;
-    std::vector<std::array<double, 3>> filtered_sun_positions;
-    std::vector<std::array<double, 3>> filtered_primary_positions;
+    std::vector<std::array<double,3>> filtered_sun_positions;
+    std::vector<std::array<double,3>> filtered_primary_positions;
 
-    // Properly calculate array sizes and time step counts
-    const int filtered_time_steps = time_steps;
-    const size_t filtered_array_size = num_faces * filtered_time_steps;
+    {
+        const size_t face_count = num_faces;
+        const int total_ts      = total_time_steps;
+        int skip_eq             = equilibration_steps;
+        int requested_out_ts    = time_steps;
 
-    // First allocate arrays to appropriate sizes with proper initialization
-    filtered_illumination_values.resize(filtered_array_size, 0.0);
-    filtered_direct_solar_values.resize(filtered_array_size, 0.0);
-    filtered_primary_reflected_values.resize(filtered_array_size, 0.0);
-    filtered_primary_ir_values.resize(filtered_array_size, 0.0);
-
-    // Clear time-related arrays
-    filtered_times.clear();
-    filtered_time_strings.clear();
-    filtered_sun_positions.clear();
-    filtered_primary_positions.clear();
-
-    // Reserve capacity for better performance
-    filtered_times.reserve(filtered_time_steps);
-    filtered_time_strings.reserve(filtered_time_steps);
-    filtered_sun_positions.reserve(filtered_time_steps);
-    filtered_primary_positions.reserve(filtered_time_steps);
-
-    // Process time arrays first
-    std::cout << "Filtering " << total_time_steps << " time steps to " << filtered_time_steps 
-            << " output time steps (skipping " << equilibration_steps << " equilibration steps)" << std::endl;
-
-    // Extract the time-related arrays safely
-    for (int t = equilibration_steps; t < total_time_steps && t < times.size(); t++) {
-        filtered_times.push_back(times[t]);
-        
-        if (t < time_strings.size()) {
-            filtered_time_strings.push_back(time_strings[t]);
+        if (skip_eq + requested_out_ts > total_ts) {
+            requested_out_ts = std::max(0, total_ts - skip_eq);
         }
-        
-        if (t < sun_positions.size()) {
-            filtered_sun_positions.push_back(sun_positions[t]);
-        }
-        
-        if (t < primary_positions.size()) {
-            filtered_primary_positions.push_back(primary_positions[t]);
-        }
-    }
 
-    // For large meshes, process in batches to avoid excessive logging
-    const size_t reporting_interval = std::max(size_t(1), num_faces / 20); // Report ~20 times
-    std::cout << "Filtering illumination data..." << std::endl;
-
-    // Filter illumination data with robust bounds checking
-    for (size_t f = 0; f < num_faces; f++) {
-        // Report progress periodically
-        if (f % reporting_interval == 0 || f == num_faces - 1) {
-            std::cout << "\rFiltering face " << f + 1 << "/" << num_faces << " (" 
-                    << std::fixed << std::setprecision(1) << (100.0 * f / num_faces) 
-                    << "%)" << std::flush;
+        // Diagnostics only if arrays exist
+        if (have_full_illum_arrays && !illumination_values.empty() && !direct_solar_values.empty()) {
+            diagnosticsIlluminationCoverage(
+                illumination_values,
+                direct_solar_values,
+                face_count,
+                total_ts,
+                "Pre-filter (full series)",
+                verbose);
         }
-        
-        // Process each time step for this face
-        for (int t = equilibration_steps; t < total_time_steps; t++) {
-            // New time index relative to filtered data
-            int new_t = t - equilibration_steps;
-            
-            // Calculate source and destination indices
-            size_t src_idx = f * total_time_steps + t;
-            size_t dst_idx = f * filtered_time_steps + new_t;
-            
-            // Get direct illumination model references for consistency
-            const auto& illumination_values = illumination_model->getIllumination();
-            const auto& direct_solar_values = illumination_model->getDirectSolarValues();
-            const auto& primary_reflected_values = illumination_model->getPrimaryReflectedValues();
-            const auto& primary_ir_values = illumination_model->getPrimaryIRFlux();
-            
-            // Robust bounds checking for both source and destination arrays
-            if (src_idx >= direct_solar_values.size() || dst_idx >= filtered_array_size) {
-                continue; // Skip this index safely
+
+        if (have_full_illum_arrays) {
+            // Normal path: face-major copy into filtered arrays
+            FilteredData fd = filterFaceMajorStable(
+                illumination_values,
+                direct_solar_values,
+                primary_reflected_values,
+                primary_ir_values,
+                surface_temps,
+                times,
+                time_strings,
+                sun_positions,
+                primary_positions,
+                face_count,
+                total_ts,
+                skip_eq,
+                requested_out_ts,
+                verbose
+            );
+
+            const int filtered_steps = static_cast<int>(fd.times.size());
+            diagnosticsIlluminationCoverage(
+                fd.illumination,
+                fd.direct,
+                face_count,
+                filtered_steps,
+                "Post-filter (output interval)",
+                verbose);
+
+            filtered_illumination_values.swap(fd.illumination);
+            filtered_direct_solar_values.swap(fd.direct);
+            filtered_primary_reflected_values.swap(fd.reflected);
+            filtered_primary_ir_values.swap(fd.ir);
+            filtered_surface_temps.swap(fd.temps);
+            filtered_times.swap(fd.times);
+            filtered_time_strings.swap(fd.time_strings);
+            filtered_sun_positions.swap(fd.sun_pos);
+            filtered_primary_positions.swap(fd.primary_pos);
+
+            time_steps = filtered_steps;
+        } else {
+            // Chunked/streamed path: slice meta and temperatures, AND extract illumination for output window only
+            const int start = skip_eq;
+            const int end   = std::min(start + requested_out_ts, total_ts);
+            const int filtered_steps = std::max(0, end - start);
+
+            // Meta slices
+            if (filtered_steps > 0) {
+                filtered_times.assign(times.begin() + start, times.begin() + end);
+                filtered_time_strings.assign(time_strings.begin() + start, time_strings.begin() + end);
+                filtered_sun_positions.assign(sun_positions.begin() + start, sun_positions.begin() + end);
+                filtered_primary_positions.assign(primary_positions.begin() + start, primary_positions.begin() + end);
             }
-            
-            // Now we can safely copy values with verified indices
-            filtered_direct_solar_values[dst_idx] = direct_solar_values[src_idx];
-            filtered_primary_reflected_values[dst_idx] = primary_reflected_values[src_idx];
-            filtered_primary_ir_values[dst_idx] = primary_ir_values[src_idx];
-            
-            // Illumination is the sum of direct and reflected
-            filtered_illumination_values[dst_idx] = 
-                direct_solar_values[src_idx] + primary_reflected_values[src_idx];
-                
-            // Add additional bounds check for illumination values if they're separate from
-            // the direct and reflected components
-            if (illumination_values.size() > 0 && src_idx < illumination_values.size()) {
-                // Override with actual illumination if available 
-                // (in case it's not just the sum of direct and reflected)
-                filtered_illumination_values[dst_idx] = illumination_values[src_idx];
-            }
-        }
-    }
-    std::cout << std::endl; // End progress line
 
-    // Now filter thermal data with the same careful approach
-    if (run_thermal_mesh && !surface_temps.empty()) {
-        std::cout << "Filtering thermal data..." << std::endl;
-        filtered_surface_temps.resize(surface_temps.size());
-        
-        for (size_t f = 0; f < surface_temps.size(); f++) {
-            if (f % reporting_interval == 0 || f == surface_temps.size() - 1) {
-                std::cout << "\rFiltering thermal face " << f + 1 << "/" << surface_temps.size() 
-                        << " (" << std::fixed << std::setprecision(1) 
-                        << (100.0 * f / surface_temps.size()) << "%)" << std::flush;
-            }
-            
-            // Initialize with safe default temperature
-            filtered_surface_temps[f].resize(filtered_time_steps, 50.0); 
-            
-            // Only copy valid indices
-            for (int t = 0; t < filtered_time_steps; t++) {
-                int src_t = t + equilibration_steps;
-                
-                // Check array bounds before accessing
-                if (src_t < surface_temps[f].size()) {
-                    filtered_surface_temps[f][t] = surface_temps[f][src_t];
+            // Temperatures slice for output interval
+            filtered_surface_temps.resize(face_count);
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < face_count; ++f) {
+                const auto& src = surface_temps[f];
+                if (filtered_steps > 0 &&
+                    src.size() >= static_cast<size_t>(total_ts) &&
+                    end <= static_cast<int>(src.size())) {
+                    filtered_surface_temps[f].assign(src.begin() + start, src.begin() + end);
                 }
             }
+
+            // Extract illumination arrays for just the output window to enable export
+            if (filtered_steps > 0 && illumination_model) {
+                const size_t out_size = face_count * static_cast<size_t>(filtered_steps);
+                filtered_direct_solar_values.assign(out_size, 0.0);
+                filtered_primary_reflected_values.assign(out_size, 0.0);
+                filtered_primary_ir_values.assign(out_size, 0.0);
+                filtered_illumination_values.assign(out_size, 0.0);
+
+                // Fill via on-demand getters; write face-major contiguous blocks
+                #pragma omp parallel for schedule(dynamic, 1024)
+                for (size_t f = 0; f < face_count; ++f) {
+                    const size_t dst_base = f * static_cast<size_t>(filtered_steps);
+                    for (int ot = 0; ot < filtered_steps; ++ot) {
+                        const int t = start + ot;
+
+                        const double d  = illumination_model->getDirectSolarValue(f, t);
+                        const double r  = illumination_model->getPrimaryReflectedValue(f, t);
+                        const double ir = illumination_model->getPrimaryIRValue(f, t);
+
+                        filtered_direct_solar_values[dst_base + ot]        = d;
+                        filtered_primary_reflected_values[dst_base + ot]    = r;
+                        filtered_primary_ir_values[dst_base + ot]           = ir;
+                        filtered_illumination_values[dst_base + ot]         = d + r; // illumination = direct + reflected
+                    }
+                }
+
+                diagnosticsIlluminationCoverage(
+                    filtered_illumination_values,
+                    filtered_direct_solar_values,
+                    face_count,
+                    filtered_steps,
+                    "Post-filter (output interval, chunked)",
+                    verbose);
+            } else {
+                // If no illumination_model or zero steps, leave arrays empty (nothing to export)
+                filtered_direct_solar_values.clear();
+                filtered_primary_reflected_values.clear();
+                filtered_primary_ir_values.clear();
+                filtered_illumination_values.clear();
+            }
+
+            time_steps = filtered_steps;
         }
-        std::cout << std::endl; // End progress line
+
+        // Optional spot check (only if we actually have direct solar and verbose mode)
+        if (verbose && !filtered_direct_solar_values.empty() && time_steps > 0) {
+            std::cout << "[Filter] Spot check (face 0) direct solar:";
+            for (int k : {0, time_steps/4, time_steps/2, (3*time_steps)/4, time_steps-1}) {
+                const size_t idx = 0 * static_cast<size_t>(time_steps) + static_cast<size_t>(k);
+                if (idx < filtered_direct_solar_values.size())
+                    std::cout << " " << filtered_direct_solar_values[idx];
+            }
+            std::cout << "\n";
+        }
+    }
+    // ========== END DATA FILTERING SECTION ==========
+
+    // Now filter thermal data only if we ran the thermal model AND temps not already filtered
+    if (run_thermal_mesh && !surface_temps.empty() && filtered_surface_temps.empty()) {
+        std::cout << "Filtering thermal data..." << std::endl;
+
+        const size_t face_count = surface_temps.size();
+        const int full_steps = total_time_steps;          // full (incl. equilibration)
+        const int skip_eq = equilibration_steps;
+        const int out_steps = time_steps;                 // already updated to filtered illumination steps
+
+        if (skip_eq + out_steps > full_steps) {
+            std::cerr << "Thermal filter: adjusting output steps (skip+out exceeds full)." << std::endl;
+        }
+
+        filtered_surface_temps.resize(face_count);
+
+        size_t report_interval = std::max<size_t>(size_t(1), face_count / 20);
+
+        // Quick diagnostic on source temps
+        std::cout << "Source temperature data check (few reference times):" << std::endl;
+        for (int probe : {0, full_steps / 2, std::max(0, full_steps - 1)}) {
+            if (probe < full_steps && !surface_temps[0].empty() && probe < (int)surface_temps[0].size()) {
+                double mn = 1e9, mx = -1e9;
+                for (size_t f = 0; f < std::min<size_t>(100, face_count); ++f) {
+                    if (probe < (int)surface_temps[f].size()) {
+                        mn = std::min(mn, surface_temps[f][probe]);
+                        mx = std::max(mx, surface_temps[f][probe]);
+                    }
+                }
+                std::cout << "  t=" << probe << ": min=" << mn << "K max=" << mx << "K" << std::endl;
+            }
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < face_count; ++f) {
+            const auto& src = surface_temps[f];
+            std::vector<double> dst(out_steps, 50.0);
+            for (int ot = 0; ot < out_steps; ++ot) {
+                int st = skip_eq + ot;
+                if (st >= 0 && st < (int)src.size()) {
+                    dst[ot] = src[st];
+                }
+            }
+            filtered_surface_temps[f].swap(dst);
+
+            if (f < 1) { // face 0 diagnostic once
+                double mn = *std::min_element(filtered_surface_temps[f].begin(), filtered_surface_temps[f].end());
+                double mx = *std::max_element(filtered_surface_temps[f].begin(), filtered_surface_temps[f].end());
+                #pragma omp critical
+                std::cout << "  Face 0 filtered temp range: [" << mn << "," << mx << "]K" << std::endl;
+            }
+            if (report_interval > 0 && f % report_interval == 0) {
+                #pragma omp critical
+                std::cout << "\rFiltering thermal faces: "
+                        << std::fixed << std::setprecision(1)
+                        << (100.0 * (f + 1) / face_count) << "%" << std::flush;
+            }
+        }
+        std::cout << "\rFiltering thermal faces: 100.0%\n";
+    } else if (run_thermal_mesh && !filtered_surface_temps.empty()) {
+        if (verbose) {
+            std::cout << "Thermal data already filtered (skipping duplicate filtering)." << std::endl;
+        }
+    }
+
+    if (run_thermal_mesh) {
+        if (!validateTemperatureMatrix(filtered_surface_temps, mesh->faces.size(), time_steps)) {
+            std::cerr << "[FATAL] Filtered temperature matrix shape invalid (faces x output_steps). Aborting.\n";
+            return 1;
+        }
     }
 
     // Now write body positions file with filtered data
@@ -3245,92 +7497,149 @@ int main(int argc, char** argv) {
                 illumination_vtk_file,
                 mesh,
                 filtered_illumination_values,
+                filtered_primary_reflected_values,
                 filtered_primary_ir_values,
                 filtered_times,
                 filtered_time_strings,
-                time_steps);
+                time_steps
+            );
+            
+            if (data_write_success) {
+                std::cout << "Illumination data written to " << illumination_vtk_file << std::endl;
+            }
         } else {
-            // Generate dynamic filenames if not specified by user
-            if (thermal_vtk_file.empty()) {
-                thermal_vtk_file = generateSimulationFilename(
-                    output_dir, 
-                    planet.name,
-                    start_time, 
-                    "thermal"
+            // For thermal runs, create a combined VTK file with all data
+            std::cout << "Writing complete data to VTK..." << std::endl;
+            MeshUtils mesh_utils;
+            
+            std::string vtk_file = (vtk_output_mode == "thermal") ? thermal_vtk_file : complete_vtk_file;
+            
+            data_write_success = mesh_utils.exportIlluminationToVTK(
+                vtk_file,
+                mesh,
+                filtered_illumination_values,
+                filtered_primary_reflected_values,
+                filtered_primary_ir_values,
+                filtered_times,
+                filtered_time_strings,
+                time_steps
+            );
+            
+            if (data_write_success && !filtered_surface_temps.empty()) {
+                std::cout << "Adding thermal data to VTK file..." << std::endl;
+                data_write_success = addThermalDataToVTK(
+                    vtk_file,
+                    mesh,
+                    filtered_surface_temps,
+                    filtered_times
                 );
             }
-
-            if (complete_vtk_file.empty()) {
-                complete_vtk_file = generateSimulationFilename(
-                    output_dir, 
-                    planet.name,
-                    start_time, 
-                    "complete"
-                );
-            }
-
-            // Conditionally write VTK files based on the selected mode
-            if (vtk_output_mode == "both" || vtk_output_mode == "complete") {
-                if (!writeCompleteVTK(
-                    complete_vtk_file, mesh, 
-                    illumination_values, primary_ir_values, surface_temps, 
-                    times, time_strings, total_time_steps, mesh_file,
-                    include_primary_ir_in_vtk)) {
-                    std::cerr << "Failed to write complete VTK file" << std::endl;
-                } else {
-                    std::cout << "Complete data written to: " << complete_vtk_file << std::endl;
-                    data_write_success = true;
-                }
-            }
-
-            if (vtk_output_mode == "both" || vtk_output_mode == "thermal") {
-                if (!writeThermalVTK(
-                    thermal_vtk_file, mesh, surface_temps, 
-                    times, time_strings, time_steps, false)) {
-                    std::cerr << "Failed to write thermal VTK file" << std::endl;
-                } else {
-                    std::cout << "Thermal data written to: " << thermal_vtk_file << std::endl;
-                    data_write_success = true;
-                }
+            
+            if (data_write_success) {
+                std::cout << "Complete data written to " << vtk_file << std::endl;
             }
         }
-    } else {
-        // Binary output format (default)
+    } else if (output_format == "binary") {
         std::cout << "Using binary output format for data files" << std::endl;
-
-        // Determine which data to write based on simulation type
+        
+        // IMPORTANT: Disable internal stats here; we'll export stats for the integration window below.
+        const bool compute_statistics_for_output = false;
         if (!run_thermal_mesh) {
-            // For illumination-only runs, we still export the mesh and illumination data
+            // For illumination-only runs, pass the filtered arrays directly
             data_write_success = exportDataAsBinary(
                 output_dir,
                 mesh,
                 filtered_illumination_values,
+                filtered_direct_solar_values,
+                filtered_primary_reflected_values,
                 filtered_primary_ir_values,
                 std::vector<std::vector<double>>(), // Empty temperature data
                 filtered_times,
                 filtered_time_strings,
                 time_steps,
-                !mesh_file.empty(), // is_custom_mesh if mesh_file is provided
-                false // explicitly exclude equilibration steps
+                !mesh_file.empty(), // is_custom_mesh
+                compute_statistics_for_output
             );
         } else {
-            // For thermal runs, export filtered data (excluding equilibration steps)
+            // For thermal runs, pass all filtered data including temperatures
             data_write_success = exportDataAsBinary(
                 output_dir,
                 mesh,
-                filtered_illumination_values, // Use filtered illumination values
-                filtered_primary_ir_values,   // Use filtered primary IR values
-                filtered_surface_temps,       // Use filtered surface temperatures
-                filtered_times,               // Use filtered times
-                filtered_time_strings,        // Use filtered time strings
-                time_steps,                   // Use main simulation time steps only
-                !mesh_file.empty(),           // is_custom_mesh if mesh_file is provided
-                false                         // explicitly exclude equilibration steps
+                filtered_illumination_values,
+                filtered_direct_solar_values,
+                filtered_primary_reflected_values,
+                filtered_primary_ir_values,
+                filtered_surface_temps,
+                filtered_times,
+                filtered_time_strings,
+                time_steps,
+                !mesh_file.empty(), // is_custom_mesh
+                compute_statistics_for_output
             );
         }
-
+        
         if (data_write_success) {
             std::cout << "Data successfully written in binary format to: " << output_dir << std::endl;
+        } else {
+            std::cerr << "ERROR: Failed to export data in binary format!" << std::endl;
+        }
+    }
+
+    // Export statistics over the INTEGRATION window only
+    if (compute_statistics) {
+        try {
+            std::cout << "\n[Statistics] Exporting statistics over integration window..." << std::endl;
+
+            bool stats_ok = false;
+            if (have_full_illum_arrays) {
+                // Arrays are present: use existing path
+                stats_ok = exportStatisticsBinary(
+                    output_dir,
+                    mesh,
+                    stats_fd.illumination,
+                    stats_fd.direct,
+                    stats_fd.reflected,
+                    stats_fd.ir,
+                    stats_fd.temps,
+                    stats_steps
+                );
+            } else {
+                // Streamed mode: compute illumination stats on-the-fly via getters
+                bool illum_ok = false;
+                if (illumination_model) {
+                    illum_ok = exportIlluminationStatisticsStreamed(
+                        output_dir,
+                        mesh,
+                        *illumination_model,
+                        stats_start_step,
+                        stats_steps
+                    );
+                } else {
+                    std::cerr << "[Statistics] No illumination_model available for streamed stats\n";
+                }
+
+                // Always export temperature stats (we already have stats_fd.temps)
+                bool temp_ok = exportStatisticsBinary(
+                    output_dir,
+                    mesh,
+                    /*illum*/ std::vector<double>(),
+                    /*dir*/   std::vector<double>(),
+                    /*refl*/  std::vector<double>(),
+                    /*ir*/    std::vector<double>(),
+                    stats_fd.temps,
+                    stats_steps
+                );
+
+                stats_ok = illum_ok && temp_ok;
+            }
+
+            if (!stats_ok) {
+                std::cerr << "WARNING: Statistics export failed." << std::endl;
+            } else {
+                std::cout << "[Statistics] Exported to " << (output_dir + "/statistics") << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "WARNING: Exception during statistics export: " << e.what() << std::endl;
         }
     }
 
@@ -3339,180 +7648,263 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: Failed to write output data files" << std::endl;
     }
 
-    // Set the location data file path for visualization
-    std::string location_data_file = "";
-    if (export_locations) {
-        // Use the provided location file or the default
-        std::string locations_file = config.getProperty("locations_file", output_dir + "/default_locations.txt");
-        
-        // Check if the file exists
-        if (!std::filesystem::exists(locations_file)) {
-            // Create a default locations file with a few representative points
-            locations_file = createDefaultLocationsFile(output_dir);
-            if (locations_file.empty()) {
-                std::cout << "Note: No locations file provided and unable to create default. Skipping location-specific data export." << std::endl;
-                export_locations = false;
-            } else {
-                std::cout << "Created default locations file: " << locations_file << std::endl;
-            }
-        }
-        
-        if (export_locations) {
-            // Only export if we have a valid locations file
-            std::string series_output = config.getProperty("series_output", output_dir + "/illumination_series.csv");
-            if (exportLocationIlluminationAndTemperature(
-                    series_output, locations_file, mesh,
-                    illumination_values, direct_solar_values, primary_reflected_values, primary_ir_values,
-                    surface_temps, time_strings, time_steps)) {
-                std::cout << "Location illumination and temperature data exported to " << series_output << std::endl;
-                location_data_file = series_output;
-            } else {
-                std::cout << "Note: Location data export was skipped." << std::endl;
-            }
-        }
-    }
+    // ========== CALCULATE AND PRINT STATISTICS (ONCE) ==========
+    // Calculate elapsed time
+    auto total_end_time = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        total_end_time - start_time_point);
 
-    // Now run visualization with the appropriate VTK file
-    if (create_visualization) {
-        std::string vtk_for_visualization = complete_vtk_file;
-        
-        // For the case where only illumination was run, use the illumination VTK
-        if (!run_thermal_mesh) {
-            vtk_for_visualization = illumination_vtk_file;
-        }
-        
-        runVisualization(
-            vtk_for_visualization,  // Use the appropriate file
-            output_dir + "/body_solar_flux.mp4",
-            output_dir + "/body_primary_ir.mp4",
-            data_write_success ? thermal_vtk_file : "",  
-            output_dir + "/body_surface_temp.mp4",
-            output_dir + "/maps",
-            output_dir + "/body_positions.csv",
-            location_data_file,  // Pass the correct location data file path
-            output_dir + "/location_plots", // Use this instead of undefined location_plots_dir
-            camera_distance,  // camera_distance
-            camera_latitude,  // camera_latitude
-            camera_longitude, // camera_longitude
-            emission_angle,   // emission_angle
-            azimuth,          // azimuth
-            10,               // fps
-            save_frames,
-            no_maps,
-            animation_width,  // animation_width
-            animation_height  // animation_height
-        );
-    }
-    
-    // Calculate some statistics
-    double total_solar_flux = 0.0;
-    double total_reflected_flux = 0.0;
-    double total_ir_flux = 0.0;
-    double max_solar_flux = 0.0;
-    double max_reflected_flux = 0.0;
-    double max_ir_flux = 0.0;
+    double total_elapsed_seconds = total_duration.count() / 1000.0;
+    long long total_elapsed_ms = total_duration.count();
 
-    for (size_t i = 0; i < illumination_values.size(); ++i) {
-        total_solar_flux += illumination_model->getDirectSolarValues()[i];
-        total_reflected_flux += illumination_model->getPrimaryReflectedValues()[i];
-        total_ir_flux += illumination_model->getPrimaryIRFlux()[i];
-        
-        max_solar_flux = std::max(max_solar_flux, illumination_model->getDirectSolarValues()[i]);
-        max_reflected_flux = std::max(max_reflected_flux, illumination_model->getPrimaryReflectedValues()[i]);
-        max_ir_flux = std::max(max_ir_flux, illumination_model->getPrimaryIRFlux()[i]);
-    }
-
-    double avg_solar_flux = total_solar_flux / illumination_values.size();
-    double avg_reflected_flux = total_reflected_flux / illumination_values.size();
-    double avg_ir_flux = total_ir_flux / illumination_values.size();
-
-    double total_flux = 0.0;
-    double max_flux = 0.0;
-    double min_flux = std::numeric_limits<double>::max();
-    
-    for (const auto& flux : illumination_values) {
-        total_flux += flux;
-        max_flux = std::max(max_flux, flux);
-        if (flux > 0.0) { // Only consider non-zero (illuminated areas)
-            min_flux = std::min(min_flux, flux);
-        }
-    }
-    
-    double avg_flux = total_flux / illumination_values.size();
-    
-    // End timing
-    auto end_time_point = std::chrono::high_resolution_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        end_time_point - start_time_point).count();
-
-    // Convert to seconds with decimal precision for display
-    double duration_sec = duration_ms / 1000.0;
-
-    // Print summary
     std::cout << "Simulation completed in " << std::fixed << std::setprecision(3) 
-              << duration_sec << " seconds (" << duration_ms << " ms)" << std::endl;
+            << total_elapsed_seconds << " seconds (" << total_elapsed_ms << " ms)" << std::endl;
+
+    // Calculate statistics from filtered arrays (output interval)
+    // Note: Temperature statistics exported above use the integration window.
+    double avg_flux = 0.0;
+    double avg_direct = 0.0;
+    double avg_reflected = 0.0;
+    double avg_ir = 0.0;
+    double max_flux = 0.0;
+    double max_direct = 0.0;
+    double max_reflected = 0.0;
+    double max_ir = 0.0;
+    double min_flux = std::numeric_limits<double>::max();
+    size_t non_zero_count = 0;
+
+    // Use filtered arrays for statistics (output interval)
+    for (size_t i = 0; i < filtered_illumination_values.size(); i++) {
+        double direct = filtered_direct_solar_values[i];
+        double reflected = filtered_primary_reflected_values[i];
+        double ir = filtered_primary_ir_values[i];
+        double total = filtered_illumination_values[i] + reflected + ir;
+        
+        if (total > 0.0) {
+            avg_flux += total;
+            avg_direct += direct;
+            avg_reflected += reflected;
+            avg_ir += ir;
+            non_zero_count++;
+            
+            max_flux = std::max(max_flux, total);
+            max_direct = std::max(max_direct, direct);
+            max_reflected = std::max(max_reflected, reflected);
+            max_ir = std::max(max_ir, ir);
+            
+            if (total < min_flux && total > 0.0) {
+                min_flux = total;
+            }
+        }
+    }
+
+    if (non_zero_count > 0) {
+        avg_flux /= non_zero_count;
+        avg_direct /= non_zero_count;
+        avg_reflected /= non_zero_count;
+        avg_ir /= non_zero_count;
+    } else {
+        min_flux = 0.0;  // Set to 0 if no non-zero values found
+    }
+
     std::cout << "Results:" << std::endl;
-    std::cout << "  Average total flux: " << avg_flux << " W/m²" << std::endl;
-    std::cout << "    - Direct solar: " << avg_solar_flux << " W/m²" << std::endl;
-    std::cout << "    - Primary reflected: " << avg_reflected_flux << " W/m²" << std::endl;
-    std::cout << "    - Primary IR: " << avg_ir_flux << " W/m²" << std::endl;
-    std::cout << "  Maximum total flux: " << max_flux << " W/m²" << std::endl;
-    std::cout << "    - Direct solar: " << max_solar_flux << " W/m²" << std::endl;
-    std::cout << "    - Primary reflected: " << max_reflected_flux << " W/m²" << std::endl;
-    std::cout << "    - Primary IR: " << max_ir_flux << " W/m²" << std::endl;
-    std::cout << "  Minimum flux (non-zero): " << min_flux << " W/m²" << std::endl;
+    std::cout << "  Average total flux: " << std::fixed << std::setprecision(9) 
+            << avg_flux << " W/mÂ²" << std::endl;
+    std::cout << "    - Direct solar: " << avg_direct << " W/mÂ²" << std::endl;
+    std::cout << "    - Primary reflected: " << avg_reflected << " W/mÂ²" << std::endl;
+    std::cout << "    - Primary IR: " << avg_ir << " W/mÂ²" << std::endl;
+    std::cout << "  Maximum total flux: " << max_flux << " W/mÂ²" << std::endl;
+    std::cout << "    - Direct solar: " << max_direct << " W/mÂ²" << std::endl;
+    std::cout << "    - Primary reflected: " << max_reflected << " W/mÂ²" << std::endl;
+    std::cout << "    - Primary IR: " << max_ir << " W/mÂ²" << std::endl;
+    std::cout << "  Minimum flux (non-zero): " << min_flux << " W/mÂ²" << std::endl;
     std::cout << "  Output written to " << output_dir << std::endl;
 
-    if (export_locations) {
-        if (locations_file.empty()) {
-            std::cerr << "Error: --locations parameter is required when --export-locations is used" << std::endl;
-        } else {
-            std::string location_output = output_dir + "/illumination_series.csv";
-            std::cout << "Exporting location illumination data to: " << location_output << std::endl;
-            
-            bool export_success = exportLocationIlluminationAndTemperature(
-                location_output,
-                locations_file,
-                mesh,
-                filtered_illumination_values,
-                filtered_direct_solar_values,
-                filtered_primary_reflected_values,
-                filtered_primary_ir_values,
-                filtered_surface_temps, // Include temperature data
-                filtered_time_strings,
-                time_steps
-            );
-            
-            if (!export_success) {
-                std::cerr << "Failed to export location data" << std::endl;
+
+    // ========== LOCATION EXPORT (if requested) ==========
+    if (export_locations && !locations_file.empty()) {
+        try {
+            const std::string series_out_path =
+                (output_dir.empty() ? series_output
+                                    : (output_dir.back() == '/' ? output_dir + series_output
+                                                                : output_dir + "/" + series_output));
+            if (!exportLocationIllumination(
+                    series_out_path,
+                    locations_file,
+                    mesh,
+                    illumination_values,
+                    direct_solar_values,
+                    primary_reflected_values,
+                    primary_ir_values,
+                    time_strings,
+                    time_steps)) {
+                std::cerr << "Warning: Failed to export location illumination series to "
+                          << series_out_path << std::endl;
+            } else {
+                std::cout << "Location illumination series written: "
+                          << series_out_path << std::endl;
             }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Location illumination export failed: "
+                      << e.what() << std::endl;
         }
     }
 
-    if (run_thermal_mesh && !filtered_surface_temps.empty()) {
-        // Check if we've already exported location data
-        if (!export_locations) {
-            // Only export here if not already exported above
-            std::string default_locations = createDefaultLocationsFile(output_dir);
-            std::cout << "Exporting location data to: " << series_output << std::endl;
-            bool export_success = exportLocationIlluminationAndTemperature(
-                series_output,
-                locations_file.empty() ? default_locations : locations_file,
-                mesh,
-                filtered_illumination_values,
-                filtered_direct_solar_values,
-                filtered_primary_reflected_values,
-                filtered_primary_ir_values,
-                filtered_surface_temps,
-                filtered_time_strings,
-                time_steps
-            );
-            
-            if (!export_success) {
-                std::cerr << "Failed to export location illumination and temperature data" << std::endl;
+    // Optional per-location depth profiles
+    if (export_locations && !locations_file.empty() && !depths_file.empty()) {
+        try {
+            auto locs = readLocationsCSV(locations_file);
+            auto depths_m = readDepthsFile(depths_file);
+            if (depths_m.empty()) {
+                std::cerr << "Warning: Depths file parsed empty; skipping depth profiles." << std::endl;
+            } else {
+                const std::string loc_out_dir =
+                    output_dir + (output_dir.back() == '/' ? "locations" : "/locations");
+                std::filesystem::create_directories(loc_out_dir);
+                std::cout << "Depth profile export: " << locs.size()
+                          << " locations, " << depths_m.size()
+                          << " depths -> " << loc_out_dir << std::endl;
+
+                auto sanitize = [](std::string s) {
+                    for (char& c : s) {
+                        if (!(std::isalnum(static_cast<unsigned char>(c)) || c=='-' || c=='_')) c = '_';
+                    }
+                    return s;
+                };
+
+                for (size_t i = 0; i < locs.size(); ++i) {
+                    const auto& tup = locs[i];
+                    const std::string name = std::get<0>(tup);
+                    const double lat_deg = std::get<1>(tup);
+                    const double lon_deg = std::get<2>(tup);
+
+                    int face_idx = findNearestFaceIndexByLatLon(mesh, lat_deg, lon_deg);
+                    if (face_idx < 0) {
+                        std::cerr << "Warning: Could not map location '"
+                                  << (name.empty() ? ("loc_"+std::to_string(i)) : name)
+                                  << "' to a mesh face; skipping." << std::endl;
+                        continue;
+                    }
+
+                    // Absorbed flux: (1 - A_vis)*(direct+reflected) + primary_ir
+                    std::vector<double> flux_sum(static_cast<size_t>(time_steps), 0.0);
+                    double A_vis = planet.getAlbedo(lon_deg * M_PI/180.0, lat_deg * M_PI/180.0);
+                    A_vis = std::clamp(A_vis, 0.0, 1.0);
+
+                    for (int t = 0; t < time_steps; ++t) {
+                        const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(time_steps)
+                                          + static_cast<size_t>(t);
+                        const double direct = (flat < direct_solar_values.size()) ? direct_solar_values[flat] : 0.0;
+                        const double refl   = (flat < primary_reflected_values.size()) ? primary_reflected_values[flat] : 0.0;
+                        const double pir    = (flat < primary_ir_values.size()) ? primary_ir_values[flat] : 0.0;
+                        flux_sum[static_cast<size_t>(t)] = (1.0 - A_vis) * (direct + refl) + pir;
+                    }
+
+                    auto T_depths = runThermalModelDepthSeries(
+                        flux_sum, times, lat_deg, config, depths_m, /*equilibration_steps*/ 0, planet);
+
+                    std::string base = sanitize(name.empty() ? ("loc_" + std::to_string(i)) : name);
+                    const std::string out_path = loc_out_dir + "/" + base + "_depths.csv";
+                    if (!writeLocationDepthCSV(out_path, name, time_strings, depths_m, T_depths)) {
+                        std::cerr << "Warning: Failed to write depth series for location '" << name << "'" << std::endl;
+                    } else {
+                        std::cout << "Wrote depth temperature series: " << out_path << std::endl;
+                    }
+                }
+                // Generate plots if enabled
+                if (generate_depth_plots) {
+                    generateDepthProfilePlots(loc_out_dir, executable_path);
+                }
             }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Depth profile export failed: " << e.what() << std::endl;
         }
     }
+
+    // ========== IMMEDIATE MEMORY CLEANUP (ALWAYS) ==========
+    // Clean up unfiltered arrays immediately to free memory
+    std::cout << "Performing memory cleanup..." << std::endl;
+
+    // Clear the UNFILTERED arrays (no longer needed)
+    illumination_values.clear();
+    illumination_values.shrink_to_fit();
+    direct_solar_values.clear(); 
+    direct_solar_values.shrink_to_fit();
+    primary_reflected_values.clear();
+    primary_reflected_values.shrink_to_fit();
+    primary_ir_values.clear();
+    primary_ir_values.shrink_to_fit();
+
+    // Clear unfiltered temperature data
+    if (!surface_temps.empty()) {
+        for (auto& temps : surface_temps) {
+            temps.clear();
+            temps.shrink_to_fit();
+        }
+        surface_temps.clear();
+        surface_temps.shrink_to_fit();
+    }
+
+    // Clear illumination model (has large internal arrays)
+    if (illumination_model) {
+        illumination_model.reset();
+    }
+
+    // Force garbage collection
+    //#pragma omp barrier
+    barrier_if_parallel();
+
+    std::cout << "Memory cleanup completed." << std::endl;
+
+    // ========== FINAL CLEANUP ==========
+    // Clean up filtered arrays and mesh before program exit
+    std::cout << "\nCleaning up remaining memory..." << std::endl;
+
+    // Clear filtered data arrays
+    filtered_illumination_values.clear();
+    filtered_illumination_values.shrink_to_fit();
+
+    filtered_direct_solar_values.clear();
+    filtered_direct_solar_values.shrink_to_fit();
+
+    filtered_primary_reflected_values.clear();
+    filtered_primary_reflected_values.shrink_to_fit();
+
+    filtered_primary_ir_values.clear();
+    filtered_primary_ir_values.shrink_to_fit();
+
+    // Clear filtered temperature data
+    if (!filtered_surface_temps.empty()) {
+        for (auto& temps : filtered_surface_temps) {
+            temps.clear();
+            temps.shrink_to_fit();
+        }
+        filtered_surface_temps.clear();
+        filtered_surface_temps.shrink_to_fit();
+    }
+
+    // Clear the mesh
+    if (mesh) {
+        mesh->vertices.clear();
+        mesh->vertices.shrink_to_fit();
+        mesh->faces.clear();
+        mesh->faces.shrink_to_fit();
+        mesh->face_normals.clear();
+        mesh->face_normals.shrink_to_fit();
+        mesh->face_centers.clear();
+        mesh->face_centers.shrink_to_fit();
+        mesh->latitudes.clear();
+        mesh->latitudes.shrink_to_fit();
+        mesh->longitudes.clear();
+        mesh->longitudes.shrink_to_fit();
+        mesh.reset();
+    }
+
+    // Ensure all OpenMP threads are finished
+    //#pragma omp barrier
+    barrier_if_parallel();
+
+    std::cout << "Cleanup completed successfully" << std::endl;
 
     return 0;
-}
+    }  // end of main

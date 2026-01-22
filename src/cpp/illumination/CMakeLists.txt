@@ -27,3 +27,9 @@ target_link_libraries(illumination_model
     ${EMBREE_LIBRARIES}  # Add this line
     OpenMP::OpenMP_CXX
 )
+
+# GPU support for BVH ray tracing
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    target_link_libraries(illumination_model PUBLIC ptm_gpu)
+    target_compile_definitions(illumination_model PUBLIC PTM_GPU_OPENCL)
+endif()

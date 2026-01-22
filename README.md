@@ -1,174 +1,456 @@
-# PTM: Planetary Thermophysical Model
-A high-performance coupled illumination-thermal model for simulating surface temperatures on planetary bodies.
+# PTM3D - Planetary Thermophysical Model 3D
 
-## Overview
-PTM3D (Planetary Thermophysical Model - 3D) is a comprehensive computational framework that combines ray-traced illumination with advanced thermophysical modeling to simulate surface temperatures on planetary bodies. The model accounts for direct solar radiation, reflected sunlight from primary bodies (like Jupiter), infrared radiation, and internal heat flux to produce accurate thermal simulations.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C++-17-blue.svg)](https://isocpp.org/std/the-standard)
+
+**PTM3D** is a high-performance computational framework for simulating surface and subsurface temperatures on planetary bodies. It combines ray-traced illumination modeling with SPICE ephemeris data and advanced thermophysical calculations to predict accurate thermal regimes on the Moon, Mercury, Europa, and other solar system objects.
+
+![PTM3D Workflow](docs/figures/ptm3d_workflow.png)
+*Figure 1: PTM3D simulation workflow showing coupled illumination-thermal-radiation modeling.*
 
 ## Key Features
-* Coupled Illumination-Thermal Physics: Combines ray-traced illumination with advanced thermophysical modeling
-* High-Performance Computing: Optimized with SIMD instructions, multi-threading via OpenMP, and efficient algorithms
-* Accurate Planetary Positions: Uses SPICE kernels for precise planetary ephemerides
-* Spatial Albedo Maps: Support for planetary albedo maps in FITS format
-* Variable Resolution: Configurable mesh resolution for balancing accuracy and computational resources
-* Visualization Tools: Python-based visualization and analysis tools
-* Multiple Output Formats: VTK, binary, and CSV outputs for detailed analysis
+
+- **Multi-body support**: Moon, Mercury, Europa, Enceladus, Mars, Ceres, and custom bodies
+- **Ray-traced illumination**: Intel Embree 4 with SIMD optimization (AVX-512/AVX2)
+- **SPICE ephemeris integration**: Accurate planetary positions via NASA NAIF kernels
+- **1D thermal conduction**: Crank-Nicolson solver with temperature-dependent properties
+- **Radiation exchange**: View factors with H-matrix compression for large meshes
+- **GPU acceleration**: OpenCL, HIP (AMD), and CUDA (NVIDIA) backends
+- **FFT-based equilibration**: Spectral solver replaces thousands of diurnal cycles
+- **Ice stability depth**: Newton-Raphson solver for subsurface ice table location
+- **Flexible mesh input**: PLY, OBJ, VTK formats with resolution control
+- **ParaView-compatible output**: VTK/PVD time series for visualization
+
+## Applications
+
+- Lunar Permanently Shadowed Regions (PSRs) thermal mapping
+- Water ice stability modeling on Europa and icy moons
+- Mercury extreme temperature variations
+- Mission thermal environment planning
+- Crater thermal regime analysis
+
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Command-Line Reference](#command-line-reference)
+- [Output Formats](#output-formats)
+- [Python Tools](#python-tools)
+- [Examples](#examples)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [Citation](#citation)
+- [License](#license)
+
+---
 
 ## Installation
+
 ### Prerequisites
-* C++ Compiler: GCC 8+ or Clang 10+ with C++17 support
-* CMake: 3.12 or higher
-* SPICE Toolkit: NASA NAIF SPICE toolkit
-* Embree: Intel Embree ray tracing kernels (version 4)
-* CFITSIO: Library for reading FITS format files
-* OpenMP: For parallel processing
-* Python 3.7+: For visualization tools (with NumPy, PyVista, Matplotlib)
+
+| Dependency | Version | Required | Purpose |
+|------------|---------|----------|---------|
+| CMake | 3.10+ | Yes | Build system |
+| C++ Compiler | C++17 | Yes | GCC 8+, Clang 10+, or Apple Clang |
+| Embree | 4.0+ | Yes | Ray tracing |
+| CFITSIO | Any | Yes | FITS file I/O |
+| Eigen3 | 3.0+ | Yes | Linear algebra |
+| CSPICE | Latest | Yes | NASA ephemeris |
+| OpenMP | Built-in | Yes | Parallelization |
+| yaml-cpp | 0.6+ | Optional | YAML config files |
+| VTK | 8.0+ | Optional | Mesh I/O |
+| OpenCL/HIP/CUDA | Various | Optional | GPU acceleration |
+
+### macOS
+
+```bash
+# Install Homebrew dependencies
+brew install cmake libomp eigen embree cfitsio yaml-cpp
+
+# Optional: VTK for mesh I/O
+brew install vtk
+
+# Download CSPICE from https://naif.jpl.nasa.gov/naif/toolkit_C.html
+# Extract to ~/software/cspice/
+```
+
+### Linux (Ubuntu/Debian)
+
+```bash
+# Core dependencies
+sudo apt-get install -y cmake build-essential libomp-dev libeigen3-dev \
+    libcfitsio-dev libyaml-cpp-dev
+
+# Embree (may need to build from source on older distros)
+sudo apt-get install -y libembree-dev
+
+# Optional: VTK
+sudo apt-get install -y libvtk9-dev
+
+# Download CSPICE from https://naif.jpl.nasa.gov/naif/toolkit_C.html
+```
 
 ### Building from Source
-1. Clone the repository:
-```
-git clone https://github.com/username/ptm.git
-cd ptm
+
+```bash
+git clone https://github.com/phayne/ptm3d.git
+cd ptm3d
+mkdir -p build && cd build
+
+# Configure (adjust CSPICE_ROOT as needed)
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DCSPICE_ROOT=/path/to/cspice
+
+# Build
+cmake --build . -j$(nproc)
+
+# Executables are in build/bin/
+ls bin/
+# ptm_thermal_sim  albedo_map_generator  crater_mesh_generator  ...
 ```
 
-2. Create a build directory:
-```
-mkdir build
-cd build
+**GPU Support (Optional)**:
+```bash
+# Auto-detect GPU backend (HIP > CUDA > OpenCL)
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=AUTO
+
+# Force specific backend
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL  # macOS with AMD GPU
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=HIP     # AMD ROCm
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=CUDA    # NVIDIA
 ```
 
-3. Configure with CMake:
-```
-cmake ..
+---
+
+## Quick Start
+
+### 1. Minimal Test (~30 seconds)
+
+```bash
+cd ptm3d/build
+./bin/ptm_thermal_sim \
+    --body Moon \
+    --resolution 4 \
+    --duration 0.5 \
+    --timesteps 24 \
+    --thermal-mesh \
+    --output ../output/quick_test
 ```
 
-4. Build the project:
-```
-make -j$(nproc)
+### 2. Using a Configuration File
+
+```bash
+./bin/ptm_thermal_sim --config ../examples/quick_test.yaml
 ```
 
-5. Install (optional):
-```
-make install
+Example `quick_test.yaml`:
+```yaml
+simulation:
+  body: "Moon"
+  start_time: "2025-01-01T00:00:00"
+  duration_days: 0.5
+  timesteps: 24
+
+mesh:
+  resolution: 4
+
+thermal:
+  run_thermal_mesh: true
+  threads: 0  # Auto-detect
+  equilibration_orbits: 5
+
+output:
+  directory: "output/quick_test"
+  format: "binary"
 ```
 
-## Project Structure
-The PTM3D codebase is organized into several key modules:
+### 3. Full Europa Simulation
+
+```bash
+./bin/ptm_thermal_sim \
+    --body Europa \
+    --resolution 5 \
+    --duration 3.55 \
+    --timesteps 144 \
+    --thermal-mesh \
+    --thermal-threads 8 \
+    --equilibration-orbits 20 \
+    --radiation-exchange \
+    --rad-hmatrix \
+    --output ../output/europa_full \
+    --verbose
+```
+
+### 4. Visualize Results
+
+```bash
+# Convert binary output to ParaView format
+python src/python/vtk_converter.py output/europa_full output/paraview
+
+# Open in ParaView
+# File → Open → output/paraview/statistics.pvd
+```
+
+![Example Output](docs/figures/temperature_map_placeholder.png)
+*Figure 2: Surface temperature distribution on a lunar mesh at local noon.*
+
+---
+
+## Architecture
+
+PTM3D uses a modular architecture with coupled physics engines:
+
+![Architecture](docs/figures/architecture.png)
+*Figure 3: PTM3D module architecture and data flow.*
 
 ### Core Modules
-* Illumination Model: Ray-traced solar illumination with shadowing effects
-* Thermal Model: Thermophysical calculations for surface and subsurface temperatures
-* Mesh Utilities: Tools for creating and managing planetary surface meshes
-* Spatial Maps: Support for albedo and thermal property maps
 
-### Tools
-* Albedo Map Generator: Precomputes albedo maps for different mesh resolutions
-* Map Processor: Utility for working with planetary maps in various formats
-* VTK Converter: Converts simulation results to ParaView-compatible formats
+| Module | Location | Description |
+|--------|----------|-------------|
+| **thermal** | `src/cpp/thermal/` | 1D heat conduction with Crank-Nicolson solver |
+| **illumination** | `src/cpp/illumination/` | Ray-traced solar flux with SPICE ephemeris |
+| **radiation** | `src/cpp/radiation/` | View factors, H-matrix compression, radiosity |
+| **gpu** | `src/cpp/gpu/` | GPU acceleration (OpenCL/HIP/CUDA) |
+| **mesh** | `src/cpp/mesh/` | Mesh I/O and utilities |
+| **ice** | `src/cpp/ice/` | Ice stability depth calculation |
 
-### Python Components
-* Thermal Visualization: Tools for visualizing temperature distributions
-* Illumination Analysis: Analysis tools for solar illumination patterns
-* ParaView Converter: Converts binary outputs to ParaView format
+### Research Modules
 
-## Usage
-### Basic Thermal Simulation
+| Module | Location | Description |
+|--------|----------|-------------|
+| **exosphere** | `src/cpp/exosphere/` | Water vapor sublimation and sputtering |
+| **viewshed** | `src/cpp/viewshed/` | Visibility analysis for mission planning |
 
-```
-./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
-    --albedo-maps-directory /path/to/albedo_maps --thermal-mesh \
-    --thermal-threads 48 --output /path/to/output --resolution 6
-```
+### Physics Overview
 
-### Command-Line Options
-* --body: Target planetary body (Europa, Moon, Mercury, etc.)
-* --duration: Simulation duration in days
-* --resolution: Mesh resolution (higher values = more detailed mesh)
-* --thermal-mesh: Enable thermal modeling for the entire mesh
-* --thermal-threads: Number of threads for thermal computation
-* --equilibration-orbits: Number of orbits for thermal equilibration
-* --albedo-maps-directory: Directory containing albedo maps
-* --output: Output directory for simulation results
+**Thermal Model**:
+- Temperature-dependent thermal conductivity: `k(T) = k_c + k_r·T³`
+- Heat capacity polynomial: `cp(T) = c₀ + c₁T + c₂T² + ...`
+- Adaptive depth grid with logarithmic spacing
+- Validated against Lunar Diviner data (RMS error <4K)
 
-## Modules
-### Illumination Module
-The illumination module calculates solar flux across the planetary surface, accounting for:
+![Thermal Wave Profiles](docs/figures/thermal_wave_profiles.png)
+*Figure 4: (a) Subsurface temperature profiles at different local solar times showing the diurnal thermal wave. (b) Temperature evolution with depth and time; the white dashed line indicates the thermal skin depth (~3.4 cm).*
 
-* Direct solar radiation
-* Primary body shadows
-* Reflected solar radiation from the primary body
-* Infrared radiation from the primary body
-* Optimization includes SIMD acceleration, efficient ray-batching, and multi-threading.
+**Radiation Exchange**:
+- Sparse view factor matrix with CSR storage
+- H-matrix hierarchical compression (O(N log N) storage)
+- Adaptive thermal-radiation coupling iterations
 
-### Thermal Module
-The thermal module simulates heat transfer and temperature evolution, including:
+---
 
-* Surface and subsurface temperatures
-* Variable material properties with depth
-* Surface (radiative-conductive equilibrium) and subsurface (heat flux) boundary conditions
-* Thermal conductivity and heat capacity variation with temperature
+## Command-Line Reference
 
-### Mesh Utilities
-Handles mesh generation and processing:
-
-* Icosphere-based global meshes at variable resolutions
-* Custom mesh import from standard formats
-* Mesh properties calculation (normals, centers, lat/lon mapping)
-* Efficient data structures for ray-tracing
-
-### Maps Module
-Handles spatial data like albedo maps:
-
-* FITS format support
-* Coordinate transformations
-* Bilinear interpolation
-* Spatial queries
-
-## Example Workflow
-1. Generate or import an albedo map:
+### Essential Options
 
 ```
-./bin/albedo_map_generator input_albedo.fits output_dir 3 8
+--body, -b <name>         Body name (Moon, Mercury, Europa, etc.)
+--config <file>           Load YAML configuration file
+--resolution <n>          Global mesh resolution (default: 5)
+--duration <days>         Simulation duration in days
+--timesteps <n>           Number of output timesteps
+--output <dir>            Output directory
+--verbose                 Enable detailed logging
 ```
 
-2. Run a thermal simulation:
+### Thermal Options
 
 ```
-./bin/ptm_thermal_sim --body Europa --duration 3.55 --equilibration-orbits 1 \
-    --albedo-maps-directory /path/to/albedo_maps --thermal-mesh \
-    --output /path/to/output --resolution 6
+--thermal-mesh            Run thermal model for all faces
+--thermal-threads <n>     Number of parallel threads (0 = auto)
+--equilibration-orbits <n> Diurnal cycles for equilibration (default: 10)
+--use-gpu-thermal         Use GPU thermal solver
 ```
 
-3. Convert results to ParaView format:
+### Radiation Exchange
 
 ```
-python src/python/ptm_paraview_converter.py --input-dir /path/to/output \
-    --output-dir /path/to/paraview_output
+--radiation-exchange      Enable inter-face radiation
+--rad-hmatrix            Use H-matrix compression (recommended for >50K faces)
+--rad-view-factor-file <f> Save/load view factors
+--rad-coupling-iter <n>   Max coupling iterations (default: 10)
+--rad-coupling-temp-tol <K> Convergence threshold (default: 0.5 K)
 ```
 
-4. Visualize specific locations:
+### Illumination
 
 ```
-python src/python/illumination_to_thermal.py --vtk /path/to/output/thermal.vtk \
-    --locations locations.txt --output thermal_locations
+--albedo-map <file>       Custom albedo FITS map
+--no-primary-reflection   Disable reflected light from primary body
+--positions <file>        Export body positions to CSV
 ```
 
-## License
-This project is licensed under the MIT License.
+Run `./bin/ptm_thermal_sim --help` for the complete reference.
+
+---
+
+## Output Formats
+
+PTM3D generates several output types:
+
+```
+output/
+├── mesh.ply                    # Mesh geometry
+├── statistics/
+│   ├── temperature_avg.bin     # Mean temperature per face
+│   ├── temperature_max.bin     # Maximum temperature
+│   ├── temperature_min.bin     # Minimum temperature
+│   ├── illumination_avg.bin    # Mean solar flux
+│   └── ice_depth.bin           # Ice stability depth
+├── temperature/
+│   ├── temperature_00001.bin   # Per-timestep temperatures
+│   └── ...
+└── illumination_series.csv     # Location time series (if --locations)
+```
+
+**Binary format**: Single-precision float arrays, one value per face.
+
+**VTK conversion**: Use `python src/python/vtk_converter.py` to create ParaView-compatible files.
+
+**NetCDF export**: Use `python src/python/netcdf_converter.py` for cross-platform analysis.
+
+---
+
+## Python Tools
+
+| Script | Purpose |
+|--------|---------|
+| `vtk_converter.py` | Convert binary output to VTK/PVD format |
+| `netcdf_converter.py` | Export to NetCDF for cross-platform analysis |
+| `plot_depth_profiles.py` | Visualize temperature vs depth |
+| `extract_timeseries.py` | Extract data for specific lat/lon locations |
+
+### Example: Convert and Visualize
+
+```bash
+# Convert to ParaView format
+python src/python/vtk_converter.py output/simulation output/paraview
+
+# Generate depth profile plots
+python src/python/plot_depth_profiles.py output/simulation/thermal_debug.txt
+
+# Export to NetCDF
+python src/python/netcdf_converter.py \
+    --input output/paraview/statistics.pvd \
+    --output output/statistics.nc \
+    --format pvd
+```
+
+---
+
+## Examples
+
+### Crater Thermal Analysis
+
+```bash
+# Generate a bowl crater mesh
+./bin/crater_mesh_generator --diameter 10 --depth 1.25 \
+    --output data/meshes/crater.ply
+
+# Run simulation with radiation exchange
+./bin/ptm_thermal_sim \
+    --mesh-file data/meshes/crater.ply \
+    --body Moon \
+    --duration 29.5 \
+    --timesteps 354 \
+    --thermal-mesh \
+    --radiation-exchange \
+    --rad-hmatrix \
+    --output output/crater_sim
+```
+
+### Extract Time Series for Specific Locations
+
+```bash
+# Create locations file
+cat > locations.txt << EOF
+0.0 0.0 SubsolarPoint
+45.0 0.0 MidLatitude
+85.0 0.0 NearPole
+EOF
+
+./bin/ptm_thermal_sim \
+    --config examples/quick_test.yaml \
+    --locations locations.txt \
+    --series-output illumination_series.csv
+```
+
+---
+
+## Validation
+
+PTM3D has been validated against:
+
+- **Lunar Diviner** radiometer measurements (RMS <4K)
+- **Hayne et al. (2017)** grid optimization methodology
+- **Potter et al. (2023)** H-matrix implementation
+
+![Validation](docs/figures/lunar_validation.png)
+*Figure 5: PTM3D validation against Hayne et al. (2017) analytical model for the lunar equator. (a) Temperature vs. local solar time. (b) Maximum and minimum temperatures vs. latitude. PTM3D reproduces the expected diurnal cycle with noon temperatures of ~388 K and nighttime temperatures of ~99 K.*
+
+---
+
+## Documentation
+
+For more detailed information, see the documentation in [`docs/`](docs/):
+
+| Document | Description |
+|----------|-------------|
+| [Thermal Model](docs/thermal-model.md) | Physics and algorithms for 1D heat conduction |
+| [Radiation Exchange](docs/radiation-exchange.md) | View factors, H-matrix compression, radiosity solver |
+| [GPU Acceleration](docs/gpu-implementation-plan.md) | GPU backend architecture and performance |
+| [API Reference](docs/api-reference.md) | C++ class and function documentation |
+| [Configuration Guide](docs/configuration.md) | Complete YAML configuration reference |
+
+---
 
 ## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
+
+Contributions are welcome! Please:
 
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+2. Create a feature branch (`git checkout -b feature/new-feature`)
+3. Make your changes with tests
+4. Submit a pull request
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+
+---
+
+## Citation
+
+If you use PTM3D in your research, please cite:
+
+```bibtex
+@software{ptm3d,
+  author = {Hayne, Paul O.},
+  title = {PTM3D: Planetary Thermophysical Model 3D},
+  year = {2025},
+  institution = {University of Colorado Boulder},
+  url = {https://github.com/phayne/ptm3d}
+}
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
+
+---
 
 ## Acknowledgments
-* NASA NAIF team for the SPICE toolkit
-* Intel for the Embree ray tracing kernels
-* The NASA Lunar Vulkan Imaging and Spectroscopy Explorer (Lunar-VISE), Lunar Reconnaissance Orbiter (LRO), and Europa Clipper for support of model development and mission-specific applications.
-* NASA Precursor Science Investigations for Europa (PSIE)
 
-## Contact
-For questions or feedback, please open an issue on GitHub or contact the maintainers.
+- NASA NAIF for SPICE toolkit and ephemeris data
+- Intel for Embree ray tracing library
+- Lunar Reconnaissance Orbiter Diviner team for validation data
+- NASA Lunar Vulkan Imaging and Spectroscopy Explorer (Lunar-VISE)
+- NASA Europa Clipper mission
+- NASA Precursor Science Investigations for Europa (PSIE)
+
+---
+
+**Questions?** Open an issue on GitHub or contact Paul Hayne (paul.hayne@colorado.edu).

@@ -9,6 +9,7 @@ message(STATUS "CFITSIO include directories: ${CFITSIO_INCLUDE_DIRS}")
 add_library(spatial_maps
     spatial_map.cpp
     fits_reader.cpp
+    albedo_manager.cpp
 )
 
 # Include directories

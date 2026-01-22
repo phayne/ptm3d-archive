@@ -34,24 +34,38 @@ struct Mesh {
     }
 
 private:
-    // Existing members...
-    std::map<std::string, std::string> properties;  // Add this property map
+    
+    std::map<std::string, std::string> properties;
 };
 
 class MeshUtils {
 public:
+
     MeshUtils();
     
     // Mesh creation and setup methods
     void setMeshResolution(int resolution);
     std::shared_ptr<Mesh> getMesh() const;
     void setupMesh();
-    
+
+    // Topographic mesh handling
+    bool loadTopographicMesh(const std::string& filename);
+    void ensureOutwardNormals();
+    bool checkForTopographicMesh(const std::string& directory, int resolution, const std::string& body_name);
+    void calculateFaceProperties(bool auto_orient_normals = true);
+    std::shared_ptr<Mesh> importMeshFromFile(
+        const std::string& filename,
+        std::vector<double>& elevations);
+    void exportMeshToFile(
+        const std::string& filename,
+        const std::shared_ptr<Mesh>& mesh,
+        const std::vector<double>& elevations);
+
     // I/O operations
     bool exportMeshToVTK(const std::string& filename) const;
     bool loadMeshFromFile(const std::string& filename);
     
-    // New function to import a pre-triangulated mesh
+    // Import a pre-triangulated mesh
     bool importTriangulatedMesh(const std::string& filename, double scale_factor = 1.0);
     
     double getFaceArea(int face_idx) const;
@@ -68,9 +82,10 @@ public:
         const std::string& filename,
         const std::shared_ptr<Mesh>& mesh,
         const std::vector<double>& illumination_values,
-        const std::vector<double>& primary_ir_values, 
+        const std::vector<double>& primary_reflected_values,  // ADD THIS
+        const std::vector<double>& primary_ir_values,
         const std::vector<double>& times,
-        const std::vector<std::string>& time_strings, 
+        const std::vector<std::string>& time_strings,
         int time_steps);
         
     bool exportMultipleVTKFiles(
@@ -95,6 +110,9 @@ public:
 
     // Helper functions for DEM handling
     std::array<double, 3> latLonElevToCartesian(double lat, double lon, double elev, double radius);
+    // Convert Cartesian coordinates to latitude/longitude
+    std::pair<double, double> latLonFromCartesian(
+        double x, double y, double z) const;
     std::vector<std::array<int, 3>> delaunayTriangulation(
         const std::vector<std::array<double, 2>>& points);
     bool isInCircumcircle(
@@ -105,10 +123,10 @@ public:
 
 private:
     void createIcosphereMesh(int resolution, Mesh& mesh);
+    std::vector<double> vertex_elevations_;  // Store vertex elevations for topographic meshes
     int getMidpoint(int a, int b, 
                     std::vector<std::array<double, 3>>& vertices, 
                     std::map<std::pair<int, int>, int>& cache);
-    void calculateFaceProperties(bool auto_orient_normals = true);
     void mapFacesToLatLon();
     bool determineMeshHemisphere();
     

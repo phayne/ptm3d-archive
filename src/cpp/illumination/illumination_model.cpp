@@ -36,9 +36,101 @@
 // SPICE includes
 #include <SpiceUsr.h>  // Angle brackets to use system include path
 
+// GPU BVH ray tracer (optional)
+#ifdef PTM_GPU_OPENCL
+#include "../gpu/bvh_opencl.h"
+#endif
+
 namespace constants = ptm_thermal::constants;  
 
 namespace numeric = ptm::numeric;             // For numeric constants
+
+namespace {
+// Helper: convert km vectors from SPICE to meters (mesh units)
+inline std::array<double,3> kmToMeters(const std::array<double,3>& vkm) {
+    return { vkm[0]*1000.0, vkm[1]*1000.0, vkm[2]*1000.0 };
+}
+// Helper: convert meters to km when needed for irradiance
+inline std::array<double,3> metersToKm(const std::array<double,3>& vm) {
+    return { vm[0]/1000.0, vm[1]/1000.0, vm[2]/1000.0 };
+}
+} // anonymous namespace
+
+namespace {
+inline double solarDiskHorizonVisibility(double altitude_rad, double disk_rad) {
+    if (disk_rad <= 0.0) return 0.0;
+    if (altitude_rad >= disk_rad) return 1.0;
+    if (altitude_rad <= -disk_rad) return 0.0;
+    const double r = disk_rad;
+    const double r2 = r*r;
+    if (altitude_rad >= 0.0) {
+        double y = altitude_rad;
+        double A_cut = r2 * std::acos(y / r) - y * std::sqrt(std::max(0.0, r2 - y*y));
+        return 1.0 - A_cut / (M_PI * r2);
+    } else {
+        double y = -altitude_rad;
+        double A_vis = r2 * std::acos(y / r) - y * std::sqrt(std::max(0.0, r2 - y*y));
+        return A_vis / (M_PI * r2);
+    }
+}
+// Limb attenuation factor (empirical smooth projection correction)
+inline double limbProjectionFactor(double altitude_rad, double disk_rad) {
+    if (altitude_rad >= disk_rad) return 1.0;
+    if (altitude_rad <= -disk_rad) return 0.0;
+    double x = (altitude_rad + disk_rad) / (2.0 * disk_rad); // 0→1 across partial phase
+    // Smooth cubic easing (better than linear near edges)
+    return std::clamp(x*x*(3.0 - 2.0*x), 0.0, 1.0);
+}
+
+inline uint32_t mix32(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16; return x;
+}
+inline uint32_t hashFaceSeed(const std::array<double,3>& c, const std::array<double,3>& n,
+                             const std::array<double,3>& sun_pos) {
+    auto q = [&](double v)->uint32_t {
+        int64_t i = static_cast<int64_t>(std::llround(v * 1e-3)); // mm→m bucket
+        return mix32(static_cast<uint32_t>(i) ^ static_cast<uint32_t>(i>>32));
+    };
+    uint32_t h = 2166136261u;
+    h = mix32(h ^ q(c[0])); h = mix32(h ^ q(c[1])); h = mix32(h ^ q(c[2]));
+    h = mix32(h ^ q(n[0])); h = mix32(h ^ q(n[1])); h = mix32(h ^ q(n[2]));
+    h = mix32(h ^ q(sun_pos[0])); h = mix32(h ^ q(sun_pos[1])); h = mix32(h ^ q(sun_pos[2]));
+    return h;
+}
+// Radical inverse base 2
+inline double vanDerCorput(uint32_t n) {
+    n = (n << 16) | (n >> 16);
+    n = ((n & 0x55555555u) << 1) | ((n & 0xAAAAAAAAu) >> 1);
+    n = ((n & 0x33333333u) << 2) | ((n & 0xCCCCCCCCu) >> 2);
+    n = ((n & 0x0F0F0F0Fu) << 4) | ((n & 0xF0F0F0F0u) >> 4);
+    n = ((n & 0x00FF00FFu) << 8) | ((n & 0xFF00FF00u) >> 8);
+    return double(n) * 2.3283064365386963e-10; // /2^32
+}
+// Hammersley point in [0,1)^2 with Cranley–Patterson rotation
+inline void hammersley(uint32_t i, uint32_t N, double uoff, double voff, double& u, double& v) {
+    u = std::fmod((double(i) / double(std::max(1u,N))) + uoff, 1.0);
+    v = std::fmod(vanDerCorput(i) + voff, 1.0);
+}
+// Concentric disk mapping (Shirley–Chiu)
+inline void squareToConcentricDisk(double u, double v, double& dx, double& dy) {
+    double sx = 2.0*u - 1.0;
+    double sy = 2.0*v - 1.0;
+    if (sx == 0.0 && sy == 0.0) { dx = dy = 0.0; return; }
+    double r, phi;
+    if (std::abs(sx) > std::abs(sy)) { r = sx; phi = (M_PI/4.0) * (sy/sx); }
+    else                             { r = sy; phi = (M_PI/2.0) - (M_PI/4.0) * (sx/sy); }
+    dx = r * std::cos(phi);
+    dy = r * std::sin(phi);
+}
+inline void rotateBasis(const std::array<double,3>& u, const std::array<double,3>& v,
+                        double ang, std::array<double,3>& ur, std::array<double,3>& vr) {
+    double c = std::cos(ang), s = std::sin(ang);
+    ur = { c*u[0] - s*v[0], c*u[1] - s*v[1], c*u[2] - s*v[2] };
+    vr = { s*u[0] + c*v[0], s*u[1] + c*v[1], s*u[2] + c*v[2] };
+}
+} // anonymous namespace
 
 namespace ptm {
 
@@ -51,8 +143,10 @@ thread_local size_t IlluminationModel::tls_batch_size = 0;
 thread_local IlluminationModel::RayBatch IlluminationModel::tls_batch;
 
 // Error handling function for Embree
-void embreeErrorFunction(void* userPtr, enum RTCError error, const char* str) {
-    std::cerr << "Embree error: " << str << " (code " << error << ")" << std::endl;
+namespace {
+inline void embreeErrorFunction(void* userPtr, RTCError error, const char* str) {
+    std::cerr << "[Embree] Error " << int(error) << ": " << (str ? str : "(null)") << std::endl;
+}
 }
 
 IlluminationModel::IlluminationModel(bool debug_output) 
@@ -86,16 +180,20 @@ void IlluminationModel::setAlbedo(double albedo) {
     albedo_ = albedo;
 }
 
+// Embree error callback definition
+static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* str) {
+    std::cerr << "[Embree] Error " << int(error) << ": " << (str ? str : "(null)") << std::endl;
+}
+
 bool IlluminationModel::initializeEmbree() {
-    // Initialize Embree device if it doesn't exist
     if (!embree_device_) {
         embree_device_ = rtcNewDevice(nullptr);
         if (!embree_device_) {
             std::cerr << "Failed to create Embree device" << std::endl;
             return false;
         }
+        rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
     }
-    
     return true;
 }
 
@@ -114,266 +212,322 @@ void IlluminationModel::cleanupEmbree() {
 
 bool IlluminationModel::initializeScene(
     const std::vector<std::array<double, 3>>& vertices,
-    const std::vector<std::array<int, 3>>& faces) {
-    
-    // Safety check for empty inputs
-    if (vertices.empty() || faces.empty()) {
-        std::cerr << "Error: Empty vertex or face array passed to initializeScene" << std::endl;
-        return false;
-    }
-    
+    const std::vector<std::array<int, 3>>& faces)
+{
     try {
-        // Create a new scene
+        if (vertices.empty() || faces.empty()) {
+            std::cerr << "[IlluminationModel] initializeScene: empty mesh" << std::endl;
+            return false;
+        }
+
+        if (!embree_device_) {
+            embree_device_ = rtcNewDevice(nullptr);
+            if (!embree_device_) {
+                std::cerr << "[IlluminationModel] Failed to create Embree device" << std::endl;
+                return false;
+            }
+            // FIX: use the canonical callback with exact signature
+            rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+        }
+
         if (embree_scene_) {
             rtcReleaseScene(embree_scene_);
             embree_scene_ = nullptr;
         }
-        
-        // Make sure device is initialized
-        if (!embree_device_) {
-            if (!initializeEmbree()) {
-                std::cerr << "Failed to initialize Embree device" << std::endl;
-                return false;
-            }
-        }
-        
+
         embree_scene_ = rtcNewScene(embree_device_);
         if (!embree_scene_) {
-            std::cerr << "Failed to create Embree scene" << std::endl;
+            std::cerr << "[IlluminationModel] Failed to create Embree scene" << std::endl;
             return false;
         }
-        
-        // Create new geometry
-        RTCGeometry geometry = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
-        if (!geometry) {
-            std::cerr << "Failed to create geometry" << std::endl;
+
+        rtcSetSceneFlags(embree_scene_, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_COMPACT);
+        rtcSetSceneBuildQuality(embree_scene_, RTC_BUILD_QUALITY_HIGH);
+
+        // FIX: avoid infinity initializers (compatible with -ffinite-math-only)
+        std::array<double,3> bb_min = { std::numeric_limits<double>::max(),
+                                        std::numeric_limits<double>::max(),
+                                        std::numeric_limits<double>::max() };
+        std::array<double,3> bb_max = { -std::numeric_limits<double>::max(),
+                                        -std::numeric_limits<double>::max(),
+                                        -std::numeric_limits<double>::max() };
+
+        for (const auto& v : vertices) {
+            bb_min[0] = std::min(bb_min[0], v[0]); bb_max[0] = std::max(bb_max[0], v[0]);
+            bb_min[1] = std::min(bb_min[1], v[1]); bb_max[1] = std::max(bb_max[1], v[1]);
+            bb_min[2] = std::min(bb_min[2], v[2]); bb_max[2] = std::max(bb_max[2], v[2]);
+        }
+
+        scene_origin_offset_ = {
+            0.5 * (bb_min[0] + bb_max[0]),
+            0.5 * (bb_min[1] + bb_max[1]),
+            0.5 * (bb_min[2] + bb_max[2])
+        };
+        scene_has_offset_ = true;
+
+        RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
+        if (!geom) {
+            std::cerr << "[IlluminationModel] Failed to create Embree geometry" << std::endl;
             return false;
         }
-        
-        // Set vertex buffer with proper error handling
-        size_t vertex_count = vertices.size();
-        std::cout << "Setting up ray tracing for " << vertex_count << " vertices and " 
-                  << faces.size() << " faces" << std::endl;
-                  
-        float* vertex_buffer = static_cast<float*>(rtcSetNewGeometryBuffer(
-            geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
-            sizeof(float) * 3, vertex_count
-        ));
-        
-        if (!vertex_buffer) {
-            std::cerr << "Failed to create vertex buffer" << std::endl;
-            rtcReleaseGeometry(geometry);
+        rtcSetGeometryBuildQuality(geom, RTC_BUILD_QUALITY_HIGH);
+        rtcSetGeometryMask(geom, 0xFFFFFFFFu);
+
+        const size_t V = vertices.size();
+        const size_t F = faces.size();
+
+        float* vbuf = static_cast<float*>(rtcSetNewGeometryBuffer(
+            geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
+            sizeof(float) * 3, V));
+        if (!vbuf) {
+            std::cerr << "[IlluminationModel] Failed to allocate vertex buffer" << std::endl;
+            rtcReleaseGeometry(geom);
             return false;
         }
-        
-        // Copy vertices to buffer with bounds checking
-        for (size_t i = 0; i < vertex_count; ++i) {
-            if (i * 3 + 2 >= vertex_count * 3) {
-                std::cerr << "Vertex buffer index out of bounds" << std::endl;
-                rtcReleaseGeometry(geometry);
-                return false;
-            }
-            vertex_buffer[i*3]     = static_cast<float>(vertices[i][0]);
-            vertex_buffer[i*3 + 1] = static_cast<float>(vertices[i][1]);
-            vertex_buffer[i*3 + 2] = static_cast<float>(vertices[i][2]);
+        for (size_t i = 0; i < V; ++i) {
+            vbuf[i*3 + 0] = static_cast<float>(vertices[i][0] - scene_origin_offset_[0]);
+            vbuf[i*3 + 1] = static_cast<float>(vertices[i][1] - scene_origin_offset_[1]);
+            vbuf[i*3 + 2] = static_cast<float>(vertices[i][2] - scene_origin_offset_[2]);
         }
-        
-        // Set index buffer with proper error handling
-        size_t face_count = faces.size();
-        unsigned* index_buffer = static_cast<unsigned*>(rtcSetNewGeometryBuffer(
-            geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
-            sizeof(unsigned) * 3, face_count
-        ));
-        
-        if (!index_buffer) {
-            std::cerr << "Failed to create index buffer" << std::endl;
-            rtcReleaseGeometry(geometry);
+
+        uint32_t* ibuf = static_cast<uint32_t*>(rtcSetNewGeometryBuffer(
+            geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
+            sizeof(uint32_t) * 3, F));
+        if (!ibuf) {
+            std::cerr << "[IlluminationModel] Failed to allocate index buffer" << std::endl;
+            rtcReleaseGeometry(geom);
             return false;
         }
-        
-        // Copy indices to buffer with validity check
-        for (size_t i = 0; i < face_count; ++i) {
-            // Check for valid vertex indices
-            if (static_cast<size_t>(faces[i][0]) >= vertex_count || 
-                static_cast<size_t>(faces[i][1]) >= vertex_count || 
-                static_cast<size_t>(faces[i][2]) >= vertex_count) {
-                std::cerr << "Face " << i << " has invalid vertex index "
-                          << faces[i][0] << ", " << faces[i][1] << ", " << faces[i][2] 
-                          << " (max valid: " << vertex_count - 1 << ")" << std::endl;
-                rtcReleaseGeometry(geometry);
-                return false;
-            }
-            
-            // Verify buffer access is in bounds
-            if (i * 3 + 2 >= face_count * 3) {
-                std::cerr << "Index buffer access out of bounds" << std::endl;
-                rtcReleaseGeometry(geometry);
-                return false;
-            }
-            
-            index_buffer[i*3]     = static_cast<unsigned>(faces[i][0]);
-            index_buffer[i*3 + 1] = static_cast<unsigned>(faces[i][1]);
-            index_buffer[i*3 + 2] = static_cast<unsigned>(faces[i][2]);
+        for (size_t i = 0; i < F; ++i) {
+            ibuf[i*3 + 0] = static_cast<uint32_t>(faces[i][0]);
+            ibuf[i*3 + 1] = static_cast<uint32_t>(faces[i][1]);
+            ibuf[i*3 + 2] = static_cast<uint32_t>(faces[i][2]);
         }
-        
-        // Commit geometry and attach to scene
-        rtcCommitGeometry(geometry);
-        unsigned geometry_id = rtcAttachGeometry(embree_scene_, geometry);
-        rtcReleaseGeometry(geometry);
-        
-        // Commit scene
-        std::cout << "Committing ray tracing scene..." << std::endl;
+
+        rtcCommitGeometry(geom);
+        rtcAttachGeometry(embree_scene_, geom);
+        rtcReleaseGeometry(geom);
+
         rtcCommitScene(embree_scene_);
-        std::cout << "Ray tracing scene ready" << std::endl;
-        
+
+        std::cout << "[IlluminationModel] Embree scene ready. V=" << V
+                  << " F=" << F
+                  << " origin shift=("
+                  << scene_origin_offset_[0] << ", "
+                  << scene_origin_offset_[1] << ", "
+                  << scene_origin_offset_[2] << ")\n";
+
+#ifdef PTM_GPU_OPENCL
+        // Build and upload BVH to GPU if GPU ray tracing is enabled
+        if (use_gpu_ray_tracer_ && gpu_ray_tracer_) {
+            try {
+                auto bvh_start = std::chrono::high_resolution_clock::now();
+
+                // Build BVH with SAH
+                gpu_bvh_ = std::make_unique<gpu::opencl::BVHBuilder>();
+                gpu::opencl::BVHConfig bvh_config;
+                bvh_config.max_triangles_per_leaf = 4;
+                bvh_config.use_sah = true;
+                bvh_config.verbose = false;
+
+                // Convert vertices to local coordinates (same as Embree)
+                std::vector<std::array<float, 3>> local_vertices(V);
+                for (size_t i = 0; i < V; ++i) {
+                    local_vertices[i] = {{
+                        static_cast<float>(vertices[i][0] - scene_origin_offset_[0]),
+                        static_cast<float>(vertices[i][1] - scene_origin_offset_[1]),
+                        static_cast<float>(vertices[i][2] - scene_origin_offset_[2])
+                    }};
+                }
+
+                // Convert indices
+                std::vector<std::array<uint32_t, 3>> indices(F);
+                for (size_t i = 0; i < F; ++i) {
+                    indices[i] = {{
+                        static_cast<uint32_t>(faces[i][0]),
+                        static_cast<uint32_t>(faces[i][1]),
+                        static_cast<uint32_t>(faces[i][2])
+                    }};
+                }
+
+                gpu_bvh_->build(local_vertices, indices, bvh_config);
+
+                auto bvh_end = std::chrono::high_resolution_clock::now();
+                double bvh_time = std::chrono::duration<double>(bvh_end - bvh_start).count();
+
+                std::cout << "[IlluminationModel] BVH built: " << gpu_bvh_->numNodes()
+                          << " nodes in " << std::fixed << std::setprecision(2)
+                          << bvh_time << "s\n";
+
+                // Upload mesh and BVH to GPU
+                auto upload_start = std::chrono::high_resolution_clock::now();
+
+                gpu_ray_tracer_->uploadMesh(local_vertices, indices);
+                gpu_ray_tracer_->uploadBVH(*gpu_bvh_);
+                gpu_mesh_uploaded_ = true;
+
+                auto upload_end = std::chrono::high_resolution_clock::now();
+                double upload_time = std::chrono::duration<double>(upload_end - upload_start).count();
+
+                std::cout << "[IlluminationModel] GPU mesh/BVH uploaded in "
+                          << std::fixed << std::setprecision(2) << upload_time << "s\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[IlluminationModel] GPU BVH setup failed: " << e.what()
+                          << ", falling back to CPU\n";
+                gpu_bvh_.reset();
+                gpu_mesh_uploaded_ = false;
+                use_gpu_ray_tracer_ = false;
+            }
+        }
+#endif
+
         return true;
-    }
-    catch (const std::exception& e) {
-        debugPrint("Debug: Exception during scene initialization: " + std::string(e.what()));
-        std::cerr << "Exception during ray tracing scene setup: " << e.what() << std::endl;
-        // Cleanup in case of exception
-        if (embree_scene_) {
-            rtcReleaseScene(embree_scene_);
-            embree_scene_ = nullptr;
-        }
+    } catch (const std::exception& e) {
+        std::cerr << "[IlluminationModel] initializeScene exception: " << e.what() << std::endl;
         return false;
-    }
-    catch (...) {
-        std::cerr << "Unknown exception during ray tracing scene setup" << std::endl;
-        // Cleanup in case of exception
-        if (embree_scene_) {
-            rtcReleaseScene(embree_scene_);
-            embree_scene_ = nullptr;
-        }
+    } catch (...) {
+        std::cerr << "[IlluminationModel] initializeScene unknown exception" << std::endl;
         return false;
     }
 }
 
 std::vector<int> IlluminationModel::intersectsFirst(
     const std::vector<std::array<double, 3>>& origins,
-    const std::vector<std::array<double, 3>>& directions) {
-    
-    if (!embree_scene_) {
-        std::cerr << "Embree scene not initialized" << std::endl;
-        return std::vector<int>(origins.size(), -1);
-    }
-    
-    size_t num_rays = origins.size();
-    std::vector<int> face_ids(num_rays, -1);  // Initialize all to -1 (no hit)
-    
-    // Create ray context
-    RTCIntersectArguments args;
-    rtcInitIntersectArguments(&args);
-    
-    // Process rays in parallel using OpenMP
-    #pragma omp parallel for
-    for (size_t i = 0; i < num_rays; ++i) {
-        // Initialize ray hit structure for Embree 4
-        RTCRayHit rayhit;
-        rayhit.ray.org_x = origins[i][0];
-        rayhit.ray.org_y = origins[i][1];
-        rayhit.ray.org_z = origins[i][2];
-        rayhit.ray.dir_x = directions[i][0];
-        rayhit.ray.dir_y = directions[i][1];
-        rayhit.ray.dir_z = directions[i][2];
-        rayhit.ray.tnear = 0.0001f;  // Small offset to avoid self-intersection
-        rayhit.ray.tfar = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
-        rayhit.ray.mask = 0;
+    const std::vector<std::array<double, 3>>& directions)
+{
+    const size_t n = std::min(origins.size(), directions.size());
+    std::vector<int> face_ids(n, -1);
+    if (!embree_scene_ || n == 0) return face_ids;
+
+    auto estimate_tnear = [](const std::array<double,3>& org_local) -> float {
+        const double r = std::sqrt(org_local[0]*org_local[0] +
+                                   org_local[1]*org_local[1] +
+                                   org_local[2]*org_local[2]);
+        return static_cast<float>(std::max(1e-3, r * 1e-7));
+    };
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        // Shift to Embree local space for robustness
+        const std::array<double,3> org_local = {
+            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+
+        // Normalize direction
+        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
+                                    directions[i][1]*directions[i][1] +
+                                    directions[i][2]*directions[i][2]);
+        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+
+        RTCRayHit rayhit{};
+        rayhit.ray.org_x = static_cast<float>(org_local[0]);
+        rayhit.ray.org_y = static_cast<float>(org_local[1]);
+        rayhit.ray.org_z = static_cast<float>(org_local[2]);
+        rayhit.ray.dir_x = static_cast<float>(directions[i][0] * inv_dl);
+        rayhit.ray.dir_y = static_cast<float>(directions[i][1] * inv_dl);
+        rayhit.ray.dir_z = static_cast<float>(directions[i][2] * inv_dl);
+
+        rayhit.ray.tnear = estimate_tnear(org_local);
+        rayhit.ray.tfar  = 1.0e30f;
+        rayhit.ray.time  = 0.0f;
+        rayhit.ray.mask  = 0xFFFFFFFFu;
         rayhit.ray.flags = 0;
-        rayhit.ray.time = 0.0f;
-        
-        // Initialize hit fields
+
         rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
         rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
-        rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-        
-        // Trace the ray
-        RTCIntersectArguments local_args = args;
-        rtcIntersect1(embree_scene_, &rayhit, &local_args);
-        
-        // Store result if hit
+
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+
+        rtcIntersect1(embree_scene_, &rayhit, &args);
+
         if (rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID) {
             face_ids[i] = static_cast<int>(rayhit.hit.primID);
         }
     }
-    
+
     return face_ids;
 }
 
 // SIMD version for improved performance when tracing multiple rays
 std::vector<int> IlluminationModel::intersectsFirstSIMD(
     const std::vector<std::array<double, 3>>& origins,
-    const std::vector<std::array<double, 3>>& directions) {
+    const std::vector<std::array<double, 3>>& directions)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    const size_t n = std::min(origins.size(), directions.size());
+    std::vector<int> face_ids(n, -1);
+    if (!embree_scene_ || n == 0) return face_ids;
 
-#if defined(__x86_64__) || defined(_M_X64)
-    if (!embree_scene_) {
-        std::cerr << "Embree scene not initialized" << std::endl;
-        return std::vector<int>(origins.size(), -1);
-    }
-    
-    size_t num_rays = origins.size();
-    std::vector<int> face_ids(num_rays, -1);  // Initialize all to -1 (no hit)
-    
-    // Process rays in SIMD packets of 8
+    auto estimate_tnear = [](float ox, float oy, float oz) -> float {
+        const double r = std::sqrt(double(ox)*ox + double(oy)*oy + double(oz)*oz);
+        return static_cast<float>(std::max(1e-3, r * 1e-7));
+    };
+
     size_t processed = 0;
-    while (processed < num_rays) {
-        // Number of rays in this packet (up to 8)
-        size_t packet_size = std::min(size_t(8), num_rays - processed);
-        
-        // Initialize SIMD ray packet
+    while (processed < n) {
+        const size_t packet_size = std::min<size_t>(8, n - processed);
+
         alignas(32) int valid[8];
-        alignas(32) RTCRayHit8 rayhit;
-        
-        // Clear valid array
         std::memset(valid, 0, sizeof(valid));
-        
-        // Set up rays for this packet
-        for (size_t i = 0; i < packet_size; ++i) {
-            valid[i] = -1;  // Mark ray as active
-            
-            size_t idx = processed + i;
-            
-            // Set ray origin and direction
-            rayhit.ray.org_x[i] = origins[idx][0];
-            rayhit.ray.org_y[i] = origins[idx][1];
-            rayhit.ray.org_z[i] = origins[idx][2];
-            rayhit.ray.dir_x[i] = directions[idx][0];
-            rayhit.ray.dir_y[i] = directions[idx][1];
-            rayhit.ray.dir_z[i] = directions[idx][2];
-            
-            // Other ray parameters
-            rayhit.ray.tnear[i] = 0.0001f;
-            rayhit.ray.tfar[i] = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
-            rayhit.ray.mask[i] = 0;
-            rayhit.ray.flags[i] = 0;
-            rayhit.ray.time[i] = 0.0f;
-            
-            // Initialize hit fields
-            rayhit.hit.geomID[i] = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.primID[i] = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.instID[0][i] = RTC_INVALID_GEOMETRY_ID;
+
+        alignas(32) RTCRayHit8 rayhit{};
+        for (size_t lane = 0; lane < packet_size; ++lane) {
+            valid[lane] = -1;
+            const size_t idx = processed + lane;
+
+            // Shift to Embree local space
+            const float org_x = static_cast<float>(origins[idx][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0));
+            const float org_y = static_cast<float>(origins[idx][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0));
+            const float org_z = static_cast<float>(origins[idx][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0));
+
+            // Normalize direction
+            const double dl = std::sqrt(directions[idx][0]*directions[idx][0] +
+                                        directions[idx][1]*directions[idx][1] +
+                                        directions[idx][2]*directions[idx][2]);
+            const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+
+            rayhit.ray.org_x[lane] = org_x;
+            rayhit.ray.org_y[lane] = org_y;
+            rayhit.ray.org_z[lane] = org_z;
+
+            rayhit.ray.dir_x[lane] = static_cast<float>(directions[idx][0] * inv_dl);
+            rayhit.ray.dir_y[lane] = static_cast<float>(directions[idx][1] * inv_dl);
+            rayhit.ray.dir_z[lane] = static_cast<float>(directions[idx][2] * inv_dl);
+
+            rayhit.ray.tnear[lane] = estimate_tnear(org_x, org_y, org_z);
+            rayhit.ray.tfar[lane]  = 1.0e30f;
+            rayhit.ray.mask[lane]  = 0xFFFFFFFFu;
+            rayhit.ray.flags[lane] = 0;
+            rayhit.ray.time[lane]  = 0.0f;
+
+            rayhit.hit.geomID[lane] = RTC_INVALID_GEOMETRY_ID;
+            rayhit.hit.primID[lane] = RTC_INVALID_GEOMETRY_ID;
+            rayhit.hit.instID[0][lane] = RTC_INVALID_GEOMETRY_ID;
         }
-        
-        // Trace ray packet
+
         RTCIntersectArguments args;
         rtcInitIntersectArguments(&args);
+        args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+
         rtcIntersect8(valid, embree_scene_, &rayhit, &args);
-        
-        // Process results
-        for (size_t i = 0; i < packet_size; ++i) {
-            size_t idx = processed + i;
-            if (rayhit.hit.geomID[i] != RTC_INVALID_GEOMETRY_ID) {
-                face_ids[idx] = static_cast<int>(rayhit.hit.primID[i]);
+
+        for (size_t lane = 0; lane < packet_size; ++lane) {
+            const size_t idx = processed + lane;
+            if (rayhit.hit.geomID[lane] != RTC_INVALID_GEOMETRY_ID) {
+                face_ids[idx] = static_cast<int>(rayhit.hit.primID[lane]);
             }
         }
-        
+
         processed += packet_size;
     }
-    
-    return face_ids;
 
+    return face_ids;
 #else
-    // Fallback to non-SIMD version on non-x86 platforms
+    // Fallback to scalar implementation
     return intersectsFirst(origins, directions);
 #endif
 }
@@ -541,6 +695,72 @@ void IlluminationModel::processRayBatch() {
     tls_batch_size = 0;
 }
 
+std::vector<uint8_t> IlluminationModel::traceOccluded(
+    const std::vector<std::array<double, 3>>& origins,
+    const std::vector<std::array<double, 3>>& directions,
+    bool /*coherent*/)
+{
+    const size_t n = origins.size();
+    std::vector<uint8_t> blocked(n, 0);
+    if (n == 0) return blocked;
+
+#ifdef PTM_GPU_OPENCL
+    // Use GPU ray tracer if available
+    if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+        return traceOccludedGPU(origins, directions);
+    }
+#endif
+
+    // Fall back to CPU Embree
+    if (!embree_scene_) return blocked;
+
+    auto estimate_tnear = [&](const std::array<double,3>& org_local) -> float {
+        const double r = std::sqrt(org_local[0]*org_local[0] +
+                                   org_local[1]*org_local[1] +
+                                   org_local[2]*org_local[2]);
+        const double ulp = std::numeric_limits<double>::epsilon() * r;
+        const double scaled = std::max(1e-6 * r, 0.01);  // 1 ppm of radius, min 1 cm
+        return static_cast<float>(std::max(16.0 * ulp, scaled));
+    };
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        // Shift to Embree local space (scene origin removal)
+        const std::array<double,3> org_local_d = {
+            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+
+        // Normalize direction
+        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
+                                    directions[i][1]*directions[i][1] +
+                                    directions[i][2]*directions[i][2]);
+        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+
+        RTCRay ray{};
+        ray.org_x = static_cast<float>(org_local_d[0]);
+        ray.org_y = static_cast<float>(org_local_d[1]);
+        ray.org_z = static_cast<float>(org_local_d[2]);
+        ray.dir_x = static_cast<float>(directions[i][0] * inv_dl);
+        ray.dir_y = static_cast<float>(directions[i][1] * inv_dl);
+        ray.dir_z = static_cast<float>(directions[i][2] * inv_dl);
+        ray.tnear = estimate_tnear(org_local_d);
+        ray.tfar  = 1.0e30f;
+        ray.mask  = 0xFFFFFFFFu;
+        ray.flags = 0;
+        ray.time  = 0.0f;
+
+        RTCOccludedArguments args;                 // CHANGE: use occluded args
+        rtcInitOccludedArguments(&args);           // CHANGE: init occluded args
+        args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+
+        rtcOccluded1(embree_scene_, &ray, &args);  // CHANGE: pass RTCOccludedArguments*
+        blocked[i] = static_cast<uint8_t>(ray.tfar < 0.0f ? 1 : 0);
+    }
+    return blocked;
+}
+
 // Batch ray tracing with 16-wide AVX-512 packets for maximum performance on supported hardware
 std::vector<int> IlluminationModel::intersectsFirstAVX512(
     const std::vector<std::array<double, 3>>& origins,
@@ -585,9 +805,9 @@ std::vector<int> IlluminationModel::intersectsFirstAVX512(
             rayhit.ray.dir_z[i] = directions[idx][2];
             
             // Other ray parameters
-            rayhit.ray.tnear[i] = 0.0001f;
-            rayhit.ray.tfar[i] = 1.0e30f; // Far distance (replaced std::numeric_limits<float>::infinity())
-            rayhit.ray.mask[i] = 0;
+            rayhit.ray.tnear[i] = 1.0e-4f;
+            rayhit.ray.tfar[i]  = 1.0e30f;
+            rayhit.ray.mask[i] = 0xFFFFFFFF;
             rayhit.ray.flags[i] = 0;
             rayhit.ray.time[i] = 0.0f;
             
@@ -961,50 +1181,62 @@ bool IlluminationModel::calculateIlluminationOptimized(
     }
     
     debugPrint("Debug: Calculating face normals and centers");
-    // Calculate face normals and centers
+    // Calculate face normals and centers (parallel) WITH outward enforcement
     std::vector<std::array<double, 3>> face_normals(mesh_faces.size());
     std::vector<std::array<double, 3>> face_centers(mesh_faces.size());
-    
-    // Use a smaller chunk size for large meshes to balance parallelism and memory usage
-    size_t chunk_size = is_very_large_mesh ? 4096 : (is_large_mesh ? 8192 : 16384);
-    
-    #pragma omp parallel for schedule(dynamic, chunk_size)
+
+    bool strict_horizon = true;
+    if (const char* ev = std::getenv("PTM_DISABLE_STRICT_HORIZON")) {
+        if (std::atoi(ev) != 0) strict_horizon = false;
+    }
+
+    // Choose a reasonable OpenMP chunk size (avoid using undeclared 'chunk_size')
+    int omp_chunk = static_cast<int>(std::max<size_t>(1, chunk_size_ / 64));
+    if (omp_chunk < 32) omp_chunk = 32;
+    #pragma omp parallel for schedule(dynamic, omp_chunk)
     for (size_t f = 0; f < mesh_faces.size(); ++f) {
         try {
             const auto& face = mesh_faces[f];
-            
-            // Add range checks to prevent out-of-bounds access
-            if (face[0] >= mesh_vertices.size() || face[1] >= mesh_vertices.size() || face[2] >= mesh_vertices.size()) {
-                #pragma omp critical
-                {
-                    std::cerr << "Error: Face " << f << " contains invalid vertex indices" << std::endl;
-                }
-                continue;  // Skip this face rather than failing
-            }
-            
             const auto& v0 = mesh_vertices[face[0]];
             const auto& v1 = mesh_vertices[face[1]];
             const auto& v2 = mesh_vertices[face[2]];
-            
-            face_normals[f] = calculateFaceNormal(v0, v1, v2);
-            face_centers[f] = {{
+
+            // Center
+            std::array<double,3> center = {
                 (v0[0] + v1[0] + v2[0]) / 3.0,
                 (v0[1] + v1[1] + v2[1]) / 3.0,
                 (v0[2] + v1[2] + v2[2]) / 3.0
-            }};
-        } catch (const std::exception& e) {
-            #pragma omp critical
-            {
-                std::cerr << "Exception during normal calculation at face " << f << ": " << e.what() << std::endl;
+            };
+
+            // Normal (raw)
+            std::array<double,3> e1 = { v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2] };
+            std::array<double,3> e2 = { v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2] };
+            std::array<double,3> n = {
+                e1[1]*e2[2] - e1[2]*e2[1],
+                e1[2]*e2[0] - e1[0]*e2[2],
+                e1[0]*e2[1] - e1[1]*e2[0]
+            };
+            double len = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            if (len > 0.0) {
+                n[0] /= len; n[1] /= len; n[2] /= len;
+            } else {
+                n = {0.0,0.0,1.0};
             }
-            // Continue processing other faces - don't fail the entire calculation for one face
+
+            // Enforce outward orientation: dot(center, normal) must be > 0
+            double dcn = center[0]*n[0] + center[1]*n[1] + center[2]*n[2];
+            if (dcn < 0.0) {
+                n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2];
+            }
+
+            face_centers[f] = center;
+            face_normals[f] = n;
         } catch (...) {
-            #pragma omp critical
-            {
-                std::cerr << "Unknown exception during normal calculation at face " << f << std::endl;
-            }
+            face_centers[f] = {0.0,0.0,0.0};
+            face_normals[f] = {0.0,0.0,1.0};
         }
     }
+    
     debugPrint("Debug: Finished calculating normals and centers");
     
     debugPrint("Debug: Resizing result arrays for " + std::to_string(mesh_faces.size()) + " faces and " + std::to_string(time_steps_) + " time steps");
@@ -1087,6 +1319,28 @@ bool IlluminationModel::calculateIlluminationOptimized(
         // Calculate direct solar illumination
         debugPrint("Debug: Calculating direct solar illumination for time step " + std::to_string(t+1));
         try {
+#ifdef PTM_GPU_OPENCL
+            // Use GPU batched version when GPU ray tracing is enabled
+            if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+                calculateDirectSolarBatchWithFiniteDiskGPU(
+                    face_centers,
+                    face_normals,
+                    sun_pos,
+                    primary_pos,
+                    timestep_direct_solar,
+                    constants::N_SOLAR_SAMPLES
+                );
+            } else {
+                calculateDirectSolarBatchWithFiniteDisk(
+                    face_centers,
+                    face_normals,
+                    sun_pos,
+                    primary_pos,
+                    timestep_direct_solar,
+                    constants::N_SOLAR_SAMPLES
+                );
+            }
+#else
             calculateDirectSolarBatchWithFiniteDisk(
                 face_centers,
                 face_normals,
@@ -1095,6 +1349,7 @@ bool IlluminationModel::calculateIlluminationOptimized(
                 timestep_direct_solar,
                 constants::N_SOLAR_SAMPLES
             );
+#endif
             debugPrint("Debug: Direct solar calculation complete for time step " + std::to_string(t+1));
         } catch (const std::exception& e) {
             debugPrint("Debug: Exception during direct solar calculation at time step " + std::to_string(t) + ": " + std::string(e.what()));
@@ -1558,11 +1813,11 @@ bool IlluminationModel::loadPositionsFromFile(const std::string& filename) {
     return true;
 }
 
-double IlluminationModel::dotProduct(const std::array<double, 3>& v1, const std::array<double, 3>& v2) {
+double IlluminationModel::dotProduct(const std::array<double, 3>& v1, const std::array<double, 3>& v2) const {
     return v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
 }
 
-std::array<double, 3> IlluminationModel::normalize(const std::array<double, 3>& v) {
+std::array<double, 3> IlluminationModel::normalize(const std::array<double, 3>& v) const {
     double length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
     
     if (length < constants::EPSILON) {
@@ -1605,41 +1860,11 @@ std::array<double, 3> IlluminationModel::calculateFaceNormal(
     return normalize(normal);
 }
 
-// Batch processing for direct solar illumination with finite disk model
-void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
-    const std::vector<std::array<double, 3>>& face_centers,
-    const std::vector<std::array<double, 3>>& face_normals,
-    const std::array<double, 3>& sun_position,
-    const std::array<double, 3>& primary_position,
-    std::vector<double>& direct_solar_values,
-    int num_samples) {
-    
-    size_t num_faces = face_centers.size();
-    direct_solar_values.resize(num_faces, 0.0);
-    
-    // Calculate direct solar illumination for each face in parallel
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < num_faces; ++i) {
-        // Use the existing single-face calculation function
-        direct_solar_values[i] = calculateSolarIlluminationWithFiniteDisk(
-            face_centers[i],
-            face_normals[i],
-            sun_position,
-            primary_position,
-            num_samples
-        );
-    }
-}
-
-// Implementation of the finite solar disk model
-double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
+double IlluminationModel::calculateShadowFlux(
     const std::array<double, 3>& face_center,
     const std::array<double, 3>& face_normal,
-    const std::array<double, 3>& sun_position,
-    const std::array<double, 3>& primary_position,
-    int num_samples) {
+    const std::array<double, 3>& sun_position) const {
     
-    // First part remains unchanged
     // Calculate sun direction and distance
     std::array<double, 3> sun_rel = {
         sun_position[0] - face_center[0],
@@ -1649,7 +1874,6 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     
     double sun_dist = vectorLength(sun_rel);
     
-    // Early exit if distance is too small
     if (sun_dist < constants::EPSILON) {
         return 0.0;
     }
@@ -1660,129 +1884,800 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         sun_rel[2] / sun_dist
     };
     
-    // Calculate cosine of angle between normal and sun
-    double cos_angle = dotProduct(face_normal, sun_dir);
+    // Calculate solar elevation angle (angle from horizontal plane)
+    // For a spherical body, the local "up" is the normalized face center
+    std::array<double, 3> up_dir = face_center;
+    double body_radius = vectorLength(up_dir);
+    if (body_radius > constants::EPSILON) {
+        up_dir[0] /= body_radius;
+        up_dir[1] /= body_radius;
+        up_dir[2] /= body_radius;
+    }
     
-    // If surface is facing away from sun, no illumination
-    if (cos_angle <= 0.0) {
+    // Solar elevation is the angle between sun direction and horizontal plane
+    // sin(elevation) = dot product of sun direction with local up
+    double sin_elevation = dotProduct(sun_dir, up_dir);
+    
+    // If sun is below local horizon, no shadow flux
+    if (sin_elevation <= 0.0) {
         return 0.0;
     }
     
-    // Create ray system for sampling points on solar disk
-    std::array<double, 3> u, v;
-    createCoordinateSystem(sun_dir, u, v);
+    // Calculate the f parameter based on crater geometry
+    // From the paper: f = 1/(1 + D²/4) where D is diameter/depth ratio
+    double D = crater_diameter_depth_ratio_;
+    double f = 1.0 / (1.0 + D * D / 4.0);
     
-    // Create grid sampling of solar disk
-    int grid_size = static_cast<int>(std::sqrt(num_samples));
-    if (grid_size < 1) grid_size = 1;
-    
+    // Calculate solar flux at body distance
     double sun_dist_au = sun_dist / constants::KM_PER_AU;
-    double solar_irradiance = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+    double solar_flux = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
     
-    // Simplified batching approach - directly collect rays in thread-local arrays
-    std::vector<std::array<double, 3>> ray_origins;
-    std::vector<std::array<double, 3>> ray_directions;
-    std::vector<bool> primary_eclipsed;
-    int total_samples = 0;
+    // Use the body's albedo and emissivity
+    double A = body_albedo_;
+    double e = body_emissivity_;
     
-    // Reserve space based on expected sample count to avoid reallocations
-    ray_origins.reserve(grid_size * grid_size);
-    ray_directions.reserve(grid_size * grid_size);
-    primary_eclipsed.reserve(grid_size * grid_size);
+    double shadow_flux = 0.0;
     
-    // Loop over grid points on solar disk - collect all rays first
-    for (int i = 0; i < grid_size; i++) {
-        for (int j = 0; j < grid_size; j++) {
-            // Generate point on unit disk
-            double x = (2.0 * ((i + 0.5) / grid_size) - 1.0) * constants::SUN_RADIUS / sun_dist;
-            double y = (2.0 * ((j + 0.5) / grid_size) - 1.0) * constants::SUN_RADIUS / sun_dist;
-            
-            // Only use points inside unit disk
-            if (x*x + y*y <= (constants::SUN_RADIUS*constants::SUN_RADIUS)/(sun_dist*sun_dist)) {
-                total_samples++;
-                
-                // Calculate direction to this point on solar disk
-                std::array<double, 3> sample_dir = {
-                    sun_dir[0] + x * u[0] + y * v[0],
-                    sun_dir[1] + x * u[1] + y * v[1],
-                    sun_dir[2] + x * u[2] + y * v[2]
-                };
-                
-                // Normalize direction
-                double len = vectorLength(sample_dir);
-                sample_dir[0] /= len;
-                sample_dir[1] /= len;
-                sample_dir[2] /= len;
-                
-                // Adjust ray origin slightly above surface to prevent self-intersection
-                std::array<double, 3> ray_origin = {
-                    face_center[0] + face_normal[0] * 0.001,
-                    face_center[1] + face_normal[1] * 0.001,
-                    face_center[2] + face_normal[2] * 0.001
-                };
-                
-                // First check for Primary eclipse using fast ray-sphere test
-                bool primary_eclipse = false;
-                
-                // Skip primary eclipse check if primary is the Sun!
-                if (!primary_is_sun_) {
-                    double t1, t2;
-                    if (raySphereIntersect(
-                            ray_origin,
-                            sample_dir,
-                            primary_position,
-                            primary_radius_,
-                            t1, t2)) {
-                        // Only count eclipse if Primary intersection is before the sun
-                        if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) {
-                            primary_eclipse = true;
-                        }
-                    }
+    if (D > 10.0) {
+        // Use simplified equation (10) for large D (shallow craters)
+        // σT⁴ = F₀ sin(e₀) * (1-A)/(D²/4) * [1 + A(1-f)/e]
+        double D2_4 = D * D / 4.0;
+        double term1 = (1.0 - A) / D2_4;
+        double term2 = 1.0 + A * (1.0 - f) / e;
+        shadow_flux = solar_flux * sin_elevation * term1 * term2;
+    } else {
+        // Use full equation (8) for more accurate calculation
+        double Af = A * f;
+        double denominator_solar = 1.0 - Af;
+        
+        // Solar scattering term
+        double solar_term = solar_flux * sin_elevation * (1.0 - A) * f / denominator_solar;
+        
+        // Multiple scattering enhancement
+        double scattering_enhancement = 1.0 + Af / denominator_solar;
+        
+        // For the thermal term, we'd need wall temperatures
+        // For now, we'll use a simplified approach
+        double ir_contribution = 0.0;
+        
+        shadow_flux = solar_term * scattering_enhancement + ir_contribution;
+    }
+    
+    return std::max(0.0, shadow_flux);
+}
+
+
+// Implementation of the finite solar disk model with shadow flux
+double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
+    const std::array<double, 3>& face_center,
+    const std::array<double, 3>& face_normal,
+    const std::array<double, 3>& sun_position,        // SPICE in km
+    const std::array<double, 3>& primary_position,    // SPICE in km
+    int num_samples)
+{
+    // Convert SPICE positions to meters for geometric tests
+    const std::array<double,3> sun_pos_m     = kmToMeters(sun_position);
+    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+
+    // Geometry in meters: vector from face to Sun (meters)
+    std::array<double, 3> sun_rel_m = {
+        sun_pos_m[0] - face_center[0],
+        sun_pos_m[1] - face_center[1],
+        sun_pos_m[2] - face_center[2]
+    };
+    double sun_dist_m = vectorLength(sun_rel_m);
+    if (sun_dist_m <= constants::EPSILON) {
+        return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+    }
+    std::array<double, 3> sun_dir = { sun_rel_m[0]/sun_dist_m, sun_rel_m[1]/sun_dist_m, sun_rel_m[2]/sun_dist_m };
+
+    // Solar angular radius uses km distance
+    const std::array<double,3> face_center_km = metersToKm(face_center);
+    std::array<double,3> sun_rel_km = {
+        sun_position[0] - face_center_km[0],
+        sun_position[1] - face_center_km[1],
+        sun_position[2] - face_center_km[2]
+    };
+    double sun_dist_km = std::sqrt(sun_rel_km[0]*sun_rel_km[0] + sun_rel_km[1]*sun_rel_km[1] + sun_rel_km[2]*sun_rel_km[2]);
+    double s = constants::SUN_RADIUS / sun_dist_km; // SUN_RADIUS is in km
+    if (s > 1.0) s = 1.0;
+    const double disk_ang   = std::asin(s);
+    const double disk_scale = std::sin(disk_ang);
+
+    // Finite-disk-aware outward-facing test
+    double cos_inc0 = dotProduct(face_normal, sun_dir);
+    if (cos_inc0 <= -std::sin(disk_ang)) {
+        return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+    }
+
+    // Local up and elevation
+    std::array<double, 3> up = face_center;
+    double r_up = vectorLength(up);
+    if (r_up > constants::EPSILON) { up[0]/=r_up; up[1]/=r_up; up[2]/=r_up; }
+    const double sin_elev = dotProduct(sun_dir, up);
+
+    // Robust origin offsets (meters)
+    const double eps_base = calculateSafeRayOffset(face_center, face_normal);
+    const double eps_n = 2.0 * eps_base;
+    const double eps_d = 12.0 * eps_base;
+
+    std::array<double, 3> ray_origin_base = {
+        face_center[0] + face_normal[0] * eps_n + sun_dir[0] * eps_d,
+        face_center[1] + face_normal[1] * eps_n + sun_dir[1] * eps_d,
+        face_center[2] + face_normal[2] * eps_n + sun_dir[2] * eps_d
+    };
+
+    // Center-ray fast path; use meters for eclipse/horizon
+    if (sin_elev > 2.0 * std::sin(disk_ang) && cos_inc0 > 0.10) {
+        if (!primary_is_sun_) {
+            double t1, t2;
+            if (raySphereIntersect(ray_origin_base, sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
+                if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) {
+                    return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
                 }
+            }
+        }
+        if (use_geometric_horizon_ && checkLunarHorizon(ray_origin_base, sun_dir, vectorLength(face_center))) {
+            return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+        }
+        // Terrain occlusion via Embree (unchanged)
+        {
+            std::vector<std::array<double,3>> o(1, ray_origin_base);
+            std::vector<std::array<double,3>> d(1, sun_dir);
+            auto occ = traceOccluded(o, d, /*coherent=*/true);
+            if (!occ.empty() && occ[0] == 0) {
+                double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
+                double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+                return solar_irr * cos_inc0;
+            }
+        }
+        // If center ray blocked, fall back to finite-disk sampling
+    }
+
+    // Disk basis with decorrelation
+    std::array<double, 3> u, v; createCoordinateSystem(sun_dir, u, v);
+    uint32_t seed = hashFaceSeed(face_center, face_normal, sun_position);
+    double theta = (seed & 0xFFFFu) * (2.0*M_PI / 65536.0);
+    std::array<double,3> ur, vr; rotateBasis(u, v, theta, ur, vr);
+    double uoff = ((seed >> 16) & 0xFFu) / 256.0;
+    double voff = ((seed >> 24) & 0xFFu) / 256.0;
+
+    // Irradiance with km
+    double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
+    double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+
+    const uint32_t baseN   = static_cast<uint32_t>(std::max(1, num_samples));
+    uint32_t initialN      = std::max<uint32_t>(8, baseN);
+    uint32_t heavyN        = std::max<uint32_t>(64, baseN * 4);
+
+    auto sample_and_accumulate = [&](uint32_t N, double& sum_cos_out,
+                                     uint32_t& total_out, uint32_t& visible_out,
+                                     uint32_t& blocked_visible_out)
+    {
+        sum_cos_out = 0.0;
+        total_out = visible_out = blocked_visible_out = 0;
+
+        std::vector<std::array<double, 3>> dirs;
+        std::vector<uint8_t> skip;
+        dirs.reserve(N);
+        skip.reserve(N);
+
+        for (uint32_t k = 0; k < N; ++k) {
+            double su, sv; hammersley(k, N, uoff, voff, su, sv);
+            double dx, dy; squareToConcentricDisk(su, sv, dx, dy);
+            if (dx*dx + dy*dy > 1.0) continue;
+
+            const double ox = disk_scale * dx, oy = disk_scale * dy;
+            std::array<double, 3> sd = {
+                sun_dir[0] + ox * ur[0] + oy * vr[0],
+                sun_dir[1] + ox * ur[1] + oy * vr[1],
+                sun_dir[2] + ox * ur[2] + oy * vr[2]
+            };
+            double l = vectorLength(sd);
+            if (l <= constants::EPSILON) continue;
+            sd[0]/=l; sd[1]/=l; sd[2]/=l;
+
+            bool sskip = false;
+
+            // Eclipse clip
+            if (!primary_is_sun_) {
+                double t1, t2;
+                if (raySphereIntersect(ray_origin_base, sd, primary_pos_m, primary_radius_, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) sskip = true;
+                }
+            }
+
+            skip.push_back(sskip ? 1 : 0);
+            if (!sskip) dirs.push_back(sd);
+            total_out++;
+        }
+
+        // Start each survivor ray slightly along its own direction too
+        std::vector<std::array<double,3>> origins;
+        origins.reserve(dirs.size());
+        for (const auto& sd : dirs) {
+            origins.push_back({ ray_origin_base[0] + sd[0]*eps_d,
+                                ray_origin_base[1] + sd[1]*eps_d,
+                                ray_origin_base[2] + sd[2]*eps_d });
+        }
+
+        // Terrain occlusion for survivors (coherent packet)
+        auto occ = traceOccluded(origins, dirs, /*coherent=*/true);
+
+        size_t m = 0;
+        for (uint32_t sidx = 0; sidx < total_out; ++sidx) {
+            if (skip[sidx]) continue;
+            const bool blocked = (m < occ.size()) && (occ[m] != 0);
+            const auto& sd = dirs[m];
+            m++;
+            if (blocked) {
+                blocked_visible_out++;
+            } else {
+                double c = dotProduct(face_normal, sd);
+                if (c > 0.0) { sum_cos_out += c; visible_out++; }
+            }
+        }
+    };
+
+    // First pass
+    double sum_cos = 0.0;
+    uint32_t total_samples = 0, visible_cnt = 0, blocked_visible_cnt = 0;
+    sample_and_accumulate(initialN, sum_cos, total_samples, visible_cnt, blocked_visible_cnt);
+
+    if (total_samples == 0) {
+        return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+    }
+
+    // Upsample if partial terrain occlusion detected
+    const bool partial_by_topo = (visible_cnt > 0 && blocked_visible_cnt > 0 && blocked_visible_cnt < visible_cnt);
+    if (partial_by_topo && heavyN > initialN) {
+        double sc2 = 0.0; uint32_t ts2=0, v2=0, bv2=0;
+        sample_and_accumulate(heavyN, sc2, ts2, v2, bv2);
+        if (ts2 > 0) { sum_cos = sc2; total_samples = ts2; }
+    }
+
+    double flux = solar_irr * (sum_cos / std::max<uint32_t>(1, total_samples));
+    if (flux <= 0.0 && enable_shadow_flux_) {
+        flux = calculateShadowFlux(face_center, face_normal, sun_pos_m);
+    }
+    return flux;
+}
+
+bool IlluminationModel::checkLunarHorizon(
+    const std::array<double, 3>& ray_origin,
+    const std::array<double, 3>& ray_direction,
+    double lunar_radius) const {
+    
+    // Ray-sphere intersection with lunar body centered at origin
+    std::array<double, 3> lunar_center = {{0.0, 0.0, 0.0}};
+    double t1, t2;
+    
+    // Use existing ray-sphere intersection method
+    if (raySphereIntersect(ray_origin, ray_direction, lunar_center, lunar_radius, t1, t2)) {
+        // Check if intersection occurs in front of the ray origin
+        // t1 is the near intersection, t2 is the far intersection
+        
+        // For horizon checking, we care about the nearest positive intersection
+        double nearest_t = -1.0;
+        if (t1 > 0.001) {  // Small epsilon to avoid self-intersection
+            nearest_t = t1;
+        } else if (t2 > 0.001) {
+            nearest_t = t2;
+        }
+        
+        if (nearest_t > 0.0) {
+            // Ray hits lunar surface before reaching infinity
+            return true;  // Blocked by lunar horizon
+        }
+    }
+    
+    return false;  // Ray escapes to space - sun is visible
+}
+
+bool IlluminationModel::calculateIlluminationFromMesh(
+    const std::shared_ptr<Mesh>& mesh,
+    const std::string& start_time,
+    double duration_days) {
+    
+    // Ensure the mesh has pre-calculated face properties
+    if (mesh->face_normals.empty() || mesh->face_centers.empty()) {
+        std::cerr << "Error: Mesh face properties not calculated. Please call calculateFaceProperties first." << std::endl;
+        return false;
+    }
+    
+    // CRITICAL FIX: Create corrected copies of normals and centers
+    // We need to ensure normals point outward for topographic meshes
+    std::vector<std::array<double, 3>> corrected_normals = mesh->face_normals;
+    const std::vector<std::array<double, 3>>& face_centers = mesh->face_centers;
+    
+    // Check and fix normal orientations for topographic meshes
+    // This is essential for correct primary IR and reflection calculations
+    int flipped_count = 0;
+    for (size_t i = 0; i < corrected_normals.size(); i++) {
+        const auto& center = face_centers[i];
+        auto& normal = corrected_normals[i];
+        
+        // For a mesh centered at the origin, the face center vector
+        // should point in the same general direction as the normal (both outward)
+        double dot = center[0] * normal[0] + 
+                     center[1] * normal[1] + 
+                     center[2] * normal[2];
+        
+        // If dot product is negative, the normal points inward
+        if (dot < 0) {
+            // Flip the normal to point outward
+            normal[0] = -normal[0];
+            normal[1] = -normal[1];
+            normal[2] = -normal[2];
+            flipped_count++;
+        }
+    }
+    
+    if (flipped_count > 0) {
+        std::cout << "Corrected " << flipped_count << " inward-pointing normals ("
+                  << std::fixed << std::setprecision(1) 
+                  << (100.0 * flipped_count / corrected_normals.size()) 
+                  << "% of faces)" << std::endl;
+    }
+    
+    // Initialize Embree for ray tracing
+    if (!initializeEmbree() || !initializeScene(mesh->vertices, mesh->faces)) {
+        std::cerr << "Failed to initialize ray tracing." << std::endl;
+        return false;
+    }
+    
+    // Get the number of faces for allocation
+    size_t num_faces = mesh->faces.size();
+    
+    // Start timer for performance measurement
+    auto start_time_point = std::chrono::high_resolution_clock::now();
+    
+    // Initialize SPICE if not already done
+    if (!initialize_spice(debug_output_enabled_)) {
+        std::cerr << "Failed to initialize SPICE." << std::endl;
+        return false;
+    }
+    
+    // Set up time steps for simulation
+    double et_start = convertTimeToET(start_time);
+    double et_end = et_start + duration_days * constants::SECONDS_PER_DAY;
+    double et_step = (et_end - et_start) / (time_steps_ - 1);
+    
+    // Check if we should use chunked storage for very large meshes
+    using_chunked_storage_ = (num_faces * time_steps_ > 100000000); // Over 100M elements
+    
+    // Initialize storage for results
+    if (using_chunked_storage_) {
+        initializeChunkedStorage(num_faces, time_steps_);
+    } else {
+        // Resize all result vectors
+        illumination_values_.resize(num_faces * time_steps_, 0.0);
+        direct_solar_values_.resize(num_faces * time_steps_, 0.0);
+        primary_reflected_values_.resize(num_faces * time_steps_, 0.0);
+        primary_ir_values_.resize(num_faces * time_steps_, 0.0);
+    }
+    
+    // Resize and calculate ephemeris data
+    times_.resize(time_steps_);
+    time_strings_.resize(time_steps_);
+    sun_positions_.resize(time_steps_);
+    primary_positions_.resize(time_steps_);
+    
+    
+    // std::ostringstream progress_prefix;
+    // progress_prefix << "Computing " << time_steps_ << " time steps: ";
+    // thermal::ProgressBar progress_bar(time_steps_, progress_prefix.str(), 50, show_progress_);
+    
+    // Generate time steps and get positions
+    for (int t = 0; t < time_steps_; t++) {
+        // Calculate ephemeris time
+        double et = et_start + t * et_step;
+        times_[t] = et;
+
+        // Convert ET to string
+        char time_string[100];
+        et2utc_c(et, "ISOC", 3, 100, time_string);
+        time_strings_[t] = std::string(time_string);
+
+        // Get positions of sun and primary body relative to target body
+        sun_positions_[t] = getSunPosition(et);
+        primary_positions_[t] = getPrimaryPosition(et);
+
+        //progress_bar.update(t + 1);
+    }
+
+    // progress_bar.finish();
+
+    // Calculate illumination for each time step with CORRECTED face properties
+    thermal::ProgressBar illum_progress(time_steps_, "Calculating illumination: ", 50, show_progress_);
+    
+    for (int t = 0; t < time_steps_; t++) {
+        // Get positions for this time step
+        const auto& sun_position = sun_positions_[t];
+        const auto& primary_position = primary_positions_[t];
+        
+        // Initialize temporary arrays for batch processing
+        std::vector<double> direct_solar_batch(num_faces, 0.0);
+        std::vector<double> primary_reflected_batch(num_faces, 0.0);
+        std::vector<double> primary_ir_batch(num_faces, 0.0);
+        
+        // CRITICAL: Use corrected_normals instead of mesh->face_normals
+
+        // Calculate direct solar illumination with finite disk model
+#ifdef PTM_GPU_OPENCL
+        // Use GPU batched version when GPU ray tracing is enabled
+        if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+            calculateDirectSolarBatchWithFiniteDiskGPU(
+                face_centers,                    // Use original face centers
+                corrected_normals,                // Use CORRECTED normals
+                sun_position,
+                primary_position,
+                direct_solar_batch
+            );
+        } else {
+            calculateDirectSolarBatchWithFiniteDisk(
+                face_centers,                    // Use original face centers
+                corrected_normals,                // Use CORRECTED normals
+                sun_position,
+                primary_position,
+                direct_solar_batch
+            );
+        }
+#else
+        calculateDirectSolarBatchWithFiniteDisk(
+            face_centers,                    // Use original face centers
+            corrected_normals,                // Use CORRECTED normals
+            sun_position,
+            primary_position,
+            direct_solar_batch
+        );
+#endif
+        
+        // Calculate primary IR heating
+        calculatePrimaryIRBatch(
+            face_centers,                    // Use original face centers
+            corrected_normals,                // Use CORRECTED normals
+            primary_position, 
+            primary_ir_batch
+        );
+        
+        // Calculate primary-reflected solar light if enabled
+        if (include_primary_reflection_) {
+            calculatePrimaryReflectedBatch(
+                face_centers,                // Use original face centers
+                corrected_normals,            // Use CORRECTED normals
+                sun_position, 
+                primary_position, 
+                primary_reflected_batch
+            );
+        }
+        
+        // Store results
+        if (using_chunked_storage_) {
+            // Store in chunked storage for large meshes
+            for (size_t f = 0; f < num_faces; f++) {
+                // Compute total illumination
+                double total_illumination = direct_solar_batch[f] + 
+                                          primary_reflected_batch[f];
                 
-                // Add this sample to tracking
-                primary_eclipsed.push_back(primary_eclipse);
+                // Store using the chunked storage methods
+                storeChunkedValue(illumination_chunks_, f, t, total_illumination);
+                storeChunkedValue(direct_solar_chunks_, f, t, direct_solar_batch[f]);
+                storeChunkedValue(primary_reflected_chunks_, f, t, primary_reflected_batch[f]);
+                storeChunkedValue(primary_ir_chunks_, f, t, primary_ir_batch[f]);
+            }
+        } else {
+            // Store in regular arrays
+            for (size_t f = 0; f < num_faces; f++) {
+                size_t idx = f * time_steps_ + t;
                 
-                // Only add rays to batch if not already eclipsed by Primary
-                if (!primary_eclipse) {
-                    ray_origins.push_back(ray_origin);
-                    ray_directions.push_back(sample_dir);
+                // Compute total illumination
+                double total_illumination = direct_solar_batch[f] + 
+                                          primary_reflected_batch[f];
+                // Note: Primary IR is typically not included in "illumination"
+                // but stored separately
+                
+                illumination_values_[idx] = total_illumination;
+                direct_solar_values_[idx] = direct_solar_batch[f];
+                primary_reflected_values_[idx] = primary_reflected_batch[f];
+                primary_ir_values_[idx] = primary_ir_batch[f];
+            }
+        }
+        
+        illum_progress.update(t + 1);
+    }
+    
+    illum_progress.finish();
+    
+    // Calculate statistics for reporting
+    double total_flux = 0.0;
+    double max_flux = 0.0;
+    double min_flux = std::numeric_limits<double>::max();
+    double total_direct = 0.0;
+    double total_reflected = 0.0;
+    double total_ir = 0.0;
+    double max_direct = 0.0;
+    double max_reflected = 0.0;
+    double max_ir = 0.0;
+    
+    size_t non_zero_count = 0;
+    
+    for (size_t f = 0; f < num_faces; f++) {
+        for (int t = 0; t < time_steps_; t++) {
+            double direct_val, reflected_val, ir_val;
+            
+            if (using_chunked_storage_) {
+                direct_val = getDirectSolarValue(f, t);
+                reflected_val = getPrimaryReflectedValue(f, t);
+                ir_val = getPrimaryIRValue(f, t);
+            } else {
+                size_t idx = f * time_steps_ + t;
+                direct_val = direct_solar_values_[idx];
+                reflected_val = primary_reflected_values_[idx];
+                ir_val = primary_ir_values_[idx];
+            }
+            
+            double total = direct_val + reflected_val + ir_val;
+            
+            if (total > 0) {
+                total_flux += total;
+                total_direct += direct_val;
+                total_reflected += reflected_val;
+                total_ir += ir_val;
+                non_zero_count++;
+                
+                max_flux = std::max(max_flux, total);
+                max_direct = std::max(max_direct, direct_val);
+                max_reflected = std::max(max_reflected, reflected_val);
+                max_ir = std::max(max_ir, ir_val);
+                
+                if (total < min_flux) {
+                    min_flux = total;
                 }
             }
         }
     }
     
-    // Process rays directly with one traceRays call
-    std::vector<int> ray_results;
-    if (!ray_origins.empty()) {
-        ray_results = traceRays(ray_origins, ray_directions);
+    // Report results
+    double avg_flux = (non_zero_count > 0) ? total_flux / non_zero_count : 0.0;
+    double avg_direct = (non_zero_count > 0) ? total_direct / non_zero_count : 0.0;
+    double avg_reflected = (non_zero_count > 0) ? total_reflected / non_zero_count : 0.0;
+    double avg_ir = (non_zero_count > 0) ? total_ir / non_zero_count : 0.0;
+    
+    // End timing
+    auto end_time_point = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time_point - start_time_point);
+    
+    std::cout << "Illumination calculation completed in " 
+              << std::fixed << std::setprecision(3) 
+              << duration.count() / 1000.0 << " seconds." << std::endl;
+    
+    // Print summary statistics if not suppressed
+    if (show_progress_) {
+        std::cout << "Results:" << std::endl;
+        std::cout << "  Average total flux: " << std::fixed << std::setprecision(9) 
+                  << avg_flux << " W/m²" << std::endl;
+        std::cout << "    - Direct solar: " << avg_direct << " W/m²" << std::endl;
+        std::cout << "    - Primary reflected: " << avg_reflected << " W/m²" << std::endl;
+        std::cout << "    - Primary IR: " << avg_ir << " W/m²" << std::endl;
+        std::cout << "  Maximum total flux: " << max_flux << " W/m²" << std::endl;
+        std::cout << "    - Direct solar: " << max_direct << " W/m²" << std::endl;
+        std::cout << "    - Primary reflected: " << max_reflected << " W/m²" << std::endl;
+        std::cout << "    - Primary IR: " << max_ir << " W/m²" << std::endl;
+        std::cout << "  Minimum flux (non-zero): " 
+                  << ((min_flux < std::numeric_limits<double>::max()) ? min_flux : 0.0) 
+                  << " W/m²" << std::endl;
     }
     
-    // Count visible samples
-    int visible_samples = 0;
-    size_t result_idx = 0;
-    
-    for (int i = 0; i < total_samples; i++) {
-        if (primary_eclipsed[i]) {
-            // Already know it's eclipsed by Primary
+    return true;
+}
+
+// Batch processing for direct solar illumination with finite disk model
+void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    const size_t n = face_centers.size();
+    direct_solar_values.assign(n, 0.0);
+    if (n == 0) return;
+
+    auto hash32 = [](uint32_t x) -> uint32_t {
+        x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
+        return x;
+    };
+    auto u01 = [&](uint32_t s) -> double { return (hash32(s) & 0xFFFFFFU) / double(0x1000000U); };
+
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t i = 0; i < n; ++i) {
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+
+        // Sun vector from this face
+        std::array<double, 3> sun_rel = {
+            sun_position[0] - fc[0],
+            sun_position[1] - fc[1],
+            sun_position[2] - fc[2]
+        };
+        double sun_dist = vectorLength(sun_rel);
+        if (sun_dist <= constants::EPSILON) { direct_solar_values[i] = 0.0; continue; }
+        std::array<double, 3> sun_dir = { sun_rel[0]/sun_dist, sun_rel[1]/sun_dist, sun_rel[2]/sun_dist };
+
+        // Incidence cosine
+        double cos_inc0 = dotProduct(fn, sun_dir);
+
+        // Solar disk geometry
+        double s = constants::SUN_RADIUS / sun_dist;
+        if (s > 1.0) s = 1.0;
+        const double disk_ang   = std::asin(s);
+        const double disk_scale = std::sin(disk_ang); // equals s
+
+        // Finite-disk horizon gate:
+        // Entire disk below horizon if n·s <= -sin(disk_ang)
+        if (cos_inc0 <= -std::sin(disk_ang)) {
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
             continue;
         }
-        
-        // Check if this ray hit any geometry (terrain)
-        bool body_eclipse = (result_idx < ray_results.size()) && (ray_results[result_idx] >= 0);
-        result_idx++;
-        
-        // Sample is visible if not eclipsed by either Primary or Body terrain
-        if (!body_eclipse) {
-            visible_samples++;
+
+        // Robust origin:
+        const double eps_base = calculateSafeRayOffset(fc, fn);
+        const double eps_n = 2.0 * eps_base;
+        const double eps_d = 8.0 * eps_base;
+
+        // In-plane jitter based on face index (stable across timesteps)
+        // std::array<double, 3> tu, tv;
+        // createCoordinateSystem(fn, tu, tv);
+        // const double jx = 2.0 * u01(uint32_t(i) ^ 0xA511E9B3u) - 1.0;
+        // const double jy = 2.0 * u01(uint32_t(i) ^ 0x63D83595u) - 1.0;
+        // const double jlen = std::min(1.0, std::sqrt(jx*jx + jy*jy));
+        // const double jamp = 0.5 * eps_n;
+        // const std::array<double,3> jitter = {
+        //     (tu[0] * jx + tv[0] * jy) * jamp * jlen,
+        //     (tu[1] * jx + tv[1] * jy) * jamp * jlen,
+        //     (tu[2] * jx + tv[2] * jy) * jamp * jlen
+        // };
+        const std::array<double, 3> jitter = {0.0, 0.0, 0.0};
+
+        std::array<double, 3> ray_o = {
+            fc[0] + fn[0] * eps_n + sun_dir[0] * eps_d + jitter[0],
+            fc[1] + fn[1] * eps_n + sun_dir[1] * eps_d + jitter[1],
+            fc[2] + fn[2] * eps_n + sun_dir[2] * eps_d + jitter[2]
+        };
+
+        // Center-ray fast path only if center is above horizon
+        if (cos_inc0 > 0.0) {
+            bool blocked = false;
+
+            // Eclipse on center ray
+            if (!primary_is_sun_) {
+                double t1, t2;
+                if (raySphereIntersect(ray_o, sun_dir, primary_position, primary_radius_, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) blocked = true;
+                }
+            }
+
+            if (!blocked) {
+                std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
+                auto occ = traceOccluded(o, d, /*coherent=*/true);
+                if (!occ.empty() && occ[0] == 0) {
+                    double sun_dist_au = sun_dist / constants::KM_PER_AU;
+                    double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+                    direct_solar_values[i] = solar_irr * cos_inc0;
+                    continue;
+                }
+            }
+            // if blocked, fall through to finite-disk sampling
         }
+        // If cos_inc0 <= 0 but disk is partially visible, we also fall through to sampling
+
+        // Finite disk sampling (decorrelated), single Embree packet query
+        std::array<double, 3> u, v;
+        createCoordinateSystem(sun_dir, u, v);
+
+        // Per-face decorrelation to reduce spatial banding
+        uint32_t seed = 0x9E3779B1u ^ uint32_t(i);
+        double theta = u01(seed) * 2.0 * M_PI;
+        std::array<double,3> ur, vr; rotateBasis(u, v, theta, ur, vr);
+        double uoff = u01(seed ^ 0x85EBCA6Bu);
+        double voff = u01(seed ^ 0xC2B2AE35u);
+
+        const uint32_t N = std::max(8, num_samples);
+        std::vector<std::array<double, 3>> dirs; dirs.reserve(N);
+        std::vector<uint8_t> skip; skip.reserve(N);
+
+        // Generate directions on the solar disk and filter only by eclipse (terrain via Embree)
+        for (uint32_t k = 0; k < N; ++k) {
+            double su, sv; hammersley(k, N, uoff, voff, su, sv);
+            double dx, dy; squareToConcentricDisk(su, sv, dx, dy);
+            if (dx*dx + dy*dy > 1.0) continue;
+
+            const double ox = disk_scale * dx, oy = disk_scale * dy;
+            std::array<double, 3> sd = {
+                sun_dir[0] + ox * ur[0] + oy * vr[0],
+                sun_dir[1] + ox * ur[1] + oy * vr[1],
+                sun_dir[2] + ox * ur[2] + oy * vr[2]
+            };
+            double l = vectorLength(sd);
+            if (l <= constants::EPSILON) continue;
+            sd[0]/=l; sd[1]/=l; sd[2]/=l;
+
+            bool sskip = false;
+
+            // Eclipse clip (before occlusion)
+            if (!primary_is_sun_) {
+                double t1, t2;
+                if (raySphereIntersect(ray_o, sd, primary_position, primary_radius_, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) sskip = true;
+                }
+            }
+
+            skip.push_back(sskip ? 1 : 0);
+            if (!sskip) dirs.push_back(sd);
+        }
+
+        // No valid samples (full eclipse)
+        if (dirs.empty()) {
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            continue;
+        }
+
+        // Start each sample a bit along its own direction as well
+        std::vector<std::array<double,3>> origins; origins.reserve(dirs.size());
+        for (const auto& sd : dirs) {
+            origins.push_back({ ray_o[0] + sd[0]*eps_d,
+                                ray_o[1] + sd[1]*eps_d,
+                                ray_o[2] + sd[2]*eps_d });
+        }
+
+        // Terrain occlusion for survivors
+        auto occ = traceOccluded(origins, dirs, /*coherent=*/true);
+
+        // Accumulate cosine-weighted contributions for unblocked samples
+        double sum_cos = 0.0;
+        uint32_t total_out = 0;
+        size_t m = 0;
+        for (uint32_t k = 0; k < skip.size(); ++k) {
+            if (skip[k]) continue;
+            const bool blocked = (m < occ.size()) && (occ[m] != 0);
+            const auto& sd = dirs[m];
+            m++;
+            total_out++;
+            if (!blocked) {
+                double c = dotProduct(fn, sd);
+                if (c > 0.0) sum_cos += c;
+            }
+        }
+
+        if (total_out == 0) {
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            continue;
+        }
+
+        double sun_dist_au = sun_dist / constants::KM_PER_AU;
+        double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+        double flux = solar_irr * (sum_cos / double(total_out));
+        if (flux <= 0.0 && enable_shadow_flux_) {
+            flux = calculateShadowFlux(fc, fn, sun_position);
+        }
+        direct_solar_values[i] = flux;
     }
-    
-    // Calculate illumination based on fraction of visible samples
-    double visibility = static_cast<double>(visible_samples) / static_cast<double>(total_samples);
-    double illumination = solar_irradiance * cos_angle * visibility;
-    
-    return illumination;
+}
+
+
+// Calculate safe ray offset based on face center and normal
+double IlluminationModel::calculateSafeRayOffset(
+    const std::array<double, 3>& face_center, 
+    const std::array<double, 3>& /*face_normal*/) const 
+{
+    // Scale-aware offset in meters: robust across global meshes and DEM roughness
+    const double r = vectorLength(face_center);                     // local radius [m]
+    const double ulp = std::numeric_limits<double>::epsilon() * r;  // machine epsilon scaled
+    const double scaled = std::max(1e-6 * r, 0.01);                 // 1 ppm of radius, min 1 cm
+    return std::max(16.0 * ulp, scaled);
 }
 
 std::array<double, 3> IlluminationModel::vectorSubtract(
@@ -1797,7 +2692,7 @@ std::array<double, 3> IlluminationModel::vectorSubtract(
 
 std::array<double, 3> IlluminationModel::crossProduct(
     const std::array<double, 3>& v1,
-    const std::array<double, 3>& v2) {
+    const std::array<double, 3>& v2) const {
     return {{
         v1[1] * v2[2] - v1[2] * v2[1],
         v1[2] * v2[0] - v1[0] * v2[2],
@@ -1805,7 +2700,7 @@ std::array<double, 3> IlluminationModel::crossProduct(
     }};
 }
 
-double IlluminationModel::vectorLength(const std::array<double, 3>& v) {
+double IlluminationModel::vectorLength(const std::array<double, 3>& v) const {
     return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
@@ -1885,73 +2780,146 @@ void IlluminationModel::calculatePrimaryIRBatch(
     std::vector<double>& ir_values) {
     
     size_t num_faces = face_centers.size();
-    ir_values.resize(num_faces, 0.0);
+    ir_values.assign(num_faces, 0.0);
     
-    // Skip IR calculation if primary is the Sun
+    // Skip if primary is the sun
     if (primary_is_sun_) {
         return;
     }
     
-    // Process each face in parallel directly
+    // Detect if face centers are in meters or kilometers
+    bool centers_in_meters = false;
+    if (!face_centers.empty()) {
+        double mag = vectorLength(face_centers[0]);
+        if (mag > 10000.0) {
+            centers_in_meters = true;
+        }
+    }
+    
+    // Get primary IR flux based on body
+    double primary_ir_flux = 0.0;
+    if (primary_body_name_ == "EARTH") {
+        primary_ir_flux = constants::EARTH_IR_FLUX;
+    } else if (primary_body_name_ == "JUPITER") {
+        primary_ir_flux = constants::JUPITER_IR_FLUX;
+    } else if (primary_body_name_ == "SATURN") {
+        primary_ir_flux = constants::SATURN_IR_FLUX;
+    } else if (primary_body_name_ == "MARS") {
+        primary_ir_flux = constants::MARS_IR_FLUX;
+    } else {
+        // Unknown primary body, no IR flux
+        return;
+    }
+    
+    // Process each face in parallel
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_center = face_centers[i];
         const auto& face_normal = face_normals[i];
         
-        // Calculate Primary direction relative to face
+        // Convert face center to kilometers if needed for consistent calculations
+        std::array<double, 3> face_center_km;
+        if (centers_in_meters) {
+            face_center_km = {
+                face_centers[i][0] / 1000.0,
+                face_centers[i][1] / 1000.0,
+                face_centers[i][2] / 1000.0
+            };
+        } else {
+            face_center_km = face_centers[i];
+        }
+        
+        // Calculate primary direction relative to face (both now in km)
         std::array<double, 3> primary_rel = {
-            primary_position[0] - face_center[0],
-            primary_position[1] - face_center[1],
-            primary_position[2] - face_center[2]
+            primary_position[0] - face_center_km[0],
+            primary_position[1] - face_center_km[1],
+            primary_position[2] - face_center_km[2]
         };
         
         double primary_dist = vectorLength(primary_rel);
         
-        // Only consider faces that potentially face Primary
+        // Skip if too close (shouldn't happen but safety check)
         if (primary_dist <= constants::EPSILON) {
             continue;
         }
         
+        // Normalize to get direction vector
         std::array<double, 3> primary_dir = {
             primary_rel[0] / primary_dist,
             primary_rel[1] / primary_dist,
             primary_rel[2] / primary_dist
         };
         
+        // Check if face is oriented toward primary
         double cos_angle = dotProduct(face_normal, primary_dir);
         
-        // Skip faces not facing Primary
+        // Skip faces not facing the primary
         if (cos_angle <= 0.0) {
             continue;
         }
         
-        // Pre-calculate heating value
+        // Calculate IR heating value
         double ir_flux = calculatePrimaryHeating(
             face_normal, primary_dir, primary_dist);
         
-        // Create ray for visibility check
+        // Ray tracing visibility check
+        // Use original mesh units for ray origin, but apply scene origin offset for Embree
+        double safe_offset = calculateSafeRayOffset(face_centers[i], face_normal);
         std::array<double, 3> ray_origin = {
-            face_center[0] + face_normal[0] * 0.001,
-            face_center[1] + face_normal[1] * 0.001,
-            face_center[2] + face_normal[2] * 0.001
+            face_centers[i][0] + face_normal[0] * safe_offset,
+            face_centers[i][1] + face_normal[1] * safe_offset,
+            face_centers[i][2] + face_normal[2] * safe_offset
         };
+
+        // Apply scene origin offset for Embree local coordinate system
+        std::array<double, 3> ray_origin_local = {
+            ray_origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            ray_origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            ray_origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+
+        // Create ray for Embree
+        RTCRayHit rayhit;
+        rayhit.ray.org_x = ray_origin_local[0];
+        rayhit.ray.org_y = ray_origin_local[1];
+        rayhit.ray.org_z = ray_origin_local[2];
+        rayhit.ray.dir_x = primary_dir[0];
+        rayhit.ray.dir_y = primary_dir[1];
+        rayhit.ray.dir_z = primary_dir[2];
+        rayhit.ray.tnear = 1.0e-4f;  // Small offset to avoid self-intersection
         
-        // Create a single ray directly
-        std::vector<std::array<double, 3>> origins = {ray_origin};
-        std::vector<std::array<double, 3>> directions = {primary_dir};
+        // CRITICAL: Set tfar to stop at primary body edge
+        // Distance from face to primary edge = distance to center - primary radius
+        // Must be in same units as mesh
+        float tfar_dist;
+        if (centers_in_meters) {
+            // Convert km distance back to meters for ray tracing
+            tfar_dist = static_cast<float>((primary_dist - primary_radius_) * 1000.0);
+        } else {
+            // Already in km
+            tfar_dist = static_cast<float>(primary_dist - primary_radius_);
+        }
+        rayhit.ray.tfar = tfar_dist;
         
-        // Use optimized traceRays function with reduced distance
-        // This avoids the need for custom ray setup and manual tfar setting
-        std::vector<int> results = traceRays(origins, directions);
+        rayhit.ray.mask = 0xFFFFFFFF;
+        rayhit.ray.flags = 0;
+        rayhit.ray.time = 0.0f;
+        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
         
-        // If ray doesn't hit anything, Primary is visible
-        // We need to verify that the hit point is beyond the primary
-        if (!results.empty() && results[0] < 0) {
+        // Trace the ray
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        rtcIntersect1(embree_scene_, &rayhit, &args);
+        
+        // If no hit, primary is visible from this face
+        if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
             ir_values[i] = ir_flux;
         }
     }
 }
 
+// Complete implementation of calculatePrimaryReflectedBatch with unit conversion fix
 void IlluminationModel::calculatePrimaryReflectedBatch(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
@@ -1960,66 +2928,137 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
     std::vector<double>& reflected_values) {
     
     size_t num_faces = face_centers.size();
-    reflected_values.resize(num_faces, 0.0);
+    reflected_values.assign(num_faces, 0.0);
     
-    // Skip calculation if primary is the Sun
+    // Skip if primary is the sun
     if (primary_is_sun_) {
         return;
     }
     
-    // Perform calculation for each face in parallel directly
+    // Detect if face centers are in meters or kilometers
+    bool centers_in_meters = false;
+    if (!face_centers.empty()) {
+        double mag = vectorLength(face_centers[0]);
+        if (mag > 10000.0) {
+            centers_in_meters = true;
+        }
+    }
+    
+    // Get primary bond albedo based on body
+    double primary_albedo = 0.3;  // Default
+    if (primary_body_name_ == "EARTH") {
+        primary_albedo = constants::EARTH_BOND_ALBEDO;
+    } else if (primary_body_name_ == "JUPITER") {
+        primary_albedo = constants::JUPITER_BOND_ALBEDO;
+    } else if (primary_body_name_ == "SATURN") {
+        primary_albedo = constants::SATURN_BOND_ALBEDO;
+    } else if (primary_body_name_ == "MARS") {
+        primary_albedo = constants::MARS_BOND_ALBEDO;
+    }
+    
+    // Process each face in parallel
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_center = face_centers[i];
         const auto& face_normal = face_normals[i];
         
-        // Calculate Primary direction relative to face
+        // Convert face center to kilometers if needed
+        std::array<double, 3> face_center_km;
+        if (centers_in_meters) {
+            face_center_km = {
+                face_centers[i][0] / 1000.0,
+                face_centers[i][1] / 1000.0,
+                face_centers[i][2] / 1000.0
+            };
+        } else {
+            face_center_km = face_centers[i];
+        }
+        
+        // Calculate primary direction relative to face
         std::array<double, 3> primary_rel = {
-            primary_position[0] - face_center[0],
-            primary_position[1] - face_center[1],
-            primary_position[2] - face_center[2]
+            primary_position[0] - face_center_km[0],
+            primary_position[1] - face_center_km[1],
+            primary_position[2] - face_center_km[2]
         };
         
         double primary_dist = vectorLength(primary_rel);
         
-        // Only consider faces that potentially face Primary
+        // Skip if too close
         if (primary_dist <= constants::EPSILON) {
             continue;
         }
         
+        // Normalize to get direction vector
         std::array<double, 3> primary_dir = {
             primary_rel[0] / primary_dist,
             primary_rel[1] / primary_dist,
             primary_rel[2] / primary_dist
         };
         
+        // Check if face is oriented toward primary
         double cos_angle = dotProduct(face_normal, primary_dir);
         
-        // Skip faces not facing Primary
+        // Skip faces not facing the primary
         if (cos_angle <= 0.0) {
             continue;
         }
         
-        // Pre-calculate reflection value
+        // Calculate reflected light value using existing physics function
+        // This function handles the phase angle and illumination calculations
         double reflection_value = calculatePrimaryReflectedLight(
             face_normal, primary_dir, sun_position, primary_position);
         
-        // Create ray for visibility check
+        // Ray tracing visibility check
+        // Use original mesh units for ray origin, but apply scene origin offset for Embree
+        double safe_offset = calculateSafeRayOffset(face_centers[i], face_normal);
         std::array<double, 3> ray_origin = {
-            face_center[0] + face_normal[0] * 0.001,
-            face_center[1] + face_normal[1] * 0.001,
-            face_center[2] + face_normal[2] * 0.001
+            face_centers[i][0] + face_normal[0] * safe_offset,
+            face_centers[i][1] + face_normal[1] * safe_offset,
+            face_centers[i][2] + face_normal[2] * safe_offset
         };
+
+        // Apply scene origin offset for Embree local coordinate system
+        std::array<double, 3> ray_origin_local = {
+            ray_origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            ray_origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            ray_origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+
+        // Create ray for Embree
+        RTCRayHit rayhit;
+        rayhit.ray.org_x = ray_origin_local[0];
+        rayhit.ray.org_y = ray_origin_local[1];
+        rayhit.ray.org_z = ray_origin_local[2];
+        rayhit.ray.dir_x = primary_dir[0];
+        rayhit.ray.dir_y = primary_dir[1];
+        rayhit.ray.dir_z = primary_dir[2];
+        rayhit.ray.tnear = 1.0e-4f;
+        rayhit.ray.tfar  = 1.0e30f; // Will be set properly below
         
-        // Create a single ray directly with origin and direction
-        std::vector<std::array<double, 3>> origins = {ray_origin};
-        std::vector<std::array<double, 3>> directions = {primary_dir};
+        // Set tfar with proper unit conversion
+        float tfar_dist;
+        if (centers_in_meters) {
+            // Convert km distance back to meters for ray tracing
+            tfar_dist = static_cast<float>((primary_dist - primary_radius_) * 1000.0);
+        } else {
+            // Already in km
+            tfar_dist = static_cast<float>(primary_dist - primary_radius_);
+        }
+        rayhit.ray.tfar = tfar_dist;
         
-        // Trace this single ray
-        std::vector<int> results = traceRays(origins, directions);
+        rayhit.ray.mask = 0xFFFFFFFF;
+        rayhit.ray.flags = 0;
+        rayhit.ray.time = 0.0f;
+        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
+        rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
         
-        // If ray doesn't hit anything, Primary is visible
-        if (!results.empty() && results[0] < 0) {
+        // Trace the ray
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        rtcIntersect1(embree_scene_, &rayhit, &args);
+        
+        // If no hit, primary is visible from this face
+        if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
             reflected_values[i] = reflection_value;
         }
     }
@@ -2050,16 +3089,49 @@ double IlluminationModel::calculatePrimaryHeating(
         return 0.0;
     }
 
-    // Use the PRIMARY_IR_FLUX constant directly as requested
     // Calculate the angular size of Primary as seen from Body
-    double primary_angular_radius = std::asin(constants::PRIMARY_RADIUS / primary_distance);
+    // Use the class member variable for primary radius instead of constant
+    double primary_angular_radius = std::asin(primary_radius_ / primary_distance);
     double solid_angle = 2 * M_PI * (1.0 - std::cos(primary_angular_radius));
 
     // View factor calculation using the solid angle and Lambert's cosine law
     double view_factor = solid_angle / (4 * M_PI) * cos_angle;
     
-    // Apply the constant IR flux, scaled by view factor
-    return constants::PRIMARY_IR_FLUX * view_factor;
+    // Use appropriate IR flux based on the primary body
+    double primary_ir_flux = 0.0;
+    
+    if (primary_is_sun_) {
+        // For Sun as primary, use solar constant scaled by distance
+        double dist_au = primary_distance / constants::KM_PER_AU;
+        primary_ir_flux = constants::SOLAR_CONSTANT / (dist_au * dist_au);
+    } 
+    else if (primary_body_name_ == "JUPITER") {
+        primary_ir_flux = constants::JUPITER_IR_FLUX;
+    }
+    else if (primary_body_name_ == "EARTH") {
+        primary_ir_flux = constants::EARTH_IR_FLUX;
+    }
+    else if (primary_body_name_ == "SATURN") {
+        primary_ir_flux = constants::SATURN_IR_FLUX;
+    }
+    else if (primary_body_name_ == "MARS") {
+        primary_ir_flux = constants::MARS_IR_FLUX;
+    }
+    else {
+        // Default calculation for other bodies based on temperature
+        // Using Stefan-Boltzmann law: flux = sigma * T^4
+        double primary_temp = 0.0;
+        if (primary_body_name_ == "JUPITER") primary_temp = constants::JUPITER_TEMPERATURE;
+        else if (primary_body_name_ == "EARTH") primary_temp = constants::EARTH_TEMPERATURE;
+        else if (primary_body_name_ == "SATURN") primary_temp = constants::SATURN_TEMPERATURE;
+        else if (primary_body_name_ == "MARS") primary_temp = constants::MARS_TEMPERATURE;
+        else primary_temp = 250.0; // Default temperature
+        
+        primary_ir_flux = constants::STEFAN_BOLTZMANN * std::pow(primary_temp, 4.0);
+    }
+    
+    // Apply the appropriate IR flux, scaled by view factor
+    return primary_ir_flux * view_factor;
 }
 
 double IlluminationModel::calculatePrimaryReflectedLight(
@@ -2101,11 +3173,28 @@ double IlluminationModel::calculatePrimaryReflectedLight(
     // Phase function for Primary's reflectance (Lambert sphere approximation)
     double phase_function = (1.0 + std::cos(phase_angle)) / 2.0;
 
-    // Primary's albedo
-    const double primary_albedo = 0.52; // Bond albedo
+    // Get Primary's albedo based on the current primary body
+    double primary_albedo = 0.0;
+    
+    if (primary_body_name_ == "JUPITER") {
+        primary_albedo = constants::JUPITER_BOND_ALBEDO;
+    }
+    else if (primary_body_name_ == "EARTH") {
+        primary_albedo = constants::EARTH_BOND_ALBEDO;
+    }
+    else if (primary_body_name_ == "SATURN") {
+        primary_albedo = constants::SATURN_BOND_ALBEDO;
+    }
+    else if (primary_body_name_ == "MARS") {
+        primary_albedo = constants::MARS_BOND_ALBEDO;
+    }
+    else {
+        primary_albedo = 0.3; // Default albedo for other bodies
+    }
 
     // Calculate angular size of Primary as seen from Body
-    double primary_angular_radius = std::asin(constants::PRIMARY_RADIUS / primary_distance);
+    // Use the member variable for radius instead of constant
+    double primary_angular_radius = std::asin(primary_radius_ / primary_distance);
     double solid_angle = 2 * M_PI * (1.0 - std::cos(primary_angular_radius));
 
     // Calculate solar flux at Primary
@@ -2212,9 +3301,9 @@ void IlluminationModel::setPlanetaryBody(thermal::PlanetaryBody body) {
     }
     
     // Use standard cout since debugPrint is non-static
-    std::cout << "Set planetary body to " << target_body_name_ 
-              << " with primary " << primary_body_name_
-              << " using meta-kernel " << meta_kernel_filename_ << std::endl;
+    // std::cout << "Set planetary body to " << target_body_name_ 
+    //           << " with primary " << primary_body_name_
+    //           << " using meta-kernel " << meta_kernel_filename_ << std::endl;
 }
 
 void IlluminationModel::initializeChunkedStorage(size_t total_faces, int time_steps) {
@@ -2291,7 +3380,7 @@ double IlluminationModel::getChunkedValue(const std::vector<std::vector<double>>
     return chunks[chunk_idx][local_idx];
 }
 
-// New accessor methods implementation
+// Accessor methods implementation
 double IlluminationModel::getIlluminationValue(size_t face_idx, size_t time_idx) const {
     if (using_chunked_storage_) {
         return getChunkedValue(illumination_chunks_, face_idx, time_idx);
@@ -2327,5 +3416,568 @@ double IlluminationModel::getPrimaryIRValue(size_t face_idx, size_t time_idx) co
     }
     return 0.0;
 }
+
+//=============================================================================
+// GPU ray tracing support
+//=============================================================================
+
+#ifdef PTM_GPU_OPENCL
+
+bool IlluminationModel::enableGPURayTracing(bool enable) {
+    if (!enable) {
+        use_gpu_ray_tracer_ = false;
+        return true;
+    }
+
+    if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_ray_tracer_->isAvailable()) {
+        // Already enabled
+        return true;
+    }
+
+    return initializeGPURayTracer();
+}
+
+bool IlluminationModel::initializeGPURayTracer() {
+    try {
+        gpu_ray_tracer_ = std::make_unique<gpu::opencl::BVHRayTracer>();
+        if (!gpu_ray_tracer_->initialize()) {
+            std::cerr << "Warning: Failed to initialize GPU BVH ray tracer, falling back to CPU" << std::endl;
+            gpu_ray_tracer_.reset();
+            use_gpu_ray_tracer_ = false;
+            return false;
+        }
+
+        const auto& info = gpu_ray_tracer_->getDeviceInfo();
+        std::cout << "GPU ray tracer initialized: " << info.name << std::endl;
+        std::cout << "  VRAM: " << (info.global_mem_size / (1024 * 1024)) << " MB" << std::endl;
+
+        use_gpu_ray_tracer_ = true;
+        gpu_mesh_uploaded_ = false;  // Will upload mesh when needed
+
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error initializing GPU ray tracer: " << e.what() << std::endl;
+        gpu_ray_tracer_.reset();
+        use_gpu_ray_tracer_ = false;
+        return false;
+    }
+}
+
+void IlluminationModel::uploadMeshToGPU() {
+    if (!gpu_ray_tracer_ || gpu_mesh_uploaded_) return;
+
+    // We need the mesh vertices and indices that were passed to initializeScene
+    // These need to be stored or re-extracted. For now, we'll use Embree's scene
+    // info to get geometry bounds and assume the mesh data is available.
+
+    // This function should be called after initializeScene() which has the mesh data.
+    // The mesh needs to be passed again or stored. For proper integration,
+    // we'll modify initializeScene to also handle GPU upload.
+
+    // For now, mark as not uploaded - actual upload happens in initializeScene
+    gpu_mesh_uploaded_ = false;
+}
+
+IlluminationModel::GPURayTracerStats IlluminationModel::getGPURayTracerStats() const {
+    GPURayTracerStats stats;
+    if (gpu_ray_tracer_) {
+        const auto& gpu_stats = gpu_ray_tracer_->getStats();
+        stats.rays_traced = gpu_stats.rays_traced;
+        stats.total_time_ms = gpu_stats.total_time_ms;
+        stats.kernel_time_ms = gpu_stats.kernel_time_ms;
+    }
+    return stats;
+}
+
+std::vector<uint8_t> IlluminationModel::traceOccludedGPU(
+    const std::vector<std::array<double, 3>>& origins,
+    const std::vector<std::array<double, 3>>& directions)
+{
+    const size_t n = origins.size();
+    std::vector<uint8_t> blocked(n, 0);
+
+    if (!gpu_ray_tracer_ || !gpu_ray_tracer_->isAvailable() || n == 0) {
+        // Fall back to CPU
+        return traceOccluded(origins, directions, false);
+    }
+
+    // Apply scene origin offset if present (same as CPU path)
+    std::vector<std::array<double, 3>> local_origins(n);
+    for (size_t i = 0; i < n; ++i) {
+        local_origins[i] = {
+            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+    }
+
+    // Normalize directions (same as CPU path)
+    std::vector<std::array<double, 3>> norm_directions(n);
+    for (size_t i = 0; i < n; ++i) {
+        double dl = std::sqrt(directions[i][0] * directions[i][0] +
+                              directions[i][1] * directions[i][1] +
+                              directions[i][2] * directions[i][2]);
+        double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+        norm_directions[i] = {
+            directions[i][0] * inv_dl,
+            directions[i][1] * inv_dl,
+            directions[i][2] * inv_dl
+        };
+    }
+
+    // GPU ray tracer is not thread-safe - serialize all calls
+    {
+        std::lock_guard<std::mutex> lock(gpu_ray_tracer_mutex_);
+        try {
+            gpu_ray_tracer_->traceShadowRays(local_origins, norm_directions, blocked);
+        } catch (const std::exception& e) {
+            std::cerr << "GPU ray trace failed: " << e.what() << ", falling back to CPU" << std::endl;
+            return traceOccluded(origins, directions, false);
+        }
+    }
+
+    return blocked;
+}
+
+void IlluminationModel::traceOccludedBatchedGPU(
+    const std::vector<float>& ray_org_x,
+    const std::vector<float>& ray_org_y,
+    const std::vector<float>& ray_org_z,
+    const std::vector<float>& ray_dir_x,
+    const std::vector<float>& ray_dir_y,
+    const std::vector<float>& ray_dir_z,
+    std::vector<uint8_t>& occluded)
+{
+    if (!gpu_ray_tracer_ || !gpu_ray_tracer_->isAvailable()) {
+        occluded.assign(ray_org_x.size(), 1);  // Assume all blocked on failure
+        return;
+    }
+
+    // Single GPU dispatch - no mutex needed as caller handles synchronization
+    gpu_ray_tracer_->traceShadowRays(ray_org_x, ray_org_y, ray_org_z,
+                                      ray_dir_x, ray_dir_y, ray_dir_z,
+                                      occluded);
+}
+
+void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    const size_t n = face_centers.size();
+    direct_solar_values.assign(n, 0.0);
+    if (n == 0) return;
+
+    // Hash function for decorrelation
+    auto hash32 = [](uint32_t x) -> uint32_t {
+        x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
+        return x;
+    };
+    auto u01 = [&](uint32_t s) -> double { return (hash32(s) & 0xFFFFFFU) / double(0x1000000U); };
+
+    const uint32_t N = std::max(8, num_samples);
+
+    // ==== PHASE 1: Generate all rays (parallel, CPU) ====
+    // We'll collect all rays from all faces, then batch them to GPU.
+    // For each face, we may generate 1 (center ray) or N (disk samples) rays.
+    // Track which rays belong to which face using per-face ray ranges.
+
+    // Pre-compute per-face info: sun direction, incidence angle, ray origin
+    struct FaceInfo {
+        std::array<double, 3> sun_dir;
+        std::array<double, 3> ray_origin;
+        double sun_dist;
+        double cos_inc0;
+        double disk_scale;
+        bool below_horizon;     // Entire disk below horizon
+        bool center_eclipsed;   // Center ray blocked by primary body
+        bool needs_sampling;    // Needs finite-disk sampling
+    };
+    std::vector<FaceInfo> face_info(n);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+        FaceInfo& fi = face_info[i];
+
+        // Sun vector from this face
+        std::array<double, 3> sun_rel = {
+            sun_position[0] - fc[0],
+            sun_position[1] - fc[1],
+            sun_position[2] - fc[2]
+        };
+        fi.sun_dist = vectorLength(sun_rel);
+
+        if (fi.sun_dist <= constants::EPSILON) {
+            fi.below_horizon = true;
+            fi.needs_sampling = false;
+            continue;
+        }
+
+        fi.sun_dir = { sun_rel[0]/fi.sun_dist, sun_rel[1]/fi.sun_dist, sun_rel[2]/fi.sun_dist };
+        fi.cos_inc0 = dotProduct(fn, fi.sun_dir);
+
+        // Solar disk geometry
+        double s = constants::SUN_RADIUS / fi.sun_dist;
+        if (s > 1.0) s = 1.0;
+        fi.disk_scale = s;  // sin(asin(s)) = s
+
+        // Check if entire disk is below horizon
+        if (fi.cos_inc0 <= -s) {
+            fi.below_horizon = true;
+            fi.needs_sampling = false;
+            continue;
+        }
+        fi.below_horizon = false;
+
+        // Compute robust ray origin
+        const double eps_base = calculateSafeRayOffset(fc, fn);
+        const double eps_n = 2.0 * eps_base;
+        const double eps_d = 8.0 * eps_base;
+
+        fi.ray_origin = {
+            fc[0] + fn[0] * eps_n + fi.sun_dir[0] * eps_d,
+            fc[1] + fn[1] * eps_n + fi.sun_dir[1] * eps_d,
+            fc[2] + fn[2] * eps_n + fi.sun_dir[2] * eps_d
+        };
+
+        // Check eclipse on center ray
+        fi.center_eclipsed = false;
+        if (!primary_is_sun_ && fi.cos_inc0 > 0.0) {
+            double t1, t2;
+            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_position, primary_radius_, t1, t2)) {
+                if ((t1 > 0.0 && t1 < fi.sun_dist) || (t2 > 0.0 && t2 < fi.sun_dist)) {
+                    fi.center_eclipsed = true;
+                }
+            }
+        }
+
+        // Determine if we need sampling (if center is below horizon or might be blocked)
+        fi.needs_sampling = (fi.cos_inc0 <= 0.0) || fi.center_eclipsed;
+    }
+
+    // ==== Collect rays for all faces ====
+    // We'll use a two-pass approach:
+    // Pass 1: Count rays per face to compute offsets
+    // Pass 2: Fill in ray data
+
+    // Ray counts: center_ray (1) or disk_samples (up to N)
+    std::vector<size_t> ray_counts(n);
+    std::vector<size_t> ray_offsets(n + 1);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        const FaceInfo& fi = face_info[i];
+        if (fi.below_horizon) {
+            ray_counts[i] = 0;
+        } else if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+            // Center ray fast path - just 1 ray
+            ray_counts[i] = 1;
+        } else {
+            // Disk sampling - estimate N rays (actual may be less due to eclipse filtering)
+            ray_counts[i] = N;
+        }
+    }
+
+    // Compute prefix sum for ray offsets
+    ray_offsets[0] = 0;
+    for (size_t i = 0; i < n; ++i) {
+        ray_offsets[i + 1] = ray_offsets[i] + ray_counts[i];
+    }
+    const size_t total_rays_estimate = ray_offsets[n];
+
+    // Allocate ray buffers (SoA format for GPU)
+    std::vector<float> ray_org_x(total_rays_estimate);
+    std::vector<float> ray_org_y(total_rays_estimate);
+    std::vector<float> ray_org_z(total_rays_estimate);
+    std::vector<float> ray_dir_x(total_rays_estimate);
+    std::vector<float> ray_dir_y(total_rays_estimate);
+    std::vector<float> ray_dir_z(total_rays_estimate);
+
+    // Track actual ray counts and eclipse flags per face
+    // These will be used in result processing
+    struct FaceRayInfo {
+        size_t ray_start;       // Starting index in global ray array
+        size_t ray_count;       // Actual number of rays generated
+        std::vector<uint8_t> eclipse_skip;  // Which disk samples were eclipsed (not traced)
+        std::vector<std::array<double, 3>> ray_dirs;  // Ray directions for result processing
+    };
+    std::vector<FaceRayInfo> face_ray_info(n);
+
+    // ==== PHASE 1b: Generate rays (parallel) ====
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t i = 0; i < n; ++i) {
+        const FaceInfo& fi = face_info[i];
+        FaceRayInfo& fri = face_ray_info[i];
+        fri.ray_start = ray_offsets[i];
+        fri.ray_count = 0;
+
+        if (fi.below_horizon) continue;
+
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+
+        // Apply scene origin offset for GPU (same as traceOccludedGPU)
+        auto apply_offset = [this](const std::array<double, 3>& p) -> std::array<double, 3> {
+            return {
+                p[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+                p[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+                p[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+            };
+        };
+
+        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+            // Center ray fast path - single ray
+            size_t idx = fri.ray_start;
+            auto local_origin = apply_offset(fi.ray_origin);
+
+            ray_org_x[idx] = static_cast<float>(local_origin[0]);
+            ray_org_y[idx] = static_cast<float>(local_origin[1]);
+            ray_org_z[idx] = static_cast<float>(local_origin[2]);
+            ray_dir_x[idx] = static_cast<float>(fi.sun_dir[0]);
+            ray_dir_y[idx] = static_cast<float>(fi.sun_dir[1]);
+            ray_dir_z[idx] = static_cast<float>(fi.sun_dir[2]);
+
+            fri.ray_count = 1;
+            fri.ray_dirs.push_back(fi.sun_dir);
+            fri.eclipse_skip.clear();
+        } else {
+            // Finite disk sampling
+            std::array<double, 3> u, v;
+            createCoordinateSystem(fi.sun_dir, u, v);
+
+            // Per-face decorrelation
+            uint32_t seed = 0x9E3779B1u ^ uint32_t(i);
+            double theta = u01(seed) * 2.0 * M_PI;
+            std::array<double, 3> ur = {
+                u[0] * std::cos(theta) + v[0] * std::sin(theta),
+                u[1] * std::cos(theta) + v[1] * std::sin(theta),
+                u[2] * std::cos(theta) + v[2] * std::sin(theta)
+            };
+            std::array<double, 3> vr = {
+                -u[0] * std::sin(theta) + v[0] * std::cos(theta),
+                -u[1] * std::sin(theta) + v[1] * std::cos(theta),
+                -u[2] * std::sin(theta) + v[2] * std::cos(theta)
+            };
+            double uoff = u01(seed ^ 0x85EBCA6Bu);
+            double voff = u01(seed ^ 0xC2B2AE35u);
+
+            fri.eclipse_skip.reserve(N);
+            fri.ray_dirs.reserve(N);
+
+            size_t idx = fri.ray_start;
+            const double eps_base = calculateSafeRayOffset(fc, fn);
+            const double eps_d = 8.0 * eps_base;
+
+            for (uint32_t k = 0; k < N; ++k) {
+                // Hammersley sampling
+                double su = double(k) / double(N);
+                double sv = 0.0;
+                uint32_t bits = k;
+                double inv = 0.5;
+                while (bits) {
+                    sv += (bits & 1) * inv;
+                    bits >>= 1;
+                    inv *= 0.5;
+                }
+                su = std::fmod(su + uoff, 1.0);
+                sv = std::fmod(sv + voff, 1.0);
+
+                // Square to concentric disk mapping
+                double a = 2.0 * su - 1.0;
+                double b = 2.0 * sv - 1.0;
+                double dx, dy;
+                if (a * a > b * b) {
+                    double r = a;
+                    double phi = (M_PI / 4.0) * (b / a);
+                    dx = r * std::cos(phi);
+                    dy = r * std::sin(phi);
+                } else if (b != 0.0) {
+                    double r = b;
+                    double phi = (M_PI / 2.0) - (M_PI / 4.0) * (a / b);
+                    dx = r * std::cos(phi);
+                    dy = r * std::sin(phi);
+                } else {
+                    dx = dy = 0.0;
+                }
+
+                if (dx*dx + dy*dy > 1.0) continue;
+
+                const double ox = fi.disk_scale * dx;
+                const double oy = fi.disk_scale * dy;
+                std::array<double, 3> sd = {
+                    fi.sun_dir[0] + ox * ur[0] + oy * vr[0],
+                    fi.sun_dir[1] + ox * ur[1] + oy * vr[1],
+                    fi.sun_dir[2] + ox * ur[2] + oy * vr[2]
+                };
+                double l = vectorLength(sd);
+                if (l <= constants::EPSILON) continue;
+                sd[0] /= l; sd[1] /= l; sd[2] /= l;
+
+                // Check eclipse
+                bool eclipsed = false;
+                if (!primary_is_sun_) {
+                    double t1, t2;
+                    if (raySphereIntersect(fi.ray_origin, sd, primary_position, primary_radius_, t1, t2)) {
+                        if ((t1 > 0.0 && t1 < fi.sun_dist) || (t2 > 0.0 && t2 < fi.sun_dist)) {
+                            eclipsed = true;
+                        }
+                    }
+                }
+
+                fri.eclipse_skip.push_back(eclipsed ? 1 : 0);
+                fri.ray_dirs.push_back(sd);
+
+                if (!eclipsed) {
+                    // Generate ray origin offset along sample direction
+                    std::array<double, 3> sample_origin = {
+                        fi.ray_origin[0] + sd[0] * eps_d,
+                        fi.ray_origin[1] + sd[1] * eps_d,
+                        fi.ray_origin[2] + sd[2] * eps_d
+                    };
+                    auto local_origin = apply_offset(sample_origin);
+
+                    ray_org_x[idx] = static_cast<float>(local_origin[0]);
+                    ray_org_y[idx] = static_cast<float>(local_origin[1]);
+                    ray_org_z[idx] = static_cast<float>(local_origin[2]);
+                    ray_dir_x[idx] = static_cast<float>(sd[0]);
+                    ray_dir_y[idx] = static_cast<float>(sd[1]);
+                    ray_dir_z[idx] = static_cast<float>(sd[2]);
+
+                    idx++;
+                    fri.ray_count++;
+                }
+            }
+        }
+    }
+
+    // Compute actual total rays
+    size_t total_rays = 0;
+    for (size_t i = 0; i < n; ++i) {
+        total_rays += face_ray_info[i].ray_count;
+    }
+
+    if (total_rays == 0) {
+        // All faces in shadow or below horizon
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            if (enable_shadow_flux_) {
+                direct_solar_values[i] = calculateShadowFlux(face_centers[i], face_normals[i], sun_position);
+            }
+        }
+        return;
+    }
+
+    // Compact ray arrays to remove unused slots
+    // Build mapping from original indices to compacted indices
+    std::vector<size_t> compact_offsets(n + 1);
+    compact_offsets[0] = 0;
+    for (size_t i = 0; i < n; ++i) {
+        compact_offsets[i + 1] = compact_offsets[i] + face_ray_info[i].ray_count;
+    }
+
+    std::vector<float> compact_org_x(total_rays);
+    std::vector<float> compact_org_y(total_rays);
+    std::vector<float> compact_org_z(total_rays);
+    std::vector<float> compact_dir_x(total_rays);
+    std::vector<float> compact_dir_y(total_rays);
+    std::vector<float> compact_dir_z(total_rays);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        const FaceRayInfo& fri = face_ray_info[i];
+        if (fri.ray_count == 0) continue;
+
+        size_t src = fri.ray_start;
+        size_t dst = compact_offsets[i];
+
+        for (size_t j = 0; j < fri.ray_count; ++j) {
+            compact_org_x[dst + j] = ray_org_x[src + j];
+            compact_org_y[dst + j] = ray_org_y[src + j];
+            compact_org_z[dst + j] = ray_org_z[src + j];
+            compact_dir_x[dst + j] = ray_dir_x[src + j];
+            compact_dir_y[dst + j] = ray_dir_y[src + j];
+            compact_dir_z[dst + j] = ray_dir_z[src + j];
+        }
+        // Update face_ray_info to use compacted indices
+        const_cast<FaceRayInfo&>(fri).ray_start = dst;
+    }
+
+    // ==== PHASE 2: GPU ray tracing (single batch) ====
+    std::vector<uint8_t> occluded;
+    {
+        std::lock_guard<std::mutex> lock(gpu_ray_tracer_mutex_);
+        traceOccludedBatchedGPU(compact_org_x, compact_org_y, compact_org_z,
+                                 compact_dir_x, compact_dir_y, compact_dir_z,
+                                 occluded);
+    }
+
+    // ==== PHASE 3: Process results (parallel) ====
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t i = 0; i < n; ++i) {
+        const FaceInfo& fi = face_info[i];
+        const FaceRayInfo& fri = face_ray_info[i];
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+
+        if (fi.below_horizon) {
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            continue;
+        }
+
+        if (fri.ray_count == 0) {
+            // All samples were eclipsed
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            continue;
+        }
+
+        double sun_dist_au = fi.sun_dist / constants::KM_PER_AU;
+        double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+
+        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+            // Center ray result
+            bool blocked = (fri.ray_start < occluded.size()) && (occluded[fri.ray_start] != 0);
+            if (!blocked) {
+                direct_solar_values[i] = solar_irr * fi.cos_inc0;
+            } else {
+                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            }
+        } else {
+            // Process disk sampling results
+            double sum_cos = 0.0;
+            uint32_t total_valid = 0;
+            size_t occ_idx = fri.ray_start;
+
+            for (size_t j = 0; j < fri.eclipse_skip.size(); ++j) {
+                if (fri.eclipse_skip[j]) continue;  // Eclipsed, not traced
+
+                bool blocked = (occ_idx < occluded.size()) && (occluded[occ_idx] != 0);
+                occ_idx++;
+                total_valid++;
+
+                if (!blocked) {
+                    double c = dotProduct(fn, fri.ray_dirs[j]);
+                    if (c > 0.0) sum_cos += c;
+                }
+            }
+
+            if (total_valid == 0) {
+                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            } else {
+                double flux = solar_irr * (sum_cos / double(total_valid));
+                if (flux <= 0.0 && enable_shadow_flux_) {
+                    flux = calculateShadowFlux(fc, fn, sun_position);
+                }
+                direct_solar_values[i] = flux;
+            }
+        }
+    }
+}
+
+#endif  // PTM_GPU_OPENCL
 
 } // namespace ptm

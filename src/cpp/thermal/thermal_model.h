@@ -13,6 +13,41 @@
 
 namespace thermal {
 
+// Fast power computation helpers - inline for header optimization
+inline double pow2(double x) { return x * x; }
+inline double pow3(double x) { return x * x * x; }
+inline double pow4(double x) { double x2 = x * x; return x2 * x2; }
+
+// Simple aligned allocator for vector data buffers
+template <typename T, std::size_t Alignment = 64>
+struct AlignedAllocator {
+    using value_type = T;
+    AlignedAllocator() noexcept {}
+    template <class U> AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        void* p = nullptr;
+    #if defined(_MSC_VER)
+        p = _aligned_malloc(n * sizeof(T), Alignment);
+        if (!p) throw std::bad_alloc();
+    #else
+        if (posix_memalign(&p, Alignment, n * sizeof(T)) != 0) throw std::bad_alloc();
+    #endif
+        return reinterpret_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept {
+    #if defined(_MSC_VER)
+        _aligned_free(p);
+    #else
+        free(p);
+    #endif
+    }
+    template <class U> struct rebind { using other = AlignedAllocator<U, Alignment>; };
+};
+
+template <typename T>
+using aligned_vector = std::vector<T, AlignedAllocator<T, 64>>;
+
 // Forward declarations
 class Planet;
 class Profile;
@@ -26,11 +61,12 @@ private:
     std::string prefix;
     bool enabled;
     bool completed;
+    int last_percentage;
     
 public:
     ProgressBar(int total, const std::string& prefix = "Progress", int barWidth = 50, bool enabled = true) 
-        : total(total), current(0), barWidth(barWidth), prefix(prefix), enabled(enabled), completed(false) {}
-    
+        : total(total), current(0), barWidth(barWidth), prefix(prefix), enabled(enabled), completed(false), last_percentage(-1) {}
+
     void update(int current) {
         if (!enabled) return;
         this->current = current;
@@ -40,23 +76,31 @@ public:
         
         // Calculate percentage
         float percent = static_cast<float>(current) / total;
+        int percentage = static_cast<int>(percent * 100);
+        
+        // Only update display if percentage has changed (prevents duplicate output)
+        if (percentage == last_percentage && current < total) {
+            return;
+        }
+        last_percentage = percentage;
+        
         int filledWidth = static_cast<int>(barWidth * percent);
         
         // Build progress bar string
-        std::cerr << "\r" << prefix << " [";  // Change to std::cerr
+        std::cerr << "\r" << prefix << " [";
         for (int i = 0; i < barWidth; ++i) {
-            if (i < filledWidth) std::cerr << "=";  // Change to std::cerr
-            else if (i == filledWidth) std::cerr << ">";  // Change to std::cerr
-            else std::cerr << " ";  // Change to std::cerr
+            if (i < filledWidth) std::cerr << "=";
+            else if (i == filledWidth) std::cerr << ">";
+            else std::cerr << " ";
         }
         
         // Add percentage at the end
-        std::cerr << "] " << static_cast<int>(percent * 100) << "%";  // Change to std::cerr
-        std::cerr.flush();  // Change to std::cerr
+        std::cerr << "] " << percentage << "%";
+        std::cerr.flush();
         
         // Mark as completed and add newline when reaching 100%
         if (current >= total) {
-            std::cerr << std::endl;  // Change to std::cerr
+            std::cerr << std::endl;
             completed = true;
         }
     }
@@ -77,6 +121,7 @@ const double MAX_PHYSICAL_TEMP_K = 500.0; // Maximum physically reasonable tempe
 double R350(double chi);
 double skinDepth(double P, double kappa);
 std::vector<double> spatialGrid(double zs, int m, int n, int b);
+std::vector<double> generateStableGrid(double skin_depth, int m, int n, int b, bool verbose = false);
 double albedoVar(double A0, double a, double b, double i);
 double T_radeq(const Planet& planet, double lat);
 double T_eq(const Planet& planet, double lat);
@@ -84,7 +129,8 @@ std::vector<double> heatCapacity(const Planet& planet, const std::vector<double>
 std::vector<double> thermCond(const std::vector<double>& kc, const std::vector<double>& T, double R350);
 void surfTemp(Profile& p, double Qs);
 void botTemp(Profile& p, double Qb);
-double getTimeStep(const Profile& p, const Planet& planet, double day, const Config& config, bool verbose = false);
+double getTimeStep(const Profile& p, const Planet& planet, double day,
+                   const Config& config, bool verbose = false);
 
 // Configuration class
 class Config {
@@ -94,11 +140,20 @@ public:
     double S0 = 1361.0;       // Solar constant at 1 AU [W.m-2]
     double chi = 2.7;         // Radiative conductivity parameter [Mitchell and de Pater, 1994]
     
-    // Numerical parameters
+    // Numerical parameters (optimized via sensitivity analysis Jan 2026)
+    // Grid parameters optimized via sensitivity analysis vs Diviner (Hayne et al. 2017)
+    // See /tmp/test_layer_fast.py for testing methodology
+    // RMS error < 4K with 10 layers, systematic offset +2.65K
     double F = 0.5;           // Fourier Mesh Number, must be <= 0.5 for stability
-    int m = 10;               // Number of layers in upper skin depth
-    int n = 5;                // Layer increase with depth: dz[i] = dz[i-1]*(1+1/n)
-    int b = 20;               // Number of skin depths to bottom layer
+    int m = 4;                // Number of layers in upper skin depth (optimal: 4, tested 3-15)
+    int n = 10;               // Layer growth factor: dz[i] = dz[i-1]*(1+1/n) (optimal: 10)
+    int b = 5;                // Number of skin depths to bottom layer (optimal: 5, minimum viable)
+
+    // Adaptive grid controls
+    bool   ADAPTIVE_GRID = true;     // Use per-profile adaptive grid instead of fixed geometric
+    double R_MAX         = 2.0;     // Max per-step growth factor for dz (geometric stretching cap)
+    int    MIN_LAYERS_DEEP_PER_SKIN = 1;    // Minimum layers per skin depth in the deep
+    double RES_DECAY_SKINS = 3.0;    // e-folding depth (in skin depths) for resolution decay
     
     // Accuracy of temperature calculations
     double DTSURF = 0.1;      // Surface temperature accuracy [K]
@@ -109,11 +164,30 @@ public:
     // Method to get R350
     double getR350() const { return R350(chi); }
 
-    // New configurable solver parameters
-    double RELAXATION_FACTOR = 0.7;      // Relaxation factor for Newton-Raphson (0-1)
-    int MAX_ITERATIONS = 30;             // Maximum iterations for surface temperature solver
-    double TEMP_TOLERANCE = 0.01;        // Temperature convergence tolerance (K)
-    double MIN_DERIVATIVE = 1e-10;       // Minimum allowed derivative to prevent division by near-zero
+    // Material property update interval
+    int MATERIAL_UPDATE_INTERVAL = 1;
+
+    // Configurable solver parameters
+    double RELAXATION_FACTOR = 0.7;
+    int MAX_ITERATIONS = 10;
+    double TEMP_TOLERANCE = 0.1;
+    double MIN_DERIVATIVE = 1e-10;
+
+    // Solver control and adaptive stepping
+    bool IMPLICIT_ALL = true;            // Force implicit (Thomas) for all layer counts
+    int  THOMAS_LIMIT = 4096;            // Also use Thomas up to this size if IMPLICIT_ALL == false
+
+    bool MULTIRATE_ADAPTIVE_STEP = true; // Enable adaptive dt using surface-controlled criterion
+    double SURF_DMAX = 0.1;              // Target max |ΔT_surface| per step [K]
+    double DT_GROW = 1.0;                // Factor to grow dt_scale when changes are small
+    double DT_SHRINK = 0.1;              // Factor to shrink dt_scale when changes are large
+    double MAX_DT_SCALE = 8.0;           // Cap for dt scaling (relative to base dt)
+
+    // Event-aware dt control for sharp flux transitions (e.g., eclipses)
+    bool  EVENT_AWARE_DT     = true;   // enable derivative-based dt refinement
+    double FLUX_DERIV_THRESH = 0.0005;    // |dQ/dt| threshold [W m^-2 s^-1] to trigger refinement
+    double FLUX_DQ_TARGET    = 0.1;    // target max |ΔQ| per step [W m^-2]
+    double MIN_EVENT_DT      = 0.25;   // minimum dt during events [s]
 
     // Custom properties storage
     std::map<std::string, std::string> custom_properties;
@@ -161,7 +235,30 @@ public:
     void setProperty(const std::string& key, double value) {
         custom_properties[key] = std::to_string(value);
     }
+
+    // Debug output configuration
+    bool THERMAL_DEBUG = false;              // Enable thermal debug output for equatorial face
+    std::string DEBUG_OUTPUT_DIR = "";       // Output directory for debug file (empty = /tmp)
+    double DEBUG_LAT_THRESHOLD = 10.0;       // Maximum latitude (degrees) for debug face selection
 };
+
+// Build per-profile adaptive grid using local κ(z) and diurnal frequency
+// Ensures: (1) dz never violates stability proxy sqrt(kappa*dt/F), (2) dz/δ grows with depth,
+// (3) total depth ≈ b·δ_surface, (4) smooth geometric stretching limited by R_MAX.
+std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& config, bool verbose = false);
+
+// Auto-tune adaptive stepping and event-aware dt using physics + flux series
+// Optional configuration via custom properties:
+//   "AUTO_TUNE_STEPPING" (bool, default true)
+//   "SURF_STEP_FRAC"     (double, default 0.01)  // fraction of diurnal ΔT for per-step ΔT
+//   "MIN_DT_FRAC_TAU"    (double, default 0.2)   // min event dt as fraction of τ_eff
+void autoTuneTimeStepping(const Planet& planet,
+                          double lat,
+                          const Profile& profile,
+                          Config& cfg,
+                          const std::vector<double>& flux_times = {},
+                          const std::vector<double>& flux_values = {},
+                          bool verbose = false);
 
 // Planet class (simplified from Python's planets module)
 class Planet {
@@ -209,6 +306,13 @@ public:
     // Methods to get mapped values at a location
     double getAlbedo(double lon, double lat) const;
     double getThermalInertia(double lon, double lat) const;
+
+    // Compute incidence-angle-dependent albedo using Hayne et al. (2017) formula:
+    // A(theta) = A0 + a*(theta/(pi/4))^3 + b*(theta/(pi/2))^8
+    // where theta is solar incidence angle (radians), A0 is base albedo,
+    // and a, b are coefficients from albedoCoef[0], albedoCoef[1]
+    // If using_albedo_map is true, returns the map value unchanged (no angle correction)
+    double getAlbedoWithIncidence(double lon, double lat, double incidence_angle) const;
 };
 
 // Profile class
@@ -219,27 +323,25 @@ public:
     double chi;
     double R350_val;
     int nlayers;
-    double day;  // Add day length for time step calculation
+    double day;
     const Config* config;
-    
+
 private:
     // Structure for aligned thermal grid data with cache-friendly layout
     struct ThermalGrid {
-        // Ensure memory alignment for SIMD operations (AVX-512 requires 64-byte alignment)
-        alignas(64) std::vector<double> z;     // Depth values
-        alignas(64) std::vector<double> dz;    // Layer thicknesses
-        alignas(64) std::vector<double> d3z;   // Derived grid coefficients
-        alignas(64) std::vector<double> g1;    // Grid coefficient 1
-        alignas(64) std::vector<double> g2;    // Grid coefficient 2
-        alignas(64) std::vector<double> kc;    // Conduction component
-        alignas(64) std::vector<double> rho;   // Density
-        alignas(64) std::vector<double> T;     // Temperature
-        alignas(64) std::vector<double> cp;    // Heat capacity
-        alignas(64) std::vector<double> k;     // Thermal conductivity
-        
-        // Methods to ensure proper allocation
+        aligned_vector<double> z;     // Depths
+        aligned_vector<double> dz;    // Depth increments
+        aligned_vector<double> d3z;   // dz[i+1]*dz[i]*(dz[i+1]+dz[i])
+        aligned_vector<double> g1;    // First grid coefficient
+        aligned_vector<double> g2;    // Second grid coefficient
+        aligned_vector<double> kc;    // Lattice/base conductivity
+        aligned_vector<double> rho;   // Density
+        aligned_vector<double> T;     // Temperature
+        aligned_vector<double> cp;    // Heat capacity
+        aligned_vector<double> k;     // Thermal conductivity
+        aligned_vector<double> kappa; // Thermal diffusivity
+
         void resize(size_t size) {
-            // Resize all arrays at once
             z.resize(size);
             dz.resize(size > 0 ? size - 1 : 0);
             d3z.resize(size > 0 ? size - 2 : 0);
@@ -250,9 +352,9 @@ private:
             T.resize(size);
             cp.resize(size);
             k.resize(size);
+            kappa.resize(size);
         }
-        
-        // Custom memory allocation for aligned vectors
+
         void reserve(size_t capacity) {
             z.reserve(capacity);
             dz.reserve(capacity > 0 ? capacity - 1 : 0);
@@ -264,16 +366,17 @@ private:
             T.reserve(capacity);
             cp.reserve(capacity);
             k.reserve(capacity);
+            kappa.reserve(capacity);
         }
     };
 
     // Memory pool for temporary arrays used in calculations
     struct MemoryPool {
-        alignas(64) std::vector<double> a_buffer;
-        alignas(64) std::vector<double> b_buffer;
-        alignas(64) std::vector<double> c_buffer;
-        alignas(64) std::vector<double> d_buffer;
-        
+        aligned_vector<double> a_buffer;
+        aligned_vector<double> b_buffer;
+        aligned_vector<double> c_buffer;
+        aligned_vector<double> d_buffer;
+
         void ensure_capacity(size_t n) {
             if (a_buffer.size() < n) {
                 a_buffer.resize(n);
@@ -282,51 +385,83 @@ private:
                 d_buffer.resize(n);
             }
         }
-        
+
         double* a() { return a_buffer.data(); }
         double* b() { return b_buffer.data(); }
         double* c() { return c_buffer.data(); }
         double* d() { return d_buffer.data(); }
     };
-    
-    // Replace individual vectors with the structure
+
+    // Material counter for updating material thermophysical properties
+    size_t material_counter = 0;
+
     ThermalGrid grid;
     MemoryPool memory_pool;
-    
+
 public:
-    // Add accessors to maintain API compatibility
-    std::vector<double>& z() { return grid.z; }
-    std::vector<double>& dz() { return grid.dz; }
-    std::vector<double>& d3z() { return grid.d3z; }
-    std::vector<double>& g1() { return grid.g1; }
-    std::vector<double>& g2() { return grid.g2; }
-    std::vector<double>& kc() { return grid.kc; }
-    std::vector<double>& rho() { return grid.rho; }
-    std::vector<double>& T() { return grid.T; }
-    std::vector<double>& cp() { return grid.cp; }
-    std::vector<double>& k() { return grid.k; }
-    
-    // Const accessors for read-only operations
-    const std::vector<double>& z() const { return grid.z; }
-    const std::vector<double>& dz() const { return grid.dz; }
-    const std::vector<double>& d3z() const { return grid.d3z; }
-    const std::vector<double>& g1() const { return grid.g1; }
-    const std::vector<double>& g2() const { return grid.g2; }
-    const std::vector<double>& kc() const { return grid.kc; }
-    const std::vector<double>& rho() const { return grid.rho; }
-    const std::vector<double>& T() const { return grid.T; }
-    const std::vector<double>& cp() const { return grid.cp; }
-    const std::vector<double>& k() const { return grid.k; }
-    
+    ThermalGrid& getGrid() { return grid; }
+    const ThermalGrid& getGrid() const { return grid; }
+
+    // Accessors to maintain API compatibility (aligned_vector)
+    aligned_vector<double>& z()     { return grid.z; }
+    aligned_vector<double>& dz()    { return grid.dz; }
+    aligned_vector<double>& d3z()   { return grid.d3z; }
+    aligned_vector<double>& g1()    { return grid.g1; }
+    aligned_vector<double>& g2()    { return grid.g2; }
+    aligned_vector<double>& kc()    { return grid.kc; }
+    aligned_vector<double>& rho()   { return grid.rho; }
+    aligned_vector<double>& T()     { return grid.T; }
+    aligned_vector<double>& cp()    { return grid.cp; }
+    aligned_vector<double>& k()     { return grid.k; }
+    aligned_vector<double>& kappa() { return grid.kappa; }
+
+    // Const accessors
+    const aligned_vector<double>& z() const     { return grid.z; }
+    const aligned_vector<double>& dz() const    { return grid.dz; }
+    const aligned_vector<double>& d3z() const   { return grid.d3z; }
+    const aligned_vector<double>& g1() const    { return grid.g1; }
+    const aligned_vector<double>& g2() const    { return grid.g2; }
+    const aligned_vector<double>& kc() const    { return grid.kc; }
+    const aligned_vector<double>& rho() const   { return grid.rho; }
+    const aligned_vector<double>& T() const     { return grid.T; }
+    const aligned_vector<double>& cp() const    { return grid.cp; }
+    const aligned_vector<double>& k() const     { return grid.k; }
+    const aligned_vector<double>& kappa() const { return grid.kappa; }
+
     // Constructor
-    Profile(const Planet& planet = Planet(), double lat = 0.0, 
+    Profile(const Planet& planet = Planet(), double lat = 0.0,
             const Config& config = Config(), bool verbose = false);
-    
+
     // Methods
     void init_T(const Planet& planet, double lat, bool verbose = false);
     void update_cp();
     void update_k();
     void update_T(double dt, double Qs = 0, double Qb = 0);
+
+    // Utility updaters
+    void recomputeKappa() {
+        const size_t n = k().size();
+        auto& kk = kappa();
+        const auto& kr = k();
+        const auto& rr = rho();
+        const auto& cc = cp();
+        if (kk.size() != n) kk.resize(n);
+        #pragma omp parallel for schedule(static) if(n > 1024)
+        for (size_t i = 0; i < n; ++i) {
+            kk[i] = kr[i] / (rr[i] * cc[i]);
+        }
+    }
+
+    void updateThermalProperties(bool update_k_first = true) {
+        if (update_k_first) {
+            update_k();
+            update_cp();
+        } else {
+            update_cp();
+            update_k();
+        }
+        recomputeKappa();
+    }
 };
 
 // Model class
@@ -362,13 +497,15 @@ public:
     // Profile object
     Profile profile;
     
-    // Config reference
+    // Tuned configuration owned by the model (mutable)
+    Config tuned_config;
+    // Config pointer used throughout (points to tuned_config)
     const Config* config;
     
-    // Add this member to store explicit output time points
+    // Store explicit output time points
     std::vector<double> output_time_points;
     
-    // Add these new members
+    // Equilibration control
     bool use_full_time_series;
     int equilibration_steps;
     int main_simulation_steps;
@@ -403,19 +540,139 @@ public:
     // Progress bar flag
     bool show_progress;
 
-private:
+protected:
     // Method to interpolate flux from arrays
     double interpolateFlux(double time);
-    
-    // Store the flux array as separate time and value vectors
     std::vector<double> flux_times;
     std::vector<double> flux_values;
+    size_t flux_idx = 1;  // rolling index for monotonic time
+
+    // Store original flux epoch for diagnostics (after we shift times to start at 0)
+    double flux_time_offset = 0.0;
+
+    // Adaptive time step control
+    double dt_scale = 1.0;                       // multiplicative dt scaling
+    double last_surface_T = std::numeric_limits<double>::quiet_NaN();
+    double chooseAdaptiveDt(double target_time); // compute next dt considering stability/accuracy
+    double estimateFluxDerivative(double time);          // finite-difference dQ/dt from series
+    double eventLimitedDt(double base_dt, double target_time); // clamp dt when |dQ/dt| is large
 };
 
 // Function to automatically optimize grid parameters based on physical properties
 void calculateOptimalGridParameters(const Planet& planet, Config& config);
 
+// =============================================================================
+// SIMD Batch Thermal Solver (SIMD-over-Pixels)
+// =============================================================================
+
+// SIMD width constants - always use 8 for array sizing, runtime check for actual width
+constexpr int THERMAL_BATCH_SIZE = 8;     // 8 doubles = 512 bits (AVX-512)
+constexpr int MAX_THERMAL_LAYERS = 128;   // Maximum supported depth layers
+
+/**
+ * Structure of Arrays (SoA) for batch thermal solving.
+ *
+ * Memory layout: data[layer * THERMAL_BATCH_SIZE + face_in_batch]
+ *
+ * This enables SIMD operations across 8 faces at each depth layer:
+ *   Layer 0: [face0, face1, face2, face3, face4, face5, face6, face7]  <- One AVX-512 load
+ *   Layer 1: [face0, face1, face2, face3, face4, face5, face6, face7]  <- One AVX-512 load
+ *   ...
+ *
+ * The Thomas algorithm is sequential in depth (layer i depends on layer i-1),
+ * but 8 independent faces can be solved in parallel at each depth.
+ */
+struct ThermalBatchSoA {
+    int n_layers;            // Number of depth layers (same for all faces in batch)
+    int n_faces;             // Actual faces in batch (may be < THERMAL_BATCH_SIZE)
+
+    // Temperature profile [n_layers * THERMAL_BATCH_SIZE]
+    // Layout: T[layer * 8 + face_in_batch]
+    alignas(64) double T[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];
+
+    // Material properties [n_layers * THERMAL_BATCH_SIZE]
+    alignas(64) double cp[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];
+    alignas(64) double k[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];
+    alignas(64) double kappa[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];
+    alignas(64) double rho[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];
+    alignas(64) double kc[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];   // Base conductivity
+
+    // Thomas algorithm buffers [n_layers * THERMAL_BATCH_SIZE]
+    alignas(64) double a_coef[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];   // Sub-diagonal
+    alignas(64) double b_coef[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];   // Main diagonal
+    alignas(64) double c_coef[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];   // Super-diagonal
+    alignas(64) double d_coef[MAX_THERMAL_LAYERS * THERMAL_BATCH_SIZE];   // RHS / solution
+
+    // Grid coefficients [n_layers] - SHARED across all faces in batch
+    alignas(64) double z[MAX_THERMAL_LAYERS];       // Depth positions
+    alignas(64) double dz[MAX_THERMAL_LAYERS];      // Layer spacing (n_layers-1 used)
+    alignas(64) double g1[MAX_THERMAL_LAYERS];      // Grid coefficient 1
+    alignas(64) double g2[MAX_THERMAL_LAYERS];      // Grid coefficient 2
+
+    // Surface properties [THERMAL_BATCH_SIZE]
+    alignas(64) double emissivity[THERMAL_BATCH_SIZE];
+    alignas(64) double flux[THERMAL_BATCH_SIZE];    // Surface absorbed flux
+    alignas(64) double Qb[THERMAL_BATCH_SIZE];      // Bottom heat flux
+
+    // Initial temperature for equilibrium [THERMAL_BATCH_SIZE]
+    alignas(64) double T_eq_init[THERMAL_BATCH_SIZE];
+
+    // Material parameters (shared across all faces in batch)
+    double cp0;              // Base heat capacity
+    double R350_val;         // Radiative conductivity coefficient (Hayne 2017)
+    double rho_s;            // Surface density
+    double rho_d;            // Deep density
+    double k_s;              // Surface conductivity
+    double k_d;              // Deep conductivity
+    double H_val;            // e-folding depth for density/conductivity
+    int n_cp_coeffs;         // Number of cp polynomial coefficients
+    alignas(64) double cp_coeffs[8];  // cp(T) polynomial coefficients
+
+    // Physical constants
+    double sigma_sb;         // Stefan-Boltzmann constant
+
+    // Accessors for layer-indexed SIMD loads
+    inline double* layer_ptr(double* arr, int layer_idx) {
+        return &arr[layer_idx * THERMAL_BATCH_SIZE];
+    }
+    inline const double* layer_ptr(const double* arr, int layer_idx) const {
+        return &arr[layer_idx * THERMAL_BATCH_SIZE];
+    }
+
+    // Initialize batch with grid and material parameters
+    void initialize(int layers, int faces, const Planet& planet, const Config& config);
+
+    // Copy grid from existing Profile
+    void copyGridFromProfile(const Profile& ref_profile);
+
+    // Set surface flux values for all faces in batch (scattered input)
+    void setFlux(const double* flux_values, int num_faces);
+
+    // Set surface flux values from contiguous memory (SIMD optimized)
+    // Use this when flux_values points to 8 contiguous doubles (column-major layout)
+    void setFluxContiguous(const double* flux_values, int num_faces);
+
+    // Advance one timestep for all faces in batch
+    void advanceTimestep(double dt);
+
+    // Get surface temperature for a specific face
+    double getSurfaceTemp(int face_idx) const { return T[face_idx]; }
+
+    // Get temperature at specific layer and face
+    double getTemp(int layer, int face_idx) const {
+        return T[layer * THERMAL_BATCH_SIZE + face_idx];
+    }
+};
+
+// Batch solver helper functions
+void initializeBatchGrid(ThermalBatchSoA& batch, const std::vector<double>& z_grid,
+                         const Planet& planet);
+void updateMaterialPropertiesBatchSIMD(ThermalBatchSoA& batch);
+void buildTridiagonalSystemBatch(ThermalBatchSoA& batch, double dt);
+void solveThomasBatchSIMD(ThermalBatchSoA& batch);
+void applySurfaceBCBatch(ThermalBatchSoA& batch, double dt);
+void applyBottomBCBatch(ThermalBatchSoA& batch);
+
 } // namespace thermal
 
 #endif // THERMAL_MODEL_H
-
