@@ -29,11 +29,7 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
 
-radiation:
-  enable: false
-  use_hmatrix: false
-  coupling_iterations: 10
-  temperature_tolerance: 0.5
+# Note: radiation options are CLI-only, not in YAML
 
 output:
   directory: "output/simulation"
@@ -83,14 +79,22 @@ output:
 
 ### radiation
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `enable` | bool | false | Enable radiation exchange |
-| `use_hmatrix` | bool | false | Use H-matrix compression |
-| `coupling_iterations` | int | 10 | Max coupling iterations |
-| `temperature_tolerance` | float | 0.5 | Convergence threshold (K) |
-| `flux_tolerance` | float | 0.1 | Flux threshold (W/m²) |
-| `view_factor_file` | string | "" | View factor cache file |
+**Note:** Radiation options are passed via command-line arguments, not YAML configuration.
+
+| CLI Flag | Default | Description |
+|----------|---------|-------------|
+| `--radiation-exchange` | off | Enable radiation exchange |
+| `--rad-hmatrix` | off | Use H-matrix compression |
+| `--rad-use-gpu` | off | Use GPU for radiosity solver |
+| `--rad-verbose` | off | Print detailed progress |
+| `--rad-view-factor-file <file>` | "" | Save/load view factors |
+| `--rad-coupling-iter <n>` | 10 | Max coupling iterations |
+| `--rad-coupling-temp-tol <K>` | 0.5 | Temperature convergence threshold |
+| `--rad-coupling-flux-tol <W/m²>` | 0.1 | Flux change threshold |
+| `--rad-coupling-face-frac <f>` | 0.01 | Fraction of faces still changing to stop |
+| `--rad-aca-tolerance <tol>` | 0.001 | ACA relative tolerance |
+| `--rad-aca-max-rank <n>` | 50 | Maximum rank for ACA |
+| `--rad-use-svd` | off | Use SVD instead of ACA for compression |
 
 ### output
 
@@ -122,6 +126,5 @@ Command-line options override YAML settings:
 | Moon | 29.53 days | 365.25 days | 1.0 |
 | Mercury | 176 days | 87.97 days | 0.387 |
 | Europa | 3.55 days | 11.86 years | 5.2 |
-| Enceladus | 1.37 days | 29.46 years | 9.54 |
-| Mars | 1.03 days | 687 days | 1.52 |
-| Ceres | 9.07 hours | 4.6 years | 2.77 |
+
+Note: These are the currently supported bodies with pre-defined thermophysical properties in the C++ code.
