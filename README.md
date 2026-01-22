@@ -10,13 +10,12 @@
 
 ## Key Features
 
-- **Multi-body support**: Moon, Mercury, Europa, Enceladus, Mars, Ceres, and custom bodies
+- **Multi-body support**: Moon, Mercury, and Europa with pre-defined thermophysical properties
 - **Ray-traced illumination**: Intel Embree 4 with SIMD optimization (AVX-512/AVX2)
 - **SPICE ephemeris integration**: Accurate planetary positions via NASA NAIF kernels
 - **1D thermal conduction**: Crank-Nicolson solver with temperature-dependent properties
 - **Radiation exchange**: View factors with H-matrix compression for large meshes
-- **GPU acceleration**: OpenCL, HIP (AMD), and CUDA (NVIDIA) backends
-- **FFT-based equilibration**: Spectral solver replaces thousands of diurnal cycles
+- **GPU acceleration**: OpenCL backend for thermal solver and radiosity (macOS/Linux)
 - **Ice stability depth**: Newton-Raphson solver for subsurface ice table location
 - **Flexible mesh input**: PLY, OBJ, VTK formats with resolution control
 - **ParaView-compatible output**: VTK/PVD time series for visualization
@@ -62,7 +61,7 @@
 | OpenMP | Built-in | Yes | Parallelization |
 | yaml-cpp | 0.6+ | Optional | YAML config files |
 | VTK | 8.0+ | Optional | Mesh I/O |
-| OpenCL/HIP/CUDA | Various | Optional | GPU acceleration |
+| OpenCL | 1.2+ | Optional | GPU acceleration |
 
 ### macOS
 
@@ -114,14 +113,10 @@ ls bin/
 
 **GPU Support (Optional)**:
 ```bash
-# Auto-detect GPU backend (HIP > CUDA > OpenCL)
-cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=AUTO
-
-# Force specific backend
-cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL  # macOS with AMD GPU
-cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=HIP     # AMD ROCm
-cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=CUDA    # NVIDIA
+# Enable OpenCL GPU acceleration (currently the only fully implemented backend)
+cmake .. -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL
 ```
+Note: OpenCL is the recommended GPU backend and works on macOS (AMD GPUs) and Linux. HIP and CUDA backends have framework support but are not fully implemented.
 
 ---
 
@@ -213,7 +208,7 @@ PTM3D uses a modular architecture with coupled physics engines:
 | **thermal** | `src/cpp/thermal/` | 1D heat conduction with Crank-Nicolson solver |
 | **illumination** | `src/cpp/illumination/` | Ray-traced solar flux with SPICE ephemeris |
 | **radiation** | `src/cpp/radiation/` | View factors, H-matrix compression, radiosity |
-| **gpu** | `src/cpp/gpu/` | GPU acceleration (OpenCL/HIP/CUDA) |
+| **gpu** | `src/cpp/gpu/` | GPU acceleration (OpenCL) |
 | **mesh** | `src/cpp/mesh/` | Mesh I/O and utilities |
 | **ice** | `src/cpp/ice/` | Ice stability depth calculation |
 
@@ -247,7 +242,7 @@ PTM3D uses a modular architecture with coupled physics engines:
 ### Essential Options
 
 ```
---body, -b <name>         Body name (Moon, Mercury, Europa, etc.)
+--body, -b <name>         Body name (Moon, Mercury, or Europa)
 --config <file>           Load YAML configuration file
 --resolution <n>          Global mesh resolution (default: 5)
 --duration <days>         Simulation duration in days
@@ -262,7 +257,7 @@ PTM3D uses a modular architecture with coupled physics engines:
 --thermal-mesh            Run thermal model for all faces
 --thermal-threads <n>     Number of parallel threads (0 = auto)
 --equilibration-orbits <n> Diurnal cycles for equilibration (default: 10)
---use-gpu-thermal         Use GPU thermal solver
+--use-gpu-thermal         Use GPU thermal solver (requires OpenCL)
 ```
 
 ### Radiation Exchange
@@ -320,8 +315,10 @@ output/
 |--------|---------|
 | `vtk_converter.py` | Convert binary output to VTK/PVD format |
 | `netcdf_converter.py` | Export to NetCDF for cross-platform analysis |
-| `plot_depth_profiles.py` | Visualize temperature vs depth |
+| `plot_depth_profiles.py` | Visualize temperature vs depth from CSV output |
+| `plot_thermal_debug.py` | Plot diurnal thermal wave profiles from debug output |
 | `extract_timeseries.py` | Extract data for specific lat/lon locations |
+| `lunar_validation_figure.py` | Generate validation plots comparing to Hayne et al. (2017) |
 
 ### Example: Convert and Visualize
 

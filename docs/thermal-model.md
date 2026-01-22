@@ -51,10 +51,14 @@ k ∂T/∂z|_bottom = Q_geo
 ## Temperature-Dependent Properties
 
 ### Thermal Conductivity
+The total thermal conductivity includes both solid conduction and radiative transfer:
 ```
-k(T) = k_c + k_r · T³
+k(T) = k_c · (1 + χ · (T/350)³)
 ```
-Where `k_c` is contact conductivity and `k_r` is radiative conductivity coefficient.
+Where:
+- `k_c` is the contact (solid) conductivity at the reference temperature
+- `χ` is the radiative conductivity parameter (default: 2.7 from Mitchell & de Pater 1994)
+- The T³ term accounts for radiative heat transfer through pore spaces
 
 ### Heat Capacity
 Polynomial fit:
@@ -63,15 +67,32 @@ cp(T) = c₀ + c₁T + c₂T² + c₃T³
 ```
 Evaluated using Horner's method for efficiency.
 
-## Spectral Equilibration
+## Thermal Equilibration
 
-FFT-based analytical solver for rapid equilibration:
-1. Decompose surface flux into Fourier harmonics
-2. Solve heat equation analytically for each harmonic
-3. Iterate to update linearized radiative BC
-4. Handoff converged profile to transient solver
+PTM3D uses diurnal time-stepping to achieve thermal equilibration:
+1. Run multiple complete diurnal cycles (configurable via `--equilibration-orbits`)
+2. Track temperature changes between cycles
+3. Continue until temperatures converge to periodic steady state
+4. Use converged profile as initial condition for science simulation
+
+The number of equilibration cycles depends on the thermal inertia: low inertia surfaces (regolith) equilibrate quickly (~5-10 cycles), while high inertia surfaces may require more cycles.
+
+## Depth-Dependent Properties
+
+Density varies with depth following an exponential profile:
+```
+ρ(z) = ρ_s + (ρ_d - ρ_s) · exp(-z/H)
+```
+Where:
+- `ρ_s` is surface density
+- `ρ_d` is deep density
+- `H` is the e-folding depth scale
+
+Thermal conductivity also varies with depth through the density dependence:
+```
+k_c(z) = k_c0 · (ρ(z) / ρ_s)
+```
 
 ## References
 
-- Hayne et al. (2017) - Grid optimization methodology
-- Spencer et al. (1989) - Thermal inertia formulation
+- Hayne et al. (2017) JGR Planets - Grid optimization methodology and lunar thermophysical properties
