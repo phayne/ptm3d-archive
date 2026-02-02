@@ -15,8 +15,13 @@ struct RadiationConfig {
 
     // View factor computation parameters
     double visibility_threshold = 1e-8;  // Min F_ij value to store (smaller = zero)
-    int max_neighbors = 2000;            // Max neighbors per face to consider (increased for craters)
+    int max_neighbors = 500;             // Hard ceiling: max neighbors per face (reduced from 2000 for better performance)
     double search_radius_factor = 10.0;  // Search radius in units of sqrt(face_area)
+
+    // Adaptive neighbor selection (per-face variable neighbor count)
+    bool adaptive_neighbors = true;      // Enable per-face adaptive selection based on captured energy
+    double captured_energy_target = 0.95; // Target fraction of radiative potential to capture (95%)
+    int min_neighbors = 20;              // Minimum neighbors per face (ensures basic coverage)
 
     // View factor method selection
     enum class ViewFactorMethod {
@@ -57,6 +62,9 @@ struct RadiationConfig {
     bool use_aca = true;                 // Use ACA by default (50-100x faster than SVD)
     double aca_tolerance = 1e-3;         // ACA relative tolerance for convergence
     int aca_max_rank = 50;               // Maximum rank before falling back to sparse
+
+    // Thread control for H-matrix building
+    int hmatrix_threads = 0;             // 0 = auto, >0 = manual thread limit
 
     // Output control
     bool output_view_factors = false;    // Write view factor matrix to file

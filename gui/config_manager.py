@@ -378,7 +378,7 @@ class ConfigManager:
             errors.append("Thermal threads cannot be negative (use 0 for auto)")
 
         if self.config["thermal"]["equilibration_orbits"] < 0:
-            errors.append("Equilibration orbits cannot be negative")
+            errors.append("Equilibration cycles cannot be negative")
 
         # Validate grid quality
         valid_grid_qualities = ["coarse", "standard", "fine", "auto"]

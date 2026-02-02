@@ -287,6 +287,11 @@ class PTM3DMainWindow(QMainWindow):
         save_btn.triggered.connect(self.save_project)
         toolbar.addAction(save_btn)
 
+        save_as_btn = QAction("Save As", self)
+        save_as_btn.setToolTip("Save Project As... (Ctrl+Shift+S)")
+        save_as_btn.triggered.connect(self.save_project_as)
+        toolbar.addAction(save_as_btn)
+
         toolbar.addSeparator()
 
         # Run/Stop
@@ -410,9 +415,18 @@ class PTM3DMainWindow(QMainWindow):
         if not self.check_unsaved_changes():
             return
 
+        # Default to examples/ directory, or current project's directory if one is open
+        if self.current_project_file:
+            start_dir = str(Path(self.current_project_file).parent)
+        else:
+            # Try examples/ directory relative to GUI location
+            gui_dir = Path(__file__).parent.parent
+            examples_dir = gui_dir / "examples"
+            start_dir = str(examples_dir) if examples_dir.exists() else str(gui_dir)
+
         filename, _ = QFileDialog.getOpenFileName(
             self, "Open Project",
-            str(Path.home()),
+            start_dir,
             "PTM3D Projects (*.ptm3d *.yaml *.yml);;All Files (*)"
         )
 
@@ -442,9 +456,17 @@ class PTM3DMainWindow(QMainWindow):
 
     def save_project_as(self):
         """Save project with new filename"""
+        # Default to examples/ directory, or current project's directory if one is open
+        if self.current_project_file:
+            start_dir = str(Path(self.current_project_file).parent)
+        else:
+            gui_dir = Path(__file__).parent.parent
+            examples_dir = gui_dir / "examples"
+            start_dir = str(examples_dir) if examples_dir.exists() else str(gui_dir)
+
         filename, _ = QFileDialog.getSaveFileName(
             self, "Save Project",
-            str(Path.home()),
+            start_dir,
             "PTM3D Projects (*.ptm3d);;YAML Files (*.yaml);;All Files (*)"
         )
 

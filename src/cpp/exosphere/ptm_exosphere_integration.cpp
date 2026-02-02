@@ -2,6 +2,7 @@
 #include "exosphere_physics.h"
 #include "sputtering_model.h"
 #include "ice_layer_model.h"
+#include "ice_crystallization_model.h"
 #include "multitimescale_evolution.h"
 #include "../mesh/mesh_utils.h"
 #include <iostream>
@@ -353,6 +354,33 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             exo_state.updateIceThickness();
         }
 
+        // Evolve ice crystallinity if crystallization model is enabled
+        if (crystallization_enabled_ && crystallization_model_ && ice_layer_state_) {
+            if (show_progress_) {
+                std::cerr << "\r[t=" << timestep_idx << "] evolving crystallinity...                 " << std::flush;
+            }
+
+            // Evolve crystallinity using current temperatures
+            crystallization_model_->evolveAllFaces(
+                dt_seconds, current_temps, ice_layer_state_->crystalline_fraction);
+
+            // Apply depositional amorphization: newly deposited ice is amorphous
+            for (size_t i = 0; i < mesh_->faces.size(); ++i) {
+                double deposited = exo_state.deposition_flux[i] * dt_seconds;
+                if (deposited > 0.0 && ice_layer_state_->ice_mass[i] > 0.0) {
+                    IceCrystallizationModel::applyDepositionalAmorphization(
+                        deposited, ice_layer_state_->ice_mass[i],
+                        ice_layer_state_->crystalline_fraction[i]);
+                }
+            }
+
+            // Accumulate radiation dose
+            for (size_t i = 0; i < mesh_->faces.size(); ++i) {
+                ice_layer_state_->cumulative_dose[i] +=
+                    ice_layer_state_->radiation_dose_rate[i] * dt_seconds;
+            }
+        }
+
         if (show_progress_) {
             std::cerr << "\r[t=" << timestep_idx << "] timestep complete.                      " << std::flush;
         }
@@ -678,6 +706,37 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             writeBinaryArray("cumulative_sublimated_kg_m2", ice_layer_state_->cumulative_sublimated);
             writeBinaryArray("cumulative_sputtered_kg_m2", ice_layer_state_->cumulative_sputtered);
             writeBinaryArray("cumulative_deposited_kg_m2", ice_layer_state_->cumulative_deposited);
+        }
+
+        // Write crystallization data if enabled
+        if (crystallization_enabled_ && crystallization_model_ && ice_layer_state_) {
+            writeBinaryArray("crystalline_fraction", ice_layer_state_->crystalline_fraction);
+            writeBinaryArray("porosity", ice_layer_state_->porosity);
+            writeBinaryArray("radiation_dose_rate_eV_mol_s", ice_layer_state_->radiation_dose_rate);
+            writeBinaryArray("cumulative_dose_eV_mol", ice_layer_state_->cumulative_dose);
+
+            // Compute and export crystallization timescale [years] for visualization
+            // Uses diurnal-averaged temperature if available, otherwise instantaneous
+            std::vector<double> cryst_timescale_yr(num_faces);
+            const double* temps = nullptr;
+            std::vector<double> temp_buf;
+            if (multiscale_export_mode_ && multiscale_evolution_) {
+                temps = multiscale_evolution_->getDiurnalAverages().avg_temperature.data();
+            } else if (!surface_temperatures_.empty() &&
+                       timestep_idx < static_cast<int>(surface_temperatures_[0].size())) {
+                temp_buf.resize(num_faces);
+                for (size_t f = 0; f < num_faces; ++f) {
+                    temp_buf[f] = surface_temperatures_[f][timestep_idx];
+                }
+                temps = temp_buf.data();
+            }
+            if (temps) {
+                for (size_t i = 0; i < num_faces; ++i) {
+                    cryst_timescale_yr[i] = crystallization_model_->crystallizationTimescale_yr(
+                        temps[i], i);
+                }
+            }
+            writeBinaryArray("crystallization_timescale_yr", cryst_timescale_yr);
         }
 
         // Export atmospheric mass summary
@@ -1015,6 +1074,56 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                   << (config.initial_nonice_concentration * 100.0) << "%" << std::endl;
     }
 
+    void PTMExosphereIntegration::enableCrystallizationModel(const CrystallizationConfig& config) {
+        if (num_faces_ == 0) {
+            std::cerr << "PTMExosphereIntegration::enableCrystallizationModel: no faces loaded yet!" << std::endl;
+            return;
+        }
+        if (!ice_layer_enabled_ || !ice_layer_state_) {
+            std::cerr << "PTMExosphereIntegration::enableCrystallizationModel: "
+                      << "ice layer model must be enabled first!" << std::endl;
+            return;
+        }
+
+        // Create crystallization model
+        crystallization_model_ = std::make_unique<IceCrystallizationModel>(num_faces_, config);
+
+        // Compute latitudes and longitudes from face centers
+        std::vector<double> latitudes(num_faces_);
+        std::vector<double> longitudes(num_faces_);
+
+        for (size_t i = 0; i < num_faces_; ++i) {
+            const auto& pos = face_centers_[i];
+            double r = std::sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2]);
+
+            if (r > 0) {
+                latitudes[i] = std::asin(pos[2] / r) * 180.0 / M_PI;
+                longitudes[i] = std::atan2(pos[1], pos[0]) * 180.0 / M_PI;
+                if (longitudes[i] < 0) longitudes[i] += 360.0;  // Convert to 0-360 east
+            }
+        }
+
+        // Initialize porosity and radiation dose rate distributions
+        crystallization_model_->initializePorosity(latitudes);
+        crystallization_model_->initializeRadiationDoseRate(latitudes, longitudes);
+
+        // Initialize crystalline fraction in ice layer state
+        crystallization_model_->initializeCrystallineFraction(ice_layer_state_->crystalline_fraction);
+
+        // Copy porosity and dose rate to ice layer state for export
+        const auto& porosity = crystallization_model_->getPorosity();
+        const auto& dose_rate = crystallization_model_->getRadiationDoseRate();
+        for (size_t i = 0; i < num_faces_; ++i) {
+            ice_layer_state_->porosity[i] = porosity[i];
+            ice_layer_state_->radiation_dose_rate[i] = dose_rate[i];
+        }
+
+        crystallization_enabled_ = true;
+        crystallization_model_->printConfig();
+
+        std::cout << "Ice crystallization model enabled." << std::endl;
+    }
+
     void PTMExosphereIntegration::disableIceLayerModel() {
         ice_layer_enabled_ = false;
         std::cout << "Ice layer model disabled (simple ice tracking)" << std::endl;
@@ -1311,6 +1420,32 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         multiscale_evolution_->evolveEpoch(*ice_layer_model_, *ice_layer_state_,
                                             face_areas_, epoch_duration);
 
+        // Evolve ice crystallinity over the epoch using diurnal-averaged temperature
+        // The analytical ODE solution handles the large epoch timestep gracefully
+        if (crystallization_enabled_ && crystallization_model_) {
+            const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
+
+            crystallization_model_->evolveAllFaces(
+                epoch_duration, diurnal_avg.avg_temperature,
+                ice_layer_state_->crystalline_fraction);
+
+            // Apply depositional amorphization from epoch-averaged deposition
+            for (size_t i = 0; i < num_faces_; ++i) {
+                double deposited = diurnal_avg.avg_deposition_flux[i] * epoch_duration;
+                if (deposited > 0.0 && ice_layer_state_->ice_mass[i] > 0.0) {
+                    IceCrystallizationModel::applyDepositionalAmorphization(
+                        deposited, ice_layer_state_->ice_mass[i],
+                        ice_layer_state_->crystalline_fraction[i]);
+                }
+            }
+
+            // Accumulate radiation dose over epoch
+            for (size_t i = 0; i < num_faces_; ++i) {
+                ice_layer_state_->cumulative_dose[i] +=
+                    ice_layer_state_->radiation_dose_rate[i] * epoch_duration;
+            }
+        }
+
         // Update ice mass for all faces based on updated concentrations
         for (size_t i = 0; i < num_faces_; ++i) {
             ice_layer_model_->updateIceMass(*ice_layer_state_, i);
@@ -1382,10 +1517,33 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  << std::fixed << std::setprecision(2) << (avg_conc * 100.0) << " %\n";
         }
 
+        // Crystallization state if enabled
+        if (crystallization_enabled_ && crystallization_model_ && ice_layer_state_) {
+            file << "\nCrystallization State:\n";
+            double sum_phi = 0.0, min_phi = 1.0, max_phi = 0.0;
+            size_t n_cryst = 0, n_amorph = 0;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                double phi = ice_layer_state_->crystalline_fraction[i];
+                sum_phi += phi;
+                min_phi = std::min(min_phi, phi);
+                max_phi = std::max(max_phi, phi);
+                if (phi > 0.9) n_cryst++;
+                if (phi < 0.1) n_amorph++;
+            }
+            file << "  Mean crystalline fraction: " << std::fixed << std::setprecision(2)
+                 << (sum_phi / num_faces_ * 100.0) << " %\n";
+            file << "  Range: " << (min_phi * 100.0) << " % - " << (max_phi * 100.0) << " %\n";
+            file << "  Mostly crystalline (>90%): " << n_cryst << " faces\n";
+            file << "  Mostly amorphous (<10%): " << n_amorph << " faces\n";
+        }
+
         file << "\n";
         file << "Units:\n";
         file << "  nonice_concentration: dimensionless [0-1], 0 = pure ice, 1 = no ice\n";
         file << "  ice_mass: kg/m² (ice mass per unit surface area)\n";
+        file << "  crystalline_fraction: dimensionless [0-1], 0 = amorphous, 1 = crystalline\n";
+        file << "  porosity: dimensionless [0-1], volume fraction of pore space\n";
+        file << "  radiation_dose_rate: eV/(molecule s)\n";
         file << "  Fluxes: kg/m²/s\n";
         file << "  Cumulative values: kg/m²\n";
 

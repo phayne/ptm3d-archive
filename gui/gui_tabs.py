@@ -551,7 +551,7 @@ class ThermalTab(BaseTab):
         equil_layout.setColumnStretch(1, 1)
 
         self.add_int_field(
-            equil_layout, 0, "Equilibration Orbits:", "thermal.equilibration_orbits",
+            equil_layout, 0, "Equilibration Cycles:", "thermal.equilibration_orbits",
             1, 100,
             "Number of day/night cycles for thermal equilibration\n"
             "(Default: 2 rotational periods)"
@@ -679,6 +679,307 @@ class ThermalTab(BaseTab):
         self.widgets["thermal.enable_shadow_flux"].setChecked(thermal["enable_shadow_flux"])
         self.widgets["thermal.crater_dd_ratio"].setValue(thermal["crater_dd_ratio"])
         self.widgets["thermal.thermal_inertia_map"].setText(thermal["thermal_inertia_map"])
+
+
+class ThermophysicalTab(BaseTab):
+    """Thermophysical properties configuration tab"""
+
+    # Signal emitted when body changes to update defaults
+    body_changed = pyqtSignal(str)
+
+    # Default properties by body (matches planetary_properties.h)
+    BODY_DEFAULTS = {
+        "Europa": {
+            "albedo": 0.5, "emissivity": 0.9, "Qb": 0.03,
+            "ks": 0.0096, "kd": 0.05, "rhos": 500.0, "rhod": 700.0,
+            "H": 0.07, "cp0": 0.0, "incidence_angle_albedo": False,
+        },
+        "Moon": {
+            "albedo": 0.12, "emissivity": 0.95, "Qb": 0.018,
+            "ks": 7.4e-4, "kd": 3.4e-3, "rhos": 1100.0, "rhod": 1800.0,
+            "H": 0.06, "cp0": -3.6125, "incidence_angle_albedo": True,
+        },
+        "Mercury": {
+            "albedo": 0.07, "emissivity": 0.93, "Qb": 0.02,
+            "ks": 0.002, "kd": 2.0, "rhos": 1800.0, "rhod": 2200.0,
+            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": True,
+        },
+        "Enceladus": {
+            "albedo": 0.81, "emissivity": 0.9, "Qb": 0.025,
+            "ks": 0.001, "kd": 0.01, "rhos": 500.0, "rhod": 700.0,
+            "H": 0.05, "cp0": 0.0, "incidence_angle_albedo": False,
+        },
+        "Titan": {
+            "albedo": 0.22, "emissivity": 0.9, "Qb": 0.005,
+            "ks": 0.02, "kd": 0.2, "rhos": 500.0, "rhod": 700.0,
+            "H": 0.1, "cp0": 0.0, "incidence_angle_albedo": False,
+        },
+        "Mars": {
+            "albedo": 0.25, "emissivity": 0.95, "Qb": 0.02,
+            "ks": 0.02, "kd": 2.0, "rhos": 1500.0, "rhod": 2000.0,
+            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": False,
+        },
+        "Ceres": {
+            "albedo": 0.09, "emissivity": 0.95, "Qb": 0.01,
+            "ks": 0.001, "kd": 0.01, "rhos": 1200.0, "rhod": 1500.0,
+            "H": 0.05, "cp0": 800.0, "incidence_angle_albedo": False,
+        },
+    }
+
+    def init_ui(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignTop)
+        layout.setSpacing(15)
+
+        # Current body label
+        body_info = QLabel("Properties shown are defaults for the selected body.")
+        body_info.setStyleSheet("color: #88ccff; font-size: 10px; padding: 5px;")
+        layout.addWidget(body_info)
+
+        # ===== SURFACE PROPERTIES =====
+        surface_group = QGroupBox("SURFACE PROPERTIES")
+        surface_layout = QGridLayout()
+        surface_layout.setColumnStretch(1, 1)
+        surface_layout.setHorizontalSpacing(15)
+        surface_layout.setVerticalSpacing(8)
+
+        # Albedo with default checkbox
+        self.add_property_with_default(
+            surface_layout, 0, "Bond Albedo:", "thermophysical.albedo",
+            "thermophysical.use_default_albedo", 0.0, 1.0, 3,
+            "Fraction of incident solar radiation reflected (0-1)"
+        )
+
+        # Emissivity with default checkbox
+        self.add_property_with_default(
+            surface_layout, 1, "Emissivity:", "thermophysical.emissivity",
+            "thermophysical.use_default_emissivity", 0.0, 1.0, 3,
+            "Thermal emissivity for IR radiation (0-1)"
+        )
+
+        # Incidence-angle dependent albedo checkbox
+        self.add_bool_field(
+            surface_layout, 2, "Incidence-Angle Dependent Albedo",
+            "thermophysical.incidence_angle_albedo",
+            "Albedo increases at grazing angles (Hayne et al. 2017)"
+        )
+
+        surface_group.setLayout(surface_layout)
+        layout.addWidget(surface_group)
+
+        # ===== THERMAL CONDUCTIVITY =====
+        cond_group = QGroupBox("THERMAL CONDUCTIVITY")
+        cond_layout = QGridLayout()
+        cond_layout.setColumnStretch(1, 1)
+        cond_layout.setHorizontalSpacing(15)
+        cond_layout.setVerticalSpacing(8)
+
+        self.add_property_with_default(
+            cond_layout, 0, "Surface ks (W/m/K):", "thermophysical.ks",
+            "thermophysical.use_default_ks", 1e-6, 10.0, 6,
+            "Surface thermal conductivity"
+        )
+
+        self.add_property_with_default(
+            cond_layout, 1, "Deep kd (W/m/K):", "thermophysical.kd",
+            "thermophysical.use_default_kd", 1e-6, 100.0, 6,
+            "Deep thermal conductivity (at depth >> H)"
+        )
+
+        self.add_property_with_default(
+            cond_layout, 2, "Scale Height H (m):", "thermophysical.H",
+            "thermophysical.use_default_H", 0.001, 1.0, 4,
+            "e-folding depth for exponential property variation"
+        )
+
+        cond_group.setLayout(cond_layout)
+        layout.addWidget(cond_group)
+
+        # ===== DENSITY =====
+        density_group = QGroupBox("DENSITY")
+        density_layout = QGridLayout()
+        density_layout.setColumnStretch(1, 1)
+        density_layout.setHorizontalSpacing(15)
+        density_layout.setVerticalSpacing(8)
+
+        self.add_property_with_default(
+            density_layout, 0, "Surface rhos (kg/m³):", "thermophysical.rhos",
+            "thermophysical.use_default_rhos", 100.0, 5000.0, 1,
+            "Surface bulk density"
+        )
+
+        self.add_property_with_default(
+            density_layout, 1, "Deep rhod (kg/m³):", "thermophysical.rhod",
+            "thermophysical.use_default_rhod", 100.0, 5000.0, 1,
+            "Deep bulk density (at depth >> H)"
+        )
+
+        density_group.setLayout(density_layout)
+        layout.addWidget(density_group)
+
+        # ===== HEAT CAPACITY =====
+        cp_group = QGroupBox("HEAT CAPACITY")
+        cp_layout = QGridLayout()
+        cp_layout.setColumnStretch(1, 1)
+        cp_layout.setHorizontalSpacing(15)
+        cp_layout.setVerticalSpacing(8)
+
+        self.add_property_with_default(
+            cp_layout, 0, "Reference cp0 (J/kg/K):", "thermophysical.cp0",
+            "thermophysical.use_default_cp0", -100.0, 2000.0, 4,
+            "Base heat capacity (may be T-dependent)"
+        )
+
+        cp_group.setLayout(cp_layout)
+        layout.addWidget(cp_group)
+
+        # ===== INTERNAL HEAT =====
+        heat_group = QGroupBox("INTERNAL HEAT")
+        heat_layout = QGridLayout()
+        heat_layout.setColumnStretch(1, 1)
+        heat_layout.setHorizontalSpacing(15)
+        heat_layout.setVerticalSpacing(8)
+
+        self.add_property_with_default(
+            heat_layout, 0, "Heat Flow Qb (W/m²):", "thermophysical.Qb",
+            "thermophysical.use_default_Qb", 0.0, 1.0, 4,
+            "Geothermal/internal heat flux at bottom boundary"
+        )
+
+        heat_group.setLayout(heat_layout)
+        layout.addWidget(heat_group)
+
+        # Info label
+        info = QLabel(
+            "ℹ Thermophysical properties control surface and subsurface heat transfer.\n"
+            "Check 'Use Default' to apply body-specific values from literature.\n"
+            "Uncheck to specify custom values for specialized modeling."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #88ccff; padding: 10px; font-size: 10px;")
+        layout.addWidget(info)
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+
+    def add_property_with_default(self, layout, row, label_text, value_key, default_key,
+                                   min_val, max_val, decimals, tooltip=""):
+        """Add a property field with a 'Use Default' checkbox"""
+        # Label
+        label = QLabel(label_text)
+        label.setToolTip(tooltip)
+        layout.addWidget(label, row, 0)
+
+        # Value spinbox
+        value_widget = QDoubleSpinBox()
+        value_widget.setRange(min_val, max_val)
+        value_widget.setDecimals(decimals)
+        value_widget.setToolTip(tooltip)
+        value_widget.valueChanged.connect(
+            lambda v: self.on_widget_changed(value_key, v)
+        )
+        layout.addWidget(value_widget, row, 1)
+
+        # Use default checkbox
+        default_check = QCheckBox("Use Default")
+        default_check.setToolTip("Use body-specific default value")
+        default_check.stateChanged.connect(
+            lambda state: self.on_default_toggled(value_key, default_key, state)
+        )
+        layout.addWidget(default_check, row, 2)
+
+        self.widgets[value_key] = value_widget
+        self.widgets[default_key] = default_check
+
+    def on_default_toggled(self, value_key, default_key, state):
+        """Handle use default checkbox toggle"""
+        use_default = (state == Qt.Checked)
+        self.config_manager.set_value(default_key, use_default)
+
+        # Disable/enable the value widget based on checkbox
+        self.widgets[value_key].setEnabled(not use_default)
+
+        # If using default, update to show default value
+        if use_default:
+            self.update_to_body_defaults()
+
+        self.value_changed.emit()
+
+    def on_body_changed(self, body_name):
+        """Update displayed defaults when body selection changes"""
+        self.update_to_body_defaults(body_name)
+
+    def update_to_body_defaults(self, body_name=None):
+        """Update all fields to show body defaults"""
+        if body_name is None:
+            config = self.config_manager.get_config()
+            body_name = config.get("simulation", {}).get("body", "Europa")
+
+        defaults = self.BODY_DEFAULTS.get(body_name, self.BODY_DEFAULTS["Europa"])
+
+        # Property mapping: (value_key, default_key, default_attr)
+        properties = [
+            ("thermophysical.albedo", "thermophysical.use_default_albedo", "albedo"),
+            ("thermophysical.emissivity", "thermophysical.use_default_emissivity", "emissivity"),
+            ("thermophysical.ks", "thermophysical.use_default_ks", "ks"),
+            ("thermophysical.kd", "thermophysical.use_default_kd", "kd"),
+            ("thermophysical.H", "thermophysical.use_default_H", "H"),
+            ("thermophysical.rhos", "thermophysical.use_default_rhos", "rhos"),
+            ("thermophysical.rhod", "thermophysical.use_default_rhod", "rhod"),
+            ("thermophysical.cp0", "thermophysical.use_default_cp0", "cp0"),
+            ("thermophysical.Qb", "thermophysical.use_default_Qb", "Qb"),
+        ]
+
+        for value_key, default_key, attr in properties:
+            if value_key in self.widgets and default_key in self.widgets:
+                use_default = self.widgets[default_key].isChecked()
+                if use_default:
+                    # Block signals to avoid triggering config updates
+                    self.widgets[value_key].blockSignals(True)
+                    self.widgets[value_key].setValue(defaults[attr])
+                    self.widgets[value_key].blockSignals(False)
+
+        # Update incidence angle albedo checkbox
+        if "thermophysical.incidence_angle_albedo" in self.widgets:
+            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
+                defaults.get("incidence_angle_albedo", False)
+            )
+
+    def load_from_config(self):
+        """Load values from configuration"""
+        config = self.config_manager.get_config()
+        thermo = config.get("thermophysical", {})
+
+        # Property mapping
+        properties = [
+            ("thermophysical.albedo", "thermophysical.use_default_albedo", "albedo", "use_default_albedo"),
+            ("thermophysical.emissivity", "thermophysical.use_default_emissivity", "emissivity", "use_default_emissivity"),
+            ("thermophysical.ks", "thermophysical.use_default_ks", "ks", "use_default_ks"),
+            ("thermophysical.kd", "thermophysical.use_default_kd", "kd", "use_default_kd"),
+            ("thermophysical.H", "thermophysical.use_default_H", "H", "use_default_H"),
+            ("thermophysical.rhos", "thermophysical.use_default_rhos", "rhos", "use_default_rhos"),
+            ("thermophysical.rhod", "thermophysical.use_default_rhod", "rhod", "use_default_rhod"),
+            ("thermophysical.cp0", "thermophysical.use_default_cp0", "cp0", "use_default_cp0"),
+            ("thermophysical.Qb", "thermophysical.use_default_Qb", "Qb", "use_default_Qb"),
+        ]
+
+        for value_key, default_key, value_attr, default_attr in properties:
+            if value_key in self.widgets:
+                self.widgets[value_key].setValue(thermo.get(value_attr, 0.0))
+            if default_key in self.widgets:
+                use_default = thermo.get(default_attr, True)
+                self.widgets[default_key].setChecked(use_default)
+                self.widgets[value_key].setEnabled(not use_default)
+
+        # Incidence angle albedo
+        if "thermophysical.incidence_angle_albedo" in self.widgets:
+            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
+                thermo.get("incidence_angle_albedo", True)
+            )
+
+        # Update displayed defaults based on current body
+        self.update_to_body_defaults()
 
 
 class IlluminationTab(BaseTab):

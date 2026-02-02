@@ -1,71 +1,71 @@
-# PTM3D High-Resolution Europa Simulation Configuration
-# Example: One Europa day with thermal analysis and visualization
-
-# ========== Simulation Parameters ==========
 simulation:
-  start_time: "2025-01-01T00:00:00"
-  duration_days: 3.55          # One Europa day
-  timesteps: 144                # High temporal resolution
-  body: "Europa"
-
-# ========== Mesh Configuration ==========
+  start_time: '2025-01-01T00:00:00'
+  duration_days: 3.55
+  timesteps: 144
+  body: Europa
 mesh:
-  resolution: 5                 # Higher resolution global mesh
+  resolution: 7
   use_topographic: false
-  topo_directory: ""
-  import_file: ""               # Leave empty for auto-generated mesh
+  topo_directory: ''
+  import_file: ''
   scale_factor: 1.0
   export_basic: false
-
-# ========== Thermal Model ==========
 thermal:
-  run_thermal_mesh: true        # Enable thermal calculations
-  threads: 0                    # Auto-detect optimal thread count
-  equilibration_orbits: 20      # More equilibration for accuracy
-  compute_statistics: true      # Calculate min/max/mean temperatures
-  thermal_inertia_map: ""       # Use default thermal properties
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 5
+  use_gpu: true
+  compute_statistics: true
+  thermal_inertia_map: ''
   enable_shadow_flux: false
   crater_dd_ratio: 8.0
-  integration_days: 3.55        # Integrate over full output window
-  integration_steps: -1         # Auto-calculate
+  integration_days: 3.55
+  integration_steps: -1
   integration_offset_days: 0.0
   integration_offset_steps: 0
-
-# ========== Illumination ==========
+radiation:
+  enabled: false
+  min_shadow_fraction: 0.3
+  verbose: false
+  use_gpu: true
+  view_factor_file: ''
+  max_coupling_iterations: 10
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+  use_hmatrix: false
+  use_aca: true
+  aca_tolerance: 0.001
+  aca_max_rank: 50
 illumination:
-  include_primary_reflection: true   # Include Jupiter's reflected light
-  use_batch_processing: true         # Enable SIMD optimizations
-  albedo_map: ""
-  albedo_maps_directory: "data/albedo_maps"
-  positions_file: ""
-
-# ========== Output Configuration ==========
+  include_primary_reflection: true
+  use_batch_processing: true
+  albedo_map: ''
+  albedo_maps_directory: ''
+  positions_file: ''
 output:
-  directory: "output/europa_high_res"
-  format: "binary"              # Binary format for performance
-  vtk_mode: "both"              # Generate both thermal and complete VTK files
-  include_primary_ir: false     # Omit for smaller file sizes
-  thermal_vtk_file: ""          # Use default naming
-  complete_vtk_file: ""
+  directory: output/europa_high_res
+  format: binary
+  vtk_mode: both
+  include_primary_ir: false
+  thermal_vtk_file: ''
+  complete_vtk_file: ''
   no_maps: false
-  locations_file: ""
-  series_output: ""
-  location_data: ""
-
-# ========== Visualization ==========
+  locations_file: ''
+  depths_file: ''
+  series_output: ''
+  location_data: ''
 visualization:
-  create: true                  # Generate visualization
-  width: 1920                   # HD resolution
+  create: true
+  width: 1920
   height: 1080
   fps: 30
   camera_distance: 5.0
-  camera_latitude: 30.0         # View from 30° north
-  camera_longitude: 0.0         # Sub-Jupiter point
+  camera_latitude: 30.0
+  camera_longitude: 0.0
   emission_angle: -1.0
   azimuth: -1.0
   save_frames: false
-
-# ========== Advanced Options ==========
 advanced:
-  verbose: true                 # Enable detailed output
-  default_visible_albedo: -1.0  # Use planet default
+  verbose: true
+  default_visible_albedo: -1.0

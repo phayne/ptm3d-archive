@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QSplitter,
     QLabel, QSlider, QPushButton, QComboBox, QGroupBox, QGridLayout,
     QSpinBox, QDoubleSpinBox, QCheckBox, QFrame, QLineEdit, QFileDialog,
-    QMessageBox
+    QMessageBox, QDialog, QDialogButtonBox, QProgressDialog,
+    QRadioButton, QButtonGroup, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
@@ -53,6 +54,7 @@ class PyVistaWidget(QWidget):
         self.results_dir = None
         self.timesteps = []
         self.mesh_data = None
+        self.detected_hemisphere = 'global'  # 'north', 'south', or 'global'
 
         # Hover highlighting state
         self.hover_face_id = None
@@ -175,6 +177,9 @@ class PyVistaWidget(QWidget):
         # Reset color range when loading new results
         self.global_data_range = None
 
+        # Reset camera tracking so first load gets default view centered on mesh
+        self._has_loaded_data = False
+
         # Load mesh
         mesh_file = self.results_dir / "mesh.ply"
         if mesh_file.exists():
@@ -222,10 +227,83 @@ class PyVistaWidget(QWidget):
                 'longitudes': longitudes
             }
 
+            # Detect hemisphere for camera orientation
+            self.detected_hemisphere = self.detect_hemisphere(latitudes)
+
             self.update_display()
 
         except Exception as e:
             print(f"Error loading mesh: {e}")
+
+    def detect_hemisphere(self, latitudes):
+        """Detect which hemisphere the mesh is predominantly in.
+
+        Args:
+            latitudes: Array of face latitudes in degrees
+
+        Returns:
+            str: 'north', 'south', or 'global' (spans both hemispheres significantly)
+        """
+        if latitudes is None or len(latitudes) == 0:
+            return 'global'
+
+        mean_lat = np.mean(latitudes)
+        min_lat = np.min(latitudes)
+        max_lat = np.max(latitudes)
+        lat_range = max_lat - min_lat
+
+        # If mesh spans more than 60 degrees of latitude, consider it global
+        if lat_range > 60:
+            # But still bias toward the hemisphere with more coverage
+            if mean_lat < -15:
+                return 'south'
+            elif mean_lat > 15:
+                return 'north'
+            return 'global'
+
+        # For regional meshes, use mean latitude
+        if mean_lat < -5:
+            return 'south'
+        elif mean_lat > 5:
+            return 'north'
+        else:
+            return 'global'
+
+    def set_hemisphere_camera(self):
+        """Set camera orientation based on detected hemisphere.
+
+        For southern hemisphere meshes, orients the view so that south pole
+        is "up" (looking from below the mesh with inverted z-axis).
+        """
+        if not PYVISTA_AVAILABLE or not self.plotter or not self.mesh:
+            return
+
+        hemisphere = getattr(self, 'detected_hemisphere', 'global')
+
+        # Get mesh center and bounds for camera positioning
+        bounds = self.mesh.bounds
+        center = self.mesh.center
+        x_range = bounds[1] - bounds[0]
+        y_range = bounds[3] - bounds[2]
+        z_range = bounds[5] - bounds[4]
+        max_dim = max(x_range, y_range, z_range)
+
+        if hemisphere == 'south':
+            # View from below: camera at negative z, looking up, with -z as "up"
+            camera_pos = (center[0], center[1], center[2] - max_dim * 2)
+            focal_point = center
+            view_up = (0, 1, 0)  # Y-up when looking from below
+            self.plotter.camera_position = [camera_pos, focal_point, view_up]
+        elif hemisphere == 'north':
+            # Standard view from above: camera at positive z, looking down
+            camera_pos = (center[0], center[1], center[2] + max_dim * 2)
+            focal_point = center
+            view_up = (0, 1, 0)  # Y-up
+            self.plotter.camera_position = [camera_pos, focal_point, view_up]
+        else:
+            # Global mesh - use default isometric view
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
 
     def read_binary_mesh(self, mesh_file):
         """Read binary PLY mesh file"""
@@ -402,7 +480,14 @@ class PyVistaWidget(QWidget):
         if not PYVISTA_AVAILABLE or not self.mesh:
             return
 
+        # Save camera position before clearing to preserve user's view
+        camera_position = self.plotter.camera_position
+
         self.plotter.clear()
+
+        # Flag to check if we should restore camera (not on first load)
+        # Use getattr to check the actual value, not just existence
+        restore_camera = camera_position is not None and getattr(self, '_has_loaded_data', False)
 
         # Determine scalar field and colormap
         scalar_field = self.current_field
@@ -477,6 +562,15 @@ class PyVistaWidget(QWidget):
                 [self.sun_position], ['Sun'],
                 point_size=20, font_size=12, text_color='yellow'
             )
+
+        # Restore camera position if this isn't the first load
+        if restore_camera:
+            self.plotter.camera_position = camera_position
+        else:
+            # First load - set camera based on detected hemisphere
+            self.set_hemisphere_camera()
+            # Mark that we've loaded data, so future updates preserve camera
+            self._has_loaded_data = True
 
     def toggle_face_selection(self, checked):
         """Toggle face selection mode on/off"""
@@ -803,6 +897,111 @@ class PyVistaWidget(QWidget):
         if PYVISTA_AVAILABLE and self.plotter:
             self.plotter.screenshot(filename)
 
+    def export_animation(self, filename, format_type="gif", fps=5, progress_callback=None):
+        """Export animation of all timesteps.
+
+        Args:
+            filename: Output file path
+            format_type: "gif" or "mp4"
+            fps: Frames per second
+            progress_callback: Optional callback(current, total) for progress updates
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not PYVISTA_AVAILABLE or not self.mesh or not self.results_dir:
+            return False
+
+        n_timesteps = len(self.timesteps)
+        if n_timesteps == 0:
+            return False
+
+        try:
+            # Store current timestep to restore later
+            original_timestep = self.current_timestep
+
+            # Store camera position to maintain consistent view
+            camera_position = self.plotter.camera_position
+
+            if format_type.lower() == "gif":
+                # Use PyVista's GIF export
+                self.plotter.open_gif(filename)
+            else:
+                # Use PyVista's movie export (requires ffmpeg)
+                self.plotter.open_movie(filename, framerate=fps)
+
+            # Iterate through all timesteps
+            for i in range(n_timesteps):
+                # Load and display timestep
+                self.load_timestep_data(i)
+
+                # Restore camera position to ensure consistent framing
+                self.plotter.camera_position = camera_position
+
+                # Ensure complete render before capturing frame
+                self.plotter.render()
+
+                # Write frame
+                self.plotter.write_frame()
+
+                # Report progress
+                if progress_callback:
+                    progress_callback(i + 1, n_timesteps)
+
+            # Mute the plotter before closing to prevent any additional frame capture
+            # by ensuring render state is stable
+            self.plotter.render()
+
+            # Close the animation file
+            self.plotter.mwriter.close()  # Close writer directly to avoid extra frame
+
+            # Reinitialize plotter after close
+            self._reinit_plotter()
+
+            # Restore original timestep
+            self.load_timestep_data(original_timestep)
+
+            return True
+
+        except Exception as e:
+            print(f"Animation export error: {e}")
+            # Try to recover
+            try:
+                # Try to close writer if it exists
+                if hasattr(self.plotter, 'mwriter') and self.plotter.mwriter:
+                    try:
+                        self.plotter.mwriter.close()
+                    except Exception:
+                        pass
+                self._reinit_plotter()
+                self.load_timestep_data(original_timestep if 'original_timestep' in dir() else 0)
+            except Exception:
+                pass
+            return False
+
+    def _reinit_plotter(self):
+        """Reinitialize the plotter after closing for animation export."""
+        if not PYVISTA_AVAILABLE:
+            return
+
+        # Get the layout
+        layout = self.layout()
+
+        # Remove old plotter widget
+        if hasattr(self, 'plotter') and self.plotter:
+            try:
+                layout.removeWidget(self.plotter.interactor)
+            except Exception:
+                pass
+
+        # Create new plotter
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background('#1e1e1e')
+        self.plotter.add_axes()
+
+        # Add back to layout (index 1, after controls)
+        layout.insertWidget(1, self.plotter.interactor, 1)
+
     def find_face_by_latlon(self, lat, lon):
         """Find the nearest face to given lat/lon coordinates"""
         if self.mesh_data is None:
@@ -942,6 +1141,12 @@ class PlotWidget(QWidget):
         self.current_plot_data = {}  # Store data for export
         self.current_timestep = 0  # Track current timestep for distribution plots
 
+        # Time axis settings
+        self.use_time_axis = False  # False = timestep index, True = actual time
+        self.time_unit = "s"  # Current time unit: s, min, hr, d
+        self.time_unit_label = "Time (s)"  # Label for x-axis
+        self.time_scale = 1.0  # Multiplier to convert timestep values to display unit
+
         self.init_ui()
 
     def init_ui(self):
@@ -1010,6 +1215,15 @@ class PlotWidget(QWidget):
         self.plot_type_combo.currentTextChanged.connect(self.on_plot_type_changed)
         plot_control_layout.addWidget(self.plot_type_combo)
 
+        # Time axis toggle
+        plot_control_layout.addWidget(QLabel("  X-Axis:"))
+        self.time_axis_btn = QPushButton("Timestep")
+        self.time_axis_btn.setCheckable(True)
+        self.time_axis_btn.setMaximumWidth(100)
+        self.time_axis_btn.setToolTip("Toggle between timestep index and actual time units")
+        self.time_axis_btn.clicked.connect(self.toggle_time_axis)
+        plot_control_layout.addWidget(self.time_axis_btn)
+
         plot_control_layout.addStretch()
 
         # Export buttons
@@ -1075,6 +1289,15 @@ class PlotWidget(QWidget):
                     if len(parts) >= 2:
                         self.timesteps.append(float(parts[0]))
                         self.timestep_labels.append(parts[1])
+
+        # Calculate appropriate time unit for this dataset
+        self.calculate_time_unit()
+
+        # Reset time axis mode and update button
+        self.use_time_axis = False
+        if hasattr(self, 'time_axis_btn'):
+            self.time_axis_btn.setText("Timestep")
+            self.time_axis_btn.setChecked(False)
 
         # Reset selection
         self.current_face = None
@@ -1148,6 +1371,88 @@ class PlotWidget(QWidget):
         """Handle plot type change"""
         self.update_plot()
 
+    def toggle_time_axis(self):
+        """Toggle between timestep index and actual time units"""
+        self.use_time_axis = not self.use_time_axis
+
+        if self.use_time_axis:
+            # Calculate and set appropriate time unit
+            self.calculate_time_unit()
+            self.time_axis_btn.setText(self.time_unit_label.replace("Time ", "").strip("()"))
+            self.time_axis_btn.setChecked(True)
+        else:
+            self.time_axis_btn.setText("Timestep")
+            self.time_axis_btn.setChecked(False)
+
+        # Refresh the current plot
+        self.update_plot()
+
+    def calculate_time_unit(self):
+        """Calculate the best time unit based on timestep interval.
+
+        Automatically selects seconds, minutes, hours, or days based on
+        the typical interval between timesteps.
+        """
+        if len(self.timesteps) < 2:
+            # Default to seconds if we can't calculate
+            self.time_unit = "s"
+            self.time_unit_label = "Time (s)"
+            self.time_scale = 1.0
+            return
+
+        # Calculate average timestep interval (timesteps are in seconds)
+        intervals = []
+        for i in range(1, len(self.timesteps)):
+            intervals.append(self.timesteps[i] - self.timesteps[i - 1])
+        avg_interval = sum(intervals) / len(intervals)
+
+        # Total duration
+        total_duration = self.timesteps[-1] - self.timesteps[0]
+
+        # Choose unit based on total duration and interval
+        # Goal: have x-axis values in a reasonable range (not too many digits)
+        if total_duration < 120:  # Less than 2 minutes
+            self.time_unit = "s"
+            self.time_unit_label = "Time (s)"
+            self.time_scale = 1.0
+        elif total_duration < 7200:  # Less than 2 hours
+            self.time_unit = "min"
+            self.time_unit_label = "Time (min)"
+            self.time_scale = 1.0 / 60.0
+        elif total_duration < 172800:  # Less than 2 days
+            self.time_unit = "hr"
+            self.time_unit_label = "Time (hr)"
+            self.time_scale = 1.0 / 3600.0
+        else:  # 2 days or more
+            self.time_unit = "d"
+            self.time_unit_label = "Time (days)"
+            self.time_scale = 1.0 / 86400.0
+
+    def get_time_axis_values(self, n_points=None):
+        """Get x-axis values based on current time axis mode.
+
+        Args:
+            n_points: Number of data points (defaults to len(self.timesteps))
+
+        Returns:
+            tuple: (x_values, x_label) where x_values is a list/array and x_label is the axis label
+        """
+        if n_points is None:
+            n_points = len(self.timesteps)
+
+        if self.use_time_axis and len(self.timesteps) >= n_points:
+            # Use actual time values, scaled to current unit
+            # Subtract first timestep to start from 0
+            t0 = self.timesteps[0] if self.timesteps else 0
+            x_values = [(self.timesteps[i] - t0) * self.time_scale for i in range(n_points)]
+            x_label = self.time_unit_label
+        else:
+            # Use timestep index
+            x_values = list(range(n_points))
+            x_label = "Timestep"
+
+        return x_values, x_label
+
     def set_timestep(self, timestep):
         """Set current timestep and update relevant plots"""
         self.current_timestep = timestep
@@ -1199,28 +1504,34 @@ class PlotWidget(QWidget):
         # Load temperature data for this face
         files = sorted(temp_dir.glob("temperature_*.bin"))
         temps = []
-        times = []
 
         for i, f in enumerate(files):
             data = self.read_binary_data(f)
             if data is not None and self.current_face < len(data):
                 temps.append(data[self.current_face])
-                times.append(i)
+
+        # Get x-axis label (even if no data, for consistent labeling)
+        _, x_label = self.get_time_axis_values(len(files) if files else 1)
 
         if temps:
-            ax.plot(times, temps, color='#ff5722', linewidth=2, marker='o',
-                    markersize=3, label='Temperature')
-            ax.fill_between(times, min(temps), temps, alpha=0.3, color='#ff5722')
+            # Get x-axis values based on time axis mode
+            x_values, x_label = self.get_time_axis_values(len(temps))
 
-            # Store for export
+            ax.plot(x_values, temps, color='#ff5722', linewidth=2, marker='o',
+                    markersize=3, label='Temperature')
+            ax.fill_between(x_values, min(temps), temps, alpha=0.3, color='#ff5722')
+
+            # Store for export (always include both timestep and time info)
             self.current_plot_data = {
                 'title': f'Temperature Time Series - Face {self.current_face}',
-                'columns': ['Timestep', 'Time_Label', 'Temperature_K'],
+                'columns': ['Timestep', 'Time_Label', f'Time_{self.time_unit}', 'Temperature_K'],
                 'data': []
             }
-            for i, t in enumerate(temps):
+            t0 = self.timesteps[0] if self.timesteps else 0
+            for i, temp in enumerate(temps):
                 label = self.timestep_labels[i] if i < len(self.timestep_labels) else ""
-                self.current_plot_data['data'].append([i, label, t])
+                time_val = (self.timesteps[i] - t0) * self.time_scale if i < len(self.timesteps) else i
+                self.current_plot_data['data'].append([i, label, time_val, temp])
 
             # Add statistics
             ax.axhline(np.mean(temps), color='#4caf50', linestyle='--',
@@ -1237,7 +1548,7 @@ class PlotWidget(QWidget):
         if self.current_face_lat is not None:
             title += f" ({self.current_face_lat:.2f}°, {self.current_face_lon:.2f}°)"
         ax.set_title(title)
-        ax.set_xlabel('Timestep')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Temperature (K)')
         ax.grid(True, alpha=0.3, color='#404040')
 
@@ -1271,6 +1582,9 @@ class PlotWidget(QWidget):
             'data': []
         }
 
+        # Get x-axis label once for all subplots
+        _, x_label = self.get_time_axis_values()
+
         for ax_idx, (field, label, color) in enumerate(fields):
             ax = axes[ax_idx // 2, ax_idx % 2]
             self.style_axis(ax)
@@ -1285,11 +1599,13 @@ class PlotWidget(QWidget):
                         values.append(data[self.current_face])
 
                 if values:
-                    ax.plot(range(len(values)), values, color=color, linewidth=1.5)
-                    ax.fill_between(range(len(values)), 0, values, alpha=0.3, color=color)
+                    # Get x-axis values based on time axis mode
+                    x_values, _ = self.get_time_axis_values(len(values))
+                    ax.plot(x_values, values, color=color, linewidth=1.5)
+                    ax.fill_between(x_values, 0, values, alpha=0.3, color=color)
 
             ax.set_title(label, fontsize=10)
-            ax.set_xlabel('Timestep', fontsize=9)
+            ax.set_xlabel(x_label, fontsize=9)
             ax.grid(True, alpha=0.3, color='#404040')
 
         self.figure.suptitle(f'Face {self.current_face} ({self.current_face_lat:.2f}°, {self.current_face_lon:.2f}°)',
@@ -1412,6 +1728,8 @@ class PlotWidget(QWidget):
         ax = self.figure.add_subplot(111)
         self.style_axis(ax)
 
+        x_label = "Timestep"  # Default
+
         temp_dir = self.results_dir / "temperature"
         if temp_dir.exists():
             files = sorted(temp_dir.glob("temperature_*.bin"))
@@ -1425,27 +1743,31 @@ class PlotWidget(QWidget):
                     means.append(np.mean(data))
 
             if mins:
-                timesteps = range(len(mins))
-                ax.fill_between(timesteps, mins, maxs, alpha=0.3, color='#ff5722',
-                                label='Min-Max Range')
-                ax.plot(timesteps, means, color='#ff5722', linewidth=2, label='Mean')
-                ax.plot(timesteps, mins, color='#2196f3', linewidth=1, linestyle='--', label='Min')
-                ax.plot(timesteps, maxs, color='#f44336', linewidth=1, linestyle='--', label='Max')
+                # Get x-axis values based on time axis mode
+                x_values, x_label = self.get_time_axis_values(len(mins))
 
-                # Store for export
+                ax.fill_between(x_values, mins, maxs, alpha=0.3, color='#ff5722',
+                                label='Min-Max Range')
+                ax.plot(x_values, means, color='#ff5722', linewidth=2, label='Mean')
+                ax.plot(x_values, mins, color='#2196f3', linewidth=1, linestyle='--', label='Min')
+                ax.plot(x_values, maxs, color='#f44336', linewidth=1, linestyle='--', label='Max')
+
+                # Store for export (include both timestep and time)
                 self.current_plot_data = {
                     'title': 'Global Temperature Statistics',
-                    'columns': ['Timestep', 'Min_K', 'Max_K', 'Mean_K'],
+                    'columns': ['Timestep', f'Time_{self.time_unit}', 'Min_K', 'Max_K', 'Mean_K'],
                     'data': []
                 }
+                t0 = self.timesteps[0] if self.timesteps else 0
                 for i in range(len(mins)):
-                    self.current_plot_data['data'].append([i, mins[i], maxs[i], means[i]])
+                    time_val = (self.timesteps[i] - t0) * self.time_scale if i < len(self.timesteps) else i
+                    self.current_plot_data['data'].append([i, time_val, mins[i], maxs[i], means[i]])
 
                 ax.legend(loc='upper right', facecolor='#252526', edgecolor='#404040',
                           labelcolor='white')
 
         ax.set_title('Global Temperature Statistics')
-        ax.set_xlabel('Timestep')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Temperature (K)')
         ax.grid(True, alpha=0.3, color='#404040')
 
@@ -1537,6 +1859,424 @@ class PlotWidget(QWidget):
         self.update_plot()
 
 
+class ExportDataDialog(QDialog):
+    """Dialog for configuring and executing data export in GeoTIFF/HDF5 formats."""
+
+    def __init__(self, results_dir, mesh_data, timesteps, parent=None):
+        super().__init__(parent)
+        self.results_dir = Path(results_dir)
+        self.mesh_data = mesh_data
+        self.timesteps = timesteps
+        self.export_worker = None
+
+        # Import availability and detection functions
+        from gui_core.data_exporter import (
+            SCIPY_AVAILABLE, RASTERIO_AVAILABLE, H5PY_AVAILABLE,
+            GridResolutionEstimator, FIELD_INFO, BODY_RADII,
+            detect_body_from_mesh, choose_projection, POLAR_LAT_THRESHOLD
+        )
+        self.scipy_available = SCIPY_AVAILABLE
+        self.rasterio_available = RASTERIO_AVAILABLE
+        self.h5py_available = H5PY_AVAILABLE
+        self.body_radii = BODY_RADII
+
+        # Auto-detect body from mesh vertices
+        self.detected_body = detect_body_from_mesh(mesh_data) if mesh_data else None
+        if self.detected_body is None:
+            self.detected_body = 'Moon'  # fallback
+        self.body_radius = BODY_RADII.get(self.detected_body, 1737400.0)
+
+        # Auto-detect projection
+        self.projection = 'eqc'  # fallback
+        if mesh_data and 'latitudes' in mesh_data:
+            self.projection = choose_projection(mesh_data['latitudes'])
+            lats = mesh_data['latitudes']
+            if self.projection == 'stere':
+                min_lat = float(np.nanmin(lats))
+                max_lat = float(np.nanmax(lats))
+                self.pole_lat = 90.0 if min_lat > POLAR_LAT_THRESHOLD else -90.0
+
+        # Auto-detect resolution
+        self.auto_resolution = 0.05  # fallback
+        if SCIPY_AVAILABLE and mesh_data:
+            self.auto_resolution = GridResolutionEstimator.estimate_resolution(
+                mesh_data['latitudes'], mesh_data['longitudes']
+            )
+
+        # Detect available fields
+        self.available_fields = []
+        for field_name in FIELD_INFO:
+            field_dir = self.results_dir / field_name
+            if field_dir.exists() and any(field_dir.glob("*.bin")):
+                self.available_fields.append(field_name)
+
+        self.setWindowTitle("Export Simulation Data")
+        self.setMinimumWidth(480)
+        self.init_ui()
+
+    def init_ui(self):
+        from gui_core.data_exporter import FIELD_INFO
+
+        layout = QVBoxLayout(self)
+
+        # Format selection
+        format_group = QGroupBox("Format")
+        format_layout = QVBoxLayout()
+
+        self.format_btn_group = QButtonGroup(self)
+        format_row = QHBoxLayout()
+
+        self.geotiff_radio = QRadioButton("GeoTIFF")
+        self.hdf5_radio = QRadioButton("HDF5")
+        self.both_radio = QRadioButton("Both")
+        self.both_radio.setChecked(True)
+
+        self.format_btn_group.addButton(self.geotiff_radio, 0)
+        self.format_btn_group.addButton(self.hdf5_radio, 1)
+        self.format_btn_group.addButton(self.both_radio, 2)
+
+        format_row.addWidget(self.geotiff_radio)
+        format_row.addWidget(self.hdf5_radio)
+        format_row.addWidget(self.both_radio)
+        format_row.addStretch()
+        format_layout.addLayout(format_row)
+
+        # Warnings for missing dependencies
+        warnings = []
+        if not self.rasterio_available:
+            warnings.append("rasterio not available (pip install rasterio)")
+            self.geotiff_radio.setEnabled(False)
+            self.both_radio.setEnabled(False)
+            self.hdf5_radio.setChecked(True)
+        if not self.h5py_available:
+            warnings.append("h5py not available (pip install h5py)")
+            self.hdf5_radio.setEnabled(False)
+            if not self.rasterio_available:
+                self.both_radio.setEnabled(False)
+            elif self.both_radio.isChecked():
+                self.geotiff_radio.setChecked(True)
+        if not self.scipy_available:
+            warnings.append("scipy not available - regridding disabled (pip install scipy)")
+
+        if warnings:
+            warn_label = QLabel("\n".join(warnings))
+            warn_label.setStyleSheet("color: #ff9800; font-size: 11px; font-style: italic;")
+            format_layout.addWidget(warn_label)
+
+        format_group.setLayout(format_layout)
+        layout.addWidget(format_group)
+
+        # Fields selection
+        fields_group = QGroupBox("Fields")
+        fields_layout = QVBoxLayout()
+
+        self.field_checks = {}
+        default_checked = {'temperature', 'illumination', 'direct_solar'}
+        for field_name in self.available_fields:
+            info = FIELD_INFO.get(field_name, {})
+            label = info.get('label', field_name)
+            units = info.get('units', '')
+            cb = QCheckBox(f"{label} ({units})" if units else label)
+            cb.setChecked(field_name in default_checked)
+            cb.stateChanged.connect(self._update_estimate)
+            fields_layout.addWidget(cb)
+            self.field_checks[field_name] = cb
+
+        if not self.available_fields:
+            no_fields_label = QLabel("No data fields found in results directory.")
+            no_fields_label.setStyleSheet("color: #ff5252; font-style: italic;")
+            fields_layout.addWidget(no_fields_label)
+
+        fields_group.setLayout(fields_layout)
+        layout.addWidget(fields_group)
+
+        # Grid & Projection
+        grid_group = QGroupBox("Grid & Projection")
+        grid_layout = QGridLayout()
+
+        # Auto-detected body
+        radius_km = self.body_radius / 1000.0
+        body_label = QLabel(f"Body: {self.detected_body} (R = {radius_km:.1f} km)")
+        body_label.setStyleSheet("font-weight: bold;")
+        grid_layout.addWidget(body_label, 0, 0, 1, 2)
+
+        # Projection type
+        if self.projection == 'stere':
+            pole_str = "North" if getattr(self, 'pole_lat', 90) > 0 else "South"
+            proj_text = f"Polar stereographic ({pole_str} pole, +proj=stere)"
+        else:
+            proj_text = "Equirectangular (+proj=eqc)"
+        proj_label = QLabel(f"CRS: {proj_text}")
+        proj_label.setStyleSheet("color: #888888; font-size: 11px;")
+        grid_layout.addWidget(proj_label, 0, 2)
+
+        grid_layout.addWidget(QLabel("Resolution:"), 1, 0)
+        self.resolution_spin = QDoubleSpinBox()
+        self.resolution_spin.setRange(0.001, 10.0)
+        self.resolution_spin.setDecimals(4)
+        self.resolution_spin.setSingleStep(0.01)
+        self.resolution_spin.setValue(self.auto_resolution)
+        self.resolution_spin.setSuffix(" degrees")
+        self.resolution_spin.valueChanged.connect(self._update_grid_info)
+        grid_layout.addWidget(self.resolution_spin, 1, 1)
+
+        auto_label = QLabel(f"(auto-detected: {self.auto_resolution}\u00b0)")
+        auto_label.setStyleSheet("color: #888888; font-size: 11px;")
+        grid_layout.addWidget(auto_label, 1, 2)
+
+        self.grid_size_label = QLabel("")
+        self.grid_size_label.setStyleSheet("color: #888888; font-size: 11px;")
+        grid_layout.addWidget(self.grid_size_label, 2, 0, 1, 3)
+
+        self.per_timestep_check = QCheckBox("One GeoTIFF per timestep (smaller files)")
+        self.per_timestep_check.setChecked(True)
+        self.per_timestep_check.setToolTip(
+            "Write individual GeoTIFF files per timestep instead of one "
+            "large multi-band file. Recommended for large meshes."
+        )
+        grid_layout.addWidget(self.per_timestep_check, 3, 0, 1, 3)
+
+        grid_group.setLayout(grid_layout)
+        layout.addWidget(grid_group)
+
+        # Output directory
+        output_group = QGroupBox("Output")
+        output_layout = QGridLayout()
+
+        output_layout.addWidget(QLabel("Directory:"), 0, 0)
+        self.output_dir_edit = QLineEdit()
+        default_out = str(self.results_dir / "exports")
+        self.output_dir_edit.setText(default_out)
+        self.output_dir_edit.textChanged.connect(self._update_estimate)
+        output_layout.addWidget(self.output_dir_edit, 0, 1)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setMaximumWidth(80)
+        browse_btn.clicked.connect(self._browse_output)
+        output_layout.addWidget(browse_btn, 0, 2)
+
+        self.estimate_label = QLabel("")
+        self.estimate_label.setStyleSheet("color: #888888; font-size: 11px;")
+        output_layout.addWidget(self.estimate_label, 1, 0, 1, 3)
+
+        output_group.setLayout(output_layout)
+        layout.addWidget(output_group)
+
+        # Buttons
+        self.button_box = QDialogButtonBox()
+        self.export_btn = self.button_box.addButton(
+            "Export", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.cancel_btn = self.button_box.addButton(
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        self.export_btn.clicked.connect(self._start_export)
+        self.cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        # Initialize displays
+        self._update_grid_info()
+        self._update_estimate()
+
+    def _get_body_radius(self):
+        """Get detected body radius in meters."""
+        return self.body_radius
+
+    def _update_grid_info(self):
+        """Update grid size display when resolution changes."""
+        if not self.mesh_data:
+            return
+        res = self.resolution_spin.value()
+        lats = self.mesh_data['latitudes']
+        lons = self.mesh_data['longitudes']
+        body_radius = self._get_body_radius()
+
+        if self.projection == 'stere':
+            # For stereographic, grid is in projected meters
+            from gui_core.data_exporter import _forward_polar_stereo
+            pole_lat = getattr(self, 'pole_lat', 90.0)
+            center_lon = float((np.nanmin(lons) + np.nanmax(lons)) / 2)
+            x, y = _forward_polar_stereo(lats, lons, pole_lat, center_lon, body_radius)
+            # Pixel size in meters from degree-resolution mapped to projected space
+            pixel_m = body_radius * np.radians(res)
+            x_range = float(np.nanmax(x) - np.nanmin(x))
+            y_range = float(np.nanmax(y) - np.nanmin(y))
+            n_x = int(np.ceil(x_range / pixel_m)) + 1
+            n_y = int(np.ceil(y_range / pixel_m)) + 1
+            self.grid_size_label.setText(
+                f"Grid size: {n_y} \u00d7 {n_x} pixels "
+                f"(~{pixel_m:.0f} m/px, stereographic)"
+            )
+        else:
+            lat_range = np.ptp(lats)
+            lon_range = np.ptp(lons)
+            n_lat = int(np.ceil(lat_range / res)) + 1
+            n_lon = int(np.ceil(lon_range / res)) + 1
+            # Pixel size in meters at center latitude
+            center_lat = (np.nanmin(lats) + np.nanmax(lats)) / 2
+            pixel_m = body_radius * np.radians(res)
+            pixel_m_lon = pixel_m * np.cos(np.radians(center_lat))
+            self.grid_size_label.setText(
+                f"Grid size: {n_lat} \u00d7 {n_lon} pixels "
+                f"(~{pixel_m:.0f} \u00d7 {pixel_m_lon:.0f} m/px at center)"
+            )
+        self._update_estimate()
+
+    def _update_estimate(self):
+        """Update estimated output size."""
+        selected_fields = [f for f, cb in self.field_checks.items() if cb.isChecked()]
+        n_fields = len(selected_fields)
+        n_timesteps = len(self.timesteps)
+
+        if n_fields == 0 or n_timesteps == 0:
+            self.estimate_label.setText("Estimated size: --")
+            self.export_btn.setEnabled(False)
+            return
+
+        self.export_btn.setEnabled(True)
+
+        res = self.resolution_spin.value()
+        lats = self.mesh_data['latitudes']
+        lons = self.mesh_data['longitudes']
+        n_faces = len(lats)
+
+        if self.projection == 'stere':
+            from gui_core.data_exporter import _forward_polar_stereo
+            pole_lat = getattr(self, 'pole_lat', 90.0)
+            center_lon = float((np.nanmin(lons) + np.nanmax(lons)) / 2)
+            body_radius = self._get_body_radius()
+            x, y = _forward_polar_stereo(lats, lons, pole_lat, center_lon, body_radius)
+            pixel_m = body_radius * np.radians(res)
+            n_lat = int(np.ceil((np.nanmax(y) - np.nanmin(y)) / pixel_m)) + 1
+            n_lon = int(np.ceil((np.nanmax(x) - np.nanmin(x)) / pixel_m)) + 1
+        else:
+            n_lat = int(np.ceil(np.ptp(lats) / res)) + 1
+            n_lon = int(np.ceil(np.ptp(lons) / res)) + 1
+
+        total_bytes = 0
+        fmt_id = self.format_btn_group.checkedId()
+
+        if fmt_id == 0 or fmt_id == 2:  # GeoTIFF or Both
+            # Multi-band GeoTIFF: ~4 bytes per pixel per band, compressed ~50%
+            total_bytes += n_fields * n_timesteps * n_lat * n_lon * 4 * 0.5
+
+        if fmt_id == 1 or fmt_id == 2:  # HDF5 or Both
+            # Unstructured: n_fields * n_timesteps * n_faces * 4 bytes, compressed ~50%
+            total_bytes += n_fields * n_timesteps * n_faces * 4 * 0.5
+            # Regridded: n_fields * n_timesteps * n_lat * n_lon * 4 bytes, compressed ~50%
+            total_bytes += n_fields * n_timesteps * n_lat * n_lon * 4 * 0.5
+
+        # Format size
+        if total_bytes < 1024:
+            size_str = f"{total_bytes:.0f} B"
+        elif total_bytes < 1024**2:
+            size_str = f"{total_bytes / 1024:.1f} KB"
+        elif total_bytes < 1024**3:
+            size_str = f"{total_bytes / 1024**2:.1f} MB"
+        else:
+            size_str = f"{total_bytes / 1024**3:.2f} GB"
+
+        self.estimate_label.setText(f"Estimated size: ~{size_str}")
+
+    def _browse_output(self):
+        """Browse for output directory."""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory",
+            self.output_dir_edit.text(),
+            QFileDialog.Option.ShowDirsOnly
+        )
+        if directory:
+            self.output_dir_edit.setText(directory)
+
+    def _start_export(self):
+        """Start the export process."""
+        from gui_core.data_exporter import DataExportWorker
+
+        selected_fields = [f for f, cb in self.field_checks.items() if cb.isChecked()]
+        if not selected_fields:
+            QMessageBox.warning(self, "No Fields", "Please select at least one field to export.")
+            return
+
+        output_dir = self.output_dir_edit.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "No Output", "Please specify an output directory.")
+            return
+
+        # Determine formats
+        fmt_id = self.format_btn_group.checkedId()
+        formats = []
+        if fmt_id == 0:
+            formats = ['geotiff']
+        elif fmt_id == 1:
+            formats = ['hdf5']
+        else:
+            formats = ['geotiff', 'hdf5']
+
+        config = {
+            'results_dir': str(self.results_dir),
+            'mesh_data': self.mesh_data,
+            'timesteps': self.timesteps,
+            'fields': selected_fields,
+            'formats': formats,
+            'resolution': self.resolution_spin.value(),
+            'output_dir': output_dir,
+            'geotiff_per_timestep': self.per_timestep_check.isChecked(),
+            'body_radius': self._get_body_radius(),
+        }
+
+        # Disable controls during export
+        self.export_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancel Export")
+
+        # Create progress dialog
+        n_timesteps = len(self.timesteps)
+        n_fields = len(selected_fields)
+        total_steps = 1 + (n_fields * n_timesteps) + n_fields
+
+        self.progress = QProgressDialog("Starting export...", "Cancel", 0, total_steps, self)
+        self.progress.setWindowTitle("Exporting Data")
+        self.progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress.setMinimumDuration(0)
+        self.progress.canceled.connect(self._cancel_export)
+        self.progress.show()
+
+        # Start worker thread
+        self.export_worker = DataExportWorker(config)
+        self.export_worker.progress_updated.connect(self._on_progress)
+        self.export_worker.status_updated.connect(self._on_status)
+        self.export_worker.export_finished.connect(self._on_finished)
+        self.export_worker.start()
+
+    def _cancel_export(self):
+        """Cancel the running export."""
+        if self.export_worker:
+            self.export_worker.cancel()
+
+    def _on_progress(self, current, total):
+        """Handle progress update."""
+        if hasattr(self, 'progress') and self.progress:
+            self.progress.setMaximum(total)
+            self.progress.setValue(current)
+
+    def _on_status(self, message):
+        """Handle status update."""
+        if hasattr(self, 'progress') and self.progress:
+            self.progress.setLabelText(message)
+
+    def _on_finished(self, success, message):
+        """Handle export completion."""
+        if hasattr(self, 'progress') and self.progress:
+            self.progress.close()
+
+        if success:
+            QMessageBox.information(self, "Export Complete", message)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Export", message)
+            self.export_btn.setEnabled(True)
+            self.cancel_btn.setText("Cancel")
+
+
 class VisualizationPanel(QWidget):
     """Combined visualization panel with 3D view and 2D plots"""
 
@@ -1612,6 +2352,26 @@ class VisualizationPanel(QWidget):
         reset_btn.setMaximumWidth(80)
         reset_btn.clicked.connect(self.reset_camera)
         layout.addWidget(reset_btn)
+
+        layout.addWidget(QLabel(" | "))
+
+        # Export Image button
+        export_img_btn = QPushButton("Export Image")
+        export_img_btn.setMaximumWidth(100)
+        export_img_btn.clicked.connect(self.export_current_image)
+        layout.addWidget(export_img_btn)
+
+        # Export Animation button
+        export_anim_btn = QPushButton("Export Animation")
+        export_anim_btn.setMaximumWidth(120)
+        export_anim_btn.clicked.connect(self.show_export_animation_dialog)
+        layout.addWidget(export_anim_btn)
+
+        # Export Data button
+        export_data_btn = QPushButton("Export Data")
+        export_data_btn.setMaximumWidth(100)
+        export_data_btn.clicked.connect(self.show_export_data_dialog)
+        layout.addWidget(export_data_btn)
 
     def load_results(self, results_dir):
         """Load simulation results"""
@@ -1692,6 +2452,178 @@ class VisualizationPanel(QWidget):
         """Refresh visualization"""
         self.view_3d.refresh()
         self.plots_2d.update_plots()
+
+    def export_current_image(self):
+        """Export current 3D view as image"""
+        if not self.view_3d.mesh or not self.view_3d.results_dir:
+            QMessageBox.warning(self, "No Data", "Please load simulation results first.")
+            return
+
+        # Get current field and timestep for default filename
+        field = self.view_3d.current_field
+        timestep = self.view_3d.current_timestep
+        default_name = f"ptm3d_{field}_t{timestep:04d}.png"
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export Image",
+            str(Path.cwd() / default_name),
+            "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg);;TIFF Images (*.tiff *.tif);;All Files (*)"
+        )
+
+        if not filename:
+            return
+
+        try:
+            self.view_3d.export_image(filename)
+            QMessageBox.information(self, "Export Complete",
+                                   f"Image exported to:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                               f"Failed to export image:\n{str(e)}")
+
+    def show_export_animation_dialog(self):
+        """Show dialog to configure and export animation"""
+        if not self.view_3d.mesh or not self.view_3d.results_dir:
+            QMessageBox.warning(self, "No Data", "Please load simulation results first.")
+            return
+
+        n_timesteps = len(self.view_3d.timesteps)
+        if n_timesteps == 0:
+            QMessageBox.warning(self, "No Timesteps", "No timesteps available for animation.")
+            return
+
+        # Create export dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Export Animation")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        # Format selection
+        format_group = QGroupBox("Animation Format")
+        format_layout = QGridLayout()
+
+        format_layout.addWidget(QLabel("Format:"), 0, 0)
+        format_combo = QComboBox()
+        format_combo.addItems(["GIF (.gif)", "MP4 Video (.mp4)"])
+        format_layout.addWidget(format_combo, 0, 1)
+
+        format_layout.addWidget(QLabel("FPS:"), 1, 0)
+        fps_spin = QSpinBox()
+        fps_spin.setRange(1, 60)
+        fps_spin.setValue(5)
+        format_layout.addWidget(fps_spin, 1, 1)
+
+        format_group.setLayout(format_layout)
+        layout.addWidget(format_group)
+
+        # Info label
+        info_label = QLabel(f"Animation will include {n_timesteps} frames\n"
+                           f"Current field: {self.view_3d.current_field}")
+        info_label.setStyleSheet("color: #888888; font-style: italic;")
+        layout.addWidget(info_label)
+
+        # Note about MP4
+        note_label = QLabel("Note: MP4 export requires ffmpeg to be installed.")
+        note_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        layout.addWidget(note_label)
+
+        # Buttons
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Get selected format
+        format_idx = format_combo.currentIndex()
+        format_type = "gif" if format_idx == 0 else "mp4"
+        fps = fps_spin.value()
+
+        # Get output filename
+        default_name = f"ptm3d_animation_{self.view_3d.current_field}"
+        if format_type == "gif":
+            file_filter = "GIF Images (*.gif);;All Files (*)"
+            default_name += ".gif"
+        else:
+            file_filter = "MP4 Videos (*.mp4);;All Files (*)"
+            default_name += ".mp4"
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export Animation",
+            str(Path.cwd() / default_name),
+            file_filter
+        )
+
+        if not filename:
+            return
+
+        # Stop playback if running
+        if self.is_playing:
+            self.toggle_playback()
+
+        # Show progress dialog
+        progress = QProgressDialog("Exporting animation...", "Cancel", 0, n_timesteps, self)
+        progress.setWindowTitle("Exporting")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        was_cancelled = False
+
+        def update_progress(current, total):
+            nonlocal was_cancelled
+            progress.setValue(current)
+            progress.setLabelText(f"Rendering frame {current}/{total}...")
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                was_cancelled = True
+
+        # Export animation
+        success = self.view_3d.export_animation(
+            filename,
+            format_type=format_type,
+            fps=fps,
+            progress_callback=update_progress
+        )
+
+        progress.close()
+
+        if was_cancelled:
+            QMessageBox.information(self, "Cancelled", "Animation export was cancelled.")
+            # Try to delete partial file
+            try:
+                Path(filename).unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif success:
+            QMessageBox.information(self, "Export Complete",
+                                   f"Animation exported to:\n{filename}")
+        else:
+            QMessageBox.critical(self, "Export Failed",
+                               "Failed to export animation.\n"
+                               "For MP4 format, ensure ffmpeg is installed.")
+
+    def show_export_data_dialog(self):
+        """Show dialog for exporting data in GeoTIFF/HDF5 formats"""
+        if not self.view_3d.mesh or not self.view_3d.results_dir:
+            QMessageBox.warning(self, "No Data", "Please load simulation results first.")
+            return
+
+        if not self.view_3d.timesteps:
+            QMessageBox.warning(self, "No Timesteps", "No timestep data available to export.")
+            return
+
+        dialog = ExportDataDialog(
+            results_dir=str(self.view_3d.results_dir),
+            mesh_data=self.view_3d.mesh_data,
+            timesteps=self.view_3d.timesteps,
+            parent=self
+        )
+        dialog.exec()
 
     def cleanup(self):
         """Clean up resources"""

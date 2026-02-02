@@ -5,6 +5,7 @@ Handles simulation execution in background thread
 
 import subprocess
 import sys
+import os
 import re
 import select
 from pathlib import Path
@@ -113,13 +114,19 @@ class SimulationThread(QThread):
             command.extend(self._build_radiation_args())
             command.extend(self._build_gpu_thermal_args())
 
+            # Pass current Python executable to subprocess so C++ can invoke it
+            # This ensures the correct Python environment (conda/venv) is used
+            env = os.environ.copy()
+            env["PYTHON_EXECUTABLE"] = sys.executable
+
             self.process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=False,
                 bufsize=0,
-                cwd=self.working_dir
+                cwd=self.working_dir,
+                env=env
             )
 
             stdout_buffer = bytearray()
@@ -206,12 +213,48 @@ class SimulationThread(QThread):
                 self.process.wait()
 
     def _is_progress_line(self, text):
-        """Check if line is a progress update"""
+        """Check if line is a progress/info update (not an error)"""
         tl = text.lower()
-        return (('[' in text and ']' in text and '%' in text) or
-                ('calculating' in tl and '%' in text) or
-                ('thermal simulation' in tl and '%' in text) or
-                ('progress' in tl and '%' in text))
+
+        # Progress bars with percentages
+        if '[' in text and ']' in text and '%' in text:
+            return True
+
+        # Known progress patterns
+        if 'calculating' in tl and '%' in text:
+            return True
+        if 'thermal simulation' in tl:
+            return True
+        if 'progress' in tl:
+            return True
+
+        # Informational patterns (not errors)
+        if 'processing chunk' in tl:
+            return True
+        if 'computing' in tl and 'of' in tl:
+            return True
+        if 'loading' in tl:
+            return True
+        if 'initializing' in tl:
+            return True
+        if 'writing' in tl and 'output' in tl:
+            return True
+        if 'saving' in tl:
+            return True
+        if 'reading' in tl:
+            return True
+        if 'starting' in tl:
+            return True
+        if 'finished' in tl:
+            return True
+        if 'complete' in tl and 'error' not in tl:
+            return True
+        if 'iteration' in tl:
+            return True
+        if 'convergence' in tl:
+            return True
+
+        return False
 
     def _extract_progress(self, text):
         """Extract progress percentage from text"""

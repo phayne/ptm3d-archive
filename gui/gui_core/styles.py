@@ -44,7 +44,7 @@ class ModernStyle:
             QWidget {{
                 background-color: {ModernStyle.BG_DARK};
                 color: {ModernStyle.TEXT_PRIMARY};
-                font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+                font-family: "Helvetica Neue", ".AppleSystemUIFont";
                 font-size: 13px;
             }}
 

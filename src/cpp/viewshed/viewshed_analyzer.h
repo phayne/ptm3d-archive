@@ -57,11 +57,12 @@ struct ViewLocation {
     int face_index;     // if type == FACE_INDEX
     std::array<double, 3> position; // if type == CARTESIAN
     std::string label;  // Optional label for this location
-    
+    std::string utc_timestamp;  // Optional UTC timestamp for this waypoint
+
     ViewLocation() : type(LAT_LON), latitude(0), longitude(0), height(2.0), face_index(-1) {}
-    
+
     // Constructor for lat/lon
-    ViewLocation(double lat, double lon, double h = 2.0, const std::string& lbl = "") 
+    ViewLocation(double lat, double lon, double h = 2.0, const std::string& lbl = "")
         : type(LAT_LON), latitude(lat), longitude(lon), height(h), face_index(-1), label(lbl) {}
 };
 
@@ -94,7 +95,10 @@ struct ViewshedResult {
     std::vector<float> distance;        // Distance to visible faces (km)
     std::vector<float> elevation_angle; // Elevation angle to faces (degrees)
     std::vector<float> azimuth;        // Azimuth to faces (degrees)
-    
+    std::vector<float> emission_angle;  // Emission angle: LOS vs face normal (degrees)
+    std::vector<float> incidence_cos;   // cos(emission_angle) for Lambertian calcs
+    std::vector<float> face_area_m2;    // Geometric face area (m^2)
+
     // Viewpoint face index (for visualization)
     int viewpoint_face_index = -1;
     

@@ -86,6 +86,12 @@ struct IceLayerState {
     std::vector<double> cumulative_deposited;   // Total ice gained from deposition [kg/m²]
     std::vector<double> cumulative_escaped;     // Total mass escaped to space [kg/m²]
 
+    // Ice crystallinity state (managed by IceCrystallizationModel)
+    std::vector<double> crystalline_fraction;    // [0-1], 0 = fully amorphous, 1 = fully crystalline
+    std::vector<double> porosity;                // [0-1], volume fraction of pore space
+    std::vector<double> radiation_dose_rate;     // [eV/(molecule·s)] energy deposition rate
+    std::vector<double> cumulative_dose;         // [eV/molecule] total accumulated radiation dose
+
     explicit IceLayerState(size_t num_faces) {
         nonice_concentration.resize(num_faces, 0.0);
         ice_mass.resize(num_faces, 0.0);
@@ -94,6 +100,11 @@ struct IceLayerState {
         cumulative_sputtered.resize(num_faces, 0.0);
         cumulative_deposited.resize(num_faces, 0.0);
         cumulative_escaped.resize(num_faces, 0.0);
+
+        crystalline_fraction.resize(num_faces, 0.0);
+        porosity.resize(num_faces, 0.0);
+        radiation_dose_rate.resize(num_faces, 0.0);
+        cumulative_dose.resize(num_faces, 0.0);
     }
 
     void reset() {
@@ -103,6 +114,9 @@ struct IceLayerState {
         std::fill(cumulative_sputtered.begin(), cumulative_sputtered.end(), 0.0);
         std::fill(cumulative_deposited.begin(), cumulative_deposited.end(), 0.0);
         std::fill(cumulative_escaped.begin(), cumulative_escaped.end(), 0.0);
+        std::fill(crystalline_fraction.begin(), crystalline_fraction.end(), 0.0);
+        // Note: porosity and radiation_dose_rate are NOT reset - they are set during initialization
+        std::fill(cumulative_dose.begin(), cumulative_dose.end(), 0.0);
     }
 };
 

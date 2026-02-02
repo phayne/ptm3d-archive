@@ -27,8 +27,6 @@ struct SimulationConfig {
     // Mesh Configuration
     struct MeshParams {
         int resolution = 5;
-        bool use_topographic = false;
-        std::string topo_directory = "";
         std::string import_file = "";
         double scale_factor = 1.0;
         bool export_basic = false;
@@ -40,6 +38,7 @@ struct SimulationConfig {
         int threads = 0;  // 0 = auto
         int equilibration_orbits = 1;
         bool compute_statistics = true;
+        bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
         std::string thermal_inertia_map = "";
         bool enable_shadow_flux = false;
         double crater_dd_ratio = 8.0;
@@ -53,6 +52,8 @@ struct SimulationConfig {
         int grid_m = 4;                   // Layers in upper skin depth (optimal: 4)
         int grid_n = 10;                  // Layer growth factor (optimal: 10)
         int grid_b = 5;                   // Skin depths to bottom (optimal: 5, minimum viable)
+        // Geothermal heat flow
+        double geothermal_heat_flow = -1.0; // W/m², -1 = use planet default
     } thermal;
     
     // Illumination
@@ -72,27 +73,35 @@ struct SimulationConfig {
         bool include_primary_ir = false;
         std::string thermal_vtk_file = "";
         std::string complete_vtk_file = "";
-        bool no_maps = false;
         std::string locations_file = "";
         std::string series_output = "";
         std::string location_data = "";
         std::string depths_file = "";
     } output;
     
-    // Visualization
-    struct VisualizationParams {
-        bool create = false;
-        int width = 1024;
-        int height = 768;
-        int fps = 30;
-        double camera_distance = 5.0;
-        double camera_latitude = 30.0;
-        double camera_longitude = 0.0;
-        double emission_angle = -1.0;  // -1 = not specified
-        double azimuth = -1.0;
-        bool save_frames = false;
-    } visualization;
-    
+    // Radiation Exchange
+    struct RadiationParams {
+        bool enabled = false;
+        double min_shadow_fraction = 0.3;
+        bool verbose = false;
+        bool use_gpu = false;
+        std::string view_factor_file = "";
+        int max_coupling_iterations = 10;
+        double coupling_temp_threshold = 0.5;
+        double coupling_flux_threshold = 0.1;
+        double coupling_face_fraction = 0.01;
+        bool use_hmatrix = false;
+        bool use_aca = true;
+        double aca_tolerance = 1e-3;
+        int aca_max_rank = 50;
+        int hmatrix_threads = 0;  // 0 = auto
+        // Adaptive neighbor selection (sparse view factors)
+        bool adaptive_neighbors = true;           // Enable per-face adaptive selection
+        double captured_energy_target = 0.95;     // Target fraction of radiative potential (95%)
+        int max_neighbors = 500;                  // Hard ceiling per face (reduced from 2000 for better performance)
+        int min_neighbors = 20;                   // Minimum neighbors per face
+    } radiation;
+
     // Advanced Options
     struct AdvancedParams {
         bool verbose = false;
@@ -175,7 +184,7 @@ private:
     void parseThermalSection(SimulationConfig::ThermalParams& params, const void* node);
     void parseIlluminationSection(SimulationConfig::IlluminationParams& params, const void* node);
     void parseOutputSection(SimulationConfig::OutputParams& params, const void* node);
-    void parseVisualizationSection(SimulationConfig::VisualizationParams& params, const void* node);
+    void parseRadiationSection(SimulationConfig::RadiationParams& params, const void* node);
     void parseAdvancedSection(SimulationConfig::AdvancedParams& params, const void* node);
 };
 

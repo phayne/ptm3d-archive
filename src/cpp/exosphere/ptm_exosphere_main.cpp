@@ -24,6 +24,7 @@
 
 #include "ptm_exosphere_integration.h"
 #include "exosphere_physics.h"
+#include "ice_crystallization_model.h"
 #include "../mesh/mesh_utils.h"
 
 // Physical constants used here
@@ -1723,6 +1724,10 @@ int main(int argc, char** argv)
     bool analytical_acceleration = true;    // Use analytical solution for slow regions
     int cache_refresh_interval = 0;         // 0 = never force refresh (use adaptive)
 
+    // Ice crystallization model options
+    bool crystallization_enabled = false;
+    ptm::exosphere::CrystallizationConfig cryst_config;
+
     // Simple argument parsing
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1771,6 +1776,37 @@ int main(int argc, char** argv)
         else if (a == "--cache-refresh" && i+1 < argc) {
             cache_refresh_interval = std::stoi(argv[++i]);
         }
+        // Ice crystallization model options
+        else if (a == "--crystallization") {
+            crystallization_enabled = true;
+            ice_layer_enabled = true;  // Crystallization requires ice layer model
+        }
+        else if (a == "--initial-crystallinity" && i+1 < argc) {
+            crystallization_enabled = true;
+            ice_layer_enabled = true;
+            cryst_config.initial_crystalline_fraction = std::stod(argv[++i]);
+        }
+        else if (a == "--activation-energy" && i+1 < argc) {
+            cryst_config.activation_energy = std::stod(argv[++i]);
+        }
+        else if (a == "--amorphization-dose" && i+1 < argc) {
+            cryst_config.amorphization_dose = std::stod(argv[++i]);
+        }
+        else if (a == "--equatorial-porosity" && i+1 < argc) {
+            cryst_config.equatorial_porosity = std::stod(argv[++i]);
+        }
+        else if (a == "--polar-porosity" && i+1 < argc) {
+            cryst_config.polar_porosity = std::stod(argv[++i]);
+        }
+        else if (a == "--dose-hemisphere-contrast" && i+1 < argc) {
+            cryst_config.hemisphere_dose_contrast = std::stod(argv[++i]);
+        }
+        else if (a == "--dose-polar-enhancement" && i+1 < argc) {
+            cryst_config.polar_dose_enhancement = std::stod(argv[++i]);
+        }
+        else if (a == "--base-dose-rate" && i+1 < argc) {
+            cryst_config.base_dose_rate = std::stod(argv[++i]);
+        }
         else if (a == "--help" || a == "-h") {
             std::cout << "Usage: " << argv[0] << " --ptm-output DIR --output DIR --timesteps N [OPTIONS]\n\n";
             std::cout << "Required:\n";
@@ -1800,7 +1836,19 @@ int main(int argc, char** argv)
             std::cout << "  --export-interval N    Export VTU every N epochs (default: 100, 0=final only)\n";
             std::cout << "  --no-analytical        Disable analytical acceleration for slow regions\n";
             std::cout << "  --cache-refresh N      Force diurnal recomputation every N epochs\n";
-            std::cout << "                         (default: 0 = adaptive refresh only, fastest)\n";
+            std::cout << "                         (default: 0 = adaptive refresh only, fastest)\n\n";
+            std::cout << "Ice crystallization model options:\n";
+            std::cout << "  --crystallization      Enable ice crystallization tracking\n";
+            std::cout << "                         (amorphous/crystalline competition)\n";
+            std::cout << "  --initial-crystallinity F  Initial crystalline fraction [0-1] (default: 0.0)\n";
+            std::cout << "  --activation-energy E  Crystallization activation energy [J/mol]\n";
+            std::cout << "                         (default: 62000, Mitchell et al. 2017)\n";
+            std::cout << "  --amorphization-dose D Dose threshold [eV/molecule] (default: 3.0)\n";
+            std::cout << "  --equatorial-porosity P  Equatorial porosity [0-1] (default: 0.5)\n";
+            std::cout << "  --polar-porosity P     Polar porosity [0-1] (default: 0.2)\n";
+            std::cout << "  --dose-hemisphere-contrast C  Trailing/leading dose ratio (default: 5.0)\n";
+            std::cout << "  --dose-polar-enhancement P    Pole/equator dose ratio (default: 2.5)\n";
+            std::cout << "  --base-dose-rate R     Base dose rate [eV/(mol s)] (default: 2.3e-6)\n";
             return 0;
         } else {
             std::cerr << "Unknown arg: " << a << std::endl;
@@ -1866,6 +1914,13 @@ int main(int argc, char** argv)
         std::cout << "\nEnabling ice layer model (lag deposit tracking):" << std::endl;
         std::cout << "  Dust volume fraction: " << (ice_layer_dust_fraction * 100) << "%" << std::endl;
         integrator.enableIceLayerModel(ice_layer_dust_fraction);
+    }
+
+    // Enable crystallization model if requested (requires ice layer model)
+    if (crystallization_enabled) {
+        std::cout << "\nEnabling ice crystallization model:" << std::endl;
+        cryst_config.enabled = true;
+        integrator.enableCrystallizationModel(cryst_config);
     }
 
     // Run simulation based on mode

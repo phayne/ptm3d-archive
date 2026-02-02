@@ -22,6 +22,8 @@ namespace ptm {
         class IceLayerModel;
         struct IceLayerState;
         struct IceLayerConfig;
+        class IceCrystallizationModel;
+        struct CrystallizationConfig;
         class MultiTimescaleEvolution;
         struct MultiTimescaleConfig;
 
@@ -101,6 +103,10 @@ namespace ptm {
             std::unique_ptr<IceLayerModel> ice_layer_model_;
             std::unique_ptr<IceLayerState> ice_layer_state_;
             bool ice_layer_enabled_ = false;
+
+            // Ice crystallization model (optional, tracks amorphous/crystalline transition)
+            std::unique_ptr<IceCrystallizationModel> crystallization_model_;
+            bool crystallization_enabled_ = false;
 
             // Multi-timescale evolution (optional, for geological timescales)
             std::unique_ptr<MultiTimescaleEvolution> multiscale_evolution_;
@@ -320,6 +326,16 @@ namespace ptm {
             void enableIceLayerModel(double initial_nonice_concentration = 0.01);
 
             /**
+             * Enable ice crystallization model
+             * Tracks amorphous/crystalline ice transition using Mitchell et al. (2017)
+             * Avrami kinetics and Nordheim et al. (2022) radiation dose model.
+             * Requires ice layer model to be enabled first.
+             *
+             * @param config Crystallization model configuration
+             */
+            void enableCrystallizationModel(const CrystallizationConfig& config);
+
+            /**
              * Disable ice layer model (use simple ice tracking)
              */
             void disableIceLayerModel();
@@ -328,6 +344,11 @@ namespace ptm {
              * Check if ice layer model is enabled
              */
             bool isIceLayerEnabled() const { return ice_layer_enabled_; }
+
+            /**
+             * Check if crystallization model is enabled
+             */
+            bool isCrystallizationEnabled() const { return crystallization_enabled_; }
 
             /**
              * Get non-ice concentration for a face [dimensionless, 0-1]

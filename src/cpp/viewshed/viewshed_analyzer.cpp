@@ -513,6 +513,9 @@ ViewshedResult ViewshedAnalyzer::computeViewshed(
     result.distance.resize(mesh_->faces.size(), -1.0f);
     result.elevation_angle.resize(mesh_->faces.size(), 0.0f);
     result.azimuth.resize(mesh_->faces.size(), 0.0f);
+    result.emission_angle.resize(mesh_->faces.size(), -1.0f);
+    result.incidence_cos.resize(mesh_->faces.size(), 0.0f);
+    result.face_area_m2.resize(mesh_->faces.size(), 0.0f);
     
     // Perform viewshed computation
     computeSingleViewshed(observer_pos, observer_face_idx, result, params);
@@ -683,6 +686,14 @@ void ViewshedAnalyzer::computeSingleViewshed(
                     double az = std::atan2(v_e, v_n) * RAD_TO_DEG;
                     if (az < 0) az += 360.0;
                     result.azimuth[fidx] = static_cast<float>(az);
+
+                    // Emission angle: angle between -LOS and outward face normal
+                    const auto& face_n = mesh_->face_normals[fidx];
+                    double dx = vx/vlen, dy = vy/vlen, dz = vz/vlen;
+                    double cos_em = -(dx*face_n[0] + dy*face_n[1] + dz*face_n[2]);
+                    cos_em = std::max(0.0, std::min(1.0, cos_em));
+                    result.emission_angle[fidx] = static_cast<float>(std::acos(cos_em) * RAD_TO_DEG);
+                    result.incidence_cos[fidx] = static_cast<float>(cos_em);
                 }
             }
             ray_origins.clear();
@@ -724,6 +735,14 @@ void ViewshedAnalyzer::computeSingleViewshed(
                 double az = std::atan2(v_e, v_n) * RAD_TO_DEG;
                 if (az < 0) az += 360.0;
                 result.azimuth[fidx] = static_cast<float>(az);
+
+                // Emission angle: angle between -LOS and outward face normal
+                const auto& face_n = mesh_->face_normals[fidx];
+                double dx = vx/vlen, dy = vy/vlen, dz = vz/vlen;
+                double cos_em = -(dx*face_n[0] + dy*face_n[1] + dz*face_n[2]);
+                cos_em = std::max(0.0, std::min(1.0, cos_em));
+                result.emission_angle[fidx] = static_cast<float>(std::acos(cos_em) * RAD_TO_DEG);
+                result.incidence_cos[fidx] = static_cast<float>(cos_em);
             }
         }
     }
@@ -1003,7 +1022,9 @@ void ViewshedAnalyzer::computeStatistics(ViewshedResult& result) const {
     for (size_t i = 0; i < result.visibility.size(); ++i) {
         if (result.visibility[i] > 0) {
             result.num_visible_faces++;
-            result.visible_area_km2 += mesh_utils_->getFaceArea(i) / 1e6;
+            double area_m2 = mesh_utils_->getFaceArea(i);
+            result.face_area_m2[i] = static_cast<float>(area_m2);
+            result.visible_area_km2 += area_m2 / 1e6;
             
             if (result.distance[i] > result.max_visible_range_km) {
                 result.max_visible_range_km = result.distance[i];
@@ -1395,8 +1416,43 @@ bool ViewshedAnalyzer::exportToHDF5(
                 face_data.push_back(f[2]);
             }
             face_dataset.write(face_data.data(), H5::PredType::NATIVE_INT);
+
+            // Write per-face geographic data
+            const size_t n_faces = mesh_->faces.size();
+            hsize_t face1d_dims[1] = {n_faces};
+            H5::DataSpace face1d_space(1, face1d_dims);
+
+            if (mesh_->latitudes.size() == n_faces) {
+                H5::DataSet lat_mesh = mesh_group.createDataSet("face_latitudes",
+                    H5::PredType::NATIVE_DOUBLE, face1d_space);
+                lat_mesh.write(mesh_->latitudes.data(), H5::PredType::NATIVE_DOUBLE);
+            }
+            if (mesh_->longitudes.size() == n_faces) {
+                H5::DataSet lon_mesh = mesh_group.createDataSet("face_longitudes",
+                    H5::PredType::NATIVE_DOUBLE, face1d_space);
+                lon_mesh.write(mesh_->longitudes.data(), H5::PredType::NATIVE_DOUBLE);
+            }
+            if (mesh_->elevations.size() == n_faces) {
+                H5::DataSet elev_mesh = mesh_group.createDataSet("face_elevations",
+                    H5::PredType::NATIVE_DOUBLE, face1d_space);
+                elev_mesh.write(mesh_->elevations.data(), H5::PredType::NATIVE_DOUBLE);
+            }
+            if (mesh_->face_normals.size() == n_faces) {
+                hsize_t norm_dims[2] = {n_faces, 3};
+                H5::DataSpace norm_space(2, norm_dims);
+                H5::DataSet norm_mesh = mesh_group.createDataSet("face_normals",
+                    H5::PredType::NATIVE_DOUBLE, norm_space);
+                std::vector<double> norm_data;
+                norm_data.reserve(n_faces * 3);
+                for (const auto& n : mesh_->face_normals) {
+                    norm_data.push_back(n[0]);
+                    norm_data.push_back(n[1]);
+                    norm_data.push_back(n[2]);
+                }
+                norm_mesh.write(norm_data.data(), H5::PredType::NATIVE_DOUBLE);
+            }
         }
-        
+
         // Write viewshed results
         H5::Group viewsheds_group = file.createGroup("/viewsheds");
         
@@ -1424,10 +1480,31 @@ bool ViewshedAnalyzer::exportToHDF5(
             elev_dataset.write(result.elevation_angle.data(), H5::PredType::NATIVE_FLOAT);
             
             // Write azimuth
-            H5::DataSet az_dataset = vgroup.createDataSet("azimuth", 
+            H5::DataSet az_dataset = vgroup.createDataSet("azimuth",
                 H5::PredType::NATIVE_FLOAT, vis_space);
             az_dataset.write(result.azimuth.data(), H5::PredType::NATIVE_FLOAT);
-            
+
+            // Write emission angle
+            if (!result.emission_angle.empty()) {
+                H5::DataSet em_dataset = vgroup.createDataSet("emission_angle",
+                    H5::PredType::NATIVE_FLOAT, vis_space);
+                em_dataset.write(result.emission_angle.data(), H5::PredType::NATIVE_FLOAT);
+            }
+
+            // Write incidence cosine
+            if (!result.incidence_cos.empty()) {
+                H5::DataSet ic_dataset = vgroup.createDataSet("incidence_cos",
+                    H5::PredType::NATIVE_FLOAT, vis_space);
+                ic_dataset.write(result.incidence_cos.data(), H5::PredType::NATIVE_FLOAT);
+            }
+
+            // Write face area
+            if (!result.face_area_m2.empty()) {
+                H5::DataSet fa_dataset = vgroup.createDataSet("face_area_m2",
+                    H5::PredType::NATIVE_FLOAT, vis_space);
+                fa_dataset.write(result.face_area_m2.data(), H5::PredType::NATIVE_FLOAT);
+            }
+
             // Write viewpoint face index
             hsize_t scalar_dims[1] = {1};
             H5::DataSpace scalar_space(1, scalar_dims);
@@ -1454,7 +1531,14 @@ bool ViewshedAnalyzer::exportToHDF5(
             H5::StrType str_type(H5::PredType::C_S1, result.location.label.size() + 1);
             H5::Attribute label_attr = loc_group.createAttribute("label", str_type, scalar_space);
             label_attr.write(str_type, result.location.label);
-            
+
+            // Write UTC timestamp as attribute (if present)
+            if (!result.location.utc_timestamp.empty()) {
+                H5::StrType ts_type(H5::PredType::C_S1, result.location.utc_timestamp.size() + 1);
+                H5::Attribute ts_attr = loc_group.createAttribute("utc_timestamp", ts_type, scalar_space);
+                ts_attr.write(ts_type, result.location.utc_timestamp);
+            }
+
             // Write statistics
             H5::Group stats_group = vgroup.createGroup("statistics");
             
@@ -1627,6 +1711,9 @@ static bool writeVTU_UnstructuredGrid(
     xml << writeFloatArray("distance_km", result.distance);
     xml << writeFloatArray("elevation_deg", result.elevation_angle);
     xml << writeFloatArray("azimuth_deg", result.azimuth);
+    xml << writeFloatArray("emission_angle_deg", result.emission_angle);
+    xml << writeFloatArray("incidence_cos", result.incidence_cos);
+    xml << writeFloatArray("face_area_m2", result.face_area_m2);
     if (!vp_mask.empty()) {
         xml << writeFloatArray("viewpoint_face", vp_mask);
     }

@@ -37,8 +37,6 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         if (root["mesh"]) {
             const auto& mesh = root["mesh"];
             config.mesh.resolution = getWithDefault(mesh, "resolution", config.mesh.resolution);
-            config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
-            config.mesh.topo_directory = getWithDefault(mesh, "topo_directory", config.mesh.topo_directory);
             config.mesh.import_file = getWithDefault(mesh, "import_file", config.mesh.import_file);
             config.mesh.scale_factor = getWithDefault(mesh, "scale_factor", config.mesh.scale_factor);
             config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
@@ -51,6 +49,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.threads = getWithDefault(thermal, "threads", config.thermal.threads);
             config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
+            config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
             config.thermal.thermal_inertia_map = getWithDefault(thermal, "thermal_inertia_map", config.thermal.thermal_inertia_map);
             config.thermal.enable_shadow_flux = getWithDefault(thermal, "enable_shadow_flux", config.thermal.enable_shadow_flux);
             config.thermal.crater_dd_ratio = getWithDefault(thermal, "crater_dd_ratio", config.thermal.crater_dd_ratio);
@@ -58,6 +57,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.integration_steps = getWithDefault(thermal, "integration_steps", config.thermal.integration_steps);
             config.thermal.integration_offset_days = getWithDefault(thermal, "integration_offset_days", config.thermal.integration_offset_days);
             config.thermal.integration_offset_steps = getWithDefault(thermal, "integration_offset_steps", config.thermal.integration_offset_steps);
+            config.thermal.geothermal_heat_flow = getWithDefault(thermal, "geothermal_heat_flow", config.thermal.geothermal_heat_flow);
         }
         
         // Parse Illumination section
@@ -84,35 +84,43 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.include_primary_ir = getWithDefault(output, "include_primary_ir", config.output.include_primary_ir);
             config.output.thermal_vtk_file = getWithDefault(output, "thermal_vtk_file", config.output.thermal_vtk_file);
             config.output.complete_vtk_file = getWithDefault(output, "complete_vtk_file", config.output.complete_vtk_file);
-            config.output.no_maps = getWithDefault(output, "no_maps", config.output.no_maps);
             config.output.locations_file = getWithDefault(output, "locations_file", config.output.locations_file);
             config.output.series_output = getWithDefault(output, "series_output", config.output.series_output);
             config.output.location_data = getWithDefault(output, "location_data", config.output.location_data);
             config.output.depths_file = getWithDefault(output, "depths_file", config.output.depths_file);
         }
         
-        // Parse Visualization section
-        if (root["visualization"]) {
-            const auto& vis = root["visualization"];
-            config.visualization.create = getWithDefault(vis, "create", config.visualization.create);
-            config.visualization.width = getWithDefault(vis, "width", config.visualization.width);
-            config.visualization.height = getWithDefault(vis, "height", config.visualization.height);
-            config.visualization.fps = getWithDefault(vis, "fps", config.visualization.fps);
-            config.visualization.camera_distance = getWithDefault(vis, "camera_distance", config.visualization.camera_distance);
-            config.visualization.camera_latitude = getWithDefault(vis, "camera_latitude", config.visualization.camera_latitude);
-            config.visualization.camera_longitude = getWithDefault(vis, "camera_longitude", config.visualization.camera_longitude);
-            config.visualization.emission_angle = getWithDefault(vis, "emission_angle", config.visualization.emission_angle);
-            config.visualization.azimuth = getWithDefault(vis, "azimuth", config.visualization.azimuth);
-            config.visualization.save_frames = getWithDefault(vis, "save_frames", config.visualization.save_frames);
+        // Parse Radiation section
+        if (root["radiation"]) {
+            const auto& rad = root["radiation"];
+            config.radiation.enabled = getWithDefault(rad, "enabled", config.radiation.enabled);
+            config.radiation.min_shadow_fraction = getWithDefault(rad, "min_shadow_fraction", config.radiation.min_shadow_fraction);
+            config.radiation.verbose = getWithDefault(rad, "verbose", config.radiation.verbose);
+            config.radiation.use_gpu = getWithDefault(rad, "use_gpu", config.radiation.use_gpu);
+            config.radiation.view_factor_file = getWithDefault(rad, "view_factor_file", config.radiation.view_factor_file);
+            config.radiation.max_coupling_iterations = getWithDefault(rad, "max_coupling_iterations", config.radiation.max_coupling_iterations);
+            config.radiation.coupling_temp_threshold = getWithDefault(rad, "coupling_temp_threshold", config.radiation.coupling_temp_threshold);
+            config.radiation.coupling_flux_threshold = getWithDefault(rad, "coupling_flux_threshold", config.radiation.coupling_flux_threshold);
+            config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
+            config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
+            config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
+            config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);
+            config.radiation.aca_max_rank = getWithDefault(rad, "aca_max_rank", config.radiation.aca_max_rank);
+            config.radiation.hmatrix_threads = getWithDefault(rad, "hmatrix_threads", config.radiation.hmatrix_threads);
+            // Adaptive neighbor selection
+            config.radiation.adaptive_neighbors = getWithDefault(rad, "adaptive_neighbors", config.radiation.adaptive_neighbors);
+            config.radiation.captured_energy_target = getWithDefault(rad, "captured_energy_target", config.radiation.captured_energy_target);
+            config.radiation.max_neighbors = getWithDefault(rad, "max_neighbors", config.radiation.max_neighbors);
+            config.radiation.min_neighbors = getWithDefault(rad, "min_neighbors", config.radiation.min_neighbors);
         }
-        
+
         // Parse Advanced section
         if (root["advanced"]) {
             const auto& adv = root["advanced"];
             config.advanced.verbose = getWithDefault(adv, "verbose", config.advanced.verbose);
             config.advanced.default_visible_albedo = getWithDefault(adv, "default_visible_albedo", config.advanced.default_visible_albedo);
         }
-        
+
         std::cout << "Successfully loaded configuration from: " << filename << std::endl;
         
     } catch (const YAML::Exception& e) {
@@ -142,9 +150,6 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // Mesh section
         out << YAML::Key << "mesh" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "resolution" << YAML::Value << config.mesh.resolution;
-        out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
-        if (!config.mesh.topo_directory.empty())
-            out << YAML::Key << "topo_directory" << YAML::Value << config.mesh.topo_directory;
         if (!config.mesh.import_file.empty())
             out << YAML::Key << "import_file" << YAML::Value << config.mesh.import_file;
         out << YAML::Key << "scale_factor" << YAML::Value << config.mesh.scale_factor;
@@ -163,6 +168,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "crater_dd_ratio" << YAML::Value << config.thermal.crater_dd_ratio;
         if (config.thermal.integration_days > 0)
             out << YAML::Key << "integration_days" << YAML::Value << config.thermal.integration_days;
+        if (config.thermal.geothermal_heat_flow > 0)
+            out << YAML::Key << "geothermal_heat_flow" << YAML::Value << config.thermal.geothermal_heat_flow;
         out << YAML::EndMap;
         
         // Illumination section
@@ -186,7 +193,6 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "thermal_vtk_file" << YAML::Value << config.output.thermal_vtk_file;
         if (!config.output.complete_vtk_file.empty())
             out << YAML::Key << "complete_vtk_file" << YAML::Value << config.output.complete_vtk_file;
-        out << YAML::Key << "no_maps" << YAML::Value << config.output.no_maps;
         if (!config.output.locations_file.empty())
             out << YAML::Key << "locations_file" << YAML::Value << config.output.locations_file;
         if (!config.output.series_output.empty())
@@ -197,18 +203,6 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "depths_file" << YAML::Value << config.output.depths_file;
         out << YAML::EndMap;
 
-        // Visualization section
-        out << YAML::Key << "visualization" << YAML::Value << YAML::BeginMap;
-        out << YAML::Key << "create" << YAML::Value << config.visualization.create;
-        out << YAML::Key << "width" << YAML::Value << config.visualization.width;
-        out << YAML::Key << "height" << YAML::Value << config.visualization.height;
-        out << YAML::Key << "fps" << YAML::Value << config.visualization.fps;
-        out << YAML::Key << "camera_distance" << YAML::Value << config.visualization.camera_distance;
-        out << YAML::Key << "camera_latitude" << YAML::Value << config.visualization.camera_latitude;
-        out << YAML::Key << "camera_longitude" << YAML::Value << config.visualization.camera_longitude;
-        out << YAML::Key << "save_frames" << YAML::Value << config.visualization.save_frames;
-        out << YAML::EndMap;
-        
         // Advanced section
         out << YAML::Key << "advanced" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "verbose" << YAML::Value << config.advanced.verbose;
@@ -262,10 +256,6 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
         // Mesh parameters
         else if (arg == "--resolution" && i + 1 < argc) {
             config.mesh.resolution = std::stoi(argv[++i]);
-        } else if (arg == "--topo") {
-            config.mesh.use_topographic = true;
-        } else if (arg == "--topo-dir" && i + 1 < argc) {
-            config.mesh.topo_directory = argv[++i];
         } else if (arg == "--mesh-file" && i + 1 < argc) {
             config.mesh.import_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
@@ -298,6 +288,8 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.thermal.grid_n = std::stoi(argv[++i]);
         } else if (arg == "--thermal-b" && i + 1 < argc) {
             config.thermal.grid_b = std::stoi(argv[++i]);
+        } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
+            config.thermal.geothermal_heat_flow = std::stod(argv[++i]);
         }
         // Illumination parameters
         else if (arg == "--no-primary-reflection") {
@@ -320,30 +312,8 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.output.vtk_mode = argv[++i];
         } else if (arg == "--include-primary-ir") {
             config.output.include_primary_ir = true;
-        } else if (arg == "--no-maps") {
-            config.output.no_maps = true;
         } else if (arg == "--locations" && i + 1 < argc) {
             config.output.locations_file = argv[++i];
-        }
-        // Visualization parameters
-        else if (arg == "--visualization") {
-            config.visualization.create = true;
-        } else if (arg == "--animation-width" && i + 1 < argc) {
-            config.visualization.width = std::stoi(argv[++i]);
-        } else if (arg == "--animation-height" && i + 1 < argc) {
-            config.visualization.height = std::stoi(argv[++i]);
-        } else if (arg == "--camera-distance" && i + 1 < argc) {
-            config.visualization.camera_distance = std::stod(argv[++i]);
-        } else if (arg == "--camera-lat" && i + 1 < argc) {
-            config.visualization.camera_latitude = std::stod(argv[++i]);
-        } else if (arg == "--camera-lon" && i + 1 < argc) {
-            config.visualization.camera_longitude = std::stod(argv[++i]);
-        } else if (arg == "--emission-angle" && i + 1 < argc) {
-            config.visualization.emission_angle = std::stod(argv[++i]);
-        } else if (arg == "--azimuth" && i + 1 < argc) {
-            config.visualization.azimuth = std::stod(argv[++i]);
-        } else if (arg == "--save-frames") {
-            config.visualization.save_frames = true;
         }
         // Advanced parameters
         else if (arg == "--verbose") {
@@ -373,8 +343,6 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "# ========== Mesh Configuration ==========\n";
     out << "mesh:\n";
     out << "  resolution: 5                       # Global mesh resolution\n";
-    out << "  use_topographic: false              # Use pre-computed topographic meshes\n";
-    out << "  topo_directory: \"\"                  # Directory for topographic meshes\n";
     out << "  import_file: \"\"                     # Import custom mesh (OBJ, PLY, VTK)\n";
     out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
     out << "  export_basic: false                 # Export basic mesh to VTK\n\n";
@@ -409,25 +377,11 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  include_primary_ir: false           # Include primary IR in VTK\n";
     out << "  thermal_vtk_file: \"\"                # Custom thermal VTK filename\n";
     out << "  complete_vtk_file: \"\"               # Custom complete VTK filename\n";
-    out << "  no_maps: false                      # Disable map generation\n";
     out << "  locations_file: \"\"                  # Specific lat/lon points file\n";
     out << "  depths_file: \"\"                     # Optional depths file (m); write per-location depth series\n";
     out << "  series_output: \"\"                   # Location time series output filename\n";
-    out << "  location_data: \"\"                   # Custom location data\n";
-    
-    out << "# ========== Visualization ==========\n";
-    out << "visualization:\n";
-    out << "  create: false                       # Generate visualization\n";
-    out << "  width: 1024                         # Animation width\n";
-    out << "  height: 768                         # Animation height\n";
-    out << "  fps: 30                             # Frames per second\n";
-    out << "  camera_distance: 5.0                # Camera distance\n";
-    out << "  camera_latitude: 30.0               # Camera latitude (degrees)\n";
-    out << "  camera_longitude: 0.0               # Camera longitude (degrees)\n";
-    out << "  emission_angle: -1.0                # Emission angle (-1=use camera pos)\n";
-    out << "  azimuth: -1.0                       # Azimuth angle (-1=use camera pos)\n";
-    out << "  save_frames: false                  # Save individual frames\n\n";
-    
+    out << "  location_data: \"\"                   # Custom location data\n\n";
+
     out << "# ========== Advanced Options ==========\n";
     out << "advanced:\n";
     out << "  verbose: false                      # Verbose output\n";
@@ -477,23 +431,13 @@ bool ConfigParser::validate(const SimulationConfig& config) {
     }
     
     // Validate VTK mode
-    if (config.output.vtk_mode != "thermal" && 
-        config.output.vtk_mode != "complete" && 
+    if (config.output.vtk_mode != "thermal" &&
+        config.output.vtk_mode != "complete" &&
         config.output.vtk_mode != "both") {
         std::cerr << "Error: vtk_mode must be 'thermal', 'complete', or 'both'" << std::endl;
         valid = false;
     }
-    
-    // Validate visualization parameters
-    if (config.visualization.width <= 0 || config.visualization.height <= 0) {
-        std::cerr << "Error: visualization dimensions must be positive" << std::endl;
-        valid = false;
-    }
-    if (config.visualization.fps <= 0) {
-        std::cerr << "Error: fps must be positive" << std::endl;
-        valid = false;
-    }
-    
+
     return valid;
 }
 

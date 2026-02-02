@@ -85,7 +85,28 @@ void RadiositySolver::initGPU() {
     }
 
     size_t n = emissivity_.size();
+    size_t nnz = F_ptr_->numNonZeros();
 
+    // Hard limit: GPU SpMV with very large matrices is unreliable on AMD drivers
+    // Even if memory fits, kernel execution can crash with >100M non-zeros
+    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros max
+    if (nnz > MAX_GPU_NNZ) {
+        std::cout << "Note: Sparse matrix too large for reliable GPU radiosity solver\n";
+        std::cout << "  Non-zeros: " << nnz / 1000000 << "M (limit: " << MAX_GPU_NNZ / 1000000 << "M)\n";
+        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        return;
+    }
+
+    // Check if sparse matrix fits in GPU memory before attempting
+    // CSR format requires: nnz * sizeof(float) for values
+    //                    + nnz * sizeof(int) for column indices
+    //                    + (n+1) * sizeof(int) for row pointers
+    // Plus working buffers: 7 * n * sizeof(float) for vectors
+    size_t csr_memory = nnz * sizeof(float) + nnz * sizeof(int) + (n + 1) * sizeof(int);
+    size_t working_memory = 7 * n * sizeof(float);  // radiosity vectors, temps, etc.
+    size_t total_gpu_memory_needed = csr_memory + working_memory;
+
+    // Create temporary solver just to check GPU memory
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
@@ -98,6 +119,29 @@ void RadiositySolver::initGPU() {
                   << "falling back to CPU\n";
         gpu_solver_.reset();
         return;
+    }
+
+    // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
+    // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
+    size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
+    size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
+
+    if (total_gpu_memory_needed > gpu_mem_limit) {
+        std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
+        std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+        std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
+        std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
+        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        gpu_solver_.reset();
+        return;
+    }
+
+    if (config_.verbose) {
+        std::cout << "GPU radiosity memory check passed:\n";
+        std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
+        std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
+        std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+        std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
     }
 
     // Upload view factor CSR data
@@ -705,7 +749,35 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
     }
 
     // Choose between H-matrix (compressed) and standard sparse view factors
-    if (config_.use_hmatrix) {
+    // AUTO-DISABLE H-matrix for very large meshes (>1M faces) - falls back to sparse
+    // This is because H-matrix working memory during build exceeds available RAM
+    // even with out-of-core storage and index clearing optimizations.
+    bool use_hmatrix = config_.use_hmatrix;
+    std::cout << "  [DEBUG] View factor method selection:" << std::endl;
+    std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
+    std::cout << "    n_faces = " << n_faces << std::endl;
+    std::cout << "    auto-disable threshold = 1,000,000 faces" << std::endl;
+
+    // Aggressive threshold: disable H-matrix for meshes > 1M faces
+    // H-matrix build memory scales as O(N²/B) where B is block size
+    // For 2M faces with typical block sizes, this exceeds 384 GB RAM
+    if (use_hmatrix && n_faces > 1000000) {
+        std::cout << std::endl;
+        std::cout << "  *** H-MATRIX AUTO-DISABLED ***" << std::endl;
+        std::cout << "  Mesh has " << n_faces << " faces (> 1M threshold)" << std::endl;
+        std::cout << "  H-matrix build memory exceeds available RAM for meshes this large." << std::endl;
+        std::cout << "  Falling back to sparse view factors with adaptive neighbor selection." << std::endl;
+        std::cout << std::endl;
+        use_hmatrix = false;
+
+        // Enable adaptive neighbor selection for memory-efficient sparse matrix
+        // Each face gets as many neighbors as needed for 99% captured energy (configurable)
+        config_.adaptive_neighbors = true;
+        std::cout << "  Adaptive neighbor selection enabled (target: "
+                  << (config_.captured_energy_target * 100) << "% captured energy)" << std::endl;
+    }
+
+    if (use_hmatrix) {
         std::cout << "Using H-matrix compression for view factors..." << std::endl;
 
         HMatrixConfig hconfig;
@@ -719,6 +791,7 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
         hconfig.aca_tolerance = config_.aca_tolerance;
         hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
             std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
@@ -830,89 +903,123 @@ bool RadiationExchangeManager::prepare(
                           << " MB" << std::endl;
             }
         }
-    } else {
-        // Compute view factors for ALL faces, not just exchange faces.
-        // This is critical because:
-        // 1. Exchange faces (shadowed floor) need to RECEIVE radiation from illuminated walls
-        // 2. Illuminated wall faces are NOT exchange faces (they're well-lit)
-        // 3. For floor to receive radiation from wall, we need F_floor,wall which requires
-        //    computing view factors FROM floors TO walls (and walls back to floors)
-        // 4. The radiosity solver needs B_wall = ε*σ*T_wall^4 to propagate to floors
-        //
-        // Computing view factors for all faces ensures that warm illuminated surfaces
-        // can contribute thermal radiation to cold shadowed surfaces.
-        if (config_.verbose) {
-            std::cout << "Computing view factors for ALL " << mesh_->faces.size()
-                      << " faces (not just " << classification_.exchange_faces
-                      << " exchange faces)..." << std::endl;
-            std::cout << "  This ensures illuminated walls can radiate to shadowed floors." << std::endl;
-        }
 
-        // Choose between H-matrix (compressed) and standard sparse view factors
-        if (config_.use_hmatrix) {
-            std::cout << "Using H-matrix compression for view factors..." << std::endl;
+        // CRITICAL: Set config and initialize GPU for loaded view factors
+        // Without this, GPU memory check is skipped and GPU crashes on large matrices
+        solver_->setConfig(config_);
+        solver_->initGPU();
 
-            // Create H-matrix configuration
-            HMatrixConfig hconfig;
-            hconfig.compression_tolerance = config_.hmatrix_tolerance;
-            hconfig.max_tree_depth = config_.hmatrix_max_depth;
-            hconfig.min_block_size = config_.hmatrix_min_block_size;
-            hconfig.max_svd_rank = config_.hmatrix_max_rank;
-            hconfig.verbose = config_.verbose;
+        is_active_ = true;
+        return true;
+    }
 
-            // ACA configuration (Adaptive Cross Approximation - much faster)
-            hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
-            hconfig.aca_tolerance = config_.aca_tolerance;
-            hconfig.aca_max_rank = config_.aca_max_rank;
+    // Compute view factors for ALL faces, not just exchange faces.
+    // This is critical because:
+    // 1. Exchange faces (shadowed floor) need to RECEIVE radiation from illuminated walls
+    // 2. Illuminated wall faces are NOT exchange faces (they're well-lit)
+    // 3. For floor to receive radiation from wall, we need F_floor,wall which requires
+    //    computing view factors FROM floors TO walls (and walls back to floors)
+    // 4. The radiosity solver needs B_wall = ε*σ*T_wall^4 to propagate to floors
+    //
+    // Computing view factors for all faces ensures that warm illuminated surfaces
+    // can contribute thermal radiation to cold shadowed surfaces.
+    if (config_.verbose) {
+        std::cout << "Computing view factors for ALL " << mesh_->faces.size()
+                  << " faces (not just " << classification_.exchange_faces
+                  << " exchange faces)..." << std::endl;
+        std::cout << "  This ensures illuminated walls can radiate to shadowed floors." << std::endl;
+    }
 
-            if (config_.use_aca) {
-                std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
-                          << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
-            } else {
-                std::cout << "  Using SVD compression" << std::endl;
-            }
+    // AUTO-DISABLE H-matrix for very large meshes (>1M faces) - falls back to sparse
+    // This is because H-matrix working memory during build exceeds available RAM
+    // even with out-of-core storage and index clearing optimizations.
+    bool use_hmatrix = config_.use_hmatrix;
+    std::cout << "  [DEBUG] View factor method selection (prepare):" << std::endl;
+    std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
+    std::cout << "    n_faces = " << n_faces << std::endl;
+    std::cout << "    auto-disable threshold = 1,000,000 faces" << std::endl;
 
-            hmatrix_view_factors_ = std::make_unique<HMatrixViewFactor>();
-            hmatrix_view_factors_->build(mesh_,
-                                         static_cast<RTCDevice>(device_),
-                                         static_cast<RTCScene>(scene_),
-                                         config_,
-                                         hconfig);
+    if (use_hmatrix && n_faces > 1000000) {
+        std::cout << std::endl;
+        std::cout << "  *** H-MATRIX AUTO-DISABLED (prepare) ***" << std::endl;
+        std::cout << "  Mesh has " << n_faces << " faces (> 1M threshold)" << std::endl;
+        std::cout << "  H-matrix build memory exceeds available RAM for meshes this large." << std::endl;
+        std::cout << "  Falling back to sparse view factors with adaptive neighbor selection." << std::endl;
+        std::cout << std::endl;
+        use_hmatrix = false;
 
-            // Create radiosity solver with H-matrix
-            solver_ = std::make_unique<RadiositySolver>(*hmatrix_view_factors_, emissivity_, areas_);
-            using_hmatrix_ = true;
+        // Enable adaptive neighbor selection for memory-efficient sparse matrix
+        // Each face gets as many neighbors as needed for 99% captured energy (configurable)
+        config_.adaptive_neighbors = true;
+        std::cout << "  Adaptive neighbor selection enabled (target: "
+                  << (config_.captured_energy_target * 100) << "% captured energy)" << std::endl;
+    }
 
-            // Always show H-matrix summary (memory savings are important info)
-            std::cout << "H-matrix view factors computed:" << std::endl;
-            std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
-                      << " MB" << std::endl;
-            std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
-            if (config_.verbose) {
-                hmatrix_view_factors_->printStatistics();
-            }
+    // Choose between H-matrix (compressed) and standard sparse view factors
+    if (use_hmatrix) {
+        std::cout << "Using H-matrix compression for view factors..." << std::endl;
+
+        // Create H-matrix configuration
+        HMatrixConfig hconfig;
+        hconfig.compression_tolerance = config_.hmatrix_tolerance;
+        hconfig.max_tree_depth = config_.hmatrix_max_depth;
+        hconfig.min_block_size = config_.hmatrix_min_block_size;
+        hconfig.max_svd_rank = config_.hmatrix_max_rank;
+        hconfig.verbose = config_.verbose;
+
+        // ACA configuration (Adaptive Cross Approximation - much faster)
+        hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
+        hconfig.aca_tolerance = config_.aca_tolerance;
+        hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.hmatrix_threads = config_.hmatrix_threads;
+
+        if (config_.use_aca) {
+            std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
+                      << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
         } else {
-            // Standard sparse view factor computation
-            std::cout << "Using sparse view factor matrix..." << std::endl;
-
-            ViewFactorCalculator calculator(mesh_,
-                                            static_cast<RTCDevice>(device_),
-                                            static_cast<RTCScene>(scene_),
-                                            config_);
-
-            // Compute for ALL faces so that wall->floor radiation is captured
-            view_factors_ = calculator.computeAll();
-
-            // Create radiosity solver
-            solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
-            using_hmatrix_ = false;
-
-            // Always show sparse matrix summary
-            std::cout << "Sparse view factors computed:" << std::endl;
-            std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
-            std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
-                      << " MB" << std::endl;
+            std::cout << "  Using SVD compression" << std::endl;
         }
+
+        hmatrix_view_factors_ = std::make_unique<HMatrixViewFactor>();
+        hmatrix_view_factors_->build(mesh_,
+                                     static_cast<RTCDevice>(device_),
+                                     static_cast<RTCScene>(scene_),
+                                     config_,
+                                     hconfig);
+
+        // Create radiosity solver with H-matrix
+        solver_ = std::make_unique<RadiositySolver>(*hmatrix_view_factors_, emissivity_, areas_);
+        using_hmatrix_ = true;
+
+        // Always show H-matrix summary (memory savings are important info)
+        std::cout << "H-matrix view factors computed:" << std::endl;
+        std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+        std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
+        if (config_.verbose) {
+            hmatrix_view_factors_->printStatistics();
+        }
+    } else {
+        // Standard sparse view factor computation
+        std::cout << "Using sparse view factor matrix..." << std::endl;
+
+        ViewFactorCalculator calculator(mesh_,
+                                        static_cast<RTCDevice>(device_),
+                                        static_cast<RTCScene>(scene_),
+                                        config_);
+
+        // Compute for ALL faces so that wall->floor radiation is captured
+        view_factors_ = calculator.computeAll();
+
+        // Create radiosity solver
+        solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
+        using_hmatrix_ = false;
+
+        // Always show sparse matrix summary
+        std::cout << "Sparse view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
     }
 
     solver_->setConfig(config_);

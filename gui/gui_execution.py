@@ -27,6 +27,11 @@ class ExecutionThread(QThread):
     def run(self):
         """Execute the command and emit output"""
         try:
+            # Pass current Python executable to subprocess so C++ can invoke it
+            # This ensures the correct Python environment (conda/venv) is used
+            env = os.environ.copy()
+            env["PYTHON_EXECUTABLE"] = sys.executable
+
             self.process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
@@ -34,7 +39,8 @@ class ExecutionThread(QThread):
                 universal_newlines=False,  # Read bytes
                 bufsize=0,
                 cwd=self.working_dir,
-                shell=isinstance(self.command, str)
+                shell=isinstance(self.command, str),
+                env=env
             )
 
             # Use bytearray so we can mutate in-place

@@ -9,8 +9,348 @@
 #include <cstring>
 #include <limits>
 #include <atomic>
+#include <iomanip>
+#include <chrono>
+
+// Platform-specific includes for memory query
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
 
 namespace radiation {
+
+// ============================================================================
+// Memory Query Functions (for adaptive neighbor selection)
+// ============================================================================
+
+static size_t getAvailableMemory() {
+#ifdef __APPLE__
+    mach_port_t host = mach_host_self();
+    vm_statistics64_data_t vm_stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm_stats), &count) == KERN_SUCCESS) {
+        vm_size_t page_size;
+        host_page_size(host, &page_size);
+        // Available = free + inactive (can be reclaimed)
+        return (vm_stats.free_count + vm_stats.inactive_count) * page_size;
+    }
+    return 0;
+#elif defined(__linux__)
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        return info.freeram * info.mem_unit;
+    }
+    return 0;
+#else
+    return 0;  // Unknown platform
+#endif
+}
+
+static size_t getTotalMemory() {
+#ifdef __APPLE__
+    int64_t memsize;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        return static_cast<size_t>(memsize);
+    }
+    return 0;
+#elif defined(__linux__)
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        return info.totalram * info.mem_unit;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+// ============================================================================
+// SIMD Batch Visibility Testing (AVX-512 / AVX2)
+// ============================================================================
+
+// Check for AVX-512 support at runtime
+static bool hasAVX512() {
+#if defined(__x86_64__) || defined(_M_X64)
+    // Check CPUID for AVX-512F support
+    unsigned int eax, ebx, ecx, edx;
+    #ifdef _MSC_VER
+    int cpuInfo[4];
+    __cpuidex(cpuInfo, 7, 0);
+    ebx = cpuInfo[1];
+    #else
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(7), "c"(0)
+    );
+    #endif
+    return (ebx & (1 << 16)) != 0;  // AVX-512F bit
+#else
+    return false;
+#endif
+}
+
+// Ray candidate for batch visibility testing
+struct RayCandidate {
+    std::array<double, 3> origin;
+    std::array<double, 3> dir;
+    float tfar;
+    int neighbor_idx;  // Track which neighbor this ray corresponds to
+};
+
+// AVX-512 16-wide ray packet visibility test
+static void batchedVisibilityTest16(
+    RTCScene scene,
+    const std::vector<RayCandidate>& candidates,
+    std::vector<bool>& visible,
+    size_t start_idx,
+    size_t end_idx) {
+
+    constexpr int BATCH_SIZE = 16;
+
+    // 64-byte aligned arrays for AVX-512
+    alignas(64) float org_x[BATCH_SIZE];
+    alignas(64) float org_y[BATCH_SIZE];
+    alignas(64) float org_z[BATCH_SIZE];
+    alignas(64) float dir_x[BATCH_SIZE];
+    alignas(64) float dir_y[BATCH_SIZE];
+    alignas(64) float dir_z[BATCH_SIZE];
+    alignas(64) float tnear[BATCH_SIZE];
+    alignas(64) float tfar_arr[BATCH_SIZE];
+    alignas(64) int valid[BATCH_SIZE];
+
+    size_t i = start_idx;
+    while (i < end_idx) {
+        int batch_count = 0;
+        size_t batch_start = i;
+
+        // Fill batch
+        while (batch_count < BATCH_SIZE && i < end_idx) {
+            const auto& c = candidates[i];
+            org_x[batch_count] = static_cast<float>(c.origin[0]);
+            org_y[batch_count] = static_cast<float>(c.origin[1]);
+            org_z[batch_count] = static_cast<float>(c.origin[2]);
+            dir_x[batch_count] = static_cast<float>(c.dir[0]);
+            dir_y[batch_count] = static_cast<float>(c.dir[1]);
+            dir_z[batch_count] = static_cast<float>(c.dir[2]);
+            tnear[batch_count] = 0.0f;
+            tfar_arr[batch_count] = c.tfar;
+            valid[batch_count] = -1;  // -1 means valid ray
+            batch_count++;
+            i++;
+        }
+
+        // Mark remaining slots as invalid
+        for (int j = batch_count; j < BATCH_SIZE; ++j) {
+            valid[j] = 0;
+            org_x[j] = org_y[j] = org_z[j] = 0.0f;
+            dir_x[j] = dir_y[j] = dir_z[j] = 0.0f;
+            tnear[j] = 0.0f;
+            tfar_arr[j] = -1.0f;
+        }
+
+        // Create 16-wide ray packet
+        RTCRayHit16 rayhit16;
+        for (int j = 0; j < BATCH_SIZE; ++j) {
+            rayhit16.ray.org_x[j] = org_x[j];
+            rayhit16.ray.org_y[j] = org_y[j];
+            rayhit16.ray.org_z[j] = org_z[j];
+            rayhit16.ray.dir_x[j] = dir_x[j];
+            rayhit16.ray.dir_y[j] = dir_y[j];
+            rayhit16.ray.dir_z[j] = dir_z[j];
+            rayhit16.ray.tnear[j] = tnear[j];
+            rayhit16.ray.tfar[j] = tfar_arr[j];
+            rayhit16.ray.mask[j] = 0xFFFFFFFF;
+            rayhit16.ray.flags[j] = 0;
+            rayhit16.ray.time[j] = 0.0f;
+            rayhit16.ray.id[j] = static_cast<unsigned int>(batch_start + j);
+            rayhit16.hit.geomID[j] = RTC_INVALID_GEOMETRY_ID;
+            rayhit16.hit.primID[j] = RTC_INVALID_GEOMETRY_ID;
+            rayhit16.hit.instID[0][j] = RTC_INVALID_GEOMETRY_ID;
+        }
+
+        // Execute 16-wide ray trace
+        rtcIntersect16(valid, scene, &rayhit16);
+
+        // Extract results
+        for (int j = 0; j < batch_count; ++j) {
+            visible[batch_start + j] = (rayhit16.hit.geomID[j] == RTC_INVALID_GEOMETRY_ID);
+        }
+    }
+}
+
+// AVX2 8-wide ray packet visibility test
+static void batchedVisibilityTest8(
+    RTCScene scene,
+    const std::vector<RayCandidate>& candidates,
+    std::vector<bool>& visible,
+    size_t start_idx,
+    size_t end_idx) {
+
+    constexpr int BATCH_SIZE = 8;
+
+    // 32-byte aligned arrays for AVX2
+    alignas(32) float org_x[BATCH_SIZE];
+    alignas(32) float org_y[BATCH_SIZE];
+    alignas(32) float org_z[BATCH_SIZE];
+    alignas(32) float dir_x[BATCH_SIZE];
+    alignas(32) float dir_y[BATCH_SIZE];
+    alignas(32) float dir_z[BATCH_SIZE];
+    alignas(32) float tnear[BATCH_SIZE];
+    alignas(32) float tfar_arr[BATCH_SIZE];
+    alignas(32) int valid[BATCH_SIZE];
+
+    size_t i = start_idx;
+    while (i < end_idx) {
+        int batch_count = 0;
+        size_t batch_start = i;
+
+        // Fill batch
+        while (batch_count < BATCH_SIZE && i < end_idx) {
+            const auto& c = candidates[i];
+            org_x[batch_count] = static_cast<float>(c.origin[0]);
+            org_y[batch_count] = static_cast<float>(c.origin[1]);
+            org_z[batch_count] = static_cast<float>(c.origin[2]);
+            dir_x[batch_count] = static_cast<float>(c.dir[0]);
+            dir_y[batch_count] = static_cast<float>(c.dir[1]);
+            dir_z[batch_count] = static_cast<float>(c.dir[2]);
+            tnear[batch_count] = 0.0f;
+            tfar_arr[batch_count] = c.tfar;
+            valid[batch_count] = -1;  // -1 means valid ray
+            batch_count++;
+            i++;
+        }
+
+        // Mark remaining slots as invalid
+        for (int j = batch_count; j < BATCH_SIZE; ++j) {
+            valid[j] = 0;
+            org_x[j] = org_y[j] = org_z[j] = 0.0f;
+            dir_x[j] = dir_y[j] = dir_z[j] = 0.0f;
+            tnear[j] = 0.0f;
+            tfar_arr[j] = -1.0f;
+        }
+
+        // Create 8-wide ray packet
+        RTCRayHit8 rayhit8;
+        for (int j = 0; j < BATCH_SIZE; ++j) {
+            rayhit8.ray.org_x[j] = org_x[j];
+            rayhit8.ray.org_y[j] = org_y[j];
+            rayhit8.ray.org_z[j] = org_z[j];
+            rayhit8.ray.dir_x[j] = dir_x[j];
+            rayhit8.ray.dir_y[j] = dir_y[j];
+            rayhit8.ray.dir_z[j] = dir_z[j];
+            rayhit8.ray.tnear[j] = tnear[j];
+            rayhit8.ray.tfar[j] = tfar_arr[j];
+            rayhit8.ray.mask[j] = 0xFFFFFFFF;
+            rayhit8.ray.flags[j] = 0;
+            rayhit8.ray.time[j] = 0.0f;
+            rayhit8.ray.id[j] = static_cast<unsigned int>(batch_start + j);
+            rayhit8.hit.geomID[j] = RTC_INVALID_GEOMETRY_ID;
+            rayhit8.hit.primID[j] = RTC_INVALID_GEOMETRY_ID;
+            rayhit8.hit.instID[0][j] = RTC_INVALID_GEOMETRY_ID;
+        }
+
+        // Execute 8-wide ray trace
+        rtcIntersect8(valid, scene, &rayhit8);
+
+        // Extract results
+        for (int j = 0; j < batch_count; ++j) {
+            visible[batch_start + j] = (rayhit8.hit.geomID[j] == RTC_INVALID_GEOMETRY_ID);
+        }
+    }
+}
+
+// Thread-safe initialization of SIMD mode (called once before parallel region)
+static bool g_simd_initialized = false;
+static bool g_use_avx512 = false;
+
+static void initializeSIMDVisibility() {
+    if (!g_simd_initialized) {
+        g_use_avx512 = hasAVX512();
+        if (g_use_avx512) {
+            std::cout << "  Using AVX-512 16-wide ray packets for visibility testing" << std::endl;
+        } else {
+            std::cout << "  Using AVX2 8-wide ray packets for visibility testing" << std::endl;
+        }
+        g_simd_initialized = true;
+    }
+}
+
+// Batched visibility test using Embree ray packets
+// Automatically selects AVX-512 (16-wide) or AVX2 (8-wide) based on CPU support
+// NOTE: initializeSIMDVisibility() must be called before using this from parallel code
+static void batchedVisibilityTest(
+    RTCScene scene,
+    const std::vector<RayCandidate>& candidates,
+    std::vector<bool>& visible) {
+
+    visible.resize(candidates.size());
+    if (candidates.empty()) return;
+
+    const size_t n_candidates = candidates.size();
+
+    if (g_use_avx512) {
+        batchedVisibilityTest16(scene, candidates, visible, 0, n_candidates);
+    } else {
+        batchedVisibilityTest8(scene, candidates, visible, 0, n_candidates);
+    }
+}
+
+// Prepare ray from two points with appropriate offsets to avoid self-intersection
+static RayCandidate prepareRay(
+    const std::array<double, 3>& p1,
+    const std::array<double, 3>& p2,
+    int neighbor_idx) {
+
+    RayCandidate ray;
+    ray.neighbor_idx = neighbor_idx;
+
+    // Compute direction
+    std::array<double, 3> dir = {{p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]}};
+    double dist = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+
+    if (dist < 1e-10) {
+        // Same point - mark as invalid ray
+        ray.origin = p1;
+        ray.dir = {{1.0, 0.0, 0.0}};
+        ray.tfar = -1.0f;
+        return ray;
+    }
+
+    // Normalize
+    dir[0] /= dist;
+    dir[1] /= dist;
+    dir[2] /= dist;
+
+    // Compute offset (same logic as isVisible)
+    double relative_offset = dist * 0.001;
+    double absolute_offset = 0.5;
+    double offset = std::max(relative_offset, absolute_offset);
+    offset = std::min(offset, dist * 0.1);
+
+    // Compute ray origin with offset
+    ray.origin = {{
+        p1[0] + offset * dir[0],
+        p1[1] + offset * dir[1],
+        p1[2] + offset * dir[2]
+    }};
+    ray.dir = dir;
+
+    // Compute tfar
+    double end_margin = std::max(dist * 0.001, absolute_offset);
+    end_margin = std::min(end_margin, dist * 0.1);
+    double tfar = dist - offset - end_margin;
+
+    ray.tfar = (tfar < 0.1f) ? -1.0f : static_cast<float>(tfar);  // -1 means skip (too close)
+
+    return ray;
+}
 
 // ============================================================================
 // ViewFactorMatrix Implementation
@@ -468,10 +808,42 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
     std::vector<std::vector<int>> local_cols(omp_get_max_threads());
     std::vector<std::vector<double>> local_vals(omp_get_max_threads());
 
+    // Compute memory budget for adaptive selection
+    size_t memory_budget = 0;
+    size_t max_total_entries = 0;
+    if (config_.adaptive_neighbors) {
+        memory_budget = computeMemoryBudget(n_total);
+        max_total_entries = memory_budget / 12;  // 12 bytes per CSR entry
+        std::cout << "  Using adaptive neighbor selection:" << std::endl;
+        std::cout << "    Target captured energy: " << (config_.captured_energy_target * 100) << "%" << std::endl;
+        std::cout << "    Min neighbors/face: " << config_.min_neighbors << std::endl;
+        std::cout << "    Max neighbors/face: " << config_.max_neighbors << std::endl;
+    }
+
+    // Statistics tracking (atomic for thread safety)
+    std::atomic<size_t> global_entry_count{0};
+    std::atomic<size_t> total_neighbors{0};
+    std::atomic<size_t> faces_at_min{0};
+    std::atomic<size_t> faces_at_max{0};
+    std::atomic<size_t> faces_at_target{0};
+
+    // Initialize SIMD visibility testing BEFORE parallel region (thread-safe)
+    if (config_.adaptive_neighbors) {
+        initializeSIMDVisibility();
+        std::cout << std::flush;  // Ensure output is visible before parallel region
+    }
+
+    // Timing for diagnostics
+    auto start_time = std::chrono::high_resolution_clock::now();
+
     // Progress tracking with atomic counter for thread-safe updates
     // Always show progress bar (not gated by verbose) since this is a long operation
     std::atomic<size_t> progress_counter{0};
-    const size_t progress_interval = std::max(n_subset / 100, static_cast<size_t>(1));  // Update ~100 times
+    // For large meshes, update more frequently (every 1000 faces or 0.1%)
+    const size_t progress_interval = std::min(
+        std::max(n_subset / 1000, static_cast<size_t>(1)),   // Update ~1000 times
+        static_cast<size_t>(1000)                             // But at least every 1000 faces
+    );
     thermal::ProgressBar progress_bar(static_cast<int>(n_subset), "View factor computation: ", 50, true);
     // Show initial 0% progress immediately
     progress_bar.update(0);
@@ -483,76 +855,69 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
         local_cols[tid].reserve(n_subset * 50 / omp_get_max_threads());
         local_vals[tid].reserve(n_subset * 50 / omp_get_max_threads());
 
+        // Thread-local scratch buffer for candidates (avoids per-face allocation)
+        std::vector<int> candidates;
+        candidates.reserve(10000);  // Pre-allocate for typical crater geometry
+
         #pragma omp for schedule(dynamic, 16)
         for (size_t i = 0; i < n_subset; ++i) {
             int face_i = face_indices[i];
 
-            // Find neighbor faces
-            auto neighbors = findNeighbors(face_i, search_radius);
+            // Find candidate neighbor faces (using by-reference overload)
+            findNeighbors(face_i, search_radius, candidates);
 
-            // Limit number of neighbors if needed
-            // Sort by POTENTIAL VIEW FACTOR (A_j * cos_i * cos_j / r²), not distance.
-            // This ensures we keep the faces that contribute most to radiation exchange.
-            if (static_cast<int>(neighbors.size()) > config_.max_neighbors) {
-                std::vector<std::pair<double, int>> potential_vf;
-                potential_vf.reserve(neighbors.size());
+            // Select neighbors and compute view factors
+            // Adaptive method returns precomputed geometry to avoid redundant calculations
+            if (config_.adaptive_neighbors) {
+                auto neighbors_with_geom = selectNeighborsAdaptive(face_i, candidates,
+                                                                    global_entry_count,
+                                                                    max_total_entries);
 
-                const auto& c_i = face_centers_[face_i];
-                const auto& n_i = face_normals_[face_i];
+                // Track statistics
+                size_t n_neighbors = neighbors_with_geom.size();
+                total_neighbors.fetch_add(n_neighbors, std::memory_order_relaxed);
 
-                for (int j : neighbors) {
-                    const auto& c_j = face_centers_[j];
-                    const auto& n_j = face_normals_[j];
-                    double A_j = face_areas_[j];
-
-                    auto r_vec = subtract(c_j, c_i);
-                    double r2 = dot(r_vec, r_vec);
-                    if (r2 < 1e-20) {
-                        potential_vf.push_back({0.0, j});
-                        continue;
-                    }
-
-                    double r = std::sqrt(r2);
-                    std::array<double, 3> r_hat = {{r_vec[0]/r, r_vec[1]/r, r_vec[2]/r}};
-
-                    // Use absolute cosines (works for any normal convention)
-                    double cos_i = std::abs(dot(n_i, r_hat));
-                    double cos_j = std::abs(dot(n_j, r_hat));
-
-                    // Potential view factor (higher is better, so we negate for sorting)
-                    double potential = A_j * cos_i * cos_j / r2;
-                    potential_vf.push_back({-potential, j});  // Negative so we keep highest
+                if (n_neighbors == static_cast<size_t>(config_.min_neighbors)) {
+                    faces_at_min.fetch_add(1, std::memory_order_relaxed);
+                } else if (n_neighbors == static_cast<size_t>(config_.max_neighbors)) {
+                    faces_at_max.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    faces_at_target.fetch_add(1, std::memory_order_relaxed);
                 }
 
-                // Sort by potential (highest first due to negation)
-                std::partial_sort(potential_vf.begin(),
-                                  potential_vf.begin() + config_.max_neighbors,
-                                  potential_vf.end());
-                neighbors.resize(config_.max_neighbors);
-                for (int k = 0; k < config_.max_neighbors; ++k) {
-                    neighbors[k] = potential_vf[k].second;
-                }
-            }
+                // Compute view factors using SIMD batch visibility testing
+                auto view_factors = computeViewFactorsBatched(face_i, neighbors_with_geom);
 
-            // Compute view factors to neighbors
-            // Debug counters (per thread)
-            int dbg_threshold_reject = 0;
-            int dbg_accepted = 0;
-
-            double max_F = 0.0;
-            for (int face_j : neighbors) {
-                if (face_j == face_i) continue;  // Skip self
-
-                double F_ij = computeAdaptive(face_i, face_j);
-                max_F = std::max(max_F, F_ij);
-
-                if (F_ij > config_.visibility_threshold) {
+                for (const auto& [face_j, F_ij] : view_factors) {
                     local_rows[tid].push_back(face_i);
                     local_cols[tid].push_back(face_j);
                     local_vals[tid].push_back(F_ij);
-                    dbg_accepted++;
-                } else if (F_ij > 0) {
-                    dbg_threshold_reject++;
+                }
+            } else {
+                // Fixed method: use original computeAdaptive (no precomputed geometry)
+                auto neighbors = selectNeighborsFixed(face_i, candidates);
+
+                // Track statistics
+                size_t n_neighbors = neighbors.size();
+                total_neighbors.fetch_add(n_neighbors, std::memory_order_relaxed);
+
+                if (n_neighbors == static_cast<size_t>(config_.min_neighbors)) {
+                    faces_at_min.fetch_add(1, std::memory_order_relaxed);
+                } else if (n_neighbors == static_cast<size_t>(config_.max_neighbors)) {
+                    faces_at_max.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    faces_at_target.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                // Compute view factors (full computation for each pair)
+                for (int face_j : neighbors) {
+                    double F_ij = computeAdaptive(face_i, face_j);
+
+                    if (F_ij > config_.visibility_threshold) {
+                        local_rows[tid].push_back(face_i);
+                        local_cols[tid].push_back(face_j);
+                        local_vals[tid].push_back(F_ij);
+                    }
                 }
             }
 
@@ -572,6 +937,33 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
 
     // Finalize progress bar
     progress_bar.finish();
+
+    // Report computation time
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+    std::cout << std::endl << "  View factor computation time: " << std::fixed << std::setprecision(1)
+              << elapsed_sec << " seconds" << std::endl;
+
+    // Print neighbor selection statistics
+    if (config_.adaptive_neighbors) {
+        double avg_neighbors = static_cast<double>(total_neighbors.load()) / n_subset;
+        std::cout << std::endl << "  Adaptive neighbor selection complete:" << std::endl;
+        std::cout << "    Average neighbors/face: " << std::fixed << std::setprecision(1)
+                  << avg_neighbors << std::endl;
+        std::cout << "    Faces at minimum (" << config_.min_neighbors << "): "
+                  << faces_at_min.load() << std::endl;
+        std::cout << "    Faces at target energy: " << faces_at_target.load() << std::endl;
+        std::cout << "    Faces at maximum (" << config_.max_neighbors << "): "
+                  << faces_at_max.load() << std::endl;
+        std::cout << "    Total neighbor selections: " << global_entry_count.load() << std::endl;
+
+        // Calculate actual vs theoretical max memory
+        size_t actual_entries = global_entry_count.load();
+        size_t max_possible = n_subset * static_cast<size_t>(config_.max_neighbors);
+        double savings_pct = 100.0 * (1.0 - static_cast<double>(actual_entries) / max_possible);
+        std::cout << "    Memory savings vs fixed max: " << std::fixed << std::setprecision(1)
+                  << savings_pct << "%" << std::endl;
+    }
 
     // Print debug summary after progress bar completes (only in verbose mode)
     if (config_.verbose) {
@@ -878,6 +1270,144 @@ double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
     }
 }
 
+double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
+                                                     const PrecomputedGeometry& geom) {
+    // Compute view factor using precomputed geometry from neighbor selection
+    // This avoids redundant distance/angle calculations for the centroid method
+    //
+    // For far faces (Ns > threshold), we can use the precomputed values directly.
+    // For nearby faces requiring subdivision, we fall back to full computation
+    // since subdivision requires computing at multiple sample points.
+
+    double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
+    double Ns = geom.r / std::sqrt(A_eff);
+
+    if (Ns <= config_.adaptive_ns_threshold) {
+        // Close faces: use subdivision method (needs full computation at sample points)
+        return computeSubdivision(face_i, face_j, config_.subdivision_level);
+    }
+
+    // Far faces: use centroid method with precomputed geometry
+    // View factor formula with OUTWARD normals (PTM3D convention):
+    //   cos_i = dot(n_i, r_hat)   (positive if face i looks toward j)
+    //   cos_j = -dot(n_j, r_hat)  (positive if face j looks toward i)
+    double cos_i = geom.dot_ni_rhat;
+    double cos_j = -geom.dot_nj_rhat;
+
+    // Skip faces that don't face each other or nearly-grazing angles
+    if (cos_i < 1e-6 || cos_j < 1e-6) {
+        return 0.0;
+    }
+
+    // Check visibility using ray tracing
+    if (!isVisible(face_centers_[face_i], face_centers_[face_j])) {
+        return 0.0;
+    }
+
+    // View factor formula: F_ij = (A_j / π) * (cos_i * cos_j) / r²
+    double A_j = face_areas_[face_j];
+    double F_ij = (A_j / M_PI) * (cos_i * cos_j) / geom.r2;
+
+    return std::max(0.0, F_ij);
+}
+
+// Compute view factors for all neighbors of a face using SIMD batch visibility testing
+// Returns vector of (neighbor_idx, F_ij) pairs for non-zero view factors
+std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatched(
+    int face_i,
+    const std::vector<NeighborData>& neighbors) {
+
+    std::vector<std::pair<int, double>> results;
+    if (neighbors.empty()) return results;
+
+    results.reserve(neighbors.size());
+
+    // Separate neighbors into far (centroid) and near (subdivision) based on Ns threshold
+    struct FarNeighbor {
+        int idx;              // Index in neighbors vector
+        int face_j;           // Face index
+        double cos_i;
+        double cos_j;
+        double r2;
+        double A_j;
+    };
+    std::vector<FarNeighbor> far_neighbors;
+    std::vector<size_t> near_neighbor_indices;
+
+    far_neighbors.reserve(neighbors.size());
+    near_neighbor_indices.reserve(neighbors.size() / 10);  // Usually few near neighbors
+
+    for (size_t idx = 0; idx < neighbors.size(); ++idx) {
+        const auto& nd = neighbors[idx];
+        int face_j = nd.neighbor_idx;
+
+        // Compute Ns to decide method
+        double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
+        double Ns = nd.geom.r / std::sqrt(A_eff);
+
+        if (Ns <= config_.adaptive_ns_threshold) {
+            // Near face: needs subdivision method
+            near_neighbor_indices.push_back(idx);
+        } else {
+            // Far face: can use centroid with batch visibility
+            double cos_i = nd.geom.dot_ni_rhat;
+            double cos_j = -nd.geom.dot_nj_rhat;
+
+            // Skip faces that don't face each other (angle filter)
+            if (cos_i >= 1e-6 && cos_j >= 1e-6) {
+                far_neighbors.push_back({
+                    static_cast<int>(idx), face_j,
+                    cos_i, cos_j, nd.geom.r2, face_areas_[face_j]
+                });
+            }
+        }
+    }
+
+    // Process far neighbors with batch visibility testing
+    if (!far_neighbors.empty()) {
+        // Prepare rays for batch visibility
+        std::vector<RayCandidate> rays;
+        rays.reserve(far_neighbors.size());
+
+        const auto& c_i = face_centers_[face_i];
+
+        for (const auto& fn : far_neighbors) {
+            const auto& c_j = face_centers_[fn.face_j];
+            RayCandidate ray = prepareRay(c_i, c_j, fn.idx);
+            rays.push_back(ray);
+        }
+
+        // Batch visibility test
+        std::vector<bool> visible;
+        batchedVisibilityTest(scene_, rays, visible);
+
+        // Compute view factors for visible pairs
+        for (size_t r = 0; r < far_neighbors.size(); ++r) {
+            // Skip invalid rays (tfar < 0 means too close, treat as visible)
+            bool is_visible = (rays[r].tfar < 0.0f) ? true : visible[r];
+
+            if (is_visible) {
+                const auto& fn = far_neighbors[r];
+                double F_ij = (fn.A_j / M_PI) * (fn.cos_i * fn.cos_j) / fn.r2;
+                if (F_ij > config_.visibility_threshold) {
+                    results.push_back({fn.face_j, F_ij});
+                }
+            }
+        }
+    }
+
+    // Process near neighbors with subdivision method (individual visibility)
+    for (size_t idx : near_neighbor_indices) {
+        const auto& nd = neighbors[idx];
+        double F_ij = computeSubdivision(face_i, nd.neighbor_idx, config_.subdivision_level);
+        if (F_ij > config_.visibility_threshold) {
+            results.push_back({nd.neighbor_idx, F_ij});
+        }
+    }
+
+    return results;
+}
+
 bool ViewFactorCalculator::isVisible(const std::array<double, 3>& p1,
                                      const std::array<double, 3>& p2) {
     // Ray from p1 toward p2
@@ -962,22 +1492,30 @@ std::vector<bool> ViewFactorCalculator::checkVisibilityBatch(
 }
 
 std::vector<int> ViewFactorCalculator::findNeighbors(int face_idx, double radius) {
+    std::vector<int> result;
+    findNeighbors(face_idx, radius, result);
+    return result;
+}
+
+// By-reference overload: avoids allocation when caller provides pre-allocated buffer
+void ViewFactorCalculator::findNeighbors(int face_idx, double radius, std::vector<int>& result) {
+    result.clear();  // Clear but keep capacity
+
     if (!spatial_grid_built_) {
         // Fallback: linear search (slow)
-        std::vector<int> neighbors;
         const auto& c = face_centers_[face_idx];
         double r2 = radius * radius;
 
         for (size_t j = 0; j < face_centers_.size(); ++j) {
             auto d = subtract(face_centers_[j], c);
             if (dot(d, d) <= r2) {
-                neighbors.push_back(static_cast<int>(j));
+                result.push_back(static_cast<int>(j));
             }
         }
-        return neighbors;
+        return;
     }
 
-    return spatial_grid_.query(face_centers_[face_idx], radius);
+    spatial_grid_.query(face_centers_[face_idx], radius, result);
 }
 
 void ViewFactorCalculator::getSubdivisionPoints(int face_idx, int level,
@@ -1106,7 +1644,15 @@ std::vector<int> ViewFactorCalculator::SpatialGrid::query(
     const std::array<double, 3>& center, double radius) const {
 
     std::vector<int> result;
-    double r2 = radius * radius;
+    query(center, radius, result);
+    return result;
+}
+
+// By-reference overload: avoids allocation when caller provides pre-allocated buffer
+void ViewFactorCalculator::SpatialGrid::query(
+    const std::array<double, 3>& center, double radius, std::vector<int>& result) const {
+
+    result.clear();  // Clear but keep capacity
 
     // Find cell range to search
     std::array<int, 3> min_cell, max_cell;
@@ -1126,8 +1672,6 @@ std::vector<int> ViewFactorCalculator::SpatialGrid::query(
             }
         }
     }
-
-    return result;
 }
 
 int ViewFactorCalculator::SpatialGrid::getCellIndex(const std::array<double, 3>& point) const {
@@ -1140,6 +1684,235 @@ int ViewFactorCalculator::SpatialGrid::getCellIndex(const std::array<double, 3>&
     iz = std::max(0, std::min(iz, grid_dims[2] - 1));
 
     return ix + iy * grid_dims[0] + iz * grid_dims[0] * grid_dims[1];
+}
+
+// ============================================================================
+// Adaptive Neighbor Selection
+// ============================================================================
+
+size_t ViewFactorCalculator::computeMemoryBudget(size_t n_faces) const {
+    size_t available = getAvailableMemory();
+    size_t total = getTotalMemory();
+
+    // If we can't query memory, use a conservative default
+    if (available == 0) {
+        std::cout << "  Warning: Could not query available memory, using conservative estimate" << std::endl;
+        // Assume 16 GB available, use 50%
+        available = 8ULL * 1024 * 1024 * 1024;
+    }
+
+    // Reserve 50% of available memory for safety
+    size_t budget = available / 2;
+
+    // Subtract estimated overhead
+    size_t embree_bvh = n_faces * 80;      // ~80 bytes per face for BVH
+    size_t working_arrays = n_faces * 100;  // Thread-local buffers
+    size_t overhead = embree_bvh + working_arrays;
+
+    if (budget <= overhead) {
+        std::cerr << "  Warning: Very low available memory" << std::endl;
+        // Minimum budget: enough for 50 neighbors per face
+        return n_faces * 50 * 12;
+    }
+
+    size_t sparse_budget = budget - overhead;
+
+    std::cout << "  Memory budget for sparse view factors:" << std::endl;
+    std::cout << "    Available RAM: " << available / (1024ULL * 1024 * 1024) << " GB" << std::endl;
+    std::cout << "    Total RAM: " << total / (1024ULL * 1024 * 1024) << " GB" << std::endl;
+    std::cout << "    Budget (50% of available): " << budget / (1024ULL * 1024 * 1024) << " GB" << std::endl;
+    std::cout << "    After overhead: " << sparse_budget / (1024ULL * 1024 * 1024) << " GB" << std::endl;
+    std::cout << "    Max sparse entries: " << sparse_budget / 12 << std::endl;
+
+    return sparse_budget;
+}
+
+std::vector<NeighborData> ViewFactorCalculator::selectNeighborsAdaptive(
+    int face_i,
+    const std::vector<int>& candidates,
+    std::atomic<size_t>& global_entry_count,
+    size_t max_total_entries) const {
+
+    if (candidates.empty()) return {};
+
+    // Compute potential view factor for each candidate and store geometry
+    // We store the raw dot products so they can be reused in view factor computation
+    struct CandidateData {
+        int j;
+        double r;
+        double r2;
+        double dot_ni_rhat;  // Raw dot product (signed)
+        double dot_nj_rhat;  // Raw dot product (signed)
+        double potential;    // For sorting (uses absolute cosines)
+    };
+    std::vector<CandidateData> candidate_data;
+    candidate_data.reserve(candidates.size());
+
+    const auto& c_i = face_centers_[face_i];
+    const auto& n_i = face_normals_[face_i];
+
+    double total_potential = 0.0;
+
+    for (int j : candidates) {
+        if (j == face_i) continue;  // Skip self
+
+        const auto& c_j = face_centers_[j];
+        const auto& n_j = face_normals_[j];
+        double A_j = face_areas_[j];
+
+        auto r_vec = subtract(c_j, c_i);
+        double r2 = dot(r_vec, r_vec);
+        if (r2 < 1e-20) continue;
+
+        double r = std::sqrt(r2);
+        std::array<double, 3> r_hat = {{r_vec[0]/r, r_vec[1]/r, r_vec[2]/r}};
+
+        // Store raw dot products (signed) for later view factor computation
+        double dot_ni = dot(n_i, r_hat);
+        double dot_nj = dot(n_j, r_hat);
+
+        // EARLY BACKFACE CULLING: Skip if faces cannot see each other
+        // Face i must see j (dot_ni > 0) and face j must face toward i (dot_nj < 0)
+        // Note: dot_nj is dot(n_j, r_hat) where r_hat points from i to j
+        // So for j to face i, n_j should point toward i, meaning dot_nj < 0
+        if (dot_ni <= 0.0 || dot_nj >= 0.0) continue;
+
+        // Potential uses absolute cosines (for ranking purposes)
+        // Since we passed backface culling: dot_ni > 0, -dot_nj > 0
+        double potential = A_j * dot_ni * (-dot_nj) / r2;
+        total_potential += potential;
+
+        candidate_data.push_back({j, r, r2, dot_ni, dot_nj, potential});
+    }
+
+    if (candidate_data.empty()) return {};
+
+    // Use std::nth_element for O(K) partial selection instead of O(K log K) full sort
+    // We only need the top max_neighbors candidates sorted
+    auto cmp = [](const CandidateData& a, const CandidateData& b) {
+        return a.potential > b.potential;  // Descending order (highest first)
+    };
+
+    size_t max_needed = std::min(candidate_data.size(),
+                                  static_cast<size_t>(config_.max_neighbors));
+
+    if (max_needed < candidate_data.size()) {
+        // Partial sort: O(K) to partition, then O(N log N) to sort only top N
+        std::nth_element(candidate_data.begin(),
+                         candidate_data.begin() + max_needed,
+                         candidate_data.end(),
+                         cmp);
+
+        // Now sort only the top portion for greedy selection
+        std::sort(candidate_data.begin(),
+                  candidate_data.begin() + max_needed,
+                  cmp);
+    } else {
+        // Small number of candidates: full sort is fine
+        std::sort(candidate_data.begin(), candidate_data.end(), cmp);
+    }
+
+    // Select neighbors until target captured energy is reached
+    std::vector<NeighborData> selected;
+    selected.reserve(std::min(candidate_data.size(), static_cast<size_t>(config_.max_neighbors)));
+
+    double captured = 0.0;
+    double target = config_.captured_energy_target * total_potential;
+
+    for (const auto& cand : candidate_data) {
+        // Check global memory ceiling
+        size_t current_count = global_entry_count.load(std::memory_order_relaxed);
+        if (current_count >= max_total_entries) {
+            break;  // Global memory limit reached
+        }
+
+        // Check hard per-face ceiling
+        if (static_cast<int>(selected.size()) >= config_.max_neighbors) {
+            break;
+        }
+
+        // Store neighbor with precomputed geometry
+        NeighborData nd;
+        nd.neighbor_idx = cand.j;
+        nd.geom.r = cand.r;
+        nd.geom.r2 = cand.r2;
+        nd.geom.dot_ni_rhat = cand.dot_ni_rhat;
+        nd.geom.dot_nj_rhat = cand.dot_nj_rhat;
+        nd.geom.potential = cand.potential;
+        selected.push_back(nd);
+
+        captured += cand.potential;
+        global_entry_count.fetch_add(1, std::memory_order_relaxed);
+
+        // Check if we've captured enough energy AND have minimum neighbors
+        if (captured >= target &&
+            static_cast<int>(selected.size()) >= config_.min_neighbors) {
+            break;
+        }
+    }
+
+    return selected;
+}
+
+std::vector<int> ViewFactorCalculator::selectNeighborsFixed(
+    int face_i,
+    const std::vector<int>& candidates) const {
+
+    if (candidates.empty()) return {};
+
+    // If we have fewer candidates than max, return all (except self)
+    std::vector<int> neighbors;
+    neighbors.reserve(candidates.size());
+    for (int j : candidates) {
+        if (j != face_i) {
+            neighbors.push_back(j);
+        }
+    }
+
+    if (static_cast<int>(neighbors.size()) <= config_.max_neighbors) {
+        return neighbors;
+    }
+
+    // Sort by potential view factor and keep top max_neighbors
+    std::vector<std::pair<double, int>> potential_vf;
+    potential_vf.reserve(neighbors.size());
+
+    const auto& c_i = face_centers_[face_i];
+    const auto& n_i = face_normals_[face_i];
+
+    for (int j : neighbors) {
+        const auto& c_j = face_centers_[j];
+        const auto& n_j = face_normals_[j];
+        double A_j = face_areas_[j];
+
+        auto r_vec = subtract(c_j, c_i);
+        double r2 = dot(r_vec, r_vec);
+        if (r2 < 1e-20) {
+            potential_vf.push_back({0.0, j});
+            continue;
+        }
+
+        double r = std::sqrt(r2);
+        std::array<double, 3> r_hat = {{r_vec[0]/r, r_vec[1]/r, r_vec[2]/r}};
+
+        double cos_i = std::abs(dot(n_i, r_hat));
+        double cos_j = std::abs(dot(n_j, r_hat));
+
+        double potential = A_j * cos_i * cos_j / r2;
+        potential_vf.push_back({-potential, j});  // Negative for descending sort
+    }
+
+    // Partial sort to get top max_neighbors
+    std::partial_sort(potential_vf.begin(),
+                      potential_vf.begin() + config_.max_neighbors,
+                      potential_vf.end());
+
+    neighbors.resize(config_.max_neighbors);
+    for (int k = 0; k < config_.max_neighbors; ++k) {
+        neighbors[k] = potential_vf[k].second;
+    }
+
+    return neighbors;
 }
 
 } // namespace radiation

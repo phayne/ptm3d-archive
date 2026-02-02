@@ -441,8 +441,6 @@ public:
 std::ofstream OutputSuppressor::null_stream;
 int OutputSuppressor::ref_count = 0;
 std::mutex OutputSuppressor::mtx;
-std::string topo_meshes_dir = "";
-bool use_topography = false;
 
 // Thread-safe stderr progress bar class
 class StderrProgressBar {
@@ -563,11 +561,7 @@ bool exportIlluminationStatisticsStreamed(
     ptm::IlluminationModel& model,
     int start_step,
     int steps);
-    
-bool runVisualization(const std::string&, const std::string&, const std::string&, 
-    const std::string&, const std::string&, const std::string&, const std::string&,
-    const std::string&, const std::string&, double, double, double, double, double, int, bool, bool, int, int);
-    
+
 bool processLocations(const std::string&, const std::string&, IlluminationModel&);
 
 bool runThermalModel(const std::string&, const std::vector<double>&, const std::vector<double>&,
@@ -1288,8 +1282,7 @@ bool exportLocationIllumination(
             std::istringstream iss(line);
             double lat = 0.0, lon = 0.0;
             if (!(iss >> lat >> lon)) {
-                // Try CSV style in this line: name,lat,lon
-                // Very permissive fallback
+                // Try CSV style: supports both name,lat,lon and lat,lon,name
                 std::string token;
                 std::vector<std::string> parts;
                 std::istringstream iss2(line);
@@ -1300,6 +1293,7 @@ bool exportLocationIllumination(
                     parts.push_back((a == std::string::npos) ? "" : token.substr(a, b - a + 1));
                 }
                 if (parts.size() >= 3) {
+                    // Try format: name,lat,lon
                     try {
                         const std::string name = parts[0];
                         lat = std::stod(parts[1]);
@@ -1308,11 +1302,35 @@ bool exportLocationIllumination(
                         location_names.push_back(name);
                         continue;
                     } catch (...) {
-                        std::cerr << "Error parsing location: " << line << std::endl;
+                        // Try format: lat,lon,name
+                        try {
+                            lat = std::stod(parts[0]);
+                            lon = std::stod(parts[1]);
+                            const std::string name = parts[2];
+                            locations.emplace_back(lat, lon);
+                            location_names.push_back(name);
+                            continue;
+                        } catch (...) {
+                            std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
+                            continue;
+                        }
+                    }
+                } else if (parts.size() == 2) {
+                    // Try format: lat,lon (no name)
+                    try {
+                        lat = std::stod(parts[0]);
+                        lon = std::stod(parts[1]);
+                        std::ostringstream name_ss;
+                        name_ss << "Location_" << std::fixed << std::setprecision(2) << lat << "_" << lon;
+                        locations.emplace_back(lat, lon);
+                        location_names.push_back(name_ss.str());
+                        continue;
+                    } catch (...) {
+                        std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
                         continue;
                     }
                 }
-                std::cerr << "Error parsing location: " << line << std::endl;
+                std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
                 continue;
             }
             // Rest of line is name (optional)
@@ -1329,7 +1347,7 @@ bool exportLocationIllumination(
     }
 
     if (locations.empty()) {
-        std::cerr << "No valid locations found in file" << std::endl;
+        std::cerr << "[ERROR] No valid locations found in file" << std::endl;
         return false;
     }
 
@@ -1453,207 +1471,6 @@ std::vector<double> calculateAbsorbedFlux(
     const thermal::Planet* planet,
     double solar_constant);
 
-bool runVisualization(
-    const std::string& illumination_vtk_file, 
-    const std::string& output_video,
-    const std::string& output_ir_video,
-    const std::string& thermal_vtk_file,
-    const std::string& output_thermal_video,
-    const std::string& output_maps_dir,
-    const std::string& positions_file,
-    const std::string& location_data_file,
-    const std::string& location_plots_dir,
-    double camera_distance,
-    double camera_latitude,
-    double camera_longitude,
-    double emission_angle,
-    double azimuth,
-    int fps,
-    bool save_frames,
-    bool skip_maps,
-    int width = 1024,
-    int height = 768) {
-    
-    // Debug output to verify parameters are received correctly
-    std::cout << "Starting visualization with camera: lat=" << camera_latitude
-              << "Â°, lon=" << camera_longitude 
-              << "Â°, distance=" << camera_distance << std::endl;
-    
-    // Check if thermal VTK file exists
-    bool thermal_file_exists = !thermal_vtk_file.empty() && std::filesystem::exists(thermal_vtk_file);
-    
-    if (!thermal_vtk_file.empty()) {
-        if (thermal_file_exists) {
-            std::cout << "Thermal VTK file found at: " << thermal_vtk_file << std::endl;
-        } else {
-            std::cout << "Warning: Thermal VTK file specified but not found at: " << thermal_vtk_file << std::endl;
-        }
-    }
-    
-    // Check if location data file exists
-    bool location_data_exists = false;
-    if (!location_data_file.empty()) {
-        location_data_exists = std::filesystem::exists(location_data_file);
-        if (location_data_exists) {
-            std::cout << "Location data file found at: " << location_data_file << std::endl;
-        } else {
-            std::cout << "Warning: Location data file specified but not found at: " << location_data_file << std::endl;
-        }
-    }
-    
-    // Path to the Python script
-    std::string script_path = "../src/python/europa_visualization.py";
-    
-    // Check if the script exists
-    if (!std::filesystem::exists(script_path)) {
-        std::cerr << "Error: Visualization script not found at: " << script_path << std::endl;
-        return false;
-    }
-    
-    // Check multiple possible module locations
-    std::vector<std::string> possible_module_paths = {
-        "../build/src/python/bindings",
-        "../src/python",
-        ".",
-        "./build/src/python/bindings"
-    };
-
-    std::string pythonpath = "";
-    for (const auto& path : possible_module_paths) {
-        // Check if directory exists
-        if (std::filesystem::exists(path)) {
-            pythonpath += path + ":";
-        }
-    }
-
-    // Remove trailing colon
-    if (!pythonpath.empty()) {
-        pythonpath.pop_back();
-    }
-
-    // Get conda environment Python if available
-    std::string python_cmd = "python3";
-    const char* conda_prefix = std::getenv("CONDA_PREFIX");
-    if (conda_prefix != nullptr) {
-        std::string conda_python = std::string(conda_prefix) + "/bin/python";
-        if (std::filesystem::exists(conda_python)) {
-            python_cmd = conda_python;
-            std::cout << "Using conda environment Python: " << python_cmd << std::endl;
-        }
-    }
-
-    // Construct command with PYTHONPATH
-    std::string command;
-    if (!pythonpath.empty()) {
-        command = "PYTHONPATH=" + pythonpath + " " + python_cmd + " " + script_path;
-    } else {
-        command = python_cmd + " " + script_path;
-    }
-    
-    // Illumination VTK for solar/IR
-    command += " --vtk \"" + illumination_vtk_file + "\"";
-    
-    // Add thermal VTK file path if available
-    if (thermal_file_exists) {
-        command += " --thermal-vtk \"" + thermal_vtk_file + "\"";
-    }
-    
-    if (!output_video.empty()) {
-        command += " --output-video \"" + output_video + "\"";
-    }
-    
-    // Add the IR video parameter
-    if (!output_ir_video.empty()) {
-        command += " --output-ir-video \"" + output_ir_video + "\"";
-    }
-    
-    // Simply add the thermal video if requested
-    if (!output_thermal_video.empty()) {
-        command += " --output-thermal-video \"" + output_thermal_video + "\"";
-    }
-    
-    // Only pass the output maps directory if we're not skipping maps
-    if (!skip_maps && !output_maps_dir.empty()) {
-        command += " --output-maps \"" + output_maps_dir + "\"";
-    }
-    
-    // Add width and height parameters to the command
-    command += " --width " + std::to_string(width) + " --height " + std::to_string(height);
-    
-    // Debug output to verify camera parameters before building command
-    std::cout << "Camera parameters for Python: lat=" << camera_latitude 
-              << ", lon=" << camera_longitude 
-              << ", distance=" << camera_distance << std::endl;
-    
-    // Add camera or emission angle parameters
-    if (emission_angle >= 0.0 && azimuth >= 0.0) {
-        command += " --emission-angle " + std::to_string(emission_angle);
-        command += " --azimuth " + std::to_string(azimuth);
-    } else {
-        // Explicit conversion to string to avoid any potential issues
-        std::stringstream lat_ss, lon_ss, dist_ss;
-        lat_ss << std::fixed << std::setprecision(6) << camera_latitude;
-        lon_ss << std::fixed << std::setprecision(6) << camera_longitude;
-        dist_ss << std::fixed << std::setprecision(6) << camera_distance;
-        
-        command += " --camera-distance " + dist_ss.str();
-        command += " --camera-lat " + lat_ss.str();
-        command += " --camera-lon " + lon_ss.str();
-    }
-    
-    command += " --fps " + std::to_string(fps);
-    
-    // Add positions file to command
-    if (!positions_file.empty()) {
-        command += " --positions \"" + positions_file + "\"";
-    }
-    
-    // Add location data file if it exists
-    if (location_data_exists) {
-        command += " --location-data \"" + location_data_file + "\"";
-        
-        // Only add location plots directory if we have valid location data
-        if (!location_plots_dir.empty()) {
-            // Make sure the directory exists
-            std::filesystem::create_directories(location_plots_dir);
-            command += " --output-location-plots \"" + location_plots_dir + "\"";
-        } else if (!output_video.empty()) {
-            // If no explicit plots directory provided, use a default location
-            std::string default_plots_dir = std::filesystem::path(output_video).parent_path().string() + "/location_plots";
-            std::filesystem::create_directories(default_plots_dir);
-            command += " --output-location-plots \"" + default_plots_dir + "\"";
-            std::cout << "Using default location plots directory: " << default_plots_dir << std::endl;
-        }
-    }
-    
-    // Add save frames argument to command if provided
-    if (save_frames) {
-        command += " --save-frames";
-    }
-    
-    // We still need the skip_maps flag in case other code paths create maps
-    if (skip_maps) {
-        command += " --skip-maps";
-    }
-    
-    // Print the full command for debugging
-    std::cout << "Running visualization command: " << command << std::endl;
-    
-    // Execute the command
-    int result = std::system(command.c_str());
-    
-    if (result != 0) {
-        std::cerr << "Warning: Visualization command returned non-zero code: " << result << std::endl;
-        return false;
-    }
-    
-    if (location_data_exists) {
-        std::cout << "Location data processed. Check for plots in the output directory." << std::endl;
-    }
-    
-    return true;
-}
-
 bool exportLocationTemperatureOnly(
     const std::string& output_file,
     const std::string& locations_file,
@@ -1772,12 +1589,12 @@ bool processLocations(const std::string& location_file,
     std::string line;
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#') continue;  // Skip comments and empty lines
-        
+
         std::istringstream iss(line);
         double lat, lon;
         if (iss >> lat >> lon) {
             locations.push_back({lat, lon});
-            
+
             // Get name if present
             std::string name;
             std::getline(iss >> std::ws, name);  // Read rest of line as name
@@ -1785,14 +1602,50 @@ bool processLocations(const std::string& location_file,
                 name = "Location_" + std::to_string(locations.size());
             }
             location_names.push_back(name);
+        } else {
+            // Try CSV format: lat,lon,name or name,lat,lon
+            std::string token;
+            std::vector<std::string> parts;
+            std::istringstream iss2(line);
+            while (std::getline(iss2, token, ',')) {
+                size_t a = token.find_first_not_of(" \t\r\n");
+                size_t b = token.find_last_not_of(" \t\r\n");
+                parts.push_back((a == std::string::npos) ? "" : token.substr(a, b - a + 1));
+            }
+            if (parts.size() >= 3) {
+                try {
+                    lat = std::stod(parts[0]);
+                    lon = std::stod(parts[1]);
+                    locations.push_back({lat, lon});
+                    location_names.push_back(parts[2]);
+                } catch (...) {
+                    try {
+                        lat = std::stod(parts[1]);
+                        lon = std::stod(parts[2]);
+                        locations.push_back({lat, lon});
+                        location_names.push_back(parts[0]);
+                    } catch (...) {
+                        // Skip invalid lines
+                    }
+                }
+            } else if (parts.size() == 2) {
+                try {
+                    lat = std::stod(parts[0]);
+                    lon = std::stod(parts[1]);
+                    locations.push_back({lat, lon});
+                    location_names.push_back("Location_" + std::to_string(locations.size()));
+                } catch (...) {
+                    // Skip invalid lines
+                }
+            }
         }
     }
-    
+
     if (locations.empty()) {
-        std::cerr << "No valid locations found in file" << std::endl;
+        std::cerr << "[ERROR] No valid locations found in file" << std::endl;
         return false;
     }
-    
+
     // Calculate illumination for all locations
     auto results = model.calculateLocationIllumination(
         locations, "2020-01-01T00:00:00", 1.0);
@@ -2702,17 +2555,104 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
               << " (n_layers=" << n_layers << ")" << std::endl;
 
-    // Prepare face albedos - try to load from binary albedo map
+    // Prepare face albedos - handle custom meshes (FITS interpolation) vs standard icospheres (binary files)
     std::vector<double> face_albedos(n_faces, default_visible_albedo);
+    bool albedo_loaded = false;
 
-    // Get body name and mesh resolution from config to load appropriate albedo map
+    // Check if we're using a custom mesh
+    bool is_custom_mesh = false;
+    try {
+        auto it = config.custom_properties.find("is_custom_mesh");
+        if (it != config.custom_properties.end()) {
+            is_custom_mesh = (it->second == "1" || it->second == "true");
+        }
+    } catch (const std::exception& e) {
+        // Use default (not custom mesh)
+    }
+
+    // Get body name from config
     std::string body_name = config.getProperty("target_body_name");
     if (!body_name.empty()) {
         // Convert to proper case
         std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
         body_name[0] = std::toupper(body_name[0]);
+    }
 
-        // Get mesh resolution from config
+    // Get albedo maps directory from config
+    std::string albedo_maps_dir = "data/albedo_maps";
+    if (config.custom_properties.count("albedo_maps_directory") > 0) {
+        albedo_maps_dir = config.getProperty("albedo_maps_directory");
+    }
+    if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+        albedo_maps_dir += '/';
+    }
+
+    if (is_custom_mesh && !body_name.empty()) {
+        // For custom meshes, load FITS file and interpolate to face centers
+        std::cout << "[GPU Thermal] Custom mesh detected - loading FITS albedo map for interpolation" << std::endl;
+
+        std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
+        std::vector<std::string> search_paths = {
+            albedo_maps_dir + albedo_fits_name,
+            "../data/albedo_maps/" + albedo_fits_name,
+            "data/albedo_maps/" + albedo_fits_name
+        };
+
+        auto albedo_map = std::make_shared<ptm::SpatialMap>();
+        bool fits_loaded = false;
+        std::string found_path;
+        for (const auto& path : search_paths) {
+            if (albedo_map->loadFromFITS(path)) {
+                found_path = path;
+                fits_loaded = true;
+                break;
+            }
+        }
+
+        if (fits_loaded) {
+            std::cout << "[GPU Thermal] Loaded FITS albedo map from: " << found_path << std::endl;
+            std::cout << "[GPU Thermal] Map dimensions: " << albedo_map->getWidth()
+                      << "x" << albedo_map->getHeight() << std::endl;
+            std::cout << "[GPU Thermal] Albedo range in map: " << albedo_map->getMin()
+                      << " to " << albedo_map->getMax() << std::endl;
+
+            // Interpolate FITS map to each face center
+            size_t valid_count = 0;
+            #pragma omp parallel for reduction(+:valid_count)
+            for (size_t f = 0; f < n_faces; f++) {
+                if (f < mesh->latitudes.size() && f < mesh->longitudes.size()) {
+                    double face_lat = mesh->latitudes[f];
+                    double face_lon = mesh->longitudes[f];
+
+                    // Normalize longitude to 0-360 range
+                    while (face_lon < 0) face_lon += 360.0;
+                    while (face_lon >= 360.0) face_lon -= 360.0;
+
+                    // Get albedo from map (note: latitude sign convention)
+                    double map_albedo = albedo_map->getValue(face_lon, -face_lat);
+
+                    if (map_albedo != albedo_map->getMissingValue() &&
+                        map_albedo >= 0.01 && map_albedo <= 1.0) {
+                        face_albedos[f] = map_albedo;
+                        valid_count++;
+                    }
+                }
+            }
+
+            double min_albedo = *std::min_element(face_albedos.begin(), face_albedos.end());
+            double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
+            double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / n_faces;
+            std::cout << "[GPU Thermal] FITS interpolation complete: " << valid_count << "/" << n_faces << " faces" << std::endl;
+            std::cout << "[GPU Thermal] Albedo range: " << min_albedo << " to " << max_albedo
+                      << " (mean: " << avg_albedo << ")" << std::endl;
+            albedo_loaded = true;
+        } else {
+            std::cout << "[GPU Thermal] Could not load FITS albedo map for " << body_name
+                      << ", using default albedo " << default_visible_albedo << std::endl;
+        }
+    }
+    else if (!body_name.empty()) {
+        // For standard icosphere meshes, try to load pre-computed binary albedo files
         int mesh_resolution = 5; // Default
         try {
             auto it = config.custom_properties.find("mesh_resolution");
@@ -2721,15 +2661,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         } catch (const std::exception& e) {
             // Use default
-        }
-
-        // Get albedo maps directory from config
-        std::string albedo_maps_dir = "data/albedo_maps";
-        if (config.custom_properties.count("albedo_maps_directory") > 0) {
-            albedo_maps_dir = config.getProperty("albedo_maps_directory");
-        }
-        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
-            albedo_maps_dir += '/';
         }
 
         // Construct binary albedo file name: e.g., "Europa_Albedo_res6.bin"
@@ -2747,11 +2678,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             loaded_albedos = importAlbedoMapFromFile(path);
             if (!loaded_albedos.empty()) {
                 if (loaded_albedos.size() == n_faces) {
-                    std::cout << "[GPU Thermal] Loaded albedo map from: " << path << std::endl;
+                    std::cout << "[GPU Thermal] Loaded binary albedo map from: " << path << std::endl;
                     std::cout << "[GPU Thermal] Albedo range: "
                               << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
                               << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
                     face_albedos = std::move(loaded_albedos);
+                    albedo_loaded = true;
                 } else {
                     std::cout << "[GPU Thermal] Albedo file size mismatch: expected " << n_faces
                               << ", got " << loaded_albedos.size() << std::endl;
@@ -2760,7 +2692,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        if (loaded_albedos.empty()) {
+        if (!albedo_loaded) {
             std::cout << "[GPU Thermal] No binary albedo map found for " << body_name
                       << " res" << mesh_resolution << ", using default albedo " << default_visible_albedo << std::endl;
         }
@@ -3291,11 +3223,18 @@ static std::vector<std::tuple<std::string,double,double>> readLocationsCSV(const
             } catch (...) {}
             continue;
         }
-        // a=name, b=lat, c=lon
+        // Try format: name,lat,lon
         try {
             double lat = std::stod(b);
             double lon = std::stod(c);
             out.emplace_back(a, lat, lon);
+            continue;
+        } catch (...) {}
+        // Try format: lat,lon,name
+        try {
+            double lat = std::stod(a);
+            double lon = std::stod(b);
+            out.emplace_back(c, lat, lon);
         } catch (...) {}
     }
     return out;
@@ -3478,9 +3417,20 @@ static bool generateDepthProfilePlots(const std::string& csv_dir, const std::str
 
     std::filesystem::path script_path = project_root / "src" / "python" / "plot_depth_profiles.py";
 
-    // Check if Python is available
-    int python_check = std::system("python3 --version > /dev/null 2>&1");
-    std::string python_cmd = (python_check == 0) ? "python3" : "python";
+    // Determine which Python to use
+    // Priority: 1) PYTHON_EXECUTABLE env var (set by conda/venv)
+    //           2) python3 if available
+    //           3) python as fallback
+    std::string python_cmd;
+    const char* python_env = std::getenv("PYTHON_EXECUTABLE");
+    if (python_env && std::strlen(python_env) > 0) {
+        // Use environment-specified Python (respects conda/venv activation)
+        python_cmd = python_env;
+    } else {
+        // Fallback: check for python3, then python
+        int python_check = std::system("python3 --version > /dev/null 2>&1");
+        python_cmd = (python_check == 0) ? "python3" : "python";
+    }
 
     // Build command
     std::ostringstream cmd;
@@ -3601,7 +3551,7 @@ bool exportLocationIlluminationAndTemperature(
             std::istringstream iss(line);
             double lat = 0.0, lon = 0.0;
             if (!(iss >> lat >> lon)) {
-                // Try CSV "name,lat,lon"
+                // Try CSV: supports both name,lat,lon and lat,lon,name
                 std::string token;
                 std::vector<std::string> parts;
                 std::istringstream iss2(line);
@@ -3611,6 +3561,7 @@ bool exportLocationIlluminationAndTemperature(
                     parts.push_back((a == std::string::npos) ? "" : token.substr(a, b - a + 1));
                 }
                 if (parts.size() >= 3) {
+                    // Try format: name,lat,lon
                     try {
                         const std::string name = parts[0];
                         lat = std::stod(parts[1]);
@@ -3619,11 +3570,35 @@ bool exportLocationIlluminationAndTemperature(
                         location_names.push_back(name);
                         continue;
                     } catch (...) {
-                        std::cerr << "Error parsing location: " << line << std::endl;
+                        // Try format: lat,lon,name
+                        try {
+                            lat = std::stod(parts[0]);
+                            lon = std::stod(parts[1]);
+                            const std::string name = parts[2];
+                            locations.emplace_back(lat, lon);
+                            location_names.push_back(name);
+                            continue;
+                        } catch (...) {
+                            std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
+                            continue;
+                        }
+                    }
+                } else if (parts.size() == 2) {
+                    // Try format: lat,lon (no name)
+                    try {
+                        lat = std::stod(parts[0]);
+                        lon = std::stod(parts[1]);
+                        std::ostringstream name_ss;
+                        name_ss << "Location_" << std::fixed << std::setprecision(2) << lat << "_" << lon;
+                        locations.emplace_back(lat, lon);
+                        location_names.push_back(name_ss.str());
+                        continue;
+                    } catch (...) {
+                        std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
                         continue;
                     }
                 }
-                std::cerr << "Error parsing location: " << line << std::endl;
+                std::cerr << "[ERROR] Error parsing location: " << line << std::endl;
                 continue;
             }
             std::string name;
@@ -3639,7 +3614,7 @@ bool exportLocationIlluminationAndTemperature(
     }
 
     if (locations.empty()) {
-        std::cerr << "No valid locations found in file" << std::endl;
+        std::cerr << "[ERROR] No valid locations found in file" << std::endl;
         return false;
     }
 
@@ -4115,8 +4090,6 @@ void showUsage(const char* programName) {
     std::cout << "  Mesh Options\n";
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  --resolution <n>           Set mesh resolution for global models (default: 5)\n";
-    std::cout << "  --topo                     Use topographic mesh (requires pre-generated meshes)\n";
-    std::cout << "  --topo-dir <dir>           Directory containing pre-computed topographic meshes\n";
     std::cout << "  --mesh-file <file>         Import triangulated mesh from file (OBJ, PLY, VTK)\n";
     std::cout << "  --mesh-scale <factor>      Scale factor for imported mesh (default: 1.0)\n";
     std::cout << "  --export-basic-mesh        Export basic mesh to VTK format\n\n";
@@ -4139,7 +4112,8 @@ void showUsage(const char* programName) {
     std::cout << "  --thermal-debug-lat DEG    Max latitude for debug face selection (default: 10)\n";
     std::cout << "  --thermal-m N              Layers in upper skin depth (default: 10)\n";
     std::cout << "  --thermal-n N              Layer growth factor (default: 15)\n";
-    std::cout << "  --thermal-b N              Skin depths to bottom layer (default: 8)\n\n";
+    std::cout << "  --thermal-b N              Skin depths to bottom layer (default: 8)\n";
+    std::cout << "  --geothermal-heat-flow Q   Geothermal heat flow [W/m²] (overrides planet default)\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Radiation Exchange Options\n";
@@ -4155,7 +4129,10 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
     std::cout << "  --rad-use-svd              Use SVD compression instead of ACA (slower)\n";
     std::cout << "  --rad-aca-tolerance T      ACA relative tolerance (default: 0.001)\n";
-    std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n\n";
+    std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n";
+    std::cout << "  --rad-hmatrix-threads N    Limit H-matrix build threads (0 = auto)\n";
+    std::cout << "  --rad-captured-energy F    Target captured energy fraction (default: 0.99 = 99%)\n";
+    std::cout << "  --rad-max-neighbors N      Override max neighbors per face (disables adaptive)\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Illumination Options\n";
@@ -4181,22 +4158,8 @@ void showUsage(const char* programName) {
     std::cout << "  --depths FILE              Depths file for thermal profile output (meters, one per line)\n";
     std::cout << "  --no-depth-plots           Skip automatic plot generation for depth profiles\n";
     std::cout << "  --location-data FILE       Specify custom location data file\n";
-    std::cout << "  --series-output FILE       Location illumination time series output\n";
-    std::cout << "  --no-maps                  Disable map generation\n\n";
-    
-    std::cout << "═══════════════════════════════════════════════════════════════\n";
-    std::cout << "  Visualization Options\n";
-    std::cout << "═══════════════════════════════════════════════════════════════\n";
-    std::cout << "  --visualization            Create visualization of the results\n";
-    std::cout << "  --animation-width N        Animation width in pixels (default: 1024)\n";
-    std::cout << "  --animation-height N       Animation height in pixels (default: 768)\n";
-    std::cout << "  --camera-distance N        Camera distance for visualization (default: 5.0)\n";
-    std::cout << "  --camera-lat N             Camera latitude in degrees (default: 30.0)\n";
-    std::cout << "  --camera-lon N             Camera longitude in degrees (default: 0.0)\n";
-    std::cout << "  --emission-angle N         Alternative: set emission angle\n";
-    std::cout << "  --azimuth N                Azimuth angle for emission angle mode\n";
-    std::cout << "  --save-frames              Save individual visualization frames\n\n";
-    
+    std::cout << "  --series-output FILE       Location illumination time series output\n\n";
+
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Advanced Options\n";
     std::cout << "═══════════════════════════════════════════════════════════════\n";
@@ -5693,10 +5656,7 @@ int main(int argc, char** argv) {
     std::string location_plots_dir = "";
     bool generate_depth_plots = true;  // Generate plots for depth profiles by default
     std::string executable_path = argv[0];  // Store for finding Python scripts
-    bool create_visualization = sim_config.visualization.create;
     bool include_primary_reflection = sim_config.illumination.include_primary_reflection;
-    bool no_maps = sim_config.output.no_maps;
-    bool save_frames = sim_config.visualization.save_frames;
     bool include_primary_ir_in_vtk = sim_config.output.include_primary_ir;
     std::string vtk_output_mode = sim_config.output.vtk_mode;
     std::string output_format = sim_config.output.format;
@@ -5727,6 +5687,12 @@ int main(int argc, char** argv) {
     // Command-line parameter for equilibration orbits
     int equilibration_orbits = sim_config.thermal.equilibration_orbits;
 
+    // GPU thermal solver from YAML config (can be overridden by --use-gpu-thermal CLI flag)
+    if (sim_config.thermal.use_gpu) {
+        config.setProperty("use_gpu_thermal", true);
+        std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
+    }
+
     // Thermal grid parameters
     int thermal_m = sim_config.thermal.grid_m;
     int thermal_n = sim_config.thermal.grid_n;
@@ -5740,33 +5706,22 @@ int main(int argc, char** argv) {
     // VTK files
     std::string thermal_vtk_file = sim_config.output.thermal_vtk_file;
     std::string complete_vtk_file = sim_config.output.complete_vtk_file;
-    
-    // Camera settings
-    double camera_distance = sim_config.visualization.camera_distance;
-    double camera_latitude = sim_config.visualization.camera_latitude;
-    double camera_longitude = sim_config.visualization.camera_longitude;
-    double emission_angle = sim_config.visualization.emission_angle;
-    double azimuth = sim_config.visualization.azimuth;
-    
+
     // New command line option
     bool export_basic_mesh = sim_config.mesh.export_basic;
-    
-    // Animation dimensions
-    int animation_width = sim_config.visualization.width;
-    int animation_height = sim_config.visualization.height;
-    
+
     // Planet (default to Europa, but can be overridden)
     thermal::Planet planet(sim_config.time.body);
+
+    // Geothermal heat flow override (from config or command line)
+    double geothermal_heat_flow = sim_config.thermal.geothermal_heat_flow;
+
     std::shared_ptr<ptm::IlluminationModel> illumination_model;
     
     // Location data file argument
     std::string location_data_arg = sim_config.output.location_data;
-    
-    // Topography flags (not in config yet, using defaults)
-    bool use_topography = sim_config.mesh.use_topographic;
-    std::string topo_meshes_dir = sim_config.mesh.topo_directory;
 
-    // Radiation exchange configuration
+    // Radiation exchange configuration (defaults, overridden by YAML then CLI)
     bool enable_radiation_exchange = false;
     bool rad_use_hmatrix = false;
     bool rad_use_gpu = false;
@@ -5781,6 +5736,41 @@ int main(int argc, char** argv) {
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
     double rad_aca_tolerance = 1e-3;        // ACA relative tolerance
     int rad_aca_max_rank = 50;              // Maximum rank before falling back to sparse
+    int rad_hmatrix_threads = 0;            // 0 = auto, >0 = manual thread limit
+
+    // Adaptive neighbor selection for sparse view factors
+    bool rad_adaptive_neighbors = true;          // Enable per-face adaptive selection
+    double rad_captured_energy_target = 0.95;    // Target fraction of radiative potential to capture
+    int rad_max_neighbors = 2000;                // Hard ceiling per face
+    int rad_min_neighbors = 20;                  // Minimum neighbors per face
+    int rad_max_neighbors_override = -1;         // -1 = use adaptive, >0 = fixed override
+
+    // Apply radiation settings from YAML config (before CLI override)
+    enable_radiation_exchange = sim_config.radiation.enabled;
+    rad_use_hmatrix = sim_config.radiation.use_hmatrix;
+    rad_use_gpu = sim_config.radiation.use_gpu;
+    rad_verbose = sim_config.radiation.verbose;
+    rad_view_factor_file = sim_config.radiation.view_factor_file;
+    rad_max_coupling_iter = sim_config.radiation.max_coupling_iterations;
+    rad_coupling_temp_tol = sim_config.radiation.coupling_temp_threshold;
+    rad_coupling_flux_tol = sim_config.radiation.coupling_flux_threshold;
+    rad_coupling_face_frac = sim_config.radiation.coupling_face_fraction;
+    rad_use_aca = sim_config.radiation.use_aca;
+    rad_aca_tolerance = sim_config.radiation.aca_tolerance;
+    rad_aca_max_rank = sim_config.radiation.aca_max_rank;
+    rad_hmatrix_threads = sim_config.radiation.hmatrix_threads;
+    // Adaptive neighbor selection parameters
+    rad_adaptive_neighbors = sim_config.radiation.adaptive_neighbors;
+    rad_captured_energy_target = sim_config.radiation.captured_energy_target;
+    rad_max_neighbors = sim_config.radiation.max_neighbors;
+    rad_min_neighbors = sim_config.radiation.min_neighbors;
+
+    if (enable_radiation_exchange) {
+        std::cout << "Radiation exchange enabled from config file" << std::endl;
+        if (rad_use_hmatrix) {
+            std::cout << "  H-matrix compression: enabled" << std::endl;
+        }
+    }
 
     // ========================================================================
     // PHASE 4: Command-line argument parsing (PRESERVED: Exact original logic)
@@ -5858,14 +5848,8 @@ int main(int argc, char** argv) {
             generate_depth_plots = false;
         } else if (arg == "--series-output" && i + 1 < argc) {
             series_output = argv[++i];
-        } else if (arg == "--visualization") {
-            create_visualization = true;
         } else if (arg == "--no-primary-reflection") {
             include_primary_reflection = false;
-        } else if (arg == "--no-maps") {
-            no_maps = true;
-        } else if (arg == "--save-frames") {
-            save_frames = true;
         } else if (arg == "--verbose") {
             verbose = true;
         } else if (arg == "--thermal-mesh") {
@@ -5890,6 +5874,9 @@ int main(int argc, char** argv) {
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
+        } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
+            geothermal_heat_flow = std::stod(argv[++i]);
+            std::cout << "Setting geothermal heat flow to: " << geothermal_heat_flow << " W/m²" << std::endl;
         } else if (arg == "--albedo-map" && i + 1 < argc) {
             albedo_map_file = argv[++i];
             config.setProperty("albedo_map", albedo_map_file);
@@ -5905,26 +5892,8 @@ int main(int argc, char** argv) {
             mesh_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
             mesh_scale_factor = std::stod(argv[++i]);
-        } else if (arg == "--emission-angle" && i + 1 < argc) {
-            emission_angle = std::stod(argv[++i]);
-            std::cout << "Setting emission angle to: " << emission_angle << "°" << std::endl;
-        } else if (arg == "--azimuth" && i + 1 < argc) {
-            azimuth = std::stod(argv[++i]);
-            std::cout << "Setting azimuth angle to: " << azimuth << "°" << std::endl;
         } else if (arg == "--export-basic-mesh") {
             export_basic_mesh = true;
-        } else if (arg == "--animation-width" && i + 1 < argc) {
-            animation_width = std::stoi(argv[++i]);
-            std::cout << "Setting animation width to: " << animation_width << " pixels" << std::endl;
-        } else if (arg == "--animation-height" && i + 1 < argc) {
-            animation_height = std::stoi(argv[++i]);
-            std::cout << "Setting animation height to: " << animation_height << " pixels" << std::endl;
-        } else if (arg == "--camera-lat" && i + 1 < argc) {
-            camera_latitude = std::stod(argv[++i]);
-            std::cout << "Setting camera latitude to: " << camera_latitude << " degrees" << std::endl;
-        } else if (arg == "--camera-lon" && i + 1 < argc) {
-            camera_longitude = std::stod(argv[++i]);
-            std::cout << "Setting camera longitude to: " << camera_longitude << " degrees" << std::endl;
         } else if (arg == "--location-data" && i + 1 < argc) {
             location_data_arg = argv[++i];
         } else if (arg == "--body" || arg == "-b") {
@@ -5993,19 +5962,6 @@ int main(int argc, char** argv) {
                 showUsage(argv[0]);
                 return 1;
             }
-        } 
-        else if (arg == "--topo") {
-            use_topography = true;
-            std::cout << "Using topographic mesh for simulation" << std::endl;
-        }
-        else if (arg == "--topo-dir") {
-            if (i + 1 < argc) {
-                topo_meshes_dir = argv[++i];
-                std::cout << "Using topographic meshes directory: " << topo_meshes_dir << std::endl;
-            } else {
-                std::cerr << "Error: --topo-dir requires a directory path" << std::endl;
-                return 1;
-            }
         } else if (arg == "--shadow-flux") {
             enable_shadow_flux = true;
             std::cout << "Enabling shadow/crater flux enhancement (default D/h ratio=" 
@@ -6065,12 +6021,27 @@ int main(int argc, char** argv) {
         } else if (arg == "--rad-aca-max-rank" && i + 1 < argc) {
             rad_aca_max_rank = std::stoi(argv[++i]);
             std::cout << "ACA max rank: " << rad_aca_max_rank << std::endl;
+        } else if (arg == "--rad-hmatrix-threads" && i + 1 < argc) {
+            rad_hmatrix_threads = std::stoi(argv[++i]);
+            std::cout << "H-matrix threads limit: " << rad_hmatrix_threads << std::endl;
+        } else if (arg == "--rad-captured-energy" && i + 1 < argc) {
+            rad_captured_energy_target = std::stod(argv[++i]);
+            std::cout << "Captured energy target: " << (rad_captured_energy_target * 100) << "%" << std::endl;
+        } else if (arg == "--rad-max-neighbors" && i + 1 < argc) {
+            rad_max_neighbors_override = std::stoi(argv[++i]);
+            std::cout << "Max neighbors override: " << rad_max_neighbors_override << " (adaptive disabled)" << std::endl;
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
         }
     }
-    
+
+    // Override planet geothermal heat flow if specified in config or command line
+    if (geothermal_heat_flow > 0) {
+        planet.Qb = geothermal_heat_flow;
+        std::cout << "Overriding planet geothermal heat flow: " << planet.Qb << " W/m²" << std::endl;
+    }
+
     // ========================================================================
     // PHASE 5: Configuration summary (optional, can be enabled with --verbose)
     // ========================================================================
@@ -6174,21 +6145,9 @@ int main(int argc, char** argv) {
             meshUtils.setupMesh();
         }
     } else {
-        // Procedural / topography path
-        bool using_topography_mesh = false;
-
-        if (use_topography && !topo_meshes_dir.empty()) {
-            std::string body_name = illumination_model
-                                      ? illumination_model->getTargetBodyName()
-                                      : "EUROPA";
-            using_topography_mesh = meshUtils.checkForTopographicMesh(
-                                        topo_meshes_dir, mesh_resolution, body_name);
-        }
-
-        if (!using_topography_mesh) {
-            meshUtils.setMeshResolution(mesh_resolution);
-            meshUtils.setupMesh();
-        }
+        // Procedural icosphere mesh path
+        meshUtils.setMeshResolution(mesh_resolution);
+        meshUtils.setupMesh();
     }
 
     // Resolve final mesh pointer:
@@ -6266,6 +6225,17 @@ int main(int argc, char** argv) {
             early_rad_config.use_aca = rad_use_aca;
             early_rad_config.aca_tolerance = rad_aca_tolerance;
             early_rad_config.aca_max_rank = rad_aca_max_rank;
+            early_rad_config.hmatrix_threads = rad_hmatrix_threads;
+
+            // Adaptive neighbor selection configuration
+            early_rad_config.adaptive_neighbors = rad_adaptive_neighbors;
+            early_rad_config.captured_energy_target = rad_captured_energy_target;
+            early_rad_config.max_neighbors = rad_max_neighbors;
+            early_rad_config.min_neighbors = rad_min_neighbors;
+            if (rad_max_neighbors_override > 0) {
+                early_rad_config.max_neighbors = rad_max_neighbors_override;
+                early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
+            }
 
             // Create temporary radiation exchange manager for view factor computation
             radiation::RadiationExchangeManager early_rad_manager(mesh, early_rad_config);
@@ -6518,6 +6488,15 @@ int main(int argc, char** argv) {
         use_streamed_thermal = false;
     }
 
+    // IMPORTANT: GPU thermal solver requires full illumination arrays upfront
+    // Cannot use streaming mode when GPU thermal is enabled
+    if (config.getPropertyBool("use_gpu_thermal", false) && use_streamed_thermal) {
+        std::cout << "Warning: GPU thermal solver requires ~" << std::fixed << std::setprecision(1)
+                  << memory_required_gb_est << " GB RAM" << std::endl;
+        std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
+        use_streamed_thermal = false;
+    }
+
     // If using chunked storage, extract the data now (SKIP if we plan to stream)
     if (using_chunked_storage && !use_streamed_thermal) {
         std::cout << "Detected chunked storage. Extracting illumination data..." << std::endl;
@@ -6680,6 +6659,16 @@ int main(int argc, char** argv) {
         // Cannot use streaming mode when radiation exchange is enabled
         if (enable_radiation_exchange && use_streamed_thermal) {
             std::cout << "Warning: Radiation exchange requires ~" << std::fixed << std::setprecision(1)
+                      << memory_required_gb_est << " GB RAM" << std::endl;
+            std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
+            use_streamed_thermal = false;
+        }
+
+        // IMPORTANT: GPU thermal solver requires full illumination arrays upfront
+        // Cannot use streaming mode when GPU thermal is enabled
+        bool use_gpu_thermal_check = thermal_config.getPropertyBool("use_gpu_thermal", false);
+        if (use_gpu_thermal_check && use_streamed_thermal) {
+            std::cout << "Warning: GPU thermal solver requires ~" << std::fixed << std::setprecision(1)
                       << memory_required_gb_est << " GB RAM" << std::endl;
             std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
             use_streamed_thermal = false;
@@ -6981,6 +6970,17 @@ int main(int argc, char** argv) {
             rad_config.use_aca = rad_use_aca;
             rad_config.aca_tolerance = rad_aca_tolerance;
             rad_config.aca_max_rank = rad_aca_max_rank;
+            rad_config.hmatrix_threads = rad_hmatrix_threads;
+
+            // Adaptive neighbor selection configuration
+            rad_config.adaptive_neighbors = rad_adaptive_neighbors;
+            rad_config.captured_energy_target = rad_captured_energy_target;
+            rad_config.max_neighbors = rad_max_neighbors;
+            rad_config.min_neighbors = rad_min_neighbors;
+            if (rad_max_neighbors_override > 0) {
+                rad_config.max_neighbors = rad_max_neighbors_override;
+                rad_config.adaptive_neighbors = false;  // Use fixed if override specified
+            }
 
             // Create radiation exchange manager
             radiation::RadiationExchangeManager rad_manager(mesh, rad_config);
@@ -7125,9 +7125,13 @@ int main(int argc, char** argv) {
 
                         double face_frac = static_cast<double>(faces_changed) / (num_faces * total_time_steps);
                         std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
-                        std::cout << "  Samples still changing: " << (face_frac * 100) << "%" << std::endl;
+                        std::cout << "  Samples still changing: " << std::scientific << std::setprecision(2)
+                                  << (face_frac * 100) << "%" << std::fixed << std::endl;
 
-                        if (max_temp_change < rad_coupling_temp_tol && face_frac < rad_coupling_face_frac) {
+                        // Converge if EITHER condition is met:
+                        // 1. Max temperature change is below threshold
+                        // 2. Fraction of samples still changing is below threshold
+                        if (max_temp_change < rad_coupling_temp_tol || face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged!" << std::endl;
                             break;
                         }

@@ -143,7 +143,19 @@ std::vector<ViewLocation> loadTraverseWaypoints(const std::string& filename) {
                     if (std::getline(iss, height_str, ',')) {
                         height = std::stod(height_str);
                     }
-                    
+
+                    // Optional UTC timestamp
+                    std::string timestamp_str;
+                    if (std::getline(iss, timestamp_str, ',')) {
+                        // Trim leading/trailing whitespace
+                        size_t start = timestamp_str.find_first_not_of(" \t\r\n");
+                        size_t end = timestamp_str.find_last_not_of(" \t\r\n");
+                        if (start != std::string::npos)
+                            timestamp_str = timestamp_str.substr(start, end - start + 1);
+                        else
+                            timestamp_str.clear();
+                    }
+
                     // Remove quotes from label if present
                     if (!label.empty() && label.front() == '"') {
                         label = label.substr(1);
@@ -151,13 +163,16 @@ std::vector<ViewLocation> loadTraverseWaypoints(const std::string& filename) {
                     if (!label.empty() && label.back() == '"') {
                         label.pop_back();
                     }
-                    
+
                     ViewLocation loc(lat, lon, height, label);
+                    loc.utc_timestamp = timestamp_str;
                     waypoints.push_back(loc);
-                    
-                    std::cout << "  Waypoint " << waypoints.size() << ": " 
-                              << label << " (Lat=" << lat << "°, Lon=" << lon 
-                              << "°, H=" << height << "m)" << std::endl;
+
+                    std::cout << "  Waypoint " << waypoints.size() << ": "
+                              << label << " (Lat=" << lat << "°, Lon=" << lon
+                              << "°, H=" << height << "m"
+                              << (timestamp_str.empty() ? "" : ", T=" + timestamp_str)
+                              << ")" << std::endl;
                     
                 } catch (const std::exception& e) {
                     std::cerr << "Warning: Error parsing line " << line_num 

@@ -88,15 +88,13 @@ class ConfigManager:
 
     DEFAULT_CONFIG = {
         "simulation": {
-            "start_time": "2030-04-10T00:00:00",
+            "start_time": "2025-01-01T00:00:00",
             "duration_days": 3.55,
             "timesteps": 144,
             "body": "Europa"
         },
         "mesh": {
             "resolution": 5,
-            "use_topographic": False,
-            "topo_directory": "",
             "import_file": "",
             "scale_factor": 1.0,
             "export_basic": False
@@ -104,7 +102,7 @@ class ConfigManager:
         "thermal": {
             "run_thermal_mesh": True,
             "threads": 0,
-            "equilibration_orbits": 10,
+            "equilibration_orbits": 1,
             "use_gpu": False,
             "compute_statistics": True,
             "thermal_inertia_map": "",
@@ -113,7 +111,34 @@ class ConfigManager:
             "integration_days": -1.0,
             "integration_steps": -1,
             "integration_offset_days": 0.0,
-            "integration_offset_steps": 0
+            "integration_offset_steps": 0,
+            "geothermal_heat_flow": -1.0  # W/m², -1 = use planet default
+        },
+        "thermophysical": {
+            # Surface properties
+            "use_default_albedo": True,
+            "albedo": 0.12,  # Display value (updated based on body)
+            "use_default_emissivity": True,
+            "emissivity": 0.95,
+            "incidence_angle_albedo": True,  # Enable angle-dependent albedo
+            # Thermal conductivity
+            "use_default_ks": True,
+            "ks": 7.4e-4,  # Surface conductivity (W/m/K)
+            "use_default_kd": True,
+            "kd": 3.4e-3,  # Deep conductivity (W/m/K)
+            "use_default_H": True,
+            "H": 0.06,  # Scale height (m)
+            # Density
+            "use_default_rhos": True,
+            "rhos": 1100.0,  # Surface density (kg/m³)
+            "use_default_rhod": True,
+            "rhod": 1800.0,  # Deep density (kg/m³)
+            # Heat capacity
+            "use_default_cp0": True,
+            "cp0": -3.6125,  # Reference heat capacity (J/kg/K)
+            # Internal heat
+            "use_default_Qb": True,
+            "Qb": 0.018  # Geothermal heat flow (W/m²)
         },
         "radiation": {
             "enabled": False,
@@ -122,13 +147,19 @@ class ConfigManager:
             "use_gpu": True,
             "view_factor_file": "",
             "max_coupling_iterations": 10,
-            "coupling_temp_threshold": 2.0,
+            "coupling_temp_threshold": 0.5,
             "coupling_flux_threshold": 0.1,
             "coupling_face_fraction": 0.01,
             "use_hmatrix": False,
             "use_aca": True,
             "aca_tolerance": 0.001,
-            "aca_max_rank": 50
+            "aca_max_rank": 50,
+            "hmatrix_threads": 0,
+            # Adaptive neighbor selection (sparse view factors)
+            "adaptive_neighbors": True,
+            "captured_energy_target": 0.95,
+            "max_neighbors": 500,
+            "min_neighbors": 20
         },
         "illumination": {
             "include_primary_reflection": True,
@@ -144,23 +175,10 @@ class ConfigManager:
             "include_primary_ir": False,
             "thermal_vtk_file": "",
             "complete_vtk_file": "",
-            "no_maps": False,
             "locations_file": "",
             "depths_file": "",
             "series_output": "",
             "location_data": ""
-        },
-        "visualization": {
-            "create": False,
-            "width": 1024,
-            "height": 768,
-            "fps": 30,
-            "camera_distance": 5.0,
-            "camera_latitude": 30.0,
-            "camera_longitude": 0.0,
-            "emission_angle": -1.0,
-            "azimuth": -1.0,
-            "save_frames": False
         },
         "advanced": {
             "verbose": False,
@@ -172,26 +190,25 @@ class ConfigManager:
         "europa_quick": {
             "simulation": {"body": "Europa", "duration_days": 0.5, "timesteps": 24},
             "mesh": {"resolution": 4},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 2},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
             "output": {"directory": "output/quick_test", "vtk_mode": "thermal"}
         },
         "europa_highres": {
             "simulation": {"body": "Europa", "duration_days": 3.55, "timesteps": 144},
             "mesh": {"resolution": 7},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 2},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
             "output": {"directory": "output/europa_high_res"},
-            "visualization": {"create": True, "width": 1920, "height": 1080},
             "advanced": {"verbose": True}
         },
         "moon_thermal": {
             "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 708},
             "mesh": {"resolution": 6},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 2},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
             "output": {"directory": "output/moon_thermal"}
         },
         "crater_radex": {
             "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 96},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 2},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
             "radiation": {
                 "enabled": True, "verbose": True, "use_gpu": True,
                 "min_shadow_fraction": 0.3, "max_coupling_iterations": 10
@@ -246,6 +263,27 @@ class ConfigManager:
 
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
 
+        # Auto-detect custom thermophysical values from loaded YAML
+        # If the YAML contains a thermophysical property, set use_default_* to False
+        if loaded and "thermophysical" in loaded:
+            loaded_thermo = loaded["thermophysical"]
+            # Map of property name to its use_default flag
+            property_flags = {
+                "albedo": "use_default_albedo",
+                "emissivity": "use_default_emissivity",
+                "ks": "use_default_ks",
+                "kd": "use_default_kd",
+                "H": "use_default_H",
+                "rhos": "use_default_rhos",
+                "rhod": "use_default_rhod",
+                "cp0": "use_default_cp0",
+                "Qb": "use_default_Qb",
+            }
+            for prop_name, flag_name in property_flags.items():
+                if prop_name in loaded_thermo:
+                    # YAML explicitly specified this property, so don't use default
+                    self.config["thermophysical"][flag_name] = False
+
     def save_to_yaml(self, filename):
         """Save configuration to YAML file"""
         with open(filename, 'w') as f:
@@ -280,7 +318,7 @@ class ConfigManager:
         if self.config["thermal"]["threads"] < 0:
             errors.append("Thermal threads cannot be negative")
         if self.config["thermal"]["equilibration_orbits"] < 0:
-            errors.append("Equilibration orbits cannot be negative")
+            errors.append("Equilibration cycles cannot be negative")
 
         # Radiation parameters
         rad = self.config.get("radiation", {})
@@ -302,12 +340,6 @@ class ConfigManager:
         valid_vtk_modes = ["thermal", "complete", "both"]
         if self.config["output"]["vtk_mode"] not in valid_vtk_modes:
             errors.append(f"VTK mode must be one of: {', '.join(valid_vtk_modes)}")
-
-        # Visualization validation
-        if self.config["visualization"]["width"] <= 0 or self.config["visualization"]["height"] <= 0:
-            errors.append("Visualization dimensions must be positive")
-        if self.config["visualization"]["fps"] <= 0:
-            errors.append("FPS must be positive")
 
         # GPU warnings
         thermal = self.config.get("thermal", {})

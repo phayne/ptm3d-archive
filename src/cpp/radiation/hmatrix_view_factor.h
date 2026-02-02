@@ -55,6 +55,9 @@ struct HMatrixConfig {
     int aca_max_rank = 50;                // Maximum rank before falling back to sparse
     int aca_min_block_size = 100;         // Minimum block size to use ACA (smaller uses SVD)
 
+    // Hierarchical subdivision control
+    int max_hierarchical_levels = 2;      // Maximum levels of hierarchical subdivision beyond start depth
+
     // Out-of-core (disk-backed) configuration for very large meshes
     bool use_out_of_core = false;         // Enable disk-backed storage during build
     std::string out_of_core_path = "";    // Path for temporary block storage
@@ -63,6 +66,9 @@ struct HMatrixConfig {
     // Memory-mapped loading configuration
     bool use_mmap_loading = false;        // Load H-matrix via mmap instead of into RAM
     size_t mmap_threshold_faces = 500000; // Auto-enable mmap loading for meshes larger than this
+
+    // Thread control for H-matrix building
+    int hmatrix_threads = 0;              // 0 = auto, >0 = manual thread limit
 };
 
 // Quadtree node for spatial partitioning of face indices (2D - legacy)
@@ -216,15 +222,16 @@ struct DiskBlock {
     // Pointer to the memory-mapped file (set by parent HMatrixViewFactor)
     const char* mmap_base = nullptr;
 
-    // Full matvec with global arrays and index mappings (called from HMatrixBlock::matvec)
-    void matvec(const double* x, double* y,
-                const std::vector<int>& row_indices,
-                const std::vector<int>& col_indices) const;
+    // Full matvec with global arrays - reads indices from mmap file (memory-efficient)
+    // This is the primary matvec method for DiskBlocks
+    void matvec(const double* x, double* y) const;
 
-    // Local matvec signature for std::visit compatibility (should never be called)
-    void matvec(const double* /*x_local*/, double* /*y_local*/) const {
-        // This should never be called - HMatrixBlock::matvec handles DiskBlock specially
-        // But we need this signature for std::visit to compile
+    // Compatibility matvec for std::visit (delegates to primary method)
+    // Note: row_indices/col_indices parameters are ignored - indices are read from disk
+    void matvec(const double* x, double* y,
+                const std::vector<int>& /*row_indices*/,
+                const std::vector<int>& /*col_indices*/) const {
+        matvec(x, y);  // Delegate to primary method that reads indices from disk
     }
 
     size_t memoryBytes() const { return sizeof(DiskBlock); }  // Only metadata in RAM
@@ -383,6 +390,7 @@ private:
     std::unique_ptr<QuadtreeNode> quadtree_root_;  // 2D quadtree (legacy)
     std::unique_ptr<OctreeNode> octree_root_;      // 3D octree (preferred for craters)
     bool use_octree_ = true;  // Use 3D octree instead of 2D quadtree
+    int start_depth_ = 0;     // Depth at which block building started (for hierarchical limit)
 
     // Configuration
     HMatrixConfig config_;

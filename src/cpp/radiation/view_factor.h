@@ -17,6 +17,22 @@ typedef struct RTCSceneTy* RTCScene;
 
 namespace radiation {
 
+// Precomputed geometry data for efficient view factor calculation
+// Stores intermediate values computed during neighbor selection to avoid recomputation
+struct PrecomputedGeometry {
+    double r;           // Distance between face centers
+    double r2;          // Squared distance
+    double dot_ni_rhat; // Raw dot product: n_i · r_hat (sign indicates orientation)
+    double dot_nj_rhat; // Raw dot product: n_j · r_hat (sign indicates orientation)
+    double potential;   // Approximate view factor for ranking: A_j * |cos_i| * |cos_j| / r²
+};
+
+// Neighbor with precomputed geometry for efficient view factor computation
+struct NeighborData {
+    int neighbor_idx;
+    PrecomputedGeometry geom;
+};
+
 // Sparse Compressed Sparse Row (CSR) storage for view factor matrix
 // Stores F_ij where i is the row (receiving face) and j is the column (emitting face)
 class ViewFactorMatrix {
@@ -117,6 +133,15 @@ private:
     double computeSubdivision(int face_i, int face_j, int level);
     double computeAdaptive(int face_i, int face_j);
 
+    // View factor computation using precomputed geometry (avoids redundant calculations)
+    double computeWithPrecomputed(int face_i, int face_j, const PrecomputedGeometry& geom);
+
+    // Batch view factor computation using SIMD visibility testing
+    // Returns vector of (neighbor_idx, F_ij) pairs for non-zero view factors
+    std::vector<std::pair<int, double>> computeViewFactorsBatched(
+        int face_i,
+        const std::vector<NeighborData>& neighbors);
+
     // Visibility check using Embree
     bool isVisible(const std::array<double, 3>& p1, const std::array<double, 3>& p2);
 
@@ -127,6 +152,24 @@ private:
 
     // Find potential neighbors within search radius
     std::vector<int> findNeighbors(int face_idx, double radius);
+    void findNeighbors(int face_idx, double radius, std::vector<int>& result);  // By-reference (avoids allocation)
+
+    // Adaptive neighbor selection based on captured energy target
+    // Returns selected neighbors with precomputed geometry for efficient view factor computation
+    // Updates global_entry_count atomically for memory tracking
+    std::vector<NeighborData> selectNeighborsAdaptive(
+        int face_i,
+        const std::vector<int>& candidates,
+        std::atomic<size_t>& global_entry_count,
+        size_t max_total_entries) const;
+
+    // Fixed neighbor selection (original behavior)
+    std::vector<int> selectNeighborsFixed(
+        int face_i,
+        const std::vector<int>& candidates) const;
+
+    // Compute memory budget for sparse view factors based on available RAM
+    size_t computeMemoryBudget(size_t n_faces) const;
 
     // Precompute face geometry
     void precomputeFaceData();
@@ -171,6 +214,7 @@ private:
 
         void build(const std::vector<std::array<double, 3>>& centers, double cell_size_hint);
         std::vector<int> query(const std::array<double, 3>& center, double radius) const;
+        void query(const std::array<double, 3>& center, double radius, std::vector<int>& result) const;  // By-reference overload (avoids allocation)
         int getCellIndex(const std::array<double, 3>& point) const;
     };
     SpatialGrid spatial_grid_;

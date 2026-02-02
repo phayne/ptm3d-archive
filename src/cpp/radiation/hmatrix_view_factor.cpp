@@ -111,6 +111,8 @@ static std::atomic<size_t> g_total_index_bytes{0};   // Bytes used for row/col i
 static std::atomic<size_t> g_peak_block_indices{0};  // Peak index memory for a single block
 static std::atomic<size_t> g_hierarchical_recursions{0};
 static std::atomic<size_t> g_aca_fail_to_zero{0};    // Large admissible blocks treated as zero
+static std::atomic<size_t> g_small_blocks_count{0};  // Small blocks (< min_block_size²) stored in RAM
+static std::atomic<size_t> g_small_blocks_bytes{0};  // Estimated bytes for small blocks in RAM
 
 static void resetProfilingCounters() {
     g_time_view_factor_us = 0;
@@ -132,6 +134,8 @@ static void resetProfilingCounters() {
     g_peak_block_indices = 0;
     g_hierarchical_recursions = 0;
     g_aca_fail_to_zero = 0;
+    g_small_blocks_count = 0;
+    g_small_blocks_bytes = 0;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -171,6 +175,8 @@ static void printProfilingCounters(double total_ms) {
     std::cout << "    ACA fail → zero:         " << g_aca_fail_to_zero.load()
               << " (large admissible blocks)" << std::endl;
     std::cout << "    Hierarchical recursions: " << g_hierarchical_recursions.load() << std::endl;
+    std::cout << "    Small blocks (in RAM):   " << g_small_blocks_count.load()
+              << " (" << (g_small_blocks_bytes.load() / (1024.0 * 1024.0)) << " MB)" << std::endl;
     std::cout << "    Index memory usage:      " << std::fixed << std::setprecision(2)
               << (g_total_index_bytes.load() / (1024.0 * 1024.0)) << " MB" << std::endl;
     std::cout << "    Peak block indices:      " << std::fixed << std::setprecision(2)
@@ -566,12 +572,58 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     n_rows_ = n_faces;
     n_cols_ = n_faces;
 
+    // AUTO-SCALE parameters for very large meshes to prevent block explosion
+    // For 2M faces with min_block_size=64, we'd get ~1M+ blocks which is too many
+    if (n_faces > 500000) {
+        // Scale min_block_size: target ~100-200 leaf blocks per tree dimension
+        // With octree depth 3, we have ~339 nodes, each with ~5893 faces
+        // min_block_size should be at least sqrt(faces_per_node) to avoid excessive subdivision
+        int faces_per_node_estimate = static_cast<int>(n_faces / 400);  // Assume ~400 octree nodes
+        int new_min_block_size = std::max(config_.min_block_size,
+            static_cast<int>(std::sqrt(static_cast<double>(faces_per_node_estimate))));
+
+        // Cap max_tree_depth to prevent deep recursion
+        int new_max_depth = std::min(config_.max_tree_depth, 6);
+
+        // CRITICAL: For very large meshes (>1M faces), disable hierarchical blocks entirely
+        // With octree, each hierarchical level creates up to 64 child pairs (8×8),
+        // leading to massive block explosion (110K → 7M+ blocks with just 2 levels)
+        int new_hierarchical_levels = config_.max_hierarchical_levels;
+        if (n_faces > 1000000) {
+            new_hierarchical_levels = 0;  // Completely disable hierarchical subdivision
+        }
+
+        bool any_change = (new_min_block_size > config_.min_block_size ||
+                           new_max_depth < config_.max_tree_depth ||
+                           new_hierarchical_levels != config_.max_hierarchical_levels);
+
+        if (any_change) {
+            std::cout << "  Large mesh optimization (>" << n_faces << " faces):" << std::endl;
+            if (new_min_block_size > config_.min_block_size) {
+                std::cout << "    Increasing min_block_size: " << config_.min_block_size
+                          << " -> " << new_min_block_size << std::endl;
+                config_.min_block_size = new_min_block_size;
+            }
+            if (new_max_depth < config_.max_tree_depth) {
+                std::cout << "    Reducing max_tree_depth: " << config_.max_tree_depth
+                          << " -> " << new_max_depth << std::endl;
+                config_.max_tree_depth = new_max_depth;
+            }
+            if (new_hierarchical_levels != config_.max_hierarchical_levels) {
+                std::cout << "    Disabling hierarchical subdivision: " << config_.max_hierarchical_levels
+                          << " -> " << new_hierarchical_levels << " levels" << std::endl;
+                config_.max_hierarchical_levels = new_hierarchical_levels;
+            }
+        }
+    }
+
     // Always print basic H-matrix build info (this is important for large meshes)
     std::cout << "Building H-matrix view factor for " << n_faces << " faces..." << std::endl;
     std::cout << "  Compression tolerance: " << config_.compression_tolerance << std::endl;
     std::cout << "  Max tree depth: " << config_.max_tree_depth << std::endl;
     std::cout << "  Min block size: " << config_.min_block_size << std::endl;
     std::cout << "  Max SVD rank: " << config_.max_svd_rank << std::endl;
+    std::cout << "  Max hierarchical levels: " << config_.max_hierarchical_levels << std::endl;
 
     // Memory estimation for large meshes
     double estimated_dense_gb = (double(n_faces) * double(n_faces) * sizeof(double)) / (1024.0 * 1024.0 * 1024.0);
@@ -664,8 +716,21 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     // Hard limits - keep block count reasonable
     // For octree at depth d, we have up to 8^d nodes (vs 4^d for quadtree)
     // This means octree can achieve similar node counts at lower depth
-    // Increased MAX_NODES to allow finer granularity for very large meshes
-    const size_t MAX_NODES = 2000;      // Cap at 2000 nodes (4M blocks max, but most are zero)
+    //
+    // CRITICAL: Block pairs = nodes², so node count must be limited aggressively
+    // - 400 nodes → 160K block pairs (manageable)
+    // - 600 nodes → 360K block pairs (heavy)
+    // - 1000 nodes → 1M block pairs (too many for very large meshes)
+    //
+    // For very large meshes (>1M faces), we prioritize completing over optimal compression
+    size_t MAX_NODES;
+    if (n_faces > 1500000) {
+        MAX_NODES = 400;  // 160K block pairs max for very large meshes (2M+ faces)
+    } else if (n_faces > 500000) {
+        MAX_NODES = 600;  // 360K block pairs max for large meshes
+    } else {
+        MAX_NODES = 1000; // 1M block pairs max for medium meshes
+    }
     const size_t MIN_NODES = 16;        // At least 16 nodes for any mesh
 
     target_nodes = std::min(target_nodes, MAX_NODES);
@@ -676,7 +741,7 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         std::cout << "    Compression method: " << (config_.compression_method == CompressionMethod::ACA ? "ACA" : "SVD") << std::endl;
         std::cout << "    Spatial tree: " << (use_octree_ ? "3D octree" : "2D quadtree") << std::endl;
         std::cout << "    Target ~" << target_faces_per_node << " faces/node" << std::endl;
-        std::cout << "    Target node count: ~" << target_nodes << " (max " << MAX_NODES << ")" << std::endl;
+        std::cout << "    Max nodes: " << MAX_NODES << " (~" << MAX_NODES * MAX_NODES / 1000 << "K block pairs)" << std::endl;
     }
 
     int start_depth = 2;  // Default for small meshes
@@ -767,6 +832,9 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
 
     std::cout << "  " << (use_octree_ ? "Octree" : "Quadtree") << ": using depth " << start_depth
               << " (" << num_nodes << " nodes, ~" << (n_faces / std::max(num_nodes, size_t(1))) << " faces/node)" << std::endl;
+
+    // Store starting depth for hierarchical level limiting
+    start_depth_ = start_depth;
 
     // Reset statistics
     num_zero_blocks_ = 0;
@@ -863,10 +931,21 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
                   << config_.memory_limit_gb << " GB limit)" << std::endl;
     }
 
-    if (estimated_total_memory > avail_before * 0.8) {
+    // Use lower threshold (50%) for large meshes to avoid late-stage OOM
+    // Memory estimates are often too low because they don't account for sparse fallbacks
+    double ooc_threshold = (n_faces > 500000) ? 0.5 : 0.8;
+    if (estimated_total_memory > avail_before * ooc_threshold) {
         auto_enable_out_of_core = true;
-        std::cout << "    Auto-enabling out-of-core storage (estimate exceeds 80% of available RAM)"
+        std::cout << "    Auto-enabling out-of-core storage (estimate exceeds "
+                  << static_cast<int>(ooc_threshold * 100) << "% of available RAM)"
                   << std::endl;
+    }
+
+    // Force out-of-core for very large meshes regardless of memory estimate
+    // because sparse fallback blocks (30-40% of total) use far more memory than estimated
+    if (n_faces > 1000000 && !config_.use_out_of_core && !auto_enable_out_of_core) {
+        auto_enable_out_of_core = true;
+        std::cout << "    Auto-enabling out-of-core storage (mesh > 1M faces)" << std::endl;
     }
 
     if (config_.use_out_of_core || auto_enable_out_of_core) {
@@ -920,11 +999,14 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     size_t total_memory = getTotalMemory();
 
     // Estimate memory per concurrent block computation
+    // NOTE: ACA is O(n) for successful compression, but ~15-20% of blocks fall back
+    // to sparse computation which is O(n²). We use a weighted estimate to be safe.
     size_t mem_per_block;
     if (config_.compression_method == CompressionMethod::ACA) {
-        // ACA: O(n) memory per block (row/column computation)
-        // 10 KB per face is conservative (accounts for batched ray tracing buffers)
-        mem_per_block = avg_faces_per_node * 10ULL * 1024ULL;  // 10 KB per face
+        // ACA is O(n), but sparse fallback is O(n²)
+        // Sparse fallback: n faces × n faces × ~56 bytes (RayCandidate) / n ≈ 60 KB/face
+        // Weighted estimate: 80% ACA (10 KB) + 20% sparse (60 KB) = 20 KB/face
+        mem_per_block = avg_faces_per_node * 20ULL * 1024ULL;  // 20 KB per face (conservative)
     } else {
         // SVD: O(n²) memory per block (full candidate matrix)
         // 200 KB per face is conservative estimate
@@ -959,12 +1041,39 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     // ACA uses much less memory, so hard limits are relaxed significantly
     int hard_limit = max_threads;
     if (config_.compression_method == CompressionMethod::ACA) {
-        // ACA: O(n) memory, so we can use many more threads
-        // Only apply hard limits for extremely large nodes
-        if (avg_faces_per_node > 50000) {
-            hard_limit = max_threads / 2;  // Very large nodes: use half threads
+        // ACA: O(n) memory for successful compression, but ~30-40% of blocks
+        // fall back to sparse computation which uses O(n²) memory per thread.
+        // With out-of-core enabled, completed blocks are written to disk, so
+        // we can use more threads for faster computation.
+        // Working memory per thread is ~200-500 MB for sparse fallback blocks.
+
+        // Thread limits with out-of-core enabled (completed blocks go to disk):
+        // CRITICAL: For very large meshes with large blocks (>5000 faces/node),
+        // each thread can use 500MB+ during ACA row/column computation.
+        // Limit threads aggressively based on faces per node.
+        if (out_of_core_enabled_) {
+            if (avg_faces_per_node > 5000) {
+                // Very large blocks: 4 threads max (each ~500MB working memory)
+                hard_limit = std::min(hard_limit, 4);
+            } else if (avg_faces_per_node > 3000) {
+                hard_limit = std::min(hard_limit, 6);
+            } else if (n_faces > 1500000) {
+                hard_limit = std::min(hard_limit, 8);
+            } else if (n_faces > 1000000) {
+                hard_limit = std::min(hard_limit, 12);
+            } else if (n_faces > 500000) {
+                hard_limit = std::min(hard_limit, 16);
+            }
+        } else {
+            // Without out-of-core, be very conservative (completed blocks stay in RAM)
+            if (n_faces > 1500000) {
+                hard_limit = std::min(hard_limit, 2);
+            } else if (n_faces > 1000000) {
+                hard_limit = std::min(hard_limit, 4);
+            } else if (n_faces > 500000) {
+                hard_limit = std::min(hard_limit, 6);
+            }
         }
-        // For nodes < 50K faces, no hard limit (memory-based limit is sufficient)
     } else {
         // SVD: O(n²) memory, keep original conservative limits
         if (avg_faces_per_node > 10000) {
@@ -984,6 +1093,12 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         std::cout << "    Hard limit applied: " << hard_limit << " threads "
                   << "(block size safety)" << std::endl;
         threads_to_use = hard_limit;
+    }
+
+    // Apply manual thread limit if specified via config
+    if (config_.hmatrix_threads > 0 && config_.hmatrix_threads < threads_to_use) {
+        std::cout << "    Manual thread limit: " << config_.hmatrix_threads << " threads" << std::endl;
+        threads_to_use = config_.hmatrix_threads;
     }
 
     std::cout << "    Final thread count: " << threads_to_use << std::endl;
@@ -1043,13 +1158,93 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
                             last_memory_report = completed;
                             size_t avail_mem = getAvailableMemory();
                             size_t idx_mem = g_total_index_bytes.load();
+
+                            // Check for block explosion (too many sub-blocks being created)
+                            size_t total_blocks_created = num_zero_blocks_ + num_sparse_blocks_ +
+                                num_lowrank_blocks_ + num_hierarchical_blocks_ + num_disk_blocks_;
+                            size_t expected_blocks_at_completion = (total_blocks_created * total_blocks) / std::max(completed, size_t(1));
+
+                            // Warn if block explosion detected (>5x expected)
+                            if (total_blocks_created > 5 * total_blocks && completed < total_blocks / 2) {
+                                std::cout << std::endl << "  [WARNING] Block explosion detected! "
+                                          << total_blocks_created << " blocks created from "
+                                          << completed << " root pairs" << std::endl;
+                                std::cout << "  [WARNING] Expected at completion: ~"
+                                          << expected_blocks_at_completion << " blocks" << std::endl;
+                                std::cout << "  [WARNING] Consider increasing min_block_size or disabling H-matrix" << std::endl;
+                            }
+
+                            // Check for memory pressure (<10 GB available)
+                            if (avail_mem < 10ULL * 1024 * 1024 * 1024) {
+                                std::cout << std::endl << "  [WARNING] Low memory: "
+                                          << (avail_mem / (1024.0 * 1024.0 * 1024.0)) << " GB available"
+                                          << std::endl;
+                            }
+
                             std::cout << std::endl << "  [MEM] Available: "
                                       << std::fixed << std::setprecision(1)
                                       << (avail_mem / (1024.0 * 1024.0 * 1024.0)) << " GB, "
-                                      << "Index storage: " << (idx_mem / (1024.0 * 1024.0)) << " MB, "
-                                      << "ACA: " << g_aca_successes.load() << "/" << g_aca_attempts.load()
-                                      << ", Sparse fallback: " << g_sparse_fallback_calls.load()
+                                      << "Index storage: " << (idx_mem / (1024.0 * 1024.0)) << " MB"
                                       << std::endl;
+
+                            // Block type counts for diagnostics
+                            std::cout << "  [MEM] Blocks: Zero=" << num_zero_blocks_
+                                      << ", Sparse=" << num_sparse_blocks_
+                                      << ", LowRank=" << num_lowrank_blocks_
+                                      << ", Hier=" << num_hierarchical_blocks_
+                                      << ", Disk=" << num_disk_blocks_
+                                      << std::endl;
+
+                            // Estimate memory usage by block type
+                            // ZeroBlock: ~16 bytes each (just n_rows/n_cols)
+                            // DiskBlock: ~64 bytes each (metadata only)
+                            // HierarchicalBlock: ~64 bytes + children vector overhead
+                            // In-memory blocks: varies significantly
+                            size_t zero_mem = num_zero_blocks_ * 16;
+                            size_t disk_mem = num_disk_blocks_ * 64;
+                            size_t hier_mem = num_hierarchical_blocks_ * 256;  // Estimate with children overhead
+                            size_t struct_overhead = (num_zero_blocks_ + num_sparse_blocks_ +
+                                                      num_lowrank_blocks_ + num_hierarchical_blocks_ +
+                                                      num_disk_blocks_) * 56;  // HMatrixBlock base overhead
+                            size_t est_overhead = zero_mem + disk_mem + hier_mem + struct_overhead + idx_mem;
+
+                            std::cout << "  [MEM] Est. tree overhead: "
+                                      << (est_overhead / (1024.0 * 1024.0)) << " MB"
+                                      << ", Hier recursions: " << g_hierarchical_recursions.load()
+                                      << std::endl;
+
+                            // Small block stats (key for memory debugging)
+                            size_t small_count = g_small_blocks_count.load();
+                            size_t small_bytes = g_small_blocks_bytes.load();
+                            std::cout << "  [MEM] Small blocks in RAM: " << small_count
+                                      << " (" << (small_bytes / (1024.0 * 1024.0)) << " MB)"
+                                      << std::endl;
+
+                            // ACA stats
+                            std::cout << "  [MEM] ACA: " << g_aca_successes.load() << "/" << g_aca_attempts.load()
+                                      << ", Sparse fallback: " << g_sparse_fallback_calls.load()
+                                      << ", Skipped: " << g_sparse_fallback_skipped.load()
+                                      << std::endl;
+
+                            // Dynamic memory warning when critically low
+                            constexpr size_t CRITICAL_MEMORY_GB = 20;
+                            if (avail_mem < CRITICAL_MEMORY_GB * 1024ULL * 1024ULL * 1024ULL) {
+                                std::cout << "  [MEM] WARNING: Available memory critically low! "
+                                          << "Consider using --rad-hmatrix-threads to limit threads "
+                                          << "or increasing system memory." << std::endl;
+                            }
+
+                            // Flush file buffer cache to disk periodically to prevent OS from
+                            // consuming excessive RAM for file buffering. This is critical on
+                            // macOS where the unified buffer cache can grow very large.
+                            if (out_of_core_enabled_ && out_of_core_fd_ >= 0) {
+                                #ifdef __APPLE__
+                                // F_FULLFSYNC ensures data reaches physical media on macOS
+                                fcntl(out_of_core_fd_, F_FULLFSYNC);
+                                #else
+                                fsync(out_of_core_fd_);
+                                #endif
+                            }
                         }
                     }
                 }
@@ -1099,6 +1294,16 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         }
     }
     std::cout << std::endl;  // Newline after progress
+
+    // Free spatial tree to save memory (~14 GB for 2M faces)
+    // The tree is only needed during block building, not for matvec
+    if (use_octree_ && octree_root_) {
+        octree_root_.reset();
+        std::cout << "  Freed octree after block building" << std::endl;
+    } else if (quadtree_root_) {
+        quadtree_root_.reset();
+        std::cout << "  Freed quadtree after block building" << std::endl;
+    }
 
     // Finalize out-of-core storage if enabled
     if (out_of_core_enabled_) {
@@ -1355,11 +1560,8 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             #pragma omp atomic
             num_zero_blocks_++;
         } else {
-            // Non-zero block - copy indices
-            block->row_indices = row_faces;
-            block->col_indices = col_faces;
-            size_t index_bytes = (n_rows + n_cols) * sizeof(int);
-            g_total_index_bytes += index_bytes;
+            // Non-zero small block - track memory usage (atomic variable, no pragma needed)
+            g_small_blocks_count++;
 
             #pragma omp atomic
             total_nnz_ += sparse.values.size();
@@ -1372,15 +1574,44 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             g_time_svd_us += std::chrono::duration_cast<std::chrono::microseconds>(svd_end - svd_start).count();
             g_svd_calls++;
 
-            if (compressed) {
-                block->data = std::move(lowrank);
+            // OUT-OF-CORE: For very large meshes, write even small blocks to disk
+            if (out_of_core_enabled_) {
+                std::vector<int> row_faces_copy(row_faces);
+                std::vector<int> col_faces_copy(col_faces);
+                DiskBlock disk;
+                if (compressed) {
+                    disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
+                } else {
+                    disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
+                }
+                block->data = disk;
+                // Indices are stored on disk - clear from RAM to save memory
+                block->row_indices.clear();
+                block->row_indices.shrink_to_fit();
+                block->col_indices.clear();
+                block->col_indices.shrink_to_fit();
                 #pragma omp atomic
-                num_lowrank_blocks_++;
+                num_disk_blocks_++;
             } else {
-                // Use sparse storage
-                block->data = std::move(sparse);
-                #pragma omp atomic
-                num_sparse_blocks_++;
+                // In-memory: store as before
+                block->row_indices = row_faces;
+                block->col_indices = col_faces;
+                size_t index_bytes = (n_rows + n_cols) * sizeof(int);
+                g_total_index_bytes += index_bytes;
+
+                if (compressed) {
+                    size_t block_bytes = lowrank.memoryBytes();
+                    g_small_blocks_bytes += block_bytes;
+                    block->data = std::move(lowrank);
+                    #pragma omp atomic
+                    num_lowrank_blocks_++;
+                } else {
+                    size_t block_bytes = sparse.memoryBytes();
+                    g_small_blocks_bytes += block_bytes;
+                    block->data = std::move(sparse);
+                    #pragma omp atomic
+                    num_sparse_blocks_++;
+                }
             }
         }
         return block;
@@ -1401,15 +1632,32 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             g_svd_calls++;
 
             if (aca_success) {
-                // Copy indices for matvec
-                block->row_indices = row_faces;
-                block->col_indices = col_faces;
-                size_t index_bytes = (n_rows + n_cols) * sizeof(int);
-                g_total_index_bytes += index_bytes;
+                // OUT-OF-CORE: Write LowRankBlock to disk instead of storing in RAM
+                if (out_of_core_enabled_) {
+                    std::vector<int> row_faces_copy(row_faces);
+                    std::vector<int> col_faces_copy(col_faces);
+                    DiskBlock disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
 
-                block->data = std::move(lowrank);
-                #pragma omp atomic
-                num_lowrank_blocks_++;
+                    block->data = disk;
+                    // Indices are stored on disk - clear from RAM to save memory
+                    block->row_indices.clear();
+                    block->row_indices.shrink_to_fit();
+                    block->col_indices.clear();
+                    block->col_indices.shrink_to_fit();
+
+                    #pragma omp atomic
+                    num_disk_blocks_++;
+                } else {
+                    // In-memory: store as before
+                    block->row_indices = row_faces;
+                    block->col_indices = col_faces;
+                    size_t index_bytes = (n_rows + n_cols) * sizeof(int);
+                    g_total_index_bytes += index_bytes;
+
+                    block->data = std::move(lowrank);
+                    #pragma omp atomic
+                    num_lowrank_blocks_++;
+                }
                 return block;
             }
 
@@ -1429,14 +1677,30 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     #pragma omp atomic
                     num_zero_blocks_++;
                 } else {
-                    block->row_indices = row_faces;
-                    block->col_indices = col_faces;
-                    g_total_index_bytes += (n_rows + n_cols) * sizeof(int);
                     #pragma omp atomic
                     total_nnz_ += sparse.values.size();
-                    block->data = std::move(sparse);
-                    #pragma omp atomic
-                    num_sparse_blocks_++;
+
+                    // OUT-OF-CORE: Write sparse block to disk
+                    if (out_of_core_enabled_) {
+                        std::vector<int> row_faces_copy(row_faces);
+                        std::vector<int> col_faces_copy(col_faces);
+                        DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
+                        block->data = disk;
+                        // Indices are stored on disk - clear from RAM to save memory
+                        block->row_indices.clear();
+                        block->row_indices.shrink_to_fit();
+                        block->col_indices.clear();
+                        block->col_indices.shrink_to_fit();
+                        #pragma omp atomic
+                        num_disk_blocks_++;
+                    } else {
+                        block->row_indices = row_faces;
+                        block->col_indices = col_faces;
+                        g_total_index_bytes += (n_rows + n_cols) * sizeof(int);
+                        block->data = std::move(sparse);
+                        #pragma omp atomic
+                        num_sparse_blocks_++;
+                    }
                 }
                 return block;
             } else {
@@ -1509,8 +1773,14 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
 
     // Not admissible and not small - subdivide if possible
     // Use hierarchical blocks for better scalability on large meshes
+    //
+    // MEMORY SAFETY: Limit hierarchical recursion depth relative to start_depth_.
+    // max_hierarchical_levels limits how many levels of HierarchicalBlock nesting are allowed.
+    int hierarchical_depth = depth - start_depth_;
+    bool hierarchical_limit_exceeded = hierarchical_depth >= config_.max_hierarchical_levels;
+
     if (!row_node->is_leaf && !col_node->is_leaf &&
-        depth < config_.max_tree_depth) {
+        depth < config_.max_tree_depth && !hierarchical_limit_exceeded) {
 
         g_hierarchical_recursions++;
 
@@ -1680,11 +1950,8 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             #pragma omp atomic
             num_zero_blocks_++;
         } else {
-            // Non-zero block - NOW copy indices (only for blocks that need them)
-            block->row_indices = row_faces;
-            block->col_indices = col_faces;
-            size_t index_bytes = (n_rows + n_cols) * sizeof(int);
-            g_total_index_bytes += index_bytes;
+            // Non-zero small block - track memory usage (atomic variable, no pragma needed)
+            g_small_blocks_count++;
 
             #pragma omp atomic
             total_nnz_ += sparse.values.size();
@@ -1696,14 +1963,44 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             g_time_svd_us += std::chrono::duration_cast<std::chrono::microseconds>(svd_end - svd_start).count();
             g_svd_calls++;
 
-            if (compressed) {
-                block->data = std::move(lowrank);
+            // OUT-OF-CORE: For very large meshes, write even small blocks to disk
+            if (out_of_core_enabled_) {
+                std::vector<int> row_faces_copy(row_faces);
+                std::vector<int> col_faces_copy(col_faces);
+                DiskBlock disk;
+                if (compressed) {
+                    disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
+                } else {
+                    disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
+                }
+                block->data = disk;
+                // Indices are stored on disk - clear from RAM to save memory
+                block->row_indices.clear();
+                block->row_indices.shrink_to_fit();
+                block->col_indices.clear();
+                block->col_indices.shrink_to_fit();
                 #pragma omp atomic
-                num_lowrank_blocks_++;
+                num_disk_blocks_++;
             } else {
-                block->data = std::move(sparse);
-                #pragma omp atomic
-                num_sparse_blocks_++;
+                // In-memory: store as before
+                block->row_indices = row_faces;
+                block->col_indices = col_faces;
+                size_t index_bytes = (n_rows + n_cols) * sizeof(int);
+                g_total_index_bytes += index_bytes;
+
+                if (compressed) {
+                    size_t block_bytes = lowrank.memoryBytes();
+                    g_small_blocks_bytes += block_bytes;
+                    block->data = std::move(lowrank);
+                    #pragma omp atomic
+                    num_lowrank_blocks_++;
+                } else {
+                    size_t block_bytes = sparse.memoryBytes();
+                    g_small_blocks_bytes += block_bytes;
+                    block->data = std::move(sparse);
+                    #pragma omp atomic
+                    num_sparse_blocks_++;
+                }
             }
         }
         return block;
@@ -1724,15 +2021,32 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             g_svd_calls++;
 
             if (aca_success) {
-                // ACA success - copy indices for matvec
-                block->row_indices = row_faces;
-                block->col_indices = col_faces;
-                size_t index_bytes = (n_rows + n_cols) * sizeof(int);
-                g_total_index_bytes += index_bytes;
+                // OUT-OF-CORE: Write LowRankBlock to disk instead of storing in RAM
+                if (out_of_core_enabled_) {
+                    std::vector<int> row_faces_copy(row_faces);
+                    std::vector<int> col_faces_copy(col_faces);
+                    DiskBlock disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
 
-                block->data = std::move(lowrank);
-                #pragma omp atomic
-                num_lowrank_blocks_++;
+                    block->data = disk;
+                    // Indices are stored on disk - clear from RAM to save memory
+                    block->row_indices.clear();
+                    block->row_indices.shrink_to_fit();
+                    block->col_indices.clear();
+                    block->col_indices.shrink_to_fit();
+
+                    #pragma omp atomic
+                    num_disk_blocks_++;
+                } else {
+                    // In-memory: store as before
+                    block->row_indices = row_faces;
+                    block->col_indices = col_faces;
+                    size_t index_bytes = (n_rows + n_cols) * sizeof(int);
+                    g_total_index_bytes += index_bytes;
+
+                    block->data = std::move(lowrank);
+                    #pragma omp atomic
+                    num_lowrank_blocks_++;
+                }
                 return block;
             }
 
@@ -1758,14 +2072,30 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     #pragma omp atomic
                     num_zero_blocks_++;
                 } else {
-                    block->row_indices = row_faces;
-                    block->col_indices = col_faces;
-                    g_total_index_bytes += (n_rows + n_cols) * sizeof(int);
                     #pragma omp atomic
                     total_nnz_ += sparse.values.size();
-                    block->data = std::move(sparse);
-                    #pragma omp atomic
-                    num_sparse_blocks_++;
+
+                    // OUT-OF-CORE: Write sparse block to disk
+                    if (out_of_core_enabled_) {
+                        std::vector<int> row_faces_copy(row_faces);
+                        std::vector<int> col_faces_copy(col_faces);
+                        DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
+                        block->data = disk;
+                        // Indices are stored on disk - clear from RAM to save memory
+                        block->row_indices.clear();
+                        block->row_indices.shrink_to_fit();
+                        block->col_indices.clear();
+                        block->col_indices.shrink_to_fit();
+                        #pragma omp atomic
+                        num_disk_blocks_++;
+                    } else {
+                        block->row_indices = row_faces;
+                        block->col_indices = col_faces;
+                        g_total_index_bytes += (n_rows + n_cols) * sizeof(int);
+                        block->data = std::move(sparse);
+                        #pragma omp atomic
+                        num_sparse_blocks_++;
+                    }
                 }
                 return block;
             } else {
@@ -1834,19 +2164,19 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     // Not admissible and not small - subdivide if possible
     // Octree has 8 children instead of quadtree's 4
     //
-    // MEMORY SAFETY: Limit recursion depth more aggressively for large meshes.
-    // With 64 child pairs per level, depth 10 can create 64^10 blocks.
-    // Instead, limit based on current block size:
-    // - Large blocks (>1000 faces) at depth > 4 should be treated as zero
-    // - This prevents runaway recursion while still allowing local refinement
-    constexpr int MAX_SAFE_DEPTH_FOR_LARGE_BLOCKS = 4;
-    constexpr size_t LARGE_BLOCK_THRESHOLD = 1000;
-
-    bool block_is_large = (n_rows > LARGE_BLOCK_THRESHOLD || n_cols > LARGE_BLOCK_THRESHOLD);
-    bool recursion_limited = block_is_large && (depth >= MAX_SAFE_DEPTH_FOR_LARGE_BLOCKS);
+    // MEMORY SAFETY: Limit hierarchical recursion depth relative to start_depth_.
+    // With 64 child pairs per level, deep recursion can create millions of blocks.
+    // max_hierarchical_levels limits how many levels of HierarchicalBlock nesting are allowed.
+    // For 2M face mesh with start_depth=3 and max_hierarchical_levels=2:
+    //   - Depth 3: buildBlock called from top level (allowed)
+    //   - Depth 4: first level of hierarchical subdivision (allowed)
+    //   - Depth 5: second level of hierarchical subdivision (allowed)
+    //   - Depth 6+: blocked, falls through to sparse/zero
+    int hierarchical_depth = depth - start_depth_;
+    bool hierarchical_limit_exceeded = hierarchical_depth >= config_.max_hierarchical_levels;
 
     if (!row_node->is_leaf && !col_node->is_leaf &&
-        depth < config_.max_tree_depth && !recursion_limited) {
+        depth < config_.max_tree_depth && !hierarchical_limit_exceeded) {
 
         g_hierarchical_recursions++;
 
@@ -1948,10 +2278,12 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             std::vector<int> col_faces_copy(col_faces);
             DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
 
-            // Store indices for matvec (still needed for global->local mapping)
-            block->row_indices = std::move(row_faces_copy);
-            block->col_indices = std::move(col_faces_copy);
             block->data = disk;
+            // Indices are stored on disk - clear from RAM to save memory
+            block->row_indices.clear();
+            block->row_indices.shrink_to_fit();
+            block->col_indices.clear();
+            block->col_indices.shrink_to_fit();
 
             #pragma omp atomic
             num_disk_blocks_++;
@@ -3702,10 +4034,9 @@ DiskBlock HMatrixViewFactor::writeBlockToDisk(
     return disk;
 }
 
-// DiskBlock::matvec - read data from disk and compute
-void DiskBlock::matvec(const double* x, double* y,
-                       const std::vector<int>& row_indices,
-                       const std::vector<int>& col_indices) const {
+// DiskBlock::matvec - read data AND indices from disk and compute
+// This version reads indices from the mmap file to save RAM (memory-efficient out-of-core)
+void DiskBlock::matvec(const double* x, double* y) const {
     if (block_type == 0) return;  // Zero block
 
     if (!mmap_base) {
@@ -3715,9 +4046,12 @@ void DiskBlock::matvec(const double* x, double* y,
 
     const char* data_ptr = mmap_base + file_offset;
 
-    // Skip stored indices (we have them passed in)
-    data_ptr += row_indices.size() * sizeof(int);
-    data_ptr += col_indices.size() * sizeof(int);
+    // Read indices from mmap file (instead of keeping in RAM)
+    const int* row_indices = reinterpret_cast<const int*>(data_ptr);
+    data_ptr += n_rows * sizeof(int);
+
+    const int* col_indices = reinterpret_cast<const int*>(data_ptr);
+    data_ptr += n_cols * sizeof(int);
 
     if (block_type == 1) {
         // Sparse block

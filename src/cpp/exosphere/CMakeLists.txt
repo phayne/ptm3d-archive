@@ -375,7 +375,7 @@ set_target_properties(test_equilibrium_bias
 install(TARGETS ptm_exosphere
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h
+install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h ice_crystallization_model.h ice_layer_model.h multitimescale_evolution.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ptm/exosphere
 )
 
