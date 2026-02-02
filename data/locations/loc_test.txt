@@ -1,7 +1,0 @@
-# lat lon name
--15.0 120.5 Pwyll_Crater
-45.0 270.0 Thera_Macula
-0.0 0.0 Sub_Jupiter
-0.0 90.0 Trailing
-0.0 180.0 Anti_Jupiter
-0.0 270.0 Leading

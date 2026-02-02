@@ -1,0 +1,6 @@
+# Latitude profile at longitude 0
+# lat,lon,name
+0,0,Equator
+30,0,Lat_30N
+60,0,Lat_60N
+89,0,Near_Pole

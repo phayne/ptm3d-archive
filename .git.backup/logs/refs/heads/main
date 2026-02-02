@@ -1,5 +1,0 @@
-0000000000000000000000000000000000000000 dbf3b6e39449e848024744d89bab8a10226b674b Paul Hayne <paha3326@macd4965.lasp.colorado.edu> 1752695980 -0600	commit (initial): Initial commit of Planetary Thermophysical Model
-dbf3b6e39449e848024744d89bab8a10226b674b f4ad3a62459a4a7fee9b3c9754d9e2539c1e0db7 Paul Hayne <paha3326@macd4965.lasp.colorado.edu> 1752710292 -0600	commit: Add Planetary Thermophysical Model (PTM) code
-f4ad3a62459a4a7fee9b3c9754d9e2539c1e0db7 fe3683d5a630077e2d33af80664fcdf5b696581a Paul Hayne <paha3326@macd4965.lasp.colorado.edu> 1752713507 -0600	commit (merge): Merge README for Planetary Thermophysical Model
-fe3683d5a630077e2d33af80664fcdf5b696581a 550585d29f04db1874b0e513a5a80087c948cb1d Paul Hayne <paha3326@macd4965.lasp.colorado.edu> 1752713834 -0600	commit: Update gitignore to exclude large generated files
-550585d29f04db1874b0e513a5a80087c948cb1d e1a6adaca6ce95391ffae61637b2c5cb70faf7ce Paul Hayne <paha3326@macd4965.lasp.colorado.edu> 1752714147 -0600	commit: Remove large data files

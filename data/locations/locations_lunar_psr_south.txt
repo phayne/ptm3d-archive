@@ -1,0 +1,5 @@
+# Example lunar PSRs
+# lat,lon,name
+-87.5,355,Haworth
+-88.1,50,Shoemaker
+-87.25,85,Faustini
