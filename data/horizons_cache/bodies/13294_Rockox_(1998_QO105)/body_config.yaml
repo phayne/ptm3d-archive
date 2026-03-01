@@ -1,0 +1,30 @@
+generic_body:
+  name: 13294 Rockox (1998 QO105)
+  ephemeris_source: spice
+  naif_id: '2013294'
+  shape:
+    type: spherical
+    radius_km: 2.619
+  orbit:
+    semi_major_axis_au: 2.25728308
+    eccentricity: 0.09831723
+    inclination_deg: 5.74019
+    lon_ascending_node_deg: 48.908555
+    arg_perihelion_deg: 148.871082
+    mean_anomaly_deg: 286.9534
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 3.24305
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.139
+    emissivity: 0.95
+    ks: 0.01
+    kd: 0.5
+    rhos: 1500.0
+    rhod: 2000.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0
+  spice_metakernel: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
+  spk_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk

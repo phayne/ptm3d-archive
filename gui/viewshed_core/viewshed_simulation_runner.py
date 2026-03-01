@@ -27,9 +27,78 @@ def _parse_utc(utc_str):
     raise ValueError(f"Cannot parse UTC: {utc_str}")
 
 
-def _map_mission_to_ptm_timestep(mission_time, ptm_timesteps):
-    """Map a mission datetime to the nearest PTM3D timestep index."""
-    shifted = mission_time - timedelta(days=SYNODIC_MONTH_DAYS)
+def _ptm_time_range(ptm_timesteps):
+    """Return (first_dt, last_dt) from the PTM timestep list."""
+    if not ptm_timesteps:
+        return None, None
+    first_dt = _parse_utc(ptm_timesteps[0][1])
+    last_dt = _parse_utc(ptm_timesteps[-1][1])
+    return first_dt, last_dt
+
+
+def _check_window_overlap(window_start, window_end, ptm_first, ptm_last):
+    """Check if a time window overlaps with the PTM data range.
+
+    Returns True if there is any overlap.
+    """
+    if ptm_first is None or ptm_last is None:
+        return False
+    return window_start <= ptm_last and window_end >= ptm_first
+
+
+def _compute_time_shift(mission_start, mission_end, ptm_first, ptm_last):
+    """Determine the appropriate time shift for mapping mission to PTM data.
+
+    Returns:
+        shift_days: Number of days to shift mission times (0 if direct overlap,
+                    positive/negative multiples of synodic month otherwise).
+        shift_applied: Boolean indicating whether a shift was applied.
+    """
+    if ptm_first is None or ptm_last is None:
+        return 0.0, False
+
+    # Check if mission window directly overlaps with PTM data
+    if _check_window_overlap(mission_start, mission_end, ptm_first, ptm_last):
+        return 0.0, False
+
+    # No direct overlap - try shifting by synodic months
+    # Find the shift that minimizes the gap
+    best_shift = 0.0
+    best_overlap = False
+
+    for n in range(-12, 13):  # Check +/- 1 year of synodic months
+        if n == 0:
+            continue
+        shift = n * SYNODIC_MONTH_DAYS
+        shifted_start = mission_start - timedelta(days=shift)
+        shifted_end = mission_end - timedelta(days=shift)
+
+        if _check_window_overlap(shifted_start, shifted_end, ptm_first, ptm_last):
+            # Found an overlapping shift - prefer smaller shifts
+            if not best_overlap or abs(n) < abs(best_shift / SYNODIC_MONTH_DAYS):
+                best_shift = shift
+                best_overlap = True
+
+    if best_overlap:
+        return best_shift, True
+
+    # No synodic shift gives overlap - use single synodic month as fallback
+    return SYNODIC_MONTH_DAYS, True
+
+
+def _map_mission_to_ptm_timestep(mission_time, ptm_timesteps, shift_days=0.0):
+    """Map a mission datetime to the nearest PTM3D timestep index.
+
+    Args:
+        mission_time: The mission datetime to map.
+        ptm_timesteps: List of (index, utc_string) tuples.
+        shift_days: Number of days to shift the mission time (0 for direct mapping).
+
+    Returns:
+        (best_idx, best_diff_seconds) -- the index and the temporal offset
+        in seconds between the (possibly shifted) mission time and the nearest PTM step.
+    """
+    shifted = mission_time - timedelta(days=shift_days)
     best_idx = 0
     best_diff = float("inf")
     for idx, (_, utc_str) in enumerate(ptm_timesteps):
@@ -38,7 +107,7 @@ def _map_mission_to_ptm_timestep(mission_time, ptm_timesteps):
         if diff < best_diff:
             best_diff = diff
             best_idx = idx
-    return best_idx
+    return best_idx, best_diff
 
 
 class ViewshedSimulationThread(QThread):
@@ -145,17 +214,68 @@ class ViewshedSimulationThread(QThread):
 
         self._emit(f"Mission: {mission['start_utc']} to {mission['end_utc']}")
 
+        # Check PTM data range and determine if time shifting is needed
+        ptm_first, ptm_last = _ptm_time_range(ptm_timesteps)
+        if ptm_first and ptm_last:
+            self._emit(
+                f"PTM data range: {ptm_first.strftime('%Y-%m-%d %H:%M')} to "
+                f"{ptm_last.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        # Compute optimal time shift (0 if mission overlaps with PTM data)
+        shift_days, shift_applied = _compute_time_shift(
+            mission_start, mission_end, ptm_first, ptm_last
+        )
+
+        # Store shift for use in aggregation functions
+        self._time_shift_days = shift_days
+
+        # Compute effective (possibly shifted) mission window
+        effective_start = mission_start - timedelta(days=shift_days)
+        effective_end = mission_end - timedelta(days=shift_days)
+
+        if shift_applied:
+            self._emit(
+                f"Shifted mission window: {effective_start.strftime('%Y-%m-%d %H:%M')} to "
+                f"{effective_end.strftime('%Y-%m-%d %H:%M')} "
+                f"(shift: {shift_days:.1f} days = {shift_days/SYNODIC_MONTH_DAYS:.1f} synodic months)"
+            )
+            # Validate shifted window overlap
+            if not _check_window_overlap(effective_start, effective_end, ptm_first, ptm_last):
+                self._emit(
+                    "WARNING: Shifted mission window does not overlap with PTM data range! "
+                    "Timestep mapping will be unreliable."
+                )
+            elif effective_start < ptm_first or effective_end > ptm_last:
+                self._emit(
+                    "WARNING: Shifted mission window only partially overlaps PTM data range."
+                )
+        else:
+            self._emit("Mission window directly overlaps PTM data range (no shifting needed)")
+
+        # Compute mean PTM timestep interval for match quality assessment
+        ptm_dt_seconds = None
+        if len(ptm_timesteps) >= 2 and ptm_first and ptm_last:
+            ptm_dt_seconds = (ptm_last - ptm_first).total_seconds() / (len(ptm_timesteps) - 1)
+
         wp_times = []
         wp_ptm_indices = []
         for i in range(n_waypoints):
             frac = i / max(n_waypoints - 1, 1)
             mission_time = mission_start + timedelta(seconds=frac * mission_duration)
-            ptm_idx = _map_mission_to_ptm_timestep(mission_time, ptm_timesteps)
+            ptm_idx, offset_sec = _map_mission_to_ptm_timestep(
+                mission_time, ptm_timesteps, shift_days
+            )
             wp_times.append(mission_time)
             wp_ptm_indices.append(ptm_idx)
+            offset_hours = offset_sec / 3600.0
+            quality = ""
+            if ptm_dt_seconds and offset_sec > ptm_dt_seconds:
+                quality = f"  (WARNING: offset {offset_hours:.1f} h > 1 PTM step)"
             self._emit(
                 f"  {self.waypoints[i]['label']:>8s}: "
-                f"{mission_time.strftime('%Y-%m-%d %H:%M')} -> PTM step {ptm_idx}"
+                f"{mission_time.strftime('%Y-%m-%d %H:%M')} -> PTM step {ptm_idx} "
+                f"(offset {offset_hours:.1f} h){quality}"
             )
 
         # ----- 6. Generate truth ice map -----
@@ -228,6 +348,23 @@ class ViewshedSimulationThread(QThread):
             temp_path = ptm_dir / "temperature" / f"temperature_{ptm_idx:04d}.bin"
             temperature = loader.load_ptm_binary(temp_path)
 
+            # Read solar illumination at this timestep (if available)
+            # PTM3D outputs to direct_solar/direct_solar_XXXX.bin
+            solar_flux = None
+            solar_path = ptm_dir / "direct_solar" / f"direct_solar_{ptm_idx:04d}.bin"
+            if solar_path.exists():
+                solar_flux = loader.load_ptm_binary(solar_path)
+            else:
+                # Try alternative naming conventions
+                for alt_dir, alt_prefix in [
+                    ("direct_solar_flux", "direct_solar_flux"),
+                    ("solar_flux", "solar_flux"),
+                ]:
+                    alt_path = ptm_dir / alt_dir / f"{alt_prefix}_{ptm_idx:04d}.bin"
+                    if alt_path.exists():
+                        solar_flux = loader.load_ptm_binary(alt_path)
+                        break
+
             # Compute geometric viewshed
             viewshed = compute_viewshed(
                 observer_lat=wp["latitude"],
@@ -246,17 +383,20 @@ class ViewshedSimulationThread(QThread):
                 f"({100.0 * n_visible / n_faces:.1f}%)"
             )
 
-            # Store per-waypoint result
+            # Store per-waypoint result (include mission time for display)
             wp_result = {
                 "label": label,
                 "ptm_idx": ptm_idx,
+                "mission_time": wp_times[wp_i],  # datetime for UTC display
                 "viewshed": viewshed,
                 "temperature": temperature,
+                "solar_flux": solar_flux,
                 "n_visible": n_visible,
             }
             self.waypoint_results.append(wp_result)
 
             # Write per-waypoint outputs
+            # Use NaN for non-visible faces (not 0.0) so they display as masked
             if out_cfg["write_per_waypoint"]:
                 vis = viewshed["visibility"]
                 mask = vis > 0
@@ -267,20 +407,26 @@ class ViewshedSimulationThread(QThread):
                 )
                 loader.write_ptm_binary(
                     output_dir / f"distance_km_{label}.bin",
-                    np.where(mask, viewshed["distance_km"], 0.0).astype(np.float32),
+                    np.where(mask, viewshed["distance_km"], np.nan).astype(np.float32),
                 )
                 loader.write_ptm_binary(
                     output_dir / f"emission_angle_{label}.bin",
-                    np.where(mask, viewshed["emission_angle_deg"], 0.0).astype(np.float32),
+                    np.where(mask, viewshed["emission_angle_deg"], np.nan).astype(np.float32),
                 )
                 loader.write_ptm_binary(
                     output_dir / f"elevation_angle_{label}.bin",
-                    np.where(mask, viewshed["elevation_angle_deg"], 0.0).astype(np.float32),
+                    np.where(mask, viewshed["elevation_angle_deg"], np.nan).astype(np.float32),
                 )
                 loader.write_ptm_binary(
                     output_dir / f"temperature_{label}.bin",
-                    np.where(mask, temperature, 0.0).astype(np.float32),
+                    np.where(mask, temperature, np.nan).astype(np.float32),
                 )
+                # Write solar illumination if available
+                if solar_flux is not None:
+                    loader.write_ptm_binary(
+                        output_dir / f"direct_solar_{label}.bin",
+                        np.where(mask, solar_flux, np.nan).astype(np.float32),
+                    )
 
             self.summary_rows.append({
                 "label": label,
@@ -337,7 +483,13 @@ class ViewshedSimulationThread(QThread):
             self._emit(f"\nComputing {len(mask_defs)} custom mask(s)")
             self._compute_masks(mask_defs, n_faces, output_dir)
 
-        # ----- 11. Summary -----
+        # ----- 11. VTK / HDF5 export -----
+        if out_cfg.get("write_vtk", False):
+            self._export_vtk(output_dir, mesh_path, n_faces)
+        if out_cfg.get("write_hdf5", False):
+            self._export_hdf5(output_dir, n_faces)
+
+        # ----- 12. Summary -----
         self._emit(f"\n{'='*60}")
         self._emit(
             f"{'Waypoint':>10s} {'Step':>5s} {'Visible':>9s}"
@@ -349,6 +501,50 @@ class ViewshedSimulationThread(QThread):
                 f"{row['n_visible']:>9,d}"
             )
 
+        # ----- 13. Write metadata (for visualization panel) -----
+        import json
+
+        # Compute face index for each waypoint (closest face to lat/lon position)
+        face_lats = self.mesh.get("face_latitudes")
+        face_lons = self.mesh.get("face_longitudes")
+
+        def find_closest_face(wp_lat, wp_lon):
+            """Find the mesh face closest to the given lat/lon."""
+            if face_lats is None or face_lons is None:
+                return None
+            # Simple angular distance (works for small regions)
+            dlat = face_lats - wp_lat
+            dlon = face_lons - wp_lon
+            # Wrap longitude difference to [-180, 180]
+            dlon = np.where(dlon > 180, dlon - 360, dlon)
+            dlon = np.where(dlon < -180, dlon + 360, dlon)
+            dist_sq = dlat**2 + dlon**2
+            return int(np.argmin(dist_sq))
+
+        # Build waypoint metadata with face indices
+        waypoint_meta = []
+        for i, wr in enumerate(self.waypoint_results):
+            wp = self.waypoints[i]
+            face_idx = find_closest_face(wp["latitude"], wp["longitude"])
+            waypoint_meta.append({
+                "label": wr["label"],
+                "ptm_idx": wr["ptm_idx"],
+                "mission_time_utc": wr["mission_time"].strftime("%Y-%m-%dT%H:%M:%S"),
+                "face_idx": face_idx,
+                "latitude": wp["latitude"],
+                "longitude": wp["longitude"],
+                "height": wp["height"],
+            })
+
+        metadata = {
+            "waypoints": waypoint_meta,
+            "mission_start_utc": mission_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "mission_end_utc": mission_end.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        metadata_path = output_dir / "viewshed_metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
         self._emit(f"\nOutput directory: {output_dir}")
         self._emit("Done.")
         self.finished_signal.emit(0)
@@ -356,11 +552,15 @@ class ViewshedSimulationThread(QThread):
     def _compute_illumination_hours(self, ptm_dir, ptm_timesteps,
                                      mission_start, mission_end,
                                      n_faces, output_dir):
-        """Compute per-face illumination hours during the traverse window."""
-        # Find timesteps in the window
+        """Compute per-face direct solar illumination hours during the traverse window.
+
+        Uses direct_solar data (not total illumination which includes reflected/IR).
+        """
+        # Find timesteps in the window (use computed time shift)
         ts_in_window = []
-        shifted_start = mission_start - timedelta(days=SYNODIC_MONTH_DAYS)
-        shifted_end = mission_end - timedelta(days=SYNODIC_MONTH_DAYS)
+        shift_days = getattr(self, '_time_shift_days', 0.0)
+        shifted_start = mission_start - timedelta(days=shift_days)
+        shifted_end = mission_end - timedelta(days=shift_days)
 
         for idx, utc_str in ptm_timesteps:
             try:
@@ -371,7 +571,15 @@ class ViewshedSimulationThread(QThread):
                 continue
 
         if len(ts_in_window) < 2:
-            self._emit("  Illumination: insufficient timesteps in window, skipping.")
+            ptm_first, ptm_last = _ptm_time_range(ptm_timesteps)
+            window_type = "effective window" if shift_days != 0 else "mission window"
+            self._emit(
+                f"  Direct solar hours: {len(ts_in_window)} timesteps in {window_type} "
+                f"[{shifted_start.strftime('%Y-%m-%d')} .. {shifted_end.strftime('%Y-%m-%d')}], "
+                f"need >= 2. PTM range: "
+                f"[{ptm_first.strftime('%Y-%m-%d') if ptm_first else '?'} .. "
+                f"{ptm_last.strftime('%Y-%m-%d') if ptm_last else '?'}]. Skipping."
+            )
             return
 
         # Compute time interval between timesteps (hours)
@@ -387,25 +595,42 @@ class ViewshedSimulationThread(QThread):
 
         illum_hours = np.zeros(n_faces, dtype=np.float64)
         n_processed = 0
+        data_source = None
 
         for (ts_idx, _), dt_h in zip(ts_in_window, dt_hours):
-            # Try illumination data first
-            flux = loader.load_illumination_timestep(ptm_dir, ts_idx)
-            if flux is not None and len(flux) == n_faces:
-                illuminated = flux > 0
-            else:
-                # Fallback: use temperature proxy (T > night threshold)
+            flux = None
+
+            # Priority 1: Try direct_solar data (direct solar flux only)
+            direct_solar_path = ptm_dir / "direct_solar" / f"direct_solar_{ts_idx:04d}.bin"
+            if direct_solar_path.exists():
+                flux = loader.load_ptm_binary(direct_solar_path)
+                if data_source is None:
+                    data_source = "direct_solar"
+
+            # Priority 2: Fallback to illumination (total illumination)
+            if flux is None or len(flux) != n_faces:
+                flux = loader.load_illumination_timestep(ptm_dir, ts_idx)
+                if flux is not None and len(flux) == n_faces:
+                    if data_source is None:
+                        data_source = "illumination (fallback)"
+
+            # Priority 3: Use temperature proxy as last resort
+            if flux is None or len(flux) != n_faces:
                 try:
                     temp = loader.load_temperature_timestep(ptm_dir, ts_idx)
                     if len(temp) == n_faces:
-                        illuminated = temp > 100.0  # rough night/day threshold
+                        flux = (temp > 100.0).astype(np.float32)  # rough day/night threshold
+                        if data_source is None:
+                            data_source = "temperature proxy (fallback)"
                     else:
                         continue
                 except FileNotFoundError:
                     continue
 
-            illum_hours += illuminated.astype(np.float64) * dt_h
-            n_processed += 1
+            if flux is not None and len(flux) == n_faces:
+                illuminated = flux > 0
+                illum_hours += illuminated.astype(np.float64) * dt_h
+                n_processed += 1
 
         if n_processed > 0:
             loader.write_ptm_binary(
@@ -414,18 +639,22 @@ class ViewshedSimulationThread(QThread):
             )
             n_lit = int(np.sum(illum_hours > 0))
             self._emit(
-                f"  Illumination hours: {n_lit:,} faces with > 0 hours "
-                f"(from {n_processed} timesteps)"
+                f"  Direct solar hours: {n_lit:,} faces with > 0 hours "
+                f"(from {n_processed} timesteps, using {data_source})"
             )
         else:
-            self._emit("  Illumination: no valid timesteps found, skipping.")
+            self._emit(
+                f"  Direct solar hours: {len(ts_in_window)} timesteps matched window but "
+                f"no data loaded successfully (check file naming/face count). Skipping."
+            )
 
     def _compute_mean_temperature(self, ptm_dir, ptm_timesteps,
                                    mission_start, mission_end,
                                    n_faces, output_dir):
         """Compute mean temperature across the traverse window."""
-        shifted_start = mission_start - timedelta(days=SYNODIC_MONTH_DAYS)
-        shifted_end = mission_end - timedelta(days=SYNODIC_MONTH_DAYS)
+        shift_days = getattr(self, '_time_shift_days', 0.0)
+        shifted_start = mission_start - timedelta(days=shift_days)
+        shifted_end = mission_end - timedelta(days=shift_days)
 
         temp_sum = np.zeros(n_faces, dtype=np.float64)
         n_ts = 0
@@ -456,7 +685,15 @@ class ViewshedSimulationThread(QThread):
                 f"range [{mean_temp.min():.1f}, {mean_temp.max():.1f}] K"
             )
         else:
-            self._emit("  Mean temperature: no timesteps in window, skipping.")
+            ptm_first, ptm_last = _ptm_time_range(ptm_timesteps)
+            window_type = "effective window" if shift_days != 0 else "mission window"
+            self._emit(
+                f"  Mean temperature: no timesteps matched {window_type} "
+                f"[{shifted_start.strftime('%Y-%m-%d')} .. {shifted_end.strftime('%Y-%m-%d')}] "
+                f"or data files could not be loaded. PTM range: "
+                f"[{ptm_first.strftime('%Y-%m-%d') if ptm_first else '?'} .. "
+                f"{ptm_last.strftime('%Y-%m-%d') if ptm_last else '?'}]. Skipping."
+            )
 
     def _compute_earth_visibility(self, ptm_dir, ptm_timesteps,
                                     mission_start, mission_end,
@@ -467,10 +704,11 @@ class ViewshedSimulationThread(QThread):
         Writes earth_visibility_fraction.bin (aggregated) and per-timestep
         earth_visible_XXXX.bin files.
         """
-        # Find timesteps in the traverse window
+        # Find timesteps in the traverse window (use computed time shift)
         ts_in_window = []
-        shifted_start = mission_start - timedelta(days=SYNODIC_MONTH_DAYS)
-        shifted_end = mission_end - timedelta(days=SYNODIC_MONTH_DAYS)
+        shift_days = getattr(self, '_time_shift_days', 0.0)
+        shifted_start = mission_start - timedelta(days=shift_days)
+        shifted_end = mission_end - timedelta(days=shift_days)
 
         for idx, utc_str in ptm_timesteps:
             try:
@@ -481,7 +719,15 @@ class ViewshedSimulationThread(QThread):
                 continue
 
         if len(ts_in_window) < 2:
-            self._emit("  Earth visibility: insufficient timesteps in window, skipping.")
+            ptm_first, ptm_last = _ptm_time_range(ptm_timesteps)
+            window_type = "effective window" if shift_days != 0 else "mission window"
+            self._emit(
+                f"  Earth visibility: {len(ts_in_window)} timesteps in {window_type} "
+                f"[{shifted_start.strftime('%Y-%m-%d')} .. {shifted_end.strftime('%Y-%m-%d')}], "
+                f"need >= 2. PTM range: "
+                f"[{ptm_first.strftime('%Y-%m-%d') if ptm_first else '?'} .. "
+                f"{ptm_last.strftime('%Y-%m-%d') if ptm_last else '?'}]. Skipping."
+            )
             return
 
         # Count per-face visible timesteps
@@ -500,7 +746,10 @@ class ViewshedSimulationThread(QThread):
                 )
 
         if n_loaded == 0:
-            self._emit("  Earth visibility: no primary_ir data found, skipping.")
+            self._emit(
+                f"  Earth visibility: {len(ts_in_window)} timesteps matched window but "
+                f"no primary_ir data loaded (check primary_ir/ directory). Skipping."
+            )
             return
 
         # Compute fraction and store
@@ -518,6 +767,210 @@ class ViewshedSimulationThread(QThread):
             f"{n_ever:,} faces visible at least once, "
             f"{n_always:,} always visible"
         )
+
+    def _export_vtk(self, output_dir, mesh_path, n_faces):
+        """Write per-waypoint VTU files and a PVD collection for ParaView.
+
+        Each waypoint produces a VTU file containing:
+          - Per-waypoint fields: visibility, distance_km, emission_angle,
+            elevation_angle, temperature, direct_solar
+          - Aggregation fields (constant across timesteps): visibility_count,
+            illumination_hours, earth_visibility_fraction, mean_temperature
+
+        A PVD (ParaView Data) collection file references all VTU files with
+        mission UTC times converted to hours-since-start for the timestep axis.
+
+        Uses raw VTK API (not PyVista) to ensure correct VTK_TRIANGLE cell
+        types in the VTU output, which is required for ParaView rendering.
+        """
+        try:
+            import vtk
+            from vtk.util import numpy_support
+        except ImportError:
+            self._emit("  VTK export: vtk not available, skipping.")
+            return
+
+        if self.mesh is None:
+            self._emit("  VTK export: no mesh data available, skipping.")
+            return
+        if not self.waypoint_results:
+            self._emit("  VTK export: no waypoint results available, skipping.")
+            return
+
+        try:
+            output_dir = Path(output_dir)
+            vtk_dir = output_dir / "vtk"
+            vtk_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build VTK unstructured grid from mesh geometry
+            vertices = np.asarray(self.mesh["vertices"], dtype=np.float64)
+            # pegasus_sim uses "face_indices"; fallback reader uses "faces"
+            face_key = (
+                "face_indices" if "face_indices" in self.mesh else "faces"
+            )
+            faces = np.asarray(self.mesh[face_key], dtype=np.int64)
+
+            ugrid = vtk.vtkUnstructuredGrid()
+            vtk_points = vtk.vtkPoints()
+            vtk_points.SetData(numpy_support.numpy_to_vtk(vertices, deep=True))
+            ugrid.SetPoints(vtk_points)
+
+            # Connectivity: [3, v0, v1, v2, 3, v0, v1, v2, ...]
+            cell_array = np.empty((len(faces), 4), dtype=np.int64)
+            cell_array[:, 0] = 3
+            cell_array[:, 1:4] = faces
+            cells = vtk.vtkCellArray()
+            cells.SetCells(
+                len(faces),
+                numpy_support.numpy_to_vtk(
+                    cell_array.ravel(), deep=True,
+                    array_type=vtk.VTK_ID_TYPE,
+                ),
+            )
+            ugrid.SetCells(vtk.VTK_TRIANGLE, cells)
+
+            # Add lat/lon as base cell data
+            for key, name in [
+                ("face_latitudes", "latitude"),
+                ("face_longitudes", "longitude"),
+            ]:
+                arr = self.mesh.get(key)
+                if arr is not None and len(arr) == n_faces:
+                    vtk_arr = numpy_support.numpy_to_vtk(
+                        np.asarray(arr, dtype=np.float64), deep=True,
+                    )
+                    vtk_arr.SetName(name)
+                    ugrid.GetCellData().AddArray(vtk_arr)
+
+            # Load aggregation fields (included in every timestep)
+            agg_names = [
+                "visibility_count", "illumination_hours",
+                "earth_visibility_fraction", "mean_temperature",
+            ]
+            agg_fields = {}
+            for name in agg_names:
+                p = output_dir / f"{name}.bin"
+                if p.exists():
+                    data = loader.load_ptm_binary(p)
+                    if len(data) == n_faces:
+                        agg_fields[name] = data
+
+            # Per-waypoint field names (files: <field>_<label>.bin)
+            wp_field_names = [
+                "visibility", "distance_km", "emission_angle",
+                "elevation_angle", "temperature", "direct_solar",
+            ]
+
+            # Compute time axis: hours since first waypoint
+            first_time = self.waypoint_results[0]["mission_time"]
+            pvd_entries = []
+
+            def _add_cell_array(grid, name, data):
+                """Add a cleaned float32 array as cell data."""
+                clean = np.nan_to_num(
+                    np.asarray(data, dtype=np.float32),
+                    nan=0.0, posinf=0.0, neginf=0.0,
+                )
+                vtk_arr = numpy_support.numpy_to_vtk(clean, deep=True)
+                vtk_arr.SetName(name)
+                grid.GetCellData().AddArray(vtk_arr)
+
+            for wr in self.waypoint_results:
+                label = wr["label"]
+                dt_hours = (
+                    (wr["mission_time"] - first_time).total_seconds() / 3600.0
+                )
+
+                # Deep-copy base grid for this timestep
+                grid = vtk.vtkUnstructuredGrid()
+                grid.DeepCopy(ugrid)
+
+                # Add per-waypoint fields
+                for fname in wp_field_names:
+                    p = output_dir / f"{fname}_{label}.bin"
+                    if p.exists():
+                        data = loader.load_ptm_binary(p)
+                        if len(data) == n_faces:
+                            _add_cell_array(grid, fname, data)
+
+                # Add aggregation fields
+                for aname, adata in agg_fields.items():
+                    _add_cell_array(grid, aname, adata)
+
+                # Write VTU with compression
+                vtu_name = f"viewshed_{label}.vtu"
+                vtu_path = vtk_dir / vtu_name
+                writer = vtk.vtkXMLUnstructuredGridWriter()
+                writer.SetInputData(grid)
+                writer.SetFileName(str(vtu_path))
+                writer.SetDataModeToAppended()
+                writer.SetCompressorTypeToZLib()
+                writer.SetCompressionLevel(1)
+                writer.SetEncodeAppendedData(0)
+                writer.Write()
+
+                pvd_entries.append((dt_hours, vtu_name))
+
+            # Write PVD collection file
+            pvd_path = vtk_dir / "viewshed.pvd"
+            with open(pvd_path, "w") as f:
+                f.write('<?xml version="1.0"?>\n')
+                f.write('<VTKFile type="Collection" version="0.1">\n')
+                f.write('  <Collection>\n')
+                for t_val, vtu_file in pvd_entries:
+                    f.write(
+                        f'    <DataSet timestep="{t_val:.6f}" '
+                        f'file="{vtu_file}"/>\n'
+                    )
+                f.write('  </Collection>\n')
+                f.write('</VTKFile>\n')
+
+            n_wp = len(pvd_entries)
+            n_agg = len(agg_fields)
+            self._emit(
+                f"  VTK export: {n_wp} waypoint VTU files in {vtk_dir}/, "
+                f"PVD collection: {pvd_path} "
+                f"({n_wp} timesteps, {n_agg} aggregation fields per file)"
+            )
+        except Exception as e:
+            self._emit_err(f"  VTK export failed: {e}")
+
+    def _export_hdf5(self, output_dir, n_faces):
+        """Write a single HDF5 file with all output fields."""
+        try:
+            import h5py
+        except ImportError:
+            self._emit("  HDF5 export: h5py not available, skipping.")
+            return
+
+        try:
+            h5_path = output_dir / "viewshed_results.h5"
+            with h5py.File(str(h5_path), "w") as f:
+                f.attrs["software"] = "PEGASUS Viewshed GUI"
+                f.attrs["n_faces"] = n_faces
+
+                # Mesh group
+                if self.mesh is not None:
+                    mg = f.create_group("mesh")
+                    for key in ("face_centers", "face_normals", "face_areas",
+                                "face_latitudes", "face_longitudes"):
+                        if key in self.mesh:
+                            mg.create_dataset(key, data=self.mesh[key],
+                                              compression="gzip")
+
+                # Data group: all .bin fields
+                dg = f.create_group("data")
+                count = 0
+                for p in sorted(Path(output_dir).glob("*.bin")):
+                    data = loader.load_ptm_binary(p)
+                    if len(data) == n_faces:
+                        dg.create_dataset(p.stem, data=data,
+                                          compression="gzip")
+                        count += 1
+
+            self._emit(f"  HDF5 export: {h5_path} ({count} fields)")
+        except Exception as e:
+            self._emit_err(f"  HDF5 export failed: {e}")
 
     def _compute_masks(self, mask_defs, n_faces, output_dir):
         """Evaluate and write custom boolean masks."""

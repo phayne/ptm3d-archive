@@ -100,6 +100,19 @@ class SimulationThread(QThread):
 
         return args
 
+    def _build_generic_body_args(self):
+        """Build command-line arguments for generic body configuration."""
+        args = []
+        if not self.config_dict:
+            return args
+
+        generic = self.config_dict.get("generic_body", {})
+        config_file = generic.get("config_file", "")
+        if config_file:
+            args.extend(["--generic-body-config", str(config_file)])
+
+        return args
+
     def run(self):
         """Execute the simulation and emit output"""
         try:
@@ -113,6 +126,7 @@ class SimulationThread(QThread):
             command = [str(executable), "--config", str(self.config_file)]
             command.extend(self._build_radiation_args())
             command.extend(self._build_gpu_thermal_args())
+            command.extend(self._build_generic_body_args())
 
             # Pass current Python executable to subprocess so C++ can invoke it
             # This ensures the correct Python environment (conda/venv) is used

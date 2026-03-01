@@ -375,7 +375,7 @@ $$k_{\mathrm{cryst}}^{1/n} = A_0^{1/n} \, \exp\!\left(\frac{-\Delta H_a}{R \, T}
 $$k_{\mathrm{eff}} = n \; k_{\mathrm{cryst}}^{1/n}$$
 
 where:
-- $A_0^{1/n} = 3.9 \times 10^{19}$ s$^{-1}$ is the pre-exponential factor (Mitchell et al. 2017, Stage 2; configurable via `--activation-energy`)
+- $A_0^{1/n} = 3.9 \times 10^{19}$ s$^{-1}$ is the pre-exponential factor (Mitchell et al. 2017, Stage 2; not configurable via CLI)
 - $\Delta H_a = 62{,}000$ J/mol $= 62$ kJ/mol is the activation energy (default; set via `--activation-energy`)
 - $R = 8.314$ J/(mol K) is the universal gas constant
 - $T$ is the surface temperature [K]
@@ -426,6 +426,8 @@ $$\dot{D}(\phi_{\mathrm{lat}}, \phi_{\mathrm{lon}}) = \dot{D}_0 \; f_{\mathrm{lo
 where $\dot{D}_0 = 2.3 \times 10^{-6}$ eV/(molecule s) is the base dose rate at the trailing apex (default; set via `--base-dose-rate`). This is calibrated to give an amorphization timescale of ~15 days at the trailing equator, consistent with JWST observations (Cartwright et al. 2025).
 
 At the trailing equator: $k_{\mathrm{amorph}} = \dot{D}_0 / E_{\mathrm{amorph}} = 2.3 \times 10^{-6} / 3.0 = 7.67 \times 10^{-7}$ s$^{-1}$, giving $\tau_{\mathrm{amorph}} = 1/k_{\mathrm{amorph}} = 1.30 \times 10^6$ s $= 15.1$ days.
+
+> **Note — Relationship to sputtering spatial model.** The radiation dose distribution uses different parameters than the [sputtering spatial model](#magnetospheric-plasma-sputtering), despite both being driven by magnetospheric ion bombardment. Sputtering is dominated by thermal plasma ($\sim 100$ eV S$^+$ and O$^+$) with moderate spatial contrast ($C_{\mathrm{hem}} = 3.0$, $E_{\mathrm{pol}} = 1.2$, linear latitude dependence). Amorphization is driven by higher-energy ions ($\sim 1$ keV) that experience stronger magnetic focusing, producing a steeper trailing/leading contrast ($C_D = 5.0$), stronger polar enhancement ($E_D = 2.5$), and a super-linear latitude dependence (exponent $1.5$). Both models share the same cosine longitude functional form centered at $270°$W. The parameter differences follow Nordheim et al. (2022), who showed that the energetic ion flux map differs substantially from the thermal plasma distribution.
 
 **Crystallinity evolution ODE:**
 
@@ -796,8 +798,6 @@ Fama, M. et al. (2008). Sputtering of ice by low-energy ions. *Surf. Sci.*, 602(
 Fama, M. et al. (2010). Radiation-induced amorphization of crystalline ice. *Surf. Sci.*, 604, 1602-1607.
 
 Leto, G. & Baratta, G.A. (2003). Ly-alpha photon induced amorphization of Ic water ice at 16 K. *Astron. Astrophys.*, 397(1), 7-13.
-
-Lucey, P.G. & Hayne, P.O. (2021). Spectral radiance of permanently shadowed regions. Unpublished manuscript.
 
 Marti, J. & Mauersberger, K. (1993). A survey and new measurements of ice vapor pressure at temperatures between 170 and 250 K. *Geophys. Res. Lett.*, 20(5), 363-366. doi:10.1029/93GL00105
 

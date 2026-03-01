@@ -230,6 +230,12 @@ class InputOutputTab(BaseViewshedConfigTab):
         self.add_bool_field(output_layout, 2, "Write per-waypoint maps",
                             "output.write_per_waypoint",
                             info_key="output.write_per_waypoint")
+        self.add_bool_field(output_layout, 3, "Write VTK file (.vtu)",
+                            "output.write_vtk",
+                            info_key="output.write_vtk")
+        self.add_bool_field(output_layout, 4, "Write HDF5 file (.h5)",
+                            "output.write_hdf5",
+                            info_key="output.write_hdf5")
 
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
@@ -246,6 +252,8 @@ class InputOutputTab(BaseViewshedConfigTab):
         self.widgets["output.output_dir"].setText(out["output_dir"])
         self.widgets["output.write_truth_map"].setChecked(out["write_truth_map"])
         self.widgets["output.write_per_waypoint"].setChecked(out["write_per_waypoint"])
+        self.widgets["output.write_vtk"].setChecked(out.get("write_vtk", False))
+        self.widgets["output.write_hdf5"].setChecked(out.get("write_hdf5", False))
 
 
 # =========================================================================

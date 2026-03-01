@@ -91,6 +91,7 @@ __kernel void materialUpdateKernel(
 
     float k_val = compute_k(T_val, kc_val, R350);
     float cp_val = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
+    if (cp_val <= 0.0f) cp_val = 800.0f;
 
     k[idx] = k_val;
     cp[idx] = cp_val;
@@ -360,6 +361,7 @@ __kernel void combinedThermalKernel(
         T_local[i] = T_val;
         k_local[i] = compute_k(T_val, kc_val, R350);
         cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
+        if (cp_local[i] <= 0.0f) cp_local[i] = 800.0f;
         kappa_local[i] = k_local[i] / (rho_val * cp_local[i]);
     }
 
@@ -540,6 +542,7 @@ __kernel void persistentThermalKernel(
             float T_val = T_local[i];
             k_local[i] = compute_k(T_val, kc_local[i], R350);
             cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
+            if (cp_local[i] <= 0.0f) cp_local[i] = 800.0f;
             kappa_local[i] = k_local[i] / (rho_local[i] * cp_local[i]);
         }
 

@@ -97,12 +97,11 @@ class ConfigManager:
             "resolution": 5,
             "import_file": "",
             "scale_factor": 1.0,
-            "export_basic": False
         },
         "thermal": {
             "run_thermal_mesh": True,
             "threads": 0,
-            "equilibration_orbits": 1,
+            "equilibration_orbits": 1.0,
             "use_gpu": False,
             "compute_statistics": True,
             "thermal_inertia_map": "",
@@ -135,10 +134,13 @@ class ConfigManager:
             "rhod": 1800.0,  # Deep density (kg/m³)
             # Heat capacity
             "use_default_cp0": True,
-            "cp0": -3.6125,  # Reference heat capacity (J/kg/K)
+            "cp0": 800.0,  # Reference heat capacity (J/kg/K)
             # Internal heat
             "use_default_Qb": True,
-            "Qb": 0.018  # Geothermal heat flow (W/m²)
+            "Qb": 0.018,  # Geothermal heat flow (W/m²)
+            # Radiative conductivity
+            "use_default_chi": True,
+            "chi": 2.7  # Radiative conductivity parameter (k = kc * [1 + chi*(T/350)^3])
         },
         "radiation": {
             "enabled": False,
@@ -183,6 +185,37 @@ class ConfigManager:
         "advanced": {
             "verbose": False,
             "default_visible_albedo": -1.0
+        },
+        "generic_body": {
+            "name": "",
+            "config_file": "",  # Path to HORIZONS-generated body_config.yaml
+            "ephemeris_source": "auto",
+            "spice_metakernel": "",
+            "naif_id": "",
+            "shape": {
+                "type": "spherical",
+                "radius_km": -1.0,
+                "semi_axis_a_km": -1.0,
+                "semi_axis_b_km": -1.0,
+                "semi_axis_c_km": -1.0,
+                "mesh_file": "",
+                "mesh_scale": 1.0,
+            },
+            "orbit": {
+                "semi_major_axis_au": -1.0,
+                "eccentricity": -1.0,
+                "inclination_deg": -1.0,
+                "lon_ascending_node_deg": -1.0,
+                "arg_perihelion_deg": -1.0,
+                "mean_anomaly_deg": -1.0,
+                "epoch": "",
+            },
+            "spin": {
+                "period_hours": -1.0,
+                "pole_ra_deg": -1.0,
+                "pole_dec_deg": -1.0,
+                "prime_meridian_deg": 0.0,
+            },
         }
     }
 
@@ -190,25 +223,25 @@ class ConfigManager:
         "europa_quick": {
             "simulation": {"body": "Europa", "duration_days": 0.5, "timesteps": 24},
             "mesh": {"resolution": 4},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
             "output": {"directory": "output/quick_test", "vtk_mode": "thermal"}
         },
         "europa_highres": {
             "simulation": {"body": "Europa", "duration_days": 3.55, "timesteps": 144},
             "mesh": {"resolution": 7},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
             "output": {"directory": "output/europa_high_res"},
             "advanced": {"verbose": True}
         },
         "moon_thermal": {
             "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 708},
             "mesh": {"resolution": 6},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
             "output": {"directory": "output/moon_thermal"}
         },
         "crater_radex": {
             "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 96},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1},
+            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
             "radiation": {
                 "enabled": True, "verbose": True, "use_gpu": True,
                 "min_shadow_fraction": 0.3, "max_coupling_iterations": 10
@@ -278,20 +311,106 @@ class ConfigManager:
                 "rhod": "use_default_rhod",
                 "cp0": "use_default_cp0",
                 "Qb": "use_default_Qb",
+                "chi": "use_default_chi",
             }
             for prop_name, flag_name in property_flags.items():
-                if prop_name in loaded_thermo:
-                    # YAML explicitly specified this property, so don't use default
+                if prop_name in loaded_thermo and flag_name not in loaded_thermo:
+                    # YAML has the property but no explicit use_default flag —
+                    # infer that the user set a custom value (backwards compat)
                     self.config["thermophysical"][flag_name] = False
+
+    @staticmethod
+    def _strip_sentinels(d):
+        """Remove sentinel values (-1.0, empty strings) from nested dict for clean YAML."""
+        result = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                cleaned = ConfigManager._strip_sentinels(v)
+                if cleaned:  # Only include non-empty sub-dicts
+                    result[k] = cleaned
+            elif isinstance(v, float) and v == -1.0:
+                continue  # Skip sentinel
+            elif isinstance(v, str) and not v:
+                continue  # Skip empty strings
+            else:
+                result[k] = v
+        return result
+
+    def _config_for_yaml(self):
+        """Return config dict suitable for YAML output.
+
+        Preserves generic_body when it has meaningful data (config_file,
+        name, or orbital elements set) so that project files survive
+        save/load cycles.  Also sanitises the body name so the separator
+        or ``[H] `` display prefix never leak into the YAML.
+
+        For generic_body output:
+        - Sentinel values (-1.0, empty strings) are stripped for clean YAML
+        - Semi-axes a/b/c are converted to a ``semi_axes_km`` YAML sequence
+          as expected by the C++ parser (config_parser.cpp:133)
+        """
+        from copy import deepcopy as _dc
+        out = {}
+        for k, v in self.config.items():
+            if k == "generic_body":
+                # Include generic_body when it carries real data
+                gb = v if isinstance(v, dict) else {}
+                has_data = (
+                    gb.get("config_file") or gb.get("name")
+                    or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+                )
+                if has_data:
+                    cleaned = self._strip_sentinels(_dc(gb))
+                    # Convert separate semi-axis keys to YAML sequence
+                    shape = cleaned.get("shape", {})
+                    a = shape.pop("semi_axis_a_km", None)
+                    b = shape.pop("semi_axis_b_km", None)
+                    c = shape.pop("semi_axis_c_km", None)
+                    if a is not None and b is not None and c is not None:
+                        shape["semi_axes_km"] = [a, b, c]
+
+                    # For generic/custom bodies, write explicit thermophysical
+                    # values to generic_body.surface so the C++ backend picks
+                    # them up (it doesn't parse the GUI thermophysical section).
+                    thermo = self.config.get("thermophysical", {})
+                    surface = cleaned.get("surface", {})
+                    for key in ("albedo", "emissivity", "ks", "kd",
+                                "rhos", "rhod", "H", "cp0", "Qb", "chi"):
+                        if key in surface:
+                            continue  # Already set (e.g. from HORIZONS config)
+                        flag = f"use_default_{key}"
+                        if not thermo.get(flag, True):
+                            val = thermo.get(key)
+                            if val is not None:
+                                surface[key] = val
+                    if surface:
+                        cleaned["surface"] = surface
+
+                    out[k] = cleaned
+                continue
+            out[k] = v
+
+        # Sanitise simulation.body
+        body = out.get("simulation", {}).get("body", "")
+        if body.startswith("[H] "):
+            out["simulation"] = _dc(out["simulation"])
+            out["simulation"]["body"] = body[4:]
+        elif "\u2500" in body:
+            # Separator character leaked — replace with generic body name
+            out["simulation"] = _dc(out["simulation"])
+            gb_name = self.config.get("generic_body", {}).get("name", "")
+            out["simulation"]["body"] = gb_name or "Custom"
+
+        return out
 
     def save_to_yaml(self, filename):
         """Save configuration to YAML file"""
         with open(filename, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+            yaml.dump(self._config_for_yaml(), f, default_flow_style=False, sort_keys=False)
 
     def generate_yaml(self):
         """Generate YAML string for preview"""
-        return yaml.dump(self.config, default_flow_style=False, sort_keys=False)
+        return yaml.dump(self._config_for_yaml(), default_flow_style=False, sort_keys=False)
 
     def validate(self):
         """Validate the current configuration.

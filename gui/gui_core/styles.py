@@ -151,10 +151,12 @@ class ModernStyle:
 
             /* === Group Box === */
             QGroupBox {{
-                border: 1px solid {ModernStyle.BORDER_COLOR};
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 8px;
+                border: none;
+                border-top: 1px solid {ModernStyle.BORDER_COLOR};
+                border-radius: 0px;
+                margin-top: 24px;
+                padding: 16px;
+                padding-top: 20px;
                 background-color: {ModernStyle.BG_MEDIUM};
                 font-weight: bold;
             }}
@@ -164,6 +166,55 @@ class ModernStyle:
                 subcontrol-position: top left;
                 padding: 0 8px;
                 color: {ModernStyle.PRIMARY_LIGHT};
+                font-size: 14px;
+            }}
+
+            /* === Collapsible Section Header === */
+            QPushButton#collapsibleHeader {{
+                background-color: {ModernStyle.BG_LIGHT};
+                border: 1px solid {ModernStyle.BORDER_COLOR};
+                border-radius: 4px;
+                color: {ModernStyle.PRIMARY_LIGHT};
+                font-weight: bold;
+                text-align: left;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+
+            QPushButton#collapsibleHeader:hover {{
+                background-color: {ModernStyle.BG_PANEL};
+                border-color: {ModernStyle.PRIMARY};
+            }}
+
+            QPushButton#collapsibleHeader:checked {{
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+
+            /* === Navigation Rail === */
+            QListWidget#NavRail {{
+                background-color: {ModernStyle.BG_PANEL};
+                border: none;
+                border-right: 1px solid {ModernStyle.BORDER_COLOR};
+                outline: none;
+                font-size: 13px;
+            }}
+
+            QListWidget#NavRail::item {{
+                padding: 12px 16px;
+                border: none;
+                color: {ModernStyle.TEXT_SECONDARY};
+            }}
+
+            QListWidget#NavRail::item:selected {{
+                background-color: {ModernStyle.PRIMARY_DARK};
+                color: white;
+                font-weight: bold;
+                border-left: 3px solid {ModernStyle.PRIMARY_LIGHT};
+            }}
+
+            QListWidget#NavRail::item:hover:!selected {{
+                background-color: {ModernStyle.BG_LIGHT};
+                color: {ModernStyle.TEXT_PRIMARY};
             }}
 
             /* === Labels === */

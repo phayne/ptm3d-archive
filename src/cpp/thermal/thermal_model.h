@@ -280,14 +280,18 @@ public:
     double cp0;       // Reference heat capacity
     std::vector<double> cpCoeff; // Heat capacity polynomial coefficients
     std::vector<double> albedoCoef; // Albedo coefficients
-    
+    double body_radius_km = 0.0; // Mean body radius (km), 0 = use mesh as-is
+
     // Constructor with name or explicit properties
     Planet(const std::string& name = "Europa");
-    
-    // New constructor that takes PlanetaryBody enum
+
+    // Constructor that takes PlanetaryBody enum
     Planet(PlanetaryBody body);
-    
-    // New method to set custom properties
+
+    // Constructor from ThermophysicalProperties directly
+    Planet(const std::string& name, const ThermophysicalProperties& props);
+
+    // Set custom properties
     void setProperty(const std::string& property_name, double value);
     
     // New method to set vector properties

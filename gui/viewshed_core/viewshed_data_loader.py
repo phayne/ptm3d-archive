@@ -74,7 +74,7 @@ def load_temperature_timestep(ptm_dir, idx):
     Returns:
         numpy.ndarray of float32 values.
     """
-    path = Path(ptm_dir) / "temperature" / f"temperature_{idx:04d}.bin"
+    path = Path(ptm_dir) / "temperature" / f"temperature_{int(idx):04d}.bin"
     return load_ptm_binary(path)
 
 
@@ -82,11 +82,15 @@ def load_timesteps(ptm_dir):
     """Load the timestep index from time_steps.txt.
 
     Returns:
-        list of (index, utc_string) tuples.
+        list of (index, utc_string) tuples where index is the sequential
+        file index (0, 1, 2, ...) matching binary file naming conventions
+        (e.g., temperature_0018.bin).
     """
     try:
         from pegasus_sim.ptm_io import read_timesteps
-        return read_timesteps(Path(ptm_dir) / "time_steps.txt")
+        raw = read_timesteps(Path(ptm_dir) / "time_steps.txt")
+        # pegasus_sim returns (ET_seconds, utc) -- convert to (file_index, utc)
+        return [(i, utc) for i, (_, utc) in enumerate(raw)]
     except ImportError:
         return _read_timesteps_minimal(Path(ptm_dir) / "time_steps.txt")
 
@@ -112,6 +116,7 @@ def load_illumination_timestep(ptm_dir, idx):
     """
     ptm_dir = Path(ptm_dir)
     # Try several possible naming conventions
+    idx = int(idx)
     for pattern in [
         f"illumination/solar_flux_{idx:04d}.bin",
         f"illumination/illumination_{idx:04d}.bin",
@@ -130,7 +135,7 @@ def load_primary_ir_timestep(ptm_dir, idx):
         numpy.ndarray or None if not available.
     """
     ptm_dir = Path(ptm_dir)
-    path = ptm_dir / f"primary_ir/primary_ir_{idx:04d}.bin"
+    path = ptm_dir / f"primary_ir/primary_ir_{int(idx):04d}.bin"
     if path.is_file():
         return load_ptm_binary(path)
     return None
@@ -199,8 +204,14 @@ def discover_timestep_range(ptm_dir, start_utc, end_utc):
 # ---------------------------------------------------------------------------
 
 def _read_timesteps_minimal(ts_path):
-    """Parse time_steps.txt without pegasus_sim."""
+    """Parse time_steps.txt without pegasus_sim.
+
+    The file format has two columns: elapsed seconds (float) and UTC string.
+    The sequential line number (0-based) is used as the index, matching the
+    binary data file naming convention (e.g., temperature_0000.bin).
+    """
     timesteps = []
+    idx = 0
     with open(ts_path, "r") as f:
         for line in f:
             line = line.strip()
@@ -208,12 +219,9 @@ def _read_timesteps_minimal(ts_path):
                 continue
             parts = line.split()
             if len(parts) >= 2:
-                try:
-                    idx = int(parts[0])
-                    utc = parts[1]
-                    timesteps.append((idx, utc))
-                except ValueError:
-                    continue
+                utc = parts[1]
+                timesteps.append((idx, utc))
+                idx += 1
     return timesteps
 
 
@@ -245,37 +253,60 @@ def _read_ply_mesh_minimal(mesh_path):
     faces = []
 
     with open(mesh_path, "rb") as f:
-        # Parse header
+        # Parse header, tracking property types for correct binary layout
         is_binary = False
         n_vertices = 0
         n_faces = 0
         header_lines = []
+        vertex_props = []
+        face_scalar_props = []
+        current_element = None
+        _ply_type_map = {
+            'float': '<f4', 'float32': '<f4',
+            'double': '<f8', 'float64': '<f8',
+            'int': '<i4', 'int32': '<i4',
+            'uint': '<u4', 'uint32': '<u4',
+            'uchar': '<u1', 'uint8': '<u1',
+            'char': '<i1', 'int8': '<i1',
+            'short': '<i2', 'int16': '<i2',
+            'ushort': '<u2', 'uint16': '<u2',
+        }
         while True:
             line = f.readline().decode("ascii", errors="replace").strip()
             header_lines.append(line)
             if line.startswith("element vertex"):
                 n_vertices = int(line.split()[-1])
+                current_element = 'vertex'
             elif line.startswith("element face"):
                 n_faces = int(line.split()[-1])
+                current_element = 'face'
+            elif line.startswith("property list"):
+                pass  # handled separately during face reading
+            elif line.startswith("property") and current_element == 'vertex':
+                parts = line.split()
+                vertex_props.append((parts[2], _ply_type_map.get(parts[1], '<f4')))
+            elif line.startswith("property") and current_element == 'face':
+                parts = line.split()
+                face_scalar_props.append((parts[2], _ply_type_map.get(parts[1], '<f4')))
             elif "binary_little_endian" in line:
                 is_binary = True
             elif line == "end_header":
                 break
 
         if is_binary:
-            # Binary little-endian: assume 3 floats per vertex
-            vdata = np.frombuffer(f.read(n_vertices * 12), dtype="<f4")
-            vertices = vdata.reshape(n_vertices, 3)
-            # Faces: each prefixed by uint8 count (3) then 3 int32 indices
-            fdata = f.read(n_faces * (1 + 12))
+            # Build vertex dtype from header properties
+            vertex_dtype = np.dtype(vertex_props) if vertex_props else np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+            vertex_data = np.frombuffer(f.read(n_vertices * vertex_dtype.itemsize), dtype=vertex_dtype)
+            vertices = np.column_stack([vertex_data['x'], vertex_data['y'], vertex_data['z']]).astype(np.float64)
+            # Faces: each prefixed by uint8 count then int32 indices, plus any scalar properties
+            face_extra_bytes = sum(np.dtype(dt).itemsize for _, dt in face_scalar_props)
             faces = np.zeros((n_faces, 3), dtype=np.int32)
-            offset = 0
             for i in range(n_faces):
-                count = fdata[offset]
-                offset += 1
-                idx = np.frombuffer(fdata[offset:offset + count * 4], dtype="<i4")
+                count = struct.unpack('<B', f.read(1))[0]
+                idx = np.frombuffer(f.read(count * 4), dtype="<i4")
                 faces[i] = idx[:3]
-                offset += count * 4
+                if face_extra_bytes > 0:
+                    f.read(face_extra_bytes)  # skip lat/lon or other per-face scalars
         else:
             # ASCII
             for _ in range(n_vertices):

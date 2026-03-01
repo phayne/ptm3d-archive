@@ -35,6 +35,8 @@ class ViewshedConfigManager:
             "output_dir": "",
             "write_truth_map": True,
             "write_per_waypoint": True,
+            "write_vtk": False,
+            "write_hdf5": False,
         },
         "masks": [],
     }

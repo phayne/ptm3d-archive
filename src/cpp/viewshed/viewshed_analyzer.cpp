@@ -310,17 +310,30 @@ bool ViewshedAnalyzer::initialize(const std::string& dem_file, double body_radiu
     embree_scene_ = rtcNewScene(embree_device_);
     RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
     
-    // Set vertices
+    // Compute scene origin offset (bounding box center) for Embree float precision
+    {
+        double min_x = std::numeric_limits<double>::max(), max_x = std::numeric_limits<double>::lowest();
+        double min_y = min_x, max_y = max_x;
+        double min_z = min_x, max_z = max_x;
+        for (const auto& v : mesh_->vertices) {
+            if (v[0] < min_x) min_x = v[0]; if (v[0] > max_x) max_x = v[0];
+            if (v[1] < min_y) min_y = v[1]; if (v[1] > max_y) max_y = v[1];
+            if (v[2] < min_z) min_z = v[2]; if (v[2] > max_z) max_z = v[2];
+        }
+        scene_origin_offset_ = { 0.5*(min_x+max_x), 0.5*(min_y+max_y), 0.5*(min_z+max_z) };
+    }
+
+    // Set vertices (shifted by scene_origin_offset_ for float precision)
     float* vertices = (float*)rtcSetNewGeometryBuffer(
         geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
         3 * sizeof(float), mesh_->vertices.size());
-    
+
     for (size_t i = 0; i < mesh_->vertices.size(); ++i) {
-        vertices[3*i + 0] = static_cast<float>(mesh_->vertices[i][0]);
-        vertices[3*i + 1] = static_cast<float>(mesh_->vertices[i][1]);
-        vertices[3*i + 2] = static_cast<float>(mesh_->vertices[i][2]);
+        vertices[3*i + 0] = static_cast<float>(mesh_->vertices[i][0] - scene_origin_offset_[0]);
+        vertices[3*i + 1] = static_cast<float>(mesh_->vertices[i][1] - scene_origin_offset_[1]);
+        vertices[3*i + 2] = static_cast<float>(mesh_->vertices[i][2] - scene_origin_offset_[2]);
     }
-    
+
     // Set triangles
     unsigned* triangles = (unsigned*)rtcSetNewGeometryBuffer(
         geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
@@ -381,24 +394,37 @@ bool ViewshedAnalyzer::initializeFromMesh(std::shared_ptr<Mesh> mesh) {
         setLocalENUFrame(mean_lat, mean_lon);
     }
 
-    // Initialize Embree (similar to above)
+    // Initialize Embree
     embree_device_ = rtcNewDevice(nullptr);
     if (!embree_device_) {
         std::cerr << "Failed to create Embree device" << std::endl;
         return false;
     }
-    
+
+    // Compute scene origin offset (bounding box center) for Embree float precision
+    {
+        double min_x = std::numeric_limits<double>::max(), max_x = std::numeric_limits<double>::lowest();
+        double min_y = min_x, max_y = max_x;
+        double min_z = min_x, max_z = max_x;
+        for (const auto& v : mesh_->vertices) {
+            if (v[0] < min_x) min_x = v[0]; if (v[0] > max_x) max_x = v[0];
+            if (v[1] < min_y) min_y = v[1]; if (v[1] > max_y) max_y = v[1];
+            if (v[2] < min_z) min_z = v[2]; if (v[2] > max_z) max_z = v[2];
+        }
+        scene_origin_offset_ = { 0.5*(min_x+max_x), 0.5*(min_y+max_y), 0.5*(min_z+max_z) };
+    }
+
     embree_scene_ = rtcNewScene(embree_device_);
     RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
-    
+
     float* vertices = (float*)rtcSetNewGeometryBuffer(
         geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
         3 * sizeof(float), mesh_->vertices.size());
-    
+
     for (size_t i = 0; i < mesh_->vertices.size(); ++i) {
-        vertices[3*i + 0] = static_cast<float>(mesh_->vertices[i][0]);
-        vertices[3*i + 1] = static_cast<float>(mesh_->vertices[i][1]);
-        vertices[3*i + 2] = static_cast<float>(mesh_->vertices[i][2]);
+        vertices[3*i + 0] = static_cast<float>(mesh_->vertices[i][0] - scene_origin_offset_[0]);
+        vertices[3*i + 1] = static_cast<float>(mesh_->vertices[i][1] - scene_origin_offset_[1]);
+        vertices[3*i + 2] = static_cast<float>(mesh_->vertices[i][2] - scene_origin_offset_[2]);
     }
     
     unsigned* triangles = (unsigned*)rtcSetNewGeometryBuffer(
@@ -590,17 +616,8 @@ void ViewshedAnalyzer::computeSingleViewshed(
     east = vec_norm(east);
     std::array<double,3> north = vec_norm(vec_cross(up, east));
 
-    // Use mesh radius for offset scale to tolerate unit mismatches
-    const double R_for_offset = std::max(body_radius_, estimate_mesh_radius(mesh_));
-    const double offset_factor = (params.ray_offset_factor > 0.0) ? params.ray_offset_factor : 1e-4;
-    const double safe_offset = std::max(1e-6 * R_for_offset, offset_factor * R_for_offset);
-
-    // Offset origin outward
-    std::array<double, 3> ray_origin = {
-        observer_pos[0] + observer_normal[0] * safe_offset,
-        observer_pos[1] + observer_normal[1] * safe_offset,
-        observer_pos[2] + observer_normal[2] * safe_offset
-    };
+    // Compute safe ray origin offset (scaled to mesh geometry, not body radius)
+    std::array<double, 3> ray_origin = calculateSafeRayOrigin(observer_pos, observer_normal, 2.0);
 
     // Prepare batches
     std::vector<std::array<double, 3>> ray_origins;
@@ -762,17 +779,23 @@ std::vector<std::pair<int, double>> ViewshedAnalyzer::batchRaycastWithDistance(
     
     // Process rays one by one (simplified for clarity - SIMD version would be similar)
     for (size_t i = 0; i < origins.size(); ++i) {
+        // Apply scene origin offset for Embree float precision
+        const double ox = origins[i][0] - scene_origin_offset_[0];
+        const double oy = origins[i][1] - scene_origin_offset_[1];
+        const double oz = origins[i][2] - scene_origin_offset_[2];
+        const double r_local = std::sqrt(ox*ox + oy*oy + oz*oz);
+
         RTCRayHit rayhit;
-        rayhit.ray.org_x = origins[i][0];
-        rayhit.ray.org_y = origins[i][1];
-        rayhit.ray.org_z = origins[i][2];
-        
-        rayhit.ray.dir_x = directions[i][0];
-        rayhit.ray.dir_y = directions[i][1];
-        rayhit.ray.dir_z = directions[i][2];
-        
-        rayhit.ray.tnear = 1e-4f;
-        // CRITICAL: Set tfar to slightly beyond target distance to catch the target face
+        rayhit.ray.org_x = static_cast<float>(ox);
+        rayhit.ray.org_y = static_cast<float>(oy);
+        rayhit.ray.org_z = static_cast<float>(oz);
+
+        rayhit.ray.dir_x = static_cast<float>(directions[i][0]);
+        rayhit.ray.dir_y = static_cast<float>(directions[i][1]);
+        rayhit.ray.dir_z = static_cast<float>(directions[i][2]);
+
+        rayhit.ray.tnear = static_cast<float>(std::max(1e-6 * r_local, 0.01));
+        // Set tfar to slightly beyond target distance to catch the target face
         rayhit.ray.tfar = target_distances[i] + 1.0f; // Add 1 meter buffer
         rayhit.ray.mask = 0xFFFFFFFF;
         rayhit.ray.flags = 0;
@@ -813,15 +836,20 @@ std::vector<int> ViewshedAnalyzer::batchRaycast(
             for (size_t j = 0; j < batch_size; ++j) {
                 valid[j] = -1;
 
-                rayhit.ray.org_x[j] = static_cast<float>(origins[i + j][0]);
-                rayhit.ray.org_y[j] = static_cast<float>(origins[i + j][1]);
-                rayhit.ray.org_z[j] = static_cast<float>(origins[i + j][2]);
+                // Apply scene origin offset
+                const double ox = origins[i + j][0] - scene_origin_offset_[0];
+                const double oy = origins[i + j][1] - scene_origin_offset_[1];
+                const double oz = origins[i + j][2] - scene_origin_offset_[2];
+                rayhit.ray.org_x[j] = static_cast<float>(ox);
+                rayhit.ray.org_y[j] = static_cast<float>(oy);
+                rayhit.ray.org_z[j] = static_cast<float>(oz);
 
                 rayhit.ray.dir_x[j] = static_cast<float>(directions[i + j][0]);
                 rayhit.ray.dir_y[j] = static_cast<float>(directions[i + j][1]);
                 rayhit.ray.dir_z[j] = static_cast<float>(directions[i + j][2]);
 
-                rayhit.ray.tnear[j] = 1e-4f;
+                const double r_local = std::sqrt(ox*ox + oy*oy + oz*oz);
+                rayhit.ray.tnear[j] = static_cast<float>(std::max(1e-6 * r_local, 0.01));
 
                 float tfar = 1e20f;
                 if (i + j < target_distances.size()) {
@@ -854,16 +882,22 @@ std::vector<int> ViewshedAnalyzer::batchRaycast(
     if (!use_simd || !has_avx512_) {
         #pragma omp parallel for
         for (size_t i = 0; i < origins.size(); ++i) {
+            // Apply scene origin offset for Embree float precision
+            const double ox = origins[i][0] - scene_origin_offset_[0];
+            const double oy = origins[i][1] - scene_origin_offset_[1];
+            const double oz = origins[i][2] - scene_origin_offset_[2];
+            const double r_local = std::sqrt(ox*ox + oy*oy + oz*oz);
+
             RTCRayHit rayhit;
-            rayhit.ray.org_x = static_cast<float>(origins[i][0]);
-            rayhit.ray.org_y = static_cast<float>(origins[i][1]);
-            rayhit.ray.org_z = static_cast<float>(origins[i][2]);
+            rayhit.ray.org_x = static_cast<float>(ox);
+            rayhit.ray.org_y = static_cast<float>(oy);
+            rayhit.ray.org_z = static_cast<float>(oz);
 
             rayhit.ray.dir_x = static_cast<float>(directions[i][0]);
             rayhit.ray.dir_y = static_cast<float>(directions[i][1]);
             rayhit.ray.dir_z = static_cast<float>(directions[i][2]);
 
-            rayhit.ray.tnear = 1e-4f;
+            rayhit.ray.tnear = static_cast<float>(std::max(1e-6 * r_local, 0.01));
             float tfar = 1e20f;
             if (i < target_distances.size()) {
                 tfar = static_cast<float>(target_distances[i] + 1.0f);
@@ -935,13 +969,8 @@ void ViewshedAnalyzer::computeHorizonProfile(
     std::array<double,3> north = cross3(up, east);
     north = norm3(north);
 
-    // Safe origin above the surface
-    const double safe_offset = std::max(1e-6 * body_radius_, 1e-4 * body_radius_);
-    const std::array<double,3> origin_out = {
-        observer_pos[0] + up[0]*safe_offset,
-        observer_pos[1] + up[1]*safe_offset,
-        observer_pos[2] + up[2]*safe_offset
-    };
+    // Safe origin above the surface (scaled to mesh geometry)
+    const std::array<double,3> origin_out = calculateSafeRayOrigin(observer_pos, up, 2.0);
     
     for (int i = 0; i < num_azimuth_samples; ++i) {
         double azimuth = i * params.angular_resolution;
@@ -983,15 +1012,21 @@ bool ViewshedAnalyzer::isRayBlocked(
     double max_distance) const {
     
     RTCRayHit rayhit;
-    rayhit.ray.org_x = origin[0];
-    rayhit.ray.org_y = origin[1];
-    rayhit.ray.org_z = origin[2];
-    
+    // Apply scene origin offset for Embree float precision
+    const double ox = origin[0] - scene_origin_offset_[0];
+    const double oy = origin[1] - scene_origin_offset_[1];
+    const double oz = origin[2] - scene_origin_offset_[2];
+    const double r_local = std::sqrt(ox*ox + oy*oy + oz*oz);
+
+    rayhit.ray.org_x = static_cast<float>(ox);
+    rayhit.ray.org_y = static_cast<float>(oy);
+    rayhit.ray.org_z = static_cast<float>(oz);
+
     rayhit.ray.dir_x = direction[0];
     rayhit.ray.dir_y = direction[1];
     rayhit.ray.dir_z = direction[2];
-    
-    rayhit.ray.tnear = 1e-4f;
+
+    rayhit.ray.tnear = static_cast<float>(std::max(1e-6 * r_local, 0.01));
     rayhit.ray.tfar = max_distance;
     rayhit.ray.mask = 0xFFFFFFFF;
     rayhit.ray.flags = 0;
@@ -1126,6 +1161,23 @@ std::pair<double, double> ViewshedAnalyzer::cartesianToLatLon(
     double lat = std::asin(ecef[2] / r) * RAD_TO_DEG;
     double lon = std::atan2(ecef[1], ecef[0]) * RAD_TO_DEG;
     return {lat, lon};
+}
+
+// Calculate safe ray origin offset (matches illumination module approach)
+std::array<double, 3> ViewshedAnalyzer::calculateSafeRayOrigin(
+    const std::array<double, 3>& surface_point,
+    const std::array<double, 3>& normal,
+    double offset_factor) const
+{
+    const double r = vec_len(surface_point);
+    // 1 ppm of radius, minimum 1 cm — same formula as IlluminationModel
+    const double eps_base = std::max(1e-6 * r, 0.01);
+    const double offset = offset_factor * eps_base;
+    return {
+        surface_point[0] + normal[0] * offset,
+        surface_point[1] + normal[1] * offset,
+        surface_point[2] + normal[2] * offset
+    };
 }
 
 // Batch computation
@@ -1671,24 +1723,19 @@ static bool writeVTU_UnstructuredGrid(
         if (idx < nCells) vp_mask[idx] = 1.0f;
     }
 
-    // FieldData (TimeValue and LocationLabel if present)
-    std::ostringstream fdata;
-    fdata << "<FieldData>\n";
-    fdata << "  <DataArray type=\"Float64\" Name=\"TimeValue\" NumberOfTuples=\"1\" format=\"ascii\">\n";
-    fdata << "    " << std::setprecision(16) << time_value << "\n";
-    fdata << "  </DataArray>\n";
-    if (!result.location.label.empty()) {
-        fdata << "  <DataArray type=\"String\" Name=\"LocationLabel\" NumberOfTuples=\"1\" format=\"ascii\">\n";
-        fdata << "    " << result.location.label << "\n";
-        fdata << "  </DataArray>\n";
-    }
-    fdata << "</FieldData>\n";
-
     // Assemble VTU XML
+    // NOTE: <FieldData> must be a child of <UnstructuredGrid>, NOT <Piece>.
+    // Valid <Piece> children are: <PointData>, <CellData>, <Points>, <Cells>.
     std::ostringstream xml;
     xml << "<?xml version=\"1.0\"?>\n";
     xml << "<VTKFile type=\"UnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
     xml << "  <UnstructuredGrid>\n";
+    // FieldData: metadata outside Piece (TimeValue for PVD time series)
+    xml << "    <FieldData>\n";
+    xml << "      <DataArray type=\"Float64\" Name=\"TimeValue\" NumberOfTuples=\"1\" format=\"ascii\">\n";
+    xml << "        " << std::setprecision(16) << time_value << "\n";
+    xml << "      </DataArray>\n";
+    xml << "    </FieldData>\n";
     xml << "    <Piece NumberOfPoints=\"" << nPts << "\" NumberOfCells=\"" << nCells << "\">\n";
     xml << "      <Points>\n";
     xml << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
@@ -1718,7 +1765,6 @@ static bool writeVTU_UnstructuredGrid(
         xml << writeFloatArray("viewpoint_face", vp_mask);
     }
     xml << "      </CellData>\n";
-    xml << fdata.str();
     xml << "    </Piece>\n";
     xml << "  </UnstructuredGrid>\n";
     xml << "</VTKFile>\n";

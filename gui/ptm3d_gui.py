@@ -427,7 +427,7 @@ class PTM3DMainWindow(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(
             self, "Open Project",
             start_dir,
-            "PTM3D Projects (*.ptm3d *.yaml *.yml);;All Files (*)"
+            "YAML Files (*.yaml *.yml);;Legacy PTM3D Projects (*.ptm3d);;All Files (*)"
         )
 
         if filename:
@@ -467,12 +467,12 @@ class PTM3DMainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self, "Save Project",
             start_dir,
-            "PTM3D Projects (*.ptm3d);;YAML Files (*.yaml);;All Files (*)"
+            "YAML Files (*.yaml);;All Files (*)"
         )
 
         if filename:
-            if not filename.endswith(('.ptm3d', '.yaml', '.yml')):
-                filename += '.ptm3d'
+            if not filename.endswith(('.yaml', '.yml')):
+                filename += '.yaml'
             self.save_project_to(filename)
 
     def save_project_to(self, filename):

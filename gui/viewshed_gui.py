@@ -263,6 +263,11 @@ class ViewshedMainWindow(QMainWindow):
         export_img_action.triggered.connect(self.export_visualization)
         viz_menu.addAction(export_img_action)
 
+        export_anim_action = QAction("Export &Animation...", self)
+        export_anim_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        export_anim_action.triggered.connect(self.export_animation)
+        viz_menu.addAction(export_anim_action)
+
         viz_menu.addSeparator()
 
         reset_cam_action = QAction("Reset &Camera", self)
@@ -566,6 +571,10 @@ class ViewshedMainWindow(QMainWindow):
     def export_visualization(self):
         if self.viz_panel is not None:
             self.viz_panel.export_image()
+
+    def export_animation(self):
+        if self.viz_panel is not None:
+            self.viz_panel.export_animation(parent=self)
 
     def reset_camera(self):
         if self.viz_panel is not None:

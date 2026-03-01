@@ -9,6 +9,9 @@ import os
 import sys
 import struct
 import argparse
+import logging
+import shutil
+import tempfile
 from pathlib import Path
 import time
 import numpy as np
@@ -35,6 +38,111 @@ try:
     HDF5_AVAILABLE = True
 except Exception:
     HDF5_AVAILABLE = False
+
+# Cloud storage path patterns
+CLOUD_STORAGE_PATTERNS = [
+    'onedrive', 'icloud', 'dropbox', 'google drive', 'googledrive',
+    'box sync', 'cloudstorage', 'creative cloud'
+]
+
+def is_cloud_storage_path(path):
+    """Check if a path is on cloud storage (OneDrive, iCloud, Dropbox, etc.)"""
+    path_lower = str(path).lower()
+    return any(pattern in path_lower for pattern in CLOUD_STORAGE_PATTERNS)
+
+def get_available_memory_gb():
+    """Get available system memory in GB"""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024**3)
+    except ImportError:
+        # Fallback: try to read from /proc/meminfo (Linux) or sysctl (macOS)
+        try:
+            import subprocess
+            if sys.platform == 'darwin':
+                # macOS: use vm_stat
+                result = subprocess.run(['vm_stat'], capture_output=True, text=True)
+                lines = result.stdout.split('\n')
+                page_size = 4096  # default
+                free_pages = 0
+                for line in lines:
+                    if 'page size' in line.lower():
+                        page_size = int(line.split()[-2])
+                    elif 'Pages free' in line:
+                        free_pages += int(line.split()[-1].rstrip('.'))
+                    elif 'Pages inactive' in line:
+                        free_pages += int(line.split()[-1].rstrip('.'))
+                return (free_pages * page_size) / (1024**3)
+            else:
+                # Linux: read /proc/meminfo
+                with open('/proc/meminfo', 'r') as f:
+                    for line in f:
+                        if line.startswith('MemAvailable:'):
+                            return int(line.split()[1]) / (1024**2)  # KB to GB
+        except Exception:
+            pass
+        # Conservative fallback: assume 8 GB available
+        return 8.0
+
+def estimate_memory_per_worker_gb(num_faces, num_data_types):
+    """Estimate memory needed per parallel worker in GB"""
+    # Per-worker memory estimate:
+    # - VTK grid: ~100 bytes per face (vertices, connectivity, cell data)
+    # - Data arrays: 4 bytes per face per data type
+    # - Working buffers: ~2x overhead for VTK internals
+    bytes_per_face = 100 + (4 * num_data_types * 2)
+    mesh_memory_gb = (num_faces * bytes_per_face) / (1024**3)
+    # Add fixed overhead for VTK libraries, Python interpreter per process
+    fixed_overhead_gb = 0.3
+    return mesh_memory_gb + fixed_overhead_gb
+
+def calculate_optimal_processes(num_faces, num_data_types, user_requested=None):
+    """Calculate optimal number of parallel processes based on system resources"""
+    cpu_count = mp.cpu_count()
+    available_memory = get_available_memory_gb()
+    memory_per_worker = estimate_memory_per_worker_gb(num_faces, num_data_types)
+
+    # Calculate limits
+    max_by_cpu = cpu_count  # Use all cores if memory allows
+    max_by_memory = max(1, int(available_memory / memory_per_worker * 0.7))  # 70% of available
+
+    # Take the minimum of CPU and memory limits
+    optimal = min(max_by_cpu, max_by_memory)
+
+    # Cap at reasonable maximum (diminishing returns beyond 8-12 for I/O bound work)
+    optimal = min(optimal, 12)
+
+    # If user specified, use their value but warn if it might cause issues
+    if user_requested is not None and user_requested > 0:
+        if user_requested > max_by_memory:
+            print(f"  Warning: {user_requested} processes may exceed available memory")
+            print(f"           (estimated {memory_per_worker:.2f} GB/worker, {available_memory:.1f} GB available)")
+        return user_requested
+
+    return max(1, optimal)
+
+def copy_directory_with_progress(src, dst, description="Copying"):
+    """Copy directory contents with progress reporting"""
+    src = Path(src)
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+
+    files = list(src.glob('*'))
+    total = len(files)
+    copied = 0
+
+    print(f"{description} {total} files to cloud storage...")
+    for f in files:
+        dest_file = dst / f.name
+        if f.is_file():
+            shutil.copy2(f, dest_file)
+        elif f.is_dir():
+            shutil.copytree(f, dest_file, dirs_exist_ok=True)
+        copied += 1
+        if copied % 50 == 0 or copied == total:
+            print(f"  Copied {copied}/{total} files")
+
+    print(f"  Transfer complete: {total} files copied")
 
 def parse_ply_header(file):
     """Parse PLY header and return format info"""
@@ -170,7 +278,7 @@ def read_time_steps(time_file):
     
     return np.array(times), time_strings
 
-def read_binary_timestep_vectorized(file_path, expected_count=None):
+def read_binary_timestep_vectorized(file_path, expected_count=None, max_retries=3):
     """Read PTM3D per-timestep binary files.
 
     Supported on-disk layouts:
@@ -179,61 +287,78 @@ def read_binary_timestep_vectorized(file_path, expected_count=None):
 
     Returns a float32 array of length expected_count if provided, else count.
     On any inconsistency or error, returns zeros of expected_count (if given), else None.
+
+    Includes retry logic for cloud storage (OneDrive, iCloud, etc.) timeouts.
     """
     if not os.path.exists(file_path):
         return None if expected_count is None else np.zeros(expected_count, dtype=np.float32)
-    try:
-        fsize = os.path.getsize(file_path)
-        if fsize < 4:
-            # Too small for header; try legacy fallback if we have an expected_count
-            if expected_count is None:
-                return None
-            return np.zeros(expected_count, dtype=np.float32)
 
-        with open(file_path, 'rb') as f:
-            # Attempt headered format first
-            hdr = f.read(4)
-            if len(hdr) == 4:
-                count = int(np.frombuffer(hdr, dtype='<u4', count=1)[0])
-            else:
-                count = 0
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            fsize = os.path.getsize(file_path)
+            if fsize < 4:
+                # Too small for header; try legacy fallback if we have an expected_count
+                if expected_count is None:
+                    return None
+                return np.zeros(expected_count, dtype=np.float32)
 
-            # Payload bytes available after header
-            payload_bytes = max(0, fsize - 4)
-            max_floats = payload_bytes // 4
+            with open(file_path, 'rb') as f:
+                # Attempt headered format first
+                hdr = f.read(4)
+                if len(hdr) == 4:
+                    count = int(np.frombuffer(hdr, dtype='<u4', count=1)[0])
+                else:
+                    count = 0
 
-            if count > 0 and max_floats >= count:
-                # Normal headered path
-                data = np.frombuffer(f.read(count * 4), dtype='<f4', count=count)
-                if expected_count is None or data.size == expected_count:
-                    return data if expected_count is None else data.astype(np.float32, copy=False)
-                # Pad/trim to expected_count
+                # Payload bytes available after header
+                payload_bytes = max(0, fsize - 4)
+                max_floats = payload_bytes // 4
+
+                if count > 0 and max_floats >= count:
+                    # Normal headered path
+                    data = np.frombuffer(f.read(count * 4), dtype='<f4', count=count)
+                    if expected_count is None or data.size == expected_count:
+                        return data if expected_count is None else data.astype(np.float32, copy=False)
+                    # Pad/trim to expected_count
+                    out = np.zeros(expected_count, dtype=np.float32)
+                    n = min(expected_count, data.size)
+                    if n > 0:
+                        out[:n] = data[:n]
+                    return out
+
+                # Fallback: legacy headerless payload (if exact size matches)
+                if expected_count is not None and fsize == expected_count * 4:
+                    f.seek(0)
+                    return np.frombuffer(f.read(), dtype='<f4', count=expected_count)
+
+                # Best-effort fallback: read whatever we can and pad/trim
+                f.seek(0)
+                raw = f.read()
+                if expected_count is None:
+                    # If divisible, decode; else None
+                    return None if len(raw) % 4 != 0 else np.frombuffer(raw, dtype='<f4')
                 out = np.zeros(expected_count, dtype=np.float32)
-                n = min(expected_count, data.size)
-                if n > 0:
-                    out[:n] = data[:n]
+                if len(raw) >= 4:
+                    n = min(len(raw) // 4, expected_count)
+                    out[:n] = np.frombuffer(raw, dtype='<f4', count=n)
                 return out
 
-            # Fallback: legacy headerless payload (if exact size matches)
-            if expected_count is not None and fsize == expected_count * 4:
-                f.seek(0)
-                return np.frombuffer(f.read(), dtype='<f4', count=expected_count)
+        except (OSError, IOError) as e:
+            # Handle cloud storage timeouts and I/O errors with retry
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                continue
+            break
+        except Exception as e:
+            print(f"  Error reading {file_path}: {e}")
+            return None if expected_count is None else np.zeros(expected_count, dtype=np.float32)
 
-            # Best-effort fallback: read whatever we can and pad/trim
-            f.seek(0)
-            raw = f.read()
-            if expected_count is None:
-                # If divisible, decode; else None
-                return None if len(raw) % 4 != 0 else np.frombuffer(raw, dtype='<f4')
-            out = np.zeros(expected_count, dtype=np.float32)
-            if len(raw) >= 4:
-                n = min(len(raw) // 4, expected_count)
-                out[:n] = np.frombuffer(raw, dtype='<f4', count=n)
-            return out
-
-    except Exception as e:
-        print(f"  Error reading {file_path}: {e}")
-        return None if expected_count is None else np.zeros(expected_count, dtype=np.float32)
+    # All retries exhausted
+    if last_error:
+        print(f"  Error reading {file_path}: {last_error}")
+    return None if expected_count is None else np.zeros(expected_count, dtype=np.float32)
 
 def create_vtk_grid_optimized(vertices, faces, normals, latitudes, longitudes):
     """Create VTK unstructured grid with optimizations"""
@@ -273,10 +398,20 @@ def create_vtk_grid_optimized(vertices, faces, normals, latitudes, longitudes):
 
 def write_vtk_timestep_optimized(ugrid, data_dict, output_file):
     """Write VTK timestep with optimizations"""
-    # Add arrays
+    # Add arrays with validation to prevent "Bad table range" errors
     for name, data in data_dict.items():
         if data is not None:
-            vtk_array = numpy_support.numpy_to_vtk(data, deep=False)
+            # Replace NaN/Inf with zeros to avoid VTK range issues
+            clean_data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+            # Validate that we have a reasonable range (VTK requires min < max for colormaps)
+            data_min = np.min(clean_data)
+            data_max = np.max(clean_data)
+            if data_min > data_max:
+                logging.error(f"Bad table range: [{data_min}, {data_max}]")
+                continue  # Skip this array
+
+            vtk_array = numpy_support.numpy_to_vtk(clean_data, deep=True)
             vtk_array.SetName(name)
             ugrid.GetCellData().AddArray(vtk_array)
 
@@ -694,15 +829,18 @@ Examples:
                        help='Output format(s): vtk, numpy, hdf5, or all (default: vtk)')
     parser.add_argument('--timesteps', type=str, help='Timesteps to convert (e.g., "0-10,20")')
     parser.add_argument('--test-mode', action='store_true', help='Test mode: only convert first timestep')
-    parser.add_argument('--parallel', type=int, default=0, 
-                      help='Number of parallel processes for VTK (0=auto, only applies to VTK format)')
+    parser.add_argument('--parallel', type=int, default=-1,
+                      help='Parallel processes (-1=auto based on CPU/memory, 0=sequential, N=use N processes)')
     parser.add_argument('--batch-size', type=int, default=10, 
                       help='Number of timesteps per batch for parallel processing')
     parser.add_argument('--no-statistics', action='store_true',
                     help='Skip statistics conversion')
     parser.add_argument('--numpy-separate-files', action='store_true',
                     help='Export NumPy data as separate files (mesh, timesteps, stats)')
-    
+    parser.add_argument('--use-local-temp', type=str, default='auto',
+                    choices=['auto', 'yes', 'no'],
+                    help='Write to local temp dir then copy to cloud (auto=detect cloud storage)')
+
     args = parser.parse_args()
     
     input_dir = Path(args.input_dir)
@@ -771,18 +909,46 @@ Examples:
         print("\n" + "="*70)
         print("VTK/VTU EXPORT")
         print("="*70)
-        
-        vtk_output_dir = output_dir if args.format == 'vtk' else output_dir / 'vtk'
-        vtk_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Determine parallel processing
-        if args.parallel == 0:
-            num_processes = min(mp.cpu_count(), 4)
+
+        vtk_final_dir = output_dir if args.format == 'vtk' else output_dir / 'vtk'
+        vtk_final_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine if we should use local temp directory for cloud storage
+        output_is_cloud = is_cloud_storage_path(vtk_final_dir)
+        use_local_temp = (
+            (args.use_local_temp == 'auto' and output_is_cloud) or
+            args.use_local_temp == 'yes'
+        )
+
+        temp_dir_obj = None
+        if use_local_temp:
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix='vtk_converter_')
+            vtk_output_dir = Path(temp_dir_obj.name)
+            print(f"Using local temp directory for faster parallel processing: {vtk_output_dir}")
+            # Calculate optimal processes based on CPU and memory
+            user_req = args.parallel if args.parallel > 0 else None
+            num_processes = calculate_optimal_processes(num_faces, len(data_types), user_req)
         else:
-            num_processes = args.parallel
-        
+            vtk_output_dir = vtk_final_dir
+            # Determine parallel processing based on storage type
+            if args.parallel == -1:
+                if output_is_cloud:
+                    num_processes = 1
+                    print("Cloud storage detected - using sequential processing to avoid timeouts")
+                else:
+                    # Calculate optimal based on resources
+                    num_processes = calculate_optimal_processes(num_faces, len(data_types))
+            elif args.parallel == 0:
+                num_processes = 1
+            else:
+                # User specified - validate against resources
+                num_processes = calculate_optimal_processes(num_faces, len(data_types), args.parallel)
+
         if num_processes > 1 and len(timesteps_to_process) > args.batch_size:
+            mem_per_worker = estimate_memory_per_worker_gb(num_faces, len(data_types))
+            avail_mem = get_available_memory_gb()
             print(f"Using {num_processes} parallel processes with batch size {args.batch_size}")
+            print(f"  ({mem_per_worker:.2f} GB/worker estimated, {avail_mem:.1f} GB available)")
             
             # Create batches
             batches = []
@@ -854,7 +1020,17 @@ Examples:
                 print(f"\nWarning: Statistics processing failed: {e}")
         else:
             print("\nStatistics conversion skipped (--no-statistics flag used)")
-    
+
+        # Copy from local temp to cloud storage if needed
+        if use_local_temp and temp_dir_obj is not None:
+            print("\n" + "-"*70)
+            vtk_elapsed = time.time() - start_time
+            print(f"VTK conversion completed in {vtk_elapsed:.1f}s")
+            print("Transferring files to cloud storage...")
+            copy_directory_with_progress(vtk_output_dir, vtk_final_dir, "Transferring")
+            temp_dir_obj.cleanup()
+            print(f"Files transferred to: {vtk_final_dir}")
+
     # ========================================================================
     # NumPy Export
     # ========================================================================

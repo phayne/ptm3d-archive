@@ -4,6 +4,9 @@
 #include "../constants/constants.h"  // For ptm_thermal::constants
 #include "../thermal/thermal_model.h"
 #include "../thermal/planetary_properties.h"
+#include "../orbital/kepler_propagator.h"
+#include "../orbital/body_fixed_frame.h"
+#include "../orbital/generic_body.h"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -1617,13 +1620,41 @@ std::pair<double, double> IlluminationModel::latLonFromCartesian(double x, doubl
 
 bool IlluminationModel::initialize_spice(bool verbose) {
     static bool spice_initialized = false;
-    
+
+    // If using Keplerian propagation, skip full SPICE initialization
+    // but still load the leapseconds kernel for time conversion
+    if (use_keplerian_) {
+        if (!spice_initialized) {
+            try {
+                erract_c("SET", 0, const_cast<char*>("RETURN"));
+                errprt_c("SET", 0, const_cast<char*>("NONE"));
+
+                // Load just the leapseconds kernel for str2et_c time conversion
+                std::string lsk_path = kernels_path_ + "/lsk/naif0012.tls";
+                if (std::filesystem::exists(lsk_path)) {
+                    furnsh_c(lsk_path.c_str());
+                    if (verbose) {
+                        std::cout << "Keplerian mode: loaded leapseconds kernel for time conversion" << std::endl;
+                    }
+                } else {
+                    std::cout << "Keplerian mode: leapseconds kernel not found at " << lsk_path
+                              << " (time conversion may use approximation)" << std::endl;
+                }
+                spice_initialized = true;
+            } catch (const std::exception& e) {
+                std::cerr << "SPICE LSK initialization error: " << e.what() << std::endl;
+            }
+        }
+        std::cout << "Using Keplerian orbit propagation for " << target_body_name_ << std::endl;
+        return true;
+    }
+
     if (!spice_initialized) {
         try {
             // Reset error handling
             erract_c("SET", 0, const_cast<char*>("RETURN"));
             errprt_c("SET", 0, const_cast<char*>("NONE"));
-            
+
             std::cout << "Initializing SPICE with meta-kernel" << std::endl;
             
             // Use the meta-kernel filename from properties
@@ -1676,26 +1707,68 @@ double IlluminationModel::convertTimeToET(const std::string& time_str) {
 }
 
 std::array<double, 3> IlluminationModel::getSunPosition(double et) {
+    if (use_keplerian_ && keplerian_propagator_ && body_fixed_frame_) {
+        // Keplerian mode: compute body position from orbital elements,
+        // then get Sun direction in body-fixed frame
+        double t_sec = keplerian_propagator_->etToSecondsFromEpoch(et);
+        auto body_pos = keplerian_propagator_->getPosition(t_sec);
+        return body_fixed_frame_->getSunInBodyFixed(t_sec, body_pos);
+    }
+
+    // SPICE mode
     double position[3];
     double lt;
-    
+
     // Use the configurable target body and frame
-    spkpos_c("SUN", et, target_body_frame_.c_str(), "LT+S", 
+    spkpos_c("SUN", et, target_body_frame_.c_str(), "LT+S",
              target_body_name_.c_str(), position, &lt);
-    checkSpiceError("getSunPosition");
-    
+
+    // Check if SPICE failed (e.g. SPK data doesn't cover this epoch).
+    // Fall back to Keplerian propagation for out-of-range times.
+    if (failed_c()) {
+        reset_c();
+        if (keplerian_propagator_ && body_fixed_frame_) {
+            double t_sec = keplerian_propagator_->etToSecondsFromEpoch(et);
+            auto body_pos = keplerian_propagator_->getPosition(t_sec);
+            return body_fixed_frame_->getSunInBodyFixed(t_sec, body_pos);
+        }
+        return {{0.0, 0.0, 0.0}};
+    }
+
+    // For generic SPICE bodies (HORIZONS SPK), we get the Sun position in
+    // ECLIPJ2000 (inertial) and must rotate to body-fixed using the spin state.
+    // Built-in bodies use IAU body-fixed frames directly from SPICE.
+    if (body_fixed_frame_ && !use_keplerian_) {
+        // spkpos_c returns Sun relative to body in ECLIPJ2000.
+        // getSunInBodyFixed expects body position relative to Sun in ecliptic J2000.
+        // body_pos_ecliptic = -(Sun relative to body) = body relative to Sun.
+        std::array<double, 3> body_pos = {{-position[0], -position[1], -position[2]}};
+
+        // Convert SPICE et to seconds from spin epoch
+        double spin_epoch_et = (body_fixed_frame_->spinState().epoch_jd - 2451545.0) * 86400.0;
+        double t_sec = et - spin_epoch_et;
+
+        return body_fixed_frame_->getSunInBodyFixed(t_sec, body_pos);
+    }
+
     return {{position[0], position[1], position[2]}};
 }
 
 std::array<double, 3> IlluminationModel::getPrimaryPosition(double et) {
+    // For heliocentric bodies without a primary, return zero vector
+    if (!has_primary_body_ || use_keplerian_) {
+        return {{0.0, 0.0, 0.0}};
+    }
+
+    // SPICE mode
     double position[3];
     double lt;
-    
+
     // Use the configurable primary and target bodies
-    spkpos_c(primary_body_name_.c_str(), et, target_body_frame_.c_str(), "LT+S", 
+    spkpos_c(primary_body_name_.c_str(), et, target_body_frame_.c_str(), "LT+S",
              target_body_name_.c_str(), position, &lt);
     checkSpiceError("getPrimaryPosition");
-    
+
     return {{position[0], position[1], position[2]}};
 }
 
@@ -3254,49 +3327,59 @@ void IlluminationModel::setPlanetaryBody(thermal::PlanetaryBody body) {
     // Set albedo from planetary properties for consistency
     setAlbedo(props.albedo);
     
+    use_keplerian_ = false;  // Built-in bodies use SPICE
+
     switch (body) {
         case thermal::PlanetaryBody::EUROPA:
             setTargetBody("EUROPA");
             setPrimaryBody("JUPITER");
             primary_radius_ = constants::JUPITER_RADIUS;
             primary_is_sun_ = false;
+            has_primary_body_ = true;
             break;
         case thermal::PlanetaryBody::MOON:
             setTargetBody("MOON");
             setPrimaryBody("EARTH");
             primary_radius_ = constants::EARTH_RADIUS;
             primary_is_sun_ = false;
+            has_primary_body_ = true;
             break;
         case thermal::PlanetaryBody::MERCURY:
             setTargetBody("MERCURY");
             setPrimaryBody("SUN");
             primary_is_sun_ = true;
+            has_primary_body_ = false;
             break;
         case thermal::PlanetaryBody::ENCELADUS:
             setTargetBody("ENCELADUS");
             setPrimaryBody("SATURN");
             primary_radius_ = constants::SATURN_RADIUS;
             primary_is_sun_ = false;
+            has_primary_body_ = true;
             break;
         case thermal::PlanetaryBody::TITAN:
             setTargetBody("TITAN");
             setPrimaryBody("SATURN");
             primary_radius_ = constants::SATURN_RADIUS;
             primary_is_sun_ = false;
+            has_primary_body_ = true;
             break;
         case thermal::PlanetaryBody::MARS:
             setTargetBody("MARS");
             setPrimaryBody("SUN");
             primary_is_sun_ = true;
+            has_primary_body_ = false;
             break;
         case thermal::PlanetaryBody::CERES:
             setTargetBody("CERES");
             setPrimaryBody("SUN");
             primary_is_sun_ = true;
+            has_primary_body_ = false;
             break;
         default:
             setTargetBody("EUROPA"); // Default
             setPrimaryBody("JUPITER");
+            has_primary_body_ = true;
             break;
     }
     
@@ -3304,6 +3387,58 @@ void IlluminationModel::setPlanetaryBody(thermal::PlanetaryBody body) {
     // std::cout << "Set planetary body to " << target_body_name_ 
     //           << " with primary " << primary_body_name_
     //           << " using meta-kernel " << meta_kernel_filename_ << std::endl;
+}
+
+void IlluminationModel::setGenericBody(const orbital::GenericBody& body) {
+    target_body_name_ = body.name;
+    has_primary_body_ = false;  // Heliocentric bodies have no primary
+    primary_is_sun_ = true;
+
+    // Set albedo from body properties
+    setAlbedo(body.thermo.albedo);
+
+    // Always create BodyFixedFrame from spin state for generic bodies.
+    // HORIZONS SPK files don't include body-fixed frame data, so we need
+    // the spin state to rotate SPICE J2000 positions to body-fixed.
+    body_fixed_frame_ = std::make_unique<orbital::BodyFixedFrame>(body.spin);
+
+    if (body.ephemeris_source == orbital::GenericBody::KEPLERIAN) {
+        // Keplerian mode
+        use_keplerian_ = true;
+        keplerian_propagator_ = std::make_unique<orbital::KeplerianPropagator>(body.orbit);
+
+        // No SPICE frame or ID needed
+        target_body_frame_ = "J2000";  // Placeholder (not used in Keplerian mode)
+        target_body_id_ = "0";
+
+        std::cout << "Configured generic body '" << body.name
+                  << "' with Keplerian propagation (a=" << body.orbit.semi_major_axis_au
+                  << " AU, e=" << body.orbit.eccentricity
+                  << ", P_rot=" << body.spin.spin_period_s / 3600.0 << " h)" << std::endl;
+    } else {
+        // SPICE mode with user-provided metakernel
+        use_keplerian_ = false;
+        meta_kernel_filename_ = body.spice_metakernel;
+
+        // Also create Keplerian propagator as fallback for times outside SPK coverage.
+        // Equilibration orbits can extend before the SPK start time.
+        keplerian_propagator_ = std::make_unique<orbital::KeplerianPropagator>(body.orbit);
+
+        // Use the NAIF body ID for SPICE queries (e.g. "2000269" for asteroid 269).
+        // SPICE doesn't recognize human-readable names for small bodies from SPK files.
+        if (!body.spice_body_id.empty()) {
+            target_body_name_ = body.spice_body_id;
+        }
+
+        // Use ecliptic J2000 frame for SPICE position queries.
+        // We then rotate to body-fixed using BodyFixedFrame (from spin state).
+        target_body_frame_ = "ECLIPJ2000";
+
+        std::cout << "Configured generic body '" << body.name
+                  << "' with SPICE ephemeris (kernel: " << body.spice_metakernel
+                  << ", NAIF ID: " << target_body_name_
+                  << ", Keplerian fallback: enabled)" << std::endl;
+    }
 }
 
 void IlluminationModel::initializeChunkedStorage(size_t total_faces, int time_steps) {

@@ -40,6 +40,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.mesh.import_file = getWithDefault(mesh, "import_file", config.mesh.import_file);
             config.mesh.scale_factor = getWithDefault(mesh, "scale_factor", config.mesh.scale_factor);
             config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
+            config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
+            config.mesh.topo_directory = getWithDefault(mesh, "topo_directory", config.mesh.topo_directory);
         }
         
         // Parse Thermal section
@@ -114,6 +116,73 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.min_neighbors = getWithDefault(rad, "min_neighbors", config.radiation.min_neighbors);
         }
 
+        // Parse Generic Body section
+        if (root["generic_body"]) {
+            const auto& gb = root["generic_body"];
+            config.generic_body.name = getWithDefault(gb, "name", config.generic_body.name);
+            config.generic_body.config_file = getWithDefault(gb, "config_file", config.generic_body.config_file);
+            config.generic_body.ephemeris_source = getWithDefault(gb, "ephemeris_source", config.generic_body.ephemeris_source);
+            config.generic_body.spice_metakernel = getWithDefault(gb, "spice_metakernel", config.generic_body.spice_metakernel);
+            config.generic_body.naif_id = getWithDefault(gb, "naif_id", config.generic_body.naif_id);
+
+            // Shape subsection
+            if (gb["shape"]) {
+                const auto& shape = gb["shape"];
+                config.generic_body.shape_type = getWithDefault(shape, "type", config.generic_body.shape_type);
+                config.generic_body.radius_km = getWithDefault(shape, "radius_km", config.generic_body.radius_km);
+                config.generic_body.mesh_file = getWithDefault(shape, "mesh_file", config.generic_body.mesh_file);
+                config.generic_body.mesh_scale = getWithDefault(shape, "mesh_scale", config.generic_body.mesh_scale);
+                if (shape["semi_axes_km"] && shape["semi_axes_km"].IsSequence() && shape["semi_axes_km"].size() == 3) {
+                    config.generic_body.semi_axis_a_km = shape["semi_axes_km"][0].as<double>();
+                    config.generic_body.semi_axis_b_km = shape["semi_axes_km"][1].as<double>();
+                    config.generic_body.semi_axis_c_km = shape["semi_axes_km"][2].as<double>();
+                }
+            }
+
+            // Orbit subsection
+            if (gb["orbit"]) {
+                const auto& orbit = gb["orbit"];
+                config.generic_body.semi_major_axis_au = getWithDefault(orbit, "semi_major_axis_au", config.generic_body.semi_major_axis_au);
+                config.generic_body.eccentricity = getWithDefault(orbit, "eccentricity", config.generic_body.eccentricity);
+                config.generic_body.inclination_deg = getWithDefault(orbit, "inclination_deg", config.generic_body.inclination_deg);
+                config.generic_body.lon_ascending_node_deg = getWithDefault(orbit, "lon_ascending_node_deg", config.generic_body.lon_ascending_node_deg);
+                config.generic_body.arg_perihelion_deg = getWithDefault(orbit, "arg_perihelion_deg", config.generic_body.arg_perihelion_deg);
+                config.generic_body.mean_anomaly_deg = getWithDefault(orbit, "mean_anomaly_deg", config.generic_body.mean_anomaly_deg);
+                config.generic_body.orbital_epoch = getWithDefault(orbit, "epoch", config.generic_body.orbital_epoch);
+            }
+
+            // Spin subsection
+            if (gb["spin"]) {
+                const auto& spin = gb["spin"];
+                config.generic_body.spin_period_hours = getWithDefault(spin, "period_hours", config.generic_body.spin_period_hours);
+                config.generic_body.pole_ra_deg = getWithDefault(spin, "pole_ra_deg", config.generic_body.pole_ra_deg);
+                config.generic_body.pole_dec_deg = getWithDefault(spin, "pole_dec_deg", config.generic_body.pole_dec_deg);
+                config.generic_body.prime_meridian_deg = getWithDefault(spin, "prime_meridian_deg", config.generic_body.prime_meridian_deg);
+            }
+
+            // Surface/thermophysical subsection
+            if (gb["surface"]) {
+                const auto& surf = gb["surface"];
+                config.generic_body.albedo = getWithDefault(surf, "albedo", config.generic_body.albedo);
+                config.generic_body.emissivity = getWithDefault(surf, "emissivity", config.generic_body.emissivity);
+                config.generic_body.ks = getWithDefault(surf, "ks", config.generic_body.ks);
+                config.generic_body.kd = getWithDefault(surf, "kd", config.generic_body.kd);
+                config.generic_body.rhos = getWithDefault(surf, "rhos", config.generic_body.rhos);
+                config.generic_body.rhod = getWithDefault(surf, "rhod", config.generic_body.rhod);
+                config.generic_body.H_scale = getWithDefault(surf, "H", config.generic_body.H_scale);
+                config.generic_body.cp0 = getWithDefault(surf, "cp0", config.generic_body.cp0);
+                config.generic_body.Qb = getWithDefault(surf, "Qb", config.generic_body.Qb);
+                config.generic_body.chi = getWithDefault(surf, "chi", config.generic_body.chi);
+            }
+        }
+
+        // Parse Thermophysical section (GUI-written overrides)
+        if (root["thermophysical"]) {
+            const auto& thermo = root["thermophysical"];
+            bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
+            config.thermophysical_albedo_explicit = !use_default_albedo;
+        }
+
         // Parse Advanced section
         if (root["advanced"]) {
             const auto& adv = root["advanced"];
@@ -154,6 +223,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "import_file" << YAML::Value << config.mesh.import_file;
         out << YAML::Key << "scale_factor" << YAML::Value << config.mesh.scale_factor;
         out << YAML::Key << "export_basic" << YAML::Value << config.mesh.export_basic;
+        out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
+        if (!config.mesh.topo_directory.empty())
+            out << YAML::Key << "topo_directory" << YAML::Value << config.mesh.topo_directory;
         out << YAML::EndMap;
         
         // Thermal section
@@ -269,7 +341,7 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
         } else if (arg == "--thermal-threads" && i + 1 < argc) {
             config.thermal.threads = std::stoi(argv[++i]);
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
-            config.thermal.equilibration_orbits = std::stoi(argv[++i]);
+            config.thermal.equilibration_orbits = std::stod(argv[++i]);
         } else if (arg == "--no-statistics") {
             config.thermal.compute_statistics = false;
         } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
@@ -315,6 +387,36 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
         } else if (arg == "--locations" && i + 1 < argc) {
             config.output.locations_file = argv[++i];
         }
+        // Generic body parameters
+        else if (arg == "--generic-body-config" && i + 1 < argc) {
+            config.generic_body.config_file = argv[++i];
+        } else if (arg == "--ephemeris-source" && i + 1 < argc) {
+            config.generic_body.ephemeris_source = argv[++i];
+        } else if (arg == "--body-radius" && i + 1 < argc) {
+            config.generic_body.radius_km = std::stod(argv[++i]);
+        } else if (arg == "--orbit-sma" && i + 1 < argc) {
+            config.generic_body.semi_major_axis_au = std::stod(argv[++i]);
+        } else if (arg == "--orbit-ecc" && i + 1 < argc) {
+            config.generic_body.eccentricity = std::stod(argv[++i]);
+        } else if (arg == "--orbit-inc" && i + 1 < argc) {
+            config.generic_body.inclination_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-lan" && i + 1 < argc) {
+            config.generic_body.lon_ascending_node_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-argp" && i + 1 < argc) {
+            config.generic_body.arg_perihelion_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-ma" && i + 1 < argc) {
+            config.generic_body.mean_anomaly_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-epoch" && i + 1 < argc) {
+            config.generic_body.orbital_epoch = argv[++i];
+        } else if (arg == "--spin-period" && i + 1 < argc) {
+            config.generic_body.spin_period_hours = std::stod(argv[++i]);
+        } else if (arg == "--spin-pole-ra" && i + 1 < argc) {
+            config.generic_body.pole_ra_deg = std::stod(argv[++i]);
+        } else if (arg == "--spin-pole-dec" && i + 1 < argc) {
+            config.generic_body.pole_dec_deg = std::stod(argv[++i]);
+        } else if (arg == "--chi" && i + 1 < argc) {
+            config.generic_body.chi = std::stod(argv[++i]);
+        }
         // Advanced parameters
         else if (arg == "--verbose") {
             config.advanced.verbose = true;
@@ -345,7 +447,9 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  resolution: 5                       # Global mesh resolution\n";
     out << "  import_file: \"\"                     # Import custom mesh (OBJ, PLY, VTK)\n";
     out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
-    out << "  export_basic: false                 # Export basic mesh to VTK\n\n";
+    out << "  export_basic: false                 # Export basic mesh to VTK\n";
+    out << "  use_topographic: false              # Use pre-computed topographic mesh\n";
+    out << "  topo_directory: \"\"                  # Directory containing topographic meshes\n\n";
     
     out << "# ========== Thermal Model ==========\n";
     out << "thermal:\n";
@@ -386,6 +490,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "advanced:\n";
     out << "  verbose: false                      # Verbose output\n";
     out << "  default_visible_albedo: -1.0        # Override albedo (-1=use planet default)\n";
+    out << "  chi: -1.0                           # Radiative conductivity parameter (-1=use default 2.7)\n";
     
     std::cout << "Template configuration file created: " << filename << std::endl;
     return true;
@@ -419,7 +524,7 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         std::cerr << "Error: thermal threads cannot be negative (use 0 for auto)" << std::endl;
         valid = false;
     }
-    if (config.thermal.equilibration_orbits < 0) {
+    if (config.thermal.equilibration_orbits < 0.0) {
         std::cerr << "Error: equilibration_orbits cannot be negative" << std::endl;
         valid = false;
     }

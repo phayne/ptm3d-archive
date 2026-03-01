@@ -48,6 +48,13 @@ public:
     std::shared_ptr<Mesh> getMesh() const;
     void setupMesh();
 
+    // Body radius (runtime override for procedural mesh generation)
+    void setBodyRadius(double radius_km);
+    double getBodyRadius() const { return body_radius_km_; }
+
+    // Ellipsoidal mesh generation (tri-axial ellipsoid via scaled icosphere)
+    void createEllipsoidMesh(int resolution, double a_km, double b_km, double c_km);
+
     // Topographic mesh handling
     bool loadTopographicMesh(const std::string& filename);
     void ensureOutwardNormals();
@@ -133,6 +140,7 @@ private:
     void normalizeVector(std::array<double, 3>& vec);
 
     int resolution_;
+    double body_radius_km_ = 0.0;   // 0 = use constants::BODY_RADIUS
     std::shared_ptr<Mesh> mesh_;
 };
 

@@ -102,6 +102,21 @@ TOOLTIPS = {
         "primary IR flux: a face is Earth-visible when primary_ir > 0. "
         "Output: earth_visibility_fraction.bin"
     ),
+
+    # Output format options
+    "output.write_vtk": (
+        "Export viewshed results as a time sequence of VTU files "
+        "(one per waypoint) with a PVD collection file for ParaView. "
+        "Each VTU contains per-waypoint fields (visibility, distance, "
+        "emission angle, elevation angle, temperature, solar flux) and "
+        "aggregation fields (visibility count, illumination hours, etc.). "
+        "Open the .pvd file in ParaView to animate through waypoints. "
+        "Requires pyvista."
+    ),
+    "output.write_hdf5": (
+        "Export all output fields and mesh data as a single HDF5 file "
+        "(.h5). Compact, portable format for further analysis. Requires h5py."
+    ),
 }
 
 

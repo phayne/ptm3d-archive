@@ -23,8 +23,9 @@ target_link_libraries(illumination_model
     PUBLIC
     constants
     mesh_utils
+    orbital
     ${CSPICE_LIBRARY}
-    ${EMBREE_LIBRARIES}  # Add this line
+    ${EMBREE_LIBRARIES}
     OpenMP::OpenMP_CXX
 )
 

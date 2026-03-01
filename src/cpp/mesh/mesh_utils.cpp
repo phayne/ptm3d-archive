@@ -448,8 +448,8 @@ void MeshUtils::createIcosphereMesh(int resolution, Mesh& mesh) {
         faces = new_faces;
     }
     
-    // Scale vertices to Body radius
-    const double radius = constants::BODY_RADIUS;
+    // Scale vertices to body radius (use runtime value if set, else compile-time default)
+    const double radius = (body_radius_km_ > 0.0) ? body_radius_km_ : constants::BODY_RADIUS;
     for (auto& v : vertices) {
         double scale = radius / std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         v[0] *= scale;
@@ -460,6 +460,46 @@ void MeshUtils::createIcosphereMesh(int resolution, Mesh& mesh) {
     // Store the results in the mesh
     mesh.vertices = std::move(vertices);
     mesh.faces = std::move(faces);
+}
+
+void MeshUtils::setBodyRadius(double radius_km) {
+    body_radius_km_ = radius_km;
+}
+
+void MeshUtils::createEllipsoidMesh(int resolution, double a_km, double b_km, double c_km) {
+    // Generate a unit icosphere then scale by direction-dependent ellipsoidal radius.
+    // a_km, b_km, c_km are the semi-axes along X, Y, Z respectively.
+    Mesh& mesh = *mesh_;
+
+    // Build unit icosphere (vertices on unit sphere)
+    // Temporarily set body_radius_km_ to 0 so createIcosphereMesh uses
+    // the unit normalization then we'll scale ourselves.
+    double saved_radius = body_radius_km_;
+    body_radius_km_ = 1.0;  // Unit sphere
+    createIcosphereMesh(resolution, mesh);
+    body_radius_km_ = saved_radius;
+
+    // Now vertices are on a unit sphere. Scale each vertex by the
+    // direction-dependent ellipsoidal radius: (a*nx, b*ny, c*nz)
+    for (auto& v : mesh.vertices) {
+        double r = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (r > 0.0) {
+            double nx = v[0] / r;
+            double ny = v[1] / r;
+            double nz = v[2] / r;
+            v[0] = a_km * nx;
+            v[1] = b_km * ny;
+            v[2] = c_km * nz;
+        }
+    }
+
+    // Recompute face properties for the ellipsoidal geometry
+    calculateFaceProperties(false);
+    mapFacesToLatLon();
+
+    std::cout << "Ellipsoidal mesh created with semi-axes (" << a_km << ", " << b_km
+              << ", " << c_km << ") km: " << mesh.vertices.size() << " vertices, "
+              << mesh.faces.size() << " faces" << std::endl;
 }
 
 void MeshUtils::ensureOutwardNormals() {
@@ -902,10 +942,12 @@ bool ptm::MeshUtils::exportMeshToVTK(const std::string& filename) const {
         vtk << "DATASET UNSTRUCTURED_GRID\n";
         
         // Write points
-        vtk << "POINTS " << mesh_->vertices.size() << " float\n";
+        vtk << "POINTS " << mesh_->vertices.size() << " double\n";
+        vtk << std::setprecision(17);
         for (const auto& v : mesh_->vertices) {
             vtk << v[0] << " " << v[1] << " " << v[2] << "\n";
         }
+        vtk << std::setprecision(6);
         
         // Write cells (faces)
         vtk << "CELLS " << mesh_->faces.size() << " " << mesh_->faces.size() * 4 << "\n";
@@ -1024,10 +1066,12 @@ bool ptm::MeshUtils::exportIlluminationToVTK(
         vtk << "DATASET UNSTRUCTURED_GRID\n";
         
         // Write vertices
-        vtk << "POINTS " << mesh->vertices.size() << " float\n";
+        vtk << "POINTS " << mesh->vertices.size() << " double\n";
+        vtk << std::setprecision(17);
         for (const auto& v : mesh->vertices) {
             vtk << v[0] << " " << v[1] << " " << v[2] << "\n";
         }
+        vtk << std::setprecision(6);
         
         // Write cells (faces)
         vtk << "CELLS " << mesh->faces.size() << " " << mesh->faces.size() * 4 << "\n";

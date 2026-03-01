@@ -33,8 +33,11 @@ def _categorise_field(name):
     if name.startswith("mask_"):
         return "mask"
     if name in ("visibility_count", "illumination_hours", "temperature_mean_traverse",
+                "earth_visibility_fraction",
                 "estimated_ice_fraction_best", "snr_best"):
         return "aggregation"
+    if name.startswith("earth_visible_"):
+        return "per_waypoint"
     # Per-waypoint fields typically end with a waypoint label
     per_wp_prefixes = (
         "visibility_", "distance_km_", "emission_angle_", "elevation_angle_",

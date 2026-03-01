@@ -30,13 +30,15 @@ struct SimulationConfig {
         std::string import_file = "";
         double scale_factor = 1.0;
         bool export_basic = false;
+        bool use_topographic = false;
+        std::string topo_directory = "";
     } mesh;
     
     // Thermal Model
     struct ThermalParams {
         bool run_thermal_mesh = false;
         int threads = 0;  // 0 = auto
-        int equilibration_orbits = 1;
+        double equilibration_orbits = 1.0;
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
         std::string thermal_inertia_map = "";
@@ -101,6 +103,68 @@ struct SimulationConfig {
         int max_neighbors = 500;                  // Hard ceiling per face (reduced from 2000 for better performance)
         int min_neighbors = 20;                   // Minimum neighbors per face
     } radiation;
+
+    // Generic Body Configuration (for user-defined bodies)
+    struct GenericBodyParams {
+        std::string name = "";            // Body name from config YAML
+        std::string config_file = "";     // Path to body config YAML file
+        std::string ephemeris_source = "auto"; // "auto", "keplerian", or "spice"
+        std::string spice_metakernel = "";    // Path to SPICE metakernel file
+        std::string naif_id = "";             // NAIF/SPICE body ID (e.g. "2000269")
+
+        // Shape parameters (-1 = use default or omit)
+        std::string shape_type = "";      // "spherical", "ellipsoidal", "custom_mesh"
+        double radius_km = -1.0;
+        double semi_axis_a_km = -1.0;
+        double semi_axis_b_km = -1.0;
+        double semi_axis_c_km = -1.0;
+        std::string mesh_file = "";       // Path to custom mesh file (OBJ/PLY)
+        double mesh_scale = 1.0;          // Scale factor for custom mesh
+
+        // Orbital elements (-1 = not specified)
+        double semi_major_axis_au = -1.0;
+        double eccentricity = -1.0;
+        double inclination_deg = -1.0;
+        double lon_ascending_node_deg = -1.0;
+        double arg_perihelion_deg = -1.0;
+        double mean_anomaly_deg = -1.0;
+        std::string orbital_epoch = "";
+
+        // Spin state (-1 = not specified)
+        double spin_period_hours = -1.0;
+        double pole_ra_deg = -1.0;
+        double pole_dec_deg = -1.0;
+        double prime_meridian_deg = 0.0;
+
+        // Thermophysical overrides (-1 = use body default)
+        double albedo = -1.0;
+        double emissivity = -1.0;
+        double ks = -1.0;
+        double kd = -1.0;
+        double rhos = -1.0;
+        double rhod = -1.0;
+        double H_scale = -1.0;
+        double cp0 = -1.0;
+        double Qb = -1.0;
+        double chi = -1.0;  // Radiative conductivity parameter (-1 = use default 2.7)
+
+        // Is this section populated?
+        bool hasOrbitalElements() const {
+            return semi_major_axis_au > 0.0;
+        }
+        bool hasSpinState() const {
+            return spin_period_hours > 0.0;
+        }
+        bool isConfigured() const {
+            return !config_file.empty() || !name.empty()
+                || hasOrbitalElements() || hasSpinState();
+        }
+    } generic_body;
+
+    // Thermophysical overrides (from YAML thermophysical section)
+    // These flags indicate the user explicitly set a property value
+    // rather than relying on the body's default.
+    bool thermophysical_albedo_explicit = false;
 
     // Advanced Options
     struct AdvancedParams {

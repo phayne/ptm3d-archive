@@ -29,6 +29,13 @@ namespace opencl {
 }
 #endif
 
+// Forward declarations for orbital mechanics
+namespace orbital {
+    class KeplerianPropagator;
+    class BodyFixedFrame;
+    struct GenericBody;
+}
+
 namespace ptm {
 
 class IlluminationModel {
@@ -102,6 +109,15 @@ public:
 
     // Set both target and primary bodies using a planetary body enum
     void setPlanetaryBody(thermal::PlanetaryBody body);
+
+    // Configure from a generic body definition (uses Keplerian propagation)
+    void setGenericBody(const orbital::GenericBody& body);
+
+    // Check if using Keplerian propagation (vs SPICE)
+    bool isKeplerian() const { return use_keplerian_; }
+
+    // Check if a primary body is configured
+    bool hasPrimaryBody() const { return has_primary_body_; }
 
     // Get the albedo for the specific planetary body
     double getAlbedo() const { return albedo_; }
@@ -324,6 +340,13 @@ private:
     // Primary body; flag to indicate if primary is the Sun
     bool primary_is_sun_ = false;
     double primary_radius_ = constants::JUPITER_RADIUS;  // Default, updated when body changes
+    bool has_primary_body_ = true;  // True for satellites (Europa→Jupiter), false for heliocentric
+
+    // Generic body / Keplerian propagation support
+    bool use_keplerian_ = false;
+    std::unique_ptr<orbital::KeplerianPropagator> keplerian_propagator_;
+    std::unique_ptr<orbital::BodyFixedFrame> body_fixed_frame_;
+    double keplerian_epoch_et_ = 0.0;  // ET offset for Keplerian epoch
 
     // Embree ray tracing methods
     bool initializeEmbree();

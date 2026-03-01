@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
+#include <iostream>
 
 namespace thermal {
 
@@ -27,12 +28,12 @@ struct ThermophysicalProperties {
     double year;          // Orbital period (seconds)
     double rAU;           // Distance from Sun (AU)
     double S;             // Solar constant at orbit (W/m²)
-    
+
     // Surface properties
     double albedo;        // Bond albedo
     double emissivity;    // Thermal emissivity
     double Qb;            // Internal heat flux (W/m²)
-    
+
     // Thermal properties
     double ks;            // Surface thermal conductivity (W/m/K)
     double kd;            // Deep thermal conductivity (W/m/K)
@@ -40,13 +41,16 @@ struct ThermophysicalProperties {
     double rhod;          // Deep density (kg/m³)
     double H;             // Scale height for density/conductivity change (m)
     double cp0;           // Reference heat capacity (J/kg/K)
-    
+
     // Variable property coefficients
     std::vector<double> cpCoeff;     // Heat capacity temperature coefficients
     std::vector<double> albedoCoef;  // Albedo variation coefficients
 
     // SPICE configuration
     std::string spice_metakernel;  // Meta-kernel filename for SPICE
+
+    // Body physical parameters (for mesh generation and generic body support)
+    double body_radius_km = 0.0;  // Mean radius (km). 0 = use mesh as-is
 };
 
 // Default properties for supported planetary bodies
@@ -78,7 +82,14 @@ public:
         if (lower_name == "mercury") return getProperties(PlanetaryBody::MERCURY);
         // Add other bodies as needed
         
-        // Default to Europa if name not recognized
+        // Default to Europa if name not recognized (warn once to avoid spam)
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "Note: Body '" << name
+                      << "' not in built-in list; using placeholder defaults"
+                      << " (generic body config will override)" << std::endl;
+            warned = true;
+        }
         return getProperties(PlanetaryBody::EUROPA);
     }
 
@@ -118,9 +129,12 @@ private:
         // SPICE configuration
         props.spice_metakernel = "europa.tm";
 
+        // Body size
+        props.body_radius_km = 1560.8;
+
         return props;
     }
-    
+
     // Moon properties - Hayne et al. (2017) JGR Planets, Table A1
     // "Global Regolith Thermophysical Properties of the Moon From the Diviner
     // Lunar Radiometer Experiment"
@@ -157,9 +171,12 @@ private:
         // SPICE configuration
         props.spice_metakernel = "moon.tm";
 
+        // Body size
+        props.body_radius_km = 1737.4;
+
         return props;
     }
-    
+
     // Mercury properties
     static ThermophysicalProperties getMercuryProperties() {
         ThermophysicalProperties props;
@@ -189,7 +206,10 @@ private:
 
         // SPICE configuration
         props.spice_metakernel = "mercury.tm";
-        
+
+        // Body size
+        props.body_radius_km = 2439.7;
+
         return props;
     }
 };

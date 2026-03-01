@@ -33,6 +33,13 @@ try:
 except ImportError:
     H5PY_AVAILABLE = False
 
+try:
+    import vtk
+    from vtk.util import numpy_support
+    VTK_AVAILABLE = True
+except ImportError:
+    VTK_AVAILABLE = False
+
 
 # Field metadata
 FIELD_INFO = {
@@ -52,6 +59,19 @@ BODY_RADII = {
     'Enceladus': 252100.0,
     'Titan': 2574730.0,
     'Ceres': 473000.0,
+}
+
+# Statistics metadata
+STAT_TYPES = ['avg', 'max', 'min']
+STAT_LABELS = {'avg': 'Average', 'max': 'Maximum', 'min': 'Minimum'}
+
+STATISTICS_FIELDS = {
+    'temperature': {'label': 'Temperature', 'units': 'K'},
+    'illumination': {'label': 'Total Illumination', 'units': 'W/m²'},
+    'direct_solar': {'label': 'Direct Solar', 'units': 'W/m²'},
+    'primary_reflected': {'label': 'Primary Reflected', 'units': 'W/m²'},
+    'primary_ir': {'label': 'Primary IR', 'units': 'W/m²'},
+    'ice_depth': {'label': 'Ice Depth', 'units': 'm'},
 }
 
 # Nice resolution values for rounding
@@ -483,7 +503,7 @@ class GeoTIFFExporter:
             'crs': crs,
             'transform': transform,
             'nodata': np.nan,
-            'compress': 'deflate',
+            'compress': 'lzw',
             'predictor': 2,
             'tiled': True,
             'blockxsize': 256,
@@ -535,7 +555,7 @@ class GeoTIFFExporter:
             'crs': crs,
             'transform': transform,
             'nodata': np.nan,
-            'compress': 'deflate',
+            'compress': 'lzw',
             'predictor': 2,
             'tiled': True,
             'blockxsize': 256,
@@ -546,6 +566,16 @@ class GeoTIFFExporter:
     def _write_tags(dst, field_name):
         """Write metadata tags to an open rasterio dataset."""
         info = FIELD_INFO.get(field_name, {})
+        if not info:
+            # Check for statistics field (e.g. 'temperature_avg')
+            parts = field_name.rsplit('_', 1)
+            if len(parts) == 2 and parts[1] in STAT_LABELS:
+                base_info = STATISTICS_FIELDS.get(parts[0], {})
+                if base_info:
+                    info = {
+                        'label': f"{base_info['label']} ({STAT_LABELS[parts[1]]})",
+                        'units': base_info.get('units', ''),
+                    }
         dst.update_tags(
             field=field_name,
             units=info.get('units', ''),
@@ -607,13 +637,36 @@ class GeoTIFFExporter:
                 dst.set_band_description(1, time_label)
             GeoTIFFExporter._write_tags(dst, field_name)
 
+    @staticmethod
+    def export_statistic(output_path, data_2d, regridder, base_field, stat_type):
+        """Write a single-band GeoTIFF for one statistic field.
+
+        Delegates to export_single_timestep for file creation, then uses
+        the same tag format as time-series exports for maximum compatibility.
+
+        Args:
+            output_path: Output file path
+            data_2d: Array of shape (N_lat, N_lon)
+            regridder: MeshRegridder instance
+            base_field: Base field name (e.g. 'temperature')
+            stat_type: Statistic type ('avg', 'max', or 'min')
+        """
+        info = STATISTICS_FIELDS.get(base_field, {})
+        stat_label = STAT_LABELS.get(stat_type, stat_type)
+        field_name = f"{base_field}_{stat_type}"
+        band_label = f"{info.get('label', base_field)} ({stat_label})"
+        GeoTIFFExporter.export_single_timestep(
+            output_path, data_2d, regridder, field_name, band_label
+        )
+
 
 class HDF5Exporter:
     """Exports simulation data to a single HDF5 file."""
 
     @staticmethod
     def export(output_path, mesh_data, timesteps, field_data,
-               regridded_data=None, regridder=None):
+               regridded_data=None, regridder=None,
+               statistics_data=None, regridded_statistics=None):
         """Write HDF5 file with mesh, time, unstructured, and regridded data.
 
         Args:
@@ -623,6 +676,8 @@ class HDF5Exporter:
             field_data: Dict of {field_name: (N_timesteps, N_faces) array}
             regridded_data: Optional dict of {field_name: (N_timesteps, N_lat, N_lon) array}
             regridder: Optional MeshRegridder instance (for grid coordinates)
+            statistics_data: Optional dict of {(base_field, stat_type): 1D face array}
+            regridded_statistics: Optional dict of {(base_field, stat_type): 2D grid array}
         """
         if not H5PY_AVAILABLE:
             raise RuntimeError("h5py is required for HDF5 export")
@@ -734,9 +789,52 @@ class HDF5Exporter:
                     ds.attrs['units'] = info.get('units', '')
                     ds.attrs['description'] = info.get('label', field_name)
 
+            # Statistics group (per-face, no time dimension)
+            if statistics_data:
+                stats_grp = f.create_group('statistics')
+                stats_grp.attrs['description'] = (
+                    'Per-face statistics computed over integration window'
+                )
+                for (base_field, stat_type), face_data in statistics_data.items():
+                    key = f"{base_field}_{stat_type}"
+                    info = STATISTICS_FIELDS.get(base_field, {})
+                    stat_label = STAT_LABELS.get(stat_type, stat_type)
+                    ds = stats_grp.create_dataset(
+                        key,
+                        data=face_data.astype(np.float32),
+                        compression='gzip', compression_opts=4
+                    )
+                    ds.attrs['units'] = info.get('units', '')
+                    ds.attrs['description'] = (
+                        f"{info.get('label', base_field)} ({stat_label})"
+                    )
+                    ds.attrs['statistic'] = stat_type
+                    ds.attrs['base_field'] = base_field
+
+            # Regridded statistics group
+            if regridded_statistics and regridder:
+                reg_stats = f.create_group('regridded_statistics')
+                reg_stats.attrs['projection'] = regridder.projection
+                reg_stats.attrs['resolution_degrees'] = regridder.resolution
+                for (base_field, stat_type), grid_data in regridded_statistics.items():
+                    key = f"{base_field}_{stat_type}"
+                    info = STATISTICS_FIELDS.get(base_field, {})
+                    stat_label = STAT_LABELS.get(stat_type, stat_type)
+                    ds = reg_stats.create_dataset(
+                        key,
+                        data=grid_data.astype(np.float32),
+                        compression='gzip', compression_opts=4
+                    )
+                    ds.attrs['units'] = info.get('units', '')
+                    ds.attrs['description'] = (
+                        f"{info.get('label', base_field)} ({stat_label})"
+                    )
+                    ds.attrs['statistic'] = stat_type
+                    ds.attrs['base_field'] = base_field
+
 
 def write_export_readme(output_dir, regridder, fields, timesteps,
-                        formats, per_timestep=False):
+                        formats, per_timestep=False, statistics=None):
     """Write a README.txt describing the exported data and projection.
 
     Args:
@@ -746,6 +844,7 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
         timesteps: List of timestep dicts with 'time' and 'label' keys
         formats: List of format strings ('geotiff', 'hdf5')
         per_timestep: Whether GeoTIFFs were written per-timestep
+        statistics: Optional list of (base_field, stat_type) tuples
     """
     output_dir = Path(output_dir)
     lines = []
@@ -864,7 +963,32 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
         lines.append("    /data/{field}   - Unstructured face data (N_timesteps, N_faces)")
         lines.append("    /regridded/     - Regridded data on regular grid")
         lines.append("    /regridded/{field} - (N_timesteps, N_lat, N_lon)")
+        if statistics:
+            lines.append("    /statistics/    - Per-face statistics (avg/max/min)")
+            lines.append("    /regridded_statistics/ - Regridded statistics")
         lines.append("  Compression: gzip level 4.")
+        lines.append("")
+
+    if statistics:
+        if 'geotiff' in formats:
+            lines.append("* statistics/{field}_{stat}.tif")
+            lines.append("")
+            lines.append("  Single-band GeoTIFF files for per-face statistics.")
+            lines.append("  Float32, NoData = NaN, compression: deflate.")
+            lines.append("")
+
+        lines.append("")
+        lines.append("Statistics")
+        lines.append("----------")
+        lines.append("Per-face statistics computed over the integration window:")
+        lines.append("")
+        for base_field, stat_type in statistics:
+            info = STATISTICS_FIELDS.get(base_field, {})
+            label = info.get('label', base_field)
+            stat_label = STAT_LABELS.get(stat_type, stat_type)
+            units = info.get('units', '')
+            units_str = f" ({units})" if units else ""
+            lines.append(f"* {label} - {stat_label}{units_str}")
         lines.append("")
 
     lines.append("")
@@ -908,6 +1032,39 @@ def read_binary_data(file_path, expected_count):
         return None
     except Exception:
         return None
+
+
+def detect_available_statistics(results_dir):
+    """Detect which statistics files are available and contain valid data.
+
+    Args:
+        results_dir: Path to the results directory
+
+    Returns:
+        List of (base_field, stat_type) tuples for files with non-NaN data.
+    """
+    stats_dir = Path(results_dir) / 'statistics'
+    if not stats_dir.is_dir():
+        return []
+
+    available = []
+    for base_field in STATISTICS_FIELDS:
+        for stat_type in STAT_TYPES:
+            filepath = stats_dir / f"{base_field}_{stat_type}.bin"
+            if not filepath.is_file() or filepath.stat().st_size <= 4:
+                continue
+            # Read and check for all-NaN (e.g. ice_depth_max/min)
+            try:
+                with open(filepath, 'rb') as f:
+                    header = f.read(4)
+                    if len(header) == 4:
+                        count = struct.unpack('<I', header)[0]
+                        data = np.frombuffer(f.read(), dtype='<f4')
+                        if len(data) == count and not np.all(np.isnan(data)):
+                            available.append((base_field, stat_type))
+            except Exception:
+                continue
+    return available
 
 
 class DataExportWorker(QThread):
@@ -957,12 +1114,14 @@ class DataExportWorker(QThread):
         output_dir = Path(self.config['output_dir'])
         per_timestep = self.config.get('geotiff_per_timestep', False)
         body_radius = self.config.get('body_radius', 1737400.0)
+        statistics = self.config.get('statistics', [])
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
         n_faces = len(mesh_data['latitudes'])
         n_timesteps = len(timesteps)
         n_fields = len(fields)
+        n_statistics = len(statistics)
 
         do_geotiff = 'geotiff' in formats and RASTERIO_AVAILABLE
         do_hdf5 = 'hdf5' in formats and H5PY_AVAILABLE
@@ -973,13 +1132,13 @@ class DataExportWorker(QThread):
         keep_grid_data = do_hdf5
 
         # Calculate total steps for progress
-        total_steps = 1 + (n_fields * n_timesteps) + n_fields
+        total_steps = 1 + (n_fields * n_timesteps) + n_fields + n_statistics
         current_step = 0
 
-        # Build regridder
-        self.status_updated.emit("Building spatial index for regridding...")
+        # Build regridder (not needed for VTU-only export)
         regridder = None
         if needs_regrid:
+            self.status_updated.emit("Building spatial index for regridding...")
             regridder = MeshRegridder(
                 mesh_data['latitudes'],
                 mesh_data['longitudes'],
@@ -1087,7 +1246,65 @@ class DataExportWorker(QThread):
             self.export_finished.emit(False, "Export cancelled")
             return
 
-        # Write HDF5 (single file with all fields)
+        # Export statistics (single-band per-face data)
+        all_stat_face_data = {}
+        all_stat_grid_data = {}
+
+        if statistics:
+            stats_dir = results_dir / 'statistics'
+
+            for base_field, stat_type in statistics:
+                if self._cancelled:
+                    self._cleanup(output_dir)
+                    self.export_finished.emit(False, "Export cancelled")
+                    return
+
+                stat_label = STAT_LABELS.get(stat_type, stat_type)
+                self.status_updated.emit(
+                    f"Processing statistic: {base_field} {stat_label}..."
+                )
+
+                filepath = stats_dir / f"{base_field}_{stat_type}.bin"
+                face_data = read_binary_data(str(filepath), n_faces)
+
+                if face_data is not None:
+                    stat_key = (base_field, stat_type)
+                    all_stat_face_data[stat_key] = face_data
+
+                    if regridder:
+                        grid_2d = regridder.regrid(face_data)
+
+                        # Skip all-NaN grids (no valid data after regridding)
+                        if np.all(np.isnan(grid_2d)):
+                            self.status_updated.emit(
+                                f"Skipping {base_field} {stat_label}: "
+                                f"all NaN after regridding"
+                            )
+                        else:
+                            all_stat_grid_data[stat_key] = grid_2d
+
+                            if do_geotiff:
+                                stat_tiff_dir = output_dir / 'statistics'
+                                stat_tiff_dir.mkdir(parents=True, exist_ok=True)
+                                tiff_path = (
+                                    stat_tiff_dir
+                                    / f"{base_field}_{stat_type}.tif"
+                                )
+                                GeoTIFFExporter.export_statistic(
+                                    tiff_path, grid_2d, regridder,
+                                    base_field, stat_type
+                                )
+
+                current_step += 1
+                self.progress_updated.emit(current_step, total_steps)
+
+            if do_geotiff and all_stat_grid_data and regridder:
+                stat_tiff_dir = output_dir / 'statistics'
+                output_files.append(
+                    f"{stat_tiff_dir}/ ({len(all_stat_grid_data)} files)"
+                )
+
+        # Write HDF5 (single file with all fields and statistics)
         if 'hdf5' in formats and H5PY_AVAILABLE:
             self.status_updated.emit("Writing HDF5 file...")
             h5_path = output_dir / "ptm3d_data.h5"
@@ -1095,25 +1312,156 @@ class DataExportWorker(QThread):
                 h5_path, mesh_data, timesteps,
                 all_face_data,
                 regridded_data=all_grid_data if regridder else None,
-                regridder=regridder
+                regridder=regridder,
+                statistics_data=(
+                    all_stat_face_data if all_stat_face_data else None
+                ),
+                regridded_statistics=(
+                    all_stat_grid_data if all_stat_grid_data else None
+                ),
             )
             output_files.append(str(h5_path))
+
+        # Write VTU/PVD (unstructured mesh, one VTU per timestep + PVD collection)
+        if 'vtu' in formats and VTK_AVAILABLE:
+            self.status_updated.emit("Writing VTU/PVD files...")
+            vtu_dir = output_dir / "vtu"
+            vtu_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build VTK unstructured grid from mesh
+            import vtk
+            from vtk.util import numpy_support
+
+            vertices = mesh_data['vertices']
+            faces = mesh_data['faces']
+            n_verts = len(vertices)
+
+            points = vtk.vtkPoints()
+            points.SetNumberOfPoints(n_verts)
+            for i in range(n_verts):
+                points.SetPoint(i, float(vertices[i, 0]),
+                                float(vertices[i, 1]),
+                                float(vertices[i, 2]))
+
+            cells = vtk.vtkCellArray()
+            for f in faces:
+                cells.InsertNextCell(3, [int(f[0]), int(f[1]), int(f[2])])
+
+            # Write one VTU per timestep with all selected fields
+            vtu_files = []
+            for t in range(n_timesteps):
+                if self._cancelled:
+                    self._cleanup(output_dir)
+                    self.export_finished.emit(False, "Export cancelled")
+                    return
+
+                grid = vtk.vtkUnstructuredGrid()
+                grid.SetPoints(points)
+                grid.SetCells(vtk.VTK_TRIANGLE, cells)
+
+                # Add lat/lon as cell data
+                for coord_name in ('latitudes', 'longitudes'):
+                    if coord_name in mesh_data:
+                        arr = numpy_support.numpy_to_vtk(
+                            mesh_data[coord_name].astype(np.float64),
+                            deep=True
+                        )
+                        arr.SetName(coord_name)
+                        grid.GetCellData().AddArray(arr)
+
+                # Add field data for this timestep
+                for field_name in fields:
+                    if field_name in all_face_data:
+                        face_vals = all_face_data[field_name][t]
+                        vtk_arr = numpy_support.numpy_to_vtk(
+                            face_vals.astype(np.float64), deep=True
+                        )
+                        vtk_arr.SetName(field_name)
+                        grid.GetCellData().AddArray(vtk_arr)
+
+                vtu_path = vtu_dir / f"ptm3d_{t:04d}.vtu"
+                writer = vtk.vtkXMLUnstructuredGridWriter()
+                writer.SetFileName(str(vtu_path))
+                writer.SetInputData(grid)
+                writer.SetDataModeToAppended()
+                writer.SetCompressorTypeToZLib()
+                writer.Write()
+                vtu_files.append(vtu_path)
+
+                self.status_updated.emit(
+                    f"Writing VTU timestep {t + 1}/{n_timesteps}..."
+                )
+
+            # Write PVD collection file
+            pvd_path = output_dir / "ptm3d_timeseries.pvd"
+            pvd_lines = [
+                '<?xml version="1.0"?>',
+                '<VTKFile type="Collection" version="0.1">',
+                '  <Collection>',
+            ]
+            for t, vtu_path in enumerate(vtu_files):
+                time_val = float(t)
+                if t < len(timesteps) and 'time' in timesteps[t]:
+                    time_val = float(timesteps[t]['time'])
+                rel_path = f"vtu/{vtu_path.name}"
+                pvd_lines.append(
+                    f'    <DataSet timestep="{time_val}" '
+                    f'file="{rel_path}"/>'
+                )
+            pvd_lines.append('  </Collection>')
+            pvd_lines.append('</VTKFile>')
+            pvd_path.write_text('\n'.join(pvd_lines))
+            output_files.append(str(pvd_path))
+
+            # Write statistics VTU files if available
+            if all_stat_face_data:
+                stat_grid = vtk.vtkUnstructuredGrid()
+                stat_grid.SetPoints(points)
+                stat_grid.SetCells(vtk.VTK_TRIANGLE, cells)
+
+                for coord_name in ('latitudes', 'longitudes'):
+                    if coord_name in mesh_data:
+                        arr = numpy_support.numpy_to_vtk(
+                            mesh_data[coord_name].astype(np.float64),
+                            deep=True
+                        )
+                        arr.SetName(coord_name)
+                        stat_grid.GetCellData().AddArray(arr)
+
+                for (base_field, stat_type), face_data in all_stat_face_data.items():
+                    vtk_arr = numpy_support.numpy_to_vtk(
+                        face_data.astype(np.float64), deep=True
+                    )
+                    vtk_arr.SetName(f"{base_field}_{stat_type}")
+                    stat_grid.GetCellData().AddArray(vtk_arr)
+
+                stat_vtu_path = output_dir / "ptm3d_statistics.vtu"
+                writer = vtk.vtkXMLUnstructuredGridWriter()
+                writer.SetFileName(str(stat_vtu_path))
+                writer.SetInputData(stat_grid)
+                writer.SetDataModeToAppended()
+                writer.SetCompressorTypeToZLib()
+                writer.Write()
+                output_files.append(str(stat_vtu_path))
+
+            output_files.append(f"{vtu_dir}/ ({len(vtu_files)} files)")
 
         # Write README
         readme_path = write_export_readme(
             output_dir, regridder, fields, timesteps,
-            formats, per_timestep=per_timestep
+            formats, per_timestep=per_timestep,
+            statistics=statistics if statistics else None
         )
         output_files.append(str(readme_path))
 
         # Summary
-        proj_name = 'polar stereographic' if (regridder and regridder.projection == 'stere') else 'equirectangular'
         file_list = "\n".join(f"  - {f}" for f in output_files)
-        self.export_finished.emit(
-            True,
-            f"Export complete! (projection: {proj_name})\n\n"
-            f"Files created:\n{file_list}"
-        )
+        if 'vtu' in formats and not do_geotiff and not do_hdf5:
+            summary = f"Export complete! (VTU/PVD format)\n\nFiles created:\n{file_list}"
+        else:
+            proj_name = 'polar stereographic' if (regridder and regridder.projection == 'stere') else 'equirectangular'
+            summary = f"Export complete! (projection: {proj_name})\n\nFiles created:\n{file_list}"
+        self.export_finished.emit(True, summary)
 
     def _cleanup(self, output_dir):
         """Remove partial output files on cancellation."""
@@ -1123,5 +1471,12 @@ class DataExportWorker(QThread):
             h5_path = output_dir / "ptm3d_data.h5"
             if h5_path.exists():
                 h5_path.unlink(missing_ok=True)
+            vtu_dir = output_dir / "vtu"
+            if vtu_dir.exists():
+                for f in vtu_dir.glob("*.vtu"):
+                    f.unlink(missing_ok=True)
+            pvd_path = output_dir / "ptm3d_timeseries.pvd"
+            if pvd_path.exists():
+                pvd_path.unlink(missing_ok=True)
         except Exception:
             pass

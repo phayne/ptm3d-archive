@@ -1,0 +1,28 @@
+generic_body:
+  name: 269 Justitia (A887 SA)
+  ephemeris_source: keplerian
+  naif_id: '2000269'
+  shape:
+    type: spherical
+    radius_km: 25.364
+  orbit:
+    semi_major_axis_au: 2.6156911
+    eccentricity: 0.21425815
+    inclination_deg: 5.477709
+    lon_ascending_node_deg: 156.849373
+    arg_perihelion_deg: 120.142275
+    mean_anomaly_deg: 249.109958
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 33.128
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.061
+    emissivity: 0.95
+    ks: 0.01
+    kd: 0.5
+    rhos: 1500.0
+    rhod: 2000.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0

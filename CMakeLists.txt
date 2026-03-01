@@ -543,6 +543,7 @@ add_subdirectory(src/cpp/constants)
 add_subdirectory(src/cpp/maps)
 add_subdirectory(src/cpp/mesh)
 add_subdirectory(src/cpp/thermal)      # This will pick up thermal_adaptive_simd.cpp
+add_subdirectory(src/cpp/orbital)      # Keplerian propagator, body-fixed frame
 
 # GPU module (must be before illumination/radiation/main to allow linking)
 if(ENABLE_GPU)

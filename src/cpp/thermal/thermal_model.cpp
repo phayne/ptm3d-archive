@@ -398,6 +398,7 @@ Planet::Planet(const std::string& name) {
     cp0 = props.cp0;
     cpCoeff = props.cpCoeff;
     albedoCoef = props.albedoCoef;
+    body_radius_km = props.body_radius_km;
 }
 
 Planet::Planet(PlanetaryBody body) {
@@ -428,6 +429,27 @@ Planet::Planet(PlanetaryBody body) {
     cp0 = props.cp0;
     cpCoeff = props.cpCoeff;
     albedoCoef = props.albedoCoef;
+    body_radius_km = props.body_radius_km;
+}
+
+Planet::Planet(const std::string& name, const ThermophysicalProperties& props) {
+    this->name = name;
+    albedo = props.albedo;
+    emissivity = props.emissivity;
+    day = props.day;
+    year = props.year;
+    rAU = props.rAU;
+    S = props.S;
+    Qb = props.Qb;
+    ks = props.ks;
+    kd = props.kd;
+    rhos = props.rhos;
+    rhod = props.rhod;
+    H = props.H;
+    cp0 = props.cp0;
+    cpCoeff = props.cpCoeff;
+    albedoCoef = props.albedoCoef;
+    body_radius_km = props.body_radius_km;
 }
 
 bool Planet::loadAlbedoMap(const std::string& filename, bool verbose) {
@@ -587,6 +609,7 @@ void Planet::setProperty(const std::string& property_name, double value) {
     else if (prop == "rhod") rhod = value;
     else if (prop == "h") H = value;
     else if (prop == "cp0") cp0 = value;
+    else if (prop == "body_radius_km" || prop == "body_radius") body_radius_km = value;
     else {
         std::cerr << "Warning: Unknown property '" << property_name << "'" << std::endl;
     }

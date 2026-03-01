@@ -77,7 +77,7 @@ struct ViewshedParams {
     int num_threads = 0;                // 0 = auto-detect
     
     // Ray tracing parameters
-    double ray_offset_factor = 1e-4;   // Surface offset to avoid self-intersection
+    double ray_offset_factor = 1e-4;   // Deprecated: offset now computed automatically from mesh scale
     bool use_avx512 = true;            // Use AVX-512 if available
     int batch_size = 16384;            // Ray batch size for processing
     
@@ -285,6 +285,9 @@ private:
     
     bool initialized_;
     double body_radius_;
+
+    // Scene origin offset for Embree float precision (bounding box center)
+    std::array<double, 3> scene_origin_offset_{0.0, 0.0, 0.0};
     
     // Thread pool for batch processing
     mutable std::mutex result_mutex_;

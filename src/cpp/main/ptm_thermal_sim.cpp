@@ -38,6 +38,9 @@
 #include "../radiation/radiation_config.h"
 #include "../radiation/radiation_exchange.h"
 
+// Orbital mechanics module (generic bodies)
+#include "../orbital/generic_body.h"
+
 // GPU thermal solver (optional)
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/thermal_opencl.h"
@@ -838,69 +841,101 @@ std::vector<double> calculateAbsorbedFlux(
         albedo_successfully_loaded = true;
     }
     // For custom mesh without explicit albedo map, try to load global albedo map
+    // Skip if: (a) user explicitly set a uniform albedo (use_default_albedo: false), or
+    //          (b) albedo_maps_directory is explicitly set to empty
     else if (is_custom_mesh) {
+        bool albedo_explicit = (config.getProperty("thermophysical_albedo_explicit") == "1");
+
         // Get the albedo maps directory
         std::string albedo_maps_dir = "data/albedo_maps";
+        bool albedo_dir_explicitly_set = false;
         if (config.custom_properties.count("albedo_maps_directory") > 0) {
             albedo_maps_dir = config.getProperty("albedo_maps_directory");
+            albedo_dir_explicitly_set = true;
         } else if (const char* env_dir = std::getenv("PTM_ALBEDO_MAPS_DIR")) {
             albedo_maps_dir = env_dir;
+            albedo_dir_explicitly_set = true;
         } else if (const char* env_dir = std::getenv("EUROPA_ALBEDO_MAPS_DIR")) {
             // Backward compatibility
             albedo_maps_dir = env_dir;
-        }
-        
-        // Ensure directory has trailing slash
-        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
-            albedo_maps_dir += '/';
-        }
-        
-        // Get the target body name from config
-        std::string body_name = config.getProperty("target_body_name");
-        if (body_name.empty()) {
-            std::cerr << "ERROR: Target body name is not specified in config." << std::endl;
-            return std::vector<double>();
+            albedo_dir_explicitly_set = true;
         }
 
-        // Convert to proper case
-        if (!body_name.empty()) {
-            std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
-            body_name[0] = std::toupper(body_name[0]);
-        }
-        
-        // Try loading the global albedo map for THIS BODY (not hardcoded Europa!)
-        // Try multiple paths (supports running from build/ directory)
-        std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
-        std::vector<std::string> search_paths = {
-            albedo_maps_dir + albedo_fits_name,           // User-specified or default path
-            "../data/albedo_maps/" + albedo_fits_name,    // Relative from build/ directory
-            "data/albedo_maps/" + albedo_fits_name        // Relative from project root
-        };
+        // Skip FITS search if user explicitly set albedo or albedo_maps_directory is empty
+        bool skip_fits = albedo_explicit || (albedo_dir_explicitly_set && albedo_maps_dir.empty());
 
-        auto global_albedo_map = std::make_shared<ptm::SpatialMap>();
-        bool found = false;
-        for (const auto& path : search_paths) {
-            std::cout << "Loading global albedo map from: " << path << std::endl;
-            if (global_albedo_map->loadFromFITS(path)) {
-                std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
-                std::cout << "Map dimensions: " << global_albedo_map->getWidth()
-                        << "x" << global_albedo_map->getHeight() << std::endl;
-                std::cout << "Albedo range in map: " << global_albedo_map->getMin()
-                        << " to " << global_albedo_map->getMax() << std::endl;
-                albedo_map_to_use = global_albedo_map;
-                albedo_successfully_loaded = true;
-                found = true;
-                break;
+        if (skip_fits) {
+            if (albedo_explicit) {
+                std::cout << "Using explicit uniform albedo " << default_visible_albedo
+                          << " (thermophysical override, FITS auto-search disabled)" << std::endl;
+            } else {
+                std::cout << "Albedo maps directory is empty, skipping FITS auto-search. "
+                          << "Using uniform albedo " << default_visible_albedo << std::endl;
             }
-        }
-        if (!found) {
-            std::cout << "No global albedo map found for " << body_name
-                    << ", using default albedo " << default_visible_albedo << std::endl;
+        } else {
+            // Ensure directory has trailing slash
+            if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+                albedo_maps_dir += '/';
+            }
+
+            // Get the target body name from config
+            std::string body_name = config.getProperty("target_body_name");
+            if (body_name.empty()) {
+                std::cerr << "ERROR: Target body name is not specified in config." << std::endl;
+                return std::vector<double>();
+            }
+
+            // Convert to proper case
+            if (!body_name.empty()) {
+                std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
+                body_name[0] = std::toupper(body_name[0]);
+            }
+
+            // Try loading the global albedo map for THIS BODY (not hardcoded Europa!)
+            std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
+            std::vector<std::string> search_paths;
+            search_paths.push_back(albedo_maps_dir + albedo_fits_name);  // User-specified or default path
+            // Only add hardcoded fallback paths if directory was NOT explicitly configured
+            if (!albedo_dir_explicitly_set) {
+                search_paths.push_back("../data/albedo_maps/" + albedo_fits_name);  // From build/ directory
+                search_paths.push_back("data/albedo_maps/" + albedo_fits_name);     // From project root
+            }
+
+            auto global_albedo_map = std::make_shared<ptm::SpatialMap>();
+            bool found = false;
+            for (const auto& path : search_paths) {
+                std::cout << "Loading global albedo map from: " << path << std::endl;
+                if (global_albedo_map->loadFromFITS(path)) {
+                    std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
+                    std::cout << "Map dimensions: " << global_albedo_map->getWidth()
+                            << "x" << global_albedo_map->getHeight() << std::endl;
+                    std::cout << "Albedo range in map: " << global_albedo_map->getMin()
+                            << " to " << global_albedo_map->getMax() << std::endl;
+                    std::cout << "NOTE: Global albedo map overrides default uniform albedo ("
+                            << default_visible_albedo << "). To disable, set "
+                            << "albedo_maps_directory to empty in config YAML." << std::endl;
+                    albedo_map_to_use = global_albedo_map;
+                    albedo_successfully_loaded = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::cout << "No global albedo map found for " << body_name
+                        << ", using default albedo " << default_visible_albedo << std::endl;
+            }
         }
     }
     else {
         // For standard icosphere meshes, try to load pre-computed binary albedo files
-        
+        // (Skip for generic bodies — no pre-computed maps exist for arbitrary bodies)
+        bool is_generic_body = (config.getProperty("using_generic_body") == "true");
+        if (is_generic_body) {
+            std::cout << "Generic body: skipping binary albedo map search, using default albedo "
+                      << default_visible_albedo << std::endl;
+        }
+
+        if (!is_generic_body) {
         // Get the albedo maps directory
         std::string albedo_maps_dir = "data/albedo_maps";
         if (config.custom_properties.count("albedo_maps_directory") > 0) {
@@ -911,12 +946,12 @@ std::vector<double> calculateAbsorbedFlux(
             // Backward compatibility
             albedo_maps_dir = env_dir;
         }
-        
+
         // Ensure directory has trailing slash
         if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
             albedo_maps_dir += '/';
         }
-        
+
         // Get the target body name from config
         std::string body_name = config.getProperty("target_body_name");
         if (!body_name.empty()) {
@@ -975,6 +1010,7 @@ std::vector<double> calculateAbsorbedFlux(
                 std::cout << "Using default albedo " << default_visible_albedo << " for all faces" << std::endl;
             }
         }
+        } // end if (!is_generic_body)
     }
 
     // Now interpolate the albedo map to each face if we have a FITS map to interpolate
@@ -2580,23 +2616,35 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Get albedo maps directory from config
     std::string albedo_maps_dir = "data/albedo_maps";
+    bool albedo_dir_explicitly_set = false;
     if (config.custom_properties.count("albedo_maps_directory") > 0) {
         albedo_maps_dir = config.getProperty("albedo_maps_directory");
-    }
-    if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
-        albedo_maps_dir += '/';
+        albedo_dir_explicitly_set = true;
     }
 
-    if (is_custom_mesh && !body_name.empty()) {
+    // Check if user explicitly set albedo (skip FITS auto-search)
+    bool albedo_explicit = (config.custom_properties.count("thermophysical_albedo_explicit") > 0 &&
+                            config.getProperty("thermophysical_albedo_explicit") == "1");
+
+    // Skip FITS search if user explicitly set albedo or albedo_maps_directory is empty
+    bool skip_fits = albedo_explicit || (albedo_dir_explicitly_set && albedo_maps_dir.empty());
+
+    if (is_custom_mesh && !body_name.empty() && !skip_fits) {
         // For custom meshes, load FITS file and interpolate to face centers
         std::cout << "[GPU Thermal] Custom mesh detected - loading FITS albedo map for interpolation" << std::endl;
 
+        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+            albedo_maps_dir += '/';
+        }
+
         std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
-        std::vector<std::string> search_paths = {
-            albedo_maps_dir + albedo_fits_name,
-            "../data/albedo_maps/" + albedo_fits_name,
-            "data/albedo_maps/" + albedo_fits_name
-        };
+        std::vector<std::string> search_paths;
+        search_paths.push_back(albedo_maps_dir + albedo_fits_name);  // User-specified or default path
+        // Only add hardcoded fallback paths if directory was NOT explicitly configured
+        if (!albedo_dir_explicitly_set) {
+            search_paths.push_back("../data/albedo_maps/" + albedo_fits_name);  // From build/ directory
+            search_paths.push_back("data/albedo_maps/" + albedo_fits_name);     // From project root
+        }
 
         auto albedo_map = std::make_shared<ptm::SpatialMap>();
         bool fits_loaded = false;
@@ -2615,6 +2663,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << "x" << albedo_map->getHeight() << std::endl;
             std::cout << "[GPU Thermal] Albedo range in map: " << albedo_map->getMin()
                       << " to " << albedo_map->getMax() << std::endl;
+            std::cout << "[GPU Thermal] NOTE: Global albedo map overrides default uniform albedo ("
+                      << default_visible_albedo << "). To disable, set "
+                      << "albedo_maps_directory to empty in config YAML." << std::endl;
 
             // Interpolate FITS map to each face center
             size_t valid_count = 0;
@@ -2651,8 +2702,19 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << ", using default albedo " << default_visible_albedo << std::endl;
         }
     }
-    else if (!body_name.empty()) {
+    else if (is_custom_mesh && skip_fits) {
+        // User explicitly set albedo or albedo_maps_directory is empty — skip FITS search
+        if (albedo_explicit) {
+            std::cout << "[GPU Thermal] Using explicit uniform albedo " << default_visible_albedo
+                      << " (thermophysical override, FITS auto-search disabled)" << std::endl;
+        } else {
+            std::cout << "[GPU Thermal] Albedo maps directory is empty, skipping FITS auto-search. "
+                      << "Using uniform albedo " << default_visible_albedo << std::endl;
+        }
+    }
+    else if (!body_name.empty() && config.getProperty("using_generic_body") != "true") {
         // For standard icosphere meshes, try to load pre-computed binary albedo files
+        // (skipped for generic bodies — no pre-computed maps exist)
         int mesh_resolution = 5; // Default
         try {
             auto it = config.custom_properties.find("mesh_resolution");
@@ -3111,7 +3173,20 @@ bool runThermalForSelectedFaces_GPU(
             }
         }
 
-        // Run persistent kernel
+        // Equilibration phase: run multiple cycles to establish correct subsurface
+        // temperature profile before output. This matches the initial GPU thermal run
+        // behavior (runThermalModelsForAllFaces_GPU_Persistent) which also runs 5 cycles.
+        // Without this, the crude linear interpolation initial profile biases faces
+        // with higher daytime temperatures to retain excess subsurface heat at night.
+        int equil_cycles = 5;
+        if (equil_cycles > 0 && total_time_steps > 1) {
+            std::vector<float> equil_output_dummy;
+            for (int eq_cycle = 0; eq_cycle < equil_cycles; ++eq_cycle) {
+                solver.solvePersistentAllTimesteps(flux_all, equil_output_dummy, total_time_steps, dt);
+            }
+        }
+
+        // Output phase (temperatures now equilibrated)
         std::vector<float> output_temps;
         solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
 
@@ -3742,26 +3817,28 @@ bool writeCompleteVTK(
     file << "DATASET UNSTRUCTURED_GRID\n";
     
     // Write vertices
-    file << "POINTS " << mesh->vertices.size() << " float\n";
+    file << "POINTS " << mesh->vertices.size() << " double\n";
+    file << std::setprecision(17);
     for (const auto& v : mesh->vertices) {
         file << v[0] << " " << v[1] << " " << v[2] << "\n";
     }
-    
+    file << std::setprecision(6);
+
     // Write cells (faces)
     file << "CELLS " << mesh->faces.size() << " " << mesh->faces.size() * 4 << "\n";
     for (const auto& f : mesh->faces) {
         file << "3 " << f[0] << " " << f[1] << " " << f[2] << "\n";
     }
-    
+
     // Write cell types (all triangles)
     file << "CELL_TYPES " << mesh->faces.size() << "\n";
     for (size_t i = 0; i < mesh->faces.size(); i++) {
         file << "5\n"; // VTK_TRIANGLE
     }
-    
+
     // Write FIELD data for time values
     file << "FIELD FieldData 2\n";
-    
+
     // Write time values
     file << "TIME_STEPS " << 1 << " " << time_steps << " float\n";
     for (int t = 0; t < time_steps; t++) {
@@ -3869,11 +3946,13 @@ bool writeThermalVTK(
     file << "DATASET UNSTRUCTURED_GRID\n";
     
     // Write vertices
-    file << "POINTS " << mesh->vertices.size() << " float\n";
+    file << "POINTS " << mesh->vertices.size() << " double\n";
+    file << std::setprecision(17);
     for (const auto& v : mesh->vertices) {
         file << v[0] << " " << v[1] << " " << v[2] << "\n";
     }
-    
+    file << std::setprecision(6);
+
     // Write faces
     file << "CELLS " << mesh->faces.size() << " " << mesh->faces.size() * 4 << "\n";
     for (const auto& f : mesh->faces) {
@@ -4068,6 +4147,7 @@ void showUsage(const char* programName) {
     std::cout << "  Configuration File Options (NEW!)\n";
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  --config FILE              Load parameters from YAML config file\n";
+    std::cout << "  --generic-body-config FILE Load generic body config from YAML\n";
     std::cout << "  --generate-template [FILE] Generate template config file\n";
     std::cout << "                             (default: ptm_config_template.yaml)\n";
     std::cout << "  --help                     Show this help message\n\n";
@@ -5684,8 +5764,8 @@ int main(int argc, char** argv) {
     // Thermal multiprocessing parameters
     int thermal_threads = sim_config.thermal.threads;
 
-    // Command-line parameter for equilibration orbits
-    int equilibration_orbits = sim_config.thermal.equilibration_orbits;
+    // Command-line parameter for equilibration orbits (fractional allowed)
+    double equilibration_orbits = sim_config.thermal.equilibration_orbits;
 
     // GPU thermal solver from YAML config (can be overridden by --use-gpu-thermal CLI flag)
     if (sim_config.thermal.use_gpu) {
@@ -6030,6 +6110,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--rad-max-neighbors" && i + 1 < argc) {
             rad_max_neighbors_override = std::stoi(argv[++i]);
             std::cout << "Max neighbors override: " << rad_max_neighbors_override << " (adaptive disabled)" << std::endl;
+        }
+        // ===== Generic Body Options =====
+        else if (arg == "--generic-body-config" && i + 1 < argc) {
+            sim_config.generic_body.config_file = argv[++i];
+            std::cout << "Generic body config file: " << sim_config.generic_body.config_file << std::endl;
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
@@ -6040,6 +6125,209 @@ int main(int argc, char** argv) {
     if (geothermal_heat_flow > 0) {
         planet.Qb = geothermal_heat_flow;
         std::cout << "Overriding planet geothermal heat flow: " << planet.Qb << " W/m²" << std::endl;
+    }
+
+    // ========================================================================
+    // PHASE 4b: Generic body construction (if configured)
+    // ========================================================================
+    bool using_generic_body = false;
+    double chi_override = -1.0;  // Radiative conductivity chi (-1 = use default 2.7)
+    orbital::GenericBody generic_body;
+
+    if (sim_config.generic_body.isConfigured()) {
+        const auto& gb = sim_config.generic_body;
+
+        // If a separate body config file is specified, load it first as a base,
+        // then overlay any values that were explicitly set via CLI / main YAML.
+        if (!gb.config_file.empty()) {
+            try {
+                ptm::ConfigParser bodyParser;
+                auto bodyConfig = bodyParser.loadFromYAML(gb.config_file);
+                const auto& loaded = bodyConfig.generic_body;
+
+                // Use loaded values as defaults; main config / CLI overrides win
+                // (sentinel -1.0 or empty string means "not set")
+                auto& dst = sim_config.generic_body;
+                if (dst.shape_type.empty()) dst.shape_type = loaded.shape_type;
+                if (dst.radius_km < 0) dst.radius_km = loaded.radius_km;
+                if (dst.mesh_file.empty()) dst.mesh_file = loaded.mesh_file;
+                if (dst.mesh_file.empty() ? false : dst.mesh_scale == 1.0) dst.mesh_scale = loaded.mesh_scale;
+                if (dst.semi_axis_a_km < 0) dst.semi_axis_a_km = loaded.semi_axis_a_km;
+                if (dst.semi_axis_b_km < 0) dst.semi_axis_b_km = loaded.semi_axis_b_km;
+                if (dst.semi_axis_c_km < 0) dst.semi_axis_c_km = loaded.semi_axis_c_km;
+                if (dst.semi_major_axis_au < 0) dst.semi_major_axis_au = loaded.semi_major_axis_au;
+                if (dst.eccentricity < 0) dst.eccentricity = loaded.eccentricity;
+                if (dst.inclination_deg < 0) dst.inclination_deg = loaded.inclination_deg;
+                if (dst.lon_ascending_node_deg < 0) dst.lon_ascending_node_deg = loaded.lon_ascending_node_deg;
+                if (dst.arg_perihelion_deg < 0) dst.arg_perihelion_deg = loaded.arg_perihelion_deg;
+                if (dst.mean_anomaly_deg < 0) dst.mean_anomaly_deg = loaded.mean_anomaly_deg;
+                if (dst.orbital_epoch.empty()) dst.orbital_epoch = loaded.orbital_epoch;
+                if (dst.spin_period_hours < 0) dst.spin_period_hours = loaded.spin_period_hours;
+                if (dst.pole_ra_deg < 0) dst.pole_ra_deg = loaded.pole_ra_deg;
+                if (dst.pole_dec_deg < 0) dst.pole_dec_deg = loaded.pole_dec_deg;
+                if (dst.albedo < 0) dst.albedo = loaded.albedo;
+                if (dst.emissivity < 0) dst.emissivity = loaded.emissivity;
+                if (dst.ks < 0) dst.ks = loaded.ks;
+                if (dst.kd < 0) dst.kd = loaded.kd;
+                if (dst.rhos < 0) dst.rhos = loaded.rhos;
+                if (dst.rhod < 0) dst.rhod = loaded.rhod;
+                if (dst.H_scale < 0) dst.H_scale = loaded.H_scale;
+                if (dst.cp0 < 0) dst.cp0 = loaded.cp0;
+                if (dst.Qb < 0) dst.Qb = loaded.Qb;
+                if (dst.ephemeris_source == "auto") dst.ephemeris_source = loaded.ephemeris_source;
+                if (dst.spice_metakernel.empty()) dst.spice_metakernel = loaded.spice_metakernel;
+                if (dst.naif_id.empty()) dst.naif_id = loaded.naif_id;
+                if (dst.name.empty()) dst.name = loaded.name;
+
+                std::cout << "Loaded generic body config from: " << gb.config_file << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Error loading generic body config file '" << gb.config_file
+                          << "': " << e.what() << std::endl;
+                return 1;
+            }
+        }
+
+        // Default missing orbital/spin parameters to sensible values.
+        // This handles the common case where the user provides SMA but omits
+        // eccentricity etc. — defaults to a circular equatorial orbit.
+        {
+            auto& dst = sim_config.generic_body;
+            if (dst.semi_major_axis_au > 0) {
+                if (dst.eccentricity < 0) {
+                    dst.eccentricity = 0.0;
+                    std::cout << "  Note: Defaulting eccentricity to 0.0 (circular orbit)" << std::endl;
+                }
+                if (dst.inclination_deg < 0) dst.inclination_deg = 0.0;
+                if (dst.lon_ascending_node_deg < 0) dst.lon_ascending_node_deg = 0.0;
+                if (dst.arg_perihelion_deg < 0) dst.arg_perihelion_deg = 0.0;
+                if (dst.mean_anomaly_deg < 0) dst.mean_anomaly_deg = 0.0;
+                if (dst.orbital_epoch.empty()) dst.orbital_epoch = "2000-01-01T12:00:00";
+            }
+            if (dst.spin_period_hours < 0) {
+                dst.spin_period_hours = 6.0;
+                std::cout << "  Note: Defaulting spin period to 6.0 hours" << std::endl;
+            }
+        }
+
+        // Re-alias after potential merge
+        const auto& cfg = sim_config.generic_body;
+
+        generic_body.name = cfg.name.empty() ? "CustomBody" : cfg.name;
+
+        // --- Shape ---
+        if (cfg.shape_type == "custom_mesh" && !cfg.mesh_file.empty()) {
+            generic_body.shape.type = orbital::BodyShape::CUSTOM_MESH;
+            generic_body.shape.custom_mesh_file = cfg.mesh_file;
+            generic_body.shape.mesh_scale = cfg.mesh_scale;
+            if (cfg.radius_km > 0)
+                generic_body.shape.radius_km = cfg.radius_km;
+            // Wire the custom mesh file into the top-level mesh config so
+            // the existing mesh loading code picks it up.
+            if (mesh_file.empty()) {
+                mesh_file = cfg.mesh_file;
+                mesh_scale_factor = cfg.mesh_scale;
+                std::cout << "Generic body custom mesh: " << mesh_file << std::endl;
+            }
+        } else if (cfg.shape_type == "ellipsoidal" &&
+            cfg.semi_axis_a_km > 0 && cfg.semi_axis_b_km > 0 && cfg.semi_axis_c_km > 0) {
+            generic_body.shape.type = orbital::BodyShape::ELLIPSOIDAL;
+            generic_body.shape.semi_axis_a_km = cfg.semi_axis_a_km;
+            generic_body.shape.semi_axis_b_km = cfg.semi_axis_b_km;
+            generic_body.shape.semi_axis_c_km = cfg.semi_axis_c_km;
+        } else {
+            generic_body.shape.type = orbital::BodyShape::SPHERICAL;
+            if (cfg.radius_km > 0)
+                generic_body.shape.radius_km = cfg.radius_km;
+        }
+
+        // --- Orbital elements ---
+        if (cfg.hasOrbitalElements()) {
+            generic_body.orbit.semi_major_axis_au = cfg.semi_major_axis_au;
+            if (cfg.eccentricity >= 0)
+                generic_body.orbit.eccentricity = cfg.eccentricity;
+            if (cfg.inclination_deg >= 0)
+                generic_body.orbit.inclination_deg = cfg.inclination_deg;
+            if (cfg.lon_ascending_node_deg >= 0)
+                generic_body.orbit.lon_ascending_node_deg = cfg.lon_ascending_node_deg;
+            if (cfg.arg_perihelion_deg >= 0)
+                generic_body.orbit.arg_perihelion_deg = cfg.arg_perihelion_deg;
+            if (cfg.mean_anomaly_deg >= 0)
+                generic_body.orbit.mean_anomaly_at_epoch_deg = cfg.mean_anomaly_deg;
+        }
+
+        // --- Spin state ---
+        if (cfg.hasSpinState()) {
+            generic_body.spin.spin_period_s = cfg.spin_period_hours * 3600.0;
+            if (cfg.pole_ra_deg >= 0)
+                generic_body.spin.pole_ra_deg = cfg.pole_ra_deg;
+            if (cfg.pole_dec_deg >= -90.0 && cfg.pole_dec_deg != -1.0)
+                generic_body.spin.pole_dec_deg = cfg.pole_dec_deg;
+        }
+
+        // --- Thermophysical properties ---
+        // Start from reasonable rocky asteroid defaults, then apply any
+        // explicit overrides from generic_body.surface in the config YAML.
+        {
+            auto defaults = orbital::GenericBody::defaultRockyAsteroid();
+            generic_body.thermo = defaults.thermo;
+        }
+        if (cfg.albedo >= 0)     generic_body.thermo.albedo = cfg.albedo;
+        if (cfg.emissivity > 0)  generic_body.thermo.emissivity = cfg.emissivity;
+        if (cfg.ks > 0)          generic_body.thermo.ks = cfg.ks;
+        if (cfg.kd > 0)          generic_body.thermo.kd = cfg.kd;
+        if (cfg.rhos > 0)        generic_body.thermo.rhos = cfg.rhos;
+        if (cfg.rhod > 0)        generic_body.thermo.rhod = cfg.rhod;
+        if (cfg.H_scale > 0)     generic_body.thermo.H = cfg.H_scale;
+        if (cfg.cp0 >= 0)        generic_body.thermo.cp0 = cfg.cp0;
+        if (cfg.Qb >= 0)         generic_body.thermo.Qb = cfg.Qb;
+        if (cfg.chi >= 0)        chi_override = cfg.chi;
+
+        // Body radius in thermophysical properties
+        generic_body.thermo.body_radius_km = generic_body.shape.meanRadiusKm();
+
+        // --- Ephemeris source ---
+        if (cfg.ephemeris_source == "spice") {
+            generic_body.ephemeris_source = orbital::GenericBody::SPICE;
+            generic_body.spice_metakernel = cfg.spice_metakernel;
+            generic_body.spice_body_id = cfg.naif_id;
+        } else {
+            generic_body.ephemeris_source = orbital::GenericBody::KEPLERIAN;
+        }
+
+        // Compute derived thermophysical properties (synodic day, S, year)
+        generic_body.updateDerivedProperties();
+
+        // Validate
+        std::string error_msg;
+        if (!generic_body.validate(error_msg)) {
+            std::cerr << "Error: Invalid generic body configuration: " << error_msg << std::endl;
+            return 1;
+        }
+
+        // Create thermal Planet from generic body properties
+        planet = thermal::Planet(generic_body.name, generic_body.thermo);
+
+        // Apply geothermal override if specified
+        if (geothermal_heat_flow > 0) {
+            planet.Qb = geothermal_heat_flow;
+        }
+
+        using_generic_body = true;
+
+        std::cout << "Using generic body: " << generic_body.name << std::endl;
+        std::cout << "  Semi-major axis: " << generic_body.orbit.semi_major_axis_au << " AU" << std::endl;
+        std::cout << "  Eccentricity: " << generic_body.orbit.eccentricity << std::endl;
+        std::cout << "  Spin period: " << generic_body.spin.spin_period_s / 3600.0 << " hours" << std::endl;
+        std::cout << "  Solar constant: " << generic_body.thermo.S << " W/m²" << std::endl;
+        std::cout << "  Synodic day: " << generic_body.thermo.day / 3600.0 << " hours" << std::endl;
+        std::cout << "  Albedo: " << generic_body.thermo.albedo << std::endl;
+        std::cout << "  Emissivity: " << generic_body.thermo.emissivity << std::endl;
+        std::cout << "  Body radius: " << generic_body.shape.meanRadiusKm() << " km" << std::endl;
+        std::cout << "  Ephemeris: " << (generic_body.ephemeris_source == orbital::GenericBody::KEPLERIAN
+                                          ? "Keplerian" : "SPICE") << std::endl;
+        if (generic_body.ephemeris_source == orbital::GenericBody::SPICE && !generic_body.spice_metakernel.empty()) {
+            std::cout << "  Metakernel: " << generic_body.spice_metakernel << std::endl;
+        }
     }
 
     // ========================================================================
@@ -6069,6 +6357,13 @@ int main(int argc, char** argv) {
     ptm::MeshUtils meshUtils;
     std::shared_ptr<Mesh> fallback_mesh;
     bool using_fallback_mesh = false;
+
+    // Set body radius for procedural mesh generation
+    if (using_generic_body && generic_body.shape.meanRadiusKm() > 0.0) {
+        meshUtils.setBodyRadius(generic_body.shape.meanRadiusKm());
+    } else if (planet.body_radius_km > 0.0) {
+        meshUtils.setBodyRadius(planet.body_radius_km);
+    }
 
     if (!mesh_file.empty()) {
         std::cout << "Importing triangulated mesh from: " << mesh_file << std::endl;
@@ -6145,9 +6440,35 @@ int main(int argc, char** argv) {
             meshUtils.setupMesh();
         }
     } else {
-        // Procedural icosphere mesh path
+        // Procedural mesh path
         meshUtils.setMeshResolution(mesh_resolution);
-        meshUtils.setupMesh();
+
+        // Try loading a pre-computed topographic mesh if enabled
+        bool topo_loaded = false;
+        if (sim_config.mesh.use_topographic) {
+            std::string topo_dir = sim_config.mesh.topo_directory;
+            if (topo_dir.empty()) {
+                topo_dir = "data/dem";
+            }
+            topo_loaded = meshUtils.checkForTopographicMesh(
+                topo_dir, mesh_resolution, sim_config.time.body);
+        }
+
+        if (!topo_loaded) {
+            if (using_generic_body &&
+                generic_body.shape.type == orbital::BodyShape::ELLIPSOIDAL &&
+                generic_body.shape.semi_axis_a_km > 0 &&
+                generic_body.shape.semi_axis_b_km > 0 &&
+                generic_body.shape.semi_axis_c_km > 0) {
+                // Generate tri-axial ellipsoidal mesh
+                meshUtils.createEllipsoidMesh(mesh_resolution,
+                    generic_body.shape.semi_axis_a_km,
+                    generic_body.shape.semi_axis_b_km,
+                    generic_body.shape.semi_axis_c_km);
+            } else {
+                meshUtils.setupMesh();
+            }
+        }
     }
 
     // Resolve final mesh pointer:
@@ -6281,12 +6602,22 @@ int main(int argc, char** argv) {
         illumination_model = std::make_shared<ptm::IlluminationModel>();
     }
 
-    // If body was specified via command line, it's already set
-    // Otherwise, initialize using the thermal::Planet that was created
-    if (planet.name != "Custom") {
+    if (using_generic_body) {
+        // Configure illumination model for generic body (Keplerian or SPICE)
+        illumination_model->setGenericBody(generic_body);
+        std::cout << "Illumination model configured for generic body: " << generic_body.name
+                  << " (" << (generic_body.ephemeris_source == orbital::GenericBody::KEPLERIAN
+                              ? "Keplerian" : "SPICE") << " ephemeris)" << std::endl;
+
+        // For Keplerian bodies, disable primary reflection (no parent body)
+        if (generic_body.ephemeris_source == orbital::GenericBody::KEPLERIAN) {
+            illumination_model->setIncludePrimaryReflection(false);
+        }
+    } else if (planet.name != "Custom") {
+        // Standard built-in body path
         // Determine body enum from name
         thermal::PlanetaryBody body_enum = thermal::PlanetaryBody::EUROPA; // Default
-        
+
         if (planet.name == "Moon") body_enum = thermal::PlanetaryBody::MOON;
         else if (planet.name == "Mercury") body_enum = thermal::PlanetaryBody::MERCURY;
         else if (planet.name == "Europa") body_enum = thermal::PlanetaryBody::EUROPA;
@@ -6294,26 +6625,26 @@ int main(int argc, char** argv) {
         else if (planet.name == "Titan") body_enum = thermal::PlanetaryBody::TITAN;
         else if (planet.name == "Mars") body_enum = thermal::PlanetaryBody::MARS;
         else if (planet.name == "Ceres") body_enum = thermal::PlanetaryBody::CERES;
-        
+
         // Set the illumination model to use the same body
         illumination_model->setPlanetaryBody(body_enum);
-        
-        // std::cout << "Illumination model using: " << illumination_model->getTargetBodyName() 
-        //       << " (Primary: " << illumination_model->getPrimaryBodyName() 
-        //       << ", Meta-kernel: " << illumination_model->getMetaKernel() << ")" << std::endl;
     }
 
-    double default_visible_albedo = illumination_model->getAlbedo();
+    double default_visible_albedo = using_generic_body
+        ? planet.albedo
+        : illumination_model->getAlbedo();
     // Ensure we're using the planet's albedo, not a hardcoded value
     if (std::abs(default_visible_albedo - planet.albedo) > 0.001) {
-        std::cout << "Warning: Mismatch between illumination albedo (" << default_visible_albedo 
+        std::cout << "Warning: Mismatch between illumination albedo (" << default_visible_albedo
                 << ") and planet albedo (" << planet.albedo << "). Using planet value." << std::endl;
         default_visible_albedo = planet.albedo;
     }
     illumination_model->initialize_spice(verbose);
     illumination_model->setAlbedo(default_visible_albedo);
     illumination_model->setKernelsPath(SPICE_KERNELS_DIR);
-    illumination_model->setIncludePrimaryReflection(include_primary_reflection);
+    if (!using_generic_body) {
+        illumination_model->setIncludePrimaryReflection(include_primary_reflection);
+    }
 
     // Load positions if available
     if (!positions_file.empty()) {
@@ -6326,7 +6657,7 @@ int main(int argc, char** argv) {
 
     // Calculate equilibration period using the correct synodic day
     // Note: equilibration_orbits represents number of day/night cycles for equilibration
-    double equilibration_days = std::max(0, equilibration_orbits) * synodic_day;
+    double equilibration_days = std::max(0.0, equilibration_orbits) * synodic_day;
 
     // The output (export) window is the user-requested duration
     const double output_days = duration_days;
@@ -6362,7 +6693,7 @@ int main(int argc, char** argv) {
     std::cout << "\n========== Thermal Equilibration Configuration ==========" << std::endl;
     std::cout << "Body: " << planet.name << std::endl;
     std::cout << "Synodic day (solar day): " << synodic_day << " Earth days" << std::endl;
-    std::cout << "Equilibration cycles: " << equilibration_orbits << " day/night cycles" << std::endl;
+    std::cout << "Equilibration cycles: " << std::fixed << std::setprecision(2) << equilibration_orbits << " day/night cycles" << std::endl;
     std::cout << "Total equilibration period: " << equilibration_days << " Earth days" << std::endl;
     std::cout << "Output window (for export): " << output_days << " Earth days" << std::endl;
     std::cout << "Requested integration (stats): " << requested_integ_days << " days"
@@ -6594,7 +6925,7 @@ int main(int argc, char** argv) {
         thermal_config.NPERDAY = 24;
         thermal_config.NYEARSEQ = 2;
         thermal_config.sigma = 5.67e-8;
-        thermal_config.chi = 2.7;  // Hayne et al. (2017) radiative conductivity parameter
+        thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 
         // Set thermal debug options from CLI (use local variables set during arg parsing)
         thermal_config.THERMAL_DEBUG = thermal_debug;
@@ -6610,6 +6941,11 @@ int main(int argc, char** argv) {
         // Add albedo maps directory to config properties
         thermal_config.setProperty("albedo_maps_directory", albedo_maps_directory);
 
+        // Flag generic bodies so albedo map code skips built-in body search
+        if (using_generic_body) {
+            thermal_config.setProperty("using_generic_body", "true");
+        }
+
         // If using thermal model, add the maps to configuration
         if (!albedo_map_file.empty()) {
             thermal_config.setProperty("albedo_map", albedo_map_file);
@@ -6621,6 +6957,12 @@ int main(int argc, char** argv) {
         // Add information about mesh type and resolution to thermal_config
         thermal_config.custom_properties["is_custom_mesh"] = (mesh_file.empty()) ? "0" : "1";
         thermal_config.custom_properties["mesh_resolution"] = std::to_string(mesh_resolution);
+
+        // Pass explicit albedo flag to prevent auto-loading FITS albedo maps
+        // when the user has explicitly set a uniform albedo value
+        if (sim_config.thermophysical_albedo_explicit) {
+            thermal_config.custom_properties["thermophysical_albedo_explicit"] = "1";
+        }
 
         // Copy GPU thermal flag from CLI parsing config to thermal_config
         if (config.getPropertyBool("use_gpu_thermal", false)) {
@@ -7086,6 +7428,40 @@ int main(int argc, char** argv) {
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
 
+                    // Diagnostic: compare indirect flux for high vs low topographic elevation
+                    // Uses radial distance from body center as elevation proxy (works on spherical bodies)
+                    // Low-elevation faces (valleys/craters) should receive MORE indirect flux
+                    {
+                        std::vector<double> radii(num_faces);
+                        for (size_t f = 0; f < num_faces; f++) {
+                            const auto& c = mesh->face_centers[f];
+                            radii[f] = std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+                        }
+                        std::vector<double> sorted_radii = radii;
+                        std::sort(sorted_radii.begin(), sorted_radii.end());
+                        double r_median = sorted_radii[num_faces / 2];
+
+                        double sum_high = 0.0, sum_low = 0.0;
+                        int n_high = 0, n_low = 0;
+                        for (size_t f = 0; f < num_faces; f++) {
+                            double max_face_ind = 0.0;
+                            for (int t = 0; t < total_time_steps; t++) {
+                                max_face_ind = std::max(max_face_ind, indirect_flux_series[f][t]);
+                            }
+                            if (radii[f] > r_median) {
+                                sum_high += max_face_ind; n_high++;
+                            } else {
+                                sum_low += max_face_ind; n_low++;
+                            }
+                        }
+                        if (n_high > 0 && n_low > 0) {
+                            std::cout << "  Avg max indirect (high elev): "
+                                      << std::fixed << std::setprecision(4) << (sum_high / n_high) << " W/m2" << std::endl;
+                            std::cout << "  Avg max indirect (low elev):  "
+                                      << std::fixed << std::setprecision(4) << (sum_low / n_low) << " W/m2" << std::endl;
+                        }
+                    }
+
                     // Step 2: Identify faces that need thermal re-run
                     // Include faces where max indirect flux over time exceeds threshold
                     std::vector<int> faces_to_rerun;
@@ -7128,10 +7504,10 @@ int main(int argc, char** argv) {
                         std::cout << "  Samples still changing: " << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
 
-                        // Converge if EITHER condition is met:
+                        // Converge when BOTH conditions are met:
                         // 1. Max temperature change is below threshold
                         // 2. Fraction of samples still changing is below threshold
-                        if (max_temp_change < rad_coupling_temp_tol || face_frac < rad_coupling_face_frac) {
+                        if (max_temp_change < rad_coupling_temp_tol && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged!" << std::endl;
                             break;
                         }

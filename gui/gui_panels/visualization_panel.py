@@ -289,10 +289,10 @@ class PyVistaWidget(QWidget):
         max_dim = max(x_range, y_range, z_range)
 
         if hemisphere == 'south':
-            # View from below: camera at negative z, looking up, with -z as "up"
+            # View from below: camera at negative z, looking up, with +X as "up"
             camera_pos = (center[0], center[1], center[2] - max_dim * 2)
             focal_point = center
-            view_up = (0, 1, 0)  # Y-up when looking from below
+            view_up = (1, 0, 0)  # +X points up in screen for south polar projection
             self.plotter.camera_position = [camera_pos, focal_point, view_up]
         elif hemisphere == 'north':
             # Standard view from above: camera at positive z, looking down
@@ -326,14 +326,14 @@ class PyVistaWidget(QWidget):
             vertex_buffer = f.read(header['num_vertices'] * vertex_dtype.itemsize)
             vertex_array = np.frombuffer(vertex_buffer, dtype=vertex_dtype)
 
-            vertices = np.empty((header['num_vertices'], 3), dtype=np.float32)
+            vertices = np.empty((header['num_vertices'], 3), dtype=np.float64)
             vertices[:, 0] = vertex_array['x']
             vertices[:, 1] = vertex_array['y']
             vertices[:, 2] = vertex_array['z']
 
             normals = None
             if 'nx' in vertex_array.dtype.names:
-                normals = np.empty((header['num_vertices'], 3), dtype=np.float32)
+                normals = np.empty((header['num_vertices'], 3), dtype=np.float64)
                 normals[:, 0] = vertex_array['nx']
                 normals[:, 1] = vertex_array['ny']
                 normals[:, 2] = vertex_array['nz']
@@ -1869,11 +1869,19 @@ class ExportDataDialog(QDialog):
         self.timesteps = timesteps
         self.export_worker = None
 
+        # Check VTK availability
+        try:
+            import vtk
+            self.vtk_available = True
+        except ImportError:
+            self.vtk_available = False
+
         # Import availability and detection functions
         from gui_core.data_exporter import (
             SCIPY_AVAILABLE, RASTERIO_AVAILABLE, H5PY_AVAILABLE,
             GridResolutionEstimator, FIELD_INFO, BODY_RADII,
-            detect_body_from_mesh, choose_projection, POLAR_LAT_THRESHOLD
+            detect_body_from_mesh, choose_projection, POLAR_LAT_THRESHOLD,
+            detect_available_statistics, STATISTICS_FIELDS, STAT_LABELS
         )
         self.scipy_available = SCIPY_AVAILABLE
         self.rasterio_available = RASTERIO_AVAILABLE
@@ -1910,6 +1918,9 @@ class ExportDataDialog(QDialog):
             if field_dir.exists() and any(field_dir.glob("*.bin")):
                 self.available_fields.append(field_name)
 
+        # Detect available statistics
+        self.available_statistics = detect_available_statistics(self.results_dir)
+
         self.setWindowTitle("Export Simulation Data")
         self.setMinimumWidth(480)
         self.init_ui()
@@ -1929,15 +1940,22 @@ class ExportDataDialog(QDialog):
         self.geotiff_radio = QRadioButton("GeoTIFF")
         self.hdf5_radio = QRadioButton("HDF5")
         self.both_radio = QRadioButton("Both")
+        self.vtu_radio = QRadioButton("VTU/PVD")
         self.both_radio.setChecked(True)
 
         self.format_btn_group.addButton(self.geotiff_radio, 0)
         self.format_btn_group.addButton(self.hdf5_radio, 1)
         self.format_btn_group.addButton(self.both_radio, 2)
+        self.format_btn_group.addButton(self.vtu_radio, 3)
+
+        if not self.vtk_available:
+            self.vtu_radio.setEnabled(False)
+            self.vtu_radio.setToolTip("VTK not available (pip install vtk)")
 
         format_row.addWidget(self.geotiff_radio)
         format_row.addWidget(self.hdf5_radio)
         format_row.addWidget(self.both_radio)
+        format_row.addWidget(self.vtu_radio)
         format_row.addStretch()
         format_layout.addLayout(format_row)
 
@@ -1957,6 +1975,8 @@ class ExportDataDialog(QDialog):
                 self.geotiff_radio.setChecked(True)
         if not self.scipy_available:
             warnings.append("scipy not available - regridding disabled (pip install scipy)")
+        if not self.vtk_available:
+            warnings.append("vtk not available - VTU/PVD export disabled (pip install vtk)")
 
         if warnings:
             warn_label = QLabel("\n".join(warnings))
@@ -1990,8 +2010,52 @@ class ExportDataDialog(QDialog):
         fields_group.setLayout(fields_layout)
         layout.addWidget(fields_group)
 
+        # Statistics selection
+        self.stat_checks = {}
+        if self.available_statistics:
+            from gui_core.data_exporter import STATISTICS_FIELDS, STAT_LABELS
+
+            stats_group = QGroupBox("Statistics (avg/max/min over integration window)")
+            stats_layout = QVBoxLayout()
+
+            # Group by base field
+            seen_fields = []
+            for base_field, _st in self.available_statistics:
+                if base_field not in seen_fields:
+                    seen_fields.append(base_field)
+
+            default_stat_fields = {'temperature', 'ice_depth'}
+            for base_field in seen_fields:
+                field_info = STATISTICS_FIELDS.get(base_field, {})
+                field_label = field_info.get('label', base_field)
+                units = field_info.get('units', '')
+                units_str = f" ({units})" if units else ""
+
+                row = QHBoxLayout()
+                row.addWidget(QLabel(f"{field_label}{units_str}:"))
+
+                for stat_type in ['avg', 'max', 'min']:
+                    key = (base_field, stat_type)
+                    if key in self.available_statistics:
+                        stat_label = STAT_LABELS[stat_type]
+                        cb = QCheckBox(stat_label)
+                        cb.setChecked(base_field in default_stat_fields)
+                        cb.stateChanged.connect(self._update_estimate)
+                        row.addWidget(cb)
+                        self.stat_checks[key] = cb
+
+                row.addStretch()
+                stats_layout.addLayout(row)
+
+            stats_group.setLayout(stats_layout)
+            layout.addWidget(stats_group)
+
+        # Connect format change to toggle grid group
+        self.format_btn_group.buttonClicked.connect(self._on_format_changed)
+
         # Grid & Projection
         grid_group = QGroupBox("Grid & Projection")
+        self.grid_group = grid_group
         grid_layout = QGridLayout()
 
         # Auto-detected body
@@ -2125,10 +2189,14 @@ class ExportDataDialog(QDialog):
     def _update_estimate(self):
         """Update estimated output size."""
         selected_fields = [f for f, cb in self.field_checks.items() if cb.isChecked()]
+        selected_stats = [
+            key for key, cb in self.stat_checks.items() if cb.isChecked()
+        ]
         n_fields = len(selected_fields)
         n_timesteps = len(self.timesteps)
+        n_statistics = len(selected_stats)
 
-        if n_fields == 0 or n_timesteps == 0:
+        if n_fields == 0 and n_statistics == 0:
             self.estimate_label.setText("Estimated size: --")
             self.export_btn.setEnabled(False)
             return
@@ -2159,12 +2227,24 @@ class ExportDataDialog(QDialog):
         if fmt_id == 0 or fmt_id == 2:  # GeoTIFF or Both
             # Multi-band GeoTIFF: ~4 bytes per pixel per band, compressed ~50%
             total_bytes += n_fields * n_timesteps * n_lat * n_lon * 4 * 0.5
+            # Statistics: single-band GeoTIFFs
+            total_bytes += n_statistics * n_lat * n_lon * 4 * 0.5
 
         if fmt_id == 1 or fmt_id == 2:  # HDF5 or Both
             # Unstructured: n_fields * n_timesteps * n_faces * 4 bytes, compressed ~50%
             total_bytes += n_fields * n_timesteps * n_faces * 4 * 0.5
             # Regridded: n_fields * n_timesteps * n_lat * n_lon * 4 bytes, compressed ~50%
             total_bytes += n_fields * n_timesteps * n_lat * n_lon * 4 * 0.5
+            # Statistics: per-face + regridded
+            total_bytes += n_statistics * n_faces * 4 * 0.5
+            total_bytes += n_statistics * n_lat * n_lon * 4 * 0.5
+
+        if fmt_id == 3:  # VTU/PVD
+            # VTU: mesh geometry + per-field data per timestep, compressed ~50%
+            mesh_bytes = n_faces * 3 * 3 * 4  # vertices (3 verts * 3 coords * float32)
+            total_bytes += n_timesteps * (mesh_bytes + n_fields * n_faces * 4) * 0.5
+            # Statistics VTU files
+            total_bytes += (mesh_bytes + n_statistics * n_faces * 4) * 0.5
 
         # Format size
         if total_bytes < 1024:
@@ -2177,6 +2257,13 @@ class ExportDataDialog(QDialog):
             size_str = f"{total_bytes / 1024**3:.2f} GB"
 
         self.estimate_label.setText(f"Estimated size: ~{size_str}")
+
+    def _on_format_changed(self, button=None):
+        """Toggle Grid & Projection group based on selected format."""
+        fmt_id = self.format_btn_group.checkedId()
+        is_vtu = (fmt_id == 3)
+        self.grid_group.setEnabled(not is_vtu)
+        self._update_estimate()
 
     def _browse_output(self):
         """Browse for output directory."""
@@ -2193,8 +2280,15 @@ class ExportDataDialog(QDialog):
         from gui_core.data_exporter import DataExportWorker
 
         selected_fields = [f for f, cb in self.field_checks.items() if cb.isChecked()]
-        if not selected_fields:
-            QMessageBox.warning(self, "No Fields", "Please select at least one field to export.")
+        selected_stats = [
+            key for key, cb in self.stat_checks.items() if cb.isChecked()
+        ]
+
+        if not selected_fields and not selected_stats:
+            QMessageBox.warning(
+                self, "Nothing Selected",
+                "Please select at least one field or statistic to export."
+            )
             return
 
         output_dir = self.output_dir_edit.text().strip()
@@ -2209,6 +2303,8 @@ class ExportDataDialog(QDialog):
             formats = ['geotiff']
         elif fmt_id == 1:
             formats = ['hdf5']
+        elif fmt_id == 3:
+            formats = ['vtu']
         else:
             formats = ['geotiff', 'hdf5']
 
@@ -2222,6 +2318,7 @@ class ExportDataDialog(QDialog):
             'output_dir': output_dir,
             'geotiff_per_timestep': self.per_timestep_check.isChecked(),
             'body_radius': self._get_body_radius(),
+            'statistics': selected_stats,
         }
 
         # Disable controls during export
@@ -2231,7 +2328,8 @@ class ExportDataDialog(QDialog):
         # Create progress dialog
         n_timesteps = len(self.timesteps)
         n_fields = len(selected_fields)
-        total_steps = 1 + (n_fields * n_timesteps) + n_fields
+        n_statistics = len(selected_stats)
+        total_steps = 1 + (n_fields * n_timesteps) + n_fields + n_statistics
 
         self.progress = QProgressDialog("Starting export...", "Cancel", 0, total_steps, self)
         self.progress.setWindowTitle("Exporting Data")
