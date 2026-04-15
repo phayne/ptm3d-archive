@@ -4,7 +4,9 @@
 #include "ice_layer_model.h"
 #include "ice_crystallization_model.h"
 #include "multitimescale_evolution.h"
+#include "composition_albedo.h"
 #include "../mesh/mesh_utils.h"
+#include "maps/albedo_manager.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -216,40 +218,52 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
     bool PTMExosphereIntegration::loadTemperatureData(const std::string& temperature_dir, int num_timesteps) {
         surface_temperatures_.clear();
         surface_temperatures_.resize(mesh_->faces.size());
-        
+
+        // Pre-allocate to avoid repeated push_back reallocations
+        for (size_t f = 0; f < mesh_->faces.size(); ++f) {
+            surface_temperatures_[f].reserve(num_timesteps);
+        }
+
+        int progress_interval = std::max(1, num_timesteps / 4);
+
         for (int t = 0; t < num_timesteps; ++t) {
             std::stringstream filename;
-            filename << temperature_dir << "/temperature/temperature_" 
+            filename << temperature_dir << "/temperature/temperature_"
                     << std::setfill('0') << std::setw(4) << t << ".bin";  // Changed from setw(3) to setw(4)
-            
+
             std::ifstream file(filename.str(), std::ios::binary);
             if (!file.is_open()) {
                 std::cerr << "Failed to open temperature file: " << filename.str() << std::endl;
                 return false;
             }
-            
+
             // Read header (number of faces)
             uint32_t num_faces;
             file.read(reinterpret_cast<char*>(&num_faces), sizeof(uint32_t));
-            
+
             if (num_faces != mesh_->faces.size()) {
                 std::cerr << "Mesh size mismatch in temperature file!" << std::endl;
                 return false;
             }
-            
+
             // Read temperature data
             std::vector<float> temp_data(num_faces);
             file.read(reinterpret_cast<char*>(temp_data.data()), num_faces * sizeof(float));
-            
+
             // Store in our array
             for (size_t f = 0; f < num_faces; ++f) {
                 surface_temperatures_[f].push_back(static_cast<double>(temp_data[f]));
             }
-            
+
             file.close();
+
+            if ((t + 1) % progress_interval == 0 || t == num_timesteps - 1) {
+                std::cerr << "\r  Loading temperatures: " << (t + 1) << "/" << num_timesteps
+                          << " (" << (100 * (t + 1) / num_timesteps) << "%)" << std::flush;
+            }
         }
-        
-        std::cout << "Loaded temperature data for " << num_timesteps << " timesteps" << std::endl;
+        std::cerr << std::endl;
+
         return true;
     }
     
@@ -286,8 +300,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 std::cerr << "\r[t=" << timestep_idx << "] applying ice layer physics...           " << std::flush;
             }
 
-            // Get ice availability factor (0 if depleted, 1 if ice present)
-            // This determines whether sublimation can occur
+            // Get ice fraction (continuous 0 to 1, scales sublimation rate)
             std::vector<double> ice_availability(mesh_->faces.size());
             for (size_t i = 0; i < mesh_->faces.size(); ++i) {
                 ice_availability[i] = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
@@ -708,6 +721,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             writeBinaryArray("cumulative_deposited_kg_m2", ice_layer_state_->cumulative_deposited);
         }
 
+        // Write composition-dependent albedo if coupling is enabled
+        if (albedo_coupling_enabled_ && !current_face_albedos_.empty()) {
+            writeBinaryArray("bond_albedo", current_face_albedos_);
+        }
+
         // Write crystallization data if enabled
         if (crystallization_enabled_ && crystallization_model_ && ice_layer_state_) {
             writeBinaryArray("crystalline_fraction", ice_layer_state_->crystalline_fraction);
@@ -850,54 +868,73 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         const auto& state = exosphere_model_->getState();
         size_t num_faces = mesh_->faces.size();
 
-        // Calculate global mean values
+        // Calculate global mean atmospheric values
         double total_area = 0.0;
-        double weighted_h2o_column_mass = 0.0;  // kg/m² (same as vapor density integrated over scale height)
-        double weighted_h2o_vapor_pressure = 0.0;  // Pa
+        double weighted_h2o_column_mass = 0.0;
+        double weighted_h2o_vapor_pressure = 0.0;
 
         for (size_t i = 0; i < num_faces; ++i) {
             double area = face_areas_[i];
             total_area += area;
 
-            // H2O column mass: vapor density * scale height
-            // For a Maxwellian atmosphere: column = vapor_density * kT / (m*g)
-            // But since emission_flux = vapor_density * v_th / 4, we can estimate
-            // For now, use vapor_density directly as a proxy (it's in kg/m³)
-            // Column mass = vapor_density * H where H = kT/(mg) is scale height
-            // For H2O at 100K: H ≈ kT/(m*g) = 1.38e-23 * 100 / (2.99e-26 * 1.314) ≈ 35 km
-            double T = 100.0;  // Use nominal temp for scale height estimate
+            // Get temperature for this face (diurnal-averaged in multiscale mode)
+            double T = 100.0;
             if (multiscale_export_mode_ && multiscale_evolution_) {
                 const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
                 if (i < diurnal_avg.avg_temperature.size()) {
                     T = std::max(50.0, diurnal_avg.avg_temperature[i]);
                 }
             }
+
+            // Gate vapor pressure by ice availability (no ice = no local vapor source)
+            double vp = state.vapor_pressure[i];
+            if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+                vp *= ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
+            }
+
+            // Column mass = vapor_density * scale_height
+            // Scale height H = kT / (m*g) for a Maxwellian atmosphere
             double scale_height = constants::BOLTZMANN_K * T /
                                   (constants::WATER_MOLECULAR_MASS * constants::EUROPA_GRAVITY);
-            double vapor_density = state.vapor_pressure[i] * constants::WATER_MOLAR_MASS /
+            double vapor_density = vp * constants::WATER_MOLAR_MASS /
                                    (constants::GAS_CONSTANT_R * T);
-            double column_mass = vapor_density * scale_height;  // kg/m²
+            double column_mass = vapor_density * scale_height;
 
             weighted_h2o_column_mass += column_mass * area;
-            weighted_h2o_vapor_pressure += state.vapor_pressure[i] * area;
+            weighted_h2o_vapor_pressure += vp * area;
         }
 
-        // Compute global means
         double mean_h2o_column_mass = (total_area > 0) ? weighted_h2o_column_mass / total_area : 0.0;
         double mean_h2o_vapor_pressure = (total_area > 0) ? weighted_h2o_vapor_pressure / total_area : 0.0;
 
-        // For O2 and H2, use approximate ratios based on photodissociation/radiolysis products
-        // Typical ratios from literature: O2/H2O ~ 10-100, H2/H2O ~ 1-10
-        // These are rough approximations; exact values depend on many factors
-        double o2_production_ratio = 0.5;  // O2 produced per H2O lost (rough estimate)
-        double h2_production_ratio = 1.0;  // H2 produced per H2O lost (rough estimate)
-
-        // O2 and H2 have longer lifetimes, so they accumulate
-        // For a rough estimate, scale by molecular mass ratio for vapor pressure
+        // O2 and H2 approximate ratios (from photodissociation/radiolysis)
+        double o2_production_ratio = 0.5;
+        double h2_production_ratio = 1.0;
         double mean_o2_vapor_pressure = mean_h2o_vapor_pressure * o2_production_ratio *
-                                        (constants::WATER_MOLAR_MASS / 0.032);  // O2 = 32 g/mol
+                                        (constants::WATER_MOLAR_MASS / 0.032);
         double mean_h2_vapor_pressure = mean_h2o_vapor_pressure * h2_production_ratio *
-                                        (constants::WATER_MOLAR_MASS / 0.002);  // H2 = 2 g/mol
+                                        (constants::WATER_MOLAR_MASS / 0.002);
+
+        // Compute mass balance rates from diurnal-averaged fluxes
+        double total_sublimation_rate = 0.0;
+        double total_deposition_rate = 0.0;
+        double total_sputtering_rate = 0.0;
+        if (multiscale_export_mode_ && multiscale_evolution_) {
+            const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
+            for (size_t i = 0; i < num_faces; ++i) {
+                double area = face_areas_[i];
+                total_sublimation_rate += diurnal_avg.avg_sublimation_flux[i] * area;
+                total_deposition_rate += diurnal_avg.avg_deposition_flux[i] * area;
+                total_sputtering_rate += diurnal_avg.avg_sputtering_flux[i] * area;
+            }
+        } else {
+            for (size_t i = 0; i < num_faces; ++i) {
+                double area = face_areas_[i];
+                total_sublimation_rate += state.emission_flux[i] * area;
+                total_deposition_rate += state.deposition_flux[i] * area;
+            }
+        }
+        double net_mass_loss_rate = total_sublimation_rate + total_sputtering_rate - total_deposition_rate;
 
         // Create output directory
         std::string atm_dir = output_dir_ + "/atmosphere";
@@ -916,7 +953,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         if (write_header) {
             file << "timestep,time_s,time_years,"
                  << "h2o_column_mass_kg_m2,h2o_vapor_pressure_Pa,"
-                 << "o2_vapor_pressure_Pa,h2_vapor_pressure_Pa\n";
+                 << "o2_vapor_pressure_Pa,h2_vapor_pressure_Pa,"
+                 << "total_sublimation_rate_kg_s,total_deposition_rate_kg_s,"
+                 << "net_mass_loss_rate_kg_s\n";
         }
 
         double time_years = time_value / timescale_constants::SECONDS_PER_YEAR;
@@ -927,7 +966,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
              << std::scientific << std::setprecision(6) << mean_h2o_column_mass << ","
              << std::scientific << std::setprecision(6) << mean_h2o_vapor_pressure << ","
              << std::scientific << std::setprecision(6) << mean_o2_vapor_pressure << ","
-             << std::scientific << std::setprecision(6) << mean_h2_vapor_pressure << "\n";
+             << std::scientific << std::setprecision(6) << mean_h2_vapor_pressure << ","
+             << std::scientific << std::setprecision(6) << total_sublimation_rate << ","
+             << std::scientific << std::setprecision(6) << total_deposition_rate << ","
+             << std::scientific << std::setprecision(6) << net_mass_loss_rate << "\n";
 
         file.close();
     }
@@ -1172,6 +1214,191 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
     }
 
     // =========================================================================
+    // Albedo-Composition Coupling Implementation
+    // =========================================================================
+
+    void PTMExosphereIntegration::enableAlbedoCoupling(const CompositionAlbedoConfig& config) {
+        if (num_faces_ == 0) {
+            std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: no faces loaded yet!" << std::endl;
+            return;
+        }
+        if (!ice_layer_enabled_ || !ice_layer_state_) {
+            std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: "
+                      << "ice layer model must be enabled first!" << std::endl;
+            return;
+        }
+
+        albedo_mapper_ = std::make_unique<CompositionAlbedoMapper>(config);
+
+        // Pass per-face non-ice endmember map if already loaded
+        if (!nonice_albedo_map_.empty()) {
+            albedo_mapper_->setNoniceEndmemberMap(nonice_albedo_map_);
+        }
+
+        // Initialize per-face albedos from current composition
+        current_face_albedos_.resize(num_faces_);
+        previous_face_albedos_.resize(num_faces_);
+
+        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration,
+                                       current_face_albedos_);
+        previous_face_albedos_ = current_face_albedos_;
+
+        albedo_coupling_enabled_ = true;
+        config.print();
+
+        std::cout << "Albedo-composition coupling enabled." << std::endl;
+        std::cout << "  Initial albedo from thermal sim: " << initial_albedo_ << std::endl;
+        std::cout << "  Current mean composition-albedo: " << std::fixed << std::setprecision(4)
+                  << std::accumulate(current_face_albedos_.begin(), current_face_albedos_.end(), 0.0)
+                     / num_faces_ << std::endl;
+    }
+
+    void PTMExosphereIntegration::disableAlbedoCoupling() {
+        albedo_coupling_enabled_ = false;
+        std::cout << "Albedo-composition coupling disabled." << std::endl;
+    }
+
+    void PTMExosphereIntegration::loadNoniceAlbedoMap(
+        const std::string& map_path, const std::string& maps_dir)
+    {
+        if (!mesh_) {
+            std::cerr << "loadNoniceAlbedoMap: mesh must be loaded first!" << std::endl;
+            return;
+        }
+
+        ptm::AlbedoManager mgr;
+        // Initialize first (sets initialized_=true, needed for getAlbedosForMesh)
+        mgr.initialize("Europa", "");
+        bool loaded = false;
+        if (!map_path.empty()) {
+            loaded = mgr.loadFromFile(map_path);
+            if (!loaded) {
+                std::cerr << "Failed to load albedo map: " << map_path << std::endl;
+                return;
+            }
+        } else if (!maps_dir.empty()) {
+            loaded = mgr.initialize("Europa", maps_dir);
+        }
+
+        if (loaded && mgr.hasMap()) {
+            nonice_albedo_map_ = mgr.getAlbedosForMesh(mesh_);
+            auto [mn, mx] = std::minmax_element(nonice_albedo_map_.begin(),
+                                                 nonice_albedo_map_.end());
+            std::cout << "Loaded per-face non-ice albedo endmembers from map ("
+                      << nonice_albedo_map_.size() << " faces, range ["
+                      << std::fixed << std::setprecision(4) << *mn << ", " << *mx
+                      << "])" << std::endl;
+
+            // Pass to mapper if already configured
+            if (albedo_mapper_) {
+                albedo_mapper_->setNoniceEndmemberMap(nonice_albedo_map_);
+            }
+        } else {
+            std::cerr << "No albedo map available for non-ice endmember." << std::endl;
+        }
+    }
+
+    void PTMExosphereIntegration::initializeConcentrationsFromAlbedoMap(
+        double percentile_low, double percentile_high)
+    {
+        if (nonice_albedo_map_.empty()) {
+            std::cerr << "initializeConcentrationsFromAlbedoMap: "
+                      << "albedo map not loaded (call loadNoniceAlbedoMap first)" << std::endl;
+            return;
+        }
+        if (!ice_layer_model_ || !ice_layer_state_) {
+            std::cerr << "initializeConcentrationsFromAlbedoMap: "
+                      << "ice layer model not enabled (call enableIceLayerModel first)" << std::endl;
+            return;
+        }
+
+        // Compute per-face concentrations from the observed albedo map
+        std::vector<double> concentrations;
+        CompositionAlbedoMapper::computeConcentrationsFromAlbedoMap(
+            nonice_albedo_map_, percentile_low, percentile_high, concentrations);
+
+        // Set concentrations on the ice layer model
+        ice_layer_model_->initializeFromConcentrations(*ice_layer_state_, concentrations);
+
+        // Set per-face initial albedos = observed map albedos
+        // (these are the albedos the PTM3D temperatures correspond to)
+        initial_face_albedos_ = nonice_albedo_map_;
+
+        // Sync ice mass to exosphere state
+        if (exosphere_model_) {
+            auto& exo_state = exosphere_model_->getMutableState();
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                exo_state.accumulated_mass[i] = ice_layer_state_->ice_mass[i];
+            }
+            exo_state.updateIceThickness();
+        }
+
+        std::cout << "Initialized per-face concentrations from albedo map." << std::endl;
+    }
+
+    double PTMExosphereIntegration::getFaceAlbedo(int face_idx) const {
+        if (albedo_coupling_enabled_ && face_idx >= 0 &&
+            face_idx < static_cast<int>(current_face_albedos_.size())) {
+            return current_face_albedos_[face_idx];
+        }
+        if (!initial_face_albedos_.empty() && face_idx >= 0 &&
+            face_idx < static_cast<int>(initial_face_albedos_.size())) {
+            return initial_face_albedos_[face_idx];
+        }
+        return initial_albedo_;
+    }
+
+    double PTMExosphereIntegration::updateAlbedoFromComposition() {
+        if (!albedo_mapper_ || !ice_layer_state_) return 0.0;
+
+        // Save previous albedos for change detection
+        previous_face_albedos_ = current_face_albedos_;
+
+        // Compute new albedos from current composition
+        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration,
+                                       current_face_albedos_);
+
+        // Compute maximum change
+        return CompositionAlbedoMapper::maxAlbedoChange(previous_face_albedos_,
+                                                        current_face_albedos_);
+    }
+
+    void PTMExosphereIntegration::updateTemperaturesForAlbedoChange() {
+        if (surface_temperatures_.empty()) return;
+
+        size_t num_timesteps = surface_temperatures_[0].size();
+        double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
+        int faces_updated = 0;
+
+        // Scale temperatures for faces with significant albedo change
+        // T_new = T_old * ((1 - A_new) / (1 - A_old))^(1/4)
+        #pragma omp parallel for reduction(+:faces_updated)
+        for (size_t f = 0; f < static_cast<size_t>(num_faces_); ++f) {
+            double albedo_change = std::abs(current_face_albedos_[f] - previous_face_albedos_[f]);
+            if (albedo_change < threshold) continue;
+
+            double old_absorptivity = 1.0 - previous_face_albedos_[f];
+            double new_absorptivity = 1.0 - current_face_albedos_[f];
+
+            // Avoid division by zero
+            if (old_absorptivity < 1e-10) continue;
+
+            double ratio = new_absorptivity / old_absorptivity;
+            double scale = std::pow(ratio, 0.25);
+
+            for (size_t t = 0; t < num_timesteps; ++t) {
+                surface_temperatures_[f][t] *= scale;
+            }
+            faces_updated++;
+        }
+
+        if (show_progress_ && faces_updated > 0) {
+            std::cout << "  Albedo coupling: updated temperatures for " << faces_updated
+                      << " / " << num_faces_ << " faces" << std::endl;
+        }
+    }
+
+    // =========================================================================
     // Multi-Timescale Evolution Implementation
     // =========================================================================
 
@@ -1224,6 +1451,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         config.export_interval = effective_export_interval;
         config.show_progress = show_progress_;
 
+        // Apply user-specified convergence thresholds (if set)
+        if (convergence_threshold_ >= 0.0) {
+            config.convergence_threshold = convergence_threshold_;
+        }
+        if (flux_convergence_threshold_ >= 0.0) {
+            config.flux_convergence_threshold = flux_convergence_threshold_;
+        }
+
         // Note: analytical_acceleration and cache_refresh_interval parameters are
         // kept for API compatibility but no longer used in the new concentration model
 
@@ -1248,44 +1483,116 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Track cache statistics
         int full_diurnal_count = 0;
         int cached_epoch_count = 0;
+        int total_super_stepped = 0;  // Total epochs advanced via super-stepping
+        int max_super_step = 0;       // Largest single super-step taken
 
-        // Main epoch loop with flux caching optimization
-        for (int epoch = 0; epoch < num_epochs; ++epoch) {
+        // Track albedo coupling statistics
+        int albedo_temp_refresh_count = 0;
+
+        // Main epoch loop with flux caching and super-stepping optimization
+        for (int epoch = 0; epoch < num_epochs; ) {
+            // Step 0 (optional): Update albedo from current composition
+            bool force_cache_refresh = false;
+            if (albedo_coupling_enabled_ && albedo_mapper_) {
+                double max_albedo_change = updateAlbedoFromComposition();
+
+                // Update statistics
+                auto& stats = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
+                stats.max_albedo_change = max_albedo_change;
+                double albedo_sum = 0.0;
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    albedo_sum += current_face_albedos_[i];
+                }
+                stats.mean_albedo = albedo_sum / num_faces_;
+
+                if (max_albedo_change > albedo_mapper_->getConfig().albedo_update_threshold) {
+                    // Albedo changed significantly - update temperatures and force cache refresh
+                    updateTemperaturesForAlbedoChange();
+                    force_cache_refresh = true;
+                    albedo_temp_refresh_count++;
+                    stats.albedo_temp_refreshes = albedo_temp_refresh_count;
+                }
+            }
+
             // Step 1: Either compute full diurnal cycle or use cached fluxes
-            bool need_full_diurnal = multiscale_evolution_->needsCacheRefresh(
-                *ice_layer_model_, *ice_layer_state_, epoch);
+            bool need_full_diurnal = force_cache_refresh ||
+                multiscale_evolution_->needsCacheRefresh(
+                    *ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
 
             if (need_full_diurnal) {
-                // Run full diurnal cycle (expensive, ~10 minutes)
+                // Run full diurnal cycle (expensive)
                 if (!computeDiurnalAverages(dt_seconds)) {
                     std::cerr << "Failed to compute diurnal averages at epoch " << epoch << std::endl;
                     break;
                 }
                 // Cache the computed base fluxes for future epochs
-                multiscale_evolution_->cacheBaseFluxes(*ice_layer_model_, *ice_layer_state_, epoch);
+                multiscale_evolution_->cacheBaseFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
                 full_diurnal_count++;
-
-                // Note: Cache refresh is silent now - info is printed at the end
             } else {
                 // Use cached fluxes with ice availability scaling (fast, milliseconds)
-                // Scale base fluxes by ice availability factor
-                multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_);
+                multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_);
                 cached_epoch_count++;
             }
 
-            // Step 2: Evolve concentration using (possibly scaled) averaged fluxes
+            // Step 2: Evolve one epoch to establish concentration_change_rate_
             evolveEpoch(epoch, epoch_duration);
 
-            // Step 3: Update statistics
-            multiscale_evolution_->updateStatistics(*ice_layer_model_, *ice_layer_state_, epoch_duration);
+            // Step 3: Compute safe super-step size.
+            // After evolving one epoch, concentration_change_rate_ is set.
+            // Predict how many MORE epochs can elapse before the next face depletes.
+            int safe_extra = 0;
+            {
+                int remaining = num_epochs - epoch - 1;
+                if (remaining > 0) {
+                    // Limit super-step to not overshoot export intervals
+                    int max_step = remaining;
+                    if (effective_export_interval > 0) {
+                        int next_export = ((epoch / effective_export_interval) + 1) * effective_export_interval;
+                        max_step = std::min(max_step, next_export - epoch - 1);
+                    }
+
+                    if (max_step > 0) {
+                        safe_extra = multiscale_evolution_->computeSafeEpochCount(
+                            *ice_layer_state_, face_areas_, epoch_duration, max_step) - 1;
+                        // -1 because computeSafeEpochCount returns total including the one we already did
+                        safe_extra = std::max(0, safe_extra);
+                    }
+
+                    if (safe_extra > 0) {
+                        // Save per-epoch stats before super-step overwrites them
+                        double saved_max_change = multiscale_evolution_->getStatistics().max_concentration_change;
+                        double saved_flux_imbalance = multiscale_evolution_->getStatistics().flux_imbalance_fraction;
+
+                        // Super-step: evolve concentration forward by safe_extra more epochs
+                        // using the same cached/computed fluxes
+                        evolveEpoch(epoch + 1, epoch_duration * safe_extra);
+                        total_super_stepped += safe_extra;
+                        max_super_step = std::max(max_super_step, safe_extra + 1);
+                        cached_epoch_count += safe_extra;
+
+                        // Restore per-epoch stats for meaningful progress reporting
+                        auto& stats = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
+                        stats.max_concentration_change = saved_max_change;
+                        stats.flux_imbalance_fraction = saved_flux_imbalance;
+                    }
+                }
+            }
+
+            int step_size = 1 + safe_extra;
+
+            // Step 4: Update statistics (accounts for all epochs in this super-step)
+            multiscale_evolution_->updateStatistics(*ice_layer_model_, *ice_layer_state_,
+                                                     epoch_duration, step_size);
 
             // Progress reporting
-            if (show_progress_ && (epoch % timescale_constants::PROGRESS_INTERVAL == 0 || epoch == num_epochs - 1)) {
+            if (show_progress_) {
                 multiscale_evolution_->printProgress();
             }
 
-            // Export at intervals (use effective_export_interval, not original parameter)
-            if (effective_export_interval > 0 && (epoch % effective_export_interval == 0 || epoch == num_epochs - 1)) {
+            // Export at intervals
+            int next_epoch = epoch + step_size;
+            if (effective_export_interval > 0 &&
+                (epoch % effective_export_interval == 0 || next_epoch >= num_epochs)) {
                 // Sync ice layer state and averaged fluxes to exosphere model before export
                 if (exosphere_model_ && multiscale_evolution_) {
                     auto& exo_state = exosphere_model_->getMutableState();
@@ -1298,11 +1605,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         }
 
                         // Sync averaged fluxes from multi-timescale evolution
-                        // These are the diurnal-averaged values scaled by ice availability
                         exo_state.emission_flux[i] = diurnal_avg.avg_sublimation_flux[i];
                         exo_state.deposition_flux[i] = diurnal_avg.avg_deposition_flux[i];
                         exo_state.net_flux[i] = diurnal_avg.avg_net_flux[i];
                         exo_state.escape_flux[i] = diurnal_avg.avg_escape_flux[i];
+
+                        // Recompute atmospheric properties from diurnal-averaged temperature
+                        double T = std::max(50.0, diurnal_avg.avg_temperature[i]);
+                        double ice_avail = (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
+                            ? ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i)
+                            : 1.0;
+                        exo_state.vapor_pressure[i] = VaporPressure::calculateVaporPressure(T) * ice_avail;
+                        exo_state.vapor_density[i] = VaporPressure::calculateVaporDensity(
+                            exo_state.vapor_pressure[i], T);
+                        exo_state.thermal_velocity[i] = VaporPressure::calculateThermalVelocity(T) * ice_avail;
                     }
                     exo_state.updateIceThickness();
                 }
@@ -1313,11 +1629,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 exportTimestepVTU(epoch, time_value);
             }
 
-            // Check convergence
-            if (multiscale_evolution_->getStatistics().converged) {
-                std::cout << "\nConverged at epoch " << epoch << std::endl;
-                break;
-            }
+            // Advance epoch counter by the super-step size
+            epoch += step_size;
         }
 
         if (show_progress_) std::cerr << std::endl;
@@ -1331,9 +1644,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "  Cache statistics:" << std::endl;
         std::cout << "    Full diurnal computations: " << full_diurnal_count << std::endl;
         std::cout << "    Cached (scaled) epochs: " << cached_epoch_count << std::endl;
+        if (total_super_stepped > 0) {
+            std::cout << "    Super-stepped epochs: " << total_super_stepped
+                      << " (max step: " << max_super_step << ")" << std::endl;
+        }
         if (full_diurnal_count > 0) {
             double speedup = static_cast<double>(full_diurnal_count + cached_epoch_count) / full_diurnal_count;
             std::cout << "    Effective speedup: " << std::setprecision(1) << speedup << "x" << std::endl;
+        }
+        if (albedo_coupling_enabled_) {
+            std::cout << "  Albedo coupling:" << std::endl;
+            std::cout << "    Temperature refreshes: " << albedo_temp_refresh_count << std::endl;
+            double mean_a = std::accumulate(current_face_albedos_.begin(),
+                                            current_face_albedos_.end(), 0.0) / num_faces_;
+            std::cout << "    Final mean albedo: " << std::fixed << std::setprecision(4) << mean_a << std::endl;
         }
 
         // Print final statistics
@@ -1364,51 +1688,141 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         size_t num_timesteps = surface_temperatures_[0].size();
 
+        // Subsample timesteps for faster accumulation.
+        // Stride > 1 uses every Nth timestep with equal weight.
+        // Error is small for smooth diurnal curves: <2% for stride=4.
+        int stride = diurnal_accumulation_stride_;
+        size_t effective_timesteps = (num_timesteps + stride - 1) / stride;
+
+        std::cout << "  Computing diurnal averages (" << effective_timesteps
+                  << "/" << num_timesteps << " timesteps";
+        if (stride > 1) std::cout << ", stride=" << stride;
+        std::cout << ")..." << std::flush;
+        auto t_diurnal_start = std::chrono::steady_clock::now();
+
         // Reset accumulator
         multiscale_evolution_->resetDiurnalAccumulator();
 
-        // Skip transport matrix rebuilds during diurnal averaging - we only need fluxes
-        // The transport matrix for deposition will use the pre-built matrix
+        // Skip matrix rebuilds during the per-timestep diurnal loop.
+        // The full transport matrix will be built ONCE after averaging, using
+        // the diurnal-averaged temperatures.
         exosphere_model_->setSkipMatrixRebuild(true);
         exosphere_model_->setVerbose(false);
 
-        // Run through one diurnal cycle, accumulating fluxes
-        for (size_t t = 0; t < num_timesteps; ++t) {
+        // Pre-allocate buffers reused across all timesteps
+        size_t nf = mesh_->faces.size();
+        std::vector<double> current_temps(nf);
+        std::vector<double> zero_deposition(num_faces_, 0.0);
+        std::vector<double> sputtering_flux;
+
+        // Run through one diurnal cycle, accumulating fluxes.
+        // Deposition will be computed after finalization from the escape fraction.
+        int accumulated_count = 0;
+        for (size_t t = 0; t < num_timesteps; t += stride) {
             // Extract temperatures for this timestep
-            std::vector<double> current_temps(mesh_->faces.size());
-            for (size_t f = 0; f < mesh_->faces.size(); ++f) {
+            for (size_t f = 0; f < nf; ++f) {
                 current_temps[f] = surface_temperatures_[f][t];
             }
 
-            // Use surface temperatures directly (new model has no thermal insulation)
+            // Compute emission, escape, and vapor properties for this timestep
             exosphere_model_->updateTemperatures(current_temps);
 
-            // Get current fluxes (without evolving mass - we just need the rates)
             const auto& state = exosphere_model_->getState();
 
             // Get sputtering fluxes if enabled
-            std::vector<double> sputtering_flux;
             if (sputtering_enabled_ && sputtering_model_ && sputtering_state_) {
                 sputtering_model_->computeSputteringRates(current_temps, face_areas_, *sputtering_state_);
                 sputtering_flux = sputtering_state_->total_mass_loss;
             }
 
-            // Accumulate into diurnal averages
+            // Accumulate emission, sputtering, escape, and temperature.
+            // Deposition passed as zeros — computed from escape fraction below.
             multiscale_evolution_->accumulateDiurnalStep(
                 state.emission_flux,
-                state.deposition_flux,
+                zero_deposition,
                 sputtering_flux,
                 state.escape_flux,
                 current_temps
             );
+            accumulated_count++;
         }
 
-        // Finalize averages
-        multiscale_evolution_->finalizeDiurnalAverages(static_cast<int>(num_timesteps));
+        // Finalize emission/sputtering/escape/temperature averages
+        multiscale_evolution_->finalizeDiurnalAverages(accumulated_count);
 
-        // Restore normal matrix rebuild and verbosity settings
-        exosphere_model_->setSkipMatrixRebuild(false);
-        exosphere_model_->setVerbose(show_progress_);
+        auto t_diurnal_end = std::chrono::steady_clock::now();
+        double diurnal_sec = std::chrono::duration<double>(t_diurnal_end - t_diurnal_start).count();
+        std::cout << " done (" << std::fixed << std::setprecision(1) << diurnal_sec << " s)" << std::endl;
+
+        // Compute diurnal-averaged deposition using matrix-free transport.
+        // This evaluates dep = M * emission on-the-fly without forming the
+        // full sparse matrix (~17 GB for 1.3M faces). Uses ~90 MB instead.
+        auto& diurnal_avg = multiscale_evolution_->getMutableDiurnalAverages();
+
+        std::cout << "  Computing transport product (matrix-free)..." << std::flush;
+        auto t_transport_start = std::chrono::steady_clock::now();
+
+        // Prepare area-weighted emission vector
+        std::vector<double> avg_emission(num_faces_);
+        for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+            avg_emission[i] = diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+        }
+
+        // Matrix-free: two-pass source-based scatter
+        std::vector<double> avg_dep;
+        exosphere_model_->computeTransportProduct(
+            diurnal_avg.avg_temperature, avg_emission, avg_dep);
+
+        for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+            diurnal_avg.avg_deposition_flux[i] = avg_dep[i] / face_areas_[i];
+        }
+
+        auto t_transport_end = std::chrono::steady_clock::now();
+        double transport_sec = std::chrono::duration<double>(t_transport_end - t_transport_start).count();
+        std::cout << "  Transport complete (" << std::fixed << std::setprecision(1)
+                  << transport_sec << " s)" << std::endl;
+
+        // Smooth sublimation (and sputtering) to match the transport's spatial
+        // resolution. The transport kernel + post-smoothing averages deposition
+        // over ~1-2°, but sublimation is computed per-face from temperature.
+        // Sharp temperature boundaries from albedo map pixels (~0.5° resolution)
+        // create sharp sublimation features that appear as artifacts in net flux.
+        // Smoothing both sides ensures consistent spatial resolution.
+        {
+            // Preserve total sublimation rate across smoothing
+            double total_sub_before = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                total_sub_before += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+            }
+
+            std::vector<double> smoothed(num_faces_);
+            exosphere_model_->smoothField(diurnal_avg.avg_sublimation_flux, smoothed);
+
+            double total_sub_after = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                total_sub_after += smoothed[i] * face_areas_[i];
+            }
+            if (total_sub_after > 0.0) {
+                double scale = total_sub_before / total_sub_after;
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    smoothed[i] *= scale;
+                }
+            }
+            diurnal_avg.avg_sublimation_flux = std::move(smoothed);
+        }
+        if (sputtering_enabled_) {
+            std::vector<double> smoothed(num_faces_);
+            exosphere_model_->smoothField(diurnal_avg.avg_sputtering_flux, smoothed);
+            diurnal_avg.avg_sputtering_flux = std::move(smoothed);
+        }
+
+        // Update net flux consistently
+        #pragma omp parallel for
+        for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+            diurnal_avg.avg_net_flux[i] = diurnal_avg.avg_deposition_flux[i]
+                                        - diurnal_avg.avg_sublimation_flux[i]
+                                        - diurnal_avg.avg_sputtering_flux[i];
+        }
 
         return true;
     }
@@ -1483,6 +1897,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
              << (stats.mean_nonice_concentration * 100.0) << " %\n";
         file << "  Faces depleted (no ice): " << stats.faces_depleted << " / " << num_faces_ << "\n";
         file << "  Converged: " << (stats.converged ? "yes" : "no") << "\n\n";
+
+        if (albedo_coupling_enabled_ && !current_face_albedos_.empty()) {
+            file << "Albedo-Composition Coupling:\n";
+            double min_a = *std::min_element(current_face_albedos_.begin(), current_face_albedos_.end());
+            double max_a = *std::max_element(current_face_albedos_.begin(), current_face_albedos_.end());
+            double mean_a = std::accumulate(current_face_albedos_.begin(),
+                                            current_face_albedos_.end(), 0.0) / num_faces_;
+            file << "  Initial albedo: " << std::fixed << std::setprecision(4) << initial_albedo_ << "\n";
+            file << "  Final mean albedo: " << mean_a << "\n";
+            file << "  Final albedo range: " << min_a << " - " << max_a << "\n";
+            file << "  Ice endmember: " << albedo_mapper_->getConfig().albedo_ice << "\n";
+            file << "  Non-ice endmember: " << albedo_mapper_->getConfig().albedo_nonice << "\n";
+            file << "  Temperature refreshes: " << stats.albedo_temp_refreshes << "\n\n";
+        }
 
         file << "Mass Balance:\n";
         file << "  Total sublimated: " << std::scientific << std::setprecision(3)

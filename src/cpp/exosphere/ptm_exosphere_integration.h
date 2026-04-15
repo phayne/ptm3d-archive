@@ -26,6 +26,8 @@ namespace ptm {
         struct CrystallizationConfig;
         class MultiTimescaleEvolution;
         struct MultiTimescaleConfig;
+        class CompositionAlbedoMapper;
+        struct CompositionAlbedoConfig;
 
         /**
          * PTM Exosphere Integration
@@ -115,6 +117,23 @@ namespace ptm {
             // Export mode flag (determines temperature output format)
             bool multiscale_export_mode_ = false;
 
+            // Albedo-composition coupling (optional, for thermal segregation feedback)
+            bool albedo_coupling_enabled_ = false;
+            std::unique_ptr<CompositionAlbedoMapper> albedo_mapper_;
+            std::vector<double> current_face_albedos_;    // per-face current albedo
+            std::vector<double> previous_face_albedos_;   // for change detection
+            double initial_albedo_ = 0.5;                 // original albedo from PTM thermal sim
+
+            // Per-face non-ice albedo endmembers from spatial map
+            std::vector<double> nonice_albedo_map_;
+
+            // Per-face initial albedos from PTM3D (for temperature scaling reference)
+            std::vector<double> initial_face_albedos_;
+
+            // Albedo coupling internal methods
+            double updateAlbedoFromComposition();
+            void updateTemperaturesForAlbedoChange();
+
             // Private methods
             void calculateFaceProperties();
             double calculateGreatCircleDistance(int face_i, int face_j);
@@ -125,7 +144,15 @@ namespace ptm {
             double besselI0(double x);
 
             bool show_progress_ = true;
-            
+
+            // Convergence thresholds (set via CLI, applied to MultiTimescaleConfig)
+            double convergence_threshold_ = -1.0;       // <0 means use default
+            double flux_convergence_threshold_ = -1.0;   // <0 means use default
+
+            // Diurnal accumulation stride: use every Nth timestep for averaging.
+            // stride=1 uses all timesteps (default), stride=4 uses every 4th (~4x faster).
+            int diurnal_accumulation_stride_ = 1;
+
         public:
             /**
              * Constructor
@@ -365,9 +392,9 @@ namespace ptm {
             double getIceMass(int face_idx) const;
 
             /**
-             * Get ice availability factor for a face
+             * Get ice fraction for a face (continuous ice availability)
              * @param face_idx Face index
-             * @return 1.0 if ice available, 0.0 if depleted
+             * @return Ice fraction [0, 1]: 1.0 = pure ice, 0.0 = fully depleted
              */
             double getIceAvailabilityFactor(int face_idx) const;
 
@@ -387,8 +414,81 @@ namespace ptm {
             double getCumulativeDeposited(int face_idx) const;
 
             // =========================================================
+            // Albedo-Composition Coupling Interface
+            // =========================================================
+
+            /**
+             * Enable albedo-composition feedback coupling
+             *
+             * When enabled, non-ice concentration from the ice layer model is
+             * mapped to surface albedo via linear mixing between ice and non-ice
+             * endmembers. Temperature arrays are scaled to reflect the new albedo
+             * using radiative equilibrium: T_new = T_old * ((1-A_new)/(1-A_old))^(1/4)
+             *
+             * This captures the positive feedback loop driving thermal segregation:
+             * sublimation -> darker surface -> higher T -> more sublimation
+             *
+             * @param config Albedo coupling configuration (endmember values, threshold)
+             */
+            void enableAlbedoCoupling(const CompositionAlbedoConfig& config);
+
+            /**
+             * Disable albedo-composition coupling
+             */
+            void disableAlbedoCoupling();
+
+            /**
+             * Check if albedo coupling is enabled
+             */
+            bool isAlbedoCouplingEnabled() const { return albedo_coupling_enabled_; }
+
+            /**
+             * Get current albedo for a face
+             * @param face_idx Face index
+             * @return Current Bond albedo (composition-dependent if coupling enabled)
+             */
+            double getFaceAlbedo(int face_idx) const;
+
+            /**
+             * Set the initial (reference) albedo used by the PTM thermal simulation
+             * This is needed to compute the temperature scaling ratio
+             * @param albedo The Bond albedo used in the original thermal simulation
+             */
+            void setInitialAlbedo(double albedo) { initial_albedo_ = albedo; }
+
+            /**
+             * Load spatially-varying non-ice albedo endmembers from a FITS/binary map.
+             * When set, the mixing model becomes per-face:
+             *   A(c, face) = A_ice*(1-c) + A_map(face)*c
+             * instead of using a uniform albedo_nonice scalar.
+             *
+             * @param map_path Path to albedo map file (FITS or binary)
+             * @param maps_dir Directory for auto-discovery (used if map_path empty)
+             */
+            void loadNoniceAlbedoMap(const std::string& map_path,
+                                     const std::string& maps_dir = "");
+
+            // =========================================================
             // Multi-Timescale Evolution Interface
             // =========================================================
+
+            /**
+             * Set convergence threshold for multi-timescale simulation
+             * @param threshold Max concentration change per epoch for convergence
+             */
+            void setConvergenceThreshold(double threshold) { convergence_threshold_ = threshold; }
+
+            /**
+             * Set flux imbalance convergence threshold
+             * @param threshold Flux imbalance fraction [0-1] for convergence (e.g. 0.01 = 1%)
+             */
+            void setFluxConvergenceThreshold(double threshold) { flux_convergence_threshold_ = threshold; }
+
+            /**
+             * Set diurnal accumulation stride for multi-timescale simulation
+             * @param stride Use every Nth timestep (1 = all, 4 = every 4th, etc.)
+             */
+            void setDiurnalStride(int stride) { diurnal_accumulation_stride_ = std::max(1, stride); }
 
             /**
              * Run multi-timescale simulation using operator splitting

@@ -25,6 +25,8 @@
 #include "ptm_exosphere_integration.h"
 #include "exosphere_physics.h"
 #include "ice_crystallization_model.h"
+#include "composition_albedo.h"
+#include "spherical_index.h"
 #include "../mesh/mesh_utils.h"
 
 // Physical constants used here
@@ -326,7 +328,12 @@ private:
     // Transport matrix
     Eigen::SparseMatrix<double> transport_matrix_;
     bool transport_matrix_valid_ = false;
-    
+
+    // Spatial index for emission flux smoothing (removes pentagon mesh artifacts)
+    ptm::exosphere::SphericalSpatialIndex spatial_index_;
+    bool spatial_index_built_ = false;
+    double mean_face_theta_ = 0.0;  // cached mean angular face size
+
     // Model parameters
     double dt_ = 3600.0;  // 1 hour timestep
     double initial_equatorial_thickness_ = 1e-4;  // 0.1 mm
@@ -755,8 +762,20 @@ public:
         if (variation > 1e-6) {
             std::cerr << "WARNING: Face centers show radius variation > 1e-6%!" << std::endl;
         }
+
+        // Build spatial index for emission flux smoothing
+        spatial_index_.build(face_centers_);
+        spatial_index_built_ = true;
+
+        // Cache mean angular face size (used for smoothing radius)
+        const double R = constants::EUROPA_RADIUS;
+        mean_face_theta_ = 0.0;
+        for (size_t i = 0; i < n_faces; ++i) {
+            mean_face_theta_ += std::sqrt(std::max(face_areas_[i], 0.0) / M_PI) / R;
+        }
+        mean_face_theta_ /= n_faces;
     }
-    
+
     // Helper function to calculate spherical triangle area
     double calculateSphericalTriangleArea(const std::array<double, 3>& v0,
                                         const std::array<double, 3>& v1,
@@ -1406,12 +1425,41 @@ public:
                 }
             }
             
-            // PHASE 3: Apply transport matrix
+            // PHASE 3: Smooth emission flux and apply transport matrix
+            // Area-weighted spatial smoothing removes mesh-topology artifacts
+            // (pentagon vs hexagon faces) while preserving physical gradients.
+            // Same approach as deposition smoothing in computeTransportProduct().
             Eigen::VectorXd emission_vec(n_faces);
-            for (size_t i = 0; i < n_faces; ++i) {
-                emission_vec(i) = emission_flux_[t][i] * face_areas_[i] * dt_;
+            {
+                double smooth_radius = 3.0 * mean_face_theta_;
+                float cos_smooth = static_cast<float>(std::cos(smooth_radius));
+                std::vector<double> em_smooth(n_faces);
+
+                #pragma omp parallel
+                {
+                    std::vector<std::pair<size_t, float>> neighbors;
+                    neighbors.reserve(64);
+
+                    #pragma omp for schedule(dynamic)
+                    for (size_t i = 0; i < n_faces; ++i) {
+                        spatial_index_.queryNeighborsByCosTheta(
+                            i, cos_smooth, neighbors);
+
+                        double wsum = face_areas_[i];
+                        double em_sum = emission_flux_[t][i] * face_areas_[i];
+                        for (const auto& [k, cos_theta] : neighbors) {
+                            em_sum += emission_flux_[t][k] * face_areas_[k];
+                            wsum += face_areas_[k];
+                        }
+                        em_smooth[i] = em_sum / wsum;
+                    }
+                }
+
+                for (size_t i = 0; i < n_faces; ++i) {
+                    emission_vec(i) = em_smooth[i] * face_areas_[i] * dt_;
+                }
             }
-            
+
             Eigen::VectorXd deposition_vec = transport_matrix_ * emission_vec;
             
             // PHASE 4: Update ice mass and calculate fluxes
@@ -1723,6 +1771,19 @@ int main(int argc, char** argv)
     int multiscale_export_interval = 100;   // Export every 100 epochs
     bool analytical_acceleration = true;    // Use analytical solution for slow regions
     int cache_refresh_interval = 0;         // 0 = never force refresh (use adaptive)
+    double convergence_threshold = -1.0;    // <0 = use default (1e-6)
+    double flux_convergence_threshold = -1.0; // <0 = use default (0.01 = 1%)
+    int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
+
+    // Albedo-composition coupling options
+    bool albedo_coupling_enabled = false;
+    ptm::exosphere::CompositionAlbedoConfig albedo_config;
+    double initial_albedo = 0.5;  // Bond albedo used in PTM thermal simulation
+    std::string albedo_nonice_map_path;  // FITS/binary albedo map for per-face non-ice endmember
+    std::string albedo_maps_dir;         // Directory for auto-discovery of albedo map
+    bool init_from_albedo_map = false;   // Initialize concentrations from albedo map
+    double albedo_percentile_low = 5.0;  // Lower percentile for concentration scaling
+    double albedo_percentile_high = 95.0; // Upper percentile for concentration scaling
 
     // Ice crystallization model options
     bool crystallization_enabled = false;
@@ -1775,6 +1836,57 @@ int main(int argc, char** argv)
         }
         else if (a == "--cache-refresh" && i+1 < argc) {
             cache_refresh_interval = std::stoi(argv[++i]);
+        }
+        else if (a == "--diurnal-stride" && i+1 < argc) {
+            diurnal_stride = std::stoi(argv[++i]);
+        }
+        else if (a == "--convergence-threshold" && i+1 < argc) {
+            convergence_threshold = std::stod(argv[++i]);
+        }
+        else if (a == "--flux-convergence" && i+1 < argc) {
+            flux_convergence_threshold = std::stod(argv[++i]);
+        }
+        // Albedo-composition coupling options
+        else if (a == "--albedo-coupling") {
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;  // Albedo coupling requires ice layer model
+        }
+        else if (a == "--albedo-ice" && i+1 < argc) {
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;
+            albedo_config.albedo_ice = std::stod(argv[++i]);
+        }
+        else if (a == "--albedo-nonice" && i+1 < argc) {
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;
+            albedo_config.albedo_nonice = std::stod(argv[++i]);
+        }
+        else if (a == "--albedo-update-threshold" && i+1 < argc) {
+            albedo_config.albedo_update_threshold = std::stod(argv[++i]);
+        }
+        else if (a == "--initial-albedo" && i+1 < argc) {
+            initial_albedo = std::stod(argv[++i]);
+        }
+        else if (a == "--albedo-nonice-map" && i+1 < argc) {
+            albedo_nonice_map_path = argv[++i];
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;
+        }
+        else if (a == "--albedo-maps-dir" && i+1 < argc) {
+            albedo_maps_dir = argv[++i];
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;
+        }
+        else if (a == "--init-from-albedo-map") {
+            init_from_albedo_map = true;
+            albedo_coupling_enabled = true;
+            ice_layer_enabled = true;
+        }
+        else if (a == "--albedo-percentile-low" && i+1 < argc) {
+            albedo_percentile_low = std::stod(argv[++i]);
+        }
+        else if (a == "--albedo-percentile-high" && i+1 < argc) {
+            albedo_percentile_high = std::stod(argv[++i]);
         }
         // Ice crystallization model options
         else if (a == "--crystallization") {
@@ -1836,7 +1948,21 @@ int main(int argc, char** argv)
             std::cout << "  --export-interval N    Export VTU every N epochs (default: 100, 0=final only)\n";
             std::cout << "  --no-analytical        Disable analytical acceleration for slow regions\n";
             std::cout << "  --cache-refresh N      Force diurnal recomputation every N epochs\n";
-            std::cout << "                         (default: 0 = adaptive refresh only, fastest)\n\n";
+            std::cout << "                         (default: 0 = adaptive refresh only, fastest)\n";
+            std::cout << "  --convergence-threshold T  Max concentration change per epoch for convergence\n";
+            std::cout << "                         (default: 1e-6)\n";
+            std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
+            std::cout << "  --diurnal-stride N     Use every Nth timestep in diurnal averaging (default: 1)\n";
+            std::cout << "                         stride=4 gives ~4x faster diurnal computation, <2%% error\n\n";
+            std::cout << "Albedo-composition coupling options (thermal segregation feedback):\n";
+            std::cout << "  --albedo-coupling      Enable composition-dependent albedo feedback\n";
+            std::cout << "  --albedo-ice A         Pure ice Bond albedo endmember (default: 0.65)\n";
+            std::cout << "  --albedo-nonice A      Non-ice lag deposit Bond albedo (default: 0.10)\n";
+            std::cout << "  --albedo-nonice-map F  FITS/binary albedo map for per-face non-ice endmember\n";
+            std::cout << "                         Overrides --albedo-nonice with spatially-varying values\n";
+            std::cout << "  --albedo-maps-dir DIR  Auto-discover albedo map in directory\n";
+            std::cout << "  --albedo-update-threshold T  Min albedo change for temp update (default: 0.01)\n";
+            std::cout << "  --initial-albedo A     Bond albedo used in PTM thermal sim (default: 0.5)\n\n";
             std::cout << "Ice crystallization model options:\n";
             std::cout << "  --crystallization      Enable ice crystallization tracking\n";
             std::cout << "                         (amorphous/crystalline competition)\n";
@@ -1871,12 +1997,18 @@ int main(int argc, char** argv)
 
     // Load mesh (prefer user-specified mesh_file; otherwise try PTM directory mesh.ply)
     std::string mesh_path = mesh_file.empty() ? (ptm_dir + "/mesh.ply") : mesh_file;
+    std::cout << "Loading mesh: " << mesh_path << "..." << std::flush;
+    auto t_mesh_start = std::chrono::steady_clock::now();
     auto mesh = load_mesh_with_meshutils(mesh_path);
     if (!mesh) {
-        std::cerr << "Failed to load mesh: " << mesh_path << std::endl;
+        std::cerr << "\nFailed to load mesh: " << mesh_path << std::endl;
         return 1;
     }
     ensure_face_centers_on_sphere(mesh);
+    auto t_mesh_end = std::chrono::steady_clock::now();
+    double mesh_sec = std::chrono::duration<double>(t_mesh_end - t_mesh_start).count();
+    std::cout << " " << mesh->faces.size() << " faces (" << std::fixed
+              << std::setprecision(1) << mesh_sec << " s)" << std::endl;
 
     // Create integration instance
     ptm::exosphere::PTMExosphereIntegration integrator(output_dir);
@@ -1894,10 +2026,15 @@ int main(int argc, char** argv)
     }
 
     // Load temperatures from PTM output directory
+    std::cout << "Loading temperature data (" << timesteps << " timesteps)..." << std::flush;
+    auto t_temp_start = std::chrono::steady_clock::now();
     if (!integrator.loadTemperatureData(ptm_dir, timesteps)) {
-        std::cerr << "Failed to load temperature data from: " << ptm_dir << std::endl;
+        std::cerr << "\nFailed to load temperature data from: " << ptm_dir << std::endl;
         return 1;
     }
+    auto t_temp_end = std::chrono::steady_clock::now();
+    double temp_sec = std::chrono::duration<double>(t_temp_end - t_temp_start).count();
+    std::cout << " done (" << std::fixed << std::setprecision(1) << temp_sec << " s)" << std::endl;
 
     // Enable sputtering if requested
     if (sputtering_enabled) {
@@ -1923,6 +2060,24 @@ int main(int argc, char** argv)
         integrator.enableCrystallizationModel(cryst_config);
     }
 
+    // Enable albedo-composition coupling if requested (requires ice layer model)
+    if (albedo_coupling_enabled) {
+        // Load per-face non-ice endmember map before enabling coupling
+        if (!albedo_nonice_map_path.empty() || !albedo_maps_dir.empty()) {
+            integrator.loadNoniceAlbedoMap(albedo_nonice_map_path, albedo_maps_dir);
+        }
+
+        // Initialize concentrations from albedo map if requested
+        // (must come after loadNoniceAlbedoMap and enableIceLayerModel)
+        if (init_from_albedo_map) {
+            integrator.initializeConcentrationsFromAlbedoMap(
+                albedo_percentile_low, albedo_percentile_high);
+        }
+
+        integrator.setInitialAlbedo(initial_albedo);
+        integrator.enableAlbedoCoupling(albedo_config);
+    }
+
     // Run simulation based on mode
     if (multiscale_enabled) {
         // Multi-timescale evolution over geological timescales
@@ -1939,6 +2094,17 @@ int main(int argc, char** argv)
         std::cout << "  Total simulation time: " << std::scientific << std::setprecision(2)
                   << total_years << " years" << std::endl;
 
+        // Set convergence thresholds if user specified them
+        if (convergence_threshold >= 0.0) {
+            integrator.setConvergenceThreshold(convergence_threshold);
+        }
+        if (flux_convergence_threshold >= 0.0) {
+            integrator.setFluxConvergenceThreshold(flux_convergence_threshold);
+        }
+        if (diurnal_stride > 1) {
+            integrator.setDiurnalStride(diurnal_stride);
+            std::cout << "  Diurnal accumulation stride: " << diurnal_stride << std::endl;
+        }
         integrator.runMultiTimescaleSimulation(multiscale_epochs,
                                                 multiscale_cycles_per_epoch,
                                                 multiscale_export_interval,

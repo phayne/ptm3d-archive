@@ -577,7 +577,8 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
     const std::vector<double>&, int, const thermal::Config&, double, double,
     std::vector<std::vector<double>>*, int, int, int,
-    const thermal::Planet* = nullptr);  // Optional planet for incidence-dependent albedo
+    const thermal::Planet* = nullptr,
+    const std::vector<double>* face_Qb = nullptr);  // Per-face heat flow override
 
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
@@ -594,7 +595,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
-    int thermal_threads);
+    int thermal_threads,
+    const std::vector<double>* face_Qb = nullptr);
 
 // GPU persistent kernel thermal solver
 bool runThermalModelsForAllFaces_GPU_Persistent(
@@ -607,7 +609,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const thermal::Config& config,
     double default_visible_albedo,
     double ir_albedo,
-    std::vector<std::vector<double>>* surface_temps_out);
+    std::vector<std::vector<double>>* surface_temps_out,
+    const std::vector<double>* face_Qb = nullptr);
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
@@ -638,7 +641,8 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_direct,
     FluxFn get_reflected,
     FluxFn get_ir,
-    std::vector<std::vector<double>>* surface_temps_out);
+    std::vector<std::vector<double>>* surface_temps_out,
+    const std::vector<double>* face_Qb = nullptr);
 
 std::vector<double> computeFaceAlbedos(
     const std::shared_ptr<Mesh>& mesh,
@@ -651,6 +655,145 @@ void fixOutOfRangeAlbedos(
     double default_visible_albedo);
 
 std::string calculateAdjustedStartTime(const std::string& iso_time, double days_offset);
+
+/**
+ * @brief Rotate mesh vertices so mesh center moves to (target_lat, target_lon).
+ *
+ * Uses Rodrigues' rotation formula. After rotating vertices, recomputes
+ * face_centers, face_normals, latitudes, and longitudes from scratch.
+ * View factors depend only on relative geometry (preserved by rotation),
+ * so pre-computed VFs remain valid.
+ */
+static void rotateMeshToLatLon(std::shared_ptr<ptm::Mesh>& mesh,
+                                double target_lat_deg,
+                                double target_lon_deg)
+{
+    if (!mesh || mesh->vertices.empty()) return;
+
+    constexpr double DEG_TO_RAD = M_PI / 180.0;
+    constexpr double RAD_TO_DEG = 180.0 / M_PI;
+
+    // 1. Compute current mesh center (mean of all vertices)
+    double cx = 0, cy = 0, cz = 0;
+    for (const auto& v : mesh->vertices) {
+        cx += v[0]; cy += v[1]; cz += v[2];
+    }
+    double N = static_cast<double>(mesh->vertices.size());
+    cx /= N; cy /= N; cz /= N;
+
+    double r = std::sqrt(cx*cx + cy*cy + cz*cz);
+    double cur_lat = std::asin(cz / r);            // radians
+    double cur_lon = std::atan2(cy, cx);            // radians
+
+    double tgt_lat = target_lat_deg * DEG_TO_RAD;
+    double tgt_lon = (target_lon_deg > -900.0) ? target_lon_deg * DEG_TO_RAD : cur_lon;
+
+    // 2. Source and target unit vectors on the sphere
+    auto to_cart = [](double lat, double lon) -> std::array<double,3> {
+        return {{ std::cos(lat)*std::cos(lon),
+                  std::cos(lat)*std::sin(lon),
+                  std::sin(lat) }};
+    };
+    auto src = to_cart(cur_lat, cur_lon);
+    auto tgt = to_cart(tgt_lat, tgt_lon);
+
+    // Rotation axis = cross(src, tgt), angle = acos(dot(src, tgt))
+    double dot = src[0]*tgt[0] + src[1]*tgt[1] + src[2]*tgt[2];
+    dot = std::max(-1.0, std::min(1.0, dot));
+    double angle = std::acos(dot);
+
+    if (angle < 1e-10) {
+        std::cout << "[Mesh Rotation] No rotation needed (already at target)" << std::endl;
+        return;
+    }
+
+    std::array<double,3> axis = {{
+        src[1]*tgt[2] - src[2]*tgt[1],
+        src[2]*tgt[0] - src[0]*tgt[2],
+        src[0]*tgt[1] - src[1]*tgt[0]
+    }};
+    double axis_len = std::sqrt(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]);
+    if (axis_len < 1e-12) {
+        // src and tgt are anti-parallel — pick any perpendicular axis
+        axis = {{ -src[1], src[0], 0.0 }};
+        axis_len = std::sqrt(axis[0]*axis[0] + axis[1]*axis[1]);
+        if (axis_len < 1e-12) { axis = {{0, 0, 1}}; axis_len = 1.0; }
+    }
+    axis[0] /= axis_len; axis[1] /= axis_len; axis[2] /= axis_len;
+
+    double cos_a = std::cos(angle);
+    double sin_a = std::sin(angle);
+
+    std::cout << "[Mesh Rotation] Rotating mesh center from ("
+              << cur_lat * RAD_TO_DEG << " deg, " << cur_lon * RAD_TO_DEG
+              << " deg) to (" << target_lat_deg << " deg, "
+              << ((target_lon_deg > -900.0) ? target_lon_deg : cur_lon * RAD_TO_DEG)
+              << " deg)" << std::endl;
+    std::cout << "  Rotation angle: " << angle * RAD_TO_DEG << " deg" << std::endl;
+
+    // 3. Apply Rodrigues' rotation to all vertices
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < mesh->vertices.size(); ++i) {
+        auto& v = mesh->vertices[i];
+        double kxv0 = axis[1]*v[2] - axis[2]*v[1];
+        double kxv1 = axis[2]*v[0] - axis[0]*v[2];
+        double kxv2 = axis[0]*v[1] - axis[1]*v[0];
+        double kdv  = axis[0]*v[0] + axis[1]*v[1] + axis[2]*v[2];
+
+        v[0] = v[0]*cos_a + kxv0*sin_a + axis[0]*kdv*(1.0 - cos_a);
+        v[1] = v[1]*cos_a + kxv1*sin_a + axis[1]*kdv*(1.0 - cos_a);
+        v[2] = v[2]*cos_a + kxv2*sin_a + axis[2]*kdv*(1.0 - cos_a);
+    }
+
+    // 4. Recompute face_centers, face_normals, latitudes, longitudes
+    const size_t F = mesh->faces.size();
+    mesh->face_centers.resize(F);
+    mesh->face_normals.resize(F);
+    mesh->latitudes.resize(F);
+    mesh->longitudes.resize(F);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < F; ++i) {
+        const auto& tri = mesh->faces[i];
+        const auto& v1 = mesh->vertices[tri[0]];
+        const auto& v2 = mesh->vertices[tri[1]];
+        const auto& v3 = mesh->vertices[tri[2]];
+
+        std::array<double,3> c = {{
+            (v1[0]+v2[0]+v3[0]) / 3.0,
+            (v1[1]+v2[1]+v3[1]) / 3.0,
+            (v1[2]+v2[2]+v3[2]) / 3.0
+        }};
+        mesh->face_centers[i] = c;
+
+        std::array<double,3> e1 = {{ v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2] }};
+        std::array<double,3> e2 = {{ v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2] }};
+        std::array<double,3> n = {{
+            e1[1]*e2[2] - e1[2]*e2[1],
+            e1[2]*e2[0] - e1[0]*e2[2],
+            e1[0]*e2[1] - e1[1]*e2[0]
+        }};
+        double L = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+        if (L > 0) { n[0]/=L; n[1]/=L; n[2]/=L; }
+        // Ensure outward-pointing normals (dot with center vector > 0)
+        double dot_cn = c[0]*n[0] + c[1]*n[1] + c[2]*n[2];
+        if (dot_cn < 0) { n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; }
+        mesh->face_normals[i] = n;
+
+        double rr = std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+        mesh->latitudes[i]  = (rr > 0) ? std::asin(c[2]/rr) * RAD_TO_DEG : 0.0;
+        mesh->longitudes[i] = std::atan2(c[1], c[0]) * RAD_TO_DEG;
+    }
+
+    // 5. Verify
+    cx = cy = cz = 0;
+    for (const auto& v : mesh->vertices) { cx += v[0]; cy += v[1]; cz += v[2]; }
+    cx /= N; cy /= N; cz /= N;
+    r = std::sqrt(cx*cx + cy*cy + cz*cz);
+    double new_lat = std::asin(cz/r) * RAD_TO_DEG;
+    double new_lon = std::atan2(cy, cx) * RAD_TO_DEG;
+    std::cout << "  New mesh center: (" << new_lat << " deg, " << new_lon << " deg)" << std::endl;
+}
 
 // ================= FUNCTION DEFINITIONS =====================
 
@@ -836,9 +979,16 @@ std::vector<double> calculateAbsorbedFlux(
     bool explicit_albedo_map = (albedo_map_to_use && albedo_map_to_use->isValid());
     bool albedo_successfully_loaded = false;
 
+    // Check if albedo map loading is disabled via use_albedo_map config option
+    bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
+
     if (explicit_albedo_map) {
         std::cout << "Using provided albedo map" << std::endl;
         albedo_successfully_loaded = true;
+    }
+    else if (albedo_map_disabled) {
+        std::cout << "Albedo map loading disabled (use_albedo_map: false), "
+                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
     }
     // For custom mesh without explicit albedo map, try to load global albedo map
     // Skip if: (a) user explicitly set a uniform albedo (use_default_albedo: false), or
@@ -1035,8 +1185,7 @@ std::vector<double> calculateAbsorbedFlux(
 
                 try {
                     // Get albedo from the map at THIS FACE's location
-                    // Note: Some maps use opposite latitude convention
-                    double map_albedo = albedo_map_to_use->getValue(face_lon, -face_lat);
+                    double map_albedo = albedo_map_to_use->getValue(face_lon, face_lat);
 
                     // Check if we got a valid value
                     if (map_albedo != albedo_map_to_use->getMissingValue() &&
@@ -1183,7 +1332,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& times,
     double latitude,
     const thermal::Config& config,
-    int equilibration_steps) {
+    int equilibration_steps,
+    double Qb_override = -1.0) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -1220,6 +1370,11 @@ std::vector<double> runThermalModelWithMatchedTimes(
     try {
         const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
+
+        // Override basal heat flow if specified (per-face or global)
+        if (Qb_override >= 0.0) {
+            planet.Qb = Qb_override;
+        }
 
         // Create thermal model
         thermal::Model model(planet,
@@ -1391,6 +1546,7 @@ bool exportLocationIllumination(
     }
 
     // Map each location to nearest face (robust helper)
+    // Location CSV uses East longitude (IAU convention), same as mesh (atan2)
     std::vector<size_t> facet_indices;
     facet_indices.reserve(locations.size());
     for (size_t i = 0; i < locations.size(); ++i) {
@@ -1848,33 +2004,115 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_direct,
     FluxFn get_reflected,
     FluxFn get_ir,
-    std::vector<std::vector<double>>* surface_temps_out)
+    std::vector<std::vector<double>>* surface_temps_out,
+    const std::vector<double>* face_Qb)
 {
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
         return false;
     }
 
-    // Optional albedo map from config (same semantics as existing code)
+    // Load per-face albedo: explicit FITS path > binary file > FITS auto-discovery > uniform default
     std::shared_ptr<ptm::SpatialMap> albedo_map;
-    if (config.custom_properties.count("albedo_map")) {
+    const size_t n_faces = mesh->faces.size();
+    std::vector<double> face_albedos(n_faces, default_visible_albedo);
+    bool albedo_loaded = false;
+
+    // Check if albedo map loading is disabled
+    bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
+
+    // 1. Try explicit FITS path from config
+    if (!albedo_map_disabled && config.custom_properties.count("albedo_map")) {
         const std::string path = config.getProperty("albedo_map");
         if (!path.empty()) {
             auto m = std::make_shared<ptm::SpatialMap>();
             if (m->loadFromFITS(path)) {
                 albedo_map = m;
+                std::cout << "[Streamed] Loaded explicit albedo map: " << path << std::endl;
             } else {
-                std::cout << "Streamed thermal: failed to load albedo map " << path
-                          << " (" << m->getLastError() << "), using default albedo\n";
+                std::cout << "[Streamed] Failed to load albedo map " << path
+                          << " (" << m->getLastError() << ")\n";
             }
         }
     }
 
-    // Precompute per-face visible albedo once
-    std::vector<double> face_albedos = computeFaceAlbedos(mesh, albedo_map, default_visible_albedo);
+    // 2. Try pre-computed binary albedo file (for standard icosphere meshes)
+    if (!albedo_map_disabled && !albedo_map) {
+        std::string body_name = config.getProperty("target_body_name");
+        if (!body_name.empty()) {
+            std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
+            body_name[0] = std::toupper(body_name[0]);
+
+            int mesh_resolution = 5;
+            auto it = config.custom_properties.find("mesh_resolution");
+            if (it != config.custom_properties.end()) {
+                try { mesh_resolution = std::stoi(it->second); } catch (...) {}
+            }
+
+            std::string albedo_maps_dir = "data/albedo_maps";
+            if (config.custom_properties.count("albedo_maps_directory") > 0) {
+                albedo_maps_dir = config.getProperty("albedo_maps_directory");
+            }
+            if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/') {
+                albedo_maps_dir += '/';
+            }
+
+            // Try binary file first
+            std::string bin_filename = body_name + "_Albedo_res" + std::to_string(mesh_resolution) + ".bin";
+            std::vector<std::string> bin_paths = {
+                albedo_maps_dir + bin_filename,
+                "../data/albedo_maps/" + bin_filename,
+                "data/albedo_maps/" + bin_filename
+            };
+            for (const auto& bp : bin_paths) {
+                auto loaded = importAlbedoMapFromFile(bp);
+                if (!loaded.empty() && loaded.size() == n_faces) {
+                    std::copy(loaded.begin(), loaded.end(), face_albedos.begin());
+                    albedo_loaded = true;
+                    std::cout << "[Streamed] Loaded binary albedo from: " << bp
+                              << "  range=[" << *std::min_element(loaded.begin(), loaded.end())
+                              << ", " << *std::max_element(loaded.begin(), loaded.end()) << "]" << std::endl;
+                    break;
+                }
+            }
+
+            // If binary not found, try FITS auto-discovery
+            if (!albedo_loaded) {
+                std::string fits_name = body_name + "-0.5deg-BondAlbedo.fits";
+                std::vector<std::string> fits_paths = {
+                    albedo_maps_dir + fits_name,
+                    "../data/albedo_maps/" + fits_name,
+                    "data/albedo_maps/" + fits_name
+                };
+                for (const auto& fp : fits_paths) {
+                    auto m = std::make_shared<ptm::SpatialMap>();
+                    if (m->loadFromFITS(fp)) {
+                        albedo_map = m;
+                        std::cout << "[Streamed] Loaded FITS albedo map: " << fp << std::endl;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply FITS albedo map if loaded (interpolate to face centers)
+    if (albedo_map && albedo_map->isValid() && !albedo_loaded) {
+        face_albedos = computeFaceAlbedos(mesh, albedo_map, default_visible_albedo);
+        albedo_loaded = true;
+    }
+
+    if (!albedo_loaded) {
+        if (albedo_map_disabled) {
+            std::cout << "[Streamed] Albedo map disabled, using uniform albedo "
+                      << default_visible_albedo << std::endl;
+        } else {
+            std::cout << "[Streamed] No albedo map found, using uniform albedo "
+                      << default_visible_albedo << std::endl;
+        }
+    }
     const double emiss_ir = 1.0 - ir_albedo;
 
-    const size_t n_faces = mesh->faces.size();
     const size_t CHUNK_SIZE = 100000;
     const size_t NUM_CHUNKS = (n_faces + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
@@ -1926,8 +2164,9 @@ bool runThermalModelsForAllFacesStreamed(
             }
 
             // Solve thermal for this face with matched times
+            double face_qb = (face_Qb && f < face_Qb->size()) ? (*face_Qb)[f] : -1.0;
             std::vector<double> temps = runThermalModelWithMatchedTimes(
-                face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0);
+                face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0, face_qb);
 
             if (surface_temps_out) {
                 (*surface_temps_out)[f].swap(temps);
@@ -1968,7 +2207,8 @@ bool runThermalModelsForAllFaces(
     int equilibration_steps,
     int total_time_steps,
     int thermal_threads,
-    const thermal::Planet* planet) {
+    const thermal::Planet* planet,
+    const std::vector<double>* face_Qb) {
     
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -2100,12 +2340,14 @@ bool runThermalModelsForAllFaces(
                 }
 
                 // Run thermal model for this face
+                double face_qb = (face_Qb && f < face_Qb->size()) ? (*face_Qb)[f] : -1.0;
                 std::vector<double> temps = runThermalModelWithMatchedTimes(
                     face_flux,
                     times,
                     mesh->latitudes[f],
                     config,
-                    equilibration_steps
+                    equilibration_steps,
+                    face_qb
                 );
 
                 // Store results locally in the chunk
@@ -2229,7 +2471,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
-    int thermal_threads)
+    int thermal_threads,
+    const std::vector<double>* face_Qb)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
@@ -2344,15 +2587,30 @@ bool runThermalModelsForAllFacesBatchSoA(
 
             batch.n_faces = faces_in_batch;
 
+            // Override per-face Qb if mask is provided
+            if (face_Qb) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    size_t gf = start_face + f;
+                    if (gf < face_Qb->size()) {
+                        batch.Qb[f] = (*face_Qb)[gf];
+                    }
+                }
+            }
+
             // Initialize temperatures with a depth-dependent profile, mirroring
-            // Profile::init_T (thermal_model.cpp). A uniform initial T at all
-            // depths leaves high-latitude faces with a persistent surface-vs-
-            // deep residual bias even after 24 lunar days of equilibration.
-            // Using the same exponential surface->deep blend as the standard
-            // path gets the batch into the same accuracy class.
+            // Profile::init_T (thermal_model.cpp:706). A uniform initial T at
+            // all depths takes many lunar days of forcing to relax into the
+            // correct geothermal gradient; for high-latitude faces it can
+            // leave ~100 K surface-vs-deep residual bias even after 24 lunar
+            // days of equilibration. Using the same exponential surface->deep
+            // blend as the standard path gets the batch into the same
+            // accuracy class as Model::run.
             for (int f = 0; f < faces_in_batch; ++f) {
                 size_t global_f = start_face + f;
 
+                // Per-face surface estimate from the face's actual average flux
+                // (includes shadowing, reflected, IR — already baked into
+                // flux_column_major by calculateAbsorbedFlux above).
                 double avg_flux = 0.0;
                 const int flux_avg_window = std::min(100, total_time_steps);
                 for (int t = 0; t < flux_avg_window; ++t) {
@@ -2367,6 +2625,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                     T_surf_est = std::max(50.0, std::min(400.0, T_surf_est));
                 }
 
+                // Deep temperature: geothermal gradient on top of surface avg,
+                // capped to prevent runaway (same formula as Profile::init_T).
                 const double R350 = config.getR350();
                 const double k_deep = planet.kd * (1.0 + R350 * T_surf_est * T_surf_est * T_surf_est);
                 const double depth = ref_profile.z().back();
@@ -2374,6 +2634,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double delta_T_geo = std::min(gradient * depth, 50.0);
                 const double T_deep = T_surf_est + delta_T_geo;
 
+                // Exponential skin-depth blend from T_surf_est at surface to T_deep at depth.
                 double cp_for_skin = planet.cp0;
                 double T_repr = 200.0;
                 double T_pow = T_repr;
@@ -2394,7 +2655,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
-            // Zero-pad unused face slots.
+            // Zero-pad unused face slots (use a benign mid-range temperature).
             for (int f = faces_in_batch; f < BS; ++f) {
                 batch.T_eq_init[f] = 200.0;
                 for (int layer = 0; layer < n_layers; ++layer) {
@@ -2403,23 +2664,31 @@ bool runThermalModelsForAllFacesBatchSoA(
             }
 
             // Equilibration phase:
-            // Mirror Model::fastEquilibrate exactly — analytical clear-sky
-            // diurnal forcing using planet.albedo (not per-face spatial
-            // albedo, not incidence-angle albedo). The standard path runs
-            // this simplified equilibration first and reconciles to full-
-            // physics fluxes during the main loop; the batch path must do
-            // the same or the two converge to different steady states and
-            // the short main loop can't bridge the gap (observed up to
-            // ~115 K residual before this fix).
-            //
-            // dt choice: planet.day / 192 gives <1 K worst-case accuracy per
-            // src/cpp/tools/test_equilibration_dt.cpp.
+            // Mirror Model::fastEquilibrate — run NYEARSEQ * round(year/day) lunar days
+            // of diurnal forcing before the main output loop. Cycle the precomputed
+            // flux trajectory as a quasi-periodic signal and substep it down to
+            // dt <= planet.day / 192 so CN accuracy stays within ~1 K worst case
+            // (see src/cpp/tools/test_equilibration_dt.cpp for the accuracy study).
             const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
                                              std::round(planet.year / planet.day);
             const double equil_duration_s = equil_days_needed * planet.day;
 
             if (equil_duration_s > 0.0 && total_time_steps >= 2) {
-                const double target_dt = planet.day / 192.0;
+                // Match Model::fastEquilibrate (thermal_model.cpp:2024) exactly:
+                // analytical clear-sky diurnal forcing using planet.albedo (not
+                // per-face spatial albedo, not incidence-angle albedo). The
+                // standard path runs this simplified equilibration first, then
+                // reconciles to full-physics fluxes during the main loop. If
+                // the batch path instead pre-equilibrates under full physics
+                // the two paths converge to different steady states and the
+                // short main loop isn't enough to bridge the gap (observed up
+                // to ~115 K max residual).
+                //
+                // dt choice: planet.day / 192 gives <1 K worst-case accuracy
+                // per src/cpp/tools/test_equilibration_dt.cpp. Much finer than
+                // that (and thus closer to fastEquilibrate's Fourier-stable dt)
+                // buys accuracy < 0.5 K at ~2× substep count.
+                const double target_dt = planet.day / 768.0;
                 const int steps_per_day = std::max(1,
                     static_cast<int>(std::round(planet.day / target_dt)));
                 const double dt_sub = planet.day / static_cast<double>(steps_per_day);
@@ -2429,6 +2698,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                 alignas(64) double flux_vec[thermal::THERMAL_BATCH_SIZE];
                 for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_vec[f] = 0.0;
 
+                // Pre-compute per-face cos(lat) and the planetary absorbed
+                // pre-factor so the per-substep inner loop is lean.
                 double cos_lat[thermal::THERMAL_BATCH_SIZE];
                 for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) cos_lat[f] = 0.0;
                 for (int f = 0; f < faces_in_batch; ++f) {
@@ -2456,21 +2727,23 @@ bool runThermalModelsForAllFacesBatchSoA(
             // Main simulation time-stepping loop.
             // Convention (matches Model::run in thermal_model.cpp:1842):
             //   surface_temps_out[f][t] == state at times[t]
-            // Store the initial state at index 0 before any advance, then
-            // after each substepped advance store the new state at index t+1.
-            // (The original code stored the post-advance state at index t and
-            // duplicated the final into the last two slots.)
-            //
-            // Main-loop substepping with linear flux interpolation. The dt
-            // ceiling is set by thermal-diffusion accuracy at the finest
-            // depth layer, not by flux-transition detection. An earlier
-            // experiment with flux-transition-based adaptive substepping
-            // saved only ~7% time at ~3x worse max error, so use uniform.
+            // So we store the initial state at index 0 before the first advance,
+            // then after each advanceTimestep(dt = times[t+1] - times[t]) we store
+            // the post-advance state at index t+1. Without this the previous
+            // code stored the post-advance state at index t (off-by-one) and
+            // duplicated the final state into indices total_time_steps-2 and -1.
             if (surface_temps_out) {
                 for (int f = 0; f < faces_in_batch; ++f) {
                     (*surface_temps_out)[start_face + f][0] = batch.getSurfaceTemp(f);
                 }
             }
+            // Main-loop substepping with linear flux interpolation.
+            // The effective dt ceiling is set by thermal-diffusion accuracy at
+            // the finest depth layer (Fourier number ~0.5 to avoid CN's
+            // low-order oscillatory error), not by flux-transition detection.
+            // An earlier experiment with flux-transition-based adaptive
+            // substepping gave only ~7% speedup at ~3x worse max error, so we
+            // use a uniform target dt here.
             const double main_target_dt = planet.day / 768.0;
             alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
@@ -2648,7 +2921,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const thermal::Config& config,
     double default_visible_albedo,
     double ir_albedo,
-    std::vector<std::vector<double>>* surface_temps_out)
+    std::vector<std::vector<double>>* surface_temps_out,
+    const std::vector<double>* face_Qb)
 {
     using namespace gpu::opencl;
 
@@ -2715,6 +2989,13 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         body_name[0] = std::toupper(body_name[0]);
     }
 
+    // Check if albedo map loading is disabled via use_albedo_map config option
+    bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
+    if (albedo_map_disabled) {
+        std::cout << "[GPU Thermal] Albedo map loading disabled (use_albedo_map: false), "
+                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
+    }
+
     // Get albedo maps directory from config
     std::string albedo_maps_dir = "data/albedo_maps";
     bool albedo_dir_explicitly_set = false;
@@ -2730,13 +3011,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // Skip FITS search if user explicitly set albedo or albedo_maps_directory is empty
     bool skip_fits = albedo_explicit || (albedo_dir_explicitly_set && albedo_maps_dir.empty());
 
-    if (is_custom_mesh && !body_name.empty() && !skip_fits) {
+    // Ensure trailing slash on albedo maps directory (used by all search paths below)
+    if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
+        albedo_maps_dir += '/';
+    }
+
+    if (!albedo_map_disabled && is_custom_mesh && !body_name.empty() && !skip_fits) {
         // For custom meshes, load FITS file and interpolate to face centers
         std::cout << "[GPU Thermal] Custom mesh detected - loading FITS albedo map for interpolation" << std::endl;
-
-        if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/' && albedo_maps_dir.back() != '\\') {
-            albedo_maps_dir += '/';
-        }
 
         std::string albedo_fits_name = body_name + "-0.5deg-BondAlbedo.fits";
         std::vector<std::string> search_paths;
@@ -2780,8 +3062,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     while (face_lon < 0) face_lon += 360.0;
                     while (face_lon >= 360.0) face_lon -= 360.0;
 
-                    // Get albedo from map (note: latitude sign convention)
-                    double map_albedo = albedo_map->getValue(face_lon, -face_lat);
+                    // Get albedo from map
+                    double map_albedo = albedo_map->getValue(face_lon, face_lat);
 
                     if (map_albedo != albedo_map->getMissingValue() &&
                         map_albedo >= 0.01 && map_albedo <= 1.0) {
@@ -2803,7 +3085,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << ", using default albedo " << default_visible_albedo << std::endl;
         }
     }
-    else if (is_custom_mesh && skip_fits) {
+    else if (!albedo_map_disabled && is_custom_mesh && skip_fits) {
         // User explicitly set albedo or albedo_maps_directory is empty — skip FITS search
         if (albedo_explicit) {
             std::cout << "[GPU Thermal] Using explicit uniform albedo " << default_visible_albedo
@@ -2813,7 +3095,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << "Using uniform albedo " << default_visible_albedo << std::endl;
         }
     }
-    else if (!body_name.empty() && config.getProperty("using_generic_body") != "true") {
+    else if (!albedo_map_disabled && !body_name.empty() && config.getProperty("using_generic_body") != "true") {
         // For standard icosphere meshes, try to load pre-computed binary albedo files
         // (skipped for generic bodies — no pre-computed maps exist)
         int mesh_resolution = 5; // Default
@@ -2915,7 +3197,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             size_t global_f = batch_start + f;
             emissivity_batch[f] = static_cast<float>(planet.emissivity);
             T_deep_batch[f] = static_cast<float>(T_deep_val);
-            Qb_batch[f] = static_cast<float>(planet.Qb);
+            // Use per-face Qb if mask is provided, otherwise planet default
+            if (face_Qb && global_f < face_Qb->size()) {
+                Qb_batch[f] = static_cast<float>((*face_Qb)[global_f]);
+            } else {
+                Qb_batch[f] = static_cast<float>(planet.Qb);
+            }
 
             for (size_t layer = 0; layer < n_layers; ++layer) {
                 size_t idx = layer * batch_n + f;
@@ -3316,7 +3603,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const thermal::Config&,
     double,
     double,
-    std::vector<std::vector<double>>*)
+    std::vector<std::vector<double>>*,
+    const std::vector<double>*)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -3645,8 +3933,7 @@ std::vector<double> computeFaceAlbedos(
             while (lon < 0) lon += 360.0;
             while (lon >= 360.0) lon -= 360.0;
             double lat = mesh->latitudes[f];
-            // Use same convention as elsewhere: maps expect -latitude
-            double v = albedo_map->getValue(lon, -lat);
+            double v = albedo_map->getValue(lon, lat);
             if (v == albedo_map->getMissingValue() || !std::isfinite(v) || v <= 0.0 || v >= 1.0) {
                 v = default_visible_albedo;
             }
@@ -3682,7 +3969,8 @@ bool exportLocationIlluminationAndTemperature(
     const std::vector<double>& primary_ir_values,
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<std::string>& time_strings,
-    int time_steps) {
+    int time_steps,
+    const std::vector<std::vector<double>>& indirect_flux = {}) {
     // Basic validations
     if (!mesh) {
         std::cerr << "exportLocationIlluminationAndTemperature: mesh is null" << std::endl;
@@ -3795,6 +4083,7 @@ bool exportLocationIlluminationAndTemperature(
     }
 
     // Map locations
+    // Location CSV uses East longitude (IAU convention), same as mesh (atan2)
     std::vector<size_t> facet_indices;
     facet_indices.reserve(locations.size());
     for (size_t i = 0; i < locations.size(); ++i) {
@@ -3827,12 +4116,14 @@ bool exportLocationIlluminationAndTemperature(
     }
 
     // Header
+    const bool have_indirect = !indirect_flux.empty();
     output << "Time";
     for (const auto& name : location_names) {
         output << "," << name << "_Total";
         output << "," << name << "_DirectSolar";
         output << "," << name << "_PrimaryReflected";
         output << "," << name << "_PrimaryIR";
+        if (have_indirect) output << "," << name << "_IndirectFlux";
         output << "," << name << "_Ts";
     }
     output << "\n";
@@ -3854,13 +4145,23 @@ bool exportLocationIlluminationAndTemperature(
         for (size_t i = 0; i < facet_indices.size(); ++i) {
             const size_t f = facet_indices[i];
             if (f >= F) {
-                output << ",0,0,0,0,0";
+                output << ",0,0,0,0";
+                if (have_indirect) output << ",0";
+                output << ",0";
                 continue;
             }
             const double tot = get_val(illumination_values, f, t);
             const double dir = get_val(direct_solar_values, f, t);
             const double rfl = get_val(primary_reflected_values, f, t);
             const double pir = get_val(primary_ir_values, f, t);
+
+            double ind = 0.0;
+            if (have_indirect && f < indirect_flux.size()) {
+                const auto& irow = indirect_flux[f];
+                if (static_cast<size_t>(t) < irow.size()) {
+                    ind = irow[static_cast<size_t>(t)];
+                }
+            }
 
             double Ts = 0.0;
             if (!surface_temps.empty() && f < surface_temps.size()) {
@@ -3869,7 +4170,9 @@ bool exportLocationIlluminationAndTemperature(
                     Ts = row[static_cast<size_t>(t)];
                 }
             }
-            output << "," << tot << "," << dir << "," << rfl << "," << pir << "," << Ts;
+            output << "," << tot << "," << dir << "," << rfl << "," << pir;
+            if (have_indirect) output << "," << ind;
+            output << "," << Ts;
         }
         output << "\n";
     }
@@ -3884,7 +4187,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& times,
     double latitude,
     const thermal::Config& config,
-    int equilibration_steps);
+    int equilibration_steps,
+    double Qb_override);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -4295,7 +4599,9 @@ void showUsage(const char* programName) {
     std::cout << "  --thermal-m N              Layers in upper skin depth (default: 10)\n";
     std::cout << "  --thermal-n N              Layer growth factor (default: 15)\n";
     std::cout << "  --thermal-b N              Skin depths to bottom layer (default: 8)\n";
-    std::cout << "  --geothermal-heat-flow Q   Geothermal heat flow [W/m²] (overrides planet default)\n\n";
+    std::cout << "  --geothermal-heat-flow Q   Geothermal heat flow [W/m²] (overrides planet default)\n";
+    std::cout << "  --heat-flow-mask FILE      Face index file for elevated Qb (one index per line)\n";
+    std::cout << "  --heat-flow-mask-value Q   Qb value [W/m²] for masked faces (default: 1.0)\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Radiation Exchange Options\n";
@@ -5884,7 +6190,8 @@ int main(int argc, char** argv) {
     std::string albedo_map_file = sim_config.illumination.albedo_map;
     std::string thermal_inertia_map_file = sim_config.thermal.thermal_inertia_map;
     std::string albedo_maps_directory = sim_config.illumination.albedo_maps_directory;
-    
+    bool use_albedo_map = sim_config.illumination.use_albedo_map;
+
     // VTK files
     std::string thermal_vtk_file = sim_config.output.thermal_vtk_file;
     std::string complete_vtk_file = sim_config.output.complete_vtk_file;
@@ -6064,6 +6371,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
             geothermal_heat_flow = std::stod(argv[++i]);
             std::cout << "Setting geothermal heat flow to: " << geothermal_heat_flow << " W/m²" << std::endl;
+        } else if (arg == "--heat-flow-mask" && i + 1 < argc) {
+            sim_config.thermal.heat_flow_mask_file = argv[++i];
+            std::cout << "Heat flow mask file: " << sim_config.thermal.heat_flow_mask_file << std::endl;
+        } else if (arg == "--heat-flow-mask-value" && i + 1 < argc) {
+            sim_config.thermal.heat_flow_mask_value = std::stod(argv[++i]);
+            std::cout << "Heat flow mask value: " << sim_config.thermal.heat_flow_mask_value << " W/m²" << std::endl;
         } else if (arg == "--albedo-map" && i + 1 < argc) {
             albedo_map_file = argv[++i];
             config.setProperty("albedo_map", albedo_map_file);
@@ -6438,6 +6751,30 @@ int main(int argc, char** argv) {
     }
 
     // ========================================================================
+    // PHASE 4c: Constant thermal inertia mode
+    // When thermophysical.constant_thermal_inertia > 0, override properties
+    // so that TI = sqrt(ks * rhos * cp) with no temperature dependence:
+    //   chi = 0  (k = ks, constant)
+    //   cpCoeff = {} (cp = cp0, constant)
+    //   cp0 = TI^2 / (ks * rhos)
+    // ========================================================================
+    double constant_ti = sim_config.thermophysical.constant_thermal_inertia;
+    if (constant_ti > 0) {
+        double ks_val = planet.ks;
+        double rhos_val = planet.rhos;
+        if (ks_val > 0 && rhos_val > 0) {
+            double cp_const = (constant_ti * constant_ti) / (ks_val * rhos_val);
+            planet.cp0 = cp_const;
+            planet.cpCoeff.clear();  // No T-dependent cp
+            chi_override = 0.0;      // No radiative conductivity
+            std::cout << "Constant thermal inertia mode: TI = " << constant_ti << " SI" << std::endl;
+            std::cout << "  ks = " << ks_val << " W/m/K, rhos = " << rhos_val
+                      << " kg/m^3, cp = " << cp_const << " J/kg/K" << std::endl;
+            std::cout << "  chi = 0 (no radiative conductivity)" << std::endl;
+        }
+    }
+
+    // ========================================================================
     // PHASE 5: Configuration summary (optional, can be enabled with --verbose)
     // ========================================================================
     if (verbose && has_config_file) {
@@ -6616,6 +6953,15 @@ int main(int argc, char** argv) {
         } else {
             std::cout << "Mesh exported to " << mesh_filename << std::endl;
         }
+    }
+
+    // ========================================================================
+    // Mesh latitude/longitude override: rotate mesh to target position
+    // ========================================================================
+    if (sim_config.mesh.latitude_override > -900.0) {
+        rotateMeshToLatLon(mesh,
+                           sim_config.mesh.latitude_override,
+                           sim_config.mesh.longitude_override);
     }
 
     // ========================================================================
@@ -7010,6 +7356,10 @@ int main(int argc, char** argv) {
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
+    // Time-varying indirect flux per face [face][timestep]
+    // Declared at this scope so it's accessible for location export later
+    std::vector<std::vector<double>> indirect_flux_series;
+
     if (run_thermal_mesh) {
         // Configure OpenMP and setup thermal model
         #ifdef _OPENMP
@@ -7047,6 +7397,7 @@ int main(int argc, char** argv) {
 
         // Add albedo maps directory to config properties
         thermal_config.setProperty("albedo_maps_directory", albedo_maps_directory);
+        thermal_config.setProperty("use_albedo_map", std::string(use_albedo_map ? "1" : "0"));
 
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {
@@ -7096,6 +7447,58 @@ int main(int argc, char** argv) {
         }
 
         bool thermal_success = false;
+
+        // Per-face geothermal heat flow mask
+        std::vector<double> face_Qb;
+        if (!sim_config.thermal.heat_flow_mask_file.empty()) {
+            std::ifstream mask_file(sim_config.thermal.heat_flow_mask_file);
+            if (!mask_file.is_open()) {
+                std::cerr << "Error: Cannot open heat flow mask file: "
+                          << sim_config.thermal.heat_flow_mask_file << std::endl;
+                return 1;
+            }
+            face_Qb.resize(num_faces, planet.Qb);
+            int mask_count = 0;
+            double qb_min = std::numeric_limits<double>::max();
+            double qb_max = 0.0;
+            bool has_per_face_values = false;
+            std::string line;
+            while (std::getline(mask_file, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                try {
+                    std::istringstream iss(line);
+                    int face_idx;
+                    double qb_val;
+                    if (!(iss >> face_idx)) continue;
+                    if (face_idx < 0 || face_idx >= static_cast<int>(num_faces)) continue;
+                    if (iss >> qb_val) {
+                        // Format: "face_idx qb_value"
+                        face_Qb[face_idx] = qb_val;
+                        has_per_face_values = true;
+                    } else {
+                        // Format: "face_idx" only — use global mask value
+                        face_Qb[face_idx] = sim_config.thermal.heat_flow_mask_value;
+                        qb_val = sim_config.thermal.heat_flow_mask_value;
+                    }
+                    if (qb_val < qb_min) qb_min = qb_val;
+                    if (qb_val > qb_max) qb_max = qb_val;
+                    mask_count++;
+                } catch (...) {
+                    // Skip malformed lines
+                }
+            }
+            if (has_per_face_values) {
+                std::cout << "Loaded heat flow mask: " << mask_count
+                          << " faces with Qb range " << qb_min << " - "
+                          << qb_max << " W/m^2" << std::endl;
+            } else {
+                std::cout << "Loaded heat flow mask: " << mask_count << " faces with Qb = "
+                          << sim_config.thermal.heat_flow_mask_value << " W/m^2" << std::endl;
+            }
+            std::cout << "  Remaining " << (num_faces - mask_count) << " faces use Qb = "
+                      << planet.Qb << " W/m^2" << std::endl;
+        }
+        const std::vector<double>* face_Qb_ptr = face_Qb.empty() ? nullptr : &face_Qb;
 
         std::vector<double> direct_solar_values_full;
         std::vector<double> primary_reflected_values_full;
@@ -7224,7 +7627,8 @@ int main(int argc, char** argv) {
                 get_direct,
                 get_reflected,
                 get_ir,
-                &surface_temps
+                &surface_temps,
+                face_Qb_ptr
             );
 
             if (!thermal_success_streamed) {
@@ -7271,7 +7675,8 @@ int main(int argc, char** argv) {
                     thermal_config,
                     default_visible_albedo,
                     0.02,
-                    &surface_temps
+                    &surface_temps,
+                    face_Qb_ptr
                 );
             } else if (use_simd_batch) {
                 thermal_success = runThermalModelsForAllFacesBatchSoA(
@@ -7288,7 +7693,8 @@ int main(int argc, char** argv) {
                     &surface_temps,
                     equilibration_steps,
                     total_time_steps,
-                    thermal_threads
+                    thermal_threads,
+                    face_Qb_ptr
                 );
             } else {
                 std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
@@ -7307,7 +7713,8 @@ int main(int argc, char** argv) {
                     equilibration_steps,
                     total_time_steps,
                     thermal_threads,
-                    &planet  // Pass planet for incidence-dependent albedo
+                    &planet,  // Pass planet for incidence-dependent albedo
+                    face_Qb_ptr
                 );
             }
 
@@ -7344,7 +7751,8 @@ int main(int argc, char** argv) {
                     thermal_config,
                     default_visible_albedo,
                     0.02,
-                    &surface_temps
+                    &surface_temps,
+                    face_Qb_ptr
                 );
             } else if (use_simd_batch) {
                 thermal_success = runThermalModelsForAllFacesBatchSoA(
@@ -7361,7 +7769,8 @@ int main(int argc, char** argv) {
                     &surface_temps,
                     equilibration_steps,
                     total_time_steps,
-                    thermal_threads
+                    thermal_threads,
+                    face_Qb_ptr
                 );
             } else {
                 std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
@@ -7380,7 +7789,8 @@ int main(int argc, char** argv) {
                     equilibration_steps,
                     total_time_steps,
                     thermal_threads,
-                    &planet  // Pass planet for incidence-dependent albedo
+                    &planet,  // Pass planet for incidence-dependent albedo
+                    face_Qb_ptr
                 );
             }
 
@@ -7494,9 +7904,49 @@ int main(int argc, char** argv) {
 
                 // Time-varying indirect flux per face [face][timestep]
                 // This is the key fix: indirect flux varies with time as wall temperatures change
-                std::vector<std::vector<double>> indirect_flux_series(num_faces);
+                // (indirect_flux_series declared at outer scope for location export)
+                indirect_flux_series.resize(num_faces);
                 for (size_t f = 0; f < num_faces; f++) {
                     indirect_flux_series[f].resize(total_time_steps, 0.0);
+                }
+
+                // Load per-face albedos for radiation coupling re-runs
+                // Must match the albedos used in the initial thermal solve
+                std::vector<double> face_albedos_rad(num_faces, planet.albedo);
+                {
+                    std::string body_name_rad = thermal_config.getProperty("target_body_name");
+                    if (!body_name_rad.empty() && std::islower(body_name_rad[0])) {
+                        body_name_rad[0] = std::toupper(body_name_rad[0]);
+                    }
+                    int mesh_res_rad = 5;
+                    try {
+                        auto it = thermal_config.custom_properties.find("mesh_resolution");
+                        if (it != thermal_config.custom_properties.end()) {
+                            mesh_res_rad = std::stoi(it->second);
+                        }
+                    } catch (...) {}
+
+                    std::string albedo_filename = body_name_rad + "_Albedo_res" + std::to_string(mesh_res_rad) + ".bin";
+                    std::string albedo_dir = thermal_config.getProperty("albedo_maps_directory");
+                    if (albedo_dir.empty()) albedo_dir = "data/albedo_maps";
+                    if (!albedo_dir.empty() && albedo_dir.back() != '/' && albedo_dir.back() != '\\') {
+                        albedo_dir += '/';
+                    }
+
+                    std::vector<std::string> albedo_search_paths = {
+                        albedo_dir + albedo_filename,
+                        "../data/albedo_maps/" + albedo_filename,
+                        "data/albedo_maps/" + albedo_filename
+                    };
+
+                    for (const auto& apath : albedo_search_paths) {
+                        auto loaded = importAlbedoMapFromFile(apath);
+                        if (!loaded.empty() && loaded.size() == num_faces) {
+                            face_albedos_rad = std::move(loaded);
+                            std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
+                            break;
+                        }
+                    }
                 }
 
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
@@ -7637,16 +8087,17 @@ int main(int argc, char** argv) {
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
 
                     // Build flux arrays with TIME-VARYING indirect contribution for all selected faces
-                    double absorbed_albedo = 1.0 - planet.albedo;
+                    // Use per-face albedos to match the initial thermal solve
                     std::vector<std::vector<double>> combined_flux(faces_to_rerun.size());
                     for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
                         int f = faces_to_rerun[idx];
+                        double face_albedo = face_albedos_rad[f];
                         combined_flux[idx].resize(total_time_steps);
                         for (int t = 0; t < total_time_steps; t++) {
                             size_t flux_idx = static_cast<size_t>(f) * total_time_steps + t;
-                            // Direct + reflected solar (absorbed)
+                            // Direct + reflected solar (absorbed) with per-face albedo
                             double solar_absorbed = (direct_solar_values[flux_idx] +
-                                                    primary_reflected_values[flux_idx]) * absorbed_albedo;
+                                                    primary_reflected_values[flux_idx]) * (1.0 - face_albedo);
                             // Add absorbed IR
                             double ir_absorbed = primary_ir_values[flux_idx] * planet.emissivity;
                             // Add TIME-VARYING indirect radiation flux at this timestep
@@ -7784,17 +8235,19 @@ int main(int argc, char** argv) {
             stats_fd.sun_pos.assign(sun_positions.begin() + stats_start_step, sun_positions.begin() + stats_start_step + stats_steps);
             stats_fd.primary_pos.assign(primary_positions.begin() + stats_start_step, primary_positions.begin() + stats_start_step + stats_steps);
 
-            // Slice temperatures for the statistics interval
-            stats_fd.temps.resize(num_faces);
-            #pragma omp parallel for schedule(static)
-            for (size_t f = 0; f < num_faces; ++f) {
-                const auto& src = surface_temps[f];
-                if (src.size() >= static_cast<size_t>(total_time_steps) &&
-                    stats_start_step + stats_steps <= static_cast<int>(src.size())) {
-                    stats_fd.temps[f].assign(
-                        src.begin() + stats_start_step,
-                        src.begin() + stats_start_step + stats_steps
-                    );
+            // Slice temperatures for the statistics interval (only if thermal was run)
+            if (!surface_temps.empty() && surface_temps.size() >= num_faces) {
+                stats_fd.temps.resize(num_faces);
+                #pragma omp parallel for schedule(static)
+                for (size_t f = 0; f < num_faces; ++f) {
+                    const auto& src = surface_temps[f];
+                    if (src.size() >= static_cast<size_t>(total_time_steps) &&
+                        stats_start_step + stats_steps <= static_cast<int>(src.size())) {
+                        stats_fd.temps[f].assign(
+                            src.begin() + stats_start_step,
+                            src.begin() + stats_start_step + stats_steps
+                        );
+                    }
                 }
             }
         }
@@ -7887,15 +8340,17 @@ int main(int argc, char** argv) {
                 filtered_primary_positions.assign(primary_positions.begin() + start, primary_positions.begin() + end);
             }
 
-            // Temperatures slice for output interval
-            filtered_surface_temps.resize(face_count);
-            #pragma omp parallel for schedule(static)
-            for (size_t f = 0; f < face_count; ++f) {
-                const auto& src = surface_temps[f];
-                if (filtered_steps > 0 &&
-                    src.size() >= static_cast<size_t>(total_ts) &&
-                    end <= static_cast<int>(src.size())) {
-                    filtered_surface_temps[f].assign(src.begin() + start, src.begin() + end);
+            // Temperatures slice for output interval (only if thermal was run)
+            if (!surface_temps.empty() && surface_temps.size() >= face_count) {
+                filtered_surface_temps.resize(face_count);
+                #pragma omp parallel for schedule(static)
+                for (size_t f = 0; f < face_count; ++f) {
+                    const auto& src = surface_temps[f];
+                    if (filtered_steps > 0 &&
+                        src.size() >= static_cast<size_t>(total_ts) &&
+                        end <= static_cast<int>(src.size())) {
+                        filtered_surface_temps[f].assign(src.begin() + start, src.begin() + end);
+                    }
                 }
             }
 
@@ -8289,7 +8744,7 @@ int main(int argc, char** argv) {
                 (output_dir.empty() ? series_output
                                     : (output_dir.back() == '/' ? output_dir + series_output
                                                                 : output_dir + "/" + series_output));
-            if (!exportLocationIllumination(
+            if (!exportLocationIlluminationAndTemperature(
                     series_out_path,
                     locations_file,
                     mesh,
@@ -8297,12 +8752,14 @@ int main(int argc, char** argv) {
                     direct_solar_values,
                     primary_reflected_values,
                     primary_ir_values,
+                    surface_temps,
                     time_strings,
-                    time_steps)) {
-                std::cerr << "Warning: Failed to export location illumination series to "
+                    time_steps,
+                    indirect_flux_series)) {
+                std::cerr << "Warning: Failed to export location data to "
                           << series_out_path << std::endl;
             } else {
-                std::cout << "Location illumination series written: "
+                std::cout << "Location illumination/temperature/indirect data written: "
                           << series_out_path << std::endl;
             }
         } catch (const std::exception& e) {
@@ -8326,6 +8783,31 @@ int main(int argc, char** argv) {
                           << " locations, " << depths_m.size()
                           << " depths -> " << loc_out_dir << std::endl;
 
+                // Load per-face albedo from binary map (same as thermal solver)
+                std::vector<double> loc_face_albedos(mesh->faces.size(), default_visible_albedo);
+                {
+                    std::string body_name = planet.name;
+                    std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
+                    if (!body_name.empty()) body_name[0] = std::toupper(body_name[0]);
+                    std::string albedo_filename = body_name + "_Albedo_res"
+                        + std::to_string(mesh_resolution) + ".bin";
+                    std::string adir = albedo_maps_directory;
+                    if (!adir.empty() && adir.back() != '/' && adir.back() != '\\') adir += '/';
+                    std::vector<std::string> search_paths = {
+                        adir + albedo_filename,
+                        "../data/albedo_maps/" + albedo_filename,
+                        "data/albedo_maps/" + albedo_filename
+                    };
+                    for (const auto& path : search_paths) {
+                        auto loaded = importAlbedoMapFromFile(path);
+                        if (!loaded.empty() && loaded.size() == mesh->faces.size()) {
+                            std::copy(loaded.begin(), loaded.end(), loc_face_albedos.begin());
+                            std::cout << "Location export: using per-face albedo from " << path << std::endl;
+                            break;
+                        }
+                    }
+                }
+
                 auto sanitize = [](std::string s) {
                     for (char& c : s) {
                         if (!(std::isalnum(static_cast<unsigned char>(c)) || c=='-' || c=='_')) c = '_';
@@ -8339,6 +8821,7 @@ int main(int argc, char** argv) {
                     const double lat_deg = std::get<1>(tup);
                     const double lon_deg = std::get<2>(tup);
 
+                    // Location CSV uses East longitude (IAU convention), same as mesh (atan2)
                     int face_idx = findNearestFaceIndexByLatLon(mesh, lat_deg, lon_deg);
                     if (face_idx < 0) {
                         std::cerr << "Warning: Could not map location '"
@@ -8348,12 +8831,15 @@ int main(int argc, char** argv) {
                     }
 
                     // Absorbed flux: (1 - A_vis)*(direct+reflected) + primary_ir
-                    std::vector<double> flux_sum(static_cast<size_t>(time_steps), 0.0);
-                    double A_vis = planet.getAlbedo(lon_deg * M_PI/180.0, lat_deg * M_PI/180.0);
+                    // Use total_time_steps (including equilibration) so the location
+                    // thermal model receives the full cycled illumination, matching
+                    // how mesh faces are handled.
+                    std::vector<double> flux_sum(static_cast<size_t>(total_time_steps), 0.0);
+                    double A_vis = loc_face_albedos[static_cast<size_t>(face_idx)];
                     A_vis = std::clamp(A_vis, 0.0, 1.0);
 
-                    for (int t = 0; t < time_steps; ++t) {
-                        const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(time_steps)
+                    for (int t = 0; t < total_time_steps; ++t) {
+                        const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(total_time_steps)
                                           + static_cast<size_t>(t);
                         const double direct = (flat < direct_solar_values.size()) ? direct_solar_values[flat] : 0.0;
                         const double refl   = (flat < primary_reflected_values.size()) ? primary_reflected_values[flat] : 0.0;
@@ -8362,7 +8848,7 @@ int main(int argc, char** argv) {
                     }
 
                     auto T_depths = runThermalModelDepthSeries(
-                        flux_sum, times, lat_deg, config, depths_m, /*equilibration_steps*/ 0, planet);
+                        flux_sum, times, lat_deg, config, depths_m, equilibration_steps, planet);
 
                     std::string base = sanitize(name.empty() ? ("loc_" + std::to_string(i)) : name);
                     const std::string out_path = loc_out_dir + "/" + base + "_depths.csv";

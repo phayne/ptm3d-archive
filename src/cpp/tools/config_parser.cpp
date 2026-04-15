@@ -42,6 +42,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
             config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
             config.mesh.topo_directory = getWithDefault(mesh, "topo_directory", config.mesh.topo_directory);
+            config.mesh.latitude_override = getWithDefault(mesh, "latitude_override", config.mesh.latitude_override);
+            config.mesh.longitude_override = getWithDefault(mesh, "longitude_override", config.mesh.longitude_override);
         }
         
         // Parse Thermal section
@@ -60,6 +62,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.integration_offset_days = getWithDefault(thermal, "integration_offset_days", config.thermal.integration_offset_days);
             config.thermal.integration_offset_steps = getWithDefault(thermal, "integration_offset_steps", config.thermal.integration_offset_steps);
             config.thermal.geothermal_heat_flow = getWithDefault(thermal, "geothermal_heat_flow", config.thermal.geothermal_heat_flow);
+            config.thermal.heat_flow_mask_file = getWithDefault(thermal, "heat_flow_mask_file", config.thermal.heat_flow_mask_file);
+            config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
         }
         
         // Parse Illumination section
@@ -69,6 +73,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "include_primary_reflection", config.illumination.include_primary_reflection);
             config.illumination.use_batch_processing =
                 getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
+            config.illumination.use_albedo_map =
+                getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
             config.illumination.albedo_map =
                 getWithDefault(n, "albedo_map", config.illumination.albedo_map);
             config.illumination.albedo_maps_directory =
@@ -181,6 +187,10 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& thermo = root["thermophysical"];
             bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
             config.thermophysical_albedo_explicit = !use_default_albedo;
+            config.thermophysical.albedo_explicit = !use_default_albedo;
+            config.thermophysical.constant_thermal_inertia = getWithDefault(
+                thermo, "constant_thermal_inertia",
+                config.thermophysical.constant_thermal_inertia);
         }
 
         // Parse Advanced section
@@ -226,6 +236,10 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
         if (!config.mesh.topo_directory.empty())
             out << YAML::Key << "topo_directory" << YAML::Value << config.mesh.topo_directory;
+        if (config.mesh.latitude_override > -900.0)
+            out << YAML::Key << "latitude_override" << YAML::Value << config.mesh.latitude_override;
+        if (config.mesh.longitude_override > -900.0)
+            out << YAML::Key << "longitude_override" << YAML::Value << config.mesh.longitude_override;
         out << YAML::EndMap;
         
         // Thermal section
@@ -242,12 +256,17 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "integration_days" << YAML::Value << config.thermal.integration_days;
         if (config.thermal.geothermal_heat_flow > 0)
             out << YAML::Key << "geothermal_heat_flow" << YAML::Value << config.thermal.geothermal_heat_flow;
+        if (!config.thermal.heat_flow_mask_file.empty())
+            out << YAML::Key << "heat_flow_mask_file" << YAML::Value << config.thermal.heat_flow_mask_file;
+        if (!config.thermal.heat_flow_mask_file.empty())
+            out << YAML::Key << "heat_flow_mask_value" << YAML::Value << config.thermal.heat_flow_mask_value;
         out << YAML::EndMap;
         
         // Illumination section
         out << YAML::Key << "illumination" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "include_primary_reflection" << YAML::Value << config.illumination.include_primary_reflection;
         out << YAML::Key << "use_batch_processing" << YAML::Value << config.illumination.use_batch_processing;
+        out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
         if (!config.illumination.albedo_map.empty())
             out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;
         out << YAML::Key << "albedo_maps_directory" << YAML::Value << config.illumination.albedo_maps_directory;
@@ -362,12 +381,18 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.thermal.grid_b = std::stoi(argv[++i]);
         } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
             config.thermal.geothermal_heat_flow = std::stod(argv[++i]);
+        } else if (arg == "--heat-flow-mask" && i + 1 < argc) {
+            config.thermal.heat_flow_mask_file = argv[++i];
+        } else if (arg == "--heat-flow-mask-value" && i + 1 < argc) {
+            config.thermal.heat_flow_mask_value = std::stod(argv[++i]);
         }
         // Illumination parameters
         else if (arg == "--no-primary-reflection") {
             config.illumination.include_primary_reflection = false;
         } else if (arg == "--no-batch") {
             config.illumination.use_batch_processing = false;
+        } else if (arg == "--no-albedo-map") {
+            config.illumination.use_albedo_map = false;
         } else if (arg == "--albedo-map" && i + 1 < argc) {
             config.illumination.albedo_map = argv[++i];
         } else if (arg == "--albedo-maps-directory" && i + 1 < argc) {
@@ -469,6 +494,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "illumination:\n";
     out << "  include_primary_reflection: true    # Include reflected sunlight from primary\n";
     out << "  use_batch_processing: true          # Use SIMD batch processing\n";
+    out << "  use_albedo_map: true                 # Auto-discover spatially-varying albedo maps\n";
     out << "  albedo_map: \"\"                      # Custom albedo map (FITS)\n";
     out << "  albedo_maps_directory: \"data/albedo_maps\"  # Albedo maps directory\n";
     out << "  positions_file: \"\"                  # Body positions file\n\n";

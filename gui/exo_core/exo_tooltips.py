@@ -108,6 +108,34 @@ TOOLTIPS = {
     ),
 
     # =========================================================================
+    # ALBEDO COUPLING (sub-group of Ice Layer)
+    # =========================================================================
+    "albedo_coupling.enabled": (
+        "Enable composition-to-albedo feedback. "
+        "As ice sublimates, non-ice material (dust/salts) concentrates at the surface, "
+        "lowering albedo. Lower albedo increases absorbed solar flux and temperature, "
+        "accelerating sublimation (positive feedback = thermal segregation). "
+        "Applied at epoch boundaries in multi-timescale mode. Auto-enables ice layer model."
+    ),
+    "albedo_coupling.ice_albedo": (
+        "Pure ice Bond albedo endmember (default: 0.65). "
+        "Albedo of a clean, fresh ice surface with no lag deposit."
+    ),
+    "albedo_coupling.nonice_albedo": (
+        "Non-ice lag deposit Bond albedo endmember (default: 0.10). "
+        "Albedo of a dust/salt-dominated surface after complete ice removal."
+    ),
+    "albedo_coupling.update_threshold": (
+        "Minimum albedo change to trigger temperature rescaling (default: 0.01). "
+        "Avoids expensive diurnal recomputation for negligible albedo changes. "
+        "Temperatures are scaled as T_new = T_old * ((1-A_new)/(1-A_old))^(1/4)."
+    ),
+    "albedo_coupling.initial_bond_albedo": (
+        "Bond albedo used in the PTM thermal simulation (default: 0.5). "
+        "Reference value for scaling temperatures when composition-albedo feedback is applied."
+    ),
+
+    # =========================================================================
     # MULTI-TIMESCALE TAB
     # =========================================================================
     "multiscale.enabled": (

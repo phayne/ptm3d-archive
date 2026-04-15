@@ -32,6 +32,8 @@ struct SimulationConfig {
         bool export_basic = false;
         bool use_topographic = false;
         std::string topo_directory = "";
+        double latitude_override = -999.0;
+        double longitude_override = -999.0;
     } mesh;
     
     // Thermal Model
@@ -56,12 +58,16 @@ struct SimulationConfig {
         int grid_b = 5;                   // Skin depths to bottom (optimal: 5, minimum viable)
         // Geothermal heat flow
         double geothermal_heat_flow = -1.0; // W/m², -1 = use planet default
+        // Per-face heat flow mask (for localized endogenic heat)
+        std::string heat_flow_mask_file = "";  // Path to face index file
+        double heat_flow_mask_value = 1.0;     // Qb for masked faces (W/m²)
     } thermal;
     
     // Illumination
     struct IlluminationParams {
         bool include_primary_reflection = true;
         bool use_batch_processing = true;
+        bool use_albedo_map = true;           // Auto-discover/load spatially-varying albedo maps
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";
         std::string positions_file = "";
@@ -164,6 +170,12 @@ struct SimulationConfig {
     // Thermophysical overrides (from YAML thermophysical section)
     // These flags indicate the user explicitly set a property value
     // rather than relying on the body's default.
+    struct ThermophysicalParams {
+        bool albedo_explicit = false;
+        double constant_thermal_inertia = -1.0;  // >0: constant TI mode (chi=0, cp=const)
+    } thermophysical;
+
+    // Legacy accessor (for compatibility)
     bool thermophysical_albedo_explicit = false;
 
     // Advanced Options

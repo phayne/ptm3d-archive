@@ -538,4 +538,32 @@ class ModernStyle:
                 border: none;
                 border-radius: 0;
             }}
+
+            /* === Dashboard Sidebar === */
+            QWidget#iconSidebar {{
+                background-color: {ModernStyle.BG_MEDIUM};
+                border-right: 1px solid {ModernStyle.BORDER_COLOR};
+            }}
+
+            QToolButton#sidebarButton {{
+                background-color: transparent;
+                color: {ModernStyle.TEXT_SECONDARY};
+                border: none;
+                border-left: 3px solid transparent;
+                border-radius: 0;
+                padding: 8px 4px;
+                font-size: 11px;
+                font-weight: bold;
+            }}
+
+            QToolButton#sidebarButton:hover {{
+                background-color: {ModernStyle.BG_LIGHT};
+                color: {ModernStyle.TEXT_PRIMARY};
+            }}
+
+            QToolButton#sidebarButton:checked {{
+                background-color: {ModernStyle.BG_DARK};
+                color: {ModernStyle.PRIMARY};
+                border-left: 3px solid {ModernStyle.PRIMARY};
+            }}
         """

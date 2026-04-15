@@ -1,0 +1,225 @@
+#include "camera_simulator.h"
+#include <iostream>
+#include <string>
+#include <vector>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+void printUsage(const char* prog) {
+    std::cout << "PTM3D Camera Simulator\n\n"
+              << "Usage: " << prog << " [options]\n\n"
+              << "Required:\n"
+              << "  --ptm-output DIR          PTM3D binary output directory\n"
+              << "  --time UTC                Render time (UTC string), can specify multiple\n"
+              << "\n"
+              << "Camera (Generic mode):\n"
+              << "  --cam-pos X Y Z           Camera position in body-fixed frame (km)\n"
+              << "  --cam-latlon LAT LON ALT  Camera position as lat(deg) lon(deg) alt(km)\n"
+              << "  --look-at X Y Z           Look-at point (km) [default: 0 0 0]\n"
+              << "  --up X Y Z                Up vector [default: 0 0 1]\n"
+              << "  --focal-mm F              Focal length in mm [default: 50]\n"
+              << "  --sensor-mm W H           Sensor dimensions in mm [default: 36 24]\n"
+              << "  --pixels NX NY            Image dimensions [default: 1024 1024]\n"
+              << "  --fov-deg F               Horizontal FOV in degrees (overrides focal length)\n"
+              << "\n"
+              << "Photometry:\n"
+              << "  --photometric MODEL       lambertian|lommel_seeliger|minnaert|hapke [default: lommel_seeliger]\n"
+              << "  --render-mode MODE        reflected|thermal|both [default: reflected]\n"
+              << "  --albedo A                Surface albedo [default: 0.12]\n"
+              << "  --ls-w W                  Lommel-Seeliger single-scattering albedo [default: 0.25]\n"
+              << "  --minnaert-k K            Minnaert limb-darkening parameter [default: 0.5]\n"
+              << "  --hapke W B0 H G THETA    Hapke parameters [default: 0.25 1.0 0.05 -0.3 20.0]\n"
+              << "  --emissivity E            Thermal emissivity [default: 0.95]\n"
+              << "  --thermal-wavelength UM   Thermal wavelength in microns [default: 10.0]\n"
+              << "  --emission-phase TYPE     lambertian|flat|polynomial [default: lambertian]\n"
+              << "\n"
+              << "Trajectory:\n"
+              << "  --trajectory FILE         Trajectory file (SPK, HORIZONS, or PROP_MAN)\n"
+              << "  --traj-format FMT         spk|horizons|propman [default: spk]\n"
+              << "  --traj-spacecraft ID      NAIF spacecraft ID [default: -1024]\n"
+              << "  --traj-epoch UTC          Epoch for PROP_MAN time offset\n"
+              << "\n"
+              << "SPICE:\n"
+              << "  --meta-kernel FILE        SPICE meta-kernel file\n"
+              << "  --kernels-path DIR        SPICE kernels directory\n"
+              << "  --target-body NAME        Target body [default: MOON]\n"
+              << "  --target-frame FRAME      Body-fixed frame [default: IAU_MOON]\n"
+              << "\n"
+              << "Output:\n"
+              << "  --output-dir DIR          Output directory [default: camera_output]\n"
+              << "  --fits                    Write FITS output [default: on]\n"
+              << "  --pgm                     Write PGM grayscale image\n"
+              << "  --no-fits                 Disable FITS output\n"
+              << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    ptm::CameraSimConfig config;
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "--help" || arg == "-h") {
+            printUsage(argv[0]);
+            return 0;
+        }
+        else if (arg == "--ptm-output" && i+1 < argc) {
+            config.ptm_output_dir = argv[++i];
+        }
+        else if (arg == "--time" && i+1 < argc) {
+            config.render_times.push_back(argv[++i]);
+        }
+        // Camera position
+        else if (arg == "--cam-pos" && i+3 < argc) {
+            config.camera.position[0] = std::stod(argv[++i]);
+            config.camera.position[1] = std::stod(argv[++i]);
+            config.camera.position[2] = std::stod(argv[++i]);
+        }
+        else if (arg == "--cam-latlon" && i+3 < argc) {
+            config.camera.use_latlon = true;
+            config.camera.latitude_deg = std::stod(argv[++i]);
+            config.camera.longitude_deg = std::stod(argv[++i]);
+            config.camera.altitude_km = std::stod(argv[++i]);
+        }
+        else if (arg == "--look-at" && i+3 < argc) {
+            config.camera.look_at[0] = std::stod(argv[++i]);
+            config.camera.look_at[1] = std::stod(argv[++i]);
+            config.camera.look_at[2] = std::stod(argv[++i]);
+        }
+        else if (arg == "--up" && i+3 < argc) {
+            config.camera.up_vector[0] = std::stod(argv[++i]);
+            config.camera.up_vector[1] = std::stod(argv[++i]);
+            config.camera.up_vector[2] = std::stod(argv[++i]);
+        }
+        else if (arg == "--focal-mm" && i+1 < argc) {
+            config.camera.focal_length_mm = std::stod(argv[++i]);
+        }
+        else if (arg == "--sensor-mm" && i+2 < argc) {
+            config.camera.sensor_width_mm = std::stod(argv[++i]);
+            config.camera.sensor_height_mm = std::stod(argv[++i]);
+        }
+        else if (arg == "--pixels" && i+2 < argc) {
+            config.camera.nx = std::stoi(argv[++i]);
+            config.camera.ny = std::stoi(argv[++i]);
+        }
+        else if (arg == "--fov-deg" && i+1 < argc) {
+            config.camera.fov_x_deg = std::stod(argv[++i]);
+        }
+        // Photometry
+        else if (arg == "--photometric" && i+1 < argc) {
+            std::string model = argv[++i];
+            if (model == "lambertian") config.reflectance_type = ptm::PhotometricModel::ReflectanceType::LAMBERTIAN;
+            else if (model == "lommel_seeliger") config.reflectance_type = ptm::PhotometricModel::ReflectanceType::LOMMEL_SEELIGER;
+            else if (model == "minnaert") config.reflectance_type = ptm::PhotometricModel::ReflectanceType::MINNAERT;
+            else if (model == "hapke") config.reflectance_type = ptm::PhotometricModel::ReflectanceType::HAPKE;
+            else std::cerr << "Unknown photometric model: " << model << std::endl;
+        }
+        else if (arg == "--render-mode" && i+1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "reflected") config.render_mode = ptm::CameraSimConfig::RenderMode::REFLECTED;
+            else if (mode == "thermal") config.render_mode = ptm::CameraSimConfig::RenderMode::THERMAL;
+            else if (mode == "both") config.render_mode = ptm::CameraSimConfig::RenderMode::BOTH;
+        }
+        else if (arg == "--albedo" && i+1 < argc) {
+            config.photometric_params.albedo = std::stod(argv[++i]);
+        }
+        else if (arg == "--ls-w" && i+1 < argc) {
+            config.photometric_params.ls_w = std::stod(argv[++i]);
+        }
+        else if (arg == "--minnaert-k" && i+1 < argc) {
+            config.photometric_params.minnaert_k = std::stod(argv[++i]);
+        }
+        else if (arg == "--hapke" && i+5 < argc) {
+            config.photometric_params.hapke_w = std::stod(argv[++i]);
+            config.photometric_params.hapke_B0 = std::stod(argv[++i]);
+            config.photometric_params.hapke_h = std::stod(argv[++i]);
+            config.photometric_params.hapke_g = std::stod(argv[++i]);
+            config.photometric_params.hapke_theta_bar = std::stod(argv[++i]);
+        }
+        else if (arg == "--emissivity" && i+1 < argc) {
+            config.photometric_params.emissivity = std::stod(argv[++i]);
+        }
+        else if (arg == "--thermal-wavelength" && i+1 < argc) {
+            config.photometric_params.thermal_wavelength_um = std::stod(argv[++i]);
+        }
+        else if (arg == "--emission-phase" && i+1 < argc) {
+            std::string type = argv[++i];
+            if (type == "lambertian") config.photometric_params.emission_phase = ptm::PhotometricModel::EmissionPhaseType::LAMBERTIAN;
+            else if (type == "flat") config.photometric_params.emission_phase = ptm::PhotometricModel::EmissionPhaseType::FLAT;
+            else if (type == "polynomial") config.photometric_params.emission_phase = ptm::PhotometricModel::EmissionPhaseType::POLYNOMIAL;
+        }
+        // Trajectory
+        else if (arg == "--trajectory" && i+1 < argc) {
+            config.trajectory_file = argv[++i];
+        }
+        else if (arg == "--traj-format" && i+1 < argc) {
+            config.trajectory_format = argv[++i];
+        }
+        else if (arg == "--traj-spacecraft" && i+1 < argc) {
+            config.trajectory_spacecraft = argv[++i];
+        }
+        else if (arg == "--traj-epoch" && i+1 < argc) {
+            config.trajectory_epoch_utc = argv[++i];
+        }
+        // SPICE
+        else if (arg == "--meta-kernel" && i+1 < argc) {
+            config.meta_kernel = argv[++i];
+        }
+        else if (arg == "--kernels-path" && i+1 < argc) {
+            config.kernels_path = argv[++i];
+        }
+        else if (arg == "--target-body" && i+1 < argc) {
+            config.target_body = argv[++i];
+        }
+        else if (arg == "--target-frame" && i+1 < argc) {
+            config.target_frame = argv[++i];
+        }
+        // Output
+        else if (arg == "--output-dir" && i+1 < argc) {
+            config.output_dir = argv[++i];
+        }
+        else if (arg == "--fits") {
+            config.output_fits = true;
+        }
+        else if (arg == "--no-fits") {
+            config.output_fits = false;
+        }
+        else if (arg == "--pgm") {
+            config.output_png = true;
+        }
+        else {
+            std::cerr << "Unknown argument: " << arg << std::endl;
+        }
+    }
+
+    // Validate
+    if (config.ptm_output_dir.empty()) {
+        std::cerr << "Error: --ptm-output is required" << std::endl;
+        printUsage(argv[0]);
+        return 1;
+    }
+    if (config.render_times.empty()) {
+        std::cerr << "Error: at least one --time is required" << std::endl;
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    // Default kernels path
+    if (config.kernels_path.empty()) {
+        config.kernels_path = "/Users/paha3326/software/cspice/data";
+    }
+
+    // Run
+    ptm::CameraSimulator simulator;
+    if (!simulator.initialize(config)) {
+        std::cerr << "Initialization failed" << std::endl;
+        return 1;
+    }
+
+    simulator.renderAllFrames();
+
+    std::cout << "\nDone." << std::endl;
+    return 0;
+}

@@ -1,0 +1,31 @@
+# Europa ico6 with uniform albedo (no spatial map)
+# Starting condition for coupled exosphere simulation:
+# uniform ice-covered surface, default Europa albedo = 0.5
+
+simulation:
+  start_time: "2025-01-01T00:00:00"
+  duration_days: 3.55              # 1 Europa orbit
+  timesteps: 288                    # 288 steps per orbit
+  body: "Europa"
+
+mesh:
+  resolution: 6                     # ico6 = 81,920 faces
+
+thermal:
+  run_thermal_mesh: true
+  threads: 0                        # auto
+  equilibration_orbits: 20          # thorough equilibration
+  compute_statistics: true
+
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false             # Uniform albedo (Europa default = 0.5)
+  albedo_maps_directory: ""
+
+output:
+  directory: "output/europa_ico6_uniform-ice"
+  format: "binary"
+
+advanced:
+  verbose: false

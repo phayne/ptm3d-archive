@@ -1365,7 +1365,13 @@ class ThermophysicalTab(BaseConfigTab):
         self.ti_spin = QDoubleSpinBox()
         self.ti_spin.setRange(0.0, 10000.0)
         self.ti_spin.setDecimals(1)
-        self.ti_spin.setToolTip("TI = \u221a(ks \u00d7 \u03c1s \u00d7 cp). Editing scales ks, kd, \u03c1s, \u03c1d.")
+        self.ti_spin.setToolTip(
+            "Thermal inertia TI = \u221a(k \u00d7 \u03c1 \u00d7 cp).\n"
+            "Setting this value activates constant-TI mode:\n"
+            "  \u2022 \u03c7 = 0 (no radiative conductivity, k = ks)\n"
+            "  \u2022 cp = TI\u00b2 / (ks \u00d7 \u03c1s), constant\n"
+            "  \u2022 No temperature dependence in k or cp"
+        )
         self.ti_spin.valueChanged.connect(self._on_ti_changed)
         ti_layout.addWidget(self.ti_spin, 0, 1)
 
@@ -1716,69 +1722,66 @@ class ThermophysicalTab(BaseConfigTab):
         self.ti_teq_label.setText(f"{T_eq:.1f} K")
 
     def _on_ti_changed(self, new_ti):
-        """Handle TI spinbox change: scale ks, kd, rhos, rhod."""
+        """Handle TI spinbox change: set constant thermal inertia mode.
+
+        When the user explicitly sets TI, the simulation uses constant
+        (temperature-independent) thermophysical properties:
+          - chi = 0 (no radiative conductivity, k = ks = const)
+          - cp = TI^2 / (ks * rhos) = const (no T-dependent heat capacity)
+          - ks and rhos are scaled to match the target TI
+        """
         if getattr(self, '_syncing_ti', False):
             return
         self._syncing_ti = True
 
         try:
-            T_eq, cp, current_ti = self._compute_ti_params()
-            if current_ti is None or cp is None:
-                return
+            ks_val = self.widgets["thermophysical.ks"].value()
+            rhos_val = self.widgets["thermophysical.rhos"].value()
 
-            if current_ti < 1e-10:
-                # Cannot scale from zero — compute absolute values instead.
-                # Set rhos to current value, compute ks = TI^2 / (rhos * cp).
-                rhos_val = self.widgets["thermophysical.rhos"].value()
-                if rhos_val <= 0:
-                    rhos_val = 1000.0
-                ks_new = (new_ti * new_ti) / (rhos_val * cp) if cp > 0 else 0.0
+            if ks_val <= 0:
+                ks_val = 0.001
+            if rhos_val <= 0:
+                rhos_val = 1000.0
 
-                for vk, dk in [("thermophysical.ks", "thermophysical.use_default_ks")]:
-                    self.widgets[dk].blockSignals(True)
-                    self.widgets[dk].setChecked(False)
-                    self.widgets[dk].blockSignals(False)
-                    self.config_manager.set_value(dk, False)
-                    self.widgets[vk].setEnabled(True)
-                    self.widgets[vk].blockSignals(True)
-                    self.widgets[vk].setValue(ks_new)
-                    self.widgets[vk].blockSignals(False)
-                    self.config_manager.set_value(vk, ks_new)
-            else:
-                # Scale factor: TI = sqrt(ks * rhos * cp) → s = (new_ti / current_ti)^2
-                # Apply sqrt(s) to each of ks and rhos (and their deep counterparts)
-                # Actually, simpler: s = new_ti / current_ti, scale each by s uniformly
-                # TI_new = sqrt(ks*s * rhos*s * cp) = s * sqrt(ks*rhos*cp) = s * TI_old ✓
-                import math
-                s = new_ti / current_ti
+            # Compute constant cp from TI = sqrt(ks * rhos * cp)
+            # => cp = TI^2 / (ks * rhos)
+            cp_const = (new_ti * new_ti) / (ks_val * rhos_val) if (ks_val * rhos_val) > 0 else 0.0
 
-                scale_props = [
-                    ("thermophysical.ks", "thermophysical.use_default_ks"),
-                    ("thermophysical.kd", "thermophysical.use_default_kd"),
-                    ("thermophysical.rhos", "thermophysical.use_default_rhos"),
-                    ("thermophysical.rhod", "thermophysical.use_default_rhod"),
-                ]
+            # Set chi = 0 (constant conductivity: k = ks, no radiative term)
+            self._set_property("thermophysical.chi", "thermophysical.use_default_chi", 0.0)
 
-                for vk, dk in scale_props:
-                    old_val = self.widgets[vk].value()
-                    new_val = old_val * s
+            # Set cp0 to the derived constant value
+            self._set_property("thermophysical.cp0", "thermophysical.use_default_cp0", cp_const)
 
-                    # Uncheck "Use Default"
-                    self.widgets[dk].blockSignals(True)
-                    self.widgets[dk].setChecked(False)
-                    self.widgets[dk].blockSignals(False)
-                    self.config_manager.set_value(dk, False)
+            # Store the constant TI value in config for the C++ solver
+            self.config_manager.set_value("thermophysical.constant_thermal_inertia", new_ti)
 
-                    # Set new value
-                    self.widgets[vk].setEnabled(True)
-                    self.widgets[vk].blockSignals(True)
-                    self.widgets[vk].setValue(new_val)
-                    self.widgets[vk].blockSignals(False)
-                    self.config_manager.set_value(vk, new_val)
+            # Update display labels
+            self.ti_cp_label.setText(f"{cp_const:.1f} J/kg/K (const)")
+            T_eq, _, _ = self._compute_ti_params()
+            if T_eq is not None:
+                self.ti_teq_label.setText(f"{T_eq:.1f} K")
 
             self.value_changed.emit()
         finally:
             self._syncing_ti = False
+
+    def _set_property(self, value_key, default_key, value):
+        """Helper: set a thermophysical property, uncheck 'Use Default'."""
+        # Uncheck "Use Default"
+        if default_key in self.widgets:
+            self.widgets[default_key].blockSignals(True)
+            self.widgets[default_key].setChecked(False)
+            self.widgets[default_key].blockSignals(False)
+            self.config_manager.set_value(default_key, False)
+
+        # Set value
+        if value_key in self.widgets:
+            self.widgets[value_key].setEnabled(True)
+            self.widgets[value_key].blockSignals(True)
+            self.widgets[value_key].setValue(value)
+            self.widgets[value_key].blockSignals(False)
+            self.config_manager.set_value(value_key, value)
 
     def on_widget_changed(self, key, value):
         """Override to update TI display when relevant properties change."""
@@ -2334,16 +2337,25 @@ class IlluminationTab(BaseConfigTab):
         albedo_layout = QGridLayout()
         albedo_layout.setColumnStretch(1, 1)
 
-        self.add_file_field(albedo_layout, 0, "Albedo Map:", "illumination.albedo_map",
+        self.add_bool_field(albedo_layout, 0, "Use Spatially-Varying Albedo Map",
+                            "illumination.use_albedo_map",
+                            "Load a spatially-varying albedo map instead of using the uniform albedo from Properties. "
+                            "When disabled, all faces use the constant albedo set in thermophysical properties.",
+                            info_key="illumination.use_albedo_map")
+        self.add_file_field(albedo_layout, 1, "Albedo Map:", "illumination.albedo_map",
                             "FITS Files (*.fits *.fit);;All Files (*)",
                             "Path to single albedo map file",
                             info_key="illumination.albedo_map")
-        self.add_directory_field(albedo_layout, 1, "Albedo Maps Directory:", "illumination.albedo_maps_directory",
+        self.add_directory_field(albedo_layout, 2, "Albedo Maps Directory:", "illumination.albedo_maps_directory",
                                  "Directory containing multiple albedo maps",
                                  info_key="illumination.albedo_maps_directory")
 
         albedo_group.setLayout(albedo_layout)
         layout.addWidget(albedo_group)
+
+        # Connect checkbox to enable/disable albedo map fields
+        self.widgets["illumination.use_albedo_map"].toggled.connect(self._on_albedo_map_toggled)
+        self._albedo_map_field_keys = ["illumination.albedo_map", "illumination.albedo_maps_directory"]
 
         # Positions
         pos_group = QGroupBox("Precomputed Positions")
@@ -2361,6 +2373,13 @@ class IlluminationTab(BaseConfigTab):
         layout.addStretch()
         self.create_scroll_area(content)
 
+    def _on_albedo_map_toggled(self, enabled):
+        """Enable/disable albedo map fields based on checkbox state."""
+        for key in self._albedo_map_field_keys:
+            widget = self.widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
     def load_from_config(self):
         config = self.config_manager.get_config()
         illum = config["illumination"]
@@ -2370,6 +2389,12 @@ class IlluminationTab(BaseConfigTab):
         self.widgets["illumination.albedo_map"].setText(illum["albedo_map"])
         self.widgets["illumination.albedo_maps_directory"].setText(illum["albedo_maps_directory"])
         self.widgets["illumination.positions_file"].setText(illum["positions_file"])
+
+        # Update albedo map field enable state
+        use_map = illum.get("use_albedo_map", True)
+        if "illumination.use_albedo_map" in self.widgets:
+            self.widgets["illumination.use_albedo_map"].setChecked(use_map)
+        self._on_albedo_map_toggled(use_map)
 
 
 class OutputTab(BaseConfigTab):

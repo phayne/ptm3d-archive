@@ -386,7 +386,23 @@ void MeshUtils::setupMesh() {
     // Calculate face centers and normals
     // For standard mesh, we don't need auto-orientation as normals are already correct
     calculateFaceProperties(false);
-    
+
+    // For icosphere meshes (smooth spheres), replace geometric triangle normals
+    // with radial normals (normalized face center direction). The geometric normal
+    // of a triangle on a discretized sphere differs systematically from the true
+    // surface normal, with pentagon-adjacent faces having a larger deviation than
+    // hexagonal faces. This creates a ~0.5 K temperature bias at icosahedral
+    // pentagon vertices. Using radial normals eliminates this artifact.
+    std::cout << "Using radial normals for icosphere mesh (smooth sphere)" << std::endl;
+    #pragma omp parallel for
+    for (size_t i = 0; i < mesh_->face_centers.size(); i++) {
+        const auto& c = mesh_->face_centers[i];
+        double r = std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+        if (r > 0) {
+            mesh_->face_normals[i] = {{c[0]/r, c[1]/r, c[2]/r}};
+        }
+    }
+
     // Map faces to lat/lon coordinates
     mapFacesToLatLon();
     

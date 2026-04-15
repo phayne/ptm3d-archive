@@ -140,7 +140,9 @@ class ConfigManager:
             "Qb": 0.018,  # Geothermal heat flow (W/m²)
             # Radiative conductivity
             "use_default_chi": True,
-            "chi": 2.7  # Radiative conductivity parameter (k = kc * [1 + chi*(T/350)^3])
+            "chi": 2.7,  # Radiative conductivity parameter (k = kc * [1 + chi*(T/350)^3])
+            # Constant thermal inertia mode
+            "constant_thermal_inertia": -1.0  # >0: constant TI (chi=0, cp=const); -1: disabled
         },
         "radiation": {
             "enabled": False,

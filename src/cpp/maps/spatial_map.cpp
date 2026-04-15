@@ -66,58 +66,112 @@ SpatialMap::SpatialMap(int width, int height,
 
 namespace {
 
-// Seam heal helper: replace both edge columns by the cross-seam average
-// of their immediate neighbors (col 1 and col width-2). This removes
-// prime-meridian stripes caused by a depressed/bad col 0.
-inline void heal_cylindrical_seam_3col(std::vector<double>& data,
-                                       int width, int height,
-                                       double missing_value) {
-    if (width < 3 || height <= 0) return;
+// Detect and mark uniform fill values in edge columns of cylindrical maps.
+// Some FITS files have sentinel/fill values (e.g. -1.0) in columns 0 and W-1
+// that are not flagged by the FITS MISSING keyword. This detects such columns
+// by checking if all values are identical and far outside the range of the
+// neighboring interior column.
+inline void detect_edge_fill_values(std::vector<double>& data,
+                                    int width, int height,
+                                    double missing_value) {
+    if (width < 4 || height <= 0) return;
+
+    auto check_and_fix_column = [&](int col) {
+        const int neighbor_col = (col == 0) ? 1 : (width - 2);
+
+        // Check if this column is uniformly a single value
+        double col_val = data[col];
+        if (!std::isfinite(col_val) || col_val == missing_value) return; // already bad
+        bool all_same = true;
+        for (int y = 1; y < height; ++y) {
+            if (data[y * width + col] != col_val) {
+                all_same = false;
+                break;
+            }
+        }
+        if (!all_same) return;
+
+        // Compute range of the neighboring interior column
+        double nmin = std::numeric_limits<double>::max();
+        double nmax = std::numeric_limits<double>::lowest();
+        for (int y = 0; y < height; ++y) {
+            double v = data[y * width + neighbor_col];
+            if (std::isfinite(v) && v != missing_value) {
+                nmin = std::min(nmin, v);
+                nmax = std::max(nmax, v);
+            }
+        }
+        if (nmin > nmax) return; // no valid neighbor data
+
+        // If the uniform value is far outside the neighbor range, mark as missing
+        double margin = 0.5 * (nmax - nmin);
+        if (col_val < nmin - margin || col_val > nmax + margin) {
+            for (int y = 0; y < height; ++y) {
+                data[y * width + col] = missing_value;
+            }
+            std::cout << "Detected fill values in edge column " << col
+                      << " (uniform value " << col_val
+                      << "), marked as missing" << std::endl;
+        }
+    };
+
+    check_and_fix_column(0);
+    check_and_fix_column(width - 1);
+}
+
+// Heal edge columns of a cylindrical (360-degree) map using linear interpolation.
+// When edge columns contain missing/invalid data, interpolates smoothly from
+// the nearest valid interior columns on each side of the seam. When edge
+// columns already contain valid data, they are left unchanged.
+inline void heal_cylindrical_seam(std::vector<double>& data,
+                                  int width, int height,
+                                  double missing_value) {
+    if (width < 4 || height <= 0) return;
     const int W = width;
 
-    auto valid = [&](double v)->bool {
-        return std::isfinite(v) && v != missing_value;
+    auto is_bad = [&](double v) -> bool {
+        return !std::isfinite(v) || v == missing_value;
     };
 
     for (int y = 0; y < height; ++y) {
-        const int i0   = y * W + 0;          // first column
-        const int i1   = y * W + 1;          // neighbor after seam
-        const int iLm1 = y * W + (W - 2);    // neighbor before last
-        const int iL   = y * W + (W - 1);    // last column
+        const int i0   = y * W + 0;       // col 0 (first)
+        const int i1   = y * W + 1;       // col 1
+        const int iLm1 = y * W + (W - 2); // col W-2
+        const int iL   = y * W + (W - 1); // col W-1 (last)
 
-        const double v1   = data[i1];
-        const double vLm1 = data[iLm1];
-        const double v0   = data[i0];
-        const double vL   = data[iL];
+        double v0   = data[i0];
+        double v1   = data[i1];
+        double vLm1 = data[iLm1];
+        double vL   = data[iL];
 
-        bool v1_ok   = valid(v1);
-        bool vLm1_ok = valid(vLm1);
-        bool v0_ok   = valid(v0);
-        bool vL_ok   = valid(vL);
+        bool v0_bad  = is_bad(v0);
+        bool v1_ok   = !is_bad(v1);
+        bool vLm1_ok = !is_bad(vLm1);
+        bool vL_bad  = is_bad(vL);
 
-        // Preferred: cross‑seam average of neighbors col(1) and col(W-2)
-        if (v1_ok && vLm1_ok) {
-            const double seam_avg = 0.5 * (v1 + vLm1);
-            data[i0] = seam_avg;
-            data[iL] = seam_avg;
-        } else if (v1_ok && !vLm1_ok) {
-            // Fall back toward the only valid neighbor on the right side
-            data[i0] = v1;
-            if (!vL_ok) data[iL] = v1;
-        } else if (!v1_ok && vLm1_ok) {
-            // Fall back toward the only valid neighbor on the left side
-            data[iL] = vLm1;
-            if (!v0_ok) data[i0] = vLm1;
-        } else {
-            // As a last resort, keep previous values (downstream sampling copes)
-            // but if both edge columns are valid while both neighbors are invalid,
-            // average the edges to ensure continuity.
-            if (v0_ok && vL_ok) {
-                const double avg = 0.5 * (v0 + vL);
-                data[i0] = avg;
-                data[iL] = avg;
+        // Both edges bad, both interior neighbors OK: linear interpolation
+        // across the 2-pixel seam gap (3 equal intervals: vLm1 -> W-1 -> 0 -> v1)
+        if (v0_bad && vL_bad && v1_ok && vLm1_ok) {
+            data[iL] = (2.0 / 3.0) * vLm1 + (1.0 / 3.0) * v1;
+            data[i0] = (1.0 / 3.0) * vLm1 + (2.0 / 3.0) * v1;
+        }
+        // Only col 0 is bad
+        else if (v0_bad && !vL_bad) {
+            if (v1_ok) {
+                data[i0] = 0.5 * (vL + v1);
+            } else {
+                data[i0] = vL;
             }
         }
+        // Only col W-1 is bad
+        else if (vL_bad && !v0_bad) {
+            if (vLm1_ok) {
+                data[iL] = 0.5 * (v0 + vLm1);
+            } else {
+                data[iL] = v0;
+            }
+        }
+        // Both edges valid: leave them unchanged
     }
 }
 
@@ -177,12 +231,13 @@ bool SpatialMap::loadFromFITS(const std::string& filename) {
         // Default to equirectangular projection unless specified otherwise
         projection_ = MapProjection::EQUIRECTANGULAR;
 
-        // UPDATED: robust seam heal using cross‑seam neighbors (col 1 and col W-2)
+        // Detect fill values in edge columns, then heal the seam
         {
             const double period = std::abs(lon_max_ - lon_min_);
             const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
-            if (is_cyl && width_ >= 3 && height_ > 0) {
-                heal_cylindrical_seam_3col(data_, width_, height_, missing_value_);
+            if (is_cyl && width_ >= 4 && height_ > 0) {
+                detect_edge_fill_values(data_, width_, height_, missing_value_);
+                heal_cylindrical_seam(data_, width_, height_, missing_value_);
             }
         }
         
@@ -595,12 +650,13 @@ bool SpatialMap::initializeFromData(
         data_[static_cast<size_t>(i)] = static_cast<double>(v);
     }
 
-    // UPDATED: robust seam heal (works for direct CFITSIO path too)
+    // Detect fill values in edge columns, then heal the seam
     {
         const double period = std::abs(lon_max_ - lon_min_);
         const bool is_cyl = (std::abs(period - 360.0) < 2.0) || (period > 350.0);
-        if (is_cyl && width_ >= 3 && height_ > 0) {
-            heal_cylindrical_seam_3col(data_, width_, height_, missing_value_);
+        if (is_cyl && width_ >= 4 && height_ > 0) {
+            detect_edge_fill_values(data_, width_, height_, missing_value_);
+            heal_cylindrical_seam(data_, width_, height_, missing_value_);
         }
     }
     

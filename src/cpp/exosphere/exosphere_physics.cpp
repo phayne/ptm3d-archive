@@ -440,10 +440,20 @@ void ExosphereModel::updateTemperatures(const std::vector<double>& temperatures)
         state_->escape_flux[i] = state_->emission_flux[i] * escape_frac;
     }
 
-    // If skip_matrix_rebuild_ is set, don't rebuild the transport matrix
-    // This is used during diurnal averaging when we only need emission/deposition fluxes
-    if (skip_matrix_rebuild_) {
-        return;
+    // Store temperatures for matrix-free transport in evolveTimeStep()
+    last_temperatures_ = temperatures;
+
+    // Matrix-free transport is used in evolveTimeStep() — skip O(N²) matrix build.
+    // The full sparse matrix can exceed 100 GB for meshes with >100K faces.
+    // Matrix build can still be forced via EXO_USE_MATRIX=1 for small meshes.
+    {
+        bool use_matrix = false;
+        if (const char* envp = std::getenv("EXO_USE_MATRIX")) {
+            use_matrix = (std::atoi(envp) != 0);
+        }
+        if (!use_matrix || skip_matrix_rebuild_) {
+            return;
+        }
     }
 
     // Check environment variable for which matrix build method to use
@@ -1268,25 +1278,35 @@ void ExosphereModel::exportIceDistribution(const std::string& filename) const {
 }
 
 void ExosphereModel::evolveTimeStep(double dt) {
-    if (!transport_matrix_valid_) {
-        updateTransportMatrix();
-    }
-    
-    // Create emission vector (total mass rate from each face)
-    Eigen::VectorXd emission(num_faces_);
+    // Build emission vector (total mass rate from each face)
+    std::vector<double> emission_vec(num_faces_);
     for (size_t i = 0; i < num_faces_; ++i) {
-        emission(i) = state_->emission_flux[i] * face_areas_[i];
+        emission_vec[i] = state_->emission_flux[i] * face_areas_[i];
     }
-    // Deposition must be F * emission (F stores row=to, col=from)
-    Eigen::VectorXd deposition = transport_matrix_ * emission;
-    
+
+    // Use matrix-free transport product (O(N) memory, no sparse matrix needed)
+    std::vector<double> deposition_vec;
+    if (!last_temperatures_.empty()) {
+        computeTransportProduct(last_temperatures_, emission_vec, deposition_vec);
+    } else {
+        // Fallback: use pre-built transport matrix if temperatures not stored
+        if (!transport_matrix_valid_) {
+            updateTransportMatrix();
+        }
+        Eigen::VectorXd em(num_faces_);
+        for (size_t i = 0; i < num_faces_; ++i) em(i) = emission_vec[i];
+        Eigen::VectorXd dep = transport_matrix_ * em;
+        deposition_vec.resize(num_faces_);
+        for (size_t i = 0; i < num_faces_; ++i) deposition_vec[i] = dep(i);
+    }
+
     // Calculate net fluxes
     #pragma omp parallel for
     for (size_t i = 0; i < num_faces_; ++i) {
-        state_->deposition_flux[i] = deposition(i) / face_areas_[i];
+        state_->deposition_flux[i] = deposition_vec[i] / face_areas_[i];
         state_->net_flux[i] = state_->deposition_flux[i] - state_->emission_flux[i];
     }
-    
+
     // Update accumulated mass using vectorized function
     #ifdef USE_AVX512
         updateMassAVX512(
@@ -1313,16 +1333,16 @@ void ExosphereModel::evolveTimeStep(double dt) {
             state_->ice_thickness[i] = state_->accumulated_mass[i] / constants::ICE_DENSITY;
         }
     #endif
-    
+
     // Calculate totals for mass balance checking
     double total_emission = 0.0;
     double total_deposition = 0.0;
     double total_escape = 0.0;
-    
+
     #pragma omp parallel for reduction(+:total_emission,total_deposition,total_escape)
     for (size_t i = 0; i < num_faces_; ++i) {
-        total_emission += emission(i);
-        total_deposition += deposition(i);
+        total_emission += emission_vec[i];
+        total_deposition += deposition_vec[i];
         total_escape += state_->escape_flux[i] * face_areas_[i];
     }
     
@@ -2582,7 +2602,10 @@ Eigen::SparseMatrix<double> BallisticTransport::buildTransportMatrixSmooth(
     double bias_range = (max_bias - min_bias);
 
     // Use 2% threshold - small biases don't significantly affect results
-    if (bias_range > 0.02) {
+    if (skip_sinkhorn_) {
+        std::cout << "  Area bias range=" << std::fixed << std::setprecision(4)
+                  << (bias_range * 100.0) << "% (Sinkhorn SKIPPED)" << std::endl;
+    } else if (bias_range > 0.02) {
         std::cout << "  Area bias detected: range=" << std::fixed << std::setprecision(4)
                   << (bias_range * 100.0) << "%, applying area-weighted Sinkhorn..." << std::endl;
 
@@ -2590,9 +2613,9 @@ Eigen::SparseMatrix<double> BallisticTransport::buildTransportMatrixSmooth(
         // Row target: Σ_i[M[j,i] * A_i] = A_j
         // Column target: Σ_j[M[j,i]] = 1 - escape_i
 
-        const int max_sinkhorn_iters = 50;  // Reduced from 100
+        const int max_sinkhorn_iters = 50;   // Reduced from 100
         const float sinkhorn_tol = 1e-4f;   // Relaxed tolerance for float
-        const float bias_target = 0.01f;    // Early exit when bias < 1%
+        const float bias_target = 0.005f;   // Early exit when bias < 0.5%
 
         // Use single precision for internal Sinkhorn computations
         std::vector<float> row_scale_f(n, 1.0f);
@@ -2766,6 +2789,416 @@ Eigen::SparseMatrix<double> BallisticTransport::buildTransportMatrixSmooth(
 
     verifyMassConservation(M);
     return M;
+}
+
+// Matrix-free transport product: computes dep = M * emission without forming M.
+// Two-pass source-based iteration with thread-local accumulation.
+// Memory: O(N + N*threads) ≈ 90 MB for 1.3M faces, vs ~17 GB for full matrix.
+void BallisticTransport::computeTransportProduct(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<double>& face_areas,
+    const std::vector<double>& temperatures,
+    const std::vector<double>& emission,
+    std::vector<double>& deposition,
+    double threshold) const
+{
+    size_t n = face_centers.size();
+    const double R = body_radius_;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Kernel cutoff: K0(15) ≈ 6e-8, captures >99.9999% of kernel weight.
+    // Larger cutoff avoids visible sharp boundary at kernel edge.
+    // At T=135K on Europa: theta_max ≈ 52° (vs 28° at xi=8).
+    // Override with EXO_XI_CUTOFF env var.
+    double xi_cutoff = 15.0;
+    if (const char* envp = std::getenv("EXO_XI_CUTOFF")) {
+        double v = std::atof(envp);
+        if (v > 1.0 && v < 100.0) xi_cutoff = v;
+    }
+
+    double T_max = *std::max_element(temperatures.begin(), temperatures.end());
+    T_max = std::max(T_max, 10.0);
+    double sigma2_max = constants::BOLTZMANN_K * T_max / constants::WATER_MOLECULAR_MASS;
+    double theta_max_global = 2.0 * sigma2_max * xi_cutoff / (constants::EUROPA_GRAVITY * R);
+    theta_max_global = std::min(theta_max_global, M_PI);
+
+    // Build spatial index if needed (persists across calls via mutable member)
+    if (!spatial_index_built_ || spatial_index_.numFaces() != n) {
+        double cell_size_deg = std::min(10.0, theta_max_global * 180.0 / M_PI / 3.0);
+        cell_size_deg = std::max(2.0, cell_size_deg);
+        spatial_index_.build(face_centers, cell_size_deg, theta_max_global * 1.1);
+        spatial_index_built_ = true;
+    }
+
+    // Mean angular face size (used for spatial smoothing radius)
+    double mean_theta = 0.0;
+    for (double A : face_areas) mean_theta += std::sqrt(std::max(A, 0.0) / M_PI) / R;
+    mean_theta /= std::max<size_t>(1, face_areas.size());
+
+    // Kernel probability density with precomputed sigma2 for the source temperature.
+    // Avoids redundant kT/m computation for each neighbor pair.
+    auto p_density_fast = [&](double d, double sigma2, double sigma4) -> double {
+        if (d <= 0.0) return 0.0;
+        double xi = constants::EUROPA_GRAVITY * d / (2.0 * sigma2);
+        if (xi > 50.0) return 0.0;
+        return (constants::EUROPA_GRAVITY * constants::EUROPA_GRAVITY * d / (4.0 * sigma4)) * besselK0(xi);
+    };
+
+    // Fallback for selfCap which needs T-parameterized calls
+    auto p_density = [&](double d, double T) -> double {
+        if (d <= 0.0 || T <= 0.0) return 0.0;
+        double sigma2 = constants::BOLTZMANN_K * T / constants::WATER_MOLECULAR_MASS;
+        double xi = constants::EUROPA_GRAVITY * d / (2.0 * sigma2);
+        if (xi > 50.0) return 0.0;
+        double sigma4 = sigma2 * sigma2;
+        return (constants::EUROPA_GRAVITY * constants::EUROPA_GRAVITY * d / (4.0 * sigma4)) * besselK0(xi);
+    };
+
+    // Self-deposition via Gauss-Legendre quadrature over spherical cap
+    auto selfCap = [&](double T, double A) -> double {
+        if (T <= 0.0 || A <= 0.0) return 0.0;
+        constexpr int NG = 6;
+        static const double xG[NG] = {-0.9324695142031520, -0.6612093864662645, -0.2386191860831969,
+                                       0.2386191860831969,  0.6612093864662645,  0.9324695142031520};
+        static const double wG[NG] = {0.1713244923791704, 0.3607615730481386, 0.4679139345726910,
+                                      0.4679139345726910, 0.3607615730481386, 0.1713244923791704};
+        double theta_cap = std::sqrt(std::max(A, 0.0) / (M_PI * R * R));
+        theta_cap = std::min(theta_cap, 0.25);
+        double a = 0, b = theta_cap;
+        double integ = 0;
+        for (int k = 0; k < NG; ++k) {
+            double t = 0.5 * ((b - a) * xG[k] + (b + a));
+            double d = R * t;
+            double pd = p_density(d, T);
+            double jac = 0.5 * (b - a);
+            integ += wG[k] * pd * (2.0 * M_PI * R * R * std::sin(t)) * jac;
+        }
+        return integ;
+    };
+
+    // === SINGLE-PASS transport scatter ===
+    // For each source: evaluate kernel weights for all neighbors within
+    // cutoff, normalize to conserve mass (minus escape), then scatter
+    // emission to neighbors. Row correction (calibration-based) handles
+    // per-face density variation (pentagon vs hexagon regions).
+
+    int num_threads = 1;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        num_threads = omp_get_num_threads();
+    }
+
+    // Thread-local deposition + calibration arrays
+    // Calibration: scatter uniform unit flux (face_areas[i]) alongside actual emission
+    // to measure area bias for Sinkhorn-like row correction.
+    std::vector<std::vector<double>> thread_dep(num_threads, std::vector<double>(n, 0.0));
+    std::vector<std::vector<double>> thread_cal(num_threads, std::vector<double>(n, 0.0));
+
+    size_t total_scatter_ops = 0;
+
+    #pragma omp parallel reduction(+:total_scatter_ops)
+    {
+        int tid = omp_get_thread_num();
+        auto& local_dep = thread_dep[tid];
+        auto& local_cal = thread_cal[tid];
+
+        std::vector<std::pair<size_t, float>> neighbors;
+        neighbors.reserve(1024);
+
+        // Thread-local cache for neighbor weights (reused per source)
+        std::vector<std::pair<size_t, double>> cached_weights;
+        cached_weights.reserve(65536);
+
+        #pragma omp for schedule(dynamic)
+        for (size_t i = 0; i < n; ++i) {
+            double e_i = emission[i];
+            double T_i = temperatures[i];
+
+            // Skip faces with no physical temperature
+            if (T_i <= 0.0) continue;
+
+            // Precompute per-source thermal parameters
+            double sigma2_i = constants::BOLTZMANN_K * T_i / constants::WATER_MOLECULAR_MASS;
+            double sigma4_i = sigma2_i * sigma2_i;
+
+            // Escape fraction (Jeans escape) — reuse sigma2 for thermal velocity
+            double vth = std::sqrt(2.0 * sigma2_i);
+            double ratio = constants::EUROPA_ESCAPE_VELOCITY / vth;
+            double escape_frac = 0.0;
+            if (ratio < 5.0) {
+                escape_frac = std::exp(-ratio * ratio) * (1.0 + ratio * ratio) / (2.0 * ratio * ratio);
+            }
+
+            double self_weight = selfCap(T_i, face_areas[i]);
+
+            // Per-source angular cutoff
+            double theta_cutoff_i = std::min(2.0 * sigma2_i * xi_cutoff / (constants::EUROPA_GRAVITY * R), M_PI);
+            float cos_cutoff_i = static_cast<float>(std::cos(theta_cutoff_i));
+
+            spatial_index_.queryNeighborsByCosTheta(i, cos_cutoff_i, neighbors);
+
+            // Phase 1: compute kernel weights and cache them
+            cached_weights.clear();
+
+            const double xi_taper_start = 0.8 * xi_cutoff;
+            const double xi_taper_range = xi_cutoff - xi_taper_start;
+
+            for (const auto& [j, cos_theta] : neighbors) {
+                double theta = FastAcos::evaluate(static_cast<double>(std::max(-1.0f, std::min(1.0f, cos_theta))));
+                double d = R * theta;
+                double pd = p_density_fast(d, sigma2_i, sigma4_i);
+                if (pd <= 0.0) continue;
+
+                // Smooth cosine taper near kernel cutoff to avoid circular disk artifacts
+                double xi = constants::EUROPA_GRAVITY * d / (2.0 * sigma2_i);
+                double taper = 1.0;
+                if (xi > xi_taper_start) {
+                    taper = 0.5 * (1.0 + std::cos(M_PI * (xi - xi_taper_start) / xi_taper_range));
+                }
+
+                double w = pd * face_areas[j] * taper;
+                if (w < threshold) continue;
+                cached_weights.emplace_back(j, w);
+            }
+
+            // Sum weights for normalization. Per-source normalization ensures
+            // each source scatters exactly (1 - escape_frac) total flux.
+            // The row correction (calibration-based) handles per-face density
+            // variation without introducing shell-boundary artifacts.
+            double sum_weights = self_weight;
+            for (const auto& [j_w, w] : cached_weights) {
+                sum_weights += w;
+            }
+
+            // Normalization
+            double target = 1.0 - escape_frac;
+            double norm_i = (sum_weights > 0.0) ? target / sum_weights : 0.0;
+
+            // Calibration: uniform unit flux from every face (emission = face_area)
+            double scaled_a = face_areas[i] * norm_i;
+
+            // Self-deposition (calibration always, actual only if emitting)
+            local_cal[i] += self_weight * scaled_a;
+            if (e_i > 0.0) {
+                double scaled_e = e_i * norm_i;
+                local_dep[i] += self_weight * scaled_e;
+                total_scatter_ops++;
+
+                // Phase 2: scatter actual emission
+                for (const auto& [j, w] : cached_weights) {
+                    local_dep[j] += w * scaled_e;
+                    total_scatter_ops++;
+                }
+            }
+
+            // Phase 2b: scatter calibration (always, for all faces with T > 0)
+            for (const auto& [j, w] : cached_weights) {
+                local_cal[j] += w * scaled_a;
+            }
+        }
+    }
+
+    // Merge pass 1 thread-local results
+    std::vector<double> calibration(n, 0.0);
+    deposition.assign(n, 0.0);
+    for (int t = 0; t < num_threads; ++t) {
+        const auto& td = thread_dep[t];
+        const auto& tc = thread_cal[t];
+        #pragma omp parallel for
+        for (size_t j = 0; j < n; ++j) {
+            deposition[j] += td[j];
+            calibration[j] += tc[j];
+        }
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    // Pre-correction mass conservation
+    double total_emission = 0.0, total_deposition = 0.0;
+    #pragma omp parallel for reduction(+:total_emission,total_deposition)
+    for (size_t i = 0; i < n; ++i) {
+        total_emission += emission[i];
+        total_deposition += deposition[i];
+    }
+
+    // === ROW-SUM BIAS CORRECTION ===
+    // The calibration vector cal[j] measures total deposition at face j for
+    // uniform emission. On a perfect mesh, cal[j] = area[j] * (1-escape).
+    // Pentagon-adjacent faces have different local face density than hexagon
+    // faces, causing systematic bias of ~20-30%. The correction factor
+    // bias[j] = area[j] / cal[j] directly corrects this mesh discretization
+    // error. This does NOT cancel the K0 kernel shape because cal[j] is a
+    // sum over all ~300K+ source faces — no single source dominates it.
+    bool disable_bias_correction = false;
+    if (const char* envp = std::getenv("EXO_DISABLE_BIAS_CORR")) {
+        disable_bias_correction = (std::atoi(envp) != 0);
+    }
+
+    // Compute per-face bias: expected (area) / actual (calibration) response
+    std::vector<double> bias(n, 1.0);
+    double max_bias = 0.0;
+    #pragma omp parallel for reduction(max:max_bias)
+    for (size_t j = 0; j < n; ++j) {
+        if (calibration[j] > 1e-30) {
+            bias[j] = face_areas[j] / calibration[j];
+            max_bias = std::max(max_bias, std::abs(bias[j] - 1.0));
+        }
+    }
+
+    double max_residual_bias = max_bias;
+
+    if (!disable_bias_correction && max_bias > 0.01) {
+        // Apply raw bias correction — exact for uniform emission,
+        // first-order accurate for non-uniform emission
+        #pragma omp parallel for
+        for (size_t j = 0; j < n; ++j) {
+            deposition[j] *= bias[j];
+        }
+        max_residual_bias = 0.0;  // Exact correction for calibration case
+    }
+
+    // === SPATIAL SMOOTHING ===
+    // Smoothing radius matches smoothField() default: 20 × mean face angular width.
+    // This ensures deposition and sublimation have consistent spatial resolution,
+    // preventing mesh artifacts in net_flux = dep - sub.
+    // Override: EXO_DEP_SMOOTH_DEG=<degrees>
+    double smooth_radius_deg = 0.0;
+    {
+        double smooth_radius = 20.0 * mean_theta;
+        if (const char* envp = std::getenv("EXO_DEP_SMOOTH_DEG")) {
+            double v = std::atof(envp);
+            if (v > 0.0 && v < 30.0) {
+                smooth_radius = v * M_PI / 180.0;
+            }
+        }
+        smooth_radius_deg = smooth_radius * 180.0 / M_PI;
+        float cos_smooth = static_cast<float>(std::cos(smooth_radius));
+        std::vector<double> dep_smooth(n);
+
+        #pragma omp parallel
+        {
+            std::vector<std::pair<size_t, float>> smooth_neighbors;
+            smooth_neighbors.reserve(512);
+
+            #pragma omp for schedule(dynamic)
+            for (size_t j = 0; j < n; ++j) {
+                spatial_index_.queryNeighborsByCosTheta(j, cos_smooth, smooth_neighbors);
+
+                double wsum = face_areas[j];
+                double dep_sum = deposition[j] * face_areas[j];
+                for (const auto& [k, cos_theta] : smooth_neighbors) {
+                    dep_sum += deposition[k] * face_areas[k];
+                    wsum += face_areas[k];
+                }
+                dep_smooth[j] = dep_sum / wsum;
+            }
+        }
+        deposition = std::move(dep_smooth);
+    }
+
+    // Restore global mass conservation (after smoothing)
+    double total_dep_corrected = 0.0;
+    #pragma omp parallel for reduction(+:total_dep_corrected)
+    for (size_t j = 0; j < n; ++j) {
+        total_dep_corrected += deposition[j];
+    }
+    if (total_dep_corrected > 1e-30 && total_deposition > 1e-30) {
+        double mass_fix = total_deposition / total_dep_corrected;
+        #pragma omp parallel for
+        for (size_t j = 0; j < n; ++j) {
+            deposition[j] *= mass_fix;
+        }
+    }
+
+    // Final conservation check
+    double total_dep_final = 0.0;
+    #pragma omp parallel for reduction(+:total_dep_final)
+    for (size_t j = 0; j < n; ++j) {
+        total_dep_final += deposition[j];
+    }
+    double conservation_ratio = (total_emission > 0.0) ? total_dep_final / total_emission : 1.0;
+
+    auto end2 = std::chrono::high_resolution_clock::now();
+    auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start);
+
+    std::cout << "Matrix-free transport: " << n << " faces, "
+              << total_scatter_ops << " scatter ops, " << ms_total.count() << " ms"
+              << ", conservation=" << std::fixed << std::setprecision(4)
+              << (conservation_ratio * 100.0) << "%"
+              << ", area-bias=" << std::setprecision(1) << (max_bias * 100.0) << "%"
+              << (disable_bias_correction ? " (uncorrected)" : " (row-corrected)")
+              << std::endl;
+}
+
+// ExosphereModel wrapper for matrix-free transport product
+void ExosphereModel::computeTransportProduct(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& emission,
+    std::vector<double>& deposition)
+{
+    transport_->computeTransportProduct(
+        face_centers_, face_areas_, temperatures, emission, deposition);
+}
+
+// Smooth a scalar field using the spatial index built by computeTransportProduct().
+// Area-weighted averaging within smooth_radius_rad.
+void BallisticTransport::smoothField(
+    const std::vector<double>& face_areas,
+    const std::vector<double>& input,
+    std::vector<double>& output,
+    double smooth_radius_rad) const
+{
+    size_t n = input.size();
+    if (!spatial_index_built_ || n == 0) {
+        output = input;
+        return;
+    }
+
+    // Default smoothing radius: 20 × mean face angular width
+    if (smooth_radius_rad <= 0.0) {
+        double mean_theta = 0.0;
+        for (double A : face_areas) mean_theta += std::sqrt(std::max(A, 0.0) / M_PI) / body_radius_;
+        mean_theta /= std::max<size_t>(1, n);
+        smooth_radius_rad = 20.0 * mean_theta;
+    }
+
+    float cos_smooth = static_cast<float>(std::cos(smooth_radius_rad));
+    output.resize(n);
+
+    #pragma omp parallel
+    {
+        std::vector<std::pair<size_t, float>> neighbors;
+        neighbors.reserve(512);
+
+        #pragma omp for schedule(dynamic)
+        for (size_t j = 0; j < n; ++j) {
+            spatial_index_.queryNeighborsByCosTheta(j, cos_smooth, neighbors);
+
+            double wsum = face_areas[j];
+            double vsum = input[j] * face_areas[j];
+            for (const auto& [k, cos_theta] : neighbors) {
+                vsum += input[k] * face_areas[k];
+                wsum += face_areas[k];
+            }
+            output[j] = vsum / wsum;
+        }
+    }
+}
+
+// ExosphereModel wrapper for smoothField
+void ExosphereModel::smoothField(
+    const std::vector<double>& input,
+    std::vector<double>& output,
+    double smooth_radius_rad)
+{
+    if (transport_) {
+        transport_->smoothField(face_areas_, input, output, smooth_radius_rad);
+    } else {
+        output = input;
+    }
 }
 
 } // namespace exosphere

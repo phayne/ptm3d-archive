@@ -558,6 +558,7 @@ add_subdirectory(src/cpp/tools)
 add_subdirectory(src/cpp/main)
 add_subdirectory(src/cpp/exosphere)
 add_subdirectory(src/cpp/viewshed)
+add_subdirectory(src/cpp/camera)
 add_subdirectory(src/cpp/ice)          # Ice table depth solver
 
 # Python bindings

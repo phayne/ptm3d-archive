@@ -29,6 +29,7 @@ class ConsolePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._module_prefix = None
         self.init_ui()
 
     def init_ui(self):
@@ -104,9 +105,22 @@ class ConsolePanel(QWidget):
                 self.output.verticalScrollBar().maximum()
             )
 
+    def set_module_prefix(self, prefix):
+        """Set a prefix prepended to all messages (e.g., '[THERMAL]').
+
+        Set to None or empty string to disable.
+        """
+        self._module_prefix = prefix if prefix else None
+
+    def _prefixed(self, text):
+        """Prepend module prefix if set."""
+        if self._module_prefix:
+            return f"{self._module_prefix} {text}"
+        return text
+
     def append_output(self, text):
         """Append standard output"""
-        self.append(text, self.COLORS['default'])
+        self.append(self._prefixed(text), self.COLORS['default'])
 
     def append_info(self, text):
         """Append info message"""

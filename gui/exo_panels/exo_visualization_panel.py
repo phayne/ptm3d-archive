@@ -12,8 +12,8 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QSplitter,
     QLabel, QSlider, QPushButton, QComboBox, QGroupBox, QGridLayout,
-    QDoubleSpinBox, QCheckBox, QFrame, QLineEdit, QFileDialog,
-    QMessageBox, QApplication
+    QDoubleSpinBox, QSpinBox, QCheckBox, QFrame, QLineEdit, QFileDialog,
+    QMessageBox, QApplication, QDialog, QDialogButtonBox, QProgressDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
@@ -96,6 +96,12 @@ class ExoPyVistaWidget(QWidget):
         self.color_range_min = None
         self.color_range_max = None
         self._has_loaded_data = False
+
+        # Lighting state
+        self.custom_lighting = False
+        self.light_azimuth = 315.0
+        self.light_elevation = 45.0
+        self.light_intensity = 1.0
 
         self.init_ui()
 
@@ -186,6 +192,13 @@ class ExoPyVistaWidget(QWidget):
         self.fixed_scale_check.stateChanged.connect(self._on_fixed_scale_changed)
         controls.addWidget(self.fixed_scale_check)
 
+        # Log scale toggle
+        self.log_scale_check = QCheckBox("Log Scale")
+        self.log_scale_check.setChecked(False)
+        self.log_scale_check.setStyleSheet("color: #e0e0e0; font-size: 11px;")
+        self.log_scale_check.stateChanged.connect(self._on_log_scale_changed)
+        controls.addWidget(self.log_scale_check)
+
         # Min input
         self.scale_min_label = QLabel("Min:")
         self.scale_min_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -219,6 +232,64 @@ class ExoPyVistaWidget(QWidget):
         ctrl_widget = QWidget()
         ctrl_widget.setLayout(controls)
         layout.insertWidget(0, ctrl_widget)
+
+        # --- Lighting controls row ---
+        light_controls = QHBoxLayout()
+        light_controls.setContentsMargins(5, 2, 5, 2)
+
+        self.lighting_check = QCheckBox("Custom Lighting")
+        self.lighting_check.setChecked(False)
+        self.lighting_check.setStyleSheet("color: #e0e0e0; font-size: 11px;")
+        self.lighting_check.stateChanged.connect(self._on_lighting_changed)
+        light_controls.addWidget(self.lighting_check)
+
+        self.az_label = QLabel("Az:")
+        self.az_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.az_label.setVisible(False)
+        light_controls.addWidget(self.az_label)
+
+        self.az_spin = QDoubleSpinBox()
+        self.az_spin.setRange(0, 360)
+        self.az_spin.setValue(315)
+        self.az_spin.setSuffix("\u00b0")
+        self.az_spin.setMaximumWidth(80)
+        self.az_spin.setVisible(False)
+        self.az_spin.valueChanged.connect(self._on_lighting_param_changed)
+        light_controls.addWidget(self.az_spin)
+
+        self.el_label = QLabel("El:")
+        self.el_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.el_label.setVisible(False)
+        light_controls.addWidget(self.el_label)
+
+        self.el_spin = QDoubleSpinBox()
+        self.el_spin.setRange(0, 90)
+        self.el_spin.setValue(45)
+        self.el_spin.setSuffix("\u00b0")
+        self.el_spin.setMaximumWidth(80)
+        self.el_spin.setVisible(False)
+        self.el_spin.valueChanged.connect(self._on_lighting_param_changed)
+        light_controls.addWidget(self.el_spin)
+
+        self.intensity_label = QLabel("Int:")
+        self.intensity_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.intensity_label.setVisible(False)
+        light_controls.addWidget(self.intensity_label)
+
+        self.intensity_spin = QDoubleSpinBox()
+        self.intensity_spin.setRange(0.0, 2.0)
+        self.intensity_spin.setValue(1.0)
+        self.intensity_spin.setSingleStep(0.1)
+        self.intensity_spin.setMaximumWidth(70)
+        self.intensity_spin.setVisible(False)
+        self.intensity_spin.valueChanged.connect(self._on_lighting_param_changed)
+        light_controls.addWidget(self.intensity_spin)
+
+        light_controls.addStretch()
+
+        light_widget = QWidget()
+        light_widget.setLayout(light_controls)
+        layout.insertWidget(1, light_widget)
 
     # -----------------------------------------------------------------
     # Mesh loading
@@ -377,6 +448,60 @@ class ExoPyVistaWidget(QWidget):
             if self._has_loaded_data:
                 self._update_mesh_display()
 
+    def _on_log_scale_changed(self, state):
+        if self._has_loaded_data:
+            self._update_mesh_display()
+
+    # -----------------------------------------------------------------
+    # Lighting controls
+    # -----------------------------------------------------------------
+
+    def _on_lighting_changed(self, state):
+        self.custom_lighting = (state == Qt.CheckState.Checked.value)
+        show = self.custom_lighting
+        for w in [self.az_label, self.az_spin, self.el_label, self.el_spin,
+                  self.intensity_label, self.intensity_spin]:
+            w.setVisible(show)
+        if self._has_loaded_data:
+            self._update_mesh_display()
+
+    def _on_lighting_param_changed(self):
+        self.light_azimuth = self.az_spin.value()
+        self.light_elevation = self.el_spin.value()
+        self.light_intensity = self.intensity_spin.value()
+        if self.custom_lighting and self._has_loaded_data:
+            self._apply_custom_lighting()
+            self.plotter.render()
+
+    def _apply_custom_lighting(self):
+        """Apply 3-light directional setup (matches viewshed panel pattern)."""
+        import math
+        self.plotter.renderer.RemoveAllLights()
+
+        az_rad = math.radians(self.light_azimuth)
+        el_rad = math.radians(self.light_elevation)
+
+        lx = -math.cos(az_rad) * math.cos(el_rad)
+        ly = -math.sin(az_rad) * math.cos(el_rad)
+        lz = -math.sin(el_rad)
+
+        # Main directional light
+        light = pv.Light(position=(0, 0, 0), focal_point=(lx, ly, lz),
+                         color='white', intensity=self.light_intensity)
+        light.positional = False
+        self.plotter.add_light(light)
+
+        # Fill light (opposite side, 20%)
+        fill = pv.Light(position=(0, 0, 0), focal_point=(-lx, -ly, -lz * 0.5),
+                        color='white', intensity=self.light_intensity * 0.2)
+        fill.positional = False
+        self.plotter.add_light(fill)
+
+        # Ambient (10%)
+        ambient = pv.Light(light_type='headlight')
+        ambient.intensity = self.light_intensity * 0.1
+        self.plotter.add_light(ambient)
+
     def _compute_global_range(self):
         """Compute min/max across sampled timesteps for current field."""
         source_dir = self.exo_dir if self.current_source == "exosphere" else self.ptm_dir
@@ -468,12 +593,32 @@ class ExoPyVistaWidget(QWidget):
             clim = (float(np.nanmin(self.current_data)),
                     float(np.nanmax(self.current_data)))
 
+        # Log scale transform
+        use_log = self.log_scale_check.isChecked()
+        if use_log and self.current_data is not None:
+            log_data = np.copy(self.current_data)
+            min_positive = float(np.min(log_data[log_data > 0])) if np.any(log_data > 0) else 1e-30
+            log_data[log_data <= 0] = min_positive
+            log_data = np.log10(log_data)
+
+            if self.current_field in self.pv_mesh.cell_data:
+                self.pv_mesh.cell_data[self.current_field] = log_data
+            elif self.current_field in self.pv_mesh.point_data:
+                self.pv_mesh.point_data[self.current_field] = log_data
+
+            if clim is not None:
+                log_min = np.log10(max(clim[0], min_positive))
+                log_max = np.log10(max(clim[1], min_positive))
+                clim = (log_min, log_max)
+
         # Determine colormap
         cmap = self.cmap_combo.currentText() if hasattr(self, "cmap_combo") else "plasma"
 
         # Field label for colorbar
         info = get_field_info(self.current_field)
         title = f"{info['label']} ({info['units']})" if info["units"] else info["label"]
+        if use_log:
+            title = f"log\u2081\u2080 {title}"
 
         # Determine whether we have scalars to show
         scalars = None
@@ -508,6 +653,10 @@ class ExoPyVistaWidget(QWidget):
             mesh_kwargs["clim"] = clim
 
         self.plotter.add_mesh(self.pv_mesh, **mesh_kwargs)
+
+        # Apply custom lighting if enabled
+        if self.custom_lighting:
+            self._apply_custom_lighting()
 
         # Re-add selection highlight
         if self.selected_face_id is not None:
@@ -638,6 +787,74 @@ class ExoPyVistaWidget(QWidget):
     def reset_camera(self):
         if PYVISTA_AVAILABLE and self.plotter:
             self.plotter.reset_camera()
+
+    def export_animation(self, filename, format_type="gif", fps=5, progress_callback=None):
+        """Export animation cycling through all timesteps."""
+        if not PYVISTA_AVAILABLE or self.pv_mesh is None:
+            return False
+
+        source_dir = self.exo_dir if self.current_source == "exosphere" else self.ptm_dir
+        if not source_dir or self.current_field not in self.fields:
+            return False
+
+        timesteps = self.fields[self.current_field]
+        n_timesteps = len(timesteps)
+        if n_timesteps == 0:
+            return False
+
+        try:
+            original_position = self._last_slider_position
+            camera_position = self.plotter.camera_position
+
+            if format_type.lower() == "gif":
+                self.plotter.open_gif(filename)
+            else:
+                self.plotter.open_movie(filename, framerate=fps)
+
+            for i in range(n_timesteps):
+                self.update_display(i)
+                self.plotter.camera_position = camera_position
+                self.plotter.render()
+                self.plotter.write_frame()
+                if progress_callback:
+                    progress_callback(i + 1, n_timesteps)
+
+            self.plotter.render()
+            self.plotter.mwriter.close()
+            self._reinit_plotter()
+            self.update_display(original_position)
+            return True
+
+        except Exception as e:
+            print(f"Animation export error: {e}")
+            try:
+                if hasattr(self.plotter, 'mwriter') and self.plotter.mwriter:
+                    try:
+                        self.plotter.mwriter.close()
+                    except Exception:
+                        pass
+                self._reinit_plotter()
+                self.update_display(
+                    original_position if 'original_position' in dir() else 0)
+            except Exception:
+                pass
+            return False
+
+    def _reinit_plotter(self):
+        """Reinitialize plotter after animation export closes it."""
+        if not PYVISTA_AVAILABLE:
+            return
+        layout = self.layout()
+        if hasattr(self, 'plotter') and self.plotter:
+            try:
+                layout.removeWidget(self.plotter.interactor)
+            except Exception:
+                pass
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background("#1e1e1e")
+        self.plotter.add_axes()
+        # Insert after controls row (0) and lighting row (1)
+        layout.insertWidget(2, self.plotter.interactor, 1)
 
 
 # =========================================================================
@@ -1155,11 +1372,27 @@ class ExoVisualizationPanel(QWidget):
         self.next_btn.clicked.connect(lambda: self._step(1))
         ts_layout.addWidget(self.next_btn)
 
+        # Play/Pause
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setMaximumWidth(60)
+        self.play_btn.clicked.connect(self._toggle_playback)
+        ts_layout.addWidget(self.play_btn)
+
+        self.play_timer = QTimer()
+        self.play_timer.timeout.connect(self._advance_timestep)
+        self.is_playing = False
+
         # Export image
         self.export_img_btn = QPushButton("Export Image")
         self.export_img_btn.setMaximumWidth(100)
         self.export_img_btn.clicked.connect(self._export_image)
         ts_layout.addWidget(self.export_img_btn)
+
+        # Export animation
+        self.export_anim_btn = QPushButton("Export Animation")
+        self.export_anim_btn.setMaximumWidth(120)
+        self.export_anim_btn.clicked.connect(self._show_export_animation_dialog)
+        ts_layout.addWidget(self.export_anim_btn)
 
         layout.addWidget(ts_frame)
 
@@ -1221,6 +1454,24 @@ class ExoVisualizationPanel(QWidget):
         new_val = max(0, min(new_val, self.ts_slider.maximum()))
         self.ts_slider.setValue(new_val)
 
+    def _toggle_playback(self):
+        if self.is_playing:
+            self.play_timer.stop()
+            self.play_btn.setText("Play")
+            self.is_playing = False
+        else:
+            self.play_timer.start(200)  # 5 fps
+            self.play_btn.setText("Pause")
+            self.is_playing = True
+
+    def _advance_timestep(self):
+        current = self.ts_slider.value()
+        max_val = self.ts_slider.maximum()
+        if current < max_val:
+            self.ts_slider.setValue(current + 1)
+        else:
+            self.ts_slider.setValue(0)  # Loop
+
     def _on_face_selected(self, face_id, info):
         self.plot_widget.set_selected_face(face_id)
         self.face_selected.emit(face_id, info)
@@ -1249,6 +1500,106 @@ class ExoVisualizationPanel(QWidget):
                     self.plot_widget.figure.savefig(filepath, dpi=150,
                                                      facecolor="#1e1e1e",
                                                      bbox_inches="tight")
+
+    def _show_export_animation_dialog(self):
+        """Show dialog to configure and export animation."""
+        pw = self.pyvista_widget
+        if pw.pv_mesh is None or pw.current_field not in pw.fields:
+            QMessageBox.warning(self, "No Data", "Please load data first.")
+            return
+
+        n_timesteps = len(pw.fields[pw.current_field])
+        if n_timesteps == 0:
+            QMessageBox.warning(self, "No Timesteps", "No timesteps available.")
+            return
+
+        # Stop playback if running
+        if self.is_playing:
+            self._toggle_playback()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Export Animation")
+        dialog.setMinimumWidth(400)
+        dlg_layout = QVBoxLayout(dialog)
+
+        format_group = QGroupBox("Animation Format")
+        fmt_layout = QGridLayout()
+        fmt_layout.addWidget(QLabel("Format:"), 0, 0)
+        format_combo = QComboBox()
+        format_combo.addItems(["GIF (.gif)", "MP4 Video (.mp4)"])
+        fmt_layout.addWidget(format_combo, 0, 1)
+
+        fmt_layout.addWidget(QLabel("FPS:"), 1, 0)
+        fps_spin = QSpinBox()
+        fps_spin.setRange(1, 60)
+        fps_spin.setValue(5)
+        fmt_layout.addWidget(fps_spin, 1, 1)
+
+        format_group.setLayout(fmt_layout)
+        dlg_layout.addWidget(format_group)
+
+        info_label = QLabel(f"Animation will include {n_timesteps} frames\n"
+                            f"Current field: {pw.current_field}")
+        info_label.setStyleSheet("color: #888888; font-style: italic;")
+        dlg_layout.addWidget(info_label)
+
+        note_label = QLabel("Note: MP4 export requires ffmpeg to be installed.")
+        note_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        dlg_layout.addWidget(note_label)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(button_box)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        format_type = "gif" if format_combo.currentIndex() == 0 else "mp4"
+        fps = fps_spin.value()
+
+        default_name = f"exo_animation_{pw.current_field}"
+        if format_type == "gif":
+            file_filter = "GIF Images (*.gif);;All Files (*)"
+            default_name += ".gif"
+        else:
+            file_filter = "MP4 Videos (*.mp4);;All Files (*)"
+            default_name += ".mp4"
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export Animation",
+            str(Path.cwd() / default_name), file_filter)
+        if not filename:
+            return
+
+        progress = QProgressDialog(
+            "Exporting animation...", "Cancel", 0, n_timesteps, self)
+        progress.setWindowTitle("Exporting")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        def update_progress(current, total):
+            progress.setValue(current)
+            progress.setLabelText(f"Rendering frame {current}/{total}...")
+            QApplication.processEvents()
+
+        success = pw.export_animation(
+            filename, format_type=format_type,
+            fps=fps, progress_callback=update_progress)
+        progress.close()
+
+        if success:
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Animation exported to:\n{filename}")
+        else:
+            QMessageBox.critical(
+                self, "Export Failed",
+                "Failed to export animation.\n"
+                "For MP4 format, ensure ffmpeg is installed.")
 
     def refresh(self):
         """Refresh current view."""

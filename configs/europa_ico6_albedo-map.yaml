@@ -1,0 +1,31 @@
+# Europa ico6 with spatially-varying albedo from FITS map
+# For self-consistent coupled exosphere simulation:
+# temperatures reflect observed albedo patterns (Galileo-derived Bond albedo)
+
+simulation:
+  start_time: "2025-01-01T00:00:00"
+  duration_days: 3.55              # 1 Europa orbit
+  timesteps: 288                    # 288 steps per orbit
+  body: "Europa"
+
+mesh:
+  resolution: 6                     # ico6 = 81,920 faces
+
+thermal:
+  run_thermal_mesh: true
+  threads: 0                        # auto
+  equilibration_orbits: 20          # thorough equilibration
+  compute_statistics: true
+
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: true              # Use spatially-varying albedo from FITS
+  albedo_maps_directory: "data/albedo_maps"
+
+output:
+  directory: "output/europa_ico6_albedo-map"
+  format: "binary"
+
+advanced:
+  verbose: false

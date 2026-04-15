@@ -27,6 +27,14 @@ class ResultsPanel(QWidget):
         self.timesteps = []
         # Default to parent directory of GUI (ptm project root)
         self.default_browse_dir = Path(__file__).parent.parent.parent
+
+        # Restore last-used results directory from settings
+        from PyQt6.QtCore import QSettings
+        self._settings = QSettings("PTM3D", "ResultsPanel")
+        saved = self._settings.value("last_results_dir")
+        if saved and Path(saved).is_dir():
+            self.current_results_dir = saved
+
         self.init_ui()
 
     def init_ui(self):
@@ -117,9 +125,14 @@ class ResultsPanel(QWidget):
 
         layout.addWidget(timestep_group)
 
+    def set_default_browse_dir(self, directory):
+        """Set the default starting directory for the browse dialog."""
+        if directory and Path(directory).is_dir():
+            self.default_browse_dir = Path(directory)
+
     def browse_results(self):
         """Open dialog to browse for results directory"""
-        # Use current results dir if set, otherwise default to project root
+        # Use current results dir if set, otherwise default browse dir
         start_dir = self.current_results_dir or str(self.default_browse_dir)
 
         directory = QFileDialog.getExistingDirectory(
@@ -139,6 +152,7 @@ class ResultsPanel(QWidget):
             return
 
         self.current_results_dir = results_dir
+        self._settings.setValue("last_results_dir", results_dir)
         self.results_tree.clear()
         self.timestep_tree.clear()
         self.timesteps = []

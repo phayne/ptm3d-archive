@@ -41,6 +41,13 @@ class ExoConfigManager:
             "dose_polar_enhancement": 2.5,
             "base_dose_rate": 2.3e-6,
         },
+        "albedo_coupling": {
+            "enabled": False,
+            "ice_albedo": 0.65,
+            "nonice_albedo": 0.10,
+            "update_threshold": 0.01,
+            "initial_bond_albedo": 0.5,
+        },
         "multiscale": {
             "enabled": False,
             "epochs": 1000,
@@ -57,6 +64,7 @@ class ExoConfigManager:
             "sputtering": {"enabled": False},
             "ice_layer": {"enabled": False},
             "crystallization": {"enabled": False},
+            "albedo_coupling": {"enabled": False},
             "multiscale": {"enabled": False},
         },
         "full_physics": {
@@ -64,6 +72,7 @@ class ExoConfigManager:
             "sputtering": {"enabled": True, "rate_scale": 1.0, "hemisphere_contrast": 3.0},
             "ice_layer": {"enabled": True, "dust_fraction": 0.05},
             "crystallization": {"enabled": True},
+            "albedo_coupling": {"enabled": True},
             "multiscale": {"enabled": False},
         },
         "geological_evolution": {
@@ -71,6 +80,7 @@ class ExoConfigManager:
             "sputtering": {"enabled": True},
             "ice_layer": {"enabled": True, "dust_fraction": 0.05},
             "crystallization": {"enabled": True},
+            "albedo_coupling": {"enabled": True},
             "multiscale": {
                 "enabled": True, "epochs": 1000,
                 "cycles_per_epoch": 100, "export_interval": 100,
@@ -129,9 +139,12 @@ class ExoConfigManager:
         """Enforce configuration dependencies.
 
         - crystallization.enabled -> ice_layer.enabled
+        - albedo_coupling.enabled -> ice_layer.enabled
         - multiscale.enabled -> ice_layer.enabled
         """
         if self.config["crystallization"]["enabled"]:
+            self.config["ice_layer"]["enabled"] = True
+        if self.config["albedo_coupling"]["enabled"]:
             self.config["ice_layer"]["enabled"] = True
         if self.config["multiscale"]["enabled"]:
             self.config["ice_layer"]["enabled"] = True
@@ -315,6 +328,23 @@ class ExoConfigManager:
                 )
             if cryst["base_dose_rate"] != 2.3e-6:
                 args.extend(["--base-dose-rate", str(cryst["base_dose_rate"])])
+
+        # Albedo coupling
+        alb = self.config["albedo_coupling"]
+        if alb["enabled"]:
+            args.append("--albedo-coupling")
+            if alb["ice_albedo"] != 0.65:
+                args.extend(["--albedo-ice", str(alb["ice_albedo"])])
+            if alb["nonice_albedo"] != 0.10:
+                args.extend(["--albedo-nonice", str(alb["nonice_albedo"])])
+            if alb["update_threshold"] != 0.01:
+                args.extend(
+                    ["--albedo-update-threshold", str(alb["update_threshold"])]
+                )
+            if alb["initial_bond_albedo"] != 0.5:
+                args.extend(
+                    ["--initial-albedo", str(alb["initial_bond_albedo"])]
+                )
 
         # Multi-timescale
         multi = self.config["multiscale"]

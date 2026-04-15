@@ -2408,12 +2408,30 @@ class VisualizationPanel(QWidget):
         self.create_controls()
         layout.addWidget(self.controls_widget)
 
+    # Known field directories and their display labels
+    FIELD_INFO = {
+        'temperature':      ('Temperature (K)',              'plasma'),
+        'illumination':     ('Total Illumination (W/m²)',    'viridis'),
+        'direct_solar':     ('Direct Solar (W/m²)',          'inferno'),
+        'primary_reflected': ('Primary Reflected (W/m²)',    'cividis'),
+        'primary_ir':       ('Primary IR (W/m²)',            'magma'),
+    }
+
     def create_controls(self):
         """Create visualization control panel"""
         self.controls_widget = QFrame()
         self.controls_widget.setFrameStyle(QFrame.Shape.StyledPanel)
         layout = QHBoxLayout(self.controls_widget)
         layout.setContentsMargins(10, 5, 10, 5)
+
+        # Field selector
+        layout.addWidget(QLabel("Field:"))
+        self.field_combo = QComboBox()
+        self.field_combo.setMinimumWidth(160)
+        self.field_combo.currentTextChanged.connect(self._on_field_combo_changed)
+        layout.addWidget(self.field_combo)
+
+        layout.addWidget(QLabel("  "))
 
         # Timestep slider
         layout.addWidget(QLabel("Timestep:"))
@@ -2475,6 +2493,9 @@ class VisualizationPanel(QWidget):
         """Load simulation results"""
         self.results_dir = results_dir
 
+        # Detect available fields
+        self._populate_field_combo(results_dir)
+
         # Load into 3D view
         self.view_3d.load_results(results_dir)
 
@@ -2485,6 +2506,45 @@ class VisualizationPanel(QWidget):
         n_timesteps = len(self.view_3d.timesteps)
         self.timestep_slider.setMaximum(max(0, n_timesteps - 1))
         self.timestep_label.setText(f"0/{n_timesteps}")
+
+    def _populate_field_combo(self, results_dir):
+        """Detect available data fields and populate the field selector."""
+        from pathlib import Path
+        results_path = Path(results_dir)
+
+        self.field_combo.blockSignals(True)
+        self.field_combo.clear()
+
+        # Preferred field order: illumination fields first if temperature is absent
+        available = []
+        for field_key, (label, _cmap) in self.FIELD_INFO.items():
+            field_dir = results_path / field_key
+            if field_dir.is_dir() and any(field_dir.glob("*.bin")):
+                available.append((field_key, label))
+
+        for field_key, label in available:
+            self.field_combo.addItem(label, field_key)
+
+        # Select best default: temperature if available, else first field
+        default_idx = 0
+        for i, (field_key, _label) in enumerate(available):
+            if field_key == "temperature":
+                default_idx = i
+                break
+
+        if available:
+            self.field_combo.setCurrentIndex(default_idx)
+            self.view_3d.set_field(available[default_idx][0])
+
+        self.field_combo.blockSignals(False)
+
+    def _on_field_combo_changed(self, label_text):
+        """Handle field selector change."""
+        field_key = self.field_combo.currentData()
+        if field_key:
+            self.view_3d.set_field(field_key)
+            if self.view_3d.current_timestep >= 0:
+                self.view_3d.load_timestep_data(self.view_3d.current_timestep)
 
     def set_timestep(self, index):
         """Set current timestep"""

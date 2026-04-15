@@ -190,7 +190,7 @@ static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* s
 
 bool IlluminationModel::initializeEmbree() {
     if (!embree_device_) {
-        embree_device_ = rtcNewDevice(nullptr);
+        embree_device_ = rtcNewDevice("backface_culling=1");
         if (!embree_device_) {
             std::cerr << "Failed to create Embree device" << std::endl;
             return false;
@@ -224,7 +224,7 @@ bool IlluminationModel::initializeScene(
         }
 
         if (!embree_device_) {
-            embree_device_ = rtcNewDevice(nullptr);
+            embree_device_ = rtcNewDevice("backface_culling=1");
             if (!embree_device_) {
                 std::cerr << "[IlluminationModel] Failed to create Embree device" << std::endl;
                 return false;
@@ -2559,6 +2559,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
     direct_solar_values.assign(n, 0.0);
     if (n == 0) return;
 
+    // Convert SPICE positions from km to meters for direction computation
+    // (face_centers are in meters, SPICE returns km)
+    const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
+    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+
     auto hash32 = [](uint32_t x) -> uint32_t {
         x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
         return x;
@@ -2570,21 +2575,22 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
 
-        // Sun vector from this face
+        // Sun vector from this face (both in meters)
         std::array<double, 3> sun_rel = {
-            sun_position[0] - fc[0],
-            sun_position[1] - fc[1],
-            sun_position[2] - fc[2]
+            sun_pos_m[0] - fc[0],
+            sun_pos_m[1] - fc[1],
+            sun_pos_m[2] - fc[2]
         };
-        double sun_dist = vectorLength(sun_rel);
-        if (sun_dist <= constants::EPSILON) { direct_solar_values[i] = 0.0; continue; }
-        std::array<double, 3> sun_dir = { sun_rel[0]/sun_dist, sun_rel[1]/sun_dist, sun_rel[2]/sun_dist };
+        double sun_dist_m = vectorLength(sun_rel);
+        if (sun_dist_m <= constants::EPSILON) { direct_solar_values[i] = 0.0; continue; }
+        std::array<double, 3> sun_dir = { sun_rel[0]/sun_dist_m, sun_rel[1]/sun_dist_m, sun_rel[2]/sun_dist_m };
 
         // Incidence cosine
         double cos_inc0 = dotProduct(fn, sun_dir);
 
-        // Solar disk geometry
-        double s = constants::SUN_RADIUS / sun_dist;
+        // Solar disk geometry (SUN_RADIUS and sun_dist_km both in km)
+        double sun_dist_km = sun_dist_m / 1000.0;
+        double s = constants::SUN_RADIUS / sun_dist_km;
         if (s > 1.0) s = 1.0;
         const double disk_ang   = std::asin(s);
         const double disk_scale = std::sin(disk_ang); // equals s
@@ -2592,7 +2598,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         // Finite-disk horizon gate:
         // Entire disk below horizon if n·s <= -sin(disk_ang)
         if (cos_inc0 <= -std::sin(disk_ang)) {
-            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
 
@@ -2625,11 +2631,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         if (cos_inc0 > 0.0) {
             bool blocked = false;
 
-            // Eclipse on center ray
+            // Eclipse on center ray (meters for sphere intersection)
             if (!primary_is_sun_) {
                 double t1, t2;
-                if (raySphereIntersect(ray_o, sun_dir, primary_position, primary_radius_, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) blocked = true;
+                if (raySphereIntersect(ray_o, sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) blocked = true;
                 }
             }
 
@@ -2637,7 +2643,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
                 std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
                 auto occ = traceOccluded(o, d, /*coherent=*/true);
                 if (!occ.empty() && occ[0] == 0) {
-                    double sun_dist_au = sun_dist / constants::KM_PER_AU;
+                    double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
                     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
                     direct_solar_values[i] = solar_irr * cos_inc0;
                     continue;
@@ -2680,11 +2686,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
             bool sskip = false;
 
-            // Eclipse clip (before occlusion)
+            // Eclipse clip (before occlusion) — use meters
             if (!primary_is_sun_) {
                 double t1, t2;
-                if (raySphereIntersect(ray_o, sd, primary_position, primary_radius_, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist) || (t2 > 0.0 && t2 < sun_dist)) sskip = true;
+                if (raySphereIntersect(ray_o, sd, primary_pos_m, primary_radius_, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) sskip = true;
                 }
             }
 
@@ -2694,7 +2700,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // No valid samples (full eclipse)
         if (dirs.empty()) {
-            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
 
@@ -2726,15 +2732,15 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         }
 
         if (total_out == 0) {
-            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
 
-        double sun_dist_au = sun_dist / constants::KM_PER_AU;
+        double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
         double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
         double flux = solar_irr * (sum_cos / double(total_out));
         if (flux <= 0.0 && enable_shadow_flux_) {
-            flux = calculateShadowFlux(fc, fn, sun_position);
+            flux = calculateShadowFlux(fc, fn, sun_pos_m);
         }
         direct_solar_values[i] = flux;
     }
@@ -3706,6 +3712,10 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     direct_solar_values.assign(n, 0.0);
     if (n == 0) return;
 
+    // Convert SPICE positions from km to meters for direction computation
+    const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
+    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+
     // Hash function for decorrelation
     auto hash32 = [](uint32_t x) -> uint32_t {
         x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
@@ -3724,7 +3734,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     struct FaceInfo {
         std::array<double, 3> sun_dir;
         std::array<double, 3> ray_origin;
-        double sun_dist;
+        double sun_dist_m;   // meters — for eclipse checks
+        double sun_dist_km;  // km — for angular size and irradiance
         double cos_inc0;
         double disk_scale;
         bool below_horizon;     // Entire disk below horizon
@@ -3739,25 +3750,26 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const auto& fn = face_normals[i];
         FaceInfo& fi = face_info[i];
 
-        // Sun vector from this face
+        // Sun vector from this face (both in meters)
         std::array<double, 3> sun_rel = {
-            sun_position[0] - fc[0],
-            sun_position[1] - fc[1],
-            sun_position[2] - fc[2]
+            sun_pos_m[0] - fc[0],
+            sun_pos_m[1] - fc[1],
+            sun_pos_m[2] - fc[2]
         };
-        fi.sun_dist = vectorLength(sun_rel);
+        fi.sun_dist_m = vectorLength(sun_rel);
+        fi.sun_dist_km = fi.sun_dist_m / 1000.0;
 
-        if (fi.sun_dist <= constants::EPSILON) {
+        if (fi.sun_dist_m <= constants::EPSILON) {
             fi.below_horizon = true;
             fi.needs_sampling = false;
             continue;
         }
 
-        fi.sun_dir = { sun_rel[0]/fi.sun_dist, sun_rel[1]/fi.sun_dist, sun_rel[2]/fi.sun_dist };
+        fi.sun_dir = { sun_rel[0]/fi.sun_dist_m, sun_rel[1]/fi.sun_dist_m, sun_rel[2]/fi.sun_dist_m };
         fi.cos_inc0 = dotProduct(fn, fi.sun_dir);
 
-        // Solar disk geometry
-        double s = constants::SUN_RADIUS / fi.sun_dist;
+        // Solar disk geometry (SUN_RADIUS in km, use km distance)
+        double s = constants::SUN_RADIUS / fi.sun_dist_km;
         if (s > 1.0) s = 1.0;
         fi.disk_scale = s;  // sin(asin(s)) = s
 
@@ -3780,12 +3792,12 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             fc[2] + fn[2] * eps_n + fi.sun_dir[2] * eps_d
         };
 
-        // Check eclipse on center ray
+        // Check eclipse on center ray (meters)
         fi.center_eclipsed = false;
         if (!primary_is_sun_ && fi.cos_inc0 > 0.0) {
             double t1, t2;
-            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_position, primary_radius_, t1, t2)) {
-                if ((t1 > 0.0 && t1 < fi.sun_dist) || (t2 > 0.0 && t2 < fi.sun_dist)) {
+            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
+                if ((t1 > 0.0 && t1 < fi.sun_dist_m) || (t2 > 0.0 && t2 < fi.sun_dist_m)) {
                     fi.center_eclipsed = true;
                 }
             }
@@ -3953,12 +3965,12 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
                 if (l <= constants::EPSILON) continue;
                 sd[0] /= l; sd[1] /= l; sd[2] /= l;
 
-                // Check eclipse
+                // Check eclipse (meters)
                 bool eclipsed = false;
                 if (!primary_is_sun_) {
                     double t1, t2;
-                    if (raySphereIntersect(fi.ray_origin, sd, primary_position, primary_radius_, t1, t2)) {
-                        if ((t1 > 0.0 && t1 < fi.sun_dist) || (t2 > 0.0 && t2 < fi.sun_dist)) {
+                    if (raySphereIntersect(fi.ray_origin, sd, primary_pos_m, primary_radius_, t1, t2)) {
+                        if ((t1 > 0.0 && t1 < fi.sun_dist_m) || (t2 > 0.0 && t2 < fi.sun_dist_m)) {
                             eclipsed = true;
                         }
                     }
@@ -4001,7 +4013,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; ++i) {
             if (enable_shadow_flux_) {
-                direct_solar_values[i] = calculateShadowFlux(face_centers[i], face_normals[i], sun_position);
+                direct_solar_values[i] = calculateShadowFlux(face_centers[i], face_normals[i], sun_pos_m);
             }
         }
         return;
@@ -4060,17 +4072,17 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const auto& fn = face_normals[i];
 
         if (fi.below_horizon) {
-            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
 
         if (fri.ray_count == 0) {
             // All samples were eclipsed
-            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
 
-        double sun_dist_au = fi.sun_dist / constants::KM_PER_AU;
+        double sun_dist_au = fi.sun_dist_km / constants::KM_PER_AU;
         double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
         if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
@@ -4079,7 +4091,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             if (!blocked) {
                 direct_solar_values[i] = solar_irr * fi.cos_inc0;
             } else {
-                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             }
         } else {
             // Process disk sampling results
@@ -4101,11 +4113,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             }
 
             if (total_valid == 0) {
-                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_position) : 0.0;
+                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             } else {
                 double flux = solar_irr * (sum_cos / double(total_valid));
                 if (flux <= 0.0 && enable_shadow_flux_) {
-                    flux = calculateShadowFlux(fc, fn, sun_position);
+                    flux = calculateShadowFlux(fc, fn, sun_pos_m);
                 }
                 direct_solar_values[i] = flux;
             }

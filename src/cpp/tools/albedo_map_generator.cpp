@@ -165,11 +165,11 @@ bool directLoadFITSToSpatialMap(SpatialMap& map, const std::string& filename) {
         cdelt2 = 1.0;  // Default to 1 degree per pixel
     }
     
-    // Calculate coordinate ranges
-    double lon_min = crval1 - (crpix1 - 0.5) * cdelt1;
-    double lon_max = crval1 + (width - crpix1 - 0.5) * cdelt1;
-    double lat_min = crval2 - (crpix2 - 0.5) * cdelt2;
-    double lat_max = crval2 + (height - crpix2 - 0.5) * cdelt2;
+    // Calculate coordinate ranges (matches FITSReader::readWCS convention)
+    double lon_min = crval1 - (crpix1 - 1) * cdelt1;
+    double lon_max = lon_min + width * cdelt1;
+    double lat_min = crval2 - (crpix2 - 1) * cdelt2;
+    double lat_max = lat_min + height * cdelt2;
     
     std::cout << "Coordinate ranges from FITS:" << std::endl;
     std::cout << "  Longitude: " << lon_min << " to " << lon_max << " degrees" << std::endl;
@@ -393,10 +393,14 @@ int main(int argc, char** argv) {
     std::cout << "Loading high-resolution albedo map: " << input_map << std::endl;
     SpatialMap albedo_map;
 
-    // Try the direct loading approach
-    if (!directLoadFITSToSpatialMap(albedo_map, input_map)) {
-        std::cerr << "Fatal error: Could not load the albedo map. Exiting." << std::endl;
-        return 1;
+    // Primary path: use SpatialMap::loadFromFITS (correct WCS via FITSReader)
+    // Fallback: directLoadFITSToSpatialMap with manual WCS handling
+    if (!safelyLoadFITSFile(albedo_map, input_map)) {
+        std::cout << "Standard FITS loading failed, trying direct approach..." << std::endl;
+        if (!directLoadFITSToSpatialMap(albedo_map, input_map)) {
+            std::cerr << "Fatal error: Could not load the albedo map. Exiting." << std::endl;
+            return 1;
+        }
     }
 
     // Add additional validation after loading

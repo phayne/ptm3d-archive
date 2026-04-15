@@ -408,9 +408,34 @@ class IceLayerTab(BaseExoConfigTab):
         self.cryst_group.setLayout(cryst_layout)
         layout.addWidget(self.cryst_group)
 
+        # Albedo coupling sub-group
+        self.albedo_group = QGroupBox("Albedo-Composition Coupling")
+        albedo_layout = QGridLayout()
+        albedo_layout.setColumnStretch(1, 1)
+
+        self.add_bool_field(albedo_layout, 0, "Enable Albedo Coupling",
+                            "albedo_coupling.enabled",
+                            info_key="albedo_coupling.enabled")
+        self.add_double_field(albedo_layout, 1, "Ice Albedo:",
+                              "albedo_coupling.ice_albedo", 0.0, 1.0, 3,
+                              info_key="albedo_coupling.ice_albedo")
+        self.add_double_field(albedo_layout, 2, "Non-Ice (Lag) Albedo:",
+                              "albedo_coupling.nonice_albedo", 0.0, 1.0, 3,
+                              info_key="albedo_coupling.nonice_albedo")
+        self.add_double_field(albedo_layout, 3, "Update Threshold:",
+                              "albedo_coupling.update_threshold", 0.001, 1.0, 3,
+                              info_key="albedo_coupling.update_threshold")
+        self.add_double_field(albedo_layout, 4, "Initial Bond Albedo:",
+                              "albedo_coupling.initial_bond_albedo", 0.0, 1.0, 3,
+                              info_key="albedo_coupling.initial_bond_albedo")
+
+        self.albedo_group.setLayout(albedo_layout)
+        layout.addWidget(self.albedo_group)
+
         # Connect enable toggles
         self.widgets["ice_layer.enabled"].stateChanged.connect(self._on_ice_toggled)
         self.widgets["crystallization.enabled"].stateChanged.connect(self._on_cryst_toggled)
+        self.widgets["albedo_coupling.enabled"].stateChanged.connect(self._on_albedo_toggled)
 
         layout.addStretch()
         self.create_scroll_area(content)
@@ -419,9 +444,11 @@ class IceLayerTab(BaseExoConfigTab):
         enabled = self.widgets["ice_layer.enabled"].isChecked()
         self.widgets["ice_layer.dust_fraction"].setEnabled(enabled)
         if not enabled:
-            # Disable crystallization if ice layer is off
+            # Disable crystallization and albedo coupling if ice layer is off
             self.widgets["crystallization.enabled"].setChecked(False)
+            self.widgets["albedo_coupling.enabled"].setChecked(False)
         self.cryst_group.setEnabled(enabled)
+        self.albedo_group.setEnabled(enabled)
 
     def _on_cryst_toggled(self):
         cryst_enabled = self.widgets["crystallization.enabled"].isChecked()
@@ -444,6 +471,23 @@ class IceLayerTab(BaseExoConfigTab):
             if key in self.widgets:
                 self.widgets[key].setEnabled(cryst_enabled)
 
+    def _on_albedo_toggled(self):
+        albedo_enabled = self.widgets["albedo_coupling.enabled"].isChecked()
+        if albedo_enabled:
+            # Auto-enable ice layer
+            self.widgets["ice_layer.enabled"].setChecked(True)
+            self.config_manager.set_value("ice_layer.enabled", True)
+        # Enable/disable albedo coupling parameter widgets
+        albedo_params = [
+            "albedo_coupling.ice_albedo",
+            "albedo_coupling.nonice_albedo",
+            "albedo_coupling.update_threshold",
+            "albedo_coupling.initial_bond_albedo",
+        ]
+        for key in albedo_params:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(albedo_enabled)
+
     def load_from_config(self):
         config = self.config_manager.get_config()
         ice = config["ice_layer"]
@@ -461,8 +505,22 @@ class IceLayerTab(BaseExoConfigTab):
         self.widgets["crystallization.dose_polar_enhancement"].setValue(cryst["dose_polar_enhancement"])
         self.widgets["crystallization.base_dose_rate"].setValue(cryst["base_dose_rate"])
 
+        # Albedo coupling
+        albedo = config.get("albedo_coupling", {})
+        if "albedo_coupling.enabled" in self.widgets:
+            self.widgets["albedo_coupling.enabled"].setChecked(albedo.get("enabled", False))
+        if "albedo_coupling.ice_albedo" in self.widgets:
+            self.widgets["albedo_coupling.ice_albedo"].setValue(albedo.get("ice_albedo", 0.65))
+        if "albedo_coupling.nonice_albedo" in self.widgets:
+            self.widgets["albedo_coupling.nonice_albedo"].setValue(albedo.get("nonice_albedo", 0.10))
+        if "albedo_coupling.update_threshold" in self.widgets:
+            self.widgets["albedo_coupling.update_threshold"].setValue(albedo.get("update_threshold", 0.01))
+        if "albedo_coupling.initial_bond_albedo" in self.widgets:
+            self.widgets["albedo_coupling.initial_bond_albedo"].setValue(albedo.get("initial_bond_albedo", 0.5))
+
         self._on_ice_toggled()
         self._on_cryst_toggled()
+        self._on_albedo_toggled()
 
 
 # =========================================================================

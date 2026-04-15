@@ -6,14 +6,14 @@
  * Physical model:
  * - The thermally active layer has a fixed thickness defined by the thermal skin depth
  * - Ice sublimates uniformly from this layer, increasing the non-ice concentration
+ * - Sublimation/sputtering rates scale with ice fraction (1 - nonice_concentration),
+ *   providing self-limiting depletion as ice is consumed
  * - When non-ice concentration reaches 1.0, no ice remains and sublimation stops
  * - Deposited ice fills void space, decreasing non-ice concentration
- * - Sputtering also removes ice, increasing non-ice concentration
  *
  * Key simplifications:
- * - No thermal damping or sublimation suppression effects
  * - Ice temperature = surface temperature (from thermal model)
- * - Sublimation/sputtering only occur when ice is present (concentration < 1)
+ * - No vertical stratification within the thermally active layer
  */
 
 #ifndef ICE_LAYER_MODEL_H
@@ -234,14 +234,18 @@ public:
     }
 
     /**
-     * Get ice availability factor (1 if ice present, 0 if not)
-     * Used to gate sublimation/sputtering fluxes
+     * Get ice availability factor as continuous ice fraction [0, 1]
+     * Sublimation/sputtering scale proportionally with exposed ice area.
+     * As non-ice material accumulates, less surface area is available for
+     * sublimation, creating self-limiting behavior at depleted faces.
      * @param state Ice layer state
      * @param face_idx Face index
-     * @return 1.0 if ice available, 0.0 if not
+     * @return (1 - nonice_concentration): 1.0 for pure ice, 0.0 for fully depleted
      */
     double getIceAvailabilityFactor(const IceLayerState& state, size_t face_idx) const {
-        return hasIce(state, face_idx) ? 1.0 : 0.0;
+        double nonice = state.nonice_concentration[face_idx];
+        if (nonice >= layer_constants::MAX_NONICE_CONCENTRATION) return 0.0;
+        return 1.0 - nonice;
     }
 
     /**
