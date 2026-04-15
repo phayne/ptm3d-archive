@@ -132,6 +132,23 @@ public:
         float dt);
 
     /**
+     * @brief Run n_equil_cycles of the persistent kernel using the same
+     * flux trajectory without reading output back between cycles, then run
+     * one final "output" cycle and read its surface temperatures into
+     * output_temps. Flux buffer is uploaded once; output buffer is
+     * downloaded once. Equivalent to calling solvePersistentAllTimesteps
+     * (n_equil_cycles + 1) times with the same arguments but avoids the
+     * wasted per-cycle 2 * n_timesteps * n_faces * sizeof(float) of PCIe
+     * traffic during equilibration.
+     */
+    void solvePersistentMultipleCycles(
+        const std::vector<float>& all_flux,
+        std::vector<float>& output_temps,
+        int n_timesteps,
+        float dt,
+        int n_equil_cycles);
+
+    /**
      * @brief Get timing of last kernel execution
      */
     float getLastKernelTimeMs() const { return last_kernel_time_ms_; }

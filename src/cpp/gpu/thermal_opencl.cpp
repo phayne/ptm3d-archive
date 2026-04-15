@@ -1096,6 +1096,117 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
               << n_faces_ << " faces in " << last_kernel_time_ms_ << " ms\n";
 }
 
+void ThermalOpenCLSolver::solvePersistentMultipleCycles(
+    const std::vector<float>& all_flux,
+    std::vector<float>& output_temps,
+    int n_timesteps,
+    float dt,
+    int n_equil_cycles)
+{
+    if (!initialized_) {
+        std::cerr << "[GPU Thermal] Solver not initialized\n";
+        return;
+    }
+    if (!persistent_kernel_) {
+        std::cerr << "[GPU Thermal] ERROR: persistent_kernel_ is null!\n";
+        return;
+    }
+    if (n_equil_cycles < 0) n_equil_cycles = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    cl_context ctx = context_->context();
+    cl_command_queue queue = context_->queue();
+    cl_int err;
+
+    const size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_;
+    if (all_flux.size() != expected_flux_size) {
+        std::cerr << "[GPU Thermal] all_flux size mismatch: expected "
+                  << expected_flux_size << ", got " << all_flux.size() << "\n";
+        return;
+    }
+
+    output_temps.resize(expected_flux_size);
+
+    // Upload flux ONCE; reuse for all equilibration cycles plus the output cycle.
+    cl_mem buf_flux_all = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                         all_flux.size() * sizeof(float),
+                                         const_cast<float*>(all_flux.data()), &err);
+    CL_CHECK(err);
+
+    // Allocate output buffer ONCE; each cycle overwrites it, only read back the final cycle.
+    cl_mem buf_output_temps = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
+                                             output_temps.size() * sizeof(float),
+                                             nullptr, &err);
+    CL_CHECK(err);
+
+    // Set kernel arguments ONCE (same for every cycle).
+    int n_faces = static_cast<int>(n_faces_);
+    int n_layers = static_cast<int>(n_layers_);
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_T_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_k_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_cp_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_kappa_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_rho_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_kc_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_flux_all));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_output_temps));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_emissivity_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_z_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_T_deep_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_Qb_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(float), &R350_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_cp_coeffs_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_cp_coeffs_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(float), &cp0_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(float), &sigma_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(float), &dt));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_faces));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_layers));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_timesteps));
+
+    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+                          config_.work_group_size) * config_.work_group_size;
+    size_t local_size = config_.work_group_size;
+
+    const int total_cycles = n_equil_cycles + 1;
+    for (int cycle = 0; cycle < total_cycles; ++cycle) {
+        err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
+                                     &global_size, &local_size, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "[GPU Thermal] Kernel launch failed (cycle " << cycle
+                      << "): " << clErrorString(err) << "\n";
+            break;
+        }
+    }
+
+    err = clFinish(queue);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] Kernel execution failed: " << clErrorString(err) << "\n";
+    }
+
+    // Read output ONCE after the final cycle.
+    err = clEnqueueReadBuffer(queue, buf_output_temps, CL_TRUE, 0,
+                              output_temps.size() * sizeof(float),
+                              output_temps.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
+    }
+
+    clReleaseMemObject(buf_flux_all);
+    clReleaseMemObject(buf_output_temps);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    last_kernel_time_ms_ = static_cast<float>(duration.count());
+
+    std::cout << "[GPU Thermal] Persistent kernel: " << total_cycles << " cycles x "
+              << n_timesteps << " timesteps for " << n_faces_ << " faces in "
+              << last_kernel_time_ms_ << " ms ("
+              << (last_kernel_time_ms_ / total_cycles) << " ms/cycle avg)\n";
+}
+
 const OpenCLDeviceInfo& ThermalOpenCLSolver::getDeviceInfo() const {
     static OpenCLDeviceInfo empty;
     return context_ ? context_->deviceInfo() : empty;

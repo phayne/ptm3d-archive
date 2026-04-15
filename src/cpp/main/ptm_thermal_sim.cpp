@@ -2957,11 +2957,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // GPU memory constraint: estimate ~50 bytes per face per layer for arrays
     // Plus flux and output: ~8 bytes per face per timestep * 2
-    // Conservative batch size based on 8GB GPU memory
+    // Conservative batch size based on 6 GB GPU memory budget.
+    // Cap at 500K faces/batch: large enough to process typical res-7 meshes in
+    // one batch (fewer per-batch setup/CL-buffer creations + persistent-kernel
+    // launches), small enough to fit comfortably on 4–8 GB integrated GPUs.
     const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
     const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;  // 6 GB conservative
     const size_t max_batch_size = std::min(n_faces, gpu_memory_limit / bytes_per_face);
-    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(100000));
+    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(500000));
 
     std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
               << " (n_layers=" << n_layers << ")" << std::endl;
@@ -3323,32 +3326,23 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        // Equilibration phase: Run the solver for multiple orbital periods before output
-        // This matches CPU behavior (config->NYEARSEQ * year/day cycles in Model::run)
-        // For bodies with day=year (e.g., Europa), we need several full cycles
-        int equil_cycles = 5;  // Number of equilibration day/night cycles
-        if (equil_cycles > 0 && total_time_steps > 1) {
-            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Running " << equil_cycles
-                          << " equilibration cycles before output phase..." << std::endl;
-            }
-
-            // Run equilibration: cycle through flux pattern multiple times without storing output
-            std::vector<float> equil_output_dummy;
-            for (int eq_cycle = 0; eq_cycle < equil_cycles; ++eq_cycle) {
-                // Run solver for one full period using the flux_all pattern
-                // Output is discarded; only the internal state (temperature profile) is kept
-                solver.solvePersistentAllTimesteps(flux_all, equil_output_dummy, total_time_steps, dt);
-            }
-
-            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Equilibration complete." << std::endl;
-            }
+        // Equilibration + output phase in a single upload/download round-trip.
+        // The old code called solvePersistentAllTimesteps 6 times, which
+        // re-uploaded flux_all (57.6 MB per batch at res 6) and read back the
+        // output buffer on every equilibration cycle even though the data
+        // was discarded. solvePersistentMultipleCycles keeps both buffers
+        // resident on the device across cycles.
+        // Number of equilibration cycles (each = total_time_steps).
+        // Sweep on Moon res-6/7: 5 -> 1 drops thermal phase ~3x with <0.5 K
+        // mean-diff change; 0 regresses max-diff by ~10 K. Stick to 1.
+        int equil_cycles = 1;
+        if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+            std::cout << "[GPU Thermal] Running " << equil_cycles
+                      << " equilibration cycles + 1 output cycle..." << std::endl;
         }
-
-        // Run persistent kernel for output phase (temperatures now equilibrated)
         std::vector<float> output_temps;
-        solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
+        solver.solvePersistentMultipleCycles(flux_all, output_temps, total_time_steps, dt,
+                                             equil_cycles);
 
         // Debug: verify output_temps matches kernel output
         if (GPU_DEBUG_OUTPUT) {
