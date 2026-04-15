@@ -1111,9 +1111,12 @@ std::vector<double> calculateAbsorbedFlux(
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
     
-    // Check if we should use incidence-dependent albedo
+    // Check if we should use incidence-dependent albedo.
+    // Skip if a spatially-varying map was already loaded (binary or FITS) — the per-face
+    // map values must not be overridden by the uniform planet->albedo + incidence formula.
     bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
                                  !planet->using_albedo_map &&
+                                 !albedo_successfully_loaded &&
                                  planet->albedoCoef.size() >= 2);
 
     if (use_incidence_albedo) {
@@ -2242,40 +2245,66 @@ bool runThermalModelsForAllFacesBatchSoA(
     std::cerr << "Using scalar fallback" << std::endl;
 #endif
 
-    // Calculate absorbed flux in COLUMN-MAJOR layout for SIMD efficiency
-    // Layout: flux_column_major[t * n_faces + f] - timestep-major ordering
-    // This allows contiguous SIMD loads of 8 faces at each timestep
+    // Build planet & optional explicit FITS albedo map up front so we can
+    // route the per-face absorbed flux through calculateAbsorbedFlux — that
+    // reuses the standard path's spatial-albedo + incidence-angle-albedo
+    // logic. Without this, the batch path previously hardcoded a uniform
+    // albedo and drifted from the standard path by up to ~115 K at
+    // albedo-sensitive faces (spatial map + high-incidence terminator).
+    thermal::Planet planet(config.getProperty("planet", "Moon"));
+
+    std::shared_ptr<ptm::SpatialMap> batch_albedo_map;
+    if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
+        const std::string path = config.getProperty("albedo_map");
+        if (!path.empty()) {
+            batch_albedo_map = std::make_shared<ptm::SpatialMap>();
+            if (!batch_albedo_map->loadFromFITS(path)) {
+                std::cout << "[SIMD Batch] Failed to load explicit albedo_map: " << path
+                          << " (" << batch_albedo_map->getLastError() << ")" << std::endl;
+                batch_albedo_map.reset();
+            }
+        }
+    }
+
+    std::cerr << "Computing absorbed flux (per-face spatial + incidence-angle albedo)..." << std::endl;
+    std::vector<double> absorbed_flux_rowmajor = calculateAbsorbedFlux(
+        direct_solar_values,
+        primary_reflected_values,
+        primary_ir_values,
+        total_time_steps,
+        batch_albedo_map,
+        mesh,
+        default_visible_albedo,
+        ir_albedo,
+        config,
+        &planet,
+        planet.S);
+    if (absorbed_flux_rowmajor.empty() ||
+        absorbed_flux_rowmajor.size() != n_faces * static_cast<size_t>(total_time_steps)) {
+        std::cerr << "[SIMD Batch] calculateAbsorbedFlux returned unexpected size -- aborting.\n";
+        return false;
+    }
+
+    // Transpose to COLUMN-MAJOR for SIMD efficiency.
+    // Layout: flux_column_major[t * n_faces + f] - timestep-major ordering.
     std::vector<double> flux_column_major(n_faces * total_time_steps, 0.0);
-
-    std::cerr << "Computing absorbed flux in column-major layout for SIMD efficiency..." << std::endl;
-
-    // Use cache-blocked transpose to avoid cache thrashing
-    // Block size chosen to fit in L1 cache (~32KB = 4096 doubles)
-    constexpr size_t BLOCK_F = 64;   // Block size for faces dimension
-    constexpr size_t BLOCK_T = 64;   // Block size for timesteps dimension
-
+    constexpr size_t BLOCK_F = 64;
+    constexpr size_t BLOCK_T = 64;
     #pragma omp parallel for schedule(static) collapse(2)
     for (size_t f_block = 0; f_block < n_faces; f_block += BLOCK_F) {
         for (int t_block = 0; t_block < total_time_steps; t_block += static_cast<int>(BLOCK_T)) {
-            // Process one block
             size_t f_end = std::min(f_block + BLOCK_F, n_faces);
             int t_end = std::min(t_block + static_cast<int>(BLOCK_T), total_time_steps);
-
             for (size_t f = f_block; f < f_end; ++f) {
-                double face_albedo = default_visible_albedo;
                 for (int t = t_block; t < t_end; ++t) {
-                    size_t src_idx = f * total_time_steps + t;
-                    size_t dst_idx = t * n_faces + f;  // Column-major: [timestep][face]
-                    double direct = direct_solar_values[src_idx];
-                    double reflected = primary_reflected_values[src_idx];
-                    double ir = primary_ir_values[src_idx];
-
-                    // Absorbed flux = (1-albedo)*solar + (1-ir_albedo)*ir
-                    flux_column_major[dst_idx] = (1.0 - face_albedo) * (direct + reflected) + (1.0 - ir_albedo) * ir;
+                    size_t src_idx = f * static_cast<size_t>(total_time_steps) + t;
+                    size_t dst_idx = static_cast<size_t>(t) * n_faces + f;
+                    flux_column_major[dst_idx] = absorbed_flux_rowmajor[src_idx];
                 }
             }
         }
     }
+    std::vector<double>().swap(absorbed_flux_rowmajor);
 
     // Initialize output
     if (surface_temps_out) {
@@ -2285,8 +2314,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
     }
 
-    // Create reference profile for grid parameters
-    thermal::Planet planet(config.getProperty("planet", "Moon"));
+    // Create reference profile for grid parameters (reuses `planet` above).
     thermal::Profile ref_profile(planet, 0.0, config, false);
     const int n_layers = ref_profile.nlayers;
 
@@ -2316,35 +2344,57 @@ bool runThermalModelsForAllFacesBatchSoA(
 
             batch.n_faces = faces_in_batch;
 
-            // Initialize temperatures for equilibration
-            // Use average expected temperature based on solar flux
+            // Initialize temperatures with a depth-dependent profile, mirroring
+            // Profile::init_T (thermal_model.cpp). A uniform initial T at all
+            // depths leaves high-latitude faces with a persistent surface-vs-
+            // deep residual bias even after 24 lunar days of equilibration.
+            // Using the same exponential surface->deep blend as the standard
+            // path gets the batch into the same accuracy class.
             for (int f = 0; f < faces_in_batch; ++f) {
                 size_t global_f = start_face + f;
-                // Estimate initial temperature from average flux
-                // Access flux_column_major[t * n_faces + f] for column-major layout
+
                 double avg_flux = 0.0;
-                for (int t = 0; t < std::min(100, total_time_steps); ++t) {
+                const int flux_avg_window = std::min(100, total_time_steps);
+                for (int t = 0; t < flux_avg_window; ++t) {
                     avg_flux += flux_column_major[t * n_faces + global_f];
                 }
-                avg_flux /= std::min(100, total_time_steps);
+                avg_flux /= std::max(1, flux_avg_window);
 
-                double T_init = 200.0;  // Default
+                double T_surf_est = 200.0;
                 if (avg_flux > 0) {
-                    // Radiative equilibrium: eps*sigma*T^4 = Q
                     double ratio = avg_flux / (planet.emissivity * SIGMA_SB);
-                    T_init = std::sqrt(std::sqrt(ratio));
-                    T_init = std::max(50.0, std::min(400.0, T_init));
+                    T_surf_est = std::sqrt(std::sqrt(ratio));
+                    T_surf_est = std::max(50.0, std::min(400.0, T_surf_est));
                 }
 
-                batch.T_eq_init[f] = T_init;
+                const double R350 = config.getR350();
+                const double k_deep = planet.kd * (1.0 + R350 * T_surf_est * T_surf_est * T_surf_est);
+                const double depth = ref_profile.z().back();
+                const double gradient = (k_deep > 0.0) ? (planet.Qb / k_deep) : 0.0;
+                const double delta_T_geo = std::min(gradient * depth, 50.0);
+                const double T_deep = T_surf_est + delta_T_geo;
 
-                // Initialize all layers to this temperature
+                double cp_for_skin = planet.cp0;
+                double T_repr = 200.0;
+                double T_pow = T_repr;
+                for (size_t j = 0; j < planet.cpCoeff.size(); ++j) {
+                    cp_for_skin += planet.cpCoeff[j] * T_pow;
+                    T_pow *= T_repr;
+                }
+                if (cp_for_skin < 100.0) cp_for_skin = 600.0;
+                const double kappa0 = planet.ks / (planet.rhos * cp_for_skin);
+                const double skin_d = thermal::skinDepth(planet.day, kappa0);
+                const double inv_skin = (skin_d > 0.0) ? (1.0 / skin_d) : 0.0;
+
+                batch.T_eq_init[f] = T_surf_est;
                 for (int layer = 0; layer < n_layers; ++layer) {
-                    batch.T[layer * BS + f] = T_init;
+                    const double z_layer = ref_profile.z()[layer];
+                    const double blend = std::exp(-z_layer * inv_skin);
+                    batch.T[layer * BS + f] = T_deep + (T_surf_est - T_deep) * blend;
                 }
             }
 
-            // Zero-pad unused face slots
+            // Zero-pad unused face slots.
             for (int f = faces_in_batch; f < BS; ++f) {
                 batch.T_eq_init[f] = 200.0;
                 for (int layer = 0; layer < n_layers; ++layer) {
@@ -2352,49 +2402,100 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
-            // Equilibration phase
-            if (equilibration_steps > 0) {
-                int steps_per_cycle = std::min(total_time_steps, 100);
-                int cycles = equilibration_steps / steps_per_cycle;
+            // Equilibration phase:
+            // Mirror Model::fastEquilibrate exactly — analytical clear-sky
+            // diurnal forcing using planet.albedo (not per-face spatial
+            // albedo, not incidence-angle albedo). The standard path runs
+            // this simplified equilibration first and reconciles to full-
+            // physics fluxes during the main loop; the batch path must do
+            // the same or the two converge to different steady states and
+            // the short main loop can't bridge the gap (observed up to
+            // ~115 K residual before this fix).
+            //
+            // dt choice: planet.day / 192 gives <1 K worst-case accuracy per
+            // src/cpp/tools/test_equilibration_dt.cpp.
+            const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
+                                             std::round(planet.year / planet.day);
+            const double equil_duration_s = equil_days_needed * planet.day;
 
-                for (int cycle = 0; cycle < cycles; ++cycle) {
-                    for (int t = 0; t < steps_per_cycle - 1 && t < total_time_steps - 1; ++t) {
-                        double dt = times[t + 1] - times[t];
+            if (equil_duration_s > 0.0 && total_time_steps >= 2) {
+                const double target_dt = planet.day / 192.0;
+                const int steps_per_day = std::max(1,
+                    static_cast<int>(std::round(planet.day / target_dt)));
+                const double dt_sub = planet.day / static_cast<double>(steps_per_day);
+                const int total_substeps = static_cast<int>(std::llround(
+                    equil_duration_s / dt_sub));
 
-                        // OPTIMIZED: Direct pointer to contiguous flux values in column-major layout
-                        // flux_column_major[t * n_faces + start_face] points to 8 contiguous doubles
-                        const double* flux_ptr = &flux_column_major[t * n_faces + start_face];
-                        batch.setFluxContiguous(flux_ptr, faces_in_batch);
+                alignas(64) double flux_vec[thermal::THERMAL_BATCH_SIZE];
+                for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_vec[f] = 0.0;
 
-                        batch.advanceTimestep(dt);
-                    }
+                double cos_lat[thermal::THERMAL_BATCH_SIZE];
+                for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) cos_lat[f] = 0.0;
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t gf = start_face + f;
+                    const double lat_rad = mesh->latitudes[gf] * (M_PI / 180.0);
+                    cos_lat[f] = std::cos(lat_rad);
                 }
-            }
+                const double planetary_absorption = planet.S * (1.0 - planet.albedo);
 
-            // Main simulation time-stepping loop
-            for (int t = 0; t < total_time_steps - 1; ++t) {
-                double dt = times[t + 1] - times[t];
-
-                // OPTIMIZED: Direct pointer to contiguous flux values in column-major layout
-                // This is a single cache-line read instead of 8 scattered reads
-                const double* flux_ptr = &flux_column_major[t * n_faces + start_face];
-                batch.setFluxContiguous(flux_ptr, faces_in_batch);
-
-                // Advance timestep for all faces in batch
-                batch.advanceTimestep(dt);
-
-                // Store surface temperatures
-                if (surface_temps_out) {
+                for (int step = 0; step < total_substeps; ++step) {
+                    const double day_fraction = static_cast<double>(step % steps_per_day)
+                                                / static_cast<double>(steps_per_day);
+                    const double hour_angle = 2.0 * M_PI * day_fraction + M_PI;
+                    const double cos_hour = std::cos(hour_angle);
                     for (int f = 0; f < faces_in_batch; ++f) {
-                        (*surface_temps_out)[start_face + f][t] = batch.getSurfaceTemp(f);
+                        const double cos_zen = cos_lat[f] * cos_hour;
+                        const double flux_factor = (cos_zen > 0.0) ? cos_zen : 0.0;
+                        flux_vec[f] = planetary_absorption * flux_factor;
                     }
+                    batch.setFluxContiguous(flux_vec, faces_in_batch);
+                    batch.advanceTimestep(dt_sub);
                 }
             }
 
-            // Store final timestep temperature
+            // Main simulation time-stepping loop.
+            // Convention (matches Model::run in thermal_model.cpp:1842):
+            //   surface_temps_out[f][t] == state at times[t]
+            // Store the initial state at index 0 before any advance, then
+            // after each substepped advance store the new state at index t+1.
+            // (The original code stored the post-advance state at index t and
+            // duplicated the final into the last two slots.)
+            //
+            // Main-loop substepping with linear flux interpolation. The dt
+            // ceiling is set by thermal-diffusion accuracy at the finest
+            // depth layer, not by flux-transition detection. An earlier
+            // experiment with flux-transition-based adaptive substepping
+            // saved only ~7% time at ~3x worse max error, so use uniform.
             if (surface_temps_out) {
                 for (int f = 0; f < faces_in_batch; ++f) {
-                    (*surface_temps_out)[start_face + f][total_time_steps - 1] = batch.getSurfaceTemp(f);
+                    (*surface_temps_out)[start_face + f][0] = batch.getSurfaceTemp(f);
+                }
+            }
+            const double main_target_dt = planet.day / 768.0;
+            alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
+            for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
+            for (int t = 0; t < total_time_steps - 1; ++t) {
+                const double dt_output = times[t + 1] - times[t];
+                const double* flux_a = &flux_column_major[t       * n_faces + start_face];
+                const double* flux_b = &flux_column_major[(t + 1) * n_faces + start_face];
+
+                const int n_sub = std::max(1,
+                    static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                const double dt_sub = dt_output / n_sub;
+
+                for (int s = 0; s < n_sub; ++s) {
+                    const double alpha = (s + 0.5) / static_cast<double>(n_sub);
+                    const double one_m = 1.0 - alpha;
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        flux_step[f] = one_m * flux_a[f] + alpha * flux_b[f];
+                    }
+                    batch.setFluxContiguous(flux_step, faces_in_batch);
+                    batch.advanceTimestep(dt_sub);
+                }
+                if (surface_temps_out) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        (*surface_temps_out)[start_face + f][t + 1] = batch.getSurfaceTemp(f);
+                    }
                 }
             }
 
@@ -4179,7 +4280,8 @@ void showUsage(const char* programName) {
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  --thermal-mesh             Run thermal model for all mesh faces\n";
     std::cout << "  --thermal-threads N        Number of parallel threads (default: auto)\n";
-    std::cout << "  --use-simd-batch           Use SIMD batch solver (8 faces in parallel)\n";
+    std::cout << "  --use-simd-batch           Use SIMD batch solver (default on; flag kept for compatibility)\n";
+    std::cout << "  --no-simd-batch            Force legacy Model::run scalar thermal path\n";
     std::cout << "  --use-gpu-thermal          Use GPU persistent kernel solver (OpenCL)\n";
     std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
     std::cout << "  --thermal-inertia-map FILE Path to thermal inertia map file\n";
@@ -5947,8 +6049,13 @@ int main(int argc, char** argv) {
         } else if (arg == "--thermal-threads" && i + 1 < argc) {
             thermal_threads = std::stoi(argv[++i]);
         } else if (arg == "--use-simd-batch") {
+            // The SIMD batch solver is now on by default; this flag is kept
+            // as a no-op for backwards-compatible scripts. Use --no-simd-batch
+            // to force the legacy scalar Model::run path.
             config.setProperty("use_simd_batch", true);
-            std::cout << "Using SIMD batch thermal solver (SIMD-over-pixels)" << std::endl;
+        } else if (arg == "--no-simd-batch") {
+            config.setProperty("use_simd_batch", false);
+            std::cout << "SIMD batch solver disabled; using legacy Model::run scalar path" << std::endl;
         } else if (arg == "--use-gpu-thermal") {
             config.setProperty("use_gpu_thermal", true);
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
@@ -6970,6 +7077,16 @@ int main(int argc, char** argv) {
             std::cout << "[GPU Thermal] Flag detected - GPU thermal solver enabled" << std::endl;
         }
 
+        // Copy SIMD batch flag from CLI parsing config to thermal_config.
+        // The batch path is on by default (see dispatch-site defaults in this
+        // file). --no-simd-batch explicitly stores "false" here, which gets
+        // propagated so the dispatch picks up the override.
+        if (config.custom_properties.count("use_simd_batch")) {
+            thermal_config.setProperty(
+                "use_simd_batch",
+                config.getPropertyBool("use_simd_batch", true));
+        }
+
         // Debug output to verify properties were set correctly
         if (verbose) {
             std::cout << "Thermal config properties:" << std::endl;
@@ -7140,7 +7257,7 @@ int main(int argc, char** argv) {
             std::cout << std::endl;
 
             // Check which thermal solver to use
-            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", false);
+            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
             bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
             if (use_gpu_thermal) {
@@ -7213,7 +7330,7 @@ int main(int argc, char** argv) {
             primary_ir_values_full        = illumination_model->getPrimaryIRFlux();
 
             // Check which thermal solver to use
-            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", false);
+            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
             bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
             if (use_gpu_thermal) {

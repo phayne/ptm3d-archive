@@ -159,6 +159,14 @@ public:
     double DTSURF = 0.1;      // Surface temperature accuracy [K]
     int NYEARSEQ = 1;         // Equilibration time [orbits]
     int NPERDAY = 24;         // Minimum number of time steps per diurnal cycle
+    // Crank-Nicolson is unconditionally stable; the Fourier-stable config dt
+    // is wildly conservative for the implicit scheme. These substep targets
+    // are set so the per-layer Fourier number stays below ~1 at the finest
+    // depth layer, which keeps CN's low-order oscillatory error under ~1 K
+    // per src/cpp/tools/test_equilibration_dt.cpp. 0 = disable override and
+    // fall back to the Fourier-stable config dt.
+    int EQUILIBRATION_STEPS_PER_DAY = 192;  // target steps-per-day in fastEquilibrate
+    int MAIN_LOOP_STEPS_PER_DAY     = 768;  // target steps-per-day in Model::run main loop
     double DTBOT = 0.1;       // Bottom layer temperature accuracy [K]
     
     // Method to get R350

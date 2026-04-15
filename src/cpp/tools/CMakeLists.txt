@@ -107,6 +107,18 @@ else()
     message(STATUS "  GDAL_LIBRARIES: ${GDAL_LIBRARIES}")
 endif()
 
+# Equilibration large-dt accuracy test
+add_executable(test_equilibration_dt test_equilibration_dt.cpp)
+target_link_libraries(test_equilibration_dt
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_equilibration_dt
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Add the crater mesh generator tool (no external dependencies)
 add_executable(crater_mesh_generator crater_mesh_generator.cpp)
 set_target_properties(crater_mesh_generator

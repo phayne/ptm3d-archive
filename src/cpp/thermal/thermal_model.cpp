@@ -1858,29 +1858,58 @@ void Model::run() {
             }
         }
 
+        // Large-dt CN substepping for the main output loop.
+        // When config->MAIN_LOOP_STEPS_PER_DAY > 0, divide each output interval
+        // into n_sub CN steps sized for ~thermal-diffusion accuracy at the
+        // finest depth layer (see note in thermal_model.h). For Moon that
+        // gives ~11 substeps per 72-step-per-lunar-day output interval, vs
+        // ~69 substeps under the Fourier-stable choice — ~6x fewer
+        // profile.update_T calls per face with max |dT| < 10 K on the
+        // Moon-benchmark test config. Falls back to the adaptive/Fourier-stable
+        // driver when the flag is 0 so existing users who tuned dt_scale or
+        // MULTIRATE_ADAPTIVE_STEP get identical behaviour.
+        const bool use_cn_substep = config && config->MAIN_LOOP_STEPS_PER_DAY > 0;
+        const double cn_target_dt = use_cn_substep
+            ? (planet.day / static_cast<double>(config->MAIN_LOOP_STEPS_PER_DAY))
+            : 0.0;
+
         for (int i = 1; i < num_outputs; i++) {
             double target_time = output_time_points[i];
-            while (t < target_time) {
-                updateOrbit();
-                surfFlux();
 
-                double dt_step = config->MULTIRATE_ADAPTIVE_STEP
-                                 ? chooseAdaptiveDt(target_time)
-                                 : std::min(dt, target_time - t);
+            if (use_cn_substep) {
+                const double dt_output = target_time - t;
+                const int n_sub = std::max(1,
+                    static_cast<int>(std::ceil(dt_output / cn_target_dt)));
+                const double dt_sub = dt_output / n_sub;
+                for (int s = 0; s < n_sub; ++s) {
+                    updateOrbit();
+                    surfFlux();
+                    profile.update_T(dt_sub, Qs, planet.Qb);
+                    t += dt_sub;
+                }
+            } else {
+                while (t < target_time) {
+                    updateOrbit();
+                    surfFlux();
 
-                double T0_before = profile.T()[0];
-                profile.update_T(dt_step, Qs, planet.Qb);
-                double dT0 = std::abs(profile.T()[0] - T0_before);
+                    double dt_step = config->MULTIRATE_ADAPTIVE_STEP
+                                     ? chooseAdaptiveDt(target_time)
+                                     : std::min(dt, target_time - t);
 
-                t += dt_step;
+                    double T0_before = profile.T()[0];
+                    profile.update_T(dt_step, Qs, planet.Qb);
+                    double dT0 = std::abs(profile.T()[0] - T0_before);
 
-                if (config->MULTIRATE_ADAPTIVE_STEP) {
-                    if (!std::isfinite(dT0)) {
-                        dt_scale = std::max(0.1, dt_scale * 0.25);
-                    } else if (dT0 < 0.25 * config->SURF_DMAX) {
-                        dt_scale = std::min(config->MAX_DT_SCALE, dt_scale * config->DT_GROW);
-                    } else if (dT0 > config->SURF_DMAX) {
-                        dt_scale = std::max(0.1, dt_scale * config->DT_SHRINK);
+                    t += dt_step;
+
+                    if (config->MULTIRATE_ADAPTIVE_STEP) {
+                        if (!std::isfinite(dT0)) {
+                            dt_scale = std::max(0.1, dt_scale * 0.25);
+                        } else if (dT0 < 0.25 * config->SURF_DMAX) {
+                            dt_scale = std::min(config->MAX_DT_SCALE, dt_scale * config->DT_GROW);
+                        } else if (dT0 > config->SURF_DMAX) {
+                            dt_scale = std::max(0.1, dt_scale * config->DT_SHRINK);
+                        }
                     }
                 }
             }
@@ -2020,48 +2049,42 @@ void Model::advance() {
     t += actual_dt;
 }
 
-// Replace the fastEquilibrate method with this properly physics-based version
+// Equilibration is unconditionally stable under Crank-Nicolson (Profile::update_T),
+// so the Fourier-stable config dt (~5000 steps/day for Moon) is wildly conservative.
+// Accuracy is dominated by thermal-diffusion resolution at the finest depth layer;
+// src/cpp/tools/test_equilibration_dt.cpp shows planet.day / 192 gives <1 K worst-case
+// error at 24 lunar days of forcing, ~26x fewer steps than the Fourier-stable choice.
 void Model::fastEquilibrate(int days, double target_time) {
     if (show_progress) {
         std::cout << "Running fast equilibration for " << days << " days..." << std::endl;
     }
-    
-    // Create progress bar
+
     ProgressBar eqProgressBar(days, "Fast Equilibration", 50, show_progress);
-    
-    // Calculate number of steps per day
-    int steps_per_day = (int)(planet.day / dt);
-    
-    // Run equilibration
+
+    // Fixed at 192 steps/day (see accuracy note above). Override via
+    // config->EQUILIBRATION_STEPS_PER_DAY if future bodies need finer.
+    const int steps_per_day = (config && config->EQUILIBRATION_STEPS_PER_DAY > 0)
+                                ? config->EQUILIBRATION_STEPS_PER_DAY
+                                : 192;
+    const double dt_eq = planet.day / static_cast<double>(steps_per_day);
+
     for (int day = 0; day < days; day++) {
         eqProgressBar.update(day);
-        
-        // Process a full day
         for (int step = 0; step < steps_per_day; step++) {
-            // Calculate phase within day (0 to 1)
-            double day_fraction = (double)step / steps_per_day;
-            
-            // Calculate hour angle
-            double hour_angle = 2.0 * M_PI * day_fraction + M_PI; // Start at midnight
-            
-            // Calculate zenith angle cosine
-            double cos_zenith = std::cos(lat) * std::cos(hour_angle);
-            
-            // Calculate solar flux
-            double flux_factor = std::max(0.0, cos_zenith);
-            double local_flux = planet.S * flux_factor * (1.0 - planet.albedo);
-            
-            // Update temperatures
-            profile.update_T(dt, local_flux, planet.Qb);
+            const double day_fraction = static_cast<double>(step) / steps_per_day;
+            const double hour_angle = 2.0 * M_PI * day_fraction + M_PI;
+            const double cos_zenith = std::cos(lat) * std::cos(hour_angle);
+            const double flux_factor = std::max(0.0, cos_zenith);
+            const double local_flux = planet.S * flux_factor * (1.0 - planet.albedo);
+            profile.update_T(dt_eq, local_flux, planet.Qb);
         }
     }
-    
+
     if (show_progress) {
         eqProgressBar.finish();
         std::cout << "Fast equilibration complete" << std::endl;
     }
-    
-    // Set time to target time to start main simulation
+
     t = target_time;
 }
 
