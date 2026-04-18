@@ -131,7 +131,6 @@ private:
     RTCDevice embree_device_ = nullptr;
     RTCScene embree_scene_ = nullptr;
     std::array<double, 3> scene_origin_offset_{0.0, 0.0, 0.0};
-    double body_radius_sq_ = 0.0;  // Mean body radius squared (m²), for shadow pre-check
 
     bool spice_initialized_ = false;
 

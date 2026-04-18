@@ -413,14 +413,6 @@ bool CameraSimulator::initializeEmbree() {
             if (v[2] < min_z) min_z = v[2]; if (v[2] > max_z) max_z = v[2];
         }
         scene_origin_offset_ = { 0.5*(min_x+max_x), 0.5*(min_y+max_y), 0.5*(min_z+max_z) };
-
-        // Compute mean body radius for shadow pre-check
-        double sum_r = 0.0;
-        for (const auto& v : mesh->vertices) {
-            sum_r += std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-        }
-        double mean_r = sum_r / static_cast<double>(mesh->vertices.size());
-        body_radius_sq_ = mean_r * mean_r;
     }
 
     // Set vertices (shifted by offset)
@@ -780,6 +772,22 @@ std::vector<PixelData> CameraSimulator::renderFrame(const std::string& utc_time)
         }
     }
 
+    // Load PTM3D direct solar irradiance for reflected-light coupling.
+    // When available, this replaces independent shadow computation — the
+    // camera sim uses PTM3D's validated illumination (finite-disk sun model,
+    // terrain occlusion, body self-shadowing) instead of re-deriving it.
+    std::vector<float> direct_solar;
+    if (output_reader_.hasDirectSolar()) {
+        direct_solar = output_reader_.getDirectSolarAtET(et);
+        if (!direct_solar.empty()) {
+            int n_lit = 0;
+            for (float v : direct_solar) if (v > 0.0f) n_lit++;
+            std::cout << "[CameraSimulator] PTM3D direct_solar: "
+                      << n_lit << " / " << direct_solar.size()
+                      << " faces illuminated" << std::endl;
+        }
+    }
+
     // Load temperature data if needed
     std::vector<float> temperatures;
     if (config_.render_mode == CameraSimConfig::RenderMode::THERMAL ||
@@ -952,59 +960,7 @@ std::vector<PixelData> CameraSimulator::renderFrame(const std::string& utc_time)
 
                 // Valid front-facing surface hit.
                 double cos_e = std::min(1.0, cos_e_raw);
-                double cos_i = vec::dot(normal, sun_dir);
-                cos_i = std::max(-1.0, std::min(1.0, cos_i));
-
-                // Shadow test: trace from hit point toward sun to detect
-                // body/terrain occlusion. Without this, every face whose
-                // terrain normal faces the sun appears illuminated even if
-                // the body blocks the line of sight — producing a soft
-                // terminator ~15° wider than reality.
-                if (cos_i > 0.0) {
-                    // Hit point in Embree (shifted) coords
-                    const double hx = cam_ox + static_cast<double>(rayhit.ray.tfar) * dir[0];
-                    const double hy = cam_oy + static_cast<double>(rayhit.ray.tfar) * dir[1];
-                    const double hz = cam_oz + static_cast<double>(rayhit.ray.tfar) * dir[2];
-
-                    // Analytical body-occlusion pre-check: if the face center
-                    // is behind the terminator plane and the ray to the sun
-                    // passes inside the mean sphere, skip Embree trace.
-                    const auto& fc = mesh->face_centers[face_id];
-                    const double fc_dot_sun = vec::dot(fc, sun_dir);
-                    bool in_shadow = false;
-                    if (fc_dot_sun < 0.0) {
-                        auto cross = vec::cross(fc, sun_dir);
-                        double closest_sq = vec::dot(cross, cross);
-                        if (closest_sq < body_radius_sq_) {
-                            in_shadow = true;
-                        }
-                    }
-
-                    // Embree shadow ray for terrain occlusion
-                    if (!in_shadow) {
-                        constexpr float shadow_eps = 2.0f;  // 2 m offset along normal
-                        RTCRay shadow_ray{};
-                        shadow_ray.org_x = static_cast<float>(hx + flat_normal[0] * shadow_eps);
-                        shadow_ray.org_y = static_cast<float>(hy + flat_normal[1] * shadow_eps);
-                        shadow_ray.org_z = static_cast<float>(hz + flat_normal[2] * shadow_eps);
-                        shadow_ray.dir_x = static_cast<float>(sun_dir[0]);
-                        shadow_ray.dir_y = static_cast<float>(sun_dir[1]);
-                        shadow_ray.dir_z = static_cast<float>(sun_dir[2]);
-                        shadow_ray.tnear = 1.0f;
-                        shadow_ray.tfar  = 1e20f;
-                        shadow_ray.mask  = 0xFFFFFFFFu;
-                        shadow_ray.flags = 0;
-
-                        RTCOccludedArguments occ_args;
-                        rtcInitOccludedArguments(&occ_args);
-                        rtcOccluded1(embree_scene_, &shadow_ray, &occ_args);
-                        if (shadow_ray.tfar < 0.0f) {
-                            in_shadow = true;
-                        }
-                    }
-
-                    if (in_shadow) cos_i = 0.0;
-                }
+                double cos_i = std::max(0.0, vec::dot(normal, sun_dir));
 
                 double cos_alpha = vec::dot(sun_dir, view_dir);
                 cos_alpha = std::max(-1.0, std::min(1.0, cos_alpha));
@@ -1021,20 +977,45 @@ std::vector<PixelData> CameraSimulator::renderFrame(const std::string& utc_time)
                     effective_albedo = face_albedos_[face_id];
                 } else {
                     effective_albedo = config_.photometric_params.albedo;
-                    have_albedo = false;  // signals the photometric model to use its internal default
+                    have_albedo = false;
                 }
 
-                // Reflected radiance
+                // Reflected radiance — coupled to PTM3D illumination.
+                // When PTM3D direct_solar is available, use it for shadow/
+                // occlusion determination instead of independent ray tracing.
+                // PTM3D's direct_solar = S × cos(i_flat) × shadow_occlusion,
+                // already encoding the finite-disk sun model, terrain shadows,
+                // and body self-occlusion validated in the illumination model.
                 double rad_sample = 0.0;
                 if (config_.render_mode == CameraSimConfig::RenderMode::REFLECTED ||
                     config_.render_mode == CameraSimConfig::RenderMode::BOTH) {
-                    if (have_albedo || have_smooth_albedo) {
-                        rad_sample = photometry_.reflectedRadiance(
-                            std::max(0.0, cos_i), cos_e, alpha_rad,
-                            solar_flux, effective_albedo);
+                    if (!direct_solar.empty() && face_id < static_cast<int>(direct_solar.size())) {
+                        // PTM3D-coupled path: use precomputed illumination
+                        const float ptm_flux = direct_solar[face_id];
+                        if (ptm_flux > 0.0f && cos_i > 1e-6) {
+                            double shadow_frac = std::min(1.0,
+                                static_cast<double>(ptm_flux) / (solar_flux * cos_i));
+                            if (have_albedo || have_smooth_albedo) {
+                                rad_sample = shadow_frac * photometry_.reflectedRadiance(
+                                    cos_i, cos_e, alpha_rad,
+                                    solar_flux, effective_albedo);
+                            } else {
+                                rad_sample = shadow_frac * photometry_.reflectedRadiance(
+                                    cos_i, cos_e, alpha_rad, solar_flux);
+                            }
+                        }
+                        // else: face is in shadow per PTM3D → rad_sample stays 0
                     } else {
-                        rad_sample = photometry_.reflectedRadiance(
-                            std::max(0.0, cos_i), cos_e, alpha_rad, solar_flux);
+                        // Fallback when PTM3D direct_solar is not available:
+                        // geometric cos_i without shadow test.
+                        if (have_albedo || have_smooth_albedo) {
+                            rad_sample = photometry_.reflectedRadiance(
+                                cos_i, cos_e, alpha_rad,
+                                solar_flux, effective_albedo);
+                        } else {
+                            rad_sample = photometry_.reflectedRadiance(
+                                cos_i, cos_e, alpha_rad, solar_flux);
+                        }
                     }
                 }
 
