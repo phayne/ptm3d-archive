@@ -179,6 +179,26 @@ void IlluminationModel::setTimeSteps(int steps) {
     time_steps_ = steps;
 }
 
+void IlluminationModel::setExternalTimeGrid(const std::vector<double>& ets_tdb) {
+    if (precomputed_positions_loaded_) {
+        std::cerr << "[IlluminationModel] Warning: setExternalTimeGrid ignored because "
+                     "a precomputed positions file is already loaded." << std::endl;
+        return;
+    }
+    external_ets_ = ets_tdb;
+    std::cout << "[IlluminationModel] External ET grid set: " << external_ets_.size()
+              << " samples";
+    if (!external_ets_.empty()) {
+        const double span_s = external_ets_.back() - external_ets_.front();
+        std::cout << " spanning " << span_s << " s (" << span_s / 86400.0 << " days)";
+    }
+    std::cout << std::endl;
+}
+
+void IlluminationModel::clearExternalTimeGrid() {
+    external_ets_.clear();
+}
+
 void IlluminationModel::setAlbedo(double albedo) {
     albedo_ = albedo;
 }
@@ -190,7 +210,7 @@ static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* s
 
 bool IlluminationModel::initializeEmbree() {
     if (!embree_device_) {
-        embree_device_ = rtcNewDevice("backface_culling=1");
+        embree_device_ = rtcNewDevice("");
         if (!embree_device_) {
             std::cerr << "Failed to create Embree device" << std::endl;
             return false;
@@ -224,7 +244,7 @@ bool IlluminationModel::initializeScene(
         }
 
         if (!embree_device_) {
-            embree_device_ = rtcNewDevice("backface_culling=1");
+            embree_device_ = rtcNewDevice("");
             if (!embree_device_) {
                 std::cerr << "[IlluminationModel] Failed to create Embree device" << std::endl;
                 return false;
@@ -1004,44 +1024,57 @@ bool IlluminationModel::calculateIllumination(
     
     // Skip position calculations if precomputed positions were loaded
     if (!precomputed_positions_loaded_) {
-        // Initialize time array
-        double start_et = convertTimeToET(start_time);
-        double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
-        double step_size = duration_seconds / time_steps_;
-        
         times_.resize(time_steps_);
         time_strings_.resize(time_steps_);
-        
-        for (int t = 0; t < time_steps_; ++t) {
-            double et = start_et + t * step_size;
-            times_[t] = et;
-            
-            // Convert to string for display
-            char time_str[41];
-            et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
-            time_strings_[t] = std::string(time_str);
+
+        if (!external_ets_.empty()) {
+            // External (possibly non-uniform) ET grid supplied by caller
+            if (static_cast<int>(external_ets_.size()) != time_steps_) {
+                std::cerr << "[IlluminationModel] ERROR: external ET grid size ("
+                          << external_ets_.size() << ") != time_steps ("
+                          << time_steps_ << ")" << std::endl;
+                return false;
+            }
+            for (int t = 0; t < time_steps_; ++t) {
+                times_[t] = external_ets_[t];
+                char time_str[41];
+                et2utc_c(times_[t], "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+            }
+        } else {
+            // Uniform grid (legacy behavior)
+            double start_et = convertTimeToET(start_time);
+            double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
+            double step_size = duration_seconds / time_steps_;
+            for (int t = 0; t < time_steps_; ++t) {
+                double et = start_et + t * step_size;
+                times_[t] = et;
+                char time_str[41];
+                et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+            }
         }
-        
+
         // Compute Sun and Primary positions for each time step
         sun_positions_.resize(time_steps_);
         primary_positions_.resize(time_steps_);
-        
+
         for (int t = 0; t < time_steps_; ++t) {
             sun_positions_[t] = getSunPosition(times_[t]);
             primary_positions_[t] = getPrimaryPosition(times_[t]);
         }
     }
-    
+
     // Calculate face normals and centers
     std::vector<std::array<double, 3>> face_normals(mesh_faces.size());
     std::vector<std::array<double, 3>> face_centers(mesh_faces.size());
-    
+
     for (size_t f = 0; f < mesh_faces.size(); ++f) {
         const auto& face = mesh_faces[f];
         const auto& v0 = mesh_vertices[face[0]];
         const auto& v1 = mesh_vertices[face[1]];
         const auto& v2 = mesh_vertices[face[2]];
-        
+
         face_normals[f] = calculateFaceNormal(v0, v1, v2);
         face_centers[f] = {{
             (v0[0] + v1[0] + v2[0]) / 3.0,
@@ -1145,28 +1178,40 @@ bool IlluminationModel::calculateIlluminationOptimized(
     if (!precomputed_positions_loaded_) {
         debugPrint("Debug: Calculating celestial body positions");
         // Initialize time array
-        double start_et = convertTimeToET(start_time);
-        double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
-        double step_size = duration_seconds / time_steps_;
-        
         times_.resize(time_steps_);
         time_strings_.resize(time_steps_);
-        
-        for (int t = 0; t < time_steps_; ++t) {
-            double et = start_et + t * step_size;
-            times_[t] = et;
-            
-            // Convert to string for display
-            char time_str[41];
-            et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
-            time_strings_[t] = std::string(time_str);
+
+        if (!external_ets_.empty()) {
+            if (static_cast<int>(external_ets_.size()) != time_steps_) {
+                std::cerr << "[IlluminationModel] ERROR: external ET grid size ("
+                          << external_ets_.size() << ") != time_steps ("
+                          << time_steps_ << ")" << std::endl;
+                return false;
+            }
+            for (int t = 0; t < time_steps_; ++t) {
+                times_[t] = external_ets_[t];
+                char time_str[41];
+                et2utc_c(times_[t], "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+            }
+        } else {
+            double start_et = convertTimeToET(start_time);
+            double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
+            double step_size = duration_seconds / time_steps_;
+            for (int t = 0; t < time_steps_; ++t) {
+                double et = start_et + t * step_size;
+                times_[t] = et;
+                char time_str[41];
+                et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+            }
         }
-        
+
         // Compute Sun and Primary positions for each time step
         debugPrint("Debug: Resizing position arrays for " + std::to_string(time_steps_) + " time steps");
         sun_positions_.resize(time_steps_);
         primary_positions_.resize(time_steps_);
-        
+
         debugPrint("Debug: Computing Sun and Primary positions");
         for (int t = 0; t < time_steps_; ++t) {
             try {
@@ -1489,30 +1534,37 @@ std::map<int, std::vector<double>> IlluminationModel::calculateLocationIlluminat
     // If positions not already loaded, calculate them
     if (sun_positions_.empty() || primary_positions_.empty()) {
         // Initialize time array
-        double start_et = convertTimeToET(start_time);
-        double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
-        double step_size = duration_seconds / time_steps_;
-        
         times_.resize(time_steps_);
         time_strings_.resize(time_steps_);
         sun_positions_.resize(time_steps_);
         primary_positions_.resize(time_steps_);
-        
-        for (int t = 0; t < time_steps_; ++t) {
-            double et = start_et + t * step_size;
-            times_[t] = et;
-            
-            // Convert to string for display
-            char time_str[41];
-            et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
-            time_strings_[t] = std::string(time_str);
-            
-            // Get positions
-            sun_positions_[t] = getSunPosition(times_[t]);
-            primary_positions_[t] = getPrimaryPosition(times_[t]);
+
+        if (!external_ets_.empty() &&
+            static_cast<int>(external_ets_.size()) == time_steps_) {
+            for (int t = 0; t < time_steps_; ++t) {
+                times_[t] = external_ets_[t];
+                char time_str[41];
+                et2utc_c(times_[t], "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+                sun_positions_[t] = getSunPosition(times_[t]);
+                primary_positions_[t] = getPrimaryPosition(times_[t]);
+            }
+        } else {
+            double start_et = convertTimeToET(start_time);
+            double duration_seconds = duration_days * constants::SECONDS_PER_DAY;
+            double step_size = duration_seconds / time_steps_;
+            for (int t = 0; t < time_steps_; ++t) {
+                double et = start_et + t * step_size;
+                times_[t] = et;
+                char time_str[41];
+                et2utc_c(et, "ISOC", 3, sizeof(time_str), time_str);
+                time_strings_[t] = std::string(time_str);
+                sun_positions_[t] = getSunPosition(times_[t]);
+                primary_positions_[t] = getPrimaryPosition(times_[t]);
+            }
         }
     }
-    
+
     // Result container
     std::map<int, std::vector<double>> location_illumination;
     
@@ -2063,6 +2115,22 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
 
+    // Analytical body-occlusion pre-check (same logic as batch path).
+    {
+        const double fc_dot_sun = face_center[0]*sun_dir[0] + face_center[1]*sun_dir[1] + face_center[2]*sun_dir[2];
+        if (fc_dot_sun < 0.0) {
+            const double cx = face_center[1]*sun_dir[2] - face_center[2]*sun_dir[1];
+            const double cy = face_center[2]*sun_dir[0] - face_center[0]*sun_dir[2];
+            const double cz = face_center[0]*sun_dir[1] - face_center[1]*sun_dir[0];
+            const double closest_sq = cx*cx + cy*cy + cz*cz;
+            const double r_fc = vectorLength(face_center);
+            const double R_occ = 0.998 * r_fc;
+            if (closest_sq < R_occ * R_occ) {
+                return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+            }
+        }
+    }
+
     // Local up and elevation
     std::array<double, 3> up = face_center;
     double r_up = vectorLength(up);
@@ -2072,7 +2140,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     // Robust origin offsets (meters)
     const double eps_base = calculateSafeRayOffset(face_center, face_normal);
     const double eps_n = 2.0 * eps_base;
-    const double eps_d = 12.0 * eps_base;
+    const double eps_d = 1.0 * eps_base;
 
     std::array<double, 3> ray_origin_base = {
         face_center[0] + face_normal[0] * eps_n + sun_dir[0] * eps_d,
@@ -2312,9 +2380,21 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     }
     
     // Set up time steps for simulation
-    double et_start = convertTimeToET(start_time);
-    double et_end = et_start + duration_days * constants::SECONDS_PER_DAY;
-    double et_step = (et_end - et_start) / (time_steps_ - 1);
+    // External grid (non-uniform) overrides the uniform grid when set.
+    const bool use_external_grid = !external_ets_.empty() &&
+        static_cast<int>(external_ets_.size()) == time_steps_;
+    double et_start = 0.0;
+    double et_end = 0.0;
+    double et_step = 0.0;
+    if (use_external_grid) {
+        et_start = external_ets_.front();
+        et_end   = external_ets_.back();
+        et_step  = 0.0;  // not used in this branch
+    } else {
+        et_start = convertTimeToET(start_time);
+        et_end = et_start + duration_days * constants::SECONDS_PER_DAY;
+        et_step = (et_end - et_start) / (time_steps_ - 1);
+    }
     
     // Check if we should use chunked storage for very large meshes
     using_chunked_storage_ = (num_faces * time_steps_ > 100000000); // Over 100M elements
@@ -2344,7 +2424,9 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     // Generate time steps and get positions
     for (int t = 0; t < time_steps_; t++) {
         // Calculate ephemeris time
-        double et = et_start + t * et_step;
+        double et = use_external_grid
+            ? external_ets_[t]
+            : (et_start + t * et_step);
         times_[t] = et;
 
         // Convert ET to string
@@ -2570,6 +2652,19 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
     };
     auto u01 = [&](uint32_t s) -> double { return (hash32(s) & 0xFFFFFFU) / double(0x1000000U); };
 
+    // Pre-compute a conservative body radius for the analytical body-
+    // occlusion pre-check below. Use the MEAN face-center radius so that
+    // faces genuinely elevated above the mean sphere (mountain tops near
+    // the terminator) can still pass to the Embree terrain check.
+    double body_radius_m_ = 0.0;
+    {
+        double sum_r = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            sum_r += vectorLength(face_centers[i]);
+        }
+        body_radius_m_ = sum_r / static_cast<double>(n);
+    }
+
     #pragma omp parallel for schedule(dynamic, 256)
     for (size_t i = 0; i < n; ++i) {
         const auto& fc = face_centers[i];
@@ -2602,29 +2697,37 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             continue;
         }
 
+        // Analytical body-occlusion pre-check. A face whose center is behind
+        // the terminator plane (dot(fc, sun_dir) < 0) AND whose shadow ray
+        // passes through the mean sphere (closest approach < R_mean) cannot
+        // see the sun regardless of terrain-slope normal orientation. This
+        // catches nightside faces that Embree's mesh trace misses, which
+        // otherwise produce spurious illumination up to ~8° past the
+        // terminator on topographic meshes.
+        {
+            const double fc_dot_sun = fc[0]*sun_dir[0] + fc[1]*sun_dir[1] + fc[2]*sun_dir[2];
+            if (fc_dot_sun < 0.0) {
+                const double cx = fc[1]*sun_dir[2] - fc[2]*sun_dir[1];
+                const double cy = fc[2]*sun_dir[0] - fc[0]*sun_dir[2];
+                const double cz = fc[0]*sun_dir[1] - fc[1]*sun_dir[0];
+                const double closest_sq = cx*cx + cy*cy + cz*cz;
+                if (closest_sq < body_radius_m_ * body_radius_m_) {
+                    direct_solar_values[i] = enable_shadow_flux_
+                        ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
+                    continue;
+                }
+            }
+        }
+
         // Robust origin:
         const double eps_base = calculateSafeRayOffset(fc, fn);
         const double eps_n = 2.0 * eps_base;
-        const double eps_d = 8.0 * eps_base;
-
-        // In-plane jitter based on face index (stable across timesteps)
-        // std::array<double, 3> tu, tv;
-        // createCoordinateSystem(fn, tu, tv);
-        // const double jx = 2.0 * u01(uint32_t(i) ^ 0xA511E9B3u) - 1.0;
-        // const double jy = 2.0 * u01(uint32_t(i) ^ 0x63D83595u) - 1.0;
-        // const double jlen = std::min(1.0, std::sqrt(jx*jx + jy*jy));
-        // const double jamp = 0.5 * eps_n;
-        // const std::array<double,3> jitter = {
-        //     (tu[0] * jx + tv[0] * jy) * jamp * jlen,
-        //     (tu[1] * jx + tv[1] * jy) * jamp * jlen,
-        //     (tu[2] * jx + tv[2] * jy) * jamp * jlen
-        // };
-        const std::array<double, 3> jitter = {0.0, 0.0, 0.0};
+        const double eps_d = 1.0 * eps_base;
 
         std::array<double, 3> ray_o = {
-            fc[0] + fn[0] * eps_n + sun_dir[0] * eps_d + jitter[0],
-            fc[1] + fn[1] * eps_n + sun_dir[1] * eps_d + jitter[1],
-            fc[2] + fn[2] * eps_n + sun_dir[2] * eps_d + jitter[2]
+            fc[0] + fn[0] * eps_n + sun_dir[0] * eps_d,
+            fc[1] + fn[1] * eps_n + sun_dir[1] * eps_d,
+            fc[2] + fn[2] * eps_n + sun_dir[2] * eps_d
         };
 
         // Center-ray fast path only if center is above horizon
