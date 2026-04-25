@@ -7,6 +7,7 @@ add_library(radiation STATIC
     face_selection.cpp
     hmatrix_view_factor.cpp
     cluster_tree.cpp
+    mc_view_factor.cpp
 )
 
 target_include_directories(radiation PUBLIC

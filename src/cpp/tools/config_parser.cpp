@@ -122,6 +122,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.max_neighbors = getWithDefault(rad, "max_neighbors", config.radiation.max_neighbors);
             config.radiation.min_neighbors = getWithDefault(rad, "min_neighbors", config.radiation.min_neighbors);
             config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
+            config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
+            config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
 
             // Resolve relative view_factor_file against the YAML file's directory so
             // the cache path is cwd-independent (GUI subprocess cwd is not necessarily

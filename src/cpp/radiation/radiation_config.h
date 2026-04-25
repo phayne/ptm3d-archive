@@ -28,6 +28,12 @@ struct RadiationConfig {
     // Threshold matches the H-matrix cluster cull (cos > 0.5).
     bool use_cluster_cull = true;
 
+    // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
+    // Selected by use_monte_carlo_vf. Scales to 4M+ meshes where H-matrix
+    // build memory and sparse-VF adaptive-neighbor cap both fall over.
+    bool use_monte_carlo_vf = false;
+    int mc_rays_per_face = 100000;       // Production default: ~10% rel err on F_ij~1e-3.
+
     // View factor method selection
     enum class ViewFactorMethod {
         CENTROID,       // M1: Fast centroid approximation

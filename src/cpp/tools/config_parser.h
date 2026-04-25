@@ -109,6 +109,9 @@ struct SimulationConfig {
         int max_neighbors = 500;                  // Hard ceiling per face (reduced from 2000 for better performance)
         int min_neighbors = 20;                   // Minimum neighbors per face
         bool use_cluster_cull = true;             // Conservative octree cluster-pair cull before ranking
+        // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
+        bool use_monte_carlo_vf = false;
+        int mc_rays_per_face = 100000;
     } radiation;
 
     // Generic Body Configuration (for user-defined bodies)

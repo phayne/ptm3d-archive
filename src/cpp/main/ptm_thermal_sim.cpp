@@ -6229,6 +6229,8 @@ int main(int argc, char** argv) {
     int rad_max_neighbors_override = -1;         // -1 = use adaptive, >0 = fixed override
     bool rad_use_cluster_cull = true;            // Conservative octree cluster-pair cull before ranking
     bool rad_force_hmatrix = false;              // Bypass historical H-matrix auto-disable (vestigial)
+    bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
+    int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
 
     // Apply radiation settings from YAML config (before CLI override)
     enable_radiation_exchange = sim_config.radiation.enabled;
@@ -6250,6 +6252,8 @@ int main(int argc, char** argv) {
     rad_max_neighbors = sim_config.radiation.max_neighbors;
     rad_min_neighbors = sim_config.radiation.min_neighbors;
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
+    rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
+    rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
 
     if (enable_radiation_exchange) {
         std::cout << "Radiation exchange enabled from config file" << std::endl;
@@ -6538,6 +6542,12 @@ int main(int argc, char** argv) {
             rad_use_hmatrix = true;  // forcing implies using
             std::cout << "H-matrix: FORCED (vestigial flag; large-mesh auto-disable already removed)"
                       << std::endl;
+        } else if (arg == "--rad-vf-monte-carlo") {
+            rad_use_monte_carlo_vf = true;
+            std::cout << "View factor method: Monte Carlo ray-gather" << std::endl;
+        } else if (arg == "--rad-mc-rays" && i + 1 < argc) {
+            rad_mc_rays_per_face = std::stoi(argv[++i]);
+            std::cout << "MC rays per face: " << rad_mc_rays_per_face << std::endl;
         }
         // ===== Generic Body Options =====
         else if (arg == "--generic-body-config" && i + 1 < argc) {
@@ -7047,6 +7057,8 @@ int main(int argc, char** argv) {
             early_rad_config.min_neighbors = rad_min_neighbors;
             early_rad_config.use_cluster_cull = rad_use_cluster_cull;
             early_rad_config.force_hmatrix = rad_force_hmatrix;
+            early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
+            early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
             if (rad_max_neighbors_override > 0) {
                 early_rad_config.max_neighbors = rad_max_neighbors_override;
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -7900,6 +7912,8 @@ int main(int argc, char** argv) {
             rad_config.min_neighbors = rad_min_neighbors;
             rad_config.use_cluster_cull = rad_use_cluster_cull;
             rad_config.force_hmatrix = rad_force_hmatrix;
+            rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
+            rad_config.mc_rays_per_face = rad_mc_rays_per_face;
             if (rad_max_neighbors_override > 0) {
                 rad_config.max_neighbors = rad_max_neighbors_override;
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified

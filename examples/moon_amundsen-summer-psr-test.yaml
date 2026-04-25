@@ -8,10 +8,12 @@ mesh:
   import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/LDEM_80S_20M__amundsen_2Mpts.ply
   scale_factor: 1.0
 thermal:
-  run_thermal_mesh: false
+  run_thermal_mesh: true
   threads: 0
   equilibration_orbits: 0.0
-  use_gpu: false
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 120.0
+  use_gpu: true
   compute_statistics: false
   thermal_inertia_map: ''
   enable_shadow_flux: false
@@ -45,24 +47,29 @@ thermophysical:
   chi: 2.7
   constant_thermal_inertia: -1.0
 radiation:
-  enabled: false
+  enabled: true
   min_shadow_fraction: 0.3
-  verbose: false
-  use_gpu: false
-  view_factor_file: ''
+  verbose: true
+  use_gpu: true
+  view_factor_file: data/vf/amundsen_4M_mc.vfm
   max_coupling_iterations: 10
   coupling_temp_threshold: 0.5
   coupling_flux_threshold: 0.1
   coupling_face_fraction: 0.01
+  # Monte Carlo ray-gather view factors — scales to 4M+ where H-matrix can't.
+  use_monte_carlo_vf: true
+  mc_rays_per_face: 100000
   use_hmatrix: false
   use_aca: true
-  aca_tolerance: 0.001
+  aca_tolerance: 0.01
   aca_max_rank: 50
   hmatrix_threads: 0
+  # Sparse-path knobs retained in case the H-matrix path falls back for any reason.
   adaptive_neighbors: true
-  captured_energy_target: 0.95
-  max_neighbors: 500
+  captured_energy_target: 0.9
+  max_neighbors: 200
   min_neighbors: 20
+  use_cluster_cull: true
 illumination:
   include_primary_reflection: true
   use_batch_processing: true
@@ -71,7 +78,7 @@ illumination:
   positions_file: ''
   use_albedo_map: true
 output:
-  directory: /Users/paha3326/Research/moon/diviner/amundsen/psr_test
+  directory: /Users/paha3326/Research/moon/diviner/amundsen/thermal-summer
   format: binary
   vtk_mode: both
   include_primary_ir: false

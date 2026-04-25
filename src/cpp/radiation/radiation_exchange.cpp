@@ -1,4 +1,5 @@
 #include "radiation_exchange.h"
+#include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../thermal/thermal_model.h"  // For ProgressBar
 
 #include <embree4/rtcore.h>
@@ -748,18 +749,34 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         return false;
     }
 
-    // The previous n_faces > 1M H-matrix auto-disable is gone; large meshes
-    // now rely on the existing out-of-core path.
+    // Method selection: Monte Carlo overrides other paths when enabled.
+    // MC was introduced because H-matrix build memory is infeasible on 4M+ meshes
+    // on this machine (killed by jetsam at ~250 GB RSS) and sparse-VF hits the
+    // max_neighbors cap for 99.5% of faces before reaching the energy target.
     bool use_hmatrix = config_.use_hmatrix;
+    const bool use_mc = config_.use_monte_carlo_vf;
     std::cout << "  [DEBUG] View factor method selection:" << std::endl;
+    std::cout << "    use_monte_carlo_vf = " << (use_mc ? "true" : "false") << std::endl;
     std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
     std::cout << "    n_faces = " << n_faces << std::endl;
 
-    if (use_hmatrix && n_faces > 1000000) {
+    if (use_hmatrix && !use_mc && n_faces > 1000000) {
         std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
     }
 
-    if (use_hmatrix) {
+    if (use_mc) {
+        std::cout << "Using Monte Carlo ray-gather for view factors..." << std::endl;
+        view_factors_ = computeMonteCarlo(mesh_,
+                                          static_cast<RTCDevice>(device_),
+                                          static_cast<RTCScene>(scene_),
+                                          config_,
+                                          config_.mc_rays_per_face);
+        using_hmatrix_ = false;
+        std::cout << "Monte Carlo view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    } else if (use_hmatrix) {
         std::cout << "Using H-matrix compression for view factors..." << std::endl;
 
         HMatrixConfig hconfig;
@@ -912,17 +929,33 @@ bool RadiationExchangeManager::prepare(
         std::cout << "  This ensures illuminated walls can radiate to shadowed floors." << std::endl;
     }
 
-    // See computeViewFactorsOnly() for the rationale; the >1M auto-disable is gone.
+    // Method selection: Monte Carlo overrides when enabled. See
+    // computeViewFactorsOnly() for the rationale.
     bool use_hmatrix = config_.use_hmatrix;
+    const bool use_mc = config_.use_monte_carlo_vf;
     std::cout << "  [DEBUG] View factor method selection (prepare):" << std::endl;
+    std::cout << "    use_monte_carlo_vf = " << (use_mc ? "true" : "false") << std::endl;
     std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
     std::cout << "    n_faces = " << n_faces << std::endl;
 
-    if (use_hmatrix && n_faces > 1000000) {
+    if (use_hmatrix && !use_mc && n_faces > 1000000) {
         std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
     }
 
-    if (use_hmatrix) {
+    if (use_mc) {
+        std::cout << "Using Monte Carlo ray-gather for view factors..." << std::endl;
+        view_factors_ = computeMonteCarlo(mesh_,
+                                          static_cast<RTCDevice>(device_),
+                                          static_cast<RTCScene>(scene_),
+                                          config_,
+                                          config_.mc_rays_per_face);
+        solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
+        using_hmatrix_ = false;
+        std::cout << "Monte Carlo view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    } else if (use_hmatrix) {
         std::cout << "Using H-matrix compression for view factors..." << std::endl;
 
         // Create H-matrix configuration
