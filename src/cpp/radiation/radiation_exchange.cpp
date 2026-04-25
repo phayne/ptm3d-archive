@@ -748,33 +748,15 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         return false;
     }
 
-    // Choose between H-matrix (compressed) and standard sparse view factors
-    // AUTO-DISABLE H-matrix for very large meshes (>1M faces) - falls back to sparse
-    // This is because H-matrix working memory during build exceeds available RAM
-    // even with out-of-core storage and index clearing optimizations.
+    // The previous n_faces > 1M H-matrix auto-disable is gone; large meshes
+    // now rely on the existing out-of-core path.
     bool use_hmatrix = config_.use_hmatrix;
     std::cout << "  [DEBUG] View factor method selection:" << std::endl;
     std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
     std::cout << "    n_faces = " << n_faces << std::endl;
-    std::cout << "    auto-disable threshold = 1,000,000 faces" << std::endl;
 
-    // Aggressive threshold: disable H-matrix for meshes > 1M faces
-    // H-matrix build memory scales as O(N²/B) where B is block size
-    // For 2M faces with typical block sizes, this exceeds 384 GB RAM
     if (use_hmatrix && n_faces > 1000000) {
-        std::cout << std::endl;
-        std::cout << "  *** H-MATRIX AUTO-DISABLED ***" << std::endl;
-        std::cout << "  Mesh has " << n_faces << " faces (> 1M threshold)" << std::endl;
-        std::cout << "  H-matrix build memory exceeds available RAM for meshes this large." << std::endl;
-        std::cout << "  Falling back to sparse view factors with adaptive neighbor selection." << std::endl;
-        std::cout << std::endl;
-        use_hmatrix = false;
-
-        // Enable adaptive neighbor selection for memory-efficient sparse matrix
-        // Each face gets as many neighbors as needed for 99% captured energy (configurable)
-        config_.adaptive_neighbors = true;
-        std::cout << "  Adaptive neighbor selection enabled (target: "
-                  << (config_.captured_energy_target * 100) << "% captured energy)" << std::endl;
+        std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
     }
 
     if (use_hmatrix) {
@@ -930,32 +912,16 @@ bool RadiationExchangeManager::prepare(
         std::cout << "  This ensures illuminated walls can radiate to shadowed floors." << std::endl;
     }
 
-    // AUTO-DISABLE H-matrix for very large meshes (>1M faces) - falls back to sparse
-    // This is because H-matrix working memory during build exceeds available RAM
-    // even with out-of-core storage and index clearing optimizations.
+    // See computeViewFactorsOnly() for the rationale; the >1M auto-disable is gone.
     bool use_hmatrix = config_.use_hmatrix;
     std::cout << "  [DEBUG] View factor method selection (prepare):" << std::endl;
     std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
     std::cout << "    n_faces = " << n_faces << std::endl;
-    std::cout << "    auto-disable threshold = 1,000,000 faces" << std::endl;
 
     if (use_hmatrix && n_faces > 1000000) {
-        std::cout << std::endl;
-        std::cout << "  *** H-MATRIX AUTO-DISABLED (prepare) ***" << std::endl;
-        std::cout << "  Mesh has " << n_faces << " faces (> 1M threshold)" << std::endl;
-        std::cout << "  H-matrix build memory exceeds available RAM for meshes this large." << std::endl;
-        std::cout << "  Falling back to sparse view factors with adaptive neighbor selection." << std::endl;
-        std::cout << std::endl;
-        use_hmatrix = false;
-
-        // Enable adaptive neighbor selection for memory-efficient sparse matrix
-        // Each face gets as many neighbors as needed for 99% captured energy (configurable)
-        config_.adaptive_neighbors = true;
-        std::cout << "  Adaptive neighbor selection enabled (target: "
-                  << (config_.captured_energy_target * 100) << "% captured energy)" << std::endl;
+        std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
     }
 
-    // Choose between H-matrix (compressed) and standard sparse view factors
     if (use_hmatrix) {
         std::cout << "Using H-matrix compression for view factors..." << std::endl;
 
@@ -1104,9 +1070,16 @@ bool RadiationExchangeManager::loadViewFactors(const std::string& filename) {
     // Sparse format: magic = 0x5646464D ("VFFM")
     if (magic == 0x484D4154) {
         // H-matrix format
-        // For large meshes, use memory-mapped loading to avoid loading entire matrix into RAM
+        // For large meshes, use memory-mapped loading to avoid loading entire matrix into RAM.
+        //
+        // KNOWN BUG (2026-04): parallel matvec on a mmap-loaded H-matrix SIGSEGVs
+        // during the first radiosity iteration on >1M-face meshes. Root cause
+        // under investigation. Until it's fixed, auto-mmap is effectively
+        // disabled by raising the threshold far above any expected mesh size.
+        // Full-RAM load is safe and the matrix typically fits comfortably
+        // (probe: 1.57M faces → 2.1 GB .hmat ≪ 384 GB RAM).
         size_t n_faces = mesh_->faces.size();
-        const size_t MMAP_THRESHOLD_FACES = 500000;  // Use mmap for meshes > 500K faces
+        const size_t MMAP_THRESHOLD_FACES = 1'000'000'000;  // effectively off
 
         bool use_mmap = (n_faces >= MMAP_THRESHOLD_FACES);
 

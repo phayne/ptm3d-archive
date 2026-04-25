@@ -23,6 +23,11 @@ struct RadiationConfig {
     double captured_energy_target = 0.95; // Target fraction of radiative potential to capture (95%)
     int min_neighbors = 20;              // Minimum neighbors per face (ensures basic coverage)
 
+    // Cluster-level visibility pre-cull (conservative octree cull before per-face ranking).
+    // Prunes candidate neighbors whose cluster's average normal is strongly back-facing.
+    // Threshold matches the H-matrix cluster cull (cos > 0.5).
+    bool use_cluster_cull = true;
+
     // View factor method selection
     enum class ViewFactorMethod {
         CENTROID,       // M1: Fast centroid approximation
@@ -53,6 +58,10 @@ struct RadiationConfig {
 
     // H-matrix compression options (for large meshes)
     bool use_hmatrix = false;            // Use hierarchical matrix compression
+    // Bypass the n_faces > 1M auto-disable so H-matrix + OOC is attempted regardless.
+    // Intended for the probe run that determines whether the >1M disable is still
+    // warranted; left off by default so existing behaviour is unchanged.
+    bool force_hmatrix = false;
     double hmatrix_tolerance = 1e-2;     // SVD truncation tolerance for low-rank blocks
     int hmatrix_max_depth = 10;          // Maximum quadtree depth
     int hmatrix_min_block_size = 64;     // Minimum block size before treating as leaf

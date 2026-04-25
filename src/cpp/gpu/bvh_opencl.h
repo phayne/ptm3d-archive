@@ -207,6 +207,21 @@ public:
                          std::vector<uint8_t>& occluded_out);
 
     /**
+     * @brief Trace shadow rays with per-ray tmax (for finite-distance visibility like view factors)
+     *
+     * Same as traceShadowRays but each ray terminates at ray_tmax[i] along its direction.
+     * Useful for view-factor visibility where tmax = distance-to-target - epsilon.
+     */
+    void traceShadowRays(const std::vector<float>& ray_org_x,
+                         const std::vector<float>& ray_org_y,
+                         const std::vector<float>& ray_org_z,
+                         const std::vector<float>& ray_dir_x,
+                         const std::vector<float>& ray_dir_y,
+                         const std::vector<float>& ray_dir_z,
+                         const std::vector<float>& ray_tmax,
+                         std::vector<uint8_t>& occluded_out);
+
+    /**
      * @brief Convenience overload for AoS ray data
      */
     void traceShadowRays(const std::vector<std::array<double, 3>>& origins,
@@ -274,6 +289,7 @@ private:
     cl_mem buf_ray_inv_dir_x_ = nullptr;
     cl_mem buf_ray_inv_dir_y_ = nullptr;
     cl_mem buf_ray_inv_dir_z_ = nullptr;
+    cl_mem buf_ray_tmax_ = nullptr;
     cl_mem buf_occluded_ = nullptr;
 
     size_t num_nodes_ = 0;

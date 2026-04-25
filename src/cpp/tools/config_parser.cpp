@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -120,6 +121,23 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.captured_energy_target = getWithDefault(rad, "captured_energy_target", config.radiation.captured_energy_target);
             config.radiation.max_neighbors = getWithDefault(rad, "max_neighbors", config.radiation.max_neighbors);
             config.radiation.min_neighbors = getWithDefault(rad, "min_neighbors", config.radiation.min_neighbors);
+            config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
+
+            // Resolve relative view_factor_file against the YAML file's directory so
+            // the cache path is cwd-independent (GUI subprocess cwd is not necessarily
+            // the repo root, which was silently breaking the VF cache).
+            if (!config.radiation.view_factor_file.empty()) {
+                std::filesystem::path vf_path(config.radiation.view_factor_file);
+                if (vf_path.is_relative()) {
+                    std::error_code ec;
+                    std::filesystem::path yaml_dir =
+                        std::filesystem::absolute(filename, ec).parent_path();
+                    if (!ec) {
+                        config.radiation.view_factor_file =
+                            (yaml_dir / vf_path).lexically_normal().string();
+                    }
+                }
+            }
         }
 
         // Parse Generic Body section

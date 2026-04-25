@@ -6227,6 +6227,8 @@ int main(int argc, char** argv) {
     int rad_max_neighbors = 2000;                // Hard ceiling per face
     int rad_min_neighbors = 20;                  // Minimum neighbors per face
     int rad_max_neighbors_override = -1;         // -1 = use adaptive, >0 = fixed override
+    bool rad_use_cluster_cull = true;            // Conservative octree cluster-pair cull before ranking
+    bool rad_force_hmatrix = false;              // Bypass historical H-matrix auto-disable (vestigial)
 
     // Apply radiation settings from YAML config (before CLI override)
     enable_radiation_exchange = sim_config.radiation.enabled;
@@ -6247,6 +6249,7 @@ int main(int argc, char** argv) {
     rad_captured_energy_target = sim_config.radiation.captured_energy_target;
     rad_max_neighbors = sim_config.radiation.max_neighbors;
     rad_min_neighbors = sim_config.radiation.min_neighbors;
+    rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
 
     if (enable_radiation_exchange) {
         std::cout << "Radiation exchange enabled from config file" << std::endl;
@@ -6524,6 +6527,17 @@ int main(int argc, char** argv) {
         } else if (arg == "--rad-max-neighbors" && i + 1 < argc) {
             rad_max_neighbors_override = std::stoi(argv[++i]);
             std::cout << "Max neighbors override: " << rad_max_neighbors_override << " (adaptive disabled)" << std::endl;
+        } else if (arg == "--rad-cluster-cull") {
+            rad_use_cluster_cull = true;
+            std::cout << "Cluster-pair visibility cull: enabled" << std::endl;
+        } else if (arg == "--rad-no-cluster-cull") {
+            rad_use_cluster_cull = false;
+            std::cout << "Cluster-pair visibility cull: disabled" << std::endl;
+        } else if (arg == "--rad-force-hmatrix") {
+            rad_force_hmatrix = true;
+            rad_use_hmatrix = true;  // forcing implies using
+            std::cout << "H-matrix: FORCED (vestigial flag; large-mesh auto-disable already removed)"
+                      << std::endl;
         }
         // ===== Generic Body Options =====
         else if (arg == "--generic-body-config" && i + 1 < argc) {
@@ -6959,6 +6973,37 @@ int main(int argc, char** argv) {
     }
 
     // ========================================================================
+    // Resolve view_factor_file to an absolute path.
+    //
+    // The GUI and CLI both pass this value as a raw string, which may be a
+    // relative path (e.g. "data/vf/amundsen.vfm"). Relative paths resolved
+    // against the subprocess cwd silently broke the cache when the GUI launched
+    // the binary from a cwd that didn't have the target subdirectory. Resolve
+    // once here so every downstream save/load uses an unambiguous absolute path.
+    // Preference order: relative to the YAML config file's directory (if any),
+    // else relative to the current working directory.
+    // ========================================================================
+    if (!rad_view_factor_file.empty()) {
+        std::filesystem::path vf_path(rad_view_factor_file);
+        if (vf_path.is_relative()) {
+            std::error_code abs_ec;
+            std::filesystem::path base;
+            if (has_config_file) {
+                base = std::filesystem::absolute(config_file, abs_ec).parent_path();
+            }
+            if (base.empty() || abs_ec) {
+                base = std::filesystem::current_path(abs_ec);
+            }
+            if (!abs_ec) {
+                rad_view_factor_file =
+                    (base / vf_path).lexically_normal().string();
+                std::cout << "Resolved view factor file: "
+                          << rad_view_factor_file << std::endl;
+            }
+        }
+    }
+
+    // ========================================================================
     // EARLY VIEW FACTOR COMPUTATION (if radiation exchange enabled)
     //
     // IMPORTANT: Compute view factors BEFORE illumination to avoid OOM.
@@ -7000,6 +7045,8 @@ int main(int argc, char** argv) {
             early_rad_config.captured_energy_target = rad_captured_energy_target;
             early_rad_config.max_neighbors = rad_max_neighbors;
             early_rad_config.min_neighbors = rad_min_neighbors;
+            early_rad_config.use_cluster_cull = rad_use_cluster_cull;
+            early_rad_config.force_hmatrix = rad_force_hmatrix;
             if (rad_max_neighbors_override > 0) {
                 early_rad_config.max_neighbors = rad_max_neighbors_override;
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -7017,16 +7064,27 @@ int main(int argc, char** argv) {
             bool vf_success = early_rad_manager.computeViewFactorsOnly();
 
             if (vf_success) {
-                // Save view factors to disk immediately
+                // Ensure parent directory exists before writing (silent-failure guard).
+                std::error_code mkdir_ec;
+                std::filesystem::create_directories(
+                    std::filesystem::path(rad_view_factor_file).parent_path(), mkdir_ec);
+
+                // Save view factors to disk immediately and honour the return value.
                 // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
                 // auto-enabled by the manager for large meshes, even if --rad-hmatrix wasn't passed
+                bool wrote = false;
                 if (early_rad_manager.getHMatrixViewFactors()) {
-                    early_rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
+                    wrote = early_rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
                 } else {
-                    early_rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
+                    wrote = early_rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
                 }
-                std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
-                view_factors_precomputed = true;
+                if (wrote) {
+                    std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
+                    view_factors_precomputed = true;
+                } else {
+                    std::cerr << "ERROR: Failed to save view factors to: " << rad_view_factor_file
+                              << " (check path, permissions, disk space)" << std::endl;
+                }
             } else {
                 std::cerr << "Warning: Early view factor computation failed." << std::endl;
                 std::cerr << "Will retry during radiation coupling phase." << std::endl;
@@ -7840,6 +7898,8 @@ int main(int argc, char** argv) {
             rad_config.captured_energy_target = rad_captured_energy_target;
             rad_config.max_neighbors = rad_max_neighbors;
             rad_config.min_neighbors = rad_min_neighbors;
+            rad_config.use_cluster_cull = rad_use_cluster_cull;
+            rad_config.force_hmatrix = rad_force_hmatrix;
             if (rad_max_neighbors_override > 0) {
                 rad_config.max_neighbors = rad_max_neighbors_override;
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -7848,12 +7908,24 @@ int main(int argc, char** argv) {
             // Create radiation exchange manager
             radiation::RadiationExchangeManager rad_manager(mesh, rad_config);
 
-            // Try to load pre-computed view factors
+            // Try to load pre-computed view factors. Distinguish "file missing" from
+            // "file present but failed to load" so cache-miss bugs are visible.
             if (!rad_view_factor_file.empty()) {
-                if (rad_manager.loadViewFactors(rad_view_factor_file)) {
-                    std::cout << "Loaded view factors from: " << rad_view_factor_file << std::endl;
+                std::error_code exists_ec;
+                bool file_exists =
+                    std::filesystem::exists(rad_view_factor_file, exists_ec);
+                if (file_exists) {
+                    if (rad_manager.loadViewFactors(rad_view_factor_file)) {
+                        std::cout << "Loaded view factors from: " << rad_view_factor_file << std::endl;
+                    } else {
+                        std::cerr << "WARN: View factor file exists but failed to load: "
+                                  << rad_view_factor_file
+                                  << " — recomputing." << std::endl;
+                    }
                 } else {
-                    std::cout << "View factors not found, will compute..." << std::endl;
+                    std::cout << "View factor file does not exist at: "
+                              << rad_view_factor_file
+                              << " — computing from scratch." << std::endl;
                 }
             }
 
@@ -7881,12 +7953,23 @@ int main(int argc, char** argv) {
                 // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
                 // auto-enabled by the manager for large meshes, even if --rad-hmatrix wasn't passed
                 if (!rad_view_factor_file.empty() && !rad_manager.hasLoadedViewFactors()) {
+                    std::error_code mkdir_ec;
+                    std::filesystem::create_directories(
+                        std::filesystem::path(rad_view_factor_file).parent_path(), mkdir_ec);
+
+                    bool wrote = false;
                     if (rad_manager.getHMatrixViewFactors()) {
-                        rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
+                        wrote = rad_manager.getHMatrixViewFactors()->writeBinary(rad_view_factor_file);
                     } else {
-                        rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
+                        wrote = rad_manager.getViewFactorMatrix().writeBinary(rad_view_factor_file);
                     }
-                    std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
+                    if (wrote) {
+                        std::cout << "Saved view factors to: " << rad_view_factor_file << std::endl;
+                    } else {
+                        std::cerr << "ERROR: Failed to save view factors to: "
+                                  << rad_view_factor_file
+                                  << " (check path, permissions, disk space)" << std::endl;
+                    }
                 }
 
                 std::cout << "\nStarting radiation-thermal coupling iterations..." << std::endl;

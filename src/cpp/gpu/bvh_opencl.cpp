@@ -59,6 +59,8 @@ __kernel void shadow_ray_kernel(
     __global const float* ray_inv_dir_x,
     __global const float* ray_inv_dir_y,
     __global const float* ray_inv_dir_z,
+    // Per-ray max t along direction (1e10 = effectively infinite)
+    __global const float* ray_tmax_in,
     // Output
     __global uchar* occluded,
     // Ray count
@@ -79,7 +81,7 @@ __kernel void shadow_ray_kernel(
     float inv_z = ray_inv_dir_z[ray_id];
 
     float ray_tmin = 0.001f;  // Small offset to avoid self-intersection
-    float ray_tmax = 1e10f;
+    float ray_tmax = ray_tmax_in[ray_id];
 
     // Stack-based BVH traversal (smaller stack for compatibility)
     uint stack[32];
@@ -856,6 +858,7 @@ bool BVHRayTracer::ensureRayBuffers(size_t num_rays) {
     if (buf_ray_inv_dir_x_) clReleaseMemObject(buf_ray_inv_dir_x_);
     if (buf_ray_inv_dir_y_) clReleaseMemObject(buf_ray_inv_dir_y_);
     if (buf_ray_inv_dir_z_) clReleaseMemObject(buf_ray_inv_dir_z_);
+    if (buf_ray_tmax_) clReleaseMemObject(buf_ray_tmax_);
     if (buf_occluded_) clReleaseMemObject(buf_occluded_);
 
     // Allocate with some headroom
@@ -892,6 +895,8 @@ bool BVHRayTracer::ensureRayBuffers(size_t num_rays) {
     CL_CHECK_FALSE(err, "clCreateBuffer ray_inv_dir_y");
     buf_ray_inv_dir_z_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
     CL_CHECK_FALSE(err, "clCreateBuffer ray_inv_dir_z");
+    buf_ray_tmax_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
+    CL_CHECK_FALSE(err, "clCreateBuffer ray_tmax");
     buf_occluded_ = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, buf_size_uchar, nullptr, &err);
     CL_CHECK_FALSE(err, "clCreateBuffer occluded");
 
@@ -905,6 +910,21 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
                                    const std::vector<float>& ray_dir_x,
                                    const std::vector<float>& ray_dir_y,
                                    const std::vector<float>& ray_dir_z,
+                                   std::vector<uint8_t>& occluded_out) {
+    // Backward-compatible: infinite tmax (original shadow-to-sun semantics).
+    std::vector<float> inf_tmax(ray_org_x.size(), 1e10f);
+    traceShadowRays(ray_org_x, ray_org_y, ray_org_z,
+                    ray_dir_x, ray_dir_y, ray_dir_z,
+                    inf_tmax, occluded_out);
+}
+
+void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
+                                   const std::vector<float>& ray_org_y,
+                                   const std::vector<float>& ray_org_z,
+                                   const std::vector<float>& ray_dir_x,
+                                   const std::vector<float>& ray_dir_y,
+                                   const std::vector<float>& ray_dir_z,
+                                   const std::vector<float>& ray_tmax,
                                    std::vector<uint8_t>& occluded_out) {
     if (!initialized_ || !mesh_uploaded_ || !bvh_uploaded_) {
         std::cerr << "BVHRayTracer not ready (init=" << initialized_ << ", mesh=" << mesh_uploaded_
@@ -967,6 +987,7 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_x_, CL_FALSE, 0, buf_size_float, inv_dir_x.data(), 0, nullptr, nullptr), "write ray_inv_dir_x");
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_y_, CL_FALSE, 0, buf_size_float, inv_dir_y.data(), 0, nullptr, nullptr), "write ray_inv_dir_y");
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_z_, CL_FALSE, 0, buf_size_float, inv_dir_z.data(), 0, nullptr, nullptr), "write ray_inv_dir_z");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmax_, CL_FALSE, 0, buf_size_float, ray_tmax.data(), 0, nullptr, nullptr), "write ray_tmax");
 
     cl_int err = clFinish(queue);
     CL_CHECK_RETURN(err, "clFinish after ray upload");
@@ -1003,6 +1024,7 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_inv_dir_x_), "setarg ray_inv_dir_x");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_inv_dir_y_), "setarg ray_inv_dir_y");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_inv_dir_z_), "setarg ray_inv_dir_z");
+    CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_tmax_), "setarg ray_tmax");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_occluded_), "setarg occluded");
     int num_rays_int = static_cast<int>(num_rays);
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(int), &num_rays_int), "setarg num_rays");
@@ -1108,6 +1130,7 @@ void BVHRayTracer::release() {
     if (buf_ray_inv_dir_x_) { clReleaseMemObject(buf_ray_inv_dir_x_); buf_ray_inv_dir_x_ = nullptr; }
     if (buf_ray_inv_dir_y_) { clReleaseMemObject(buf_ray_inv_dir_y_); buf_ray_inv_dir_y_ = nullptr; }
     if (buf_ray_inv_dir_z_) { clReleaseMemObject(buf_ray_inv_dir_z_); buf_ray_inv_dir_z_ = nullptr; }
+    if (buf_ray_tmax_) { clReleaseMemObject(buf_ray_tmax_); buf_ray_tmax_ = nullptr; }
     if (buf_occluded_) { clReleaseMemObject(buf_occluded_); buf_occluded_ = nullptr; }
 
     context_.reset();

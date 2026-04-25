@@ -9,6 +9,7 @@
 #include <omp.h>
 
 #include "radiation_config.h"
+#include "cluster_tree.h"
 #include "../mesh/mesh_utils.h"
 
 // Forward declarations for Embree
@@ -219,6 +220,9 @@ private:
     };
     SpatialGrid spatial_grid_;
     bool spatial_grid_built_ = false;
+
+    // Cluster-pair visibility cull (lightweight centroid octree)
+    std::unique_ptr<ClusterTree> cluster_tree_;
 };
 
 } // namespace radiation

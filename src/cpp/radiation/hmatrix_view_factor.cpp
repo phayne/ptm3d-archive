@@ -585,12 +585,17 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         // Cap max_tree_depth to prevent deep recursion
         int new_max_depth = std::min(config_.max_tree_depth, 6);
 
-        // CRITICAL: For very large meshes (>1M faces), disable hierarchical blocks entirely
-        // With octree, each hierarchical level creates up to 64 child pairs (8×8),
-        // leading to massive block explosion (110K → 7M+ blocks with just 2 levels)
+        // For >1M face meshes, hierarchical subdivision was previously disabled
+        // entirely to bound block count. That made the top-of-octree non-admissible
+        // blocks (~12k faces/side on Amundsen 4M) undivided, so the sparse-fallback
+        // working set ballooned past 300 GB at ~11% build progress before OOM.
+        // Clamp to 1 level instead: non-admissible huge blocks get a single 8×8
+        // subdivision, capping per-block working memory at ~(n/8)²·56 B while
+        // only ~64× multiplying a minority of blocks (admissible blocks are
+        // unaffected). Empirically keeps peak RSS bounded on 384 GB machines.
         int new_hierarchical_levels = config_.max_hierarchical_levels;
         if (n_faces > 1000000) {
-            new_hierarchical_levels = 0;  // Completely disable hierarchical subdivision
+            new_hierarchical_levels = std::min(new_hierarchical_levels, 1);
         }
 
         bool any_change = (new_min_block_size > config_.min_block_size ||
@@ -1052,7 +1057,14 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         // each thread can use 500MB+ during ACA row/column computation.
         // Limit threads aggressively based on faces per node.
         if (out_of_core_enabled_) {
-            if (avg_faces_per_node > 5000) {
+            // Amundsen 4M (avg 11943 faces/node) with 4 threads hit ~250 GB RSS
+            // and was killed by macOS jetsam despite OOC. Peak-memory scaling is
+            // O(threads · n_per_node²), so for very large clusters we drop to 2
+            // threads to keep system memory pressure tolerable on 384 GB machines.
+            if (avg_faces_per_node > 8000 || n_faces > 2500000) {
+                // Pathological: few-GB per ACA/sparse-fallback attempt. 2 threads.
+                hard_limit = std::min(hard_limit, 2);
+            } else if (avg_faces_per_node > 5000) {
                 // Very large blocks: 4 threads max (each ~500MB working memory)
                 hard_limit = std::min(hard_limit, 4);
             } else if (avg_faces_per_node > 3000) {
@@ -1585,11 +1597,11 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                 }
                 block->data = disk;
-                // Indices are stored on disk - clear from RAM to save memory
-                block->row_indices.clear();
-                block->row_indices.shrink_to_fit();
-                block->col_indices.clear();
-                block->col_indices.shrink_to_fit();
+                // Keep parent indices populated. writeBlock() serialises them; if
+                // cleared, loaded H-matrix matvec silently skips every disk-backed
+                // block (empty-indices guard in HMatrixBlock::matvec) -> zero flux.
+                block->row_indices = row_faces;
+                block->col_indices = col_faces;
                 #pragma omp atomic
                 num_disk_blocks_++;
             } else {
@@ -1639,11 +1651,9 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     DiskBlock disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
 
                     block->data = disk;
-                    // Indices are stored on disk - clear from RAM to save memory
-                    block->row_indices.clear();
-                    block->row_indices.shrink_to_fit();
-                    block->col_indices.clear();
-                    block->col_indices.shrink_to_fit();
+                    // Keep parent indices populated (see zero-flux bug note).
+                    block->row_indices = row_faces;
+                    block->col_indices = col_faces;
 
                     #pragma omp atomic
                     num_disk_blocks_++;
@@ -1686,11 +1696,9 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                         std::vector<int> col_faces_copy(col_faces);
                         DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                         block->data = disk;
-                        // Indices are stored on disk - clear from RAM to save memory
-                        block->row_indices.clear();
-                        block->row_indices.shrink_to_fit();
-                        block->col_indices.clear();
-                        block->col_indices.shrink_to_fit();
+                        // Keep parent indices populated (see zero-flux bug note).
+                        block->row_indices = row_faces;
+                        block->col_indices = col_faces;
                         #pragma omp atomic
                         num_disk_blocks_++;
                     } else {
@@ -1838,13 +1846,25 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     // Fall back to sparse computation
     // WARNING: This uses O(n²) memory. For ACA mode with large blocks, this is dangerous.
     // Only do full sparse computation for small blocks.
-    constexpr size_t MAX_SAFE_BLOCK_FOR_FULL_SPARSE = 2000;  // 2K × 2K = 32 MB max
+    //
+    // Cap chosen for two regimes:
+    //   - Without OOC: tight (300) to keep concurrent-thread working-set bounded.
+    //   - With OOC: 5000. Rationale:
+    //     * 1.57M-face probe had ~5809 faces/node with cap=2000 silently zeroing
+    //       5749/65469 (8.8%) non-zero blocks. Raising to 5000 covers that regime.
+    //     * 4M-face Amundsen build at cap=10000 grew to 315 GB RSS at only 11%
+    //       completion on a 384 GB machine — sparse-fallback working memory
+    //       (O(n²)·56 B) accumulates too fast on deep-crater geometry even with
+    //       the thread limiter. 5000 caps working set at ~1.4 GB per block ×
+    //       4 threads = 5.6 GB concurrent; completion is safe.
+    const size_t max_sparse_size_q = out_of_core_enabled_ ? 5000 : 300;
 
     if (config_.compression_method == CompressionMethod::ACA &&
-        (n_rows > MAX_SAFE_BLOCK_FOR_FULL_SPARSE || n_cols > MAX_SAFE_BLOCK_FOR_FULL_SPARSE)) {
+        (n_rows > max_sparse_size_q || n_cols > max_sparse_size_q)) {
         // Block is too large for safe O(n²) computation with many threads
         // Store as zero block - this sacrifices accuracy but prevents OOM
-        // This should rarely happen if quadtree depth is sufficient
+        // This should rarely happen if the tree depth and the cap above are sized
+        // to let normal cluster pairs fit.
         g_sparse_fallback_skipped++;
         ZeroBlock zero;
         zero.n_rows = n_rows;
@@ -1974,11 +1994,11 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                 }
                 block->data = disk;
-                // Indices are stored on disk - clear from RAM to save memory
-                block->row_indices.clear();
-                block->row_indices.shrink_to_fit();
-                block->col_indices.clear();
-                block->col_indices.shrink_to_fit();
+                // Keep parent indices populated. writeBlock() serialises them; if
+                // cleared, loaded H-matrix matvec silently skips every disk-backed
+                // block (empty-indices guard in HMatrixBlock::matvec) -> zero flux.
+                block->row_indices = row_faces;
+                block->col_indices = col_faces;
                 #pragma omp atomic
                 num_disk_blocks_++;
             } else {
@@ -2028,11 +2048,9 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     DiskBlock disk = writeBlockToDisk(lowrank, row_faces_copy, col_faces_copy);
 
                     block->data = disk;
-                    // Indices are stored on disk - clear from RAM to save memory
-                    block->row_indices.clear();
-                    block->row_indices.shrink_to_fit();
-                    block->col_indices.clear();
-                    block->col_indices.shrink_to_fit();
+                    // Keep parent indices populated (see zero-flux bug note).
+                    block->row_indices = row_faces;
+                    block->col_indices = col_faces;
 
                     #pragma omp atomic
                     num_disk_blocks_++;
@@ -2081,11 +2099,9 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                         std::vector<int> col_faces_copy(col_faces);
                         DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                         block->data = disk;
-                        // Indices are stored on disk - clear from RAM to save memory
-                        block->row_indices.clear();
-                        block->row_indices.shrink_to_fit();
-                        block->col_indices.clear();
-                        block->col_indices.shrink_to_fit();
+                        // Keep parent indices populated (see zero-flux bug note).
+                        block->row_indices = row_faces;
+                        block->col_indices = col_faces;
                         #pragma omp atomic
                         num_disk_blocks_++;
                     } else {
@@ -2240,9 +2256,10 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     // non-admissible (close together) and couldn't be subdivided further, so they
     // represent genuine nearby interactions that matter for accuracy.
     //
-    // OUT-OF-CORE MODE: When enabled, we can compute larger blocks because
-    // the data is written to disk immediately rather than stored in RAM.
-    size_t max_sparse_size = out_of_core_enabled_ ? 2000 : 300;
+    // OUT-OF-CORE MODE: see the matching quadtree comment for rationale.
+    // 5000 is a middle ground: covers Nobile's ~5809 avg faces/node, and
+    // avoids the 315-GB-at-11% blowup seen on 4M Amundsen at cap=10000.
+    size_t max_sparse_size = out_of_core_enabled_ ? 5000 : 300;
 
     if (config_.compression_method == CompressionMethod::ACA &&
         (n_rows > max_sparse_size || n_cols > max_sparse_size)) {
@@ -2279,11 +2296,9 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             DiskBlock disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
 
             block->data = disk;
-            // Indices are stored on disk - clear from RAM to save memory
-            block->row_indices.clear();
-            block->row_indices.shrink_to_fit();
-            block->col_indices.clear();
-            block->col_indices.shrink_to_fit();
+            // Keep parent indices populated (see zero-flux bug note).
+            block->row_indices = row_faces;
+            block->col_indices = col_faces;
 
             #pragma omp atomic
             num_disk_blocks_++;

@@ -719,6 +719,19 @@ void ViewFactorCalculator::precomputeFaceData() {
     double cell_hint = std::sqrt(avg_area) * 10.0;
     spatial_grid_.build(face_centers_, cell_hint);
     spatial_grid_built_ = true;
+
+    // Build lightweight cluster-pair visibility cull tree (conservative pre-filter
+    // before per-face neighbor ranking). Gated by config flag.
+    if (config_.use_cluster_cull) {
+        cluster_tree_ = std::make_unique<ClusterTree>();
+        cluster_tree_->build(face_centers_, face_normals_);
+        if (config_.verbose) {
+            std::cout << "Cluster cull tree: " << cluster_tree_->numLeaves()
+                      << " leaves, ~"
+                      << (cluster_tree_->memoryBytes() / (1024 * 1024))
+                      << " MB" << std::endl;
+        }
+    }
 }
 
 double ViewFactorCalculator::computeFaceArea(int face_idx) {
@@ -1751,10 +1764,27 @@ std::vector<NeighborData> ViewFactorCalculator::selectNeighborsAdaptive(
     const auto& c_i = face_centers_[face_i];
     const auto& n_i = face_normals_[face_i];
 
+    // Cluster-pair visibility pre-cull (conservative). Source leaf looked up once;
+    // for each candidate the test is an O(1) dot-product check against precomputed
+    // per-leaf average center/normal. Safe no-op when tree was not built.
+    const ClusterTree* cluster = cluster_tree_.get();
+    const int src_leaf = (cluster != nullptr) ? cluster->leafId(face_i) : -1;
+
     double total_potential = 0.0;
 
     for (int j : candidates) {
         if (j == face_i) continue;  // Skip self
+
+        // Conservative cluster-pair cull BEFORE computing per-face geometry.
+        // Saves subtract + sqrt + two dot products per culled candidate and,
+        // more importantly, removes them from the ranking set.
+        if (cluster != nullptr && src_leaf >= 0) {
+            int j_leaf = cluster->leafId(j);
+            if (j_leaf >= 0 && j_leaf != src_leaf &&
+                !cluster->canLeavesSeeEachOther(src_leaf, j_leaf)) {
+                continue;
+            }
+        }
 
         const auto& c_j = face_centers_[j];
         const auto& n_j = face_normals_[j];

@@ -108,6 +108,7 @@ struct SimulationConfig {
         double captured_energy_target = 0.95;     // Target fraction of radiative potential (95%)
         int max_neighbors = 500;                  // Hard ceiling per face (reduced from 2000 for better performance)
         int min_neighbors = 20;                   // Minimum neighbors per face
+        bool use_cluster_cull = true;             // Conservative octree cluster-pair cull before ranking
     } radiation;
 
     // Generic Body Configuration (for user-defined bodies)
