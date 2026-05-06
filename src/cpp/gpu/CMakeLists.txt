@@ -133,6 +133,7 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
     # Works on macOS with AMD GPUs, Linux, Windows
     set(GPU_SOURCES
         thermal_opencl.cpp
+        thermal_gpu_pool.cpp
         radiosity_opencl.cpp
         bvh_opencl.cpp
     )
@@ -203,6 +204,7 @@ if(GPU_BACKEND_USED STREQUAL "OPENCL")
     install(FILES
         opencl_config.h
         thermal_opencl.h
+        thermal_gpu_pool.h
         radiosity_opencl.h
         bvh_opencl.h
         DESTINATION include/gpu
