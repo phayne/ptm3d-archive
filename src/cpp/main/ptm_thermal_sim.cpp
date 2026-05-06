@@ -3335,26 +3335,396 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // output timesteps were accumulated.
     }
 
+    // ----- Per-batch worker (shared by serial and multi-GPU paths) -----
+    // The lambda contains everything that runs after a ThermalOpenCLSolver is
+    // initialized for one batch: host-side prep + uploads + persistent
+    // kernel + result download + writebacks. Single-GPU calls it inline
+    // from the serial for-loop below; multi-GPU dispatches it via
+    // ThermalGPUDevicePool.submit().
+    //
+    // Bit-equivalence note: capturing all relevant state by reference and
+    // calling the lambda in the serial path is functionally identical to
+    // the previous inline body (same kernel inputs, same execution order on
+    // the same device).
+    auto run_batch_on_solver = [&](ThermalOpenCLSolver& solver,
+                                    size_t batch_idx,
+                                    size_t batch_start,
+                                    size_t batch_n) -> bool {
+        // Prepare mesh data for this batch (SoA layout: [layer * batch_n + face_in_batch])
+        std::vector<float> z_grid_f(n_layers);
+        for (size_t i = 0; i < n_layers; ++i) {
+            z_grid_f[i] = static_cast<float>(z_grid[i]);
+        }
+
+        std::vector<float> rho_batch(batch_n * n_layers);
+        std::vector<float> kc_batch(batch_n * n_layers);
+        std::vector<float> emissivity_batch(batch_n);
+        std::vector<float> T_deep_batch(batch_n);
+        std::vector<float> Qb_batch(batch_n);
+
+        const auto& rho_ref = reference_profile.rho();
+        const auto& kc_ref = reference_profile.kc();
+        const auto& T_ref = reference_profile.T();
+        double T_deep_val = T_ref.back();
+        double R350_val = reference_profile.R350_val;
+
+        const bool use_per_face_H = (face_H_overrides != nullptr) &&
+                                    !face_H_overrides->empty();
+
+        for (size_t f = 0; f < batch_n; ++f) {
+            size_t global_f = batch_start + f;
+            emissivity_batch[f] = static_cast<float>(planet.emissivity);
+            T_deep_batch[f] = static_cast<float>(T_deep_val);
+            if (face_Qb && global_f < face_Qb->size()) {
+                Qb_batch[f] = static_cast<float>((*face_Qb)[global_f]);
+            } else {
+                Qb_batch[f] = static_cast<float>(planet.Qb);
+            }
+
+            if (use_per_face_H) {
+                const double H_face = (global_f < face_H_overrides->size())
+                                    ? (*face_H_overrides)[global_f]
+                                    : planet.H;
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    const double depth = z_grid[layer];
+                    const double df    = std::exp(-depth / H_face);
+                    rho_batch[idx] = static_cast<float>(planet.rhod + (planet.rhos - planet.rhod) * df);
+                    kc_batch[idx]  = static_cast<float>(planet.kd  + (planet.ks  - planet.kd ) * df);
+                }
+            } else {
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    rho_batch[idx] = static_cast<float>(rho_ref[layer]);
+                    kc_batch[idx]  = static_cast<float>(kc_ref[layer]);
+                }
+            }
+        }
+
+        solver.uploadMeshData(z_grid_f, rho_batch, kc_batch, emissivity_batch, T_deep_batch, Qb_batch);
+
+        if (GPU_DEBUG_OUTPUT && batch_idx == 0) {
+            std::cerr << "[GPU Thermal DEBUG] z_grid (first 10): ";
+            for (size_t i = 0; i < std::min(n_layers, (size_t)10); ++i) {
+                std::cerr << z_grid_f[i] << " ";
+            }
+            std::cerr << "\n";
+            std::cerr << "[GPU Thermal DEBUG] rho[0] (first face): " << rho_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] kc[0] (first face): " << kc_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] emissivity (first face): " << emissivity_batch[0] << "\n";
+            std::cerr << "[GPU Thermal DEBUG] T_deep (first face): " << T_deep_batch[0] << "\n";
+        }
+
+        std::vector<float> cp_coeffs_f;
+        for (double c : planet.cpCoeff) {
+            cp_coeffs_f.push_back(static_cast<float>(c));
+        }
+        solver.setMaterialParams(
+            static_cast<float>(planet.cp0),
+            cp_coeffs_f,
+            static_cast<float>(R350_val),
+            static_cast<float>(5.67051196e-8)
+        );
+
+        std::vector<float> T_initial(batch_n * n_layers);
+        for (size_t f = 0; f < batch_n; ++f) {
+            size_t global_f = batch_start + f;
+            double albedo = face_albedos[global_f];
+            double avg_flux = 0.0;
+            int n_samples = std::min(10, total_time_steps);
+            for (int t = 0; t < n_samples; ++t) {
+                size_t flux_idx = global_f * total_time_steps + t;
+                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+            }
+            avg_flux /= n_samples;
+
+            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+            if (T_eq < 40.0) T_eq = 100.0;
+            if (T_eq > 400.0) T_eq = 400.0;
+
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                size_t idx = layer * batch_n + f;
+                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+            }
+        }
+        solver.uploadInitialTemperature(T_initial);
+
+        if (!loaded_initial_T.empty()) {
+            std::vector<float> T_chunked(batch_n * n_layers);
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                const float* src = loaded_initial_T.data()
+                                 + layer * n_faces + batch_start;
+                float*       dst = T_chunked.data() + layer * batch_n;
+                std::copy(src, src + batch_n, dst);
+            }
+            solver.uploadAllTemps(T_chunked);
+        }
+
+        if (GPU_DEBUG_OUTPUT && batch_idx == 0) {
+            std::cerr << "[GPU Thermal DEBUG] Initial T profile for face 0: ";
+            for (size_t layer = 0; layer < std::min(n_layers, (size_t)10); ++layer) {
+                std::cerr << T_initial[layer * batch_n + 0] << " ";
+            }
+            std::cerr << "\n";
+            std::cerr << "[GPU Thermal DEBUG] T_deep_val = " << T_deep_val << ", R350_val = " << R350_val << "\n";
+            std::cerr << "[GPU Thermal DEBUG] dt = " << dt << " seconds\n";
+
+            double T_repr = 200.0;
+            double kc = kc_batch[0];
+            double k_repr = kc * (1.0 + R350_val * T_repr * T_repr * T_repr);
+            double cp_repr = planet.cp0;
+            for (size_t c = 0; c < planet.cpCoeff.size(); ++c) {
+                cp_repr += planet.cpCoeff[c] * std::pow(T_repr, c + 1);
+            }
+            double rho_repr = rho_batch[0];
+            double kappa_repr = k_repr / (rho_repr * cp_repr);
+            double dz_min = z_grid[1] - z_grid[0];
+            double Fo = kappa_repr * dt / (dz_min * dz_min);
+            std::cerr << "[GPU Thermal DEBUG] Stability check: k=" << k_repr << ", cp=" << cp_repr
+                      << ", rho=" << rho_repr << ", kappa=" << kappa_repr
+                      << ", dz_min=" << dz_min << ", Fo=" << Fo << "\n";
+            if (Fo > 0.5) {
+                std::cerr << "[GPU Thermal WARNING] Fourier number " << Fo << " > 0.5, solver may be unstable!\n";
+            }
+        }
+
+        auto prepare_flux = [&](int t_start, int n_steps) {
+            std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
+            #pragma omp parallel for schedule(static)
+            for (int t = 0; t < n_steps; ++t) {
+                for (size_t f = 0; f < batch_n; ++f) {
+                    size_t global_f = batch_start + f;
+                    size_t flux_idx = global_f * total_time_steps + (t_start + t);
+
+                    double albedo = face_albedos[global_f];
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+
+                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+                    flux[t * batch_n + f] = static_cast<float>(absorbed);
+                }
+            }
+            return flux;
+        };
+
+        int equil_cycles = 1;
+        std::vector<float> output_temps;
+
+        std::vector<float> batch_avg_E;
+        std::vector<float>* batch_avg_E_ptr = nullptr;
+        if (ice_acc) {
+            batch_avg_E.assign(static_cast<size_t>(n_layers) * batch_n, 0.0f);
+            batch_avg_E_ptr = &batch_avg_E;
+        }
+
+        if (two_phase) {
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Phase 1: " << equil_cycles
+                          << " eq cycles × " << equilibration_steps
+                          << " steps (dt=" << std::fixed << std::setprecision(1)
+                          << eq_dt << "s)" << std::endl;
+            }
+            auto flux_eq = prepare_flux(0, equilibration_steps);
+            std::vector<float> eq_output_discard;
+            solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
+                                                 equilibration_steps, eq_dt, equil_cycles);
+
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Phase 2: 1 output cycle × "
+                          << output_steps << " steps (dt="
+                          << out_dt << "s)" << std::endl;
+            }
+            auto flux_out = prepare_flux(equilibration_steps, output_steps);
+            solver.solvePersistentMultipleCycles(flux_out, output_temps,
+                                                 output_steps, out_dt, 0,
+                                                 batch_avg_E_ptr,
+                                                 /*accum_start*/ 0,
+                                                 /*accum_end*/   output_steps);
+        } else {
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Running " << equil_cycles
+                          << " equilibration cycles + 1 output cycle..." << std::endl;
+            }
+            auto flux_all = prepare_flux(0, total_time_steps);
+            solver.solvePersistentMultipleCycles(flux_all, output_temps,
+                                                 total_time_steps, dt, equil_cycles,
+                                                 batch_avg_E_ptr,
+                                                 /*accum_start*/ equilibration_steps,
+                                                 /*accum_end*/   total_time_steps);
+        }
+
+        if (ice_acc) {
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                const float* src = batch_avg_E.data() + layer * batch_n;
+                float*       dst = ice_acc->sum_E.data() + layer * n_faces + batch_start;
+                std::copy(src, src + batch_n, dst);
+            }
+        }
+
+        if (dump_final_state) {
+            std::vector<float> batch_T_final;
+            try {
+                solver.downloadAllTemps(batch_T_final);
+            } catch (const std::exception& e) {
+                std::cerr << "[GPU Thermal] WARNING: downloadAllTemps failed: "
+                          << e.what() << "\n";
+                batch_T_final.clear();
+            }
+            if (batch_T_final.size() == batch_n * n_layers) {
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const float* src = batch_T_final.data() + layer * batch_n;
+                    float*       dst = assembled_final_T.data() + layer * n_faces + batch_start;
+                    std::copy(src, src + batch_n, dst);
+                }
+            }
+        }
+
+        if (GPU_DEBUG_OUTPUT) {
+            std::cerr << "[GPU Thermal DEBUG] output_temps size: " << output_temps.size()
+                      << ", expected: " << (static_cast<size_t>(total_time_steps) * batch_n) << "\n";
+            if (!output_temps.empty()) {
+                std::cerr << "[GPU Thermal DEBUG] Host output_temps[0..4]: ";
+                for (size_t i = 0; i < std::min(size_t(5), output_temps.size()); ++i) {
+                    std::cerr << output_temps[i] << " ";
+                }
+                std::cerr << "\n";
+
+                for (int check_t : {0, 10, 100, 500, 832}) {
+                    size_t idx = check_t * batch_n;
+                    if (idx < output_temps.size()) {
+                        std::cerr << "[GPU Thermal DEBUG] output_temps at t=" << check_t << " (face 0): "
+                                  << output_temps[idx] << " K\n";
+                    }
+                }
+            }
+        }
+
+        if (surface_temps_out) {
+            if (GPU_DEBUG_OUTPUT) {
+                std::cerr << "[GPU Thermal DEBUG] Copying batch " << (batch_idx + 1)
+                          << " results to surface_temps_out (batch_n=" << batch_n
+                          << ", output_temps.size=" << output_temps.size() << ")\n";
+
+                if (!output_temps.empty()) {
+                    float sample_val = output_temps[0];
+                    std::cerr << "[GPU Thermal DEBUG] output_temps[0] = " << sample_val << "\n";
+                }
+            }
+
+            const int copy_n = two_phase ? (total_time_steps - equilibration_steps) : total_time_steps;
+            const int copy_offset = two_phase ? equilibration_steps : 0;
+
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t global_f = batch_start + f;
+                for (int t = 0; t < copy_n; ++t) {
+                    (*surface_temps_out)[global_f][copy_offset + t] =
+                        static_cast<double>(output_temps[t * batch_n + f]);
+                }
+            }
+
+            if (GPU_DEBUG_OUTPUT) {
+                std::cerr << "[GPU Thermal DEBUG] After copy: surface_temps_out[0][0] = "
+                          << (*surface_temps_out)[batch_start][0] << "\n";
+            }
+        }
+
+        return true;
+    };
+
     // ----- Multi-GPU device-pool dispatch (opt-in) -----
-    // When the user asks for multi-device thermal (gpu_devices != 1 or an
-    // explicit gpu_device_ids list), refuse rather than silently fall back —
-    // the loop refactor that consumes ThermalGPUDevicePool is staged
-    // separately. The legacy serial loop below still services all
-    // single-device runs (gpu_devices == 1, default), byte-identical to
-    // pre-multi-GPU behaviour.
+    // gpu_devices == 1 (default) AND gpu_device_ids empty → fall through to
+    // the single-device serial loop below (byte-identical to legacy code).
+    // gpu_devices == 0 / "auto" → use every enumerated GPU.
+    // gpu_device_ids non-empty → use exactly those device indices.
     const bool use_multi_gpu_thermal =
         (gpu_devices != 1) || !gpu_device_ids.empty();
     if (use_multi_gpu_thermal) {
-        std::cerr << "[GPU Thermal] Multi-GPU dispatch requested "
-                  << "(gpu_devices=" << gpu_devices
-                  << ", gpu_device_ids size=" << gpu_device_ids.size()
-                  << ") but the pool wiring is not yet enabled in this build. "
-                  << "Use --gpu-devices 1 (default) until the loop refactor lands."
-                  << std::endl;
-        return false;
+        auto all_gpus = OpenCLContext::enumerateGPUs(/*only_available=*/true);
+        std::vector<OpenCLDeviceInfo> selected;
+        if (!gpu_device_ids.empty()) {
+            for (int id : gpu_device_ids) {
+                if (id < 0 || static_cast<size_t>(id) >= all_gpus.size()) {
+                    std::cerr << "[GPU Thermal] Invalid gpu_device_id " << id
+                              << " (only " << all_gpus.size() << " GPUs enumerated)"
+                              << std::endl;
+                    return false;
+                }
+                selected.push_back(all_gpus[id]);
+            }
+        } else if (gpu_devices == 0) {
+            selected = all_gpus;
+        } else {
+            const int n = std::min(gpu_devices,
+                                   static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n; ++i) selected.push_back(all_gpus[i]);
+        }
+        if (selected.empty()) {
+            std::cerr << "[GPU Thermal] No GPUs selected for multi-GPU dispatch"
+                      << std::endl;
+            return false;
+        }
+
+        std::cout << "[GPU Thermal] Multi-GPU dispatch across " << selected.size()
+                  << " device(s):" << std::endl;
+        for (size_t i = 0; i < selected.size(); ++i) {
+            std::cout << "  [" << i << "] " << selected[i].name << " ("
+                      << (selected[i].global_mem_size / (1024 * 1024)) << " MB)"
+                      << std::endl;
+        }
+        if (gpu_inter_batch_pause_ms > 0) {
+            std::cout << "[GPU Thermal] Inter-batch pause: "
+                      << gpu_inter_batch_pause_ms << " ms (per device)" << std::endl;
+        }
+
+        ThermalGPUPoolConfig pool_cfg;
+        pool_cfg.devices = selected;
+        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+        pool_cfg.verbose = false;
+        ThermalGPUDevicePool pool(std::move(pool_cfg));
+
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        std::vector<std::future<bool>> futures;
+        futures.reserve(n_batches);
+        for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+            const size_t batch_start = batch_idx * BATCH_SIZE;
+            const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_faces);
+            const size_t batch_n     = batch_end - batch_start;
+            futures.push_back(pool.submit(batch_n, n_layers, opencl_config,
+                [&run_batch_on_solver, batch_idx, batch_start, batch_n](
+                    ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
+                    return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
+                }));
+        }
+
+        bool all_ok = true;
+        size_t completed = 0;
+        for (auto& f : futures) {
+            const bool ok = f.get();
+            ++completed;
+            std::cout << "\r[GPU Thermal Pool] " << completed << "/" << n_batches
+                      << " batches done" << std::flush;
+            all_ok = ok && all_ok;
+        }
+        std::cout << std::endl;
+
+        if (!all_ok) {
+            std::cerr << "[GPU Thermal] Multi-GPU dispatch had at least one batch failure"
+                      << std::endl;
+            return false;
+        }
+
+        // Skip the single-device serial loop — work is done.
+        goto post_batch_loop;
     }
-    // Silence unused-arg warnings until the multi-GPU dispatch consumes them.
-    (void)gpu_inter_batch_pause_ms;
 
     for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
         size_t batch_start = batch_idx * BATCH_SIZE;
@@ -3740,6 +4110,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         (void)batch_duration;  // Suppress unused warning when not in verbose mode
     }
 
+post_batch_loop:
     // Complete the progress bar
     std::cout << "\r[GPU Thermal] Progress: 100.0% (complete)                    " << std::endl;
 
