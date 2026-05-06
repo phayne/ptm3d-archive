@@ -635,7 +635,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // n_layers, then n_layers*n_faces float32 (layer-major SoA, the
     // GPU buf_T_ native layout).
     const std::string& initial_state_file = "",
-    const std::string& final_state_file   = "");
+    const std::string& final_state_file   = "",
+    // Multi-GPU controls (see config_parser.h thermal.gpu_*).
+    //   gpu_devices == 1 (default) AND gpu_device_ids empty → legacy
+    //     single-device path, byte-identical to pre-multi-GPU behaviour.
+    //   gpu_devices == 0 / "auto" → use every enumerated GPU.
+    //   gpu_device_ids non-empty → use exactly those device indices.
+    //   gpu_batch_size = 0 keeps the legacy 6 GB / 500 K-face cap.
+    int gpu_devices = 1,
+    const std::vector<int>& gpu_device_ids = {},
+    size_t gpu_batch_size = 0,
+    int gpu_inter_batch_pause_ms = 0);
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
@@ -2997,7 +3007,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const std::vector<double>* face_H_overrides,
     ice::IceStabilityAccumulator* ice_acc,
     const std::string& initial_state_file,
-    const std::string& final_state_file)
+    const std::string& final_state_file,
+    int gpu_devices,
+    const std::vector<int>& gpu_device_ids,
+    size_t gpu_batch_size_override,
+    int gpu_inter_batch_pause_ms)
 {
     using namespace gpu::opencl;
 
@@ -3118,8 +3132,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // launches), small enough to fit comfortably on 4–8 GB integrated GPUs.
     const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
     const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;  // 6 GB conservative
-    const size_t max_batch_size = std::min(n_faces, gpu_memory_limit / bytes_per_face);
-    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(500000));
+    const size_t max_batch_size_legacy = std::min(n_faces, gpu_memory_limit / bytes_per_face);
+    // gpu_batch_size_override > 0 lets the user shrink batches (watchdog mitigation
+    // on macOS+AMD; see memory/gpu_hang_amd_macos.md). 0 keeps legacy behaviour.
+    const size_t BATCH_SIZE = (gpu_batch_size_override > 0)
+        ? std::min(n_faces, std::min(max_batch_size_legacy, gpu_batch_size_override))
+        : std::min(max_batch_size_legacy, static_cast<size_t>(500000));
 
     std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
               << " (n_layers=" << n_layers << ")" << std::endl;
@@ -3316,6 +3334,27 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // n_samples will be set after the batch loop, once we know how many
         // output timesteps were accumulated.
     }
+
+    // ----- Multi-GPU device-pool dispatch (opt-in) -----
+    // When the user asks for multi-device thermal (gpu_devices != 1 or an
+    // explicit gpu_device_ids list), refuse rather than silently fall back —
+    // the loop refactor that consumes ThermalGPUDevicePool is staged
+    // separately. The legacy serial loop below still services all
+    // single-device runs (gpu_devices == 1, default), byte-identical to
+    // pre-multi-GPU behaviour.
+    const bool use_multi_gpu_thermal =
+        (gpu_devices != 1) || !gpu_device_ids.empty();
+    if (use_multi_gpu_thermal) {
+        std::cerr << "[GPU Thermal] Multi-GPU dispatch requested "
+                  << "(gpu_devices=" << gpu_devices
+                  << ", gpu_device_ids size=" << gpu_device_ids.size()
+                  << ") but the pool wiring is not yet enabled in this build. "
+                  << "Use --gpu-devices 1 (default) until the loop refactor lands."
+                  << std::endl;
+        return false;
+    }
+    // Silence unused-arg warnings until the multi-GPU dispatch consumes them.
+    (void)gpu_inter_batch_pause_ms;
 
     for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
         size_t batch_start = batch_idx * BATCH_SIZE;
@@ -8514,7 +8553,11 @@ int main(int argc, char** argv) {
                     face_H_ptr_g,
                     ice_acc_ptr_a,
                     sim_config.thermal.initial_state_file,
-                    sim_config.thermal.final_state_file
+                    sim_config.thermal.final_state_file,
+                    sim_config.thermal.gpu_devices,
+                    sim_config.thermal.gpu_device_ids,
+                    sim_config.thermal.gpu_batch_size,
+                    sim_config.thermal.gpu_inter_batch_pause_ms
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
@@ -8620,7 +8663,11 @@ int main(int argc, char** argv) {
                     face_H_ptr_g,
                     ice_acc_ptr_b,
                     sim_config.thermal.initial_state_file,
-                    sim_config.thermal.final_state_file
+                    sim_config.thermal.final_state_file,
+                    sim_config.thermal.gpu_devices,
+                    sim_config.thermal.gpu_device_ids,
+                    sim_config.thermal.gpu_batch_size,
+                    sim_config.thermal.gpu_inter_batch_pause_ms
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
