@@ -71,7 +71,9 @@ STATISTICS_FIELDS = {
     'direct_solar': {'label': 'Direct Solar', 'units': 'W/m²'},
     'primary_reflected': {'label': 'Primary Reflected', 'units': 'W/m²'},
     'primary_ir': {'label': 'Primary IR', 'units': 'W/m²'},
-    'ice_depth': {'label': 'Ice Depth', 'units': 'm'},
+    # scalar=True: single per-face value (no avg/max/min split). On disk as
+    # ice_depth.bin (Schorghofer J(z)=J0 stability depth, not a time-average).
+    'ice_depth': {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
 }
 
 # Nice resolution values for rounding
@@ -567,7 +569,7 @@ class GeoTIFFExporter:
         """Write metadata tags to an open rasterio dataset."""
         info = FIELD_INFO.get(field_name, {})
         if not info:
-            # Check for statistics field (e.g. 'temperature_avg')
+            # Statistics field with avg/max/min suffix (e.g. 'temperature_avg').
             parts = field_name.rsplit('_', 1)
             if len(parts) == 2 and parts[1] in STAT_LABELS:
                 base_info = STATISTICS_FIELDS.get(parts[0], {})
@@ -576,6 +578,14 @@ class GeoTIFFExporter:
                         'label': f"{base_info['label']} ({STAT_LABELS[parts[1]]})",
                         'units': base_info.get('units', ''),
                     }
+        if not info:
+            # Scalar statistics field (e.g. 'ice_depth' — no _avg/_max/_min).
+            base_info = STATISTICS_FIELDS.get(field_name, {})
+            if base_info:
+                info = {
+                    'label': base_info.get('label', field_name),
+                    'units': base_info.get('units', ''),
+                }
         dst.update_tags(
             field=field_name,
             units=info.get('units', ''),
@@ -649,12 +659,19 @@ class GeoTIFFExporter:
             data_2d: Array of shape (N_lat, N_lon)
             regridder: MeshRegridder instance
             base_field: Base field name (e.g. 'temperature')
-            stat_type: Statistic type ('avg', 'max', or 'min')
+            stat_type: Statistic type ('avg', 'max', 'min', or None for
+                scalar single-band fields like ice_depth).
         """
         info = STATISTICS_FIELDS.get(base_field, {})
-        stat_label = STAT_LABELS.get(stat_type, stat_type)
-        field_name = f"{base_field}_{stat_type}"
-        band_label = f"{info.get('label', base_field)} ({stat_label})"
+        if stat_type is None:
+            field_name = base_field
+            units = info.get('units', '')
+            label = info.get('label', base_field)
+            band_label = f"{label} ({units})" if units else label
+        else:
+            stat_label = STAT_LABELS.get(stat_type, stat_type)
+            field_name = f"{base_field}_{stat_type}"
+            band_label = f"{info.get('label', base_field)} ({stat_label})"
         GeoTIFFExporter.export_single_timestep(
             output_path, data_2d, regridder, field_name, band_label
         )
@@ -796,19 +813,25 @@ class HDF5Exporter:
                     'Per-face statistics computed over integration window'
                 )
                 for (base_field, stat_type), face_data in statistics_data.items():
-                    key = f"{base_field}_{stat_type}"
                     info = STATISTICS_FIELDS.get(base_field, {})
-                    stat_label = STAT_LABELS.get(stat_type, stat_type)
+                    if stat_type is None:
+                        # Scalar field (e.g. ice_depth): no _<stat> suffix.
+                        key = base_field
+                        description = info.get('label', base_field)
+                        stat_attr = 'value'
+                    else:
+                        key = f"{base_field}_{stat_type}"
+                        stat_label = STAT_LABELS.get(stat_type, stat_type)
+                        description = f"{info.get('label', base_field)} ({stat_label})"
+                        stat_attr = stat_type
                     ds = stats_grp.create_dataset(
                         key,
                         data=face_data.astype(np.float32),
                         compression='gzip', compression_opts=4
                     )
                     ds.attrs['units'] = info.get('units', '')
-                    ds.attrs['description'] = (
-                        f"{info.get('label', base_field)} ({stat_label})"
-                    )
-                    ds.attrs['statistic'] = stat_type
+                    ds.attrs['description'] = description
+                    ds.attrs['statistic'] = stat_attr
                     ds.attrs['base_field'] = base_field
 
             # Regridded statistics group
@@ -817,19 +840,24 @@ class HDF5Exporter:
                 reg_stats.attrs['projection'] = regridder.projection
                 reg_stats.attrs['resolution_degrees'] = regridder.resolution
                 for (base_field, stat_type), grid_data in regridded_statistics.items():
-                    key = f"{base_field}_{stat_type}"
                     info = STATISTICS_FIELDS.get(base_field, {})
-                    stat_label = STAT_LABELS.get(stat_type, stat_type)
+                    if stat_type is None:
+                        key = base_field
+                        description = info.get('label', base_field)
+                        stat_attr = 'value'
+                    else:
+                        key = f"{base_field}_{stat_type}"
+                        stat_label = STAT_LABELS.get(stat_type, stat_type)
+                        description = f"{info.get('label', base_field)} ({stat_label})"
+                        stat_attr = stat_type
                     ds = reg_stats.create_dataset(
                         key,
                         data=grid_data.astype(np.float32),
                         compression='gzip', compression_opts=4
                     )
                     ds.attrs['units'] = info.get('units', '')
-                    ds.attrs['description'] = (
-                        f"{info.get('label', base_field)} ({stat_label})"
-                    )
-                    ds.attrs['statistic'] = stat_type
+                    ds.attrs['description'] = description
+                    ds.attrs['statistic'] = stat_attr
                     ds.attrs['base_field'] = base_field
 
 
@@ -985,10 +1013,13 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
         for base_field, stat_type in statistics:
             info = STATISTICS_FIELDS.get(base_field, {})
             label = info.get('label', base_field)
-            stat_label = STAT_LABELS.get(stat_type, stat_type)
             units = info.get('units', '')
             units_str = f" ({units})" if units else ""
-            lines.append(f"* {label} - {stat_label}{units_str}")
+            if stat_type is None:
+                lines.append(f"* {label}{units_str}")
+            else:
+                stat_label = STAT_LABELS.get(stat_type, stat_type)
+                lines.append(f"* {label} - {stat_label}{units_str}")
         lines.append("")
 
     lines.append("")
@@ -1047,23 +1078,32 @@ def detect_available_statistics(results_dir):
     if not stats_dir.is_dir():
         return []
 
+    def _file_has_data(filepath):
+        """True iff the binary stats file is well-formed and not all-NaN."""
+        if not filepath.is_file() or filepath.stat().st_size <= 4:
+            return False
+        try:
+            with open(filepath, 'rb') as f:
+                header = f.read(4)
+                if len(header) != 4:
+                    return False
+                count = struct.unpack('<I', header)[0]
+                data = np.frombuffer(f.read(), dtype='<f4')
+                return len(data) == count and not np.all(np.isnan(data))
+        except Exception:
+            return False
+
     available = []
-    for base_field in STATISTICS_FIELDS:
+    for base_field, info in STATISTICS_FIELDS.items():
+        if info.get('scalar'):
+            # Single per-face value, file is <base>.bin (no _avg/_max/_min).
+            # Selection key uses stat_type=None to flag the scalar path.
+            if _file_has_data(stats_dir / f"{base_field}.bin"):
+                available.append((base_field, None))
+            continue
         for stat_type in STAT_TYPES:
-            filepath = stats_dir / f"{base_field}_{stat_type}.bin"
-            if not filepath.is_file() or filepath.stat().st_size <= 4:
-                continue
-            # Read and check for all-NaN (e.g. ice_depth_max/min)
-            try:
-                with open(filepath, 'rb') as f:
-                    header = f.read(4)
-                    if len(header) == 4:
-                        count = struct.unpack('<I', header)[0]
-                        data = np.frombuffer(f.read(), dtype='<f4')
-                        if len(data) == count and not np.all(np.isnan(data)):
-                            available.append((base_field, stat_type))
-            except Exception:
-                continue
+            if _file_has_data(stats_dir / f"{base_field}_{stat_type}.bin"):
+                available.append((base_field, stat_type))
     return available
 
 
@@ -1259,12 +1299,27 @@ class DataExportWorker(QThread):
                     self.export_finished.emit(False, "Export cancelled")
                     return
 
-                stat_label = STAT_LABELS.get(stat_type, stat_type)
-                self.status_updated.emit(
-                    f"Processing statistic: {base_field} {stat_label}..."
-                )
+                # Scalar fields (e.g. ice_depth) carry stat_type=None and
+                # live on disk as <base>.bin / <base>.tif. Non-scalar fields
+                # use the stat_type-suffixed filenames.
+                is_scalar = stat_type is None
+                if is_scalar:
+                    field_label = STATISTICS_FIELDS.get(
+                        base_field, {}
+                    ).get('label', base_field)
+                    self.status_updated.emit(
+                        f"Processing statistic: {field_label}..."
+                    )
+                    filepath = stats_dir / f"{base_field}.bin"
+                    tiff_name = f"{base_field}.tif"
+                else:
+                    stat_label = STAT_LABELS.get(stat_type, stat_type)
+                    self.status_updated.emit(
+                        f"Processing statistic: {base_field} {stat_label}..."
+                    )
+                    filepath = stats_dir / f"{base_field}_{stat_type}.bin"
+                    tiff_name = f"{base_field}_{stat_type}.tif"
 
-                filepath = stats_dir / f"{base_field}_{stat_type}.bin"
                 face_data = read_binary_data(str(filepath), n_faces)
 
                 if face_data is not None:
@@ -1276,9 +1331,12 @@ class DataExportWorker(QThread):
 
                         # Skip all-NaN grids (no valid data after regridding)
                         if np.all(np.isnan(grid_2d)):
+                            tag = (
+                                field_label if is_scalar
+                                else f"{base_field} {stat_label}"
+                            )
                             self.status_updated.emit(
-                                f"Skipping {base_field} {stat_label}: "
-                                f"all NaN after regridding"
+                                f"Skipping {tag}: all NaN after regridding"
                             )
                         else:
                             all_stat_grid_data[stat_key] = grid_2d
@@ -1286,10 +1344,7 @@ class DataExportWorker(QThread):
                             if do_geotiff:
                                 stat_tiff_dir = output_dir / 'statistics'
                                 stat_tiff_dir.mkdir(parents=True, exist_ok=True)
-                                tiff_path = (
-                                    stat_tiff_dir
-                                    / f"{base_field}_{stat_type}.tif"
-                                )
+                                tiff_path = stat_tiff_dir / tiff_name
                                 GeoTIFFExporter.export_statistic(
                                     tiff_path, grid_2d, regridder,
                                     base_field, stat_type
@@ -1432,7 +1487,11 @@ class DataExportWorker(QThread):
                     vtk_arr = numpy_support.numpy_to_vtk(
                         face_data.astype(np.float64), deep=True
                     )
-                    vtk_arr.SetName(f"{base_field}_{stat_type}")
+                    arr_name = (
+                        base_field if stat_type is None
+                        else f"{base_field}_{stat_type}"
+                    )
+                    vtk_arr.SetName(arr_name)
                     stat_grid.GetCellData().AddArray(vtk_arr)
 
                 stat_vtu_path = output_dir / "ptm3d_statistics.vtu"

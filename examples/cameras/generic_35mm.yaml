@@ -1,0 +1,20 @@
+# Generic 35mm full-frame pinhole camera (reference baseline).
+# With principal_point at image center, zero distortion, and look-at
+# pointing, this reproduces the default PTM3D camera simulator behaviour.
+camera:
+  focal_length_mm: 50.0
+  sensor_mm: [36.0, 24.0]       # Full-frame 35 mm sensor
+  nx: 1024
+  ny: 1024
+  # principal_point omitted → defaults to (nx/2, ny/2)
+  # distortion omitted → pure pinhole
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

@@ -6,6 +6,7 @@ Enhanced with face selection via click or lat/lon input, and data export
 
 import numpy as np
 from pathlib import Path
+import re
 import struct
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QSplitter,
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QValidator
 
 # PyVista for 3D visualization
 try:
@@ -66,6 +67,25 @@ class PyVistaWidget(QWidget):
         self.color_range_min = None
         self.color_range_max = None
         self.global_data_range = None  # Will be computed from all timesteps
+
+        # Per-field colormap overrides. Empty by default — falls back to
+        # VisualizationPanel.FIELD_INFO[field][1]. The toolbar's Colormap
+        # dropdown writes here; survives field switches so each field
+        # remembers its last user-chosen palette.
+        self.cmap_overrides = {}
+
+        # Synthetic ("sun") lighting state. When enabled, the default
+        # PyVista headlight is replaced by a directional sun light at
+        # (sun_azimuth_deg, sun_elevation_deg) on the local-tangent
+        # frame at the mesh centroid, plus a soft ambient fill.
+        # Defaults are populated from the mesh latitudes on first load
+        # (see _set_default_sun_from_latitude).
+        self.synthetic_lighting_enabled = False
+        self.sun_azimuth_deg = 0.0      # 0 = local north, 90 = east, 180 = south
+        self.sun_elevation_deg = 30.0   # 0 = horizon, 90 = zenith
+        self.sun_intensity = 1.0
+        self.ambient_intensity = 0.2
+        self.mesh_mean_lat_deg = 0.0
 
         self.init_ui()
 
@@ -229,6 +249,12 @@ class PyVistaWidget(QWidget):
 
             # Detect hemisphere for camera orientation
             self.detected_hemisphere = self.detect_hemisphere(latitudes)
+
+            # Pick default sun position from the mesh's mean latitude.
+            # Doesn't override existing user choices on subsequent loads
+            # within the same session unless the user clicks "Use
+            # latitude default" in the lighting dialog.
+            self._set_default_sun_from_latitude(latitudes)
 
             self.update_display()
 
@@ -422,7 +448,22 @@ class PyVistaWidget(QWidget):
             self.update_display()
 
     def load_field_data(self, field_name, timestep_index, expected_count):
-        """Load a specific data field for a timestep"""
+        """Load a specific data field for a timestep, or a per-face annual
+        statistic (in which case timestep_index is ignored).
+
+        Statistics are recognised by trailing _max/_avg/_min and live in
+        <results>/statistics/<field_name>.bin (single file, no timestep).
+        """
+        # Statistics path: single file, no timestep index
+        if (field_name.endswith('_max') or field_name.endswith('_avg')
+                or field_name.endswith('_min')
+                or field_name == 'ice_depth'):
+            stats_path = self.results_dir / 'statistics' / f"{field_name}.bin"
+            if not stats_path.exists():
+                return None
+            return self.read_binary_data(stats_path, expected_count)
+
+        # Per-timestep series path
         field_dirs = {
             'temperature': 'temperature',
             'direct_solar': 'direct_solar',
@@ -496,8 +537,24 @@ class PyVistaWidget(QWidget):
         else:
             scalars = None
 
-        # Choose colormap based on field
-        cmap = 'plasma' if 'temperature' in self.current_field.lower() else 'viridis'
+        # Choose colormap based on field. Resolution order:
+        #   1. user override stored in self.cmap_overrides for this field
+        #   2. explicit default from VisualizationPanel.FIELD_INFO
+        #   3. 'temperature ⇒ plasma, else viridis' fallback
+        cmap = 'viridis'
+        try:
+            override = self.cmap_overrides.get(self.current_field)
+            if override:
+                cmap = override
+            else:
+                info = VisualizationPanel.FIELD_INFO.get(self.current_field)
+                if info is not None:
+                    cmap = info[1]
+                elif 'temperature' in self.current_field.lower():
+                    cmap = 'plasma'
+        except Exception:
+            if 'temperature' in self.current_field.lower():
+                cmap = 'plasma'
 
         # Determine color range (clim)
         clim = None
@@ -539,6 +596,10 @@ class PyVistaWidget(QWidget):
             mesh_kwargs['clim'] = clim
 
         self.plotter.add_mesh(self.mesh, **mesh_kwargs)
+
+        # Apply synthetic sun lighting if enabled (replaces default
+        # headlight with a directional sun + soft ambient fill).
+        self._apply_synthetic_lighting()
 
         # Re-add selection highlight if there was one
         if self.selected_face_id is not None:
@@ -886,6 +947,151 @@ class PyVistaWidget(QWidget):
         self.global_data_range = None
         if self.mesh and self.results_dir:
             self.load_timestep_data(self.current_timestep)
+
+    def get_effective_cmap(self, field_name=None):
+        """Return the colormap currently used for `field_name` (or current).
+        Mirrors the resolution order in update_display(): user override,
+        FIELD_INFO default, then 'plasma' for temperature-ish fields,
+        else 'viridis'."""
+        if field_name is None:
+            field_name = self.current_field
+        override = self.cmap_overrides.get(field_name)
+        if override:
+            return override
+        info = VisualizationPanel.FIELD_INFO.get(field_name)
+        if info is not None:
+            return info[1]
+        if isinstance(field_name, str) and 'temperature' in field_name.lower():
+            return 'plasma'
+        return 'viridis'
+
+    # ---------- Synthetic ("sun") lighting -------------------------------
+
+    def _set_default_sun_from_latitude(self, latitudes):
+        """Set sun_azimuth/elevation defaults from the mesh's mean
+        latitude, using the typical-noon-sun-elevation rule
+        elevation = max(5°, 90° − |mean_lat|). Only applied on first
+        mesh load per session — subsequent loads keep the user's
+        previously chosen sun position so panning between datasets
+        doesn't reset it."""
+        if latitudes is None or len(latitudes) == 0:
+            return
+        mean_lat = float(np.mean(latitudes))
+        self.mesh_mean_lat_deg = mean_lat
+        if not getattr(self, '_sun_defaults_set', False):
+            self.sun_elevation_deg = max(5.0, 90.0 - abs(mean_lat))
+            # Sun is on the equator side of the observer's meridian at
+            # local noon. Northern-hemisphere observer sees sun toward
+            # the south; southern-hemisphere observer sees it toward
+            # the north.
+            self.sun_azimuth_deg = 180.0 if mean_lat > 0 else 0.0
+            self._sun_defaults_set = True
+
+    def set_synthetic_lighting(self, enabled, azimuth_deg=None,
+                               elevation_deg=None, intensity=None,
+                               ambient=None):
+        """Update synthetic-lighting parameters and redraw."""
+        self.synthetic_lighting_enabled = bool(enabled)
+        if azimuth_deg   is not None: self.sun_azimuth_deg   = float(azimuth_deg)
+        if elevation_deg is not None: self.sun_elevation_deg = float(elevation_deg)
+        if intensity     is not None: self.sun_intensity     = float(intensity)
+        if ambient       is not None: self.ambient_intensity = float(ambient)
+        if self.mesh:
+            self.update_display()
+
+    def _apply_synthetic_lighting(self):
+        """Replace the plotter's lights with a directional sun light + a
+        soft ambient fill positioned by (azimuth, elevation) in the
+        mesh-centroid local tangent frame. No-op when disabled or when
+        no mesh is present."""
+        if not PYVISTA_AVAILABLE or not self.plotter or not self.mesh:
+            return
+        if not self.synthetic_lighting_enabled:
+            # Restore the default 3-light kit so the scene reverts to
+            # PyVista's normal lighting when the user turns this off.
+            try:
+                self.plotter.remove_all_lights()
+                self.plotter.enable_lightkit()
+            except Exception:
+                pass
+            return
+
+        # Local tangent frame at the mesh centroid (which sits roughly
+        # on the body sphere, so centroid normalised = local up).
+        try:
+            centroid = np.asarray(self.mesh.center, dtype=float)
+        except Exception:
+            return
+        r = np.linalg.norm(centroid)
+        if r < 1.0:
+            # Mesh centred at body origin — fall back to global +z up.
+            up = np.array([0.0, 0.0, 1.0])
+            centroid = up * 1.0
+        else:
+            up = centroid / r
+
+        # Project geographic-north (+z) onto tangent plane → local north.
+        # If centroid is near a pole this projection vanishes, so fall
+        # back to a perpendicular direction.
+        n_geo = np.array([0.0, 0.0, 1.0])
+        north = n_geo - np.dot(n_geo, up) * up
+        if np.linalg.norm(north) < 1e-6:
+            north = np.array([1.0, 0.0, 0.0]) - np.dot([1.0, 0.0, 0.0], up) * up
+        north = north / np.linalg.norm(north)
+        east = np.cross(up, north)
+        east = east / max(np.linalg.norm(east), 1e-12)
+
+        az = np.deg2rad(self.sun_azimuth_deg)
+        el = np.deg2rad(self.sun_elevation_deg)
+        # Direction TOWARD the sun, in world coords:
+        sun_dir = (np.cos(el) * (np.cos(az) * north + np.sin(az) * east)
+                   + np.sin(el) * up)
+
+        # Place light far enough that VTK treats it as effectively
+        # parallel rays across the mesh.
+        try:
+            bounds = self.mesh.bounds
+            mesh_extent = max(bounds[1]-bounds[0],
+                              bounds[3]-bounds[2],
+                              bounds[5]-bounds[4])
+        except Exception:
+            mesh_extent = r
+        D = max(mesh_extent * 50.0, 1.0)
+        light_pos = centroid + D * sun_dir
+        focal = centroid
+
+        try:
+            self.plotter.remove_all_lights()
+            sun = pv.Light(position=tuple(light_pos),
+                           focal_point=tuple(focal),
+                           color='white',
+                           intensity=self.sun_intensity)
+            sun.light_type = 'scene light'
+            sun.positional = False
+            self.plotter.add_light(sun)
+            # Soft ambient fill so the night side isn't pure black.
+            ambient_pos = centroid - D * up
+            fill = pv.Light(position=tuple(ambient_pos),
+                            focal_point=tuple(focal),
+                            color='white',
+                            intensity=self.ambient_intensity)
+            fill.light_type = 'scene light'
+            self.plotter.add_light(fill)
+        except Exception as e:
+            print(f"[Lighting] failed to apply synthetic lights: {e}")
+
+    def set_cmap_override(self, field_name, cmap):
+        """Override the colormap for `field_name`. Pass cmap=None or '' to
+        clear the override (revert to FIELD_INFO default). Triggers a
+        redraw if the override applies to the currently displayed field."""
+        if not field_name:
+            return
+        if cmap:
+            self.cmap_overrides[field_name] = cmap
+        else:
+            self.cmap_overrides.pop(field_name, None)
+        if field_name == self.current_field and self.mesh:
+            self.update_display()
 
     def reset_camera(self):
         """Reset camera to default view"""
@@ -1859,6 +2065,63 @@ class PlotWidget(QWidget):
         self.update_plot()
 
 
+# Match plain decimals OR scientific notation: 0.001, 3.3e-6, 1.5E+02, etc.
+# Permissive partial-match (`^...$` not anchored to require the user finish)
+# is left to QValidator.Intermediate; we only insist on Acceptable when the
+# whole text parses as float.
+_SCI_NUMBER_RE = re.compile(
+    r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$"
+)
+_SCI_PARTIAL_RE = re.compile(
+    r"^[+-]?(\d+\.?\d*|\.\d+)?([eE][+-]?\d*)?$"
+)
+
+
+class ScientificDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that accepts scientific notation in user input
+    (e.g. ``3.3e-6``) and renders very small / very large values in ``%g``
+    format. Plain decimals like ``0.0000036`` still work.
+
+    Drop-in replacement: same .value()/.setValue() API.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 9 decimals lets the spinner step by ``setSingleStep`` even at
+        # microdegree scale without round-trip rounding errors.
+        self.setDecimals(9)
+
+    def validate(self, text, pos):
+        s = text.strip()
+        # Strip trailing suffix (set via setSuffix) so the user sees / types
+        # "3.3e-6 degrees" but parsing doesn't choke.
+        suf = self.suffix()
+        if suf and s.endswith(suf.strip()):
+            s = s[: -len(suf.strip())].strip()
+        if not s:
+            return (QValidator.State.Intermediate, text, pos)
+        if _SCI_NUMBER_RE.match(s):
+            return (QValidator.State.Acceptable, text, pos)
+        if _SCI_PARTIAL_RE.match(s):
+            return (QValidator.State.Intermediate, text, pos)
+        return (QValidator.State.Invalid, text, pos)
+
+    def valueFromText(self, text):
+        s = text.strip()
+        suf = self.suffix()
+        if suf and s.endswith(suf.strip()):
+            s = s[: -len(suf.strip())].strip()
+        try:
+            return float(s)
+        except ValueError:
+            return self.minimum()
+
+    def textFromValue(self, value):
+        # Use general format: switches to scientific automatically below
+        # ~1e-4 so 3.3e-6 displays compactly. Trailing zeros suppressed.
+        return f"{value:g}"
+
+
 class ExportDataDialog(QDialog):
     """Dialog for configuring and executing data export in GeoTIFF/HDF5 formats."""
 
@@ -2003,9 +2266,25 @@ class ExportDataDialog(QDialog):
             self.field_checks[field_name] = cb
 
         if not self.available_fields:
-            no_fields_label = QLabel("No data fields found in results directory.")
-            no_fields_label.setStyleSheet("color: #ff5252; font-style: italic;")
-            fields_layout.addWidget(no_fields_label)
+            if self.available_statistics:
+                # Stats-only run (chunked workflow with skip_time_series=true).
+                # The Statistics section below is the user's path forward.
+                hint = QLabel(
+                    "Time-series fields not present "
+                    "(skip_time_series=true). Statistics still available "
+                    "below."
+                )
+                hint.setStyleSheet("color: #888888; font-style: italic;")
+                hint.setWordWrap(True)
+                fields_layout.addWidget(hint)
+            else:
+                no_fields_label = QLabel(
+                    "No data fields found in results directory."
+                )
+                no_fields_label.setStyleSheet(
+                    "color: #ff5252; font-style: italic;"
+                )
+                fields_layout.addWidget(no_fields_label)
 
         fields_group.setLayout(fields_layout)
         layout.addWidget(fields_group)
@@ -2018,7 +2297,7 @@ class ExportDataDialog(QDialog):
             stats_group = QGroupBox("Statistics (avg/max/min over integration window)")
             stats_layout = QVBoxLayout()
 
-            # Group by base field
+            # Group by base field, preserving insertion order
             seen_fields = []
             for base_field, _st in self.available_statistics:
                 if base_field not in seen_fields:
@@ -2030,19 +2309,30 @@ class ExportDataDialog(QDialog):
                 field_label = field_info.get('label', base_field)
                 units = field_info.get('units', '')
                 units_str = f" ({units})" if units else ""
+                is_scalar = field_info.get('scalar', False)
 
                 row = QHBoxLayout()
-                row.addWidget(QLabel(f"{field_label}{units_str}:"))
-
-                for stat_type in ['avg', 'max', 'min']:
-                    key = (base_field, stat_type)
+                if is_scalar:
+                    # Scalar fields (e.g. ice_depth): single checkbox, no
+                    # avg/max/min split.
+                    key = (base_field, None)
                     if key in self.available_statistics:
-                        stat_label = STAT_LABELS[stat_type]
-                        cb = QCheckBox(stat_label)
+                        cb = QCheckBox(f"{field_label}{units_str}")
                         cb.setChecked(base_field in default_stat_fields)
                         cb.stateChanged.connect(self._update_estimate)
                         row.addWidget(cb)
                         self.stat_checks[key] = cb
+                else:
+                    row.addWidget(QLabel(f"{field_label}{units_str}:"))
+                    for stat_type in ['avg', 'max', 'min']:
+                        key = (base_field, stat_type)
+                        if key in self.available_statistics:
+                            stat_label = STAT_LABELS[stat_type]
+                            cb = QCheckBox(stat_label)
+                            cb.setChecked(base_field in default_stat_fields)
+                            cb.stateChanged.connect(self._update_estimate)
+                            row.addWidget(cb)
+                            self.stat_checks[key] = cb
 
                 row.addStretch()
                 stats_layout.addLayout(row)
@@ -2075,16 +2365,41 @@ class ExportDataDialog(QDialog):
         grid_layout.addWidget(proj_label, 0, 2)
 
         grid_layout.addWidget(QLabel("Resolution:"), 1, 0)
-        self.resolution_spin = QDoubleSpinBox()
-        self.resolution_spin.setRange(0.001, 10.0)
-        self.resolution_spin.setDecimals(4)
-        self.resolution_spin.setSingleStep(0.01)
-        self.resolution_spin.setValue(self.auto_resolution)
-        self.resolution_spin.setSuffix(" degrees")
-        self.resolution_spin.valueChanged.connect(self._update_grid_info)
-        grid_layout.addWidget(self.resolution_spin, 1, 1)
+        # Resolution spinbox + unit selector live in a small horizontal row
+        # so we can switch between "degrees" (the canonical regridder unit)
+        # and "m/px" (convenient for science users). The spinbox accepts
+        # scientific notation (e.g. 3.3e-6) for sub-microdegree resolutions.
+        res_row = QHBoxLayout()
+        res_row.setContentsMargins(0, 0, 0, 0)
 
-        auto_label = QLabel(f"(auto-detected: {self.auto_resolution}\u00b0)")
+        self.resolution_spin = ScientificDoubleSpinBox()
+        # Range covers 1 m/px on Moon (~3.3e-6\u00b0) up to 10\u00b0 (regional eqc).
+        self.resolution_spin.setRange(1e-7, 100.0)
+        self.resolution_spin.setSingleStep(0.001)
+        self.resolution_spin.setValue(self.auto_resolution)
+        self.resolution_spin.valueChanged.connect(self._on_resolution_changed)
+        res_row.addWidget(self.resolution_spin, 1)
+
+        self.resolution_unit_combo = QComboBox()
+        self.resolution_unit_combo.addItems(["degrees", "m/px"])
+        self.resolution_unit_combo.setCurrentText("degrees")
+        self.resolution_unit_combo.currentTextChanged.connect(
+            self._on_resolution_unit_changed
+        )
+        res_row.addWidget(self.resolution_unit_combo, 0)
+
+        # Internal source-of-truth (always degrees). Updated in the
+        # value/unit-change handlers; read by _start_export.
+        self._resolution_degrees = float(self.auto_resolution)
+
+        grid_layout.addLayout(res_row, 1, 1)
+
+        # Auto-detected display: degrees + meters at the body's surface.
+        auto_pixel_m = self._get_body_radius() * np.radians(self.auto_resolution)
+        auto_label = QLabel(
+            f"(auto-detected: {self.auto_resolution:g}\u00b0  "
+            f"\u2248 {auto_pixel_m:.2f} m/px)"
+        )
         auto_label.setStyleSheet("color: #888888; font-size: 11px;")
         grid_layout.addWidget(auto_label, 1, 2)
 
@@ -2146,11 +2461,50 @@ class ExportDataDialog(QDialog):
         """Get detected body radius in meters."""
         return self.body_radius
 
+    def _meters_per_degree(self):
+        """Great-circle metres per degree at the body's surface."""
+        return self._get_body_radius() * np.radians(1.0)
+
+    def _spin_value_to_degrees(self, value):
+        """Convert the current spinbox value to degrees, honouring the unit
+        combo. The regridder always works in degrees."""
+        unit = self.resolution_unit_combo.currentText()
+        if unit == "m/px":
+            return float(value) / self._meters_per_degree()
+        return float(value)
+
+    def _degrees_to_spin_value(self, degrees):
+        """Inverse of _spin_value_to_degrees, for switching units without
+        changing the underlying physical resolution."""
+        unit = self.resolution_unit_combo.currentText()
+        if unit == "m/px":
+            return float(degrees) * self._meters_per_degree()
+        return float(degrees)
+
+    def _on_resolution_changed(self, value):
+        """User edited the spinbox — recompute canonical degrees + refresh."""
+        self._resolution_degrees = self._spin_value_to_degrees(value)
+        self._update_grid_info()
+
+    def _on_resolution_unit_changed(self, _new_unit):
+        """User switched between degrees and m/px — preserve the physical
+        resolution by converting the displayed value, not by reinterpreting
+        the same numeric input under a different unit."""
+        # Block the valueChanged signal while we update the display so we
+        # don't double-convert.
+        new_display = self._degrees_to_spin_value(self._resolution_degrees)
+        self.resolution_spin.blockSignals(True)
+        try:
+            self.resolution_spin.setValue(new_display)
+        finally:
+            self.resolution_spin.blockSignals(False)
+        self._update_grid_info()
+
     def _update_grid_info(self):
         """Update grid size display when resolution changes."""
         if not self.mesh_data:
             return
-        res = self.resolution_spin.value()
+        res = self._resolution_degrees
         lats = self.mesh_data['latitudes']
         lons = self.mesh_data['longitudes']
         body_radius = self._get_body_radius()
@@ -2203,7 +2557,7 @@ class ExportDataDialog(QDialog):
 
         self.export_btn.setEnabled(True)
 
-        res = self.resolution_spin.value()
+        res = self._resolution_degrees
         lats = self.mesh_data['latitudes']
         lons = self.mesh_data['longitudes']
         n_faces = len(lats)
@@ -2314,7 +2668,7 @@ class ExportDataDialog(QDialog):
             'timesteps': self.timesteps,
             'fields': selected_fields,
             'formats': formats,
-            'resolution': self.resolution_spin.value(),
+            'resolution': self._resolution_degrees,
             'output_dir': output_dir,
             'geotiff_per_timestep': self.per_timestep_check.isChecked(),
             'body_radius': self._get_body_radius(),
@@ -2408,14 +2762,66 @@ class VisualizationPanel(QWidget):
         self.create_controls()
         layout.addWidget(self.controls_widget)
 
-    # Known field directories and their display labels
+    # Known field directories and their display labels.
+    # Per-timestep series (loaded from <results>/<key>/<key>_NNNN.bin)
+    # plus statistics rasters (loaded from <results>/statistics/<key>.bin
+    # — single file each, no timestep index). Statistics keys are recognised
+    # by the trailing _max / _avg / _min / a leading 'ice_depth_' suffix.
+    # Curated set of matplotlib colormaps for the toolbar Colormap dropdown.
+    # Order: perceptually-uniform sequential first, then classic sequentials,
+    # cyclic, diverging, qualitative, then their _r reversed counterparts.
+    # Any cmap matplotlib/PyVista supports can be passed directly to
+    # PyVistaWidget.set_cmap_override(); these are just the convenient ones.
+    AVAILABLE_COLORMAPS = [
+        # perceptually uniform
+        'viridis', 'plasma', 'inferno', 'magma', 'cividis',
+        'viridis_r', 'plasma_r', 'inferno_r', 'magma_r', 'cividis_r',
+        # classic sequential
+        'gray', 'gray_r', 'hot', 'cool', 'turbo', 'jet',
+        'Blues', 'Greens', 'Oranges', 'Reds', 'Purples',
+        'Blues_r', 'Greens_r', 'Oranges_r', 'Reds_r', 'Purples_r',
+        # diverging
+        'coolwarm', 'bwr', 'seismic', 'RdBu_r', 'RdYlBu_r', 'PiYG',
+        # cyclic
+        'twilight', 'twilight_shifted', 'hsv',
+        # terrain-flavoured
+        'terrain', 'gist_earth', 'ocean', 'cubehelix',
+    ]
+
     FIELD_INFO = {
-        'temperature':      ('Temperature (K)',              'plasma'),
-        'illumination':     ('Total Illumination (W/m²)',    'viridis'),
-        'direct_solar':     ('Direct Solar (W/m²)',          'inferno'),
-        'primary_reflected': ('Primary Reflected (W/m²)',    'cividis'),
-        'primary_ir':       ('Primary IR (W/m²)',            'magma'),
+        # Per-step time series
+        'temperature':       ('Temperature (K)',                       'plasma'),
+        'illumination':      ('Total Illumination (W/m²)',             'viridis'),
+        'direct_solar':      ('Direct Solar (W/m²)',                   'inferno'),
+        'primary_reflected': ('Primary Reflected (W/m²)',              'cividis'),
+        'primary_ir':        ('Primary IR (W/m²)',                     'magma'),
+        # Statistics: per-face annual aggregates (no timestep)
+        'temperature_max':       ('Annual Max Temperature (K)',        'plasma'),
+        'temperature_avg':       ('Annual Mean Temperature (K)',       'plasma'),
+        'temperature_min':       ('Annual Min Temperature (K)',        'plasma'),
+        'illumination_max':      ('Max Illumination (W/m²)',           'viridis'),
+        'illumination_avg':      ('Mean Illumination (W/m²)',          'viridis'),
+        'illumination_min':      ('Min Illumination (W/m²)',           'viridis'),
+        'direct_solar_max':      ('Max Direct Solar (W/m²)',           'inferno'),
+        'direct_solar_avg':      ('Mean Direct Solar (W/m²)',          'inferno'),
+        'direct_solar_min':      ('Min Direct Solar (W/m²)',           'inferno'),
+        'primary_reflected_max': ('Max Primary Reflected (W/m²)',      'cividis'),
+        'primary_reflected_avg': ('Mean Primary Reflected (W/m²)',     'cividis'),
+        'primary_ir_max':        ('Max Primary IR (W/m²)',             'magma'),
+        'primary_ir_avg':        ('Mean Primary IR (W/m²)',            'magma'),
+        # Schorghofer & Taylor (2007) depth-resolved ice-stability output.
+        # Single per-face value (no avg/max/min split). File: ice_depth.bin.
+        'ice_depth':             ('Ice Stability Depth (m)',           'cividis_r'),
     }
+
+    # Field keys that come from the statistics directory rather than a
+    # per-timestep series. (All names ending in _max / _avg / _min, plus
+    # the special-cased single-value 'ice_depth' produced by the new
+    # Schorghofer-style accumulator.)
+    @staticmethod
+    def is_stats_field(field_key):
+        return (field_key.endswith('_max') or field_key.endswith('_avg') or
+                field_key.endswith('_min') or field_key == 'ice_depth')
 
     def create_controls(self):
         """Create visualization control panel"""
@@ -2430,6 +2836,18 @@ class VisualizationPanel(QWidget):
         self.field_combo.setMinimumWidth(160)
         self.field_combo.currentTextChanged.connect(self._on_field_combo_changed)
         layout.addWidget(self.field_combo)
+
+        layout.addWidget(QLabel("  "))
+
+        # Colormap selector. Per-field; remembers the last user choice
+        # for each field via PyVistaWidget.cmap_overrides.
+        layout.addWidget(QLabel("Colormap:"))
+        self.cmap_combo = QComboBox()
+        self.cmap_combo.setMinimumWidth(120)
+        for cm in self.AVAILABLE_COLORMAPS:
+            self.cmap_combo.addItem(cm)
+        self.cmap_combo.currentTextChanged.connect(self._on_cmap_combo_changed)
+        layout.addWidget(self.cmap_combo)
 
         layout.addWidget(QLabel("  "))
 
@@ -2463,6 +2881,23 @@ class VisualizationPanel(QWidget):
         self.show_edges_check = QCheckBox("Show Edges")
         self.show_edges_check.stateChanged.connect(self.on_show_edges_changed)
         layout.addWidget(self.show_edges_check)
+
+        # Synthetic sun lighting toggle + access to az/el dialog. Default
+        # sun position is computed from the loaded mesh's mean latitude
+        # (typical-noon-sun-elevation rule); the dialog lets the user
+        # tweak az/el or restore that default.
+        self.sun_light_check = QCheckBox("Sun Light")
+        self.sun_light_check.setToolTip(
+            "Replace default lighting with a directional sun positioned\n"
+            "at typical-noon elevation for the mesh's mean latitude.")
+        self.sun_light_check.stateChanged.connect(self._on_sun_light_toggled)
+        layout.addWidget(self.sun_light_check)
+
+        sun_btn = QPushButton("Sun…")
+        sun_btn.setMaximumWidth(50)
+        sun_btn.setToolTip("Adjust sun azimuth / elevation")
+        sun_btn.clicked.connect(self._open_sun_dialog)
+        layout.addWidget(sun_btn)
 
         reset_btn = QPushButton("Reset View")
         reset_btn.setMaximumWidth(80)
@@ -2508,33 +2943,55 @@ class VisualizationPanel(QWidget):
         self.timestep_label.setText(f"0/{n_timesteps}")
 
     def _populate_field_combo(self, results_dir):
-        """Detect available data fields and populate the field selector."""
+        """Detect available data fields and populate the field selector.
+
+        Two sources are scanned:
+          1. Per-timestep series:  <results>/<field_key>/<field_key>_NNNN.bin
+          2. Statistics:           <results>/statistics/<field_key>.bin
+        Items from (1) come first; if both are present we still list both
+        so the user can switch between the time-series view and the
+        annual aggregates.
+        """
         from pathlib import Path
         results_path = Path(results_dir)
 
         self.field_combo.blockSignals(True)
         self.field_combo.clear()
 
-        # Preferred field order: illumination fields first if temperature is absent
         available = []
+        stats_dir = results_path / "statistics"
+
         for field_key, (label, _cmap) in self.FIELD_INFO.items():
-            field_dir = results_path / field_key
-            if field_dir.is_dir() and any(field_dir.glob("*.bin")):
-                available.append((field_key, label))
+            if self.is_stats_field(field_key):
+                # Statistics file: <results>/statistics/<key>.bin
+                bin_path = stats_dir / f"{field_key}.bin"
+                if bin_path.is_file():
+                    available.append((field_key, label))
+            else:
+                # Per-timestep series: <results>/<key>/<key>_NNNN.bin
+                field_dir = results_path / field_key
+                if field_dir.is_dir() and any(field_dir.glob("*.bin")):
+                    available.append((field_key, label))
 
         for field_key, label in available:
             self.field_combo.addItem(label, field_key)
 
-        # Select best default: temperature if available, else first field
+        # Select best default: temperature time-series if available; else
+        # temperature_max as a fallback statistic; else first field.
         default_idx = 0
-        for i, (field_key, _label) in enumerate(available):
-            if field_key == "temperature":
-                default_idx = i
-                break
+        for preferred in ("temperature", "temperature_max"):
+            for i, (field_key, _label) in enumerate(available):
+                if field_key == preferred:
+                    default_idx = i
+                    break
+            else:
+                continue
+            break
 
         if available:
             self.field_combo.setCurrentIndex(default_idx)
             self.view_3d.set_field(available[default_idx][0])
+            self._sync_cmap_combo_to_field(available[default_idx][0])
 
         self.field_combo.blockSignals(False)
 
@@ -2543,6 +3000,36 @@ class VisualizationPanel(QWidget):
         field_key = self.field_combo.currentData()
         if field_key:
             self.view_3d.set_field(field_key)
+            # Sync the colormap dropdown to the new field's effective cmap
+            # without triggering set_cmap_override.
+            self._sync_cmap_combo_to_field(field_key)
+
+    def _sync_cmap_combo_to_field(self, field_key):
+        """Update the Colormap dropdown to show the cmap currently in use
+        for `field_key`, without firing the change handler."""
+        if not hasattr(self, 'cmap_combo') or self.cmap_combo is None:
+            return
+        cmap = self.view_3d.get_effective_cmap(field_key)
+        idx = self.cmap_combo.findText(cmap)
+        self.cmap_combo.blockSignals(True)
+        if idx >= 0:
+            self.cmap_combo.setCurrentIndex(idx)
+        else:
+            # Cmap is something not in our curated list — add it as a one-off
+            # so the user can see what's active. Stays available until the
+            # GUI restarts.
+            self.cmap_combo.addItem(cmap)
+            self.cmap_combo.setCurrentIndex(self.cmap_combo.count() - 1)
+        self.cmap_combo.blockSignals(False)
+
+    def _on_cmap_combo_changed(self, cmap):
+        """Handle Colormap dropdown change — apply override for the
+        currently-selected field and redraw."""
+        if not cmap:
+            return
+        field_key = self.field_combo.currentData()
+        if field_key:
+            self.view_3d.set_cmap_override(field_key, cmap)
             if self.view_3d.current_timestep >= 0:
                 self.view_3d.load_timestep_data(self.view_3d.current_timestep)
 
@@ -2551,8 +3038,29 @@ class VisualizationPanel(QWidget):
         self.timestep_slider.setValue(index)
 
     def set_field(self, field_name):
-        """Set data field to visualize"""
+        """Set data field to visualize.
+
+        Called both from the panel's own field_combo (via
+        _on_field_combo_changed → view_3d.set_field) and from external
+        callers such as the main toolbar's field selector. In the
+        external case we must keep the panel's own field_combo and
+        cmap_combo in sync, otherwise the user-facing colormap dropdown
+        ends up writing overrides to the wrong field.
+        """
         self.view_3d.set_field(field_name)
+        # Sync the internal field_combo (signals blocked so we don't
+        # re-enter this code path).
+        if hasattr(self, 'field_combo') and self.field_combo is not None:
+            for i in range(self.field_combo.count()):
+                if self.field_combo.itemData(i) == field_name:
+                    if self.field_combo.currentIndex() != i:
+                        self.field_combo.blockSignals(True)
+                        self.field_combo.setCurrentIndex(i)
+                        self.field_combo.blockSignals(False)
+                    break
+        # Sync the colormap dropdown to this field's effective cmap.
+        if hasattr(self, 'cmap_combo') and self.cmap_combo is not None:
+            self._sync_cmap_combo_to_field(field_name)
 
     def on_timestep_slider_changed(self, value):
         """Handle timestep slider change"""
@@ -2584,6 +3092,136 @@ class VisualizationPanel(QWidget):
     def on_show_edges_changed(self, state):
         """Handle show edges checkbox"""
         pass
+
+    # ---------- Synthetic sun lighting callbacks --------------------------
+
+    def _on_sun_light_toggled(self, state):
+        """Toolbar 'Sun Light' checkbox -> apply or revert lighting."""
+        enabled = bool(state)
+        # Use whatever az/el the view_3d has stored (latitude-default on
+        # first mesh load, or the user's most recent dialog choice).
+        self.view_3d.set_synthetic_lighting(
+            enabled,
+            azimuth_deg=self.view_3d.sun_azimuth_deg,
+            elevation_deg=self.view_3d.sun_elevation_deg)
+
+    def _open_sun_dialog(self):
+        """Open a small dialog to adjust sun azimuth/elevation/intensity
+        and reset to the latitude-derived default. Live preview: every
+        slider change re-renders immediately."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Sun Lighting")
+        layout = QGridLayout(dlg)
+
+        v = self.view_3d
+        # Mesh-mean-latitude readout for context.
+        info_lbl = QLabel(
+            f"Mesh mean latitude: {v.mesh_mean_lat_deg:+.2f}°   "
+            f"(typical noon elevation: {max(0.0, 90.0 - abs(v.mesh_mean_lat_deg)):.1f}°)")
+        layout.addWidget(info_lbl, 0, 0, 1, 3)
+
+        enable_cb = QCheckBox("Enable synthetic sun light")
+        enable_cb.setChecked(v.synthetic_lighting_enabled)
+        layout.addWidget(enable_cb, 1, 0, 1, 3)
+
+        # Azimuth: 0 = local north (toward geographic north pole projection),
+        # 90 = east, 180 = south, 270 = west. Range 0..360°.
+        layout.addWidget(QLabel("Azimuth (°N→E):"), 2, 0)
+        az_spin = QDoubleSpinBox()
+        az_spin.setRange(0.0, 360.0)
+        az_spin.setSingleStep(5.0)
+        az_spin.setDecimals(1)
+        az_spin.setValue(v.sun_azimuth_deg)
+        layout.addWidget(az_spin, 2, 1)
+        az_slider = QSlider(Qt.Orientation.Horizontal)
+        az_slider.setRange(0, 360)
+        az_slider.setValue(int(round(v.sun_azimuth_deg)))
+        layout.addWidget(az_slider, 2, 2)
+
+        # Elevation: 0 = horizon, 90 = zenith. Allow slight negative
+        # values so the user can investigate sub-horizon geometries.
+        layout.addWidget(QLabel("Elevation (° above horizon):"), 3, 0)
+        el_spin = QDoubleSpinBox()
+        el_spin.setRange(-10.0, 90.0)
+        el_spin.setSingleStep(1.0)
+        el_spin.setDecimals(1)
+        el_spin.setValue(v.sun_elevation_deg)
+        layout.addWidget(el_spin, 3, 1)
+        el_slider = QSlider(Qt.Orientation.Horizontal)
+        el_slider.setRange(-10, 90)
+        el_slider.setValue(int(round(v.sun_elevation_deg)))
+        layout.addWidget(el_slider, 3, 2)
+
+        # Sun + ambient intensity.
+        layout.addWidget(QLabel("Sun intensity:"), 4, 0)
+        sun_spin = QDoubleSpinBox()
+        sun_spin.setRange(0.0, 5.0)
+        sun_spin.setSingleStep(0.1)
+        sun_spin.setDecimals(2)
+        sun_spin.setValue(v.sun_intensity)
+        layout.addWidget(sun_spin, 4, 1, 1, 2)
+
+        layout.addWidget(QLabel("Ambient fill:"), 5, 0)
+        amb_spin = QDoubleSpinBox()
+        amb_spin.setRange(0.0, 2.0)
+        amb_spin.setSingleStep(0.05)
+        amb_spin.setDecimals(2)
+        amb_spin.setValue(v.ambient_intensity)
+        layout.addWidget(amb_spin, 5, 1, 1, 2)
+
+        # Reset to latitude-derived defaults.
+        reset_btn = QPushButton("Use latitude default")
+        reset_btn.setToolTip(
+            "Reset azimuth/elevation to the typical-noon position for the\n"
+            "mesh's mean latitude.")
+        layout.addWidget(reset_btn, 6, 0, 1, 3)
+
+        # Close button.
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.accept)
+        bb.accepted.connect(dlg.accept)
+        layout.addWidget(bb, 7, 0, 1, 3)
+
+        # --- live preview wiring (sliders <-> spinboxes <-> view) ----------
+        applying = {'busy': False}
+        def apply():
+            if applying['busy']:
+                return
+            applying['busy'] = True
+            try:
+                v.set_synthetic_lighting(
+                    enable_cb.isChecked(),
+                    azimuth_deg=az_spin.value(),
+                    elevation_deg=el_spin.value(),
+                    intensity=sun_spin.value(),
+                    ambient=amb_spin.value())
+                # Keep the toolbar checkbox in sync.
+                self.sun_light_check.blockSignals(True)
+                self.sun_light_check.setChecked(enable_cb.isChecked())
+                self.sun_light_check.blockSignals(False)
+            finally:
+                applying['busy'] = False
+
+        def link_slider_spin(slider, spin):
+            slider.valueChanged.connect(lambda val: spin.setValue(float(val)))
+            spin.valueChanged.connect(lambda val: slider.setValue(int(round(val))))
+        link_slider_spin(az_slider, az_spin)
+        link_slider_spin(el_slider, el_spin)
+
+        enable_cb.toggled.connect(apply)
+        az_spin.valueChanged.connect(apply)
+        el_spin.valueChanged.connect(apply)
+        sun_spin.valueChanged.connect(apply)
+        amb_spin.valueChanged.connect(apply)
+
+        def reset_to_default():
+            mean_lat = v.mesh_mean_lat_deg
+            az_spin.setValue(180.0 if mean_lat > 0 else 0.0)
+            el_spin.setValue(max(5.0, 90.0 - abs(mean_lat)))
+        reset_btn.clicked.connect(reset_to_default)
+
+        dlg.setMinimumWidth(420)
+        dlg.exec()
 
     def on_face_selected(self, face_id, data):
         """Handle face selection from 3D view"""

@@ -318,6 +318,126 @@ class SimulationRunner:
         return None
 
 
+class CameraSimThread(QThread):
+    """Thread for running ptm_camera_sim without blocking GUI."""
+
+    output_ready = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+    progress_update = pyqtSignal(float)
+    frame_rendered = pyqtSignal(str)   # emits FITS path when a frame is written
+    finished = pyqtSignal(int)
+
+    def __init__(self, command, working_dir=None):
+        super().__init__()
+        self.command = command          # full CLI arg list
+        self.working_dir = working_dir
+        self.process = None
+        self._stop_requested = False
+
+    def run(self):
+        try:
+            env = os.environ.copy()
+            self.process = subprocess.Popen(
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=False,
+                bufsize=0,
+                cwd=self.working_dir,
+                env=env,
+            )
+
+            stdout_buf = bytearray()
+            stderr_buf = bytearray()
+
+            def drain(buf, is_stderr):
+                parts = re.split(b'[\r\n]', buf)
+                complete = parts[:-1]
+                remainder = parts[-1] if parts else b""
+                for seg in complete:
+                    if not seg:
+                        continue
+                    line = seg.decode('utf-8', errors='replace').strip()
+                    if not line:
+                        continue
+                    # Parse frame progress
+                    m = re.match(r'=== Frame (\d+)/(\d+) ===', line)
+                    if m:
+                        cur, tot = int(m.group(1)), int(m.group(2))
+                        self.progress_update.emit(100.0 * cur / max(1, tot))
+                    # Detect written FITS
+                    if 'Wrote FITS:' in line:
+                        fits_path = line.split('Wrote FITS:')[-1].strip()
+                        self.frame_rendered.emit(fits_path)
+                    signal = self.error_ready if is_stderr else self.output_ready
+                    signal.emit(line)
+                buf.clear()
+                buf.extend(remainder)
+
+            while not self._stop_requested:
+                if self.process.poll() is not None:
+                    tail = self.process.stdout.read() or b""
+                    if tail:
+                        stdout_buf.extend(tail)
+                    tail = self.process.stderr.read() or b""
+                    if tail:
+                        stderr_buf.extend(tail)
+                    break
+                readable, _, _ = select.select(
+                    [self.process.stdout, self.process.stderr], [], [], 0.1)
+                for stream in readable:
+                    data = stream.read(4096)
+                    if not data:
+                        continue
+                    if stream is self.process.stdout:
+                        stdout_buf.extend(data)
+                        drain(stdout_buf, False)
+                    else:
+                        stderr_buf.extend(data)
+                        drain(stderr_buf, True)
+
+            for buf, is_err in [(stdout_buf, False), (stderr_buf, True)]:
+                if buf:
+                    try:
+                        t = buf.decode('utf-8', errors='replace').strip()
+                        if t:
+                            self.output_ready.emit(t)
+                    except Exception:
+                        pass
+
+            self.process.wait()
+            self.finished.emit(self.process.returncode)
+
+        except Exception as e:
+            self.error_ready.emit(f"Camera sim error: {e}")
+            self.finished.emit(-1)
+
+    def stop(self):
+        self._stop_requested = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+
+    @staticmethod
+    def find_camera_executable():
+        """Locate ptm_camera_sim executable."""
+        candidates = [
+            Path(__file__).parent.parent.parent / "build" / "bin" / "ptm_camera_sim",
+            Path("../build/bin/ptm_camera_sim"),
+            Path("../../build/bin/ptm_camera_sim"),
+            Path("./build/bin/ptm_camera_sim"),
+        ]
+        for p in candidates:
+            resolved = p.resolve()
+            if resolved.exists():
+                return resolved
+        return None
+
+
 class ConverterThread(QThread):
     """Thread for running VTK conversion"""
 

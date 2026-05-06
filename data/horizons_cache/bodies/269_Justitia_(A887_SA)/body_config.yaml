@@ -3,8 +3,9 @@ generic_body:
   ephemeris_source: keplerian
   naif_id: '2000269'
   shape:
-    type: spherical
+    type: custom_mesh
     radius_km: 25.364
+    mesh_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
   orbit:
     semi_major_axis_au: 2.6156911
     eccentricity: 0.21425815
@@ -15,6 +16,8 @@ generic_body:
     epoch: '2000-01-01T12:00:00'
   spin:
     period_hours: 33.128
+    pole_ra_deg: 85.069
+    pole_dec_deg: -57.852
     prime_meridian_deg: 0.0
   surface:
     albedo: 0.061

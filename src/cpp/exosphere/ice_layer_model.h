@@ -203,6 +203,37 @@ public:
     }
 
     /**
+     * Initialize from a per-face non-ice concentration field.
+     *
+     * Used to seed the ice-layer state from an external map (e.g. derived from
+     * the observed Galileo Bond-albedo distribution via
+     * CompositionAlbedoMapper::computeConcentrationsFromAlbedoMap). Each
+     * concentration is clamped to [0, MAX_NONICE_CONCENTRATION], the per-face
+     * ice mass is then derived from the remaining ice fraction.
+     *
+     * @param state          Ice layer state to initialize
+     * @param concentrations Per-face initial non-ice concentrations [0-1]
+     */
+    void initializeFromConcentrations(IceLayerState& state,
+                                      const std::vector<double>& concentrations) {
+        if (concentrations.size() != num_faces_) {
+            std::cerr << "IceLayerModel::initializeFromConcentrations: size mismatch ("
+                      << concentrations.size() << " vs " << num_faces_ << ")"
+                      << std::endl;
+            return;
+        }
+
+        state.reset();
+
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            state.nonice_concentration[i] = std::clamp(
+                concentrations[i], 0.0, layer_constants::MAX_NONICE_CONCENTRATION);
+            updateIceMass(state, i);
+        }
+    }
+
+    /**
      * Update ice mass from non-ice concentration for a single face
      * @param state Ice layer state
      * @param face_idx Face index

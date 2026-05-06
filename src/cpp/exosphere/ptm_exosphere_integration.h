@@ -468,6 +468,18 @@ namespace ptm {
             void loadNoniceAlbedoMap(const std::string& map_path,
                                      const std::string& maps_dir = "");
 
+            /**
+             * Pre-load per-face non-ice concentrations from the observed albedo
+             * map so albedo-coupling runs start at "current Europa" rather than
+             * uniform ice + 1000-yr spin-up. Requires loadNoniceAlbedoMap and
+             * enableIceLayerModel to have been called first.
+             *
+             * @param percentile_low  Darkest percentile mapped to c=1 (e.g. 5)
+             * @param percentile_high Brightest percentile mapped to c=0 (e.g. 95)
+             */
+            void initializeConcentrationsFromAlbedoMap(double percentile_low,
+                                                       double percentile_high);
+
             // =========================================================
             // Multi-Timescale Evolution Interface
             // =========================================================

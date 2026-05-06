@@ -1,0 +1,44 @@
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 5.0
+  timesteps: 240
+  body: Moon
+mesh:
+  resolution: 4
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 2.0
+  equilibration_steps_per_day: 24
+  use_gpu: false
+  compute_statistics: true
+  use_default_property_map: true
+  property_maps_directory: data/property_maps
+  enable_shadow_flux: false
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  use_default_emissivity: true
+  use_default_ks: true
+  use_default_kd: true
+  use_default_H: true
+  use_default_rhos: true
+  use_default_rhod: true
+  use_default_cp0: true
+  use_default_Qb: true
+  use_default_chi: true
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: /tmp/ptm_propmap_long
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false

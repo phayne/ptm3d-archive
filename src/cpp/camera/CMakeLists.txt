@@ -11,6 +11,7 @@ set(CAMERA_SOURCES
     camera_simulator.cpp
     ptm_output_reader.cpp
     trajectory_reader.cpp
+    camera_yaml.cpp
 )
 
 set(CAMERA_HEADERS
@@ -19,6 +20,7 @@ set(CAMERA_HEADERS
     camera_simulator.h
     ptm_output_reader.h
     trajectory_reader.h
+    camera_yaml.h
 )
 
 add_library(camera_sim STATIC ${CAMERA_SOURCES})
@@ -38,6 +40,36 @@ target_link_libraries(camera_sim PUBLIC
     ${CSPICE_LIBRARIES}
     ${CFITSIO_LIBRARIES}
 )
+
+# Link yaml-cpp for the camera YAML definition file loader.
+# HAVE_YAML_CPP is defined globally by the project-level CMake when yaml-cpp
+# is found; camera_yaml.cpp compiles to a stub when the flag is absent.
+# (Mirrors the pattern used in src/cpp/tools/CMakeLists.txt — when
+# YAML_CPP_LIBRARIES is just the bare name "yaml-cpp", we need to resolve
+# it to a full path via find_library so linking succeeds.)
+if(YAML_CPP_FOUND)
+    if(YAML_CPP_INCLUDE_DIRS)
+        target_include_directories(camera_sim PUBLIC ${YAML_CPP_INCLUDE_DIRS})
+    endif()
+    if(YAML_CPP_LIBRARIES STREQUAL "yaml-cpp")
+        find_library(YAML_CPP_LIBRARY_PATH_CAMERA
+            NAMES yaml-cpp
+            HINTS
+                ${YAML_CPP_LIBRARY_DIRS}
+                ${YAML_CPP_LIBDIR}
+                /opt/homebrew/lib
+                /usr/local/lib
+                $ENV{CONDA_PREFIX}/lib
+        )
+        if(YAML_CPP_LIBRARY_PATH_CAMERA)
+            target_link_libraries(camera_sim PUBLIC ${YAML_CPP_LIBRARY_PATH_CAMERA})
+        endif()
+    elseif(TARGET yaml-cpp)
+        target_link_libraries(camera_sim PUBLIC yaml-cpp)
+    elseif(YAML_CPP_LIBRARIES)
+        target_link_libraries(camera_sim PUBLIC ${YAML_CPP_LIBRARIES})
+    endif()
+endif()
 
 # OpenMP support
 if(OpenMP_CXX_FOUND)

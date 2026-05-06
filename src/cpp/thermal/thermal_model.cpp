@@ -629,8 +629,15 @@ void Planet::setVectorProperty(const std::string& property_name, const std::vect
 }
 
 // Profile class implementation
-Profile::Profile(const Planet& planet, double lat, const Config& config, bool verbose) {
+Profile::Profile(const Planet& planet, double lat, const Config& config, bool verbose,
+                 double H_override) {
     this->planet = planet;
+    // If a per-face H override was supplied, propagate it to the local copy of
+    // `planet` so that all downstream methods (init_T, update_k, batch grid
+    // sharing, etc.) see the right value. The depth-grid initialization below
+    // also uses H_face directly to avoid relying on this overwrite for clarity.
+    const double H_face = (H_override > 0.0) ? H_override : planet.H;
+    this->planet.H = H_face;
     this->config = &config;
     this->emissivity = planet.emissivity;
     this->chi = config.chi;
@@ -654,10 +661,12 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     double skin_d    = skinDepth(planet.day, kappa_ref);
     if (skin_d < 0.01) skin_d = 0.01; // minimum skin depth
 
-    // Build spatial grid (adaptive or classic)
+    // Build spatial grid (adaptive or classic). Use this->planet (which has
+    // H_face applied) so per-face H affects the depth-grid layout, not just
+    // the rho/k initialization below.
     std::vector<double> z_tmp;
     if (config.ADAPTIVE_GRID) {
-        z_tmp = generateAdaptiveGrid(planet, config, verbose);
+        z_tmp = generateAdaptiveGrid(this->planet, config, verbose);
     } else {
         z_tmp = generateStableGrid(skin_d, config.m, config.n, config.b, verbose);
     }
@@ -680,12 +689,15 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
         g2()[i] = 2.0 * dz()[i]   / d3z()[i];
     }
 
-    // Initialize thermophysical properties vs. depth
+    // Initialize thermophysical properties vs. depth.
+    // Use the (possibly per-face overridden) H_face stratification scale so
+    // that low-H regolith profiles concentrate the conductivity/density
+    // transition near the surface and high-H profiles smear it deeper.
     kc().resize(nlayers);
     rho().resize(nlayers);
     for (int i = 0; i < nlayers; i++) {
         double depth = z()[i];
-        double df = std::exp(-depth / planet.H);
+        double df = std::exp(-depth / H_face);
         kc()[i]  = planet.kd + (planet.ks  - planet.kd)  * df;
         rho()[i] = planet.rhod + (planet.rhos - planet.rhod) * df;
     }
@@ -2208,7 +2220,8 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
     std::memset(d_coef, 0, sizeof(d_coef));
 }
 
-void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile) {
+void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile,
+                                          const double* H_per_face) {
     n_layers = ref_profile.nlayers;
 
     // Copy grid arrays (shared across all faces in batch)
@@ -2223,16 +2236,30 @@ void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile) {
         g2[i] = ref_profile.g2()[i];
     }
 
-    // Initialize base conductivity and density for all faces
-    for (int layer = 0; layer < n_layers; ++layer) {
-        double depth = z[layer];
-        double depth_factor = std::exp(-depth / H_val);
-        double kc_val = k_d + (k_s - k_d) * depth_factor;
-        double rho_val = rho_d + (rho_s - rho_d) * depth_factor;
-
+    // Initialize base conductivity and density for all faces.
+    // When H_per_face is supplied, each face gets its own exp(-z/H_f) profile;
+    // otherwise the batch's shared H_val drives a single profile shared by all
+    // faces in the batch (legacy path).
+    if (H_per_face) {
         for (int f = 0; f < n_faces; ++f) {
-            kc[layer * THERMAL_BATCH_SIZE + f] = kc_val;
-            rho[layer * THERMAL_BATCH_SIZE + f] = rho_val;
+            const double Hf = (H_per_face[f] > 0.0) ? H_per_face[f] : H_val;
+            for (int layer = 0; layer < n_layers; ++layer) {
+                const double depth = z[layer];
+                const double df    = std::exp(-depth / Hf);
+                kc [layer * THERMAL_BATCH_SIZE + f] = k_d  + (k_s  - k_d ) * df;
+                rho[layer * THERMAL_BATCH_SIZE + f] = rho_d + (rho_s - rho_d) * df;
+            }
+        }
+    } else {
+        for (int layer = 0; layer < n_layers; ++layer) {
+            const double depth = z[layer];
+            const double df    = std::exp(-depth / H_val);
+            const double kc_val  = k_d  + (k_s  - k_d ) * df;
+            const double rho_val = rho_d + (rho_s - rho_d) * df;
+            for (int f = 0; f < n_faces; ++f) {
+                kc [layer * THERMAL_BATCH_SIZE + f] = kc_val;
+                rho[layer * THERMAL_BATCH_SIZE + f] = rho_val;
+            }
         }
     }
 

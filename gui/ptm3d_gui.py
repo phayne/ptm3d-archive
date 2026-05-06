@@ -25,13 +25,15 @@ from PyQt6.QtGui import QAction, QIcon, QFont, QKeySequence, QPalette, QColor
 # Local modules
 from gui_core.config_manager import ConfigManager
 from gui_core.styles import ModernStyle
-from gui_core.simulation_runner import SimulationRunner, SimulationThread
+from gui_core.simulation_runner import SimulationRunner, SimulationThread, CameraSimThread
 
 # Panels
 from gui_panels.config_panel import ConfigurationPanel
 from gui_panels.visualization_panel import VisualizationPanel
 from gui_panels.results_panel import ResultsPanel
 from gui_panels.console_panel import ConsolePanel
+from gui_panels.camera_panel import CameraPanel
+from gui_panels.batch_dashboard_panel import BatchDashboardPanel
 
 
 class PTM3DMainWindow(QMainWindow):
@@ -86,6 +88,9 @@ class PTM3DMainWindow(QMainWindow):
         # Create docked console at bottom
         self.create_console_dock()
 
+        # Give camera panel a reference to the console (created after it)
+        self.camera_panel.console = self.console_panel
+
         # Create menu bar
         self.create_menu_bar()
 
@@ -115,6 +120,21 @@ class PTM3DMainWindow(QMainWindow):
         # Results Browser Panel
         self.results_panel = ResultsPanel()
         self.left_tabs.addTab(self.results_panel, "Results Browser")
+
+        # Camera Simulation Panel
+        self.camera_panel = CameraPanel(
+            config_manager=self.config_manager,
+            console_panel=getattr(self, 'console_panel', None))
+        self.left_tabs.addTab(self.camera_panel, "Camera")
+        self.camera_panel.run_requested.connect(self._launch_camera_sim)
+        self.camera_panel.stop_requested.connect(self._stop_camera_sim)
+        self.camera_sim_thread = None
+
+        # Batch Runs panel — monitor and control multi-site batch jobs
+        # (e.g. run_a3gt_batch.py). Read-only view of in-flight runs +
+        # pause / stop controls; does not own the orchestrator process.
+        self.batch_panel = BatchDashboardPanel()
+        self.left_tabs.addTab(self.batch_panel, "Batch Runs")
 
         layout.addWidget(self.left_tabs)
 
@@ -329,18 +349,15 @@ class PTM3DMainWindow(QMainWindow):
         self.timestep_combo.currentIndexChanged.connect(self.on_timestep_changed)
         toolbar.addWidget(self.timestep_combo)
 
-        # Data field selector
+        # Data field selector. Items are populated dynamically once a
+        # results directory is loaded — see _refresh_field_combo. Until then
+        # we leave a placeholder to indicate no results loaded.
         toolbar.addWidget(QLabel("  Field: "))
         self.field_combo = QComboBox()
-        self.field_combo.setMinimumWidth(180)
-        self.field_combo.addItems([
-            "Temperature (K)",
-            "Direct Solar (W/m²)",
-            "Illumination Total (W/m²)",
-            "Primary Reflected (W/m²)",
-            "Primary IR (W/m²)"
-        ])
-        self.field_combo.currentTextChanged.connect(self.on_field_changed)
+        self.field_combo.setMinimumWidth(220)
+        self.field_combo.addItem("(no results loaded)", None)
+        self.field_combo.setEnabled(False)
+        self.field_combo.currentIndexChanged.connect(self.on_field_changed)
         toolbar.addWidget(self.field_combo)
 
     def create_status_bar(self):
@@ -671,6 +688,34 @@ class PTM3DMainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.simulation_thread = None
 
+    # === Camera Simulation ===
+
+    def _launch_camera_sim(self, command):
+        """Launch ptm_camera_sim in a background thread."""
+        if self.camera_sim_thread and self.camera_sim_thread.isRunning():
+            self.console_panel.append_error("Camera simulation already running")
+            return
+
+        self.camera_sim_thread = CameraSimThread(command)
+        self.camera_sim_thread.output_ready.connect(self._on_camera_output)
+        self.camera_sim_thread.error_ready.connect(
+            self.console_panel.append_error)
+        self.camera_sim_thread.frame_rendered.connect(
+            self.camera_panel._add_thumbnail)
+        self.camera_sim_thread.finished.connect(
+            self.camera_panel.on_simulation_finished)
+        self.camera_sim_thread.start()
+
+    def _on_camera_output(self, line):
+        """Route camera sim stdout to console and camera panel."""
+        self.console_panel.append(line)
+        self.camera_panel.on_output_line(line)
+
+    def _stop_camera_sim(self):
+        """Stop the running camera simulation."""
+        if self.camera_sim_thread:
+            self.camera_sim_thread.stop()
+
     def update_simulation_status(self, status):
         """Update simulation status indicator"""
         status_styles = {
@@ -746,17 +791,64 @@ class PTM3DMainWindow(QMainWindow):
             self.viz_panel.set_timestep(index)
             self.results_panel.select_timestep(index)
 
-    def on_field_changed(self, field_name):
-        """Handle data field selection"""
-        field_map = {
-            "Temperature (K)": "temperature",
-            "Direct Solar (W/m²)": "direct_solar",
-            "Illumination Total (W/m²)": "illumination",
-            "Primary Reflected (W/m²)": "primary_reflected",
-            "Primary IR (W/m²)": "primary_ir"
-        }
-        field = field_map.get(field_name, "temperature")
-        self.viz_panel.set_field(field)
+    def on_field_changed(self, _index):
+        """Handle data field selection. Field key is stored as the combo's
+        UserRole data so we don't have to reverse-look-up by label."""
+        field = self.field_combo.currentData()
+        if field:
+            self.viz_panel.set_field(field)
+
+    def _refresh_field_combo(self, results_dir):
+        """Repopulate the toolbar field selector based on what's actually
+        present in the results directory. Mirrors VisualizationPanel's
+        FIELD_INFO + per-step + statistics scan but lives on the toolbar.
+        """
+        from pathlib import Path
+        from gui_panels.visualization_panel import VisualizationPanel
+        results_path = Path(results_dir)
+        stats_dir = results_path / "statistics"
+
+        self.field_combo.blockSignals(True)
+        self.field_combo.clear()
+
+        available = []
+        for field_key, (label, _cmap) in VisualizationPanel.FIELD_INFO.items():
+            # Use the canonical classifier so any file-naming change (e.g.
+            # the new single-file Schorghofer ice_depth output) is picked
+            # up automatically.
+            if VisualizationPanel.is_stats_field(field_key):
+                if (stats_dir / f"{field_key}.bin").is_file():
+                    available.append((field_key, label))
+            else:
+                d = results_path / field_key
+                if d.is_dir() and any(d.glob("*.bin")):
+                    available.append((field_key, label))
+
+        if not available:
+            self.field_combo.addItem("(no data found)", None)
+            self.field_combo.setEnabled(False)
+        else:
+            for field_key, label in available:
+                self.field_combo.addItem(label, field_key)
+            self.field_combo.setEnabled(True)
+            # Default selection: prefer time-series temperature, then
+            # temperature_max, then first available.
+            preferred_order = ("temperature", "temperature_max")
+            default_idx = 0
+            for pref in preferred_order:
+                for i, (k, _l) in enumerate(available):
+                    if k == pref:
+                        default_idx = i
+                        break
+                else:
+                    continue
+                break
+            self.field_combo.setCurrentIndex(default_idx)
+
+        self.field_combo.blockSignals(False)
+        # Trigger one synthesise change so the viz panel applies the default
+        if self.field_combo.isEnabled():
+            self.on_field_changed(self.field_combo.currentIndex())
 
     # === Signal Handlers ===
 
@@ -775,6 +867,10 @@ class PTM3DMainWindow(QMainWindow):
         self.timestep_combo.clear()
         self.timestep_combo.addItems([f"t={i}" for i in range(len(timesteps))])
         self.timestep_combo.setEnabled(len(timesteps) > 0)
+
+        # Repopulate the toolbar field selector from FIELD_INFO + the actual
+        # contents of the chosen results dir (per-step series + statistics).
+        self._refresh_field_combo(results_dir)
 
     def on_timestep_selected(self, timestep_index, timestep_time):
         """Handle timestep selection from results panel"""

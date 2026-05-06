@@ -2,12 +2,13 @@
   "269 Justitia (A887 SA)": {
     "naif_id": "269",
     "body_type": "asteroid",
-    "cache_date": "2026-02-24T10:46:02.042183",
+    "cache_date": "2026-05-06T05:29:03.735301",
     "spk_start": "",
     "spk_stop": "",
-    "has_damit_shape": false,
-    "damit_id": 0,
-    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml"
+    "has_damit_shape": true,
+    "damit_id": 2858,
+    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
+    "shape_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj"
   },
   "623 Chimaera (A907 BC)": {
     "naif_id": "623",

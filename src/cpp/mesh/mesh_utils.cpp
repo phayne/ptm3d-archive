@@ -380,6 +380,12 @@ std::shared_ptr<Mesh> MeshUtils::getMesh() const {
 }
 
 void MeshUtils::setupMesh() {
+    // Defensive: a prior failed loadTopographicMesh used to null mesh_; if
+    // any other path leaves mesh_ unset, allocate a fresh one rather than
+    // dereferencing null below.
+    if (!mesh_) {
+        mesh_ = std::make_shared<Mesh>();
+    }
     // Create an icosphere mesh for the body
     createIcosphereMesh(resolution_, *mesh_);
     
@@ -562,13 +568,18 @@ void MeshUtils::ensureOutwardNormals() {
 // Updated loadTopographicMesh function using the robust method:
 bool ptm::MeshUtils::loadTopographicMesh(const std::string& filename) {
     std::cout << "Loading topographic mesh from: " << filename << std::endl;
-    
-    mesh_ = importMeshFromFile(filename, vertex_elevations_);
-    
-    if (!mesh_) {
+
+    // Load into a local first; only commit to mesh_ on success so that a
+    // partial-read failure (e.g. truncated lat/lon arrays) does not destroy
+    // the existing mesh_ and leave the object in a half-broken state. The
+    // fallback path in setupMesh() then has a valid mesh_ to repopulate.
+    auto loaded = importMeshFromFile(filename, vertex_elevations_);
+
+    if (!loaded) {
         std::cerr << "Failed to load topographic mesh from: " << filename << std::endl;
         return false;
     }
+    mesh_ = loaded;
     
     // Retrieve the resolution from the mesh properties
     std::string res_str = mesh_->getProperty("resolution", "0");
@@ -579,12 +590,12 @@ bool ptm::MeshUtils::loadTopographicMesh(const std::string& filename) {
         resolution_ = 0;
     }
     
-    // For topographic meshes, ensure we have valid face properties
+    // For topographic meshes, ensure we have valid face properties.
+    // The topo binary file stores pre-computed normals and centers, so
+    // this only fires if they're somehow missing.
     if (mesh_->face_normals.empty() || mesh_->face_centers.empty()) {
-        calculateFaceProperties(false); // Calculate without auto-orient first
+        calculateFaceProperties(false);
     }
-    
-    // Now ensure all normals point outward (more robust for topographic meshes)
     ensureOutwardNormals();
     
     // Make sure we have lat/lon coordinates
@@ -644,13 +655,16 @@ bool ptm::MeshUtils::checkForTopographicMesh(const std::string& directory, int r
     std::error_code ec;
     if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
         // project-relative fallback
-        fs::path alt = fs::path("src") / "cpp" / "data" / "dem";
+        fs::path alt = fs::path("src") / "cpp" / "data" / "topo";
         if (fs::exists(alt, ec) && fs::is_directory(alt, ec)) {
             dir = alt;
         }
     }
 
     const std::string res_str = std::to_string(resolution);
+    // Modern (2026-04) layout: <dir>/<body>/topo_<body>_ico<N>.bin
+    const std::string ico_suffix = std::string("_ico") + res_str + ".bin";
+    // Legacy layout (kept for back-compat): <dir>/<Body>_Topo_res<N>.bin
     const std::string suffix_exact = std::string("_Topo_res") + res_str + ".bin";
 
     // Normalize body name variants
@@ -663,8 +677,13 @@ bool ptm::MeshUtils::checkForTopographicMesh(const std::string& directory, int r
         for (size_t i=1;i<bn_cap.size();++i) bn_cap[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(bn_cap[i])));
     }
 
-    // Direct candidates (fast path)
+    // Direct candidates (fast path), in priority order:
+    //   1) <dir>/<body>/topo_<body>_ico<N>.bin       (modern, body subdir)
+    //   2) <dir>/topo_<body>_ico<N>.bin              (modern, flat)
+    //   3) <dir>/<Body>_Topo_res<N>.bin              (legacy)
     std::vector<fs::path> direct_candidates = {
+        dir / bn_lower / ("topo_" + bn_lower + ico_suffix),
+        dir / ("topo_" + bn_lower + ico_suffix),
         dir / (bn + suffix_exact),
         dir / (bn_cap + suffix_exact),
         dir / (bn_upper + suffix_exact),

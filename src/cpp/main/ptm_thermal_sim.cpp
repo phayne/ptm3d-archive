@@ -31,6 +31,7 @@
 #include "../tools/config_parser.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/planetary_properties.h"
+#include "../thermal/thermal_property_map.h"
 #include "../maps/spatial_map.h"
 #include "../ice/ice_table.h"
 
@@ -596,9 +597,14 @@ bool runThermalModelsForAllFacesBatchSoA(
     int equilibration_steps,
     int total_time_steps,
     int thermal_threads,
-    const std::vector<double>* face_Qb = nullptr);
+    const std::vector<double>* face_Qb = nullptr,
+    const std::vector<double>* face_H_overrides = nullptr);
 
 // GPU persistent kernel thermal solver
+// equilibration_steps: number of steps in the equilibration phase (0 = all steps
+// are output). When > 0 and the eq phase has a different dt from the output phase,
+// the solver runs in two passes: equilibration cycles with eq_dt, then one output
+// cycle with output_dt.
 bool runThermalModelsForAllFaces_GPU_Persistent(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<double>& direct_solar_values,
@@ -606,11 +612,29 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const std::vector<double>& primary_ir_values,
     const std::vector<double>& times,
     int total_time_steps,
+    int equilibration_steps,
     const thermal::Config& config,
     double default_visible_albedo,
     double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
-    const std::vector<double>* face_Qb = nullptr);
+    const std::vector<double>* face_Qb = nullptr,
+    const std::vector<double>* face_H_overrides = nullptr,
+    // Optional Schorghofer & Taylor (2007) accumulator. When non-null,
+    // ⟨E(T(z,t))⟩ per face × native depth node is filled over the
+    // post-equilibration output window. Must be preallocated to
+    // n_faces × n_layers via IceStabilityAccumulator::allocate(); the
+    // function fills sum_E and z, and sets n_samples to output_steps.
+    ice::IceStabilityAccumulator* ice_acc = nullptr,
+    // Optional thermal-state checkpoint paths used by the chunked-run
+    // orchestrator. When initial_state_file is non-empty, the per-face
+    // T(z) profile is loaded from that file BEFORE each batch's GPU
+    // kernel runs. When final_state_file is non-empty, the per-face
+    // T(z) profile is dumped to that file AFTER all batches finish.
+    // Format: uint32 magic 'PTMT' (0x50544D54), uint32 n_faces, uint32
+    // n_layers, then n_layers*n_faces float32 (layer-major SoA, the
+    // GPU buf_T_ native layout).
+    const std::string& initial_state_file = "",
+    const std::string& final_state_file   = "");
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
@@ -642,7 +666,8 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_reflected,
     FluxFn get_ir,
     std::vector<std::vector<double>>* surface_temps_out,
-    const std::vector<double>* face_Qb = nullptr);
+    const std::vector<double>* face_Qb = nullptr,
+    const std::vector<double>* face_H_overrides = nullptr);
 
 std::vector<double> computeFaceAlbedos(
     const std::shared_ptr<Mesh>& mesh,
@@ -1333,7 +1358,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double latitude,
     const thermal::Config& config,
     int equilibration_steps,
-    double Qb_override = -1.0) {
+    double Qb_override = -1.0,
+    double H_override  = -1.0) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -1374,6 +1400,13 @@ std::vector<double> runThermalModelWithMatchedTimes(
         // Override basal heat flow if specified (per-face or global)
         if (Qb_override >= 0.0) {
             planet.Qb = Qb_override;
+        }
+
+        // Override H-parameter if a per-face value was supplied (Diviner /
+        // Hayne+2017 map or user custom). This drives the rho(z), k(z) profile
+        // in Profile::Profile() and changes the diurnal thermal inertia.
+        if (H_override > 0.0) {
+            planet.H = H_override;
         }
 
         // Create thermal model
@@ -2005,7 +2038,8 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_reflected,
     FluxFn get_ir,
     std::vector<std::vector<double>>* surface_temps_out,
-    const std::vector<double>* face_Qb)
+    const std::vector<double>* face_Qb,
+    const std::vector<double>* face_H_overrides)
 {
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
@@ -2165,8 +2199,13 @@ bool runThermalModelsForAllFacesStreamed(
 
             // Solve thermal for this face with matched times
             double face_qb = (face_Qb && f < face_Qb->size()) ? (*face_Qb)[f] : -1.0;
+            // Per-face H from the property map (-1 = use planet default).
+            double face_H = (face_H_overrides && f < face_H_overrides->size())
+                          ? (*face_H_overrides)[f]
+                          : -1.0;
             std::vector<double> temps = runThermalModelWithMatchedTimes(
-                face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0, face_qb);
+                face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
+                face_qb, face_H);
 
             if (surface_temps_out) {
                 (*surface_temps_out)[f].swap(temps);
@@ -2341,13 +2380,19 @@ bool runThermalModelsForAllFaces(
 
                 // Run thermal model for this face
                 double face_qb = (face_Qb && f < face_Qb->size()) ? (*face_Qb)[f] : -1.0;
+                // Per-face H from the property map (Diviner / user-supplied);
+                // -1.0 means "use planet default".
+                double face_H = (planet && f < planet->face_H_overrides.size())
+                              ? planet->face_H_overrides[f]
+                              : -1.0;
                 std::vector<double> temps = runThermalModelWithMatchedTimes(
                     face_flux,
                     times,
                     mesh->latitudes[f],
                     config,
                     equilibration_steps,
-                    face_qb
+                    face_qb,
+                    face_H
                 );
 
                 // Store results locally in the chunk
@@ -2472,7 +2517,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     int equilibration_steps,
     int total_time_steps,
     int thermal_threads,
-    const std::vector<double>* face_Qb)
+    const std::vector<double>* face_Qb,
+    const std::vector<double>* face_H_overrides)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
@@ -2586,6 +2632,29 @@ bool runThermalModelsForAllFacesBatchSoA(
             int faces_in_batch = static_cast<int>(end_face - start_face);
 
             batch.n_faces = faces_in_batch;
+
+            // Per-face H-parameter override: when the planet has a per-face H
+            // map loaded (Diviner Hayne+2017 or user-supplied), refresh kc/rho
+            // for THIS batch using each face's local H. The grid (z, dz, g1,
+            // g2) stays as the ref-profile grid — built from the body-default
+            // skin depth — which is fine because individual face H values vary
+            // by < 10x and the geometric stretching keeps every layer well-
+            // resolved across that span.
+            std::array<double, thermal::THERMAL_BATCH_SIZE> H_batch{};
+            const bool have_face_H = (face_H_overrides != nullptr) &&
+                                     !face_H_overrides->empty();
+            if (have_face_H) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t gf = start_face + f;
+                    H_batch[f] = (gf < face_H_overrides->size())
+                                ? (*face_H_overrides)[gf]
+                                : planet.H;
+                }
+                for (int f = faces_in_batch; f < thermal::THERMAL_BATCH_SIZE; ++f) {
+                    H_batch[f] = planet.H;
+                }
+                batch.copyGridFromProfile(ref_profile, H_batch.data());
+            }
 
             // Override per-face Qb if mask is provided
             if (face_Qb) {
@@ -2918,11 +2987,16 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const std::vector<double>& primary_ir_values,
     const std::vector<double>& times,
     int total_time_steps,
+    int equilibration_steps,
     const thermal::Config& config,
     double default_visible_albedo,
     double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
-    const std::vector<double>* face_Qb)
+    const std::vector<double>* face_Qb,
+    const std::vector<double>* face_H_overrides,
+    ice::IceStabilityAccumulator* ice_acc,
+    const std::string& initial_state_file,
+    const std::string& final_state_file)
 {
     using namespace gpu::opencl;
 
@@ -2935,6 +3009,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     auto start_total = std::chrono::high_resolution_clock::now();
 
+    // Initialize output. In two-phase mode, only the output phase temperatures
+    // are stored (not equilibration), saving ~eq_steps/total * memory.
     // Initialize output
     if (surface_temps_out) {
         surface_temps_out->resize(n_faces);
@@ -2949,10 +3025,88 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
 
-    // Calculate dt from times array
-    float dt = 0.0f;
-    if (total_time_steps > 1) {
-        dt = static_cast<float>(times[1] - times[0]);
+    // ---- Optional initial / final thermal-state checkpoint -------------
+    // Magic bytes 'PTMT' (0x50544D54) identify the format.
+    constexpr uint32_t kThermalStateMagic = 0x50544D54;
+
+    // Load initial T(z) once; we'll slice per-batch below.
+    // Layout in file: layer-major across ALL faces, float32, size
+    // n_layers * n_faces. Matches the GPU SoA in buf_T_.
+    std::vector<float> loaded_initial_T;
+    if (!initial_state_file.empty()) {
+        std::ifstream is(initial_state_file, std::ios::binary);
+        if (!is) {
+            std::cerr << "[GPU Thermal] ERROR: cannot open initial_state_file '"
+                      << initial_state_file << "'\n";
+            return false;
+        }
+        uint32_t magic = 0, file_n_faces = 0, file_n_layers = 0;
+        is.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+        is.read(reinterpret_cast<char*>(&file_n_faces), sizeof(uint32_t));
+        is.read(reinterpret_cast<char*>(&file_n_layers), sizeof(uint32_t));
+        if (!is || magic != kThermalStateMagic) {
+            std::cerr << "[GPU Thermal] ERROR: bad magic in initial_state_file '"
+                      << initial_state_file << "' (got 0x" << std::hex << magic
+                      << ", expected 0x" << kThermalStateMagic << std::dec << ")\n";
+            return false;
+        }
+        if (file_n_faces != static_cast<uint32_t>(n_faces) ||
+            file_n_layers != static_cast<uint32_t>(n_layers)) {
+            std::cerr << "[GPU Thermal] ERROR: initial_state_file shape mismatch "
+                      << "(file=" << file_n_faces << "x" << file_n_layers
+                      << ", live=" << n_faces << "x" << n_layers << ")\n";
+            return false;
+        }
+        const size_t expected = static_cast<size_t>(file_n_faces) * file_n_layers;
+        loaded_initial_T.resize(expected);
+        is.read(reinterpret_cast<char*>(loaded_initial_T.data()),
+                expected * sizeof(float));
+        if (!is) {
+            std::cerr << "[GPU Thermal] ERROR: short read on initial_state_file\n";
+            return false;
+        }
+        std::cout << "[GPU Thermal] Loaded initial T(z) checkpoint: "
+                  << initial_state_file << " ("
+                  << expected * sizeof(float) / (1024.0*1024.0) << " MiB)\n";
+    }
+
+    // Whole-mesh buffer to receive the final T(z) profile, if requested.
+    // Filled per-batch and dumped at the end.
+    std::vector<float> assembled_final_T;
+    const bool dump_final_state = !final_state_file.empty();
+    if (dump_final_state) {
+        assembled_final_T.assign(n_layers * n_faces, 0.0f);
+    }
+    // -------------------------------------------------------------------
+
+    // Calculate dt for each phase. When equilibration uses a different cadence
+    // from the output phase, we run the GPU solver in two passes.
+    const int output_steps = total_time_steps - equilibration_steps;
+    float eq_dt = 0.0f;
+    float out_dt = 0.0f;
+    bool two_phase = false;
+
+    if (equilibration_steps > 1) {
+        eq_dt = static_cast<float>(times[1] - times[0]);
+    }
+    if (output_steps > 1 && equilibration_steps < total_time_steps) {
+        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
+    } else if (equilibration_steps > 1) {
+        out_dt = eq_dt;
+    }
+    if (equilibration_steps <= 0) eq_dt = out_dt;
+
+    two_phase = (equilibration_steps > 0 && output_steps > 0 &&
+                 std::abs(eq_dt - out_dt) > 1e-3f);
+
+    // For single-phase (legacy), use a single dt.
+    float dt = two_phase ? eq_dt : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
+
+    if (two_phase) {
+        std::cout << "[GPU Thermal] Two-phase execution: eq_dt="
+                  << std::fixed << std::setprecision(1) << eq_dt << "s ("
+                  << equilibration_steps << " steps), out_dt="
+                  << out_dt << "s (" << output_steps << " steps)" << std::endl;
     }
 
     // GPU memory constraint: estimate ~50 bytes per face per layer for arrays
@@ -3152,15 +3306,46 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     size_t n_batches = (n_faces + BATCH_SIZE - 1) / BATCH_SIZE;
     std::cout << "[GPU Thermal] Processing " << n_faces << " faces in " << n_batches << " batch(es)..." << std::endl;
 
+    // ----- Schorghofer & Taylor (2007) ice-stability accumulator setup -----
+    // Pre-size the global accumulator and copy the depth grid. Each batch
+    // contributes its slice of faces to ice_acc->sum_E[layer * n_faces + face].
+    if (ice_acc) {
+        ice_acc->allocate(static_cast<int>(n_faces), static_cast<int>(n_layers));
+        for (size_t i = 0; i < n_layers; ++i) ice_acc->z[i] = z_grid[i];
+        // n_samples will be set after the batch loop, once we know how many
+        // output timesteps were accumulated.
+    }
+
     for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
         size_t batch_start = batch_idx * BATCH_SIZE;
         size_t batch_end = std::min(batch_start + BATCH_SIZE, n_faces);
         size_t batch_n = batch_end - batch_start;
 
-        // Progress bar
+        // Progress bar with elapsed-time and ETA
         double progress = 100.0 * static_cast<double>(batch_start) / static_cast<double>(n_faces);
         std::cout << "\r[GPU Thermal] Progress: " << std::fixed << std::setprecision(1)
-                  << progress << "% (batch " << (batch_idx + 1) << "/" << n_batches << ")" << std::flush;
+                  << progress << "% (batch " << (batch_idx + 1) << "/" << n_batches << ")";
+        {
+            double elapsed_s = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - start_total).count();
+            auto fmt = [](double s) -> std::string {
+                if (s < 0.0 || !std::isfinite(s)) return "?";
+                if (s < 60.0)   { std::ostringstream o; o << std::fixed << std::setprecision(0) << s << "s"; return o.str(); }
+                if (s < 3600.0) { int m = (int)(s/60.0); int r = (int)(s - m*60); std::ostringstream o; o << m << "m " << r << "s"; return o.str(); }
+                int h = (int)(s/3600.0); int m = (int)((s - h*3600.0)/60.0);
+                std::ostringstream o; o << h << "h" << m << "m"; return o.str();
+            };
+            std::cout << " | elapsed " << fmt(elapsed_s);
+            if (batch_idx > 0) {
+                double frac = static_cast<double>(batch_idx) / static_cast<double>(n_batches);
+                if (frac > 0.01) {
+                    double eta_s = elapsed_s * (1.0 - frac) / frac;
+                    std::cout << ", ETA " << fmt(eta_s);
+                }
+            }
+            std::cout << "       ";  // pad for shrinking ETA strings
+        }
+        std::cout << std::flush;
 
         auto batch_start_time = std::chrono::high_resolution_clock::now();
 
@@ -3196,6 +3381,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         double T_deep_val = T_ref.back();  // Deep temperature from initialized profile
         double R350_val = reference_profile.R350_val;
 
+        // When a per-face H map is loaded, override rho(z) and k_c(z) per face
+        // using each face's own H. Without a map, every face shares the
+        // reference profile (legacy behavior). The depth grid (z_grid_f) stays
+        // shared — same caveat as the CPU batch path: built for the body
+        // default skin depth.
+        const bool use_per_face_H = (face_H_overrides != nullptr) &&
+                                    !face_H_overrides->empty();
+
         for (size_t f = 0; f < batch_n; ++f) {
             size_t global_f = batch_start + f;
             emissivity_batch[f] = static_cast<float>(planet.emissivity);
@@ -3207,10 +3400,23 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 Qb_batch[f] = static_cast<float>(planet.Qb);
             }
 
-            for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                rho_batch[idx] = static_cast<float>(rho_ref[layer]);
-                kc_batch[idx] = static_cast<float>(kc_ref[layer]);
+            if (use_per_face_H) {
+                const double H_face = (global_f < face_H_overrides->size())
+                                    ? (*face_H_overrides)[global_f]
+                                    : planet.H;
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    const double depth = z_grid[layer];
+                    const double df    = std::exp(-depth / H_face);
+                    rho_batch[idx] = static_cast<float>(planet.rhod + (planet.rhos - planet.rhod) * df);
+                    kc_batch[idx]  = static_cast<float>(planet.kd  + (planet.ks  - planet.kd ) * df);
+                }
+            } else {
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    rho_batch[idx] = static_cast<float>(rho_ref[layer]);
+                    kc_batch[idx]  = static_cast<float>(kc_ref[layer]);
+                }
             }
         }
 
@@ -3274,6 +3480,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         }
         solver.uploadInitialTemperature(T_initial);
 
+        // If a chunked-run initial-state file was loaded, overwrite the
+        // (computed-from-flux) initial T with the saved per-face profile
+        // from the previous chunk. Slice the global layer-major buffer
+        // into this batch's local SoA layout: dst[layer*batch_n+f] =
+        // src[layer*n_faces + batch_start + f].
+        if (!loaded_initial_T.empty()) {
+            std::vector<float> T_chunked(batch_n * n_layers);
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                const float* src = loaded_initial_T.data()
+                                 + layer * n_faces + batch_start;
+                float*       dst = T_chunked.data() + layer * batch_n;
+                std::copy(src, src + batch_n, dst);
+            }
+            solver.uploadAllTemps(T_chunked);
+        }
+
         // Debug: show initial temperature profile
         if (GPU_DEBUG_OUTPUT && batch_idx == 0) {
             std::cerr << "[GPU Thermal DEBUG] Initial T profile for face 0: ";
@@ -3305,44 +3527,112 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        // Prepare flux data in timestep-major layout: [timestep * batch_n + face_in_batch]
-        std::vector<float> flux_all(static_cast<size_t>(total_time_steps) * batch_n);
+        // Helper: prepare flux data in timestep-major layout for a range of timesteps.
+        auto prepare_flux = [&](int t_start, int n_steps) {
+            std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
+            #pragma omp parallel for schedule(static)
+            for (int t = 0; t < n_steps; ++t) {
+                for (size_t f = 0; f < batch_n; ++f) {
+                    size_t global_f = batch_start + f;
+                    size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-        #pragma omp parallel for schedule(static)
-        for (int t = 0; t < total_time_steps; ++t) {
-            for (size_t f = 0; f < batch_n; ++f) {
-                size_t global_f = batch_start + f;
-                size_t flux_idx = global_f * total_time_steps + t;
+                    double albedo = face_albedos[global_f];
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
 
-                double albedo = face_albedos[global_f];
-                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+                    flux[t * batch_n + f] = static_cast<float>(absorbed);
+                }
+            }
+            return flux;
+        };
 
-                // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
-                double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+        // Number of equilibration cycles (each replays the flux sequence).
+        int equil_cycles = 1;
+        std::vector<float> output_temps;
 
-                flux_all[t * batch_n + f] = static_cast<float>(absorbed);
+        // Per-batch Schorghofer accumulator buffer. Sized n_layers × batch_n.
+        // The OpenCL solver fills this when ice_acc is enabled.
+        std::vector<float> batch_avg_E;
+        std::vector<float>* batch_avg_E_ptr = nullptr;
+        if (ice_acc) {
+            batch_avg_E.assign(static_cast<size_t>(n_layers) * batch_n, 0.0f);
+            batch_avg_E_ptr = &batch_avg_E;
+        }
+
+        if (two_phase) {
+            // ---- Two-phase GPU execution ----
+            // Phase 1: equilibration with coarse dt (temperatures persist on GPU)
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Phase 1: " << equil_cycles
+                          << " eq cycles × " << equilibration_steps
+                          << " steps (dt=" << std::fixed << std::setprecision(1)
+                          << eq_dt << "s)" << std::endl;
+            }
+            auto flux_eq = prepare_flux(0, equilibration_steps);
+            std::vector<float> eq_output_discard;
+            solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
+                                                 equilibration_steps, eq_dt, equil_cycles);
+
+            // Phase 2: output with fine dt (1 cycle, download results).
+            // Accumulator runs over the entire output cycle: [0, output_steps).
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Phase 2: 1 output cycle × "
+                          << output_steps << " steps (dt="
+                          << out_dt << "s)" << std::endl;
+            }
+            auto flux_out = prepare_flux(equilibration_steps, output_steps);
+            solver.solvePersistentMultipleCycles(flux_out, output_temps,
+                                                 output_steps, out_dt, 0,
+                                                 batch_avg_E_ptr,
+                                                 /*accum_start*/ 0,
+                                                 /*accum_end*/   output_steps);
+        } else {
+            // ---- Single-phase (legacy) ----
+            // Accumulator runs only on the FINAL cycle, and only for relative
+            // timesteps in the output portion of the trajectory:
+            //   [equilibration_steps, total_time_steps).
+            if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
+                std::cout << "[GPU Thermal] Running " << equil_cycles
+                          << " equilibration cycles + 1 output cycle..." << std::endl;
+            }
+            auto flux_all = prepare_flux(0, total_time_steps);
+            solver.solvePersistentMultipleCycles(flux_all, output_temps,
+                                                 total_time_steps, dt, equil_cycles,
+                                                 batch_avg_E_ptr,
+                                                 /*accum_start*/ equilibration_steps,
+                                                 /*accum_end*/   total_time_steps);
+        }
+
+        // Copy this batch's accumulator into the global ice_acc buffer.
+        if (ice_acc) {
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                const float* src = batch_avg_E.data() + layer * batch_n;
+                float*       dst = ice_acc->sum_E.data() + layer * n_faces + batch_start;
+                std::copy(src, src + batch_n, dst);
             }
         }
 
-        // Equilibration + output phase in a single upload/download round-trip.
-        // The old code called solvePersistentAllTimesteps 6 times, which
-        // re-uploaded flux_all (57.6 MB per batch at res 6) and read back the
-        // output buffer on every equilibration cycle even though the data
-        // was discarded. solvePersistentMultipleCycles keeps both buffers
-        // resident on the device across cycles.
-        // Number of equilibration cycles (each = total_time_steps).
-        // Sweep on Moon res-6/7: 5 -> 1 drops thermal phase ~3x with <0.5 K
-        // mean-diff change; 0 regresses max-diff by ~10 K. Stick to 1.
-        int equil_cycles = 1;
-        if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-            std::cout << "[GPU Thermal] Running " << equil_cycles
-                      << " equilibration cycles + 1 output cycle..." << std::endl;
+        // If a final-state checkpoint was requested, download this batch's
+        // final T(z) and merge it into the whole-mesh layer-major buffer.
+        if (dump_final_state) {
+            std::vector<float> batch_T_final;
+            try {
+                solver.downloadAllTemps(batch_T_final);
+            } catch (const std::exception& e) {
+                std::cerr << "[GPU Thermal] WARNING: downloadAllTemps failed: "
+                          << e.what() << "\n";
+                batch_T_final.clear();
+            }
+            if (batch_T_final.size() == batch_n * n_layers) {
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const float* src = batch_T_final.data() + layer * batch_n;
+                    float*       dst = assembled_final_T.data() + layer * n_faces + batch_start;
+                    std::copy(src, src + batch_n, dst);
+                }
+            }
         }
-        std::vector<float> output_temps;
-        solver.solvePersistentMultipleCycles(flux_all, output_temps, total_time_steps, dt,
-                                             equil_cycles);
 
         // Debug: verify output_temps matches kernel output
         if (GPU_DEBUG_OUTPUT) {
@@ -3380,11 +3670,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
             }
 
+            // In two-phase mode, output_temps has output_steps entries and
+            // surface_temps_out is also sized to output_steps (no eq data stored).
+            // In single-phase, both have total_time_steps entries.
+            // In two-phase mode, output_temps has output_steps entries.
+            // Copy into the output portion of surface_temps (after eq slots).
+            const int copy_n = two_phase ? (total_time_steps - equilibration_steps) : total_time_steps;
+            const int copy_offset = two_phase ? equilibration_steps : 0;
+
             #pragma omp parallel for schedule(static)
             for (size_t f = 0; f < batch_n; ++f) {
                 size_t global_f = batch_start + f;
-                for (int t = 0; t < total_time_steps; ++t) {
-                    (*surface_temps_out)[global_f][t] = static_cast<double>(output_temps[t * batch_n + f]);
+                for (int t = 0; t < copy_n; ++t) {
+                    (*surface_temps_out)[global_f][copy_offset + t] =
+                        static_cast<double>(output_temps[t * batch_n + f]);
                 }
             }
 
@@ -3408,6 +3707,42 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(end_total - start_total);
     std::cout << "[GPU Thermal] Completed " << n_faces << " faces x " << total_time_steps
               << " timesteps in " << total_duration.count() << " seconds" << std::endl;
+
+    // Finalize Schorghofer accumulator. n_samples is the number of output
+    // timesteps over which the GPU kernel summed E(T(z,t)). For both two-phase
+    // and single-phase modes, the output window is `output_steps` long.
+    if (ice_acc) {
+        ice_acc->n_samples = output_steps;
+        std::cout << "[Ice stability] Accumulated <E(z)> over " << output_steps
+                  << " output samples × " << n_layers << " depth nodes × "
+                  << n_faces << " faces" << std::endl;
+    }
+
+    // Dump final thermal state if requested. PTMT magic + dims + raw float32.
+    if (dump_final_state) {
+        std::ofstream os(final_state_file, std::ios::binary);
+        if (!os) {
+            std::cerr << "[GPU Thermal] WARNING: cannot open final_state_file '"
+                      << final_state_file << "' for write\n";
+        } else {
+            uint32_t magic = kThermalStateMagic;
+            uint32_t nf = static_cast<uint32_t>(n_faces);
+            uint32_t nl = static_cast<uint32_t>(n_layers);
+            os.write(reinterpret_cast<const char*>(&magic), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(&nf),    sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(&nl),    sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(assembled_final_T.data()),
+                     assembled_final_T.size() * sizeof(float));
+            if (!os.good()) {
+                std::cerr << "[GPU Thermal] WARNING: short write on final_state_file\n";
+            } else {
+                std::cout << "[GPU Thermal] Wrote final T(z) checkpoint: "
+                          << final_state_file << " ("
+                          << (assembled_final_T.size() * sizeof(float)) / (1024.0*1024.0)
+                          << " MiB)\n";
+            }
+        }
+    }
 
     return true;
 }
@@ -3499,15 +3834,34 @@ bool runThermalForSelectedFaces_GPU(
         std::vector<float> T_deep_batch(batch_n);
         std::vector<float> Qb_batch(batch_n);
 
+        // Per-face H map (selected-faces variant): map slot f -> global face id
+        // via face_indices[batch_start + f], then look up planet.face_H_overrides.
+        const bool use_per_face_H = !planet.face_H_overrides.empty();
+
         for (size_t f = 0; f < batch_n; ++f) {
             emissivity_batch[f] = static_cast<float>(planet.emissivity);
             T_deep_batch[f] = static_cast<float>(T_deep_val);
             Qb_batch[f] = static_cast<float>(planet.Qb);
 
-            for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                rho_batch[idx] = static_cast<float>(rho_ref[layer]);
-                kc_batch[idx] = static_cast<float>(kc_ref[layer]);
+            if (use_per_face_H) {
+                const int   global_f = face_indices[batch_start + f];
+                const double H_face  = (global_f >= 0 &&
+                                         static_cast<size_t>(global_f) < planet.face_H_overrides.size())
+                                     ? planet.face_H_overrides[global_f]
+                                     : planet.H;
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    const double depth = z_grid[layer];
+                    const double df    = std::exp(-depth / H_face);
+                    rho_batch[idx] = static_cast<float>(planet.rhod + (planet.rhos - planet.rhod) * df);
+                    kc_batch[idx]  = static_cast<float>(planet.kd  + (planet.ks  - planet.kd ) * df);
+                }
+            } else {
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    const size_t idx = layer * batch_n + f;
+                    rho_batch[idx] = static_cast<float>(rho_ref[layer]);
+                    kc_batch[idx]  = static_cast<float>(kc_ref[layer]);
+                }
             }
         }
 
@@ -3593,6 +3947,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const std::vector<double>&,
     const std::vector<double>&,
     const std::vector<double>&,
+    int,
     int,
     const thermal::Config&,
     double,
@@ -4182,7 +4537,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double latitude,
     const thermal::Config& config,
     int equilibration_steps,
-    double Qb_override);
+    double Qb_override,
+    double H_override);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -4582,6 +4938,13 @@ void showUsage(const char* programName) {
     std::cout << "  --no-simd-batch            Force legacy Model::run scalar thermal path\n";
     std::cout << "  --use-gpu-thermal          Use GPU persistent kernel solver (OpenCL)\n";
     std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
+    std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
+    std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
+    std::cout << "                             > 0 = explicit override for the equilibration segment.\n";
+    std::cout << "  --equilibration-samples-per-diurnal N  Accuracy-based default:\n";
+    std::cout << "                             target illumination samples per diurnal cycle on the\n";
+    std::cout << "                             target body (24=<2 K accuracy, 48=<1 K, 12=marginal,\n";
+    std::cout << "                             <=0=legacy/match output cadence).\n";
     std::cout << "  --thermal-inertia-map FILE Path to thermal inertia map file\n";
     std::cout << "  --no-statistics            Disable computation of statistics\n";
     std::cout << "  --integration-days DAYS    Integration window in days\n";
@@ -5080,7 +5443,12 @@ static FilteredData filterFaceMajorStable(
             int st = start + ot;
             size_t si = src_base + static_cast<size_t>(st);
             size_t di = dst_base + static_cast<size_t>(ot);
-            if (si >= illum_full.size()) continue;
+            // Bounds check: use the largest available source array.
+            // illum_full may be empty (freed to save memory) while component
+            // arrays (direct, reflected, ir) still have the data.
+            size_t max_src = std::max({illum_full.size(), direct_full.size(),
+                                       refl_full.size(), ir_full.size()});
+            if (si >= max_src) continue;
 
             double ds = direct_full.empty() ? 0.0 : direct_full[si];
             double rf = refl_full.empty()   ? 0.0 : refl_full[si];
@@ -5407,9 +5775,16 @@ bool writeTemperatureTimeStepChunked(
 
 // Statistics computation structure
 struct Statistics {
-    std::vector<double> avg;  // Average across time
-    std::vector<double> max;  // Maximum across time
-    std::vector<double> min;  // Minimum across time
+    std::vector<double> avg;    // Average across time
+    std::vector<double> max;    // Maximum across time
+    std::vector<double> min;    // Minimum across time
+    // Optional pre-reduction state used by the chunked-run merge path
+    // (output.write_raw_stats=true). When populated, sum[f] is the
+    // running sum of valid samples and count[f] is the number of valid
+    // samples — allowing N independent chunks to be combined exactly
+    // via sum-of-sums and sum-of-counts for the global avg.
+    std::vector<double>   sum;
+    std::vector<uint32_t> count;
 };
 
 // Function to compute statistics for a data array
@@ -5422,35 +5797,39 @@ Statistics computeStatistics(
     stats.avg.resize(num_faces, 0.0);
     stats.max.resize(num_faces, std::numeric_limits<double>::lowest());
     stats.min.resize(num_faces, std::numeric_limits<double>::max());
-    
+    stats.sum.assign(num_faces, 0.0);
+    stats.count.assign(num_faces, 0u);
+
     // If data array is empty, return zeros
     if (data_array.empty()) {
         std::fill(stats.max.begin(), stats.max.end(), 0.0);
         std::fill(stats.min.begin(), stats.min.end(), 0.0);
         return stats;
     }
-    
+
     // Compute statistics for each face
     for (size_t f = 0; f < num_faces; f++) {
         double sum = 0.0;
         int valid_count = 0;
-        
+
         for (int t = 0; t < time_steps; t++) {
             size_t idx = f * time_steps + t;
             if (idx < data_array.size()) {
                 double value = data_array[idx];
                 sum += value;
                 valid_count++;
-                
+
                 stats.max[f] = std::max(stats.max[f], value);
                 stats.min[f] = std::min(stats.min[f], value);
             }
         }
-        
+
         if (valid_count > 0) {
             stats.avg[f] = sum / valid_count;
         }
-        
+        stats.sum[f]   = sum;
+        stats.count[f] = static_cast<uint32_t>(valid_count);
+
         // Handle case where no valid data found
         if (stats.max[f] == std::numeric_limits<double>::lowest()) {
             stats.max[f] = 0.0;
@@ -5459,7 +5838,7 @@ Statistics computeStatistics(
             stats.min[f] = 0.0;
         }
     }
-    
+
     return stats;
 }
 
@@ -5473,36 +5852,40 @@ Statistics computeTemperatureStatistics(
     stats.avg.resize(num_faces, 0.0);
     stats.max.resize(num_faces, std::numeric_limits<double>::lowest());
     stats.min.resize(num_faces, std::numeric_limits<double>::max());
-    
+    stats.sum.assign(num_faces, 0.0);
+    stats.count.assign(num_faces, 0u);
+
     // If temperature data is empty, return zeros
     if (surface_temps.empty() || surface_temps.size() != num_faces) {
         std::fill(stats.max.begin(), stats.max.end(), 0.0);
         std::fill(stats.min.begin(), stats.min.end(), 0.0);
         return stats;
     }
-    
+
     // Compute statistics for each face
     for (size_t f = 0; f < num_faces; f++) {
         double sum = 0.0;
         int valid_count = 0;
-        
+
         if (f < surface_temps.size()) {
             const auto& face_temps = surface_temps[f];
-            
+
             for (size_t t = 0; t < face_temps.size() && t < static_cast<size_t>(time_steps); t++) {
                 double value = face_temps[t];
                 sum += value;
                 valid_count++;
-                
+
                 stats.max[f] = std::max(stats.max[f], value);
                 stats.min[f] = std::min(stats.min[f], value);
             }
         }
-        
+
         if (valid_count > 0) {
             stats.avg[f] = sum / valid_count;
         }
-        
+        stats.sum[f]   = sum;
+        stats.count[f] = static_cast<uint32_t>(valid_count);
+
         // Handle case where no valid data found
         if (stats.max[f] == std::numeric_limits<double>::lowest()) {
             stats.max[f] = 0.0;
@@ -5511,7 +5894,7 @@ Statistics computeTemperatureStatistics(
             stats.min[f] = 0.0;
         }
     }
-    
+
     return stats;
 }
 
@@ -5571,9 +5954,109 @@ bool writeStatisticsBinary(
         min_out.close();
         
         return true;
-        
+
     } catch (const std::exception& e) {
         std::cerr << "Exception writing statistics: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+// Write merge-friendly raw statistics into <output_dir>/statistics/_raw/.
+// Produces:
+//   <data_type>_sum.bin    : uint32 N + N float64 (per-face sum)
+//   <data_type>_count.bin  : uint32 N + N uint32  (per-face sample count)
+// Used by the chunked-run orchestrator + ptm_merge_chunks tool to combine
+// N independent chunks losslessly.
+bool writeRawStatsBinary(
+    const std::string& output_dir,
+    const std::string& data_type,
+    const Statistics& stats,
+    size_t num_faces) {
+
+    if (stats.sum.size() != num_faces || stats.count.size() != num_faces) {
+        std::cerr << "[raw-stats] " << data_type
+                  << ": sum/count not populated (likely a streamed-stats path); "
+                     "skipping raw write.\n";
+        return false;
+    }
+    try {
+        std::string raw_dir = output_dir + "/statistics/_raw";
+        std::filesystem::create_directories(raw_dir);
+
+        // <data_type>_sum.bin
+        {
+            std::ofstream os(raw_dir + "/" + data_type + "_sum.bin",
+                             std::ios::binary);
+            if (!os) return false;
+            uint32_t N = static_cast<uint32_t>(num_faces);
+            os.write(reinterpret_cast<const char*>(&N), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(stats.sum.data()),
+                     stats.sum.size() * sizeof(double));
+            if (!os.good()) return false;
+        }
+        // <data_type>_count.bin
+        {
+            std::ofstream os(raw_dir + "/" + data_type + "_count.bin",
+                             std::ios::binary);
+            if (!os) return false;
+            uint32_t N = static_cast<uint32_t>(num_faces);
+            os.write(reinterpret_cast<const char*>(&N), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(stats.count.data()),
+                     stats.count.size() * sizeof(uint32_t));
+            if (!os.good()) return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Exception writing raw stats: " << e.what() << "\n";
+        return false;
+    }
+}
+
+// Write the Schorghofer ⟨E(z)⟩ accumulator (raw form) so a chunked-run
+// merge step can sum sum_E and n_samples across chunks before solving
+// for stability depth on the merged accumulator.
+//   ice_depth_sum_E.bin     : uint32 n_layers,n_faces + n_layers*n_faces float32 (layer-major)
+//   ice_depth_n_samples.txt : single integer line
+//   depth_grid.bin          : uint32 n_layers + n_layers float64 (z values)
+bool writeIceStabilityRaw(
+    const std::string& output_dir,
+    const ice::IceStabilityAccumulator& acc) {
+    if (!acc.ready()) {
+        std::cerr << "[raw-stats] ice-stability accumulator not ready; skipping raw write.\n";
+        return false;
+    }
+    try {
+        std::string raw_dir = output_dir + "/statistics/_raw";
+        std::filesystem::create_directories(raw_dir);
+
+        {
+            std::ofstream os(raw_dir + "/ice_depth_sum_E.bin", std::ios::binary);
+            if (!os) return false;
+            uint32_t nl = static_cast<uint32_t>(acc.n_layers);
+            uint32_t nf = static_cast<uint32_t>(acc.n_faces);
+            os.write(reinterpret_cast<const char*>(&nl), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(&nf), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(acc.sum_E.data()),
+                     acc.sum_E.size() * sizeof(float));
+            if (!os.good()) return false;
+        }
+        {
+            std::ofstream os(raw_dir + "/ice_depth_n_samples.txt");
+            if (!os) return false;
+            os << acc.n_samples << "\n";
+        }
+        {
+            std::ofstream os(raw_dir + "/depth_grid.bin", std::ios::binary);
+            if (!os) return false;
+            uint32_t nl = static_cast<uint32_t>(acc.n_layers);
+            os.write(reinterpret_cast<const char*>(&nl), sizeof(uint32_t));
+            os.write(reinterpret_cast<const char*>(acc.z.data()),
+                     acc.z.size() * sizeof(double));
+            if (!os.good()) return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Exception writing ice-stability raw stats: " << e.what() << "\n";
         return false;
     }
 }
@@ -5661,137 +6144,81 @@ bool exportStatisticsBinary(
     const std::vector<double>& primary_reflected_values,
     const std::vector<double>& primary_ir_values,
     const std::vector<std::vector<double>>& surface_temps,
-    int time_steps) {
-    
+    int time_steps,
+    bool write_raw = false) {
+
     size_t face_count = mesh->faces.size();
-    
+
     std::cout << "\n[exportStatisticsBinary] Computing and exporting statistics..." << std::endl;
     std::cout << "  Face count: " << face_count << std::endl;
     std::cout << "  Time steps: " << time_steps << std::endl;
-    
+    if (write_raw) {
+        std::cout << "  Writing merge-friendly raw stats (statistics/_raw/)" << std::endl;
+    }
+
     bool all_success = true;
-    
+
+    // Local helper to write per-datatype stats + optional raw side files.
+    auto write_one = [&](const std::string& name, const Statistics& s) {
+        bool ok = writeStatisticsBinary(output_dir, name, s, face_count);
+        if (!ok) {
+            std::cerr << "  Failed to write " << name << " statistics" << std::endl;
+            all_success = false;
+        }
+        if (ok && write_raw) {
+            if (!writeRawStatsBinary(output_dir, name, s, face_count)) {
+                std::cerr << "  Failed to write " << name << " raw stats" << std::endl;
+                all_success = false;
+            }
+        }
+    };
+
     // Compute and write illumination statistics
     if (!illumination_values.empty()) {
         std::cout << "  Computing illumination statistics..." << std::endl;
-        Statistics illum_stats = computeStatistics(illumination_values, face_count, time_steps);
-        if (!writeStatisticsBinary(output_dir, "illumination", illum_stats, face_count)) {
-            std::cerr << "  Failed to write illumination statistics" << std::endl;
-            all_success = false;
-        }
+        write_one("illumination",
+                  computeStatistics(illumination_values, face_count, time_steps));
     }
-    
+
     // Compute and write direct solar statistics
     if (!direct_solar_values.empty()) {
         std::cout << "  Computing direct solar statistics..." << std::endl;
-        Statistics direct_stats = computeStatistics(direct_solar_values, face_count, time_steps);
-        if (!writeStatisticsBinary(output_dir, "direct_solar", direct_stats, face_count)) {
-            std::cerr << "  Failed to write direct solar statistics" << std::endl;
-            all_success = false;
-        }
+        write_one("direct_solar",
+                  computeStatistics(direct_solar_values, face_count, time_steps));
     }
-    
+
     // Compute and write primary reflected statistics
     if (!primary_reflected_values.empty()) {
         std::cout << "  Computing primary reflected statistics..." << std::endl;
-        Statistics reflected_stats = computeStatistics(primary_reflected_values, face_count, time_steps);
-        if (!writeStatisticsBinary(output_dir, "primary_reflected", reflected_stats, face_count)) {
-            std::cerr << "  Failed to write primary reflected statistics" << std::endl;
-            all_success = false;
-        }
+        write_one("primary_reflected",
+                  computeStatistics(primary_reflected_values, face_count, time_steps));
     }
-    
+
     // Compute and write primary IR statistics
     if (!primary_ir_values.empty()) {
         std::cout << "  Computing primary IR statistics..." << std::endl;
-        Statistics ir_stats = computeStatistics(primary_ir_values, face_count, time_steps);
-        if (!writeStatisticsBinary(output_dir, "primary_ir", ir_stats, face_count)) {
-            std::cerr << "  Failed to write primary IR statistics" << std::endl;
-            all_success = false;
-        }
+        write_one("primary_ir",
+                  computeStatistics(primary_ir_values, face_count, time_steps));
     }
-    
+
     // Compute and write temperature statistics
     if (!surface_temps.empty()) {
         std::cout << "  Computing temperature statistics..." << std::endl;
-        Statistics temp_stats = computeTemperatureStatistics(surface_temps, face_count, time_steps);
-        if (!writeStatisticsBinary(output_dir, "temperature", temp_stats, face_count)) {
-            std::cerr << "  Failed to write temperature statistics" << std::endl;
-            all_success = false;
-        }
-        
-        // Compute ice depth using mean and max temperatures
-        std::cout << "  Computing ice stability depths..." << std::endl;
-        try {
-            // Ice depth solver parameters (matching Python defaults)
-            const double J0 = 3e-14;      // vapor flux limit [kg m^-2 s^-1]
-            const double delta = 1e-4;    // convergence tolerance [m]
-            const double z0 = 0.0;        // initial depth guess [m]
-            const double l = 100e-6;      // mean free path [m]
-            const double zs = 0.1;        // thermal skin depth [m]
-            const double Q = 0.02;        // geothermal flux [W m^-2]
-            const double k = 1e-3;        // thermal conductivity [W m^-1 K^-1]
-            const int max_iter = 200;     // max Newton iterations
-            const double z_min = 0.0;     // minimum depth [m]
-            const double z_max = 5.0;     // maximum depth [m]
-            const bool use_openmp = true; // enable parallel computation
-            
-            // Call ice depth solver
-            std::vector<double> ice_depths = ice::computeIceDepths(
-                temp_stats.avg,  // mean temperature [K]
-                temp_stats.max,  // max temperature [K]
-                J0, delta, z0, l, zs, Q, k, max_iter, z_min, z_max,
-                nullptr,         // don't need iteration counts
-                use_openmp
-            );
-            
-            // Package ice depths as Statistics structure (only avg is meaningful)
-            Statistics ice_stats;
-            ice_stats.avg = ice_depths;
-            ice_stats.max.resize(face_count, std::numeric_limits<double>::quiet_NaN());
-            ice_stats.min.resize(face_count, std::numeric_limits<double>::quiet_NaN());
-            
-            if (!writeStatisticsBinary(output_dir, "ice_depth", ice_stats, face_count)) {
-                std::cerr << "  Failed to write ice depth statistics" << std::endl;
-                all_success = false;
-            } else {
-                // Report ice depth statistics
-                double valid_count = 0.0;
-                double sum = 0.0;
-                double min_depth = std::numeric_limits<double>::max();
-                double max_depth = std::numeric_limits<double>::lowest();
-                
-                for (size_t i = 0; i < ice_depths.size(); ++i) {
-                    if (!std::isnan(ice_depths[i])) {
-                        valid_count += 1.0;
-                        sum += ice_depths[i];
-                        if (ice_depths[i] < min_depth) min_depth = ice_depths[i];
-                        if (ice_depths[i] > max_depth) max_depth = ice_depths[i];
-                    }
-                }
-                
-                if (valid_count > 0) {
-                    double avg_depth = sum / valid_count;
-                    std::cout << "    Ice depth: valid=" << static_cast<int>(valid_count) 
-                              << "/" << face_count
-                              << ", mean=" << std::fixed << std::setprecision(6) << avg_depth << " m"
-                              << ", range=[" << min_depth << ", " << max_depth << "] m" << std::endl;
-                } else {
-                    std::cout << "    Ice depth: no stable solutions found" << std::endl;
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "  Exception computing ice depths: " << e.what() << std::endl;
-            all_success = false;
-        }
+        write_one("temperature",
+                  computeTemperatureStatistics(surface_temps, face_count, time_steps));
+        // Note: ice-depth statistics are computed separately by the main
+        // driver from the Schorghofer & Taylor (2007) IceStabilityAccumulator
+        // (only when thermal.compute_ice_stability is enabled). The legacy
+        // surface-T-only Newton solver was removed in favour of the
+        // depth-resolved time-averaged formulation.
     }
-    
+
     if (all_success) {
         std::cout << "\n[exportStatisticsBinary] Statistics export completed successfully!" << std::endl;
     } else {
         std::cerr << "\n[exportStatisticsBinary] Some statistics failed to export!" << std::endl;
     }
-    
+
     return all_success;
 }
 
@@ -5808,7 +6235,8 @@ bool exportDataAsBinary(
     const std::vector<std::string>& time_strings,
     int time_steps,
     bool is_custom_mesh,
-    bool compute_statistics)
+    bool compute_statistics,
+    bool skip_mesh = false)
 {
     using std::cerr;
     using std::cout;
@@ -5861,10 +6289,14 @@ bool exportDataAsBinary(
          << (primary_ir_values.empty()?"":" primary_ir")
          << (surface_temps.empty()?"":" temperature") << "\n";
 
-    // Mesh PLY (binary with per-face lat/lon to satisfy downstream python)
-    if (!exportMeshToPLY(output_dir + "/mesh.ply", mesh)) {
-        cerr << "[exportDataAsBinary] ERROR exporting mesh\n";
-        return false;
+    // Mesh PLY (binary with per-face lat/lon to satisfy downstream python).
+    // Skipped on chunked-run chunks 1+ (the orchestrator propagates the
+    // mesh from chunk 0 to the parent dir, so per-chunk copies are wasteful).
+    if (!skip_mesh) {
+        if (!exportMeshToPLY(output_dir + "/mesh.ply", mesh)) {
+            cerr << "[exportDataAsBinary] ERROR exporting mesh\n";
+            return false;
+        }
     }
     if (!writeTimeStepsFile(output_dir + "/time_steps.txt", times, time_strings)) {
         cerr << "[exportDataAsBinary] ERROR writing time metadata\n";
@@ -6150,7 +6582,12 @@ int main(int argc, char** argv) {
     thermal::Config config;
 
     bool compute_statistics = sim_config.thermal.compute_statistics;
-    
+
+    // Schorghofer & Taylor (2007) ice-stability accumulator. Persists from
+    // the thermal solve through the statistics-export phase. Empty / unused
+    // unless sim_config.thermal.compute_ice_stability is true.
+    ice::IceStabilityAccumulator ice_stability_accum;
+
     // Mesh input options
     std::string mesh_file = sim_config.mesh.import_file;
     double mesh_scale_factor = sim_config.mesh.scale_factor;
@@ -6169,6 +6606,14 @@ int main(int argc, char** argv) {
     // Command-line parameter for equilibration orbits (fractional allowed)
     double equilibration_orbits = sim_config.thermal.equilibration_orbits;
 
+    // Optional: separate (coarser) cadence for the equilibration period.
+    // Priority order:
+    //   1. equilibration_steps_per_day > 0  => explicit override
+    //   2. equilibration_samples_per_diurnal_cycle > 0 => auto-compute from body's synodic day
+    //   3. otherwise => legacy (match output cadence)
+    double eq_steps_per_day_cli = sim_config.thermal.equilibration_steps_per_day;
+    double eq_samples_per_diurnal_cli = sim_config.thermal.equilibration_samples_per_diurnal_cycle;
+
     // GPU thermal solver from YAML config (can be overridden by --use-gpu-thermal CLI flag)
     if (sim_config.thermal.use_gpu) {
         config.setProperty("use_gpu_thermal", true);
@@ -6183,6 +6628,9 @@ int main(int argc, char** argv) {
     // Command line options for maps
     std::string albedo_map_file = sim_config.illumination.albedo_map;
     std::string thermal_inertia_map_file = sim_config.thermal.thermal_inertia_map;
+    std::string h_parameter_map_file     = sim_config.thermal.h_parameter_map;
+    bool        use_default_property_map = sim_config.thermal.use_default_property_map;
+    std::string property_maps_directory  = sim_config.thermal.property_maps_directory;
     std::string albedo_maps_directory = sim_config.illumination.albedo_maps_directory;
     bool use_albedo_map = sim_config.illumination.use_albedo_map;
 
@@ -6369,6 +6817,10 @@ int main(int argc, char** argv) {
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
+        } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
+            eq_steps_per_day_cli = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-samples-per-diurnal" && i + 1 < argc) {
+            eq_samples_per_diurnal_cli = std::stod(argv[++i]);
         } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
             geothermal_heat_flow = std::stod(argv[++i]);
             std::cout << "Setting geothermal heat flow to: " << geothermal_heat_flow << " W/m²" << std::endl;
@@ -6771,10 +7223,17 @@ int main(int argc, char** argv) {
     // ========================================================================
     // PHASE 4c: Constant thermal inertia mode
     // When thermophysical.constant_thermal_inertia > 0, override properties
-    // so that TI = sqrt(ks * rhos * cp) with no temperature dependence:
-    //   chi = 0  (k = ks, constant)
-    //   cpCoeff = {} (cp = cp0, constant)
+    // so that TI = sqrt(k * rho * cp) is constant in temperature AND depth:
+    //   chi = 0       (k = ks, constant in T)
+    //   cpCoeff = {}  (cp = cp0, constant in T)
     //   cp0 = TI^2 / (ks * rhos)
+    //   kd  = ks      (collapse the regolith two-layer profile)
+    //   rhod = rhos   (so k(z) and rho(z) are uniform with depth)
+    // Without the kd/rhod override, the per-layer interpolation
+    //   k(z)   = kd  + (ks  - kd ) * exp(-z/H)
+    //   rho(z) = rhod + (rhos - rhod) * exp(-z/H)
+    // (see ~line 3410) leaves TI(z) varying from `constant_ti` at z=0 to
+    // sqrt(kd * rhod * cp_const) at z >> H, defeating the user's intent.
     // ========================================================================
     double constant_ti = sim_config.thermophysical.constant_thermal_inertia;
     if (constant_ti > 0) {
@@ -6782,13 +7241,27 @@ int main(int argc, char** argv) {
         double rhos_val = planet.rhos;
         if (ks_val > 0 && rhos_val > 0) {
             double cp_const = (constant_ti * constant_ti) / (ks_val * rhos_val);
+            double old_kd = planet.kd;
+            double old_rhod = planet.rhod;
             planet.cp0 = cp_const;
             planet.cpCoeff.clear();  // No T-dependent cp
             chi_override = 0.0;      // No radiative conductivity
-            std::cout << "Constant thermal inertia mode: TI = " << constant_ti << " SI" << std::endl;
+            // Force depth-invariance: deep == surface for k and rho so the
+            // regolith profile collapses and TI(z) = constant_ti at every
+            // depth, not just z=0.
+            planet.kd = ks_val;
+            planet.rhod = rhos_val;
+            std::cout << "Constant thermal inertia mode: TI = " << constant_ti
+                      << " SI (constant in temperature AND depth)" << std::endl;
             std::cout << "  ks = " << ks_val << " W/m/K, rhos = " << rhos_val
                       << " kg/m^3, cp = " << cp_const << " J/kg/K" << std::endl;
             std::cout << "  chi = 0 (no radiative conductivity)" << std::endl;
+            if (old_kd != ks_val || old_rhod != rhos_val) {
+                std::cout << "  Collapsing regolith profile: kd "
+                          << old_kd << " -> " << ks_val << " W/m/K, rhod "
+                          << old_rhod << " -> " << rhos_val << " kg/m^3"
+                          << std::endl;
+            }
         }
     }
 
@@ -6910,7 +7383,7 @@ int main(int argc, char** argv) {
         if (sim_config.mesh.use_topographic) {
             std::string topo_dir = sim_config.mesh.topo_directory;
             if (topo_dir.empty()) {
-                topo_dir = "data/dem";
+                topo_dir = "data/topo";
             }
             topo_loaded = meshUtils.checkForTopographicMesh(
                 topo_dir, mesh_resolution, sim_config.time.body);
@@ -6961,7 +7434,95 @@ int main(int argc, char** argv) {
         std::cerr << "Mesh validation failed. Exiting." << std::endl;
         return 1;
     }
-    
+
+    // ----------------------------------------------------------------------
+    // Per-face thermophysical-property map (optional)
+    //
+    // Three trigger conditions, in priority order:
+    //   1. h_parameter_map     -> custom per-face H file (binary float32)
+    //   2. thermal_inertia_map -> custom per-face TI file (binary float32);
+    //                              loader inverts to effective H per face
+    //   3. use_default_property_map -> auto-discover bundled icosphere map
+    //                                   <property_maps_directory>/<body>/...
+    //
+    // The loaded H values land in planet.face_H_overrides; from there the
+    // thermal solver uses them via Planet::H_for_face() (single-face) and the
+    // batch path (per-face refresh of kc/rho in copyGridFromProfile).
+    // ----------------------------------------------------------------------
+    {
+        const size_t n_faces_for_map = mesh->faces.size();
+        std::optional<thermal::ThermalPropertyMap> tpm;
+        std::string source_label;
+        std::string map_mode_label;
+
+        auto set_planet_overrides = [&](const thermal::ThermalPropertyMap& m) {
+            planet.face_H_overrides = m.H_values();
+            planet.face_H_valid     = m.valid_mask();
+        };
+
+        if (!h_parameter_map_file.empty()) {
+            map_mode_label = "H_PARAMETER (custom)";
+            tpm = thermal::ThermalPropertyMap::loadCustom(
+                h_parameter_map_file, n_faces_for_map,
+                thermal::ThermalPropertyMap::Mode::H_PARAMETER);
+            source_label = h_parameter_map_file;
+        } else if (!thermal_inertia_map_file.empty()) {
+            map_mode_label = "THERMAL_INERTIA (custom; inverted to H)";
+            tpm = thermal::ThermalPropertyMap::loadCustom(
+                thermal_inertia_map_file, n_faces_for_map,
+                thermal::ThermalPropertyMap::Mode::THERMAL_INERTIA);
+            source_label = thermal_inertia_map_file;
+        } else if (use_default_property_map) {
+            // Derive ico level from face count: faces = 20 * 4^level
+            int detected_level = -1;
+            {
+                size_t f = n_faces_for_map;
+                if (f >= 20 && (f % 20) == 0) {
+                    size_t r = f / 20;
+                    int lvl = 0;
+                    while (r > 1 && (r & 1) == 0 && (r & 2) == 0) {
+                        // r should be 4^lvl (only bits at positions 0, 2, 4, ... allowed)
+                        r >>= 2;
+                        ++lvl;
+                    }
+                    if (r == 1) detected_level = lvl;
+                }
+            }
+            if (detected_level < 0) {
+                std::cerr << "[property-map] mesh face count " << n_faces_for_map
+                          << " is not an icosphere (20*4^N). "
+                             "Custom h_parameter_map / thermal_inertia_map required.\n";
+            } else {
+                map_mode_label = "H_PARAMETER (bundled default)";
+                tpm = thermal::ThermalPropertyMap::loadDefault(
+                    sim_config.time.body, detected_level,
+                    property_maps_directory,
+                    thermal::ThermalPropertyMap::Mode::H_PARAMETER);
+                if (tpm) {
+                    source_label = tpm->source_path();
+                }
+            }
+        }
+
+        if (tpm) {
+            set_planet_overrides(*tpm);
+            std::cout << "[property-map] " << map_mode_label
+                      << "  source=" << source_label
+                      << "  faces=" << tpm->H_values().size()
+                      << "  default_fraction="
+                      << (tpm->fraction_default() * 100.0) << "%"
+                      << "  H[range]=" << *std::min_element(tpm->H_values().begin(), tpm->H_values().end())
+                      << ".." << *std::max_element(tpm->H_values().begin(), tpm->H_values().end())
+                      << " m\n";
+        } else if (!h_parameter_map_file.empty() ||
+                   !thermal_inertia_map_file.empty() ||
+                   use_default_property_map) {
+            std::cerr << "[property-map] WARNING: requested map could not be loaded;"
+                         " falling back to single body-default H="
+                      << planet.H << " m\n";
+        }
+    }
+
     // Export mesh to VTK for visualization
     if (export_basic_mesh) {
         std::string mesh_filename = output_dir + "/ptm_mesh.vtk";
@@ -7096,6 +7657,8 @@ int main(int argc, char** argv) {
                 } else {
                     std::cerr << "ERROR: Failed to save view factors to: " << rad_view_factor_file
                               << " (check path, permissions, disk space)" << std::endl;
+                    // Don't mark precomputed so the later phase will rebuild instead of
+                    // trying to load a non-existent file.
                 }
             } else {
                 std::cerr << "Warning: Early view factor computation failed." << std::endl;
@@ -7172,6 +7735,21 @@ int main(int argc, char** argv) {
     }
     double synodic_day = getSynodicDayFromPlanet(planet);
 
+    // When loading a thermal-state checkpoint (chunked-run workflow),
+    // the previous chunk's final T(z) is already equilibrated — we
+    // disable equilibration entirely so the chunk's flux/time vectors
+    // span only the requested output window. Without this, the
+    // chunk's `total_time_steps` would still include the full
+    // equilibration prefix, the GPU would integrate over all of it,
+    // and the per-chunk stats would mix in equilibration samples.
+    if (!sim_config.thermal.initial_state_file.empty() &&
+        equilibration_orbits > 0.0) {
+        std::cout << "[chunked] thermal.initial_state_file is set; "
+                     "forcing equilibration_orbits=0 (was "
+                  << equilibration_orbits << ")\n";
+        equilibration_orbits = 0.0;
+    }
+
     // Calculate equilibration period using the correct synodic day
     // Note: equilibration_orbits represents number of day/night cycles for equilibration
     double equilibration_days = std::max(0.0, equilibration_orbits) * synodic_day;
@@ -7222,27 +7800,86 @@ int main(int argc, char** argv) {
     // Calculate adjusted start time that includes equilibration period
     std::string adjustedStartTime = calculateAdjustedStartTime(start_time, -equilibration_days);
 
-    // Maintain constant temporal resolution based on the output window density
-    // steps_per_day = time_steps / output_days (if > 0)
-    const double steps_per_day = (output_days > 0.0 && time_steps > 0)
+    // Decoupled equilibration / output cadences.
+    //
+    // The OUTPUT cadence is derived from the user-requested (timesteps, duration_days)
+    // and controls the sampling density of the output window.
+    //
+    // The EQUILIBRATION cadence defaults to the output cadence (legacy behavior) but
+    // can be overridden via sim_config.thermal.equilibration_steps_per_day (or the
+    // --equilibration-steps-per-day CLI flag). Using a coarser cadence during
+    // equilibration dramatically reduces illumination-array size and ray-tracing cost
+    // when the output cadence is very fine (e.g., 1-min for camera simulations).
+    const double output_steps_per_day = (output_days > 0.0 && time_steps > 0)
         ? (static_cast<double>(time_steps) / output_days)
         : 0.0;
 
-    // Total steps for the entire simulation (equil + post-eq)
-    int total_time_steps = static_cast<int>(std::llround(steps_per_day * total_simulation_days));
-    // Steps that belong to equilibration segment
-    int equilibration_steps = static_cast<int>(std::llround(steps_per_day * equilibration_days));
+    // Determine equilibration cadence using priority:
+    //   1. explicit steps_per_day > 0
+    //   2. accuracy-based auto-compute from samples_per_diurnal_cycle > 0
+    //   3. legacy (match output cadence)
+    double eq_steps_per_day = output_steps_per_day;
+    std::string eq_cadence_source = "legacy (matches output cadence)";
+    bool user_set_eq_cadence = false;
+    if (eq_steps_per_day_cli > 0.0) {
+        eq_steps_per_day = eq_steps_per_day_cli;
+        eq_cadence_source = "explicit (equilibration_steps_per_day)";
+        user_set_eq_cadence = true;
+    } else if (eq_samples_per_diurnal_cli > 0.0 && synodic_day > 0.0) {
+        eq_steps_per_day = eq_samples_per_diurnal_cli / synodic_day;
+        std::ostringstream oss;
+        oss << "auto (" << eq_samples_per_diurnal_cli
+            << " samples/diurnal cycle; synodic_day=" << synodic_day << " Earth-days)";
+        eq_cadence_source = oss.str();
+        user_set_eq_cadence = true;
+    }
+
+    // Note: GPU thermal solver now supports two-phase execution with different dt
+    // for equilibration vs output. No fallback needed — the solver is called twice
+    // with equilibration_steps passed to split the flux array.
+
+    // Guard: fast-rotator warning (less than 12 samples per diurnal cycle during eq).
+    if (user_set_eq_cadence) {
+        double samples_per_diurnal = eq_steps_per_day * synodic_day;
+        if (samples_per_diurnal < 12.0) {
+            std::cerr << "WARNING: equilibration cadence resolves only "
+                      << std::fixed << std::setprecision(2) << samples_per_diurnal
+                      << " samples per diurnal cycle on " << planet.name
+                      << "; consider >= 24 samples/diurnal-cycle ("
+                      << (24.0 / synodic_day) << " steps/Earth-day).\n";
+        }
+    }
+
+    // Compute equilibration / output / total step counts
+    int equilibration_steps = (equilibration_days > 0.0 && eq_steps_per_day > 0.0)
+        ? static_cast<int>(std::llround(eq_steps_per_day * equilibration_days))
+        : 0;
+    int output_steps = static_cast<int>(std::llround(output_steps_per_day * post_eq_days_needed));
+    int total_time_steps = equilibration_steps + output_steps;
+
     // For sanity, output_steps_expected should match user time_steps (modulo rounding)
-    int output_steps_expected = static_cast<int>(std::llround(steps_per_day * output_days));
+    int output_steps_expected = static_cast<int>(std::llround(output_steps_per_day * output_days));
 
     // Verify the calculation
     std::cout << "Time step calculation:" << std::endl;
     std::cout << "  Requested output time steps: " << time_steps << std::endl;
     std::cout << "  Output window (days): " << output_days << std::endl;
-    std::cout << "  Steps per day (from output window): " << std::fixed << std::setprecision(6) << steps_per_day << std::endl;
+    std::cout << "  Output cadence:        " << std::fixed << std::setprecision(6)
+              << output_steps_per_day << " steps/Earth-day" << std::endl;
+    std::cout << "  Equilibration cadence: " << std::fixed << std::setprecision(6)
+              << eq_steps_per_day << " steps/Earth-day"
+              << " [" << eq_cadence_source << "]"
+              << std::endl;
+    if (user_set_eq_cadence) {
+        std::cout << "    -> " << std::fixed << std::setprecision(2)
+                  << (eq_steps_per_day * synodic_day)
+                  << " samples per diurnal cycle on " << planet.name << std::endl;
+    }
     std::cout << "  Total simulation days: " << total_simulation_days << std::endl;
-    std::cout << "  Total time steps (including equilibration and integration coverage): " << total_time_steps << std::endl;
     std::cout << "  Equilibration steps: " << equilibration_steps << std::endl;
+    std::cout << "  Output steps:        " << output_steps << std::endl;
+    std::cout << "  Total time steps (including equilibration and integration coverage): "
+              << total_time_steps << std::endl;
     if (output_steps_expected != time_steps) {
         std::cout << "  Note: output steps after rounding: " << output_steps_expected << " (requested " << time_steps << ")\n";
     }
@@ -7250,14 +7887,48 @@ int main(int argc, char** argv) {
     // Sanity check
     if (equilibration_steps < 0 || total_time_steps < 1) {
         std::cerr << "ERROR: Invalid time step configuration! Check parameters." << std::endl;
-        // Fallback to original behavior
+        // Fallback to original behavior (legacy uniform cadence)
         total_simulation_days = equilibration_days + output_days;
-        total_time_steps = std::max(1, time_steps + static_cast<int>(std::llround(steps_per_day * equilibration_days)));
+        total_time_steps = std::max(1, time_steps + static_cast<int>(
+            std::llround(output_steps_per_day * equilibration_days)));
         equilibration_steps = std::max(0, total_time_steps - time_steps);
+        eq_steps_per_day = output_steps_per_day;
+        user_set_eq_cadence = false;
     }
 
-    // Update the illumination model with the total time steps
+    // Build the ET grid: coarse equilibration block followed by fine output block.
+    // This is passed to the illumination model via setExternalTimeGrid() so that
+    // ray-tracing + SPICE position queries happen only at these sampled times.
+    std::vector<double> external_ets;
+    if (total_time_steps > 0) {
+        external_ets.reserve(total_time_steps);
+        double et0 = illumination_model->convertTimeToET(adjustedStartTime);
+        // Equilibration block: uniform cadence strictly inside [et0, et0 + eq_days)
+        if (equilibration_steps > 0) {
+            double eq_seconds = equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY;
+            for (int i = 0; i < equilibration_steps; ++i) {
+                // multiply-before-divide for robust floating-point
+                external_ets.push_back(et0 + (static_cast<double>(i) * eq_seconds) /
+                                              static_cast<double>(equilibration_steps));
+            }
+        }
+        // Output block: uniform fine cadence starting exactly at et0 + equilibration_days
+        double et_out_start = et0 + equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY;
+        double out_seconds = post_eq_days_needed * ptm_thermal::constants::SECONDS_PER_DAY;
+        for (int i = 0; i < output_steps; ++i) {
+            external_ets.push_back(et_out_start + (static_cast<double>(i) * out_seconds) /
+                                                   static_cast<double>(output_steps));
+        }
+    }
+
+    // Update the illumination model with the total time steps and external grid
     illumination_model->setTimeSteps(total_time_steps);
+    if (user_set_eq_cadence &&
+        std::abs(eq_steps_per_day - output_steps_per_day) > 1e-6) {
+        // Only install the external grid when we actually want non-uniform sampling
+        // (keeps legacy behavior byte-identical when user leaves default).
+        illumination_model->setExternalTimeGrid(external_ets);
+    }
 
     // Run illumination model for the full period but keep track of where the requested interval starts
     std::cout << "Running illumination simulation for " << total_simulation_days 
@@ -7384,6 +8055,14 @@ int main(int argc, char** argv) {
         std::cout << "Detected chunked storage. Skipping full illumination extraction (~"
                   << std::fixed << std::setprecision(1) << memory_required_gb_est
                   << " GB). Will stream illumination to the thermal solver." << std::endl;
+    }
+
+    // Release chunked storage after extraction — the flat arrays now own the data.
+    // This frees ~180+ GB of duplicated illumination data that would otherwise
+    // coexist with the flat arrays + surface_temps during the thermal solve.
+    if (!use_streamed_thermal && using_chunked_storage) {
+        illumination_model->releaseChunkedStorage();
+        std::cout << "[Memory] Released chunked illumination storage after extraction" << std::endl;
     }
 
     // NOW verify the extracted data (only meaningful if we actually extracted)
@@ -7564,14 +8243,19 @@ int main(int argc, char** argv) {
         }
         const std::vector<double>* face_Qb_ptr = face_Qb.empty() ? nullptr : &face_Qb;
 
+        // Reuse illumination arrays from the outer-scope extraction if already
+        // populated. This avoids a second ~180 GB allocation that would OOM.
         std::vector<double> direct_solar_values_full;
         std::vector<double> primary_reflected_values_full;
         std::vector<double> primary_ir_values_full;
 
+        const bool already_extracted = !direct_solar_values.empty();
+
         // Detect chunked storage (arrays empty => chunked)
-        bool using_chunked_storage = illumination_model->getDirectSolarValues().empty() || 
-                                    illumination_model->getPrimaryReflectedValues().empty() || 
-                                    illumination_model->getPrimaryIRFlux().empty();
+        bool using_chunked_storage = !already_extracted &&
+            (illumination_model->getDirectSolarValues().empty() ||
+             illumination_model->getPrimaryReflectedValues().empty() ||
+             illumination_model->getPrimaryIRFlux().empty());
 
         const size_t total_values_est = num_faces * static_cast<size_t>(total_time_steps);
         const size_t bytes_per_value = sizeof(double);
@@ -7679,7 +8363,11 @@ int main(int argc, char** argv) {
                 return illumination_model->getPrimaryIRValue(f, t);
             };
 
-            // Streamed thermal: no face×time allocations
+            // Streamed thermal: no face×time allocations.
+            // Pass planet.face_H_overrides if loaded so each face gets its
+            // own H-driven rho(z), k(z) profile.
+            const std::vector<double>* face_H_ptr =
+                planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
             bool thermal_success_streamed = runThermalModelsForAllFacesStreamed(
                 mesh,
                 times,
@@ -7692,7 +8380,8 @@ int main(int argc, char** argv) {
                 get_reflected,
                 get_ir,
                 &surface_temps,
-                face_Qb_ptr
+                face_Qb_ptr,
+                face_H_ptr
             );
 
             if (!thermal_success_streamed) {
@@ -7728,7 +8417,26 @@ int main(int argc, char** argv) {
             bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
             bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
+            // Schorghofer & Taylor (2007) accumulator pointer. Null when the
+            // user has not requested ice-stability output → zero overhead path.
+            ice::IceStabilityAccumulator* ice_acc_ptr_a =
+                sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
+
             if (use_gpu_thermal) {
+                const std::vector<double>* face_H_ptr_g =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                // When loading a thermal-state checkpoint, skip equilibration
+                // entirely — the loaded T(z) is already equilibrated by the
+                // previous chunk.
+                int eq_steps_eff = equilibration_steps;
+                if (!sim_config.thermal.initial_state_file.empty()) {
+                    if (eq_steps_eff > 0) {
+                        std::cout << "[GPU Thermal] thermal.initial_state_file is set; "
+                                     "forcing equilibration_steps=0 (was "
+                                  << eq_steps_eff << ")" << std::endl;
+                    }
+                    eq_steps_eff = 0;
+                }
                 thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
                     mesh,
                     direct_solar_values_full,
@@ -7736,13 +8444,20 @@ int main(int argc, char** argv) {
                     primary_ir_values_full,
                     times,
                     total_time_steps,
+                    eq_steps_eff,
                     thermal_config,
                     default_visible_albedo,
                     0.02,
                     &surface_temps,
-                    face_Qb_ptr
+                    face_Qb_ptr,
+                    face_H_ptr_g,
+                    ice_acc_ptr_a,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file
                 );
             } else if (use_simd_batch) {
+                const std::vector<double>* face_H_ptr_b =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 thermal_success = runThermalModelsForAllFacesBatchSoA(
                     output_dir,
                     mesh,
@@ -7758,7 +8473,8 @@ int main(int argc, char** argv) {
                     equilibration_steps,
                     total_time_steps,
                     thermal_threads,
-                    face_Qb_ptr
+                    face_Qb_ptr,
+                    face_H_ptr_b
                 );
             } else {
                 std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
@@ -7795,16 +8511,38 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else {
-            // Not chunked: pull full arrays and run standard path
-            direct_solar_values_full      = illumination_model->getDirectSolarValues();
-            primary_reflected_values_full = illumination_model->getPrimaryReflectedValues();
-            primary_ir_values_full        = illumination_model->getPrimaryIRFlux();
+            // Not chunked (or already extracted in outer scope): use existing arrays.
+            // Use swap (not move/copy) to temporarily transfer ownership to _full
+            // for the thermal solve. After the solve, swap back so the outer-scope
+            // vectors are restored for the export phase.
+            // For both chunked-already-extracted and non-chunked cases, the outer-scope
+            // arrays have the data. Reference them for the thermal solver.
+            // Use swap to avoid a copy — the swap-back below restores them for export.
+            direct_solar_values_full.swap(direct_solar_values);
+            primary_reflected_values_full.swap(primary_reflected_values);
+            primary_ir_values_full.swap(primary_ir_values);
 
             // Check which thermal solver to use
             bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
             bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
+            // Schorghofer & Taylor (2007) accumulator pointer. Null when the
+            // user has not requested ice-stability output → zero overhead path.
+            ice::IceStabilityAccumulator* ice_acc_ptr_b =
+                sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
+
             if (use_gpu_thermal) {
+                const std::vector<double>* face_H_ptr_g =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                int eq_steps_eff = equilibration_steps;
+                if (!sim_config.thermal.initial_state_file.empty()) {
+                    if (eq_steps_eff > 0) {
+                        std::cout << "[GPU Thermal] thermal.initial_state_file is set; "
+                                     "forcing equilibration_steps=0 (was "
+                                  << eq_steps_eff << ")" << std::endl;
+                    }
+                    eq_steps_eff = 0;
+                }
                 thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
                     mesh,
                     direct_solar_values_full,
@@ -7812,13 +8550,20 @@ int main(int argc, char** argv) {
                     primary_ir_values_full,
                     times,
                     total_time_steps,
+                    eq_steps_eff,
                     thermal_config,
                     default_visible_albedo,
                     0.02,
                     &surface_temps,
-                    face_Qb_ptr
+                    face_Qb_ptr,
+                    face_H_ptr_g,
+                    ice_acc_ptr_b,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file
                 );
             } else if (use_simd_batch) {
+                const std::vector<double>* face_H_ptr_b =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 thermal_success = runThermalModelsForAllFacesBatchSoA(
                     output_dir,
                     mesh,
@@ -7834,7 +8579,8 @@ int main(int argc, char** argv) {
                     equilibration_steps,
                     total_time_steps,
                     thermal_threads,
-                    face_Qb_ptr
+                    face_Qb_ptr,
+                    face_H_ptr_b
                 );
             } else {
                 std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
@@ -7870,12 +8616,38 @@ int main(int argc, char** argv) {
                 std::cerr << "Error during thermal mesh simulation" << std::endl;
                 return 1;
             }
+
+            // Swap illumination data back to outer scope for the export phase.
+            direct_solar_values.swap(direct_solar_values_full);
+            primary_reflected_values.swap(primary_reflected_values_full);
+            primary_ir_values.swap(primary_ir_values_full);
         }
 
         if (!thermal_success && surface_temps.empty()) {
             std::cerr << "Error during thermal mesh simulation" << std::endl;
             return 1;
         }
+
+        // Free the combined illumination_values array (~61 GB for ico9×1560).
+        // The export filter reconstructs it from direct+reflected if needed
+        // (filterFaceMajorStable line: il = illum_full.empty() ? (ds+rf) : illum_full[si]).
+        // The per-component arrays (direct_solar, reflected, ir) must stay alive for export.
+        {
+            std::vector<double>().swap(illumination_values);
+            std::cout << "[Memory] Released combined illumination array ("
+                      << "keeping per-component arrays for export)" << std::endl;
+        }
+
+        // If the GPU solver used two-phase execution, surface_temps contains only
+        // the output_steps (not eq + output). Adjust the bookkeeping so downstream
+        // export code (filterFaceMajorStable) doesn't try to skip past data that
+        // isn't there.
+        // surface_temps has total_time_steps entries per face. In two-phase mode,
+        // the eq slots (0..equilibration_steps-1) are zero-filled since those
+        // temperatures were evolved on GPU but not downloaded. The existing
+        // export filter skips them via skip_eq = equilibration_steps.
+        // IMPORTANT: do NOT modify total_time_steps or equilibration_steps here —
+        // they define the stride for indexing into the illumination arrays.
 
         // ========================================================================
         // RADIATION EXCHANGE COUPLING (Optional)
@@ -8266,11 +9038,14 @@ int main(int argc, char** argv) {
     }
 
     // Full arrays exist iff not streaming or we explicitly extracted
-    const bool have_full_illum_arrays =
+    bool have_full_illum_arrays =
         !(using_chunked_storage && use_streamed_thermal) &&
         !direct_solar_values.empty() &&
         !primary_reflected_values.empty() &&
         !primary_ir_values.empty();
+    // Independent flag: did the stride-based export already write per-step files?
+    // (Distinct from have_full_illum_arrays so the stats path can still use stats_fd.)
+    bool stride_export_already_done = false;
 
     // ===== INTEGRATION (statistics) interval =====
     int stats_start_step = 0;
@@ -8378,45 +9153,210 @@ int main(int argc, char** argv) {
                 verbose);
         }
 
+        // Illumination arrays are available for the export filter.
         if (have_full_illum_arrays) {
-            // Normal path: face-major copy into filtered arrays
-            FilteredData fd = filterFaceMajorStable(
-                illumination_values,
-                direct_solar_values,
-                primary_reflected_values,
-                primary_ir_values,
-                surface_temps,
-                times,
-                time_strings,
-                sun_positions,
-                primary_positions,
-                face_count,
-                total_ts,
-                skip_eq,
-                requested_out_ts,
-                verbose
-            );
+            // For large arrays (>10 GB), filter in-place to avoid doubling memory.
+            // filterFaceMajorStable allocates full copies which would OOM for ico9.
+            const double array_gb = static_cast<double>(face_count) * total_ts * 8.0 / (1024.0*1024.0*1024.0);
 
-            const int filtered_steps = static_cast<int>(fd.times.size());
-            diagnosticsIlluminationCoverage(
-                fd.illumination,
-                fd.direct,
-                face_count,
-                filtered_steps,
-                "Post-filter (output interval)",
-                verbose);
+            if (array_gb > 10.0 && skip_eq > 0) {
+                // Large arrays: skip the filter entirely. Instead, pass the
+                // original arrays directly to the export function with the
+                // correct stride (total_ts) and offset (skip_eq). The export
+                // reads `arr[f * stride + offset + t]` for output timestep t.
+                // This avoids allocating any intermediate filtered copies.
+                std::cout << "[Memory] Large arrays (~" << std::fixed
+                          << std::setprecision(0) << array_gb * 3
+                          << " GB); exporting with stride=" << total_ts
+                          << " offset=" << skip_eq << " (no intermediate copy)"
+                          << std::endl;
 
-            filtered_illumination_values.swap(fd.illumination);
-            filtered_direct_solar_values.swap(fd.direct);
-            filtered_primary_reflected_values.swap(fd.reflected);
-            filtered_primary_ir_values.swap(fd.ir);
-            filtered_surface_temps.swap(fd.temps);
-            filtered_times.swap(fd.times);
-            filtered_time_strings.swap(fd.time_strings);
-            filtered_sun_positions.swap(fd.sun_pos);
-            filtered_primary_positions.swap(fd.primary_pos);
+                // Slice only the meta arrays (tiny)
+                filtered_times.assign(times.begin() + skip_eq,
+                                      times.begin() + skip_eq + requested_out_ts);
+                filtered_time_strings.assign(time_strings.begin() + skip_eq,
+                                             time_strings.begin() + skip_eq + requested_out_ts);
+                filtered_sun_positions.assign(sun_positions.begin() + skip_eq,
+                                              sun_positions.begin() + skip_eq + requested_out_ts);
+                filtered_primary_positions.assign(primary_positions.begin() + skip_eq,
+                                                   primary_positions.begin() + skip_eq + requested_out_ts);
 
-            time_steps = filtered_steps;
+                // The illumination and temperature arrays keep their original
+                // layout (stride = total_ts). We pass skip_eq and total_ts to
+                // the export function so it reads the right slice.
+                // Use empty filtered_* arrays to signal the export to use
+                // the originals with stride/offset.
+                time_steps = requested_out_ts;
+
+                // Export directly from original arrays with stride
+                {
+                    using std::cout;
+                    const size_t F = face_count;
+                    const int out_steps = requested_out_ts;
+                    const int stride = total_ts;
+                    const int offset = skip_eq;
+
+                    // Always write mesh + time metadata (downstream stats consumers need them).
+                    // Skip mesh.ply when output.skip_mesh is set (chunked-run chunks 1+).
+                    namespace fs = std::filesystem;
+                    fs::create_directories(output_dir);
+                    if (!sim_config.output.skip_mesh &&
+                        !exportMeshToPLY(output_dir + "/mesh.ply", mesh)) {
+                        std::cerr << "ERROR exporting mesh\n";
+                    }
+                    writeTimeStepsFile(output_dir + "/time_steps.txt",
+                                       filtered_times, filtered_time_strings);
+
+                    if (sim_config.output.skip_time_series) {
+                        cout << "[output] skip_time_series=true (stride-based path) — "
+                                "per-step binary files NOT written; only mesh + statistics.\n";
+                        // Fall through to the metadata + skip-the-loop block below.
+                    } else {
+                    // Create per-step output directories
+                    fs::create_directories(output_dir + "/illumination");
+                    fs::create_directories(output_dir + "/direct_solar");
+                    fs::create_directories(output_dir + "/primary_reflected");
+                    fs::create_directories(output_dir + "/primary_ir");
+                    fs::create_directories(output_dir + "/temperature");
+
+                    std::cout << "\n[exportDataAsBinary] Stride-based export\n"
+                              << "  Faces=" << F << " time_steps=" << out_steps
+                              << " stride=" << stride << " offset=" << offset << "\n";
+
+                    std::vector<float> buf(F);
+                    int report = std::max(1, out_steps / 20);
+
+                    for (int t = 0; t < out_steps; ++t) {
+                        if (t % report == 0 || t == out_steps - 1) {
+                            cout << "\r  Progress " << (t+1) << "/" << out_steps << std::flush;
+                        }
+
+                        auto writeComponent = [&](const std::vector<double>& arr,
+                                                   const std::string& dir,
+                                                   const std::string& prefix) {
+                            if (arr.empty()) return;
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < F; ++f) {
+                                size_t idx = f * static_cast<size_t>(stride) + offset + t;
+                                buf[f] = (idx < arr.size())
+                                    ? static_cast<float>(arr[idx]) : 0.0f;
+                            }
+                            std::ostringstream fn;
+                            fn << output_dir << "/" << dir << "/" << prefix
+                               << "_" << std::setw(4) << std::setfill('0') << t << ".bin";
+
+                            std::ofstream out(fn.str(), std::ios::binary);
+                            uint32_t count = static_cast<uint32_t>(F);
+                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                        };
+
+                        // Illumination = direct + reflected (reconstruct on the fly)
+                        {
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < F; ++f) {
+                                size_t idx = f * static_cast<size_t>(stride) + offset + t;
+                                float ds = (idx < direct_solar_values.size())
+                                    ? static_cast<float>(direct_solar_values[idx]) : 0.0f;
+                                float rf = (idx < primary_reflected_values.size())
+                                    ? static_cast<float>(primary_reflected_values[idx]) : 0.0f;
+                                buf[f] = ds + rf;
+                            }
+                            std::ostringstream fn;
+                            fn << output_dir << "/illumination/illumination_"
+                               << std::setw(4) << std::setfill('0') << t << ".bin";
+                            std::ofstream out(fn.str(), std::ios::binary);
+                            uint32_t count = static_cast<uint32_t>(F);
+                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                        }
+
+                        writeComponent(direct_solar_values, "direct_solar", "direct_solar");
+                        writeComponent(primary_reflected_values, "primary_reflected", "primary_reflected");
+                        writeComponent(primary_ir_values, "primary_ir", "primary_ir");
+
+                        // Temperature (face-major vector<vector<double>>)
+                        if (!surface_temps.empty()) {
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < F; ++f) {
+                                int src_t = offset + t;
+                                float v = 50.0f;
+                                if (f < surface_temps.size() &&
+                                    src_t < static_cast<int>(surface_temps[f].size())) {
+                                    double tv = surface_temps[f][src_t];
+                                    if (std::isfinite(tv) && tv > 0.0 && tv < 10000.0)
+                                        v = static_cast<float>(tv);
+                                }
+                                buf[f] = v;
+                            }
+                            std::ostringstream fn;
+                            fn << output_dir << "/temperature/temperature_"
+                               << std::setw(4) << std::setfill('0') << t << ".bin";
+                            std::ofstream out(fn.str(), std::ios::binary);
+                            uint32_t count = static_cast<uint32_t>(F);
+                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                        }
+                    }
+                    cout << "\n  Export complete: " << out_steps << "/" << out_steps << "\n";
+                    cout << "  Binary export completed successfully!\n";
+                    } // end else (per-step files written)
+                }
+
+                // Write metadata
+                {
+                    std::ofstream meta(output_dir + "/metadata.txt");
+                    meta << "faces=" << face_count << "\n"
+                         << "time_steps=" << requested_out_ts << "\n"
+                         << "successful_timesteps=" << requested_out_ts << "\n"
+                         << "failed_timesteps=0\n"
+                         << "is_custom_mesh=false\n"
+                         << "components=illumination,direct_solar,primary_reflected,primary_ir,temperature\n";
+                }
+
+                // Signal the caller to skip the normal binary export below.
+                stride_export_already_done = true;
+
+            } else {
+                // Normal path (small arrays): allocate filtered copies
+                FilteredData fd = filterFaceMajorStable(
+                    illumination_values,
+                    direct_solar_values,
+                    primary_reflected_values,
+                    primary_ir_values,
+                    surface_temps,
+                    times,
+                    time_strings,
+                    sun_positions,
+                    primary_positions,
+                    face_count,
+                    total_ts,
+                    skip_eq,
+                    requested_out_ts,
+                    verbose
+                );
+
+                const int filtered_steps = static_cast<int>(fd.times.size());
+                diagnosticsIlluminationCoverage(
+                    fd.illumination,
+                    fd.direct,
+                    face_count,
+                    filtered_steps,
+                    "Post-filter (output interval)",
+                    verbose);
+
+                filtered_illumination_values.swap(fd.illumination);
+                filtered_direct_solar_values.swap(fd.direct);
+                filtered_primary_reflected_values.swap(fd.reflected);
+                filtered_primary_ir_values.swap(fd.ir);
+                filtered_surface_temps.swap(fd.temps);
+                filtered_times.swap(fd.times);
+                filtered_time_strings.swap(fd.time_strings);
+                filtered_sun_positions.swap(fd.sun_pos);
+                filtered_primary_positions.swap(fd.primary_pos);
+
+                time_steps = filtered_steps;
+            }
         } else {
             // Chunked/streamed path: slice meta and temperatures, AND extract illumination for output window only
             const int start = skip_eq;
@@ -8646,9 +9586,9 @@ int main(int argc, char** argv) {
                 std::cout << "Complete data written to " << vtk_file << std::endl;
             }
         }
-    } else if (output_format == "binary") {
+    } else if (output_format == "binary" && !sim_config.output.skip_time_series && !stride_export_already_done) {
         std::cout << "Using binary output format for data files" << std::endl;
-        
+
         // IMPORTANT: Disable internal stats here; we'll export stats for the integration window below.
         const bool compute_statistics_for_output = false;
         if (!run_thermal_mesh) {
@@ -8665,7 +9605,8 @@ int main(int argc, char** argv) {
                 filtered_time_strings,
                 time_steps,
                 !mesh_file.empty(), // is_custom_mesh
-                compute_statistics_for_output
+                compute_statistics_for_output,
+                sim_config.output.skip_mesh
             );
         } else {
             // For thermal runs, pass all filtered data including temperatures
@@ -8681,7 +9622,8 @@ int main(int argc, char** argv) {
                 filtered_time_strings,
                 time_steps,
                 !mesh_file.empty(), // is_custom_mesh
-                compute_statistics_for_output
+                compute_statistics_for_output,
+                sim_config.output.skip_mesh
             );
         }
         
@@ -8690,6 +9632,23 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "ERROR: Failed to export data in binary format!" << std::endl;
         }
+    } else if (output_format == "binary" && sim_config.output.skip_time_series) {
+        std::cout << "[output] skip_time_series=true — per-step binary files NOT written; "
+                     "writing mesh + time metadata + statistics only." << std::endl;
+        try {
+            std::filesystem::create_directories(output_dir);
+        } catch (const std::exception& e) {
+            std::cerr << "[output] WARNING: cannot create output dir: " << e.what() << "\n";
+        }
+        bool mesh_ok = true;
+        if (!sim_config.output.skip_mesh) {
+            mesh_ok = exportMeshToPLY(output_dir + "/mesh.ply", mesh);
+            if (!mesh_ok) std::cerr << "[output] WARNING: mesh.ply write failed\n";
+        }
+        bool time_ok = writeTimeStepsFile(output_dir + "/time_steps.txt",
+                                          filtered_times, filtered_time_strings);
+        if (!time_ok) std::cerr << "[output] WARNING: time_steps.txt write failed\n";
+        data_write_success = mesh_ok && time_ok;
     }
 
     // Export statistics over the INTEGRATION window only
@@ -8697,6 +9656,7 @@ int main(int argc, char** argv) {
         try {
             std::cout << "\n[Statistics] Exporting statistics over integration window..." << std::endl;
 
+            const bool write_raw = sim_config.output.write_raw_stats;
             bool stats_ok = false;
             if (have_full_illum_arrays) {
                 // Arrays are present: use existing path
@@ -8708,7 +9668,8 @@ int main(int argc, char** argv) {
                     stats_fd.reflected,
                     stats_fd.ir,
                     stats_fd.temps,
-                    stats_steps
+                    stats_steps,
+                    write_raw
                 );
             } else {
                 // Streamed mode: compute illumination stats on-the-fly via getters
@@ -8734,7 +9695,8 @@ int main(int argc, char** argv) {
                     /*refl*/  std::vector<double>(),
                     /*ir*/    std::vector<double>(),
                     stats_fd.temps,
-                    stats_steps
+                    stats_steps,
+                    write_raw
                 );
 
                 stats_ok = illum_ok && temp_ok;
@@ -8747,6 +9709,82 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::cerr << "WARNING: Exception during statistics export: " << e.what() << std::endl;
+        }
+
+        // Schorghofer & Taylor (2007) ice-stability output. Computed only
+        // when the user asked for it (zero overhead otherwise) and only
+        // when the GPU/CPU thermal solver actually filled the accumulator.
+        if (sim_config.thermal.compute_ice_stability && ice_stability_accum.ready()) {
+            const auto& isp = sim_config.thermal.ice_stability;
+            const double l_m = isp.grain_hop_length_um * 1e-6;
+            std::cout << "[Ice stability] Solving J(z)=μℓ⟨E⟩/(2z)=J0 per face... "
+                      << "(N_samples=" << ice_stability_accum.n_samples
+                      << ", layers=" << ice_stability_accum.n_layers
+                      << ", J0=" << std::scientific << std::setprecision(2)
+                      << isp.flux_threshold_kgm2s
+                      << " kg/m²/s, ℓ=" << std::fixed << std::setprecision(1)
+                      << isp.grain_hop_length_um << " μm)" << std::endl;
+            std::vector<float> ice_depth = ice::computeIceStabilityDepths(
+                ice_stability_accum,
+                isp.flux_threshold_kgm2s,
+                l_m,
+                /* z_max_m */ -1.0,
+                /* use_openmp */ true);
+
+            // If raw-stats output is enabled, dump the per-face × per-layer
+            // ⟨E(z)⟩ accumulator alongside the solved depth so a chunked
+            // run's merge step can sum-then-solve.
+            if (sim_config.output.write_raw_stats) {
+                if (writeIceStabilityRaw(output_dir, ice_stability_accum)) {
+                    std::cout << "[Ice stability] Wrote raw accumulator to "
+                              << output_dir << "/statistics/_raw/" << std::endl;
+                }
+            }
+
+            // Write a single ice_depth.bin (replaces the legacy three-suffix
+            // ice_depth_avg/max/min.bin). Format matches writeStatisticsBinary:
+            // uint32 N, then N float32 values.
+            try {
+                std::filesystem::create_directories(output_dir + "/statistics");
+            } catch (...) {}
+            const std::string fn = output_dir + "/statistics/ice_depth.bin";
+            std::ofstream of(fn, std::ios::binary);
+            if (of) {
+                uint32_t N = static_cast<uint32_t>(ice_depth.size());
+                of.write(reinterpret_cast<const char*>(&N), sizeof(uint32_t));
+                of.write(reinterpret_cast<const char*>(ice_depth.data()),
+                         ice_depth.size() * sizeof(float));
+                if (of.good()) {
+                    // Quick summary
+                    size_t n_at_zero = 0, n_capped = 0, n_finite = 0;
+                    double sum = 0.0, lo = 1e30, hi = 0.0;
+                    const double cap = ice_stability_accum.z.empty() ? 0.0 :
+                                        ice_stability_accum.z.back();
+                    for (float v : ice_depth) {
+                        if (std::isfinite(v)) {
+                            ++n_finite;
+                            sum += v;
+                            if (v < lo) lo = v;
+                            if (v > hi) hi = v;
+                            if (v == 0.0f) ++n_at_zero;
+                            if (cap > 0.0 && v >= static_cast<float>(cap) - 1e-6f) ++n_capped;
+                        }
+                    }
+                    const double mean = (n_finite > 0) ? sum / n_finite : 0.0;
+                    std::cout << "[Ice stability] Wrote " << fn << "  ("
+                              << n_finite << " finite, range " << lo << ".." << hi
+                              << " m, mean " << mean << " m, "
+                              << n_at_zero << " at surface, "
+                              << n_capped << " at z_max=" << cap << " m)" << std::endl;
+                } else {
+                    std::cerr << "[Ice stability] WARNING: write failed for " << fn << "\n";
+                }
+            } else {
+                std::cerr << "[Ice stability] WARNING: cannot open " << fn << " for write\n";
+            }
+        } else if (sim_config.thermal.compute_ice_stability) {
+            std::cerr << "[Ice stability] WARNING: requested but accumulator not ready "
+                         "(thermal solver path may not yet implement the hook)." << std::endl;
         }
     }
 

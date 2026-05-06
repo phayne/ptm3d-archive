@@ -20,20 +20,67 @@ struct CameraConfig {
     double longitude_deg = 0.0;
     double altitude_km = 100.0;
 
-    // Look-at point or direction
+    // Look-at target. FIXED (default) uses the look_at XYZ point directly.
+    // LATLON computes the surface point from (lat, lon) each frame.
+    // LIMB_SUN / LIMB_PRIMARY track the point on the visible limb closest to the
+    // Sun / Earth (computed per frame from SPICE positions).
+    enum class LookAtMode { FIXED, LATLON, LIMB_SUN, LIMB_PRIMARY };
+    LookAtMode look_at_mode = LookAtMode::FIXED;
+
     std::array<double, 3> look_at{0.0, 0.0, 0.0};
     bool use_direction = false;  // If true, look_at is treated as a direction vector
+
+    // For LATLON mode: surface point at this lat/lon (alt = 0).
+    double look_at_lat_deg = 0.0;
+    double look_at_lon_deg = 0.0;
 
     // Up vector hint
     std::array<double, 3> up_vector{0.0, 0.0, 1.0};
 
-    // Optics
+    // Optics — pinhole geometry
     double focal_length_mm = 50.0;
     double sensor_width_mm = 36.0;   // 35mm full-frame default
     double sensor_height_mm = 24.0;
     int nx = 1024;
     int ny = 1024;
     double fov_x_deg = -1.0;  // If > 0, overrides focal_length
+
+    // Realistic-camera extensions. All default to pinhole behaviour (zero
+    // distortion, principal point at image center, square pixels) so existing
+    // configurations are bit-identical.
+    //
+    // Principal point (pixel coordinates, 0-indexed, sensor top-left origin).
+    // < 0 means "use image center" ((nx-1)/2, (ny-1)/2).
+    double cx = -1.0;
+    double cy = -1.0;
+
+    // Anisotropic pixel pitch (mm/pixel). If BOTH > 0, these override the
+    // sensor_width_mm / sensor_height_mm derivation and allow non-square pixels.
+    double pixel_pitch_x_mm = -1.0;
+    double pixel_pitch_y_mm = -1.0;
+
+    // Brown-Conrady distortion (OpenCV convention). All zero = pure pinhole.
+    //   Forward model (ideal → distorted normalized coords):
+    //     x_d = x*(1 + k1*r² + k2*r⁴ + k3*r⁶) + 2*p1*x*y + p2*(r² + 2x²)
+    //     y_d = y*(1 + k1*r² + k2*r⁴ + k3*r⁶) + p1*(r² + 2y²) + 2*p2*x*y
+    // The ray generator uses the inverse (iterative fixed-point).
+    double k1 = 0.0, k2 = 0.0, k3 = 0.0;   // radial
+    double p1 = 0.0, p2 = 0.0;              // tangential
+
+    // Orientation source. Controls how R_cam→world is built in configure().
+    // LOOK_AT is the legacy/default path.
+    enum class Pointing { LOOK_AT, QUATERNION, ROTATION_MATRIX, SPICE_CK };
+    Pointing pointing = Pointing::LOOK_AT;
+
+    // Quaternion (w, x, y, z) mapping camera frame → body-fixed frame.
+    // Used only when pointing == QUATERNION.
+    std::array<double, 4> quaternion{1.0, 0.0, 0.0, 0.0};
+
+    // Explicit 3x3 rotation matrix R_cam→world (row-major).
+    // Used only when pointing == ROTATION_MATRIX.
+    std::array<std::array<double, 3>, 3> rotation_matrix{{
+        {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}
+    }};
 
     // SPICE IK mode
     std::string instrument_name;
@@ -63,9 +110,19 @@ public:
     };
     Ray generateRay(int px, int py) const;
 
+    // Generate a ray for pixel (px, py) with a sub-pixel offset.
+    // subpx, subpy should be in [-0.5, +0.5] for samples inside the pixel.
+    // Used for N×N supersampling (anti-aliasing).
+    Ray generateRaySubpixel(int px, int py, double subpx, double subpy) const;
+
     // Generate all rays (row-major: py * nx + px)
     void generateAllRays(std::vector<std::array<double, 3>>& origins,
                          std::vector<std::array<double, 3>>& directions) const;
+
+    // Convert lat/lon/alt to body-fixed XYZ (km). Public so that
+    // CameraSimulator::renderFrame() can use it for dynamic look-at.
+    static std::array<double, 3> latlonaltToXYZ(double lat_deg, double lon_deg,
+                                                 double alt_km, double body_radius_km);
 
     int width() const { return nx_; }
     int height() const { return ny_; }
@@ -73,6 +130,30 @@ public:
     const std::array<double, 3>& forward() const { return forward_; }
     double fovXDeg() const { return fov_x_deg_; }
     double fovYDeg() const { return fov_y_deg_; }
+
+    // Principal point (1-indexed FITS convention) and focal length in pixels.
+    // Exposed for FITS WCS writing.
+    double principalPointX() const { return cx_; }
+    double principalPointY() const { return cy_; }
+    double focalLengthPxX()  const { return f_x_px_; }
+    double focalLengthPxY()  const { return f_y_px_; }
+    double pixelPitchXMm()   const { return pixel_pitch_x_mm_; }
+    double pixelPitchYMm()   const { return pixel_pitch_y_mm_; }
+    double focalLengthMm()   const { return focal_length_mm_; }
+
+    // True iff any distortion coefficient is non-zero.
+    bool hasDistortion() const {
+        return k1_ != 0.0 || k2_ != 0.0 || k3_ != 0.0 || p1_ != 0.0 || p2_ != 0.0;
+    }
+    double k1() const { return k1_; }
+    double k2() const { return k2_; }
+    double k3() const { return k3_; }
+    double p1() const { return p1_; }
+    double p2() const { return p2_; }
+
+    // SPICE-IK metadata (populated after configureFromSPICE; empty otherwise).
+    const std::string& instrumentFrame() const { return instrument_frame_; }
+    int instrumentId() const { return instrument_naif_id_; }
 
 private:
     std::array<double, 3> position_{0, 0, 0};
@@ -88,9 +169,31 @@ private:
     double half_width_tan_ = 0.0;
     double half_height_tan_ = 0.0;
 
-    // Convert lat/lon/alt to body-fixed XYZ
-    static std::array<double, 3> latlonaltToXYZ(double lat_deg, double lon_deg,
-                                                 double alt_km, double body_radius_km);
+    // Cached realistic-camera intrinsics, populated in configure().
+    double focal_length_mm_ = 50.0;
+    double pixel_pitch_x_mm_ = 0.0;
+    double pixel_pitch_y_mm_ = 0.0;
+    double f_x_px_ = 0.0;   // focal length in pixels (x axis)
+    double f_y_px_ = 0.0;
+    double cx_ = 0.0;       // principal point (pixels, 0-indexed)
+    double cy_ = 0.0;
+    double k1_ = 0.0, k2_ = 0.0, k3_ = 0.0;
+    double p1_ = 0.0, p2_ = 0.0;
+    bool has_distortion_ = false;
+
+    // SPICE-IK metadata
+    std::string instrument_frame_;
+    int instrument_naif_id_ = 0;
+
+    // Helper: invert Brown-Conrady forward model (distorted → ideal normalized
+    // coords) via 5-iteration fixed-point. Matches OpenCV undistortPoints.
+    void undistortNormalized(double x_d, double y_d,
+                             double& x_u, double& y_u) const;
+
+    // Helper: build (right_, up_, forward_) from a quaternion (w, x, y, z) or
+    // from an explicit rotation matrix (camera frame → body-fixed frame).
+    void setAxesFromQuaternion(const std::array<double, 4>& q);
+    void setAxesFromRotationMatrix(const std::array<std::array<double, 3>, 3>& R);
 };
 
 // Vector math utilities

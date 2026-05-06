@@ -102,9 +102,29 @@ class ConfigManager:
             "run_thermal_mesh": True,
             "threads": 0,
             "equilibration_orbits": 1.0,
+            # Equilibration cadence (optional). Priority:
+            # 1) equilibration_steps_per_day > 0 -> explicit override (steps/Earth-day)
+            # 2) equilibration_samples_per_diurnal_cycle > 0 -> accuracy-based auto
+            # 3) both <=0 -> legacy (match output cadence)
+            # GUI default uses samples_per_diurnal_cycle=120 ("Balanced" tier, ~4 K max
+            # accuracy on Moon ico3 reference test).
+            "equilibration_steps_per_day": -1.0,
+            "equilibration_samples_per_diurnal_cycle": 120.0,
             "use_gpu": False,
             "compute_statistics": True,
+            # Per-face thermal property maps. The GUI presents these via two
+            # synthetic fields (property_map_mode, property_map_kind) that map
+            # onto the underlying YAML keys at save time:
+            #   mode 0 (None)    -> use_default_property_map=False, both file paths empty
+            #   mode 1 (Bundled) -> use_default_property_map=True
+            #   mode 2 (Custom)  + kind 0 (H)  -> h_parameter_map = <path>
+            #                    + kind 1 (TI) -> thermal_inertia_map = <path>
+            "property_map_mode": 0,
+            "property_map_kind": 0,
             "thermal_inertia_map": "",
+            "h_parameter_map": "",
+            "use_default_property_map": False,
+            "property_maps_directory": "data/property_maps",
             "enable_shadow_flux": False,
             "crater_dd_ratio": 8.0,
             "integration_days": -1.0,
@@ -298,6 +318,29 @@ class ConfigManager:
 
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
 
+        # Derive synthetic GUI fields property_map_mode / property_map_kind
+        # from the underlying YAML keys (so the GUI radio reflects the file).
+        therm = self.config.get("thermal", {})
+        h_path  = therm.get("h_parameter_map", "")
+        ti_path = therm.get("thermal_inertia_map", "")
+        use_def = therm.get("use_default_property_map", False)
+        if h_path:
+            therm["property_map_mode"] = 2  # Custom
+            therm["property_map_kind"] = 0  # H
+        elif ti_path:
+            therm["property_map_mode"] = 2  # Custom
+            therm["property_map_kind"] = 1  # TI
+        elif use_def:
+            therm["property_map_mode"] = 1  # Bundled default
+            # Kind defaults to H (which is what the bundled default is); user
+            # can flip to TI bundled if the file is ti273k_*.bin (not yet
+            # auto-discovered in v1).
+            therm["property_map_kind"] = 0
+        else:
+            therm["property_map_mode"] = 0  # None
+            therm["property_map_kind"] = 0
+        self.config["thermal"] = therm
+
         # Auto-detect custom thermophysical values from loaded YAML
         # If the YAML contains a thermophysical property, set use_default_* to False
         if loaded and "thermophysical" in loaded:
@@ -391,6 +434,62 @@ class ConfigManager:
                     out[k] = cleaned
                 continue
             out[k] = v
+
+        # Translate the synthetic property-map mode/kind into the underlying
+        # YAML keys the C++ parser consumes, then strip the synthetic ones.
+        # mode 0 = None ; 1 = Bundled default ; 2 = Custom file
+        # kind 0 = H-parameter ; 1 = Thermal inertia
+        # The GUI's QComboBox writeback stores the *label text* (see
+        # add_combo_field's currentTextChanged binding), so map labels back
+        # to indices defensively.
+        _MODE_LABELS = {
+            "None (uniform body H)": 0,
+            "Bundled icosphere default for body": 1,
+            "Custom file": 2,
+        }
+        _KIND_LABELS = {
+            "H-parameter (m)": 0,
+            "Thermal inertia (J m^-2 K^-1 s^-1/2)": 1,
+        }
+        def _to_index(raw, label_map):
+            if isinstance(raw, str):
+                if raw in label_map:
+                    return label_map[raw]
+                # numeric string fallback (e.g. "1")
+                try:
+                    return int(raw)
+                except (ValueError, TypeError):
+                    return 0
+            try:
+                return int(raw)
+            except (ValueError, TypeError):
+                return 0
+        if "thermal" in out:
+            therm = _dc(out["thermal"])
+            mode = _to_index(therm.pop("property_map_mode", 0), _MODE_LABELS)
+            kind = _to_index(therm.pop("property_map_kind", 0), _KIND_LABELS)
+            # Reset all three underlying knobs first so we serialize a
+            # consistent state regardless of stale fields in self.config.
+            therm["use_default_property_map"] = False
+            therm["thermal_inertia_map"] = ""
+            therm["h_parameter_map"] = ""
+            if mode == 1:  # Bundled default
+                therm["use_default_property_map"] = True
+            elif mode == 2:  # Custom file
+                # The GUI single file widget binds to thermal_inertia_map by
+                # convention; on first load from a YAML that wrote
+                # h_parameter_map, the path may still live there. Pull from
+                # whichever has data.
+                src_thermal = self.config.get("thermal", {})
+                custom_path = (
+                    src_thermal.get("thermal_inertia_map", "")
+                    or src_thermal.get("h_parameter_map", "")
+                )
+                if kind == 0:
+                    therm["h_parameter_map"] = custom_path
+                else:
+                    therm["thermal_inertia_map"] = custom_path
+            out["thermal"] = therm
 
         # Sanitise simulation.body
         body = out.get("simulation", {}).get("body", "")

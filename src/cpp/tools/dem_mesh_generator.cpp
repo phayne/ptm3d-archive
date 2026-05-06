@@ -82,7 +82,8 @@ bool areCoordinatesReasonable(double lon_min, double lon_max, double lat_min, do
 }
 
 // Load DEM using GDAL library
-bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename) {
+bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename,
+                         double mean_radius = 1737400.0) {
     // Initialize GDAL
     GDALAllRegister();
     
@@ -126,7 +127,33 @@ bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename) {
     double lon_max = lon_min + width * geotransform[1];
     double lat_max = geotransform[3];
     double lat_min = lat_max + height * geotransform[5];
-    
+
+    // Auto-detect projected (metric) Equidistant / SimpleCylindrical
+    // coordinates and convert to degrees. The LOLA SLDEM2015 / LDEM_118m
+    // products from PDS ship with projected metres at 0° standard parallel:
+    //   x_metres = R * lon_radians ;  y_metres = R * lat_radians.
+    // Triggered when the raw bounds are obviously not lat/lon (any |coord|
+    // exceeding 720°), which is a safe heuristic since a global lat/lon
+    // raster fits within ±180° lon / ±90° lat.
+    if (std::abs(lon_min) > 720.0 || std::abs(lon_max) > 720.0 ||
+        std::abs(lat_min) > 720.0 || std::abs(lat_max) > 720.0) {
+        const double R = mean_radius;     // metres; passed via argv[5]
+        const double rad_to_deg = 180.0 / M_PI;
+        std::cout << "Detected projected (metric) coordinates; converting to "
+                  << "degrees using R = " << R << " m\n";
+        lon_min = lon_min * rad_to_deg / R;
+        lon_max = lon_max * rad_to_deg / R;
+        lat_min = lat_min * rad_to_deg / R;
+        lat_max = lat_max * rad_to_deg / R;
+        // GeoTIFF bounds can exceed exact ±90 / ±180 by a fraction of a pixel
+        // due to mean-radius rounding in the projection definition. Clamp so
+        // the downstream reasonableness check doesn't reject a global raster.
+        lat_min = std::max(-90.0, std::min(90.0, lat_min));
+        lat_max = std::max(-90.0, std::min(90.0, lat_max));
+        lon_min = std::max(-360.0, std::min(360.0, lon_min));
+        lon_max = std::max(-360.0, std::min(360.0, lon_max));
+    }
+
     std::cout << "Initial coordinate range calculation:" << std::endl;
     std::cout << "  Longitude: " << lon_min << " to " << lon_max << " degrees" << std::endl;
     std::cout << "  Latitude: " << lat_min << " to " << lat_max << " degrees" << std::endl;
@@ -390,20 +417,26 @@ int main(int argc, char** argv) {
         std::cout << "  min_res: Minimum resolution level (default: 3)" << std::endl;
         std::cout << "  max_res: Maximum resolution level (default: 7)" << std::endl;
         std::cout << "  body_radius: Mean radius of body in meters (default: 1737400 for Moon)" << std::endl;
-        std::cout << "  elevation_scale: Scaling factor for elevation values (default: 1.0)" << std::endl;
+        std::cout << "  elevation_scale: Scaling factor for elevation values (default: 0.5)" << std::endl;
+        std::cout << "                   0.5 is the LOLA SLDEM2015 / LDEM_118m DN-to-metre factor." << std::endl;
+        std::cout << "                   Override only if your input DEM is already pre-scaled to metres." << std::endl;
         return 1;
     }
-    
+
     std::string input_dem = argv[1];
     std::string output_dir = argv[2];
     int min_resolution = (argc > 3) ? std::stoi(argv[3]) : 3;
     int max_resolution = (argc > 4) ? std::stoi(argv[4]) : 7;
     double mean_radius = (argc > 5) ? std::stod(argv[5]) : MEAN_LUNAR_RADIUS;
-    double elevation_scale = (argc > 6) ? std::stod(argv[6]) : 1.0;
-    
-    if (elevation_scale != 1.0) {
-        std::cout << "Using elevation scaling factor: " << elevation_scale << "x" << std::endl;
+    // Default 0.5 reflects the LOLA SLDEM2015 / LDEM_118m DN-to-metre factor
+    // (16-bit signed integers store elevation in 0.5 m increments).
+    double elevation_scale = (argc > 6) ? std::stod(argv[6]) : 0.5;
+
+    std::cout << "Using elevation scaling factor: " << elevation_scale << "x";
+    if (elevation_scale != 0.5) {
+        std::cout << "  WARNING: non-default (LOLA DN factor is 0.5)";
     }
+    std::cout << std::endl;
     
     // Create output directory if it doesn't exist
     std::filesystem::create_directories(output_dir);
@@ -412,7 +445,7 @@ int main(int argc, char** argv) {
     std::cout << "Loading high-resolution DEM: " << input_dem << std::endl;
     SpatialMap dem_map;
 
-    if (!loadDEMToSpatialMap(dem_map, input_dem)) {
+    if (!loadDEMToSpatialMap(dem_map, input_dem, mean_radius)) {
         std::cerr << "Fatal error: Could not load the DEM. Exiting." << std::endl;
         return 1;
     }
@@ -578,7 +611,15 @@ int main(int argc, char** argv) {
         std::cout << "  Radius range: " << radius_range << " meters (" 
                   << (100.0 * radius_range / mean_vertex_radius) << "%)" << std::endl;
         
-        // Recalculate face properties with the new elevations
+        // Recalculate face properties with the new elevations.
+        // setupMesh() already populated face_normals (radial) and face_centers
+        // (from un-displaced unit-icosphere vertices). Without clearing those
+        // arrays, calculateFaceProperties' skip-cache short-circuits and we
+        // ship stale data: normals stay purely radial (no slope tilt) and
+        // face_centers stay at the wrong scale. Clearing forces a clean
+        // recompute from the now-displaced vertex positions.
+        mesh->face_normals.clear();
+        mesh->face_centers.clear();
         meshUtils.calculateFaceProperties(false);
         
         // Extract the body name from the input file or use a command-line parameter
@@ -607,10 +648,25 @@ int main(int argc, char** argv) {
         }
         
         std::cout << "Generating mesh for body: " << body_name << std::endl;
-        std::string output_file = output_dir + "/" + body_name + "_Topo_res" + std::to_string(resolution) + ".bin";
-        
-        // Save the mesh with elevations
-        meshUtils.exportMeshToFile(output_file, mesh, vertex_elevations);
+        // 2026-04 naming: topo_<body>_ico<N>.bin (parallels hpar_<body>_ico<N>.bin
+        // and ti273k_<body>_ico<N>.bin under data/property_maps/<body>/).
+        std::string body_lower = body_name;
+        std::transform(body_lower.begin(), body_lower.end(), body_lower.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        std::string output_file = output_dir + "/topo_" + body_lower
+                                + "_ico" + std::to_string(resolution) + ".bin";
+
+        // Apply elevation_scale to the elevations array as well, so the file
+        // stores elevations in metres (matching the geometry of the vertex
+        // positions written above). Canonical Moon_Topo_res9.bin (the
+        // Artemis-validated reference) follows this convention.
+        std::vector<double> scaled_elevations(vertex_elevations.size());
+        for (size_t i = 0; i < vertex_elevations.size(); ++i) {
+            scaled_elevations[i] = vertex_elevations[i] * elevation_scale;
+        }
+
+        // Save the mesh with (scaled) elevations
+        meshUtils.exportMeshToFile(output_file, mesh, scaled_elevations);
         std::cout << "Saved topographic mesh to " << output_file << std::endl;
     }
     

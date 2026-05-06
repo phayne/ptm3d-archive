@@ -1714,6 +1714,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::vector<double> current_temps(nf);
         std::vector<double> zero_deposition(num_faces_, 0.0);
         std::vector<double> sputtering_flux;
+        // Per-timestep crystallization rate buffer (only populated when the
+        // crystallization model is active; left untouched otherwise).
+        std::vector<double> k_cryst_step;
+        const std::vector<double>* porosity_per_face = nullptr;
+        if (crystallization_enabled_ && crystallization_model_) {
+            k_cryst_step.assign(nf, 0.0);
+            porosity_per_face = &crystallization_model_->getPorosity();
+        }
 
         // Run through one diurnal cycle, accumulating fluxes.
         // Deposition will be computed after finalization from the escape fraction.
@@ -1744,6 +1752,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 state.escape_flux,
                 current_temps
             );
+
+            // Accumulate <k_cryst(T(t))> per face for the multi-timescale
+            // crystallization step (Eq. D34 with the time-averaged Avrami rate).
+            // Lock-step with accumulateDiurnalStep so the averaging denominator
+            // matches.
+            if (crystallization_enabled_ && crystallization_model_ && porosity_per_face) {
+                #pragma omp parallel for
+                for (size_t f = 0; f < nf; ++f) {
+                    k_cryst_step[f] = crystallization_model_->crystallizationRate(
+                        current_temps[f], (*porosity_per_face)[f]);
+                }
+                multiscale_evolution_->accumulateCrystallizationRate(k_cryst_step);
+            }
+
             accumulated_count++;
         }
 
@@ -1834,13 +1856,16 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         multiscale_evolution_->evolveEpoch(*ice_layer_model_, *ice_layer_state_,
                                             face_areas_, epoch_duration);
 
-        // Evolve ice crystallinity over the epoch using diurnal-averaged temperature
-        // The analytical ODE solution handles the large epoch timestep gracefully
+        // Evolve ice crystallinity over the epoch using the time-averaged
+        // crystallization rate <k_cryst(T(t))>, NOT k_cryst(<T>). The latter
+        // is biased by Jensen's inequality near the crystallization knife-edge
+        // (k_cryst is exponential in T) and underpredicts steady-state phi_C
+        // by orders of magnitude on warm-equator faces.
         if (crystallization_enabled_ && crystallization_model_) {
             const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
 
-            crystallization_model_->evolveAllFaces(
-                epoch_duration, diurnal_avg.avg_temperature,
+            crystallization_model_->evolveAllFacesWithRate(
+                epoch_duration, diurnal_avg.avg_crystallization_rate,
                 ice_layer_state_->crystalline_fraction);
 
             // Apply depositional amorphization from epoch-averaged deposition

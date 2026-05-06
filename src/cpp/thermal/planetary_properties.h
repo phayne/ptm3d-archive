@@ -148,7 +148,7 @@ private:
         props.S = 1361.0;                     // Solar constant at 1 AU (W/m²)
 
         // Surface properties (Hayne et al. 2017 Table A1)
-        props.albedo = 0.12;                  // Bond albedo A0
+        props.albedo = 0.12;                  // Hemispherical albedo A0 at normal incidence (theta=0)
         props.emissivity = 0.95;              // Thermal emissivity
         props.Qb = 0.018;                     // Internal heat flux (W/m²), Langseth et al. 1976
 

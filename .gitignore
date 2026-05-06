@@ -51,6 +51,20 @@ results/
 data/maps/*.fits
 data/kernels/
 data/meshes/moon3d_cartesian_double.ply
+data/alma/
+data/dem/
+data/spice/
+data/topo/
+data/jwst/
+data/property_maps/
+
+# Local caches and outputs
+.cache/
+camera_output/
+plots/
+notebooks/
+examples/data/
+docs/figures/jwst/
 
 # Research papers (keep locally, reference by DOI in docs)
 docs/*.pdf

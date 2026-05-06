@@ -495,7 +495,15 @@ __kernel void persistentThermalKernel(
     float dt,                          // Timestep
     int n_faces,
     int n_layers,
-    int n_timesteps)
+    int n_timesteps,
+    // Schorghofer & Taylor (2007) ice-stability accumulator (optional).
+    // When do_accumulate != 0, ⟨E(T(z,t))⟩ is summed per face × layer
+    // for every timestep in [accum_start, accum_end). Buffer must be
+    // n_layers * n_faces large but is otherwise unused when disabled.
+    __global float* avg_E_accum,       // sum of E [n_layers * n_faces]
+    int do_accumulate,                 // 0 = skip, 1 = accumulate during this kernel call
+    int accum_start,                   // first relative timestep at which to accumulate
+    int accum_end)                     // one past last relative timestep to accumulate
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -628,6 +636,25 @@ __kernel void persistentThermalKernel(
 
         // Step 4: Store surface temperature for this timestep
         output_temps[t * n_faces + face] = T_local[0];
+
+        // Step 5: Schorghofer & Taylor (2007) sublimation-rate accumulator.
+        // Optional. Constants match src/cpp/ice/ice_table.cpp:
+        //   PT      = 611.657 Pa  (triple-point pressure)
+        //   L_MU/KB = 6139.06 K   (latent heat × molecular mass / Boltzmann)
+        //   1/TT    = 1/273.16 K
+        //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
+        // Each face owns its column of avg_E_accum, so no atomics needed.
+        if (do_accumulate != 0 && t >= accum_start && t < accum_end) {
+            for (int i = 0; i < n_layers; ++i) {
+                float Ti = T_local[i];
+                if (Ti > 30.0f) {
+                    float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
+                    float pv  = 611.657f * native_exp(arg);
+                    float E   = 6.21e23f * pv * native_rsqrt(Ti);
+                    avg_E_accum[i * n_faces + face] += E;
+                }
+            }
+        }
 
     } // End timestep loop
 

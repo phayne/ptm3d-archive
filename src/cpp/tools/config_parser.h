@@ -41,9 +41,34 @@ struct SimulationConfig {
         bool run_thermal_mesh = false;
         int threads = 0;  // 0 = auto
         double equilibration_orbits = 1.0;
+        // Separate (coarser) cadence for the equilibration period.
+        // Highest-priority explicit override: if > 0, used directly (in steps per Earth-day).
+        // -1.0 (default) = unset; behavior determined by equilibration_samples_per_diurnal_cycle.
+        double equilibration_steps_per_day = -1.0;
+
+        // Accuracy-based equilibration cadence: target number of illumination/flux samples
+        // per diurnal (day/night) cycle for the target body. The actual steps/Earth-day is
+        // computed at runtime as (samples_per_diurnal_cycle / synodic_day_earth).
+        // Physics guidance: 24 samples/cycle yields <2 K accuracy for the Moon; 48 gives
+        // <1 K; 12 is marginal; <6 is not recommended.
+        //  > 0 = auto-compute equilibration cadence with this many samples per diurnal cycle
+        //  <= 0 = fall back to legacy behavior (match output cadence)
+        // Only consulted when equilibration_steps_per_day <= 0.
+        double equilibration_samples_per_diurnal_cycle = -1.0;
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
+
+        // Per-face thermal property map: a per-face binary float32 array (one
+        // value per mesh face, in face-index order) overriding the body-default
+        // H-parameter (or, equivalently, the depth-weighted thermal inertia).
+        // Only one of {h_parameter_map, thermal_inertia_map} may be set.
+        // If use_default_property_map = true and both paths are empty, the
+        // bundled icosphere map for the current body is auto-discovered under
+        // <property_maps_directory>/<body>/.
         std::string thermal_inertia_map = "";
+        std::string h_parameter_map = "";
+        bool        use_default_property_map = false;
+        std::string property_maps_directory  = "data/property_maps";
         bool enable_shadow_flux = false;
         double crater_dd_ratio = 8.0;
         double integration_days = -1.0;  // -1 means use output window
@@ -61,6 +86,36 @@ struct SimulationConfig {
         // Per-face heat flow mask (for localized endogenic heat)
         std::string heat_flow_mask_file = "";  // Path to face index file
         double heat_flow_mask_value = 1.0;     // Qb for masked faces (W/m²)
+
+        // Per-face thermal-state checkpointing (used by the chunked-run
+        // orchestrator scripts/run_chunked_simulation.py).
+        // initial_state_file: if non-empty, load per-face T(z) profile
+        //   from this binary file at the start of the run, skip
+        //   equilibration entirely (forces equilibration_steps=0).
+        // final_state_file: if non-empty, dump per-face T(z) profile
+        //   to this binary file at the end of the run (after the GPU
+        //   solver finishes).
+        // Format: uint32 magic 0x50544D54 ('PTMT'), uint32 n_faces,
+        //   uint32 n_layers, then n_layers*n_faces float32 values
+        //   (layer-major to match the GPU SoA layout).
+        std::string initial_state_file = "";
+        std::string final_state_file   = "";
+
+        // Schorghofer & Taylor (2007) ice-stability output. When enabled,
+        // the thermal solver accumulates time-averaged sublimation rate
+        // ⟨E(T(z,t))⟩ at each native depth node during the integration
+        // window, and post-solve solves J(z) = μℓ⟨E⟩(z)/(2z) = J₀ for
+        // the stability depth per face. Disabled by default — zero
+        // overhead when off. Output: statistics/ice_depth.bin (one
+        // float32 per face).
+        bool compute_ice_stability = false;
+        struct IceStabilityParams {
+            double flux_threshold_kgm2s     = 3.0e-14;  // J₀, ~1 mm/Ga
+            double grain_hop_length_um      = 75.0;     // ℓ
+            double geothermal_gradient_K_per_m = 0.0;   // extra g on top of solver T(z); 0 = trust solver
+            double sublimation_enthalpy_kJmol  = 51.058; // Q (Schorghofer Eq. 4)
+            int    n_depth_subsamples       = -1;       // -1 = use every native depth node
+        } ice_stability;
     } thermal;
     
     // Illumination
@@ -85,6 +140,17 @@ struct SimulationConfig {
         std::string series_output = "";
         std::string location_data = "";
         std::string depths_file = "";
+        bool skip_time_series = false;  // skip per-step binary writes (statistics still computed)
+        // Write merge-friendly raw statistics (per-face sums, sample counts,
+        // and the Schorghofer ice-depth ⟨E(z)⟩ accumulator) to
+        // statistics/_raw/ alongside the usual {datatype}_{max,avg,min}.bin.
+        // Used by the chunked-run orchestrator + ptm_merge_chunks tool.
+        bool write_raw_stats = false;
+        // Skip writing mesh.ply to the output directory. Useful for the
+        // chunked-run workflow: chunk 0 emits mesh.ply once for the
+        // orchestrator to propagate, chunks 1+ set this true and skip
+        // the redundant ~hundreds-of-MB write per chunk.
+        bool skip_mesh = false;
     } output;
     
     // Radiation Exchange

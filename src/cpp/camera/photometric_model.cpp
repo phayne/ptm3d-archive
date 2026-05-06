@@ -57,6 +57,27 @@ double PhotometricModel::reflectedRadiance(double cos_i, double cos_e,
     return r * cos_i * solar_flux;
 }
 
+double PhotometricModel::reflectedRadiance(double cos_i, double cos_e,
+                                            double alpha_rad,
+                                            double solar_flux,
+                                            double face_albedo) const {
+    if (cos_i <= 0.0 || cos_e <= 0.0) return 0.0;
+
+    // Scale the reflectance by face_albedo / reference_albedo
+    // For Lambertian: reference is params_.albedo
+    // For Lommel-Seeliger: reference is params_.ls_w (single-scattering albedo)
+    // For Hapke: reference is params_.hapke_w
+    double ref_albedo = params_.albedo;
+    switch (type_) {
+        case ReflectanceType::LOMMEL_SEELIGER: ref_albedo = params_.ls_w; break;
+        case ReflectanceType::HAPKE: ref_albedo = params_.hapke_w; break;
+        default: break;
+    }
+
+    double scale = (ref_albedo > 0.0) ? (face_albedo / ref_albedo) : 1.0;
+    return reflectedRadiance(cos_i, cos_e, alpha_rad, solar_flux) * scale;
+}
+
 double PhotometricModel::reflectedIF(double cos_i, double cos_e,
                                       double alpha_rad) const {
     if (cos_i <= 0.0 || cos_e <= 0.0) return 0.0;

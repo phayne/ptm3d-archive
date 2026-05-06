@@ -30,6 +30,8 @@ public:
                                            Interpolation mode = Interpolation::LINEAR) const;
     std::vector<float> getDirectSolarAtET(double et,
                                           Interpolation mode = Interpolation::LINEAR) const;
+    std::vector<float> getPrimaryReflectedAtET(double et,
+                                               Interpolation mode = Interpolation::LINEAR) const;
 
     // Direct timestep access (no interpolation)
     std::vector<float> loadTimestepData(const std::string& field, int step_index) const;
@@ -46,6 +48,7 @@ public:
     bool hasTemperature() const { return has_temperature_; }
     bool hasIllumination() const { return has_illumination_; }
     bool hasDirectSolar() const { return has_direct_solar_; }
+    bool hasPrimaryReflected() const { return has_primary_reflected_; }
 
 private:
     std::shared_ptr<Mesh> mesh_;
@@ -56,6 +59,7 @@ private:
     bool has_temperature_ = false;
     bool has_illumination_ = false;
     bool has_direct_solar_ = false;
+    bool has_primary_reflected_ = false;
 
     // LRU cache for loaded timestep data
     mutable std::map<std::string, std::vector<float>> cache_;

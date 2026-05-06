@@ -1,0 +1,71 @@
+simulation:
+  # Flyby window: 1 hour before to 5 hours after closest approach (23:01 UTC).
+  # Extended to capture Sun emerging from eclipse (~01:30) and crossing the FOV.
+  start_time: '2026-04-06T22:00:00'
+  duration_days: 0.25                  # 6 hours (to 04:00 UTC)
+  timesteps: 360                       # 1-minute cadence during flyby
+  body: Moon
+mesh:
+  resolution: 9                        # 5,242,880 faces
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: true
+  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
+thermal:
+  run_thermal_mesh: true
+  threads: 0                           # auto (use all available)
+  # Full lunation of equilibration, but with accuracy-based coarse cadence.
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  # Balanced tier (~4 K max error, calibrated on Moon ico3 reference).
+  # 120 samples/diurnal cycle × 1 orbit = 120 equilibration steps total.
+  equilibration_samples_per_diurnal_cycle: 120.0
+  use_gpu: false                       # CPU path for non-uniform time grid
+  compute_statistics: false
+  thermal_inertia_map: ''
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+  use_default_ks: true
+  ks: 0.00074
+  use_default_kd: true
+  kd: 0.0034
+  use_default_H: true
+  H: 0.06
+  use_default_rhos: true
+  rhos: 1100.0
+  use_default_rhod: true
+  rhod: 1800.0
+  use_default_cp0: true
+  cp0: 800.0
+  use_default_Qb: true
+  Qb: 0.018
+  use_default_chi: true
+  chi: 2.7
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: true
+  albedo_map: ''
+  albedo_maps_directory: data/albedo_maps
+  positions_file: ''
+output:
+  directory: output/moon_artemis2_ico9_prod_ext
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0

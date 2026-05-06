@@ -121,6 +121,13 @@ struct DiurnalAverages {
     std::vector<double> avg_escape_flux;        // Time-averaged escape [kg/(m²·s)]
     std::vector<double> avg_temperature;        // Time-averaged temperature [K]
 
+    // Time-averaged crystallization rate <k_cryst(T(t))> [s^-1].
+    // Distinct from k_cryst(<T>) because k_cryst is exponential in T; using
+    // <k_cryst(T)> avoids a Jensen's-inequality bias of many orders of
+    // magnitude near the crystallization knife-edge (~125 K). Populated only
+    // when the crystallization model is active; left at zero otherwise.
+    std::vector<double> avg_crystallization_rate;
+
     // Cached base fluxes (theoretical full-rate, normalized by ice fraction at cache time)
     // evolveEpoch() uses these directly with analytical exponential evolution
     std::vector<double> base_sublimation_flux;  // Full-rate sublimation [kg/(m²·s)]
@@ -148,6 +155,7 @@ struct DiurnalAverages {
         avg_net_flux.resize(num_faces, 0.0);
         avg_escape_flux.resize(num_faces, 0.0);
         avg_temperature.resize(num_faces, 0.0);
+        avg_crystallization_rate.resize(num_faces, 0.0);
 
         base_sublimation_flux.resize(num_faces, 0.0);
         base_sputtering_flux.resize(num_faces, 0.0);
@@ -166,6 +174,7 @@ struct DiurnalAverages {
         std::fill(avg_net_flux.begin(), avg_net_flux.end(), 0.0);
         std::fill(avg_escape_flux.begin(), avg_escape_flux.end(), 0.0);
         std::fill(avg_temperature.begin(), avg_temperature.end(), 0.0);
+        std::fill(avg_crystallization_rate.begin(), avg_crystallization_rate.end(), 0.0);
         std::fill(max_temperature.begin(), max_temperature.end(), 0.0);
         std::fill(min_temperature.begin(), min_temperature.end(), 1000.0);
         // Note: base_* and cached_* are NOT reset - they persist across epochs
@@ -181,6 +190,7 @@ struct DiurnalAverages {
             avg_net_flux[i] *= inv_n;
             avg_escape_flux[i] *= inv_n;
             avg_temperature[i] *= inv_n;
+            avg_crystallization_rate[i] *= inv_n;
         }
     }
 
@@ -431,6 +441,24 @@ public:
      */
     void finalizeDiurnalAverages(int num_timesteps) {
         diurnal_avg_->finalize(num_timesteps);
+    }
+
+    /**
+     * Accumulate per-face crystallization rate at one diurnal timestep.
+     *
+     * Must be called once per diurnal timestep (and once per stride if
+     * subsampling is in use), exactly in lock-step with accumulateDiurnalStep,
+     * so that the averaging denominator matches. After the diurnal cycle
+     * completes, finalizeDiurnalAverages divides by the timestep count to
+     * yield <k_cryst(T(t))> per face.
+     *
+     * @param k_cryst_per_face Pre-computed k_cryst(T(t), porosity) [s^-1]
+     */
+    void accumulateCrystallizationRate(const std::vector<double>& k_cryst_per_face) {
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            diurnal_avg_->avg_crystallization_rate[i] += k_cryst_per_face[i];
+        }
     }
 
     /**

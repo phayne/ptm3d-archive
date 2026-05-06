@@ -6,7 +6,7 @@ simulation:
 mesh:
   resolution: 7
   use_topographic: true
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem
+  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
   import_file: ''
   scale_factor: 1.0
   export_basic: false

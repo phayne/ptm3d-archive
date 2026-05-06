@@ -339,6 +339,19 @@ public:
         std::vector<double>& deposition,
         double threshold = 1e-10) const;
 
+    // Area-weighted smoothing of a per-face scalar over the spatial-index
+    // neighbourhood within `smooth_radius_rad` (or, if <=0, a default of
+    // ~20× the mean face angular width). Used to match the per-face
+    // sublimation field to the transport's effective spatial resolution
+    // so that sharp albedo-map pixel boundaries do not create artifacts in
+    // the net-flux map. Falls back to copying input → output when the
+    // spatial index has not yet been built.
+    void smoothField(
+        const std::vector<double>& face_areas,
+        const std::vector<double>& input,
+        std::vector<double>& output,
+        double smooth_radius_rad = -1.0) const;
+
     // NEW: Check if spatial index is built
     bool isSpatialIndexBuilt() const { return spatial_index_built_; }
 
@@ -486,6 +499,14 @@ public:
         const std::vector<double>& temperatures,
         const std::vector<double>& emission,
         std::vector<double>& deposition);
+
+    // Area-weighted smoothing of a per-face scalar field. Forwards to
+    // BallisticTransport::smoothField using face_areas_ and the transport's
+    // spatial index. If transport is not initialized, copies input → output.
+    void smoothField(
+        const std::vector<double>& input,
+        std::vector<double>& output,
+        double smooth_radius_rad = -1.0);
 
     // Optional: Method to check ice availability at each face
     std::vector<bool> getIcePresenceMask() const {

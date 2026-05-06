@@ -266,9 +266,14 @@ public:
      */
     double computeRadiationDoseRate(double latitude_deg, double longitude_deg) const {
         // Longitude factor: trailing hemisphere enhanced
-        // Trailing apex at 270°E (= 90°W)
+        // Trailing apex at 90°E (= 270°W in IAU west-positive). Cassidy et al.
+        // (2013) and Nordheim et al. (2022) place the trailing apex 90° east of
+        // sub-Jupiter; the run's mesh.ply (IAU east-positive from SPICE) and
+        // Galileo Bond-albedo map are consistent with this convention. The
+        // previous value of 270.0 here was 180° offset from the data and has
+        // been corrected.
         // Nordheim et al. (2022): S+ trailing/leading ratio ~5:1
-        double trailing_angle_rad = (longitude_deg - 270.0) * M_PI / 180.0;
+        double trailing_angle_rad = (longitude_deg - 90.0) * M_PI / 180.0;
         double cos_trailing = std::cos(trailing_angle_rad);
 
         // Map cos from [-1, +1] to [1/contrast, 1]
@@ -332,6 +337,39 @@ public:
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
             evolveCrystallinity(dt, temperatures[i], i, crystalline_fraction[i]);
+        }
+    }
+
+    /**
+     * Evolve crystallinity for all faces using a pre-computed crystallization
+     * rate per face — the time-averaged Avrami rate <k_cryst(T(t))>.
+     *
+     * This is the correct way to apply the analytical D34 ODE solution over
+     * an epoch when temperature varies on a much faster timescale than the
+     * epoch (the multi-timescale operator-splitting case). Calling
+     * evolveAllFaces with the diurnal-mean temperature instead is biased by
+     * Jensen's inequality because k_cryst is exponential in T:
+     * &lt;k_cryst(T)&gt; can exceed k_cryst(&lt;T&gt;) by orders of magnitude near
+     * Europa's crystallization knife-edge (~125 K).
+     *
+     * @param dt Time step [s] (typically one full epoch)
+     * @param k_cryst_per_face Per-face time-averaged crystallization rate [s^-1]
+     * @param crystalline_fraction Per-face crystalline fractions [0-1], modified in place
+     */
+    void evolveAllFacesWithRate(double dt,
+                                const std::vector<double>& k_cryst_per_face,
+                                std::vector<double>& crystalline_fraction) const {
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            double k_cryst = k_cryst_per_face[i];
+            double k_amorph = amorphizationRate(radiation_dose_rate_[i]);
+            double k_total = k_cryst + k_amorph;
+            if (k_total < 1e-30) continue;
+
+            double phi_eq = k_cryst / k_total;
+            double decay = std::exp(-k_total * dt);
+            double phi = phi_eq + (crystalline_fraction[i] - phi_eq) * decay;
+            crystalline_fraction[i] = std::clamp(phi, 0.0, 1.0);
         }
     }
 

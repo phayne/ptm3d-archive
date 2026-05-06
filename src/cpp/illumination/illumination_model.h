@@ -50,6 +50,15 @@ public:
     void setMeshResolution(int resolution);
     void setTimeSteps(int steps);
     void setAlbedo(double albedo);
+
+    // Supply an externally-built, possibly non-uniform ephemeris-time grid.
+    // When set (non-empty), calculateIllumination / calculateIlluminationFromMesh
+    // populate times_, time_strings_, sun_positions_, primary_positions_ from
+    // these ETs instead of the internal uniform grid. Size must equal time_steps_.
+    // Used for decoupled equilibration/output cadences.
+    void setExternalTimeGrid(const std::vector<double>& ets_tdb);
+    void clearExternalTimeGrid();
+    bool hasExternalTimeGrid() const { return !external_ets_.empty(); }
     void setKernelsPath(const std::string& path) {
         kernels_path_ = path;
     }
@@ -307,6 +316,21 @@ private:
     void initializeChunkedStorage(size_t total_faces, int time_steps);
     void storeChunkedValue(std::vector<std::vector<double>>& chunks, size_t face_idx, size_t time_idx, double value);
     double getChunkedValue(const std::vector<std::vector<double>>& chunks, size_t face_idx, size_t time_idx) const;
+
+public:
+    // Release chunked storage memory after extraction to flat arrays.
+    void releaseChunkedStorage() {
+        for (auto& c : illumination_chunks_)       std::vector<double>().swap(c);
+        for (auto& c : direct_solar_chunks_)        std::vector<double>().swap(c);
+        for (auto& c : primary_reflected_chunks_)   std::vector<double>().swap(c);
+        for (auto& c : primary_ir_chunks_)          std::vector<double>().swap(c);
+        illumination_chunks_.clear();
+        direct_solar_chunks_.clear();
+        primary_reflected_chunks_.clear();
+        primary_ir_chunks_.clear();
+        using_chunked_storage_ = false;
+    }
+private:
     
     // Mutex for thread synchronization when processing batches
     std::mutex batch_mutex_;
@@ -462,6 +486,8 @@ private:
     // Results storage
     std::vector<double> times_;  // Ephemeris times
     std::vector<std::string> time_strings_;  // Human-readable times
+    // External ET grid (optional). When non-empty, overrides uniform grid construction.
+    std::vector<double> external_ets_;
     std::vector<std::array<double, 3>> sun_positions_;
     std::vector<std::array<double, 3>> primary_positions_;
     std::vector<double> illumination_values_;  // Flattened: [face_idx * time_steps + time_idx]

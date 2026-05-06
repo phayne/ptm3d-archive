@@ -3,9 +3,13 @@
 
 #include <vector>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <iostream>  // Add this for std::cout
+#include <chrono>    // for ProgressBar elapsed/ETA
+#include <sstream>   // for ProgressBar duration formatting
+#include <iomanip>   // for ProgressBar duration formatting
 #include "eigen_config.h"
 #include <map>       // Add this for std::map
 #include "planetary_properties.h"  // Add this include
@@ -62,30 +66,57 @@ private:
     bool enabled;
     bool completed;
     int last_percentage;
-    
+    std::chrono::steady_clock::time_point start_time;
+    bool started;
+
+    // Format a duration in seconds as "Xs", "Xm Ys", or "XhYm" depending
+    // on magnitude. Keep it short so the progress line stays readable.
+    static std::string format_duration(double seconds) {
+        if (seconds < 0.0 || !std::isfinite(seconds)) return "?";
+        if (seconds < 60.0) {
+            std::ostringstream o; o << std::fixed << std::setprecision(0)
+                                     << seconds << "s"; return o.str();
+        }
+        if (seconds < 3600.0) {
+            int m = static_cast<int>(seconds / 60.0);
+            int s = static_cast<int>(seconds - m * 60);
+            std::ostringstream o; o << m << "m " << s << "s"; return o.str();
+        }
+        int h = static_cast<int>(seconds / 3600.0);
+        int m = static_cast<int>((seconds - h * 3600.0) / 60.0);
+        std::ostringstream o; o << h << "h" << m << "m"; return o.str();
+    }
+
 public:
-    ProgressBar(int total, const std::string& prefix = "Progress", int barWidth = 50, bool enabled = true) 
-        : total(total), current(0), barWidth(barWidth), prefix(prefix), enabled(enabled), completed(false), last_percentage(-1) {}
+    ProgressBar(int total, const std::string& prefix = "Progress", int barWidth = 50, bool enabled = true)
+        : total(total), current(0), barWidth(barWidth), prefix(prefix), enabled(enabled),
+          completed(false), last_percentage(-1), started(false) {}
 
     void update(int current) {
         if (!enabled) return;
         this->current = current;
-        
+
         // Skip if we've already completed the progress bar
         if (completed) return;
-        
+
+        // Lazily start the wall-clock timer on first real update.
+        if (!started) {
+            start_time = std::chrono::steady_clock::now();
+            started = true;
+        }
+
         // Calculate percentage
         float percent = static_cast<float>(current) / total;
         int percentage = static_cast<int>(percent * 100);
-        
+
         // Only update display if percentage has changed (prevents duplicate output)
         if (percentage == last_percentage && current < total) {
             return;
         }
         last_percentage = percentage;
-        
+
         int filledWidth = static_cast<int>(barWidth * percent);
-        
+
         // Build progress bar string
         std::cerr << "\r" << prefix << " [";
         for (int i = 0; i < barWidth; ++i) {
@@ -93,18 +124,30 @@ public:
             else if (i == filledWidth) std::cerr << ">";
             else std::cerr << " ";
         }
-        
-        // Add percentage at the end
+
+        // Percentage + elapsed/ETA. ETA only meaningful once we have
+        // a few percent of progress; suppress it earlier to avoid
+        // garbage estimates.
         std::cerr << "] " << percentage << "%";
+        if (started) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed_s = std::chrono::duration<double>(now - start_time).count();
+            std::cerr << " | elapsed " << format_duration(elapsed_s);
+            if (percent > 0.01 && current < total) {
+                double eta_s = elapsed_s * (1.0 - percent) / percent;
+                std::cerr << ", ETA " << format_duration(eta_s);
+            }
+            std::cerr << "       ";  // pad for shrinking ETA strings
+        }
         std::cerr.flush();
-        
+
         // Mark as completed and add newline when reaching 100%
         if (current >= total) {
             std::cerr << std::endl;
             completed = true;
         }
     }
-    
+
     void finish() {
         if (enabled && !completed) {
             update(total);
@@ -310,6 +353,17 @@ public:
     std::shared_ptr<ptm::SpatialMap> thermal_inertia_map;
     bool using_albedo_map = false;
     bool using_thermal_inertia_map = false;
+
+    // Per-face H-parameter override (Diviner-derived map or user custom).
+    // Empty when no map is loaded. Indexed by face index in mesh order.
+    std::vector<double> face_H_overrides;
+    std::vector<std::uint8_t> face_H_valid;
+    inline double H_for_face(int face_idx) const {
+        if (face_idx >= 0 && face_idx < static_cast<int>(face_H_overrides.size())) {
+            return face_H_overrides[face_idx];
+        }
+        return H;
+    }
     
     // Methods to load maps
     bool loadAlbedoMap(const std::string& filename, bool verbose = true);
@@ -440,9 +494,14 @@ public:
     const aligned_vector<double>& k() const     { return grid.k; }
     const aligned_vector<double>& kappa() const { return grid.kappa; }
 
-    // Constructor
+    // Constructor.
+    // H_override < 0 means "use planet.H"; otherwise it overrides the
+    // body-default H-parameter for both the depth-grid skin-depth estimate
+    // and the rho(z)/k(z) exp(-z/H) initialization. Per-face H maps go through
+    // this path (driver looks up planet.H_for_face(face_idx)).
     Profile(const Planet& planet = Planet(), double lat = 0.0,
-            const Config& config = Config(), bool verbose = false);
+            const Config& config = Config(), bool verbose = false,
+            double H_override = -1.0);
 
     // Methods
     void init_T(const Planet& planet, double lat, bool verbose = false);
@@ -654,8 +713,12 @@ struct ThermalBatchSoA {
     // Initialize batch with grid and material parameters
     void initialize(int layers, int faces, const Planet& planet, const Config& config);
 
-    // Copy grid from existing Profile
-    void copyGridFromProfile(const Profile& ref_profile);
+    // Copy grid from existing Profile.
+    // If H_per_face is non-null, it must point to `n_faces` doubles; rho/kc
+    // are then initialised per-face with each face's own H. Otherwise the
+    // batch's shared H_val is used (legacy behavior).
+    void copyGridFromProfile(const Profile& ref_profile,
+                             const double* H_per_face = nullptr);
 
     // Set surface flux values for all faces in batch (scattered input)
     void setFlux(const double* flux_values, int num_faces);

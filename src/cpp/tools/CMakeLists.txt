@@ -15,6 +15,19 @@ target_link_libraries(albedo_map_generator
     ${OpenMP_CXX_LIBRARIES}
 )
 
+# Lunar property-map generator (Diviner H-par raster -> per-face icosphere maps)
+add_executable(lunar_property_map_generator lunar_property_map_generator.cpp)
+target_link_libraries(lunar_property_map_generator
+    mesh_utils
+    constants
+)
+set_target_properties(lunar_property_map_generator
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Try to find GDAL with hints to the conda environment
 # Prefer active conda env if available; fall back to europa_viz env path
 set(CONDA_PREFIX_DIR "$ENV{CONDA_PREFIX}")
@@ -116,6 +129,23 @@ target_link_libraries(test_equilibration_dt
 )
 set_target_properties(test_equilibration_dt
     PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Chunked-run statistics merge tool. Combines per-chunk raw statistics
+# (statistics/_raw/) from N chunks into a single set of merged stats
+# (max/avg/min) plus the Schorghofer ice-stability depth recomputed
+# from the merged ⟨E(z)⟩ accumulator.
+add_executable(ptm_merge_chunks ptm_merge_chunks.cpp)
+target_link_libraries(ptm_merge_chunks
+    PRIVATE
+    ice_table
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(ptm_merge_chunks
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 

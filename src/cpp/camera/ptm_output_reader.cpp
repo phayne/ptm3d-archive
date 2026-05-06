@@ -37,6 +37,7 @@ bool PTMOutputReader::loadFromDirectory(const std::string& output_dir) {
     has_temperature_ = fs::exists(output_dir + "/temperature");
     has_illumination_ = fs::exists(output_dir + "/illumination");
     has_direct_solar_ = fs::exists(output_dir + "/direct_solar");
+    has_primary_reflected_ = fs::exists(output_dir + "/primary_reflected");
 
     std::cout << "[PTMOutputReader] Loaded " << getNumFaces() << " faces, "
               << getNumTimeSteps() << " time steps" << std::endl;
@@ -44,6 +45,7 @@ bool PTMOutputReader::loadFromDirectory(const std::string& output_dir) {
               << (has_temperature_ ? "temperature " : "")
               << (has_illumination_ ? "illumination " : "")
               << (has_direct_solar_ ? "direct_solar " : "")
+              << (has_primary_reflected_ ? "primary_reflected " : "")
               << std::endl;
 
     return true;
@@ -227,6 +229,10 @@ std::vector<float> PTMOutputReader::getIlluminationAtET(double et, Interpolation
 
 std::vector<float> PTMOutputReader::getDirectSolarAtET(double et, Interpolation mode) const {
     return getFieldAtET("direct_solar", et, mode);
+}
+
+std::vector<float> PTMOutputReader::getPrimaryReflectedAtET(double et, Interpolation mode) const {
+    return getFieldAtET("primary_reflected", et, mode);
 }
 
 } // namespace ptm

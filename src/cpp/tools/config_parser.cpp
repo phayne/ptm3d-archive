@@ -53,9 +53,14 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.run_thermal_mesh = getWithDefault(thermal, "run_thermal_mesh", config.thermal.run_thermal_mesh);
             config.thermal.threads = getWithDefault(thermal, "threads", config.thermal.threads);
             config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
+            config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
+            config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
             config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
             config.thermal.thermal_inertia_map = getWithDefault(thermal, "thermal_inertia_map", config.thermal.thermal_inertia_map);
+            config.thermal.h_parameter_map = getWithDefault(thermal, "h_parameter_map", config.thermal.h_parameter_map);
+            config.thermal.use_default_property_map = getWithDefault(thermal, "use_default_property_map", config.thermal.use_default_property_map);
+            config.thermal.property_maps_directory = getWithDefault(thermal, "property_maps_directory", config.thermal.property_maps_directory);
             config.thermal.enable_shadow_flux = getWithDefault(thermal, "enable_shadow_flux", config.thermal.enable_shadow_flux);
             config.thermal.crater_dd_ratio = getWithDefault(thermal, "crater_dd_ratio", config.thermal.crater_dd_ratio);
             config.thermal.integration_days = getWithDefault(thermal, "integration_days", config.thermal.integration_days);
@@ -65,6 +70,22 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.geothermal_heat_flow = getWithDefault(thermal, "geothermal_heat_flow", config.thermal.geothermal_heat_flow);
             config.thermal.heat_flow_mask_file = getWithDefault(thermal, "heat_flow_mask_file", config.thermal.heat_flow_mask_file);
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
+            config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
+            config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
+            if (thermal["ice_stability"]) {
+                const auto& is_node = thermal["ice_stability"];
+                config.thermal.ice_stability.flux_threshold_kgm2s =
+                    getWithDefault(is_node, "flux_threshold_kgm2s", config.thermal.ice_stability.flux_threshold_kgm2s);
+                config.thermal.ice_stability.grain_hop_length_um =
+                    getWithDefault(is_node, "grain_hop_length_um", config.thermal.ice_stability.grain_hop_length_um);
+                config.thermal.ice_stability.geothermal_gradient_K_per_m =
+                    getWithDefault(is_node, "geothermal_gradient_K_per_m", config.thermal.ice_stability.geothermal_gradient_K_per_m);
+                config.thermal.ice_stability.sublimation_enthalpy_kJmol =
+                    getWithDefault(is_node, "sublimation_enthalpy_kJmol", config.thermal.ice_stability.sublimation_enthalpy_kJmol);
+                config.thermal.ice_stability.n_depth_subsamples =
+                    getWithDefault(is_node, "n_depth_subsamples", config.thermal.ice_stability.n_depth_subsamples);
+            }
         }
         
         // Parse Illumination section
@@ -97,6 +118,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.series_output = getWithDefault(output, "series_output", config.output.series_output);
             config.output.location_data = getWithDefault(output, "location_data", config.output.location_data);
             config.output.depths_file = getWithDefault(output, "depths_file", config.output.depths_file);
+            config.output.skip_time_series = getWithDefault(output, "skip_time_series", config.output.skip_time_series);
+            config.output.write_raw_stats = getWithDefault(output, "write_raw_stats", config.output.write_raw_stats);
+            config.output.skip_mesh = getWithDefault(output, "skip_mesh", config.output.skip_mesh);
         }
         
         // Parse Radiation section
@@ -267,9 +291,17 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "run_thermal_mesh" << YAML::Value << config.thermal.run_thermal_mesh;
         out << YAML::Key << "threads" << YAML::Value << config.thermal.threads;
         out << YAML::Key << "equilibration_orbits" << YAML::Value << config.thermal.equilibration_orbits;
+        out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
+        out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;
         out << YAML::Key << "compute_statistics" << YAML::Value << config.thermal.compute_statistics;
         if (!config.thermal.thermal_inertia_map.empty())
             out << YAML::Key << "thermal_inertia_map" << YAML::Value << config.thermal.thermal_inertia_map;
+        if (!config.thermal.h_parameter_map.empty())
+            out << YAML::Key << "h_parameter_map" << YAML::Value << config.thermal.h_parameter_map;
+        if (config.thermal.use_default_property_map)
+            out << YAML::Key << "use_default_property_map" << YAML::Value << config.thermal.use_default_property_map;
+        if (config.thermal.property_maps_directory != "data/property_maps")
+            out << YAML::Key << "property_maps_directory" << YAML::Value << config.thermal.property_maps_directory;
         out << YAML::Key << "enable_shadow_flux" << YAML::Value << config.thermal.enable_shadow_flux;
         out << YAML::Key << "crater_dd_ratio" << YAML::Value << config.thermal.crater_dd_ratio;
         if (config.thermal.integration_days > 0)
@@ -280,8 +312,22 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "heat_flow_mask_file" << YAML::Value << config.thermal.heat_flow_mask_file;
         if (!config.thermal.heat_flow_mask_file.empty())
             out << YAML::Key << "heat_flow_mask_value" << YAML::Value << config.thermal.heat_flow_mask_value;
+        if (!config.thermal.initial_state_file.empty())
+            out << YAML::Key << "initial_state_file" << YAML::Value << config.thermal.initial_state_file;
+        if (!config.thermal.final_state_file.empty())
+            out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
+        if (config.thermal.compute_ice_stability) {
+            out << YAML::Key << "compute_ice_stability" << YAML::Value << config.thermal.compute_ice_stability;
+            out << YAML::Key << "ice_stability" << YAML::Value << YAML::BeginMap;
+            out << YAML::Key << "flux_threshold_kgm2s" << YAML::Value << config.thermal.ice_stability.flux_threshold_kgm2s;
+            out << YAML::Key << "grain_hop_length_um" << YAML::Value << config.thermal.ice_stability.grain_hop_length_um;
+            out << YAML::Key << "geothermal_gradient_K_per_m" << YAML::Value << config.thermal.ice_stability.geothermal_gradient_K_per_m;
+            out << YAML::Key << "sublimation_enthalpy_kJmol" << YAML::Value << config.thermal.ice_stability.sublimation_enthalpy_kJmol;
+            out << YAML::Key << "n_depth_subsamples" << YAML::Value << config.thermal.ice_stability.n_depth_subsamples;
+            out << YAML::EndMap;
+        }
         out << YAML::EndMap;
-        
+
         // Illumination section
         out << YAML::Key << "illumination" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "include_primary_reflection" << YAML::Value << config.illumination.include_primary_reflection;
@@ -312,6 +358,12 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "location_data" << YAML::Value << config.output.location_data;
         if (!config.output.depths_file.empty())
             out << YAML::Key << "depths_file" << YAML::Value << config.output.depths_file;
+        if (config.output.skip_time_series)
+            out << YAML::Key << "skip_time_series" << YAML::Value << config.output.skip_time_series;
+        if (config.output.write_raw_stats)
+            out << YAML::Key << "write_raw_stats" << YAML::Value << config.output.write_raw_stats;
+        if (config.output.skip_mesh)
+            out << YAML::Key << "skip_mesh" << YAML::Value << config.output.skip_mesh;
         out << YAML::EndMap;
 
         // Advanced section
@@ -381,10 +433,20 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.thermal.threads = std::stoi(argv[++i]);
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             config.thermal.equilibration_orbits = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
+            config.thermal.equilibration_steps_per_day = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-samples-per-diurnal" && i + 1 < argc) {
+            config.thermal.equilibration_samples_per_diurnal_cycle = std::stod(argv[++i]);
         } else if (arg == "--no-statistics") {
             config.thermal.compute_statistics = false;
         } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
             config.thermal.thermal_inertia_map = argv[++i];
+        } else if (arg == "--h-parameter-map" && i + 1 < argc) {
+            config.thermal.h_parameter_map = argv[++i];
+        } else if (arg == "--use-default-property-map") {
+            config.thermal.use_default_property_map = true;
+        } else if (arg == "--property-maps-directory" && i + 1 < argc) {
+            config.thermal.property_maps_directory = argv[++i];
         } else if (arg == "--shadow-flux") {
             config.thermal.enable_shadow_flux = true;
         } else if (arg == "--crater-dd-ratio" && i + 1 < argc) {
@@ -494,15 +556,33 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
     out << "  export_basic: false                 # Export basic mesh to VTK\n";
     out << "  use_topographic: false              # Use pre-computed topographic mesh\n";
-    out << "  topo_directory: \"\"                  # Directory containing topographic meshes\n\n";
+    out << "  topo_directory: \"\"                  # Directory containing topographic meshes\n";
+    out << "                                      # (default: data/topo, with per-body subdir)\n\n";
     
     out << "# ========== Thermal Model ==========\n";
     out << "thermal:\n";
     out << "  run_thermal_mesh: true              # Run thermal model\n";
     out << "  threads: 0                          # Number of threads (0=auto)\n";
     out << "  equilibration_orbits: 10            # Day/night cycles for equilibration\n";
+    out << "  equilibration_steps_per_day: -1     # Explicit eq cadence (steps/Earth-day); -1 = auto\n";
+    out << "  equilibration_samples_per_diurnal_cycle: 120  # Accuracy target when eq_steps_per_day<=0\n";
+    out << "                                      # Calibrated on Moon ico3 vs legacy reference:\n";
+    out << "                                      #   120 -> ~4 K max err (Balanced, default)\n";
+    out << "                                      #   240 -> ~3 K max err (High accuracy)\n";
+    out << "                                      #    30 -> ~7 K max err (Fast)\n";
+    out << "                                      #   <=0 -> legacy (match output cadence)\n";
     out << "  compute_statistics: true            # Compute temperature statistics\n";
-    out << "  thermal_inertia_map: \"\"             # Path to thermal inertia map\n";
+    out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
+    out << "  ice_stability:\n";
+    out << "    flux_threshold_kgm2s: 3.0e-14     # J0 (~1 mm/Ga survival rate)\n";
+    out << "    grain_hop_length_um: 75.0         # ell, regolith grain diameter\n";
+    out << "    geothermal_gradient_K_per_m: 0.0  # extra g on top of solver T(z); 0 = trust solver\n";
+    out << "    sublimation_enthalpy_kJmol: 51.058 # Q (Schorghofer Eq. 4)\n";
+    out << "    n_depth_subsamples: -1            # -1 = use every native depth node\n";
+    out << "  thermal_inertia_map: \"\"             # Path to per-face TI map (binary float32, n_faces values)\n";
+    out << "  h_parameter_map: \"\"                 # Path to per-face H-parameter map (alternative to TI map)\n";
+    out << "  use_default_property_map: false     # Auto-discover bundled icosphere map for the body\n";
+    out << "  property_maps_directory: \"data/property_maps\"  # Root for bundled maps (<dir>/<body>/...)\n";
     out << "  enable_shadow_flux: false           # Enable crater flux enhancement\n";
     out << "  crater_dd_ratio: 8.0                # Crater diameter/depth ratio\n";
     out << "  integration_days: -1                # Integration window (-1=use output window)\n";
@@ -530,7 +610,10 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  locations_file: \"\"                  # Specific lat/lon points file\n";
     out << "  depths_file: \"\"                     # Optional depths file (m); write per-location depth series\n";
     out << "  series_output: \"\"                   # Location time series output filename\n";
-    out << "  location_data: \"\"                   # Custom location data\n\n";
+    out << "  location_data: \"\"                   # Custom location data\n";
+    out << "  skip_time_series: false             # Skip per-step binary files (saves disk; statistics still computed)\n";
+    out << "  write_raw_stats: false              # Write merge-friendly raw stats (statistics/_raw/*.bin) for chunked runs\n";
+    out << "  skip_mesh: false                    # Skip writing mesh.ply (used by chunked workflow on chunks 1+)\n\n";
 
     out << "# ========== Advanced Options ==========\n";
     out << "advanced:\n";
@@ -574,7 +657,25 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         std::cerr << "Error: equilibration_orbits cannot be negative" << std::endl;
         valid = false;
     }
-    
+    // equilibration_steps_per_day: allow -1 (sentinel = match output cadence) or strictly positive.
+    // Reject 0 and negative-but-not-minus-one values.
+    if (config.thermal.equilibration_steps_per_day != -1.0 &&
+        config.thermal.equilibration_steps_per_day <= 0.0) {
+        std::cerr << "Error: equilibration_steps_per_day must be > 0 "
+                     "(or -1 to match output cadence); got "
+                  << config.thermal.equilibration_steps_per_day << std::endl;
+        valid = false;
+    }
+
+    // Per-face thermal property maps: H and TI are mutually exclusive (the
+    // model is parameterised on H, and we only want one input source of truth).
+    if (!config.thermal.h_parameter_map.empty() &&
+        !config.thermal.thermal_inertia_map.empty()) {
+        std::cerr << "Error: cannot set both h_parameter_map and "
+                     "thermal_inertia_map (choose one)\n";
+        valid = false;
+    }
+
     // Validate output format
     if (config.output.format != "binary" && config.output.format != "vtk") {
         std::cerr << "Error: output format must be 'binary' or 'vtk'" << std::endl;

@@ -1,0 +1,40 @@
+# Europa Clipper Earth Gravity Assist (EGA) — 2026-12-03
+#
+# Clipper's EGA is a flyby of EARTH, not the Moon. From Clipper's vantage
+# during the sim window (2026-12-01 → 2026-12-06), the Moon's closest
+# approach is at 2026-12-03T18:19:34 UTC at 390,668 km (not close — this
+# is near the Earth–Moon distance).
+#
+# fov_x_deg / fov_y_deg were derived by scripts/clipper_ega_ca_fov.py so the
+# Moon fills ~91% of the short image axis at Moon-CA. Because only fov_x_deg
+# is read by the camera sim, we set it as the horizontal FOV (0.84°) and let
+# the image aspect (1392/928) set the vertical FOV at 0.56°.
+#
+# With a ~0.8° FOV, the Sun (0.5°) and Earth (up to 2°-ish from Clipper
+# during the flyby) will almost never land in the frame when we point at
+# the Moon. --render-sun and --render-primary are still enabled on the CLI,
+# but they'll only paint pixels if their disks happen to fall in the FOV.
+camera:
+  focal_length_mm: 50.0            # nominal; fov_x_deg overrides it
+  sensor_mm: [35.9, 23.9]          # Nikon D5 reference (matches Artemis II look)
+  nx: 1392
+  ny: 928
+  fov_x_deg: 0.8400
+
+  distortion:
+    model: brown_conrady
+    k1: -0.005
+    k2:  0.0002
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]       # Moon body-fixed center (IAU_MOON)
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

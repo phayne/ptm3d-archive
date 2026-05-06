@@ -209,6 +209,38 @@ class ResultsPanel(QWidget):
                 dir_item.setText(2, f"{len(files)} files")
                 dir_item.setData(0, Qt.ItemDataRole.UserRole, str(dir_path))
 
+        # Statistics directory (annual aggregates: max/avg/min per face)
+        stats_dir = results_path / "statistics"
+        if stats_dir.exists():
+            stats_item = QTreeWidgetItem(root)
+            stats_item.setText(0, "Statistics (annual)")
+            stats_item.setText(1, "Aggregate")
+            stats_files = sorted(stats_dir.glob("*.bin"))
+            stats_item.setText(2, f"{len(stats_files)} files")
+            stats_item.setData(0, Qt.ItemDataRole.UserRole, str(stats_dir))
+            # Group children by data type for clarity
+            tag_to_node = {}
+            for f in stats_files:
+                # filename: <datatype>_<stat>.bin where stat ∈ {max, avg, min}
+                stem = f.stem
+                if stem.endswith("_max") or stem.endswith("_avg") or stem.endswith("_min"):
+                    tag = stem.rsplit("_", 1)[0]
+                    stat = stem.rsplit("_", 1)[1]
+                else:
+                    tag = stem
+                    stat = ""
+                if tag not in tag_to_node:
+                    parent = QTreeWidgetItem(stats_item)
+                    parent.setText(0, tag)
+                    parent.setText(1, "Datatype")
+                    parent.setData(0, Qt.ItemDataRole.UserRole, str(stats_dir))
+                    tag_to_node[tag] = parent
+                child = QTreeWidgetItem(tag_to_node[tag])
+                child.setText(0, f.name)
+                child.setText(1, stat or "stat")
+                child.setText(2, self.format_size(f.stat().st_size))
+                child.setData(0, Qt.ItemDataRole.UserRole, str(f))
+
         # Mesh file
         mesh_file = results_path / "mesh.ply"
         if mesh_file.exists():
@@ -300,6 +332,16 @@ class ResultsPanel(QWidget):
                 total_size = sum(f.stat().st_size for f in files)
                 lines.append(f"{dir_name}: {len(files)} files ({self.format_size(total_size)})")
 
+        # Statistics summary (if present)
+        stats_dir = results_path / "statistics"
+        if stats_dir.exists():
+            stats_files = sorted(stats_dir.glob("*.bin"))
+            if stats_files:
+                total = sum(f.stat().st_size for f in stats_files)
+                lines.append(
+                    f"statistics: {len(stats_files)} files ({self.format_size(total)})"
+                )
+
         # Modification time
         lines.append("")
         mtime = datetime.fromtimestamp(results_path.stat().st_mtime)
@@ -344,6 +386,38 @@ class ResultsPanel(QWidget):
         lines.append(f"Size: {self.format_size(file_path.stat().st_size)}")
         mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
         lines.append(f"Modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # If this is a per-face binary (PTM3D writeStatisticsBinary or
+        # writeBinaryData), read it and summarise. Format: uint32 N + N×float32.
+        if file_path.suffix == ".bin" and file_path.stat().st_size > 4:
+            try:
+                import struct
+                import numpy as np
+                with open(file_path, "rb") as f:
+                    raw_n = f.read(4)
+                    n = struct.unpack("<I", raw_n)[0]
+                    expected = 4 + n * 4
+                    actual = file_path.stat().st_size
+                    if actual == expected:
+                        arr = np.frombuffer(f.read(n * 4), dtype="<f4")
+                        finite = arr[np.isfinite(arr)]
+                        lines.append("")
+                        lines.append(f"Faces: {n:,}")
+                        if finite.size:
+                            lines.append(
+                                f"Range: {finite.min():.4g} … {finite.max():.4g}"
+                            )
+                            lines.append(
+                                f"Mean : {finite.mean():.4g}   "
+                                f"Median: {np.median(finite):.4g}"
+                            )
+                            n_nan = arr.size - finite.size
+                            if n_nan:
+                                lines.append(f"NaN  : {n_nan:,} ({100*n_nan/arr.size:.2f}%)")
+                        else:
+                            lines.append("All values NaN/inf")
+            except Exception as exc:
+                lines.append(f"(could not parse as PTM3D binary: {exc})")
 
         self.details_text.setText("\n".join(lines))
 

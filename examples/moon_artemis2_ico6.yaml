@@ -8,12 +8,12 @@ mesh:
   import_file: ''
   scale_factor: 1.0
   use_topographic: true
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem
+  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
 thermal:
   run_thermal_mesh: true
   threads: 0
   equilibration_orbits: 1.0
-  use_gpu: false
+  use_gpu: true
   compute_statistics: true
   thermal_inertia_map: ''
   enable_shadow_flux: false

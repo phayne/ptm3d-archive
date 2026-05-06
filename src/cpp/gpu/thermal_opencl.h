@@ -104,6 +104,16 @@ public:
     void downloadAllTemps(std::vector<float>& T_all);
 
     /**
+     * @brief Upload full temperature profiles into the GPU buffer.
+     *
+     * Inverse of downloadAllTemps. T_all must have size n_faces × n_layers
+     * in the same SoA layout (layer-major: T[layer * n_faces + face]).
+     * Used by the chunked-run workflow to warm-start a chunk from the
+     * final thermal state of the previous chunk.
+     */
+    void uploadAllTemps(const std::vector<float>& T_all);
+
+    /**
      * @brief Wait for all operations to complete
      */
     void synchronize();
@@ -129,7 +139,14 @@ public:
         const std::vector<float>& all_flux,
         std::vector<float>& output_temps,
         int n_timesteps,
-        float dt);
+        float dt,
+        // Optional Schorghofer & Taylor (2007) accumulator. When non-null,
+        // ⟨E(T(z,t))⟩ is summed per face × layer over relative timesteps in
+        // [accum_start, accum_end). Buffer must be n_layers × n_faces float
+        // (caller responsible for sizing/zeroing). Pass nullptr to disable.
+        std::vector<float>* avg_E_inout = nullptr,
+        int accum_start = 0,
+        int accum_end   = -1 /* -1 = n_timesteps */);
 
     /**
      * @brief Run n_equil_cycles of the persistent kernel using the same
@@ -146,7 +163,14 @@ public:
         std::vector<float>& output_temps,
         int n_timesteps,
         float dt,
-        int n_equil_cycles);
+        int n_equil_cycles,
+        // Optional Schorghofer & Taylor (2007) accumulator. When non-null,
+        // ⟨E(T(z,t))⟩ is accumulated only during the FINAL (output) cycle,
+        // for relative timesteps in [accum_start, accum_end). Equilibration
+        // cycles (cycles 0..n_equil_cycles-1) skip accumulation.
+        std::vector<float>* avg_E_inout = nullptr,
+        int accum_start = 0,
+        int accum_end   = -1 /* -1 = n_timesteps */);
 
     /**
      * @brief Get timing of last kernel execution

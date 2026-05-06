@@ -158,4 +158,86 @@ std::vector<double> computeIceDepths(const std::vector<double>& Tavg,
     return depths;
 }
 
+// ---------------------------------------------------------------------------
+// Schorghofer & Taylor (2007) depth-resolved ice-stability solver
+// ---------------------------------------------------------------------------
+std::vector<float>
+computeIceStabilityDepths(const IceStabilityAccumulator& acc,
+                          double J0_kgm2s,
+                          double l_m,
+                          double z_max_m,
+                          bool   use_openmp) {
+    std::vector<float> out;
+    if (!acc.ready()) return out;
+    const int F = acc.n_faces;
+    const int L = acc.n_layers;
+    const double inv_N = 1.0 / static_cast<double>(acc.n_samples);
+    const double prefactor = 0.5 * MU * l_m / J0_kgm2s;  // J(z) = μℓ⟨E⟩/(2z) ⇒ z* = (μℓ/2J₀)·⟨E⟩
+    const double z_cap = (z_max_m > 0.0) ? z_max_m : acc.z.back();
+    out.assign(static_cast<std::size_t>(F), 0.0f);
+
+    auto solve_face = [&](int f) {
+        // Build ⟨E(z_i)⟩ on the fly; layer-major access.
+        // Walk from surface down: stability depth is the smallest z such
+        // that z ≥ μℓ⟨E(z)⟩ / (2 J₀).  Since ⟨E⟩ falls off rapidly with
+        // depth (T decreases) and z grows monotonically, the function
+        //     g(z) = z − (μℓ/2J₀)·⟨E(z)⟩
+        // is monotonically increasing. We bracket between successive
+        // layers and refine with log-linear interpolation in ⟨E⟩.
+
+        // Quick check: ⟨E⟩ at surface already small enough?
+        double E0 = acc.sum_E[0 * F + f] * inv_N;
+        if (!(E0 > 0.0)) { out[f] = 0.0f; return; }
+        double rhs0 = prefactor * E0;          // required depth to balance flux at z=0+
+        if (rhs0 <= acc.z[0]) {
+            out[f] = static_cast<float>(acc.z[0]);
+            return;
+        }
+        // Walk down layers
+        for (int i = 1; i < L; ++i) {
+            double Ei = acc.sum_E[static_cast<std::size_t>(i) * F + f] * inv_N;
+            double rhs_i = (Ei > 0.0) ? prefactor * Ei : 0.0;
+            // crossing condition: at i, z_i ≥ rhs_i (i.e. g(z_i) ≥ 0)
+            if (acc.z[i] >= rhs_i) {
+                // crossed between i-1 and i. Log-linear interpolate ⟨E⟩
+                // (i.e. linear in log) and use bisection-style refinement.
+                double zlo = acc.z[i-1], zhi = acc.z[i];
+                double Elo = acc.sum_E[static_cast<std::size_t>(i-1) * F + f] * inv_N;
+                double Ehi = Ei;
+                // 8 bisection iterations is plenty given E falls off
+                // exponentially with z.
+                for (int k = 0; k < 8; ++k) {
+                    double zmid = 0.5 * (zlo + zhi);
+                    // log-linear interp of E
+                    double t = (zmid - acc.z[i-1]) / std::max(1e-30, acc.z[i] - acc.z[i-1]);
+                    double logE_lo = std::log(std::max(1e-300, Elo));
+                    double logE_hi = std::log(std::max(1e-300, Ehi));
+                    double logE = logE_lo + t * (logE_hi - logE_lo);
+                    double Em = std::exp(logE);
+                    double rhs_m = prefactor * Em;
+                    if (zmid >= rhs_m) zhi = zmid;
+                    else               zlo = zmid;
+                }
+                double zsol = 0.5 * (zlo + zhi);
+                if (zsol < 0.0)        zsol = 0.0;
+                if (zsol > z_cap)      zsol = z_cap;
+                out[f] = static_cast<float>(zsol);
+                return;
+            }
+        }
+        // ⟨E⟩ never falls low enough → ice unstable to the bottom of the model
+        out[f] = static_cast<float>(z_cap);
+    };
+
+    #ifdef _OPENMP
+    if (use_openmp) {
+        #pragma omp parallel for schedule(static)
+        for (int f = 0; f < F; ++f) solve_face(f);
+        return out;
+    }
+    #endif
+    for (int f = 0; f < F; ++f) solve_face(f);
+    return out;
+}
+
 } // namespace ice

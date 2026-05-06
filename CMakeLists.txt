@@ -309,8 +309,18 @@ endif()
 # Include Embree in all targets that need it
 include_directories(${EMBREE_INCLUDE_DIRS})
 
-# Find Eigen
+# Find Eigen. Eigen 3.3+ ships only the imported target Eigen3::Eigen and a
+# mixed-case Eigen3_INCLUDE_DIR variable; older FindEigen3.cmake set the
+# all-caps EIGEN3_INCLUDE_DIR. Resolve both spellings so Brew's modern Eigen
+# (5.x) and any legacy install both feed include_directories below.
 find_package(Eigen3 REQUIRED)
+if(NOT EIGEN3_INCLUDE_DIR)
+    if(Eigen3_INCLUDE_DIR)
+        set(EIGEN3_INCLUDE_DIR "${Eigen3_INCLUDE_DIR}")
+    elseif(TARGET Eigen3::Eigen)
+        get_target_property(EIGEN3_INCLUDE_DIR Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+    endif()
+endif()
 include_directories(${EIGEN3_INCLUDE_DIR})
 message(STATUS "Found Eigen3: ${EIGEN3_INCLUDE_DIR}")
 

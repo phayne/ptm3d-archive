@@ -281,7 +281,7 @@ class BaseConfigTab(QWidget):
             "output.locations_file": "data/locations",
             "output.depths_file": "data/locations",
             "mesh.import_file": "data/meshes",
-            "mesh.topo_directory": "data/dem",
+            "mesh.topo_directory": "data/topo",
             "illumination.albedo_map": "data/albedo_maps",
             "illumination.albedo_maps_directory": "data/albedo_maps",
             "thermal.thermal_inertia_map": "data/thermal_inertia",
@@ -394,8 +394,39 @@ class SimulationTab(BaseConfigTab):
 
         # Row 3: Time Steps
         self.add_int_field(time_layout, 3, "Time Steps:", "simulation.timesteps",
-                           1, 10000, "Number of output timesteps",
+                           1, 100000, "Number of output timesteps",
                            info_key="simulation.timesteps")
+        # Connect timesteps widget to sync step size
+        self.widgets["simulation.timesteps"].valueChanged.connect(
+            self._on_timesteps_changed)
+
+        # Row 4: Time Step Size (alternative to number of steps)
+        step_label = QLabel("Step Size:")
+        step_label.setToolTip("Output cadence — editing this updates Time Steps, and vice versa")
+        time_layout.addWidget(step_label, 4, 0)
+
+        step_container = QWidget()
+        step_hlayout = QHBoxLayout(step_container)
+        step_hlayout.setContentsMargins(0, 0, 0, 0)
+        step_hlayout.setSpacing(4)
+
+        self.step_size_spin = QDoubleSpinBox()
+        self.step_size_spin.setRange(0.001, 1e7)
+        self.step_size_spin.setDecimals(3)
+        self.step_size_spin.setSingleStep(1.0)
+        self.step_size_spin.setValue(1.0)
+        self.step_size_spin.setToolTip("Output time step size")
+        self.step_size_spin.valueChanged.connect(self._on_step_size_changed)
+        step_hlayout.addWidget(self.step_size_spin, stretch=1)
+
+        self.step_unit_combo = QComboBox()
+        self.step_unit_combo.addItems(["minutes", "seconds", "hours"])
+        self.step_unit_combo.setMaximumWidth(100)
+        self.step_unit_combo.setToolTip("Step size unit")
+        self.step_unit_combo.currentTextChanged.connect(self._on_step_unit_changed)
+        step_hlayout.addWidget(self.step_unit_combo)
+
+        time_layout.addWidget(step_container, 4, 1)
 
         time_group.setLayout(time_layout)
         layout.addWidget(time_group)
@@ -430,6 +461,19 @@ class SimulationTab(BaseConfigTab):
 
         layout.addStretch()
         self.create_scroll_area(content)
+
+        # Initialize step size from current duration + timesteps
+        self._sync_step_size_from_config()
+
+    def _sync_step_size_from_config(self):
+        """Initialize step size display from current config values."""
+        days = self.config_manager.get_value("simulation.duration_days", 3.55)
+        n_steps = self.config_manager.get_value("simulation.timesteps", 144)
+        if n_steps > 0 and days > 0:
+            step_sec = (days * 86400.0) / n_steps
+            self.step_size_spin.blockSignals(True)
+            self.step_size_spin.setValue(self._seconds_to_step_display(step_sec))
+            self.step_size_spin.blockSignals(False)
 
     # ── Duration / End-Time synchronisation ──────────────────────────
 
@@ -496,6 +540,13 @@ class SimulationTab(BaseConfigTab):
         self.config_manager.set_value("simulation.duration_days", days)
         self.value_changed.emit()
         self._sync_end_time_from_start_and_duration()
+        # Also update step size display (timesteps stays fixed, step size adjusts)
+        n_steps = self.config_manager.get_value("simulation.timesteps", 144)
+        if n_steps > 0 and days > 0:
+            step_sec = (days * 86400.0) / n_steps
+            self.step_size_spin.blockSignals(True)
+            self.step_size_spin.setValue(self._seconds_to_step_display(step_sec))
+            self.step_size_spin.blockSignals(False)
 
     def _on_duration_unit_changed(self, unit_text):
         """Handle unit combo selection change — re-display in new unit."""
@@ -563,6 +614,81 @@ class SimulationTab(BaseConfigTab):
                 self.end_time_edit.setText("")
                 self.end_time_edit.blockSignals(False)
         finally:
+            self._syncing = False
+
+    # ── Time Steps ↔ Step Size synchronisation ─────────────────────
+
+    def _step_size_to_seconds(self, value=None):
+        """Convert the step size spinbox value to seconds using current unit."""
+        if value is None:
+            value = self.step_size_spin.value()
+        unit = self.step_unit_combo.currentText()
+        if unit == "seconds":
+            return value
+        elif unit == "hours":
+            return value * 3600.0
+        else:  # minutes
+            return value * 60.0
+
+    def _seconds_to_step_display(self, seconds):
+        """Convert seconds to the current step-size display unit."""
+        unit = self.step_unit_combo.currentText()
+        if unit == "seconds":
+            return seconds
+        elif unit == "hours":
+            return seconds / 3600.0
+        else:  # minutes
+            return seconds / 60.0
+
+    def _on_timesteps_changed(self, n_steps):
+        """When timesteps changes, update the step size display."""
+        if self._syncing:
+            return
+        days = self.config_manager.get_value("simulation.duration_days", 3.55)
+        if n_steps > 0 and days > 0:
+            step_sec = (days * 86400.0) / n_steps
+            self._syncing = True
+            self.step_size_spin.blockSignals(True)
+            self.step_size_spin.setValue(self._seconds_to_step_display(step_sec))
+            self.step_size_spin.blockSignals(False)
+            self._syncing = False
+
+    def _on_step_size_changed(self, display_value):
+        """When step size changes, update the timesteps count."""
+        if self._syncing:
+            return
+        step_sec = self._step_size_to_seconds(display_value)
+        if step_sec <= 0:
+            return
+        days = self.config_manager.get_value("simulation.duration_days", 3.55)
+        total_sec = days * 86400.0
+        n_steps = max(1, round(total_sec / step_sec))
+
+        self._syncing = True
+        try:
+            ts_widget = self.widgets.get("simulation.timesteps")
+            if ts_widget:
+                ts_widget.blockSignals(True)
+                ts_widget.setValue(n_steps)
+                ts_widget.blockSignals(False)
+            self.config_manager.set_value("simulation.timesteps", n_steps)
+            self.value_changed.emit()
+        finally:
+            self._syncing = False
+
+    def _on_step_unit_changed(self, unit_text):
+        """When the step unit changes, re-display the step size in the new unit."""
+        if self._syncing:
+            return
+        # Recompute from current timesteps + duration
+        days = self.config_manager.get_value("simulation.duration_days", 3.55)
+        n_steps = self.config_manager.get_value("simulation.timesteps", 144)
+        if n_steps > 0 and days > 0:
+            step_sec = (days * 86400.0) / n_steps
+            self._syncing = True
+            self.step_size_spin.blockSignals(True)
+            self.step_size_spin.setValue(self._seconds_to_step_display(step_sec))
+            self.step_size_spin.blockSignals(False)
             self._syncing = False
 
     # ── Body selection ───────────────────────────────────────────────
@@ -881,7 +1007,69 @@ class ThermalTab(BaseConfigTab):
         control_layout.addWidget(eq_container, 2, 1)
         self.widgets["thermal.equilibration_orbits"] = self.eq_spin
 
-        self.add_bool_field(control_layout, 3, "Compute Statistics", "thermal.compute_statistics",
+        # Row 3: Equilibration cadence mode
+        # Decouples equilibration time-step cadence from output cadence.
+        # For large meshes with fine output cadence, this dramatically reduces
+        # illumination memory and compute (up to 50x measured).
+        cad_label = QLabel("Eq. Cadence:")
+        cad_label.setToolTip(
+            "Time-step cadence during equilibration phase (separate from output cadence).\n"
+            "Legacy: match output cadence (slow, byte-identical to old PTM3D).\n"
+            "Accuracy tiers set samples per diurnal cycle of the target body.\n"
+            "Custom: set explicit steps per Earth-day."
+        )
+        control_layout.addWidget(cad_label, 3, 0)
+
+        cad_container = QWidget()
+        cad_hlayout = QHBoxLayout(cad_container)
+        cad_hlayout.setContentsMargins(0, 0, 0, 0)
+        cad_hlayout.setSpacing(4)
+
+        self.eq_cadence_combo = QComboBox()
+        # Tier values and accuracy targets were calibrated against an ico3 Moon
+        # reference run (see scripts/test_eq_cadence_accuracy.sh for the method).
+        # Accuracy = max |ΔT| at the first output timestep vs. the legacy run.
+        self.eq_cadence_combo.addItems([
+            "Balanced (120 samples/cycle, ~4 K max)",
+            "High accuracy (240 samples/cycle, ~3 K max)",
+            "Fast (30 samples/cycle, ~7 K max)",
+            "Legacy (match output cadence)",
+            "Custom (steps/Earth-day)",
+        ])
+        self.eq_cadence_combo.setToolTip(
+            "Preset accuracy tier for equilibration. Affects only equilibration.\n"
+            "Output cadence is always set by the Time / Timesteps parameters."
+        )
+        self.eq_cadence_combo.currentIndexChanged.connect(self._on_eq_cadence_mode_changed)
+        cad_hlayout.addWidget(self.eq_cadence_combo, stretch=1)
+
+        # Custom steps/day spinbox (only shown/used in Custom mode)
+        self.eq_cadence_spin = QDoubleSpinBox()
+        self.eq_cadence_spin.setRange(0.01, 100000.0)
+        self.eq_cadence_spin.setDecimals(3)
+        self.eq_cadence_spin.setSingleStep(1.0)
+        self.eq_cadence_spin.setValue(24.0)
+        self.eq_cadence_spin.setMaximumWidth(110)
+        self.eq_cadence_spin.setToolTip(
+            "Custom cadence in steps per Earth-day. Only used in Custom mode."
+        )
+        self.eq_cadence_spin.setEnabled(False)
+        self.eq_cadence_spin.valueChanged.connect(self._on_eq_cadence_value_changed)
+        cad_hlayout.addWidget(self.eq_cadence_spin)
+
+        control_layout.addWidget(cad_container, 3, 1)
+
+        # Live readout of the effective cadence (body-aware)
+        self.eq_cadence_readout = QLabel("")
+        self.eq_cadence_readout.setStyleSheet("color: gray; font-size: 10px;")
+        self.eq_cadence_readout.setToolTip(
+            "Computed effective cadence for the current body.\n"
+            "'samples per diurnal cycle' is body-independent; 'steps per Earth-day' is what\n"
+            "PTM3D uses internally and depends on the body's synodic day."
+        )
+        control_layout.addWidget(self.eq_cadence_readout, 4, 1)
+
+        self.add_bool_field(control_layout, 5, "Compute Statistics", "thermal.compute_statistics",
                             "Calculate min/max/mean temperature statistics",
                             info_key="thermal.compute_statistics")
 
@@ -921,16 +1109,82 @@ class ThermalTab(BaseConfigTab):
         maps_layout = QGridLayout()
         maps_layout.setColumnStretch(1, 1)
 
-        self.add_file_field(maps_layout, 0, "Thermal Inertia Map:", "thermal.thermal_inertia_map",
-                            "FITS Files (*.fits *.fit);;All Files (*)",
-                            "Path to thermal inertia map",
-                            info_key="thermal.thermal_inertia_map")
+        # Map mode selector: None / Bundled / Custom
+        self.add_combo_field(
+            maps_layout, 0, "Map Mode:", "thermal.property_map_mode",
+            ["None (uniform body H)",
+             "Bundled icosphere default for body",
+             "Custom file"],
+            "None: every face uses the body-default H. "
+            "Bundled: auto-discover the icosphere map under "
+            "<property_maps_directory>/<body>/. "
+            "Custom: load a per-face binary float32 file (one value per mesh face).",
+            info_key="thermal.property_map_mode",
+        )
+
+        # Map content type
+        self.add_combo_field(
+            maps_layout, 1, "Map Content:", "thermal.property_map_kind",
+            ["H-parameter (m)", "Thermal inertia (J m^-2 K^-1 s^-1/2)"],
+            "H-parameter: per-face e-folding depth feeding rho(z), k(z). "
+            "Thermal inertia: per-face TI(273 K); the loader inverts to an "
+            "effective H per face so the same downstream model is reused.",
+            info_key="thermal.property_map_kind",
+        )
+
+        self.add_file_field(
+            maps_layout, 2, "Custom Map File:", "thermal.thermal_inertia_map",
+            "Binary Files (*.bin);;All Files (*)",
+            "Path to per-face binary float32 (matches mesh face count). "
+            "Used only when Map Mode = Custom file. The Map Content selector "
+            "tells PTM3D how to interpret the file (H or TI).",
+            info_key="thermal.thermal_inertia_map",
+        )
+        self.add_directory_field(
+            maps_layout, 3, "Property Maps Dir:", "thermal.property_maps_directory",
+            "Root directory for bundled maps. Files are looked up under "
+            "<dir>/<body>/{hpar|ti273k}_<body>_ico<level>.bin.",
+            info_key="thermal.property_maps_directory",
+        )
 
         maps_group.setLayout(maps_layout)
         layout.addWidget(maps_group)
 
+        # Wire enable/disable based on mode
+        self.widgets["thermal.property_map_mode"].currentIndexChanged.connect(
+            self._on_property_map_mode_changed
+        )
+        self._property_map_dependent_keys = [
+            "thermal.thermal_inertia_map",
+            "thermal.property_maps_directory",
+            "thermal.property_map_kind",
+        ]
+
         layout.addStretch()
         self.create_scroll_area(content)
+
+    # ── Property-map mode handler ────────────────────────────────────
+
+    def _on_property_map_mode_changed(self, index):
+        """Enable/disable property-map dependent fields based on mode.
+
+        index 0 = None (uniform body H)
+        index 1 = Bundled icosphere default for body
+        index 2 = Custom file
+        """
+        # Custom file mode: enable the file picker; bundled mode: disable file picker
+        # but keep dir picker enabled. None: disable everything except mode itself.
+        is_custom = (index == 2)
+        is_bundled = (index == 1)
+        is_active = (index != 0)
+
+        widgets = self.widgets
+        if "thermal.thermal_inertia_map" in widgets:
+            widgets["thermal.thermal_inertia_map"].setEnabled(is_custom)
+        if "thermal.property_maps_directory" in widgets:
+            widgets["thermal.property_maps_directory"].setEnabled(is_bundled or is_custom)
+        if "thermal.property_map_kind" in widgets:
+            widgets["thermal.property_map_kind"].setEnabled(is_active)
 
     # ── Equilibration unit conversion ────────────────────────────────
 
@@ -1026,6 +1280,125 @@ class ThermalTab(BaseConfigTab):
             self.eq_spin.blockSignals(False)
         finally:
             self._syncing = False
+        # Refresh the cadence readout text for the new body
+        self._update_eq_cadence_readout()
+
+    # ── Equilibration cadence handlers ────────────────────────────────
+
+    # Mode indices match the order of items added to eq_cadence_combo
+    _EQ_MODE_BALANCED = 0     # 24 samples/diurnal
+    _EQ_MODE_HIGH     = 1     # 48 samples/diurnal
+    _EQ_MODE_FAST     = 2     # 12 samples/diurnal
+    _EQ_MODE_LEGACY   = 3     # match output cadence
+    _EQ_MODE_CUSTOM   = 4     # explicit steps/Earth-day
+
+    _EQ_ACCURACY_SAMPLES = {
+        _EQ_MODE_BALANCED: 120.0,
+        _EQ_MODE_HIGH:     240.0,
+        _EQ_MODE_FAST:      30.0,
+    }
+
+    def _on_eq_cadence_mode_changed(self, idx):
+        """Handle cadence-mode dropdown change."""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            if idx in self._EQ_ACCURACY_SAMPLES:
+                # Accuracy tier: set samples_per_diurnal_cycle, clear explicit steps/day
+                samples = self._EQ_ACCURACY_SAMPLES[idx]
+                self.config_manager.set_value("thermal.equilibration_samples_per_diurnal_cycle", samples)
+                self.config_manager.set_value("thermal.equilibration_steps_per_day", -1.0)
+                self.eq_cadence_spin.setEnabled(False)
+                # Reflect the chosen samples value in the spinbox for transparency (in
+                # Custom mode, the same spinbox means steps/day; here it just shows the
+                # sample count for the reference body — advisory only).
+                self.eq_cadence_spin.blockSignals(True)
+                self.eq_cadence_spin.setValue(samples)
+                self.eq_cadence_spin.blockSignals(False)
+            elif idx == self._EQ_MODE_LEGACY:
+                # Legacy: clear both (backend falls back to matching output cadence)
+                self.config_manager.set_value("thermal.equilibration_samples_per_diurnal_cycle", -1.0)
+                self.config_manager.set_value("thermal.equilibration_steps_per_day", -1.0)
+                self.eq_cadence_spin.setEnabled(False)
+            elif idx == self._EQ_MODE_CUSTOM:
+                # Custom: set explicit steps/Earth-day from the spinbox, clear samples
+                self.config_manager.set_value("thermal.equilibration_samples_per_diurnal_cycle", -1.0)
+                self.config_manager.set_value("thermal.equilibration_steps_per_day",
+                                              float(self.eq_cadence_spin.value()))
+                self.eq_cadence_spin.setEnabled(True)
+        finally:
+            self._syncing = False
+        self._update_eq_cadence_readout()
+        self.value_changed.emit()
+
+    def _on_eq_cadence_value_changed(self, value):
+        """Handle custom-mode steps/day change."""
+        if self._syncing:
+            return
+        if self.eq_cadence_combo.currentIndex() != self._EQ_MODE_CUSTOM:
+            return  # Ignore changes when the spinbox is a read-only display
+        self.config_manager.set_value("thermal.equilibration_steps_per_day", float(value))
+        self.config_manager.set_value("thermal.equilibration_samples_per_diurnal_cycle", -1.0)
+        self._update_eq_cadence_readout()
+        self.value_changed.emit()
+
+    def _update_eq_cadence_readout(self):
+        """Update the human-readable cadence summary for the current body."""
+        idx = self.eq_cadence_combo.currentIndex()
+        synodic = self._current_synodic_days if self._current_synodic_days > 0 else 1.0
+        if idx in self._EQ_ACCURACY_SAMPLES:
+            samples = self._EQ_ACCURACY_SAMPLES[idx]
+            spd = samples / synodic
+            self.eq_cadence_readout.setText(
+                f"= {samples:.0f} samples/diurnal cycle  \u2192  {spd:.3f} steps/Earth-day "
+                f"(synodic {synodic:.2f} d)"
+            )
+        elif idx == self._EQ_MODE_LEGACY:
+            self.eq_cadence_readout.setText(
+                "= matches output cadence (potentially huge for fine output + long equilibration)"
+            )
+        elif idx == self._EQ_MODE_CUSTOM:
+            spd = float(self.eq_cadence_spin.value())
+            samples = spd * synodic
+            self.eq_cadence_readout.setText(
+                f"= {spd:.3f} steps/Earth-day  \u2192  {samples:.2f} samples/diurnal cycle "
+                f"(synodic {synodic:.2f} d)"
+            )
+        else:
+            self.eq_cadence_readout.setText("")
+
+    def _sync_eq_cadence_from_config(self):
+        """Set combo + spin to reflect stored values (called from load_from_config)."""
+        thermal = self.config_manager.get_config().get("thermal", {})
+        explicit = thermal.get("equilibration_steps_per_day", -1.0)
+        samples = thermal.get("equilibration_samples_per_diurnal_cycle", -1.0)
+
+        self.eq_cadence_combo.blockSignals(True)
+        self.eq_cadence_spin.blockSignals(True)
+        try:
+            if explicit is not None and explicit > 0.0:
+                self.eq_cadence_combo.setCurrentIndex(self._EQ_MODE_CUSTOM)
+                self.eq_cadence_spin.setValue(float(explicit))
+                self.eq_cadence_spin.setEnabled(True)
+            elif samples is not None and samples > 0.0:
+                # Snap to known tiers; otherwise use Balanced as closest default
+                tier_idx = self._EQ_MODE_BALANCED
+                for idx_k, s_k in self._EQ_ACCURACY_SAMPLES.items():
+                    if abs(float(samples) - s_k) < 1e-6:
+                        tier_idx = idx_k
+                        break
+                self.eq_cadence_combo.setCurrentIndex(tier_idx)
+                self.eq_cadence_spin.setValue(self._EQ_ACCURACY_SAMPLES[tier_idx])
+                self.eq_cadence_spin.setEnabled(False)
+            else:
+                # Both unset/legacy
+                self.eq_cadence_combo.setCurrentIndex(self._EQ_MODE_LEGACY)
+                self.eq_cadence_spin.setEnabled(False)
+        finally:
+            self.eq_cadence_combo.blockSignals(False)
+            self.eq_cadence_spin.blockSignals(False)
+        self._update_eq_cadence_readout()
 
     # ── Config loading ───────────────────────────────────────────────
 
@@ -1054,9 +1427,32 @@ class ThermalTab(BaseConfigTab):
 
             self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
             self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
-            self.widgets["thermal.thermal_inertia_map"].setText(thermal["thermal_inertia_map"])
+
+            # Property maps (synthetic mode/kind drive the UI; underlying
+            # YAML keys are managed by ConfigManager at save/load time).
+            mode = int(thermal.get("property_map_mode", 0))
+            kind = int(thermal.get("property_map_kind", 0))
+            if "thermal.property_map_mode" in self.widgets:
+                self.widgets["thermal.property_map_mode"].setCurrentIndex(mode)
+            if "thermal.property_map_kind" in self.widgets:
+                self.widgets["thermal.property_map_kind"].setCurrentIndex(kind)
+            # The custom-file widget reuses the existing thermal_inertia_map
+            # field (file picker). When kind=H-parameter, the same widget is
+            # interpreted as an h_parameter_map path at save-time.
+            custom_path = thermal.get("thermal_inertia_map", "") or thermal.get("h_parameter_map", "")
+            self.widgets["thermal.thermal_inertia_map"].setText(custom_path)
+            if "thermal.property_maps_directory" in self.widgets:
+                self.widgets["thermal.property_maps_directory"].setText(
+                    thermal.get("property_maps_directory", "data/property_maps")
+                )
+            # Sync enable state to mode
+            self._on_property_map_mode_changed(mode)
         finally:
             self._syncing = False
+
+        # Sync equilibration-cadence widgets from config (must run OUTSIDE _syncing
+        # because the combo/spin have their own block-signals guards).
+        self._sync_eq_cadence_from_config()
 
 
 class RadiationTab(BaseConfigTab):
@@ -1729,14 +2125,47 @@ class ThermophysicalTab(BaseConfigTab):
           - chi = 0 (no radiative conductivity, k = ks = const)
           - cp = TI^2 / (ks * rhos) = const (no T-dependent heat capacity)
           - ks and rhos are scaled to match the target TI
+
+        Generic-body awareness: when a generic body is active (asteroid /
+        Keplerian run), the C++ solver builds `planet` from
+        ``generic_body.thermo`` (see ptm_thermal_sim.cpp:7198) and
+        recomputes cp from those ks/rhos at the constant_thermal_inertia
+        override (line 7231). To keep the GUI's displayed cp consistent
+        with the cp the simulation will actually use, we read ks/rhos from
+        ``generic_body.surface`` in that case and write the derived cp
+        there too (mirroring to thermophysical.cp0 for display).
         """
         if getattr(self, '_syncing_ti', False):
             return
         self._syncing_ti = True
 
         try:
-            ks_val = self.widgets["thermophysical.ks"].value()
-            rhos_val = self.widgets["thermophysical.rhos"].value()
+            # Detect "generic body active" via either of the canonical
+            # config keys the body-definition tab populates. Robust to a
+            # YAML that defines only one of name/config_file.
+            gb_active = (
+                bool(self.config_manager.get_value(
+                    "generic_body.name", "")) or
+                bool(self.config_manager.get_value(
+                    "generic_body.config_file", ""))
+            )
+
+            if gb_active:
+                # Prefer generic_body.surface values; fall back to top-level
+                # widgets only if the generic_body keys aren't populated.
+                ks_val = self.config_manager.get_value(
+                    "generic_body.surface.ks", -1.0)
+                if ks_val is None or ks_val <= 0:
+                    ks_val = self.widgets["thermophysical.ks"].value()
+                rhos_val = self.config_manager.get_value(
+                    "generic_body.surface.rhos", -1.0)
+                if rhos_val is None or rhos_val <= 0:
+                    rhos_val = self.widgets["thermophysical.rhos"].value()
+                source_label = "generic_body.surface"
+            else:
+                ks_val = self.widgets["thermophysical.ks"].value()
+                rhos_val = self.widgets["thermophysical.rhos"].value()
+                source_label = "thermophysical"
 
             if ks_val <= 0:
                 ks_val = 0.001
@@ -1745,19 +2174,34 @@ class ThermophysicalTab(BaseConfigTab):
 
             # Compute constant cp from TI = sqrt(ks * rhos * cp)
             # => cp = TI^2 / (ks * rhos)
-            cp_const = (new_ti * new_ti) / (ks_val * rhos_val) if (ks_val * rhos_val) > 0 else 0.0
+            cp_const = ((new_ti * new_ti) / (ks_val * rhos_val)
+                        if (ks_val * rhos_val) > 0 else 0.0)
 
             # Set chi = 0 (constant conductivity: k = ks, no radiative term)
-            self._set_property("thermophysical.chi", "thermophysical.use_default_chi", 0.0)
+            self._set_property(
+                "thermophysical.chi", "thermophysical.use_default_chi", 0.0)
+            # Set top-level cp0 (mirror, drives the GUI display)
+            self._set_property(
+                "thermophysical.cp0", "thermophysical.use_default_cp0",
+                cp_const)
 
-            # Set cp0 to the derived constant value
-            self._set_property("thermophysical.cp0", "thermophysical.use_default_cp0", cp_const)
+            if gb_active:
+                # Mirror chi=0 and the derived cp into generic_body.surface
+                # so the asteroid-path values the C++ actually consumes
+                # match what the GUI shows. These keys don't have
+                # use_default_* siblings, so set them directly.
+                self.config_manager.set_value(
+                    "generic_body.surface.chi", 0.0)
+                self.config_manager.set_value(
+                    "generic_body.surface.cp0", cp_const)
 
             # Store the constant TI value in config for the C++ solver
-            self.config_manager.set_value("thermophysical.constant_thermal_inertia", new_ti)
+            self.config_manager.set_value(
+                "thermophysical.constant_thermal_inertia", new_ti)
 
             # Update display labels
-            self.ti_cp_label.setText(f"{cp_const:.1f} J/kg/K (const)")
+            self.ti_cp_label.setText(
+                f"{cp_const:.1f} J/kg/K (const, from {source_label} ks·ρs)")
             T_eq, _, _ = self._compute_ti_params()
             if T_eq is not None:
                 self.ti_teq_label.setText(f"{T_eq:.1f} K")
@@ -1784,14 +2228,21 @@ class ThermophysicalTab(BaseConfigTab):
             self.config_manager.set_value(value_key, value)
 
     def on_widget_changed(self, key, value):
-        """Override to update TI display when relevant properties change."""
+        """Override to update TI display when relevant properties change.
+
+        Includes generic_body.surface.ks/rhos so that asteroid-mode runs
+        re-derive cp from the same values the C++ solver will use when
+        constant_thermal_inertia is active.
+        """
         super().on_widget_changed(key, value)
         if getattr(self, '_syncing_ti', False):
             return
         if key in ("thermophysical.ks", "thermophysical.kd",
                     "thermophysical.rhos", "thermophysical.rhod",
                     "thermophysical.albedo", "thermophysical.emissivity",
-                    "thermophysical.cp0"):
+                    "thermophysical.cp0",
+                    "generic_body.surface.ks",
+                    "generic_body.surface.rhos"):
             self._update_ti_display()
 
 
@@ -1858,6 +2309,20 @@ class BodyDefinitionTab(BaseConfigTab):
         # Connect shape type combo to visibility toggler
         self.widgets["generic_body.shape.type"].currentTextChanged.connect(
             self._on_shape_type_changed
+        )
+
+        # Propagate generic_body.shape.mesh_file → mesh.import_file when the
+        # shape is custom_mesh. The C++ thermal solver loads the mesh from
+        # sim_config.mesh.import_file (ptm_thermal_sim.cpp:6592); the
+        # generic_body.shape.custom_mesh_file field is set but never read,
+        # so without this propagation a "custom_mesh" shape selection in
+        # the Body Definition tab would silently fall back to the
+        # icosphere from `mesh.resolution`.
+        self.widgets["generic_body.shape.mesh_file"].textChanged.connect(
+            self._propagate_mesh_to_top_level
+        )
+        self.widgets["generic_body.shape.mesh_scale"].valueChanged.connect(
+            self._propagate_mesh_to_top_level
         )
 
         # ---- Group 2: Orbital Elements ----
@@ -1987,6 +2452,37 @@ class BodyDefinitionTab(BaseConfigTab):
         # Mesh file + scale: visible for custom_mesh
         self._set_row_visible("generic_body.shape.mesh_file", is_mesh)
         self._set_row_visible("generic_body.shape.mesh_scale", is_mesh)
+
+        # Sync to the top-level mesh.import_file (the actual mesh load path).
+        self._propagate_mesh_to_top_level()
+
+    def _propagate_mesh_to_top_level(self, *_args):
+        """Mirror generic_body.shape.{mesh_file,mesh_scale} to
+        mesh.{import_file,scale_factor} when shape.type == 'custom_mesh'.
+
+        This is the bridge between the asteroid-side body shape config
+        and the simulation's actual mesh loader. The C++ thermal sim
+        consumes sim_config.mesh.import_file
+        (ptm_thermal_sim.cpp:6592); generic_body.shape.custom_mesh_file
+        is metadata only. Without this mirror, picking 'custom_mesh' in
+        the Body Definition tab silently does nothing — the run still
+        uses the icosphere from `mesh.resolution`.
+
+        We only push when shape.type == 'custom_mesh' so other shape
+        modes don't clobber a user-set top-level mesh.import_file.
+        """
+        shape_type_widget = self.widgets.get("generic_body.shape.type")
+        if shape_type_widget is None:
+            return
+        if shape_type_widget.currentText() != "custom_mesh":
+            return
+        mesh_file = self.widgets["generic_body.shape.mesh_file"].text().strip()
+        mesh_scale = float(self.widgets["generic_body.shape.mesh_scale"].value())
+        # config_manager is shared across tabs; the Mesh tab will pick up
+        # the new value the next time it renders or the YAML is saved.
+        if mesh_file:
+            self.config_manager.set_value("mesh.import_file", mesh_file)
+            self.config_manager.set_value("mesh.scale_factor", mesh_scale)
 
     def _on_ephemeris_source_changed(self, source):
         """Toggle SPICE-related field visibility."""

@@ -47,6 +47,10 @@ public:
     double reflectedRadiance(double cos_i, double cos_e, double alpha_rad,
                              double solar_flux) const;
 
+    // Same, but with per-face albedo override (used when an albedo map is loaded)
+    double reflectedRadiance(double cos_i, double cos_e, double alpha_rad,
+                             double solar_flux, double face_albedo) const;
+
     // Compute I/F (radiance factor) — dimensionless
     double reflectedIF(double cos_i, double cos_e, double alpha_rad) const;
 

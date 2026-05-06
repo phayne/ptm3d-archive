@@ -243,7 +243,14 @@ __kernel void persistentThermalKernel(
     float dt_output,  // OUTPUT timestep (may be large, e.g., hours)
     int n_faces,
     int n_layers,
-    int n_timesteps)
+    int n_timesteps,
+    // Schorghofer & Taylor (2007) ice-stability accumulator (optional).
+    // When do_accumulate != 0, ⟨E(T(z,t))⟩ is summed per face × layer
+    // for every output timestep in [accum_start, accum_end).
+    __global float* avg_E_accum,
+    int do_accumulate,
+    int accum_start,
+    int accum_end)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -293,10 +300,25 @@ __kernel void persistentThermalKernel(
     // Stable dt: Fo = kappa * dt / dz^2 < 0.49
     float dt_stable = 0.49f * min_dz2 / max_kappa;
 
-    // Clamp dt_stable to reasonable range
-    dt_stable = fmax(1.0f, fmin(dt_stable, dt_output));  // At least 1 second, at most output dt
+    // Clamp dt_stable to reasonable range. The lower bound is the
+    // larger of:
+    //   - 1 second (legacy floor for fine-event resolution), and
+    //   - dt_output / N_SUBSTEPS_MAX, which caps per-output-step
+    //     substeps to a value that keeps the persistent kernel below
+    //     the macOS GPU-watchdog timeout (~5–10 s default).
+    // Without this second floor, very cold checkpoint states (24 K
+    // PSR floors) yield tiny cp(T), large kappa = k/(rho·cp), tiny
+    // dt_stable per the CFL criterion, and worst-case work-items
+    // accumulate enough substeps that the kernel never finishes
+    // within the watchdog window — causing the AMD driver to abort
+    // with gpusKillClientExt.
+    const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
+    float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
+    if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
+    dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
 
-    // Number of sub-steps per output interval
+    // Number of sub-steps per output interval (capped above by the
+    // dt_stable floor)
     int n_substeps = (int)ceil(dt_output / dt_stable);
     float dt = dt_output / (float)n_substeps;  // Actual sub-step size
 
@@ -489,6 +511,25 @@ __kernel void persistentThermalKernel(
 
         // Store surface temperature after all sub-steps are complete
         output_temps[t * n_faces + face] = T_local[0];
+
+        // Schorghofer & Taylor (2007) sublimation-rate accumulator (optional).
+        // Constants match src/cpp/ice/ice_table.cpp:
+        //   PT      = 611.657 Pa  (triple-point pressure)
+        //   L_MU/KB = 6139.06 K   (latent heat × molecular mass / Boltzmann)
+        //   1/TT    = 1/273.16 K
+        //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
+        // Each face owns its column → no atomics required.
+        if (do_accumulate != 0 && t >= accum_start && t < accum_end) {
+            for (int i = 0; i < n_layers; ++i) {
+                float Ti = T_local[i];
+                if (Ti > 30.0f) {
+                    float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
+                    float pv  = 611.657f * native_exp(arg);
+                    float E   = 6.21e23f * pv * native_rsqrt(Ti);
+                    avg_E_accum[i * n_faces + face] += E;
+                }
+            }
+        }
     }  // End of output timestep loop
 
     // Write final state back
@@ -908,6 +949,21 @@ void ThermalOpenCLSolver::downloadAllTemps(std::vector<float>& T_all) {
                                 T_all.data(), 0, nullptr, nullptr));
 }
 
+void ThermalOpenCLSolver::uploadAllTemps(const std::vector<float>& T_all) {
+    if (!initialized_) {
+        throw std::runtime_error("ThermalOpenCLSolver not initialized");
+    }
+    const size_t expected = n_faces_ * n_layers_;
+    if (T_all.size() != expected) {
+        throw std::runtime_error(
+            "ThermalOpenCLSolver::uploadAllTemps: size mismatch (got "
+            + std::to_string(T_all.size()) + ", expected " + std::to_string(expected) + ")");
+    }
+    CL_CHECK(clEnqueueWriteBuffer(context_->queue(), buf_T_, CL_TRUE, 0,
+                                  T_all.size() * sizeof(float),
+                                  T_all.data(), 0, nullptr, nullptr));
+}
+
 void ThermalOpenCLSolver::synchronize() {
     if (context_) {
         context_->finish();
@@ -918,7 +974,10 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     const std::vector<float>& all_flux,
     std::vector<float>& output_temps,
     int n_timesteps,
-    float dt)
+    float dt,
+    std::vector<float>* avg_E_inout,
+    int accum_start,
+    int accum_end)
 {
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
@@ -962,8 +1021,32 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         std::cerr << "[GPU Thermal] ERROR: persistent_kernel_ is null!\n";
         clReleaseMemObject(buf_flux_all);
         clReleaseMemObject(buf_output_temps);
+        // buf_avg_E is created later, after this point — no release needed here.
         return;
     }
+
+    // Optional Schorghofer accumulator buffer (size n_layers * n_faces).
+    // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
+    // kernel arg slot is always valid.
+    const bool enable_accum = (avg_E_inout != nullptr);
+    cl_mem buf_avg_E = nullptr;
+    if (enable_accum) {
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        }
+        buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                   avg_E_inout->size() * sizeof(float),
+                                   avg_E_inout->data(), &err);
+    } else {
+        float dummy = 0.0f;
+        buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(float), &dummy, &err);
+    }
+    CL_CHECK(err);
+
+    int do_accum_int    = enable_accum ? 1 : 0;
+    int accum_start_eff = (accum_start < 0) ? 0 : accum_start;
+    int accum_end_eff   = (accum_end   < 0) ? n_timesteps : accum_end;
 
     int arg = 0;
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_T_));
@@ -987,6 +1070,10 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_faces));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_layers));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_timesteps));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_avg_E));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_int));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
@@ -1084,9 +1171,20 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                   << ", n_cp_coeffs=" << n_cp_coeffs_ << "\n";
     }
 
+    // Read back the Schorghofer accumulator if requested.
+    if (enable_accum) {
+        cl_int rerr = clEnqueueReadBuffer(queue, buf_avg_E, CL_TRUE, 0,
+                                          avg_E_inout->size() * sizeof(float),
+                                          avg_E_inout->data(), 0, nullptr, nullptr);
+        if (rerr != CL_SUCCESS) {
+            std::cerr << "[GPU Thermal] Failed to read avg_E_accum: " << clErrorString(rerr) << "\n";
+        }
+    }
+
     // Clean up temporary buffers
     clReleaseMemObject(buf_flux_all);
     clReleaseMemObject(buf_output_temps);
+    clReleaseMemObject(buf_avg_E);
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -1101,7 +1199,10 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     std::vector<float>& output_temps,
     int n_timesteps,
     float dt,
-    int n_equil_cycles)
+    int n_equil_cycles,
+    std::vector<float>* avg_E_inout,
+    int accum_start,
+    int accum_end)
 {
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
@@ -1140,6 +1241,28 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                                              nullptr, &err);
     CL_CHECK(err);
 
+    // Optional Schorghofer accumulator (size n_layers * n_faces).
+    // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
+    // kernel arg slot is always valid.
+    const bool enable_accum = (avg_E_inout != nullptr);
+    cl_mem buf_avg_E = nullptr;
+    if (enable_accum) {
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        }
+        buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                   avg_E_inout->size() * sizeof(float),
+                                   avg_E_inout->data(), &err);
+    } else {
+        float dummy = 0.0f;
+        buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(float), &dummy, &err);
+    }
+    CL_CHECK(err);
+
+    int accum_start_eff = (accum_start < 0) ? 0 : accum_start;
+    int accum_end_eff   = (accum_end   < 0) ? n_timesteps : accum_end;
+
     // Set kernel arguments ONCE (same for every cycle).
     int n_faces = static_cast<int>(n_faces_);
     int n_layers = static_cast<int>(n_layers_);
@@ -1165,6 +1288,14 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_faces));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_layers));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &n_timesteps));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_avg_E));
+    // do_accumulate slot — overridden each cycle below (only the final
+    // cycle accumulates).
+    int do_accum_zero = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_zero));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
+    const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
@@ -1172,6 +1303,10 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
 
     const int total_cycles = n_equil_cycles + 1;
     for (int cycle = 0; cycle < total_cycles; ++cycle) {
+        // Only accumulate on the FINAL cycle (the "output" cycle).
+        int do_accum_this_cycle = (enable_accum && cycle == total_cycles - 1) ? 1 : 0;
+        CL_CHECK(clSetKernelArg(persistent_kernel_, kArgIdxDoAccumulate,
+                                 sizeof(int), &do_accum_this_cycle));
         err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
                                      &global_size, &local_size, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
@@ -1194,8 +1329,19 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
     }
 
+    // Read back the Schorghofer accumulator if requested.
+    if (enable_accum) {
+        cl_int rerr = clEnqueueReadBuffer(queue, buf_avg_E, CL_TRUE, 0,
+                                          avg_E_inout->size() * sizeof(float),
+                                          avg_E_inout->data(), 0, nullptr, nullptr);
+        if (rerr != CL_SUCCESS) {
+            std::cerr << "[GPU Thermal] Failed to read avg_E_accum: " << clErrorString(rerr) << "\n";
+        }
+    }
+
     clReleaseMemObject(buf_flux_all);
     clReleaseMemObject(buf_output_temps);
+    clReleaseMemObject(buf_avg_E);
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
