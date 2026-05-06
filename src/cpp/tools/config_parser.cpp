@@ -57,6 +57,20 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
             config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
+            config.thermal.gpu_devices = getWithDefault(thermal, "gpu_devices", config.thermal.gpu_devices);
+            if (thermal["gpu_device_ids"] && thermal["gpu_device_ids"].IsSequence()) {
+                config.thermal.gpu_device_ids.clear();
+                for (const auto& v : thermal["gpu_device_ids"]) {
+                    config.thermal.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            // gpu_batch_size is a size_t in config but YAML deserializes as int — accept both.
+            if (thermal["gpu_batch_size"]) {
+                config.thermal.gpu_batch_size =
+                    static_cast<size_t>(thermal["gpu_batch_size"].as<long long>());
+            }
+            config.thermal.gpu_inter_batch_pause_ms = getWithDefault(
+                thermal, "gpu_inter_batch_pause_ms", config.thermal.gpu_inter_batch_pause_ms);
             config.thermal.thermal_inertia_map = getWithDefault(thermal, "thermal_inertia_map", config.thermal.thermal_inertia_map);
             config.thermal.h_parameter_map = getWithDefault(thermal, "h_parameter_map", config.thermal.h_parameter_map);
             config.thermal.use_default_property_map = getWithDefault(thermal, "use_default_property_map", config.thermal.use_default_property_map);
@@ -294,6 +308,20 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
         out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;
         out << YAML::Key << "compute_statistics" << YAML::Value << config.thermal.compute_statistics;
+        // Multi-GPU knobs (only emit when not at defaults — keep templates clean).
+        if (config.thermal.gpu_devices != 1)
+            out << YAML::Key << "gpu_devices" << YAML::Value << config.thermal.gpu_devices;
+        if (!config.thermal.gpu_device_ids.empty()) {
+            out << YAML::Key << "gpu_device_ids" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+            for (int id : config.thermal.gpu_device_ids) out << id;
+            out << YAML::EndSeq;
+        }
+        if (config.thermal.gpu_batch_size != 0)
+            out << YAML::Key << "gpu_batch_size" << YAML::Value
+                << static_cast<long long>(config.thermal.gpu_batch_size);
+        if (config.thermal.gpu_inter_batch_pause_ms != 0)
+            out << YAML::Key << "gpu_inter_batch_pause_ms" << YAML::Value
+                << config.thermal.gpu_inter_batch_pause_ms;
         if (!config.thermal.thermal_inertia_map.empty())
             out << YAML::Key << "thermal_inertia_map" << YAML::Value << config.thermal.thermal_inertia_map;
         if (!config.thermal.h_parameter_map.empty())

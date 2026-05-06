@@ -45,6 +45,7 @@
 // GPU thermal solver (optional)
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/thermal_opencl.h"
+#include "../gpu/thermal_gpu_pool.h"
 #endif
 
 #ifdef _OPENMP
@@ -4937,6 +4938,14 @@ void showUsage(const char* programName) {
     std::cout << "  --use-simd-batch           Use SIMD batch solver (default on; flag kept for compatibility)\n";
     std::cout << "  --no-simd-batch            Force legacy Model::run scalar thermal path\n";
     std::cout << "  --use-gpu-thermal          Use GPU persistent kernel solver (OpenCL)\n";
+    std::cout << "  --list-gpu-devices         Print enumerated OpenCL GPUs and exit\n";
+    std::cout << "  --gpu-devices N|auto       Number of GPUs for the thermal pool (default: 1).\n";
+    std::cout << "                             'auto'/'all' = use every enumerated GPU.\n";
+    std::cout << "  --gpu-device-ids 0,1,...   Explicit GPU indices (overrides --gpu-devices).\n";
+    std::cout << "                             Indices come from --list-gpu-devices.\n";
+    std::cout << "  --gpu-batch-size N         Per-device max faces/batch (default: 0 = legacy 6 GB cap).\n";
+    std::cout << "                             Smaller batches reduce macOS+AMD watchdog hang risk.\n";
+    std::cout << "  --gpu-inter-batch-pause-ms N  Sleep ms between batches on the same device (default: 0).\n";
     std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
     std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
     std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
@@ -6521,6 +6530,26 @@ int main(int argc, char** argv) {
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
+        } else if (arg == "--list-gpu-devices") {
+#ifdef PTM_GPU_OPENCL
+            auto devs = gpu::opencl::OpenCLContext::enumerateGPUs(/*only_available=*/false);
+            if (devs.empty()) {
+                std::cout << "No OpenCL GPU devices detected." << std::endl;
+            } else {
+                std::cout << "Detected " << devs.size()
+                          << " OpenCL GPU device(s):\n";
+                for (size_t k = 0; k < devs.size(); ++k) {
+                    std::cout << "  GPU " << k << ": " << devs[k].name
+                              << " (" << (devs[k].global_mem_size / (1024 * 1024))
+                              << " MB, " << devs[k].max_compute_units << " CUs"
+                              << (devs[k].available ? "" : ", UNAVAILABLE")
+                              << ")" << std::endl;
+                }
+            }
+#else
+            std::cout << "Built without OpenCL support; --list-gpu-devices is a no-op." << std::endl;
+#endif
+            return 0;
         }
     }
 
@@ -6815,6 +6844,38 @@ int main(int argc, char** argv) {
         } else if (arg == "--use-gpu-thermal") {
             config.setProperty("use_gpu_thermal", true);
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
+        } else if (arg == "--gpu-devices" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto" || val == "all") {
+                sim_config.thermal.gpu_devices = 0;  // 0 = all available
+            } else {
+                sim_config.thermal.gpu_devices = std::stoi(val);
+            }
+            std::cout << "[Multi-GPU] gpu_devices = "
+                      << (sim_config.thermal.gpu_devices == 0 ? "auto"
+                                                              : std::to_string(sim_config.thermal.gpu_devices))
+                      << std::endl;
+        } else if (arg == "--gpu-device-ids" && i + 1 < argc) {
+            sim_config.thermal.gpu_device_ids.clear();
+            std::stringstream ss(argv[++i]);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty()) sim_config.thermal.gpu_device_ids.push_back(std::stoi(token));
+            }
+            std::cout << "[Multi-GPU] gpu_device_ids =";
+            for (int id : sim_config.thermal.gpu_device_ids) std::cout << " " << id;
+            std::cout << std::endl;
+        } else if (arg == "--gpu-batch-size" && i + 1 < argc) {
+            long long v = std::stoll(argv[++i]);
+            sim_config.thermal.gpu_batch_size = static_cast<size_t>(std::max<long long>(0, v));
+            std::cout << "[Multi-GPU] gpu_batch_size = "
+                      << sim_config.thermal.gpu_batch_size
+                      << (sim_config.thermal.gpu_batch_size == 0 ? " (=legacy formula)" : "")
+                      << std::endl;
+        } else if (arg == "--gpu-inter-batch-pause-ms" && i + 1 < argc) {
+            sim_config.thermal.gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
+            std::cout << "[Multi-GPU] gpu_inter_batch_pause_ms = "
+                      << sim_config.thermal.gpu_inter_batch_pause_ms << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
         } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
