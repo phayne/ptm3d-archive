@@ -173,6 +173,112 @@ public:
     }
 
     /**
+     * @brief Enumerate all GPU devices across every OpenCL platform.
+     *
+     * Returns a stable, deterministic list (platform-major, device-minor)
+     * suitable for indexing via `--gpu-device-ids`. The single-device
+     * `initialize(bool)` path below is left unchanged for byte-identical
+     * behaviour at N=1.
+     *
+     * @param only_available If true, drop devices whose CL_DEVICE_AVAILABLE
+     *        is false (busy, faulted, disabled).
+     */
+    static std::vector<OpenCLDeviceInfo> enumerateGPUs(bool only_available = true) {
+        std::vector<OpenCLDeviceInfo> result;
+        cl_uint num_platforms = 0;
+        if (clGetPlatformIDs(0, nullptr, &num_platforms) != CL_SUCCESS || num_platforms == 0) {
+            return result;
+        }
+        std::vector<cl_platform_id> platforms(num_platforms);
+        if (clGetPlatformIDs(num_platforms, platforms.data(), nullptr) != CL_SUCCESS) {
+            return result;
+        }
+        for (auto platform : platforms) {
+            cl_uint num_devices = 0;
+            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices) != CL_SUCCESS
+                || num_devices == 0) {
+                continue;
+            }
+            std::vector<cl_device_id> devs(num_devices);
+            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devs.data(), nullptr)
+                != CL_SUCCESS) {
+                continue;
+            }
+            for (auto dev : devs) {
+                cl_bool avail = CL_FALSE;
+                clGetDeviceInfo(dev, CL_DEVICE_AVAILABLE, sizeof(avail), &avail, nullptr);
+                if (only_available && !avail) continue;
+
+                OpenCLDeviceInfo info;
+                info.device_id = dev;
+                info.platform_id = platform;
+                info.available = (avail == CL_TRUE);
+                char buf[256] = {0};
+                clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(buf), buf, nullptr);
+                info.name = buf;
+                buf[0] = 0;
+                clGetDeviceInfo(dev, CL_DEVICE_VENDOR, sizeof(buf), buf, nullptr);
+                info.vendor = buf;
+                buf[0] = 0;
+                clGetDeviceInfo(dev, CL_DEVICE_VERSION, sizeof(buf), buf, nullptr);
+                info.version = buf;
+                clGetDeviceInfo(dev, CL_DEVICE_TYPE, sizeof(info.type), &info.type, nullptr);
+                clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE,
+                                sizeof(info.global_mem_size), &info.global_mem_size, nullptr);
+                clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE,
+                                sizeof(info.local_mem_size), &info.local_mem_size, nullptr);
+                clGetDeviceInfo(dev, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                                sizeof(info.max_work_group_size), &info.max_work_group_size, nullptr);
+                clGetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS,
+                                sizeof(info.max_compute_units), &info.max_compute_units, nullptr);
+                result.push_back(std::move(info));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @brief Initialize OpenCL context pinned to a specific enumerated device.
+     *
+     * Used by the multi-GPU device pool. The single-device default path
+     * (`initialize(bool)` below) is byte-identical to legacy behaviour.
+     *
+     * @return true if initialization succeeded.
+     */
+    bool initialize(const OpenCLDeviceInfo& handle) {
+        if (initialized_) return true;
+        if (handle.device_id == nullptr || handle.platform_id == nullptr) return false;
+
+        device_   = handle.device_id;
+        platform_ = handle.platform_id;
+        queryDeviceInfo();
+
+        cl_int err = CL_SUCCESS;
+        cl_context_properties props[] = {
+            CL_CONTEXT_PLATFORM, (cl_context_properties)platform_, 0
+        };
+        context_ = clCreateContext(props, 1, &device_, nullptr, nullptr, &err);
+        if (err != CL_SUCCESS) return false;
+
+#ifdef CL_VERSION_2_0
+        cl_queue_properties queue_props[] = {
+            CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0
+        };
+        queue_ = clCreateCommandQueueWithProperties(context_, device_, queue_props, &err);
+#else
+        queue_ = clCreateCommandQueue(context_, device_, CL_QUEUE_PROFILING_ENABLE, &err);
+#endif
+        if (err != CL_SUCCESS) {
+            clReleaseContext(context_);
+            context_ = nullptr;
+            return false;
+        }
+
+        initialized_ = true;
+        return true;
+    }
+
+    /**
      * @brief Initialize OpenCL context with best available GPU
      * @param prefer_gpu If true, prefer GPU over CPU devices
      * @return true if initialization succeeded
