@@ -52,6 +52,13 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& thermal = root["thermal"];
             config.thermal.run_thermal_mesh = getWithDefault(thermal, "run_thermal_mesh", config.thermal.run_thermal_mesh);
             config.thermal.threads = getWithDefault(thermal, "threads", config.thermal.threads);
+            // Depth-grid resolution. m = layers per upper skin depth; n = layer
+            // growth factor; b = skin depths to bottom layer. These were
+            // previously read only from --thermal-{m,n,b} CLI flags, with the
+            // YAML keys silently ignored — fixed here.
+            config.thermal.grid_m = getWithDefault(thermal, "thermal_m", config.thermal.grid_m);
+            config.thermal.grid_n = getWithDefault(thermal, "thermal_n", config.thermal.grid_n);
+            config.thermal.grid_b = getWithDefault(thermal, "thermal_b", config.thermal.grid_b);
             config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
             config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
@@ -176,6 +183,17 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
             config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
             config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
+
+            // Multi-GPU radiosity dispatch (mirrors thermal pool YAML keys).
+            config.radiation.gpu_devices = getWithDefault(rad, "gpu_devices", config.radiation.gpu_devices);
+            if (rad["gpu_device_ids"] && rad["gpu_device_ids"].IsSequence()) {
+                config.radiation.gpu_device_ids.clear();
+                for (const auto& v : rad["gpu_device_ids"]) {
+                    config.radiation.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            config.radiation.gpu_batch_size = getWithDefault(rad, "gpu_batch_size", config.radiation.gpu_batch_size);
+            config.radiation.gpu_inter_batch_pause_ms = getWithDefault(rad, "gpu_inter_batch_pause_ms", config.radiation.gpu_inter_batch_pause_ms);
 
             // Resolve relative view_factor_file against the YAML file's directory so
             // the cache path is cwd-independent (GUI subprocess cwd is not necessarily
@@ -318,6 +336,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "thermal" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "run_thermal_mesh" << YAML::Value << config.thermal.run_thermal_mesh;
         out << YAML::Key << "threads" << YAML::Value << config.thermal.threads;
+        out << YAML::Key << "thermal_m" << YAML::Value << config.thermal.grid_m;
+        out << YAML::Key << "thermal_n" << YAML::Value << config.thermal.grid_n;
+        out << YAML::Key << "thermal_b" << YAML::Value << config.thermal.grid_b;
         out << YAML::Key << "equilibration_orbits" << YAML::Value << config.thermal.equilibration_orbits;
         out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
         out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;

@@ -89,10 +89,20 @@ struct SimulationConfig {
         int integration_offset_steps = 0;
         bool debug = false;               // Enable thermal debug output for one equatorial face
         double debug_lat_threshold = 10.0; // Maximum latitude (deg) for debug face selection
-        // Grid parameters optimized vs Diviner (Hayne et al. 2017), RMS < 4K with 10 layers
-        int grid_m = 4;                   // Layers in upper skin depth (optimal: 4)
-        int grid_n = 10;                  // Layer growth factor (optimal: 10)
-        int grid_b = 5;                   // Skin depths to bottom (optimal: 5, minimum viable)
+        // Vertical depth-grid parameters. m = layers per upper skin depth;
+        // n = layer growth factor (in units used by the adaptive grid); b =
+        // skin depths to bottom layer. The defaults below give a bottom at
+        // ~b·δ_diurnal so the diurnal wave is fully damped before the
+        // bottom Neumann BC clips it. With the radiative-conductivity term
+        // χ(T/350)³ ~doubling K at deep temperatures, the effective skin
+        // depth at depth is ~1.5–2× the surface lattice value — so b needs
+        // to be ≥ ~10 for the wave to attenuate by exp(-5) below the BC.
+        // The previous defaults (m=4, n=10, b=5) gave only ~3 actual
+        // e-folds at depth, leaving a ~tens-of-K diurnal residual at the
+        // bottom that contaminated extrapolated location-export depths.
+        int grid_m = 10;                  // Layers in upper skin depth
+        int grid_n = 15;                  // Layer growth factor
+        int grid_b = 20;                  // Skin depths to bottom (≈12 e-folds of damping at deep T)
         // Geothermal heat flow
         double geothermal_heat_flow = -1.0; // W/m², -1 = use planet default
         // Per-face heat flow mask (for localized endogenic heat)
@@ -208,6 +218,14 @@ struct SimulationConfig {
         // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;
+        // Multi-GPU radiosity dispatch (mirrors thermal pool config).
+        // Per-timestep solves are independent so the timestep-batch can be
+        // split across N GPUs. Default == 1 preserves legacy single-GPU
+        // behaviour byte-identically. Only consulted when use_gpu = true.
+        int gpu_devices = 1;
+        std::vector<int> gpu_device_ids;
+        int gpu_batch_size = 0;              // 0 = auto = 4 * gpu_devices
+        int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation (mac+AMD)
     } radiation;
 
     // Generic Body Configuration (for user-defined bodies)

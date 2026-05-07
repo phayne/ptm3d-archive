@@ -15,6 +15,7 @@
 namespace gpu {
 namespace opencl {
     class RadiosityOpenCLSolver;
+    class RadiosityGPUDevicePool;
 }
 }
 #endif
@@ -95,6 +96,19 @@ public:
     std::vector<double> solve(const std::vector<double>& temperatures,
                               const std::vector<double>& solar_flux);
 
+    // Batched solve: each row is one timestep's (T, Q_solar). Returns one row
+    // of indirect flux per input timestep. When gpu_devices > 1 and the GPU
+    // pool was successfully initialized, the batch is partitioned across the
+    // pool's devices and solved concurrently. Otherwise falls back to a
+    // serial loop over single-timestep solve() — semantically identical to
+    // the caller running its own per-timestep loop.
+    std::vector<std::vector<double>> solveBatch(
+        const std::vector<std::vector<double>>& temperatures_per_timestep,
+        const std::vector<std::vector<double>>& solar_flux_per_timestep);
+
+    // True iff the GPU pool was successfully initialized (gpu_devices > 1).
+    bool hasGPUPool() const;
+
     // Compute thermal emission from faces (ε σ T^4)
     std::vector<double> computeThermalEmission(const std::vector<double>& temperatures) const;
 
@@ -144,9 +158,13 @@ private:
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL
-    // GPU radiosity solver
+    // GPU radiosity solver — single-device path (used when gpu_devices == 1).
     std::unique_ptr<gpu::opencl::RadiosityOpenCLSolver> gpu_solver_;
+    // Multi-GPU dispatch pool (used when gpu_devices > 1). When set, each
+    // batch picks the next-idle device's persistent solver and calls solve().
+    std::unique_ptr<gpu::opencl::RadiosityGPUDevicePool> gpu_pool_;
     bool use_gpu_ = false;
+    int  pool_batch_size_ = 0;  // resolved from config: 4 * n_devices when 0/auto
 #endif
 
     // Convergence tracking
@@ -219,6 +237,19 @@ public:
     std::vector<double> computeIndirectFlux(
         const std::vector<double>& temperatures,
         const std::vector<double>& solar_flux);
+
+    // Compute indirect radiation for a batch of timesteps (multi-GPU path).
+    // Inputs are [n_timesteps][n_faces]; output mirrors the shape.
+    // When the underlying RadiositySolver has a GPU pool, the batch is
+    // dispatched across all pool devices in parallel. Otherwise loops
+    // computeIndirectFlux() per timestep. The caller is responsible for
+    // chunking the full timestep range into reasonably-sized batches.
+    std::vector<std::vector<double>> computeIndirectFluxBatch(
+        const std::vector<std::vector<double>>& temperatures_per_timestep,
+        const std::vector<std::vector<double>>& solar_flux_per_timestep);
+
+    // True iff multi-GPU radiosity dispatch is active.
+    bool hasGPUPool() const;
 
     // Get face classification
     const FaceClassification& getClassification() const { return classification_; }

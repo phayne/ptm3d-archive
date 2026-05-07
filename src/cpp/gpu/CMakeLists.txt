@@ -135,6 +135,7 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_opencl.cpp
         thermal_gpu_pool.cpp
         radiosity_opencl.cpp
+        radiosity_gpu_pool.cpp
         bvh_opencl.cpp
         bvh_gpu_pool.cpp
         cwbvh_builder.cpp
@@ -232,6 +233,7 @@ if(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_opencl.h
         thermal_gpu_pool.h
         radiosity_opencl.h
+        radiosity_gpu_pool.h
         bvh_opencl.h
         bvh_gpu_pool.h
         cwbvh_builder.h

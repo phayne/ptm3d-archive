@@ -62,6 +62,14 @@ struct RadiationConfig {
     // GPU acceleration options
     bool use_gpu = false;                // Use GPU for radiosity solver (requires OpenCL)
 
+    // Multi-GPU radiosity dispatch (enabled only when use_gpu = true).
+    // Mirrors the thermal pool's dispatch model: per-timestep solves are
+    // mutually independent, so the batch can be split across N GPUs.
+    int gpu_devices = 1;                 // 1 = legacy single-GPU; >1 = pool
+    std::vector<int> gpu_device_ids;     // Explicit device indices (overrides gpu_devices)
+    int gpu_batch_size = 0;              // Timesteps per pool batch (0 = auto = 4 * gpu_devices)
+    int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation, mirrors thermal pool
+
     // H-matrix compression options (for large meshes)
     bool use_hmatrix = false;            // Use hierarchical matrix compression
     // Bypass the n_faces > 1M auto-disable so H-matrix + OOC is attempted regardless.

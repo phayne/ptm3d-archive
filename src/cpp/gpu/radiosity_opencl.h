@@ -60,10 +60,22 @@ public:
     RadiosityOpenCLSolver& operator=(const RadiosityOpenCLSolver&) = delete;
 
     /**
-     * @brief Initialize OpenCL resources
+     * @brief Initialize OpenCL resources on the first available GPU.
      * @return true if initialization succeeded
      */
     bool initialize();
+
+    /**
+     * @brief Initialize OpenCL resources pinned to a specific enumerated GPU.
+     *
+     * Used by RadiosityGPUDevicePool to spin up one solver per device. The
+     * default-device path (`initialize()` above) is byte-identical to legacy
+     * behaviour so single-device callers are unaffected.
+     *
+     * @param device_handle Device handle from OpenCLContext::enumerateGPUs().
+     * @return true if initialization succeeded.
+     */
+    bool initialize(const OpenCLDeviceInfo& device_handle);
 
     /**
      * @brief Upload CSR view factor matrix (call once at start)

@@ -7,6 +7,7 @@
 
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/radiosity_opencl.h"
+#include "../gpu/radiosity_gpu_pool.h"
 #endif
 
 #include <iostream>
@@ -162,9 +163,98 @@ void RadiositySolver::initGPU() {
 
     use_gpu_ = true;
 
+    // Multi-GPU dispatch pool (only when gpu_devices > 1). The single-GPU
+    // path above stays in place even when the pool is active so that
+    // single-timestep solve() callers (the CPU fallback hook + direct
+    // computeIndirectFlux callers) still work; the batched solveBatch()
+    // path is what actually uses the pool.
+    const bool want_pool = (config_.gpu_devices > 1)
+                            || !config_.gpu_device_ids.empty();
+    if (want_pool) {
+        // Resolve which physical devices to use (mirrors the thermal pool).
+        std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
+            gpu::opencl::OpenCLContext::enumerateGPUs(true);
+        std::vector<gpu::opencl::OpenCLDeviceInfo> chosen;
+        if (!config_.gpu_device_ids.empty()) {
+            for (int id : config_.gpu_device_ids) {
+                if (id >= 0 && static_cast<size_t>(id) < all_gpus.size()) {
+                    chosen.push_back(all_gpus[id]);
+                } else {
+                    std::cerr << "Warning: rad-gpu-device-id " << id
+                              << " out of range (have " << all_gpus.size()
+                              << " GPUs); skipping\n";
+                }
+            }
+        } else {
+            const int n_req = (config_.gpu_devices == 0)
+                ? static_cast<int>(all_gpus.size())
+                : std::min<int>(config_.gpu_devices,
+                                static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n_req; ++i) chosen.push_back(all_gpus[i]);
+        }
+
+        if (chosen.size() < 2) {
+            if (config_.verbose) {
+                std::cout << "[Radiosity Pool] Pool not instantiated "
+                             "(only " << chosen.size() << " device(s) selected); "
+                             "single-GPU path remains active\n";
+            }
+        } else {
+            gpu::opencl::RadiosityGPUPoolConfig pool_cfg;
+            pool_cfg.devices = chosen;
+            pool_cfg.inter_batch_pause_ms = config_.gpu_inter_batch_pause_ms;
+            pool_cfg.verbose = config_.verbose;
+
+            gpu::opencl::RadiosityOpenCLConfig solver_cfg;
+            solver_cfg.max_iterations = config_.max_iterations;
+            solver_cfg.convergence_tolerance = config_.convergence_tolerance;
+            solver_cfg.verbose = config_.verbose;
+            // Cross-batch warm-start has no meaning across devices — disable
+            // it so each batch's first timestep starts from cold radiosity.
+            // Cost: typically 5-10 extra Jacobi iterations on the first
+            // timestep of each batch.
+            solver_cfg.warm_start = false;
+
+            gpu_pool_ = std::make_unique<gpu::opencl::RadiosityGPUDevicePool>(
+                std::move(pool_cfg));
+            if (!gpu_pool_->initialize(n, solver_cfg)) {
+                std::cerr << "Warning: Failed to initialize multi-GPU radiosity "
+                             "pool; falling back to single-GPU path\n";
+                gpu_pool_.reset();
+            } else if (!gpu_pool_->uploadStaticData(F_ptr_->values(),
+                                                     F_ptr_->colIndices(),
+                                                     F_ptr_->rowPointers(),
+                                                     emissivity_f,
+                                                     reflectivity_f)) {
+                std::cerr << "Warning: Failed to replicate radiosity static "
+                             "data to pool devices; falling back to "
+                             "single-GPU path\n";
+                gpu_pool_.reset();
+            } else {
+                pool_batch_size_ = (config_.gpu_batch_size > 0)
+                    ? config_.gpu_batch_size
+                    : 4 * static_cast<int>(gpu_pool_->numDevices());
+                if (config_.verbose) {
+                    std::cout << "[Radiosity Pool] Active: "
+                              << gpu_pool_->numDevices() << " GPU(s), "
+                              << "batch_size=" << pool_batch_size_
+                              << " timesteps per dispatch\n";
+                }
+            }
+        }
+    }
+
     if (config_.verbose) {
         std::cout << "GPU radiosity solver enabled\n";
     }
+#endif
+}
+
+bool RadiositySolver::hasGPUPool() const {
+#ifdef PTM_GPU_OPENCL
+    return gpu_pool_ != nullptr;
+#else
+    return false;
 #endif
 }
 
@@ -201,6 +291,85 @@ std::vector<double> RadiositySolver::solveGPU(
     return indirect_flux;
 }
 #endif
+
+std::vector<std::vector<double>> RadiositySolver::solveBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep)
+{
+    const size_t n_steps = temperatures_per_timestep.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps);
+
+    // Single-device or CPU fallback: serial loop over solve(). Semantically
+    // identical to the caller running its own per-timestep loop.
+#ifdef PTM_GPU_OPENCL
+    if (!gpu_pool_) {
+#endif
+        for (size_t k = 0; k < n_steps; ++k) {
+            indirect_per_timestep[k] =
+                solve(temperatures_per_timestep[k], solar_flux_per_timestep[k]);
+        }
+        return indirect_per_timestep;
+#ifdef PTM_GPU_OPENCL
+    }
+
+    // Multi-GPU dispatch: split the n_steps timesteps round-robin across
+    // pool devices. Each device's worker iterates over its assigned slice
+    // and runs solve() (synchronous on that device).
+    const size_t n_dev = gpu_pool_->numDevices();
+    const size_t n = emissivity_.size();
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(n_dev);
+
+    // Round-robin assignment: timestep k goes to device k % n_dev. Keeps
+    // load balanced when n_steps is not a multiple of n_dev.
+    for (size_t d = 0; d < n_dev; ++d) {
+        // Build the per-device list of timestep indices to process.
+        std::vector<size_t> device_steps;
+        for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
+        if (device_steps.empty()) continue;
+
+        futures.push_back(gpu_pool_->submit(
+            [&temperatures_per_timestep, &solar_flux_per_timestep,
+             &indirect_per_timestep, device_steps, n](
+                gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                std::vector<float> temps_f(n), solar_f(n), indirect_f;
+                for (size_t k : device_steps) {
+                    const auto& temps_d = temperatures_per_timestep[k];
+                    const auto& solar_d = solar_flux_per_timestep[k];
+                    for (size_t i = 0; i < n; ++i) {
+                        temps_f[i] = static_cast<float>(temps_d[i]);
+                        solar_f[i] = static_cast<float>(solar_d[i]);
+                    }
+                    solver.solve(temps_f, solar_f, indirect_f);
+                    auto& out = indirect_per_timestep[k];
+                    out.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        out[i] = static_cast<double>(indirect_f[i]);
+                    }
+                }
+                return true;
+            }));
+    }
+
+    bool all_ok = true;
+    for (auto& f : futures) {
+        if (!f.get()) all_ok = false;
+    }
+    if (!all_ok) {
+        std::cerr << "Warning: one or more multi-GPU radiosity batches "
+                     "returned failure; results may be incomplete\n";
+    }
+
+    // Aggregate convergence stats from any one solver — they are not strictly
+    // tracked across batches, but the caller uses these only for diagnostics.
+    last_iterations_ = 0;     // not aggregated; caller treats as advisory
+    last_residual_ = 0.0;
+    converged_ = all_ok;
+
+    return indirect_per_timestep;
+#endif
+}
 
 std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatures,
                                             const std::vector<double>& solar_flux) {
@@ -1029,6 +1198,54 @@ bool RadiationExchangeManager::prepare(
     is_active_ = true;
 
     return true;
+}
+
+bool RadiationExchangeManager::hasGPUPool() const {
+    return solver_ ? solver_->hasGPUPool() : false;
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep) {
+
+    const size_t n_steps = temperatures_per_timestep.size();
+    const size_t n = mesh_->faces.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps,
+                                                            std::vector<double>(n, 0.0));
+
+    if (!is_active_ || !solver_ || n_steps == 0) {
+        return indirect_per_timestep;
+    }
+
+    auto raw_per_step = solver_->solveBatch(temperatures_per_timestep,
+                                             solar_flux_per_timestep);
+
+    // Map back to all faces using the exchange-face index list (same as
+    // computeIndirectFlux). Update aggregate stats from the last timestep.
+    double sum = 0.0;
+    double max_flux = 0.0;
+    for (size_t k = 0; k < n_steps; ++k) {
+        const auto& flux = raw_per_step[k];
+        if (flux.empty()) continue;
+        for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
+            int face_idx = classification_.exchange_face_indices[i];
+            indirect_per_timestep[k][face_idx] = flux[face_idx];
+        }
+    }
+    if (!raw_per_step.empty() && !raw_per_step.back().empty()) {
+        for (int idx : classification_.exchange_face_indices) {
+            sum += indirect_per_timestep.back()[idx];
+            max_flux = std::max(max_flux, indirect_per_timestep.back()[idx]);
+        }
+        stats_.mean_indirect_flux = sum / std::max(size_t(1),
+                                                    classification_.exchange_faces);
+        stats_.max_indirect_flux = max_flux;
+        stats_.solver_iterations = solver_->getLastIterations();
+        stats_.solver_residual = solver_->getLastResidual();
+    }
+
+    return indirect_per_timestep;
 }
 
 std::vector<double> RadiationExchangeManager::computeIndirectFlux(
