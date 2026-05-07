@@ -5356,6 +5356,11 @@ void showUsage(const char* programName) {
     std::cout << "  --gpu-batch-size N         Per-device max faces/batch (default: 0 = legacy 6 GB cap).\n";
     std::cout << "                             Smaller batches reduce macOS+AMD watchdog hang risk.\n";
     std::cout << "  --gpu-inter-batch-pause-ms N  Sleep ms between batches on the same device (default: 0).\n";
+    std::cout << "  --use-gpu-illumination     Use GPU BVH ray tracer for shadow rays (default: CPU Embree)\n";
+    std::cout << "  --illum-gpu-devices N|auto Number of GPUs for the illumination pool (default: 1)\n";
+    std::cout << "  --illum-gpu-device-ids 0,1,...  Explicit illumination GPU indices\n";
+    std::cout << "  --illum-gpu-inter-batch-pause-ms N  Per-device sleep between illumination batches\n";
+    std::cout << "  --bvh-cache-file FILE      Disk cache for the BVH (default: <output>/bvh_cache.bvh1)\n";
     std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
     std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
     std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
@@ -7286,6 +7291,39 @@ int main(int argc, char** argv) {
             sim_config.thermal.gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
             std::cout << "[Multi-GPU] gpu_inter_batch_pause_ms = "
                       << sim_config.thermal.gpu_inter_batch_pause_ms << std::endl;
+        } else if (arg == "--use-gpu-illumination") {
+            sim_config.illumination.use_gpu = true;
+            std::cout << "Using GPU BVH ray tracer for illumination (OpenCL)" << std::endl;
+        } else if (arg == "--illum-gpu-devices" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto" || val == "all") {
+                sim_config.illumination.gpu_devices = 0;
+            } else {
+                sim_config.illumination.gpu_devices = std::stoi(val);
+            }
+            std::cout << "[Illum GPU] gpu_devices = "
+                      << (sim_config.illumination.gpu_devices == 0 ? "auto"
+                          : std::to_string(sim_config.illumination.gpu_devices))
+                      << std::endl;
+        } else if (arg == "--illum-gpu-device-ids" && i + 1 < argc) {
+            sim_config.illumination.gpu_device_ids.clear();
+            std::stringstream ss(argv[++i]);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty())
+                    sim_config.illumination.gpu_device_ids.push_back(std::stoi(token));
+            }
+            std::cout << "[Illum GPU] gpu_device_ids =";
+            for (int id : sim_config.illumination.gpu_device_ids) std::cout << " " << id;
+            std::cout << std::endl;
+        } else if (arg == "--illum-gpu-inter-batch-pause-ms" && i + 1 < argc) {
+            sim_config.illumination.gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
+            std::cout << "[Illum GPU] gpu_inter_batch_pause_ms = "
+                      << sim_config.illumination.gpu_inter_batch_pause_ms << std::endl;
+        } else if (arg == "--bvh-cache-file" && i + 1 < argc) {
+            sim_config.illumination.bvh_cache_file = argv[++i];
+            std::cout << "[Illum GPU] bvh_cache_file = "
+                      << sim_config.illumination.bvh_cache_file << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
         } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
@@ -8196,6 +8234,22 @@ int main(int argc, char** argv) {
     if (!using_generic_body) {
         illumination_model->setIncludePrimaryReflection(include_primary_reflection);
     }
+
+#ifdef PTM_GPU_OPENCL
+    // Wire up GPU BVH ray tracer if requested. Must happen BEFORE
+    // calculateIlluminationFromMesh / initializeScene so the BVH is built
+    // and replicated across the pool's devices on first scene init.
+    if (sim_config.illumination.use_gpu) {
+        illumination_model->configureGPURayTracingDevices(
+            sim_config.illumination.gpu_devices,
+            sim_config.illumination.gpu_device_ids,
+            sim_config.illumination.gpu_inter_batch_pause_ms);
+        if (!illumination_model->enableGPURayTracing(true)) {
+            std::cerr << "Warning: GPU illumination requested but pool init failed; "
+                         "continuing on CPU Embree" << std::endl;
+        }
+    }
+#endif
 
     // Load positions if available
     if (!positions_file.empty()) {
