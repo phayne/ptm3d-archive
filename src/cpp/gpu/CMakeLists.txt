@@ -136,13 +136,27 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_gpu_pool.cpp
         radiosity_opencl.cpp
         bvh_opencl.cpp
+        bvh_gpu_pool.cpp
+        cwbvh_builder.cpp
     )
+
+    # BVH layout selection: CWBVH (Ylitie 2017, default) vs BVH_GPU
+    # (tinybvh's 64 B BVH4-ish layout, fallback) vs BVH2_LEGACY (the
+    # 2018-era SoA BVH2 we shipped before this branch). Layouts can
+    # coexist in the source tree; the active one is gated by
+    # PTM_BVH_CWBVH / PTM_BVH_GPU / PTM_BVH_LEGACY.
+    set(PTM_BVH_LAYOUT "CWBVH" CACHE STRING
+        "BVH layout: CWBVH | BVH_GPU | BVH2_LEGACY")
+    set_property(CACHE PTM_BVH_LAYOUT PROPERTY STRINGS
+        "CWBVH" "BVH_GPU" "BVH2_LEGACY")
+    message(STATUS "BVH layout: ${PTM_BVH_LAYOUT}")
 
     add_library(ptm_gpu ${GPU_SOURCES})
 
     target_link_libraries(ptm_gpu
         PUBLIC
         OpenCL::OpenCL
+        tinybvh
     )
 
     target_compile_definitions(ptm_gpu
@@ -150,6 +164,18 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
         PTM_GPU_ENABLED=1
         PTM_GPU_OPENCL=1
     )
+
+    if(PTM_BVH_LAYOUT STREQUAL "CWBVH")
+        target_compile_definitions(ptm_gpu PUBLIC PTM_BVH_CWBVH=1)
+    elseif(PTM_BVH_LAYOUT STREQUAL "BVH_GPU")
+        target_compile_definitions(ptm_gpu PUBLIC PTM_BVH_GPU=1)
+    elseif(PTM_BVH_LAYOUT STREQUAL "BVH2_LEGACY")
+        target_compile_definitions(ptm_gpu PUBLIC PTM_BVH_LEGACY=1)
+    else()
+        message(FATAL_ERROR
+            "Unknown PTM_BVH_LAYOUT='${PTM_BVH_LAYOUT}'; "
+            "expected CWBVH | BVH_GPU | BVH2_LEGACY")
+    endif()
 
     # OpenCL compile options
     target_compile_options(ptm_gpu PRIVATE
@@ -207,6 +233,8 @@ if(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_gpu_pool.h
         radiosity_opencl.h
         bvh_opencl.h
+        bvh_gpu_pool.h
+        cwbvh_builder.h
         DESTINATION include/gpu
     )
 endif()

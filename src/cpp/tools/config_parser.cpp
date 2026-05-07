@@ -117,6 +117,20 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "albedo_maps_directory", config.illumination.albedo_maps_directory);
             config.illumination.positions_file =
                 getWithDefault(n, "positions_file", config.illumination.positions_file);
+            config.illumination.use_gpu = getWithDefault(n, "use_gpu",
+                config.illumination.use_gpu);
+            config.illumination.gpu_devices = getWithDefault(n, "gpu_devices",
+                config.illumination.gpu_devices);
+            if (n["gpu_device_ids"] && n["gpu_device_ids"].IsSequence()) {
+                config.illumination.gpu_device_ids.clear();
+                for (const auto& v : n["gpu_device_ids"]) {
+                    config.illumination.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            config.illumination.gpu_inter_batch_pause_ms = getWithDefault(n,
+                "gpu_inter_batch_pause_ms", config.illumination.gpu_inter_batch_pause_ms);
+            config.illumination.bvh_cache_file = getWithDefault(n,
+                "bvh_cache_file", config.illumination.bvh_cache_file);
         }
         
         // Parse Output section
@@ -366,6 +380,22 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "albedo_maps_directory" << YAML::Value << config.illumination.albedo_maps_directory;
         if (!config.illumination.positions_file.empty())
             out << YAML::Key << "positions_file" << YAML::Value << config.illumination.positions_file;
+        // Illumination GPU knobs (only emit when not at defaults).
+        if (config.illumination.use_gpu)
+            out << YAML::Key << "use_gpu" << YAML::Value << config.illumination.use_gpu;
+        if (config.illumination.gpu_devices != 1)
+            out << YAML::Key << "gpu_devices" << YAML::Value << config.illumination.gpu_devices;
+        if (!config.illumination.gpu_device_ids.empty()) {
+            out << YAML::Key << "gpu_device_ids" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+            for (int id : config.illumination.gpu_device_ids) out << id;
+            out << YAML::EndSeq;
+        }
+        if (config.illumination.gpu_inter_batch_pause_ms != 0)
+            out << YAML::Key << "gpu_inter_batch_pause_ms" << YAML::Value
+                << config.illumination.gpu_inter_batch_pause_ms;
+        if (!config.illumination.bvh_cache_file.empty())
+            out << YAML::Key << "bvh_cache_file" << YAML::Value
+                << config.illumination.bvh_cache_file;
         out << YAML::EndMap;
         
         // Output section

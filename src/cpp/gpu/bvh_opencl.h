@@ -156,10 +156,19 @@ public:
     BVHRayTracer& operator=(const BVHRayTracer&) = delete;
 
     /**
-     * @brief Initialize OpenCL context and compile kernels
+     * @brief Initialize OpenCL context and compile kernels (default first-available GPU)
      * @return true if initialization succeeded
      */
     bool initialize();
+
+    /**
+     * @brief Initialize OpenCL resources pinned to a specific device.
+     *
+     * Used by BVHGPUPool to route a tracer instance to one of several
+     * enumerated GPUs. The single-device default initialize() is unchanged
+     * so legacy runs stay byte-identical.
+     */
+    bool initialize(const OpenCLDeviceInfo& device_handle);
 
     /**
      * @brief Check if GPU ray tracer is available

@@ -138,6 +138,24 @@ struct SimulationConfig {
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";
         std::string positions_file = "";
+
+        // GPU-accelerated shadow ray tracing (off by default; CPU Embree is
+        // the historical default for large lunar runs). When use_gpu is true,
+        // the BVH ray tracer is initialized and routed through BVHGPUPool.
+        bool use_gpu = false;
+
+        // Multi-GPU dispatch knobs for the BVH ray tracer. Defaults preserve
+        // single-GPU behaviour (gpu_devices == 1, gpu_device_ids empty).
+        // gpu_devices == 0 / "auto" → use every enumerated GPU.
+        // gpu_device_ids overrides gpu_devices when non-empty.
+        int gpu_devices = 1;
+        std::vector<int> gpu_device_ids;
+        int  gpu_inter_batch_pause_ms = 0;
+
+        // Path to a serialized BVH cache (writes after first build, reads
+        // on subsequent runs). Empty = auto-derive under the output directory
+        // (<output>/bvh_cache.bvh1). Set to "off" to disable.
+        std::string bvh_cache_file = "";
     } illumination;
     
     // Output Configuration
