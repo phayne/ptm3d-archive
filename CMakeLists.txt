@@ -555,6 +555,9 @@ add_subdirectory(src/cpp/mesh)
 add_subdirectory(src/cpp/thermal)      # This will pick up thermal_adaptive_simd.cpp
 add_subdirectory(src/cpp/orbital)      # Keplerian propagator, body-fixed frame
 
+# Vendored third-party headers
+add_subdirectory(third_party/tinybvh)
+
 # GPU module (must be before illumination/radiation/main to allow linking)
 if(ENABLE_GPU)
     add_subdirectory(src/cpp/gpu)
