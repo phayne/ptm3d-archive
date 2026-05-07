@@ -350,6 +350,7 @@ def main() -> int:
             max_points=args.roi_max_points,
             density_exp=args.density_exp,
         )
+        site_windows_ok = 0
         for j, w in enumerate(windows):
             yaml_path = write_window_yaml(s, w, mesh, template_text)
             ok = run_window(s, w, yaml_path, dry_run=args.dry_run)
@@ -359,9 +360,28 @@ def main() -> int:
                 eta = elapsed * (n_total - done_idx) / done_idx
                 print(f"  [progress] {done_idx}/{n_total} windows  "
                       f"elapsed={fmt_duration(elapsed)}  ETA={fmt_duration(eta)}")
-            if not ok:
+            if ok:
+                site_windows_ok += 1
+            else:
                 failures.append((s["ellipse_id"], w["tag"]))
                 n_done -= 1
+
+        # After all windows for this site succeed, run the composite merger
+        # so the GUI Results Browser can read the site (mesh.ply at site root,
+        # statistics/{temperature,illumination,ice_depth}*.bin populated).
+        # Skip if any window failed -- the user should debug first.
+        if site_windows_ok == len(windows) and not args.dry_run:
+            site_dir = OUTPUT_ROOT / s["ellipse_id"]
+            print(f"  [{s['ellipse_id']}] all windows complete; running composite merge")
+            merge_cmd = [PYTHON, str(REPO / "scripts" / "a3gt_v2_merge_sparse.py"),
+                         "--site-dir", str(site_dir)]
+            mret = subprocess.run(merge_cmd)
+            if mret.returncode != 0:
+                print(f"  [{s['ellipse_id']}] WARNING: merge exited {mret.returncode}; "
+                      f"GUI may not be able to read this site until manually merged",
+                      file=sys.stderr)
+            else:
+                print(f"  [{s['ellipse_id']}] merge complete; site is GUI-ready")
 
     print()
     print(f"Done in {fmt_duration(time.time() - start_all)}: "
