@@ -243,6 +243,16 @@ public:
                                        int inter_batch_pause_ms = 0);
 
     /**
+     * @brief Set the BVH disk cache path. Empty string disables caching.
+     * If the file exists at scene-init time, the BVH is loaded from it
+     * (skipping the SAH build, which dominates first-run startup for
+     * 5 M-face meshes). After the build, the BVH is written back to
+     * the file for future runs to consume.
+     */
+    void setBVHCacheFile(const std::string& path) { bvh_cache_file_ = path; }
+    const std::string& getBVHCacheFile() const { return bvh_cache_file_; }
+
+    /**
      * @brief Check if GPU ray tracing is currently enabled and available
      */
     bool isGPURayTracingEnabled() const { return use_gpu_ray_tracer_; }
@@ -589,6 +599,8 @@ private:
     int                gpu_devices_count_         = 1;
     std::vector<int>   gpu_device_ids_;
     int                gpu_inter_batch_pause_ms_  = 0;
+    // BVH disk cache path (empty = disabled).
+    std::string        bvh_cache_file_;
 
     // Initialize GPU BVH ray tracer
     bool initializeGPURayTracer();

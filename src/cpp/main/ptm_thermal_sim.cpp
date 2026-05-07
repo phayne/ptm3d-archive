@@ -8244,6 +8244,18 @@ int main(int argc, char** argv) {
             sim_config.illumination.gpu_devices,
             sim_config.illumination.gpu_device_ids,
             sim_config.illumination.gpu_inter_batch_pause_ms);
+
+        // BVH disk cache: explicit path wins; otherwise auto-derive from output dir.
+        // "off" disables caching entirely.
+        std::string bvh_cache = sim_config.illumination.bvh_cache_file;
+        if (bvh_cache.empty()) {
+            bvh_cache = sim_config.output.directory + "/bvh_cache.bvh1";
+        }
+        illumination_model->setBVHCacheFile(bvh_cache);
+        if (bvh_cache != "off") {
+            std::cout << "[Illum GPU] BVH cache: " << bvh_cache << std::endl;
+        }
+
         if (!illumination_model->enableGPURayTracing(true)) {
             std::cerr << "Warning: GPU illumination requested but pool init failed; "
                          "continuing on CPU Embree" << std::endl;

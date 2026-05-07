@@ -374,12 +374,38 @@ bool IlluminationModel::initializeScene(
                     }};
                 }
 
-                gpu_bvh_->build(local_vertices, indices, bvh_config);
+                // Try to load BVH from disk cache first (saves the ~500 ms
+                // SAH build on 5 M-face lunar meshes). If load fails or file
+                // is missing, build from scratch and persist for next run.
+                bool loaded_from_cache = false;
+                if (!bvh_cache_file_.empty() && bvh_cache_file_ != "off") {
+                    if (gpu_bvh_->read(bvh_cache_file_)) {
+                        loaded_from_cache = (gpu_bvh_->numTriangles() == F);
+                        if (!loaded_from_cache) {
+                            std::cout << "[IlluminationModel] BVH cache "
+                                      << bvh_cache_file_ << " mismatched mesh size ("
+                                      << gpu_bvh_->numTriangles() << " vs " << F
+                                      << "); rebuilding\n";
+                            gpu_bvh_ = std::make_unique<gpu::opencl::BVHBuilder>();
+                        }
+                    }
+                }
+                if (!loaded_from_cache) {
+                    gpu_bvh_->build(local_vertices, indices, bvh_config);
+                    if (!bvh_cache_file_.empty() && bvh_cache_file_ != "off") {
+                        if (gpu_bvh_->write(bvh_cache_file_)) {
+                            std::cout << "[IlluminationModel] BVH cache written to "
+                                      << bvh_cache_file_ << "\n";
+                        }
+                    }
+                }
 
                 auto bvh_end = std::chrono::high_resolution_clock::now();
                 double bvh_time = std::chrono::duration<double>(bvh_end - bvh_start).count();
 
-                std::cout << "[IlluminationModel] BVH built: " << gpu_bvh_->numNodes()
+                std::cout << "[IlluminationModel] BVH "
+                          << (loaded_from_cache ? "loaded from cache: " : "built: ")
+                          << gpu_bvh_->numNodes()
                           << " nodes in " << std::fixed << std::setprecision(2)
                           << bvh_time << "s\n";
 
