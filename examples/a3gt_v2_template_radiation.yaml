@@ -1,0 +1,129 @@
+# A3GT v2 — per-window template for the sparse 18-yr workflow.
+#
+# This template is rendered by scripts/a3gt_v2_orchestrator.py once per
+# (site, window) combination. Placeholders {{...}} are substituted in
+# Python before passing the rendered YAML to scripts/run_chunked_simulation.py.
+#
+# Each rendered config covers ONE 30-day lunation window centered on a
+# subsolar-lat extremum (summer or winter) for one of the production
+# years (0, 5, 9, 14). At hourly cadence, that's 30 × 24 = 720 timesteps.
+# `output.write_raw_stats: true` makes ptm_thermal_sim emit per-window
+# statistics/_raw/{datatype}_sum.bin / _count.bin so the composite
+# merger (a3gt_v2_merge_sparse.py) can combine them later into 18-yr
+# approximate stats.
+#
+# The chunked orchestrator (run_chunked_simulation.py) further splits a
+# window into RAM-fitting chunks if needed; for 720 ts × ~5 M-face
+# meshes typical chunk planning fits a single chunk.
+simulation:
+  start_time: '{{ start_time }}'
+  duration_days: {{ duration_days }}    # 30 for lunation, 365.25 if a full-year truth window
+  timesteps: {{ timesteps }}            # duration_days × 24 (hourly cadence)
+  body: Moon
+mesh:
+  resolution: 9                          # ignored when import_file is set
+  import_file: '{{ mesh_path }}'
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  use_gpu: true
+  # Multi-GPU thermal (4 W6800X dies). Keep the recommended hang knobs.
+  gpu_devices: 4
+  gpu_batch_size: 200000
+  gpu_inter_batch_pause_ms: 1500
+  equilibration_orbits: 2.0
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 120.0
+  compute_statistics: true
+  use_default_property_map: true
+  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps
+  thermal_inertia_map: ''
+  h_parameter_map: ''
+  compute_ice_stability: true
+  ice_stability:
+    flux_threshold_kgm2s: 3.0e-14
+    grain_hop_length_um: 75.0
+    geothermal_gradient_K_per_m: 0.0
+    sublimation_enthalpy_kJmol: 51.058
+    n_depth_subsamples: -1
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+  use_default_ks: true
+  ks: 0.00074
+  use_default_kd: true
+  kd: 0.0034
+  use_default_H: true
+  H: 0.06
+  use_default_rhos: true
+  rhos: 1100.0
+  use_default_rhod: true
+  rhod: 1800.0
+  use_default_cp0: true
+  cp0: 800.0
+  use_default_Qb: true
+  Qb: 0.018
+  use_default_chi: true
+  chi: 2.7
+  constant_thermal_inertia: -1.0
+radiation:
+  # Surface-to-surface radiation exchange (terrain IR re-radiation onto PSR
+  # floors and across crater walls). Enabled for the radiation-coupled A3GT
+  # v2 batch.
+  enabled: true
+  # H-matrix compression with ACA. For ~1.8M-face 3 km meshes the H-matrix
+  # path auto-switches to out-of-core storage (radiation_exchange.cpp:763).
+  use_hmatrix: true
+  use_aca: true
+  aca_tolerance: 1.0e-2          # looser tolerance, ~3-5x faster build
+  aca_max_rank: 50
+  hmatrix_threads: 0             # 0 = auto
+  # Adaptive neighbor selection: target 95% captured energy per face.
+  adaptive_neighbors: true
+  captured_energy_target: 0.95
+  min_neighbors: 20
+  max_neighbors: 500
+  use_cluster_cull: true
+  # Coupling-loop tuning (matches the CLI defaults from CLAUDE.md).
+  max_coupling_iterations: 10
+  coupling_temp_threshold: 0.5
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+  # Per-site view-factor cache: rendered to <site_dir>/view_factors.hmat by
+  # the orchestrator. The first window builds it; subsequent windows load it.
+  view_factor_file: '{{ vf_file }}'
+  verbose: true
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_map: ''
+  positions_file: ''
+  # GPU illumination is broken on lunar (see memory: gpu_illumination_lunar_correctness.md).
+  # Lunar workflow stays on CPU Embree.
+  use_gpu: false
+output:
+  directory: '{{ output_dir }}'
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+  # Per-step time series files would explode disk for 8 windows × 720 ts × 11 sites.
+  # Stats binaries are computed regardless (compute_statistics: true above).
+  skip_time_series: true
+  # Write raw sum/count buffers so a3gt_v2_merge_sparse.py can composite.
+  write_raw_stats: true
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0

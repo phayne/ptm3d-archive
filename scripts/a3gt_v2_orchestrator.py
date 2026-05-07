@@ -53,6 +53,7 @@ DTM_TOOL = (DTM_TOOL_LOCAL if DTM_TOOL_LOCAL.is_file()
             and os.access(DTM_TOOL_LOCAL, os.X_OK) else DTM_TOOL_REMOTE)
 MESH_DIR = REPO / "data" / "dem" / "a3gt_v2"
 TEMPLATE = REPO / "examples" / "a3gt_v2_template.yaml"
+TEMPLATE_RAD = REPO / "examples" / "a3gt_v2_template_radiation.yaml"
 RUN_CHUNKED = REPO / "scripts" / "run_chunked_simulation.py"
 DEFAULT_OUTPUT_ROOT = REPO / "output" / "a3gt_v2"
 # Mutable; set in main() based on --output-root.
@@ -176,7 +177,8 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
 # --------------------------------------------------------------------------
 
 def render_yaml(template_text: str, *, start_time: str, duration_days: float,
-                timesteps: int, mesh_path: Path, output_dir: Path) -> str:
+                timesteps: int, mesh_path: Path, output_dir: Path,
+                vf_file: Path | None = None) -> str:
     out = template_text
     repl = {
         "{{ start_time }}":    start_time,
@@ -184,6 +186,7 @@ def render_yaml(template_text: str, *, start_time: str, duration_days: float,
         "{{ timesteps }}":     str(int(timesteps)),
         "{{ mesh_path }}":     str(mesh_path),
         "{{ output_dir }}":    str(output_dir),
+        "{{ vf_file }}":       str(vf_file) if vf_file is not None else "",
     }
     for k, v in repl.items():
         out = out.replace(k, v)
@@ -191,7 +194,8 @@ def render_yaml(template_text: str, *, start_time: str, duration_days: float,
 
 
 def write_window_yaml(site: dict, window: dict, mesh: Path,
-                       template_text: str) -> Path:
+                       template_text: str,
+                       vf_file: Path | None = None) -> Path:
     """Render the per-window YAML to disk and return its path."""
     yaml_path = window_yaml_path(site["ellipse_id"], window["tag"])
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +211,7 @@ def write_window_yaml(site: dict, window: dict, mesh: Path,
         timesteps=timesteps,
         mesh_path=mesh,
         output_dir=out_dir,
+        vf_file=vf_file,
     )
     yaml_path.write_text(rendered)
     return yaml_path
@@ -292,6 +297,11 @@ def main() -> int:
                    help=f"Root directory for per-site simulation outputs "
                         f"(default: {DEFAULT_OUTPUT_ROOT}). "
                         "Use a local-disk path to keep outputs off OneDrive.")
+    p.add_argument("--radiation", action="store_true",
+                   help="Enable surface-to-surface radiation exchange "
+                        "(uses examples/a3gt_v2_template_radiation.yaml). "
+                        "Per-site view-factor cache is built once and reused "
+                        "across the 8 windows.")
     args = p.parse_args()
 
     # Honor --output-root by overriding the module-level OUTPUT_ROOT;
@@ -332,8 +342,11 @@ def main() -> int:
     # action == run
     schedule = json.loads(args.schedule.read_text())
     windows = schedule["windows"]
-    template_text = TEMPLATE.read_text()
-    print(f"\nSchedule: {schedule['year_set']} ({len(windows)} windows)\n")
+    template_path = TEMPLATE_RAD if args.radiation else TEMPLATE
+    template_text = template_path.read_text()
+    print(f"\nSchedule: {schedule['year_set']} ({len(windows)} windows)")
+    print(f"Template: {template_path.name}"
+          f"{' [radiation enabled]' if args.radiation else ''}\n")
 
     n_total = len(sites) * len(windows)
     n_done = n_total
@@ -350,9 +363,18 @@ def main() -> int:
             max_points=args.roi_max_points,
             density_exp=args.density_exp,
         )
+        # Per-site view-factor cache: lives at <site_dir>/view_factors.hmat,
+        # built by the first window's run, reused by all subsequent windows.
+        # (Same geometry across all 8 windows — view factors are identical.)
+        vf_file = (OUTPUT_ROOT / s["ellipse_id"] / "view_factors.hmat"
+                    if args.radiation else None)
+        if vf_file is not None:
+            vf_file.parent.mkdir(parents=True, exist_ok=True)
+
         site_windows_ok = 0
         for j, w in enumerate(windows):
-            yaml_path = write_window_yaml(s, w, mesh, template_text)
+            yaml_path = write_window_yaml(s, w, mesh, template_text,
+                                           vf_file=vf_file)
             ok = run_window(s, w, yaml_path, dry_run=args.dry_run)
             done_idx = i * len(windows) + j + 1
             elapsed = time.time() - start_all

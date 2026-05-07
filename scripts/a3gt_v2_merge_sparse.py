@@ -142,6 +142,37 @@ def write_summary(site_dir: Path, ellipse_id: str, n_windows: int,
     return out
 
 
+def cleanup_window_dirs(window_dirs: list[Path]) -> int:
+    """Remove each window subdir (chunk_NNN/, per-window statistics/,
+    _thermal_state/, time_steps.txt) once the composite merge has
+    written the site-root statistics/. Returns total bytes freed.
+
+    Safety: this is destructive (rm -rf each window dir). It runs only
+    after the merger reports success and the site-root statistics/
+    directory contains the canonical merged binaries. The window subdirs
+    contain only intermediate per-window/per-chunk data that the
+    composite already absorbed -- they are not needed for downstream
+    analysis, GUI viz, or summary.json regeneration.
+    """
+    bytes_freed = 0
+    for w in window_dirs:
+        try:
+            for root, _dirs, files in os.walk(w):
+                for fn in files:
+                    fp = Path(root) / fn
+                    try:
+                        bytes_freed += fp.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(w)
+        except OSError as e:
+            print(f"  warn: failed to remove {w}: {e}", file=sys.stderr)
+    return bytes_freed
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -149,6 +180,10 @@ def main() -> int:
                    help="Per-site root, e.g. output/a3gt_v2/A03MM022/")
     p.add_argument("--merge-bin", type=Path, default=None,
                    help="Path to ptm_merge_chunks (default: auto-detect).")
+    p.add_argument("--keep-chunks", action="store_true",
+                   help="Keep per-window subdirectories (chunk_*, "
+                        "per-window statistics/, _thermal_state/) after merge "
+                        "(default: delete to free disk).")
     args = p.parse_args()
 
     if not args.site_dir.is_dir():
@@ -191,6 +226,25 @@ def main() -> int:
     summary_path = write_summary(args.site_dir, args.site_dir.name,
                                   n_windows=n_windows, n_chunks=len(chunk_dirs))
     print(f"\nSummary: {summary_path}")
+
+    # Composite merge succeeded and the canonical statistics/ directory is
+    # populated; the per-window subdirs are now redundant. Remove them
+    # (chunk_*/, per-window statistics/, _thermal_state/) unless
+    # --keep-chunks is set.
+    if not args.keep_chunks:
+        # Verify the merge actually produced the canonical output before
+        # deleting (defense in depth -- ptm_merge_chunks already exited 0).
+        merged_ok = (args.site_dir / "statistics" / "temperature_avg.bin").is_file()
+        if merged_ok:
+            window_dirs = sorted({c.parent for c in chunk_dirs})
+            print(f"\nCleaning up {len(window_dirs)} window dir(s)"
+                  f" ({len(chunk_dirs)} chunks total)...")
+            freed = cleanup_window_dirs(window_dirs)
+            print(f"  freed {freed / (1024**3):.2f} GB")
+        else:
+            print("  warn: site-root statistics/temperature_avg.bin missing; "
+                  "skipping cleanup", file=sys.stderr)
+
     summary = json.loads(summary_path.read_text())
     if "temperature" in summary:
         t = summary["temperature"]
