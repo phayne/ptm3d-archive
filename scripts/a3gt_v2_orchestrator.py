@@ -54,7 +54,9 @@ DTM_TOOL = (DTM_TOOL_LOCAL if DTM_TOOL_LOCAL.is_file()
 MESH_DIR = REPO / "data" / "dem" / "a3gt_v2"
 TEMPLATE = REPO / "examples" / "a3gt_v2_template.yaml"
 RUN_CHUNKED = REPO / "scripts" / "run_chunked_simulation.py"
-OUTPUT_ROOT = REPO / "output" / "a3gt_v2"
+DEFAULT_OUTPUT_ROOT = REPO / "output" / "a3gt_v2"
+# Mutable; set in main() based on --output-root.
+OUTPUT_ROOT: Path = DEFAULT_OUTPUT_ROOT
 
 PYTHON = "/Users/paha3326/anaconda3/envs/europa_viz/bin/python3"
 
@@ -282,7 +284,18 @@ def main() -> int:
     p.add_argument("--roi-max-points", type=int, default=2_500_000)
     p.add_argument("--density-exp", type=float, default=1.0,
                    help="Mesh density falloff exponent (1.0 = linear; A3GT v2 default).")
+    p.add_argument("--output-root", type=Path, default=None,
+                   help=f"Root directory for per-site simulation outputs "
+                        f"(default: {DEFAULT_OUTPUT_ROOT}). "
+                        "Use a local-disk path to keep outputs off OneDrive.")
     args = p.parse_args()
+
+    # Honor --output-root by overriding the module-level OUTPUT_ROOT;
+    # downstream helpers (window_dir, window_yaml_path, etc.) read this.
+    global OUTPUT_ROOT
+    if args.output_root is not None:
+        OUTPUT_ROOT = args.output_root.expanduser().resolve()
+    print(f"Output root: {OUTPUT_ROOT}")
 
     if not args.manifest.is_file():
         sys.exit(f"manifest not found: {args.manifest}")
