@@ -51,6 +51,8 @@ public:
     /// failure (the device is dropped from the pool).
     bool uploadMesh(const std::vector<std::array<double, 3>>& vertices,
                     const std::vector<std::array<int, 3>>& indices);
+    bool uploadMesh(const std::vector<std::array<float, 3>>& vertices,
+                    const std::vector<std::array<uint32_t, 3>>& indices);
 
     /// Upload BVH to every healthy device. Same drop-on-failure semantics.
     bool uploadBVH(const BVHBuilder& bvh);
@@ -63,6 +65,11 @@ public:
 
     /// Optional access to per-slot device metadata (for diagnostics).
     const OpenCLDeviceInfo& deviceAt(size_t i) const;
+
+    /// Aggregated stats summed across all healthy devices.
+    /// (Wall time is the *sum* across devices; for parallel wall time
+    /// use the model's own wall-clock timers.)
+    BVHRayTracer::Stats getAggregatedStats() const;
 
     /// Trace shadow rays across all healthy devices in parallel.
     /// Output `occluded_out` is sized to match the input ray count.

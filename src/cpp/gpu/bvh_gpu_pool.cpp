@@ -83,6 +83,26 @@ bool BVHGPUPool::uploadMesh(const std::vector<std::array<double, 3>>& vertices,
     return all_ok;
 }
 
+bool BVHGPUPool::uploadMesh(const std::vector<std::array<float, 3>>& vertices,
+                            const std::vector<std::array<uint32_t, 3>>& indices) {
+    bool all_ok = true;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        auto& slot = *slots_[i];
+        if (!slot.healthy || !slot.tracer) continue;
+        try {
+            slot.tracer->uploadMesh(vertices, indices);
+        } catch (const std::exception& e) {
+            std::cerr << "[BVH Pool] Mesh upload failed on device " << i
+                      << " (" << slot.handle.name << "): " << e.what()
+                      << "; dropping" << std::endl;
+            slot.tracer.reset();
+            slot.healthy = false;
+            all_ok = false;
+        }
+    }
+    return all_ok;
+}
+
 bool BVHGPUPool::uploadBVH(const BVHBuilder& bvh) {
     bool all_ok = true;
     for (size_t i = 0; i < slots_.size(); ++i) {
@@ -125,6 +145,19 @@ const OpenCLDeviceInfo& BVHGPUPool::deviceAt(size_t i) const {
         throw std::out_of_range("BVHGPUPool::deviceAt");
     }
     return slots_[i]->handle;
+}
+
+BVHRayTracer::Stats BVHGPUPool::getAggregatedStats() const {
+    BVHRayTracer::Stats agg;
+    for (const auto& slot_ptr : slots_) {
+        if (!slot_ptr || !slot_ptr->tracer) continue;
+        const auto& s = slot_ptr->tracer->getStats();
+        agg.rays_traced   += s.rays_traced;
+        agg.total_time_ms += s.total_time_ms;
+        agg.upload_time_ms += s.upload_time_ms;
+        agg.kernel_time_ms += s.kernel_time_ms;
+    }
+    return agg;
 }
 
 std::vector<size_t> BVHGPUPool::healthyIndices() const {

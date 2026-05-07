@@ -42,6 +42,7 @@
 // GPU BVH ray tracer (optional)
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/bvh_opencl.h"
+#include "../gpu/bvh_gpu_pool.h"
 #endif
 
 namespace constants = ptm_thermal::constants;  
@@ -342,11 +343,11 @@ bool IlluminationModel::initializeScene(
 
 #ifdef PTM_GPU_OPENCL
         // Build and upload BVH to GPU if GPU ray tracing is enabled
-        if (use_gpu_ray_tracer_ && gpu_ray_tracer_) {
+        if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_ray_pool_->isReady()) {
             try {
                 auto bvh_start = std::chrono::high_resolution_clock::now();
 
-                // Build BVH with SAH
+                // Build BVH with SAH (CPU-side, replicated across all pool devices)
                 gpu_bvh_ = std::make_unique<gpu::opencl::BVHBuilder>();
                 gpu::opencl::BVHConfig bvh_config;
                 bvh_config.max_triangles_per_leaf = 4;
@@ -382,17 +383,16 @@ bool IlluminationModel::initializeScene(
                           << " nodes in " << std::fixed << std::setprecision(2)
                           << bvh_time << "s\n";
 
-                // Upload mesh and BVH to GPU
+                // Upload mesh and BVH to every pool device.
                 auto upload_start = std::chrono::high_resolution_clock::now();
-
-                gpu_ray_tracer_->uploadMesh(local_vertices, indices);
-                gpu_ray_tracer_->uploadBVH(*gpu_bvh_);
-                gpu_mesh_uploaded_ = true;
-
+                gpu_ray_pool_->uploadMesh(local_vertices, indices);
+                gpu_ray_pool_->uploadBVH(*gpu_bvh_);
+                gpu_mesh_uploaded_ = gpu_ray_pool_->isReady();
                 auto upload_end = std::chrono::high_resolution_clock::now();
                 double upload_time = std::chrono::duration<double>(upload_end - upload_start).count();
 
-                std::cout << "[IlluminationModel] GPU mesh/BVH uploaded in "
+                std::cout << "[IlluminationModel] GPU mesh/BVH uploaded to "
+                          << gpu_ray_pool_->numDevices() << " device(s) in "
                           << std::fixed << std::setprecision(2) << upload_time << "s\n";
             } catch (const std::exception& e) {
                 std::cerr << "[IlluminationModel] GPU BVH setup failed: " << e.what()
@@ -729,7 +729,7 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
 
 #ifdef PTM_GPU_OPENCL
     // Use GPU ray tracer if available
-    if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+    if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_) {
         return traceOccludedGPU(origins, directions);
     }
 #endif
@@ -1369,7 +1369,7 @@ bool IlluminationModel::calculateIlluminationOptimized(
         try {
 #ifdef PTM_GPU_OPENCL
             // Use GPU batched version when GPU ray tracing is enabled
-            if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+            if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_) {
                 calculateDirectSolarBatchWithFiniteDiskGPU(
                     face_centers,
                     face_normals,
@@ -2461,7 +2461,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         // Calculate direct solar illumination with finite disk model
 #ifdef PTM_GPU_OPENCL
         // Use GPU batched version when GPU ray tracing is enabled
-        if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_mesh_uploaded_) {
+        if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_) {
             calculateDirectSolarBatchWithFiniteDiskGPU(
                 face_centers,                    // Use original face centers
                 corrected_normals,                // Use CORRECTED normals
@@ -3673,7 +3673,7 @@ bool IlluminationModel::enableGPURayTracing(bool enable) {
         return true;
     }
 
-    if (use_gpu_ray_tracer_ && gpu_ray_tracer_ && gpu_ray_tracer_->isAvailable()) {
+    if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_ray_pool_->isReady()) {
         // Already enabled
         return true;
     }
@@ -3683,32 +3683,83 @@ bool IlluminationModel::enableGPURayTracing(bool enable) {
 
 bool IlluminationModel::initializeGPURayTracer() {
     try {
-        gpu_ray_tracer_ = std::make_unique<gpu::opencl::BVHRayTracer>();
-        if (!gpu_ray_tracer_->initialize()) {
-            std::cerr << "Warning: Failed to initialize GPU BVH ray tracer, falling back to CPU" << std::endl;
-            gpu_ray_tracer_.reset();
+        // Resolve the device list from configureGPURayTracingDevices() state.
+        auto all_gpus = gpu::opencl::OpenCLContext::enumerateGPUs(/*only_available=*/true);
+        std::vector<gpu::opencl::OpenCLDeviceInfo> selected;
+        if (!gpu_device_ids_.empty()) {
+            for (int id : gpu_device_ids_) {
+                if (id < 0 || static_cast<size_t>(id) >= all_gpus.size()) {
+                    std::cerr << "Warning: invalid illumination gpu_device_id " << id
+                              << " (only " << all_gpus.size() << " GPUs enumerated); ignoring"
+                              << std::endl;
+                    continue;
+                }
+                selected.push_back(all_gpus[id]);
+            }
+        } else if (gpu_devices_count_ <= 0) {
+            // 0 / "auto" → use all available GPUs.
+            selected = all_gpus;
+        } else if (gpu_devices_count_ == 1) {
+            if (!all_gpus.empty()) selected.push_back(all_gpus.front());
+        } else {
+            const int n = std::min(gpu_devices_count_,
+                                   static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n; ++i) selected.push_back(all_gpus[i]);
+        }
+
+        if (selected.empty()) {
+            std::cerr << "Warning: no GPUs available for ray tracing" << std::endl;
+            gpu_ray_pool_.reset();
             use_gpu_ray_tracer_ = false;
             return false;
         }
 
-        const auto& info = gpu_ray_tracer_->getDeviceInfo();
-        std::cout << "GPU ray tracer initialized: " << info.name << std::endl;
-        std::cout << "  VRAM: " << (info.global_mem_size / (1024 * 1024)) << " MB" << std::endl;
+        gpu_ray_pool_ = std::make_unique<gpu::opencl::BVHGPUPool>(
+            std::move(selected), gpu_inter_batch_pause_ms_, /*verbose=*/false);
+        if (!gpu_ray_pool_->initialize()) {
+            std::cerr << "Warning: BVHGPUPool::initialize() failed; "
+                         "falling back to CPU" << std::endl;
+            gpu_ray_pool_.reset();
+            use_gpu_ray_tracer_ = false;
+            return false;
+        }
+
+        std::cout << "GPU ray tracer initialized across "
+                  << gpu_ray_pool_->numDevices() << " device(s):" << std::endl;
+        for (size_t k = 0; k < gpu_ray_pool_->numDevices(); ++k) {
+            const auto& info = gpu_ray_pool_->deviceAt(k);
+            std::cout << "  [" << k << "] " << info.name << " ("
+                      << (info.global_mem_size / (1024 * 1024)) << " MB)"
+                      << std::endl;
+        }
+        if (gpu_inter_batch_pause_ms_ > 0) {
+            std::cout << "  Inter-batch pause: " << gpu_inter_batch_pause_ms_
+                      << " ms (per device)" << std::endl;
+        }
 
         use_gpu_ray_tracer_ = true;
         gpu_mesh_uploaded_ = false;  // Will upload mesh when needed
-
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error initializing GPU ray tracer: " << e.what() << std::endl;
-        gpu_ray_tracer_.reset();
+        gpu_ray_pool_.reset();
         use_gpu_ray_tracer_ = false;
         return false;
     }
 }
 
+void IlluminationModel::configureGPURayTracingDevices(
+    int gpu_devices,
+    const std::vector<int>& gpu_device_ids,
+    int inter_batch_pause_ms)
+{
+    gpu_devices_count_         = gpu_devices;
+    gpu_device_ids_            = gpu_device_ids;
+    gpu_inter_batch_pause_ms_  = inter_batch_pause_ms;
+}
+
 void IlluminationModel::uploadMeshToGPU() {
-    if (!gpu_ray_tracer_ || gpu_mesh_uploaded_) return;
+    if (!gpu_ray_pool_ || gpu_mesh_uploaded_) return;
 
     // We need the mesh vertices and indices that were passed to initializeScene
     // These need to be stored or re-extracted. For now, we'll use Embree's scene
@@ -3724,11 +3775,11 @@ void IlluminationModel::uploadMeshToGPU() {
 
 IlluminationModel::GPURayTracerStats IlluminationModel::getGPURayTracerStats() const {
     GPURayTracerStats stats;
-    if (gpu_ray_tracer_) {
-        const auto& gpu_stats = gpu_ray_tracer_->getStats();
-        stats.rays_traced = gpu_stats.rays_traced;
-        stats.total_time_ms = gpu_stats.total_time_ms;
-        stats.kernel_time_ms = gpu_stats.kernel_time_ms;
+    if (gpu_ray_pool_) {
+        const auto agg = gpu_ray_pool_->getAggregatedStats();
+        stats.rays_traced    = agg.rays_traced;
+        stats.total_time_ms  = agg.total_time_ms;
+        stats.kernel_time_ms = agg.kernel_time_ms;
     }
     return stats;
 }
@@ -3740,7 +3791,7 @@ std::vector<uint8_t> IlluminationModel::traceOccludedGPU(
     const size_t n = origins.size();
     std::vector<uint8_t> blocked(n, 0);
 
-    if (!gpu_ray_tracer_ || !gpu_ray_tracer_->isAvailable() || n == 0) {
+    if (!gpu_ray_pool_ || !gpu_ray_pool_->isReady() || n == 0) {
         // Fall back to CPU
         return traceOccluded(origins, directions, false);
     }
@@ -3769,15 +3820,12 @@ std::vector<uint8_t> IlluminationModel::traceOccludedGPU(
         };
     }
 
-    // GPU ray tracer is not thread-safe - serialize all calls
-    {
-        std::lock_guard<std::mutex> lock(gpu_ray_tracer_mutex_);
-        try {
-            gpu_ray_tracer_->traceShadowRays(local_origins, norm_directions, blocked);
-        } catch (const std::exception& e) {
-            std::cerr << "GPU ray trace failed: " << e.what() << ", falling back to CPU" << std::endl;
-            return traceOccluded(origins, directions, false);
-        }
+    // The pool serializes per-device internally; no outer mutex needed.
+    try {
+        gpu_ray_pool_->traceShadowRays(local_origins, norm_directions, blocked);
+    } catch (const std::exception& e) {
+        std::cerr << "GPU ray trace failed: " << e.what() << ", falling back to CPU" << std::endl;
+        return traceOccluded(origins, directions, false);
     }
 
     return blocked;
@@ -3792,13 +3840,13 @@ void IlluminationModel::traceOccludedBatchedGPU(
     const std::vector<float>& ray_dir_z,
     std::vector<uint8_t>& occluded)
 {
-    if (!gpu_ray_tracer_ || !gpu_ray_tracer_->isAvailable()) {
+    if (!gpu_ray_pool_ || !gpu_ray_pool_->isReady()) {
         occluded.assign(ray_org_x.size(), 1);  // Assume all blocked on failure
         return;
     }
 
     // Single GPU dispatch - no mutex needed as caller handles synchronization
-    gpu_ray_tracer_->traceShadowRays(ray_org_x, ray_org_y, ray_org_z,
+    gpu_ray_pool_->traceShadowRays(ray_org_x, ray_org_y, ray_org_z,
                                       ray_dir_x, ray_dir_y, ray_dir_z,
                                       occluded);
 }
@@ -4157,14 +4205,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const_cast<FaceRayInfo&>(fri).ray_start = dst;
     }
 
-    // ==== PHASE 2: GPU ray tracing (single batch) ====
+    // ==== PHASE 2: GPU ray tracing (single batch; pool partitions across devices) ====
     std::vector<uint8_t> occluded;
-    {
-        std::lock_guard<std::mutex> lock(gpu_ray_tracer_mutex_);
-        traceOccludedBatchedGPU(compact_org_x, compact_org_y, compact_org_z,
-                                 compact_dir_x, compact_dir_y, compact_dir_z,
-                                 occluded);
-    }
+    traceOccludedBatchedGPU(compact_org_x, compact_org_y, compact_org_z,
+                             compact_dir_x, compact_dir_y, compact_dir_z,
+                             occluded);
 
     // ==== PHASE 3: Process results (parallel) ====
     #pragma omp parallel for schedule(dynamic, 256)

@@ -25,6 +25,7 @@ namespace gpu {
 namespace opencl {
     class BVHBuilder;
     class BVHRayTracer;
+    class BVHGPUPool;
 }
 }
 #endif
@@ -222,6 +223,24 @@ public:
      * @return true if GPU was successfully initialized, false otherwise
      */
     bool enableGPURayTracing(bool enable = true);
+
+    /**
+     * @brief Configure multi-GPU ray tracing.
+     *
+     * Must be called BEFORE initializeScene() so the device list is set
+     * when the BVH/mesh upload happens. Defaults preserve single-GPU
+     * behaviour.
+     *
+     * @param gpu_devices N (>=1) or 0 for "all available GPUs".
+     * @param gpu_device_ids If non-empty, exactly those device indices
+     *        (overrides gpu_devices). Indices come from
+     *        OpenCLContext::enumerateGPUs().
+     * @param inter_batch_pause_ms Optional sleep between batches on the
+     *        same device (watchdog mitigation knob).
+     */
+    void configureGPURayTracingDevices(int gpu_devices,
+                                       const std::vector<int>& gpu_device_ids,
+                                       int inter_batch_pause_ms = 0);
 
     /**
      * @brief Check if GPU ray tracing is currently enabled and available
@@ -562,10 +581,14 @@ private:
     // GPU ray tracing members
 #ifdef PTM_GPU_OPENCL
     std::unique_ptr<gpu::opencl::BVHBuilder> gpu_bvh_;
-    std::unique_ptr<gpu::opencl::BVHRayTracer> gpu_ray_tracer_;
-    mutable std::mutex gpu_ray_tracer_mutex_;  // Protects GPU ray tracer calls (not thread-safe)
+    std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;
     bool use_gpu_ray_tracer_ = false;
     bool gpu_mesh_uploaded_ = false;
+
+    // Multi-GPU dispatch config (defaults preserve single-GPU behaviour).
+    int                gpu_devices_count_         = 1;
+    std::vector<int>   gpu_device_ids_;
+    int                gpu_inter_batch_pause_ms_  = 0;
 
     // Initialize GPU BVH ray tracer
     bool initializeGPURayTracer();
