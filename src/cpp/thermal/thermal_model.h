@@ -186,15 +186,16 @@ public:
     // Numerical parameters
     double F = 0.5;           // Fourier Mesh Number, must be <= 0.5 for stability
     int m = 10;               // Number of layers in upper skin depth
-    int n = 15;               // Layer growth factor: dz[i] = dz[i-1]*(1+1/n)
+    int n = 15;               // Layer growth factor (only used by legacy non-adaptive grid path)
     // b = skin depths to bottom layer. With the radiative-conductivity term
     // χ(T/350)³ ~doubling K at deep regolith temperatures, the effective deep
-    // skin depth is ~1.5–2× the surface lattice value. b=20 puts the bottom
-    // at ~12 e-folds of damping at the deep effective skin depth so the
-    // diurnal wave is fully attenuated before the bottom Neumann BC. The
-    // legacy default b=5 left tens of K of residual diurnal amplitude at the
-    // bottom layer, which contaminated extrapolated location-export depths.
-    int b = 20;
+    // skin depth is ~1.5–2× the surface lattice value. b=15 places the bottom
+    // at ~9 effective e-folds of damping (~45 cm on the Moon), giving a
+    // residual diurnal amplitude < 0.1 K at the bottom Neumann BC — well
+    // attenuated, with ~1.7× lower thermal-kernel cost than b=20. The legacy
+    // default b=5 left tens of K of residual diurnal amplitude at the bottom
+    // layer, which contaminated extrapolated location-export depths.
+    int b = 15;
 
     // Adaptive grid controls
     bool   ADAPTIVE_GRID = true;     // Use per-profile adaptive grid instead of fixed geometric

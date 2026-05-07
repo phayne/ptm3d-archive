@@ -101,8 +101,8 @@ struct SimulationConfig {
         // e-folds at depth, leaving a ~tens-of-K diurnal residual at the
         // bottom that contaminated extrapolated location-export depths.
         int grid_m = 10;                  // Layers in upper skin depth
-        int grid_n = 15;                  // Layer growth factor
-        int grid_b = 20;                  // Skin depths to bottom (≈12 e-folds of damping at deep T)
+        int grid_n = 15;                  // Layer growth factor (only used by legacy non-adaptive path)
+        int grid_b = 15;                  // Skin depths to bottom (≈9 e-folds of damping at deep T; bottom amp <0.05 K)
         // Geothermal heat flow
         double geothermal_heat_flow = -1.0; // W/m², -1 = use planet default
         // Per-face heat flow mask (for localized endogenic heat)
