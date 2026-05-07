@@ -136,6 +136,7 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_gpu_pool.cpp
         radiosity_opencl.cpp
         bvh_opencl.cpp
+        bvh_gpu_pool.cpp
     )
 
     add_library(ptm_gpu ${GPU_SOURCES})
@@ -207,6 +208,7 @@ if(GPU_BACKEND_USED STREQUAL "OPENCL")
         thermal_gpu_pool.h
         radiosity_opencl.h
         bvh_opencl.h
+        bvh_gpu_pool.h
         DESTINATION include/gpu
     )
 endif()
