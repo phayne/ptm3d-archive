@@ -601,6 +601,36 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::vector<double>* face_Qb = nullptr,
     const std::vector<double>* face_H_overrides = nullptr);
 
+// Apply the Hayne et al. (2017) incidence-angle correction to a base
+// normal-incidence Bond albedo A0. Composes:
+//
+//     A(θ) = A0 + a·(θ/(π/4))^3 + b·(θ/(π/2))^8
+//
+// where θ is the solar incidence angle. cos_theta is recovered from the
+// direct flux via cos(θ) = direct / S_solar (clamped to [0,1]). When the
+// body has no albedoCoef (e.g., Europa), the base albedo is returned
+// unchanged. Used by both CPU and GPU thermal flux pipelines so per-face
+// map values from a spatial albedo map still receive the angular
+// correction (otherwise high-θ faces are biased ~kelvin-warm in
+// nighttime cooling because too much daytime flux is absorbed).
+static inline double applyIncidenceAlbedo(double A0,
+                                          double direct_flux,
+                                          double solar_constant,
+                                          double a_coef,
+                                          double b_coef) {
+    if (solar_constant <= 0.0 || direct_flux <= 0.0) return A0;
+    double cos_theta = direct_flux / solar_constant;
+    if (cos_theta >= 1.0) return A0;
+    if (cos_theta <  0.0) cos_theta = 0.0;
+    const double theta = std::acos(cos_theta);
+    const double t45 = theta / (M_PI / 4.0);
+    const double t90 = theta / (M_PI / 2.0);
+    double A = A0 + a_coef * t45 * t45 * t45 + b_coef * std::pow(t90, 8);
+    if (A < 0.0) A = 0.0;
+    if (A > 1.0) A = 1.0;
+    return A;
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -1296,12 +1326,14 @@ std::vector<double> calculateAbsorbedFlux(
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
     
-    // Check if we should use incidence-dependent albedo.
-    // Skip if a spatially-varying map was already loaded (binary or FITS) — the per-face
-    // map values must not be overridden by the uniform planet->albedo + incidence formula.
+    // Apply the Hayne et al. (2017) incidence-angle correction whenever the
+    // body's albedoCoef are set. When a spatially-varying albedo map is in
+    // use, the per-face map value supersedes the body default A0; the angular
+    // correction is *still* applied on top. Previously the gate also required
+    // !using_albedo_map which silently dropped the high-θ correction for
+    // map-using runs and biased nighttime temperatures at high latitudes by
+    // several K.
     bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
-                                 !planet->using_albedo_map &&
-                                 !albedo_successfully_loaded &&
                                  planet->albedoCoef.size() >= 2);
 
     if (use_incidence_albedo) {
@@ -3492,6 +3524,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
+        const double a_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar = planet.S;
+        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
             #pragma omp parallel for schedule(static)
@@ -3500,10 +3537,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double albedo = face_albedos[global_f];
+                    double base_A = face_albedos[global_f];
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+
+                    // Hayne (2017) incidence-angle correction on the base albedo.
+                    // The map (if loaded) provides A0(lon,lat); the (a,b) coefficients
+                    // give the angular dependence A(θ) = A0 + a·(θ/π/4)^3 + b·(θ/π/2)^8.
+                    double albedo = has_angular
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                        : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
@@ -3937,6 +3981,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
+        const double a_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar2 = planet.S;
+        const bool   has_angular2 = (planet.albedoCoef.size() >= 2 && S_solar2 > 0.0);
+
         // Helper: prepare flux data in timestep-major layout for a range of timesteps.
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
@@ -3946,10 +3995,15 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double albedo = face_albedos[global_f];
+                    double base_A = face_albedos[global_f];
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+
+                    // Hayne (2017) angular albedo correction (composes on top of map A0).
+                    double albedo = has_angular2
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar2, a_coef2, b_coef2)
+                        : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
                     flux[t * batch_n + f] = static_cast<float>(absorbed);

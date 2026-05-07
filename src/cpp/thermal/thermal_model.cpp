@@ -551,24 +551,23 @@ double Planet::getThermalInertia(double lon, double lat) const {
 }
 
 double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_angle) const {
-    // If using an albedo map, return the map value directly (no incidence correction)
-    // This allows users to provide spatially-varying albedo maps that override the model
-    if (using_albedo_map && albedo_map) {
-        double map_value = albedo_map->getValue(lon, lat);
-        if (map_value != albedo_map->getMissingValue()) {
-            return map_value;
-        }
-    }
-
-    // Apply incidence-angle-dependent albedo formula from Hayne et al. (2017)
-    // A(theta) = A0 + a*(theta/(pi/4))^3 + b*(theta/(pi/2))^8
-    // where theta is solar incidence angle in radians
-    // albedoCoef[0] = a, albedoCoef[1] = b
+    // Resolve the base normal-incidence albedo A0. If a spatially-varying map
+    // was loaded, its per-face value supersedes the body default. The Hayne
+    // et al. (2017) angular correction is *still* applied on top — the map
+    // describes A0(lon, lat); the (a, b) coefficients describe how A varies
+    // with solar zenith angle θ. Returning the bare map value would silently
+    // drop the high-θ correction, biasing high-latitude nighttime cooling.
 
     // Clamp incidence angle to [0, pi/2] - beyond pi/2 is not illuminated
     double theta = std::max(0.0, std::min(incidence_angle, M_PI / 2.0));
 
-    double A0 = albedo;  // Base albedo
+    double A0 = albedo;  // Body-default base albedo
+    if (using_albedo_map && albedo_map) {
+        double map_value = albedo_map->getValue(lon, lat);
+        if (map_value != albedo_map->getMissingValue()) {
+            A0 = map_value;
+        }
+    }
 
     // Check if we have albedo coefficients
     if (albedoCoef.size() >= 2) {
