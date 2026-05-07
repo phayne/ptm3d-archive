@@ -686,7 +686,12 @@ bool runThermalForSelectedFaces_GPU(
     const std::vector<double>& times,
     int total_time_steps,
     const thermal::Config& config,
-    std::vector<std::vector<double>>& surface_temps); // In/out: updated for selected faces
+    std::vector<std::vector<double>>& surface_temps, // In/out: updated for selected faces
+    // Multi-GPU dispatch knobs (mirrors the all-faces path). Defaults preserve
+    // legacy single-GPU serial-batches behaviour.
+    int gpu_devices = 1,
+    const std::vector<int>& gpu_device_ids = {},
+    int gpu_inter_batch_pause_ms = 0);
 
 void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
@@ -4234,7 +4239,10 @@ bool runThermalForSelectedFaces_GPU(
     const std::vector<double>& times,
     int total_time_steps,
     const thermal::Config& config,
-    std::vector<std::vector<double>>& surface_temps)
+    std::vector<std::vector<double>>& surface_temps,
+    int gpu_devices,
+    const std::vector<int>& gpu_device_ids,
+    int gpu_inter_batch_pause_ms)
 {
     using namespace gpu::opencl;
 
@@ -4271,22 +4279,14 @@ bool runThermalForSelectedFaces_GPU(
     // Process faces in batches
     size_t n_batches = (n_selected + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
-        size_t batch_start = batch_idx * BATCH_SIZE;
-        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
-        size_t batch_n = batch_end - batch_start;
-
-        // Initialize solver for this batch
-        ThermalOpenCLConfig opencl_config;
-        opencl_config.verbose = false;
-        opencl_config.work_group_size = 64;
-
-        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
-        if (!solver.initialize()) {
-            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver for selected faces" << std::endl;
-            return false;
-        }
-
+    // Per-batch worker: encapsulates the upload + equilibration + output-phase
+    // logic that was previously inline in the for-loop. Pulled out so it can
+    // be invoked from either the legacy single-GPU loop or the multi-GPU
+    // pool's submit() callback.
+    auto run_batch_on_solver = [&](ThermalOpenCLSolver& solver,
+                                   size_t batch_idx,
+                                   size_t batch_start,
+                                   size_t batch_n) -> bool {
         // Prepare mesh data in SoA layout: [layer * batch_n + face_in_batch]
         std::vector<float> z_grid_f(n_layers);
         for (size_t i = 0; i < n_layers; ++i) {
@@ -4399,6 +4399,102 @@ bool runThermalForSelectedFaces_GPU(
                 surface_temps[face_idx][t] = static_cast<double>(output_temps[t * batch_n + f]);
             }
         }
+
+        (void)batch_idx;  // unused in single-GPU branch but kept for pool callback parity
+        return true;
+    };
+
+    // Multi-GPU dispatch (opt-in): mirrors the all-faces path. When enabled,
+    // the per-batch lambda above runs concurrently across N devices via the
+    // ThermalGPUDevicePool (~3x speedup measured on the 4-die W6800X Duo).
+    const bool use_multi_gpu =
+        (gpu_devices != 1) || !gpu_device_ids.empty();
+    if (use_multi_gpu) {
+        auto all_gpus = OpenCLContext::enumerateGPUs(/*only_available=*/true);
+        std::vector<OpenCLDeviceInfo> selected;
+        if (!gpu_device_ids.empty()) {
+            for (int id : gpu_device_ids) {
+                if (id < 0 || static_cast<size_t>(id) >= all_gpus.size()) {
+                    std::cerr << "[GPU Thermal] Invalid gpu_device_id " << id
+                              << " (only " << all_gpus.size()
+                              << " GPUs enumerated)" << std::endl;
+                    return false;
+                }
+                selected.push_back(all_gpus[id]);
+            }
+        } else if (gpu_devices == 0) {
+            selected = all_gpus;
+        } else {
+            const int n = std::min(gpu_devices,
+                                   static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n; ++i) selected.push_back(all_gpus[i]);
+        }
+        if (selected.empty()) {
+            std::cerr << "[GPU Thermal] No GPUs selected for selected-faces "
+                         "multi-GPU dispatch" << std::endl;
+            return false;
+        }
+
+        std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
+                     "across " << selected.size() << " device(s)" << std::endl;
+
+        ThermalGPUPoolConfig pool_cfg;
+        pool_cfg.devices = selected;
+        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+        pool_cfg.verbose = false;
+        ThermalGPUDevicePool pool(std::move(pool_cfg));
+
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        std::vector<std::future<bool>> futures;
+        futures.reserve(n_batches);
+        for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+            const size_t batch_start = batch_idx * BATCH_SIZE;
+            const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_selected);
+            const size_t batch_n     = batch_end - batch_start;
+            futures.push_back(pool.submit(batch_n, n_layers, opencl_config,
+                [&run_batch_on_solver, batch_idx, batch_start, batch_n](
+                    ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
+                    return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
+                }));
+        }
+
+        bool all_ok = true;
+        size_t completed = 0;
+        for (auto& f : futures) {
+            const bool ok = f.get();
+            ++completed;
+            std::cout << "\r  [GPU Thermal Pool] " << completed << "/" << n_batches
+                      << " re-thermal batches done" << std::flush;
+            all_ok = ok && all_ok;
+        }
+        std::cout << std::endl;
+        return all_ok;
+    }
+
+    // Legacy single-GPU serial-batches path (byte-identical to pre-multi-GPU
+    // behaviour when gpu_devices == 1).
+    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * BATCH_SIZE;
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
+        size_t batch_n = batch_end - batch_start;
+
+        // Initialize solver for this batch (single-device default path)
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
+        if (!solver.initialize()) {
+            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver for selected faces" << std::endl;
+            return false;
+        }
+
+        if (!run_batch_on_solver(solver, batch_idx, batch_start, batch_n)) {
+            return false;
+        }
     }
 
     return true;
@@ -4432,7 +4528,10 @@ bool runThermalForSelectedFaces_GPU(
     const std::vector<double>&,
     int,
     const thermal::Config&,
-    std::vector<std::vector<double>>&)
+    std::vector<std::vector<double>>&,
+    int,
+    const std::vector<int>&,
+    int)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -9692,7 +9791,11 @@ int main(int argc, char** argv) {
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
                     if (use_gpu_thermal_rerun && faces_to_rerun.size() >= 100) {
-                        // Use GPU thermal solver for radiation coupling re-runs
+                        // Use GPU thermal solver for radiation coupling re-runs.
+                        // Forward the same multi-GPU pool knobs as the all-faces
+                        // initial thermal solve so the re-run benefits from the
+                        // same dispatch (default gpu_devices == 1 falls back to
+                        // legacy single-GPU serial batches byte-identically).
                         std::cout << "  Using GPU thermal solver..." << std::endl;
                         bool gpu_success = runThermalForSelectedFaces_GPU(
                             mesh,
@@ -9701,7 +9804,10 @@ int main(int argc, char** argv) {
                             times,
                             total_time_steps,
                             thermal_config,
-                            surface_temps
+                            surface_temps,
+                            sim_config.thermal.gpu_devices,
+                            sim_config.thermal.gpu_device_ids,
+                            sim_config.thermal.gpu_inter_batch_pause_ms
                         );
                         if (!gpu_success) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
