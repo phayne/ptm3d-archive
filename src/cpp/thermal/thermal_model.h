@@ -183,14 +183,18 @@ public:
     double S0 = 1361.0;       // Solar constant at 1 AU [W.m-2]
     double chi = 2.7;         // Radiative conductivity parameter [Mitchell and de Pater, 1994]
     
-    // Numerical parameters (optimized via sensitivity analysis Jan 2026)
-    // Grid parameters optimized via sensitivity analysis vs Diviner (Hayne et al. 2017)
-    // See /tmp/test_layer_fast.py for testing methodology
-    // RMS error < 4K with 10 layers, systematic offset +2.65K
+    // Numerical parameters
     double F = 0.5;           // Fourier Mesh Number, must be <= 0.5 for stability
-    int m = 4;                // Number of layers in upper skin depth (optimal: 4, tested 3-15)
-    int n = 10;               // Layer growth factor: dz[i] = dz[i-1]*(1+1/n) (optimal: 10)
-    int b = 5;                // Number of skin depths to bottom layer (optimal: 5, minimum viable)
+    int m = 10;               // Number of layers in upper skin depth
+    int n = 15;               // Layer growth factor: dz[i] = dz[i-1]*(1+1/n)
+    // b = skin depths to bottom layer. With the radiative-conductivity term
+    // χ(T/350)³ ~doubling K at deep regolith temperatures, the effective deep
+    // skin depth is ~1.5–2× the surface lattice value. b=20 puts the bottom
+    // at ~12 e-folds of damping at the deep effective skin depth so the
+    // diurnal wave is fully attenuated before the bottom Neumann BC. The
+    // legacy default b=5 left tens of K of residual diurnal amplitude at the
+    // bottom layer, which contaminated extrapolated location-export depths.
+    int b = 20;
 
     // Adaptive grid controls
     bool   ADAPTIVE_GRID = true;     // Use per-profile adaptive grid instead of fixed geometric

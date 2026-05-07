@@ -25,7 +25,7 @@ thermal:
   integration_offset_steps: 0
   thermal_m: 10
   thermal_n: 15
-  thermal_b: 8
+  thermal_b: 20
 radiation:
   enabled: false
   min_shadow_fraction: 0.3
