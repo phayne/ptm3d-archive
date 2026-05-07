@@ -83,13 +83,16 @@ radiation:
   # floors and across crater walls). Enabled for the radiation-coupled A3GT
   # v2 batch.
   enabled: true
-  # H-matrix compression with ACA. For ~1.8M-face 3 km meshes the H-matrix
-  # path auto-switches to out-of-core storage (radiation_exchange.cpp:763).
-  use_hmatrix: true
-  use_aca: true
-  aca_tolerance: 1.0e-2          # looser tolerance, ~3-5x faster build
-  aca_max_rank: 50
-  hmatrix_threads: 0             # 0 = auto
+  # Monte Carlo ray-gather view factors (mc_view_factor.cpp). Selected over
+  # H-matrix because on this 1.8 M-face mesh the H-matrix peak RAM grew
+  # 60+ GB per ~10% of build and would have hit the 250 GB jetsam ceiling
+  # near the end of the build (a probe attempt died with SIGKILL at ~76%
+  # block-pair completion, available RAM having dropped from 256 GB to
+  # 194 GB in one 10% step). MC scales sub-linearly in RAM and is the
+  # documented escape hatch for >1M-face meshes per radiation_config.h.
+  use_monte_carlo_vf: true
+  mc_rays_per_face: 100000        # production default: ~10% rel err on F_ij ~ 1e-3
+  use_hmatrix: false              # ignored when MC is selected
   # Adaptive neighbor selection: target 95% captured energy per face.
   adaptive_neighbors: true
   captured_energy_target: 0.95
