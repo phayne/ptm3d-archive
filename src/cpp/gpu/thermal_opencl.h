@@ -53,10 +53,19 @@ public:
     ThermalOpenCLSolver& operator=(const ThermalOpenCLSolver&) = delete;
 
     /**
-     * @brief Initialize OpenCL resources
+     * @brief Initialize OpenCL resources (default first-available GPU)
      * @return true if initialization succeeded
      */
     bool initialize();
+
+    /**
+     * @brief Initialize OpenCL resources pinned to a specific device.
+     *
+     * Used by ThermalGPUDevicePool to route a solver instance to one of
+     * several enumerated GPUs. The single-device default initialize()
+     * above is unchanged so legacy runs stay byte-identical.
+     */
+    bool initialize(const OpenCLDeviceInfo& device_handle);
 
     /**
      * @brief Upload mesh geometry and material properties

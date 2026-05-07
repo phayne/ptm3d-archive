@@ -619,7 +619,7 @@ ThermalOpenCLSolver::~ThermalOpenCLSolver() {
 bool ThermalOpenCLSolver::initialize() {
     if (initialized_) return true;
 
-    // Create OpenCL context
+    // Create OpenCL context with default first-available GPU
     context_ = std::make_unique<OpenCLContext>();
     if (!context_->initialize(true)) {  // Prefer GPU
         if (config_.verbose) {
@@ -648,6 +648,42 @@ bool ThermalOpenCLSolver::initialize() {
     if (config_.verbose) {
         std::cout << "ThermalOpenCLSolver initialized: "
                   << n_faces_ << " faces, " << n_layers_ << " layers\n";
+    }
+
+    return true;
+}
+
+bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
+    if (initialized_) return true;
+
+    context_ = std::make_unique<OpenCLContext>();
+    if (!context_->initialize(device_handle)) {
+        if (config_.verbose) {
+            std::cerr << "Failed to initialize OpenCL context on device "
+                      << device_handle.name << "\n";
+        }
+        return false;
+    }
+
+    if (config_.verbose) {
+        printDeviceInfo(context_->deviceInfo());
+    }
+
+    buildKernels();
+    createBuffers();
+
+    if (!program_ || !persistent_kernel_ || !buf_T_ || !buf_rho_) {
+        std::cerr << "[GPU Thermal] Failed to initialize OpenCL resources on device "
+                  << device_handle.name << "\n";
+        release();
+        return false;
+    }
+
+    initialized_ = true;
+
+    if (config_.verbose) {
+        std::cout << "ThermalOpenCLSolver initialized on " << device_handle.name
+                  << ": " << n_faces_ << " faces, " << n_layers_ << " layers\n";
     }
 
     return true;

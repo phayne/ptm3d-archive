@@ -58,6 +58,18 @@ struct SimulationConfig {
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
 
+        // Multi-GPU controls (OpenCL only). Defaults preserve legacy behaviour:
+        //   gpu_devices == 1 (and gpu_device_ids empty) → first available GPU,
+        //   gpu_batch_size == 0 → existing 6 GB / 500 K-face cap,
+        //   gpu_inter_batch_pause_ms == 0 → no pause.
+        // Set gpu_devices = 0 (or "auto" via the CLI flag) to use every
+        // enumerated GPU. gpu_device_ids overrides gpu_devices when non-empty;
+        // indices come from --list-gpu-devices.
+        int gpu_devices = 1;
+        std::vector<int> gpu_device_ids;
+        size_t gpu_batch_size = 0;
+        int    gpu_inter_batch_pause_ms = 0;
+
         // Per-face thermal property map: a per-face binary float32 array (one
         // value per mesh face, in face-index order) overriding the body-default
         // H-parameter (or, equivalently, the depth-weighted thermal inertia).
