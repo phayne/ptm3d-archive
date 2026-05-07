@@ -92,9 +92,13 @@ def read_n_faces(ply: Path) -> int:
     return 0
 
 
-def site_mesh_path(site: dict) -> Path:
-    """data/dem/a3gt_v2/A03MM022_85.218S_31.850E_R5km_linear.ply"""
-    return MESH_DIR / f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_{site['lon_deg']:.3f}E_R5km_linear.ply"
+def site_mesh_path(site: dict, roi_radius_km: float = 5.0) -> Path:
+    """data/dem/a3gt_v2/A03MM022_85.218S_31.850E_R{N}km_linear.ply"""
+    rkm = f"{roi_radius_km:g}"
+    return MESH_DIR / (
+        f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
+        f"{site['lon_deg']:.3f}E_R{rkm}km_linear.ply"
+    )
 
 
 def window_dir(ellipse_id: str, window_tag: str) -> Path:
@@ -122,10 +126,10 @@ def window_is_complete(window_dir_: Path) -> bool:
 def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
                core_frac: float = 0.05, max_points: int = 2_500_000,
                density_exp: float = 1.0) -> Path:
-    """Build a 1 m/px-center / 5 km-ROI / linear-density-falloff PLY for a site.
+    """Build a 1 m/px-center / N km-ROI / linear-density-falloff PLY for a site.
     Reuses the existing dtm_to_ply_delaunay binary; same call signature as
     run_a3gt_batch.py:build_mesh but with --density-exp 1.0 instead of 2.0."""
-    ply = site_mesh_path(site)
+    ply = site_mesh_path(site, roi_radius_km=roi_km)
     MESH_DIR.mkdir(parents=True, exist_ok=True)
 
     if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
