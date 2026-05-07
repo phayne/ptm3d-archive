@@ -222,7 +222,7 @@ def write_window_yaml(site: dict, window: dict, mesh: Path,
 # --------------------------------------------------------------------------
 
 def run_window(site: dict, window: dict, yaml_path: Path,
-                dry_run: bool) -> bool:
+                dry_run: bool, chunk_timeout_min: float | None = None) -> bool:
     """Invoke run_chunked_simulation.py for one window. Returns True if window
     completes successfully (or was already complete)."""
     out_dir = window_dir(site["ellipse_id"], window["tag"])
@@ -240,6 +240,8 @@ def run_window(site: dict, window: dict, yaml_path: Path,
         "--output-dir", str(out_dir),
         "--resume",
     ]
+    if chunk_timeout_min is not None:
+        cmd.extend(["--chunk-timeout-min", f"{chunk_timeout_min:g}"])
     print(f"  [{site['ellipse_id']}/{window['tag']}] running")
     print(f"             cmd: {' '.join(cmd)}")
     if dry_run:
@@ -302,6 +304,12 @@ def main() -> int:
                         "(uses examples/a3gt_v2_template_radiation.yaml). "
                         "Per-site view-factor cache is built once and reused "
                         "across the 8 windows.")
+    p.add_argument("--chunk-timeout-min", type=float, default=None,
+                   help="Per-chunk wall-time cap (minutes) passed through to "
+                        "run_chunked_simulation.py. Default = the runner's own "
+                        "default (60 min). Use a larger value (e.g. 360) for "
+                        "radiation-coupled runs, where each iteration's thermal "
+                        "re-run can push window wall-time well past 60 min.")
     args = p.parse_args()
 
     # Honor --output-root by overriding the module-level OUTPUT_ROOT;
@@ -375,7 +383,8 @@ def main() -> int:
         for j, w in enumerate(windows):
             yaml_path = write_window_yaml(s, w, mesh, template_text,
                                            vf_file=vf_file)
-            ok = run_window(s, w, yaml_path, dry_run=args.dry_run)
+            ok = run_window(s, w, yaml_path, dry_run=args.dry_run,
+                             chunk_timeout_min=args.chunk_timeout_min)
             done_idx = i * len(windows) + j + 1
             elapsed = time.time() - start_all
             if done_idx > 0 and not args.dry_run:
