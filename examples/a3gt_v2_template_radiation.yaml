@@ -108,6 +108,15 @@ radiation:
   # the orchestrator. The first window builds it; subsequent windows load it.
   view_factor_file: '{{ vf_file }}'
   verbose: true
+  # GPU radiosity: dispatches the per-timestep "Computing indirect flux"
+  # loop across all 4 W6800X dies (mirrors thermal multi-GPU pool). The
+  # CSR view-factor matrix and face properties are replicated to each
+  # device once at init; per-timestep T and Q_solar are uploaded per
+  # batch. inter-batch pause matches the validated thermal-pool setting.
+  use_gpu: true
+  gpu_devices: 4
+  gpu_batch_size: 0                 # 0 = auto = 4 * gpu_devices
+  gpu_inter_batch_pause_ms: 1500
 illumination:
   include_primary_reflection: true
   use_batch_processing: true

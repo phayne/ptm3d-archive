@@ -59,6 +59,10 @@ RadiositySolver::RadiositySolver(const HMatrixViewFactor& H,
     initCommon(emissivity, areas);
 }
 
+// Default destructor in the .cpp where forward-declared GPU types are
+// fully visible.
+RadiositySolver::~RadiositySolver() = default;
+
 void RadiositySolver::initGPU() {
 #ifdef PTM_GPU_OPENCL
     if (config_.verbose) {
@@ -89,14 +93,26 @@ void RadiositySolver::initGPU() {
     size_t n = emissivity_.size();
     size_t nnz = F_ptr_->numNonZeros();
 
-    // Hard limit: GPU SpMV with very large matrices is unreliable on AMD drivers
-    // Even if memory fits, kernel execution can crash with >100M non-zeros
-    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros max
-    if (nnz > MAX_GPU_NNZ) {
-        std::cout << "Note: Sparse matrix too large for reliable GPU radiosity solver\n";
+    // Soft limit: GPU SpMV with very large sparse matrices was historically
+    // unreliable on AMD drivers (kernel execution could crash with >100M
+    // non-zeros). The limit is bypassed when the user explicitly opts into
+    // the multi-GPU pool path (gpu_devices > 1 or gpu_device_ids set) —
+    // they are committing to the new code path and accept the risk for the
+    // larger meshes the pool was designed to handle.
+    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros default ceiling
+    const bool want_pool = (config_.gpu_devices > 1)
+                            || !config_.gpu_device_ids.empty();
+    if (nnz > MAX_GPU_NNZ && !want_pool) {
+        std::cout << "Note: Sparse matrix too large for reliable single-GPU radiosity solver\n";
         std::cout << "  Non-zeros: " << nnz / 1000000 << "M (limit: " << MAX_GPU_NNZ / 1000000 << "M)\n";
         std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        std::cout << "  Tip: enable the multi-GPU pool with radiation.gpu_devices > 1 to bypass this limit.\n";
         return;
+    }
+    if (nnz > MAX_GPU_NNZ && want_pool) {
+        std::cout << "Note: Sparse matrix has " << nnz / 1000000 << "M non-zeros (>"
+                  << MAX_GPU_NNZ / 1000000
+                  << "M soft limit); proceeding because multi-GPU pool was requested\n";
     }
 
     // Check if sparse matrix fits in GPU memory before attempting
@@ -114,62 +130,66 @@ void RadiositySolver::initGPU() {
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
     gpu_config.verbose = config_.verbose;
 
-    gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
-
-    if (!gpu_solver_->initialize()) {
-        std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
-                  << "falling back to CPU\n";
-        gpu_solver_.reset();
-        return;
-    }
-
-    // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
-    // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
-    size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
-    size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
-
-    if (total_gpu_memory_needed > gpu_mem_limit) {
-        std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
-        std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-        std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
-        std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
-        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
-        gpu_solver_.reset();
-        return;
-    }
-
-    if (config_.verbose) {
-        std::cout << "GPU radiosity memory check passed:\n";
-        std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
-        std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
-        std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-        std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
-    }
-
-    // Upload view factor CSR data
-    gpu_solver_->uploadViewFactors(
-        F_ptr_->values(),
-        F_ptr_->colIndices(),
-        F_ptr_->rowPointers());
-
-    // Upload face properties (convert to float)
+    // When the multi-GPU pool is requested, skip the single-GPU solver path
+    // entirely — the pool's per-device persistent solvers will handle every
+    // solve via solveBatch(). Avoids redundant device 0 allocation and
+    // dodges the >100M-nnz single-GPU stability concerns the pool was
+    // designed to bypass.
     std::vector<float> emissivity_f(n);
     std::vector<float> reflectivity_f(n);
     for (size_t i = 0; i < n; ++i) {
         emissivity_f[i] = static_cast<float>(emissivity_[i]);
         reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
     }
-    gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
 
-    use_gpu_ = true;
+    if (!want_pool) {
+        gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
+
+        if (!gpu_solver_->initialize()) {
+            std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
+                      << "falling back to CPU\n";
+            gpu_solver_.reset();
+            return;
+        }
+
+        // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
+        // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
+        size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
+        size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
+
+        if (total_gpu_memory_needed > gpu_mem_limit) {
+            std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
+            std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+            std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
+            std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
+            std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+            gpu_solver_.reset();
+            return;
+        }
+
+        if (config_.verbose) {
+            std::cout << "GPU radiosity memory check passed:\n";
+            std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
+            std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
+            std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+            std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
+        }
+
+        // Upload view factor CSR data
+        gpu_solver_->uploadViewFactors(
+            F_ptr_->values(),
+            F_ptr_->colIndices(),
+            F_ptr_->rowPointers());
+        gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+
+        use_gpu_ = true;
+    }
 
     // Multi-GPU dispatch pool (only when gpu_devices > 1). The single-GPU
     // path above stays in place even when the pool is active so that
     // single-timestep solve() callers (the CPU fallback hook + direct
     // computeIndirectFlux callers) still work; the batched solveBatch()
     // path is what actually uses the pool.
-    const bool want_pool = (config_.gpu_devices > 1)
-                            || !config_.gpu_device_ids.empty();
     if (want_pool) {
         // Resolve which physical devices to use (mirrors the thermal pool).
         std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =

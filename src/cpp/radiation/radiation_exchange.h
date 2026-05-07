@@ -86,6 +86,13 @@ public:
                     const std::vector<double>& emissivity,
                     const std::vector<double>& areas);
 
+    // Explicit destructor: required because unique_ptr<RadiosityOpenCLSolver>
+    // and unique_ptr<RadiosityGPUDevicePool> are forward-declared, so the
+    // implicit destructor would be instantiated at every dependent's
+    // translation unit (e.g. test_bowl_crater.cpp). Defining it in the .cpp
+    // keeps the GPU types out of the public header.
+    ~RadiositySolver();
+
     // Set configuration
     void setConfig(const RadiationConfig& config) { config_ = config; }
 
