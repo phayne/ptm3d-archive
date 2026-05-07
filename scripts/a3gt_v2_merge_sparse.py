@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -169,6 +171,22 @@ def main() -> int:
     ret = subprocess.run(cmd)
     if ret.returncode != 0:
         sys.exit(f"ptm_merge_chunks exit {ret.returncode}")
+
+    # Copy mesh.ply to the site root for downstream viz / GUI Results Browser
+    # (which expects the mesh adjacent to the merged statistics/). Same mesh
+    # in every window — pick the first chunk's copy. Hardlink if same volume,
+    # else copy.
+    mesh_dst = args.site_dir / "mesh.ply"
+    if not mesh_dst.exists():
+        mesh_src = chunk_dirs[0] / "mesh.ply"
+        if mesh_src.is_file():
+            try:
+                os.link(mesh_src, mesh_dst)
+            except OSError:
+                shutil.copy2(mesh_src, mesh_dst)
+            print(f"  mesh.ply → site root ({mesh_dst.stat().st_size / 1e6:.1f} MB)")
+        else:
+            print(f"  warn: no mesh.ply found at {mesh_src}", file=sys.stderr)
 
     summary_path = write_summary(args.site_dir, args.site_dir.name,
                                   n_windows=n_windows, n_chunks=len(chunk_dirs))
