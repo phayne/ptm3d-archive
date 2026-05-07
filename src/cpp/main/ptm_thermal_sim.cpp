@@ -5455,7 +5455,12 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n";
     std::cout << "  --rad-hmatrix-threads N    Limit H-matrix build threads (0 = auto)\n";
     std::cout << "  --rad-captured-energy F    Target captured energy fraction (default: 0.99 = 99%)\n";
-    std::cout << "  --rad-max-neighbors N      Override max neighbors per face (disables adaptive)\n\n";
+    std::cout << "  --rad-max-neighbors N      Override max neighbors per face (disables adaptive)\n";
+    std::cout << "  --rad-gpu-devices N|auto   Number of GPUs for the radiosity pool (default: 1).\n";
+    std::cout << "                             1 = legacy single-GPU; auto = all enumerated GPUs.\n";
+    std::cout << "  --rad-gpu-device-ids 0,1,...  Explicit radiosity GPU indices (overrides --rad-gpu-devices).\n";
+    std::cout << "  --rad-gpu-batch-size N     Timesteps dispatched per pool round (default: auto = 4 * N_devices).\n";
+    std::cout << "  --rad-gpu-inter-batch-pause-ms N  Sleep between consecutive batches on same device (default: 0).\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Illumination Options\n";
@@ -7178,6 +7183,12 @@ int main(int argc, char** argv) {
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
 
+    // Multi-GPU radiosity dispatch (mirrors thermal pool semantics).
+    int rad_gpu_devices = 1;                     // 1 = legacy single-GPU; >1 = pool
+    std::vector<int> rad_gpu_device_ids;         // Explicit indices (overrides rad_gpu_devices)
+    int rad_gpu_batch_size = 0;                  // 0 = auto = 4 * rad_gpu_devices
+    int rad_gpu_inter_batch_pause_ms = 0;        // Watchdog mitigation
+
     // Apply radiation settings from YAML config (before CLI override)
     enable_radiation_exchange = sim_config.radiation.enabled;
     rad_use_hmatrix = sim_config.radiation.use_hmatrix;
@@ -7200,6 +7211,11 @@ int main(int argc, char** argv) {
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
     rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
+    // Multi-GPU radiosity (only consulted if rad_use_gpu == true).
+    rad_gpu_devices = sim_config.radiation.gpu_devices;
+    rad_gpu_device_ids = sim_config.radiation.gpu_device_ids;
+    rad_gpu_batch_size = sim_config.radiation.gpu_batch_size;
+    rad_gpu_inter_batch_pause_ms = sim_config.radiation.gpu_inter_batch_pause_ms;
 
     if (enable_radiation_exchange) {
         std::cout << "Radiation exchange enabled from config file" << std::endl;
@@ -7563,6 +7579,36 @@ int main(int argc, char** argv) {
         } else if (arg == "--rad-mc-rays" && i + 1 < argc) {
             rad_mc_rays_per_face = std::stoi(argv[++i]);
             std::cout << "MC rays per face: " << rad_mc_rays_per_face << std::endl;
+        } else if (arg == "--rad-gpu-devices" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto" || val == "all") {
+                rad_gpu_devices = 0;  // 0 = all available
+            } else {
+                rad_gpu_devices = std::stoi(val);
+            }
+            std::cout << "[Multi-GPU radiosity] gpu_devices = "
+                      << (rad_gpu_devices == 0 ? "auto"
+                                                : std::to_string(rad_gpu_devices))
+                      << std::endl;
+        } else if (arg == "--rad-gpu-device-ids" && i + 1 < argc) {
+            rad_gpu_device_ids.clear();
+            std::stringstream ss(argv[++i]);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty()) rad_gpu_device_ids.push_back(std::stoi(token));
+            }
+            std::cout << "[Multi-GPU radiosity] gpu_device_ids =";
+            for (int id : rad_gpu_device_ids) std::cout << " " << id;
+            std::cout << std::endl;
+        } else if (arg == "--rad-gpu-batch-size" && i + 1 < argc) {
+            rad_gpu_batch_size = std::stoi(argv[++i]);
+            std::cout << "[Multi-GPU radiosity] gpu_batch_size = "
+                      << rad_gpu_batch_size << " timesteps/dispatch"
+                      << std::endl;
+        } else if (arg == "--rad-gpu-inter-batch-pause-ms" && i + 1 < argc) {
+            rad_gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
+            std::cout << "[Multi-GPU radiosity] inter-batch pause = "
+                      << rad_gpu_inter_batch_pause_ms << " ms" << std::endl;
         }
         // ===== Generic Body Options =====
         else if (arg == "--generic-body-config" && i + 1 < argc) {
@@ -9285,6 +9331,12 @@ int main(int argc, char** argv) {
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            // Multi-GPU radiosity dispatch — pool is materialized inside
+            // RadiositySolver::initGPU() when gpu_devices > 1 and use_gpu = true.
+            rad_config.gpu_devices = rad_gpu_devices;
+            rad_config.gpu_device_ids = rad_gpu_device_ids;
+            rad_config.gpu_batch_size = rad_gpu_batch_size;
+            rad_config.gpu_inter_batch_pause_ms = rad_gpu_inter_batch_pause_ms;
             if (rad_max_neighbors_override > 0) {
                 rad_config.max_neighbors = rad_max_neighbors_override;
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -9421,34 +9473,85 @@ int main(int argc, char** argv) {
 
                     thermal::ProgressBar flux_progress(total_time_steps, "Computing indirect flux", 50, true);
 
-                    // Sequential timestep loop - each solve uses all threads for H-matrix matvec
-                    // The H-matrix matvec is parallelized over ~2M blocks internally
-                    for (int t = 0; t < total_time_steps; t++) {
-                        // Extract temperatures at timestep t
-                        std::vector<double> temps_t(num_faces);
-                        std::vector<double> solar_t(num_faces);
+                    // Multi-GPU radiosity dispatch: when the pool is active,
+                    // process timesteps in batches sized to amortize per-batch
+                    // overhead across N GPUs concurrently. Single-GPU and CPU
+                    // paths use batch_size = 1 for byte-identical legacy behaviour.
+                    const bool use_pool_dispatch = rad_manager.hasGPUPool();
+                    int batch_size = 1;
+                    if (use_pool_dispatch) {
+                        batch_size = (rad_gpu_batch_size > 0)
+                            ? rad_gpu_batch_size
+                            : 4 * std::max(1, rad_gpu_devices);
+                        std::cout << "  [Multi-GPU radiosity] dispatching "
+                                  << batch_size << " timesteps/batch across "
+                                  << rad_gpu_devices << " GPUs" << std::endl;
+                    }
 
-                        #pragma omp parallel for schedule(static)
-                        for (size_t f = 0; f < num_faces; f++) {
-                            temps_t[f] = surface_temps[f][t];
-                            solar_t[f] = direct_solar_values[f * total_time_steps + t];
-                        }
+                    for (int t_start = 0; t_start < total_time_steps;
+                         t_start += batch_size) {
+                        const int t_end =
+                            std::min(t_start + batch_size, total_time_steps);
+                        const int n_batch = t_end - t_start;
 
-                        // Compute indirect flux at this timestep
-                        std::vector<double> indirect_t = rad_manager.computeIndirectFlux(temps_t, solar_t);
-
-                        // Store time-varying indirect flux and accumulate statistics
-                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
-                        for (size_t f = 0; f < num_faces; f++) {
-                            indirect_flux_series[f][t] = indirect_t[f];
-                            if (indirect_t[f] > max_indirect) {
-                                max_indirect = indirect_t[f];
+                        if (n_batch == 1 && !use_pool_dispatch) {
+                            // Legacy fast path: single timestep, no batch
+                            // wrapping. Preserves byte-identical behaviour
+                            // for CPU and single-GPU radiation paths.
+                            const int t = t_start;
+                            std::vector<double> temps_t(num_faces);
+                            std::vector<double> solar_t(num_faces);
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < num_faces; f++) {
+                                temps_t[f] = surface_temps[f][t];
+                                solar_t[f] = direct_solar_values[f * total_time_steps + t];
                             }
-                            total_indirect_sum += indirect_t[f];
+                            std::vector<double> indirect_t =
+                                rad_manager.computeIndirectFlux(temps_t, solar_t);
+                            #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                            for (size_t f = 0; f < num_faces; f++) {
+                                indirect_flux_series[f][t] = indirect_t[f];
+                                if (indirect_t[f] > max_indirect) {
+                                    max_indirect = indirect_t[f];
+                                }
+                                total_indirect_sum += indirect_t[f];
+                            }
+                        } else {
+                            // Batched path: build [n_batch][num_faces] of
+                            // (T, Q_solar), dispatch to multi-GPU pool,
+                            // write back to indirect_flux_series.
+                            std::vector<std::vector<double>> temps_batch(n_batch);
+                            std::vector<std::vector<double>> solar_batch(n_batch);
+                            #pragma omp parallel for schedule(static)
+                            for (int j = 0; j < n_batch; j++) {
+                                const int t = t_start + j;
+                                temps_batch[j].resize(num_faces);
+                                solar_batch[j].resize(num_faces);
+                                for (size_t f = 0; f < num_faces; f++) {
+                                    temps_batch[j][f] = surface_temps[f][t];
+                                    solar_batch[j][f] = direct_solar_values[f * total_time_steps + t];
+                                }
+                            }
+
+                            std::vector<std::vector<double>> indirect_batch =
+                                rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch);
+
+                            for (int j = 0; j < n_batch; j++) {
+                                const int t = t_start + j;
+                                const auto& indirect_t = indirect_batch[j];
+                                #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                                for (size_t f = 0; f < num_faces; f++) {
+                                    indirect_flux_series[f][t] = indirect_t[f];
+                                    if (indirect_t[f] > max_indirect) {
+                                        max_indirect = indirect_t[f];
+                                    }
+                                    total_indirect_sum += indirect_t[f];
+                                }
+                            }
                         }
 
-                        if ((t + 1) % 10 == 0 || t == total_time_steps - 1) {
-                            flux_progress.update(t + 1);
+                        if (t_end % 10 == 0 || t_end == total_time_steps) {
+                            flux_progress.update(t_end);
                         }
                     }
                     flux_progress.finish();
