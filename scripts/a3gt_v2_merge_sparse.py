@@ -158,7 +158,8 @@ def main() -> int:
         sys.exit(f"No completed chunks found under {args.site_dir}; "
                  "run the orchestrator first.")
 
-    n_windows = len({c.parent.parent.name for c in chunk_dirs})
+    # Each chunk_dir is .../<site>/<window>/<chunk_NNN>; the window dir is .parent.
+    n_windows = len({c.parent.name for c in chunk_dirs})
     print(f"Site {args.site_dir.name}: merging "
           f"{len(chunk_dirs)} chunk(s) from {n_windows} window(s) "
           f"into {args.site_dir}/statistics/")
