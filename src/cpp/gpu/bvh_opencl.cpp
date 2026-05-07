@@ -549,6 +549,30 @@ bool BVHRayTracer::initialize() {
     }
 }
 
+bool BVHRayTracer::initialize(const OpenCLDeviceInfo& device_handle) {
+    if (initialized_) return true;
+
+    try {
+        context_ = std::make_unique<OpenCLContext>();
+        if (!context_->initialize(device_handle)) {
+            std::cerr << "Warning: Failed to initialize OpenCL for BVH ray tracer on device "
+                      << device_handle.name << std::endl;
+            return false;
+        }
+
+        buildKernels();
+
+        work_group_size_ = std::min(context_->deviceInfo().max_work_group_size, size_t(256));
+
+        initialized_ = true;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Error initializing BVH ray tracer on " << device_handle.name
+                  << ": " << e.what() << std::endl;
+        return false;
+    }
+}
+
 void BVHRayTracer::buildKernels() {
     std::string source = getBVHKernelSource();
 
