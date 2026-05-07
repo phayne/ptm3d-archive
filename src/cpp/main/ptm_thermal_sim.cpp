@@ -9636,11 +9636,29 @@ int main(int argc, char** argv) {
                         std::cout << "  Samples still changing: " << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
 
-                        // Converge when BOTH conditions are met:
-                        // 1. Max temperature change is below threshold
-                        // 2. Fraction of samples still changing is below threshold
-                        if (max_temp_change < rad_coupling_temp_tol && face_frac < rad_coupling_face_frac) {
-                            std::cout << "  Converged!" << std::endl;
+                        // Converge when EITHER condition is met (matches the
+                        // CLAUDE.md "Adaptive iteration count" docstring). The
+                        // earlier AND-conjunction blocked exit when a tiny
+                        // handful of pathological faces (typically PSR-floor
+                        // wall-junction edges with extreme radiation feedback)
+                        // oscillated by hundreds of K, even after 99.99% of
+                        // samples had settled below the temp tolerance. The
+                        // face_frac criterion captures whether the bulk of the
+                        // mesh has stabilized; the max-temp criterion captures
+                        // whether even the worst face has stabilized. Either
+                        // is a sufficient stopping condition.
+                        if (max_temp_change < rad_coupling_temp_tol) {
+                            std::cout << "  Converged on max-temperature criterion ("
+                                      << max_temp_change << " K < " << rad_coupling_temp_tol
+                                      << " K)" << std::endl;
+                            break;
+                        }
+                        if (face_frac < rad_coupling_face_frac) {
+                            std::cout << "  Converged on face-fraction criterion ("
+                                      << std::scientific << std::setprecision(2)
+                                      << (face_frac * 100) << "% < "
+                                      << (rad_coupling_face_frac * 100) << "% of samples)"
+                                      << std::fixed << std::endl;
                             break;
                         }
                     }
