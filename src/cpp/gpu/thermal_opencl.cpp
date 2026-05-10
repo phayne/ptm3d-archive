@@ -607,9 +607,25 @@ void printOpenCLInfo(std::ostream& out) {
 ThermalOpenCLSolver::ThermalOpenCLSolver(size_t n_faces, size_t n_layers,
                                          const ThermalOpenCLConfig& config)
     : n_faces_(n_faces)
+    , n_faces_active_(n_faces)
     , n_layers_(n_layers)
     , config_(config)
 {
+}
+
+void ThermalOpenCLSolver::setActiveFaceCount(size_t n) {
+    if (n == 0) {
+        n_faces_active_ = n_faces_;
+        return;
+    }
+    if (n > n_faces_) {
+        std::cerr << "[GPU Thermal] setActiveFaceCount(" << n
+                  << ") exceeds capacity " << n_faces_
+                  << "; clamping to capacity\n";
+        n_faces_active_ = n_faces_;
+        return;
+    }
+    n_faces_active_ = n;
 }
 
 ThermalOpenCLSolver::~ThermalOpenCLSolver() {
@@ -919,7 +935,7 @@ void ThermalOpenCLSolver::advanceTimestep(float dt) {
     auto start = std::chrono::high_resolution_clock::now();
 
     cl_command_queue queue = context_->queue();
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
 
     // Set kernel arguments
@@ -945,7 +961,7 @@ void ThermalOpenCLSolver::advanceTimestep(float dt) {
     CL_CHECK(clSetKernelArg(combined_kernel_, arg++, sizeof(int), &n_layers));
 
     // Launch kernel
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -965,11 +981,14 @@ void ThermalOpenCLSolver::downloadSurfaceTemps(std::vector<float>& T_surface) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
 
-    T_surface.resize(n_faces_);
+    T_surface.resize(n_faces_active_);
 
-    // Surface temps are at layer 0, which is at indices [0, n_faces)
+    // Surface temps are at layer 0, which is at indices [0, n_faces_active_).
+    // (The buffer itself is sized to capacity n_faces_; only the active
+    // prefix carries valid data after a kernel launch with the matching
+    // n_faces arg.)
     CL_CHECK(clEnqueueReadBuffer(context_->queue(), buf_T_, CL_TRUE, 0,
-                                n_faces_ * sizeof(float),
+                                n_faces_active_ * sizeof(float),
                                 T_surface.data(), 0, nullptr, nullptr));
 }
 
@@ -978,8 +997,12 @@ void ThermalOpenCLSolver::downloadAllTemps(std::vector<float>& T_all) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
 
-    T_all.resize(n_faces_ * n_layers_);
+    T_all.resize(n_faces_active_ * n_layers_);
 
+    // SoA layout in the buffer is [layer * n_faces_active_ + face]. The
+    // kernel uses n_faces_active_ as the stride too, so the live data is
+    // packed in the first n_faces_active_ * n_layers_ floats of the buffer
+    // (capacity beyond that is unused junk).
     CL_CHECK(clEnqueueReadBuffer(context_->queue(), buf_T_, CL_TRUE, 0,
                                 T_all.size() * sizeof(float),
                                 T_all.data(), 0, nullptr, nullptr));
@@ -989,7 +1012,7 @@ void ThermalOpenCLSolver::uploadAllTemps(const std::vector<float>& T_all) {
     if (!initialized_) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
-    const size_t expected = n_faces_ * n_layers_;
+    const size_t expected = n_faces_active_ * n_layers_;
     if (T_all.size() != expected) {
         throw std::runtime_error(
             "ThermalOpenCLSolver::uploadAllTemps: size mismatch (got "
@@ -1027,7 +1050,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     cl_int err;
 
     // Validate input size
-    size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_;
+    size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_active_;
     if (all_flux.size() != expected_flux_size) {
         std::cerr << "[GPU Thermal] all_flux size mismatch: expected "
                   << expected_flux_size << ", got " << all_flux.size() << "\n";
@@ -1049,7 +1072,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(err);
 
     // Set kernel arguments
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
 
     // Verify kernel is valid
@@ -1061,14 +1084,14 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         return;
     }
 
-    // Optional Schorghofer accumulator buffer (size n_layers * n_faces).
+    // Optional Schorghofer accumulator buffer (size n_layers * n_faces_active_).
     // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
     // kernel arg slot is always valid.
     const bool enable_accum = (avg_E_inout != nullptr);
     cl_mem buf_avg_E = nullptr;
     if (enable_accum) {
-        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
-            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_active_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_active_, 0.0f);
         }
         buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                    avg_E_inout->size() * sizeof(float),
@@ -1112,7 +1135,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
 
     // Launch kernel - one work item per face
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -1158,7 +1181,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         // Show first few values for face 0
         std::cerr << "[GPU Thermal DEBUG] Face 0 temps (first 10 timesteps): ";
         for (int t = 0; t < std::min(10, n_timesteps); ++t) {
-            std::cerr << output_temps[t * n_faces_ + 0] << " ";
+            std::cerr << output_temps[t * n_faces_active_ + 0] << " ";
         }
         std::cerr << "\n";
 
@@ -1166,7 +1189,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         std::cerr << "[GPU Thermal DEBUG] Face 0 temps at later steps: ";
         for (int t : {1000, 2000, 3000, 4000, 5000, 5500, 5800, 5989}) {
             if (t < n_timesteps) {
-                std::cerr << "t=" << t << ":" << output_temps[t * n_faces_ + 0] << " ";
+                std::cerr << "t=" << t << ":" << output_temps[t * n_faces_active_ + 0] << " ";
             }
         }
         std::cerr << "\n";
@@ -1189,14 +1212,14 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                   << " / " << n_timesteps << "\n";
 
         // Read back final T profile to check interior temperatures
-        std::vector<float> T_final(n_faces_ * n_layers_);
+        std::vector<float> T_final(n_faces_active_ * n_layers_);
         cl_int read_err = clEnqueueReadBuffer(queue, buf_T_, CL_TRUE, 0,
                                                T_final.size() * sizeof(float),
                                                T_final.data(), 0, nullptr, nullptr);
         if (read_err == CL_SUCCESS) {
             std::cerr << "[GPU Thermal DEBUG] Final T profile for face 0 (all layers): ";
             for (size_t layer = 0; layer < n_layers_; ++layer) {
-                std::cerr << T_final[layer * n_faces_ + 0] << " ";
+                std::cerr << T_final[layer * n_faces_active_ + 0] << " ";
             }
             std::cerr << "\n";
         }
@@ -1227,7 +1250,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     last_kernel_time_ms_ = static_cast<float>(duration.count());
 
     std::cout << "[GPU Thermal] Persistent kernel processed " << n_timesteps << " timesteps for "
-              << n_faces_ << " faces in " << last_kernel_time_ms_ << " ms\n";
+              << n_faces_active_ << " faces in " << last_kernel_time_ms_ << " ms\n";
 }
 
 void ThermalOpenCLSolver::solvePersistentMultipleCycles(
@@ -1256,7 +1279,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     cl_command_queue queue = context_->queue();
     cl_int err;
 
-    const size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_;
+    const size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_active_;
     if (all_flux.size() != expected_flux_size) {
         std::cerr << "[GPU Thermal] all_flux size mismatch: expected "
                   << expected_flux_size << ", got " << all_flux.size() << "\n";
@@ -1277,14 +1300,14 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                                              nullptr, &err);
     CL_CHECK(err);
 
-    // Optional Schorghofer accumulator (size n_layers * n_faces).
+    // Optional Schorghofer accumulator (size n_layers * n_faces_active_).
     // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
     // kernel arg slot is always valid.
     const bool enable_accum = (avg_E_inout != nullptr);
     cl_mem buf_avg_E = nullptr;
     if (enable_accum) {
-        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
-            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_active_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_active_, 0.0f);
         }
         buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                    avg_E_inout->size() * sizeof(float),
@@ -1300,7 +1323,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     int accum_end_eff   = (accum_end   < 0) ? n_timesteps : accum_end;
 
     // Set kernel arguments ONCE (same for every cycle).
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
     int arg = 0;
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_T_));
@@ -1333,7 +1356,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -1384,7 +1407,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     last_kernel_time_ms_ = static_cast<float>(duration.count());
 
     std::cout << "[GPU Thermal] Persistent kernel: " << total_cycles << " cycles x "
-              << n_timesteps << " timesteps for " << n_faces_ << " faces in "
+              << n_timesteps << " timesteps for " << n_faces_active_ << " faces in "
               << last_kernel_time_ms_ << " ms ("
               << (last_kernel_time_ms_ / total_cycles) << " ms/cycle avg)\n";
 }

@@ -26,7 +26,9 @@
 #include <csignal>
 #include <execinfo.h>
 #include <cxxabi.h>
-#include <unistd.h>   // for STDERR_FILENO
+#include <unistd.h>   // for STDERR_FILENO, fsync
+#include <cstdio>     // for std::fopen / fprintf / fflush / fclose (heartbeat)
+#include <ctime>      // for gmtime_r / strftime (heartbeat)
 
 #include "../tools/config_parser.h"
 #include "../thermal/thermal_model.h"
@@ -679,6 +681,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
+//
+// shared_thermal_pool: optional pre-built ThermalGPUDevicePool*. When the
+// caller passes one (typed as void* to keep this declaration GPU-build
+// agnostic), the function uses it instead of constructing a fresh pool.
+// Hoisting the pool above the radiation-coupling iter loop eliminates the
+// per-iter OpenCL context create/destroy churn that wedged the macOS+AMD
+// driver during long re-thermal runs (kernel hang → SMC -108 forced reset).
+// Pass nullptr to keep the legacy build-pool-per-call behaviour.
 bool runThermalForSelectedFaces_GPU(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<int>& face_indices,           // Faces to process
@@ -691,13 +701,59 @@ bool runThermalForSelectedFaces_GPU(
     // legacy single-GPU serial-batches behaviour.
     int gpu_devices = 1,
     const std::vector<int>& gpu_device_ids = {},
-    int gpu_inter_batch_pause_ms = 0);
+    int gpu_inter_batch_pause_ms = 0,
+    void* shared_thermal_pool = nullptr);
 
 void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
-    
+
 bool addThermalDataToVTK(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<std::vector<double>>&, const std::vector<double>&);
+
+// ---------------------------------------------------------------------------
+// Heartbeat: single-line "where are we right now" file in <output_dir>.
+// Rewritten before each long-running phase with explicit fsync(). Survives
+// hard kernel hangs where stdout/stderr buffers never reach disk — the
+// macOS+AMD OpenCL driver has wedged the box badly enough during multi-hour
+// rad-coupling runs that the unified log captured nothing pre-reboot. The
+// heartbeat is small enough that open-write-fsync-close is cheap (~ms) yet
+// pinpoints the in-flight phase after the box comes back up. Best-effort;
+// silently ignores I/O errors.
+// ---------------------------------------------------------------------------
+namespace {
+std::string g_heartbeat_dir;
+std::mutex  g_heartbeat_mtx;
+
+void setHeartbeatDir(const std::string& dir) {
+    std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+    g_heartbeat_dir = dir;
+}
+
+void writeHeartbeat(const std::string& msg) {
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+        dir = g_heartbeat_dir;
+    }
+    if (dir.empty()) return;
+    const std::string path = dir + "/heartbeat.txt";
+    FILE* fp = std::fopen(path.c_str(), "w");
+    if (!fp) return;
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_utc{};
+    gmtime_r(&t, &tm_utc);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+    std::fprintf(fp, "%s %s\n", ts, msg.c_str());
+    std::fflush(fp);
+    int fd = ::fileno(fp);
+    if (fd >= 0) ::fsync(fd);
+    std::fclose(fp);
+}
+}  // namespace
 
 using FluxFn = std::function<double(size_t,int)>;
 bool runThermalModelsForAllFacesStreamed(
@@ -3731,15 +3787,29 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << gpu_inter_batch_pause_ms << " ms (per device)" << std::endl;
         }
 
-        ThermalGPUPoolConfig pool_cfg;
-        pool_cfg.devices = selected;
-        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
-        pool_cfg.verbose = false;
-        ThermalGPUDevicePool pool(std::move(pool_cfg));
-
         ThermalOpenCLConfig opencl_config;
         opencl_config.verbose = false;
         opencl_config.work_group_size = 64;
+
+        // Persistent-solver pool: one ThermalOpenCLSolver per device, sized
+        // to BATCH_SIZE capacity, reused across every batch on its device.
+        // Constructor eagerly calls solver.initialize() per device, so any
+        // OpenCL init failure surfaces here (not mid-loop).
+        ThermalGPUPoolConfig pool_cfg;
+        pool_cfg.devices = selected;
+        pool_cfg.max_n_faces = BATCH_SIZE;
+        pool_cfg.n_layers = n_layers;
+        pool_cfg.solver_config = opencl_config;
+        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+        pool_cfg.verbose = false;
+        std::unique_ptr<ThermalGPUDevicePool> pool;
+        try {
+            pool = std::make_unique<ThermalGPUDevicePool>(std::move(pool_cfg));
+        } catch (const std::exception& e) {
+            std::cerr << "[GPU Thermal] Multi-GPU pool construction failed: "
+                      << e.what() << std::endl;
+            return false;
+        }
 
         std::vector<std::future<bool>> futures;
         futures.reserve(n_batches);
@@ -3747,7 +3817,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             const size_t batch_start = batch_idx * BATCH_SIZE;
             const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_faces);
             const size_t batch_n     = batch_end - batch_start;
-            futures.push_back(pool.submit(batch_n, n_layers, opencl_config,
+            futures.push_back(pool->submit(batch_n,
                 [&run_batch_on_solver, batch_idx, batch_start, batch_n](
                     ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
                     return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
@@ -4242,7 +4312,8 @@ bool runThermalForSelectedFaces_GPU(
     std::vector<std::vector<double>>& surface_temps,
     int gpu_devices,
     const std::vector<int>& gpu_device_ids,
-    int gpu_inter_batch_pause_ms)
+    int gpu_inter_batch_pause_ms,
+    void* shared_thermal_pool)
 {
     using namespace gpu::opencl;
 
@@ -4374,22 +4445,24 @@ bool runThermalForSelectedFaces_GPU(
             }
         }
 
-        // Equilibration phase: run multiple cycles to establish correct subsurface
-        // temperature profile before output. This matches the initial GPU thermal run
-        // behavior (runThermalModelsForAllFaces_GPU_Persistent) which also runs 5 cycles.
-        // Without this, the crude linear interpolation initial profile biases faces
-        // with higher daytime temperatures to retain excess subsurface heat at night.
-        int equil_cycles = 5;
-        if (equil_cycles > 0 && total_time_steps > 1) {
-            std::vector<float> equil_output_dummy;
-            for (int eq_cycle = 0; eq_cycle < equil_cycles; ++eq_cycle) {
-                solver.solvePersistentAllTimesteps(flux_all, equil_output_dummy, total_time_steps, dt);
-            }
-        }
-
-        // Output phase (temperatures now equilibrated)
+        // Equilibration + output via solvePersistentMultipleCycles: runs
+        // (n_equil_cycles + 1) cycles back-to-back on the GPU but allocates
+        // the per-cycle scratch buffers (flux + output) exactly ONCE for the
+        // whole sequence. The previous implementation called
+        // solvePersistentAllTimesteps in a loop, which alloc/freed ~144 MB
+        // of GPU buffers (50K faces × 720 ts × 4 B × 2 bufs) per cycle ×
+        // 6 cycles per batch × ~6 batches per device. That buffer-thrash
+        // pattern, while the radiosity pool's 1.3 GB VF matrix is
+        // co-resident on each AMD W6800X die under macOS, wedged the GPU
+        // driver and forced a system reboot mid-rad-iter-1 on the
+        // production Mons-Mouton run (Y00_summer, 2026-05-09).
+        // The all-faces dispatch in runThermalModelsForAllFaces_GPU_Persistent
+        // already used solvePersistentMultipleCycles for the same reason.
+        const int equil_cycles = 5;
         std::vector<float> output_temps;
-        solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
+        solver.solvePersistentMultipleCycles(flux_all, output_temps,
+                                             total_time_steps, dt,
+                                             equil_cycles);
 
         // Copy results back to surface_temps (transpose from timestep-major to face-major)
         for (size_t f = 0; f < batch_n; ++f) {
@@ -4435,18 +4508,50 @@ bool runThermalForSelectedFaces_GPU(
             return false;
         }
 
-        std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
-                     "across " << selected.size() << " device(s)" << std::endl;
+        // Two paths: caller-supplied long-lived pool (preferred — eliminates
+        // per-iter context churn during radiation-thermal coupling) or
+        // function-local pool (legacy when caller passes nullptr).
+        ThermalGPUDevicePool* pool_ptr = nullptr;
+        std::unique_ptr<ThermalGPUDevicePool> local_pool;
 
-        ThermalGPUPoolConfig pool_cfg;
-        pool_cfg.devices = selected;
-        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
-        pool_cfg.verbose = false;
-        ThermalGPUDevicePool pool(std::move(pool_cfg));
+        if (shared_thermal_pool != nullptr) {
+            pool_ptr = static_cast<ThermalGPUDevicePool*>(shared_thermal_pool);
+            std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
+                         "(shared pool, " << pool_ptr->numDevices()
+                      << " device(s))" << std::endl;
+            if (BATCH_SIZE > pool_ptr->capacity()) {
+                std::cerr << "  [GPU Thermal Pool] Shared pool capacity "
+                          << pool_ptr->capacity() << " < required BATCH_SIZE "
+                          << BATCH_SIZE << "; falling back to local pool"
+                          << std::endl;
+                pool_ptr = nullptr;
+            }
+        }
 
-        ThermalOpenCLConfig opencl_config;
-        opencl_config.verbose = false;
-        opencl_config.work_group_size = 64;
+        if (pool_ptr == nullptr) {
+            std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
+                         "across " << selected.size() << " device(s)" << std::endl;
+
+            ThermalOpenCLConfig opencl_config;
+            opencl_config.verbose = false;
+            opencl_config.work_group_size = 64;
+
+            ThermalGPUPoolConfig pool_cfg;
+            pool_cfg.devices = selected;
+            pool_cfg.max_n_faces = BATCH_SIZE;
+            pool_cfg.n_layers = n_layers;
+            pool_cfg.solver_config = opencl_config;
+            pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+            pool_cfg.verbose = false;
+            try {
+                local_pool = std::make_unique<ThermalGPUDevicePool>(std::move(pool_cfg));
+            } catch (const std::exception& e) {
+                std::cerr << "  [GPU Thermal Pool] Construction failed: "
+                          << e.what() << std::endl;
+                return false;
+            }
+            pool_ptr = local_pool.get();
+        }
 
         std::vector<std::future<bool>> futures;
         futures.reserve(n_batches);
@@ -4454,7 +4559,7 @@ bool runThermalForSelectedFaces_GPU(
             const size_t batch_start = batch_idx * BATCH_SIZE;
             const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_selected);
             const size_t batch_n     = batch_end - batch_start;
-            futures.push_back(pool.submit(batch_n, n_layers, opencl_config,
+            futures.push_back(pool_ptr->submit(batch_n,
                 [&run_batch_on_solver, batch_idx, batch_start, batch_n](
                     ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
                     return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
@@ -4468,6 +4573,13 @@ bool runThermalForSelectedFaces_GPU(
             ++completed;
             std::cout << "\r  [GPU Thermal Pool] " << completed << "/" << n_batches
                       << " re-thermal batches done" << std::flush;
+            // Heartbeat every batch — the re-thermal phase is exactly where
+            // the macOS+AMD driver wedged. Pinpointing the last completed
+            // batch index after a hang lets us correlate with GPU temps
+            // and decide whether to drop concurrency further.
+            writeHeartbeat("re_thermal batch " + std::to_string(completed)
+                           + "/" + std::to_string(n_batches)
+                           + (ok ? " ok" : " FAILED"));
             all_ok = ok && all_ok;
         }
         std::cout << std::endl;
@@ -4531,7 +4643,8 @@ bool runThermalForSelectedFaces_GPU(
     std::vector<std::vector<double>>&,
     int,
     const std::vector<int>&,
-    int)
+    int,
+    void*)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -5546,9 +5659,13 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-verbose              Print detailed radiation progress\n";
     std::cout << "  --rad-view-factor-file F   Save/load view factors from file\n";
     std::cout << "  --rad-coupling-iter N      Max coupling iterations (default: 10)\n";
-    std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 2.0)\n";
-    std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] (default: 0.1)\n";
+    std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 0.5)\n";
+    std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] for LEGACY mode (default: 0.1)\n";
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
+    std::cout << "  --rad-coupling-select-mode MODE  Face-selection mode: 'physics' (default) or 'legacy'.\n";
+    std::cout << "                                   physics: ΔT predictor (1−α)·ΔF/(4εσT³) > temp_tol·safety.\n";
+    std::cout << "                                   legacy:  absolute |max indirect flux| > flux_tol.\n";
+    std::cout << "  --rad-coupling-select-safety F   Safety factor on predicted-ΔT threshold (default: 0.5).\n";
     std::cout << "  --rad-use-svd              Use SVD compression instead of ACA (slower)\n";
     std::cout << "  --rad-aca-tolerance T      ACA relative tolerance (default: 0.001)\n";
     std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n";
@@ -7078,6 +7195,13 @@ void printBanner() {
 }
 
 int main(int argc, char** argv) {
+    // Line-buffer stdout so progress prints reach disk before a kernel hang
+    // can swallow them. The macOS+AMD OpenCL driver has wedged the box hard
+    // enough during multi-hour rad-coupling runs that the unified log
+    // captures nothing pre-reboot — line-buffering at least keeps the
+    // user-visible run log fresh up to the moment of the hang.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     printBanner();
 
     // ========================================================================
@@ -7155,6 +7279,10 @@ int main(int argc, char** argv) {
     int mesh_resolution = sim_config.mesh.resolution;
     int time_steps = sim_config.time.timesteps;
     std::string output_dir = sim_config.output.directory;
+    // Wire heartbeat to the output dir so post-mortem readers can see the
+    // last in-flight phase after a kernel hang / forced reboot.
+    setHeartbeatDir(output_dir);
+    writeHeartbeat("startup output_dir=" + output_dir);
     double integration_days = sim_config.thermal.integration_days;
     int integration_steps_cli = sim_config.thermal.integration_steps;
     double integration_offset_days = sim_config.thermal.integration_offset_days;
@@ -7262,8 +7390,10 @@ int main(int argc, char** argv) {
     std::string rad_view_factor_file = "";
     int rad_max_coupling_iter = 10;
     double rad_coupling_temp_tol = 2.0;     // Temperature convergence threshold [K]
-    double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2]
+    double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2] (legacy mode only)
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
+    std::string rad_coupling_select_mode = "physics";  // "physics" (default) or "legacy"
+    double rad_coupling_select_safety = 0.5;            // Safety factor on predicted-ΔT threshold
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -7298,6 +7428,8 @@ int main(int argc, char** argv) {
     rad_coupling_temp_tol = sim_config.radiation.coupling_temp_threshold;
     rad_coupling_flux_tol = sim_config.radiation.coupling_flux_threshold;
     rad_coupling_face_frac = sim_config.radiation.coupling_face_fraction;
+    rad_coupling_select_mode = sim_config.radiation.coupling_select_mode;
+    rad_coupling_select_safety = sim_config.radiation.coupling_select_safety;
     rad_use_aca = sim_config.radiation.use_aca;
     rad_aca_tolerance = sim_config.radiation.aca_tolerance;
     rad_aca_max_rank = sim_config.radiation.aca_max_rank;
@@ -7643,6 +7775,20 @@ int main(int argc, char** argv) {
             rad_coupling_flux_tol = std::stod(argv[++i]);
         } else if (arg == "--rad-coupling-face-frac" && i + 1 < argc) {
             rad_coupling_face_frac = std::stod(argv[++i]);
+        } else if (arg == "--rad-coupling-select-mode" && i + 1 < argc) {
+            rad_coupling_select_mode = argv[++i];
+            if (rad_coupling_select_mode != "physics" && rad_coupling_select_mode != "legacy") {
+                std::cerr << "Invalid --rad-coupling-select-mode '"
+                          << rad_coupling_select_mode
+                          << "': must be 'physics' or 'legacy'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation coupling face-selection mode: "
+                      << rad_coupling_select_mode << std::endl;
+        } else if (arg == "--rad-coupling-select-safety" && i + 1 < argc) {
+            rad_coupling_select_safety = std::stod(argv[++i]);
+            std::cout << "Radiation coupling select safety factor: "
+                      << rad_coupling_select_safety << std::endl;
         } else if (arg == "--rad-use-svd") {
             rad_use_aca = false;
             std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
@@ -9515,6 +9661,18 @@ int main(int argc, char** argv) {
                 // Store previous iteration temperatures for convergence check
                 std::vector<std::vector<double>> prev_temps = surface_temps;
 
+                // Per-face max indirect flux from the previous iter — used by
+                // the physics-mode selector to compute ΔF (the change in
+                // indirect flux) rather than absolute flux. On iter 0 there
+                // is no prior, so the selector falls back to absolute flux.
+                std::vector<double> prev_max_indirect(num_faces, 0.0);
+
+                // Whether the physics-mode selector is active for this run.
+                const bool rad_coupling_physics_mode =
+                    (rad_coupling_select_mode == "physics");
+                std::cout << "  Face-selection mode: "
+                          << rad_coupling_select_mode << std::endl;
+
                 // Time-varying indirect flux per face [face][timestep]
                 // This is the key fix: indirect flux varies with time as wall temperatures change
                 // (indirect_flux_series declared at outer scope for location export)
@@ -9562,8 +9720,120 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // Hoisted thermal GPU pool for radiation-coupling re-thermal.
+                // Created once before the iter loop and reused across every
+                // selected-faces re-thermal call. Eliminates per-iter OpenCL
+                // context create/destroy churn that wedged the macOS+AMD
+                // driver during multi-hour rad-on runs (SMC -108 forced
+                // reset; see memory/multi_gpu_thermal.md). Sized to the
+                // re-thermal hard cap (50000 faces) — actual batches narrow
+                // via setActiveFaceCount.
+                void* shared_rerun_pool = nullptr;
+#ifdef PTM_GPU_OPENCL
+                std::unique_ptr<gpu::opencl::ThermalGPUDevicePool> rerun_pool;
+                if (thermal_config.getPropertyBool("use_gpu_thermal", false)
+                    && (sim_config.thermal.gpu_devices != 1
+                        || !sim_config.thermal.gpu_device_ids.empty())) {
+                    auto all_gpus = gpu::opencl::OpenCLContext::enumerateGPUs();
+                    std::vector<gpu::opencl::OpenCLDeviceInfo> rerun_devs;
+                    if (!sim_config.thermal.gpu_device_ids.empty()) {
+                        for (int id : sim_config.thermal.gpu_device_ids) {
+                            if (id >= 0
+                                && static_cast<size_t>(id) < all_gpus.size()) {
+                                rerun_devs.push_back(all_gpus[id]);
+                            }
+                        }
+                    } else if (sim_config.thermal.gpu_devices == 0) {
+                        rerun_devs = all_gpus;
+                    } else {
+                        const int n_req =
+                            std::min(sim_config.thermal.gpu_devices,
+                                     static_cast<int>(all_gpus.size()));
+                        for (int i = 0; i < n_req; ++i) {
+                            rerun_devs.push_back(all_gpus[i]);
+                        }
+                    }
+
+                    // Cap re-thermal concurrency: rad-coupling re-thermal
+                    // runs *concurrently* with the radiosity pool on the same
+                    // dies, roughly doubling driver pressure vs the rad-OFF
+                    // N=4 benchmark. The May-9 smoke crashed overnight even
+                    // with the persistent-context fix in place. Cap at 2 by
+                    // default (override with PTM_RAD_RERUN_MAX_GPUS env);
+                    // skip the cap when the user passed explicit
+                    // gpu_device_ids, which is an opt-in to expert config.
+                    {
+                        int rerun_max = 2;
+                        if (const char* env =
+                                std::getenv("PTM_RAD_RERUN_MAX_GPUS")) {
+                            int v = std::atoi(env);
+                            if (v > 0) rerun_max = v;
+                        }
+                        if (sim_config.thermal.gpu_device_ids.empty()
+                            && static_cast<int>(rerun_devs.size()) > rerun_max) {
+                            std::cout << "  [GPU Thermal Pool] Capping "
+                                         "re-thermal concurrency at "
+                                      << rerun_max << " device(s) (was "
+                                      << rerun_devs.size()
+                                      << ") to reduce macOS+AMD driver "
+                                         "pressure during rad-coupling. "
+                                         "Override: PTM_RAD_RERUN_MAX_GPUS env."
+                                      << std::endl;
+                            rerun_devs.resize(rerun_max);
+                        }
+                    }
+
+                    if (rerun_devs.size() >= 2) {
+                        // Match the n_layers and BATCH_SIZE that
+                        // runThermalForSelectedFaces_GPU computes internally.
+                        // BATCH_SIZE is hardcoded to min(memory-limit, 50000)
+                        // there; we size for the 50000 cap so the same pool
+                        // covers every iter's re-thermal regardless of the
+                        // selected-face count.
+                        thermal::Profile rerun_profile(planet, 0.0,
+                                                       thermal_config, false);
+                        const size_t rerun_n_layers = rerun_profile.z().size();
+                        constexpr size_t kRerunBatchCap = 50000;
+
+                        gpu::opencl::ThermalOpenCLConfig solver_cfg;
+                        solver_cfg.verbose = false;
+                        solver_cfg.work_group_size = 64;
+
+                        gpu::opencl::ThermalGPUPoolConfig pool_cfg;
+                        pool_cfg.devices = rerun_devs;
+                        pool_cfg.max_n_faces = kRerunBatchCap;
+                        pool_cfg.n_layers = rerun_n_layers;
+                        pool_cfg.solver_config = solver_cfg;
+                        pool_cfg.inter_batch_pause_ms =
+                            sim_config.thermal.gpu_inter_batch_pause_ms;
+                        pool_cfg.verbose = false;
+                        try {
+                            rerun_pool = std::make_unique<
+                                gpu::opencl::ThermalGPUDevicePool>(
+                                std::move(pool_cfg));
+                            shared_rerun_pool = rerun_pool.get();
+                            std::cout << "  [GPU Thermal Pool] Hoisted "
+                                         "re-thermal pool: "
+                                      << rerun_devs.size() << " device(s), "
+                                      << "capacity=" << kRerunBatchCap
+                                      << " faces, n_layers="
+                                      << rerun_n_layers << std::endl;
+                        } catch (const std::exception& e) {
+                            std::cerr << "  [GPU Thermal Pool] Hoisted pool "
+                                         "construction failed: " << e.what()
+                                      << " — re-thermal will build per-iter "
+                                         "pools instead" << std::endl;
+                            rerun_pool.reset();
+                            shared_rerun_pool = nullptr;
+                        }
+                    }
+                }
+#endif  // PTM_GPU_OPENCL
+
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
+                    writeHeartbeat("rad_iter " + std::to_string(iter + 1)
+                                   + " start (max=" + std::to_string(rad_max_coupling_iter) + ")");
 
                     // Step 1: Compute indirect flux at EVERY timestep
                     // This captures time-varying thermal emission from illuminated walls
@@ -9693,59 +9963,159 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Step 2: Identify faces that need thermal re-run
-                    // Include faces where max indirect flux over time exceeds threshold
-                    std::vector<int> faces_to_rerun;
+                    // Step 2: Per-face statistics + selection.
+                    //
+                    // Single pass over (face, timestep) computes everything
+                    // both the selector and the convergence check need:
+                    //   - max_indirect[f]: max over t of indirect_flux_series
+                    //   - max_T[f]:        max over t of surface_temps
+                    //   - observed_dT[f]:  max over t of |T_iter − T_iter-1|
+                    //                      (zero on iter 0 since prev_temps == surface_temps)
+                    //   - global max_temp_change (= max over f of observed_dT)
+                    //
+                    // Physics mode (default):
+                    //   ΔF[f]    = max(0, max_indirect[f] − prev_max_indirect[f])  (iter > 0)
+                    //              max_indirect[f]                                  (iter == 0)
+                    //   T_eff[f] = max(max_T[f], T_floor=40 K)
+                    //   pred_dT  = (1−α)·ΔF / (4εσ·T_eff³)   ← linearized radiative response
+                    //   select if max(pred_dT, observed_dT) > temp_tol·safety
+                    //
+                    //   This combines Phase A (predict future change from new
+                    //   indirect flux) and Phase B (don't drop a face that's
+                    //   still moving even if its flux didn't change). A face
+                    //   with stable flux AND stable past T is naturally frozen.
+                    //
+                    // Legacy mode:
+                    //   select if max_indirect[f] > rad_coupling_flux_tol
+                    //   (reproduces pre-2026-05-09 behavior byte-for-byte).
+                    std::vector<double> face_max_indirect(num_faces, 0.0);
+                    std::vector<double> observed_dT(num_faces, 0.0);
+                    std::vector<double> face_max_T(num_faces, 0.0);
+                    double max_temp_change = 0.0;
+                    double total_indirect_per_face_sum = 0.0;
+
+                    #pragma omp parallel for schedule(static) \
+                        reduction(max:max_temp_change) \
+                        reduction(+:total_indirect_per_face_sum)
                     for (size_t f = 0; f < num_faces; f++) {
-                        double max_face_indirect = 0.0;
+                        double mi = 0.0, mT = 0.0, odT = 0.0;
                         for (int t = 0; t < total_time_steps; t++) {
-                            if (indirect_flux_series[f][t] > max_face_indirect) {
-                                max_face_indirect = indirect_flux_series[f][t];
-                            }
+                            const double v = indirect_flux_series[f][t];
+                            if (v > mi) mi = v;
+                            const double T = surface_temps[f][t];
+                            if (T > mT) mT = T;
+                            const double dT = std::abs(T - prev_temps[f][t]);
+                            if (dT > odT) odT = dT;
                         }
-                        // Include face if max indirect flux over time exceeds threshold
-                        if (max_face_indirect > rad_coupling_flux_tol) {
-                            faces_to_rerun.push_back(static_cast<int>(f));
-                        }
+                        face_max_indirect[f] = mi;
+                        face_max_T[f]        = mT;
+                        observed_dT[f]       = odT;
+                        total_indirect_per_face_sum += mi;
+                        if (odT > max_temp_change) max_temp_change = odT;
                     }
 
-                    std::cout << "  Faces with significant indirect flux: " << faces_to_rerun.size()
-                              << " / " << num_faces << std::endl;
+                    // Pick faces to re-run.
+                    std::vector<int> faces_to_rerun;
+                    faces_to_rerun.reserve(num_faces / 4);
+                    int n_frozen_by_dT = 0;
+                    int n_frozen_by_freeze = 0;
+
+                    if (rad_coupling_physics_mode) {
+                        const double epsilon = planet.emissivity;
+                        const double sigma = 5.67051196e-8;
+                        const double T_floor = 40.0;
+                        const double pred_dT_threshold =
+                            rad_coupling_temp_tol * rad_coupling_select_safety;
+
+                        for (size_t f = 0; f < num_faces; f++) {
+                            const double dF = (iter == 0)
+                                ? face_max_indirect[f]
+                                : std::max(0.0, face_max_indirect[f] - prev_max_indirect[f]);
+                            const double T_eff = std::max(face_max_T[f], T_floor);
+                            const double dTdF = (1.0 - face_albedos_rad[f])
+                                              / (4.0 * epsilon * sigma * T_eff * T_eff * T_eff);
+                            const double pred_dT = dTdF * dF;
+
+                            // Phase A criterion: does the new indirect flux
+                            // imply a future T change above the threshold?
+                            // Phase B criterion: did the face's T already
+                            // change meaningfully in the previous re-thermal?
+                            const bool select = (pred_dT >= pred_dT_threshold)
+                                             || (iter > 0 && observed_dT[f] >= pred_dT_threshold);
+                            if (select) {
+                                faces_to_rerun.push_back(static_cast<int>(f));
+                            } else {
+                                if (iter > 0 && observed_dT[f] < pred_dT_threshold) {
+                                    ++n_frozen_by_freeze;
+                                }
+                                if (pred_dT < pred_dT_threshold) {
+                                    ++n_frozen_by_dT;
+                                }
+                            }
+                        }
+                        std::cout << "  Faces above predicted ΔT threshold ("
+                                  << pred_dT_threshold << " K): "
+                                  << faces_to_rerun.size() << " / " << num_faces
+                                  << "  (frozen: " << (num_faces - faces_to_rerun.size())
+                                  << ")" << std::endl;
+                    } else {
+                        for (size_t f = 0; f < num_faces; f++) {
+                            if (face_max_indirect[f] > rad_coupling_flux_tol) {
+                                faces_to_rerun.push_back(static_cast<int>(f));
+                            }
+                        }
+                        std::cout << "  Faces with significant indirect flux: "
+                                  << faces_to_rerun.size() << " / " << num_faces
+                                  << std::endl;
+                    }
 
                     if (faces_to_rerun.empty()) {
                         std::cout << "  No faces need re-run. Converged." << std::endl;
                         break;
                     }
 
-                    // Check convergence from previous iteration
+                    // Convergence check (skip on iter 0 — observed_dT is all 0
+                    // there because prev_temps == surface_temps).
                     if (iter > 0) {
-                        double max_temp_change = 0.0;
-                        int faces_changed = 0;
-
-                        for (size_t f = 0; f < num_faces; f++) {
-                            for (int t = 0; t < total_time_steps; t++) {
-                                double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                if (dT > max_temp_change) max_temp_change = dT;
-                                if (dT > rad_coupling_temp_tol) faces_changed++;
+                        // True face-fraction: count of faces whose max-over-t
+                        // ΔT exceeds rad_coupling_temp_tol. The legacy code
+                        // counted (face, timestep) samples and divided by
+                        // num_faces·total_time_steps, which is ~total_time_steps×
+                        // more permissive — keep that for legacy mode for
+                        // bit-equivalence; physics mode uses the truer metric.
+                        size_t faces_changing = 0;
+                        if (rad_coupling_physics_mode) {
+                            for (size_t f = 0; f < num_faces; f++) {
+                                if (observed_dT[f] > rad_coupling_temp_tol) ++faces_changing;
                             }
+                        } else {
+                            // Legacy sample-fraction (preserves byte-equivalence).
+                            size_t samples_changing = 0;
+                            for (size_t f = 0; f < num_faces; f++) {
+                                for (int t = 0; t < total_time_steps; t++) {
+                                    const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
+                                    if (dT > rad_coupling_temp_tol) ++samples_changing;
+                                }
+                            }
+                            faces_changing = samples_changing;  // reused below as a "count"
                         }
+                        const double frac_denom = rad_coupling_physics_mode
+                            ? static_cast<double>(num_faces)
+                            : static_cast<double>(num_faces) * total_time_steps;
+                        const double face_frac = static_cast<double>(faces_changing) / frac_denom;
 
-                        double face_frac = static_cast<double>(faces_changed) / (num_faces * total_time_steps);
                         std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
-                        std::cout << "  Samples still changing: " << std::scientific << std::setprecision(2)
+                        std::cout << (rad_coupling_physics_mode
+                                       ? "  Faces still changing:   "
+                                       : "  Samples still changing: ")
+                                  << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
 
-                        // Converge when EITHER condition is met (matches the
-                        // CLAUDE.md "Adaptive iteration count" docstring). The
-                        // earlier AND-conjunction blocked exit when a tiny
-                        // handful of pathological faces (typically PSR-floor
-                        // wall-junction edges with extreme radiation feedback)
-                        // oscillated by hundreds of K, even after 99.99% of
-                        // samples had settled below the temp tolerance. The
-                        // face_frac criterion captures whether the bulk of the
-                        // mesh has stabilized; the max-temp criterion captures
-                        // whether even the worst face has stabilized. Either
-                        // is a sufficient stopping condition.
+                        // Converge when EITHER condition is met. The earlier
+                        // AND-conjunction blocked exit when a tiny handful of
+                        // pathological faces (typically PSR-floor edges with
+                        // extreme radiation feedback) oscillated by hundreds
+                        // of K, even after 99.99% of the mesh had settled.
                         if (max_temp_change < rad_coupling_temp_tol) {
                             std::cout << "  Converged on max-temperature criterion ("
                                       << max_temp_change << " K < " << rad_coupling_temp_tol
@@ -9756,14 +10126,18 @@ int main(int argc, char** argv) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
                                       << (face_frac * 100) << "% < "
-                                      << (rad_coupling_face_frac * 100) << "% of samples)"
+                                      << (rad_coupling_face_frac * 100) << "%)"
                                       << std::fixed << std::endl;
                             break;
                         }
                     }
 
-                    // Save previous temps for next iteration comparison
+                    // Save previous-iter snapshots for the NEXT iter.
                     prev_temps = surface_temps;
+                    prev_max_indirect = face_max_indirect;
+                    (void)total_indirect_per_face_sum;
+                    (void)n_frozen_by_dT;
+                    (void)n_frozen_by_freeze;
 
                     // Step 3: Re-run thermal for selected faces with TIME-VARYING indirect flux
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
@@ -9807,7 +10181,8 @@ int main(int argc, char** argv) {
                             surface_temps,
                             sim_config.thermal.gpu_devices,
                             sim_config.thermal.gpu_device_ids,
-                            sim_config.thermal.gpu_inter_batch_pause_ms
+                            sim_config.thermal.gpu_inter_batch_pause_ms,
+                            shared_rerun_pool
                         );
                         if (!gpu_success) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
