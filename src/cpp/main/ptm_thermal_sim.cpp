@@ -9754,16 +9754,26 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Cap re-thermal concurrency: rad-coupling re-thermal
-                    // runs *concurrently* with the radiosity pool on the same
-                    // dies, roughly doubling driver pressure vs the rad-OFF
-                    // N=4 benchmark. The May-9 smoke crashed overnight even
-                    // with the persistent-context fix in place. Cap at 2 by
-                    // default (override with PTM_RAD_RERUN_MAX_GPUS env);
-                    // skip the cap when the user passed explicit
-                    // gpu_device_ids, which is an opt-in to expert config.
+                    // Cap re-thermal concurrency to 1 GPU by default.
+                    // Rationale (May 12, 2026 production campaign):
+                    //  * At N=2 (the previous default), ~25% of high-load
+                    //    winter windows (~640 K selected faces) hit the
+                    //    `gpusKillClientExt` hang and required the chunked
+                    //    runner's 3-attempt retry budget; 3 of 88 windows
+                    //    failed outright and needed a follow-up --resume.
+                    //  * At N=1, the May 12 recovery cleared all 3 failed
+                    //    windows in 81 minutes with zero retries.
+                    //  * Per-window wall at N=1 (~23 min) measured within
+                    //    noise of clean N=2 (~25 min) — the re-thermal
+                    //    phase isn't 2× slower because the inter-batch
+                    //    pause overhead is preserved across N and the
+                    //    kernel time is not the dominant cost. Net: N=1
+                    //    is the same speed and removes the failure mode.
+                    // Skip the cap when the user passed explicit
+                    // gpu_device_ids — that's an opt-in to expert config.
+                    // Override the default with PTM_RAD_RERUN_MAX_GPUS=N.
                     {
-                        int rerun_max = 2;
+                        int rerun_max = 1;
                         if (const char* env =
                                 std::getenv("PTM_RAD_RERUN_MAX_GPUS")) {
                             int v = std::atoi(env);
