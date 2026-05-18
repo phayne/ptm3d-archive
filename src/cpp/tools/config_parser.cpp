@@ -39,6 +39,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& mesh = root["mesh"];
             config.mesh.resolution = getWithDefault(mesh, "resolution", config.mesh.resolution);
             config.mesh.import_file = getWithDefault(mesh, "import_file", config.mesh.import_file);
+            config.mesh.occluder_file = getWithDefault(mesh, "occluder_file", config.mesh.occluder_file);
             config.mesh.scale_factor = getWithDefault(mesh, "scale_factor", config.mesh.scale_factor);
             config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
             config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
@@ -170,6 +171,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_temp_threshold = getWithDefault(rad, "coupling_temp_threshold", config.radiation.coupling_temp_threshold);
             config.radiation.coupling_flux_threshold = getWithDefault(rad, "coupling_flux_threshold", config.radiation.coupling_flux_threshold);
             config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
+            config.radiation.coupling_select_mode = getWithDefault(rad, "coupling_select_mode", config.radiation.coupling_select_mode);
+            config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
             config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
             config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
             config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);
@@ -321,6 +324,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "resolution" << YAML::Value << config.mesh.resolution;
         if (!config.mesh.import_file.empty())
             out << YAML::Key << "import_file" << YAML::Value << config.mesh.import_file;
+        if (!config.mesh.occluder_file.empty())
+            out << YAML::Key << "occluder_file" << YAML::Value << config.mesh.occluder_file;
         out << YAML::Key << "scale_factor" << YAML::Value << config.mesh.scale_factor;
         out << YAML::Key << "export_basic" << YAML::Value << config.mesh.export_basic;
         out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
@@ -500,6 +505,8 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.mesh.resolution = std::stoi(argv[++i]);
         } else if (arg == "--mesh-file" && i + 1 < argc) {
             config.mesh.import_file = argv[++i];
+        } else if (arg == "--occluder-file" && i + 1 < argc) {
+            config.mesh.occluder_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
             config.mesh.scale_factor = std::stod(argv[++i]);
         } else if (arg == "--export-basic-mesh") {
@@ -632,6 +639,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "mesh:\n";
     out << "  resolution: 5                       # Global mesh resolution\n";
     out << "  import_file: \"\"                     # Import custom mesh (OBJ, PLY, VTK)\n";
+    out << "  occluder_file: \"\"                   # Optional occluder-only ring/annulus PLY (shadow ray-tracing only; not solved/output)\n";
     out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
     out << "  export_basic: false                 # Export basic mesh to VTK\n";
     out << "  use_topographic: false              # Use pre-computed topographic mesh\n";

@@ -23,6 +23,7 @@ simulation:
 mesh:
   resolution: 9                          # ignored when import_file is set
   import_file: '{{ mesh_path }}'
+  occluder_file: '{{ occluder_path }}'   # coarse occluder ring (shadow-only); empty unless --extended
   scale_factor: 1.0
   use_topographic: false
 thermal:

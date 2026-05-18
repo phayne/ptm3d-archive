@@ -184,6 +184,18 @@ def main() -> int:
                    help="Keep per-window subdirectories (chunk_*, "
                         "per-window statistics/, _thermal_state/) after merge "
                         "(default: delete to free disk).")
+    p.add_argument("--r-core-km", type=float, default=None,
+                   help="If set, crop the merged extended-mesh deliverable "
+                        "(mesh.ply + statistics/*.bin) back to this core ROI "
+                        "radius before cleanup. Needs --manifest (or "
+                        "--site-latlon) for the site center.")
+    p.add_argument("--manifest", type=Path, default=None,
+                   help="site_manifest.json; site center looked up by "
+                        "--site-dir name (for --r-core-km crop).")
+    p.add_argument("--site-latlon", nargs=2, type=float, default=None,
+                   metavar=("LAT", "LON"),
+                   help="Explicit site center for --r-core-km crop "
+                        "(alternative to --manifest).")
     args = p.parse_args()
 
     if not args.site_dir.is_dir():
@@ -226,6 +238,35 @@ def main() -> int:
     summary_path = write_summary(args.site_dir, args.site_dir.name,
                                   n_windows=n_windows, n_chunks=len(chunk_dirs))
     print(f"\nSummary: {summary_path}")
+
+    # Crop the extended-mesh deliverable back to the requested core ROI.
+    # Runs AFTER write_summary (merge needs the full-mesh _raw buffers for
+    # correct cross-window math) and BEFORE cleanup. crop_site rewrites
+    # mesh.ply (full -> mesh_extended.ply) and every statistics/*.bin with
+    # one identical face mask, then regenerates summary.json.
+    if args.r_core_km is not None:
+        if args.site_latlon:
+            slat, slon = args.site_latlon
+        elif args.manifest and args.manifest.is_file():
+            mf = json.loads(args.manifest.read_text())
+            rec = next((s for s in mf.get("sites", [])
+                        if s["ellipse_id"] == args.site_dir.name), None)
+            if rec is None:
+                sys.exit(f"--r-core-km set but {args.site_dir.name} not in "
+                         f"{args.manifest}")
+            slat, slon = float(rec["lat_deg"]), float(rec["lon_deg"])
+        else:
+            sys.exit("--r-core-km requires --manifest or --site-latlon")
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from a3gt_v2_crop_core import crop_site
+        cres = crop_site(args.site_dir, slat, slon, args.r_core_km)
+        if cres.get("errors"):
+            print(f"  WARNING: crop reported {len(cres['errors'])} error(s); "
+                  f"deliverable may be inconsistent", file=sys.stderr)
+        else:
+            print(f"  cropped to core: {cres['n_faces_core']:,} / "
+                  f"{cres['n_faces_extended']:,} faces "
+                  f"(R_core={args.r_core_km:g} km)")
 
     # Composite merge succeeded and the canonical statistics/ directory is
     # populated; the per-window subdirs are now redundant. Remove them

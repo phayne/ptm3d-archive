@@ -23,6 +23,7 @@ simulation:
 mesh:
   resolution: 9                          # ignored when import_file is set
   import_file: '{{ mesh_path }}'
+  occluder_file: '{{ occluder_path }}'   # coarse occluder ring (shadow-only); empty unless --extended
   scale_factor: 1.0
   use_topographic: false
 thermal:
@@ -30,8 +31,12 @@ thermal:
   threads: 0
   use_gpu: true
   # Multi-GPU thermal (4 W6800X dies). Keep the recommended hang knobs.
+  # 100K batch keeps each persistent-kernel dispatch ~1.5s — well under the
+  # macOS AMD soft watchdog (5-10s) even when terrain heterogeneity
+  # stretches the TDMA tail. 200K was the original Justitia-validated value
+  # but proved marginal on heterogeneous lunar 1.8M-face meshes.
   gpu_devices: 4
-  gpu_batch_size: 200000
+  gpu_batch_size: 100000
   gpu_inter_batch_pause_ms: 1500
   equilibration_orbits: 2.0
   equilibration_steps_per_day: -1.0

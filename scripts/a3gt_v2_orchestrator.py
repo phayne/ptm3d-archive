@@ -44,7 +44,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 REPO = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm")
-DEM = Path(
+sys.path.insert(0, str(REPO / "scripts"))
+# Legacy single-DEM fallback (used only when the manifest is NOT catalog mode).
+DEFAULT_DEM = Path(
     "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt/mons-mouton/mm-sfs-dem.tif")
 DTM_TOOL_LOCAL = Path("/tmp/dtm_to_ply_delaunay")
 DTM_TOOL_REMOTE = Path(
@@ -93,13 +95,27 @@ def read_n_faces(ply: Path) -> int:
     return 0
 
 
-def site_mesh_path(site: dict, roi_radius_km: float = 5.0) -> Path:
-    """data/dem/a3gt_v2/A03MM022_85.218S_31.850E_R{N}km_linear.ply"""
-    rkm = f"{roi_radius_km:g}"
-    return MESH_DIR / (
-        f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
-        f"{site['lon_deg']:.3f}E_R{rkm}km_linear.ply"
-    )
+def site_mesh_path(site: dict, roi_radius_km: float = 5.0,
+                   r_core_km: float | None = None,
+                   r_ext_km: float | None = None,
+                   density_exp: float | None = None) -> Path:
+    """Per-site mesh PLY path.
+
+    Legacy (single-DEM / non-extended): keeps the historical name
+    ``A03MM022_85.218S_31.850E_R{N}km_linear.ply`` so existing production
+    meshes are still found/skipped.
+
+    Extended (physics-horizon): encodes both radii + the density exponent so
+    extended and legacy meshes never collide:
+    ``A03MM022_85.218S_31.850E_Rcore3_Rext11.57_p1.5.ply``.
+    """
+    base = (f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
+            f"{site['lon_deg']:.3f}E_")
+    if r_core_km is not None and r_ext_km is not None:
+        return MESH_DIR / (
+            f"{base}Rcore{r_core_km:g}_Rext{r_ext_km:g}"
+            f"_p{(density_exp if density_exp is not None else 0):g}.ply")
+    return MESH_DIR / f"{base}R{roi_radius_km:g}km_linear.ply"
 
 
 def window_dir(ellipse_id: str, window_tag: str) -> Path:
@@ -126,11 +142,17 @@ def window_is_complete(window_dir_: Path) -> bool:
 
 def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
                core_frac: float = 0.05, max_points: int = 2_500_000,
-               density_exp: float = 1.0) -> Path:
-    """Build a 1 m/px-center / N km-ROI / linear-density-falloff PLY for a site.
-    Reuses the existing dtm_to_ply_delaunay binary; same call signature as
-    run_a3gt_batch.py:build_mesh but with --density-exp 1.0 instead of 2.0."""
-    ply = site_mesh_path(site, roi_radius_km=roi_km)
+               density_exp: float = 1.0,
+               dem_override: Path | None = None,
+               mesh_path: Path | None = None) -> Path:
+    """Build a 1 m/px-center / N km-ROI / density-falloff PLY for a site.
+
+    Reuses the existing dtm_to_ply_delaunay binary. ``dem_override`` is the
+    per-site VRT mosaic in catalog mode (GDAL opens a .vrt transparently, so
+    no C++ change); ``mesh_path`` is the extended-name PLY. Both default to
+    the legacy single-DEM behavior when omitted."""
+    ply = mesh_path or site_mesh_path(site, roi_radius_km=roi_km)
+    dem = dem_override or DEFAULT_DEM
     MESH_DIR.mkdir(parents=True, exist_ok=True)
 
     if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
@@ -140,7 +162,7 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
 
     cmd = [
         str(DTM_TOOL),
-        str(DEM),
+        str(dem),
         str(ply),
         "--roi-center", f"{site['lat_deg']:.6f}", f"{site['lon_deg']:.6f}",
         "--roi-radius", f"{roi_km:g}",
@@ -178,7 +200,8 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
 
 def render_yaml(template_text: str, *, start_time: str, duration_days: float,
                 timesteps: int, mesh_path: Path, output_dir: Path,
-                vf_file: Path | None = None) -> str:
+                vf_file: Path | None = None,
+                occluder_path: Path | None = None) -> str:
     out = template_text
     repl = {
         "{{ start_time }}":    start_time,
@@ -187,6 +210,7 @@ def render_yaml(template_text: str, *, start_time: str, duration_days: float,
         "{{ mesh_path }}":     str(mesh_path),
         "{{ output_dir }}":    str(output_dir),
         "{{ vf_file }}":       str(vf_file) if vf_file is not None else "",
+        "{{ occluder_path }}": str(occluder_path) if occluder_path else "",
     }
     for k, v in repl.items():
         out = out.replace(k, v)
@@ -195,7 +219,8 @@ def render_yaml(template_text: str, *, start_time: str, duration_days: float,
 
 def write_window_yaml(site: dict, window: dict, mesh: Path,
                        template_text: str,
-                       vf_file: Path | None = None) -> Path:
+                       vf_file: Path | None = None,
+                       occluder: Path | None = None) -> Path:
     """Render the per-window YAML to disk and return its path."""
     yaml_path = window_yaml_path(site["ellipse_id"], window["tag"])
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,6 +237,7 @@ def write_window_yaml(site: dict, window: dict, mesh: Path,
         mesh_path=mesh,
         output_dir=out_dir,
         vf_file=vf_file,
+        occluder_path=occluder,
     )
     yaml_path.write_text(rendered)
     return yaml_path
@@ -263,14 +289,172 @@ def run_window(site: dict, window: dict, yaml_path: Path,
 # Main
 # --------------------------------------------------------------------------
 
+def _catalog_for(manifest: dict) -> dict | None:
+    """Load the dem_catalog.json referenced by a catalog-mode manifest."""
+    if manifest.get("dem_mode") != "catalog":
+        return None
+    cp = manifest.get("dem_catalog")
+    if cp and Path(cp).is_file():
+        return json.loads(Path(cp).read_text())
+    sys.exit(f"catalog-mode manifest but dem_catalog not found: {cp}")
+
+
+def resolve_site_dem(site: dict, manifest: dict, catalog: dict | None,
+                     dry_run: bool, clip_radius_km: float, *,
+                     include_lola: bool = True, tag: str = "") -> Path:
+    """Per-site DEM: a lazily-built ``-te``-clipped VRT (catalog mode) or
+    the legacy single DEM.
+
+    ``include_lola=False`` → SfS-only VRT (used for the high-res *core*;
+    LOLA must not contaminate the thermally-solved ROI). ``True`` → SfS +
+    LOLA underlay (used for the coarse occluder *ring*). ``tag`` keeps the
+    core vs ring VRTs distinct on disk.
+
+    MANDATORY ``-te`` clip: an unclipped SfS+LOLA VRT is 608k x 608k @ 1 m
+    (the 1 m SfS forces the whole LOLA extent to a 1 m grid). Raises
+    ValueError if no canonical DEM is usable (caller → graceful skip)."""
+    if catalog is None:
+        return DEFAULT_DEM
+    from dem_vrt import build_site_vrt
+    x, y = float(site["x_m"]), float(site["y_m"])
+    pad = max(2000.0, 0.05 * clip_radius_km * 1000.0)   # circle->bbox + proj pad
+    r_m = clip_radius_km * 1000.0 + pad
+    te = {"x_min": x - r_m, "x_max": x + r_m,
+          "y_min": y - r_m, "y_max": y + r_m}
+    suffix = f"{('_' + tag) if tag else ''}_R{clip_radius_km:g}km" \
+             f"{'_lola' if include_lola else '_sfs'}"
+    vrt = (REPO / "data" / "dem" / "a3gt_v2" /
+           f"{site['ellipse_id']}{suffix}.vrt")
+    if vrt.exists():
+        return vrt
+    by_id = {d["id"]: d for d in catalog["dems"]}
+    ranked = [by_id[d["id"]] for d in site.get("dems", [])
+              if d.get("role") != "base" and d["id"] in by_id]
+    lola = catalog.get("lola_base") if include_lola else None
+    if dry_run:
+        print(f"  [{site['ellipse_id']}] (dry-run) VRT {vrt.name} "
+              f"(-te ±{r_m/1000:g}km) <- {[d['id'] for d in ranked]}"
+              f"{' +lola' if lola and lola.get('present') else ''}")
+        return vrt
+    build_site_vrt(ranked, lola, vrt, target_extent_m=te, verbose=True)
+    return vrt
+
+
+def extended_params_for(site: dict, schedule: dict, args) -> dict:
+    """Physics-horizon extended-mesh dtm params for one site."""
+    from a3gt_v2_extended_mesh import (extended_mesh_params,
+                                       DENSITY_EXP_RING_DEFAULT)
+    de = (args.density_exp_ring if args.density_exp_ring is not None
+          else DENSITY_EXP_RING_DEFAULT)
+    return extended_mesh_params(
+        site, schedule, r_core_km=args.r_core_km,
+        sun_elev_floor_deg=args.sun_elev_floor_deg,
+        r_ext_hard_cap_km=args.r_ext_hard_cap_km,
+        max_points=args.ext_max_points, density_exp_ring=de)
+
+
+def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
+                        schedule: dict | None, args
+                        ) -> tuple[Path | None, Path | None]:
+    """Resolve the per-site DEM(s) + build the mesh(es).
+
+    Returns ``(core_mesh, occluder_ring)``:
+      * legacy / non-extended → ``(mesh, None)`` (unchanged behavior).
+      * ``--extended`` → core+ring architecture
+        (docs/extended-occluder-architecture.md): the **core** is the
+        standard production R3km SfS mesh (thermal/radiation/output, no
+        crop); the **ring** is a coarse LOLA annulus passed to the sim as
+        ``mesh.occluder_file`` (shadow-ray BVH only).
+    ``(None, None)`` if the site must be skipped (no usable DEM)."""
+    if not args.extended:
+        try:
+            dem = resolve_site_dem(site, manifest, catalog, args.dry_run,
+                                   args.roi_radius_km)
+        except (ValueError, RuntimeError) as e:
+            print(f"  [{site['ellipse_id']}] SKIP: DEM unavailable ({e})",
+                  file=sys.stderr)
+            return None, None
+        return (build_mesh(site, dry_run=args.dry_run,
+                           roi_km=args.roi_radius_km,
+                           core_frac=args.roi_core_frac,
+                           max_points=args.roi_max_points,
+                           density_exp=args.density_exp,
+                           dem_override=dem), None)
+
+    # --- core + occluder-ring architecture ---
+    ep = extended_params_for(site, schedule, args)
+    r_core, r_ext = ep["r_core_km"], ep["r_ext_km"]
+    print(f"  [{site['ellipse_id']}] core+ring: R_core={r_core:g} "
+          f"R_ext={r_ext:g} km (raw {ep['r_ext_raw_km']:g}, "
+          f"sun_min={ep['sun_elev_min_deg']:g}deg"
+          f"{', COVERAGE-CAPPED' if ep['coverage_capped'] else ''})")
+    # Core DEM = SfS-only (LOLA must not contaminate the solved ROI). For
+    # sites with NO SfS at the center (the LOLA-rescued ones), fall back to
+    # a LOLA-resolution core — same as their pre-core/ring behavior; small
+    # & GPU-safe, just coarse science.
+    try:
+        try:
+            core_dem = resolve_site_dem(site, manifest, catalog, args.dry_run,
+                                        r_core, include_lola=False, tag="core")
+        except (ValueError, RuntimeError):
+            print(f"  [{site['ellipse_id']}] no SfS at center — LOLA-"
+                  f"resolution core fallback", file=sys.stderr)
+            core_dem = resolve_site_dem(site, manifest, catalog, args.dry_run,
+                                        r_core, include_lola=True,
+                                        tag="corelola")
+        ring_vrt = resolve_site_dem(site, manifest, catalog, args.dry_run,
+                                    r_ext, include_lola=True, tag="ring")
+    except (ValueError, RuntimeError) as e:
+        print(f"  [{site['ellipse_id']}] SKIP: DEM unavailable ({e})",
+              file=sys.stderr)
+        return None, None
+
+    # Core = standard production R3km mesh (proven density; no extended
+    # calibration). Legacy site_mesh_path name (roi=r_core).
+    core_mesh = build_mesh(site, dry_run=args.dry_run, roi_km=r_core,
+                           core_frac=args.roi_core_frac,
+                           max_points=args.roi_max_points,
+                           density_exp=args.density_exp,
+                           dem_override=core_dem)
+    ring_ply = (MESH_DIR / f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
+                f"{site['lon_deg']:.3f}E_ring_Rcore{r_core:g}"
+                f"_Rext{r_ext:g}km.ply")
+    if ring_ply.exists() and ring_ply.stat().st_size > 100_000:
+        print(f"  [{site['ellipse_id']}] ring present ({ring_ply.name}) — skip")
+        return core_mesh, ring_ply
+    from a3gt_v2_ring_mesh import build_ring
+    try:
+        build_ring(float(site["lat_deg"]), float(site["lon_deg"]), ring_vrt,
+                   ring_ply, r_core_km=r_core, r_ext_km=r_ext,
+                   dry_run=args.dry_run)
+    except (RuntimeError, ValueError) as e:
+        print(f"  [{site['ellipse_id']}] SKIP: ring build failed ({e})",
+              file=sys.stderr)
+        return None, None
+    return core_mesh, ring_ply
+
+
 def filter_sites(manifest: dict, only: list[str], also_partial: bool) -> list[dict]:
-    """Return sites matching --filter (or all 'in' / 'in+partial' if no filter)."""
+    """Return sites matching --filter (or all 'in' / 'in+partial' if no filter).
+
+    Catalog-mode sites flagged ``skip`` (no DEM covers the center) are always
+    excluded — even when explicitly named in --filter — with the reason
+    printed, so an uncovered site never aborts the batch."""
     sites = manifest["sites"]
     if only:
         keep_ids = set(only)
-        return [s for s in sites if s["ellipse_id"] in keep_ids]
-    accepted = {"in", "partial"} if also_partial else {"in"}
-    return [s for s in sites if s["status"] in accepted]
+        chosen = [s for s in sites if s["ellipse_id"] in keep_ids]
+    else:
+        accepted = {"in", "partial"} if also_partial else {"in"}
+        chosen = [s for s in sites if s["status"] in accepted]
+    out = []
+    for s in chosen:
+        if s.get("skip"):
+            print(f"  [{s['ellipse_id']}] SKIP: "
+                  f"{s.get('skip_reason', 'no DEM coverage')}")
+            continue
+        out.append(s)
+    return out
 
 
 def main() -> int:
@@ -295,6 +479,31 @@ def main() -> int:
     p.add_argument("--roi-max-points", type=int, default=2_500_000)
     p.add_argument("--density-exp", type=float, default=1.0,
                    help="Mesh density falloff exponent (1.0 = linear; A3GT v2 default).")
+    # Core + occluder-ring architecture (catalog mode). Requires --schedule.
+    # docs/extended-occluder-architecture.md
+    p.add_argument("--extended", action="store_true",
+                   help="Core+ring: build the standard R3km SfS core "
+                        "(thermal/radiation/output, no crop) plus a coarse "
+                        "LOLA occluder ring out to the physics horizon, "
+                        "passed to the sim as mesh.occluder_file (shadow "
+                        "ray-trace only). Requires --schedule.")
+    p.add_argument("--r-core-km", type=float, default=3.0,
+                   help="Core ROI radius (the delivered/solved region).")
+    p.add_argument("--sun-elev-floor-deg", type=float, default=1.0,
+                   help="Floor on min solar elevation (caps R_ext in PSRs).")
+    p.add_argument("--r-ext-hard-cap-km", type=float, default=20.0,
+                   help="Hard upper cap on the extended radius (20 km: "
+                        "near-field occluders + tractable VRT/mesh build).")
+    p.add_argument("--density-exp-ring", type=float, default=None,
+                   help="Override the calibrated ring density exponent "
+                        "(default 1.5, calibrated 2026-05-16).")
+    p.add_argument("--ext-max-points", type=int, default=1_400_000,
+                   help="Point budget for EXTENDED meshes (default 1.4M, "
+                        "re-calibrated at R_ext=20km/LOLA: ~2.8M faces "
+                        "(~1.55x production), 2-3km core <=5m (~=production), "
+                        "LOLA-saturated ring, far below the GPU-wedge regime. "
+                        "Separate from legacy --roi-max-points so non-extended "
+                        "runs are unaffected.")
     p.add_argument("--output-root", type=Path, default=None,
                    help=f"Root directory for per-site simulation outputs "
                         f"(default: {DEFAULT_OUTPUT_ROOT}). "
@@ -323,13 +532,21 @@ def main() -> int:
         sys.exit(f"manifest not found: {args.manifest}")
     if args.action == "run" and (not args.schedule or not args.schedule.is_file()):
         sys.exit("--action run requires --schedule path to a subsolar schedule JSON")
+    if args.extended and (not args.schedule or not args.schedule.is_file()):
+        sys.exit("--extended requires --schedule (min solar elevation drives "
+                 "the physics horizon)")
 
     manifest = json.loads(args.manifest.read_text())
+    catalog = _catalog_for(manifest)
+    schedule = (json.loads(args.schedule.read_text())
+                if args.schedule and args.schedule.is_file() else None)
     sites = filter_sites(manifest, args.filter, args.include_partial)
     if not sites:
         sys.exit("No sites match the filter / status criteria.")
 
-    print(f"Selected {len(sites)} site(s):")
+    print(f"Selected {len(sites)} site(s)"
+          f"{' [catalog mode]' if catalog else ''}"
+          f"{' [core+occluder-ring]' if args.extended else ''}:")
     for s in sites:
         print(f"  {s['ellipse_id']}  {s['region']:<22}  status={s['status']}")
 
@@ -337,14 +554,7 @@ def main() -> int:
 
     if args.action == "generate-meshes":
         for s in sites:
-            build_mesh(
-                s,
-                dry_run=args.dry_run,
-                roi_km=args.roi_radius_km,
-                core_frac=args.roi_core_frac,
-                max_points=args.roi_max_points,
-                density_exp=args.density_exp,
-            )
+            plan_and_build_mesh(s, manifest, catalog, schedule, args)
         return 0
 
     # action == run
@@ -361,16 +571,16 @@ def main() -> int:
     failures: list[tuple[str, str]] = []
     start_all = time.time()
 
+    skipped: list[str] = []
     for i, s in enumerate(sites):
-        # First check / build mesh for this site.
-        mesh = build_mesh(
-            s,
-            dry_run=args.dry_run,
-            roi_km=args.roi_radius_km,
-            core_frac=args.roi_core_frac,
-            max_points=args.roi_max_points,
-            density_exp=args.density_exp,
-        )
+        # First check / build mesh for this site (catalog VRT + extended
+        # params resolved here; None => no usable DEM, skip gracefully).
+        core_mesh, occluder = plan_and_build_mesh(
+            s, manifest, catalog, schedule, args)
+        if core_mesh is None:
+            skipped.append(s["ellipse_id"])
+            n_done -= len(windows)
+            continue
         # Per-site view-factor cache: lives at <site_dir>/view_factors.hmat,
         # built by the first window's run, reused by all subsequent windows.
         # (Same geometry across all 8 windows — view factors are identical.)
@@ -381,8 +591,9 @@ def main() -> int:
 
         site_windows_ok = 0
         for j, w in enumerate(windows):
-            yaml_path = write_window_yaml(s, w, mesh, template_text,
-                                           vf_file=vf_file)
+            yaml_path = write_window_yaml(s, w, core_mesh, template_text,
+                                           vf_file=vf_file,
+                                           occluder=occluder)
             ok = run_window(s, w, yaml_path, dry_run=args.dry_run,
                              chunk_timeout_min=args.chunk_timeout_min)
             done_idx = i * len(windows) + j + 1
@@ -404,6 +615,8 @@ def main() -> int:
         if site_windows_ok == len(windows) and not args.dry_run:
             site_dir = OUTPUT_ROOT / s["ellipse_id"]
             print(f"  [{s['ellipse_id']}] all windows complete; running composite merge")
+            # core+ring architecture: thermal output is natively the core
+            # ROI — NO crop (the ring is occluder-only, never solved/output).
             merge_cmd = [PYTHON, str(REPO / "scripts" / "a3gt_v2_merge_sparse.py"),
                          "--site-dir", str(site_dir)]
             mret = subprocess.run(merge_cmd)
@@ -417,6 +630,9 @@ def main() -> int:
     print()
     print(f"Done in {fmt_duration(time.time() - start_all)}: "
           f"{n_done}/{n_total} windows succeeded.")
+    if skipped:
+        print(f"\nSkipped {len(skipped)} site(s) (no usable DEM): "
+              f"{', '.join(skipped)}")
     if failures:
         print(f"\nFailures ({len(failures)}):")
         for sid, tag in failures:

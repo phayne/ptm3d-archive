@@ -244,6 +244,35 @@ bool IlluminationModel::initializeScene(
             return false;
         }
 
+        // Occluder-only geometry: append the ring/annulus triangles to the
+        // ray-tracing BVH so distant topography shadows the core. They are
+        // shadow-only (boolean rtcOccluded path returns no face id), never
+        // thermally solved / radiosity-coupled / output. When there are no
+        // occluders, Vv/Ff alias the inputs verbatim → byte-identical to
+        // the pre-occluder behavior. See docs/extended-occluder-architecture.md
+        std::vector<std::array<double, 3>> verts_merged;
+        std::vector<std::array<int, 3>>    faces_merged;
+        const std::vector<std::array<double, 3>>* Vsrc = &vertices;
+        const std::vector<std::array<int, 3>>*    Fsrc = &faces;
+        if (!occluder_faces_.empty() && !occluder_vertices_.empty()) {
+            const int voff = static_cast<int>(vertices.size());
+            verts_merged = vertices;
+            verts_merged.insert(verts_merged.end(),
+                                occluder_vertices_.begin(),
+                                occluder_vertices_.end());
+            faces_merged = faces;
+            faces_merged.reserve(faces.size() + occluder_faces_.size());
+            for (const auto& f : occluder_faces_)
+                faces_merged.push_back({ f[0] + voff, f[1] + voff, f[2] + voff });
+            Vsrc = &verts_merged;
+            Fsrc = &faces_merged;
+            std::cout << "[IlluminationModel] + " << occluder_faces_.size()
+                      << " occluder triangles (shadow-only; core faces="
+                      << faces.size() << ")\n";
+        }
+        const std::vector<std::array<double, 3>>& Vv = *Vsrc;
+        const std::vector<std::array<int, 3>>&    Ff = *Fsrc;
+
         if (!embree_device_) {
             embree_device_ = rtcNewDevice("");
             if (!embree_device_) {
@@ -276,7 +305,7 @@ bool IlluminationModel::initializeScene(
                                         -std::numeric_limits<double>::max(),
                                         -std::numeric_limits<double>::max() };
 
-        for (const auto& v : vertices) {
+        for (const auto& v : Vv) {
             bb_min[0] = std::min(bb_min[0], v[0]); bb_max[0] = std::max(bb_max[0], v[0]);
             bb_min[1] = std::min(bb_min[1], v[1]); bb_max[1] = std::max(bb_max[1], v[1]);
             bb_min[2] = std::min(bb_min[2], v[2]); bb_max[2] = std::max(bb_max[2], v[2]);
@@ -297,8 +326,8 @@ bool IlluminationModel::initializeScene(
         rtcSetGeometryBuildQuality(geom, RTC_BUILD_QUALITY_HIGH);
         rtcSetGeometryMask(geom, 0xFFFFFFFFu);
 
-        const size_t V = vertices.size();
-        const size_t F = faces.size();
+        const size_t V = Vv.size();
+        const size_t F = Ff.size();
 
         float* vbuf = static_cast<float*>(rtcSetNewGeometryBuffer(
             geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
@@ -309,9 +338,9 @@ bool IlluminationModel::initializeScene(
             return false;
         }
         for (size_t i = 0; i < V; ++i) {
-            vbuf[i*3 + 0] = static_cast<float>(vertices[i][0] - scene_origin_offset_[0]);
-            vbuf[i*3 + 1] = static_cast<float>(vertices[i][1] - scene_origin_offset_[1]);
-            vbuf[i*3 + 2] = static_cast<float>(vertices[i][2] - scene_origin_offset_[2]);
+            vbuf[i*3 + 0] = static_cast<float>(Vv[i][0] - scene_origin_offset_[0]);
+            vbuf[i*3 + 1] = static_cast<float>(Vv[i][1] - scene_origin_offset_[1]);
+            vbuf[i*3 + 2] = static_cast<float>(Vv[i][2] - scene_origin_offset_[2]);
         }
 
         uint32_t* ibuf = static_cast<uint32_t*>(rtcSetNewGeometryBuffer(
@@ -323,9 +352,9 @@ bool IlluminationModel::initializeScene(
             return false;
         }
         for (size_t i = 0; i < F; ++i) {
-            ibuf[i*3 + 0] = static_cast<uint32_t>(faces[i][0]);
-            ibuf[i*3 + 1] = static_cast<uint32_t>(faces[i][1]);
-            ibuf[i*3 + 2] = static_cast<uint32_t>(faces[i][2]);
+            ibuf[i*3 + 0] = static_cast<uint32_t>(Ff[i][0]);
+            ibuf[i*3 + 1] = static_cast<uint32_t>(Ff[i][1]);
+            ibuf[i*3 + 2] = static_cast<uint32_t>(Ff[i][2]);
         }
 
         rtcCommitGeometry(geom);
@@ -358,9 +387,9 @@ bool IlluminationModel::initializeScene(
                 std::vector<std::array<float, 3>> local_vertices(V);
                 for (size_t i = 0; i < V; ++i) {
                     local_vertices[i] = {{
-                        static_cast<float>(vertices[i][0] - scene_origin_offset_[0]),
-                        static_cast<float>(vertices[i][1] - scene_origin_offset_[1]),
-                        static_cast<float>(vertices[i][2] - scene_origin_offset_[2])
+                        static_cast<float>(Vv[i][0] - scene_origin_offset_[0]),
+                        static_cast<float>(Vv[i][1] - scene_origin_offset_[1]),
+                        static_cast<float>(Vv[i][2] - scene_origin_offset_[2])
                     }};
                 }
 
@@ -368,9 +397,9 @@ bool IlluminationModel::initializeScene(
                 std::vector<std::array<uint32_t, 3>> indices(F);
                 for (size_t i = 0; i < F; ++i) {
                     indices[i] = {{
-                        static_cast<uint32_t>(faces[i][0]),
-                        static_cast<uint32_t>(faces[i][1]),
-                        static_cast<uint32_t>(faces[i][2])
+                        static_cast<uint32_t>(Ff[i][0]),
+                        static_cast<uint32_t>(Ff[i][1]),
+                        static_cast<uint32_t>(Ff[i][2])
                     }};
                 }
 

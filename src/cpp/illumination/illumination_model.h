@@ -253,6 +253,22 @@ public:
     const std::string& getBVHCacheFile() const { return bvh_cache_file_; }
 
     /**
+     * Register occluder-only geometry (e.g. a coarse LOLA ring/annulus
+     * surrounding the SfS core). These triangles are appended to the
+     * ray-tracing BVH so distant topography shadows the core, but are
+     * NOT thermally solved, NOT in the radiosity matrix, and NOT output —
+     * they exist only to block direct-solar rays. Must be called BEFORE
+     * initializeScene()/calculateIlluminationFromMesh(). Empty = no-op
+     * (the core-only path is then byte-identical to before).
+     */
+    void setOccluderGeometry(
+        const std::vector<std::array<double, 3>>& vertices,
+        const std::vector<std::array<int, 3>>& faces) {
+        occluder_vertices_ = vertices;
+        occluder_faces_ = faces;
+    }
+
+    /**
      * @brief Check if GPU ray tracing is currently enabled and available
      */
     bool isGPURayTracingEnabled() const { return use_gpu_ray_tracer_; }
@@ -511,6 +527,12 @@ private:
     // Scene origin shift to improve numerical robustness (applied in Embree space)
     std::array<double,3> scene_origin_offset_{0.0, 0.0, 0.0};
     bool scene_has_offset_ = false;
+
+    // Occluder-only geometry (shadow ray-tracing); appended to the BVH in
+    // initializeScene(). Never thermally solved / output. See
+    // docs/extended-occluder-architecture.md.
+    std::vector<std::array<double, 3>> occluder_vertices_;
+    std::vector<std::array<int, 3>>    occluder_faces_;
     
     // Results storage
     std::vector<double> times_;  // Ephemeris times

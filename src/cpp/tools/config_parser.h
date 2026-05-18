@@ -28,6 +28,11 @@ struct SimulationConfig {
     struct MeshParams {
         int resolution = 5;
         std::string import_file = "";
+        // Optional occluder-only mesh (coarse LOLA ring/annulus around the
+        // SfS core). Added to the illumination shadow-ray BVH ONLY — never
+        // thermally solved, radiosity-coupled, or output. Empty = none.
+        // See docs/extended-occluder-architecture.md.
+        std::string occluder_file = "";
         double scale_factor = 1.0;
         bool export_basic = false;
         bool use_topographic = false;
@@ -204,6 +209,19 @@ struct SimulationConfig {
         double coupling_temp_threshold = 0.5;
         double coupling_flux_threshold = 0.1;
         double coupling_face_fraction = 0.01;
+        // Face-selection mode for the rad-thermal coupling re-thermal phase.
+        // "physics" (default): linearized ΔT predictor, ΔT ≈ (1−α)·ΔF / (4εσT³).
+        //                      Re-runs faces whose predicted T change exceeds
+        //                      coupling_temp_threshold·coupling_select_safety.
+        //                      Also implicitly freezes faces whose observed
+        //                      ΔT in the previous iter was below threshold.
+        // "legacy": absolute flux threshold (max indirect flux > coupling_flux_threshold).
+        //           Reproduces pre-2026-05-09 behavior for byte-identical re-runs.
+        std::string coupling_select_mode = "physics";
+        // Safety factor applied to the predicted-ΔT threshold. The predictor
+        // is a linearization that breaks down for ΔF ≳ T·few; multiplying the
+        // threshold by this factor (default 0.5) errs on the side of inclusion.
+        double coupling_select_safety = 0.5;
         bool use_hmatrix = false;
         bool use_aca = true;
         double aca_tolerance = 1e-3;
