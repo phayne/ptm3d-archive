@@ -240,13 +240,20 @@ Starting from the surface temperatures $T_i(t)$ computed by the initial thermal 
    - Solve the radiosity equation to obtain $Q_{\text{indirect},i}(t)$.
    - Store in the array `indirect_flux_series[i][t]`.
 
-2. **Identify faces needing thermal re-run.** For each face $i$, find $\max_t Q_{\text{indirect},i}(t)$. Include face $i$ in the re-run set if this maximum exceeds the flux threshold $\tau_Q$ (default 0.1 W/m$^2$).
+2. **Identify faces needing thermal re-run.** Two modes (configured via `--rad-coupling-select-mode`):
+
+   - **`physics`** (default): linearized ΔT predictor. For each face $i$:
+     $$\widehat{\Delta T}_i = \frac{(1-\alpha_i)\,\Delta F_i}{4\,\varepsilon\,\sigma\,T_{\text{eff},i}^3},\qquad
+       T_{\text{eff},i} = \max\bigl(\max_t T_i(t),\;40\ \text{K}\bigr)$$
+     where $\Delta F_i = \max_t Q_{\text{indirect},i}^{(k)}(t) - \max_t Q_{\text{indirect},i}^{(k-1)}(t)$ on iter $k>0$, or $\max_t Q_{\text{indirect},i}^{(0)}(t)$ on iter 0. Include face $i$ if $\widehat{\Delta T}_i \geq \tau_T \cdot s$, where $s$ is the safety factor (default 0.5). Also include face $i$ if its observed $\max_t |T_i^{(k)}(t)-T_i^{(k-1)}(t)| \geq \tau_T \cdot s$ (per-face freeze: if the face is still moving from the previous re-thermal, recompute it; once it has stopped *and* its flux is stable, drop it).
+   - **`legacy`**: include face $i$ if $\max_t Q_{\text{indirect},i}(t) > \tau_Q$ (default 0.1 W/m$^2$). Reproduces pre-2026-05-09 behavior byte-for-byte.
 
 3. **Check convergence** (for $k > 1$). Compute:
    - $\Delta T_{\max} = \max_{i,t} |T_i^{(k)}(t) - T_i^{(k-1)}(t)|$
-   - $f_{\text{changed}} = \text{count}(|\Delta T| > \tau_T) \,/\, (N \cdot N_t)$
+   - In `physics` mode, $f_{\text{changed}} = \text{count}\bigl(\max_t|\Delta T_i| > \tau_T\bigr)\,/\,N$ (true face-fraction).
+   - In `legacy` mode, $f_{\text{changed}} = \text{count}(|\Delta T| > \tau_T)\,/\,(N\cdot N_t)$ (sample-fraction, unchanged from pre-fix).
 
-   Converged if both $\Delta T_{\max} < \tau_T$ and $f_{\text{changed}} < f_{\text{threshold}}$.
+   Converged when **either** $\Delta T_{\max} < \tau_T$ **or** $f_{\text{changed}} < f_{\text{threshold}}$ (changed from AND to OR in commit 807d374; the AND-conjunction blocked exit when a handful of pathological PSR-floor edges oscillated by hundreds of K even after 99.99% of the mesh had settled).
 
 4. **Re-run thermal model** for selected faces with the combined time-varying flux:
 
@@ -261,18 +268,28 @@ Starting from the surface temperatures $T_i(t)$ computed by the initial thermal 
 | Parameter | Flag | Default | Description |
 |-----------|------|---------|-------------|
 | $k_{\max}$ | `--rad-coupling-iter` | 10 | Maximum coupling iterations |
-| $\tau_T$ | `--rad-coupling-temp-tol` | 2.0 K | Temperature change threshold |
-| $\tau_Q$ | `--rad-coupling-flux-tol` | 0.1 W/m$^2$ | Indirect flux threshold for face selection |
-| $f_{\text{threshold}}$ | `--rad-coupling-face-frac` | 0.01 (1%) | Fraction of face-time samples still changing |
+| $\tau_T$ | `--rad-coupling-temp-tol` | 0.5 K | Temperature change threshold |
+| $\tau_Q$ | `--rad-coupling-flux-tol` | 0.1 W/m$^2$ | Indirect flux threshold (legacy mode only) |
+| $f_{\text{threshold}}$ | `--rad-coupling-face-frac` | 0.01 (1%) | Convergence threshold on faces (physics) or samples (legacy) still changing |
+| select mode | `--rad-coupling-select-mode` | `physics` | Face-selection criterion: `physics` (default) or `legacy` |
+| $s$ | `--rad-coupling-select-safety` | 0.5 | Safety factor on the predicted-ΔT threshold |
 
-Convergence requires **both** temperature and face-fraction criteria to be satisfied simultaneously.
+Convergence is satisfied when **either** the temperature or face-fraction criterion is met (changed from AND in May 2026).
 
 ### 7.3 Optimizations
 
-- **Selective thermal re-run**: only faces with significant indirect flux ($> \tau_Q$) are re-solved, avoiding unnecessary computation on faces unaffected by radiation exchange.
+- **Physics-based selective thermal re-run** (default): only faces whose linearized radiative response predicts $\widehat{\Delta T}\geq \tau_T\cdot s$ are re-solved (or whose observed $\Delta T$ from the previous iter still exceeds that threshold). This naturally handles cold PSR floors (where the response is amplified by $T^{-3}$) and warm slopes asymmetrically, and freezes faces that have already converged.
+- **Legacy absolute-flux selection** (`--rad-coupling-select-mode legacy`): include faces where $\max_t Q_{\text{indirect},i}(t) > \tau_Q$. Reachable for byte-equivalent reproductions of pre-fix runs.
 - **Warm-start thermal solver**: each coupling iteration initializes from the previous iteration's temperature profile, reducing the number of time steps needed to reach the new equilibrium.
-- **First-iteration prediction**: on the first coupling iteration, faces where indirect flux is $< 1\%$ of total absorbed flux are skipped.
 - **Per-face albedo matching**: the coupling loop uses the same per-face albedo maps as the initial thermal solve, loaded from binary files, ensuring consistency.
+
+## 7.5 Validation: Bowl Crater (Ingersoll 1992)
+
+The radiation exchange module is validated against the analytic two-zone bowl-crater model of Ingersoll, Svitek & Murray (1992) using the standalone test program `bin/test_bowl_crater`. The crater is a spherical cap with depth-to-diameter ratio $d/D \in \{0.1, 0.2, 0.3\}$, discretized into 1404 triangular faces (20 radial rings × 36 azimuthal divisions). The test exercises the full view-factor and radiosity-solver pipeline at four crater latitudes ($0°$, $70°$, $80°$, $85°$).
+
+Figure C.1 summarizes the validation. Panel (a) shows the geometry and the rim-shadow critical solar elevation $\beta_c = \arctan(2 d/D)$. Panel (b) shows the analytic Ingersoll equilibrium floor temperature $T_f(\beta)$ for the three depth ratios using Moon defaults $A = 0.12$, $\varepsilon = 0.95$, $T_w = 200$ K, recovering the characteristic shoulder at $\beta = \beta_c$ above which the floor sees direct sun. Panel (c) compares PTM3D's per-face floor sky view factor $F_\text{sky}$ against the analytic spherical-cap formula $\sin^2\alpha$: the four latitudes agree with the analytic mean (0.8621) to within 0.5 %, with a per-mesh-face range of $\pm0.4 \%$ around the mean. Panel (d) reports the radiosity solver diagnostics: view-factor density 99.86 %, reciprocity test passed for all 1.97 M significant pairs, CPU radiosity solver converging in 2 iterations to residual $\sim 5 \times 10^{-5}$, and GPU vs CPU agreement of 0.0001 % relative error.
+
+![Figure C.1: Bowl-crater radiation exchange validation](figures/v2/bowl_crater_ingersoll.png)
 
 ## 8. Face Classification
 
@@ -339,9 +356,11 @@ IlluminationModel
 --rad-verbose                  Print detailed progress information
 --rad-view-factor-file FILE    Save/load pre-computed view factors
 --rad-coupling-iter N          Max coupling iterations (default: 10)
---rad-coupling-temp-tol K      Temperature convergence threshold in K (default: 2.0)
---rad-coupling-flux-tol W      Flux change threshold in W/m² (default: 0.1)
+--rad-coupling-temp-tol K      Temperature convergence threshold in K (default: 0.5)
+--rad-coupling-flux-tol W      Flux change threshold in W/m² (legacy mode only; default: 0.1)
 --rad-coupling-face-frac F     Face fraction still changing to stop (default: 0.01)
+--rad-coupling-select-mode M   Selection mode: 'physics' (default) or 'legacy'
+--rad-coupling-select-safety F Safety factor on predicted-ΔT threshold (default: 0.5)
 --rad-aca-tolerance T          ACA relative convergence tolerance (default: 1e-3)
 --rad-aca-max-rank R           Maximum ACA rank before fallback (default: 50)
 --rad-hmatrix-threads N        Limit H-matrix build threads (0 = auto)

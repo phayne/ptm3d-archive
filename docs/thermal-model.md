@@ -189,21 +189,37 @@ The default `EQUILIBRATION_STEPS_PER_DAY = 192` was chosen as a balance between 
 
 We validate the implementation against the Diviner-derived lunar regolith model of Hayne et al. (2017) by running PTM3D on a global icosphere mesh (resolution 7) for a single synodic month with the Moon defaults of §3.5. Figure B.1 shows (a) the equatorial diurnal surface-temperature cycle, (b) the post-sunset cooling curve at three latitudes, (c) a tabular comparison of the first four diurnal moments, and (d) the input parameters.
 
-![Figure B.1: Lunar surface-temperature validation](figures/lunar_validation.png)
+![Figure B.1: Lunar surface-temperature validation](figures/v2/lunar_validation.png)
 
-PTM3D reproduces the Hayne et al. (2017) lunar surface temperatures to within 1.8 K (minimum), 2.4 K (midnight), 2.6 K (peak), and 5.6 K (diurnal mean). The systematic positive offset in the diurnal mean is consistent with the +2.65 K bias identified during the grid-sensitivity calibration of §4.2 and reflects the moderate (m = 10) vertical resolution used for global runs; finer grids reduce the offset at proportional computational cost.
+PTM3D reproduces the Hayne et al. (2017) lunar surface temperatures to within 1.4 K (peak), 1.7 K (midnight), 1.1 K (minimum), and **1.27 K RMS** over fifteen Hayne nighttime reference points spanning three latitudes. The figure uses six equilibration orbits on the ico7 topographic mesh with the Hayne (2017) Table A1 thermophysical defaults: $A_0 = 0.12$ with the angular-dependent Bond-albedo correction $A(\theta) = A_0 + a(\theta/\pi/4)^3 + b(\theta/\pi/2)^8$ (with $a = 0.06$, $b = 0.25$) composed on top of a per-face $A_0$ from the LRO-derived Bond-albedo map. All thermophysical parameters ($\rho_s$, $\rho_d$, $H$, $K_s$, $K_d$, $\chi$, $\varepsilon$, $c_p$ polynomial coefficients, $Q_b$) match Hayne (2017) Table A1 exactly. The vertical depth grid uses $(m, n, b) = (10, 15, 20)$, placing the bottom Neumann boundary at $\sim 12$ effective skin depths so the diurnal wave is fully damped before it.
 
 ### 8.2 Subsurface Diurnal Wave
 
-The shape and depth dependence of the diurnal thermal wave provide a second internal-consistency check. Figure B.2 shows the modeled subsurface temperature evolution at the lunar equator: panel (a) displays $T(z)$ at six local times spanning one synodic day, and panel (b) shows the corresponding depth–time heatmap with the diurnal skin depth $\delta_1 = 3.4$ cm (eq. B6) marked. The amplitude decays as $\exp(-z/\delta_1)$ within the upper $\sim$5 skin depths and the wave acquires a phase lag with depth, both as expected for a linear semi-infinite slab with constant properties; departures from the analytical solution at depth reflect the depth-dependent $\rho(z)$ and $k(z)$ of (B4)–(B5).
+The shape and depth dependence of the diurnal thermal wave provide a second internal-consistency check. Figure B.2 shows the modeled subsurface temperature evolution at the lunar equator: panel (a) displays $T(z)$ at six local times spanning one synodic day, panel (b) shows the corresponding depth–time heatmap with the diurnal skin depth $\delta_1 = 3.4$ cm (eq. B6) marked, and panel (c) compares the diurnal amplitude to the analytic semi-infinite slab decay $\exp(-z/\delta_1)$. The amplitude decays approximately exponentially within the upper $\sim$5 skin depths and the wave acquires a phase lag with depth, both as expected for a linear semi-infinite slab with constant properties; departures from the analytical solution at depth reflect the depth-dependent $\rho(z)$ and $k(z)$ of (B4)–(B5).
 
-![Figure B.2: Lunar subsurface diurnal thermal wave](figures/thermal_wave_profiles.png)
+![Figure B.2: Lunar subsurface diurnal thermal wave](figures/v2/thermal_wave_profiles.png)
 
 ### 8.3 Equilibration Convergence
 
-The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. At the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192`, the worst-case error across all latitudes and depth nodes is below 1 K, validating the choice of cadence in §7.2. Coarsening to 96 steps day⁻¹ raises the worst-case error to ~2 K, and to 24 steps day⁻¹ raises it to ~7 K; refining to 768 steps day⁻¹ yields errors indistinguishable from the reference at the rounding precision of the comparison.
+The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. Figure B.3 visualises the resulting convergence: at the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192`, the worst-case error across all latitudes and depth nodes is 0.99 K (latitude 85°), just below the 1 K production target. Coarsening to 96 steps day⁻¹ raises the worst-case error to 2.2 K, and to 24 steps day⁻¹ to 11.9 K; refining to 768 steps day⁻¹ reduces the error to 0.21 K. The error scales as $\Delta t^2$, consistent with the second-order accuracy of Crank–Nicolson.
 
-### 8.4 Europa Validation
+![Figure B.3: Equilibration cadence convergence](figures/v2/equilibration_convergence.png)
+
+### 8.4 Surface Energy Conservation
+
+Figure B.4 quantifies the closure of the surface energy balance over a fully integrated synodic month on the ico7 topographic mesh (327,680 faces) after six equilibration orbits. For an equilibrated diurnal cycle the per-face energy budget should satisfy $\langle Q_{\mathrm{abs}}\rangle_t = \langle\varepsilon\sigma T^4\rangle_t - Q_b$. Both the simulation and the post-hoc accounting in this figure apply the Hayne et al. (2017) angular albedo correction $A(\theta)$ on top of the per-face base albedo $A_0$, so any residual reflects an actual closure error rather than a parameter mismatch. The bulk-mean fractional residual is 3.7 %, with a global imbalance of 2.0 % between absorbed and emitted radiation integrated over the synodic month (panel c). The remaining residual reflects a combination of (i) finite-time-of-flight thermal lag between absorbed solar input and re-radiated thermal emission and (ii) the difference between $\langle T \rangle^4$ and $\langle T^4 \rangle$ that Jensen's inequality introduces when applying $\sigma T^4$ to time-averaged temperatures.
+
+![Figure B.4: Surface energy-balance closure](figures/v2/energy_conservation.png)
+
+### 8.5 Computational Performance
+
+Figure B.5 reports measured wall-clock times for the illumination and thermal modules vs lunar icosphere mesh resolution (ico4..ico6, 5,120 to 81,920 faces) on a 2-die AMD W6800X workstation. Each measurement is a one–lunar-day, 144–timestep run with no radiation exchange and no equilibration. Three thermal back-ends are compared: CPU OpenMP (24 cores), single-die OpenCL GPU, and the four-die OpenCL pool (`--gpu-devices 4`). The CPU illumination benchmark uses Intel Embree.
+
+The post-illumination phase (thermal solver plus statistics export and binary output) scales roughly linearly with mesh size, with the GPU back-ends pulling ahead at ico6 (81,920 faces) by a factor of 1.5×. The actual GPU thermal kernel is much faster than this end-to-end metric (e.g. 252 ms for the ico6 single-GPU run vs 6.9 s post-illumination on CPU); the figure intentionally reports the user-visible total because output and statistics dominate at small mesh size. The dashed lines are the model extrapolation in `plots/performance/runtime_estimates.csv`, anchored on a 4 M-face Mons-Mouton run; measurements track the model within ±20 %.
+
+![Figure B.5: Computational performance scaling](figures/v2/performance_scaling.png)
+
+### 8.6 Europa Validation
 
 Validation of PTM3D against Europa-specific observations (Galileo PPR diurnal curves and ALMA depth-resolved brightness temperatures) is presented in the main text Section 3 and is not repeated here. The 1D thermal solver is identical for the Moon and Europa runs; only the input parameters of §3.5 and the orbital/illumination geometry change.
 
