@@ -878,10 +878,35 @@ bool RadiationExchangeManager::initializeScene() {
         rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0,
                                 RTC_FORMAT_FLOAT3, 3 * sizeof(float), n_verts));
 
+    // Recenter to the mesh bounding-box center before float32 conversion. At
+    // planetary-scale absolute coordinates (e.g. lunar selenocentric, |Z|~1.7e6 m)
+    // a float32 ulp (~0.1 m) exceeds a meter-scale patch's features, collapsing
+    // Embree's BVH and making visibility ray tracing pathologically slow. The
+    // H-matrix builder (HMatrixViewFactor::build) computes the IDENTICAL shift
+    // from the same mesh_->vertices and applies it to its ray origins, so rays
+    // and scene share one small-coordinate space. View factors depend only on
+    // relative geometry, so the constant shift is exact.
+    std::array<double,3> bbmin = {{ mesh_->vertices[0][0], mesh_->vertices[0][1], mesh_->vertices[0][2] }};
+    std::array<double,3> bbmax = bbmin;
+    for (size_t i = 1; i < n_verts; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            bbmin[k] = std::min(bbmin[k], mesh_->vertices[i][k]);
+            bbmax[k] = std::max(bbmax[k], mesh_->vertices[i][k]);
+        }
+    }
+    const std::array<double,3> origin_shift = {{
+        0.5 * (bbmin[0] + bbmax[0]),
+        0.5 * (bbmin[1] + bbmax[1]),
+        0.5 * (bbmin[2] + bbmax[2])
+    }};
+    std::cout << "  Radiation Embree scene recentered by ("
+              << origin_shift[0] << ", " << origin_shift[1] << ", " << origin_shift[2]
+              << ") for float32 precision" << std::endl;
+
     for (size_t i = 0; i < n_verts; ++i) {
-        vertices[3 * i + 0] = static_cast<float>(mesh_->vertices[i][0]);
-        vertices[3 * i + 1] = static_cast<float>(mesh_->vertices[i][1]);
-        vertices[3 * i + 2] = static_cast<float>(mesh_->vertices[i][2]);
+        vertices[3 * i + 0] = static_cast<float>(mesh_->vertices[i][0] - origin_shift[0]);
+        vertices[3 * i + 1] = static_cast<float>(mesh_->vertices[i][1] - origin_shift[1]);
+        vertices[3 * i + 2] = static_cast<float>(mesh_->vertices[i][2] - origin_shift[2]);
     }
 
     // Set indices

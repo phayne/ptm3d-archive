@@ -12,6 +12,7 @@
 #include <atomic>
 #include <random>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <Eigen/SVD>
 #include <Eigen/QR>
@@ -622,6 +623,19 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         }
     }
 
+    // Env override (tuning lever for OOM mitigation): more hierarchical levels
+    // subdivide the near-field non-admissible blocks into smaller leaves,
+    // shrinking per-block view-factor working memory at the cost of more
+    // (mostly cheap) blocks. Overrides the large-mesh clamp above.
+    if (const char* env_h = std::getenv("PTM_HMATRIX_HIER_LEVELS")) {
+        int h = std::atoi(env_h);
+        if (h >= 0) {
+            std::cout << "  Env PTM_HMATRIX_HIER_LEVELS=" << h
+                      << " (was " << config_.max_hierarchical_levels << ")" << std::endl;
+            config_.max_hierarchical_levels = h;
+        }
+    }
+
     // Always print basic H-matrix build info (this is important for large meshes)
     std::cout << "Building H-matrix view factor for " << n_faces << " faces..." << std::endl;
     std::cout << "  Compression tolerance: " << config_.compression_tolerance << std::endl;
@@ -644,6 +658,31 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     face_normals_.resize(n_faces);
     face_areas_.resize(n_faces);
 
+    // Recenter geometry to its bounding-box center. A surface patch can sit at
+    // planetary-scale absolute coordinates (e.g. lunar selenocentric, |Z|~1.7e6 m)
+    // while spanning only meters; at that magnitude a float32 ulp (~0.1 m) exceeds
+    // the feature size, collapsing Embree's BVH and making visibility ray tracing
+    // pathologically slow. The ray origins below derive from face_centers_, and
+    // RadiationExchangeManager applies this SAME bbox-center shift to the Embree
+    // scene vertices (computed identically from mesh_->vertices), so rays and scene
+    // stay in one small-coordinate space. View factors depend only on relative
+    // geometry, so the constant shift is exact; normals/areas use vertex
+    // differences and are unaffected.
+    const auto& V0 = mesh_->vertices;
+    std::array<double,3> bbmin = {{ V0[0][0], V0[0][1], V0[0][2] }};
+    std::array<double,3> bbmax = bbmin;
+    for (size_t i = 1; i < V0.size(); ++i) {
+        for (int k = 0; k < 3; ++k) {
+            bbmin[k] = std::min(bbmin[k], V0[i][k]);
+            bbmax[k] = std::max(bbmax[k], V0[i][k]);
+        }
+    }
+    const std::array<double,3> origin_shift = {{
+        0.5 * (bbmin[0] + bbmax[0]),
+        0.5 * (bbmin[1] + bbmax[1]),
+        0.5 * (bbmin[2] + bbmax[2])
+    }};
+
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n_faces; ++i) {
         const auto& face = mesh_->faces[i];
@@ -651,11 +690,11 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         const auto& v1 = mesh_->vertices[face[1]];
         const auto& v2 = mesh_->vertices[face[2]];
 
-        // Compute center
+        // Compute center (in recentered coordinates; see origin_shift above)
         face_centers_[i] = {{
-            (v0[0] + v1[0] + v2[0]) / 3.0,
-            (v0[1] + v1[1] + v2[1]) / 3.0,
-            (v0[2] + v1[2] + v2[2]) / 3.0
+            (v0[0] + v1[0] + v2[0]) / 3.0 - origin_shift[0],
+            (v0[1] + v1[1] + v2[1]) / 3.0 - origin_shift[1],
+            (v0[2] + v1[2] + v2[2]) / 3.0 - origin_shift[2]
         }};
 
         // Compute normal and area
@@ -1057,18 +1096,25 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         // each thread can use 500MB+ during ACA row/column computation.
         // Limit threads aggressively based on faces per node.
         if (out_of_core_enabled_) {
-            // Amundsen 4M (avg 11943 faces/node) with 4 threads hit ~250 GB RSS
-            // and was killed by macOS jetsam despite OOC. Peak-memory scaling is
-            // O(threads · n_per_node²), so for very large clusters we drop to 2
-            // threads to keep system memory pressure tolerable on 384 GB machines.
+            // Large-block builds blow up memory super-linearly in thread count.
+            // Measured on moon3d (1.7M-face bowl crater, 5756 faces/node, OOC):
+            // 4 threads drained 116 GB by 21% of the block build and OOM-killed
+            // (jetsam, exit -9); 1 thread stayed essentially FLAT (-1.3 GB over
+            // the same span). The cause is not the per-block O(n²) working set
+            // itself (~tens of MB) but multithreaded allocator fragmentation:
+            // each worker's arena grows and freed blocks are not reused across
+            // threads, so RSS climbs without bound. The old "~500 MB/thread"
+            // estimate undercounted this by ~250x. For sparse-fallback-heavy
+            // (concave) clusters we therefore serialize the build; benign
+            // (convex) large meshes that compress cleanly can raise the count
+            // via PTM_HMATRIX_THREADS (env override applied below).
             if (avg_faces_per_node > 8000 || n_faces > 2500000) {
-                // Pathological: few-GB per ACA/sparse-fallback attempt. 2 threads.
-                hard_limit = std::min(hard_limit, 2);
+                hard_limit = std::min(hard_limit, 1);
             } else if (avg_faces_per_node > 5000) {
-                // Very large blocks: 4 threads max (each ~500MB working memory)
-                hard_limit = std::min(hard_limit, 4);
+                // moon3d-class: proven OOM at 4 threads, flat at 1.
+                hard_limit = std::min(hard_limit, 1);
             } else if (avg_faces_per_node > 3000) {
-                hard_limit = std::min(hard_limit, 6);
+                hard_limit = std::min(hard_limit, 2);
             } else if (n_faces > 1500000) {
                 hard_limit = std::min(hard_limit, 8);
             } else if (n_faces > 1000000) {
@@ -1111,6 +1157,18 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     if (config_.hmatrix_threads > 0 && config_.hmatrix_threads < threads_to_use) {
         std::cout << "    Manual thread limit: " << config_.hmatrix_threads << " threads" << std::endl;
         threads_to_use = config_.hmatrix_threads;
+    }
+
+    // Env override (highest priority): tuning lever for OOM mitigation.
+    // Peak build memory scales ~linearly with concurrent block computations,
+    // so capping threads is the most direct way to bound RSS on a fixed machine.
+    if (const char* env_threads = std::getenv("PTM_HMATRIX_THREADS")) {
+        int t = std::atoi(env_threads);
+        if (t > 0) {
+            std::cout << "    Env PTM_HMATRIX_THREADS=" << t
+                      << " (overrides " << threads_to_use << ")" << std::endl;
+            threads_to_use = t;
+        }
     }
 
     std::cout << "    Final thread count: " << threads_to_use << std::endl;
@@ -1246,17 +1304,12 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
                                           << "or increasing system memory." << std::endl;
                             }
 
-                            // Flush file buffer cache to disk periodically to prevent OS from
-                            // consuming excessive RAM for file buffering. This is critical on
-                            // macOS where the unified buffer cache can grow very large.
-                            if (out_of_core_enabled_ && out_of_core_fd_ >= 0) {
-                                #ifdef __APPLE__
-                                // F_FULLFSYNC ensures data reaches physical media on macOS
-                                fcntl(out_of_core_fd_, F_FULLFSYNC);
-                                #else
-                                fsync(out_of_core_fd_);
-                                #endif
-                            }
+                            // Note: no periodic buffer-cache flush is needed. On macOS the
+                            // out-of-core fd is opened with F_NOCACHE (see initOutOfCore), so
+                            // writes go straight to disk and never accumulate in the unified
+                            // buffer cache. The old F_FULLFSYNC here did not evict cached pages
+                            // (it only forced dirty data to the platter) and was an expensive
+                            // no-op for the RAM problem it was meant to solve.
                         }
                     }
                 }
@@ -1857,7 +1910,12 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     //       (O(n²)·56 B) accumulates too fast on deep-crater geometry even with
     //       the thread limiter. 5000 caps working set at ~1.4 GB per block ×
     //       4 threads = 5.6 GB concurrent; completion is safe.
-    const size_t max_sparse_size_q = out_of_core_enabled_ ? 5000 : 300;
+    static const size_t sparse_cap_override_q = [](){
+        const char* e = std::getenv("PTM_HMATRIX_SPARSE_CAP");
+        return e ? std::strtoul(e, nullptr, 10) : 0UL;
+    }();
+    const size_t max_sparse_size_q = sparse_cap_override_q ? sparse_cap_override_q
+                                                           : (out_of_core_enabled_ ? 5000 : 300);
 
     if (config_.compression_method == CompressionMethod::ACA &&
         (n_rows > max_sparse_size_q || n_cols > max_sparse_size_q)) {
@@ -2031,6 +2089,37 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
 
         // Try ACA first if enabled
         if (config_.compression_method == CompressionMethod::ACA) {
+            // Guard: skip ACA for pathologically large admissible blocks.
+            // A near-coplanar crater floor cannot be split in Z by the 3D octree,
+            // so one node can hold hundreds of thousands of faces. ACA on such a
+            // block costs aca_max_rank * O(n) ray-traced row/column evaluations
+            // and balloons RSS (observed: a single block freezing the build for
+            // 10+ min at ~266 GB before the existing aca-fail-to-zero fallback
+            // could trigger). Admissible (well-separated) blocks contribute little
+            // and the code already zeros large ACA failures, so we zero these up
+            // front. Tunable via PTM_HMATRIX_ACA_CAP (faces per side; 0 = off).
+            static const size_t aca_cap = [](){
+                const char* e = std::getenv("PTM_HMATRIX_ACA_CAP");
+                return e ? std::strtoul(e, nullptr, 10) : 12000UL;
+            }();
+            if (aca_cap && ((size_t)n_rows > aca_cap || (size_t)n_cols > aca_cap)) {
+                static std::atomic<int> capped_logs{0};
+                if (capped_logs.fetch_add(1) < 8) {
+                    #pragma omp critical(hmatrix_progress)
+                    std::cout << "  [ACA-cap] zeroed large admissible block "
+                              << n_rows << "x" << n_cols
+                              << " (> " << aca_cap << "); set PTM_HMATRIX_ACA_CAP to tune"
+                              << std::endl;
+                }
+                g_aca_fail_to_zero++;
+                ZeroBlock zero;
+                zero.n_rows = n_rows;
+                zero.n_cols = n_cols;
+                block->data = zero;
+                #pragma omp atomic
+                num_zero_blocks_++;
+                return block;
+            }
             LowRankBlock lowrank;
             auto aca_start = std::chrono::high_resolution_clock::now();
             bool aca_success = tryCompressToLowRankACA(
@@ -2259,7 +2348,15 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     // OUT-OF-CORE MODE: see the matching quadtree comment for rationale.
     // 5000 is a middle ground: covers Nobile's ~5809 avg faces/node, and
     // avoids the 315-GB-at-11% blowup seen on 4M Amundsen at cap=10000.
-    size_t max_sparse_size = out_of_core_enabled_ ? 5000 : 300;
+    // Env PTM_HMATRIX_SPARSE_CAP overrides this for OOM tuning: a smaller cap
+    // skips (zeros) larger nearby blocks instead of doing the O(n²) sparse
+    // compute, trading some near-field accuracy for bounded working memory.
+    static const size_t sparse_cap_override = [](){
+        const char* e = std::getenv("PTM_HMATRIX_SPARSE_CAP");
+        return e ? std::strtoul(e, nullptr, 10) : 0UL;
+    }();
+    size_t max_sparse_size = sparse_cap_override ? sparse_cap_override
+                                                 : (out_of_core_enabled_ ? 5000 : 300);
 
     if (config_.compression_method == CompressionMethod::ACA &&
         (n_rows > max_sparse_size || n_cols > max_sparse_size)) {
@@ -3907,7 +4004,17 @@ bool HMatrixViewFactor::initOutOfCore(const std::string& path) {
     out_of_core_enabled_ = true;
     out_of_core_size_ = 0;
 
+#ifdef __APPLE__
+    // macOS: bypass the unified buffer cache for streamed block writes.
+    // Without this, write() pages accumulate in the UBC (not counted as
+    // free+inactive by getAvailableMemory) and jetsam OOM-kills the build
+    // on large meshes. F_FULLFSYNC alone does not evict these pages.
+    fcntl(out_of_core_fd_, F_NOCACHE, 1);
+    std::cout << "  Out-of-core storage enabled (direct/uncached I/O): "
+              << out_of_core_file_ << std::endl;
+#else
     std::cout << "  Out-of-core storage enabled: " << out_of_core_file_ << std::endl;
+#endif
     return true;
 }
 
@@ -3919,6 +4026,14 @@ void HMatrixViewFactor::finalizeOutOfCore() {
 
     // Get final file size
     out_of_core_size_ = lseek(out_of_core_fd_, 0, SEEK_END);
+
+#ifdef __APPLE__
+    // Restore normal caching for the read phase: repeated matvec reads during
+    // the radiosity solve benefit from the page cache, and these are clean,
+    // reclaimable pages (not the build-time write accumulation we guarded
+    // against in initOutOfCore).
+    fcntl(out_of_core_fd_, F_NOCACHE, 0);
+#endif
 
     // Memory-map the file for reading
     if (out_of_core_size_ > 0) {
