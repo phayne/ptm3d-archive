@@ -361,6 +361,15 @@ private:
     // Compute view factor between two faces
     double computeViewFactor(int face_i, int face_j) const;
 
+    // Near-field-accurate view factor via area-to-area numerical quadrature.
+    // The M1 centroid estimator A_j*cos_i*cos_j/(pi*r^2) is a far-field
+    // approximation (valid only for r >> face size) and overshoots for close
+    // or adjacent pairs, which is what makes Sum_j F_ij exceed 1 and the
+    // radiosity coupling diverge. This double-integrates over both triangles,
+    // subdividing more finely as the pair gets closer, so the result is
+    // physically bounded (Sum_j F_ij <= 1) with no artificial cap.
+    double computeViewFactorRefined(int face_i, int face_j) const;
+
     // Visibility check
     bool isVisible(const std::array<double, 3>& p1,
                    const std::array<double, 3>& p2) const;

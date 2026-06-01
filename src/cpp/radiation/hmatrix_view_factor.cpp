@@ -2748,6 +2748,14 @@ void HMatrixViewFactor::computeViewFactorBlock(
             cand.local_row = static_cast<int>(i);
             cand.local_col = static_cast<int>(j);
             cand.estimated_F = estimated_F;
+            // Refine near-field pairs, where the M1 centroid estimate overshoots
+            // (this is the source of Sum_j F_ij > 1). d = characteristic size.
+            {
+                const double d_size = std::sqrt(face_areas_[face_i]) + std::sqrt(A_j);
+                if (r < 4.0 * d_size) {
+                    cand.estimated_F = computeViewFactorRefined(face_i, face_j);
+                }
+            }
 
             std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
 
@@ -3507,7 +3515,93 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     // Passed all culling tests - now do the expensive visibility check
     if (!isVisible(c_i, c_j)) return 0.0;
 
+    // M1 (centroid) estimate is a far-field approximation. In the near field
+    // (centers closer than a few face-widths) it overshoots, so refine with
+    // area-to-area quadrature. d = characteristic face size.
+    const double A_i = face_areas_[face_i];
+    const double d = std::sqrt(A_i) + std::sqrt(A_j);
+    if (r < 4.0 * d) {
+        return computeViewFactorRefined(face_i, face_j);
+    }
     return estimated_F;
+}
+
+double HMatrixViewFactor::computeViewFactorRefined(int fi, int fj) const {
+    // F_ij = (1/A_i) * integral_Ai integral_Aj (cos_i cos_j)/(pi r^2) dA_j dA_i,
+    // evaluated by subdividing each triangle into m^2 congruent sub-triangles
+    // and summing over their centroids (the M1 estimator is the m=1 case).
+    const auto& Fi = mesh_->faces[fi];
+    const auto& Fj = mesh_->faces[fj];
+    const auto& a0 = mesh_->vertices[Fi[0]];
+    const auto& a1 = mesh_->vertices[Fi[1]];
+    const auto& a2 = mesh_->vertices[Fi[2]];
+    const auto& b0 = mesh_->vertices[Fj[0]];
+    const auto& b1 = mesh_->vertices[Fj[1]];
+    const auto& b2 = mesh_->vertices[Fj[2]];
+    const auto& n_i = face_normals_[fi];
+    const auto& n_j = face_normals_[fj];
+    const double A_i = face_areas_[fi];
+    const double A_j = face_areas_[fj];
+
+    // Subdivision count from proximity (numerical resolution, not a clamp):
+    // m ~ 2 for adjacent pairs, growing as the pair gets closer.
+    const double d = std::sqrt(A_i) + std::sqrt(A_j);
+    auto rv = subtract(face_centers_[fj], face_centers_[fi]);
+    const double r0 = std::sqrt(dot(rv, rv));
+    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(4.0 * d / r0)) : 16;
+    if (m < 1) m = 1;
+    if (m > 16) m = 16;  // quadrature resolution ceiling (numerical, not physical)
+
+    // Centroids of the m^2 sub-triangles of a triangle (p0,p1,p2), in
+    // barycentric coordinates over edges e1=p1-p0, e2=p2-p0.
+    auto sub_centroids = [&](const std::array<double, 3>& p0,
+                             const std::array<double, 3>& p1,
+                             const std::array<double, 3>& p2,
+                             std::vector<std::array<double, 3>>& out) {
+        out.clear();
+        out.reserve(static_cast<size_t>(m) * m);
+        const std::array<double, 3> e1 = {{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}};
+        const std::array<double, 3> e2 = {{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]}};
+        auto at = [&](double u, double v) {
+            return std::array<double, 3>{{p0[0] + u * e1[0] + v * e2[0],
+                                          p0[1] + u * e1[1] + v * e2[1],
+                                          p0[2] + u * e1[2] + v * e2[2]}};
+        };
+        const double inv3m = 1.0 / (3.0 * m);
+        for (int i = 0; i < m; ++i) {
+            for (int j = 0; j < m - i; ++j) {
+                out.push_back(at((3.0 * i + 1.0) * inv3m, (3.0 * j + 1.0) * inv3m));      // "up"
+                if (j < m - 1 - i) {
+                    out.push_back(at((3.0 * i + 2.0) * inv3m, (3.0 * j + 2.0) * inv3m));  // "down"
+                }
+            }
+        }
+    };
+
+    std::vector<std::array<double, 3>> si, sj;
+    sub_centroids(a0, a1, a2, si);
+    sub_centroids(b0, b1, b2, sj);
+    if (si.empty() || sj.empty()) return 0.0;  // m>=1 makes this unreachable
+
+    const double wi = A_i / static_cast<double>(si.size());  // equal sub-triangle areas
+    const double wj = A_j / static_cast<double>(sj.size());
+
+    double sum = 0.0;
+    for (const auto& p : si) {
+        for (const auto& q : sj) {
+            const std::array<double, 3> rvec = {{q[0] - p[0], q[1] - p[1], q[2] - p[2]}};
+            const double r2 = dot(rvec, rvec);
+            if (r2 < 1e-18) continue;
+            const double rinv = 1.0 / std::sqrt(r2);
+            const std::array<double, 3> rh = {{rvec[0] * rinv, rvec[1] * rinv, rvec[2] * rinv}};
+            const double ci = dot(n_i, rh);
+            const double cj = -dot(n_j, rh);
+            if (ci > 0.0 && cj > 0.0) {
+                sum += (ci * cj) / (M_PI * r2) * wi * wj;
+            }
+        }
+    }
+    return sum / A_i;
 }
 
 bool HMatrixViewFactor::isVisible(const std::array<double, 3>& p1,
