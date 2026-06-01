@@ -10066,6 +10066,25 @@ int main(int argc, char** argv) {
                 }
 #endif  // PTM_GPU_OPENCL
 
+                // Picard under-relaxation for the thermal–radiation coupling.
+                // Each iteration blends the freshly-computed indirect flux with
+                // the previous iterate: indirect = (1-ω)·prev + ω·new. Without
+                // it, clusters of mutually-facing faces ratchet their indirect
+                // flux up every iteration (1105→3046 W/m² over 5 iters, never
+                // converging) and a few peg the 500 K MAX_TEMP clamp. The fixed
+                // point is unchanged — ω only damps the path to it. With the
+                // near-field-accurate view factors (computeViewFactorRefined),
+                // Σ_j F_ij ≤ ~1 holds and the coupling already converges in one
+                // iteration, so under-relaxation is OFF by default (ω=1, the
+                // full Picard step) and retained only as an env-gated safety
+                // knob for pathological meshes. Tunable via PTM_RAD_COUPLING_RELAX.
+                double rad_relax = 1.0;
+                if (const char* e = std::getenv("PTM_RAD_COUPLING_RELAX")) {
+                    const double v = std::atof(e);
+                    if (v > 0.0 && v <= 1.0) rad_relax = v;
+                }
+                std::cout << "  Coupling under-relaxation ω = " << rad_relax << std::endl;
+
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
                     writeHeartbeat("rad_iter " + std::to_string(iter + 1)
@@ -10113,9 +10132,11 @@ int main(int argc, char** argv) {
                             }
                             std::vector<double> indirect_t =
                                 rad_manager.computeIndirectFlux(temps_t, solar_t);
+                            const double w = (iter == 0) ? 1.0 : rad_relax;
                             #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                             for (size_t f = 0; f < num_faces; f++) {
-                                indirect_flux_series[f][t] = indirect_t[f];
+                                indirect_flux_series[f][t] =
+                                    (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
                                 if (indirect_t[f] > max_indirect) {
                                     max_indirect = indirect_t[f];
                                 }
@@ -10144,9 +10165,11 @@ int main(int argc, char** argv) {
                             for (int j = 0; j < n_batch; j++) {
                                 const int t = t_start + j;
                                 const auto& indirect_t = indirect_batch[j];
+                                const double w = (iter == 0) ? 1.0 : rad_relax;
                                 #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                                 for (size_t f = 0; f < num_faces; f++) {
-                                    indirect_flux_series[f][t] = indirect_t[f];
+                                    indirect_flux_series[f][t] =
+                                        (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
                                     if (indirect_t[f] > max_indirect) {
                                         max_indirect = indirect_t[f];
                                     }
