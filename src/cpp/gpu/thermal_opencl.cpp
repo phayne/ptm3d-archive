@@ -379,9 +379,9 @@ __kernel void persistentThermalKernel(
                     // dT = relaxation * f / df, then T_new = T0 - dT
                     dT_nr = 0.8f * f / df;
                     T_surf = T0 - dT_nr;
-
-                    // Clamp to physical range (matching CPU MIN_TEMP=3.0, MAX_TEMP=500.0)
-                    T_surf = fmax(3.0f, fmin(500.0f, T_surf));
+                    // No clamp: f(T) is monotonically decreasing, so the damped
+                    // Newton converges to the unique physical root (temperatures
+                    // set by physics, not bounded to an arbitrary range).
                 }
 
                 T_local[0] = T_surf;
@@ -498,14 +498,15 @@ __kernel void persistentThermalKernel(
             // Note: Bottom layer T[n_layers-1] was already set by flux BC before solve
             // and remains unchanged during interior solve (not part of tridiagonal system)
 
-            // Physical clamping for ALL layers (matching CPU solver)
-            // This prevents numerical instabilities from causing runaway temperatures
+            // NaN/Inf guard only (NOT a temperature clamp): the implicit
+            // Crank-Nicolson conduction update is unconditionally stable, so
+            // valid temperatures are left untouched and set by physics. This
+            // recovers solely from a non-finite value (e.g. a degenerate cell),
+            // which correct physics never produces, so the sim isn't corrupted.
             for (int i = 0; i < n_layers; ++i) {
                 if (!isfinite(T_local[i])) {
-                    // NaN/Inf guard: reset to reasonable temperature
-                    T_local[i] = 200.0f;  // Safe fallback value
+                    T_local[i] = 200.0f;  // last-resort recovery, should never fire
                 }
-                T_local[i] = fmax(3.0f, fmin(1000.0f, T_local[i]));
             }
         }  // End of sub-stepping loop
 

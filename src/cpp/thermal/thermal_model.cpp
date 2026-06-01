@@ -1253,9 +1253,12 @@ void surfTemp(Profile& p, double Qs) {
     double dz0 = p.dz()[0];
     double T1 = p.T()[1];
     
-    const double MIN_TEMP = 3.0;
-    const double MAX_TEMP = 500.0;
-    
+    // No artificial temperature clamps: the surface energy balance
+    // f(T) = Qs + k*(T1-T)/dz - eps*sigma*T^4 is monotonically decreasing in T
+    // (df/dT < 0), so it has a unique physical root that the damped Newton
+    // iteration below converges to. Temperatures are therefore set by physics,
+    // not bounded to an arbitrary [3, 500] K range.
+
     // Better initial guess
     double Tnew;
     if (Qs > 0) {
@@ -1287,10 +1290,8 @@ void surfTemp(Profile& p, double Qs) {
         
         dT = relaxation * f / df;
         Tnew = T0 - dT;
-        
-        Tnew = std::max(MIN_TEMP, std::min(MAX_TEMP, Tnew));
     }
-    
+
     p.T()[0] = Tnew;
 }
 
