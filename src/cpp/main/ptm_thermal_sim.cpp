@@ -4613,9 +4613,23 @@ bool runThermalForSelectedFaces_GPU(
         // Copy output surface T into surface_temps at the output-window
         // slots. In two-phase mode, eq-window slots stay at 0 (matches
         // iter-0). In single-phase, the full range is written.
+        //
+        // RE-THERMAL WARMUP GUARD: unlike iter-0 (which continues on-GPU from a
+        // pre-converged surface), this path uploadAllTemps()-seeds iter-0's
+        // post-eq T(z) and the GPU surfTemp Newton solve needs ~2 steps to
+        // re-converge the SURFACE from that upload — producing a spurious cold,
+        // MIN_TEMP-clamped transient in the first 1-2 recorded output steps.
+        // (Diagnosed via time-series: of all sub-40 K samples, ~50% land on
+        // step 0, ~50% on step 1, <1% on step >=2; excluding the first two steps
+        // recovers a night min that matches the rad-off baseline.) The deep
+        // column is seeded correctly, so only the surface needs the skip. iter-0
+        // already wrote physically-correct values for these warmup steps (no
+        // indirect flux, a negligible difference over 2 of 360 steps), so we
+        // keep those and overwrite only the settled steps.
+        constexpr int kReThermalWarmupSkip = 2;
         for (size_t f = 0; f < batch_n; ++f) {
             const int face_idx = face_indices[batch_start + f];
-            for (int t = 0; t < n_out; ++t) {
+            for (int t = kReThermalWarmupSkip; t < n_out; ++t) {
                 surface_temps[face_idx][t_offset + t] =
                     static_cast<double>(output_temps[t * batch_n + f]);
             }
