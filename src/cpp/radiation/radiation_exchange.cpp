@@ -39,6 +39,29 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
     radiosity_.resize(n, 0.0);
     radiosity_new_.resize(n, 0.0);
     temp_vec_.resize(n, 0.0);
+
+    // View-factor row normalization (energy conservation / radiosity stability).
+    // Compute the row sums Σ_j F_ij once via a single F·1 matvec. The M1 point
+    // estimator overshoots in the near field, so on fine/concave meshes some rows
+    // sum to > 1, which makes the radiosity gain > 1 and the coupling diverge.
+    // Store 1/max(1, Σ_j F_ij) and apply it after every F·x in the solve.
+    {
+        std::vector<double> ones(n, 1.0), rowsum(n, 0.0);
+        if (F_op_) F_op_->matvec(ones, rowsum);
+        vf_row_norm_.assign(n, 1.0);
+        size_t n_over = 0;
+        double max_rs = 0.0, sum_rs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double rs = rowsum[i];
+            if (rs > 1.0) { vf_row_norm_[i] = 1.0 / rs; ++n_over; }
+            max_rs = std::max(max_rs, rs);
+            sum_rs += rs;
+        }
+        std::cout << "[Radiosity] View-factor row sums Σ_j F_ij: max=" << max_rs
+                  << ", mean=" << (n ? sum_rs / static_cast<double>(n) : 0.0)
+                  << " (" << n_over << "/" << n
+                  << " rows > 1 renormalized for energy conservation)" << std::endl;
+    }
 }
 
 RadiositySolver::RadiositySolver(const ViewFactorMatrix& F,
@@ -302,10 +325,12 @@ std::vector<double> RadiositySolver::solveGPU(
     last_residual_ = gpu_solver_->getLastResidual();
     converged_ = gpu_solver_->didConverge();
 
-    // Convert back to double
+    // Convert back to double, applying the view-factor row normalization
+    // (Σ_j F_ij ≤ 1) for energy conservation / radiosity-gain stability.
     std::vector<double> indirect_flux(n);
     for (size_t i = 0; i < n; ++i) {
-        indirect_flux[i] = static_cast<double>(indirect_f[i]);
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        indirect_flux[i] = static_cast<double>(indirect_f[i]) * norm;
     }
 
     return indirect_flux;
@@ -351,7 +376,8 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
 
         futures.push_back(gpu_pool_->submit(
             [&temperatures_per_timestep, &solar_flux_per_timestep,
-             &indirect_per_timestep, device_steps, n](
+             &indirect_per_timestep, device_steps, n,
+             &row_norm = vf_row_norm_](
                 gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
                 std::vector<float> temps_f(n), solar_f(n), indirect_f;
                 for (size_t k : device_steps) {
@@ -365,7 +391,8 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                     auto& out = indirect_per_timestep[k];
                     out.resize(n);
                     for (size_t i = 0; i < n; ++i) {
-                        out[i] = static_cast<double>(indirect_f[i]);
+                        const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                        out[i] = static_cast<double>(indirect_f[i]) * norm;
                     }
                 }
                 return true;
@@ -426,13 +453,14 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     std::vector<double> indirect_flux(n, 0.0);
     std::vector<double> incoming(n, 0.0);
 
-    // incoming_i = Σ_j F_ij B_j
+    // incoming_i = Σ_j F_ij B_j  (renormalized so Σ_j F_ij ≤ 1)
     F_op_->matvec(radiosity, incoming);
 
     for (size_t i = 0; i < n; ++i) {
         // Absorbed flux = emissivity * incoming radiosity
         // (by Kirchhoff's law, absorptivity = emissivity)
-        indirect_flux[i] = emissivity_[i] * incoming[i];
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        indirect_flux[i] = emissivity_[i] * incoming[i] * norm;
     }
 
     return indirect_flux;
@@ -466,14 +494,15 @@ std::vector<double> RadiositySolver::computeScatteredSolar(
         scattered_source[i] = reflectivity_[i] * solar_flux[i];
     }
 
-    // Received scattered solar: F^T * (ρ Q_solar)
+    // Received scattered solar: F^T * (ρ Q_solar)  (renormalized so Σ_j F_ij ≤ 1)
     std::vector<double> received(n, 0.0);
     F_op_->matvec(scattered_source, received);
 
     // Absorbed scattered solar
     std::vector<double> absorbed(n);
     for (size_t i = 0; i < n; ++i) {
-        absorbed[i] = emissivity_[i] * received[i];
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        absorbed[i] = emissivity_[i] * received[i] * norm;
     }
 
     return absorbed;
@@ -502,6 +531,10 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
         // B_new = E + ρ Q_solar + ρ F B
         // Note: matvec is internally parallelized over H-matrix blocks
         F_op_->matvec(radiosity, temp_vec);
+        // Renormalize Σ_j F_ij ≤ 1 so the radiosity gain ρ·Σ stays < 1 (stable).
+        for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) {
+            temp_vec[i] *= vf_row_norm_[i];
+        }
 
         double max_change = 0.0;
         double max_val = 0.0;

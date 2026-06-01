@@ -162,6 +162,14 @@ private:
     std::vector<double> emissivity_;
     std::vector<double> reflectivity_;  // 1 - emissivity
     std::vector<double> areas_;
+    // Per-face view-factor row normalization = 1/max(1, Σ_j F_ij). The M1
+    // centroid view-factor estimator overshoots in the near field, so on fine
+    // or concave meshes Σ_j F_ij can exceed 1 — non-physical for an open scene
+    // (must be ≤ 1). Uncorrected, this drives the radiosity gain > 1 and makes
+    // the thermal–radiation coupling diverge (indirect flux blew up past 10× the
+    // solar constant, clamping temperatures to MIN/MAX). Multiplying every F·x
+    // result by this factor renormalizes to an energy-conserving F̂·x.
+    std::vector<double> vf_row_norm_;
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL
