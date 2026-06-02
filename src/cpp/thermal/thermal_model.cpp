@@ -1289,6 +1289,18 @@ void surfTemp(Profile& p, double Qs) {
         }
         
         dT = relaxation * f / df;
+
+        // Robust-Newton step limiter (globalization, NOT an output clamp).
+        // For very cold, low-conductivity faces (PSR floors) df = -k/dz -
+        // 4εσT^3 -> 0 as both terms vanish, so an unguarded step overshoots
+        // past the unique positive root of the monotonic f(T) into NEGATIVE
+        // T. Capping the step to a fraction of the current T keeps every
+        // iterate strictly positive and converges to the true physical root
+        // (e.g. ~25 K geothermal balance). Warm faces take sub-cap steps, so
+        // their result is unchanged; the temperature is still set by physics.
+        const double max_step = 0.5 * T0;
+        if (dT >  max_step) dT =  max_step;
+        if (dT < -max_step) dT = -max_step;
         Tnew = T0 - dT;
     }
 

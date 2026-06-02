@@ -3694,12 +3694,32 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                               << e.what() << "\n";
                     batch_T_post_eq.clear();
                 }
-                if (batch_T_post_eq.size() == batch_n * n_layers) {
+                // downloadAllTemps packs data with stride = activeFaceCount(),
+                // which EXCEEDS batch_n when the persistent solver was allocated
+                // to a larger capacity (e.g. a shared pool sized to the
+                // re-thermal cap). The old guard compared the size to
+                // batch_n*n_layers and the copy assumed a batch_n stride; both
+                // are wrong in that case, so the snapshot silently captured
+                // NOTHING and the rad-coupling re-thermal later started every
+                // selected face from a zero T(z) column. That was masked by the
+                // old [3,500] K clamp (the zero column was clamped to the 3 K
+                // floor — the long-standing "3 K PSR" artifact) and surfaces as
+                // a 0 K -> runaway divergence once the clamp is removed. Use the
+                // actual active-face stride, and warn loudly if capture fails.
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_post_eq.size() == active * n_layers) {
                     for (size_t layer = 0; layer < n_layers; ++layer) {
-                        const float* src = batch_T_post_eq.data() + layer * batch_n;
+                        const float* src = batch_T_post_eq.data() + layer * active;
                         float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
                         std::copy(src, src + batch_n, dst);
                     }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: post-eq snapshot NOT captured"
+                                 " (download size " << batch_T_post_eq.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
                 }
             }
 
@@ -4178,6 +4198,40 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
                                                  equilibration_steps, eq_dt, equil_cycles);
 
+            // Snapshot the post-eq T(z) for the rad-coupling re-thermal hand-off
+            // (same purpose as the multi-GPU run_batch_on_solver path). This
+            // single-GPU inline loop previously had NO snapshot, so on
+            // single-GPU runs assembled_post_eq_T stayed all-zero and every
+            // re-thermal'd face started from a 0 K column — masked by the old
+            // [3,500] K clamp (the "3 K PSR" artifact), exposed as 0 K->runaway
+            // divergence once the clamp was removed. downloadAllTemps packs with
+            // stride = activeFaceCount(), so use that (not batch_n).
+            if (post_eq_T_out) {
+                std::vector<float> batch_T_post_eq;
+                try {
+                    solver.downloadAllTemps(batch_T_post_eq);
+                } catch (const std::exception& e) {
+                    std::cerr << "[GPU Thermal] WARNING: downloadAllTemps (post-eq) failed: "
+                              << e.what() << "\n";
+                    batch_T_post_eq.clear();
+                }
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_post_eq.size() == active * n_layers) {
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        const float* src = batch_T_post_eq.data() + layer * active;
+                        float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
+                        std::copy(src, src + batch_n, dst);
+                    }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: post-eq snapshot NOT captured"
+                                 " (download size " << batch_T_post_eq.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
+                }
+            }
+
             // Phase 2: output with fine dt (1 cycle, download results).
             // Accumulator runs over the entire output cycle: [0, output_steps).
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
@@ -4349,10 +4403,27 @@ post_batch_loop:
     }
 
     // Hand the assembled post-eq T(z) profile to the caller (rad-coupling
-    // iter loop). In single-phase configs we never wrote into the buffer,
-    // so the caller will see all zeros and must fall back to a different
-    // initial-state strategy.
+    // iter loop). Safety net: a face with an all-zero column was never
+    // equilibrated, and the rad-coupling re-thermal would start it from 0 K
+    // and ramp it to a runaway (the bug that the missing single-GPU snapshot
+    // and the [3,500] K clamp together hid). Warn loudly if any survive so
+    // this class of bug can never silently corrupt a coupled run again.
     if (post_eq_T_out) {
+        if (two_phase) {
+            size_t n_zero = 0;
+            for (size_t fc = 0; fc < n_faces; ++fc) {
+                bool all_zero = true;
+                for (size_t l = 0; l < n_layers; ++l) {
+                    if (assembled_post_eq_T[l * n_faces + fc] != 0.0f) { all_zero = false; break; }
+                }
+                if (all_zero) ++n_zero;
+            }
+            if (n_zero > 0) {
+                std::cerr << "[GPU Thermal] WARNING: " << n_zero << "/" << n_faces
+                          << " faces have an all-zero post-eq column; rad-coupling"
+                             " re-thermal of these faces would diverge\n";
+            }
+        }
         *post_eq_T_out = assembled_post_eq_T;
     }
 

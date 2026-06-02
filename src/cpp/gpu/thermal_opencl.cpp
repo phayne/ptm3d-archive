@@ -376,12 +376,24 @@ __kernel void persistentThermalKernel(
 
                     if (fabs(df) < 1e-10f) df = -1e-10f;
 
-                    // dT = relaxation * f / df, then T_new = T0 - dT
+                    // dT = relaxation * f / df
                     dT_nr = 0.8f * f / df;
+
+                    // Robust-Newton step limiter (globalization, NOT an output
+                    // clamp). For very cold, low-conductivity faces (PSR floors)
+                    // df = -k/dz - 4εσT^3 -> 0 as both terms vanish, so an
+                    // unguarded Newton step overshoots past the unique positive
+                    // root of the monotonic f(T) into NEGATIVE T, collapsing the
+                    // column. Capping the step to a fraction of the current T
+                    // keeps every iterate strictly positive and converges to the
+                    // true physical root (e.g. ~25 K from geothermal balance).
+                    // Warm, well-conditioned faces take sub-cap steps, so their
+                    // result is bit-unchanged. The final temperature is still set
+                    // by physics (the root of f), not bounded to a fixed range.
+                    float max_step = 0.5f * T0;
+                    if (dT_nr >  max_step) dT_nr =  max_step;
+                    if (dT_nr < -max_step) dT_nr = -max_step;
                     T_surf = T0 - dT_nr;
-                    // No clamp: f(T) is monotonically decreasing, so the damped
-                    // Newton converges to the unique physical root (temperatures
-                    // set by physics, not bounded to an arbitrary range).
                 }
 
                 T_local[0] = T_surf;
