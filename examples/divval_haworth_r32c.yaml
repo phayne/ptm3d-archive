@@ -1,0 +1,91 @@
+simulation:
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 365.25
+  timesteps: 365
+  body: Moon
+mesh:
+  resolution: 9
+  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/haworth_radcore_r32c.ply
+  occluder_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/haworth_ring_32_200.ply
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  use_gpu: true
+  gpu_devices: 1
+  gpu_batch_size: 4000
+  gpu_inter_batch_pause_ms: 1500
+  equilibration_orbits: 25.0
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 30.0
+  compute_statistics: true
+  use_default_property_map: true
+  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps
+  thermal_inertia_map: ''
+  h_parameter_map: ''
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+  eq_indirect_flux_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/haworth_r32c_qind.bin
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+  use_default_ks: true
+  ks: 0.00074
+  use_default_kd: true
+  kd: 0.0034
+  use_default_H: true
+  H: 0.06
+  use_default_rhos: true
+  rhos: 1100.0
+  use_default_rhod: true
+  rhod: 1800.0
+  use_default_cp0: true
+  cp0: 800.0
+  use_default_Qb: true
+  Qb: 0.018
+  use_default_chi: true
+  chi: 2.7
+  constant_thermal_inertia: -1.0
+radiation:
+  enabled: true
+  min_shadow_fraction: 0.8
+  verbose: false
+  use_gpu: true
+  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/haworth_radcore_r32c.vf
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+  use_hmatrix: true
+  use_aca: true
+  aca_tolerance: 0.001
+  aca_max_rank: 50
+  hmatrix_threads: 0
+  adaptive_neighbors: true
+  captured_energy_target: 0.95
+  max_neighbors: 500
+  min_neighbors: 20
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_map: ''
+  positions_file: ''
+output:
+  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/divval_haworth_r32c
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+  skip_time_series: false
+advanced:
+  verbose: true
+  default_visible_albedo: -1.0
