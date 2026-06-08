@@ -86,6 +86,18 @@ struct RadiationConfig {
     double aca_tolerance = 1e-3;         // ACA relative tolerance for convergence
     int aca_max_rank = 50;               // Maximum rank before falling back to sparse
 
+    // H-matrix: bisect + re-ACA large admissible blocks instead of zeroing them
+    // (recovers crater floor<->wall IR coupling lost above ~100k faces). Default ON.
+    // Env PTM_HMATRIX_SUBDIVIDE (1/0) overrides this at build time.
+    bool hmatrix_subdivide_admissible = true;
+
+    // Anisotropic (roughness-beamed) thermal emission (Smith 1967).
+    // Sun-facing rough micro-facets beam thermal IR toward the Sun; for polar
+    // craters this enhances wall->floor IR (sun-dependent, amplifies the seasonal
+    // cycle). rms_slope_deg = 0 (default) => pure Lambertian, byte-identical.
+    double rms_slope_deg = 0.0;          // RMS micro-slope [deg]; 0 = OFF (Lambertian)
+    double beam_vf_threshold = 1e-7;     // Min renormalized VF to keep a beam pair
+
     // Thread control for H-matrix building
     int hmatrix_threads = 0;             // 0 = auto, >0 = manual thread limit
 

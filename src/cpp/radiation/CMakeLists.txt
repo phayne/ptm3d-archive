@@ -61,6 +61,94 @@ set_target_properties(test_bowl_crater PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Ingersoll bowl-crater validation driven by the PRODUCTION radiation module
+# (Embree-occluded ViewFactorCalculator + RadiositySolver). Writes .npy outputs.
+add_executable(bowl_crater_ptm bowl_crater_ptm.cpp)
+target_link_libraries(bowl_crater_ptm PRIVATE
+    radiation
+    mesh_utils
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bowl_crater_ptm PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(bowl_crater_ptm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Dump per-face VF row sums (terrain view factor) from a saved H-matrix, to
+# compare model floor->wall coupling against the geometric DEM ground truth.
+add_executable(vf_rowsum_dump vf_rowsum_dump.cpp)
+target_link_libraries(vf_rowsum_dump PRIVATE radiation mesh_utils)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_rowsum_dump PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_rowsum_dump PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Apply a saved H-matrix to an arbitrary per-face vector (y = F*v), to diagnose
+# WHERE a face's view-factor coupling points (e.g. floor -> warm rim).
+add_executable(vf_apply vf_apply.cpp)
+target_link_libraries(vf_apply PRIVATE radiation mesh_utils)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_apply PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_apply PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Concrete floor->warm pairwise examination (visibility + cos_i facet/macroscopic).
+add_executable(vf_examine_pairs vf_examine_pairs.cpp)
+target_link_libraries(vf_examine_pairs PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(vf_examine_pairs PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_examine_pairs PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_examine_pairs PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Ground-truth VF by cosine-weighted hemisphere Monte-Carlo ray casting (Embree).
+add_executable(vf_hemisphere_mc vf_hemisphere_mc.cpp)
+target_link_libraries(vf_hemisphere_mc PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(vf_hemisphere_mc PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_hemisphere_mc PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_hemisphere_mc PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Geometric ground-truth floor indirect FLUX (cosine MC weighted by eps*sigma*Tmax^4),
+# to decide whether the floor-center coupling deficit is a VF under-count or physical.
+add_executable(vf_mc_flux vf_mc_flux.cpp)
+target_link_libraries(vf_mc_flux PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(vf_mc_flux PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_mc_flux PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_mc_flux PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Single-face VF visibility probe (robust-mode toggle) for the fine-mesh
+# floor->far-rim coupling-collapse diagnosis.
+add_executable(vf_face_probe vf_face_probe.cpp)
+target_link_libraries(vf_face_probe PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(vf_face_probe PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_face_probe PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_face_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Standalone validator for the Smith (1967) beamed-emission chi factor
+# (header-only math in smith_beaming.h; no mesh/Embree/SPICE dependency).
+add_executable(test_beam_chi test_beam_chi.cpp)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_beam_chi PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(test_beam_chi PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Benchmark executable for H-matrix vs sparse comparison
 add_executable(benchmark_hmatrix benchmark_hmatrix.cpp)
 target_link_libraries(benchmark_hmatrix PRIVATE
@@ -101,3 +189,12 @@ endif()
 set_target_properties(benchmark_gpu_visibility PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Grazing-Sun shadow-ray artifact check (lift sweep)
+add_executable(illum_check illum_check.cpp)
+target_link_libraries(illum_check PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(illum_check PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(illum_check PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(illum_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

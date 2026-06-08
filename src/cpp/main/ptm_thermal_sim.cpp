@@ -689,7 +689,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int gpu_devices = 1,
     const std::vector<int>& gpu_device_ids = {},
     size_t gpu_batch_size = 0,
-    int gpu_inter_batch_pause_ms = 0);
+    int gpu_inter_batch_pause_ms = 0,
+    // Per-GLOBAL-face time-mean indirect flux <q_ind>[f] (W/m^2) ADDED to the
+    // EQUILIBRATION-phase absorbed flux only (deep radiation-coupling, pass 2).
+    // Empty (default) = legacy: equilibration sees no indirect term. Indexed by
+    // global face id, matching prepare_flux's global_f = batch_start + f.
+    const std::vector<double>& eq_indirect_flux = {});
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
@@ -3133,7 +3138,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int gpu_devices,
     const std::vector<int>& gpu_device_ids,
     size_t gpu_batch_size_override,
-    int gpu_inter_batch_pause_ms)
+    int gpu_inter_batch_pause_ms,
+    const std::vector<double>& eq_indirect_flux)
 {
     using namespace gpu::opencl;
 
@@ -3651,6 +3657,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    // Deep radiation-coupling (pass 2): add the per-face time-mean
+                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
+                    // call is uniquely prepare_flux(0, equilibration_steps); the
+                    // output window already gets the time-varying indirect via the
+                    // coupling, so this avoids double-counting there.
+                    if (t_start == 0 && n_steps == equilibration_steps
+                            && equilibration_steps < total_time_steps
+                            && !eq_indirect_flux.empty()
+                            && global_f < eq_indirect_flux.size()) {
+                        absorbed += eq_indirect_flux[global_f];
+                    }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
             }
@@ -4165,6 +4182,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    // Deep radiation-coupling (pass 2): add the per-face time-mean
+                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
+                    // call is uniquely prepare_flux(0, equilibration_steps); the
+                    // output window already gets the time-varying indirect via the
+                    // coupling, so this avoids double-counting there.
+                    if (t_start == 0 && n_steps == equilibration_steps
+                            && equilibration_steps < total_time_steps
+                            && !eq_indirect_flux.empty()
+                            && global_f < eq_indirect_flux.size()) {
+                        absorbed += eq_indirect_flux[global_f];
+                    }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
             }
@@ -4515,7 +4543,21 @@ bool runThermalForSelectedFaces_GPU(
     const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
     const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;
     const size_t max_batch_size = std::min(n_selected, gpu_memory_limit / bytes_per_face);
-    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(50000));
+    size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(50000));
+    // Re-equilibration with indirect flux (PTM_EQ_WITH_INDIRECT) folds long
+    // multi-cycle equilibration kernels into each batch. At the 50000-face
+    // default that blows past the macOS+AMD GPU command-buffer timeout
+    // (gpusKillClientExt). Cap the batch to iter-0's proven-safe width so each
+    // 750-step eq kernel matches the all-faces path's regime.
+    if (const char* e = std::getenv("PTM_EQ_WITH_INDIRECT");
+        e && std::atoi(e) != 0) {
+        size_t cap = 4000;
+        if (const char* b = std::getenv("PTM_EQ_RETHERMAL_BATCH")) {
+            const int v = std::atoi(b);
+            if (v > 0) cap = static_cast<size_t>(v);
+        }
+        BATCH_SIZE = std::min(BATCH_SIZE, cap);
+    }
 
     // Get reference material properties
     const auto& rho_ref = reference_profile.rho();
@@ -4630,6 +4672,97 @@ bool runThermalForSelectedFaces_GPU(
         const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
         const double S_solar = planet.S;
         const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+
+        // ----------------------------------------------------------------
+        // Optional: re-equilibrate the deep column WITH the indirect flux
+        // before the output cycle (env PTM_EQ_WITH_INDIRECT=1, cycles via
+        // PTM_EQ_INDIRECT_CYCLES, default 2).
+        //
+        // The post_eq_T_state handed in by iter-0 was equilibrated with ZERO
+        // indirect (the eq phase of runThermalModelsForAllFaces_GPU_Persistent
+        // omits it — the indirect is only known after the radiosity). For a
+        // permanently-shadowed floor whose surface flux is almost entirely
+        // indirect IR, that means the deep column settles to the bare
+        // direct+geothermal floor (~25 K) and then DRAINS the indirect-warmed
+        // surface downward during the output cycle, capping the summer max.
+        // Re-running a few equilibration cycles here with the indirect folded
+        // into the eq-window forcing lets the column settle to the correct
+        // (warmer) indirect-equilibrated state, starting from iter-0's already
+        // reasonable column (no cold-start divergence).
+        //
+        // The eq window [start-eq_days, start) precedes the output window and
+        // covers earlier orbits of the same (stationary) seasonal cycle, so
+        // each eq timestep's indirect is phase-mapped from the output-window
+        // indirect_flux_series at the matching annual phase.
+        static const bool eq_with_indirect = []() {
+            const char* e = std::getenv("PTM_EQ_WITH_INDIRECT");
+            return e && std::atoi(e) != 0;
+        }();
+        static const int eq_indirect_cycles = []() {
+            const char* e = std::getenv("PTM_EQ_INDIRECT_CYCLES");
+            const int v = e ? std::atoi(e) : 2;
+            return v > 0 ? v : 2;
+        }();
+        if (eq_with_indirect && two_phase && equilibration_steps > 0
+                && !indirect_flux_series.empty()) {
+            const double out_t0  = times[equilibration_steps];
+            const double cyc_sec = (total_time_steps > equilibration_steps + 1)
+                ? (times[total_time_steps - 1] - out_t0) : 0.0;
+            std::vector<float> eq_flux(static_cast<size_t>(equilibration_steps) * batch_n);
+            #pragma omp parallel for schedule(static)
+            for (int t = 0; t < equilibration_steps; ++t) {
+                // Phase-map this eq timestep onto an output-window timestep.
+                int map_out = 0;
+                if (cyc_sec > 0.0) {
+                    double frac = (times[t] - out_t0) / cyc_sec;   // < 0 for eq steps
+                    frac -= std::floor(frac);                      // wrap into [0,1)
+                    map_out = std::min(output_steps - 1,
+                                       std::max(0, static_cast<int>(
+                                           std::lround(frac * (output_steps - 1)))));
+                }
+                for (size_t f = 0; f < batch_n; ++f) {
+                    const int    global_f = face_indices[batch_start + f];
+                    const size_t flux_idx = static_cast<size_t>(global_f)
+                                          * total_time_steps + t;
+                    const double base_A   = planet.albedo;
+                    const double direct   = (flux_idx < direct_solar_values.size())
+                                          ? direct_solar_values[flux_idx] : 0.0;
+                    const double reflected = (flux_idx < primary_reflected_values.size())
+                                          ? primary_reflected_values[flux_idx] : 0.0;
+                    const double ir       = (flux_idx < primary_ir_values.size())
+                                          ? primary_ir_values[flux_idx] : 0.0;
+                    const double albedo = has_angular
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                        : base_A;
+                    double absorbed = (1.0 - albedo) * direct
+                                    + (1.0 - albedo) * reflected
+                                    + planet.emissivity * ir;
+                    const auto& irow = indirect_flux_series[global_f];
+                    const int oidx = equilibration_steps + map_out;
+                    if (oidx < static_cast<int>(irow.size())) absorbed += irow[oidx];
+                    eq_flux[t * batch_n + f] = static_cast<float>(absorbed);
+                }
+            }
+            // Run the cycles as SEPARATE single-cycle dispatches (each
+            // equilibration_steps long, matching iter-0's safe kernel size)
+            // with an inter-cycle pause, instead of one (cycles+1)*steps
+            // mega-kernel that trips the macOS+AMD watchdog.
+            for (int c = 0; c < eq_indirect_cycles; ++c) {
+                std::vector<float> eq_discard;
+                solver.solvePersistentMultipleCycles(eq_flux, eq_discard,
+                                                     equilibration_steps, eq_dt,
+                                                     /*n_equil_cycles=*/0);
+                if (gpu_inter_batch_pause_ms > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(gpu_inter_batch_pause_ms));
+                }
+            }
+            if (batch_idx == 0) {
+                std::cout << "  [Re-thermal] Re-equilibrated WITH indirect flux ("
+                          << eq_indirect_cycles << " cycle(s) x " << equilibration_steps
+                          << " steps, phase-mapped) — PTM_EQ_WITH_INDIRECT" << std::endl;
+            }
+        }
 
         // Build output-window flux. Same composition as iter-0's
         // prepare_flux (Hayne on direct/reflected, ε on primary_ir)
@@ -4840,6 +4973,13 @@ bool runThermalForSelectedFaces_GPU(
         if (!run_batch_on_solver(solver, batch_idx, batch_start, batch_n)) {
             return false;
         }
+        // Inter-batch pause lets the macOS+AMD driver state settle between
+        // consecutive batches on the same device — important when each batch
+        // now carries multi-cycle eq kernels (PTM_EQ_WITH_INDIRECT).
+        if (gpu_inter_batch_pause_ms > 0 && batch_idx + 1 < n_batches) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(gpu_inter_batch_pause_ms));
+        }
     }
 
     return true;
@@ -4868,7 +5008,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int,
     const std::vector<int>&,
     size_t,
-    int)
+    int,
+    const std::vector<double>&)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -7659,6 +7800,10 @@ int main(int argc, char** argv) {
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
 
+    // Anisotropic (roughness-beamed) thermal emission (Smith 1967). 0 = OFF.
+    double rad_rms_slope_deg = 0.0;              // RMS micro-slope [deg]
+    double rad_beam_vf_threshold = 1e-7;         // Min renormalized VF to keep a beam pair
+
     // Multi-GPU radiosity dispatch (mirrors thermal pool semantics).
     int rad_gpu_devices = 1;                     // 1 = legacy single-GPU; >1 = pool
     std::vector<int> rad_gpu_device_ids;         // Explicit indices (overrides rad_gpu_devices)
@@ -7689,6 +7834,8 @@ int main(int argc, char** argv) {
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
     rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
+    rad_rms_slope_deg = sim_config.radiation.rms_slope_deg;
+    rad_beam_vf_threshold = sim_config.radiation.beam_vf_threshold;
     // Multi-GPU radiosity (only consulted if rad_use_gpu == true).
     rad_gpu_devices = sim_config.radiation.gpu_devices;
     rad_gpu_device_ids = sim_config.radiation.gpu_device_ids;
@@ -8323,6 +8470,37 @@ int main(int argc, char** argv) {
 
     // ========================================================================
     // PHASE 4c: Constant thermal inertia mode
+    // ========================================================================
+    // Optional scalar property overrides (sensitivity sweeps). Applied to the
+    // finalized Planet (Moon/SPICE path included) BEFORE the constant-TI block
+    // and BEFORE illumination albedo sync (~line 8814), so albedo flows to
+    // face_albedos / radiosity reflectance and ks/kd feed the constant-TI cp.
+    // Sentinel <0 leaves the body default untouched -> baseline runs unchanged.
+    // ========================================================================
+    {
+        const auto& tp = sim_config.thermophysical;
+        if (tp.albedo_override >= 0.0) {
+            std::cout << "Property override: albedo A0 " << planet.albedo
+                      << " -> " << tp.albedo_override << std::endl;
+            planet.albedo = tp.albedo_override;
+        }
+        if (tp.emissivity_override > 0.0) {
+            std::cout << "Property override: emissivity " << planet.emissivity
+                      << " -> " << tp.emissivity_override << std::endl;
+            planet.emissivity = tp.emissivity_override;
+        }
+        if (tp.ks_override > 0.0) {
+            std::cout << "Property override: ks " << planet.ks
+                      << " -> " << tp.ks_override << " W/m/K" << std::endl;
+            planet.ks = tp.ks_override;
+        }
+        if (tp.kd_override > 0.0) {
+            std::cout << "Property override: kd " << planet.kd
+                      << " -> " << tp.kd_override << " W/m/K" << std::endl;
+            planet.kd = tp.kd_override;
+        }
+    }
+
     // When thermophysical.constant_thermal_inertia > 0, override properties
     // so that TI = sqrt(k * rho * cp) is constant in temperature AND depth:
     //   chi = 0       (k = ks, constant in T)
@@ -8721,6 +8899,8 @@ int main(int argc, char** argv) {
             early_rad_config.force_hmatrix = rad_force_hmatrix;
             early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            early_rad_config.rms_slope_deg = rad_rms_slope_deg;
+            early_rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             if (rad_max_neighbors_override > 0) {
                 early_rad_config.max_neighbors = rad_max_neighbors_override;
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -9266,6 +9446,43 @@ int main(int argc, char** argv) {
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
+    // Deep radiation-coupling (pass 2): per-global-face time-mean indirect flux
+    // loaded from a previous pass-1 run (thermal.eq_indirect_flux_file). Added to
+    // the EQUILIBRATION-phase forcing so the deep column equilibrates consistent
+    // with the wall-heating it receives during the output window. Empty = legacy.
+    std::vector<double> eq_indirect_vec;
+    if (!sim_config.thermal.eq_indirect_flux_file.empty()) {
+        const std::string& path = sim_config.thermal.eq_indirect_flux_file;
+        std::ifstream qin(path, std::ios::binary);
+        if (!qin) {
+            std::cerr << "Warning: cannot open eq_indirect_flux_file '" << path
+                      << "' — equilibration will not include indirect flux." << std::endl;
+        } else {
+            uint32_t magic = 0, nf = 0;
+            qin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            qin.read(reinterpret_cast<char*>(&nf), sizeof(nf));
+            if (magic != 0x51494E44u) {  // 'QIND'
+                std::cerr << "Warning: eq_indirect_flux_file '" << path
+                          << "' bad magic (0x" << std::hex << magic << std::dec
+                          << "); ignoring." << std::endl;
+            } else if (nf != mesh->faces.size()) {
+                std::cerr << "Warning: eq_indirect_flux_file face count " << nf
+                          << " != mesh faces " << mesh->faces.size()
+                          << "; ignoring." << std::endl;
+            } else {
+                eq_indirect_vec.resize(nf);
+                qin.read(reinterpret_cast<char*>(eq_indirect_vec.data()),
+                         static_cast<std::streamsize>(nf) * sizeof(double));
+                double s = 0.0, mx = 0.0;
+                for (double q : eq_indirect_vec) { s += q; mx = std::max(mx, q); }
+                std::cout << "[Deep coupling] Loaded eq-indirect flux for " << nf
+                          << " faces from " << path << " (mean "
+                          << (s / std::max<uint32_t>(1, nf)) << ", max " << mx
+                          << " W/m^2) — added to equilibration forcing." << std::endl;
+            }
+        }
+    }
+
     // Time-varying indirect flux per face [face][timestep]
     // Declared at this scope so it's accessible for location export later
     std::vector<std::vector<double>> indirect_flux_series;
@@ -9635,7 +9852,8 @@ int main(int argc, char** argv) {
                     sim_config.thermal.gpu_devices,
                     sim_config.thermal.gpu_device_ids,
                     sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms
+                    sim_config.thermal.gpu_inter_batch_pause_ms,
+                    eq_indirect_vec
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
@@ -9746,7 +9964,8 @@ int main(int argc, char** argv) {
                     sim_config.thermal.gpu_devices,
                     sim_config.thermal.gpu_device_ids,
                     sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms
+                    sim_config.thermal.gpu_inter_batch_pause_ms,
+                    eq_indirect_vec
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
@@ -9873,6 +10092,8 @@ int main(int argc, char** argv) {
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            rad_config.rms_slope_deg = rad_rms_slope_deg;
+            rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             // Multi-GPU radiosity dispatch — pool is materialized inside
             // RadiositySolver::initGPU() when gpu_devices > 1 and use_gpu = true.
             rad_config.gpu_devices = rad_gpu_devices;
@@ -10201,8 +10422,16 @@ int main(int argc, char** argv) {
                                 temps_t[f] = surface_temps[f][t];
                                 solar_t[f] = direct_solar_values[f * total_time_steps + t];
                             }
+                            // Smith beamed emission needs the Sun direction.
+                            std::array<double, 3> s_hat = {0.0, 0.0, 0.0};
+                            if (rad_rms_slope_deg > 0.0 &&
+                                t < static_cast<int>(sun_positions.size())) {
+                                const auto& sp = sun_positions[t];
+                                double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+                                if (sl > 0.0) s_hat = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                            }
                             std::vector<double> indirect_t =
-                                rad_manager.computeIndirectFlux(temps_t, solar_t);
+                                rad_manager.computeIndirectFlux(temps_t, solar_t, s_hat);
                             const double w = (iter == 0) ? 1.0 : rad_relax;
                             #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                             for (size_t f = 0; f < num_faces; f++) {
@@ -10230,8 +10459,21 @@ int main(int argc, char** argv) {
                                 }
                             }
 
+                            // Per-timestep Sun directions for Smith beamed emission.
+                            std::vector<std::array<double, 3>> sun_dirs_batch;
+                            if (rad_rms_slope_deg > 0.0) {
+                                sun_dirs_batch.assign(n_batch, {0.0, 0.0, 0.0});
+                                for (int j = 0; j < n_batch; j++) {
+                                    const int t = t_start + j;
+                                    if (t >= static_cast<int>(sun_positions.size())) continue;
+                                    const auto& sp = sun_positions[t];
+                                    double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+                                    if (sl > 0.0) sun_dirs_batch[j] = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                                }
+                            }
                             std::vector<std::vector<double>> indirect_batch =
-                                rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch);
+                                rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
+                                                                     sun_dirs_batch);
 
                             for (int j = 0; j < n_batch; j++) {
                                 const int t = t_start + j;
@@ -10587,6 +10829,126 @@ int main(int argc, char** argv) {
                 std::cout << "\n=== Radiation Exchange Complete ===" << std::endl;
                 std::cout << "  Mean indirect flux: " << stats.mean_indirect_flux << " W/m2" << std::endl;
                 std::cout << "  Max indirect flux: " << stats.max_indirect_flux << " W/m2" << std::endl;
+
+                // Deep radiation-coupling (pass 1): dump the per-face OUTPUT-window
+                // time-mean indirect flux <q_ind>[f] so a follow-up run can feed it
+                // into equilibration (thermal.eq_indirect_flux_file). Format:
+                // uint32 magic 'QIND', uint32 n_faces, n_faces float64.
+                if (!sim_config.thermal.indirect_mean_out_file.empty()
+                        && !indirect_flux_series.empty()) {
+                    const std::string& opath = sim_config.thermal.indirect_mean_out_file;
+                    const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                    const int out_lo = equilibration_steps;
+                    const int out_hi = total_time_steps;
+                    const int out_n = std::max(1, out_hi - out_lo);
+                    std::vector<double> q_ind_mean(nf, 0.0);
+                    #pragma omp parallel for schedule(static)
+                    for (uint32_t f = 0; f < nf; ++f) {
+                        const auto& row = indirect_flux_series[f];
+                        double s = 0.0;
+                        for (int t = out_lo; t < out_hi && t < static_cast<int>(row.size()); ++t)
+                            s += row[t];
+                        q_ind_mean[f] = s / out_n;
+                    }
+                    std::ofstream qo(opath, std::ios::binary);
+                    if (qo) {
+                        const uint32_t magic = 0x51494E44u;  // 'QIND'
+                        qo.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                        qo.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                        qo.write(reinterpret_cast<const char*>(q_ind_mean.data()),
+                                 static_cast<std::streamsize>(nf) * sizeof(double));
+                        double s = 0.0, mx = 0.0;
+                        for (double q : q_ind_mean) { s += q; mx = std::max(mx, q); }
+                        std::cout << "[Deep coupling] Wrote per-face mean indirect flux ("
+                                  << nf << " faces, mean " << (s / std::max<uint32_t>(1, nf))
+                                  << ", max " << mx << " W/m^2) -> " << opath << std::endl;
+                    } else {
+                        std::cerr << "Warning: cannot write indirect_mean_out_file '"
+                                  << opath << "'." << std::endl;
+                    }
+                }
+
+                // Per-timestep indirect-flux dump (env-gated) for offline flux
+                // analysis: PTM_DUMP_QIND_SERIES=<path>. Writes the per-face
+                // OUTPUT-window indirect (IR + reflected) radiosity flux series,
+                // aligned 1:1 with the saved direct_solar/illumination step files,
+                // so a script can form the total absorbed flux = direct + indirect
+                // and reduce it to per-face max/mean (the coupling effect on flux,
+                // which is otherwise visible only in temperature). Format:
+                // uint32 magic 'QIDT', uint32 n_faces, uint32 n_steps, then
+                // n_faces*n_steps float32 (face-major: all steps of face 0, ...).
+                if (const char* qsp = std::getenv("PTM_DUMP_QIND_SERIES")) {
+                    if (!indirect_flux_series.empty()) {
+                        const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = total_time_steps;
+                        const uint32_t ns = static_cast<uint32_t>(std::max(0, out_hi - out_lo));
+                        std::ofstream qo(qsp, std::ios::binary);
+                        if (qo) {
+                            const uint32_t magic = 0x51494454u;  // 'QIDT'
+                            qo.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                            qo.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                            qo.write(reinterpret_cast<const char*>(&ns), sizeof(ns));
+                            std::vector<float> rowbuf(ns);
+                            for (uint32_t f = 0; f < nf; ++f) {
+                                const auto& row = indirect_flux_series[f];
+                                for (uint32_t j = 0; j < ns; ++j) {
+                                    const int t = out_lo + static_cast<int>(j);
+                                    rowbuf[j] = (t < static_cast<int>(row.size()))
+                                        ? static_cast<float>(row[t]) : 0.0f;
+                                }
+                                qo.write(reinterpret_cast<const char*>(rowbuf.data()),
+                                         static_cast<std::streamsize>(ns) * sizeof(float));
+                            }
+                            std::cout << "[Deep coupling] Wrote per-timestep indirect flux series ("
+                                      << nf << " faces x " << ns << " steps) -> " << qsp << std::endl;
+                        } else {
+                            std::cerr << "Warning: cannot write PTM_DUMP_QIND_SERIES '"
+                                      << qsp << "'." << std::endl;
+                        }
+                    }
+                }
+
+                // Reflected-IR diagnostic (Lucey & Hayne 2021): for each face,
+                // the peak surface T over the output window and the radiosity
+                // indirect flux AT that instant. A follow-up script forms the
+                // apparent bolometric T = [(eps*sigma*T^4 + (1-eps)*I_inc)/sigma]^1/4
+                // (I_inc ~ Q_indirect/eps) to estimate the wall-IR reflected
+                // toward Diviner but absent from the emission-only comparison.
+                // Env-gated: PTM_DUMP_REFLIR=<path>. Format: uint32 magic 'RFIR',
+                // uint32 n_faces, then n_faces*(float64 Tpeak, float64 q_at_peak).
+                if (const char* rp = std::getenv("PTM_DUMP_REFLIR")) {
+                    if (!indirect_flux_series.empty() && !surface_temps.empty()) {
+                        const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = total_time_steps;
+                        std::vector<double> pk(static_cast<size_t>(nf) * 2, 0.0);
+                        #pragma omp parallel for schedule(static)
+                        for (uint32_t f = 0; f < nf; ++f) {
+                            const auto& Trow = surface_temps[f];
+                            const auto& Qrow = indirect_flux_series[f];
+                            double tmax = 0.0, qat = 0.0;
+                            for (int t = out_lo; t < out_hi && t < static_cast<int>(Trow.size()); ++t) {
+                                if (Trow[t] > tmax) {
+                                    tmax = Trow[t];
+                                    qat = (t < static_cast<int>(Qrow.size())) ? Qrow[t] : 0.0;
+                                }
+                            }
+                            pk[2 * f] = tmax;
+                            pk[2 * f + 1] = qat;
+                        }
+                        std::ofstream ro(rp, std::ios::binary);
+                        if (ro) {
+                            const uint32_t magic = 0x52464952u;  // 'RFIR'
+                            ro.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                            ro.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                            ro.write(reinterpret_cast<const char*>(pk.data()),
+                                     static_cast<std::streamsize>(nf) * 2 * sizeof(double));
+                            std::cout << "[Reflected-IR] Wrote per-face (Tpeak, q@peak) for "
+                                      << nf << " faces -> " << rp << std::endl;
+                        }
+                    }
+                }
             }
 
             std::cout << "=================================================\n" << std::endl;

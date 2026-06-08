@@ -1,4 +1,5 @@
 #include "radiation_exchange.h"
+#include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../thermal/thermal_model.h"  // For ProgressBar
 
@@ -61,6 +62,19 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                   << ", mean=" << (n ? sum_rs / static_cast<double>(n) : 0.0)
                   << " (" << n_over << "/" << n
                   << " rows > 1 renormalized for energy conservation)" << std::endl;
+        // Optional diagnostic: dump per-face VF row sums for completeness checks
+        // (e.g. is the floor<->distant-wall coupling captured?). Set the env var
+        // PTM_DUMP_VF_ROWSUMS to a path. Format: uint32 n, then n float64.
+        if (const char* dp = std::getenv("PTM_DUMP_VF_ROWSUMS")) {
+            std::ofstream ro(dp, std::ios::binary);
+            if (ro) {
+                uint32_t nn = static_cast<uint32_t>(n);
+                ro.write(reinterpret_cast<const char*>(&nn), sizeof(nn));
+                ro.write(reinterpret_cast<const char*>(rowsum.data()),
+                         static_cast<std::streamsize>(n) * sizeof(double));
+                std::cout << "[Radiosity] Dumped per-face VF row sums -> " << dp << std::endl;
+            }
+        }
     }
 }
 
@@ -1037,6 +1051,7 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
         hconfig.aca_tolerance = config_.aca_tolerance;
         hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
@@ -1156,6 +1171,12 @@ bool RadiationExchangeManager::prepare(
         solver_->initGPU();
 
         is_active_ = true;
+        if (config_.rms_slope_deg > 0.0) {
+            chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+            buildChiTable();
+            buildBeamPairs();
+            beam_active_ = !beam_pairs_.empty();
+        }
         return true;
     }
 
@@ -1217,6 +1238,7 @@ bool RadiationExchangeManager::prepare(
         hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
         hconfig.aca_tolerance = config_.aca_tolerance;
         hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
@@ -1275,6 +1297,14 @@ bool RadiationExchangeManager::prepare(
 
     is_active_ = true;
 
+    // Smith (1967) anisotropic beamed-emission setup (only when rms_slope_deg>0).
+    if (config_.rms_slope_deg > 0.0) {
+        chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+        buildChiTable();
+        buildBeamPairs();
+        beam_active_ = !beam_pairs_.empty();
+    }
+
     return true;
 }
 
@@ -1286,6 +1316,16 @@ std::vector<std::vector<double>>
 RadiationExchangeManager::computeIndirectFluxBatch(
     const std::vector<std::vector<double>>& temperatures_per_timestep,
     const std::vector<std::vector<double>>& solar_flux_per_timestep) {
+    // Delegate to the Sun-aware overload with no Sun directions (beaming off).
+    return computeIndirectFluxBatch(temperatures_per_timestep,
+                                    solar_flux_per_timestep, {});
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep,
+    const std::vector<std::array<double, 3>>& sun_dirs) {
 
     const size_t n_steps = temperatures_per_timestep.size();
     const size_t n = mesh_->faces.size();
@@ -1299,6 +1339,8 @@ RadiationExchangeManager::computeIndirectFluxBatch(
     auto raw_per_step = solver_->solveBatch(temperatures_per_timestep,
                                              solar_flux_per_timestep);
 
+    const bool do_beam = beam_active_ && (sun_dirs.size() == n_steps);
+
     // Map back to all faces using the exchange-face index list (same as
     // computeIndirectFlux). Update aggregate stats from the last timestep.
     double sum = 0.0;
@@ -1309,6 +1351,13 @@ RadiationExchangeManager::computeIndirectFluxBatch(
         for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
             int face_idx = classification_.exchange_face_indices[i];
             indirect_per_timestep[k][face_idx] = flux[face_idx];
+        }
+        // Smith beamed-emission correction (per timestep, Sun-dependent).
+        if (do_beam) {
+            const auto& s = sun_dirs[k];
+            if (s[0] != 0.0 || s[1] != 0.0 || s[2] != 0.0) {
+                addBeamedFlux(temperatures_per_timestep[k], s, indirect_per_timestep[k]);
+            }
         }
     }
     if (!raw_per_step.empty() && !raw_per_step.back().empty()) {
@@ -1329,6 +1378,14 @@ RadiationExchangeManager::computeIndirectFluxBatch(
 std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     const std::vector<double>& temperatures,
     const std::vector<double>& solar_flux) {
+    // Delegate to the Sun-aware overload with no Sun direction (beaming off).
+    return computeIndirectFlux(temperatures, solar_flux, {0.0, 0.0, 0.0});
+}
+
+std::vector<double> RadiationExchangeManager::computeIndirectFlux(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux,
+    const std::array<double, 3>& sun_dir) {
 
     size_t n = mesh_->faces.size();
     indirect_flux_.assign(n, 0.0);
@@ -1337,7 +1394,7 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
         return indirect_flux_;
     }
 
-    // Solve radiosity equation
+    // Solve radiosity equation (isotropic/Lambertian thermal emission)
     auto flux = solver_->solve(temperatures, solar_flux);
 
     // Map back to all faces
@@ -1346,7 +1403,14 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
         indirect_flux_[face_idx] = flux[face_idx];
     }
 
-    // Update statistics
+    // Smith (1967) anisotropic beamed-emission correction (Sun-dependent).
+    // Redistributes each sunlit wall's fixed total emission toward the floor.
+    const bool sun_valid = (sun_dir[0] != 0.0 || sun_dir[1] != 0.0 || sun_dir[2] != 0.0);
+    if (beam_active_ && sun_valid) {
+        addBeamedFlux(temperatures, sun_dir, indirect_flux_);
+    }
+
+    // Update statistics (after beaming so they reflect the corrected flux)
     double sum = 0.0;
     double max_flux = 0.0;
     for (int idx : classification_.exchange_face_indices) {
@@ -1360,6 +1424,127 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     stats_.solver_residual = solver_->getLastResidual();
 
     return indirect_flux_;
+}
+
+// ============================================================================
+// Smith (1967) anisotropic beamed thermal emission
+// The directional-emission math lives in smith_beaming.h (shared with the
+// standalone validator test_beam_chi.cpp).
+// ============================================================================
+
+void RadiationExchangeManager::buildChiTable() {
+    chi_ns_ = 24; chi_ne_ = 24; chi_npsi_ = 33;
+    chi_table_ = smith::buildChiTable(chi_w_rad_, chi_ns_, chi_ne_, chi_npsi_);
+}
+
+float RadiationExchangeManager::lookupChi(double cos_sun, double cos_e,
+                                          double cos_psi) const {
+    return smith::evalChi(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                          cos_sun, cos_e, cos_psi);
+}
+
+void RadiationExchangeManager::buildBeamPairs() {
+    beam_pairs_.clear();
+    if (classification_.exchange_face_indices.empty()) return;
+
+    // Receivers = the radiation-exchange (shadowed-floor) faces.
+    const std::vector<int>& receivers = classification_.exchange_face_indices;
+
+    // Geometric VF + Embree visibility for receiver rows. Backend-independent
+    // (works for H-matrix runs where per-row matrix access is unavailable), and
+    // uses the same F formula and row-normalization as the radiosity.
+    ViewFactorCalculator calc(mesh_, static_cast<RTCDevice>(device_),
+                              static_cast<RTCScene>(scene_), config_);
+    ViewFactorMatrix rows = calc.computeSubset(receivers);  // global row indexing
+
+    // Cache per-face mean normals (float) for the run-time beamed pass.
+    const auto& normals = calc.getFaceNormals();
+    const auto& centers = calc.getFaceCenters();
+    beam_normals_.resize(normals.size());
+    for (size_t f = 0; f < normals.size(); ++f) {
+        beam_normals_[f] = { static_cast<float>(normals[f][0]),
+                             static_cast<float>(normals[f][1]),
+                             static_cast<float>(normals[f][2]) };
+    }
+
+    const auto& shadow = classification_.shadow_fractions;
+    const double thresh = config_.beam_vf_threshold;
+
+    std::vector<int> cols;
+    std::vector<double> vals;
+    for (int i : receivers) {
+        rows.getRow(i, cols, vals);     // global receiver index
+        if (cols.empty()) continue;
+        double rowsum = 0.0;
+        for (double v : vals) rowsum += v;
+        double rownorm = 1.0 / std::max(1.0, rowsum);   // matches radiosity vf_row_norm
+        const auto& ci = centers[i];
+        for (size_t m = 0; m < cols.size(); ++m) {
+            int j = cols[m];
+            if (j < 0 || j >= static_cast<int>(shadow.size())) continue;
+            if (shadow[j] >= 0.99) continue;            // permanently shadowed -> not an emitter
+            double Fhat = vals[m] * rownorm;
+            if (Fhat <= thresh) continue;
+            const auto& cj = centers[j];
+            double dx = ci[0] - cj[0], dy = ci[1] - cj[1], dz = ci[2] - cj[2];
+            double r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < 1e-20) continue;
+            double inv = 1.0 / std::sqrt(r2);
+            double dirx = dx * inv, diry = dy * inv, dirz = dz * inv;
+            const auto& nj = normals[j];
+            double cos_e = nj[0] * dirx + nj[1] * diry + nj[2] * dirz;
+            if (cos_e <= 0.0) continue;                 // wall not emitting toward floor
+            BeamPair bp;
+            bp.i = i;
+            bp.j = j;
+            bp.Fhat_ij = static_cast<float>(Fhat);
+            bp.cos_e = static_cast<float>(cos_e);
+            bp.dir_ji = { static_cast<float>(dirx),
+                          static_cast<float>(diry),
+                          static_cast<float>(dirz) };
+            beam_pairs_.push_back(bp);
+        }
+    }
+
+    std::cout << "  Smith beamed emission: " << beam_pairs_.size()
+              << " wall->floor beam pairs (rms_slope = " << config_.rms_slope_deg
+              << " deg)" << std::endl;
+}
+
+void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperatures,
+                                             const std::array<double, 3>& sun_dir,
+                                             std::vector<double>& flux) const {
+    if (beam_pairs_.empty()) return;
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+
+    // Accumulate the signed (chi-1) corrections, then apply once per receiver so
+    // the result stays non-negative (absorbed flux). OpenMP-safe via atomic add
+    // on the receiver bucket would race the final clamp, so reduce into a local.
+    const size_t np = beam_pairs_.size();
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < np; ++k) {
+        const BeamPair& bp = beam_pairs_[k];
+        const std::array<float, 3>& nj = beam_normals_[bp.j];
+        double cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
+        if (cos_sun <= 0.0) continue;   // wall mean in shadow this timestep -> no beaming
+        double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                             + bp.dir_ji[2] * sz);
+        double chi = lookupChi(cos_sun, static_cast<double>(bp.cos_e), cos_psi);
+        double delta = chi - 1.0;
+        if (delta == 0.0) continue;
+        double Tj = temperatures[bp.j];
+        double Ej = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj;
+        double dq = emissivity_[bp.i] * Ej * static_cast<double>(bp.Fhat_ij) * delta;
+        #pragma omp atomic
+        flux[bp.i] += dq;
+    }
+
+    // Keep absorbed indirect flux non-negative on the receiver set.
+    for (int i : classification_.exchange_face_indices) {
+        if (flux[i] < 0.0) flux[i] = 0.0;
+    }
 }
 
 void RadiationExchangeManager::setEmissivity(double emissivity) {

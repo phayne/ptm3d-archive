@@ -94,6 +94,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
             config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
             config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
+            config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
                 const auto& is_node = thermal["ice_stability"];
@@ -186,6 +188,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
             config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
             config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
+            // Anisotropic roughness-beamed emission (Smith 1967); 0 = Lambertian.
+            config.radiation.rms_slope_deg = getWithDefault(rad, "rms_slope_deg", config.radiation.rms_slope_deg);
+            config.radiation.beam_vf_threshold = getWithDefault(rad, "beam_vf_threshold", config.radiation.beam_vf_threshold);
 
             // Multi-GPU radiosity dispatch (mirrors thermal pool YAML keys).
             config.radiation.gpu_devices = getWithDefault(rad, "gpu_devices", config.radiation.gpu_devices);
@@ -284,6 +289,17 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermophysical.constant_thermal_inertia = getWithDefault(
                 thermo, "constant_thermal_inertia",
                 config.thermophysical.constant_thermal_inertia);
+            // Optional scalar property overrides (sensitivity sweeps). Distinct
+            // keys (suffixed _override) so existing configs that carry ignored
+            // GUI scalars are unaffected; sentinel <0 leaves the body default.
+            config.thermophysical.albedo_override = getWithDefault(
+                thermo, "albedo_override", config.thermophysical.albedo_override);
+            config.thermophysical.emissivity_override = getWithDefault(
+                thermo, "emissivity_override", config.thermophysical.emissivity_override);
+            config.thermophysical.ks_override = getWithDefault(
+                thermo, "ks_override", config.thermophysical.ks_override);
+            config.thermophysical.kd_override = getWithDefault(
+                thermo, "kd_override", config.thermophysical.kd_override);
         }
 
         // Parse Advanced section

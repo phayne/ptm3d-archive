@@ -114,6 +114,46 @@ static std::atomic<size_t> g_hierarchical_recursions{0};
 static std::atomic<size_t> g_aca_fail_to_zero{0};    // Large admissible blocks treated as zero
 static std::atomic<size_t> g_small_blocks_count{0};  // Small blocks (< min_block_size²) stored in RAM
 static std::atomic<size_t> g_small_blocks_bytes{0};  // Estimated bytes for small blocks in RAM
+// Admissible-block subdivision (robustness fix: bisect instead of zero)
+static std::atomic<size_t> g_admissible_subdivided{0};   // Large admissible blocks bisected instead of zeroed
+static std::atomic<size_t> g_subdiv_leaves_lowrank{0};   // Sub-blocks captured as ACA low-rank
+static std::atomic<size_t> g_subdiv_leaves_sparse{0};    // Sub-blocks computed exact sparse
+static std::atomic<size_t> g_subdiv_leaves_zero{0};      // Sub-blocks genuinely empty
+static std::atomic<size_t> g_subdiv_depth_cap_zero{0};   // LAST-RESORT: leaf still huge at depth cap -> zeroed
+
+// Shared source of truth for the ACA face-count cap (env PTM_HMATRIX_ACA_CAP,
+// default 12000 faces/side; 0 = off). Read once. Used both by buildBlock's
+// admissible pre-zero guard and by buildAdmissibleSubdivided's per-sub-block gate.
+static size_t getAcaCap() {
+    static const size_t v = [](){
+        const char* e = std::getenv("PTM_HMATRIX_ACA_CAP");
+        return e ? std::strtoul(e, nullptr, 10) : 12000UL;
+    }();
+    return v;
+}
+
+// Visibility-ray lift: fraction of the local face edge to lift the occlusion ray
+// origin ALONG THE FACE NORMAL, clearing local sub-mesh roughness so grazing
+// floor->rim sightlines are not spuriously self-occluded (env PTM_HMATRIX_RAY_LIFT;
+// 0 = legacy along-ray offset only). ~0.3-0.5 clears ~10deg facet roughness.
+static double getRayLiftFactor() {
+    static const double v = [](){
+        const char* e = std::getenv("PTM_HMATRIX_RAY_LIFT");
+        return e ? std::atof(e) : 0.0;
+    }();
+    return v;
+}
+
+// Whether to bisect+re-ACA large admissible blocks instead of zeroing them.
+// Env PTM_HMATRIX_SUBDIVIDE (1/0) overrides the config flag when set; OFF
+// reproduces the exact legacy zero behavior for A/B verification.
+static bool subdivideEnabled(const HMatrixConfig& c) {
+    static const int env = [](){
+        const char* e = std::getenv("PTM_HMATRIX_SUBDIVIDE");
+        return e ? std::atoi(e) : -1;   // -1 = unset, defer to config
+    }();
+    return env < 0 ? c.subdivide_large_admissible : (env != 0);
+}
 
 static void resetProfilingCounters() {
     g_time_view_factor_us = 0;
@@ -137,6 +177,11 @@ static void resetProfilingCounters() {
     g_aca_fail_to_zero = 0;
     g_small_blocks_count = 0;
     g_small_blocks_bytes = 0;
+    g_admissible_subdivided = 0;
+    g_subdiv_leaves_lowrank = 0;
+    g_subdiv_leaves_sparse = 0;
+    g_subdiv_leaves_zero = 0;
+    g_subdiv_depth_cap_zero = 0;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -175,6 +220,11 @@ static void printProfilingCounters(double total_ms) {
               << " (block too large)" << std::endl;
     std::cout << "    ACA fail → zero:         " << g_aca_fail_to_zero.load()
               << " (large admissible blocks)" << std::endl;
+    std::cout << "    Admissible subdivided:   " << g_admissible_subdivided.load()
+              << " (leaves: lowrank=" << g_subdiv_leaves_lowrank.load()
+              << ", sparse=" << g_subdiv_leaves_sparse.load()
+              << ", zero=" << g_subdiv_leaves_zero.load()
+              << ", depth-cap-zero=" << g_subdiv_depth_cap_zero.load() << ")" << std::endl;
     std::cout << "    Hierarchical recursions: " << g_hierarchical_recursions.load() << std::endl;
     std::cout << "    Small blocks (in RAM):   " << g_small_blocks_count.load()
               << " (" << (g_small_blocks_bytes.load() / (1024.0 * 1024.0)) << " MB)" << std::endl;
@@ -555,6 +605,80 @@ size_t HMatrixBlock::memoryBytes() const {
 // HMatrixViewFactor Implementation
 // ============================================================================
 
+// Macroscopic (smoothed) face normals via a LOCAL PLANE FIT (PCA of neighbor face
+// centers within `radius`): the eigenvector of the smallest covariance eigenvalue
+// is the local surface normal, oriented to agree with the facet normal. This gives
+// "up" on the flat floor and the true wall orientation on walls (UNLIKE averaging
+// facet normals, which cancels on steep/opposing faces and corrupts the VF). Used
+// for the VF cosine terms so grazing floor<->rim coupling survives on fine meshes.
+void HMatrixViewFactor::computeSmoothedNormals(double radius) {
+    const size_t N = face_centers_.size();
+    smoothed_normals_.assign(N, {{0.0, 0.0, 0.0}});
+    if (N == 0) return;
+    const double inv = 1.0 / std::max(1e-6, radius);
+    std::array<double, 3> mn = face_centers_[0], mx = face_centers_[0];
+    for (size_t i = 1; i < N; ++i)
+        for (int k = 0; k < 3; ++k) {
+            mn[k] = std::min(mn[k], face_centers_[i][k]);
+            mx[k] = std::max(mx[k], face_centers_[i][k]);
+        }
+    const long long ny = (long long)((mx[1] - mn[1]) * inv) + 1;
+    const long long nz = (long long)((mx[2] - mn[2]) * inv) + 1;
+    auto cellkey = [&](const std::array<double, 3>& p) -> long long {
+        long long cx = (long long)((p[0] - mn[0]) * inv);
+        long long cy = (long long)((p[1] - mn[1]) * inv);
+        long long cz = (long long)((p[2] - mn[2]) * inv);
+        return (cx * ny + cy) * nz + cz;
+    };
+    std::unordered_map<long long, std::vector<int>> grid;
+    grid.reserve(N);
+    for (size_t i = 0; i < N; ++i) grid[cellkey(face_centers_[i])].push_back((int)i);
+    const double r2 = radius * radius;
+    #pragma omp parallel for schedule(dynamic, 1024)
+    for (size_t i = 0; i < N; ++i) {
+        const auto& ci = face_centers_[i];
+        long long cx = (long long)((ci[0] - mn[0]) * inv);
+        long long cy = (long long)((ci[1] - mn[1]) * inv);
+        long long cz = (long long)((ci[2] - mn[2]) * inv);
+        // accumulate weighted covariance of neighbor centers about their mean
+        double sw = 0.0; std::array<double,3> mean = {{0,0,0}};
+        std::vector<std::pair<std::array<double,3>,double>> nbr;
+        nbr.reserve(64);
+        for (int dx = -1; dx <= 1; ++dx)
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    long long key = ((cx + dx) * ny + (cy + dy)) * nz + (cz + dz);
+                    auto it = grid.find(key);
+                    if (it == grid.end()) continue;
+                    for (int j : it->second) {
+                        const auto& cj = face_centers_[j];
+                        double d2 = (cj[0]-ci[0])*(cj[0]-ci[0]) + (cj[1]-ci[1])*(cj[1]-ci[1]) + (cj[2]-ci[2])*(cj[2]-ci[2]);
+                        if (d2 > r2) continue;
+                        double w = face_areas_[j];
+                        nbr.push_back({cj, w}); sw += w;
+                        mean[0]+=w*cj[0]; mean[1]+=w*cj[1]; mean[2]+=w*cj[2];
+                    }
+                }
+        if (nbr.size() < 6 || sw <= 0) { smoothed_normals_[i] = face_normals_[i]; continue; }
+        mean[0]/=sw; mean[1]/=sw; mean[2]/=sw;
+        Eigen::Matrix3d C = Eigen::Matrix3d::Zero();
+        for (auto& pr : nbr) {
+            double w = pr.second;
+            double ex = pr.first[0]-mean[0], ey = pr.first[1]-mean[1], ez = pr.first[2]-mean[2];
+            C(0,0)+=w*ex*ex; C(0,1)+=w*ex*ey; C(0,2)+=w*ex*ez;
+            C(1,1)+=w*ey*ey; C(1,2)+=w*ey*ez; C(2,2)+=w*ez*ez;
+        }
+        C(1,0)=C(0,1); C(2,0)=C(0,2); C(2,1)=C(1,2);
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(C);
+        Eigen::Vector3d nrm = es.eigenvectors().col(0);   // smallest eigenvalue = normal
+        std::array<double,3> sn = {{nrm[0], nrm[1], nrm[2]}};
+        // orient to agree with the facet normal (outward)
+        const auto& fn = face_normals_[i];
+        if (sn[0]*fn[0]+sn[1]*fn[1]+sn[2]*fn[2] < 0) { sn[0]=-sn[0]; sn[1]=-sn[1]; sn[2]=-sn[2]; }
+        smoothed_normals_[i] = sn;
+    }
+}
+
 void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
                                RTCDevice device,
                                RTCScene scene,
@@ -708,6 +832,45 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
             face_normals_[i] = {{n[0] / area2, n[1] / area2, n[2] / area2}};
         } else {
             face_normals_[i] = {{0.0, 0.0, 1.0}};
+        }
+    }
+
+    // Optional: heightfield-horizon visibility (robust grazing-tangent occlusion).
+    // up = radial = normalize(origin_shift) (the patch's selenocentric center);
+    // cell ~ median face pitch (sqrt of mean area). Used in place of the Embree
+    // thin-ray in computeViewFactorRow/Column/Block when enabled.
+    {
+        const char* hv = std::getenv("PTM_HMATRIX_HORIZON_VIS");
+        use_horizon_vis_ = (hv && std::atoi(hv) != 0);
+        if (use_horizon_vis_) {
+            double mean_area = 0.0;
+            for (size_t i = 0; i < n_faces; ++i) mean_area += face_areas_[i];
+            mean_area = n_faces ? mean_area / n_faces : 1.0;
+            double cell = std::sqrt(std::max(1e-6, 2.0 * mean_area));   // ~ face pitch
+            std::array<double,3> up = origin_shift;
+            double Lu = std::sqrt(up[0]*up[0]+up[1]*up[1]+up[2]*up[2]);
+            if (Lu > 0) { up[0]/=Lu; up[1]/=Lu; up[2]/=Lu; } else { up = {{0,0,1}}; }
+            std::cout << "  [horizon-vis] building heightfield (cell=" << cell
+                      << " m, up=" << up[0] << "," << up[1] << "," << up[2] << ")" << std::endl;
+            horizon_.build(face_centers_, up, cell);
+        }
+    }
+
+    // Optional: smoothed (macroscopic) normals for the VF cosine terms. Raw
+    // per-facet normals on fine rough meshes decouple grazing floor<->rim pairs;
+    // the local-mean normal gives the resolution-independent VF (validated by
+    // bin/vf_hemisphere_mc: floor<->warm 0.0032 macroscopic vs ~0 per-facet at 400k).
+    {
+        const char* sn = std::getenv("PTM_HMATRIX_SMOOTH_NORMALS");
+        use_smoothed_normals_ = (sn && std::atoi(sn) != 0);
+        if (use_smoothed_normals_) {
+            double R = 300.0;
+            if (const char* sr = std::getenv("PTM_HMATRIX_SMOOTH_RADIUS")) {
+                double v = std::atof(sr); if (v > 0) R = v;
+            }
+            std::cout << "  [smooth-normals] computing macroscopic VF normals (radius="
+                      << R << " m)" << std::endl;
+            computeSmoothedNormals(R);
         }
     }
 
@@ -1962,6 +2125,200 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
 }
 
 // ============================================================================
+// Bounded recursive subdivision of a LARGE admissible block
+// ============================================================================
+// Replaces the old "zero the large admissible block" fallback. Bisects the
+// FACE-INDEX LISTS directly (not octree children, which may be leaves) by spatial
+// median, re-attempts ACA on each compact sub-cluster, and computes small leaves
+// as exact sparse -- so crater floor<->wall coupling survives above ~100k faces
+// without the 266 GB single-block RSS balloon. Fan-out is 2 per level and the
+// indices are PARTITIONED (never duplicated), so total work is LINEAR in block
+// size, not the exponential blow-up the old comment feared (that referred to
+// subdividing the 8x8 octree children, not the face lists). RSS is bounded at
+// every level: no ACA runs on a side > aca_cap and each sparse leaf is
+// <= subdiv_leaf_size. Termination is guaranteed -- each level strictly halves
+// the larger dimension, so both reach <= leaf in finite steps where the sparse
+// leaf branch returns; the absolute depth cap is only a paranoia backstop.
+std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildAdmissibleSubdivided(
+    const std::vector<int>& row_faces,
+    const std::vector<int>& col_faces,
+    int subdiv_depth,
+    bool try_aca) {
+
+    const int n_rows = static_cast<int>(row_faces.size());
+    const int n_cols = static_cast<int>(col_faces.size());
+    const size_t leaf = static_cast<size_t>(std::max(1, config_.subdiv_leaf_size));
+    const size_t aca_cap = getAcaCap();
+
+    // Emit one leaf pair: cheap ACA (compact sub-cluster, within cap) else exact
+    // sparse (small enough) else nullptr to signal "recurse". Mirrors the existing
+    // ACA-success and <=500-sparse paths, honoring out-of-core and the zero-flux
+    // index guard. ACA is skipped on the entry block (subdiv_depth == 0): we are
+    // here precisely because ACA on the full block is too big or already failed.
+    auto emit_leaf = [&](const std::vector<int>& rf,
+                         const std::vector<int>& cf) -> std::unique_ptr<HMatrixBlock> {
+        const int rn = static_cast<int>(rf.size());
+        const int cn = static_cast<int>(cf.size());
+        auto blk = std::make_unique<HMatrixBlock>();
+
+        // (a) Compact sub-cluster within the ACA cap: try cheap low-rank first.
+        // Skipped for near-field (inadmissible) reroutes (try_aca=false): those
+        // blocks are not low-rank, so a rank-capped ACA would under-count the
+        // strong floor<->wall coupling and inject small negative entries; we want
+        // exact sparse leaves there.
+        if (try_aca && subdiv_depth > 0 &&
+            (aca_cap == 0 || ((size_t)rn <= aca_cap && (size_t)cn <= aca_cap)) &&
+            rn >= config_.aca_min_block_size && cn >= config_.aca_min_block_size) {
+            LowRankBlock lowrank;
+            auto t0 = std::chrono::high_resolution_clock::now();
+            bool ok = tryCompressToLowRankACA(rf, cf, lowrank, config_.aca_tolerance);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            g_time_svd_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            g_svd_calls++;
+            if (ok) {
+                if (out_of_core_enabled_) {
+                    std::vector<int> rc(rf), cc(cf);
+                    blk->data = writeBlockToDisk(lowrank, rc, cc);
+                    blk->row_indices = rf;
+                    blk->col_indices = cf;
+                    #pragma omp atomic
+                    num_disk_blocks_++;
+                } else {
+                    blk->row_indices = rf;
+                    blk->col_indices = cf;
+                    g_total_index_bytes += (rn + cn) * sizeof(int);
+                    blk->data = std::move(lowrank);
+                    #pragma omp atomic
+                    num_lowrank_blocks_++;
+                }
+                g_subdiv_leaves_lowrank++;
+                return blk;
+            }
+        }
+
+        // (b) Small enough for an exact sparse leaf.
+        if ((size_t)rn <= leaf && (size_t)cn <= leaf) {
+            SparseBlock sparse;
+            computeViewFactorBlock(rf, cf, sparse);
+            if (sparse.values.empty()) {
+                ZeroBlock zero;
+                zero.n_rows = rn;
+                zero.n_cols = cn;
+                blk->data = zero;
+                #pragma omp atomic
+                num_zero_blocks_++;
+                g_subdiv_leaves_zero++;
+            } else {
+                #pragma omp atomic
+                total_nnz_ += sparse.values.size();
+                if (out_of_core_enabled_) {
+                    std::vector<int> rc(rf), cc(cf);
+                    blk->data = writeBlockToDisk(sparse, rc, cc);
+                    blk->row_indices = rf;
+                    blk->col_indices = cf;
+                    #pragma omp atomic
+                    num_disk_blocks_++;
+                } else {
+                    blk->row_indices = rf;
+                    blk->col_indices = cf;
+                    g_total_index_bytes += (rn + cn) * sizeof(int);
+                    blk->data = std::move(sparse);
+                    #pragma omp atomic
+                    num_sparse_blocks_++;
+                }
+                g_subdiv_leaves_sparse++;
+            }
+            return blk;
+        }
+
+        // (c) Still large and ACA didn't take it -> signal "recurse".
+        return nullptr;
+    };
+
+    // Absolute depth backstop (paranoia only; natural termination is guaranteed).
+    // 2^64 faces is absurd, so this never fires for a real mesh; if it ever did,
+    // preserve the legacy OOM safety by zeroing the residual with a warning.
+    constexpr int kAbsDepthCap = 64;
+    if (subdiv_depth >= kAbsDepthCap &&
+        ((size_t)n_rows > leaf || (size_t)n_cols > leaf)) {
+        static std::atomic<int> cap_logs{0};
+        if (cap_logs.fetch_add(1) < 8) {
+            #pragma omp critical(hmatrix_progress)
+            std::cout << "  [subdiv] WARNING depth cap hit, zeroing residual "
+                      << n_rows << "x" << n_cols << " block (last resort)" << std::endl;
+        }
+        auto blk = std::make_unique<HMatrixBlock>();
+        ZeroBlock zero;
+        zero.n_rows = n_rows;
+        zero.n_cols = n_cols;
+        blk->data = zero;
+        #pragma omp atomic
+        num_zero_blocks_++;
+        g_subdiv_depth_cap_zero++;
+        g_aca_fail_to_zero++;   // keep the legacy metric meaningful
+        return blk;
+    }
+
+    // Try to emit THIS pair as a single leaf (cheap ACA or exact sparse).
+    if (auto leaf_blk = emit_leaf(row_faces, col_faces)) {
+        return leaf_blk;
+    }
+
+    // Otherwise spatially bisect the LARGER face list along its longest centroid
+    // extent (median split -> balanced halves -> predictable depth) and recurse.
+    const bool split_rows = (n_rows >= n_cols);
+    const std::vector<int>& src = split_rows ? row_faces : col_faces;
+
+    double lo[3] = { 1e300, 1e300, 1e300 };
+    double hi[3] = { -1e300, -1e300, -1e300 };
+    for (int f : src) {
+        const auto& c = face_centers_[f];
+        for (int a = 0; a < 3; ++a) {
+            lo[a] = std::min(lo[a], c[a]);
+            hi[a] = std::max(hi[a], c[a]);
+        }
+    }
+    int axis = 0;
+    double best_ext = hi[0] - lo[0];
+    for (int a = 1; a < 3; ++a) {
+        double ext = hi[a] - lo[a];
+        if (ext > best_ext) { best_ext = ext; axis = a; }
+    }
+
+    std::vector<int> ordered(src);
+    auto mid = ordered.begin() + ordered.size() / 2;
+    std::nth_element(ordered.begin(), mid, ordered.end(),
+        [&](int p, int q) { return face_centers_[p][axis] < face_centers_[q][axis]; });
+    std::vector<int> a_half(ordered.begin(), mid);
+    std::vector<int> b_half(mid, ordered.end());
+
+    // Degenerate guard: coincident centroids defeat the spatial split -> halve by
+    // index instead (still strictly reduces size, so termination holds).
+    if (a_half.empty() || b_half.empty()) {
+        a_half.assign(src.begin(), src.begin() + src.size() / 2);
+        b_half.assign(src.begin() + src.size() / 2, src.end());
+    }
+
+    auto hier_blk = std::make_unique<HMatrixBlock>();
+    HierarchicalBlock hier;
+    hier.n_rows = n_rows;
+    hier.n_cols = n_cols;
+    // HierarchicalBlock carries no own indices (matvec passes globals to children).
+    hier.children.reserve(2);
+    if (split_rows) {
+        hier.children.push_back(buildAdmissibleSubdivided(a_half, col_faces, subdiv_depth + 1, try_aca));
+        hier.children.push_back(buildAdmissibleSubdivided(b_half, col_faces, subdiv_depth + 1, try_aca));
+    } else {
+        hier.children.push_back(buildAdmissibleSubdivided(row_faces, a_half, subdiv_depth + 1, try_aca));
+        hier.children.push_back(buildAdmissibleSubdivided(row_faces, b_half, subdiv_depth + 1, try_aca));
+    }
+    hier_blk->data = std::move(hier);
+    #pragma omp atomic
+    num_hierarchical_blocks_++;
+    return hier_blk;
+}
+
+// ============================================================================
 // Octree version of buildBlock (3D spatial partitioning)
 // ============================================================================
 
@@ -2098,11 +2455,24 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
             // could trigger). Admissible (well-separated) blocks contribute little
             // and the code already zeros large ACA failures, so we zero these up
             // front. Tunable via PTM_HMATRIX_ACA_CAP (faces per side; 0 = off).
-            static const size_t aca_cap = [](){
-                const char* e = std::getenv("PTM_HMATRIX_ACA_CAP");
-                return e ? std::strtoul(e, nullptr, 10) : 12000UL;
-            }();
+            const size_t aca_cap = getAcaCap();
             if (aca_cap && ((size_t)n_rows > aca_cap || (size_t)n_cols > aca_cap)) {
+                // Large admissible block: ACA on it would balloon RSS. Instead of
+                // zeroing (which decouples crater floor<->wall above ~100k faces),
+                // bisect the face-index lists and re-attempt ACA on compact
+                // sub-clusters (bounded RSS). OFF reproduces the legacy zero.
+                if (subdivideEnabled(config_)) {
+                    static std::atomic<int> sub_logs{0};
+                    if (sub_logs.fetch_add(1) < 8) {
+                        #pragma omp critical(hmatrix_progress)
+                        std::cout << "  [subdiv] bisecting large admissible block "
+                                  << n_rows << "x" << n_cols
+                                  << " (> aca_cap " << aca_cap << ") instead of zeroing"
+                                  << std::endl;
+                    }
+                    g_admissible_subdivided++;
+                    return buildAdmissibleSubdivided(row_faces, col_faces, /*subdiv_depth=*/0);
+                }
                 static std::atomic<int> capped_logs{0};
                 if (capped_logs.fetch_add(1) < 8) {
                     #pragma omp critical(hmatrix_progress)
@@ -2204,8 +2574,14 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                 }
                 return block;
             } else {
-                // Large admissible block where ACA failed - treat as zero
-                // This is the key fix: prevents memory explosion from subdivision
+                // Large admissible block where ACA failed. Bisect the face-index
+                // lists and re-attempt ACA on compact sub-clusters instead of
+                // zeroing (which decoupled crater floor<->wall above ~100k faces).
+                // OFF reproduces the legacy zero behavior for A/B verification.
+                if (subdivideEnabled(config_)) {
+                    g_admissible_subdivided++;
+                    return buildAdmissibleSubdivided(row_faces, col_faces, /*subdiv_depth=*/0);
+                }
                 g_aca_fail_to_zero++;
                 ZeroBlock zero;
                 zero.n_rows = n_rows;
@@ -2360,6 +2736,18 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
 
     if (config_.compression_method == CompressionMethod::ACA &&
         (n_rows > max_sparse_size || n_cols > max_sparse_size)) {
+        // Inadmissible (near-field) block too large for a single sparse compute.
+        // This is the strongest, most important coupling (e.g. crater floor <->
+        // nearby wall): zeroing it under-radiates PSR floors above ~100k faces,
+        // where the coplanar floor cannot be split in Z by the octree and its
+        // near-field blocks stay > max_sparse_size after hierarchical subdivision.
+        // Bisect the face-index lists and compute bounded sparse leaves instead of
+        // zeroing. OFF (or PTM_HMATRIX_SPARSE_CAP) reproduces the legacy zero.
+        if (subdivideEnabled(config_)) {
+            g_admissible_subdivided++;
+            return buildAdmissibleSubdivided(row_faces, col_faces, /*subdiv_depth=*/0,
+                                             /*try_aca=*/false);
+        }
         g_sparse_fallback_skipped++;
         ZeroBlock zero;
         zero.n_rows = n_rows;
@@ -2707,7 +3095,7 @@ void HMatrixViewFactor::computeViewFactorBlock(
     for (size_t i = 0; i < row_faces.size(); ++i) {
         int face_i = row_faces[i];
         const auto& c_i = face_centers_[face_i];
-        const auto& n_i = face_normals_[face_i];
+        const auto& n_i = vfNormal(face_i);
 
         row_candidates[i].reserve(reserve_per_row);
 
@@ -2716,7 +3104,7 @@ void HMatrixViewFactor::computeViewFactorBlock(
             if (face_i == face_j) continue;
 
             const auto& c_j = face_centers_[face_j];
-            const auto& n_j = face_normals_[face_j];
+            const auto& n_j = vfNormal(face_j);
             double A_j = face_areas_[face_j];
 
             // Geometric culling
@@ -2769,7 +3157,7 @@ void HMatrixViewFactor::computeViewFactorBlock(
                 c_i[1] + offset * dir[1],
                 c_i[2] + offset * dir[2]
             }};
-            cand.dir = dir;
+            { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
 
             double end_margin = std::max(r * 0.001, absolute_offset);
             end_margin = std::min(end_margin, r * 0.1);
@@ -2815,7 +3203,16 @@ void HMatrixViewFactor::computeViewFactorBlock(
 
         if (!ray_candidates.empty()) {
             std::vector<bool> ray_visible;
-            batchedVisibilityTest(scene_, ray_candidates, ray_visible);
+            if (use_horizon_vis_ && horizon_.built()) {
+                // Heightfield-horizon occlusion (robust at grazing tangent).
+                ray_visible.assign(ray_candidates.size(), true);
+                for (size_t kk = 0; kk < ray_candidates.size(); ++kk)
+                    ray_visible[kk] = !horizon_.occluded(
+                        row_faces[ray_candidates[kk].local_row],
+                        col_faces[ray_candidates[kk].local_col]);
+            } else {
+                batchedVisibilityTest(scene_, ray_candidates, ray_visible);
+            }
 
             for (size_t k = 0; k < ray_candidates.size(); ++k) {
                 visible[ray_indices[k]] = ray_visible[k];
@@ -3046,7 +3443,7 @@ void HMatrixViewFactor::computeViewFactorRow(
 
     int face_i = row_faces[local_row];
     const auto& c_i = face_centers_[face_i];
-    const auto& n_i = face_normals_[face_i];
+    const auto& n_i = vfNormal(face_i);
 
     // Collect candidates that pass geometric culling
     std::vector<RayCandidate> candidates;
@@ -3057,7 +3454,7 @@ void HMatrixViewFactor::computeViewFactorRow(
         if (face_i == face_j) continue;
 
         const auto& c_j = face_centers_[face_j];
-        const auto& n_j = face_normals_[face_j];
+        const auto& n_j = vfNormal(face_j);
         double A_j = face_areas_[face_j];
 
         // Geometric culling (same as computeViewFactorBlock)
@@ -3102,7 +3499,7 @@ void HMatrixViewFactor::computeViewFactorRow(
             c_i[1] + offset * dir[1],
             c_i[2] + offset * dir[2]
         }};
-        cand.dir = dir;
+        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
 
         double end_margin = std::max(r * 0.001, absolute_offset);
         end_margin = std::min(end_margin, r * 0.1);
@@ -3159,7 +3556,7 @@ void HMatrixViewFactor::computeViewFactorColumn(
 
     int face_j = col_faces[local_col];
     const auto& c_j = face_centers_[face_j];
-    const auto& n_j = face_normals_[face_j];
+    const auto& n_j = vfNormal(face_j);
     double A_j = face_areas_[face_j];
 
     // Collect candidates that pass geometric culling
@@ -3171,7 +3568,7 @@ void HMatrixViewFactor::computeViewFactorColumn(
         if (face_i == face_j) continue;
 
         const auto& c_i = face_centers_[face_i];
-        const auto& n_i = face_normals_[face_i];
+        const auto& n_i = vfNormal(face_i);
 
         // Geometric culling (same as computeViewFactorBlock)
         auto r_vec = subtract(c_j, c_i);
@@ -3216,7 +3613,7 @@ void HMatrixViewFactor::computeViewFactorColumn(
             c_i[1] + offset * dir[1],
             c_i[2] + offset * dir[2]
         }};
-        cand.dir = dir;
+        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
 
         double end_margin = std::max(r * 0.001, absolute_offset);
         end_margin = std::min(end_margin, r * 0.1);
@@ -3324,7 +3721,23 @@ bool HMatrixViewFactor::tryCompressToLowRankACA(
             }
         }
 
-        if (j_pivot < 0) break;  // No valid pivot found
+        if (j_pivot < 0) {
+            // Robust ACA pivoting. The current row's residual is zero on all
+            // unused columns (e.g. a floor face that is fully occluded from this
+            // wall cluster, common with visibility-structured view-factor blocks).
+            // A naive ACA stops here and returns rank 0, after which the caller
+            // ZEROS the entire large admissible block -- discarding the
+            // floor<->wall IR coupling for every other face in it (the PSR-floor
+            // decoupling seen at >100k faces). Instead, skip to the next unused
+            // row and retry without consuming a rank term. Bounded by m skips.
+            used_rows[i_pivot] = true;
+            int alt = -1;
+            for (int i = 0; i < m; ++i) { if (!used_rows[i]) { alt = i; break; } }
+            if (alt < 0) break;   // every row exhausted -> genuinely empty block
+            i_pivot = alt;
+            --k;                  // this sweep produced no rank-1 update
+            continue;
+        }
 
         double gamma = row_vec[j_pivot];
 
@@ -3468,8 +3881,8 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
 
     const auto& c_i = face_centers_[face_i];
     const auto& c_j = face_centers_[face_j];
-    const auto& n_i = face_normals_[face_i];
-    const auto& n_j = face_normals_[face_j];
+    const auto& n_i = vfNormal(face_i);
+    const auto& n_j = vfNormal(face_j);
     double A_j = face_areas_[face_j];
 
     auto r_vec = subtract(c_j, c_i);
@@ -3538,8 +3951,8 @@ double HMatrixViewFactor::computeViewFactorRefined(int fi, int fj) const {
     const auto& b0 = mesh_->vertices[Fj[0]];
     const auto& b1 = mesh_->vertices[Fj[1]];
     const auto& b2 = mesh_->vertices[Fj[2]];
-    const auto& n_i = face_normals_[fi];
-    const auto& n_j = face_normals_[fj];
+    const auto& n_i = vfNormal(fi);
+    const auto& n_j = vfNormal(fj);
     const double A_i = face_areas_[fi];
     const double A_j = face_areas_[fj];
 

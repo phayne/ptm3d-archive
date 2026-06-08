@@ -387,6 +387,29 @@ bool testReciprocity(const ViewFactorMatrix& F,
         }
     }
 
+    // Recompute the unconditional max relative residual across ALL significant
+    // pairs, so the validation log always carries a number for the methods paper.
+    double overall_max_err = 0.0;
+    double overall_sum_err = 0.0;
+    size_t overall_count = 0;
+    for (size_t i = 0; i < F.numRows(); ++i) {
+        std::vector<int> cols2;
+        std::vector<double> vals2;
+        F.getRow(static_cast<int>(i), cols2, vals2);
+        for (size_t k = 0; k < cols2.size(); ++k) {
+            int j = cols2[k];
+            double F_ij = vals2[k];
+            double F_ji = F.get(j, static_cast<int>(i));
+            if (F_ij < min_significant && F_ji < min_significant) continue;
+            double e = std::abs(areas[i] * F_ij - areas[j] * F_ji) /
+                       std::max(1e-30, 0.5 * (areas[i] * F_ij + areas[j] * F_ji));
+            overall_max_err = std::max(overall_max_err, e);
+            overall_sum_err += e;
+            ++overall_count;
+        }
+    }
+    double overall_mean_err = overall_count ? (overall_sum_err / overall_count) : 0.0;
+
     if (error_count > 0) {
         std::cerr << "  Total reciprocity violations: " << error_count
                   << " (skipped " << small_value_count << " small values)"
@@ -396,6 +419,10 @@ bool testReciprocity(const ViewFactorMatrix& F,
         std::cout << "  Checked " << (F.numNonZeros() - small_value_count)
                   << " significant pairs (skipped " << small_value_count << " small)" << std::endl;
     }
+    std::cout << "  Max relative residual (full scan): "
+              << (overall_max_err * 100) << "%"
+              << "   mean: " << (overall_mean_err * 100) << "%"
+              << "   over " << overall_count << " significant pairs" << std::endl;
 
     return passed;
 }

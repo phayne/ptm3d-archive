@@ -128,6 +128,22 @@ struct SimulationConfig {
         std::string initial_state_file = "";
         std::string final_state_file   = "";
 
+        // Deep radiation-coupling, two-pass scheme (fixes the cold-PSR-floor
+        // bias from equilibrating the deep column WITHOUT the radiosity
+        // indirect flux). Orchestrated as two binary runs:
+        //  - indirect_mean_out_file: if non-empty, after the radiation-coupling
+        //    Picard loop, write the per-face OUTPUT-window time-mean indirect
+        //    flux <q_ind>[f] (W/m^2) to this binary file.
+        //  - eq_indirect_flux_file: if non-empty, load per-face <q_ind>[f] from
+        //    this file and ADD it to the EQUILIBRATION-phase absorbed flux only
+        //    (the output window already gets the time-varying indirect via the
+        //    coupling), so the deep column equilibrates consistent with the
+        //    wall-heating forcing.
+        // Format: uint32 magic 0x51494E44 ('QIND'), uint32 n_faces, then
+        //   n_faces float64 values (per global face id).
+        std::string indirect_mean_out_file = "";
+        std::string eq_indirect_flux_file  = "";
+
         // Schorghofer & Taylor (2007) ice-stability output. When enabled,
         // the thermal solver accumulates time-averaged sublimation rate
         // ⟨E(T(z,t))⟩ at each native depth node during the integration
@@ -236,6 +252,10 @@ struct SimulationConfig {
         // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;
+        // Anisotropic (roughness-beamed) thermal emission, Smith 1967.
+        // 0 (default) = Lambertian, byte-identical. RMS micro-slope [deg].
+        double rms_slope_deg = 0.0;
+        double beam_vf_threshold = 1e-7;
         // Multi-GPU radiosity dispatch (mirrors thermal pool config).
         // Per-timestep solves are independent so the timestep-batch can be
         // split across N GPUs. Default == 1 preserves legacy single-GPU
@@ -309,6 +329,13 @@ struct SimulationConfig {
     struct ThermophysicalParams {
         bool albedo_explicit = false;
         double constant_thermal_inertia = -1.0;  // >0: constant TI mode (chi=0, cp=const)
+        // Optional scalar overrides applied to the body Planet after construction
+        // (Moon/SPICE path included). Sentinel <0 (or <0 for albedo) = leave the
+        // body default untouched. Used for property sensitivity sweeps.
+        double albedo_override = -1.0;      // >=0: override Bond albedo A0
+        double emissivity_override = -1.0;  // >0:  override emissivity
+        double ks_override = -1.0;          // >0:  override surface conductivity ks
+        double kd_override = -1.0;          // >0:  override deep conductivity kd
     } thermophysical;
 
     // Legacy accessor (for compatibility)

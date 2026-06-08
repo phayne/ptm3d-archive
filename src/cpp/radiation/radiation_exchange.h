@@ -220,6 +220,21 @@ private:
     std::vector<std::array<double, 3>> face_centers_;
 };
 
+// One emitter->receiver beam pair for the Smith (1967) anisotropic thermal-
+// emission pass. Built once in prepare() (only when rms_slope_deg > 0), pruned
+// to sunlit-wall (emitter j) -> shadowed-floor (receiver i) pairs. The beamed
+// correction redistributes each wall's fixed total emission (epsilon sigma T^4)
+// angularly: hot Sun-facing micro-facets beam IR preferentially toward the Sun,
+// which at the lunar pole (grazing Sun, wall sloped toward floor) enhances
+// wall->floor IR. See addBeamedFlux().
+struct BeamPair {
+    int i;                       // receiver face (shadowed floor)
+    int j;                       // emitter face (sunlit wall)
+    float Fhat_ij;               // renormalized VF weight (matches radiosity)
+    float cos_e;                 // emission-angle cosine n_j . dir_ji (fixed)
+    std::array<float, 3> dir_ji; // unit emitter->receiver direction (body frame)
+};
+
 // Main radiation exchange manager
 // Coordinates view factor computation, radiosity solving, and thermal integration
 class RadiationExchangeManager {
@@ -253,6 +268,16 @@ public:
         const std::vector<double>& temperatures,
         const std::vector<double>& solar_flux);
 
+    // Overload with the current Sun direction (unit, body-fixed frame). Required
+    // for the Smith anisotropic-emission pass (rms_slope_deg > 0); the beamed
+    // wall->floor enhancement is Sun-direction-dependent. When rms_slope_deg == 0
+    // this is byte-identical to the 2-arg overload. The 2-arg overload delegates
+    // here with sun_dir = {0,0,0} (beaming inactive).
+    std::vector<double> computeIndirectFlux(
+        const std::vector<double>& temperatures,
+        const std::vector<double>& solar_flux,
+        const std::array<double, 3>& sun_dir);
+
     // Compute indirect radiation for a batch of timesteps (multi-GPU path).
     // Inputs are [n_timesteps][n_faces]; output mirrors the shape.
     // When the underlying RadiositySolver has a GPU pool, the batch is
@@ -262,6 +287,15 @@ public:
     std::vector<std::vector<double>> computeIndirectFluxBatch(
         const std::vector<std::vector<double>>& temperatures_per_timestep,
         const std::vector<std::vector<double>>& solar_flux_per_timestep);
+
+    // Batch overload with per-timestep Sun directions (unit, body-fixed). When
+    // rms_slope_deg > 0 the Smith beamed pass is applied per timestep after the
+    // (multi-GPU) radiosity solve. sun_dirs.size() must equal the batch length.
+    // Empty sun_dirs (or rms_slope_deg == 0) => identical to the 2-arg overload.
+    std::vector<std::vector<double>> computeIndirectFluxBatch(
+        const std::vector<std::vector<double>>& temperatures_per_timestep,
+        const std::vector<std::vector<double>>& solar_flux_per_timestep,
+        const std::vector<std::array<double, 3>>& sun_dirs);
 
     // True iff multi-GPU radiosity dispatch is active.
     bool hasGPUPool() const;
@@ -340,6 +374,32 @@ private:
 
     // Work arrays
     std::vector<double> indirect_flux_;
+
+    // --- Smith (1967) anisotropic beamed thermal emission ---------------------
+    // All inactive unless config_.rms_slope_deg > 0 (beam_active_ == false).
+    bool beam_active_ = false;
+    double chi_w_rad_ = 0.0;                       // RMS micro-slope [rad]
+    std::vector<BeamPair> beam_pairs_;             // sunlit-wall -> shadowed-floor
+    std::vector<std::array<float, 3>> beam_normals_; // per-face mean normals (float)
+    // Directional emission factor chi(cos_sun, cos_e, cos_psi) on a regular grid.
+    // cos_sun = n_j.s_hat in [0,1]; cos_e = n_j.dir_ji in [0,1]; cos_psi = dir_ji.s_hat in [-1,1].
+    // Energy-normalized: cos_e-weighted hemispherical mean of chi == 1.
+    std::vector<float> chi_table_;
+    int chi_ns_ = 0, chi_ne_ = 0, chi_npsi_ = 0;
+
+    // Build the chi lookup table by Gaussian quadrature over the Smith facet-
+    // slope distribution (called once in prepare() when rms_slope_deg > 0).
+    void buildChiTable();
+    // Build the pruned sunlit-wall -> shadowed-floor beam-pair list (geometry +
+    // Embree visibility), renormalized to match the radiosity VF weights.
+    void buildBeamPairs();
+    // Add the per-timestep beamed correction: for each pair,
+    //   flux[i] += eps_i * eps_j * sigma * T_j^4 * Fhat_ij * (chi - 1).
+    void addBeamedFlux(const std::vector<double>& temperatures,
+                       const std::array<double, 3>& sun_dir,
+                       std::vector<double>& flux) const;
+    // Trilinear lookup into chi_table_; returns 1.0 outside the active domain.
+    float lookupChi(double cos_sun, double cos_e, double cos_psi) const;
 };
 
 } // namespace radiation
