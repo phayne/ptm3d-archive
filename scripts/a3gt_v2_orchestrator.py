@@ -136,6 +136,18 @@ def window_is_complete(window_dir_: Path) -> bool:
     return (window_dir_ / "statistics" / "temperature_avg.bin").is_file()
 
 
+def site_is_composited(site_dir_: Path) -> bool:
+    """A site is fully done once a3gt_v2_merge_sparse.py has written the
+    site-root composite (statistics/temperature_avg.bin + summary.json).
+
+    That merge step ALSO deletes the per-window dirs to reclaim disk, so
+    window_is_complete() finds no surviving marker for any window of a
+    finished site and run_window() would (wrongly) recompute all of them
+    on resume. Guard on the site-root composite to skip the whole site."""
+    return ((site_dir_ / "statistics" / "temperature_avg.bin").is_file()
+            and (site_dir_ / "summary.json").is_file())
+
+
 # --------------------------------------------------------------------------
 # Mesh build (Phase 1)
 # --------------------------------------------------------------------------
@@ -220,7 +232,8 @@ def render_yaml(template_text: str, *, start_time: str, duration_days: float,
 def write_window_yaml(site: dict, window: dict, mesh: Path,
                        template_text: str,
                        vf_file: Path | None = None,
-                       occluder: Path | None = None) -> Path:
+                       occluder: Path | None = None,
+                       steps_per_day: float = 24.0) -> Path:
     """Render the per-window YAML to disk and return its path."""
     yaml_path = window_yaml_path(site["ellipse_id"], window["tag"])
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,7 +241,7 @@ def write_window_yaml(site: dict, window: dict, mesh: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     duration = window["duration_days"]
-    timesteps = int(round(duration * 24))  # hourly cadence
+    timesteps = int(round(duration * steps_per_day))  # cadence = samples/Earth-day
     rendered = render_yaml(
         template_text,
         start_time=window["start_iso"],
@@ -301,7 +314,8 @@ def _catalog_for(manifest: dict) -> dict | None:
 
 def resolve_site_dem(site: dict, manifest: dict, catalog: dict | None,
                      dry_run: bool, clip_radius_km: float, *,
-                     include_lola: bool = True, tag: str = "") -> Path:
+                     include_lola: bool = True, tag: str = "",
+                     sfs: bool = True) -> Path:
     """Per-site DEM: a lazily-built ``-te``-clipped VRT (catalog mode) or
     the legacy single DEM.
 
@@ -328,8 +342,15 @@ def resolve_site_dem(site: dict, manifest: dict, catalog: dict | None,
     if vrt.exists():
         return vrt
     by_id = {d["id"]: d for d in catalog["dems"]}
-    ranked = [by_id[d["id"]] for d in site.get("dems", [])
-              if d.get("role") != "base" and d["id"] in by_id]
+    # The occluder ring is a COARSE LOLA-resolution annulus (it never enters
+    # the radiosity, only the shadow BVH). Including the 1 m SfS forces the
+    # DTM tool to read a 1 m grid over the whole R_ext extent — ~10 GB at
+    # R_ext=20 km but ~100+ GB at R_ext=82 km (it materialized that and filled
+    # the disk). `sfs=False` builds a LOLA-only (~80 m) ring VRT; the ring is
+    # sampled at hundreds of metres regardless, so the occluder is unaffected.
+    ranked = ([by_id[d["id"]] for d in site.get("dems", [])
+               if d.get("role") != "base" and d["id"] in by_id]
+              if sfs else [])
     lola = catalog.get("lola_base") if include_lola else None
     if dry_run:
         print(f"  [{site['ellipse_id']}] (dry-run) VRT {vrt.name} "
@@ -403,7 +424,8 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                                         r_core, include_lola=True,
                                         tag="corelola")
         ring_vrt = resolve_site_dem(site, manifest, catalog, args.dry_run,
-                                    r_ext, include_lola=True, tag="ring")
+                                    r_ext, include_lola=True, tag="ring",
+                                    sfs=False)
     except (ValueError, RuntimeError) as e:
         print(f"  [{site['ellipse_id']}] SKIP: DEM unavailable ({e})",
               file=sys.stderr)
@@ -416,6 +438,32 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                            max_points=args.roi_max_points,
                            density_exp=args.density_exp,
                            dem_override=core_dem)
+    # Empty-SfS-core fallback: resolve_site_dem can succeed (a covering SfS
+    # DEM exists) yet the dtm tool emits a 0-face PLY when SfS pixels are
+    # too sparse / holed inside R_core. Catch that and retry with a LOLA-
+    # underlaid core DEM, same fallback the no-SfS-at-center branch uses.
+    if (not args.dry_run and core_mesh and Path(core_mesh).exists()
+            and read_n_faces(Path(core_mesh)) == 0):
+        print(f"  [{site['ellipse_id']}] SfS core produced 0 faces "
+              f"(sparse SfS coverage at center) — LOLA-resolution core "
+              f"fallback", file=sys.stderr)
+        try:
+            core_dem = resolve_site_dem(site, manifest, catalog, args.dry_run,
+                                        r_core, include_lola=True,
+                                        tag="corelola")
+        except (ValueError, RuntimeError) as e:
+            print(f"  [{site['ellipse_id']}] SKIP: LOLA core DEM unavailable "
+                  f"({e})", file=sys.stderr)
+            return None, None
+        core_mesh = build_mesh(site, dry_run=args.dry_run, roi_km=r_core,
+                               core_frac=args.roi_core_frac,
+                               max_points=args.roi_max_points,
+                               density_exp=args.density_exp,
+                               dem_override=core_dem)
+        if read_n_faces(Path(core_mesh)) == 0:
+            print(f"  [{site['ellipse_id']}] SKIP: LOLA core also produced "
+                  f"0 faces", file=sys.stderr)
+            return None, None
     ring_ply = (MESH_DIR / f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
                 f"{site['lon_deg']:.3f}E_ring_Rcore{r_core:g}"
                 f"_Rext{r_ext:g}km.ply")
@@ -426,6 +474,7 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
     try:
         build_ring(float(site["lat_deg"]), float(site["lon_deg"]), ring_vrt,
                    ring_ply, r_core_km=r_core, r_ext_km=r_ext,
+                   ring_max_points=args.ring_max_points,
                    dry_run=args.dry_run)
     except (RuntimeError, ValueError) as e:
         print(f"  [{site['ellipse_id']}] SKIP: ring build failed ({e})",
@@ -494,6 +543,12 @@ def main() -> int:
     p.add_argument("--r-ext-hard-cap-km", type=float, default=20.0,
                    help="Hard upper cap on the extended radius (20 km: "
                         "near-field occluders + tractable VRT/mesh build).")
+    p.add_argument("--ring-max-points", type=int, default=80_000,
+                   help="Occluder-ring point budget (default 80k). Raise for "
+                        "finer distant-horizon shadows on a large R_ext.")
+    p.add_argument("--steps-per-day", type=float, default=24.0,
+                   help="Output samples per Earth-day (cadence). 24=hourly "
+                        "(default), 48=30-min, 144=10-min.")
     p.add_argument("--density-exp-ring", type=float, default=None,
                    help="Override the calibrated ring density exponent "
                         "(default 1.5, calibrated 2026-05-16).")
@@ -589,11 +644,23 @@ def main() -> int:
         if vf_file is not None:
             vf_file.parent.mkdir(parents=True, exist_ok=True)
 
+        # Site-level resume guard: if the composite merge already ran for
+        # this site, its per-window dirs were deleted by the merge step,
+        # so the per-window check below would recompute the entire site.
+        # Skip the whole site instead (idempotent resume).
+        if (not args.dry_run
+                and site_is_composited(OUTPUT_ROOT / s["ellipse_id"])):
+            print(f"  [{s['ellipse_id']}] site composite present "
+                  f"(statistics/ + summary.json) — skipping all "
+                  f"{len(windows)} windows")
+            continue
+
         site_windows_ok = 0
         for j, w in enumerate(windows):
             yaml_path = write_window_yaml(s, w, core_mesh, template_text,
                                            vf_file=vf_file,
-                                           occluder=occluder)
+                                           occluder=occluder,
+                                           steps_per_day=args.steps_per_day)
             ok = run_window(s, w, yaml_path, dry_run=args.dry_run,
                              chunk_timeout_min=args.chunk_timeout_min)
             done_idx = i * len(windows) + j + 1
