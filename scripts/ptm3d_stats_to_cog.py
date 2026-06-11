@@ -113,7 +113,24 @@ def main():
                              "but doesn't compose well across sites).")
     parser.add_argument('--resume', action='store_true',
                         help="Skip output files that already exist")
+    parser.add_argument('--nodata-value', default='-3.4028235e+38',
+                        help="Nodata fill for pixels outside the mesh. Default "
+                             "is the float32 sentinel -3.4028235e+38, which "
+                             "every GIS reliably renders as transparent. Pass "
+                             "'nan' for the legacy NaN convention (some viewers "
+                             "paint NaN as the color-ramp minimum, e.g. "
+                             "ice_depth 0 = spurious surface ice in the corners "
+                             "outside the circular mesh).")
     args = parser.parse_args()
+
+    nv = args.nodata_value
+    if isinstance(nv, str) and nv.strip().lower() == 'nan':
+        nodata_value = float('nan')
+    else:
+        try:
+            nodata_value = float(nv)
+        except (TypeError, ValueError):
+            sys.exit(f"ERROR: invalid --nodata-value {nv!r} (number or 'nan')")
 
     mesh_path = Path(args.mesh).resolve()
     stats_dir = Path(args.stats).resolve()
@@ -249,6 +266,7 @@ def main():
                 blocksize=args.blocksize, compress=args.compress,
                 overview_resampling=args.overview_resampling,
                 interpolation=args.interpolation,
+                nodata_value=nodata_value,
             )
         except Exception as exc:
             print(f"      FAIL  {field_name:30s} ({type(exc).__name__}: {exc})",

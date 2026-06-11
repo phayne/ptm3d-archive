@@ -216,11 +216,21 @@ def _pick_overview_levels(width, height, blocksize):
 
 # --- Main export -----------------------------------------------------------
 
+# Default nodata for out-of-mesh / invalid pixels. A numeric sentinel
+# (float32 -FLT_MAX) rather than NaN: every GIS reliably honors a numeric
+# nodata as transparent, whereas float NaN nodata is silently rendered as the
+# color-ramp minimum by many viewers (e.g. ice_depth 0 -> spurious "ice at the
+# surface" in the rectangular corners outside the circular mesh). Pass
+# nodata_value=float('nan') to restore the legacy NaN convention.
+DEFAULT_NODATA = float(np.finfo(np.float32).min)  # -3.4028235e+38
+
+
 def export_field(output_path, face_values, regridder, field_name,
                  *, blocksize=512, compress='LZW',
                  overview_resampling='AVERAGE',
                  software='PTM3D',
-                 interpolation='linear'):
+                 interpolation='linear',
+                 nodata_value=DEFAULT_NODATA):
     """Regrid ``face_values`` and write a COG to ``output_path``.
 
     Args:
@@ -252,6 +262,15 @@ def export_field(output_path, face_values, regridder, field_name,
     stats_tags = _compute_stats_tags(grid_flipped)
     created = datetime.now().isoformat()
 
+    # Replace non-finite (out-of-mesh / invalid) pixels with the nodata
+    # sentinel AFTER stats are computed from the NaN mask, so a finite sentinel
+    # can never inflate the valid-percent or skew the min/max/mean tags. When
+    # nodata_value is itself NaN (legacy mode) this is a no-op.
+    if np.isfinite(nodata_value):
+        grid_flipped = np.where(
+            np.isfinite(grid_flipped), grid_flipped, np.float32(nodata_value)
+        ).astype(np.float32, copy=False)
+
     output_path = str(output_path)
     output_dir = os.path.dirname(output_path) or '.'
     os.makedirs(output_dir, exist_ok=True)
@@ -279,7 +298,7 @@ def export_field(output_path, face_values, regridder, field_name,
 
             band = ds.GetRasterBand(1)
             band.WriteArray(grid_flipped)
-            band.SetNoDataValue(float('nan'))
+            band.SetNoDataValue(float(nodata_value))
             band.SetDescription(band_desc)
             for k, v in stats_tags.items():
                 band.SetMetadataItem(k, v)
