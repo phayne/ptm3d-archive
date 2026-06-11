@@ -792,6 +792,19 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     surfTemp(*this, Qs);
     if (Qb != 0.0) botTemp(*this, Qb);
 
+    // Geothermal-equilibrium floor (mirrors the GPU persistent kernel). In
+    // steady darkness the surface radiates the interior heat flux Qb, so no
+    // node can sustain a temperature below T_geo = (Qb/(eps*sigma))^0.25. The
+    // under-resolved CN substep at a sharp sunlit->shadow transition lets the
+    // upper column drift numerically below this physical floor; clamping the
+    // finalize loop at T_lo = max(CMB, T_geo) corrects only that sub-floor
+    // drift (real PSR floors converge to T_geo from above -> no-op). Per-face,
+    // physics-set, NOT the arbitrary [3,500] K clamp.
+    const double sigma_sb = config ? config->sigma : 5.670374419e-8;
+    const double T_geo = (Qb > 0.0)
+        ? std::sqrt(std::sqrt(Qb / (emissivity * sigma_sb))) : 0.0;
+    const double T_lo = std::max(ABSOLUTE_ZERO_K, T_geo);
+
     const size_t n_tot = grid.T.size();
     if (n_tot < 3) return;            // need at least 1 interior node
     const size_t n_int = n_tot - 2;   // number of interior nodes
@@ -1030,7 +1043,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
         return;
     }
@@ -1084,7 +1097,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
         return;
     }
@@ -1242,7 +1255,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     #pragma omp parallel for schedule(static) if(n_tot > 1024)
     for (size_t i = 0; i < n_tot; ++i) {
         if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-        Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+        Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
     }
 }
 
@@ -2337,6 +2350,25 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     buildTridiagonalSystemBatch(*this, dt);
     solveThomasBatchSIMD(*this);
     applyBottomBCBatch(*this);
+
+    // Geothermal-equilibrium floor (mirrors the GPU persistent kernel and the
+    // scalar Profile::update_T path). In steady darkness the surface radiates
+    // the interior heat flux Qb, so no node can sustain a temperature below
+    // T_geo = (Qb/(eps*sigma))^0.25. The under-resolved CN substep at a sharp
+    // sunlit->shadow transition lets the upper column of a low-inertia face
+    // drift numerically below this physical floor; clamping each face's column
+    // at T_geo corrects only that sub-floor drift (real PSR floors converge to
+    // T_geo from above -> no-op). Per-face, physics-set, NOT a fixed clamp.
+    for (int f = 0; f < n_faces; ++f) {
+        const double qb = Qb[f];
+        if (qb <= 0.0) continue;
+        const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
+        if (T_geo <= ABSOLUTE_ZERO_K) continue;
+        for (int layer = 0; layer < n_layers; ++layer) {
+            double& Tlf = T[layer * THERMAL_BATCH_SIZE + f];
+            if (Tlf < T_geo) Tlf = T_geo;
+        }
+    }
 }
 
 // Initialize batch grid from z-grid vector

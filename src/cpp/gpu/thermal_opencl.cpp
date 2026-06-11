@@ -278,6 +278,14 @@ __kernel void persistentThermalKernel(
     float eps = emissivity[face];
     float Q_bottom = Qb[face];  // Interior heat flux (W/m²)
 
+    // Geothermal-equilibrium temperature: the coldest a surface radiating
+    // against the interior heat flux Qb can sustain in steady darkness,
+    // T_geo = (Qb/(eps*sigma))^0.25 (all of Qb exits at the surface as
+    // radiation). Used as a physics-based low-side floor at the end of each
+    // substep; 0 (disabled) when Qb <= 0.
+    float T_geo = (Q_bottom > 0.0f)
+        ? native_sqrt(native_sqrt(Q_bottom / (eps * sigma))) : 0.0f;
+
     // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
     // Need to compute kappa first to get stable dt
     // Use initial temperature to estimate kappa
@@ -518,6 +526,27 @@ __kernel void persistentThermalKernel(
             for (int i = 0; i < n_layers; ++i) {
                 if (!isfinite(T_local[i])) {
                     T_local[i] = 200.0f;  // last-resort recovery, should never fire
+                }
+            }
+
+            // Geothermal-equilibrium floor (physics-based, NOT an arbitrary
+            // [3,500] K clamp). The substep dt is fixed from the initial
+            // column and capped at N_SUBSTEPS_MAX for the GPU watchdog, so it
+            // under-resolves the ~minute surface skin response. At a sharp
+            // sunlit->shadow flux drop on a low-inertia face the upper column
+            // cools faster than the under-resolved conduction can resupply
+            // heat from below, drifting numerically below the physical night
+            // floor (recorded as spurious ~5-24 K minima on faces that are
+            // otherwise sunlit, Tavg~100 K). The interior heat flux Qb sets a
+            // hard lower bound: in steady darkness the surface radiates Qb, so
+            // no node can sustain a temperature below T_geo = (Qb/(eps*sigma))
+            // ^0.25 (~24 K here). Real PSR floors converge to T_geo from
+            // ABOVE, so this is a no-op for them; only the sub-floor numerical
+            // undershoot is corrected. Per-face and physics-set, so it does
+            // not bound results to a fixed range or perturb the bulk solution.
+            if (T_geo > 0.0f) {
+                for (int i = 0; i < n_layers; ++i) {
+                    T_local[i] = fmax(T_local[i], T_geo);
                 }
             }
         }  // End of sub-stepping loop
