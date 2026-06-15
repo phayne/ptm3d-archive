@@ -2910,8 +2910,19 @@ double IlluminationModel::calculateSafeRayOffset(
     const std::array<double, 3>& face_center, 
     const std::array<double, 3>& /*face_normal*/) const 
 {
-    // Scale-aware offset in meters: robust across global meshes and DEM roughness
-    const double r = vectorLength(face_center);                     // local radius [m]
+    // Scale-aware offset in meters: robust across global meshes and DEM roughness.
+    // The radius MUST be measured in the same recentered frame the Embree/BVH scene
+    // lives in (scene_origin_offset_ is subtracted in initializeScene), exactly as the
+    // sibling estimate_tnear lambda in traceOccluded does. Using the raw selenocentric
+    // center here inflated the offset ~175x (1.74 m vs ~1 cm) on lunar meshes, lifting
+    // grazing-sun shadow rays ~3.5 m and lowering a 200 m-distant rim's apparent horizon
+    // by ~1 deg -> spurious illumination of permanently-shadowed crater floors.
+    const std::array<double, 3> c_local = {
+        face_center[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        face_center[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        face_center[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    const double r = vectorLength(c_local);                         // local radius [m]
     const double ulp = std::numeric_limits<double>::epsilon() * r;  // machine epsilon scaled
     const double scaled = std::max(1e-6 * r, 0.01);                 // 1 ppm of radius, min 1 cm
     return std::max(16.0 * ulp, scaled);
