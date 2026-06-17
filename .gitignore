@@ -116,3 +116,8 @@ examples/leibniz_disco.yaml
 # luna1.diviner.ucla.edu/~jpierre/diviner/level4_polar/). Only the
 # pre-filtered *_polar.npy (lat < -86.5) are tracked.
 data/diviner_seasonal/*.txt
+
+# Local scratch: working mesh copies (OneDrive evicts cloud placeholders for
+# C++ readers, so meshes are re-pinned here) and ad-hoc dump files.
+tmp/
+tmp_illum_*.txt
