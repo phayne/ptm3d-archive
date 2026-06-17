@@ -160,7 +160,11 @@ private:
     const ViewFactorMatrix* F_ptr_ = nullptr;  // For row access in Gauss-Seidel
     bool use_hmatrix_ = false;
     std::vector<double> emissivity_;
-    std::vector<double> reflectivity_;  // 1 - emissivity
+    std::vector<double> reflectivity_;  // 1 - emissivity (thermal reflectivity)
+    // Solar Bond albedo for the reflected-SOLAR source term only (empty = fall back
+    // to reflectivity_ = 1-eps, the legacy behavior). Set from PTM_SOLAR_ALBEDO so
+    // a sunlit wall scatters ~0.12 of its insolation rather than ~0.05. See initCommon.
+    std::vector<double> solar_reflectivity_;
     std::vector<double> areas_;
     // Per-face view-factor row normalization = 1/max(1, Σ_j F_ij). The M1
     // centroid view-factor estimator overshoots in the near field, so on fine
@@ -379,6 +383,11 @@ private:
     // All inactive unless config_.rms_slope_deg > 0 (beam_active_ == false).
     bool beam_active_ = false;
     double chi_w_rad_ = 0.0;                       // RMS micro-slope [rad]
+    // Also beam the reflected-SOLAR source (opposition/backscatter) toward the floor,
+    // not just thermal IR. Gated by PTM_BEAM_SOLAR; solar_albedo_beam_ is the Bond
+    // albedo applied to the per-face incident solar flux. See addBeamedFlux().
+    bool beam_solar_ = false;
+    double solar_albedo_beam_ = 0.0;
     std::vector<BeamPair> beam_pairs_;             // sunlit-wall -> shadowed-floor
     std::vector<std::array<float, 3>> beam_normals_; // per-face mean normals (float)
     // Directional emission factor chi(cos_sun, cos_e, cos_psi) on a regular grid.
@@ -396,8 +405,13 @@ private:
     // Add the per-timestep beamed correction: for each pair,
     //   flux[i] += eps_i * eps_j * sigma * T_j^4 * Fhat_ij * (chi - 1).
     void addBeamedFlux(const std::vector<double>& temperatures,
+                       const std::vector<double>& solar_flux,
                        const std::array<double, 3>& sun_dir,
                        std::vector<double>& flux) const;
+    // Read PTM_BEAM_SOLAR / PTM_SOLAR_ALBEDO to enable beaming the reflected-solar
+    // source toward the floor (opposition), in addition to thermal IR. Called from
+    // prepare() when beaming is active.
+    void configureSolarBeaming();
     // Trilinear lookup into chi_table_; returns 1.0 outside the active domain.
     float lookupChi(double cos_sun, double cos_e, double cos_psi) const;
 };

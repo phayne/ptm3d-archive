@@ -30,10 +30,36 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
     emissivity_ = emissivity;
     areas_ = areas;
 
+    // Optional radiation-emissivity override (PTM_RAD_EMISSIVITY) for consistency
+    // studies: forces the radiosity emissivity (and hence reflectivity = 1-eps below)
+    // to a single value, independent of the body/config-propagation path.
+    if (const char* re = std::getenv("PTM_RAD_EMISSIVITY")) {
+        double e = std::atof(re);
+        if (e > 0.0 && e <= 1.0 && !emissivity_.empty()) {
+            std::fill(emissivity_.begin(), emissivity_.end(), e);
+            std::cout << "  [PTM_RAD_EMISSIVITY] radiosity emissivity forced to " << e
+                      << " (reflectivity 1-eps=" << (1.0 - e) << ")" << std::endl;
+        }
+    }
+
     size_t n = emissivity.size();
     reflectivity_.resize(n);
     for (size_t i = 0; i < n; ++i) {
         reflectivity_[i] = 1.0 - emissivity_[i];
+    }
+
+    // Albedo fix (PTM_SOLAR_ALBEDO): the reflected-SOLAR source should scatter the
+    // solar Bond albedo (~0.12), not the thermal reflectivity 1-eps (~0.05). When the
+    // env is set we fill a separate solar_reflectivity_ used only for the solar source
+    // (computeScatteredSolar + the solar_source term in solve); the thermal multiple-
+    // scattering rho*F*B keeps 1-eps. Unset => empty => byte-identical legacy behavior.
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) {
+            solar_reflectivity_.assign(n, a);
+            std::cout << "  [PTM_SOLAR_ALBEDO] reflected-solar source uses Bond albedo "
+                      << a << " (was 1-eps=" << (n ? reflectivity_[0] : 0.0) << ")\n";
+        }
     }
 
     // Pre-allocate work arrays
@@ -446,10 +472,12 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     // Compute thermal emission: E_i = ε_i σ T_i^4
     auto emission = computeThermalEmission(temperatures);
 
-    // Compute reflected solar source: ρ_i Q_solar_i
+    // Compute reflected solar source: ρ_solar_i Q_solar_i (Bond albedo if set, else 1-eps)
     std::vector<double> solar_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
     for (size_t i = 0; i < n; ++i) {
-        solar_source[i] = reflectivity_[i] * solar_flux[i];
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        solar_source[i] = rs * solar_flux[i];
     }
 
     // Solve radiosity equation: B = E + ρ F B + ρ Q_solar
@@ -502,10 +530,12 @@ std::vector<double> RadiositySolver::computeScatteredSolar(
 
     size_t n = solar_flux.size();
 
-    // First bounce: ρ_i Q_solar_i leaves face i
+    // First bounce: ρ_solar_i Q_solar_i leaves face i (Bond albedo if set, else 1-eps)
     std::vector<double> scattered_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
     for (size_t i = 0; i < n; ++i) {
-        scattered_source[i] = reflectivity_[i] * solar_flux[i];
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        scattered_source[i] = rs * solar_flux[i];
     }
 
     // Received scattered solar: F^T * (ρ Q_solar)  (renormalized so Σ_j F_ij ≤ 1)
@@ -1176,6 +1206,7 @@ bool RadiationExchangeManager::prepare(
             buildChiTable();
             buildBeamPairs();
             beam_active_ = !beam_pairs_.empty();
+            configureSolarBeaming();
         }
         return true;
     }
@@ -1303,6 +1334,7 @@ bool RadiationExchangeManager::prepare(
         buildChiTable();
         buildBeamPairs();
         beam_active_ = !beam_pairs_.empty();
+        configureSolarBeaming();
     }
 
     return true;
@@ -1356,7 +1388,8 @@ RadiationExchangeManager::computeIndirectFluxBatch(
         if (do_beam) {
             const auto& s = sun_dirs[k];
             if (s[0] != 0.0 || s[1] != 0.0 || s[2] != 0.0) {
-                addBeamedFlux(temperatures_per_timestep[k], s, indirect_per_timestep[k]);
+                addBeamedFlux(temperatures_per_timestep[k], solar_flux_per_timestep[k],
+                              s, indirect_per_timestep[k]);
             }
         }
     }
@@ -1407,7 +1440,7 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     // Redistributes each sunlit wall's fixed total emission toward the floor.
     const bool sun_valid = (sun_dir[0] != 0.0 || sun_dir[1] != 0.0 || sun_dir[2] != 0.0);
     if (beam_active_ && sun_valid) {
-        addBeamedFlux(temperatures, sun_dir, indirect_flux_);
+        addBeamedFlux(temperatures, solar_flux, sun_dir, indirect_flux_);
     }
 
     // Update statistics (after beaming so they reflect the corrected flux)
@@ -1511,7 +1544,24 @@ void RadiationExchangeManager::buildBeamPairs() {
               << " deg)" << std::endl;
 }
 
+void RadiationExchangeManager::configureSolarBeaming() {
+    beam_solar_ = false;
+    solar_albedo_beam_ = 0.0;
+    if (const char* bs = std::getenv("PTM_BEAM_SOLAR")) beam_solar_ = (std::atoi(bs) != 0);
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) solar_albedo_beam_ = a;
+    }
+    if (beam_solar_ && solar_albedo_beam_ <= 0.0) solar_albedo_beam_ = 0.12;  // default Bond
+    if (beam_solar_) {
+        std::cout << "  [PTM_BEAM_SOLAR] beaming reflected solar (Bond albedo "
+                  << solar_albedo_beam_ << ") toward the floor, in addition to thermal IR"
+                  << std::endl;
+    }
+}
+
 void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperatures,
+                                             const std::vector<double>& solar_flux,
                                              const std::array<double, 3>& sun_dir,
                                              std::vector<double>& flux) const {
     if (beam_pairs_.empty()) return;
@@ -1535,8 +1585,17 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
         double delta = chi - 1.0;
         if (delta == 0.0) continue;
         double Tj = temperatures[bp.j];
-        double Ej = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj;
-        double dq = emissivity_[bp.i] * Ej * static_cast<double>(bp.Fhat_ij) * delta;
+        double Ej = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj;   // thermal IR source
+        // Solar opposition beaming (PTM_BEAM_SOLAR): the reflected-solar source
+        // (albedo * incident sunlight) leaving the sunlit wall has the same m.s facet
+        // structure as its IR emission, so the floor (backscatter) gets the same chi
+        // enhancement. Absorbed at the floor with eps_i (consistent with the radiosity's
+        // solar handling). Off by default => byte-identical IR-only beaming.
+        double Sj = 0.0;
+        if (beam_solar_ && bp.j < static_cast<int>(solar_flux.size())) {
+            Sj = solar_albedo_beam_ * solar_flux[bp.j];
+        }
+        double dq = emissivity_[bp.i] * (Ej + Sj) * static_cast<double>(bp.Fhat_ij) * delta;
         #pragma omp atomic
         flux[bp.i] += dq;
     }
