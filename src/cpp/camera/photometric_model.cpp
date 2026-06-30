@@ -215,7 +215,11 @@ double PhotometricModel::thermalSpectralRadiance(double T_kelvin, double cos_e,
     double B = planckFunction(lambda_m, T_kelvin);
     // Convert from W/m^2/sr/m to W/m^2/sr/um
     B *= 1e-6;
-    return params_.emissivity * B * emissionPhase(cos_e);
+    // Camera-measured emitted radiance is view-angle independent for a
+    // Lambertian grey emitter: L = epsilon * B(lambda, T). No cos(emission)
+    // factor — that weighting belongs to emitted *flux*/radiosity, not to what
+    // a pixel measures. (cos_e > 0 is still required for the face to be visible.)
+    return params_.emissivity * B;
 }
 
 double PhotometricModel::thermalBroadbandRadiance(double T_kelvin, double cos_e) const {

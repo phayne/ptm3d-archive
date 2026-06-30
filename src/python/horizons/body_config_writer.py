@@ -88,18 +88,17 @@ class BodyConfigWriter:
         gb["name"] = name
         gb["ephemeris_source"] = ephemeris_source
 
-        # Compute SPICE NAIF ID for SPK queries
-        # Convention: numbered asteroids = 2000000 + number, comets = 1000000 + number
+        # SPICE NAIF ID for SPK queries.
+        #
+        # This MUST be the body id actually stored in the downloaded SPK, not
+        # a value computed from the asteroid number.  HORIZONS has migrated
+        # small-body SPK ids from the old "2000000 + number" scheme to the new
+        # "20000000 + number" scheme, so any locally computed id is unreliable
+        # and causes spkpos to fail with SPKINSUFFDATA.  The caller is expected
+        # to pass the id read back from the SPK (see read_spk_body_id); we write
+        # it through verbatim.
         if naif_id:
-            try:
-                num = int(naif_id.rstrip(";").strip())
-                if body_type == "comet":
-                    gb["naif_id"] = str(1000000 + num)
-                else:
-                    # Asteroids and other small bodies
-                    gb["naif_id"] = str(2000000 + num)
-            except ValueError:
-                gb["naif_id"] = naif_id  # Use as-is if not numeric
+            gb["naif_id"] = str(naif_id).rstrip(";").strip()
 
         # Shape
         shape = {}
