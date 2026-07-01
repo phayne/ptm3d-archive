@@ -695,6 +695,44 @@ std::vector<PixelData> CameraSimulator::renderFrame(const std::string& utc_time)
         look_at_km[1] * km_to_mesh_,
         look_at_km[2] * km_to_mesh_
     };
+
+    // Per-frame "up" convention: the body-fixed axis perpendicular to the
+    // spacecraft velocity and closest to the body spin-axis positive direction
+    // (north pole). By IAU/SPICE convention the body-fixed +Z axis is the
+    // positive spin axis, so up = normalize(pole - (pole.v_hat) v_hat), i.e. the
+    // projection of the pole onto the plane perpendicular to velocity. This is
+    // the perpendicular-to-velocity direction that stays closest to the pole.
+    // Only applied in LOOK_AT pointing (SPICE_CK carries its own attitude).
+    if (config_.camera.up_mode == CameraConfig::UpMode::VELOCITY_POLE &&
+        cam_config.pointing == CameraConfig::Pointing::LOOK_AT) {
+        // Velocity in the body-fixed target frame (same frame as look_at / up).
+        std::array<double, 3> vel_km_s = trajectory_.getVelocity(et);
+        double vlen = vec::length(vel_km_s);
+        const std::array<double, 3> pole = {0.0, 0.0, 1.0};  // body-fixed +Z = north
+        if (vlen > 1e-12) {
+            auto v_hat = vec::scale(vel_km_s, 1.0 / vlen);
+            double proj = vec::dot(pole, v_hat);
+            auto up = vec::sub(pole, vec::scale(v_hat, proj));
+            double ulen = vec::length(up);
+            if (ulen > 1e-6) {
+                cam_config.up_vector = vec::scale(up, 1.0 / ulen);
+            } else {
+                // Degenerate: velocity nearly parallel to the pole. The pole
+                // gives no usable "up" perpendicular to motion; fall back to the
+                // body-fixed +X projected off velocity (any axis off the pole).
+                const std::array<double, 3> alt = {1.0, 0.0, 0.0};
+                auto up_alt = vec::sub(alt, vec::scale(v_hat, vec::dot(alt, v_hat)));
+                if (vec::length(up_alt) < 1e-6) {
+                    up_alt = vec::sub(std::array<double, 3>{0.0, 1.0, 0.0},
+                                      vec::scale(v_hat, vec::dot(
+                                          std::array<double, 3>{0.0, 1.0, 0.0}, v_hat)));
+                }
+                cam_config.up_vector = vec::normalize(up_alt);
+            }
+        }
+        // If velocity is unavailable (vlen == 0) keep the configured up_vector.
+    }
+
     camera_.configure(cam_config);
     // If pointing is SPICE-driven, override the axes with the IK+CK lookup for
     // this ET. Position / intrinsics are kept from the configure() above.

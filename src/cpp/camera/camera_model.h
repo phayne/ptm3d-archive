@@ -34,7 +34,13 @@ struct CameraConfig {
     double look_at_lat_deg = 0.0;
     double look_at_lon_deg = 0.0;
 
-    // Up vector hint
+    // Up vector hint. In EXPLICIT mode (default) up_vector is used as-is for the
+    // LOOK_AT Gram-Schmidt. In VELOCITY_POLE mode the simulator recomputes
+    // up_vector per frame as the body-fixed axis perpendicular to the spacecraft
+    // velocity and closest to the body spin-axis positive direction (north pole,
+    // = body-fixed +Z by IAU/SPICE convention); see CameraSimulator::renderFrame.
+    enum class UpMode { EXPLICIT, VELOCITY_POLE };
+    UpMode up_mode = UpMode::EXPLICIT;
     std::array<double, 3> up_vector{0.0, 0.0, 1.0};
 
     // Optics — pinhole geometry
