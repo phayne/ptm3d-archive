@@ -162,15 +162,23 @@ void CameraSimulator::computeSmoothShadingAttributes() {
 
     const bool has_albedo = (!face_albedos_.empty() && face_albedos_.size() == nf);
 
-    // Only allocate vertex albedos when we have per-face albedo data to
-    // propagate. When empty, the render loop falls through to the uniform
-    // albedo path, avoiding a "zero-albedo" black-image bug.
+    // Resolve the uniform scalar albedo used when no per-face map is present.
+    // Honor the config's scalar visible albedo; if it is negative (an "unset"
+    // sentinel), fall back to the surface albedo default. This keeps the value
+    // strictly positive so the smooth-shading path carries a real reflectance
+    // instead of leaving vertex albedos empty (which reads as a black image).
+    double uniform_albedo = config_.photometric_params.albedo;
+    if (uniform_albedo < 0.0) uniform_albedo = 0.051;
+
+    // Allocate vertex albedos in both cases. With a per-face map we area-weight
+    // the map onto vertices below; with no map we seed every vertex with the
+    // uniform scalar so the reflected channel is never zero by construction.
     std::vector<double> w_albedo;
     if (has_albedo) {
         vertex_albedos_.assign(nv, 0.0);
         w_albedo.assign(nv, 0.0);
     } else {
-        vertex_albedos_.clear();
+        vertex_albedos_.assign(nv, uniform_albedo);
     }
 
     // Accumulate area-weighted face attributes onto each of the face's three vertices.
@@ -211,8 +219,13 @@ void CameraSimulator::computeSmoothShadingAttributes() {
             vertex_normals_[v] = vec::normalize(vertex_normals_[v]);
             ++n_normal;
         }
-        if (has_albedo && w_albedo[v] > 0.0) {
-            vertex_albedos_[v] /= w_albedo[v];
+        if (has_albedo) {
+            if (w_albedo[v] > 0.0) {
+                vertex_albedos_[v] /= w_albedo[v];
+                ++n_albedo;
+            }
+        } else {
+            // Uniform-albedo path: every vertex was seeded with the scalar.
             ++n_albedo;
         }
     }
