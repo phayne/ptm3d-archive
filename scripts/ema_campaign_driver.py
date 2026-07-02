@@ -316,6 +316,10 @@ for num,name in TARGETS:
         ca_utc=sp.et2utc(etm,'ISOC',0)
         log(f"{name}: NAIF {naif} CA {ca_utc} range {dmin:.0f}km vrel {vrel:.1f} period {period:.3f}h pole({ra:.1f},{dec:.1f}){' ASSUMED' if pole_assumed else ''}")
 
+        # Resolve Hapke params (incl. single-scattering albedo w) up front so the
+        # thermal directional-hemispheric albedo path and the camera reflectance use
+        # the SAME per-body w. body_config 'surface.hapke' overrides win here too.
+        hp=hapke_params(num,gb)
         THERMDIR=f"{TROOT}/{num}{name.lower()}/flyby"; os.makedirs(THERMDIR,exist_ok=True)
         # thermal config: 1.5-rotation window centered on CA, 40-orbit eq
         win_h=1.5*period; start_et=etm-0.75*period*3600.0
@@ -331,7 +335,8 @@ for num,name in TARGETS:
                 'emissivity':0.95,'use_default_ks':False,'ks':0.01,'use_default_kd':False,'kd':0.5,
                 'use_default_H':False,'H':0.05,'use_default_rhos':False,'rhos':1500.0,'use_default_rhod':False,
                 'rhod':2000.0,'use_default_cp0':False,'cp0':800.0,'use_default_Qb':False,'Qb':0.0,
-                'use_default_chi':False,'chi':0.0,'incidence_angle_albedo':False},
+                'use_default_chi':False,'chi':0.0,'incidence_angle_albedo':True,
+                'albedo_hapke_w':hp['w']},
             'radiation':{'enabled':False},
             'illumination':{'include_primary_reflection':False,'use_batch_processing':True},
             'output':{'directory':THERMDIR,'format':'binary','vtk_mode':'none','series_output':'per_timestep'},
@@ -365,7 +370,7 @@ for num,name in TARGETS:
 
         camdir=f"{CROOT}/{num}{name.lower()}/flyby"; animdir=camdir+"/anim"
         os.makedirs(camdir,exist_ok=True)
-        hp=hapke_params(num,gb)
+        # hp was resolved above (before the thermal config) so thermal + camera share w.
         log(f"{name}: Hapke w={hp['w']} B0={hp['B0']} h={hp['h']} g={hp['g']} "
             f"theta_bar={hp['theta_bar']} (geom-albedo target {albedo})")
         # 3 snapshots at CA-2/CA/CA+2 min
