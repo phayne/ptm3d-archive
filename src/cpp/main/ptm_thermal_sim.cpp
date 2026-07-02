@@ -615,15 +615,41 @@ bool runThermalModelsForAllFacesBatchSoA(
 // map values from a spatial albedo map still receive the angular
 // correction (otherwise high-θ faces are biased ~kelvin-warm in
 // nighttime cooling because too much daytime flux is absorbed).
+//
+// Directional-hemispheric (Hapke) branch: opt-in via use_hapke (default
+// false → byte-identical to the pre-Hapke Hayne-only path). When on, the
+// analytic closed form A_h(mu0) = 1 - gamma*H(mu0,w) supersedes the Hayne
+// polynomial entirely — this is the SAME closed form as
+// Planet::getAlbedoWithIncidence() (thermal_model.cpp:579-589), replicated
+// here because the GPU flux build runs host-side per-timestep and cannot
+// call a Planet method inside the hot OpenMP loop cheaply. Guaranteed in
+// [0,1] for w in [0,1], mu0 in [0,1]. A0 is unused in the Hapke branch (the
+// gate derives w so A_h(mu0=1) == body A0 already; see the bisection at the
+// config gate). Returns A0 for the unilluminated / normal-incidence cases,
+// which matches both the CPU reference (calculateAbsorbedFlux) and the
+// A_h(mu0=1)==A0 construction.
 static inline double applyIncidenceAlbedo(double A0,
                                           double direct_flux,
                                           double solar_constant,
                                           double a_coef,
-                                          double b_coef) {
+                                          double b_coef,
+                                          bool use_hapke = false,
+                                          double hapke_w = -1.0) {
     if (solar_constant <= 0.0 || direct_flux <= 0.0) return A0;
     double cos_theta = direct_flux / solar_constant;
     if (cos_theta >= 1.0) return A0;
     if (cos_theta <  0.0) cos_theta = 0.0;
+    if (use_hapke && hapke_w >= 0.0) {
+        // Analytic directional-hemispheric albedo A_h(mu0) = 1 - gamma*H(mu0,w).
+        const double w     = std::max(0.0, std::min(1.0, hapke_w));
+        const double gamma = std::sqrt(std::max(0.0, 1.0 - w));
+        const double mu0   = cos_theta;  // already clamped to [0,1)
+        const double H     = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
+        double A_h = 1.0 - gamma * H;
+        if (A_h < 0.0) A_h = 0.0;
+        if (A_h > 1.0) A_h = 1.0;
+        return A_h;
+    }
     const double theta = std::acos(cos_theta);
     const double t45 = theta / (M_PI / 4.0);
     const double t90 = theta / (M_PI / 2.0);
@@ -3183,6 +3209,25 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
 
+    // Directional-hemispheric (Hapke) albedo gate. The gate is resolved on the
+    // main-scope Planet and forwarded as thermal_config properties (see the
+    // thermal_config build site). This locally-rebuilt Planet does not inherit
+    // it, so re-read it here and drive the host-side flux build below. Default
+    // OFF → byte-identical Hayne-only path preserved for all non-Hapke runs.
+    const bool   use_hapke = config.getPropertyBool("use_hapke_albedo", false)
+                             && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
+    const double hapke_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
+    planet.use_hapke_albedo = use_hapke;
+    planet.hapke_albedo_w   = hapke_w;
+    if (use_hapke) {
+        // Mirror the CPU reference log (calculateAbsorbedFlux, ~line 1442) so a
+        // gate-ON run is verifiable from stdout — proves the branch FIRES.
+        std::cout << "[GPU Thermal] Using directional-hemispheric (Hapke) albedo "
+                     "A_h(i) = 1 - gamma*H(mu0,w)" << std::endl;
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << planet.albedo
+                  << ", single-scattering w = " << hapke_w << std::endl;
+    }
+
     // ---- Optional initial / final thermal-state checkpoint -------------
     // Magic bytes 'PTMT' (0x50544D54) identify the format.
     constexpr uint32_t kThermalStateMagic = 0x50544D54;
@@ -3650,6 +3695,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
         const double S_solar = planet.S;
         const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+        // Incidence-dependent albedo fires for Hayne (has_angular) OR the Hapke
+        // gate (use_hapke). Both need S>0 to recover cos(theta) from flux. When
+        // both are off this is false and applyIncidenceAlbedo is bypassed →
+        // byte-identical constant-albedo path.
+        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
 
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
@@ -3664,11 +3714,13 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
 
-                    // Hayne (2017) incidence-angle correction on the base albedo.
-                    // The map (if loaded) provides A0(lon,lat); the (a,b) coefficients
-                    // give the angular dependence A(θ) = A0 + a·(θ/π/4)^3 + b·(θ/π/2)^8.
-                    double albedo = has_angular
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                    // Incidence-angle correction on the base albedo. Hayne (2017):
+                    // A(θ) = A0 + a·(θ/π/4)^3 + b·(θ/π/2)^8. Hapke branch (opt-in):
+                    // A_h(mu0) = 1 - gamma*H(mu0,w), which supersedes Hayne and
+                    // ignores base_A (w already encodes the body Bond albedo).
+                    double albedo = use_incidence
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                               use_hapke, hapke_w)
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
@@ -4176,6 +4228,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         const double b_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
         const double S_solar2 = planet.S;
         const bool   has_angular2 = (planet.albedoCoef.size() >= 2 && S_solar2 > 0.0);
+        // Hayne OR Hapke gate (see prepare_flux above for rationale).
+        const bool   use_incidence2 = has_angular2 || (use_hapke && S_solar2 > 0.0);
 
         // Helper: prepare flux data in timestep-major layout for a range of timesteps.
         auto prepare_flux = [&](int t_start, int n_steps) {
@@ -4191,9 +4245,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
 
-                    // Hayne (2017) angular albedo correction (composes on top of map A0).
-                    double albedo = has_angular2
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar2, a_coef2, b_coef2)
+                    // Incidence-angle correction (Hayne composes on map A0; Hapke
+                    // closed form supersedes, ignoring base_A).
+                    double albedo = use_incidence2
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar2, a_coef2, b_coef2,
+                                               use_hapke, hapke_w)
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
@@ -4520,6 +4576,14 @@ bool runThermalForSelectedFaces_GPU(
     const size_t n_layers = z_grid.size();
     const size_t n_faces_total = mesh->faces.size();
 
+    // Directional-hemispheric (Hapke) albedo gate (re-read from config; this
+    // path rebuilds its own Planet). Kept consistent with iter-0's flux build
+    // so the rad-coupling re-thermal uses the SAME absorbed-solar composition.
+    // Default OFF → byte-identical Hayne-only path.
+    const bool   use_hapke = config.getPropertyBool("use_hapke_albedo", false)
+                             && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
+    const double hapke_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
+
     // Two-phase detection (mirrors iter-0 setup at lines 3199-3217 of
     // runThermalModelsForAllFaces_GPU_Persistent). When eq_dt != out_dt
     // we run two solver calls: equilibration cycles at eq_dt, then one
@@ -4687,6 +4751,8 @@ bool runThermalForSelectedFaces_GPU(
         const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
         const double S_solar = planet.S;
         const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+        // Hayne OR Hapke gate (both need S>0 to recover cos(theta) from flux).
+        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
 
         // ----------------------------------------------------------------
         // Optional: re-equilibrate the deep column WITH the indirect flux
@@ -4746,8 +4812,9 @@ bool runThermalForSelectedFaces_GPU(
                                           ? primary_reflected_values[flux_idx] : 0.0;
                     const double ir       = (flux_idx < primary_ir_values.size())
                                           ? primary_ir_values[flux_idx] : 0.0;
-                    const double albedo = has_angular
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                    const double albedo = use_incidence
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                               use_hapke, hapke_w)
                         : base_A;
                     double absorbed = (1.0 - albedo) * direct
                                     + (1.0 - albedo) * reflected
@@ -4802,8 +4869,9 @@ bool runThermalForSelectedFaces_GPU(
                 const double ir       = (flux_idx < primary_ir_values.size())
                                       ? primary_ir_values[flux_idx] : 0.0;
 
-                const double albedo = has_angular
-                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                const double albedo = use_incidence
+                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                           use_hapke, hapke_w)
                     : base_A;
 
                 double absorbed = (1.0 - albedo) * direct
@@ -9624,6 +9692,19 @@ int main(int argc, char** argv) {
                 config.getPropertyBool("use_simd_batch", true));
         }
 
+        // Propagate the directional-hemispheric (Hapke) albedo gate into
+        // thermal_config. The gate is resolved imperatively onto the main-scope
+        // `planet` (single-scattering w derived/validated at the config block
+        // ~line 8548); the GPU thermal solver rebuilds its OWN Planet from
+        // config properties and would otherwise never see the gate. Only set
+        // these when the gate is on → thermal_config stays byte-identical for
+        // every non-Hapke run (default OFF path unchanged for Moon3D/A3GT/
+        // Europa/gate-off EMA).
+        if (planet.use_hapke_albedo && planet.hapke_albedo_w >= 0.0) {
+            thermal_config.setProperty("use_hapke_albedo", true);
+            thermal_config.setProperty("hapke_albedo_w", planet.hapke_albedo_w);
+        }
+
         // Debug output to verify properties were set correctly
         if (verbose) {
             std::cout << "Thermal config properties:" << std::endl;
@@ -10813,6 +10894,12 @@ int main(int argc, char** argv) {
                                             ? planet.albedoCoef[1] : 0.0;
                         const double S_solar = planet.S;
                         const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+                        // Hapke gate (main-scope planet already carries the gate).
+                        const bool   use_hapke = planet.use_hapke_albedo
+                                               && planet.hapke_albedo_w >= 0.0;
+                        const double hapke_w   = planet.hapke_albedo_w;
+                        const bool   use_incidence = has_angular
+                                                   || (use_hapke && S_solar > 0.0);
 
                         combined_flux.resize(faces_to_rerun.size());
                         for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
@@ -10825,8 +10912,9 @@ int main(int argc, char** argv) {
                                 const double direct = direct_solar_values[flux_idx];
                                 const double reflected = primary_reflected_values[flux_idx];
                                 const double ir = primary_ir_values[flux_idx];
-                                const double albedo = has_angular
-                                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef)
+                                const double albedo = use_incidence
+                                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                                           use_hapke, hapke_w)
                                     : base_A;
                                 combined_flux[idx][t] = (1.0 - albedo) * direct
                                                       + (1.0 - albedo) * reflected
