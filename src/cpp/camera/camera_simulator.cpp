@@ -163,11 +163,22 @@ void CameraSimulator::computeSmoothShadingAttributes() {
     const bool has_albedo = (!face_albedos_.empty() && face_albedos_.size() == nf);
 
     // Resolve the uniform scalar albedo used when no per-face map is present.
-    // Honor the config's scalar visible albedo; if it is negative (an "unset"
-    // sentinel), fall back to the surface albedo default. This keeps the value
-    // strictly positive so the smooth-shading path carries a real reflectance
-    // instead of leaving vertex albedos empty (which reads as a black image).
+    // This value is what the reflected path threads into the per-face
+    // reflectedRadiance() overload, which rescales the reflectance by
+    // face_albedo / reference_albedo (reference = the ACTIVE model's own albedo
+    // param). For Hapke this reference is hapke_w. A calibrated Hapke model
+    // (hapke_w tuned so the disk integral matches the body geometric albedo)
+    // must be rendered as-calibrated, i.e. with that scale factor at unity — so
+    // seed the uniform albedo from hapke_w rather than the generic scalar. Any
+    // separate geometric-albedo scalar would otherwise silently rescale (and
+    // darken) the calibrated reflectance. Other models keep the scalar albedo
+    // (unchanged behavior). If the resolved value is a negative "unset"
+    // sentinel, fall back to a dark-asteroid default so the reflected channel is
+    // never a black image.
     double uniform_albedo = config_.photometric_params.albedo;
+    if (config_.reflectance_type == PhotometricModel::ReflectanceType::HAPKE) {
+        uniform_albedo = config_.photometric_params.hapke_w;
+    }
     if (uniform_albedo < 0.0) uniform_albedo = 0.051;
 
     // Allocate vertex albedos in both cases. With a per-face map we area-weight
@@ -696,41 +707,83 @@ std::vector<PixelData> CameraSimulator::renderFrame(const std::string& utc_time)
         look_at_km[2] * km_to_mesh_
     };
 
-    // Per-frame "up" convention: the body-fixed axis perpendicular to the
-    // spacecraft velocity and closest to the body spin-axis positive direction
-    // (north pole). By IAU/SPICE convention the body-fixed +Z axis is the
-    // positive spin axis, so up = normalize(pole - (pole.v_hat) v_hat), i.e. the
-    // projection of the pole onto the plane perpendicular to velocity. This is
-    // the perpendicular-to-velocity direction that stays closest to the pole.
-    // Only applied in LOOK_AT pointing (SPICE_CK carries its own attitude).
-    if (config_.camera.up_mode == CameraConfig::UpMode::VELOCITY_POLE &&
-        cam_config.pointing == CameraConfig::Pointing::LOOK_AT) {
-        // Velocity in the body-fixed target frame (same frame as look_at / up).
-        std::array<double, 3> vel_km_s = trajectory_.getVelocity(et);
-        double vlen = vec::length(vel_km_s);
+    // Per-frame "up" convention. By IAU/SPICE convention the body-fixed +Z axis
+    // is the positive spin axis (north pole). Two dynamic modes project that pole
+    // onto the image plane; both apply only in LOOK_AT pointing (SPICE_CK carries
+    // its own attitude).
+    //
+    // VELOCITY_POLE: project the pole off the spacecraft velocity,
+    //     up = normalize(pole - (pole.v_hat) v_hat).
+    //   Perpendicular-to-velocity, closest to the pole.
+    //
+    // BORESIGHT_POLE: project the pole off the camera boresight,
+    //     up = normalize(pole - (pole.b_hat) b_hat),  b_hat = look dir.
+    //   This puts north exactly in the image plane regardless of velocity. Sign
+    //   forced north-up (up.pole > 0); fallback to a fixed body axis when the
+    //   pole is within 5 deg of the boresight (|pole.b_hat| > cos(5 deg)).
+    if (cam_config.pointing == CameraConfig::Pointing::LOOK_AT &&
+        (config_.camera.up_mode == CameraConfig::UpMode::VELOCITY_POLE ||
+         config_.camera.up_mode == CameraConfig::UpMode::BORESIGHT_POLE)) {
         const std::array<double, 3> pole = {0.0, 0.0, 1.0};  // body-fixed +Z = north
-        if (vlen > 1e-12) {
-            auto v_hat = vec::scale(vel_km_s, 1.0 / vlen);
-            double proj = vec::dot(pole, v_hat);
-            auto up = vec::sub(pole, vec::scale(v_hat, proj));
+
+        if (config_.camera.up_mode == CameraConfig::UpMode::VELOCITY_POLE) {
+            // Velocity in the body-fixed target frame (same frame as look_at/up).
+            std::array<double, 3> vel_km_s = trajectory_.getVelocity(et);
+            double vlen = vec::length(vel_km_s);
+            if (vlen > 1e-12) {
+                auto v_hat = vec::scale(vel_km_s, 1.0 / vlen);
+                double proj = vec::dot(pole, v_hat);
+                auto up = vec::sub(pole, vec::scale(v_hat, proj));
+                double ulen = vec::length(up);
+                if (ulen > 1e-6) {
+                    cam_config.up_vector = vec::scale(up, 1.0 / ulen);
+                } else {
+                    // Degenerate: velocity nearly parallel to the pole. Fall back
+                    // to the body-fixed +X projected off velocity.
+                    const std::array<double, 3> alt = {1.0, 0.0, 0.0};
+                    auto up_alt = vec::sub(alt, vec::scale(v_hat, vec::dot(alt, v_hat)));
+                    if (vec::length(up_alt) < 1e-6) {
+                        up_alt = vec::sub(std::array<double, 3>{0.0, 1.0, 0.0},
+                                          vec::scale(v_hat, vec::dot(
+                                              std::array<double, 3>{0.0, 1.0, 0.0}, v_hat)));
+                    }
+                    cam_config.up_vector = vec::normalize(up_alt);
+                }
+            }
+            // If velocity is unavailable (vlen == 0) keep the configured up_vector.
+        } else {  // BORESIGHT_POLE
+            // Boresight (look direction), body-fixed frame, in km units.
+            auto b_hat = vec::normalize(vec::sub(look_at_km, cam_pos_km));
+            double proj = vec::dot(pole, b_hat);
+            // cos(5 deg) ~ 0.9961947. When the pole is nearly along the boresight
+            // its projection is ill-conditioned; fall back to a fixed body axis
+            // (+X, itself projected off the boresight) so up stays well-defined.
+            constexpr double COS_5_DEG = 0.99619469809174553;
+            std::array<double, 3> up;
+            if (std::abs(proj) > COS_5_DEG) {
+                const std::array<double, 3> alt = {1.0, 0.0, 0.0};
+                double aproj = vec::dot(alt, b_hat);
+                up = vec::sub(alt, vec::scale(b_hat, aproj));
+                if (vec::length(up) < 1e-6) {
+                    const std::array<double, 3> alt2 = {0.0, 1.0, 0.0};
+                    up = vec::sub(alt2, vec::scale(b_hat, vec::dot(alt2, b_hat)));
+                }
+            } else {
+                up = vec::sub(pole, vec::scale(b_hat, proj));
+                // Force north-up: the projected axis should point toward, not
+                // away from, the pole. (Guaranteed here since up.pole = 1 - proj^2
+                // >= 0, but keep the explicit sign flip as a contract.)
+                if (vec::dot(up, pole) < 0.0) up = vec::scale(up, -1.0);
+            }
             double ulen = vec::length(up);
             if (ulen > 1e-6) {
                 cam_config.up_vector = vec::scale(up, 1.0 / ulen);
-            } else {
-                // Degenerate: velocity nearly parallel to the pole. The pole
-                // gives no usable "up" perpendicular to motion; fall back to the
-                // body-fixed +X projected off velocity (any axis off the pole).
-                const std::array<double, 3> alt = {1.0, 0.0, 0.0};
-                auto up_alt = vec::sub(alt, vec::scale(v_hat, vec::dot(alt, v_hat)));
-                if (vec::length(up_alt) < 1e-6) {
-                    up_alt = vec::sub(std::array<double, 3>{0.0, 1.0, 0.0},
-                                      vec::scale(v_hat, vec::dot(
-                                          std::array<double, 3>{0.0, 1.0, 0.0}, v_hat)));
-                }
-                cam_config.up_vector = vec::normalize(up_alt);
             }
+            // Handedness: CameraModel::configure() builds right = up x forward
+            // (or forward x up) with a fixed convention; supplying a north-up,
+            // boresight-perpendicular up keeps (right, up, forward) right-handed
+            // so the rendered image is not mirrored. No sign flip needed here.
         }
-        // If velocity is unavailable (vlen == 0) keep the configured up_vector.
     }
 
     camera_.configure(cam_config);

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <cassert>
 #include <atomic>
 #include <fstream>
 #include <iomanip>
@@ -567,6 +568,25 @@ double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_a
         if (map_value != albedo_map->getMissingValue()) {
             A0 = map_value;
         }
+    }
+
+    // Directional-hemispheric (Hapke) albedo branch (opt-in, gated). Returns the
+    // ANALYTIC closed form A_h(mu0) = 1 - gamma*H(mu0,w), which is guaranteed in
+    // [0, 1] for w in [0, 1] and mu0 in [0, 1] (unlike a numerical hemisphere
+    // integral of the bidirectional Hapke BRDF, which overshoots 1 at grazing
+    // incidence and violates energy conservation). Independent of the Hayne
+    // polynomial below, so the baseline path is untouched when the gate is off.
+    if (use_hapke_albedo && hapke_albedo_w >= 0.0) {
+        double w = std::max(0.0, std::min(1.0, hapke_albedo_w));
+        double gamma = std::sqrt(std::max(0.0, 1.0 - w));
+        double mu0 = std::cos(theta);            // theta already clamped to [0, pi/2]
+        mu0 = std::max(0.0, std::min(1.0, mu0));
+        double H = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
+        double A_h = 1.0 - gamma * H;
+        // Analytic guard: A_h(i) MUST be in [0, 1] for all i and all w.
+        assert(A_h >= -1e-9 && A_h <= 1.0 + 1e-9 &&
+               "Hapke A_h(i) out of [0,1] — closed-form energy-conservation guard");
+        return std::max(0.0, std::min(1.0, A_h));
     }
 
     // Check if we have albedo coefficients
@@ -2031,9 +2051,20 @@ void Model::updateOrbit() {
     
     // Only apply flux when sun is above horizon
     double flux_factor = std::max(0.0, cos_zenith);
-    
+
+    // Absorptivity (1 - A). Default path uses the constant Bond albedo. With the
+    // Hapke directional-hemispheric gate on, A varies with incidence via the
+    // analytic A_h(mu0). The default branch keeps the exact prior expression so
+    // gate-off runs are byte-identical.
+    double one_minus_A = 1.0 - planet.albedo;
+    if (planet.use_hapke_albedo && flux_factor > 0.0) {
+        double incidence_angle = std::acos(std::min(1.0, flux_factor));
+        double A_h = planet.getAlbedoWithIncidence(0.0, lat, incidence_angle);
+        one_minus_A = 1.0 - A_h;
+    }
+
     // Calculate absorbed solar flux
-    Sabs = planet.S * flux_factor * (1.0 - planet.albedo);
+    Sabs = planet.S * flux_factor * one_minus_A;
 }
 
 // Set surface flux Qs based on time series or default solar calculation
@@ -2112,7 +2143,14 @@ void Model::fastEquilibrate(int days, double target_time) {
             const double hour_angle = 2.0 * M_PI * day_fraction + M_PI;
             const double cos_zenith = std::cos(lat) * std::cos(hour_angle);
             const double flux_factor = std::max(0.0, cos_zenith);
-            const double local_flux = planet.S * flux_factor * (1.0 - planet.albedo);
+            // Absorptivity: constant Bond albedo by default; gated Hapke A_h(i)
+            // when enabled (gate off -> byte-identical to prior expression).
+            double one_minus_A = 1.0 - planet.albedo;
+            if (planet.use_hapke_albedo && flux_factor > 0.0) {
+                double inc = std::acos(std::min(1.0, flux_factor));
+                one_minus_A = 1.0 - planet.getAlbedoWithIncidence(0.0, lat, inc);
+            }
+            const double local_flux = planet.S * flux_factor * one_minus_A;
             profile.update_T(dt_eq, local_flux, planet.Qb);
         }
     }

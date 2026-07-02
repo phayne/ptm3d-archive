@@ -1427,14 +1427,29 @@ std::vector<double> calculateAbsorbedFlux(
     // !using_albedo_map which silently dropped the high-θ correction for
     // map-using runs and biased nighttime temperatures at high latitudes by
     // several K.
+    // Incidence-angle-dependent albedo is active when either (a) the body has
+    // Hayne (2017) polynomial coefficients, or (b) the Hapke directional-
+    // hemispheric gate is on. getAlbedoWithIncidence() internally routes to the
+    // correct model (Hapke branch first when use_hapke_albedo). When neither is
+    // set the constant Bond albedo is used and the path is byte-identical.
+    bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
+                             planet->hapke_albedo_w >= 0.0);
     bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
-                                 planet->albedoCoef.size() >= 2);
+                                 (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
 
     if (use_incidence_albedo) {
-        std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-        std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
-        std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
-                  << ", b = " << planet->albedoCoef[1] << std::endl;
+        if (use_hapke_albedo) {
+            std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
+                         "1 - gamma*H(mu0,w)" << std::endl;
+            std::cout << "  Base albedo A0 = " << planet->albedo
+                      << ", single-scattering w = " << planet->hapke_albedo_w
+                      << std::endl;
+        } else {
+            std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
+            std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
+            std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
+                      << ", b = " << planet->albedoCoef[1] << std::endl;
+        }
     }
 
     // Apply albedo to calculate absorbed flux for each face at each time step
@@ -8498,6 +8513,40 @@ int main(int argc, char** argv) {
             std::cout << "Property override: kd " << planet.kd
                       << " -> " << tp.kd_override << " W/m/K" << std::endl;
             planet.kd = tp.kd_override;
+        }
+
+        // Directional-hemispheric (Hapke) albedo gate. Opt-in; default OFF ->
+        // untouched baseline. When on, derive the single-scattering albedo w from
+        // config (albedo_hapke_w) or invert the body Bond albedo A0 for w such
+        // that the hemispherically-averaged A_h reproduces A0 at normal incidence
+        // (A_h(mu0=1) = 1 - gamma*(3)/(1+2*gamma)). We solve that 1-D monotone
+        // relation for w by bisection so the gate defaults to the body's own
+        // albedo rather than an arbitrary value.
+        if (tp.albedo_hapke) {
+            double w = tp.albedo_hapke_w;
+            if (w < 0.0) {
+                // Invert A_h(mu0=1; w) = A0 for w by bisection (A_h monotone in w).
+                double A0 = planet.albedo;
+                auto Ah_normal = [](double ww) {
+                    double gamma = std::sqrt(std::max(0.0, 1.0 - ww));
+                    double H = 3.0 / (1.0 + 2.0 * gamma);  // mu0 = 1
+                    return 1.0 - gamma * H;
+                };
+                double lo = 0.0, hi = 1.0;
+                for (int it = 0; it < 60; ++it) {
+                    double mid = 0.5 * (lo + hi);
+                    if (Ah_normal(mid) < A0) lo = mid; else hi = mid;
+                }
+                w = 0.5 * (lo + hi);
+                std::cout << "Hapke albedo gate: derived single-scattering w = "
+                          << w << " from Bond albedo A0 = " << A0
+                          << " (A_h at normal incidence)" << std::endl;
+            } else {
+                std::cout << "Hapke albedo gate: single-scattering w = " << w
+                          << " (from config)" << std::endl;
+            }
+            planet.use_hapke_albedo = true;
+            planet.hapke_albedo_w = std::max(0.0, std::min(1.0, w));
         }
     }
 

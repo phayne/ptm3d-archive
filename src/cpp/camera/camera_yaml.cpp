@@ -92,6 +92,21 @@ bool loadCameraYaml(const std::string& filepath, CameraSimConfig& config) {
                 readArray<double, 3>(pt, "up",      config.camera.up_vector);
                 config.camera.use_direction =
                     getOr(pt, "use_direction", config.camera.use_direction);
+                // Optional dynamic up convention (CLI flags still override).
+                const std::string up_mode =
+                    getOr<std::string>(pt, "up_mode", std::string{});
+                if (up_mode == "explicit") {
+                    config.camera.up_mode = CameraConfig::UpMode::EXPLICIT;
+                } else if (up_mode == "velocity_pole") {
+                    config.camera.up_mode = CameraConfig::UpMode::VELOCITY_POLE;
+                } else if (up_mode == "boresight_pole") {
+                    config.camera.up_mode = CameraConfig::UpMode::BORESIGHT_POLE;
+                } else if (!up_mode.empty()) {
+                    std::cerr << "[camera_yaml] Unknown pointing.up_mode '"
+                              << up_mode << "' (expected: explicit | "
+                              << "velocity_pole | boresight_pole)" << std::endl;
+                    return false;
+                }
             } else if (mode == "quaternion") {
                 config.camera.pointing = CameraConfig::Pointing::QUATERNION;
                 if (!readArray<double, 4>(pt, "quaternion",
@@ -196,6 +211,22 @@ bool loadCameraYaml(const std::string& filepath, CameraSimConfig& config) {
                 getOr(ph, "ls_w", config.photometric_params.ls_w);
             config.photometric_params.minnaert_k =
                 getOr(ph, "minnaert_k", config.photometric_params.minnaert_k);
+
+            // Hapke parameters. w is the single-scattering albedo (calibrated to
+            // the body's geometric albedo via the opposition-excluded disk
+            // integral); B0/h/g/theta_bar are the phase-dependence structural
+            // params (Fermi's class-based provisional defaults — override here).
+            config.photometric_params.hapke_w =
+                getOr(ph, "hapke_w", config.photometric_params.hapke_w);
+            config.photometric_params.hapke_B0 =
+                getOr(ph, "hapke_B0", config.photometric_params.hapke_B0);
+            config.photometric_params.hapke_h =
+                getOr(ph, "hapke_h", config.photometric_params.hapke_h);
+            config.photometric_params.hapke_g =
+                getOr(ph, "hapke_g", config.photometric_params.hapke_g);
+            config.photometric_params.hapke_theta_bar =
+                getOr(ph, "hapke_theta_bar",
+                      config.photometric_params.hapke_theta_bar);
         }
 
         std::cout << "[camera_yaml] Loaded camera definition from "

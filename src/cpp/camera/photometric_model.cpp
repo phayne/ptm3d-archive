@@ -102,6 +102,24 @@ double PhotometricModel::reflectedIF(double cos_i, double cos_e,
     return M_PI * r * cos_i;
 }
 
+double PhotometricModel::geometricAlbedoFromW(double w) {
+    // Opposition-excluded isotropic disk integral (Hapke 1993):
+    //     p = w/8 + 0.49*r0 + 0.196*r0^2,   r0 = (1-gamma)/(1+gamma),
+    //     gamma = sqrt(1-w).
+    // The w/8 term is the singly-scattered contribution at zero phase; the two
+    // r0 terms are the isotropic multiple-scattering contribution. B0 and g are
+    // intentionally NOT included — this is the calibration/verification integral,
+    // not the bidirectional render (see header).
+    double ww = std::max(0.0, std::min(1.0, w));
+    double gamma = std::sqrt(std::max(0.0, 1.0 - ww));
+    double r0 = (1.0 - gamma) / (1.0 + gamma);
+    return ww / 8.0 + 0.49 * r0 + 0.196 * r0 * r0;
+}
+
+double PhotometricModel::geometricAlbedo() const {
+    return geometricAlbedoFromW(params_.hapke_w);
+}
+
 // ============================================================================
 // Individual reflectance models
 // ============================================================================

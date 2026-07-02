@@ -10,9 +10,12 @@ Products per target (in CROOT/<num><name>/flyby/):
   <name>_flyby_reflected_snapshots.png  reflected/visible bracket stills (RADIANCE HDU)
   <name>_flyby_reflected.mp4            reflected/visible flyby movie
 
-NOTE: the RADIANCE (reflected) values are still on the pre-Hapke normalization
-(~8x too dark); the reflected product path is the rendering FEATURE, not a final
-science product. The Hapke fix is a separate follow-up task.
+Reflectance is Hapke: per-body single-scattering albedo w is calibrated to the
+body's geometric albedo (opposition-excluded disk integral), so the RADIANCE
+(reflected) HDU is now physically normalized — no longer the ~8x-dark Lommel-
+Seeliger level nor the old fudge. Structural Hapke params (B0/h/g/theta_bar) are
+Fermi's provisional class-based defaults (see HAPKE_DEFAULTS), overridable per
+body via the body_config 'surface.hapke' block.
 """
 import os, sys, re, json, glob, time, math, subprocess
 import numpy as np, yaml
@@ -38,6 +41,31 @@ LAM=10.5e-6; EPS=0.95; HP=6.62607015e-34; CC=2.99792458e8; KB=1.380649e-23
 # Rockox first (thermal already done -> validates render/MP4 fast), then chronological
 TARGETS=[("13294","Rockox"),("10253","Westerwald"),("623","Chimaera"),
          ("88055","Ghaf"),("23871","Ousha"),("59980","Moza")]
+
+# Per-body Hapke parameters (Fermi). w is the single-scattering albedo calibrated
+# to reproduce each body's geometric albedo via the opposition-EXCLUDED disk
+# integral p = w/8 + 0.49*r0 + 0.196*r0^2, r0 = (1-gamma)/(1+gamma),
+# gamma = sqrt(1-w). B0/h/g/theta_bar are Fermi's class-based PROVISIONAL
+# defaults (measured values pending a literature lookup) — override per body
+# here or via the body_config 'surface.hapke' block (which wins if present).
+# Keyed by (num, name) -> {w, B0, h, g, theta_bar}.
+HAPKE_DEFAULTS={
+    "10253":{"w":0.797,"B0":0.8,"h":0.06,"g":-0.27,"theta_bar":20.0},  # Westerwald p=0.313
+    "13294":{"w":0.465,"B0":1.0,"h":0.05,"g":-0.30,"theta_bar":20.0},  # Rockox     p=0.139
+    "59980":{"w":0.416,"B0":1.0,"h":0.05,"g":-0.30,"theta_bar":20.0},  # Moza       p=0.121
+    "88055":{"w":0.204,"B0":1.5,"h":0.05,"g":-0.35,"theta_bar":20.0},  # Ghaf       p=0.054
+    "23871":{"w":0.193,"B0":1.5,"h":0.05,"g":-0.35,"theta_bar":20.0},  # Ousha      p=0.051
+    "623"  :{"w":0.143,"B0":1.5,"h":0.05,"g":-0.35,"theta_bar":20.0},  # Chimaera   p=0.037
+}
+
+def hapke_params(num,gb):
+    """Resolve Hapke params for a body: body_config 'surface.hapke' overrides the
+    class-based defaults; falls back to a mid dark-asteroid default if unknown."""
+    hp=dict(HAPKE_DEFAULTS.get(num,{"w":0.20,"B0":1.5,"h":0.05,"g":-0.35,"theta_bar":20.0}))
+    cfg_hp=(gb.get('surface',{}) or {}).get('hapke',{}) or {}
+    for k in ("w","B0","h","g","theta_bar"):
+        if k in cfg_hp: hp[k]=float(cfg_hp[k])
+    return hp
 
 def log(m):
     s=f"[{time.strftime('%H:%M:%S')}] {m}"
@@ -121,18 +149,21 @@ def thermal_done(outdir):
     return (len(glob.glob(outdir+"/temperature/*.bin"))>=200 and
             os.path.exists(outdir+"/statistics/temperature_avg.bin"))
 
-def render(ptm_output, times, outdir, naif, frame, mk, albedo=0.051):
-    # albedo defaults to the dark-asteroid scalar (0.051) so the reflected/visible
-    # channel is never blank if a caller forgets to thread the value through.
-    if albedo is None or float(albedo) < 0.0:
-        albedo = 0.051
+def render(ptm_output, times, outdir, naif, frame, mk, hp):
+    # Reflectance is now Hapke: single-scattering albedo hp['w'] is calibrated so
+    # the disk-integrated geometric albedo matches the body's known value; B0/h/g/
+    # theta_bar carry the phase dependence away from opposition. The C++ seeds the
+    # uniform vertex albedo from hapke_w so the calibrated model is rendered as-is
+    # (no separate geometric-albedo scalar rescale). Up-vector uses the boresight-
+    # projected north pole (keeps north in the image plane).
     os.makedirs(outdir,exist_ok=True)
     cmd=[CBIN,"--ptm-output",ptm_output,
          "--camera-yaml",CAMYAML,"--meta-kernel",mk,"--trajectory",SCSPK,
          "--traj-format","spk","--traj-spacecraft","-60000","--target-body",naif,
          "--target-frame",frame,"--render-mode","both","--thermal-wavelength","10.5",
-         "--emissivity","0.95","--albedo",str(albedo),"--photometric","lommel_seeliger",
-         "--up-velocity-pole","--supersample","2","--fits","--pgm","--output-dir",outdir]
+         "--emissivity","0.95","--photometric","hapke",
+         "--hapke",str(hp['w']),str(hp['B0']),str(hp['h']),str(hp['g']),str(hp['theta_bar']),
+         "--up-boresight-pole","--supersample","2","--fits","--pgm","--output-dir",outdir]
     for t in times: cmd+=["--time",t]
     return run(cmd, outdir+"/render.log")
 
@@ -143,7 +174,7 @@ def fits_tb(fp):
 
 def fits_reflected(fp):
     # Reflected/visible-light radiance lives in the RADIANCE HDU (W/m^2/sr).
-    # NOTE: still on the pre-Hapke normalization (~8x too dark). Rendered linearly.
+    # Hapke-normalized (per-body w calibrated to geometric albedo). Rendered linearly.
     from astropy.io import fits
     r=np.asarray(fits.open(fp)['RADIANCE'].data,float)
     on=r>0
@@ -168,8 +199,8 @@ def snapshot_png(camdir,out_png,title):
     plt.savefig(out_png,dpi=130,facecolor='black'); plt.close()
 
 def snapshot_png_reflected(camdir,out_png,title):
-    # Reflected/visible-light bracket stills from the RADIANCE HDU. Independent of
-    # the thermal stills; does not read or overwrite them.
+    # Reflected/visible-light bracket stills from the RADIANCE HDU (Hapke-
+    # normalized). Independent of the thermal stills; does not read/overwrite them.
     rads=[fits_reflected(camdir+f"/frame_000{i}.fits")[0] for i in range(3)]
     pos=np.concatenate([r[r>0] for r in rads]) if any((r>0).any() for r in rads) else np.array([0.0])
     vmax=float(np.percentile(pos,99.5)) if pos.size and pos.max()>0 else 1.0
@@ -249,6 +280,30 @@ for num,name in TARGETS:
         naif=str(spk_body_id(spkf)[0])
         radius=float(gb['shape']['radius_km']); period=float(gb['spin']['period_hours'])
         albedo=float(gb['surface']['albedo'])
+        # Shape selection: honor whatever the body_config declares. A body may
+        # ship a real shape model (type: custom_mesh + mesh_file); the previous
+        # driver hardcoded type: spherical and blanked mesh.import_file, silently
+        # discarding it. Carry the declared type + mesh_file through to BOTH
+        # generic_body.shape.mesh_file and top-level mesh.import_file. When no
+        # shape file is present, fall back to the spherical approximation with a
+        # clear warning.
+        shape_type=str(gb['shape'].get('type','spherical')).strip().lower()
+        shape_mesh_file=str(gb['shape'].get('mesh_file','') or '')
+        shape_mesh_scale=float(gb['shape'].get('mesh_scale',1.0))
+        if shape_type=='custom_mesh' and shape_mesh_file and os.path.exists(shape_mesh_file):
+            use_mesh=True
+            log(f"{name}: shape model -> custom_mesh {shape_mesh_file} (scale {shape_mesh_scale})")
+        else:
+            use_mesh=False
+            if shape_type=='custom_mesh':
+                log(f"{name}: WARNING custom_mesh declared but mesh_file "
+                    f"'{shape_mesh_file}' missing -> using spherical approximation")
+            elif shape_type not in ('spherical',''):
+                log(f"{name}: WARNING unsupported shape type '{shape_type}' -> "
+                    f"using spherical approximation")
+            else:
+                log(f"{name}: no shape model -> using spherical approximation "
+                    f"(radius {radius} km)")
         ra=gb['spin'].get('pole_ra_deg'); dec=gb['spin'].get('pole_dec_deg')
         pole_assumed=False
         if ra is None or dec is None:  # no measured pole -> orbital pole (obliquity 0)
@@ -266,7 +321,8 @@ for num,name in TARGETS:
         win_h=1.5*period; start_et=etm-0.75*period*3600.0
         tconf={'simulation':{'start_time':sp.et2utc(start_et,'ISOC',0).replace('Z',''),
                 'duration_days':win_h/24.0,'timesteps':292,'body':gb.get('name',name)},
-            'mesh':{'resolution':6,'import_file':'','scale_factor':1.0,'export_basic':False},
+            'mesh':{'resolution':6,'import_file':(shape_mesh_file if use_mesh else ''),
+                    'scale_factor':(shape_mesh_scale if use_mesh else 1.0),'export_basic':False},
             'thermal':{'run_thermal_mesh':True,'threads':0,'equilibration_orbits':40,'use_gpu':True,
                 'compute_statistics':True,'integration_days':-1.0,'integration_steps':-1,
                 'integration_offset_days':0.0,'integration_offset_steps':0,'geothermal_heat_flow':-1.0,
@@ -282,7 +338,9 @@ for num,name in TARGETS:
             'advanced':{'verbose':False,'default_visible_albedo':-1.0},
             'generic_body':{'name':gb.get('name',name),'config_file':bcfg,'ephemeris_source':'spice',
                 'spice_metakernel':bdir+'/metakernel.tm','naif_id':naif,
-                'shape':{'type':'spherical','radius_km':radius,'mesh_file':'','mesh_scale':1.0,
+                'shape':{'type':('custom_mesh' if use_mesh else 'spherical'),'radius_km':radius,
+                         'mesh_file':(shape_mesh_file if use_mesh else ''),
+                         'mesh_scale':(shape_mesh_scale if use_mesh else 1.0),
                          'semi_axes_km':[0.001,0.001,0.001]},
                 'orbit':gb['orbit'],
                 'spin':{'period_hours':period,'pole_ra_deg':ra,'pole_dec_deg':dec,'prime_meridian_deg':0.0},
@@ -307,16 +365,19 @@ for num,name in TARGETS:
 
         camdir=f"{CROOT}/{num}{name.lower()}/flyby"; animdir=camdir+"/anim"
         os.makedirs(camdir,exist_ok=True)
+        hp=hapke_params(num,gb)
+        log(f"{name}: Hapke w={hp['w']} B0={hp['B0']} h={hp['h']} g={hp['g']} "
+            f"theta_bar={hp['theta_bar']} (geom-albedo target {albedo})")
         # 3 snapshots at CA-2/CA/CA+2 min
         snaps=[sp.et2utc(etm+dt,'ISOC',0) for dt in (-120.0,0.0,120.0)]
-        render(THERMDIR,snaps,camdir,naif,frame,cam_mk,albedo)
+        render(THERMDIR,snaps,camdir,naif,frame,cam_mk,hp)
         title=f"({num}) {name} - EMA ECAM-IR3S VNFOV thermal-IR | CA {ca_utc} {dmin:.0f} km"
         rtitle=f"({num}) {name} - EMA ECAM-IR3S VNFOV reflected | CA {ca_utc} {dmin:.0f} km"
         snapshot_png(camdir,camdir+f"/{name.lower()}_flyby_snapshots.png",title)
         snapshot_png_reflected(camdir,camdir+f"/{name.lower()}_flyby_reflected_snapshots.png",rtitle)
         # dense flyby sequence (consistent ~6x zoom), 49 frames
         half=min(900.0, 5.9*dmin/vrel); times=[sp.et2utc(etm+t,'ISOC',0) for t in np.linspace(-half,half,49)]
-        render(THERMDIR,times,animdir,naif,frame,cam_mk,albedo)
+        render(THERMDIR,times,animdir,naif,frame,cam_mk,hp)
         make_mp4(animdir,camdir+f"/{name.lower()}_flyby.mp4",title)
         make_mp4_reflected(animdir,camdir+f"/{name.lower()}_flyby_reflected.mp4",rtitle)
         man[name]={'status':'DONE','ca':ca_utc,'range_km':round(dmin,1),'phase_naif':naif,

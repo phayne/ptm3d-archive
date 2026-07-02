@@ -359,6 +359,16 @@ public:
     bool using_albedo_map = false;
     bool using_thermal_inertia_map = false;
 
+    // Directional-hemispheric (Hapke) albedo model, OFF by default. When on,
+    // getAlbedoWithIncidence() returns the analytic closed form
+    //   A_h(mu0) = 1 - gamma * H(mu0, w),  gamma = sqrt(1 - w),
+    //   H(mu0, w) = (1 + 2*mu0) / (1 + 2*mu0*gamma),  mu0 = cos(incidence),
+    // instead of the Hayne (2017) polynomial. Gated so baseline runs are
+    // byte-identical when off. use_hapke_albedo defaults false; hapke_albedo_w
+    // is the single-scattering albedo (set from config, or derived from A0).
+    bool use_hapke_albedo = false;
+    double hapke_albedo_w = -1.0;
+
     // Per-face H-parameter override (Diviner-derived map or user custom).
     // Empty when no map is loaded. Indexed by face index in mesh order.
     std::vector<double> face_H_overrides;

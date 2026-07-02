@@ -300,6 +300,18 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 thermo, "ks_override", config.thermophysical.ks_override);
             config.thermophysical.kd_override = getWithDefault(
                 thermo, "kd_override", config.thermophysical.kd_override);
+
+            // Directional-hemispheric (Hapke) albedo gate. Two equivalent opt-in
+            // spellings: the previously-dead `incidence_angle_albedo` bool, or
+            // `albedo_model: hapke`. Default OFF -> the Hayne-polynomial/constant
+            // path is untouched and baseline runs stay byte-identical.
+            bool inc_alb = getWithDefault(thermo, "incidence_angle_albedo", false);
+            std::string albedo_model =
+                getWithDefault<std::string>(thermo, "albedo_model", std::string{});
+            for (auto& c : albedo_model) c = std::tolower(c);
+            config.thermophysical.albedo_hapke = (inc_alb || albedo_model == "hapke");
+            config.thermophysical.albedo_hapke_w = getWithDefault(
+                thermo, "albedo_hapke_w", config.thermophysical.albedo_hapke_w);
         }
 
         // Parse Advanced section

@@ -336,6 +336,17 @@ struct SimulationConfig {
         double emissivity_override = -1.0;  // >0:  override emissivity
         double ks_override = -1.0;          // >0:  override surface conductivity ks
         double kd_override = -1.0;          // >0:  override deep conductivity kd
+
+        // Directional-hemispheric (Hapke) albedo model, OFF by default. When
+        // enabled, the absorbed-solar term uses the analytic closed form
+        //   A_h(mu0) = 1 - gamma * H(mu0, w),  gamma = sqrt(1-w),
+        //   H(mu0,w) = (1 + 2*mu0) / (1 + 2*mu0*gamma),  mu0 = cos(incidence),
+        // replacing the constant (1 - albedo). Gated so baseline (Moon3D / A3GT /
+        // Europa) runs stay byte-identical. Opt in via `incidence_angle_albedo:
+        // true` or `albedo_model: hapke` in the thermophysical section.
+        bool   albedo_hapke = false;        // gate: use A_h(i) closed form
+        double albedo_hapke_w = -1.0;       // single-scattering albedo w; <0 =
+                                            // derive from the Bond albedo A0.
     } thermophysical;
 
     // Legacy accessor (for compatibility)
