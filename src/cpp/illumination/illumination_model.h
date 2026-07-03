@@ -528,6 +528,40 @@ private:
     std::array<double,3> scene_origin_offset_{0.0, 0.0, 0.0};
     bool scene_has_offset_ = false;
 
+    // Mesh topology flag: true if the CORE mesh is an OPEN patch (has boundary
+    // edges belonging to exactly one triangle), false if watertight/closed (0
+    // boundary edges). Computed once in initializeScene() over the core faces
+    // (occluders excluded). Gates the analytic body-occlusion pre-check:
+    //   - CLOSED mesh (e.g. 623 Chimaera): the Embree BVH holds the full body and
+    //     self-occludes, so the analytic pre-check is DISABLED (it over-culls
+    //     sunward grazing facets on shaped bodies). This matches the GPU path,
+    //     which has never had a pre-check and is correct on closed bodies.
+    //   - OPEN mesh (e.g. the lunar/Europa micro-patch): the BVH has no far-side
+    //     geometry so shadow rays pass through the bulk body; the analytic body-
+    //     sphere is the SOLE self-occlusion guard, so the pre-check runs. It culls
+    //     a face only when the body sphere lies BETWEEN the face and the sun
+    //     (forward ray-sphere hit at t>0) -- NOT gated by mu, and NOT a bare
+    //     |fc x sun| < R line test, which would wrongly cull sunward-tilted facets
+    //     just past the terminator. Applied to the CPU AND GPU paths identically.
+    // See docs/illumination-model.md and memory
+    // ptm-mu-gate-open-mesh-selfocclusion-fail.
+    bool mesh_is_open_ = false;
+
+    // Body-level occluding-sphere radius (NATIVE mesh units, same units as the
+    // runtime face-center radius |fc|). Used by the OPEN-mesh analytic body-
+    // occlusion pre-check as the sphere the shadow ray must clear. Computed once
+    // in initializeScene() as min over core-face centroid radii -- the solid bulk
+    // of the body reaches down to its lowest face, so a shadow ray whose closest
+    // approach falls inside this sphere is blocked by the body. This REPLACES the
+    // former per-face 0.998*|fc| inset, which put the occluder ~0.2% (thousands of
+    // m on the Moon) BELOW the surface and left a ~3.6 deg blind band: on a near-
+    // tangent micro-patch the grazing night-side ray cleared the sunken sphere and
+    // leaked. min(|fc|) keys the sphere to the true body radius (relief-adaptive:
+    // it is the lowest crater floor) so tangent grazing rays are caught, while no
+    // face is ever culled by a sphere larger than its own radius (0 daytime loss).
+    // 0 until the scene is built.
+    double body_radius_occ_native_ = 0.0;
+
     // Occluder-only geometry (shadow ray-tracing); appended to the BVH in
     // initializeScene(). Never thermally solved / output. See
     // docs/extended-occluder-architecture.md.

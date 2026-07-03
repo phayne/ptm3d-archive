@@ -16,6 +16,7 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <random>
 #include <limits>
 #include <cassert>
@@ -317,6 +318,68 @@ bool IlluminationModel::initializeScene(
             0.5 * (bb_min[2] + bb_max[2])
         };
         scene_has_offset_ = true;
+
+        // Closed-vs-open mesh detection (topology, not shape). Count boundary
+        // edges: an undirected edge shared by exactly one triangle is a boundary
+        // edge. 0 boundary edges => watertight/closed; any => open patch. Uses the
+        // CORE faces only (an occluder ring is legitimately open and must NOT flip
+        // the body pre-check on for a closed core). O(edges) with a hash set.
+        // Gates the analytic body-occlusion pre-check on the CPU AND GPU paths;
+        // see the mesh_is_open_ note in the header and memory
+        // ptm-mu-gate-open-mesh-selfocclusion-fail.
+        {
+            const auto t_topo0 = std::chrono::steady_clock::now();
+            // Map each undirected edge (min,max vertex id) -> incidence count.
+            std::unordered_map<uint64_t, uint32_t> edge_count;
+            edge_count.reserve(faces.size() * 3);
+            auto edge_key = [](int a, int b) -> uint64_t {
+                uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+                uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+                return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+            };
+            for (const auto& f : faces) {
+                ++edge_count[edge_key(f[0], f[1])];
+                ++edge_count[edge_key(f[1], f[2])];
+                ++edge_count[edge_key(f[2], f[0])];
+            }
+            size_t boundary_edges = 0;
+            for (const auto& kv : edge_count) {
+                if (kv.second == 1) ++boundary_edges;
+            }
+            mesh_is_open_ = (boundary_edges > 0);
+
+            // Body-level occluding-sphere radius for the OPEN-mesh pre-check:
+            // min over core-face centroid radii (native units, matching runtime
+            // |fc|). See the body_radius_occ_native_ note in the header. Only
+            // meaningful/used when mesh_is_open_; harmless to compute for closed.
+            double r_min = std::numeric_limits<double>::max();
+            for (const auto& f : faces) {
+                const auto& a = vertices[f[0]];
+                const auto& b = vertices[f[1]];
+                const auto& c = vertices[f[2]];
+                const double cx = (a[0] + b[0] + c[0]) / 3.0;
+                const double cy = (a[1] + b[1] + c[1]) / 3.0;
+                const double cz = (a[2] + b[2] + c[2]) / 3.0;
+                const double rc = std::sqrt(cx*cx + cy*cy + cz*cz);
+                if (rc < r_min) r_min = rc;
+            }
+            body_radius_occ_native_ = (r_min == std::numeric_limits<double>::max())
+                                          ? 0.0 : r_min;
+
+            const auto t_topo1 = std::chrono::steady_clock::now();
+            const double topo_ms =
+                std::chrono::duration<double, std::milli>(t_topo1 - t_topo0).count();
+            std::cout << "[IlluminationModel] mesh topology: "
+                      << (mesh_is_open_ ? "OPEN patch" : "CLOSED (watertight)")
+                      << " (" << boundary_edges << " boundary edges / "
+                      << edge_count.size() << " unique edges, "
+                      << faces.size() << " core faces; detect "
+                      << topo_ms << " ms). Analytic body-occlusion pre-check "
+                      << (mesh_is_open_ ? "ENABLED (open: sole self-occlusion guard)."
+                                        : "DISABLED (closed: Embree self-occludes).")
+                      << " R_occ(body) = " << body_radius_occ_native_
+                      << " (native units).\n";
+        }
 
         RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
         if (!geom) {
@@ -2170,18 +2233,38 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
 
-    // Analytical body-occlusion pre-check (same logic as batch path).
-    {
+    // Analytical body-occlusion pre-check (same logic as batch/GPU paths).
+    // TOPOLOGY GATE (not shape): run this cull ONLY on OPEN patch meshes. On a
+    // CLOSED (watertight) mesh the Embree BVH holds the full body and self-
+    // occludes, so this analytic sphere test is unnecessary and over-culls
+    // sunward-tilted grazing facets on shaped bodies -- disable it and let Embree
+    // do all occlusion (matching the GPU path, correct on closed bodies). On an
+    // OPEN micro-patch (lunar/Europa) the BVH has no far-side geometry, so shadow
+    // rays would pass THROUGH the bulk body; here the analytic body-sphere is the
+    // SOLE self-occlusion guard.
+    //
+    // Cull only when the body SPHERE actually lies BETWEEN the face and the sun,
+    // i.e. the forward ray (origin=fc, dir=sun) intersects the body sphere at
+    // t>0. This forward test -- NOT a bare |fc x sun| < R_occ line test -- is
+    // what distinguishes a genuine far-side/behind-the-limb face from a sunward-
+    // tilted face just past the geometric terminator whose grazing ray only comes
+    // near the near limb going AWAY from the body. The old bare-line test (with a
+    // 0.998*|fc| inset that masked it) wrongly culled mu>0 sunward facets once the
+    // inset was tightened. R_occ = body-level radius (min core-face centroid
+    // radius), which is relief-adaptive and never exceeds a face's own radius, so
+    // no lit face is culled. Ungated by mu -- the forward-intersection condition
+    // already excludes lit sunward facets. See mesh_is_open_ / body_radius_occ_
+    // notes and memory ptm-mu-gate-open-mesh-selfocclusion-fail.
+    if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
         const double fc_dot_sun = face_center[0]*sun_dir[0] + face_center[1]*sun_dir[1] + face_center[2]*sun_dir[2];
-        if (fc_dot_sun < 0.0) {
-            const double cx = face_center[1]*sun_dir[2] - face_center[2]*sun_dir[1];
-            const double cy = face_center[2]*sun_dir[0] - face_center[0]*sun_dir[2];
-            const double cz = face_center[0]*sun_dir[1] - face_center[1]*sun_dir[0];
-            const double closest_sq = cx*cx + cy*cy + cz*cz;
-            const double r_fc = vectorLength(face_center);
-            const double R_occ = 0.998 * r_fc;
-            if (closest_sq < R_occ * R_occ) {
-                return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+        if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+            const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+            double tb1, tb2;
+            if (raySphereIntersect(face_center, sun_dir, body_center,
+                                   body_radius_occ_native_, tb1, tb2)) {
+                if (tb1 > 0.0 || tb2 > 0.0) {
+                    return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+                }
             }
         }
     }
@@ -2754,22 +2837,40 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // Analytical body-occlusion pre-check. A face whose center is behind
         // the terminator plane (dot(fc, sun_dir) < 0) AND whose shadow ray
-        // passes through the mean sphere (closest approach < R_mean) cannot
+        // passes through the occluding sphere (closest approach < R_occ) cannot
         // see the sun regardless of terrain-slope normal orientation. This
         // catches nightside faces that Embree's mesh trace misses, which
         // otherwise produce spurious illumination up to ~8° past the
         // terminator on topographic meshes.
-        {
+        //
+        // TOPOLOGY GATE (not shape): run this cull ONLY on OPEN patch meshes. On a
+        // CLOSED (watertight) mesh the Embree BVH self-occludes, so the pre-check
+        // is unnecessary and over-culls sunward-tilted grazing facets on shaped
+        // bodies -- disable it and let Embree do all occlusion. On an OPEN micro-
+        // patch the BVH has no far-side geometry, so the analytic body-sphere is
+        // the SOLE self-occlusion guard.
+        //
+        // Cull only when the body SPHERE lies BETWEEN the face and the sun: the
+        // forward ray (origin=fc, dir=sun) must intersect the body sphere at t>0.
+        // A bare |fc x sun| < R_occ line test culls sunward-tilted (mu>0) facets
+        // just past the terminator whose ray only grazes the near limb going away
+        // from the body -- the forward-intersection condition excludes them. R_occ
+        // = body-level radius (min core-face centroid radius), relief-adaptive and
+        // never larger than a face's own radius, so no lit face is culled. See
+        // mesh_is_open_ / body_radius_occ_ notes and memory
+        // ptm-mu-gate-open-mesh-selfocclusion-fail.
+        if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
             const double fc_dot_sun = fc[0]*sun_dir[0] + fc[1]*sun_dir[1] + fc[2]*sun_dir[2];
-            if (fc_dot_sun < 0.0) {
-                const double cx = fc[1]*sun_dir[2] - fc[2]*sun_dir[1];
-                const double cy = fc[2]*sun_dir[0] - fc[0]*sun_dir[2];
-                const double cz = fc[0]*sun_dir[1] - fc[1]*sun_dir[0];
-                const double closest_sq = cx*cx + cy*cy + cz*cz;
-                if (closest_sq < body_radius_m_ * body_radius_m_) {
-                    direct_solar_values[i] = enable_shadow_flux_
-                        ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
-                    continue;
+            if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+                const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+                double tb1, tb2;
+                if (raySphereIntersect(fc, sun_dir, body_center,
+                                       body_radius_occ_native_, tb1, tb2)) {
+                    if (tb1 > 0.0 || tb2 > 0.0) {
+                        direct_solar_values[i] = enable_shadow_flux_
+                            ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
+                        continue;
+                    }
                 }
             }
         }
@@ -3958,6 +4059,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         bool below_horizon;     // Entire disk below horizon
         bool center_eclipsed;   // Center ray blocked by primary body
         bool needs_sampling;    // Needs finite-disk sampling
+        bool precheck_occluded; // Analytic body-occlusion pre-check culled it
+                                // (OPEN meshes only; see below)
     };
     std::vector<FaceInfo> face_info(n);
 
@@ -3979,6 +4082,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         if (fi.sun_dist_m <= constants::EPSILON) {
             fi.below_horizon = true;
             fi.needs_sampling = false;
+            fi.precheck_occluded = false;
             continue;
         }
 
@@ -3994,9 +4098,38 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         if (fi.cos_inc0 <= -s) {
             fi.below_horizon = true;
             fi.needs_sampling = false;
+            fi.precheck_occluded = false;
             continue;
         }
         fi.below_horizon = false;
+        fi.precheck_occluded = false;
+
+        // Analytic body-occlusion pre-check, TOPOLOGY-gated to OPEN meshes only,
+        // mirroring the CPU paths EXACTLY so CPU and GPU stay equivalent. On a
+        // CLOSED mesh the GPU BVH self-occludes (no pre-check needed, historical
+        // correct behavior); on an OPEN micro-patch the BVH has no far-side
+        // geometry, so without this the GPU path leaks sun through the bulk body.
+        // Cull only when the body sphere lies BETWEEN the face and the sun
+        // (forward ray-sphere hit at t>0); R_occ = body-level radius. This forward
+        // test excludes sunward-tilted (mu>0) facets just past the terminator so
+        // no lit face is lost. A culled face generates NO rays and routes to
+        // shadow-flux/zero. See memory ptm-mu-gate-open-mesh-selfocclusion-fail.
+        if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
+            const double fc_dot_sun = fc[0]*fi.sun_dir[0] + fc[1]*fi.sun_dir[1] + fc[2]*fi.sun_dir[2];
+            if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+                const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+                double tb1, tb2;
+                if (raySphereIntersect(fc, fi.sun_dir, body_center,
+                                       body_radius_occ_native_, tb1, tb2)) {
+                    if (tb1 > 0.0 || tb2 > 0.0) {
+                        fi.precheck_occluded = true;
+                        fi.needs_sampling = false;
+                        fi.center_eclipsed = false;
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Compute robust ray origin
         const double eps_base = calculateSafeRayOffset(fc, fn);
@@ -4036,7 +4169,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) {
         const FaceInfo& fi = face_info[i];
-        if (fi.below_horizon) {
+        if (fi.below_horizon || fi.precheck_occluded) {
             ray_counts[i] = 0;
         } else if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
             // Center ray fast path - just 1 ray
@@ -4080,7 +4213,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         fri.ray_start = ray_offsets[i];
         fri.ray_count = 0;
 
-        if (fi.below_horizon) continue;
+        if (fi.below_horizon || fi.precheck_occluded) continue;
 
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
@@ -4285,7 +4418,9 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
 
-        if (fi.below_horizon) {
+        if (fi.below_horizon || fi.precheck_occluded) {
+            // Below horizon, or culled by the analytic body-occlusion pre-check
+            // (OPEN meshes) -- no rays traced; treat as shadowed.
             direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
