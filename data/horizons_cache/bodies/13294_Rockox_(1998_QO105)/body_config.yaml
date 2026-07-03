@@ -1,7 +1,7 @@
 generic_body:
   name: 13294 Rockox (1998 QO105)
   ephemeris_source: spice
-  naif_id: '2013294'
+  naif_id: '20013294'
   shape:
     type: spherical
     radius_km: 2.619
@@ -15,6 +15,8 @@ generic_body:
     epoch: '2000-01-01T12:00:00'
   spin:
     period_hours: 3.24305
+    pole_ra_deg: 99.88    # converted from ecliptic lon=119.1, lat=-78.7 (Carry+2024) via astropy barycentricmeanecliptic->ICRS
+    pole_dec_deg: -56.26
     prime_meridian_deg: 0.0
   surface:
     albedo: 0.139

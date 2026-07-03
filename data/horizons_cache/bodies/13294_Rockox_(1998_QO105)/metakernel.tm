@@ -11,14 +11,19 @@ KPL/MK
 
 \begindata
 
-  PATH_VALUES  = ( '/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)' )
-  PATH_SYMBOLS = ( 'KERNELS' )
+  PATH_VALUES  = (
+                   '/Users/paha3326/software/cspice/data',
+                   '/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data+',
+                   '/horizons_cache/bodies/13294_Rockox_(1998_QO105)'
+  )
+  PATH_SYMBOLS = ( 'KERNELS',
+                   'BODY' )
 
   KERNELS_TO_LOAD = (
             '$KERNELS/lsk/naif0012.tls'
             '$KERNELS/pck/pck00011.tpc'
             '$KERNELS/spk/de440s.bsp'
-            '/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk'
+            '$BODY/ephemeris.spk'
   )
 
 \begintext
