@@ -577,6 +577,11 @@ bool runThermalModel(const std::string&, const std::vector<double>&, const std::
 std::vector<double> runThermalModelForFace(const std::vector<double>&, const std::vector<double>&,
     double, const thermal::Config&, int);
     
+// Apply main()-forwarded generic-body thermophysical props to a solver's local
+// Planet (defined below near the solver bodies; forward-declared for the per-face
+// path above the definition). See the definition for why this is needed.
+static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config);
+
 bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
     const std::vector<double>&, int, const thermal::Config&, double, double,
@@ -1574,6 +1579,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     try {
         const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
+        applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
 
         // Override basal heat flow if specified (per-face or global)
         if (Qb_override >= 0.0) {
@@ -2203,6 +2209,35 @@ std::vector<double> runThermalModelForFace(
     }
 }
 
+// Apply generic-body thermophysical properties that main() forwarded via the
+// thermal_config "gb_*" properties. The thermal solvers below each rebuild a
+// LOCAL Planet from the body NAME (config "planet"); for a non-built-in generic
+// body (e.g. an asteroid) that name resolves to Europa PLACEHOLDER defaults
+// (planetary_properties.h getPropertiesByName), so the configured surface
+// conductivity ks / the ks->kd depth profile / cp0 / rho / H / cpCoeff (and the
+// constant_thermal_inertia collapse, already baked into the main Planet) never
+// reached the conduction -- thermal inertia was silently ignored for all EMA
+// asteroid runs. Gated on "gb_thermo": built-in Moon/Europa runs (which do not
+// set it) are byte-identical untouched. Call right after the local Planet is
+// built and BEFORE reference_profile, so the depth grid / cp / kc all pick it up.
+static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config) {
+    if (config.getProperty("gb_thermo", "").empty()) return;  // only generic bodies
+    double v;
+    if ((v = config.getPropertyDouble("gb_ks",   -1.0)) >  0.0) planet.ks   = v;
+    if ((v = config.getPropertyDouble("gb_kd",   -1.0)) >  0.0) planet.kd   = v;
+    if ((v = config.getPropertyDouble("gb_cp0",  -1.0)) >= 0.0) planet.cp0  = v;
+    if ((v = config.getPropertyDouble("gb_rhos", -1.0)) >  0.0) planet.rhos = v;
+    if ((v = config.getPropertyDouble("gb_rhod", -1.0)) >  0.0) planet.rhod = v;
+    if ((v = config.getPropertyDouble("gb_H",    -1.0)) >  0.0) planet.H    = v;
+    if ((v = config.getPropertyDouble("gb_albedo",     -1.0)) >= 0.0) planet.albedo     = v;
+    if ((v = config.getPropertyDouble("gb_emissivity", -1.0)) >  0.0) planet.emissivity = v;
+    // cpCoeff forwarded as a comma-separated list; empty string => constant cp.
+    planet.cpCoeff.clear();
+    std::stringstream ss(config.getProperty("gb_cpCoeff", ""));
+    std::string tok;
+    while (std::getline(ss, tok, ',')) if (!tok.empty()) planet.cpCoeff.push_back(std::stod(tok));
+}
+
 // Streamed thermal path: read illumination on demand; no giant buffers
 bool runThermalModelsForAllFacesStreamed(
     const std::shared_ptr<Mesh>& mesh,
@@ -2719,6 +2754,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // albedo and drifted from the standard path by up to ~115 K at
     // albedo-sensitive faces (spatial map + high-incidence terminator).
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
 
     std::shared_ptr<ptm::SpatialMap> batch_albedo_map;
     if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
@@ -3205,6 +3241,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -4571,6 +4608,7 @@ bool runThermalForSelectedFaces_GPU(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -9656,6 +9694,29 @@ int main(int argc, char** argv) {
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {
             thermal_config.setProperty("using_generic_body", "true");
+
+            // Forward the fully-configured main Planet's thermophysical properties
+            // so the solvers (which rebuild a local Planet from the body NAME and
+            // otherwise fall back to Europa placeholder defaults) apply the real
+            // ks / ks->kd depth profile / cp0 / rho / H / cpCoeff (and any
+            // constant_thermal_inertia collapse already baked into `planet`).
+            // Applied by applyGenericBodyThermo() at each solver entry point;
+            // gated on "gb_thermo" so built-in Moon/Europa runs stay byte-identical.
+            thermal_config.setProperty("gb_thermo", "1");
+            thermal_config.setProperty("gb_ks",         planet.ks);
+            thermal_config.setProperty("gb_kd",         planet.kd);
+            thermal_config.setProperty("gb_cp0",        planet.cp0);
+            thermal_config.setProperty("gb_rhos",       planet.rhos);
+            thermal_config.setProperty("gb_rhod",       planet.rhod);
+            thermal_config.setProperty("gb_H",          planet.H);
+            thermal_config.setProperty("gb_albedo",     planet.albedo);
+            thermal_config.setProperty("gb_emissivity", planet.emissivity);
+            std::string gb_cpc;
+            for (size_t i = 0; i < planet.cpCoeff.size(); ++i) {
+                if (i) gb_cpc += ",";
+                gb_cpc += std::to_string(planet.cpCoeff[i]);
+            }
+            thermal_config.setProperty("gb_cpCoeff", gb_cpc);
         }
 
         // If using thermal model, add the maps to configuration
