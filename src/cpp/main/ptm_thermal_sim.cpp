@@ -3662,29 +3662,56 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(5.67051196e-8)
         );
 
+        // Initial subsurface temperature seed.
+        //
+        // Generic-body path: seed every face with the smooth, longitude-independent
+        // diurnal-mean radiative-equilibrium reference profile (Profile::init_T,
+        // T_avg = T_ss/sqrt(2); docs/equilibration-paper.md §5), identical to the
+        // CPU path's starting state. The legacy per-face seed (else branch) derived
+        // T(z,0) from the *instantaneous* absorbed flux over the first 10
+        // equilibration steps, with a hard 100 K nightside floor, which stamped a
+        // body-fixed day/night (terminator) discontinuity into the subsurface. Once
+        // the configured (higher) thermal inertia is applied on the generic-body
+        // path a finite equilibration no longer erases that imprint, and it
+        // surfaces as the body-fixed "seam" in the spinning-asteroid flybys. The
+        // smooth seed removes it at the source and matches the CPU path.
+        //
+        // Gated on "using_generic_body" (mirrors applyGenericBodyThermo / 710db0f):
+        // built-in Moon/Europa/A3GT runs keep the legacy seed and stay
+        // byte-identical to their established baselines.
         std::vector<float> T_initial(batch_n * n_layers);
-        for (size_t f = 0; f < batch_n; ++f) {
-            size_t global_f = batch_start + f;
-            double albedo = face_albedos[global_f];
-            double avg_flux = 0.0;
-            int n_samples = std::min(10, total_time_steps);
-            for (int t = 0; t < n_samples; ++t) {
-                size_t flux_idx = global_f * total_time_steps + t;
-                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
-            }
-            avg_flux /= n_samples;
-
-            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-            if (T_eq < 40.0) T_eq = 100.0;
-            if (T_eq > 400.0) T_eq = 400.0;
-
+        if (config.getProperty("using_generic_body") == "true") {
+            const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                const float Tl = static_cast<float>(T_seed[layer]);
+                for (size_t f = 0; f < batch_n; ++f) {
+                    T_initial[layer * batch_n + f] = Tl;
+                }
+            }
+        } else {
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t global_f = batch_start + f;
+                double albedo = face_albedos[global_f];
+                double avg_flux = 0.0;
+                int n_samples = std::min(10, total_time_steps);
+                for (int t = 0; t < n_samples; ++t) {
+                    size_t flux_idx = global_f * total_time_steps + t;
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                }
+                avg_flux /= n_samples;
+
+                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                if (T_eq < 40.0) T_eq = 100.0;
+                if (T_eq > 400.0) T_eq = 400.0;
+
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    size_t idx = layer * batch_n + f;
+                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                }
             }
         }
         solver.uploadInitialTemperature(T_initial);
@@ -4181,35 +4208,49 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
         );
 
-        // Initialize temperature (equilibrium temperature for all layers)
+        // Initial subsurface temperature seed. Generic bodies get the smooth
+        // diurnal-mean reference profile (removes the body-fixed asteroid "seam";
+        // see the companion note on the other GPU persistent entry point); built-in
+        // Moon/Europa/A3GT keep the legacy per-face instantaneous-flux seed and stay
+        // byte-identical. Gated on "using_generic_body" (mirrors 710db0f).
         std::vector<float> T_initial(batch_n * n_layers);
-        for (size_t f = 0; f < batch_n; ++f) {
-            // Get initial flux to estimate equilibrium temperature
-            // Include ALL flux components (direct, reflected, IR) for accurate initialization
-            size_t global_f = batch_start + f;
-            double albedo = face_albedos[global_f];
-            double avg_flux = 0.0;
-            int n_samples = std::min(10, total_time_steps);
-            for (int t = 0; t < n_samples; ++t) {
-                size_t flux_idx = global_f * total_time_steps + t;
-                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
-                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
-            }
-            avg_flux /= n_samples;
-
-            // Equilibrium temperature from Stefan-Boltzmann
-            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-            if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
-            if (T_eq > 400.0) T_eq = 400.0;
-
+        if (config.getProperty("using_generic_body") == "true") {
+            const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                // Linear interpolation between surface and deep temperature
-                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                const float Tl = static_cast<float>(T_seed[layer]);
+                for (size_t f = 0; f < batch_n; ++f) {
+                    T_initial[layer * batch_n + f] = Tl;
+                }
+            }
+        } else {
+            for (size_t f = 0; f < batch_n; ++f) {
+                // Get initial flux to estimate equilibrium temperature
+                // Include ALL flux components (direct, reflected, IR) for accurate initialization
+                size_t global_f = batch_start + f;
+                double albedo = face_albedos[global_f];
+                double avg_flux = 0.0;
+                int n_samples = std::min(10, total_time_steps);
+                for (int t = 0; t < n_samples; ++t) {
+                    size_t flux_idx = global_f * total_time_steps + t;
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                    // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                }
+                avg_flux /= n_samples;
+
+                // Equilibrium temperature from Stefan-Boltzmann
+                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
+                if (T_eq > 400.0) T_eq = 400.0;
+
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    size_t idx = layer * batch_n + f;
+                    // Linear interpolation between surface and deep temperature
+                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                }
             }
         }
         solver.uploadInitialTemperature(T_initial);
