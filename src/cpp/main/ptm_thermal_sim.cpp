@@ -2231,6 +2231,12 @@ static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Confi
     if ((v = config.getPropertyDouble("gb_H",    -1.0)) >  0.0) planet.H    = v;
     if ((v = config.getPropertyDouble("gb_albedo",     -1.0)) >= 0.0) planet.albedo     = v;
     if ((v = config.getPropertyDouble("gb_emissivity", -1.0)) >  0.0) planet.emissivity = v;
+    // Orbital/rotational scalars (see main): the name-resolved local Planet
+    // otherwise carries Europa placeholder values for these on the generic path.
+    if ((v = config.getPropertyDouble("gb_day",  -1.0)) >  0.0) planet.day  = v;
+    if ((v = config.getPropertyDouble("gb_S",    -1.0)) >  0.0) planet.S    = v;
+    if ((v = config.getPropertyDouble("gb_year", -1.0)) >  0.0) planet.year = v;
+    if ((v = config.getPropertyDouble("gb_Qb",   -2.0)) >= 0.0) planet.Qb   = v;
     // cpCoeff forwarded as a comma-separated list; empty string => constant cp.
     planet.cpCoeff.clear();
     std::stringstream ss(config.getProperty("gb_cpCoeff", ""));
@@ -2952,9 +2958,23 @@ bool runThermalModelsForAllFacesBatchSoA(
             // flux trajectory as a quasi-periodic signal and substep it down to
             // dt <= planet.day / 192 so CN accuracy stays within ~1 K worst case
             // (see src/cpp/tools/test_equilibration_dt.cpp for the accuracy study).
-            const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
-                                             std::round(planet.year / planet.day);
-            const double equil_duration_s = equil_days_needed * planet.day;
+            double equil_duration_s;
+            if (config.getProperty("using_generic_body") == "true") {
+                // Generic (fast-rotating) body: equilibrate for the CONFIGURED number
+                // of DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps
+                // was sized in main as (output cadence)x(equilibration_orbits)x(diurnal
+                // period), so equilibration_steps x output-cadence dt = the intended
+                // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day)
+                // here would be ~10^4 four-hour cycles (an asteroid's year is that many
+                // diurnal periods) and never finish. Gated -> Moon/Europa untouched.
+                const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
+                const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
+                equil_duration_s = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
+            } else {
+                const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
+                                                 std::round(planet.year / planet.day);
+                equil_duration_s = equil_days_needed * planet.day;
+            }
 
             if (equil_duration_s > 0.0 && total_time_steps >= 2) {
                 // Match Model::fastEquilibrate (thermal_model.cpp:2024) exactly:
@@ -9538,7 +9558,17 @@ int main(int argc, char** argv) {
     const size_t arrays_count = 3; // direct, reflected, ir (illum is reconstructed as direct+reflected)
     const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
     const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
-    const double STREAM_THRESHOLD_GB = 10.0;
+    // Max illumination footprint (GB) to EXTRACT into RAM; above this the thermal
+    // solver streams per-(face,timestep) from the in-RAM chunk store, which re-reads
+    // through every equilibration cycle and loses the flat-array fast path (~100x
+    // slower). Default 10 GB keeps very large meshes (e.g. lunar 500k, ~180 GB) on
+    // the streaming path. Override with PTM_RAM_ILLUM_MAX_GB to force smaller (ico6
+    // asteroid, ~15 GB) meshes to RAM-extract on high-memory boxes. Default unchanged.
+    double STREAM_THRESHOLD_GB = 10.0;
+    if (const char* ev = std::getenv("PTM_RAM_ILLUM_MAX_GB")) {
+        double ev_gb = std::atof(ev);
+        if (ev_gb > 0.0) STREAM_THRESHOLD_GB = ev_gb;
+    }
     bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
 
     // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
@@ -9752,6 +9782,18 @@ int main(int argc, char** argv) {
             thermal_config.setProperty("gb_H",          planet.H);
             thermal_config.setProperty("gb_albedo",     planet.albedo);
             thermal_config.setProperty("gb_emissivity", planet.emissivity);
+            // Also forward the orbital/rotational scalars. The solver entry points
+            // rebuild a LOCAL Planet from the body NAME, which for a generic body
+            // resolves to Europa placeholder defaults -- so without these the
+            // subsurface grid and analytical equilibration used Europa's rotation
+            // period (day), solar constant (S), orbital period (year) and Qb
+            // instead of the generic body's. day drives the diurnal skin depth
+            // (grid resolution) and the equilibration diurnal period; S and the
+            // Bond albedo drive the equilibration forcing; year sets its duration.
+            thermal_config.setProperty("gb_day",  planet.day);
+            thermal_config.setProperty("gb_S",    planet.S);
+            thermal_config.setProperty("gb_year", planet.year);
+            thermal_config.setProperty("gb_Qb",   planet.Qb);
             std::string gb_cpc;
             for (size_t i = 0; i < planet.cpCoeff.size(); ++i) {
                 if (i) gb_cpc += ",";
@@ -9888,7 +9930,14 @@ int main(int argc, char** argv) {
         const size_t arrays_count = 3; // direct, reflected, ir
         const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
         const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
-        const double STREAM_THRESHOLD_GB = 10.0;
+        // Max illumination footprint (GB) to EXTRACT into RAM; above this we stream
+        // per-(face,timestep) (~100x slower, see the other STREAM_THRESHOLD_GB site).
+        // Default 10 GB unchanged; PTM_RAM_ILLUM_MAX_GB overrides for ico6 asteroids.
+        double STREAM_THRESHOLD_GB = 10.0;
+        if (const char* ev = std::getenv("PTM_RAM_ILLUM_MAX_GB")) {
+            double ev_gb = std::atof(ev);
+            if (ev_gb > 0.0) STREAM_THRESHOLD_GB = ev_gb;
+        }
         bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
 
         // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
