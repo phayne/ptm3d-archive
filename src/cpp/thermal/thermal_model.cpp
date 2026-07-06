@@ -791,7 +791,18 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
 void Profile::update_T(double dt, double Qs, double Qb) {
     // 0) Boundary conditions (update boundary nodes T[0], T[n-1])
     surfTemp(*this, Qs);
+    // Always update the bottom node. Qb != 0 applies the geothermal-flux BC;
+    // Qb == 0 uses botTemp(0) => T[n] = T[n-1], the zero-gradient (insulated)
+    // base. Without the else the Qb == 0 bottom node is left FROZEN at its init
+    // value and the interior CN treats it as a fixed-temperature Dirichlet
+    // reservoir, leaking a small spurious flux whenever that init temperature
+    // does not match the equilibrated column mean (Fermi's surface energy-
+    // conservation finding, localized to <F_bottom_out> by the test_ice_twolayer
+    // budget). The batch SoA path (applyBottomBCBatch) already applies
+    // T[last] = T[last-1] + Qb*dz/k unconditionally, so this makes the per-profile
+    // path agree with it at Qb == 0.
     if (Qb != 0.0) botTemp(*this, Qb);
+    else           botTemp(*this, 0.0);
 
     const size_t n_tot = grid.T.size();
     if (n_tot < 3) return;            // need at least 1 interior node
