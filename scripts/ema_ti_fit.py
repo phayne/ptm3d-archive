@@ -35,7 +35,7 @@ Subcommands:
   extract   -- extract T(local-time) from one real thermal output dir (smoke test).
   fit       -- run the real campaign fit once Rocky's 15-point sweep + cameras exist.
 """
-import os, sys, glob, json, argparse, importlib.util
+import os, sys, re, glob, json, argparse, importlib.util
 import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -47,42 +47,44 @@ def _load(mod, path):
     s = importlib.util.spec_from_file_location(mod, path); m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m); return m
 
-# This module used to importlib-load /tmp/ema_sweep_driver.py, a scratch copy that
-# did not survive a reboot -- leaving this script dead on import. The tracked
-# scripts/ema_campaign_driver.py now carries an `if __name__ == "__main__":` guard,
-# so it can be imported inertly and supplies `thermal_done` + `HAPKE_DEFAULTS`.
+# EMA-01 (RESOLVED 2026-07-09): `alb_point` and `disk_p_from_w` were Hapke
+# disk-integrated photometry helpers that lived ONLY in the deleted scratch module
+# /tmp/ema_sweep_driver.py, which left the `fit` path dead on import. Fermi's formula
+# survived in a comment at ema_campaign_driver.py:45-48 and is now transcribed
+# verbatim into the tracked, pure module scripts/ema_hapke.py (with its provenance
+# and opposition-convention caveats). We import the recovered helpers from there.
 #
-# `alb_point` and `disk_p_from_w` existed ONLY in that deleted scratch module. They
-# are not in any tracked file and not in any git branch (searched 2026-07-09). They
-# are Hapke disk-integrated photometry helpers and MUST NOT be guessed at: a wrong
-# w -> p mapping would silently bias every thermal-inertia fit. Rather than
-# substitute, the shim below fails loudly at the call site. See $PTM/BUGS.md EMA-01.
+# The tracked scripts/ema_campaign_driver.py carries an `if __name__ == "__main__":`
+# guard, so it imports inertly and still supplies `thermal_done` + `HAPKE_DEFAULTS`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ema_campaign_driver as _driver
+import ema_hapke
 
-_LOST_MSG = (
-    "ema_ti_fit: `{0}` was defined only in the deleted scratch module "
-    "/tmp/ema_sweep_driver.py and is NOT recoverable from tracked source or git "
-    "history. It is Hapke disk-integrated photometry; re-derive it deliberately "
-    "(route to Fermi/Paul) rather than approximating -- a wrong w->p mapping "
-    "silently biases every TI fit. Blocks the `fit` path. See $PTM/BUGS.md EMA-01."
-)
 
 class _Drv:
-    """Tracked driver symbols, plus explicit failures for the two lost helpers."""
+    """Tracked driver symbols (thermal_done, HAPKE_DEFAULTS) plus the recovered
+    Hapke photometry helpers from ema_hapke (EMA-01, resolved 2026-07-09)."""
     thermal_done   = staticmethod(_driver.thermal_done)
     HAPKE_DEFAULTS = _driver.HAPKE_DEFAULTS
+    alb_point      = staticmethod(ema_hapke.alb_point)
+    disk_p_from_w  = staticmethod(ema_hapke.disk_p_from_w)
 
-    @staticmethod
-    def alb_point(*a, **k):
-        raise NotImplementedError(_LOST_MSG.format("alb_point"))
-
-    @staticmethod
-    def disk_p_from_w(*a, **k):
-        raise NotImplementedError(_LOST_MSG.format("disk_p_from_w"))
 
 _drv = _Drv()
 _noise = _load("ema_noise", PTM+"/scripts/ema_camera_noise.py")
+
+
+def _body_num_from_sweep_root(sweep_root):
+    """Derive the body number ('623', '23871', ...) from a sweep-root path such as
+    '.../thermal/623chimaera/sweep' -> '623', by matching the '<num><name>'
+    directory component. Returns None if no such component is present. Mirrors the
+    dynamic pattern at ema_ousha_extra_offgrid.py:148 and fixes EMA-02: the `fit`
+    path must NOT silently reuse Chimaera's albedo for every body."""
+    for part in reversed(os.path.normpath(sweep_root).split(os.sep)):
+        m = re.match(r"(\d+)[a-z]", part)
+        if m:
+            return m.group(1)
+    return None
 
 # ================= real thermal-output extraction =================
 def read_temp_bin(path):
@@ -269,7 +271,10 @@ def selftest(seed=1, outdir="/tmp/ema_ti_fit_selftest"):
     os.makedirs(outdir, exist_ok=True)
     rng = np.random.default_rng(seed)
     tis = [10.0, 32.0, 100.0, 316.0, 1000.0]
-    # albedo points as the driver builds them (Chimaera w_nom=0.143)
+    # EMA-02 note: selftest is a SYNTHETIC machinery test (analytic toy grid, no real
+    # sweep dir). There is no sweep_root / body number in scope here, so w is a fixed
+    # Chimaera anchor (w_nom=0.143) BY CONSTRUCTION -- not the silent-default bug. The
+    # per-body fix lives in the `fit` path, which derives the body from --sweep-root.
     albs = sorted(_drv.alb_point(0.143, s)[0] for s in (0.5, 1.0, 2.0))
     p_nom = _drv.disk_p_from_w(0.143)
     grid = _toy_grid(tis, albs)
@@ -363,7 +368,15 @@ def main(argv=None):
         os.makedirs(a.out, exist_ok=True)
         grid = load_sweep_grid(a.sweep_root, a.lat_band, a.nbins, a.epoch)
         rng = np.random.default_rng(a.seed)
-        p_nom = _drv.disk_p_from_w(_drv.HAPKE_DEFAULTS['623']['w'])
+        # EMA-02: derive the body from --sweep-root; never default to Chimaera's albedo.
+        num = _body_num_from_sweep_root(a.sweep_root)
+        if num is None or num not in _drv.HAPKE_DEFAULTS:
+            raise SystemExit(
+                f"ema_ti_fit fit: cannot resolve a body number from --sweep-root "
+                f"{a.sweep_root!r} (expected a '<num><name>' component such as "
+                f"'623chimaera' with an entry in HAPKE_DEFAULTS). Refusing to guess "
+                f"the albedo -- see BUGS.md EMA-02.")
+        p_nom = _drv.disk_p_from_w(_drv.HAPKE_DEFAULTS[num]['w'])
         results = []
         for ti_true in a.truth_ti:
             clean = grid.predict(ti_true, p_nom)
