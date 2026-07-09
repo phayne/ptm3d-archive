@@ -347,6 +347,201 @@ def cmd_manifest(args):
     return 0
 
 
+# ------------------------------------------------------------------ liveness (P7)
+def cmd_liveness(args):
+    """A job is stalled ONLY if its own heartbeat has not advanced.
+
+    Never infer a stall from `ps` + output-directory mtime. On 2026-07-06 a render writing
+    frames to a temp dir looked byte-identical to a hang -- no worker process at the instant
+    of the snapshot, no new files under the output dir -- and was declared stalled. It was
+    fine. If a job writes no heartbeat, the honest answer is UNKNOWN, not a guess.
+    """
+    p = os.path.join(args.dir, "progress.json")
+    if not os.path.exists(p):
+        print(json.dumps({"state": "UNKNOWN", "reason": "no progress.json; this job writes no "
+                                                        "heartbeat. Liveness cannot be determined -- "
+                                                        "say so, do not guess from `ps`."}, indent=2))
+        return 3
+    hb = json.load(open(p))
+    now = datetime.now(timezone.utc)
+    last = datetime.fromisoformat(hb["last_advance_utc"].replace("Z", "+00:00"))
+    age_min = (now - last).total_seconds() / 60.0
+
+    alive = None
+    if hb.get("pid"):
+        try:
+            os.kill(int(hb["pid"]), 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+
+    # A cleanly finished job has no pid and no advancing heartbeat -- exactly like a dead one.
+    # Only the job itself can tell them apart, so it records `finished` on clean exit.
+    if hb.get("failed"):
+        state, rc = "FAILED", 1
+    elif hb.get("finished"):
+        state, rc = "DONE", 0
+    elif alive is False:
+        state, rc = "SIM_DOWN", 1
+    elif age_min > args.stall_min:
+        state, rc = "WEDGE_SUSPECT", 1
+    else:
+        state, rc = "RUNNING", 0
+
+    out = {"state": state, "unit": hb.get("unit"), "unit_total": hb.get("unit_total"),
+           "unit_label": hb.get("unit_label"), "pid": hb.get("pid"), "pid_alive": alive,
+           "minutes_since_advance": round(age_min, 2), "stall_min": args.stall_min}
+    if hb.get("unit") and hb.get("unit_total"):
+        out["percent"] = round(100.0 * hb["unit"] / hb["unit_total"], 1)
+    print(json.dumps(out, indent=2))
+    return rc
+
+
+# ------------------------------------------------------------------ figure provenance (P11)
+def _sha256(path, limit=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def cmd_figure(args):
+    """Record (or verify) what produced a figure.
+
+    `fit_curves.png` was reviewed and approved, then became unregenerable: its generator
+    imported a /tmp copy of ema_ti_fit.py that no longer exists. A caption says what a
+    figure means; provenance says how to make it again.
+    """
+    prov = args.figure + ".provenance.json"
+    if args.check:
+        if not os.path.exists(prov):
+            print(f"FAIL: {args.figure} has no provenance. A reported figure must record its "
+                  f"generating script, that script's hash, and its input hashes.")
+            return 1
+        d = json.load(open(prov))
+        stale = []
+        s = d.get("script")
+        if s and os.path.exists(s["path"]) and md5(s["path"]) != s["md5"]:
+            stale.append(f"script changed: {s['path']}")
+        for i in d.get("inputs", []):
+            if os.path.exists(i["path"]) and md5(i["path"]) != i["md5"]:
+                stale.append(f"input changed: {i['path']}")
+        for m in stale:
+            print(f"STALE: {m}")
+        print("PASS: provenance present and current" if not stale
+              else "FAIL: figure is stale w.r.t. its recorded provenance")
+        return 1 if stale else 0
+
+    if not os.path.exists(args.figure):
+        print(f"FAIL: no such figure {args.figure}", file=sys.stderr)
+        return 1
+    git = "/Library/Developer/CommandLineTools/usr/bin/git"
+    repo = os.environ.get("PTM", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def sh(c):
+        try:
+            return subprocess.run(c, cwd=repo, capture_output=True, text=True,
+                                  timeout=120).stdout.strip() or None
+        except Exception:
+            return None
+
+    d = {"figure": os.path.abspath(args.figure), "sha256": _sha256(args.figure),
+         "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+         "commit": sh([git, "rev-parse", "HEAD"]),
+         "dirty": bool(sh([git, "status", "--porcelain"]))}
+    if args.script:
+        d["script"] = {"path": os.path.abspath(args.script), "md5": md5(args.script),
+                       "tracked": bool(sh([git, "ls-files", args.script]))}
+        if not d["script"]["tracked"]:
+            print("WARNING: the generating script is UNTRACKED. It is one `rm` from gone, and "
+                  "this figure is then unregenerable.", file=sys.stderr)
+    d["inputs"] = [{"path": os.path.abspath(i), "md5": md5(i), "bytes": os.path.getsize(i)}
+                   for i in (args.input or []) if os.path.exists(i)]
+    with open(prov, "w") as fh:
+        json.dump(d, fh, indent=2)
+    print(json.dumps(d, indent=2))
+    print(f"\nwrote {prov}")
+    return 0
+
+
+# ------------------------------------------------------------------ precommit (P11)
+def _hunks(argv, repo):
+    """Return {file: [hunk_md5, ...]} from a `git diff` invocation, at -U0 for stability."""
+    git = "/Library/Developer/CommandLineTools/usr/bin/git"
+    out = subprocess.run([git] + argv, cwd=repo, capture_output=True, text=True, timeout=600).stdout
+    files, cur, buf = {}, None, []
+
+    def flush():
+        if cur and buf:
+            files.setdefault(cur, []).append(hashlib.md5("\n".join(buf).encode()).hexdigest())
+
+    for line in out.split("\n"):
+        if line.startswith("diff --git "):
+            flush(); buf = []
+            cur = line.split(" b/")[-1]
+        elif line.startswith("@@"):
+            flush(); buf = []
+        # NOT `line[:1] in "+-"`: for an empty line that is `"" in "+-"`, which is True in
+        # Python, so blank lines got folded into the hunk body. The same hunk then hashed
+        # differently depending on whether a trailing blank line followed it -- which is
+        # exactly the difference between `git diff -- <one file>` and a full-repo diff.
+        elif line[:1] in ("+", "-") and not line.startswith(("+++", "---")):
+            buf.append(line)
+    flush()
+    return files
+
+
+def cmd_precommit(args):
+    """Catch pre-existing edits riding along in your commit.
+
+    On 2026-07-09 a commit swept in three uncommitted working-tree edits (use_gpu True->False,
+    chi 0.0->2.7 x2) under a message asserting "no behavior change to any simulation". The
+    edits were the user's, deliberately held back. `git add <explicit paths>` is not enough:
+    it stages everything already dirty in those paths.
+
+    Usage:  precommit --snapshot     (at the START of a session, before you edit anything)
+            precommit --verify       (after `git add`, before `git commit`)
+    """
+    repo = os.environ.get("PTM", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    snap = args.snapshot_file or os.path.join(repo, ".git", "ptm_precommit_snapshot.json")
+
+    if args.snapshot:
+        pre = _hunks(["diff", "HEAD", "-U0"], repo)
+        with open(snap, "w") as fh:
+            json.dump({"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                       "pre_existing": pre}, fh, indent=2)
+        n = sum(len(v) for v in pre.values())
+        print(f"snapshot: {n} pre-existing hunks across {len(pre)} files -> {snap}")
+        return 0
+
+    if not os.path.exists(snap):
+        print("FAIL: no snapshot. Run `precommit --snapshot` before you start editing, so the "
+              "tool can tell your hunks from ones that were already there.", file=sys.stderr)
+        return 1
+    pre = json.load(open(snap))["pre_existing"]
+    staged = _hunks(["diff", "--cached", "-U0"], repo)
+
+    bad, mine = {}, 0
+    for f, hs in staged.items():
+        carried = [h for h in hs if h in set(pre.get(f, []))]
+        mine += len(hs) - len(carried)
+        if carried:
+            bad[f] = len(carried)
+
+    print(json.dumps({"staged_files": len(staged), "your_hunks": mine,
+                      "pre_existing_hunks_staged": bad}, indent=2))
+    if bad:
+        print("\nFAIL: the staged diff contains hunks that existed BEFORE this session.\n"
+              "      They are not yours. Unstage them (`git restore --staged <file>`), or\n"
+              "      disclose them explicitly in the commit message.", file=sys.stderr)
+        return 1
+    print("\nPASS: every staged hunk was authored after the snapshot.")
+    return 0
+
+
 # ------------------------------------------------------------------ selftest
 def cmd_selftest(args):
     E = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science"
@@ -428,6 +623,17 @@ def main(argv=None):
     m.add_argument("--binary"); m.add_argument("--cmdline")
     m.add_argument("--expected-cells", type=int); m.add_argument("--expected-timesteps", type=int)
     m.add_argument("--expected-frames", type=int); m.set_defaults(fn=cmd_manifest)
+
+    lv = sub.add_parser("liveness"); lv.add_argument("dir")
+    lv.add_argument("--stall-min", type=float, default=60.0); lv.set_defaults(fn=cmd_liveness)
+
+    fg = sub.add_parser("figure"); fg.add_argument("figure")
+    fg.add_argument("--script"); fg.add_argument("--input", action="append")
+    fg.add_argument("--check", action="store_true"); fg.set_defaults(fn=cmd_figure)
+
+    pc = sub.add_parser("precommit")
+    pc.add_argument("--snapshot", action="store_true"); pc.add_argument("--verify", action="store_true")
+    pc.add_argument("--snapshot-file"); pc.set_defaults(fn=cmd_precommit)
 
     st = sub.add_parser("selftest"); st.set_defaults(fn=cmd_selftest)
 
