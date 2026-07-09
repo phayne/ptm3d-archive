@@ -41,15 +41,14 @@ from astropy.io import fits
 PTM = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
 
 # Reuse the driver's assembler/snapshot helpers + Planck constants, READ-ONLY.
-_spec = importlib.util.spec_from_file_location("ema_driver", "/tmp/ema_sweep_driver.py")
-# Rocky (2026-07-03): the TRACKED scripts/ema_campaign_driver.py on
-# feat/generic-body-thermo-fix has NO `if __name__=='__main__':` guard -- its
-# top-level code runs unconditionally on import and reads sys.argv of the
-# IMPORTING process to select targets (`if len(sys.argv)>1: sel=set(sys.argv[1:])`).
-# Importing it from here would risk silently kicking off a REAL campaign run
-# using THIS script's argv. The /tmp scratch driver IS properly guarded
-# (`if __name__=='__main__': main(...)`), so import it here instead -- inert.
-_d = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_d)   # no main() -> guarded
+# ema_campaign_driver.py's top-level campaign block is now wrapped in an
+# `if __name__ == "__main__":` guard, so importing it here is inert -- it can no
+# longer launch a real campaign off the importing process's argv. That missing
+# guard was why this import previously pointed at /tmp/ema_sweep_driver.py, a
+# scratch copy that did not survive a reboot and left this tracked script dead
+# on import. Import the tracked module directly; no /tmp dependency.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ema_campaign_driver as _d
 EPS, LAM, HP, CC, KB = _d.EPS, _d.LAM, _d.HP, _d.CC, _d.KB
 
 # ---- noise-model spec constants ----

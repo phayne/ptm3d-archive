@@ -264,135 +264,136 @@ def make_mp4_reflected(animdir,out_mp4,title,fps=12):
         for p in pngs: w.append_data(imageio.imread(p))
 
 # ---- main ----
-man=json.load(open(MANIFEST)) if os.path.exists(MANIFEST) else {}
-os.makedirs(STATUSDIR,exist_ok=True)
-os.makedirs(LOGDIR,exist_ok=True)
-if len(sys.argv)>1:
-    sel=set(sys.argv[1:]); TARGETS=[t for t in TARGETS if t[1] in sel]
-for num,name in TARGETS:
-    try:
-        sp.kclear()
-        cand=[d for d in os.listdir(BODIES) if d.startswith(num+"_")]
-        if not cand: log(f"{name}: NO CACHE DIR -> skip"); continue
-        bdir=os.path.join(BODIES,cand[0]); spkf=bdir+"/ephemeris.spk"; bcfg=bdir+"/body_config.yaml"
-        cfg=yaml.safe_load(open(bcfg)); gb=cfg.get('generic_body',cfg)
-        for k in [CSP+"/lsk/naif0012.tls",CSP+"/spk/de440s.bsp",spkf,SCSPK]: sp.furnsh(k)
-        naif=str(spk_body_id(spkf)[0])
-        radius=float(gb['shape']['radius_km']); period=float(gb['spin']['period_hours'])
-        albedo=float(gb['surface']['albedo'])
-        # Shape selection: honor whatever the body_config declares. A body may
-        # ship a real shape model (type: custom_mesh + mesh_file); the previous
-        # driver hardcoded type: spherical and blanked mesh.import_file, silently
-        # discarding it. Carry the declared type + mesh_file through to BOTH
-        # generic_body.shape.mesh_file and top-level mesh.import_file. When no
-        # shape file is present, fall back to the spherical approximation with a
-        # clear warning.
-        shape_type=str(gb['shape'].get('type','spherical')).strip().lower()
-        shape_mesh_file=str(gb['shape'].get('mesh_file','') or '')
-        shape_mesh_scale=float(gb['shape'].get('mesh_scale',1.0))
-        if shape_type=='custom_mesh' and shape_mesh_file and os.path.exists(shape_mesh_file):
-            use_mesh=True
-            log(f"{name}: shape model -> custom_mesh {shape_mesh_file} (scale {shape_mesh_scale})")
-        else:
-            use_mesh=False
-            if shape_type=='custom_mesh':
-                log(f"{name}: WARNING custom_mesh declared but mesh_file "
-                    f"'{shape_mesh_file}' missing -> using spherical approximation")
-            elif shape_type not in ('spherical',''):
-                log(f"{name}: WARNING unsupported shape type '{shape_type}' -> "
-                    f"using spherical approximation")
+if __name__ == "__main__":
+    man=json.load(open(MANIFEST)) if os.path.exists(MANIFEST) else {}
+    os.makedirs(STATUSDIR,exist_ok=True)
+    os.makedirs(LOGDIR,exist_ok=True)
+    if len(sys.argv)>1:
+        sel=set(sys.argv[1:]); TARGETS=[t for t in TARGETS if t[1] in sel]
+    for num,name in TARGETS:
+        try:
+            sp.kclear()
+            cand=[d for d in os.listdir(BODIES) if d.startswith(num+"_")]
+            if not cand: log(f"{name}: NO CACHE DIR -> skip"); continue
+            bdir=os.path.join(BODIES,cand[0]); spkf=bdir+"/ephemeris.spk"; bcfg=bdir+"/body_config.yaml"
+            cfg=yaml.safe_load(open(bcfg)); gb=cfg.get('generic_body',cfg)
+            for k in [CSP+"/lsk/naif0012.tls",CSP+"/spk/de440s.bsp",spkf,SCSPK]: sp.furnsh(k)
+            naif=str(spk_body_id(spkf)[0])
+            radius=float(gb['shape']['radius_km']); period=float(gb['spin']['period_hours'])
+            albedo=float(gb['surface']['albedo'])
+            # Shape selection: honor whatever the body_config declares. A body may
+            # ship a real shape model (type: custom_mesh + mesh_file); the previous
+            # driver hardcoded type: spherical and blanked mesh.import_file, silently
+            # discarding it. Carry the declared type + mesh_file through to BOTH
+            # generic_body.shape.mesh_file and top-level mesh.import_file. When no
+            # shape file is present, fall back to the spherical approximation with a
+            # clear warning.
+            shape_type=str(gb['shape'].get('type','spherical')).strip().lower()
+            shape_mesh_file=str(gb['shape'].get('mesh_file','') or '')
+            shape_mesh_scale=float(gb['shape'].get('mesh_scale',1.0))
+            if shape_type=='custom_mesh' and shape_mesh_file and os.path.exists(shape_mesh_file):
+                use_mesh=True
+                log(f"{name}: shape model -> custom_mesh {shape_mesh_file} (scale {shape_mesh_scale})")
             else:
-                log(f"{name}: no shape model -> using spherical approximation "
-                    f"(radius {radius} km)")
-        ra=gb['spin'].get('pole_ra_deg'); dec=gb['spin'].get('pole_dec_deg')
-        pole_assumed=False
-        if ra is None or dec is None:  # no measured pole -> orbital pole (obliquity 0)
-            o=gb['orbit']; i=math.radians(o['inclination_deg']); Om=math.radians(o['lon_ascending_node_deg'])
-            nx=math.sin(i)*math.sin(Om); ny=-math.sin(i)*math.cos(Om); nz=math.cos(i)
-            lon=math.degrees(math.atan2(ny,nx))%360; lat=math.degrees(math.asin(nz))
-            ra,dec=ecl_pole_to_radec(lon,lat); pole_assumed=True
-        ra=float(ra); dec=float(dec)
-        etm,dmin,vrel=find_ca(naif)
-        ca_utc=sp.et2utc(etm,'ISOC',0)
-        log(f"{name}: NAIF {naif} CA {ca_utc} range {dmin:.0f}km vrel {vrel:.1f} period {period:.3f}h pole({ra:.1f},{dec:.1f}){' ASSUMED' if pole_assumed else ''}")
+                use_mesh=False
+                if shape_type=='custom_mesh':
+                    log(f"{name}: WARNING custom_mesh declared but mesh_file "
+                        f"'{shape_mesh_file}' missing -> using spherical approximation")
+                elif shape_type not in ('spherical',''):
+                    log(f"{name}: WARNING unsupported shape type '{shape_type}' -> "
+                        f"using spherical approximation")
+                else:
+                    log(f"{name}: no shape model -> using spherical approximation "
+                        f"(radius {radius} km)")
+            ra=gb['spin'].get('pole_ra_deg'); dec=gb['spin'].get('pole_dec_deg')
+            pole_assumed=False
+            if ra is None or dec is None:  # no measured pole -> orbital pole (obliquity 0)
+                o=gb['orbit']; i=math.radians(o['inclination_deg']); Om=math.radians(o['lon_ascending_node_deg'])
+                nx=math.sin(i)*math.sin(Om); ny=-math.sin(i)*math.cos(Om); nz=math.cos(i)
+                lon=math.degrees(math.atan2(ny,nx))%360; lat=math.degrees(math.asin(nz))
+                ra,dec=ecl_pole_to_radec(lon,lat); pole_assumed=True
+            ra=float(ra); dec=float(dec)
+            etm,dmin,vrel=find_ca(naif)
+            ca_utc=sp.et2utc(etm,'ISOC',0)
+            log(f"{name}: NAIF {naif} CA {ca_utc} range {dmin:.0f}km vrel {vrel:.1f} period {period:.3f}h pole({ra:.1f},{dec:.1f}){' ASSUMED' if pole_assumed else ''}")
 
-        # Resolve Hapke params (incl. single-scattering albedo w) up front so the
-        # thermal directional-hemispheric albedo path and the camera reflectance use
-        # the SAME per-body w. body_config 'surface.hapke' overrides win here too.
-        hp=hapke_params(num,gb)
-        THERMDIR=f"{TROOT}/{num}{name.lower()}/flyby"; os.makedirs(THERMDIR,exist_ok=True)
-        # thermal config: 1.5-rotation window centered on CA, 40-orbit eq
-        win_h=1.5*period; start_et=etm-0.75*period*3600.0
-        tconf={'simulation':{'start_time':sp.et2utc(start_et,'ISOC',0).replace('Z',''),
-                'duration_days':win_h/24.0,'timesteps':292,'body':gb.get('name',name)},
-            'mesh':{'resolution':6,'import_file':(shape_mesh_file if use_mesh else ''),
-                    'scale_factor':(shape_mesh_scale if use_mesh else 1.0),'export_basic':False},
-            'thermal':{'run_thermal_mesh':True,'threads':0,'equilibration_orbits':40,'use_gpu':True,
-                'compute_statistics':True,'integration_days':-1.0,'integration_steps':-1,
-                'integration_offset_days':0.0,'integration_offset_steps':0,'geothermal_heat_flow':-1.0,
-                'enable_shadow_flux':False,'crater_dd_ratio':8.0,'thermal_inertia_map':''},
-            'thermophysical':{'use_default_albedo':False,'albedo':albedo,'use_default_emissivity':False,
-                'emissivity':0.95,'use_default_ks':False,'ks':0.01,'use_default_kd':False,'kd':0.5,
-                'use_default_H':False,'H':0.05,'use_default_rhos':False,'rhos':1500.0,'use_default_rhod':False,
-                'rhod':2000.0,'use_default_cp0':False,'cp0':800.0,'use_default_Qb':False,'Qb':0.0,
-                'use_default_chi':False,'chi':0.0,'incidence_angle_albedo':True,
-                'albedo_hapke_w':hp['w']},
-            'radiation':{'enabled':False},
-            'illumination':{'include_primary_reflection':False,'use_batch_processing':True},
-            'output':{'directory':THERMDIR,'format':'binary','vtk_mode':'none','series_output':'per_timestep'},
-            'advanced':{'verbose':False,'default_visible_albedo':-1.0},
-            'generic_body':{'name':gb.get('name',name),'config_file':bcfg,'ephemeris_source':'spice',
-                'spice_metakernel':bdir+'/metakernel.tm','naif_id':naif,
-                'shape':{'type':('custom_mesh' if use_mesh else 'spherical'),'radius_km':radius,
-                         'mesh_file':(shape_mesh_file if use_mesh else ''),
-                         'mesh_scale':(shape_mesh_scale if use_mesh else 1.0),
-                         'semi_axes_km':[0.001,0.001,0.001]},
-                'orbit':gb['orbit'],
-                'spin':{'period_hours':period,'pole_ra_deg':ra,'pole_dec_deg':dec,'prime_meridian_deg':0.0},
-                'surface':{'albedo':albedo,'emissivity':0.95,'ks':0.01,'kd':0.5,'rhos':1500.0,'rhod':2000.0,
-                           'H':0.05,'cp0':800.0,'Qb':0.0,'chi':0.0}}}
-        tcfg_path=PTM+f"/examples/ema_{num}{name.lower()}_flyby.yaml"
-        yaml.safe_dump(tconf,open(tcfg_path,'w'),sort_keys=False)
+            # Resolve Hapke params (incl. single-scattering albedo w) up front so the
+            # thermal directional-hemispheric albedo path and the camera reflectance use
+            # the SAME per-body w. body_config 'surface.hapke' overrides win here too.
+            hp=hapke_params(num,gb)
+            THERMDIR=f"{TROOT}/{num}{name.lower()}/flyby"; os.makedirs(THERMDIR,exist_ok=True)
+            # thermal config: 1.5-rotation window centered on CA, 40-orbit eq
+            win_h=1.5*period; start_et=etm-0.75*period*3600.0
+            tconf={'simulation':{'start_time':sp.et2utc(start_et,'ISOC',0).replace('Z',''),
+                    'duration_days':win_h/24.0,'timesteps':292,'body':gb.get('name',name)},
+                'mesh':{'resolution':6,'import_file':(shape_mesh_file if use_mesh else ''),
+                        'scale_factor':(shape_mesh_scale if use_mesh else 1.0),'export_basic':False},
+                'thermal':{'run_thermal_mesh':True,'threads':0,'equilibration_orbits':40,'use_gpu':True,
+                    'compute_statistics':True,'integration_days':-1.0,'integration_steps':-1,
+                    'integration_offset_days':0.0,'integration_offset_steps':0,'geothermal_heat_flow':-1.0,
+                    'enable_shadow_flux':False,'crater_dd_ratio':8.0,'thermal_inertia_map':''},
+                'thermophysical':{'use_default_albedo':False,'albedo':albedo,'use_default_emissivity':False,
+                    'emissivity':0.95,'use_default_ks':False,'ks':0.01,'use_default_kd':False,'kd':0.5,
+                    'use_default_H':False,'H':0.05,'use_default_rhos':False,'rhos':1500.0,'use_default_rhod':False,
+                    'rhod':2000.0,'use_default_cp0':False,'cp0':800.0,'use_default_Qb':False,'Qb':0.0,
+                    'use_default_chi':False,'chi':0.0,'incidence_angle_albedo':True,
+                    'albedo_hapke_w':hp['w']},
+                'radiation':{'enabled':False},
+                'illumination':{'include_primary_reflection':False,'use_batch_processing':True},
+                'output':{'directory':THERMDIR,'format':'binary','vtk_mode':'none','series_output':'per_timestep'},
+                'advanced':{'verbose':False,'default_visible_albedo':-1.0},
+                'generic_body':{'name':gb.get('name',name),'config_file':bcfg,'ephemeris_source':'spice',
+                    'spice_metakernel':bdir+'/metakernel.tm','naif_id':naif,
+                    'shape':{'type':('custom_mesh' if use_mesh else 'spherical'),'radius_km':radius,
+                             'mesh_file':(shape_mesh_file if use_mesh else ''),
+                             'mesh_scale':(shape_mesh_scale if use_mesh else 1.0),
+                             'semi_axes_km':[0.001,0.001,0.001]},
+                    'orbit':gb['orbit'],
+                    'spin':{'period_hours':period,'pole_ra_deg':ra,'pole_dec_deg':dec,'prime_meridian_deg':0.0},
+                    'surface':{'albedo':albedo,'emissivity':0.95,'ks':0.01,'kd':0.5,'rhos':1500.0,'rhod':2000.0,
+                               'H':0.05,'cp0':800.0,'Qb':0.0,'chi':0.0}}}
+            tcfg_path=PTM+f"/examples/ema_{num}{name.lower()}_flyby.yaml"
+            yaml.safe_dump(tconf,open(tcfg_path,'w'),sort_keys=False)
 
-        if thermal_done(THERMDIR):
-            log(f"{name}: thermal already complete -> skip run")
-        else:
-            log(f"{name}: thermal run starting ...")
-            rc=run([TBIN,"--config",tcfg_path], f"{LOGDIR}/ema_{num}_thermal.log")
-            ok=os.path.exists(THERMDIR+"/statistics/temperature_avg.bin")
-            log(f"{name}: thermal rc={rc} done={ok}")
-            if not ok: man[name]={'status':'THERMAL_FAILED','ca':ca_utc}; json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2); continue
+            if thermal_done(THERMDIR):
+                log(f"{name}: thermal already complete -> skip run")
+            else:
+                log(f"{name}: thermal run starting ...")
+                rc=run([TBIN,"--config",tcfg_path], f"{LOGDIR}/ema_{num}_thermal.log")
+                ok=os.path.exists(THERMDIR+"/statistics/temperature_avg.bin")
+                log(f"{name}: thermal rc={rc} done={ok}")
+                if not ok: man[name]={'status':'THERMAL_FAILED','ca':ca_utc}; json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2); continue
 
-        # spin PCK + camera metakernel
-        frame=f"IAU_{name.upper()}_{num}"; spin_name=f"{name.lower()}_spin.tpc"
-        write_spin_pck(bdir+"/"+spin_name,naif,frame,ra,dec,period,radius)
-        cam_mk=bdir+"/metakernel_camera.tm"; write_cam_metakernel(cam_mk,bdir,spin_name)
+            # spin PCK + camera metakernel
+            frame=f"IAU_{name.upper()}_{num}"; spin_name=f"{name.lower()}_spin.tpc"
+            write_spin_pck(bdir+"/"+spin_name,naif,frame,ra,dec,period,radius)
+            cam_mk=bdir+"/metakernel_camera.tm"; write_cam_metakernel(cam_mk,bdir,spin_name)
 
-        camdir=f"{CROOT}/{num}{name.lower()}/flyby"; animdir=camdir+"/anim"
-        os.makedirs(camdir,exist_ok=True)
-        # hp was resolved above (before the thermal config) so thermal + camera share w.
-        log(f"{name}: Hapke w={hp['w']} B0={hp['B0']} h={hp['h']} g={hp['g']} "
-            f"theta_bar={hp['theta_bar']} (geom-albedo target {albedo})")
-        # 3 snapshots at CA-2/CA/CA+2 min
-        snaps=[sp.et2utc(etm+dt,'ISOC',0) for dt in (-120.0,0.0,120.0)]
-        render(THERMDIR,snaps,camdir,naif,frame,cam_mk,hp)
-        title=f"({num}) {name} - EMA ECAM-IR3S VNFOV thermal-IR | CA {ca_utc} {dmin:.0f} km"
-        rtitle=f"({num}) {name} - EMA ECAM-IR3S VNFOV reflected | CA {ca_utc} {dmin:.0f} km"
-        snapshot_png(camdir,camdir+f"/{name.lower()}_flyby_snapshots.png",title)
-        snapshot_png_reflected(camdir,camdir+f"/{name.lower()}_flyby_reflected_snapshots.png",rtitle)
-        # dense flyby sequence (consistent ~6x zoom), 49 frames
-        half=min(900.0, 5.9*dmin/vrel); times=[sp.et2utc(etm+t,'ISOC',0) for t in np.linspace(-half,half,49)]
-        render(THERMDIR,times,animdir,naif,frame,cam_mk,hp)
-        make_mp4(animdir,camdir+f"/{name.lower()}_flyby.mp4",title)
-        make_mp4_reflected(animdir,camdir+f"/{name.lower()}_flyby_reflected.mp4",rtitle)
-        man[name]={'status':'DONE','ca':ca_utc,'range_km':round(dmin,1),'phase_naif':naif,
-                   'pole_assumed':pole_assumed,'snapshots':camdir+f"/{name.lower()}_flyby_snapshots.png",
-                   'mp4':camdir+f"/{name.lower()}_flyby.mp4",
-                   'reflected_snapshots':camdir+f"/{name.lower()}_flyby_reflected_snapshots.png",
-                   'reflected_mp4':camdir+f"/{name.lower()}_flyby_reflected.mp4"}
-        json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2)
-        log(f"{name}: DONE -> thermal + reflected snapshots + MP4s")
-    except Exception as e:
-        import traceback; log(f"{name}: ERROR {e}\n{traceback.format_exc()}")
-        man[name]={'status':'ERROR','error':str(e)}; json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2)
-log("CAMPAIGN DRIVER FINISHED")
+            camdir=f"{CROOT}/{num}{name.lower()}/flyby"; animdir=camdir+"/anim"
+            os.makedirs(camdir,exist_ok=True)
+            # hp was resolved above (before the thermal config) so thermal + camera share w.
+            log(f"{name}: Hapke w={hp['w']} B0={hp['B0']} h={hp['h']} g={hp['g']} "
+                f"theta_bar={hp['theta_bar']} (geom-albedo target {albedo})")
+            # 3 snapshots at CA-2/CA/CA+2 min
+            snaps=[sp.et2utc(etm+dt,'ISOC',0) for dt in (-120.0,0.0,120.0)]
+            render(THERMDIR,snaps,camdir,naif,frame,cam_mk,hp)
+            title=f"({num}) {name} - EMA ECAM-IR3S VNFOV thermal-IR | CA {ca_utc} {dmin:.0f} km"
+            rtitle=f"({num}) {name} - EMA ECAM-IR3S VNFOV reflected | CA {ca_utc} {dmin:.0f} km"
+            snapshot_png(camdir,camdir+f"/{name.lower()}_flyby_snapshots.png",title)
+            snapshot_png_reflected(camdir,camdir+f"/{name.lower()}_flyby_reflected_snapshots.png",rtitle)
+            # dense flyby sequence (consistent ~6x zoom), 49 frames
+            half=min(900.0, 5.9*dmin/vrel); times=[sp.et2utc(etm+t,'ISOC',0) for t in np.linspace(-half,half,49)]
+            render(THERMDIR,times,animdir,naif,frame,cam_mk,hp)
+            make_mp4(animdir,camdir+f"/{name.lower()}_flyby.mp4",title)
+            make_mp4_reflected(animdir,camdir+f"/{name.lower()}_flyby_reflected.mp4",rtitle)
+            man[name]={'status':'DONE','ca':ca_utc,'range_km':round(dmin,1),'phase_naif':naif,
+                       'pole_assumed':pole_assumed,'snapshots':camdir+f"/{name.lower()}_flyby_snapshots.png",
+                       'mp4':camdir+f"/{name.lower()}_flyby.mp4",
+                       'reflected_snapshots':camdir+f"/{name.lower()}_flyby_reflected_snapshots.png",
+                       'reflected_mp4':camdir+f"/{name.lower()}_flyby_reflected.mp4"}
+            json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2)
+            log(f"{name}: DONE -> thermal + reflected snapshots + MP4s")
+        except Exception as e:
+            import traceback; log(f"{name}: ERROR {e}\n{traceback.format_exc()}")
+            man[name]={'status':'ERROR','error':str(e)}; json.dump(man[name],open(STATUSDIR+f"/{name}.json",'w'),indent=2)
+    log("CAMPAIGN DRIVER FINISHED")
