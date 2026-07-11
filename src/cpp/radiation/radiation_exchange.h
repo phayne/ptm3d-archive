@@ -116,11 +116,49 @@ public:
     // True iff the GPU pool was successfully initialized (gpu_devices > 1).
     bool hasGPUPool() const;
 
+    // True iff the GPU two-band path (solveGPUTwoBand) is active after initGPU()
+    // (band-separated + GPU init succeeded + all Σ_j F_ij ≤ 1). Lets a test confirm
+    // the GPU path actually engaged rather than silently falling back to CPU.
+    bool isGPUTwoBand() const {
+#ifdef PTM_GPU_OPENCL
+        return two_band_gpu_ok_ && use_gpu_;
+#else
+        return false;
+#endif
+    }
+
     // Compute thermal emission from faces (ε σ T^4)
     std::vector<double> computeThermalEmission(const std::vector<double>& temperatures) const;
 
     // Compute scattered solar radiation (single bounce)
     std::vector<double> computeScatteredSolar(const std::vector<double>& solar_flux) const;
+
+    // True iff band-separated (visible + thermal-IR) radiosity is active
+    // (PTM_RAD_TWO_BAND set and a Bond albedo supplied via PTM_SOLAR_ALBEDO).
+    bool isTwoBand() const { return two_band_; }
+
+    // Set the per-face visible Bond albedo A_i used by the reflected-solar source
+    // and the two-band visible channel (scatter A_i / absorb 1-A_i). Replaces the
+    // uniform env scalar so A_rad == A_BC per face, and is TIME-UPDATABLE: call it
+    // before each solve() when the boundary condition uses an incidence-dependent
+    // albedo (Hayne/Hapke), so the reflected-solar energy the enclosure receives
+    // matches the (1-A_i) the surface BC absorbs (no per-face energy leak). The
+    // size must equal the face count; a mismatch warns and is ignored. See A2 in
+    // TICKET-two-band-radiosity-production.md and docs/two-band-radiosity-derivation.tex.
+    void setSolarAlbedo(const std::vector<double>& solar_albedo);
+
+    // Activate band-separated (two-band) radiosity from config (D1), independent of
+    // the PTM_RAD_TWO_BAND env. Requires a per-face Bond albedo already supplied via
+    // setSolarAlbedo(); if none is set this WARNS and stays gray (never invents one).
+    void enableTwoBand();
+
+    // Band-separated absorbed indirect fluxes from the last two-band solve()
+    // (Paul's new product). Empty in the legacy gray path. lastIndirect() (the
+    // solve() return) is their sum; these expose each band separately:
+    //   Q_ind^vis_i = (1-A_i) Σ_j F_ij B^vis_j   (multiply-scattered solar)
+    //   Q_ind^ir_i  = ε_i     Σ_j F_ij B^ir_j    (thermal IR, unchanged)
+    const std::vector<double>& lastIndirectVisible() const { return last_indirect_vis_; }
+    const std::vector<double>& lastIndirectIR() const { return last_indirect_ir_; }
 
     // Get convergence information from last solve
     int getLastIterations() const { return last_iterations_; }
@@ -141,18 +179,39 @@ private:
     void initCommon(const std::vector<double>& emissivity,
                     const std::vector<double>& areas);
 
-    // Jacobi iteration solver
+    // Jacobi iteration solver. scatter_refl is the per-face reflectance applied to
+    // the multiple-scatter term ρ·F·B: reflectivity_ (=1-ε) for the gray/IR band,
+    // the Bond albedo A for the two-band visible channel. Passing it explicitly
+    // (rather than reading reflectivity_) lets the same kernel drive both bands;
+    // the gray path passes reflectivity_ so its arithmetic is byte-identical.
     std::vector<double> solveJacobi(const std::vector<double>& emission,
-                                    const std::vector<double>& solar_source);
+                                    const std::vector<double>& solar_source,
+                                    const std::vector<double>& scatter_refl);
 
-    // Gauss-Seidel iteration (faster convergence)
+    // Gauss-Seidel iteration (faster convergence). scatter_refl as in solveJacobi.
     std::vector<double> solveGaussSeidel(const std::vector<double>& emission,
-                                         const std::vector<double>& solar_source);
+                                         const std::vector<double>& solar_source,
+                                         const std::vector<double>& scatter_refl);
+
+    // Band-separated (visible + thermal-IR) radiosity solve. See the derivation in
+    // docs/two-band-radiosity-derivation.tex, Eqs (4)-(6). Reuses the SAME view-
+    // factor operator and the SAME Jacobi/GS kernel; the visible channel is
+    // T-independent and is cached across Picard sweeps at fixed solar_flux.
+    std::vector<double> solveTwoBand(const std::vector<double>& temperatures,
+                                     const std::vector<double>& solar_flux);
 
 #ifdef PTM_GPU_OPENCL
     // GPU-accelerated solve
     std::vector<double> solveGPU(const std::vector<double>& temperatures,
                                  const std::vector<double>& solar_flux);
+
+    // GPU band-separated (two-band) solve (B1). Mirrors solveTwoBand() on the GPU by
+    // running the verified gray kernels twice: IR band (solar=0, ε/1-ε) + visible band
+    // (temps=0, properties ε←1-A / ρ←A, source A·Q), summed. Only reached when
+    // two_band_gpu_ok_ (all Σ_j F_ij ≤ 1). Float32 => matches the CPU two-band to GPU
+    // float precision, not bit-identically (same contract as the gray GPU path).
+    std::vector<double> solveGPUTwoBand(const std::vector<double>& temperatures,
+                                        const std::vector<double>& solar_flux);
 #endif
 
     // Data members
@@ -164,8 +223,35 @@ private:
     // Solar Bond albedo for the reflected-SOLAR source term only (empty = fall back
     // to reflectivity_ = 1-eps, the legacy behavior). Set from PTM_SOLAR_ALBEDO so
     // a sunlit wall scatters ~0.12 of its insolation rather than ~0.05. See initCommon.
+    // In two-band mode this same per-face value is the visible Bond albedo A for the
+    // whole visible channel (scatter A, absorb 1-A), not just the first-bounce source.
     std::vector<double> solar_reflectivity_;
     std::vector<double> areas_;
+
+    // --- Band-separated (two-band) radiosity state -----------------------------
+    // Enabled by PTM_RAD_TWO_BAND (requires PTM_SOLAR_ALBEDO for the Bond albedo A).
+    // OFF by default => the legacy single gray-band path runs, byte-identical.
+    bool two_band_ = false;
+    // True iff the GPU is running the two-band solve (B1). Only enabled when every
+    // vf_row_norm_[i] == 1 (no Σ_j F_ij > 1 row), because the GPU Jacobi kernel does
+    // NOT apply the row-norm inside its iteration (the GPU analogue of PTM-08). On a
+    // mesh with an overshoot row the GPU visible band would diverge, so two-band with
+    // any Σ>1 row falls back to the row-norm-protected CPU solve (warned in initGPU).
+    bool two_band_gpu_ok_ = false;
+    // Absorbed indirect flux from each band, from the last solveTwoBand() (the new
+    // per-band product). Their sum is what solve() returns and the surface BC consumes.
+    // Written per solve() call; read by the caller before the next call. solve() is
+    // NOT re-entrant on a single instance (the multi-GPU pool uses one solver per
+    // device); do not call concurrently on the same RadiositySolver.
+    std::vector<double> last_indirect_vis_;
+    std::vector<double> last_indirect_ir_;
+    // NOTE (B2/B3): the previous single-slot visible cache (keyed on the last
+    // solar_flux) was REMOVED. In production the coupling loop nests for iter { for t },
+    // so consecutive solve() calls carry different solar_flux and the cache MISSED
+    // every call while paying an O(n) vector compare + copy, and it was mutable
+    // cross-call state hostile to concurrency. The visible system (I - A F) B_vis =
+    // A Q_solar converges in 1-2 SpMV (ρ(A F) ≤ A_max f_max < 1; derivation §3), so
+    // re-solving it each call is the intended, cheap cost — not the cache.
     // Per-face view-factor row normalization = 1/max(1, Σ_j F_ij). The M1
     // centroid view-factor estimator overshoots in the near field, so on fine
     // or concave meshes Σ_j F_ij can exceed 1 — non-physical for an open scene
@@ -304,6 +390,30 @@ public:
     // True iff multi-GPU radiosity dispatch is active.
     bool hasGPUPool() const;
 
+    // Set the per-face visible Bond albedo A_i for the two-band radiosity (A2).
+    // Stored and forwarded to the underlying RadiositySolver. May be called before
+    // prepare() (applied at solver creation) or per-timestep before
+    // computeIndirectFlux() when the surface-BC albedo is incidence-dependent, so
+    // A_rad == A_BC per face and reflected-solar energy closes. Size must equal the
+    // mesh face count.
+    void setSolarAlbedo(const std::vector<double>& solar_albedo);
+
+    // Activate band-separated (two-band) radiosity on the underlying solver (D1),
+    // e.g. after per-face albedo has been sourced post-prepare(). Two-band enabled
+    // this late uses the CPU two-band solve (the GPU two-band gate is set at
+    // initGPU time). No-op if the solver does not exist yet.
+    void enableTwoBand();
+
+    // True iff the underlying solver is running band-separated (two-band) radiosity.
+    bool isTwoBand() const;
+
+    // Per-band absorbed indirect flux from the last computeIndirectFlux[Batch]()
+    // (C1, Paul's product): absorbed reflected-SOLAR and absorbed thermal-IR as
+    // SEPARATE full-face vectors (0 on non-exchange faces). Empty in the gray path.
+    // Their sum equals the total indirect flux the surface BC consumes.
+    const std::vector<double>& lastIndirectVisible() const { return indirect_flux_vis_; }
+    const std::vector<double>& lastIndirectIR() const { return indirect_flux_ir_; }
+
     // Get face classification
     const FaceClassification& getClassification() const { return classification_; }
 
@@ -372,12 +482,20 @@ private:
     // Face properties
     std::vector<double> emissivity_;
     std::vector<double> areas_;
+    // Per-face visible Bond albedo A_i for the two-band radiosity (A2). Empty =>
+    // the solver keeps its env-sourced albedo. Forwarded to solver_ on creation
+    // (prepare) and whenever setSolarAlbedo() is called.
+    std::vector<double> solar_albedo_;
 
     // Statistics
     Statistics stats_;
 
     // Work arrays
     std::vector<double> indirect_flux_;
+    // Per-band absorbed indirect flux (C1), mapped to all faces. Populated by
+    // computeIndirectFlux[Batch]() only when the solver runs two-band.
+    std::vector<double> indirect_flux_vis_;
+    std::vector<double> indirect_flux_ir_;
 
     // --- Smith (1967) anisotropic beamed thermal emission ---------------------
     // All inactive unless config_.rms_slope_deg > 0 (beam_active_ == false).

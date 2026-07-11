@@ -10375,6 +10375,11 @@ int main(int argc, char** argv) {
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
+            // Band-separated (visible + thermal-IR) radiosity (D1). Default OFF =>
+            // byte-identical gray path. When ON, the per-face Bond albedo is sourced
+            // into the solver after face_albedos_rad is loaded (below), and two-band
+            // is activated then (CPU two-band path). D2 default-flip is Paul's call.
+            rad_config.band_separated = sim_config.radiation.band_separated;
             // Multi-GPU radiosity dispatch — pool is materialized inside
             // RadiositySolver::initGPU() when gpu_devices > 1 and use_gpu = true.
             rad_config.gpu_devices = rad_gpu_devices;
@@ -10516,6 +10521,35 @@ int main(int argc, char** argv) {
                             std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
                             break;
                         }
+                    }
+                }
+
+                // D1: band-separated (two-band) radiosity in production. Source the
+                // SAME per-face Bond albedo the surface BC uses (face_albedos_rad) into
+                // the radiosity, then activate two-band (CPU two-band path — the GPU
+                // two-band gate is set at initGPU time, which already ran in prepare()).
+                // Default OFF => this block is skipped and the run is byte-identical.
+                if (rad_config.band_separated) {
+                    rad_manager.setSolarAlbedo(face_albedos_rad);
+                    rad_manager.enableTwoBand();
+                    std::cout << "  [radiation.band_separated] two-band radiosity ON: visible band "
+                                 "uses per-face Bond albedo (scatter A_i / absorb 1-A_i), IR band 1-eps/eps."
+                              << std::endl;
+                    // The per-face albedo sourced here is the STATIC base Bond albedo. When
+                    // the BC uses an incidence-dependent albedo (Hayne angular / Hapke), the
+                    // absorbed A_BC(θ) varies per timestep while the radiosity A is static —
+                    // a residual per-face energy leak at grazing incidence. Wiring the
+                    // per-timestep incidence-albedo update into the coupling loop
+                    // (RadiationExchangeManager::setSolarAlbedo per timestep) is the remaining
+                    // A2/D1 production step; warn rather than close energy silently-wrong.
+                    const bool incidence_on =
+                        (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
+                    if (incidence_on) {
+                        std::cout << "  [radiation.band_separated] WARNING: incidence-dependent albedo is "
+                                     "active; the two-band reflected-solar albedo is the STATIC base value, "
+                                     "so energy does not fully close at grazing incidence. Per-timestep "
+                                     "incidence-albedo update in the coupling loop is not yet wired."
+                                  << std::endl;
                     }
                 }
 

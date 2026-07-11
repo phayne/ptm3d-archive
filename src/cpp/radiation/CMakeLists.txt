@@ -61,6 +61,25 @@ set_target_properties(test_bowl_crater PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Two-band radiosity PTM-08 severity test: Gauss-Seidel vs Jacobi on a synthetic
+# concave enclosure with Σ_j F_ij > 1 (vf_row_norm_ active), visible Bond albedo A.
+# Regression fixture: exits nonzero while GS omits the row-norm, 0 once A1 lands.
+add_executable(test_two_band_rownorm test_two_band_rownorm.cpp)
+target_link_libraries(test_two_band_rownorm PRIVATE
+    radiation
+    mesh_utils
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_two_band_rownorm PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    target_link_libraries(test_two_band_rownorm PRIVATE ptm_gpu)
+    target_compile_definitions(test_two_band_rownorm PRIVATE PTM_GPU_OPENCL)
+endif()
+set_target_properties(test_two_band_rownorm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Ingersoll bowl-crater validation driven by the PRODUCTION radiation module
 # (Embree-occluded ViewFactorCalculator + RadiositySolver). Writes .npy outputs.
 add_executable(bowl_crater_ptm bowl_crater_ptm.cpp)
