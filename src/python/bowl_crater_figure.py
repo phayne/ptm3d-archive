@@ -114,7 +114,11 @@ def make_figure(log_path: Path, out_path: Path) -> None:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("log", nargs="?", default="/tmp/bowl_crater_full.log")
+    # Default to a TRACKED artifact so Fig 7 is reproducible (was /tmp, which is
+    # cleared on reboot and lost the published numbers). Generate the log with:
+    #   build/bin/test_bowl_crater > output/bowl_conv/bowl_crater_full.log
+    p.add_argument("log", nargs="?",
+                   default="output/bowl_conv/bowl_crater_full.log")
     p.add_argument("--out", default="docs/figures/v2/bowl_crater_ingersoll.png")
     args = p.parse_args()
     make_figure(Path(args.log), Path(args.out))

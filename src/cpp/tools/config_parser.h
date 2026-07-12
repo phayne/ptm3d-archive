@@ -256,9 +256,10 @@ struct SimulationConfig {
         // 0 (default) = Lambertian, byte-identical. RMS micro-slope [deg].
         double rms_slope_deg = 0.0;
         double beam_vf_threshold = 1e-7;
-        // Band-separated (visible + thermal-IR) radiosity (D1). Default OFF =>
-        // byte-identical gray radiosity. See docs/two-band-radiosity-derivation.tex.
-        bool band_separated = false;
+        // Band-separated (visible + thermal-IR) radiosity (D1). Production DEFAULT
+        // ON (D2, 2026-07-12); gray recovered exactly with band_separated:false.
+        // See docs/two-band-radiosity-derivation.tex.
+        bool band_separated = true;
         // Multi-GPU radiosity dispatch (mirrors thermal pool config).
         // Per-timestep solves are independent so the timestep-batch can be
         // split across N GPUs. Default == 1 preserves legacy single-GPU

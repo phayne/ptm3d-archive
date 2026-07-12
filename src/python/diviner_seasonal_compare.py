@@ -17,6 +17,7 @@ Output: a per-site 4x3 figure (rows: summer-max, summer-avg, winter-max,
 winter-avg; cols: Diviner | PTM3D | diff) + a summary JSON of bias/RMSE.
 """
 from __future__ import annotations
+import argparse
 import json
 import re
 from pathlib import Path
@@ -55,7 +56,17 @@ RUN_OVERRIDE = {"haworth": "divval_haworth_r32c",
                 "faustini": "divval_faustini_fix",
                 "shackleton": "divval_shackleton_r32",
                 "sunlit": "divval_sunlit_fix"}
+# Explicit absolute-path run-directory overrides, keyed by site key. EMPTY by
+# default (NO behavior change vs the committed script); populated only via
+# --run-dir SITE=PATH. Takes precedence over RUN_OVERRIDE/OUTROOT so a run
+# OUTSIDE OUTROOT (e.g. the two-band run in ~/dev/heat3d) can be wired in
+# without touching the defaults above.
+RUN_DIR_ABS: dict = {}
 WINDOW_KM, CELL_M, CORE_KM = 15.0, 250.0, 15.0
+# Manuscript Fig. 8 site-overview row (--overview): wider-region LOLA topography +
+# Diviner summer Tbol,max context, with the CORE_KM comparison window outlined.
+LOLA = REPO / "data/dem/validation/_lola_20m_spstereo_pm120km.tif"
+OVERVIEW_ROI_KM = 30.0
 
 # Per-site color scales (K), tuned to each site's T_bol distribution (see
 # diviner_seasonal_histograms.py): (T_lo, T_hi) for the Diviner/PTM3D panels,
@@ -94,6 +105,8 @@ def resolve_run(key):
     """Use the corrected (occluder+eq+eq-indirect) run if it exists yet,
     otherwise fall back to the 2-orbit production run. Lets the figure
     regenerate incrementally as each site's re-run completes."""
+    if key in RUN_DIR_ABS:               # explicit absolute override (--run-dir)
+        return Path(RUN_DIR_ABS[key])
     ov = RUN_OVERRIDE.get(key)
     if ov and (OUTROOT / ov / "mesh.ply").exists():
         return OUTROOT / ov
@@ -200,11 +213,121 @@ def fill_internal_gaps(arr):
     return out
 
 
-def main():
+def _context_grids(lat0, lon0):
+    """LOLA elevation + Diviner summer-max binned on a +/-OVERVIEW_ROI_KM stereo
+    grid — the wider-region site-overview context for the manuscript Fig. 8 top
+    row. Reuses the diviner_se_rim_paper.py recipe: LOLA is nearest-sampled from
+    the south-polar-stereo DEM (DN->m via x0.5), Diviner summer-max is queried by
+    nearest neighbour (the level-4 product is a sparse point cloud; binning leaves
+    white gaps), masked where the nearest observation is > 1.5 km away."""
+    import rasterio
+    from scipy.ndimage import map_coordinates
+    from scipy.spatial import cKDTree
+    x0, y0 = TO_XY.transform(lon0, lat0)
+    n = 300
+    gx = np.linspace(x0 - OVERVIEW_ROI_KM * 1e3, x0 + OVERVIEW_ROI_KM * 1e3, n)
+    gy = np.linspace(y0 - OVERVIEW_ROI_KM * 1e3, y0 + OVERVIEW_ROI_KM * 1e3, n)
+    GX, GY = np.meshgrid(gx, gy)
+    src = rasterio.open(LOLA)
+    inv = ~src.transform
+    elev = src.read(1).astype(float)
+    col, row = inv * (GX.ravel(), GY.ravel())
+    EL = map_coordinates(elev, [row, col], order=1, mode="constant",
+                         cval=np.nan).reshape(GX.shape) * 0.5   # DN -> m
+    d = np.load(SEASDIR / "polar_south_80_summer_max_polar.npy")
+    good = np.isfinite(d[:, 2]) & (d[:, 2] > 0)
+    dx, dy = TO_XY.transform(d[good, 1], d[good, 0])
+    tree = cKDTree(np.column_stack([dx, dy]))
+    dist, idx = tree.query(np.column_stack([GX.ravel(), GY.ravel()]), k=1)
+    DT = d[good, 2][idx].reshape(GX.shape).astype(float)
+    DT[dist.reshape(GX.shape) > 1500.0] = np.nan
+    ext = [-OVERVIEW_ROI_KM, OVERVIEW_ROI_KM, -OVERVIEW_ROI_KM, OVERVIEW_ROI_KM]
+    return EL, DT, ext
+
+
+def _figure_with_overview(lat0, lon0):
+    """Manuscript Fig. 8 layout: a 1x2 site-overview row (LEFT = LOLA topography,
+    RIGHT = Diviner summer Tbol,max, both over a wide ROI, with the CORE_KM
+    comparison window outlined by a cyan circle + center cross) ABOVE an empty 4x3
+    axes grid. Returns (fig, axes4x3); the caller fills the 4x3 exactly as in the
+    default layout so the comparison grid is unchanged."""
+    import matplotlib.gridspec as gridspec
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import LightSource
+    EL, DT, cext = _context_grids(lat0, lon0)
+    fig = plt.figure(figsize=(8.6, 14.0))
+    outer = gridspec.GridSpec(2, 1, height_ratios=[1.35, 4.0], hspace=0.18)
+    topgs = outer[0].subgridspec(1, 2, wspace=0.45)
+    axT = fig.add_subplot(topgs[0, 0])
+    ls = LightSource(azdeg=315, altdeg=30)
+    hs = ls.hillshade(np.nan_to_num(EL, nan=np.nanmean(EL)), vert_exag=2.0,
+                      dx=200, dy=200)
+    e0, e1 = np.nanpercentile(EL, [1, 99])
+    axT.imshow(hs, origin="lower", extent=cext, cmap="gray")
+    axT.imshow(EL, origin="lower", extent=cext, cmap="terrain", alpha=0.55,
+               vmin=e0, vmax=e1)
+    fig.colorbar(ScalarMappable(Normalize(e0, e1), "terrain"), ax=axT, shrink=0.85,
+                 pad=0.03, label="Elevation (m)")
+    axT.set_title("LOLA topography", fontsize=11)
+    axD = fig.add_subplot(topgs[0, 1])
+    dl, dh = np.nanpercentile(DT[np.isfinite(DT)], [2, 98])
+    imD = axD.imshow(DT, origin="lower", extent=cext, cmap="inferno",
+                     vmin=dl, vmax=dh)
+    fig.colorbar(imD, ax=axD, shrink=0.85, pad=0.03, label="$T$ (K)")
+    axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
+    for ax in (axT, axD):
+        th = np.linspace(0, 2 * np.pi, 100)
+        ax.plot(CORE_KM * np.cos(th), CORE_KM * np.sin(th), "c-", lw=1.4)
+        ax.plot(0, 0, "c+", ms=10, mew=1.8)
+        ax.set_xlabel("x (km)"); ax.set_ylabel("y (km)")
+        ax.set_aspect("equal")
+    gs = outer[1].subgridspec(4, 3, hspace=0.32, wspace=0.30)
+    axes = np.empty((4, 3), dtype=object)
+    for r in range(4):
+        for c in range(3):
+            axes[r, c] = fig.add_subplot(gs[r, c])
+    return fig, axes
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--run-dir", action="append", default=[], metavar="SITE=PATH",
+                    help="Explicit absolute run-directory override for a site key "
+                         "(repeatable). Does NOT change the built-in defaults.")
+    ap.add_argument("--site", action="append", default=[], metavar="KEY",
+                    help="Restrict to these site key(s) (repeatable). Default: all.")
+    ap.add_argument("--outdir", default=None,
+                    help="Output directory (default: docs/figures/diviner_validation/seasonal).")
+    ap.add_argument("--tag", default="",
+                    help="Filename suffix for figures/JSON (avoids overwriting).")
+    ap.add_argument("--figstem", default=None,
+                    help="Override the per-site figure basename (single-site use only).")
+    ap.add_argument("--overview", action="store_true",
+                    help="Prepend the manuscript Fig. 8 site-overview row (LOLA "
+                         "topography + Diviner summer Tbol,max over a wide ROI, "
+                         "comparison window outlined) above the 4x3 grid. Single "
+                         "site only; the 4x3 comparison grid is unchanged.")
+    args = ap.parse_args(argv)
+    for spec in args.run_dir:
+        if "=" not in spec:
+            ap.error(f"--run-dir expects SITE=PATH, got {spec!r}")
+        k, p = spec.split("=", 1)
+        RUN_DIR_ABS[k] = p
+    site_filter = set(args.site) or None
+    tag = args.tag
+    outdir = (Path(args.outdir) if args.outdir
+              else REPO / "docs/figures/diviner_validation/seasonal")
+    outdir.mkdir(parents=True, exist_ok=True)
+    sites = [s for s in SITES if site_filter is None or s[1] in site_filter]
+    if args.figstem is not None and len(sites) != 1:
+        ap.error("--figstem is only valid with exactly one --site")
+    if args.overview and len(sites) != 1:
+        ap.error("--overview is only valid with exactly one --site")
+
     apply_style()
     sp.furnsh(METAKERNEL)
     summary = {}
-    for disp, key, lat0, lon0 in SITES:
+    for disp, key, lat0, lon0 in sites:
         run = resolve_run(key)
         if not (run / "mesh.ply").exists():
             print(f"skip {key}: no run"); continue
@@ -226,8 +349,12 @@ def main():
                 summary.setdefault(key, {})[f"{season}_{stat_name}"] = st
                 print(f"   {season:6s} {stat_name:4s}: N={st['n']} bias={st['bias']:+.1f} RMSE={st['rmse']:.1f}")
 
-        # per-site figure: 4 rows x 3 cols
-        fig, axes = plt.subplots(4, 3, figsize=(8.0, 10.2))
+        # per-site figure: 4 rows x 3 cols, optionally with the manuscript Fig. 8
+        # site-overview row (LOLA topo + Diviner summer Tbol,max) prepended above.
+        if args.overview:
+            fig, axes = _figure_with_overview(lat0, lon0)
+        else:
+            fig, axes = plt.subplots(4, 3, figsize=(8.0, 10.2))
         for r, (season, stat_name, model, dvm, st, g) in enumerate(rows):
             ext = [(g["ex"][0]-g["x0"])/1e3, (g["ex"][-1]-g["x0"])/1e3,
                    (g["ey"][0]-g["y0"])/1e3, (g["ey"][-1]-g["y0"])/1e3]
@@ -253,22 +380,37 @@ def main():
                             bbox=dict(fc="white", ec="0.7", alpha=0.85))
         for c in range(3):
             axes[3, c].set_xlabel("x (km)")
-        fig.suptitle(f"PTM3D vs Diviner seasonal $T_{{bol}}$ — {disp}",
-                     fontsize=12, fontweight="bold", y=0.995)
-        fig.tight_layout(rect=(0, 0, 1, 0.985))
-        outdir = REPO / "docs/figures/diviner_validation/seasonal"
-        outdir.mkdir(parents=True, exist_ok=True)
         slug = disp.lower().replace(" ", "_")
-        out = outdir / f"seasonal_{slug}"
-        for fmt, dpi in ((".png", 300), (".pdf", None)):
-            fig.savefig(out.with_suffix(fmt), dpi=dpi)
+        stem = args.figstem if args.figstem is not None else f"seasonal_{slug}"
+        out = outdir / f"{stem}{tag}"
+        if args.overview:
+            # Match the paper's Fig. 8: no overall suptitle; GridSpec + tight bbox.
+            for fmt, dpi in ((".png", 300), (".pdf", None)):
+                fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
+        else:
+            fig.suptitle(f"PTM3D vs Diviner seasonal $T_{{bol}}$ — {disp}",
+                         fontsize=12, fontweight="bold", y=0.995)
+            fig.tight_layout(rect=(0, 0, 1, 0.985))
+            for fmt, dpi in ((".png", 300), (".pdf", None)):
+                fig.savefig(out.with_suffix(fmt), dpi=dpi)
         plt.close(fig)
         print(f"[{key}] wrote {out.with_suffix('.png')}")
 
-    outdir = REPO / "docs/figures/diviner_validation/seasonal"
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2))
+    if summary:
+        (outdir / f"summary{tag}.json").write_text(json.dumps(summary, indent=2))
+    else:
+        print("WARNING: no runs resolved; summary.json NOT written (nothing to compare)")
 
-    # cross-site summary bar chart
+    # cross-site summary bar chart (skip when fewer than two sites are selected)
+    if len(summary) < 2:
+        print("\n=== SEASONAL SUMMARY (bias / RMSE, K) ===")
+        for k, v in summary.items():
+            print(f"  {k}:")
+            for kk, st in v.items():
+                print(f"     {kk:14s} N={st['n']:5d} bias={st['bias']:+6.1f} "
+                      f"RMSE={st['rmse']:5.1f}")
+        sp.kclear()
+        return summary
     order = [(k, lat) for (disp, k, lat, lon) in SITES if k in summary]
     keys = [k for k, _ in order]
     dlabel = {k: d for d, k, *_ in SITES}
@@ -291,7 +433,7 @@ def main():
                  fontweight="bold", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     for fmt, dpi in ((".png", 300), (".pdf", None)):
-        fig.savefig(outdir / ("seasonal_summary" + fmt), dpi=dpi)
+        fig.savefig(outdir / (f"seasonal_summary{tag}" + fmt), dpi=dpi)
     plt.close(fig)
 
     print("\n=== SEASONAL SUMMARY (bias / RMSE, K) ===")
@@ -300,6 +442,7 @@ def main():
         for kk, st in v.items():
             print(f"     {kk:14s} N={st['n']:5d} bias={st['bias']:+6.1f} RMSE={st['rmse']:5.1f}")
     sp.kclear()
+    return summary
 
 
 if __name__ == "__main__":

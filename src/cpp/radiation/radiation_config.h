@@ -51,14 +51,16 @@ struct RadiationConfig {
     double convergence_tolerance = 0.01; // Relative convergence criterion
     bool use_acceleration = true;        // Use Gauss-Seidel acceleration
 
-    // Band-separated (visible + thermal-IR) radiosity (PTM-07 fix). Default OFF =>
-    // the legacy single gray-band solve runs, byte-identical. When true, the visible
-    // band scatters/absorbs the per-face Bond albedo A_i (sourced from the surface
-    // albedo config) and the IR band keeps 1-eps/eps; their two absorbed indirect
-    // fluxes are summed. Requires a per-face albedo (setSolarAlbedo). The env
-    // PTM_RAD_TWO_BAND remains an equivalent activation path. Paul's default-flip is
-    // a separate reviewed decision (D2). See docs/two-band-radiosity-derivation.tex.
-    bool band_separated = false;
+    // Band-separated (visible + thermal-IR) radiosity (PTM-07 fix). Production
+    // DEFAULT ON (D2, 2026-07-12): the visible band scatters/absorbs the per-face
+    // Bond albedo A_i (sourced from the surface albedo config) and the IR band
+    // keeps 1-eps/eps; their two absorbed indirect fluxes are summed. Requires a
+    // per-face albedo (setSolarAlbedo) — without one, enableTwoBand() warns LOUD and
+    // stays gray, so the default is safe. The legacy single gray-band solve is
+    // recovered EXACTLY (byte-identical at A=1-eps) by setting band_separated=false.
+    // The env PTM_RAD_TWO_BAND remains an equivalent activation path.
+    // See docs/two-band-radiosity-derivation.tex.
+    bool band_separated = true;
 
     // Multi-scattering control
     int max_bounces = 1;                 // Number of scattering bounces (1 = single)

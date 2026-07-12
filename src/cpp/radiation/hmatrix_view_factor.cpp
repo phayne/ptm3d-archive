@@ -762,7 +762,19 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
 
     // Always print basic H-matrix build info (this is important for large meshes)
     std::cout << "Building H-matrix view factor for " << n_faces << " faces..." << std::endl;
-    std::cout << "  Compression tolerance: " << config_.compression_tolerance << std::endl;
+    {
+        // Show the tolerance in default float notation so an inherited
+        // std::fixed / low-precision stream state (from an upstream caller) cannot
+        // truncate it to a misleading "0.0". Display-only; the value is honored
+        // regardless (BUGS.md PTM-09). Save/restore leaves cout unchanged.
+        const std::ios::fmtflags saved_fmt = std::cout.flags();
+        const std::streamsize saved_prec = std::cout.precision();
+        std::cout.unsetf(std::ios::floatfield);
+        std::cout.precision(6);
+        std::cout << "  Compression tolerance: " << config_.compression_tolerance << std::endl;
+        std::cout.flags(saved_fmt);
+        std::cout.precision(saved_prec);
+    }
     std::cout << "  Max tree depth: " << config_.max_tree_depth << std::endl;
     std::cout << "  Min block size: " << config_.min_block_size << std::endl;
     std::cout << "  Max SVD rank: " << config_.max_svd_rank << std::endl;

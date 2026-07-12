@@ -118,6 +118,66 @@ def floor_temperature_curve(
 
 
 # ---------------------------------------------------------------------------
+# Ingersoll, Svitek & Murray (1992) Eq 8 — the SHADOWED-interior closed form.
+#
+# For a spherical-cap bowl whose interior is fully in shadow (β < β_crit), the
+# interior sees no direct Sun; it is heated only by (a) thermal IR from the
+# sunlit walls and (b) sunlight the walls scatter down into it. Ingersoll's
+# Eq 8 gives the equilibrium emission of that shadowed interior:
+#
+#     σ T⁴ = S sin(β) · f(1−A)/(1−A f) · [ 1 + A(1−f)/ε ],
+#
+# with f = 1 − F_sky the interior-to-wall view factor (geometry only). This is
+# the reference the production two-band radiosity is validated against on the
+# bowl harness (bowl_crater_ptm.cpp). It is DISTINCT from the two-zone
+# ``floor_temperature`` above (which assumes an isothermal 200 K wall and adds a
+# direct-Sun term for β > β_crit); Eq 8 self-consistently closes the sunlit-wall
+# scattering and so is the correct shadow-limit curve.
+
+def shadow_sigmaT4_eq8(
+    beta_rad: float | np.ndarray,
+    depth_to_diameter: float,
+    *,
+    albedo: float = 0.12,
+    emissivity: float = 0.95,
+    solar_constant: float = SOLAR_CONSTANT,
+) -> np.ndarray:
+    """σ T⁴ (W m⁻²) of the shadowed spherical-cap interior — Ingersoll Eq 8.
+
+    β is the solar elevation above the local horizon; valid where the interior
+    is fully shadowed (β < β_crit).
+    """
+    beta = np.atleast_1d(np.asarray(beta_rad, dtype=float))
+    f = 1.0 - sky_view_factor(depth_to_diameter)
+    A = albedo
+    sigT4 = (solar_constant * np.sin(beta)
+             * f * (1.0 - A) / (1.0 - A * f)
+             * (1.0 + A * (1.0 - f) / emissivity))
+    return sigT4
+
+
+def shadow_temperature_eq8(
+    beta_rad: float | np.ndarray,
+    depth_to_diameter: float,
+    **kw,
+) -> np.ndarray:
+    """Equilibrium temperature (K) of the shadowed interior — Ingersoll Eq 8."""
+    return (shadow_sigmaT4_eq8(beta_rad, depth_to_diameter, **kw) / SIGMA) ** 0.25
+
+
+def shadow_flux_eq8(
+    beta_rad: float | np.ndarray,
+    depth_to_diameter: float,
+    *,
+    emissivity: float = 0.95,
+    **kw,
+) -> np.ndarray:
+    """Emitted flux ε σ T⁴ (W m⁻²) of the shadowed interior — Ingersoll Eq 8."""
+    return emissivity * shadow_sigmaT4_eq8(
+        beta_rad, depth_to_diameter, emissivity=emissivity, **kw)
+
+
+# ---------------------------------------------------------------------------
 # Self-test / smoke check
 
 def _smoke_check() -> None:

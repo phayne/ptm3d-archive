@@ -155,6 +155,23 @@ void RadiositySolver::enableTwoBand() {
         two_band_ = true;
         std::cout << "  [radiation.band_separated] band-separated radiosity ACTIVE (config): "
                      "visible band absorbs 1-A_i, IR band absorbs eps_i; Q_ind = vis + ir.\n";
+#ifdef PTM_GPU_OPENCL
+        // Never substitute CPU for a GPU request silently. If the GPU solver was
+        // already initialized (initGPU ran) before two-band was enabled, the GPU
+        // two-band gate (two_band_gpu_ok_, set inside initGPU) never engaged, so
+        // every solve falls back to the CPU two-band path. Warn once so this perf
+        // substitution is visible. To engage the single-GPU two-band mirror,
+        // enable two-band BEFORE initGPU (source the per-face albedo before
+        // RadiationExchangeManager::prepare()); production radiosity is CPU-only
+        // for two-band until that ordering fix / the multi-GPU + H-matrix two-band
+        // mirror lands.
+        if (use_gpu_ && !two_band_gpu_ok_) {
+            std::cerr << "  [radiation.band_separated] WARNING: two-band was enabled AFTER GPU "
+                         "initialization; the single-GPU two-band path is NOT engaged -> running "
+                         "CPU two-band radiosity (correct results, slower). Enable two-band before "
+                         "initGPU to use the GPU two-band mirror.\n";
+        }
+#endif
     }
 }
 
@@ -1324,8 +1341,22 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
             std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
                       << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
         } else {
             std::cout << "  Using SVD compression" << std::endl;
         }
@@ -1517,8 +1548,22 @@ bool RadiationExchangeManager::prepare(
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
             std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
                       << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
         } else {
             std::cout << "  Using SVD compression" << std::endl;
         }
