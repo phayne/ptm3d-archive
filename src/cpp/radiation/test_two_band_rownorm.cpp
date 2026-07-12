@@ -272,6 +272,94 @@ int runB1() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// B1b (BUGS.md PTM-11): the single-GPU two-band gate is ORDERING-SENSITIVE.
+// two_band_gpu_ok_ is set inside initGPU() ONLY if two_band_ is already true at that
+// moment (radiation_exchange.cpp:359-360). So the per-face Bond albedo + enableTwoBand()
+// MUST be sourced BEFORE initGPU() — which is exactly what RadiationExchangeManager::
+// prepare() sequences (setSolarAlbedo -> enableTwoBand -> initGPU), and what the
+// ptm_thermal_sim caller now does by sourcing the albedo BEFORE prepare(). If they are
+// sourced AFTER initGPU() (the PTM-11 bug), the gate never engages and solve() falls to
+// the CPU two-band path (isGPUTwoBand() == false; enableTwoBand() warns).
+//
+// DISCRIMINATING test for the fix's mechanism: the SAME solver, SAME small Σ_j F_ij ≤ 1
+// mesh, run in BOTH orderings. isGPUTwoBand() must be TRUE for the correct order and
+// FALSE for the buggy order. Two-band is driven ONLY by the explicit API here (the env
+// vars are unset), so the constructor does not set two_band_ before initGPU and the buggy
+// ordering is faithfully reproduced. If GPU two-band cannot engage at all (no GPU / init
+// fell back), we SKIP (as B1 does). Returns 0 on PASS or SKIP, 1 if the ordering did NOT
+// discriminate (mechanism broken).
+int runB1b() {
+#ifdef PTM_GPU_OPENCL
+    unsetenv("PTM_RAD_TWO_BAND");
+    unsetenv("PTM_SOLAR_ALBEDO");
+
+    const int    N = 64;
+    const double EPS = 0.96, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), A_vec(N, A);
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    std::printf("=== B1b: PTM-11 init-ordering gate discrimination (N=%d, s=%.2f, A=%.2f) ===\n",
+                N, s, A);
+
+    auto make_cfg = []() {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        return cfg;
+    };
+
+    bool correct_engaged = false, buggy_engaged = false;
+
+    try {
+        // CORRECT order (the fix): setSolarAlbedo -> enableTwoBand -> initGPU.
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg = make_cfg();
+        solver.setConfig(cfg);
+        solver.setSolarAlbedo(A_vec);
+        solver.enableTwoBand();
+        solver.initGPU();
+        correct_engaged = solver.isGPUTwoBand();
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU threw in correct-order init (%s).\n\n", e.what());
+        return 0;
+    }
+
+    if (!correct_engaged) {
+        std::printf("  SKIP: GPU two-band did not engage even in the correct order "
+                    "(no GPU / init fell back).\n\n");
+        return 0;
+    }
+
+    try {
+        // BUGGY order (PTM-11): initGPU -> setSolarAlbedo -> enableTwoBand.
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg = make_cfg();
+        solver.setConfig(cfg);
+        solver.initGPU();          // two_band_ still false here -> gray GPU init
+        solver.setSolarAlbedo(A_vec);
+        solver.enableTwoBand();    // sets two_band_ AFTER init -> gate missed (warns)
+        buggy_engaged = solver.isGPUTwoBand();
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU threw in buggy-order init (%s).\n\n", e.what());
+        return 0;
+    }
+
+    const bool ok = correct_engaged && !buggy_engaged;
+    std::printf("  correct order (albedo/two-band BEFORE initGPU): isGPUTwoBand=%s (want true)\n",
+                correct_engaged ? "true" : "false");
+    std::printf("  buggy   order (albedo/two-band AFTER  initGPU): isGPUTwoBand=%s (want false)\n",
+                buggy_engaged ? "true" : "false");
+    std::printf("  B1b verdict: %s (ordering %s the GPU two-band gate)\n\n",
+                ok ? "PASS" : "FAIL",
+                ok ? "discriminates" : "does NOT discriminate");
+    return ok ? 0 : 1;
+#else
+    std::printf("=== B1b: SKIP (built without PTM_GPU_OPENCL) ===\n\n");
+    return 0;
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -355,8 +443,9 @@ int main() {
 
     int a2_fail = runA2();
     int b1_fail = runB1();
+    int b1b_fail = runB1b();
 
-    std::printf("=== OVERALL: A0/A1 fails=%d  A2 fails=%d  B1 fails=%d ===\n",
-                n_fail, a2_fail, b1_fail);
-    return n_fail + a2_fail + b1_fail;
+    std::printf("=== OVERALL: A0/A1 fails=%d  A2 fails=%d  B1 fails=%d  B1b fails=%d ===\n",
+                n_fail, a2_fail, b1_fail, b1b_fail);
+    return n_fail + a2_fail + b1_fail + b1b_fail;
 }
