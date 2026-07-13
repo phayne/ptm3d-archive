@@ -26,7 +26,7 @@ import pyvista as pv
 
 sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
-from ptm_pubstyle import apply_style, DOUBLE_W
+from ptm_pubstyle import apply_style, DOUBLE_W, load_face_mask
 
 
 def load_stat(d: Path, name: str) -> np.ndarray:
@@ -45,6 +45,12 @@ def main() -> int:
     ap.add_argument("--ncycles", type=int, default=2,
                     help="number of synodic cycles to tile (shows curves connect)")
     ap.add_argument("--out", default="docs/figures/moon3d_500k/temp_timeseries.png")
+    ap.add_argument("--mask-tmax", type=float, default=0.0,
+                    help="exclude faces whose coupled max-T exceeds this (K) from "
+                         "face selection (view-factor over-count artifacts); 0 = keep all")
+    ap.add_argument("--reclassify-mask", default="",
+                    help="boolean face-mask (make_psr_mask.py): also exclude spurious-lit "
+                         "deep-PSR faces from selection")
     a = ap.parse_args()
     cdir, bdir = Path(a.coupled), Path(a.baseline)
 
@@ -62,24 +68,32 @@ def main() -> int:
     bavg = load_stat(bdir, "avg")
     warm = cavg - bavg                   # radiative warming
 
+    # mask view-factor-overcount artifacts (coupled max-T above the physical limit)
+    keep = (cmax <= a.mask_tmax) if a.mask_tmax > 0 else np.ones(len(cmax), bool)
+    if a.reclassify_mask:
+        keep = keep & ~load_face_mask(a.reclassify_mask)   # also drop spurious-lit deep-PSR faces
+    if a.mask_tmax > 0 or a.reclassify_mask:
+        print(f"  excluding {int(np.count_nonzero(~keep))} hot faces "
+              f"(coupled max-T > {a.mask_tmax:.0f} K) from selection")
+
     # ---- select faces by thermal regime ----
     # Pick REPRESENTATIVE faces, not statistical extremes: the global argmax(cmax)
     # is a rare near-vertical facet (>500 K, top-5 of 509k) and argmax(warm) lands
     # on a face whose rad-off baseline is spuriously cold (+300 K "warming" is not
     # physical for inter-face IR). Use robust, regime-typical selectors instead.
-    flat = np.where(tilt < 5)[0]
+    flat = np.where((tilt < 5) & keep)[0]
 
-    # warm sunlit slope: typical strongly-heated slope (~415 K = 99.9th pct), not
-    # the handful of >450 K spikes.
-    tgt = 415.0
-    sun_c = np.where((cmax >= tgt - 8) & (cmax <= tgt + 8) & (tilt < 60) & (cmin > 40))[0]
+    # warm sunlit slope: warmest typical KEPT slope (~the physical subsolar max when
+    # masking, else the legacy 415 K), not the handful of over-count spikes.
+    tgt = float(np.percentile(cmax[keep], 99.5)) if a.mask_tmax > 0 else 415.0
+    sun_c = np.where((cmax >= tgt - 8) & (cmax <= tgt + 8) & (tilt < 60) & (cmin > 40) & keep)[0]
     warm_sunlit = int(sun_c[np.argmin(np.abs(cmax[sun_c] - tgt))]) if sun_c.size \
-        else int(np.argmax(cmax))
+        else int(np.argmax(np.where(keep, cmax, -np.inf)))
 
     # IR-warmed shadowed floor: a cold, never-strongly-lit face (cmax < 160 K)
     # lifted by inter-face IR -- restrict to a believable lift (<= 70 K) so we
     # don't grab a baseline artifact.
-    flr_c = np.where((cmax < 160) & (cmin > 35) & (warm > 10) & (warm < 70))[0]
+    flr_c = np.where((cmax < 160) & (cmin > 35) & (warm > 10) & (warm < 70) & keep)[0]
     ir_floor = int(flr_c[np.argmax(warm[flr_c])]) if flr_c.size else int(np.argmax(warm))
 
     # cold shadowed facet: stays cold all cycle, negligible IR gain (cold trap).
@@ -142,7 +156,9 @@ def main() -> int:
     fig.tight_layout()
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300)
-    print(f"wrote {out}")
+    if out.suffix == ".png":
+        fig.savefig(out.with_suffix(".pdf"))
+    print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
     for name, fi in sel.items():
         print(f"  {name:20} face {fi:7d} slope {tilt[fi]:5.1f}deg  "
               f"Tmax {cmax[fi]:6.1f} Tmin {cmin[fi]:6.1f} warm {warm[fi]:+5.1f}K")

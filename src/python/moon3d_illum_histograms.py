@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, COLORS, DOUBLE_W, panel_label
+from ptm_pubstyle import apply_style, COLORS, DOUBLE_W, panel_label, load_face_mask
 
 
 def load_stat(stat_dir: Path, field: str, name: str) -> np.ndarray:
@@ -57,6 +57,12 @@ def main() -> int:
                     help="cold-trap faces have peak surface T below this (K)")
     ap.add_argument("--out", default="docs/figures/moon3d_500k/illum_histograms.png")
     ap.add_argument("--bins", type=int, default=120)
+    ap.add_argument("--mask-tmax", type=float, default=0.0,
+                    help="exclude faces whose coupled max-T exceeds this (K) as "
+                         "view-factor over-count artifacts; 0 = keep all")
+    ap.add_argument("--reclassify-mask", default="",
+                    help="boolean face-mask file (make_psr_mask.py): spurious-lit "
+                         "deep-PSR faces reclassified as PSR (illumination set to 0)")
     a = ap.parse_args()
     run = Path(a.run)
 
@@ -81,6 +87,17 @@ def main() -> int:
     d_avg = d_sum / nuse
     t_avg = t_sum / nuse
 
+    rc = load_face_mask(a.reclassify_mask) if a.reclassify_mask else np.zeros(nf, bool)
+    if rc.any():
+        d_max[rc] = 0.0; d_avg[rc] = 0.0; t_max[rc] = 0.0; t_avg[rc] = 0.0   # -> PSR
+        print(f"  reclassified {int(rc.sum())} spurious-lit deep-PSR faces as PSR (illum=0)")
+    if a.mask_tmax > 0:
+        tcmax = np.fromfile(run / "statistics" / "temperature_max.bin", dtype=np.float32)[1:]
+        keep = (tcmax <= a.mask_tmax) | rc            # keep reclassified faces (don't exclude)
+        d_max, d_avg, t_max, t_avg = d_max[keep], d_avg[keep], t_max[keep], t_avg[keep]
+        print(f"  masked {int(np.count_nonzero(~keep))} hot faces "
+              f"(coupled max-T > {a.mask_tmax:.0f} K) as VF-overcount artifacts")
+
     apply_style()
     fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_W, 0.46 * DOUBLE_W))
     panels = [("Maximum", d_max, t_max, "a"), ("Mean", d_avg, t_avg, "b")]
@@ -98,17 +115,11 @@ def main() -> int:
         ax.set_title(f"{title} illumination")
         ax.set_xlabel("absorbed solar + IR flux (W m$^{-2}$)")
         ax.set_yscale("log")
-        # add headroom at the top so the percentile table sits in white space
-        ax.set_ylim(0.8, ax.get_ylim()[1] * 22)
+        # modest top headroom so the tallest bar clears the frame (the large 22x
+        # band that reserved space for the removed on-figure percentile table is
+        # no longer needed under the clean-figure standard)
+        ax.set_ylim(0.8, ax.get_ylim()[1] * 3)
         panel_label(ax, f"({lab})")
-        # percentile table (W/m^2): rad OFF (direct) vs rad ON (direct + indirect)
-        po = np.percentile(off, PCTS); pn = np.percentile(on, PCTS)
-        rows = ["pctile " + "".join(f"{p:>6d}" for p in PCTS),
-                "OFF    " + "".join(f"{o:6.0f}" for o in po),
-                "ON     " + "".join(f"{n:6.0f}" for n in pn)]
-        ax.text(0.97, 0.97, "\n".join(rows), transform=ax.transAxes,
-                va="top", ha="right", fontsize=6.8, family="monospace",
-                bbox=dict(fc="white", ec="0.7", alpha=0.9))
     axes[0].set_ylabel("face count")
 
     from matplotlib.patches import Patch
@@ -119,7 +130,9 @@ def main() -> int:
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300)
-    print(f"wrote {out}")
+    if out.suffix == ".png":
+        fig.savefig(out.with_suffix(".pdf"))
+    print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
     for title, off, on, _ in panels:
         po = np.percentile(off, PCTS); pn = np.percentile(on, PCTS)
         print(f"  {title:8s} W/m2  pct {PCTS}")

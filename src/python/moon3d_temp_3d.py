@@ -83,26 +83,22 @@ def centroids(v: np.ndarray, f: np.ndarray) -> np.ndarray:
 
 
 def render_panel(ax, v, f, fc_vals, cmap, norm, elev, azim, title, cbar_label,
-                 zexag=3.0):
+                 zexag=3.0, mask=None, mask_color=(0.7, 0.7, 0.7, 1.0)):
     """Flat-shaded Poly3DCollection colored by per-face fc_vals.
 
     Vertical relief is exaggerated by `zexag` for legibility (the real patch
     is a shallow ~0.2 depth/diameter crater) and the box aspect follows the
-    true (exaggerated) data extents rather than a forced cube.
+    true (exaggerated) data extents rather than a forced cube. Faces flagged
+    in `mask` (view-factor over-count artifacts) are drawn in a neutral gray
+    so they neither color-code as false-hot nor drive the color scale.
     """
     v = v.copy()
-    # Correct hemisphere orientation: reorient to the local (east, north, up)
-    # frame so the OUTWARD radial points +z. The patch is selenocentric, and for
-    # a southern-hemisphere site the outward normal is ~ -z; using global z as
-    # "up" renders the underside and inverts the relief (craters look like bumps).
-    c = v.mean(0); up = c / np.linalg.norm(c)
-    zax = np.array([0.0, 0.0, 1.0]); north = zax - (zax @ up) * up; north /= np.linalg.norm(north)
-    east = np.cross(north, up); east /= np.linalg.norm(east)
-    v = np.column_stack([(v - c) @ east, (v - c) @ north, (v - c) @ up])
     v[:, 2] *= zexag
     polys = v[f]                                   # (nf, 3, 3)
     sm = ScalarMappable(norm=norm, cmap=cmap)
     colors = sm.to_rgba(fc_vals)
+    if mask is not None:
+        colors[mask] = mask_color
     pc = Poly3DCollection(polys, facecolors=colors, edgecolors="none",
                           linewidths=0.0, antialiased=False, rasterized=True)
     ax.add_collection3d(pc)
@@ -137,6 +133,10 @@ def main() -> int:
                     help="decimate to ~this many faces for matplotlib display")
     ap.add_argument("--elev", type=float, default=24.0)
     ap.add_argument("--azim", type=float, default=-62.0)
+    ap.add_argument("--mask-tmax", type=float, default=0.0,
+                    help="draw faces whose coupled MAX-T exceeds this (K) in neutral "
+                         "gray and exclude them from the color scale (view-factor "
+                         "over-count artifacts); 0 = keep all")
     a = ap.parse_args()
 
     full = pv.read(a.ply)               # connectivity only (points are float32)
@@ -155,6 +155,15 @@ def main() -> int:
         f"face/stat mismatch: {len(ff)} faces, {len(coupled)} coupled, {len(baseline)} baseline"
     diff = coupled - baseline
 
+    # view-factor over-count artifact mask (on coupled MAX-T, not the rendered field)
+    if a.mask_tmax > 0:
+        hot = load_stat(Path(a.coupled), "max") > a.mask_tmax
+        print(f"masking {int(hot.sum())} over-count faces "
+              f"(coupled max-T > {a.mask_tmax:.0f} K) as neutral gray")
+    else:
+        hot = np.zeros(len(coupled), bool)
+    good = ~hot
+
     # Render the full clean geometry directly: decimate_pro shatters this
     # open lunar patch (boundary + near-coplanar facets) into spikes, and the
     # mesh barely reduces anyway, so the full 509k faces are drawn (already
@@ -169,20 +178,20 @@ def main() -> int:
     axL = fig.add_subplot(1, 2, 1, projection="3d", computed_zorder=False)
     axR = fig.add_subplot(1, 2, 2, projection="3d", computed_zorder=False)
 
-    nL = Normalize(np.percentile(coupled_d, 1), np.percentile(coupled_d, 99))
+    nL = Normalize(np.percentile(coupled_d[good], 1), np.percentile(coupled_d[good], 99))
     render_panel(axL, vd, fd, coupled_d, "inferno", nL, a.elev, a.azim,
-                 f"Radiatively-coupled {field_name} T", "T (K)")
+                 f"Radiatively-coupled {field_name} T", "T (K)", mask=hot)
     axL.text2D(0.03, 0.95, "(a)", transform=axL.transAxes,
                fontsize=10, fontweight="bold", va="top")
 
-    dmax = np.percentile(np.abs(diff_d), 99.5)
+    dmax = np.percentile(np.abs(diff_d[good]), 99.5)
     dmax = max(dmax, 1.0)
-    if diff_d.min() < -0.5:
+    if diff_d[good].min() < -0.5:
         nR = TwoSlopeNorm(vmin=-dmax, vcenter=0.0, vmax=dmax); cmapR = "RdBu_r"
     else:
         nR = Normalize(0.0, dmax); cmapR = "hot"
     render_panel(axR, vd, fd, diff_d, cmapR, nR, a.elev, a.azim,
-                 f"Coupling effect (Δ{field_name} T)", "ΔT (K)")
+                 f"Coupling effect (Δ{field_name} T)", "ΔT (K)", mask=hot)
     axR.text2D(0.03, 0.95, "(b)", transform=axR.transAxes,
                fontsize=10, fontweight="bold", va="top")
 
@@ -191,9 +200,12 @@ def main() -> int:
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=300)
-    print(f"wrote {out}")
-    print(f"  Δ{field_name}T: min={diff.min():+.1f} max={diff.max():+.1f} "
-          f"mean={diff.mean():+.2f} K (full-res)")
+    if out.suffix == ".png":
+        fig.savefig(out.with_suffix(".pdf"))
+    print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
+    dg = diff[good]
+    print(f"  Δ{field_name}T (non-over-count faces): min={dg.min():+.1f} "
+          f"max={dg.max():+.1f} mean={dg.mean():+.2f} K")
     return 0
 
 
