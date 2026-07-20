@@ -1,0 +1,7 @@
+# Example viewpoint locations file for PTM3D viewshed analysis
+# Format: label,latitude,longitude,height_meters
+# 
+# For Dark Horse mission traverse planning
+# Haworth rim waypoints
+Lander_0,-86.92793,336.98892,2.0
+Rover_0,-86.97231,337.86622,1.0

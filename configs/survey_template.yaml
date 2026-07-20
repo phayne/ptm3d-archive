@@ -1,0 +1,109 @@
+# =============================================================================
+# PTM3D Polar Survey Configuration
+# =============================================================================
+# This file defines the complete configuration for an end-to-end illumination
+# and thermal survey of a lunar (or other body) polar region.
+#
+# Usage:
+#   python3 scripts/survey/run_survey.py configs/my_survey.yaml
+#   python3 scripts/survey/run_survey.py configs/my_survey.yaml --step mesh
+#   python3 scripts/survey/run_survey.py configs/my_survey.yaml --status
+# =============================================================================
+
+# --- Survey metadata ---
+survey:
+  name: "amundsen_2026"           # Survey identifier (used for output directories)
+  body: Moon                      # Target body (Moon, Mercury, Ceres, etc.)
+  body_radius: 1737400.0          # Mean body radius in meters
+
+# --- Region of Interest ---
+roi:
+  center_lat: -84.5               # ROI center latitude (degrees)
+  center_lon: 85.5                # ROI center longitude (degrees East)
+  radius_km: 75                   # ROI radius in kilometers
+  max_points: 2000000             # Maximum mesh vertices
+  density_exp: 1.0                # Density falloff exponent (1=linear, 2=quadratic, 0.5=sqrt)
+  core_frac: 0.10                 # Fraction of radius at full resolution
+
+# --- DEM input ---
+dem:
+  file: "/path/to/LDEM_80S_20M.LBL"   # DEM file (GeoTIFF, PDS IMG via .LBL, etc.)
+  south_pole_coords: true              # Apply south pole coordinate corrections
+
+# --- Time period ---
+time:
+  start: "2026-04-01T00:00:00"   # Survey start time (ISO 8601 UTC)
+  duration_years: 2.0            # Total survey duration
+  lunation_days: 29.530588       # Synodic month length (days)
+  timesteps_per_lunation: 360    # Timesteps per lunation (~2 hr resolution at 360)
+
+# --- Illumination survey ---
+illumination:
+  num_lunations: 25              # Number of lunations to simulate
+  compute_duration_maps: true    # Compute illum_fraction and max_continuous_hours
+                                 # (requires re-running with per-timestep binary output)
+  include_primary_reflection: true
+  use_albedo_map: false
+
+# --- Thermal model (optional) ---
+thermal:
+  enabled: true
+  lunations: [7, 13]             # Which lunation indices to simulate (e.g., summer + winter)
+  equilibration_orbits: 1.0      # Thermal equilibration cycles
+  radiation_exchange: true       # Enable radiation exchange (view factors + radiosity)
+  max_coupling_iterations: 1     # Radiation-thermal coupling iterations
+  use_gpu: true                  # Use GPU for thermal solver (if compiled with OpenCL)
+  view_factor_file: ""           # Path to cached view factors (empty = compute + save)
+
+# --- Thermophysical properties ---
+thermophysical:
+  albedo: 0.12
+  emissivity: 0.95
+  incidence_angle_albedo: true
+  ks: 0.00074                    # Surface thermal conductivity (W/m/K)
+  kd: 0.0034                    # Deep thermal conductivity (W/m/K)
+  H: 0.06                       # H-parameter (e-folding depth in meters)
+  rhos: 1100.0                  # Surface density (kg/m³)
+  rhod: 1800.0                  # Deep density (kg/m³)
+  cp0: 800.0                    # Heat capacity at 200K (J/kg/K)
+  Qb: 0.018                     # Geothermal heat flow (W/m²)
+  chi: 2.7                      # Conductivity temperature exponent
+
+# --- Site selection criteria ---
+selection_criteria:
+  min_illum_fraction: 0.0001     # Minimum illuminated time fraction (exclude PSR)
+  max_illum_fraction: 0.20       # Maximum illuminated time fraction (exclude always-lit)
+  min_continuous_hours: 8.0      # Minimum continuous illumination window (hours)
+  max_temperature_K: 150.0       # Maximum summer peak temperature (K)
+  min_cluster_size: 50           # Minimum mesh faces per cluster
+
+# --- Named sites of interest (always included in analysis) ---
+named_sites:
+  - name: "Wilcoski"
+    lat: -83.93341
+    lon: 92.51474
+
+# --- Traverse planning (optional) ---
+traverse:
+  enabled: false
+  start_lat: -84.5              # Traverse start latitude
+  start_lon: 85.5               # Traverse start longitude
+  start_time: "2026-10-01T00:00:00"  # Mission start time (UTC)
+  max_distance_km: 50.0         # Maximum total traverse distance
+  max_duration_days: 14.0       # Maximum mission duration
+  return_to_start: true         # Must return to starting point
+  min_sites: 3                  # Minimum number of sites to visit
+  max_slope_deg: 15.0           # Maximum terrain slope (15° rover, 30° EVA)
+  min_rest_hours: 2.0           # Minimum rest period at each waypoint
+  traverse_speed_kmh: 2.0       # Average traverse speed (km/h)
+  require_illuminated: true     # Only visit sites during illumination windows
+  viewshed:
+    enabled: false
+    observer_height_m: 2.0      # Observer height above surface
+    max_range_km: 10.0          # Viewshed computation radius
+
+# --- Output ---
+output:
+  base_dir: "output/amundsen_2026"   # Base output directory
+  report_format: html                # html, compact_html, or notebook
+  clean_per_timestep_data: true      # Delete per-timestep binaries after processing

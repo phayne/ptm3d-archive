@@ -1,0 +1,31 @@
+# Nikon D5 with AF-S NIKKOR 70-200mm f/2.8E FL ED VR at 200mm
+# This is the camera setup used by Artemis II astronauts for lunar surface imaging.
+#
+# Nikon D5 sensor: 35.9 x 23.9 mm, 5568 x 3712 pixels (20.8 MP)
+# Pixel pitch: 6.449 microns (35.9/5568)
+# At 200mm: FOV = 10.26 x 6.84 deg
+# Distortion at 200mm: mild pincushion (k1 ~ -0.005)
+camera:
+  focal_length_mm: 200.0
+  sensor_mm: [35.9, 23.9]
+  nx: 1392                    # quarter-res for animation (full: 5568)
+  ny: 928                     # quarter-res for animation (full: 3712)
+  # pixel_pitch derived from sensor/nx: 25.8 um (effective at quarter-res)
+
+  distortion:
+    model: brown_conrady
+    k1: -0.005                # mild pincushion typical of 200mm telephoto
+    k2:  0.0002
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

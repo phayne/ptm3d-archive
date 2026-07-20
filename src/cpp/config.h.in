@@ -1,0 +1,15 @@
+#ifndef PTM_THERMAL_CONFIG_H
+#define PTM_THERMAL_CONFIG_H
+
+#include <string>
+
+namespace ptm_thermal {
+namespace config {
+
+// Path to SPICE kernels directory
+const std::string SPICE_KERNELS_DIR = "@SPICE_KERNELS_DIR@";
+
+} // namespace config
+} // namespace ptm_thermal
+
+#endif // PTM_THERMAL_CONFIG_H

@@ -1,0 +1,30 @@
+# Nikon D5 with AF-S NIKKOR 70-200mm f/2.8E FL ED VR at 100mm
+# This configuration shows a near-full-disk view of the Moon during the
+# Artemis II flyby (Moon subtends ~24 deg at CA, FOV ~20 deg).
+#
+# Nikon D5: 35.9 x 23.9 mm sensor, 5568 x 3712 px native (20.8 MP)
+# Using quarter-resolution (1392 x 928) for animation rendering.
+# Pixel pitch at this resolution: 25.8 um effective
+camera:
+  focal_length_mm: 100.0
+  sensor_mm: [35.9, 23.9]
+  nx: 1392
+  ny: 928
+
+  distortion:
+    model: brown_conrady
+    k1: -0.008             # mild pincushion at 100mm
+    k2:  0.0003
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

@@ -1,0 +1,49 @@
+# Europa Clipper EGA — E-THEMIS thermal IR imager (Christensen et al. 2024 SSR, Table 2)
+#
+#   Detector:           1280 x 1200 uncooled microbolometer, 12-um pitch
+#   Active per band:    896 cross-track × 140 along-track
+#   Telescope FOV:      5.85° cross-track × 4.01° along-track (full detector)
+#   Filter FOV/band:    5.85° cross-track × 0.91° along-track (per band)
+#   IFOV:               0.114 mrad/pixel  ( = 5.85° / 896 = 4.01° / 614 )
+#   Telescope:          3-mirror anastigmat, f = 105.2 mm, EPD = 64.5 mm
+#                       f/1.34 cross-track, f/1.92 along-track
+#   Bands (filters):    Band 1 = 7-14 um, Band 2 = 14-28 um, Band 3 = 28-80 um
+#
+# Per the user's request, we model E-THEMIS as scanned in azimuth to form a
+# SQUARE image of 5.85° × 5.85° at native pixel scale (896 × 896 pixels at
+# 12-um pitch). The native focal length and detector pitch are honoured so
+# the derived FOV exactly reproduces the spec values.
+#
+# Thermal band: set on the CLI via --thermal-wavelength. Defaults to 10 um
+# (Band 1 centre). For other bands use:
+#   Band 1 (7-14 um)  → ~10 um
+#   Band 2 (14-28 um) → ~20 um
+#   Band 3 (28-80 um) → ~50 um
+#
+# Photometry:  Lommel-Seeliger / albedo 0.12 / emissivity 0.95 (consistent with
+# the previous Clipper EGA renders). The reflectance model only matters for
+# the RADIANCE HDU; the THERMAL HDU is driven by Planck × emissivity at the
+# chosen wavelength regardless.
+camera:
+  focal_length_mm: 105.2
+  pixel_pitch_mm: [0.012, 0.012]   # 12-um detector pitch — drives sensor + FOV
+  nx: 896
+  ny: 896
+
+  distortion:
+    model: brown_conrady
+    k1:  0.0
+    k2:  0.0
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]       # Moon body-fixed centre (IAU_MOON)
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

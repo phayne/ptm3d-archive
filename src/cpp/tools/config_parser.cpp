@@ -1,0 +1,754 @@
+#include "config_parser.h"
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+
+#ifdef HAVE_YAML_CPP
+#include <yaml-cpp/yaml.h>
+#endif
+
+namespace ptm {
+
+#ifdef HAVE_YAML_CPP
+
+// Helper template for safe YAML node access with defaults
+template<typename T>
+T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaultVal) {
+    if (node && node[key]) return node[key].as<T>();
+    return defaultVal;
+}
+
+SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
+    SimulationConfig config;
+    try {
+        YAML::Node root = YAML::LoadFile(filename);
+        
+        // Parse Time section
+        if (root["simulation"]) {
+            const auto& sim = root["simulation"];
+            config.time.start_time = getWithDefault(sim, "start_time", config.time.start_time);
+            config.time.duration_days = getWithDefault(sim, "duration_days", config.time.duration_days);
+            config.time.timesteps = getWithDefault(sim, "timesteps", config.time.timesteps);
+            config.time.body = getWithDefault(sim, "body", config.time.body);
+        }
+        
+        // Parse Mesh section
+        if (root["mesh"]) {
+            const auto& mesh = root["mesh"];
+            config.mesh.resolution = getWithDefault(mesh, "resolution", config.mesh.resolution);
+            config.mesh.import_file = getWithDefault(mesh, "import_file", config.mesh.import_file);
+            config.mesh.scale_factor = getWithDefault(mesh, "scale_factor", config.mesh.scale_factor);
+            config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
+            config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
+            config.mesh.topo_directory = getWithDefault(mesh, "topo_directory", config.mesh.topo_directory);
+            config.mesh.latitude_override = getWithDefault(mesh, "latitude_override", config.mesh.latitude_override);
+            config.mesh.longitude_override = getWithDefault(mesh, "longitude_override", config.mesh.longitude_override);
+        }
+        
+        // Parse Thermal section
+        if (root["thermal"]) {
+            const auto& thermal = root["thermal"];
+            config.thermal.run_thermal_mesh = getWithDefault(thermal, "run_thermal_mesh", config.thermal.run_thermal_mesh);
+            config.thermal.threads = getWithDefault(thermal, "threads", config.thermal.threads);
+            config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
+            config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
+            config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
+            config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
+            config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
+            config.thermal.gpu_devices = getWithDefault(thermal, "gpu_devices", config.thermal.gpu_devices);
+            if (thermal["gpu_device_ids"] && thermal["gpu_device_ids"].IsSequence()) {
+                config.thermal.gpu_device_ids.clear();
+                for (const auto& v : thermal["gpu_device_ids"]) {
+                    config.thermal.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            // gpu_batch_size is a size_t in config but YAML deserializes as int — accept both.
+            if (thermal["gpu_batch_size"]) {
+                config.thermal.gpu_batch_size =
+                    static_cast<size_t>(thermal["gpu_batch_size"].as<long long>());
+            }
+            config.thermal.gpu_inter_batch_pause_ms = getWithDefault(
+                thermal, "gpu_inter_batch_pause_ms", config.thermal.gpu_inter_batch_pause_ms);
+            config.thermal.thermal_inertia_map = getWithDefault(thermal, "thermal_inertia_map", config.thermal.thermal_inertia_map);
+            config.thermal.h_parameter_map = getWithDefault(thermal, "h_parameter_map", config.thermal.h_parameter_map);
+            config.thermal.use_default_property_map = getWithDefault(thermal, "use_default_property_map", config.thermal.use_default_property_map);
+            config.thermal.property_maps_directory = getWithDefault(thermal, "property_maps_directory", config.thermal.property_maps_directory);
+            config.thermal.enable_shadow_flux = getWithDefault(thermal, "enable_shadow_flux", config.thermal.enable_shadow_flux);
+            config.thermal.crater_dd_ratio = getWithDefault(thermal, "crater_dd_ratio", config.thermal.crater_dd_ratio);
+            config.thermal.integration_days = getWithDefault(thermal, "integration_days", config.thermal.integration_days);
+            config.thermal.integration_steps = getWithDefault(thermal, "integration_steps", config.thermal.integration_steps);
+            config.thermal.integration_offset_days = getWithDefault(thermal, "integration_offset_days", config.thermal.integration_offset_days);
+            config.thermal.integration_offset_steps = getWithDefault(thermal, "integration_offset_steps", config.thermal.integration_offset_steps);
+            config.thermal.geothermal_heat_flow = getWithDefault(thermal, "geothermal_heat_flow", config.thermal.geothermal_heat_flow);
+            config.thermal.heat_flow_mask_file = getWithDefault(thermal, "heat_flow_mask_file", config.thermal.heat_flow_mask_file);
+            config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
+            config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
+            config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
+            if (thermal["ice_stability"]) {
+                const auto& is_node = thermal["ice_stability"];
+                config.thermal.ice_stability.flux_threshold_kgm2s =
+                    getWithDefault(is_node, "flux_threshold_kgm2s", config.thermal.ice_stability.flux_threshold_kgm2s);
+                config.thermal.ice_stability.grain_hop_length_um =
+                    getWithDefault(is_node, "grain_hop_length_um", config.thermal.ice_stability.grain_hop_length_um);
+                config.thermal.ice_stability.geothermal_gradient_K_per_m =
+                    getWithDefault(is_node, "geothermal_gradient_K_per_m", config.thermal.ice_stability.geothermal_gradient_K_per_m);
+                config.thermal.ice_stability.sublimation_enthalpy_kJmol =
+                    getWithDefault(is_node, "sublimation_enthalpy_kJmol", config.thermal.ice_stability.sublimation_enthalpy_kJmol);
+                config.thermal.ice_stability.n_depth_subsamples =
+                    getWithDefault(is_node, "n_depth_subsamples", config.thermal.ice_stability.n_depth_subsamples);
+            }
+        }
+        
+        // Parse Illumination section
+        if (root["illumination"]) {
+            const auto& n = root["illumination"];
+            config.illumination.include_primary_reflection =
+                getWithDefault(n, "include_primary_reflection", config.illumination.include_primary_reflection);
+            config.illumination.use_batch_processing =
+                getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
+            config.illumination.use_albedo_map =
+                getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
+            config.illumination.albedo_map =
+                getWithDefault(n, "albedo_map", config.illumination.albedo_map);
+            config.illumination.albedo_maps_directory =
+                getWithDefault(n, "albedo_maps_directory", config.illumination.albedo_maps_directory);
+            config.illumination.positions_file =
+                getWithDefault(n, "positions_file", config.illumination.positions_file);
+            config.illumination.use_gpu = getWithDefault(n, "use_gpu",
+                config.illumination.use_gpu);
+            config.illumination.gpu_devices = getWithDefault(n, "gpu_devices",
+                config.illumination.gpu_devices);
+            if (n["gpu_device_ids"] && n["gpu_device_ids"].IsSequence()) {
+                config.illumination.gpu_device_ids.clear();
+                for (const auto& v : n["gpu_device_ids"]) {
+                    config.illumination.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            config.illumination.gpu_inter_batch_pause_ms = getWithDefault(n,
+                "gpu_inter_batch_pause_ms", config.illumination.gpu_inter_batch_pause_ms);
+            config.illumination.bvh_cache_file = getWithDefault(n,
+                "bvh_cache_file", config.illumination.bvh_cache_file);
+        }
+        
+        // Parse Output section
+        if (root["output"]) {
+            const auto& output = root["output"];
+            config.output.directory = getWithDefault(output, "directory", config.output.directory);
+            config.output.format = getWithDefault(output, "format", config.output.format);
+            config.output.vtk_mode = getWithDefault(output, "vtk_mode", config.output.vtk_mode);
+            config.output.include_primary_ir = getWithDefault(output, "include_primary_ir", config.output.include_primary_ir);
+            config.output.thermal_vtk_file = getWithDefault(output, "thermal_vtk_file", config.output.thermal_vtk_file);
+            config.output.complete_vtk_file = getWithDefault(output, "complete_vtk_file", config.output.complete_vtk_file);
+            config.output.locations_file = getWithDefault(output, "locations_file", config.output.locations_file);
+            config.output.series_output = getWithDefault(output, "series_output", config.output.series_output);
+            config.output.location_data = getWithDefault(output, "location_data", config.output.location_data);
+            config.output.depths_file = getWithDefault(output, "depths_file", config.output.depths_file);
+            config.output.skip_time_series = getWithDefault(output, "skip_time_series", config.output.skip_time_series);
+            config.output.write_raw_stats = getWithDefault(output, "write_raw_stats", config.output.write_raw_stats);
+            config.output.skip_mesh = getWithDefault(output, "skip_mesh", config.output.skip_mesh);
+        }
+        
+        // Parse Radiation section
+        if (root["radiation"]) {
+            const auto& rad = root["radiation"];
+            config.radiation.enabled = getWithDefault(rad, "enabled", config.radiation.enabled);
+            config.radiation.min_shadow_fraction = getWithDefault(rad, "min_shadow_fraction", config.radiation.min_shadow_fraction);
+            config.radiation.verbose = getWithDefault(rad, "verbose", config.radiation.verbose);
+            config.radiation.use_gpu = getWithDefault(rad, "use_gpu", config.radiation.use_gpu);
+            config.radiation.view_factor_file = getWithDefault(rad, "view_factor_file", config.radiation.view_factor_file);
+            config.radiation.max_coupling_iterations = getWithDefault(rad, "max_coupling_iterations", config.radiation.max_coupling_iterations);
+            config.radiation.coupling_temp_threshold = getWithDefault(rad, "coupling_temp_threshold", config.radiation.coupling_temp_threshold);
+            config.radiation.coupling_flux_threshold = getWithDefault(rad, "coupling_flux_threshold", config.radiation.coupling_flux_threshold);
+            config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
+            config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
+            config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
+            config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);
+            config.radiation.aca_max_rank = getWithDefault(rad, "aca_max_rank", config.radiation.aca_max_rank);
+            config.radiation.hmatrix_threads = getWithDefault(rad, "hmatrix_threads", config.radiation.hmatrix_threads);
+            // Adaptive neighbor selection
+            config.radiation.adaptive_neighbors = getWithDefault(rad, "adaptive_neighbors", config.radiation.adaptive_neighbors);
+            config.radiation.captured_energy_target = getWithDefault(rad, "captured_energy_target", config.radiation.captured_energy_target);
+            config.radiation.max_neighbors = getWithDefault(rad, "max_neighbors", config.radiation.max_neighbors);
+            config.radiation.min_neighbors = getWithDefault(rad, "min_neighbors", config.radiation.min_neighbors);
+            config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
+            config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
+            config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
+
+            // Resolve relative view_factor_file against the YAML file's directory so
+            // the cache path is cwd-independent (GUI subprocess cwd is not necessarily
+            // the repo root, which was silently breaking the VF cache).
+            if (!config.radiation.view_factor_file.empty()) {
+                std::filesystem::path vf_path(config.radiation.view_factor_file);
+                if (vf_path.is_relative()) {
+                    std::error_code ec;
+                    std::filesystem::path yaml_dir =
+                        std::filesystem::absolute(filename, ec).parent_path();
+                    if (!ec) {
+                        config.radiation.view_factor_file =
+                            (yaml_dir / vf_path).lexically_normal().string();
+                    }
+                }
+            }
+        }
+
+        // Parse Generic Body section
+        if (root["generic_body"]) {
+            const auto& gb = root["generic_body"];
+            config.generic_body.name = getWithDefault(gb, "name", config.generic_body.name);
+            config.generic_body.config_file = getWithDefault(gb, "config_file", config.generic_body.config_file);
+            config.generic_body.ephemeris_source = getWithDefault(gb, "ephemeris_source", config.generic_body.ephemeris_source);
+            config.generic_body.spice_metakernel = getWithDefault(gb, "spice_metakernel", config.generic_body.spice_metakernel);
+            config.generic_body.naif_id = getWithDefault(gb, "naif_id", config.generic_body.naif_id);
+
+            // Shape subsection
+            if (gb["shape"]) {
+                const auto& shape = gb["shape"];
+                config.generic_body.shape_type = getWithDefault(shape, "type", config.generic_body.shape_type);
+                config.generic_body.radius_km = getWithDefault(shape, "radius_km", config.generic_body.radius_km);
+                config.generic_body.mesh_file = getWithDefault(shape, "mesh_file", config.generic_body.mesh_file);
+                config.generic_body.mesh_scale = getWithDefault(shape, "mesh_scale", config.generic_body.mesh_scale);
+                if (shape["semi_axes_km"] && shape["semi_axes_km"].IsSequence() && shape["semi_axes_km"].size() == 3) {
+                    config.generic_body.semi_axis_a_km = shape["semi_axes_km"][0].as<double>();
+                    config.generic_body.semi_axis_b_km = shape["semi_axes_km"][1].as<double>();
+                    config.generic_body.semi_axis_c_km = shape["semi_axes_km"][2].as<double>();
+                }
+            }
+
+            // Orbit subsection
+            if (gb["orbit"]) {
+                const auto& orbit = gb["orbit"];
+                config.generic_body.semi_major_axis_au = getWithDefault(orbit, "semi_major_axis_au", config.generic_body.semi_major_axis_au);
+                config.generic_body.eccentricity = getWithDefault(orbit, "eccentricity", config.generic_body.eccentricity);
+                config.generic_body.inclination_deg = getWithDefault(orbit, "inclination_deg", config.generic_body.inclination_deg);
+                config.generic_body.lon_ascending_node_deg = getWithDefault(orbit, "lon_ascending_node_deg", config.generic_body.lon_ascending_node_deg);
+                config.generic_body.arg_perihelion_deg = getWithDefault(orbit, "arg_perihelion_deg", config.generic_body.arg_perihelion_deg);
+                config.generic_body.mean_anomaly_deg = getWithDefault(orbit, "mean_anomaly_deg", config.generic_body.mean_anomaly_deg);
+                config.generic_body.orbital_epoch = getWithDefault(orbit, "epoch", config.generic_body.orbital_epoch);
+            }
+
+            // Spin subsection
+            if (gb["spin"]) {
+                const auto& spin = gb["spin"];
+                config.generic_body.spin_period_hours = getWithDefault(spin, "period_hours", config.generic_body.spin_period_hours);
+                config.generic_body.pole_ra_deg = getWithDefault(spin, "pole_ra_deg", config.generic_body.pole_ra_deg);
+                config.generic_body.pole_dec_deg = getWithDefault(spin, "pole_dec_deg", config.generic_body.pole_dec_deg);
+                config.generic_body.prime_meridian_deg = getWithDefault(spin, "prime_meridian_deg", config.generic_body.prime_meridian_deg);
+            }
+
+            // Surface/thermophysical subsection
+            if (gb["surface"]) {
+                const auto& surf = gb["surface"];
+                config.generic_body.albedo = getWithDefault(surf, "albedo", config.generic_body.albedo);
+                config.generic_body.emissivity = getWithDefault(surf, "emissivity", config.generic_body.emissivity);
+                config.generic_body.ks = getWithDefault(surf, "ks", config.generic_body.ks);
+                config.generic_body.kd = getWithDefault(surf, "kd", config.generic_body.kd);
+                config.generic_body.rhos = getWithDefault(surf, "rhos", config.generic_body.rhos);
+                config.generic_body.rhod = getWithDefault(surf, "rhod", config.generic_body.rhod);
+                config.generic_body.H_scale = getWithDefault(surf, "H", config.generic_body.H_scale);
+                config.generic_body.cp0 = getWithDefault(surf, "cp0", config.generic_body.cp0);
+                config.generic_body.Qb = getWithDefault(surf, "Qb", config.generic_body.Qb);
+                config.generic_body.chi = getWithDefault(surf, "chi", config.generic_body.chi);
+            }
+        }
+
+        // Parse Thermophysical section (GUI-written overrides)
+        if (root["thermophysical"]) {
+            const auto& thermo = root["thermophysical"];
+            bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
+            config.thermophysical_albedo_explicit = !use_default_albedo;
+            config.thermophysical.albedo_explicit = !use_default_albedo;
+            config.thermophysical.constant_thermal_inertia = getWithDefault(
+                thermo, "constant_thermal_inertia",
+                config.thermophysical.constant_thermal_inertia);
+        }
+
+        // Parse Advanced section
+        if (root["advanced"]) {
+            const auto& adv = root["advanced"];
+            config.advanced.verbose = getWithDefault(adv, "verbose", config.advanced.verbose);
+            config.advanced.default_visible_albedo = getWithDefault(adv, "default_visible_albedo", config.advanced.default_visible_albedo);
+        }
+
+        std::cout << "Successfully loaded configuration from: " << filename << std::endl;
+        
+    } catch (const YAML::Exception& e) {
+        last_error_ = std::string("YAML parsing error: ") + e.what();
+        throw std::runtime_error(last_error_);
+    } catch (const std::exception& e) {
+        last_error_ = std::string("Error loading config: ") + e.what();
+        throw std::runtime_error(last_error_);
+    }
+    
+    return config;
+}
+
+bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfig& config) {
+    try {
+        YAML::Emitter out;
+        out << YAML::BeginMap;
+        
+        // Simulation section
+        out << YAML::Key << "simulation" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "start_time" << YAML::Value << config.time.start_time;
+        out << YAML::Key << "duration_days" << YAML::Value << config.time.duration_days;
+        out << YAML::Key << "timesteps" << YAML::Value << config.time.timesteps;
+        out << YAML::Key << "body" << YAML::Value << config.time.body;
+        out << YAML::EndMap;
+        
+        // Mesh section
+        out << YAML::Key << "mesh" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "resolution" << YAML::Value << config.mesh.resolution;
+        if (!config.mesh.import_file.empty())
+            out << YAML::Key << "import_file" << YAML::Value << config.mesh.import_file;
+        out << YAML::Key << "scale_factor" << YAML::Value << config.mesh.scale_factor;
+        out << YAML::Key << "export_basic" << YAML::Value << config.mesh.export_basic;
+        out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
+        if (!config.mesh.topo_directory.empty())
+            out << YAML::Key << "topo_directory" << YAML::Value << config.mesh.topo_directory;
+        if (config.mesh.latitude_override > -900.0)
+            out << YAML::Key << "latitude_override" << YAML::Value << config.mesh.latitude_override;
+        if (config.mesh.longitude_override > -900.0)
+            out << YAML::Key << "longitude_override" << YAML::Value << config.mesh.longitude_override;
+        out << YAML::EndMap;
+        
+        // Thermal section
+        out << YAML::Key << "thermal" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "run_thermal_mesh" << YAML::Value << config.thermal.run_thermal_mesh;
+        out << YAML::Key << "threads" << YAML::Value << config.thermal.threads;
+        out << YAML::Key << "equilibration_orbits" << YAML::Value << config.thermal.equilibration_orbits;
+        out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
+        out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;
+        out << YAML::Key << "compute_statistics" << YAML::Value << config.thermal.compute_statistics;
+        // Multi-GPU knobs (only emit when not at defaults — keep templates clean).
+        if (config.thermal.gpu_devices != 1)
+            out << YAML::Key << "gpu_devices" << YAML::Value << config.thermal.gpu_devices;
+        if (!config.thermal.gpu_device_ids.empty()) {
+            out << YAML::Key << "gpu_device_ids" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+            for (int id : config.thermal.gpu_device_ids) out << id;
+            out << YAML::EndSeq;
+        }
+        if (config.thermal.gpu_batch_size != 0)
+            out << YAML::Key << "gpu_batch_size" << YAML::Value
+                << static_cast<long long>(config.thermal.gpu_batch_size);
+        if (config.thermal.gpu_inter_batch_pause_ms != 0)
+            out << YAML::Key << "gpu_inter_batch_pause_ms" << YAML::Value
+                << config.thermal.gpu_inter_batch_pause_ms;
+        if (!config.thermal.thermal_inertia_map.empty())
+            out << YAML::Key << "thermal_inertia_map" << YAML::Value << config.thermal.thermal_inertia_map;
+        if (!config.thermal.h_parameter_map.empty())
+            out << YAML::Key << "h_parameter_map" << YAML::Value << config.thermal.h_parameter_map;
+        if (config.thermal.use_default_property_map)
+            out << YAML::Key << "use_default_property_map" << YAML::Value << config.thermal.use_default_property_map;
+        if (config.thermal.property_maps_directory != "data/property_maps")
+            out << YAML::Key << "property_maps_directory" << YAML::Value << config.thermal.property_maps_directory;
+        out << YAML::Key << "enable_shadow_flux" << YAML::Value << config.thermal.enable_shadow_flux;
+        out << YAML::Key << "crater_dd_ratio" << YAML::Value << config.thermal.crater_dd_ratio;
+        if (config.thermal.integration_days > 0)
+            out << YAML::Key << "integration_days" << YAML::Value << config.thermal.integration_days;
+        if (config.thermal.geothermal_heat_flow > 0)
+            out << YAML::Key << "geothermal_heat_flow" << YAML::Value << config.thermal.geothermal_heat_flow;
+        if (!config.thermal.heat_flow_mask_file.empty())
+            out << YAML::Key << "heat_flow_mask_file" << YAML::Value << config.thermal.heat_flow_mask_file;
+        if (!config.thermal.heat_flow_mask_file.empty())
+            out << YAML::Key << "heat_flow_mask_value" << YAML::Value << config.thermal.heat_flow_mask_value;
+        if (!config.thermal.initial_state_file.empty())
+            out << YAML::Key << "initial_state_file" << YAML::Value << config.thermal.initial_state_file;
+        if (!config.thermal.final_state_file.empty())
+            out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
+        if (config.thermal.compute_ice_stability) {
+            out << YAML::Key << "compute_ice_stability" << YAML::Value << config.thermal.compute_ice_stability;
+            out << YAML::Key << "ice_stability" << YAML::Value << YAML::BeginMap;
+            out << YAML::Key << "flux_threshold_kgm2s" << YAML::Value << config.thermal.ice_stability.flux_threshold_kgm2s;
+            out << YAML::Key << "grain_hop_length_um" << YAML::Value << config.thermal.ice_stability.grain_hop_length_um;
+            out << YAML::Key << "geothermal_gradient_K_per_m" << YAML::Value << config.thermal.ice_stability.geothermal_gradient_K_per_m;
+            out << YAML::Key << "sublimation_enthalpy_kJmol" << YAML::Value << config.thermal.ice_stability.sublimation_enthalpy_kJmol;
+            out << YAML::Key << "n_depth_subsamples" << YAML::Value << config.thermal.ice_stability.n_depth_subsamples;
+            out << YAML::EndMap;
+        }
+        out << YAML::EndMap;
+
+        // Illumination section
+        out << YAML::Key << "illumination" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "include_primary_reflection" << YAML::Value << config.illumination.include_primary_reflection;
+        out << YAML::Key << "use_batch_processing" << YAML::Value << config.illumination.use_batch_processing;
+        out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
+        if (!config.illumination.albedo_map.empty())
+            out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;
+        out << YAML::Key << "albedo_maps_directory" << YAML::Value << config.illumination.albedo_maps_directory;
+        if (!config.illumination.positions_file.empty())
+            out << YAML::Key << "positions_file" << YAML::Value << config.illumination.positions_file;
+        // Illumination GPU knobs (only emit when not at defaults).
+        if (config.illumination.use_gpu)
+            out << YAML::Key << "use_gpu" << YAML::Value << config.illumination.use_gpu;
+        if (config.illumination.gpu_devices != 1)
+            out << YAML::Key << "gpu_devices" << YAML::Value << config.illumination.gpu_devices;
+        if (!config.illumination.gpu_device_ids.empty()) {
+            out << YAML::Key << "gpu_device_ids" << YAML::Value << YAML::Flow << YAML::BeginSeq;
+            for (int id : config.illumination.gpu_device_ids) out << id;
+            out << YAML::EndSeq;
+        }
+        if (config.illumination.gpu_inter_batch_pause_ms != 0)
+            out << YAML::Key << "gpu_inter_batch_pause_ms" << YAML::Value
+                << config.illumination.gpu_inter_batch_pause_ms;
+        if (!config.illumination.bvh_cache_file.empty())
+            out << YAML::Key << "bvh_cache_file" << YAML::Value
+                << config.illumination.bvh_cache_file;
+        out << YAML::EndMap;
+        
+        // Output section
+        out << YAML::Key << "output" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "directory" << YAML::Value << config.output.directory;
+        out << YAML::Key << "format" << YAML::Value << config.output.format;
+        out << YAML::Key << "vtk_mode" << YAML::Value << config.output.vtk_mode;
+        out << YAML::Key << "include_primary_ir" << YAML::Value << config.output.include_primary_ir;
+        if (!config.output.thermal_vtk_file.empty())
+            out << YAML::Key << "thermal_vtk_file" << YAML::Value << config.output.thermal_vtk_file;
+        if (!config.output.complete_vtk_file.empty())
+            out << YAML::Key << "complete_vtk_file" << YAML::Value << config.output.complete_vtk_file;
+        if (!config.output.locations_file.empty())
+            out << YAML::Key << "locations_file" << YAML::Value << config.output.locations_file;
+        if (!config.output.series_output.empty())
+            out << YAML::Key << "series_output" << YAML::Value << config.output.series_output;
+        if (!config.output.location_data.empty())
+            out << YAML::Key << "location_data" << YAML::Value << config.output.location_data;
+        if (!config.output.depths_file.empty())
+            out << YAML::Key << "depths_file" << YAML::Value << config.output.depths_file;
+        if (config.output.skip_time_series)
+            out << YAML::Key << "skip_time_series" << YAML::Value << config.output.skip_time_series;
+        if (config.output.write_raw_stats)
+            out << YAML::Key << "write_raw_stats" << YAML::Value << config.output.write_raw_stats;
+        if (config.output.skip_mesh)
+            out << YAML::Key << "skip_mesh" << YAML::Value << config.output.skip_mesh;
+        out << YAML::EndMap;
+
+        // Advanced section
+        out << YAML::Key << "advanced" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "verbose" << YAML::Value << config.advanced.verbose;
+        out << YAML::EndMap;
+        
+        out << YAML::EndMap;
+        
+        std::ofstream fout(filename);
+        if (!fout) {
+            last_error_ = "Cannot open file for writing: " + filename;
+            return false;
+        }
+        fout << out.c_str();
+        return true;
+        
+    } catch (const std::exception& e) {
+        last_error_ = std::string("Error saving config: ") + e.what();
+        return false;
+    }
+}
+
+#else
+
+// Fallback implementation without YAML support
+SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
+    last_error_ = "YAML support not available. Please install yaml-cpp library.";
+    throw std::runtime_error(last_error_);
+}
+
+bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfig& config) {
+    last_error_ = "YAML support not available. Please install yaml-cpp library.";
+    return false;
+}
+
+#endif // HAVE_YAML_CPP
+
+void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        // Time parameters
+        if (arg == "--start" && i + 1 < argc) {
+            config.time.start_time = argv[++i];
+        } else if (arg == "--duration" && i + 1 < argc) {
+            config.time.duration_days = std::stod(argv[++i]);
+        } else if (arg == "--timesteps" && i + 1 < argc) {
+            config.time.timesteps = std::stoi(argv[++i]);
+        } else if ((arg == "--body" || arg == "-b") && i + 1 < argc) {
+            config.time.body = argv[++i];
+        }
+        // Mesh parameters
+        else if (arg == "--resolution" && i + 1 < argc) {
+            config.mesh.resolution = std::stoi(argv[++i]);
+        } else if (arg == "--mesh-file" && i + 1 < argc) {
+            config.mesh.import_file = argv[++i];
+        } else if (arg == "--mesh-scale" && i + 1 < argc) {
+            config.mesh.scale_factor = std::stod(argv[++i]);
+        } else if (arg == "--export-basic-mesh") {
+            config.mesh.export_basic = true;
+        }
+        // Thermal parameters
+        else if (arg == "--thermal-mesh") {
+            config.thermal.run_thermal_mesh = true;
+        } else if (arg == "--thermal-threads" && i + 1 < argc) {
+            config.thermal.threads = std::stoi(argv[++i]);
+        } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
+            config.thermal.equilibration_orbits = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
+            config.thermal.equilibration_steps_per_day = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-samples-per-diurnal" && i + 1 < argc) {
+            config.thermal.equilibration_samples_per_diurnal_cycle = std::stod(argv[++i]);
+        } else if (arg == "--no-statistics") {
+            config.thermal.compute_statistics = false;
+        } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
+            config.thermal.thermal_inertia_map = argv[++i];
+        } else if (arg == "--h-parameter-map" && i + 1 < argc) {
+            config.thermal.h_parameter_map = argv[++i];
+        } else if (arg == "--use-default-property-map") {
+            config.thermal.use_default_property_map = true;
+        } else if (arg == "--property-maps-directory" && i + 1 < argc) {
+            config.thermal.property_maps_directory = argv[++i];
+        } else if (arg == "--shadow-flux") {
+            config.thermal.enable_shadow_flux = true;
+        } else if (arg == "--crater-dd-ratio" && i + 1 < argc) {
+            config.thermal.crater_dd_ratio = std::stod(argv[++i]);
+        } else if (arg == "--thermal-debug") {
+            config.thermal.debug = true;
+        } else if (arg == "--thermal-debug-lat" && i + 1 < argc) {
+            config.thermal.debug_lat_threshold = std::stod(argv[++i]);
+        } else if (arg == "--thermal-m" && i + 1 < argc) {
+            config.thermal.grid_m = std::stoi(argv[++i]);
+        } else if (arg == "--thermal-n" && i + 1 < argc) {
+            config.thermal.grid_n = std::stoi(argv[++i]);
+        } else if (arg == "--thermal-b" && i + 1 < argc) {
+            config.thermal.grid_b = std::stoi(argv[++i]);
+        } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
+            config.thermal.geothermal_heat_flow = std::stod(argv[++i]);
+        } else if (arg == "--heat-flow-mask" && i + 1 < argc) {
+            config.thermal.heat_flow_mask_file = argv[++i];
+        } else if (arg == "--heat-flow-mask-value" && i + 1 < argc) {
+            config.thermal.heat_flow_mask_value = std::stod(argv[++i]);
+        }
+        // Illumination parameters
+        else if (arg == "--no-primary-reflection") {
+            config.illumination.include_primary_reflection = false;
+        } else if (arg == "--no-batch") {
+            config.illumination.use_batch_processing = false;
+        } else if (arg == "--no-albedo-map") {
+            config.illumination.use_albedo_map = false;
+        } else if (arg == "--albedo-map" && i + 1 < argc) {
+            config.illumination.albedo_map = argv[++i];
+        } else if (arg == "--albedo-maps-directory" && i + 1 < argc) {
+            config.illumination.albedo_maps_directory = argv[++i];
+        } else if (arg == "--positions" && i + 1 < argc) {
+            config.illumination.positions_file = argv[++i];
+        }
+        // Output parameters
+        else if (arg == "--output" && i + 1 < argc) {
+            config.output.directory = argv[++i];
+        } else if (arg == "--output-format" && i + 1 < argc) {
+            config.output.format = argv[++i];
+        } else if (arg == "--vtk-mode" && i + 1 < argc) {
+            config.output.vtk_mode = argv[++i];
+        } else if (arg == "--include-primary-ir") {
+            config.output.include_primary_ir = true;
+        } else if (arg == "--locations" && i + 1 < argc) {
+            config.output.locations_file = argv[++i];
+        }
+        // Generic body parameters
+        else if (arg == "--generic-body-config" && i + 1 < argc) {
+            config.generic_body.config_file = argv[++i];
+        } else if (arg == "--ephemeris-source" && i + 1 < argc) {
+            config.generic_body.ephemeris_source = argv[++i];
+        } else if (arg == "--body-radius" && i + 1 < argc) {
+            config.generic_body.radius_km = std::stod(argv[++i]);
+        } else if (arg == "--orbit-sma" && i + 1 < argc) {
+            config.generic_body.semi_major_axis_au = std::stod(argv[++i]);
+        } else if (arg == "--orbit-ecc" && i + 1 < argc) {
+            config.generic_body.eccentricity = std::stod(argv[++i]);
+        } else if (arg == "--orbit-inc" && i + 1 < argc) {
+            config.generic_body.inclination_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-lan" && i + 1 < argc) {
+            config.generic_body.lon_ascending_node_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-argp" && i + 1 < argc) {
+            config.generic_body.arg_perihelion_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-ma" && i + 1 < argc) {
+            config.generic_body.mean_anomaly_deg = std::stod(argv[++i]);
+        } else if (arg == "--orbit-epoch" && i + 1 < argc) {
+            config.generic_body.orbital_epoch = argv[++i];
+        } else if (arg == "--spin-period" && i + 1 < argc) {
+            config.generic_body.spin_period_hours = std::stod(argv[++i]);
+        } else if (arg == "--spin-pole-ra" && i + 1 < argc) {
+            config.generic_body.pole_ra_deg = std::stod(argv[++i]);
+        } else if (arg == "--spin-pole-dec" && i + 1 < argc) {
+            config.generic_body.pole_dec_deg = std::stod(argv[++i]);
+        } else if (arg == "--chi" && i + 1 < argc) {
+            config.generic_body.chi = std::stod(argv[++i]);
+        }
+        // Advanced parameters
+        else if (arg == "--verbose") {
+            config.advanced.verbose = true;
+        }
+    }
+}
+
+bool ConfigParser::generateTemplate(const std::string& filename) {
+    std::ofstream out(filename);
+    if (!out) {
+        std::cerr << "Cannot create file: " << filename << std::endl;
+        return false;
+    }
+    
+    out << "# PTM3D Simulation Configuration Template\n";
+    out << "# This file contains all available configuration parameters\n";
+    out << "# with their default values and descriptions.\n\n";
+    
+    out << "# ========== Simulation Parameters ==========\n";
+    out << "simulation:\n";
+    out << "  start_time: \"2025-01-01T00:00:00\"  # ISO 8601 format\n";
+    out << "  duration_days: 3.55                # Simulation duration\n";
+    out << "  timesteps: 72                       # Number of output timesteps\n";
+    out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n\n";
+    
+    out << "# ========== Mesh Configuration ==========\n";
+    out << "mesh:\n";
+    out << "  resolution: 5                       # Global mesh resolution\n";
+    out << "  import_file: \"\"                     # Import custom mesh (OBJ, PLY, VTK)\n";
+    out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
+    out << "  export_basic: false                 # Export basic mesh to VTK\n";
+    out << "  use_topographic: false              # Use pre-computed topographic mesh\n";
+    out << "  topo_directory: \"\"                  # Directory containing topographic meshes\n";
+    out << "                                      # (default: data/topo, with per-body subdir)\n\n";
+    
+    out << "# ========== Thermal Model ==========\n";
+    out << "thermal:\n";
+    out << "  run_thermal_mesh: true              # Run thermal model\n";
+    out << "  threads: 0                          # Number of threads (0=auto)\n";
+    out << "  equilibration_orbits: 10            # Day/night cycles for equilibration\n";
+    out << "  equilibration_steps_per_day: -1     # Explicit eq cadence (steps/Earth-day); -1 = auto\n";
+    out << "  equilibration_samples_per_diurnal_cycle: 120  # Accuracy target when eq_steps_per_day<=0\n";
+    out << "                                      # Calibrated on Moon ico3 vs legacy reference:\n";
+    out << "                                      #   120 -> ~4 K max err (Balanced, default)\n";
+    out << "                                      #   240 -> ~3 K max err (High accuracy)\n";
+    out << "                                      #    30 -> ~7 K max err (Fast)\n";
+    out << "                                      #   <=0 -> legacy (match output cadence)\n";
+    out << "  compute_statistics: true            # Compute temperature statistics\n";
+    out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
+    out << "  ice_stability:\n";
+    out << "    flux_threshold_kgm2s: 3.0e-14     # J0 (~1 mm/Ga survival rate)\n";
+    out << "    grain_hop_length_um: 75.0         # ell, regolith grain diameter\n";
+    out << "    geothermal_gradient_K_per_m: 0.0  # extra g on top of solver T(z); 0 = trust solver\n";
+    out << "    sublimation_enthalpy_kJmol: 51.058 # Q (Schorghofer Eq. 4)\n";
+    out << "    n_depth_subsamples: -1            # -1 = use every native depth node\n";
+    out << "  thermal_inertia_map: \"\"             # Path to per-face TI map (binary float32, n_faces values)\n";
+    out << "  h_parameter_map: \"\"                 # Path to per-face H-parameter map (alternative to TI map)\n";
+    out << "  use_default_property_map: false     # Auto-discover bundled icosphere map for the body\n";
+    out << "  property_maps_directory: \"data/property_maps\"  # Root for bundled maps (<dir>/<body>/...)\n";
+    out << "  enable_shadow_flux: false           # Enable crater flux enhancement\n";
+    out << "  crater_dd_ratio: 8.0                # Crater diameter/depth ratio\n";
+    out << "  integration_days: -1                # Integration window (-1=use output window)\n";
+    out << "  integration_steps: -1               # Integration steps (-1=auto)\n";
+    out << "  integration_offset_days: 0.0        # Offset for integration window\n";
+    out << "  integration_offset_steps: 0         # Offset steps for integration\n\n";
+    
+    out << "# ========== Illumination ==========\n";
+    out << "illumination:\n";
+    out << "  include_primary_reflection: true    # Include reflected sunlight from primary\n";
+    out << "  use_batch_processing: true          # Use SIMD batch processing\n";
+    out << "  use_albedo_map: true                 # Auto-discover spatially-varying albedo maps\n";
+    out << "  albedo_map: \"\"                      # Custom albedo map (FITS)\n";
+    out << "  albedo_maps_directory: \"data/albedo_maps\"  # Albedo maps directory\n";
+    out << "  positions_file: \"\"                  # Body positions file\n\n";
+    
+    out << "# ========== Output Configuration ==========\n";
+    out << "output:\n";
+    out << "  directory: \"output\"                 # Output directory\n";
+    out << "  format: \"binary\"                    # Output format (binary or vtk)\n";
+    out << "  vtk_mode: \"both\"                    # VTK mode (thermal, complete, both)\n";
+    out << "  include_primary_ir: false           # Include primary IR in VTK\n";
+    out << "  thermal_vtk_file: \"\"                # Custom thermal VTK filename\n";
+    out << "  complete_vtk_file: \"\"               # Custom complete VTK filename\n";
+    out << "  locations_file: \"\"                  # Specific lat/lon points file\n";
+    out << "  depths_file: \"\"                     # Optional depths file (m); write per-location depth series\n";
+    out << "  series_output: \"\"                   # Location time series output filename\n";
+    out << "  location_data: \"\"                   # Custom location data\n";
+    out << "  skip_time_series: false             # Skip per-step binary files (saves disk; statistics still computed)\n";
+    out << "  write_raw_stats: false              # Write merge-friendly raw stats (statistics/_raw/*.bin) for chunked runs\n";
+    out << "  skip_mesh: false                    # Skip writing mesh.ply (used by chunked workflow on chunks 1+)\n\n";
+
+    out << "# ========== Advanced Options ==========\n";
+    out << "advanced:\n";
+    out << "  verbose: false                      # Verbose output\n";
+    out << "  default_visible_albedo: -1.0        # Override albedo (-1=use planet default)\n";
+    out << "  chi: -1.0                           # Radiative conductivity parameter (-1=use default 2.7)\n";
+    
+    std::cout << "Template configuration file created: " << filename << std::endl;
+    return true;
+}
+
+bool ConfigParser::validate(const SimulationConfig& config) {
+    bool valid = true;
+    
+    // Validate time parameters
+    if (config.time.duration_days <= 0) {
+        std::cerr << "Error: duration_days must be positive" << std::endl;
+        valid = false;
+    }
+    if (config.time.timesteps <= 0) {
+        std::cerr << "Error: timesteps must be positive" << std::endl;
+        valid = false;
+    }
+    
+    // Validate mesh parameters
+    if (config.mesh.resolution < 1) {
+        std::cerr << "Error: mesh resolution must be >= 1" << std::endl;
+        valid = false;
+    }
+    if (config.mesh.scale_factor <= 0) {
+        std::cerr << "Error: mesh scale_factor must be positive" << std::endl;
+        valid = false;
+    }
+    
+    // Validate thermal parameters
+    if (config.thermal.threads < 0) {
+        std::cerr << "Error: thermal threads cannot be negative (use 0 for auto)" << std::endl;
+        valid = false;
+    }
+    if (config.thermal.equilibration_orbits < 0.0) {
+        std::cerr << "Error: equilibration_orbits cannot be negative" << std::endl;
+        valid = false;
+    }
+    // equilibration_steps_per_day: allow -1 (sentinel = match output cadence) or strictly positive.
+    // Reject 0 and negative-but-not-minus-one values.
+    if (config.thermal.equilibration_steps_per_day != -1.0 &&
+        config.thermal.equilibration_steps_per_day <= 0.0) {
+        std::cerr << "Error: equilibration_steps_per_day must be > 0 "
+                     "(or -1 to match output cadence); got "
+                  << config.thermal.equilibration_steps_per_day << std::endl;
+        valid = false;
+    }
+
+    // Per-face thermal property maps: H and TI are mutually exclusive (the
+    // model is parameterised on H, and we only want one input source of truth).
+    if (!config.thermal.h_parameter_map.empty() &&
+        !config.thermal.thermal_inertia_map.empty()) {
+        std::cerr << "Error: cannot set both h_parameter_map and "
+                     "thermal_inertia_map (choose one)\n";
+        valid = false;
+    }
+
+    // Validate output format
+    if (config.output.format != "binary" && config.output.format != "vtk") {
+        std::cerr << "Error: output format must be 'binary' or 'vtk'" << std::endl;
+        valid = false;
+    }
+    
+    // Validate VTK mode
+    if (config.output.vtk_mode != "thermal" &&
+        config.output.vtk_mode != "complete" &&
+        config.output.vtk_mode != "both") {
+        std::cerr << "Error: vtk_mode must be 'thermal', 'complete', or 'both'" << std::endl;
+        valid = false;
+    }
+
+    return valid;
+}
+
+} // namespace ptm

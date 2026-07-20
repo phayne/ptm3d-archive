@@ -1,0 +1,70 @@
+# PTM3D config for ALMA observation H4
+# Thelen et al. (2024)
+# Epoch: 2017-07-30T00:00:00
+# Band 6 (233.0 GHz), trailing hemisphere
+# Sub-observer: lon=287.0°W, lat=-1.5°
+
+simulation:
+  start_time: '2017-07-30T00:00:00'
+  duration_days: 3.55
+  timesteps: 288
+  body: Europa
+mesh:
+  resolution: 6
+  use_topographic: false
+  topo_directory: ''
+  import_file: ''
+  scale_factor: 1.0
+  export_basic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 10
+  compute_statistics: true
+  thermal_inertia_map: ''
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: 3.55
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  grid_m: 4
+  grid_n: 10
+  grid_b: 10
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  albedo_map: ''
+  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  positions_file: ''
+output:
+  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/alma/alma_H4
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+  thermal_vtk_file: ''
+  complete_vtk_file: ''
+  no_maps: false
+  locations_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/configs/alma/alma_H4_locations.csv
+  depths_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/configs/alma/alma_depths.txt
+  series_output: ''
+  location_data: ''
+visualization:
+  create: false
+advanced:
+  verbose: true
+  default_visible_albedo: -1.0
+_alma_metadata:
+  observation_label: H4
+  reference: Thelen et al. (2024)
+  sub_obs_lon_deg_W: 287.02
+  sub_obs_lat_deg: -1.5
+  ang_diam_arcsec: 0.754
+  alma_band: 6
+  freq_ghz: 233.0
+  beam_mas_maj_min:
+  - 163
+  - 78
+  hemisphere: trailing

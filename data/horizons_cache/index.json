@@ -1,0 +1,38 @@
+{
+  "269 Justitia (A887 SA)": {
+    "naif_id": "269",
+    "body_type": "asteroid",
+    "cache_date": "2026-05-06T05:29:03.735301",
+    "spk_start": "",
+    "spk_stop": "",
+    "has_damit_shape": true,
+    "damit_id": 2858,
+    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
+    "shape_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj"
+  },
+  "623 Chimaera (A907 BC)": {
+    "naif_id": "623",
+    "body_type": "asteroid",
+    "cache_date": "2026-02-02T11:51:00.417901",
+    "spk_start": "2024-12-24",
+    "spk_stop": "2025-01-31",
+    "has_damit_shape": true,
+    "damit_id": 9110,
+    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/body_config.yaml",
+    "spk_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/ephemeris.spk",
+    "metakernel_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/metakernel.tm",
+    "shape_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape.obj"
+  },
+  "13294 Rockox (1998 QO105)": {
+    "naif_id": "13294",
+    "body_type": "asteroid",
+    "cache_date": "2026-02-02T13:12:39.393633",
+    "spk_start": "2024-12-31",
+    "spk_stop": "2025-02-05",
+    "has_damit_shape": false,
+    "damit_id": 0,
+    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/body_config.yaml",
+    "spk_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk",
+    "metakernel_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm"
+  }
+}

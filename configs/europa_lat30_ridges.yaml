@@ -1,0 +1,71 @@
+advanced:
+  verbose: false
+illumination:
+  include_primary_reflection: true
+  use_albedo_map: false
+  use_batch_processing: true
+mesh:
+  export_basic: false
+  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Ridges_DEM_60m_SOCET.ply
+  latitude_override: 30.0
+  resolution: 5
+  scale_factor: 1.0
+  use_topographic: false
+output:
+  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/europa_lat30_ridges
+  format: binary
+  include_primary_ir: false
+  vtk_mode: both
+radiation:
+  aca_max_rank: 50
+  aca_tolerance: 0.001
+  adaptive_neighbors: true
+  captured_energy_target: 0.95
+  coupling_face_fraction: 0.01
+  coupling_flux_threshold: 0.1
+  coupling_temp_threshold: 0.5
+  enabled: true
+  hmatrix_threads: 0
+  max_coupling_iterations: 10
+  max_neighbors: 500
+  min_neighbors: 20
+  min_shadow_fraction: 0.3
+  use_aca: true
+  use_gpu: true
+  use_hmatrix: false
+  verbose: false
+  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Ridges_DEM_60m_SOCET.vf
+simulation:
+  body: Europa
+  duration_days: 3.55
+  start_time: '2030-01-01T00:00:00'
+  timesteps: 144
+thermal:
+  compute_statistics: true
+  enable_shadow_flux: false
+  equilibration_orbits: 10.0
+  geothermal_heat_flow: -1.0
+  run_thermal_mesh: true
+  threads: 0
+  use_gpu: true
+thermophysical:
+  H: 0.07
+  Qb: 0.03
+  albedo: 0.5
+  chi: 0.0
+  cp0: 0.0
+  emissivity: 0.9
+  kd: 0.05
+  ks: 0.0096
+  rhod: 700.0
+  rhos: 500.0
+  use_default_H: false
+  use_default_Qb: false
+  use_default_albedo: true
+  use_default_chi: false
+  use_default_cp0: false
+  use_default_emissivity: false
+  use_default_kd: false
+  use_default_ks: false
+  use_default_rhod: false
+  use_default_rhos: false

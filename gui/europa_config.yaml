@@ -1,0 +1,56 @@
+simulation:
+  start_time: '2030-04-10T00:00:00'
+  duration_days: 3.55
+  timesteps: 144
+  body: Europa
+mesh:
+  resolution: 5
+  use_topographic: false
+  topo_directory: ''
+  import_file: ''
+  scale_factor: 1.0
+  export_basic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 10
+  compute_statistics: true
+  thermal_inertia_map: ''
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  albedo_map: ''
+  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  positions_file: ''
+output:
+  directory: output
+  format: binary
+  vtk_mode: both
+  include_primary_ir: false
+  thermal_vtk_file: ''
+  complete_vtk_file: ''
+  no_maps: false
+  locations_file: ''
+  depths_file: ''
+  series_output: ''
+  location_data: ''
+visualization:
+  create: false
+  width: 1024
+  height: 768
+  fps: 30
+  camera_distance: 5.0
+  camera_latitude: 30.0
+  camera_longitude: 0.0
+  emission_angle: -1.0
+  azimuth: -1.0
+  save_frames: false
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0

@@ -1,0 +1,33 @@
+# Artemis II camera example with Brown-Conrady distortion and SPICE CK pointing.
+# Replace the instrument_name / ik_kernel / ck_kernel with actual mission kernels
+# when they become available. The intrinsics below are representative of a
+# long-focal-length narrow-angle camera for lunar flyby imaging.
+camera:
+  focal_length_mm: 700.0
+  pixel_pitch_mm:  [0.012, 0.012]   # 12-micron pixels, square
+  nx: 2048
+  ny: 2048
+  principal_point: [1024.0, 1024.0]
+
+  distortion:
+    model: brown_conrady
+    k1: -0.02           # mild pincushion
+    k2:  0.005
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: spice_ck
+    # SPICE IK + CK drive the per-frame orientation:
+    instrument_name: ARTEMIS_II_CAM
+
+  spice:
+    instrument_name: ARTEMIS_II_CAM
+    ik_kernel:  kernels/ik/artemis_cam.ti          # TODO: supply actual IK
+    ck_kernel:  kernels/ck/artemis_nominal.bc      # TODO: supply actual CK
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

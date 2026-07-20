@@ -1,0 +1,297 @@
+/*
+ * Europa Magnetospheric Plasma Sputtering Model - Implementation
+ *
+ * See sputtering_model.h for documentation and references.
+ */
+
+#include "sputtering_model.h"
+#include <algorithm>
+#include <numeric>
+#include <iomanip>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace ptm {
+namespace exosphere {
+
+void SputteringModel::initializeSpatialDistribution(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<double>& face_latitudes,
+    const std::vector<double>& face_longitudes)
+{
+    if (face_centers.size() != num_faces_) {
+        std::cerr << "SputteringModel: face_centers size mismatch!" << std::endl;
+        return;
+    }
+
+    spatial_weight_.resize(num_faces_);
+
+    // Compute latitude and longitude if not provided
+    std::vector<double> latitudes = face_latitudes;
+    std::vector<double> longitudes = face_longitudes;
+
+    if (latitudes.empty() || longitudes.empty()) {
+        latitudes.resize(num_faces_);
+        longitudes.resize(num_faces_);
+
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            const auto& pos = face_centers[i];
+            double r = std::sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2]);
+
+            if (r > 0) {
+                // Latitude: angle from equatorial plane
+                latitudes[i] = std::asin(pos[2] / r) * 180.0 / M_PI;
+
+                // Longitude: angle in x-y plane (standard convention)
+                longitudes[i] = std::atan2(pos[1], pos[0]) * 180.0 / M_PI;
+            } else {
+                latitudes[i] = 0.0;
+                longitudes[i] = 0.0;
+            }
+        }
+    }
+
+    // Compute spatial weights based on hemisphere and latitude
+    double total_weight = 0.0;
+
+    #pragma omp parallel for reduction(+:total_weight)
+    for (size_t i = 0; i < num_faces_; ++i) {
+        // Convert to west longitude for Europa convention
+        double west_lon = toWestLongitude(longitudes[i]);
+
+        // Compute flux factors
+        double lon_factor = computeLongitudeFluxFactor(west_lon);
+        double lat_factor = computeLatitudeFluxFactor(latitudes[i]);
+
+        spatial_weight_[i] = lon_factor * lat_factor;
+        total_weight += spatial_weight_[i];
+    }
+
+    // Normalize weights so they sum to num_faces_ (i.e., mean = 1.0)
+    if (total_weight > 0) {
+        double norm = num_faces_ / total_weight;
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            spatial_weight_[i] *= norm;
+        }
+    }
+
+    // Compute reference ion flux at trailing apex
+    // Global rate / surface area gives average flux
+    // Trailing apex has maximum weight, so reference = average * max_weight / mean_weight
+    double avg_flux = sputtering_constants::GLOBAL_H2O_RATE / sputtering_constants::EUROPA_SURFACE_AREA;
+
+    // Convert to mass flux and find reference
+    // The spatial_weight_ is already normalized so mean = 1.0
+    double max_weight = *std::max_element(spatial_weight_.begin(), spatial_weight_.end());
+    reference_ion_flux_ = avg_flux * max_weight;
+
+    spatial_initialized_ = true;
+
+    // Report initialization
+    double min_weight = *std::min_element(spatial_weight_.begin(), spatial_weight_.end());
+    std::cout << "Sputtering spatial distribution initialized:" << std::endl;
+    std::cout << "  Weight range: " << std::fixed << std::setprecision(3)
+              << min_weight << " - " << max_weight << std::endl;
+    std::cout << "  Trailing/leading ratio: " << (max_weight / min_weight) << std::endl;
+}
+
+void SputteringModel::computeSputteringRates(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& face_areas,
+    SputteringState& state) const
+{
+    if (!config_.enabled) {
+        state.reset();
+        return;
+    }
+
+    if (!spatial_initialized_) {
+        std::cerr << "SputteringModel: spatial distribution not initialized!" << std::endl;
+        state.reset();
+        return;
+    }
+
+    if (temperatures.size() != num_faces_ || face_areas.size() != num_faces_) {
+        std::cerr << "SputteringModel: size mismatch in computeSputteringRates!" << std::endl;
+        state.reset();
+        return;
+    }
+
+    // Global average sputtering flux (molecules/m²/s)
+    double avg_molecule_flux = sputtering_constants::GLOBAL_H2O_RATE / sputtering_constants::EUROPA_SURFACE_AREA;
+
+    // Apply rate scaling
+    avg_molecule_flux *= config_.rate_scale;
+
+    // Convert to mass flux (kg/m²/s)
+    double avg_mass_flux = avg_molecule_flux * sputtering_constants::H2O_MASS;
+
+    #pragma omp parallel for
+    for (size_t i = 0; i < num_faces_; ++i) {
+        double T = temperatures[i];
+
+        // Check minimum temperature
+        if (T < config_.min_sputtering_temp) {
+            state.ion_flux[i] = 0.0;
+            state.sputtering_yield[i] = 0.0;
+            state.h2o_sputter_flux[i] = 0.0;
+            state.o2_production_flux[i] = 0.0;
+            state.h2_production_flux[i] = 0.0;
+            state.total_mass_loss[i] = 0.0;
+            state.redeposition_flux[i] = 0.0;
+            continue;
+        }
+
+        // Spatial weighting (already normalized to mean=1)
+        double spatial_factor = spatial_weight_[i];
+
+        // Temperature-dependent yield enhancement
+        double temp_factor = computeTemperatureYieldFactor(T);
+
+        // Store yield factor for diagnostics
+        state.sputtering_yield[i] = temp_factor;
+
+        // Total sputtering mass flux for this face
+        double total_sputter_flux = avg_mass_flux * spatial_factor * temp_factor;
+
+        // Partition into species
+        double h2o_flux = total_sputter_flux * config_.h2o_fraction;
+        double o2_flux = total_sputter_flux * config_.o2_fraction;
+        double h2_flux = total_sputter_flux * config_.h2_fraction;
+
+        // Store species fluxes
+        state.h2o_sputter_flux[i] = h2o_flux;
+        state.o2_production_flux[i] = o2_flux;
+        state.h2_production_flux[i] = h2_flux;
+
+        // Compute mass loss (what escapes to space)
+        double h2o_escape = h2o_flux * config_.h2o_escape_fraction;
+        double o2_escape = o2_flux * config_.o2_escape_fraction;
+        double h2_escape = h2_flux * config_.h2_escape_fraction;
+
+        // Net mass loss to space
+        state.total_mass_loss[i] = h2o_escape + o2_escape + h2_escape;
+
+        // H2O that redeposits locally (ballistic hop returns to surface)
+        // This is already accounted for in the transport matrix, so we track it
+        // separately for diagnostics but don't apply it here
+        state.redeposition_flux[i] = h2o_flux * (1.0 - config_.h2o_escape_fraction);
+
+        // Ion flux for diagnostics (convert back to molecules/m²/s)
+        state.ion_flux[i] = (total_sputter_flux / sputtering_constants::H2O_MASS) * spatial_factor;
+    }
+}
+
+double SputteringModel::applySputteringMassLoss(
+    const SputteringState& state,
+    std::vector<double>& accumulated_mass,
+    const std::vector<double>& face_areas,
+    double dt)
+{
+    if (!config_.enabled) {
+        return 0.0;
+    }
+
+    if (accumulated_mass.size() != num_faces_ || face_areas.size() != num_faces_) {
+        std::cerr << "SputteringModel: size mismatch in applySputteringMassLoss!" << std::endl;
+        return 0.0;
+    }
+
+    double total_sputtered = 0.0;
+    double total_escaped = 0.0;
+    double total_redeposited = 0.0;
+
+    #pragma omp parallel for reduction(+:total_sputtered,total_escaped,total_redeposited)
+    for (size_t i = 0; i < num_faces_; ++i) {
+        // Total mass sputtered from this face this timestep
+        double sputtered_mass = state.h2o_sputter_flux[i] * dt;
+
+        // Can't sputter more than available ice
+        // accumulated_mass is in kg/m², multiply by area for total kg
+        double available_mass = accumulated_mass[i];
+
+        if (sputtered_mass > available_mass) {
+            sputtered_mass = available_mass;
+        }
+
+        // Apply mass loss (sputtering removes ice from surface)
+        accumulated_mass[i] -= sputtered_mass;
+
+        // Ensure non-negative
+        if (accumulated_mass[i] < 0.0) {
+            accumulated_mass[i] = 0.0;
+        }
+
+        // Track statistics
+        total_sputtered += sputtered_mass * face_areas[i];
+
+        // Escaped mass (fraction that doesn't return)
+        double escaped = sputtered_mass * config_.h2o_escape_fraction;
+        total_escaped += escaped * face_areas[i];
+
+        // Redeposited mass (H2O that returns via ballistic transport)
+        // Note: This is handled by the transport matrix, so we just track it
+        double redeposited = sputtered_mass * (1.0 - config_.h2o_escape_fraction);
+        total_redeposited += redeposited * face_areas[i];
+    }
+
+    // Also add O2 and H2 escape to total escaped
+    #pragma omp parallel for reduction(+:total_escaped)
+    for (size_t i = 0; i < num_faces_; ++i) {
+        total_escaped += state.o2_production_flux[i] * config_.o2_escape_fraction * dt * face_areas[i];
+        total_escaped += state.h2_production_flux[i] * config_.h2_escape_fraction * dt * face_areas[i];
+    }
+
+    // Update cumulative statistics
+    total_sputtered_mass_ += total_sputtered;
+    total_escaped_mass_ += total_escaped;
+    total_redeposited_mass_ += total_redeposited;
+
+    return total_escaped;
+}
+
+void SputteringModel::printConfig() const {
+    std::cout << "\n=== Sputtering Model Configuration ===" << std::endl;
+    std::cout << "  Enabled: " << (config_.enabled ? "yes" : "no") << std::endl;
+
+    if (!config_.enabled) {
+        std::cout << "  (Sputtering disabled - no further parameters apply)" << std::endl;
+        return;
+    }
+
+    std::cout << "  Rate scale factor: " << config_.rate_scale << std::endl;
+    std::cout << "  Hemisphere contrast: " << config_.hemisphere_contrast
+              << " (trailing/leading ratio)" << std::endl;
+    std::cout << "  Polar enhancement: " << config_.polar_enhancement << std::endl;
+    std::cout << "  Temperature dependent: " << (config_.temperature_dependent ? "yes" : "no") << std::endl;
+    std::cout << "  Min sputtering temp: " << config_.min_sputtering_temp << " K" << std::endl;
+
+    std::cout << "\n  Species fractions:" << std::endl;
+    std::cout << "    H2O: " << (config_.h2o_fraction * 100) << "%" << std::endl;
+    std::cout << "    O2:  " << (config_.o2_fraction * 100) << "%" << std::endl;
+    std::cout << "    H2:  " << (config_.h2_fraction * 100) << "%" << std::endl;
+
+    std::cout << "\n  Escape fractions:" << std::endl;
+    std::cout << "    H2O: " << (config_.h2o_escape_fraction * 100) << "%" << std::endl;
+    std::cout << "    O2:  " << (config_.o2_escape_fraction * 100) << "%" << std::endl;
+    std::cout << "    H2:  " << (config_.h2_escape_fraction * 100) << "%" << std::endl;
+
+    // Compute expected global rates
+    double h2o_total = sputtering_constants::GLOBAL_H2O_RATE * sputtering_constants::H2O_MASS
+                       * config_.rate_scale;
+    double h2o_escape_rate = h2o_total * config_.h2o_escape_fraction;
+
+    std::cout << "\n  Expected global rates (with current settings):" << std::endl;
+    std::cout << "    Total H2O sputtered: " << std::scientific << std::setprecision(2)
+              << (sputtering_constants::GLOBAL_H2O_RATE * config_.rate_scale) << " molecules/s" << std::endl;
+    std::cout << "    H2O mass loss rate: " << h2o_total << " kg/s" << std::endl;
+    std::cout << "    H2O escape rate: " << h2o_escape_rate << " kg/s" << std::endl;
+    std::cout << std::fixed;
+}
+
+} // namespace exosphere
+} // namespace ptm

@@ -1,0 +1,30 @@
+# Europa Clipper EGA — wide-view camera (Earth + Moon in same FOV)
+#
+# FOV chosen from scripts/clipper_ega_wideview_fov.py so that both Earth and
+# Moon fit in-frame for ~62% of the 240-frame window. Near Earth-CA the
+# Moon and Earth are up to ~84° apart as seen from Clipper; those frames
+# show only the body nearest the look_at direction (Moon) with Earth off-frame.
+camera:
+  focal_length_mm: 50.0
+  sensor_mm: [35.9, 23.9]
+  nx: 1392
+  ny: 928
+  fov_x_deg: 45.0
+
+  distortion:
+    model: brown_conrady
+    k1:  0.0
+    k2:  0.0
+    k3:  0.0
+    p1:  0.0
+    p2:  0.0
+
+  pointing:
+    mode: look_at
+    look_at: [0.0, 0.0, 0.0]       # Moon body-fixed center (IAU_MOON)
+    up:      [0.0, 0.0, 1.0]
+
+  photometry:
+    reflectance: lommel_seeliger
+    albedo:      0.12
+    emissivity:  0.95

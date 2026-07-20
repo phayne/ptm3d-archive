@@ -1,0 +1,26 @@
+# Waypoint locations for PTM3D viewshed analysis
+# Format: label,latitude,longitude,height_meters
+#
+# For Dark Horse mission traverse planning
+# Haworth rim traverse 01
+Lander,-87.16188, 343.29715, 1
+Rover01,-87.16438, 343.34371, 1
+Rover02,-87.16518, 343.40713, 1
+Rover03,-87.16854, 343.42038, 1
+Rover04,-87.17168, 343.43531, 1
+Rover05,-87.17464, 343.42052, 1
+Rover06,-87.17772, 343.44997, 1
+Rover07,-87.17786, 343.51929, 1
+Rover08,-87.18008, 343.56685, 1
+Rover09,-87.18095, 343.63175, 1
+Rover10,-87.17912, 343.68461, 1
+Rover11,-87.18061, 343.74869, 1
+Rover12,-87.17934, 343.80714, 1
+Rover13,-87.18126, 343.86238, 1
+Rover14,-87.18353, 343.91118, 1
+Rover15,-87.18626, 343.94908, 1
+Rover16,-87.18975, 343.96747, 1
+Rover17,-87.19106, 344.02427, 1
+Rover18,-87.18910, 344.07490, 1
+Rover19,-87.19009, 344.14377, 1
+Rover20,-87.19097, 344.21104, 1

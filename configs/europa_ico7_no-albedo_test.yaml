@@ -1,0 +1,30 @@
+# Test config: Europa ico7, no albedo map, for verifying radial normal fix
+# Uniform albedo (planet default), no spatial variation
+
+simulation:
+  start_time: "2025-01-01T00:00:00"
+  duration_days: 3.55              # 1 Europa orbit for output
+  timesteps: 144                    # 144 steps per orbit
+  body: "Europa"
+
+mesh:
+  resolution: 7                     # ico7 = 327,680 faces
+
+thermal:
+  run_thermal_mesh: true
+  threads: 0                        # auto
+  equilibration_orbits: 10          # 10 orbits equilibration
+  compute_statistics: true
+
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false              # DISABLE albedo map -> uniform albedo
+  albedo_maps_directory: ""
+
+output:
+  directory: "output/europa_ico7_radial-normals-test"
+  format: "binary"
+
+advanced:
+  verbose: false
