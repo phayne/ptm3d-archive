@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <cassert>
 #include <atomic>
 #include <fstream>
 #include <iomanip>
@@ -551,24 +552,42 @@ double Planet::getThermalInertia(double lon, double lat) const {
 }
 
 double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_angle) const {
-    // If using an albedo map, return the map value directly (no incidence correction)
-    // This allows users to provide spatially-varying albedo maps that override the model
-    if (using_albedo_map && albedo_map) {
-        double map_value = albedo_map->getValue(lon, lat);
-        if (map_value != albedo_map->getMissingValue()) {
-            return map_value;
-        }
-    }
-
-    // Apply incidence-angle-dependent albedo formula from Hayne et al. (2017)
-    // A(theta) = A0 + a*(theta/(pi/4))^3 + b*(theta/(pi/2))^8
-    // where theta is solar incidence angle in radians
-    // albedoCoef[0] = a, albedoCoef[1] = b
+    // Resolve the base normal-incidence albedo A0. If a spatially-varying map
+    // was loaded, its per-face value supersedes the body default. The Hayne
+    // et al. (2017) angular correction is *still* applied on top — the map
+    // describes A0(lon, lat); the (a, b) coefficients describe how A varies
+    // with solar zenith angle θ. Returning the bare map value would silently
+    // drop the high-θ correction, biasing high-latitude nighttime cooling.
 
     // Clamp incidence angle to [0, pi/2] - beyond pi/2 is not illuminated
     double theta = std::max(0.0, std::min(incidence_angle, M_PI / 2.0));
 
-    double A0 = albedo;  // Base albedo
+    double A0 = albedo;  // Body-default base albedo
+    if (using_albedo_map && albedo_map) {
+        double map_value = albedo_map->getValue(lon, lat);
+        if (map_value != albedo_map->getMissingValue()) {
+            A0 = map_value;
+        }
+    }
+
+    // Directional-hemispheric (Hapke) albedo branch (opt-in, gated). Returns the
+    // ANALYTIC closed form A_h(mu0) = 1 - gamma*H(mu0,w), which is guaranteed in
+    // [0, 1] for w in [0, 1] and mu0 in [0, 1] (unlike a numerical hemisphere
+    // integral of the bidirectional Hapke BRDF, which overshoots 1 at grazing
+    // incidence and violates energy conservation). Independent of the Hayne
+    // polynomial below, so the baseline path is untouched when the gate is off.
+    if (use_hapke_albedo && hapke_albedo_w >= 0.0) {
+        double w = std::max(0.0, std::min(1.0, hapke_albedo_w));
+        double gamma = std::sqrt(std::max(0.0, 1.0 - w));
+        double mu0 = std::cos(theta);            // theta already clamped to [0, pi/2]
+        mu0 = std::max(0.0, std::min(1.0, mu0));
+        double H = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
+        double A_h = 1.0 - gamma * H;
+        // Analytic guard: A_h(i) MUST be in [0, 1] for all i and all w.
+        assert(A_h >= -1e-9 && A_h <= 1.0 + 1e-9 &&
+               "Hapke A_h(i) out of [0,1] — closed-form energy-conservation guard");
+        return std::max(0.0, std::min(1.0, A_h));
+    }
 
     // Check if we have albedo coefficients
     if (albedoCoef.size() >= 2) {
@@ -791,18 +810,20 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
 void Profile::update_T(double dt, double Qs, double Qb) {
     // 0) Boundary conditions (update boundary nodes T[0], T[n-1])
     surfTemp(*this, Qs);
-    // Always update the bottom node. Qb != 0 applies the geothermal-flux BC;
-    // Qb == 0 uses botTemp(0) => T[n] = T[n-1], the zero-gradient (insulated)
-    // base. Without the else the Qb == 0 bottom node is left FROZEN at its init
-    // value and the interior CN treats it as a fixed-temperature Dirichlet
-    // reservoir, leaking a small spurious flux whenever that init temperature
-    // does not match the equilibrated column mean (Fermi's surface energy-
-    // conservation finding, localized to <F_bottom_out> by the test_ice_twolayer
-    // budget). The batch SoA path (applyBottomBCBatch) already applies
-    // T[last] = T[last-1] + Qb*dz/k unconditionally, so this makes the per-profile
-    // path agree with it at Qb == 0.
     if (Qb != 0.0) botTemp(*this, Qb);
-    else           botTemp(*this, 0.0);
+
+    // Geothermal-equilibrium floor (mirrors the GPU persistent kernel). In
+    // steady darkness the surface radiates the interior heat flux Qb, so no
+    // node can sustain a temperature below T_geo = (Qb/(eps*sigma))^0.25. The
+    // under-resolved CN substep at a sharp sunlit->shadow transition lets the
+    // upper column drift numerically below this physical floor; clamping the
+    // finalize loop at T_lo = max(CMB, T_geo) corrects only that sub-floor
+    // drift (real PSR floors converge to T_geo from above -> no-op). Per-face,
+    // physics-set, NOT the arbitrary [3,500] K clamp.
+    const double sigma_sb = config ? config->sigma : 5.670374419e-8;
+    const double T_geo = (Qb > 0.0)
+        ? std::sqrt(std::sqrt(Qb / (emissivity * sigma_sb))) : 0.0;
+    const double T_lo = std::max(ABSOLUTE_ZERO_K, T_geo);
 
     const size_t n_tot = grid.T.size();
     if (n_tot < 3) return;            // need at least 1 interior node
@@ -1042,7 +1063,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
         return;
     }
@@ -1096,7 +1117,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
         return;
     }
@@ -1254,7 +1275,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     #pragma omp parallel for schedule(static) if(n_tot > 1024)
     for (size_t i = 0; i < n_tot; ++i) {
         if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-        Tptr[i] = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+        Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
     }
 }
 
@@ -1265,9 +1286,12 @@ void surfTemp(Profile& p, double Qs) {
     double dz0 = p.dz()[0];
     double T1 = p.T()[1];
     
-    const double MIN_TEMP = 3.0;
-    const double MAX_TEMP = 500.0;
-    
+    // No artificial temperature clamps: the surface energy balance
+    // f(T) = Qs + k*(T1-T)/dz - eps*sigma*T^4 is monotonically decreasing in T
+    // (df/dT < 0), so it has a unique physical root that the damped Newton
+    // iteration below converges to. Temperatures are therefore set by physics,
+    // not bounded to an arbitrary [3, 500] K range.
+
     // Better initial guess
     double Tnew;
     if (Qs > 0) {
@@ -1298,11 +1322,21 @@ void surfTemp(Profile& p, double Qs) {
         }
         
         dT = relaxation * f / df;
+
+        // Robust-Newton step limiter (globalization, NOT an output clamp).
+        // For very cold, low-conductivity faces (PSR floors) df = -k/dz -
+        // 4εσT^3 -> 0 as both terms vanish, so an unguarded step overshoots
+        // past the unique positive root of the monotonic f(T) into NEGATIVE
+        // T. Capping the step to a fraction of the current T keeps every
+        // iterate strictly positive and converges to the true physical root
+        // (e.g. ~25 K geothermal balance). Warm faces take sub-cap steps, so
+        // their result is unchanged; the temperature is still set by physics.
+        const double max_step = 0.5 * T0;
+        if (dT >  max_step) dT =  max_step;
+        if (dT < -max_step) dT = -max_step;
         Tnew = T0 - dT;
-        
-        Tnew = std::max(MIN_TEMP, std::min(MAX_TEMP, Tnew));
     }
-    
+
     p.T()[0] = Tnew;
 }
 
@@ -2017,9 +2051,20 @@ void Model::updateOrbit() {
     
     // Only apply flux when sun is above horizon
     double flux_factor = std::max(0.0, cos_zenith);
-    
+
+    // Absorptivity (1 - A). Default path uses the constant Bond albedo. With the
+    // Hapke directional-hemispheric gate on, A varies with incidence via the
+    // analytic A_h(mu0). The default branch keeps the exact prior expression so
+    // gate-off runs are byte-identical.
+    double one_minus_A = 1.0 - planet.albedo;
+    if (planet.use_hapke_albedo && flux_factor > 0.0) {
+        double incidence_angle = std::acos(std::min(1.0, flux_factor));
+        double A_h = planet.getAlbedoWithIncidence(0.0, lat, incidence_angle);
+        one_minus_A = 1.0 - A_h;
+    }
+
     // Calculate absorbed solar flux
-    Sabs = planet.S * flux_factor * (1.0 - planet.albedo);
+    Sabs = planet.S * flux_factor * one_minus_A;
 }
 
 // Set surface flux Qs based on time series or default solar calculation
@@ -2098,7 +2143,14 @@ void Model::fastEquilibrate(int days, double target_time) {
             const double hour_angle = 2.0 * M_PI * day_fraction + M_PI;
             const double cos_zenith = std::cos(lat) * std::cos(hour_angle);
             const double flux_factor = std::max(0.0, cos_zenith);
-            const double local_flux = planet.S * flux_factor * (1.0 - planet.albedo);
+            // Absorptivity: constant Bond albedo by default; gated Hapke A_h(i)
+            // when enabled (gate off -> byte-identical to prior expression).
+            double one_minus_A = 1.0 - planet.albedo;
+            if (planet.use_hapke_albedo && flux_factor > 0.0) {
+                double inc = std::acos(std::min(1.0, flux_factor));
+                one_minus_A = 1.0 - planet.getAlbedoWithIncidence(0.0, lat, inc);
+            }
+            const double local_flux = planet.S * flux_factor * one_minus_A;
             profile.update_T(dt_eq, local_flux, planet.Qb);
         }
     }
@@ -2336,6 +2388,25 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     buildTridiagonalSystemBatch(*this, dt);
     solveThomasBatchSIMD(*this);
     applyBottomBCBatch(*this);
+
+    // Geothermal-equilibrium floor (mirrors the GPU persistent kernel and the
+    // scalar Profile::update_T path). In steady darkness the surface radiates
+    // the interior heat flux Qb, so no node can sustain a temperature below
+    // T_geo = (Qb/(eps*sigma))^0.25. The under-resolved CN substep at a sharp
+    // sunlit->shadow transition lets the upper column of a low-inertia face
+    // drift numerically below this physical floor; clamping each face's column
+    // at T_geo corrects only that sub-floor drift (real PSR floors converge to
+    // T_geo from above -> no-op). Per-face, physics-set, NOT a fixed clamp.
+    for (int f = 0; f < n_faces; ++f) {
+        const double qb = Qb[f];
+        if (qb <= 0.0) continue;
+        const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
+        if (T_geo <= ABSOLUTE_ZERO_K) continue;
+        for (int layer = 0; layer < n_layers; ++layer) {
+            double& Tlf = T[layer * THERMAL_BATCH_SIZE + f];
+            if (Tlf < T_geo) Tlf = T_geo;
+        }
+    }
 }
 
 // Initialize batch grid from z-grid vector

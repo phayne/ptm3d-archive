@@ -39,7 +39,9 @@ class ThermalOpenCLSolver {
 public:
     /**
      * @brief Constructor
-     * @param n_faces Number of mesh faces
+     * @param n_faces Number of mesh faces (treated as MAX/CAPACITY when used
+     *                with setActiveFaceCount; long-lived buffers are sized to
+     *                this value)
      * @param n_layers Number of depth layers per face
      * @param config Solver configuration
      */
@@ -182,6 +184,30 @@ public:
         int accum_end   = -1 /* -1 = n_timesteps */);
 
     /**
+     * @brief Set the active face count for the next call.
+     *
+     * Lets a single solver instance (sized for `n_faces` capacity at
+     * construction) be reused for batches smaller than that capacity.
+     * The next kernel launch will operate on the first `n` faces only;
+     * upload and download helpers expect/return data sized to `n`.
+     *
+     * Why: re-creating a ThermalOpenCLSolver per batch is the failure
+     * mode that wedged the macOS+AMD OpenCL driver during the
+     * radiation-coupling re-thermal phase (see
+     * memory/gpu_hang_amd_macos.md). Long-lived per-device solvers
+     * eliminate context create/destroy churn.
+     *
+     * Asserts n <= n_faces (capacity). Pass 0 to revert to capacity.
+     */
+    void setActiveFaceCount(size_t n);
+
+    /// Active face count (== capacity unless setActiveFaceCount was called).
+    size_t activeFaceCount() const noexcept { return n_faces_active_; }
+
+    /// Capacity (the n_faces passed to the constructor).
+    size_t capacity() const noexcept { return n_faces_; }
+
+    /**
      * @brief Get timing of last kernel execution
      */
     float getLastKernelTimeMs() const { return last_kernel_time_ms_; }
@@ -206,7 +232,8 @@ private:
     // Release resources
     void release();
 
-    size_t n_faces_;
+    size_t n_faces_;          // capacity (max batch size; sets long-lived buffer sizes)
+    size_t n_faces_active_;   // current active face count for kernel launches
     size_t n_layers_;
     ThermalOpenCLConfig config_;
 

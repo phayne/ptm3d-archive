@@ -183,14 +183,19 @@ public:
     double S0 = 1361.0;       // Solar constant at 1 AU [W.m-2]
     double chi = 2.7;         // Radiative conductivity parameter [Mitchell and de Pater, 1994]
     
-    // Numerical parameters (optimized via sensitivity analysis Jan 2026)
-    // Grid parameters optimized via sensitivity analysis vs Diviner (Hayne et al. 2017)
-    // See /tmp/test_layer_fast.py for testing methodology
-    // RMS error < 4K with 10 layers, systematic offset +2.65K
+    // Numerical parameters
     double F = 0.5;           // Fourier Mesh Number, must be <= 0.5 for stability
-    int m = 4;                // Number of layers in upper skin depth (optimal: 4, tested 3-15)
-    int n = 10;               // Layer growth factor: dz[i] = dz[i-1]*(1+1/n) (optimal: 10)
-    int b = 5;                // Number of skin depths to bottom layer (optimal: 5, minimum viable)
+    int m = 10;               // Number of layers in upper skin depth
+    int n = 15;               // Layer growth factor (only used by legacy non-adaptive grid path)
+    // b = skin depths to bottom layer. With the radiative-conductivity term
+    // χ(T/350)³ ~doubling K at deep regolith temperatures, the effective deep
+    // skin depth is ~1.5–2× the surface lattice value. b=15 places the bottom
+    // at ~9 effective e-folds of damping (~45 cm on the Moon), giving a
+    // residual diurnal amplitude < 0.1 K at the bottom Neumann BC — well
+    // attenuated, with ~1.7× lower thermal-kernel cost than b=20. The legacy
+    // default b=5 left tens of K of residual diurnal amplitude at the bottom
+    // layer, which contaminated extrapolated location-export depths.
+    int b = 15;
 
     // Adaptive grid controls
     bool   ADAPTIVE_GRID = true;     // Use per-profile adaptive grid instead of fixed geometric
@@ -353,6 +358,16 @@ public:
     std::shared_ptr<ptm::SpatialMap> thermal_inertia_map;
     bool using_albedo_map = false;
     bool using_thermal_inertia_map = false;
+
+    // Directional-hemispheric (Hapke) albedo model, OFF by default. When on,
+    // getAlbedoWithIncidence() returns the analytic closed form
+    //   A_h(mu0) = 1 - gamma * H(mu0, w),  gamma = sqrt(1 - w),
+    //   H(mu0, w) = (1 + 2*mu0) / (1 + 2*mu0*gamma),  mu0 = cos(incidence),
+    // instead of the Hayne (2017) polynomial. Gated so baseline runs are
+    // byte-identical when off. use_hapke_albedo defaults false; hapke_albedo_w
+    // is the single-scattering albedo (set from config, or derived from A0).
+    bool use_hapke_albedo = false;
+    double hapke_albedo_w = -1.0;
 
     // Per-face H-parameter override (Diviner-derived map or user custom).
     // Empty when no map is loaded. Indexed by face index in mesh order.

@@ -278,6 +278,14 @@ __kernel void persistentThermalKernel(
     float eps = emissivity[face];
     float Q_bottom = Qb[face];  // Interior heat flux (W/m²)
 
+    // Geothermal-equilibrium temperature: the coldest a surface radiating
+    // against the interior heat flux Qb can sustain in steady darkness,
+    // T_geo = (Qb/(eps*sigma))^0.25 (all of Qb exits at the surface as
+    // radiation). Used as a physics-based low-side floor at the end of each
+    // substep; 0 (disabled) when Qb <= 0.
+    float T_geo = (Q_bottom > 0.0f)
+        ? native_sqrt(native_sqrt(Q_bottom / (eps * sigma))) : 0.0f;
+
     // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
     // Need to compute kappa first to get stable dt
     // Use initial temperature to estimate kappa
@@ -376,12 +384,24 @@ __kernel void persistentThermalKernel(
 
                     if (fabs(df) < 1e-10f) df = -1e-10f;
 
-                    // dT = relaxation * f / df, then T_new = T0 - dT
+                    // dT = relaxation * f / df
                     dT_nr = 0.8f * f / df;
-                    T_surf = T0 - dT_nr;
 
-                    // Clamp to physical range (matching CPU MIN_TEMP=3.0, MAX_TEMP=500.0)
-                    T_surf = fmax(3.0f, fmin(500.0f, T_surf));
+                    // Robust-Newton step limiter (globalization, NOT an output
+                    // clamp). For very cold, low-conductivity faces (PSR floors)
+                    // df = -k/dz - 4εσT^3 -> 0 as both terms vanish, so an
+                    // unguarded Newton step overshoots past the unique positive
+                    // root of the monotonic f(T) into NEGATIVE T, collapsing the
+                    // column. Capping the step to a fraction of the current T
+                    // keeps every iterate strictly positive and converges to the
+                    // true physical root (e.g. ~25 K from geothermal balance).
+                    // Warm, well-conditioned faces take sub-cap steps, so their
+                    // result is bit-unchanged. The final temperature is still set
+                    // by physics (the root of f), not bounded to a fixed range.
+                    float max_step = 0.5f * T0;
+                    if (dT_nr >  max_step) dT_nr =  max_step;
+                    if (dT_nr < -max_step) dT_nr = -max_step;
+                    T_surf = T0 - dT_nr;
                 }
 
                 T_local[0] = T_surf;
@@ -498,14 +518,36 @@ __kernel void persistentThermalKernel(
             // Note: Bottom layer T[n_layers-1] was already set by flux BC before solve
             // and remains unchanged during interior solve (not part of tridiagonal system)
 
-            // Physical clamping for ALL layers (matching CPU solver)
-            // This prevents numerical instabilities from causing runaway temperatures
+            // NaN/Inf guard only (NOT a temperature clamp): the implicit
+            // Crank-Nicolson conduction update is unconditionally stable, so
+            // valid temperatures are left untouched and set by physics. This
+            // recovers solely from a non-finite value (e.g. a degenerate cell),
+            // which correct physics never produces, so the sim isn't corrupted.
             for (int i = 0; i < n_layers; ++i) {
                 if (!isfinite(T_local[i])) {
-                    // NaN/Inf guard: reset to reasonable temperature
-                    T_local[i] = 200.0f;  // Safe fallback value
+                    T_local[i] = 200.0f;  // last-resort recovery, should never fire
                 }
-                T_local[i] = fmax(3.0f, fmin(1000.0f, T_local[i]));
+            }
+
+            // Geothermal-equilibrium floor (physics-based, NOT an arbitrary
+            // [3,500] K clamp). The substep dt is fixed from the initial
+            // column and capped at N_SUBSTEPS_MAX for the GPU watchdog, so it
+            // under-resolves the ~minute surface skin response. At a sharp
+            // sunlit->shadow flux drop on a low-inertia face the upper column
+            // cools faster than the under-resolved conduction can resupply
+            // heat from below, drifting numerically below the physical night
+            // floor (recorded as spurious ~5-24 K minima on faces that are
+            // otherwise sunlit, Tavg~100 K). The interior heat flux Qb sets a
+            // hard lower bound: in steady darkness the surface radiates Qb, so
+            // no node can sustain a temperature below T_geo = (Qb/(eps*sigma))
+            // ^0.25 (~24 K here). Real PSR floors converge to T_geo from
+            // ABOVE, so this is a no-op for them; only the sub-floor numerical
+            // undershoot is corrected. Per-face and physics-set, so it does
+            // not bound results to a fixed range or perturb the bulk solution.
+            if (T_geo > 0.0f) {
+                for (int i = 0; i < n_layers; ++i) {
+                    T_local[i] = fmax(T_local[i], T_geo);
+                }
             }
         }  // End of sub-stepping loop
 
@@ -607,9 +649,25 @@ void printOpenCLInfo(std::ostream& out) {
 ThermalOpenCLSolver::ThermalOpenCLSolver(size_t n_faces, size_t n_layers,
                                          const ThermalOpenCLConfig& config)
     : n_faces_(n_faces)
+    , n_faces_active_(n_faces)
     , n_layers_(n_layers)
     , config_(config)
 {
+}
+
+void ThermalOpenCLSolver::setActiveFaceCount(size_t n) {
+    if (n == 0) {
+        n_faces_active_ = n_faces_;
+        return;
+    }
+    if (n > n_faces_) {
+        std::cerr << "[GPU Thermal] setActiveFaceCount(" << n
+                  << ") exceeds capacity " << n_faces_
+                  << "; clamping to capacity\n";
+        n_faces_active_ = n_faces_;
+        return;
+    }
+    n_faces_active_ = n;
 }
 
 ThermalOpenCLSolver::~ThermalOpenCLSolver() {
@@ -919,7 +977,7 @@ void ThermalOpenCLSolver::advanceTimestep(float dt) {
     auto start = std::chrono::high_resolution_clock::now();
 
     cl_command_queue queue = context_->queue();
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
 
     // Set kernel arguments
@@ -945,7 +1003,7 @@ void ThermalOpenCLSolver::advanceTimestep(float dt) {
     CL_CHECK(clSetKernelArg(combined_kernel_, arg++, sizeof(int), &n_layers));
 
     // Launch kernel
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -965,11 +1023,14 @@ void ThermalOpenCLSolver::downloadSurfaceTemps(std::vector<float>& T_surface) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
 
-    T_surface.resize(n_faces_);
+    T_surface.resize(n_faces_active_);
 
-    // Surface temps are at layer 0, which is at indices [0, n_faces)
+    // Surface temps are at layer 0, which is at indices [0, n_faces_active_).
+    // (The buffer itself is sized to capacity n_faces_; only the active
+    // prefix carries valid data after a kernel launch with the matching
+    // n_faces arg.)
     CL_CHECK(clEnqueueReadBuffer(context_->queue(), buf_T_, CL_TRUE, 0,
-                                n_faces_ * sizeof(float),
+                                n_faces_active_ * sizeof(float),
                                 T_surface.data(), 0, nullptr, nullptr));
 }
 
@@ -978,8 +1039,12 @@ void ThermalOpenCLSolver::downloadAllTemps(std::vector<float>& T_all) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
 
-    T_all.resize(n_faces_ * n_layers_);
+    T_all.resize(n_faces_active_ * n_layers_);
 
+    // SoA layout in the buffer is [layer * n_faces_active_ + face]. The
+    // kernel uses n_faces_active_ as the stride too, so the live data is
+    // packed in the first n_faces_active_ * n_layers_ floats of the buffer
+    // (capacity beyond that is unused junk).
     CL_CHECK(clEnqueueReadBuffer(context_->queue(), buf_T_, CL_TRUE, 0,
                                 T_all.size() * sizeof(float),
                                 T_all.data(), 0, nullptr, nullptr));
@@ -989,7 +1054,7 @@ void ThermalOpenCLSolver::uploadAllTemps(const std::vector<float>& T_all) {
     if (!initialized_) {
         throw std::runtime_error("ThermalOpenCLSolver not initialized");
     }
-    const size_t expected = n_faces_ * n_layers_;
+    const size_t expected = n_faces_active_ * n_layers_;
     if (T_all.size() != expected) {
         throw std::runtime_error(
             "ThermalOpenCLSolver::uploadAllTemps: size mismatch (got "
@@ -1027,7 +1092,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     cl_int err;
 
     // Validate input size
-    size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_;
+    size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_active_;
     if (all_flux.size() != expected_flux_size) {
         std::cerr << "[GPU Thermal] all_flux size mismatch: expected "
                   << expected_flux_size << ", got " << all_flux.size() << "\n";
@@ -1049,7 +1114,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(err);
 
     // Set kernel arguments
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
 
     // Verify kernel is valid
@@ -1061,14 +1126,14 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         return;
     }
 
-    // Optional Schorghofer accumulator buffer (size n_layers * n_faces).
+    // Optional Schorghofer accumulator buffer (size n_layers * n_faces_active_).
     // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
     // kernel arg slot is always valid.
     const bool enable_accum = (avg_E_inout != nullptr);
     cl_mem buf_avg_E = nullptr;
     if (enable_accum) {
-        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
-            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_active_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_active_, 0.0f);
         }
         buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                    avg_E_inout->size() * sizeof(float),
@@ -1112,7 +1177,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
 
     // Launch kernel - one work item per face
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -1158,7 +1223,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         // Show first few values for face 0
         std::cerr << "[GPU Thermal DEBUG] Face 0 temps (first 10 timesteps): ";
         for (int t = 0; t < std::min(10, n_timesteps); ++t) {
-            std::cerr << output_temps[t * n_faces_ + 0] << " ";
+            std::cerr << output_temps[t * n_faces_active_ + 0] << " ";
         }
         std::cerr << "\n";
 
@@ -1166,7 +1231,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         std::cerr << "[GPU Thermal DEBUG] Face 0 temps at later steps: ";
         for (int t : {1000, 2000, 3000, 4000, 5000, 5500, 5800, 5989}) {
             if (t < n_timesteps) {
-                std::cerr << "t=" << t << ":" << output_temps[t * n_faces_ + 0] << " ";
+                std::cerr << "t=" << t << ":" << output_temps[t * n_faces_active_ + 0] << " ";
             }
         }
         std::cerr << "\n";
@@ -1189,14 +1254,14 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                   << " / " << n_timesteps << "\n";
 
         // Read back final T profile to check interior temperatures
-        std::vector<float> T_final(n_faces_ * n_layers_);
+        std::vector<float> T_final(n_faces_active_ * n_layers_);
         cl_int read_err = clEnqueueReadBuffer(queue, buf_T_, CL_TRUE, 0,
                                                T_final.size() * sizeof(float),
                                                T_final.data(), 0, nullptr, nullptr);
         if (read_err == CL_SUCCESS) {
             std::cerr << "[GPU Thermal DEBUG] Final T profile for face 0 (all layers): ";
             for (size_t layer = 0; layer < n_layers_; ++layer) {
-                std::cerr << T_final[layer * n_faces_ + 0] << " ";
+                std::cerr << T_final[layer * n_faces_active_ + 0] << " ";
             }
             std::cerr << "\n";
         }
@@ -1227,7 +1292,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     last_kernel_time_ms_ = static_cast<float>(duration.count());
 
     std::cout << "[GPU Thermal] Persistent kernel processed " << n_timesteps << " timesteps for "
-              << n_faces_ << " faces in " << last_kernel_time_ms_ << " ms\n";
+              << n_faces_active_ << " faces in " << last_kernel_time_ms_ << " ms\n";
 }
 
 void ThermalOpenCLSolver::solvePersistentMultipleCycles(
@@ -1256,7 +1321,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     cl_command_queue queue = context_->queue();
     cl_int err;
 
-    const size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_;
+    const size_t expected_flux_size = static_cast<size_t>(n_timesteps) * n_faces_active_;
     if (all_flux.size() != expected_flux_size) {
         std::cerr << "[GPU Thermal] all_flux size mismatch: expected "
                   << expected_flux_size << ", got " << all_flux.size() << "\n";
@@ -1277,14 +1342,14 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                                              nullptr, &err);
     CL_CHECK(err);
 
-    // Optional Schorghofer accumulator (size n_layers * n_faces).
+    // Optional Schorghofer accumulator (size n_layers * n_faces_active_).
     // Allocate a real buffer if requested; otherwise a 4-byte dummy so the
     // kernel arg slot is always valid.
     const bool enable_accum = (avg_E_inout != nullptr);
     cl_mem buf_avg_E = nullptr;
     if (enable_accum) {
-        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_) {
-            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_, 0.0f);
+        if (avg_E_inout->size() != static_cast<size_t>(n_layers_) * n_faces_active_) {
+            avg_E_inout->assign(static_cast<size_t>(n_layers_) * n_faces_active_, 0.0f);
         }
         buf_avg_E = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                    avg_E_inout->size() * sizeof(float),
@@ -1300,7 +1365,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     int accum_end_eff   = (accum_end   < 0) ? n_timesteps : accum_end;
 
     // Set kernel arguments ONCE (same for every cycle).
-    int n_faces = static_cast<int>(n_faces_);
+    int n_faces = static_cast<int>(n_faces_active_);
     int n_layers = static_cast<int>(n_layers_);
     int arg = 0;
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_T_));
@@ -1333,7 +1398,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
-    size_t global_size = ((n_faces_ + config_.work_group_size - 1) /
+    size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
@@ -1384,7 +1449,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     last_kernel_time_ms_ = static_cast<float>(duration.count());
 
     std::cout << "[GPU Thermal] Persistent kernel: " << total_cycles << " cycles x "
-              << n_timesteps << " timesteps for " << n_faces_ << " faces in "
+              << n_timesteps << " timesteps for " << n_faces_active_ << " faces in "
               << last_kernel_time_ms_ << " ms ("
               << (last_kernel_time_ms_ / total_cycles) << " ms/cycle avg)\n";
 }
