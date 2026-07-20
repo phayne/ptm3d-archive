@@ -26,7 +26,9 @@
 #include <csignal>
 #include <execinfo.h>
 #include <cxxabi.h>
-#include <unistd.h>   // for STDERR_FILENO
+#include <unistd.h>   // for STDERR_FILENO, fsync
+#include <cstdio>     // for std::fopen / fprintf / fflush / fclose (heartbeat)
+#include <ctime>      // for gmtime_r / strftime (heartbeat)
 
 #include "../tools/config_parser.h"
 #include "../thermal/thermal_model.h"
@@ -575,6 +577,11 @@ bool runThermalModel(const std::string&, const std::vector<double>&, const std::
 std::vector<double> runThermalModelForFace(const std::vector<double>&, const std::vector<double>&,
     double, const thermal::Config&, int);
     
+// Apply main()-forwarded generic-body thermophysical props to a solver's local
+// Planet (defined below near the solver bodies; forward-declared for the per-face
+// path above the definition). See the definition for why this is needed.
+static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config);
+
 bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
     const std::vector<double>&, int, const thermal::Config&, double, double,
@@ -600,6 +607,62 @@ bool runThermalModelsForAllFacesBatchSoA(
     int thermal_threads,
     const std::vector<double>* face_Qb = nullptr,
     const std::vector<double>* face_H_overrides = nullptr);
+
+// Apply the Hayne et al. (2017) incidence-angle correction to a base
+// normal-incidence Bond albedo A0. Composes:
+//
+//     A(θ) = A0 + a·(θ/(π/4))^3 + b·(θ/(π/2))^8
+//
+// where θ is the solar incidence angle. cos_theta is recovered from the
+// direct flux via cos(θ) = direct / S_solar (clamped to [0,1]). When the
+// body has no albedoCoef (e.g., Europa), the base albedo is returned
+// unchanged. Used by both CPU and GPU thermal flux pipelines so per-face
+// map values from a spatial albedo map still receive the angular
+// correction (otherwise high-θ faces are biased ~kelvin-warm in
+// nighttime cooling because too much daytime flux is absorbed).
+//
+// Directional-hemispheric (Hapke) branch: opt-in via use_hapke (default
+// false → byte-identical to the pre-Hapke Hayne-only path). When on, the
+// analytic closed form A_h(mu0) = 1 - gamma*H(mu0,w) supersedes the Hayne
+// polynomial entirely — this is the SAME closed form as
+// Planet::getAlbedoWithIncidence() (thermal_model.cpp:579-589), replicated
+// here because the GPU flux build runs host-side per-timestep and cannot
+// call a Planet method inside the hot OpenMP loop cheaply. Guaranteed in
+// [0,1] for w in [0,1], mu0 in [0,1]. A0 is unused in the Hapke branch (the
+// gate derives w so A_h(mu0=1) == body A0 already; see the bisection at the
+// config gate). Returns A0 for the unilluminated / normal-incidence cases,
+// which matches both the CPU reference (calculateAbsorbedFlux) and the
+// A_h(mu0=1)==A0 construction.
+static inline double applyIncidenceAlbedo(double A0,
+                                          double direct_flux,
+                                          double solar_constant,
+                                          double a_coef,
+                                          double b_coef,
+                                          bool use_hapke = false,
+                                          double hapke_w = -1.0) {
+    if (solar_constant <= 0.0 || direct_flux <= 0.0) return A0;
+    double cos_theta = direct_flux / solar_constant;
+    if (cos_theta >= 1.0) return A0;
+    if (cos_theta <  0.0) cos_theta = 0.0;
+    if (use_hapke && hapke_w >= 0.0) {
+        // Analytic directional-hemispheric albedo A_h(mu0) = 1 - gamma*H(mu0,w).
+        const double w     = std::max(0.0, std::min(1.0, hapke_w));
+        const double gamma = std::sqrt(std::max(0.0, 1.0 - w));
+        const double mu0   = cos_theta;  // already clamped to [0,1)
+        const double H     = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
+        double A_h = 1.0 - gamma * H;
+        if (A_h < 0.0) A_h = 0.0;
+        if (A_h > 1.0) A_h = 1.0;
+        return A_h;
+    }
+    const double theta = std::acos(cos_theta);
+    const double t45 = theta / (M_PI / 4.0);
+    const double t90 = theta / (M_PI / 2.0);
+    double A = A0 + a_coef * t45 * t45 * t45 + b_coef * std::pow(t90, 8);
+    if (A < 0.0) A = 0.0;
+    if (A > 1.0) A = 1.0;
+    return A;
+}
 
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
@@ -636,6 +699,18 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // GPU buf_T_ native layout).
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "",
+    // When non-null, the per-face T(z) state AT THE END OF THE
+    // EQUILIBRATION PHASE (before the output cycle starts) is COPIED
+    // INTO this vector — layer-major SoA matching ThermalOpenCLSolver::buf_T_,
+    // size n_layers × n_faces. The rad-coupling iter loop uses this so
+    // re-thermal can upload exactly iter-0's post-eq state, skip its own
+    // eq phase entirely, and run only the output cycle with the updated
+    // (indirect-augmented) flux BC. This avoids re-running eq from a
+    // cold-start in every rad iter, which numerically diverges from
+    // iter-0's converged state. In single-phase configs (eq_dt == out_dt)
+    // there is no separate eq end-point, so the buffer is filled at the
+    // final cycle's end (same as final_state_file dump).
+    std::vector<float>* post_eq_T_out = nullptr,
     // Multi-GPU controls (see config_parser.h thermal.gpu_*).
     //   gpu_devices == 1 (default) AND gpu_device_ids empty → legacy
     //     single-device path, byte-identical to pre-multi-GPU behaviour.
@@ -645,24 +720,104 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int gpu_devices = 1,
     const std::vector<int>& gpu_device_ids = {},
     size_t gpu_batch_size = 0,
-    int gpu_inter_batch_pause_ms = 0);
+    int gpu_inter_batch_pause_ms = 0,
+    // Per-GLOBAL-face time-mean indirect flux <q_ind>[f] (W/m^2) ADDED to the
+    // EQUILIBRATION-phase absorbed flux only (deep radiation-coupling, pass 2).
+    // Empty (default) = legacy: equilibration sees no indirect term. Indexed by
+    // global face id, matching prepare_flux's global_f = batch_start + f.
+    const std::vector<double>& eq_indirect_flux = {});
 
 // GPU thermal solver for selected faces with pre-combined flux arrays
 // Used in radiation-thermal coupling iterations where flux includes indirect radiation
+//
+// shared_thermal_pool: optional pre-built ThermalGPUDevicePool*. When the
+// caller passes one (typed as void* to keep this declaration GPU-build
+// agnostic), the function uses it instead of constructing a fresh pool.
+// Hoisting the pool above the radiation-coupling iter loop eliminates the
+// per-iter OpenCL context create/destroy churn that wedged the macOS+AMD
+// driver during long re-thermal runs (kernel hang → SMC -108 forced reset).
+// Pass nullptr to keep the legacy build-pool-per-call behaviour.
 bool runThermalForSelectedFaces_GPU(
     const std::shared_ptr<Mesh>& mesh,
-    const std::vector<int>& face_indices,           // Faces to process
-    const std::vector<std::vector<double>>& flux,   // Pre-combined flux per face [face_idx][timestep]
+    const std::vector<int>& face_indices,
+    // Raw illumination flux arrays (face-major: f * total_time_steps + t).
+    // Same source data iter-0 uses — re-thermal applies Hayne + IR
+    // multiplier internally, identical to iter-0's prepare_flux.
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    // Per-face per-timestep indirect flux from the radiation-coupling
+    // module (already ε-scaled by RadiositySolver). Added on top of
+    // iter-0's flux composition; produces the only physical difference
+    // between iter-0 and rad-coupling iter N.
+    const std::vector<std::vector<double>>& indirect_flux_series,
+    // iter-0's POST-EQUILIBRATION T(z) state per face — same starting
+    // point iter-0 used for its output cycle. Layer-major SoA matching
+    // ThermalOpenCLSolver::buf_T_ (size n_layers × n_faces). When sized
+    // for the mesh, re-thermal uploads this and SKIPS its own eq phase.
+    const std::vector<float>& post_eq_T_state,
     const std::vector<double>& times,
     int total_time_steps,
+    int equilibration_steps,
     const thermal::Config& config,
-    std::vector<std::vector<double>>& surface_temps); // In/out: updated for selected faces
+    std::vector<std::vector<double>>& surface_temps,
+    // Multi-GPU dispatch knobs (mirrors the all-faces path). Defaults preserve
+    // legacy single-GPU serial-batches behaviour.
+    int gpu_devices = 1,
+    const std::vector<int>& gpu_device_ids = {},
+    int gpu_inter_batch_pause_ms = 0,
+    void* shared_thermal_pool = nullptr);
 
 void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
-    
+
 bool addThermalDataToVTK(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<std::vector<double>>&, const std::vector<double>&);
+
+// ---------------------------------------------------------------------------
+// Heartbeat: single-line "where are we right now" file in <output_dir>.
+// Rewritten before each long-running phase with explicit fsync(). Survives
+// hard kernel hangs where stdout/stderr buffers never reach disk — the
+// macOS+AMD OpenCL driver has wedged the box badly enough during multi-hour
+// rad-coupling runs that the unified log captured nothing pre-reboot. The
+// heartbeat is small enough that open-write-fsync-close is cheap (~ms) yet
+// pinpoints the in-flight phase after the box comes back up. Best-effort;
+// silently ignores I/O errors.
+// ---------------------------------------------------------------------------
+namespace {
+std::string g_heartbeat_dir;
+std::mutex  g_heartbeat_mtx;
+
+void setHeartbeatDir(const std::string& dir) {
+    std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+    g_heartbeat_dir = dir;
+}
+
+void writeHeartbeat(const std::string& msg) {
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+        dir = g_heartbeat_dir;
+    }
+    if (dir.empty()) return;
+    const std::string path = dir + "/heartbeat.txt";
+    FILE* fp = std::fopen(path.c_str(), "w");
+    if (!fp) return;
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_utc{};
+    gmtime_r(&t, &tm_utc);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+    std::fprintf(fp, "%s %s\n", ts, msg.c_str());
+    std::fflush(fp);
+    int fd = ::fileno(fp);
+    if (fd >= 0) ::fsync(fd);
+    std::fclose(fp);
+}
+}  // namespace
 
 using FluxFn = std::function<double(size_t,int)>;
 bool runThermalModelsForAllFacesStreamed(
@@ -1296,19 +1451,36 @@ std::vector<double> calculateAbsorbedFlux(
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
     
-    // Check if we should use incidence-dependent albedo.
-    // Skip if a spatially-varying map was already loaded (binary or FITS) — the per-face
-    // map values must not be overridden by the uniform planet->albedo + incidence formula.
+    // Apply the Hayne et al. (2017) incidence-angle correction whenever the
+    // body's albedoCoef are set. When a spatially-varying albedo map is in
+    // use, the per-face map value supersedes the body default A0; the angular
+    // correction is *still* applied on top. Previously the gate also required
+    // !using_albedo_map which silently dropped the high-θ correction for
+    // map-using runs and biased nighttime temperatures at high latitudes by
+    // several K.
+    // Incidence-angle-dependent albedo is active when either (a) the body has
+    // Hayne (2017) polynomial coefficients, or (b) the Hapke directional-
+    // hemispheric gate is on. getAlbedoWithIncidence() internally routes to the
+    // correct model (Hapke branch first when use_hapke_albedo). When neither is
+    // set the constant Bond albedo is used and the path is byte-identical.
+    bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
+                             planet->hapke_albedo_w >= 0.0);
     bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
-                                 !planet->using_albedo_map &&
-                                 !albedo_successfully_loaded &&
-                                 planet->albedoCoef.size() >= 2);
+                                 (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
 
     if (use_incidence_albedo) {
-        std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-        std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
-        std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
-                  << ", b = " << planet->albedoCoef[1] << std::endl;
+        if (use_hapke_albedo) {
+            std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
+                         "1 - gamma*H(mu0,w)" << std::endl;
+            std::cout << "  Base albedo A0 = " << planet->albedo
+                      << ", single-scattering w = " << planet->hapke_albedo_w
+                      << std::endl;
+        } else {
+            std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
+            std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
+            std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
+                      << ", b = " << planet->albedoCoef[1] << std::endl;
+        }
     }
 
     // Apply albedo to calculate absorbed flux for each face at each time step
@@ -1407,6 +1579,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     try {
         const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
+        applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
 
         // Override basal heat flow if specified (per-face or global)
         if (Qb_override >= 0.0) {
@@ -2036,6 +2209,41 @@ std::vector<double> runThermalModelForFace(
     }
 }
 
+// Apply generic-body thermophysical properties that main() forwarded via the
+// thermal_config "gb_*" properties. The thermal solvers below each rebuild a
+// LOCAL Planet from the body NAME (config "planet"); for a non-built-in generic
+// body (e.g. an asteroid) that name resolves to Europa PLACEHOLDER defaults
+// (planetary_properties.h getPropertiesByName), so the configured surface
+// conductivity ks / the ks->kd depth profile / cp0 / rho / H / cpCoeff (and the
+// constant_thermal_inertia collapse, already baked into the main Planet) never
+// reached the conduction -- thermal inertia was silently ignored for all EMA
+// asteroid runs. Gated on "gb_thermo": built-in Moon/Europa runs (which do not
+// set it) are byte-identical untouched. Call right after the local Planet is
+// built and BEFORE reference_profile, so the depth grid / cp / kc all pick it up.
+static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config) {
+    if (config.getProperty("gb_thermo", "").empty()) return;  // only generic bodies
+    double v;
+    if ((v = config.getPropertyDouble("gb_ks",   -1.0)) >  0.0) planet.ks   = v;
+    if ((v = config.getPropertyDouble("gb_kd",   -1.0)) >  0.0) planet.kd   = v;
+    if ((v = config.getPropertyDouble("gb_cp0",  -1.0)) >= 0.0) planet.cp0  = v;
+    if ((v = config.getPropertyDouble("gb_rhos", -1.0)) >  0.0) planet.rhos = v;
+    if ((v = config.getPropertyDouble("gb_rhod", -1.0)) >  0.0) planet.rhod = v;
+    if ((v = config.getPropertyDouble("gb_H",    -1.0)) >  0.0) planet.H    = v;
+    if ((v = config.getPropertyDouble("gb_albedo",     -1.0)) >= 0.0) planet.albedo     = v;
+    if ((v = config.getPropertyDouble("gb_emissivity", -1.0)) >  0.0) planet.emissivity = v;
+    // Orbital/rotational scalars (see main): the name-resolved local Planet
+    // otherwise carries Europa placeholder values for these on the generic path.
+    if ((v = config.getPropertyDouble("gb_day",  -1.0)) >  0.0) planet.day  = v;
+    if ((v = config.getPropertyDouble("gb_S",    -1.0)) >  0.0) planet.S    = v;
+    if ((v = config.getPropertyDouble("gb_year", -1.0)) >  0.0) planet.year = v;
+    if ((v = config.getPropertyDouble("gb_Qb",   -2.0)) >= 0.0) planet.Qb   = v;
+    // cpCoeff forwarded as a comma-separated list; empty string => constant cp.
+    planet.cpCoeff.clear();
+    std::stringstream ss(config.getProperty("gb_cpCoeff", ""));
+    std::string tok;
+    while (std::getline(ss, tok, ',')) if (!tok.empty()) planet.cpCoeff.push_back(std::stod(tok));
+}
+
 // Streamed thermal path: read illumination on demand; no giant buffers
 bool runThermalModelsForAllFacesStreamed(
     const std::shared_ptr<Mesh>& mesh,
@@ -2552,6 +2760,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // albedo and drifted from the standard path by up to ~115 K at
     // albedo-sensitive faces (spatial map + high-incidence terminator).
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
 
     std::shared_ptr<ptm::SpatialMap> batch_albedo_map;
     if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
@@ -2749,9 +2958,23 @@ bool runThermalModelsForAllFacesBatchSoA(
             // flux trajectory as a quasi-periodic signal and substep it down to
             // dt <= planet.day / 192 so CN accuracy stays within ~1 K worst case
             // (see src/cpp/tools/test_equilibration_dt.cpp for the accuracy study).
-            const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
-                                             std::round(planet.year / planet.day);
-            const double equil_duration_s = equil_days_needed * planet.day;
+            double equil_duration_s;
+            if (config.getProperty("using_generic_body") == "true") {
+                // Generic (fast-rotating) body: equilibrate for the CONFIGURED number
+                // of DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps
+                // was sized in main as (output cadence)x(equilibration_orbits)x(diurnal
+                // period), so equilibration_steps x output-cadence dt = the intended
+                // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day)
+                // here would be ~10^4 four-hour cycles (an asteroid's year is that many
+                // diurnal periods) and never finish. Gated -> Moon/Europa untouched.
+                const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
+                const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
+                equil_duration_s = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
+            } else {
+                const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
+                                                 std::round(planet.year / planet.day);
+                equil_duration_s = equil_days_needed * planet.day;
+            }
 
             if (equil_duration_s > 0.0 && total_time_steps >= 2) {
                 // Match Model::fastEquilibrate (thermal_model.cpp:2024) exactly:
@@ -3008,10 +3231,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     ice::IceStabilityAccumulator* ice_acc,
     const std::string& initial_state_file,
     const std::string& final_state_file,
+    std::vector<float>* post_eq_T_out,
     int gpu_devices,
     const std::vector<int>& gpu_device_ids,
     size_t gpu_batch_size_override,
-    int gpu_inter_batch_pause_ms)
+    int gpu_inter_batch_pause_ms,
+    const std::vector<double>& eq_indirect_flux)
 {
     using namespace gpu::opencl;
 
@@ -3036,9 +3261,29 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
+
+    // Directional-hemispheric (Hapke) albedo gate. The gate is resolved on the
+    // main-scope Planet and forwarded as thermal_config properties (see the
+    // thermal_config build site). This locally-rebuilt Planet does not inherit
+    // it, so re-read it here and drive the host-side flux build below. Default
+    // OFF → byte-identical Hayne-only path preserved for all non-Hapke runs.
+    const bool   use_hapke = config.getPropertyBool("use_hapke_albedo", false)
+                             && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
+    const double hapke_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
+    planet.use_hapke_albedo = use_hapke;
+    planet.hapke_albedo_w   = hapke_w;
+    if (use_hapke) {
+        // Mirror the CPU reference log (calculateAbsorbedFlux, ~line 1442) so a
+        // gate-ON run is verifiable from stdout — proves the branch FIRES.
+        std::cout << "[GPU Thermal] Using directional-hemispheric (Hapke) albedo "
+                     "A_h(i) = 1 - gamma*H(mu0,w)" << std::endl;
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << planet.albedo
+                  << ", single-scattering w = " << hapke_w << std::endl;
+    }
 
     // ---- Optional initial / final thermal-state checkpoint -------------
     // Magic bytes 'PTMT' (0x50544D54) identify the format.
@@ -3091,6 +3336,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const bool dump_final_state = !final_state_file.empty();
     if (dump_final_state) {
         assembled_final_T.assign(n_layers * n_faces, 0.0f);
+    }
+
+    // Whole-mesh buffer to receive iter-0's POST-EQUILIBRATION T(z), if
+    // requested by the caller via post_eq_T_out. Filled per-batch right
+    // after the eq-phase solver call (two-phase configs) or at the end
+    // of the single-phase cycle. Used by the radiation-coupling iter
+    // loop so re-thermal can upload the same starting state iter-0 used
+    // for its output cycle.
+    std::vector<float> assembled_post_eq_T;
+    if (post_eq_T_out) {
+        assembled_post_eq_T.assign(n_layers * n_faces, 0.0f);
     }
     // -------------------------------------------------------------------
 
@@ -3426,29 +3682,56 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(5.67051196e-8)
         );
 
+        // Initial subsurface temperature seed.
+        //
+        // Generic-body path: seed every face with the smooth, longitude-independent
+        // diurnal-mean radiative-equilibrium reference profile (Profile::init_T,
+        // T_avg = T_ss/sqrt(2); docs/equilibration-paper.md §5), identical to the
+        // CPU path's starting state. The legacy per-face seed (else branch) derived
+        // T(z,0) from the *instantaneous* absorbed flux over the first 10
+        // equilibration steps, with a hard 100 K nightside floor, which stamped a
+        // body-fixed day/night (terminator) discontinuity into the subsurface. Once
+        // the configured (higher) thermal inertia is applied on the generic-body
+        // path a finite equilibration no longer erases that imprint, and it
+        // surfaces as the body-fixed "seam" in the spinning-asteroid flybys. The
+        // smooth seed removes it at the source and matches the CPU path.
+        //
+        // Gated on "using_generic_body" (mirrors applyGenericBodyThermo / 710db0f):
+        // built-in Moon/Europa/A3GT runs keep the legacy seed and stay
+        // byte-identical to their established baselines.
         std::vector<float> T_initial(batch_n * n_layers);
-        for (size_t f = 0; f < batch_n; ++f) {
-            size_t global_f = batch_start + f;
-            double albedo = face_albedos[global_f];
-            double avg_flux = 0.0;
-            int n_samples = std::min(10, total_time_steps);
-            for (int t = 0; t < n_samples; ++t) {
-                size_t flux_idx = global_f * total_time_steps + t;
-                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
-            }
-            avg_flux /= n_samples;
-
-            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-            if (T_eq < 40.0) T_eq = 100.0;
-            if (T_eq > 400.0) T_eq = 400.0;
-
+        if (config.getProperty("using_generic_body") == "true") {
+            const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                const float Tl = static_cast<float>(T_seed[layer]);
+                for (size_t f = 0; f < batch_n; ++f) {
+                    T_initial[layer * batch_n + f] = Tl;
+                }
+            }
+        } else {
+            for (size_t f = 0; f < batch_n; ++f) {
+                size_t global_f = batch_start + f;
+                double albedo = face_albedos[global_f];
+                double avg_flux = 0.0;
+                int n_samples = std::min(10, total_time_steps);
+                for (int t = 0; t < n_samples; ++t) {
+                    size_t flux_idx = global_f * total_time_steps + t;
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                }
+                avg_flux /= n_samples;
+
+                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                if (T_eq < 40.0) T_eq = 100.0;
+                if (T_eq > 400.0) T_eq = 400.0;
+
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    size_t idx = layer * batch_n + f;
+                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                }
             }
         }
         solver.uploadInitialTemperature(T_initial);
@@ -3492,6 +3775,16 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
+        const double a_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar = planet.S;
+        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+        // Incidence-dependent albedo fires for Hayne (has_angular) OR the Hapke
+        // gate (use_hapke). Both need S>0 to recover cos(theta) from flux. When
+        // both are off this is false and applyIncidenceAlbedo is bypassed →
+        // byte-identical constant-albedo path.
+        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
+
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
             #pragma omp parallel for schedule(static)
@@ -3500,12 +3793,32 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double albedo = face_albedos[global_f];
+                    double base_A = face_albedos[global_f];
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
 
-                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+                    // Incidence-angle correction on the base albedo. Hayne (2017):
+                    // A(θ) = A0 + a·(θ/π/4)^3 + b·(θ/π/2)^8. Hapke branch (opt-in):
+                    // A_h(mu0) = 1 - gamma*H(mu0,w), which supersedes Hayne and
+                    // ignores base_A (w already encodes the body Bond albedo).
+                    double albedo = use_incidence
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                               use_hapke, hapke_w)
+                        : base_A;
+
+                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    // Deep radiation-coupling (pass 2): add the per-face time-mean
+                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
+                    // call is uniquely prepare_flux(0, equilibration_steps); the
+                    // output window already gets the time-varying indirect via the
+                    // coupling, so this avoids double-counting there.
+                    if (t_start == 0 && n_steps == equilibration_steps
+                            && equilibration_steps < total_time_steps
+                            && !eq_indirect_flux.empty()
+                            && global_f < eq_indirect_flux.size()) {
+                        absorbed += eq_indirect_flux[global_f];
+                    }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
             }
@@ -3533,6 +3846,50 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::vector<float> eq_output_discard;
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
                                                  equilibration_steps, eq_dt, equil_cycles);
+
+            // Snapshot the post-eq T(z) profile here — this is exactly
+            // the initial state the output cycle is about to run from.
+            // The rad-coupling iter loop reuses this so re-thermal can
+            // skip its own eq phase and run with iter-0's converged
+            // depth profile (instead of a cold-start that may converge
+            // to a different fixed point).
+            if (post_eq_T_out) {
+                std::vector<float> batch_T_post_eq;
+                try {
+                    solver.downloadAllTemps(batch_T_post_eq);
+                } catch (const std::exception& e) {
+                    std::cerr << "[GPU Thermal] WARNING: downloadAllTemps (post-eq) failed: "
+                              << e.what() << "\n";
+                    batch_T_post_eq.clear();
+                }
+                // downloadAllTemps packs data with stride = activeFaceCount(),
+                // which EXCEEDS batch_n when the persistent solver was allocated
+                // to a larger capacity (e.g. a shared pool sized to the
+                // re-thermal cap). The old guard compared the size to
+                // batch_n*n_layers and the copy assumed a batch_n stride; both
+                // are wrong in that case, so the snapshot silently captured
+                // NOTHING and the rad-coupling re-thermal later started every
+                // selected face from a zero T(z) column. That was masked by the
+                // old [3,500] K clamp (the zero column was clamped to the 3 K
+                // floor — the long-standing "3 K PSR" artifact) and surfaces as
+                // a 0 K -> runaway divergence once the clamp is removed. Use the
+                // actual active-face stride, and warn loudly if capture fails.
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_post_eq.size() == active * n_layers) {
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        const float* src = batch_T_post_eq.data() + layer * active;
+                        float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
+                        std::copy(src, src + batch_n, dst);
+                    }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: post-eq snapshot NOT captured"
+                                 " (download size " << batch_T_post_eq.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
+                }
+            }
 
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
                 std::cout << "[GPU Thermal] Phase 2: 1 output cycle × "
@@ -3682,15 +4039,29 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << gpu_inter_batch_pause_ms << " ms (per device)" << std::endl;
         }
 
-        ThermalGPUPoolConfig pool_cfg;
-        pool_cfg.devices = selected;
-        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
-        pool_cfg.verbose = false;
-        ThermalGPUDevicePool pool(std::move(pool_cfg));
-
         ThermalOpenCLConfig opencl_config;
         opencl_config.verbose = false;
         opencl_config.work_group_size = 64;
+
+        // Persistent-solver pool: one ThermalOpenCLSolver per device, sized
+        // to BATCH_SIZE capacity, reused across every batch on its device.
+        // Constructor eagerly calls solver.initialize() per device, so any
+        // OpenCL init failure surfaces here (not mid-loop).
+        ThermalGPUPoolConfig pool_cfg;
+        pool_cfg.devices = selected;
+        pool_cfg.max_n_faces = BATCH_SIZE;
+        pool_cfg.n_layers = n_layers;
+        pool_cfg.solver_config = opencl_config;
+        pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+        pool_cfg.verbose = false;
+        std::unique_ptr<ThermalGPUDevicePool> pool;
+        try {
+            pool = std::make_unique<ThermalGPUDevicePool>(std::move(pool_cfg));
+        } catch (const std::exception& e) {
+            std::cerr << "[GPU Thermal] Multi-GPU pool construction failed: "
+                      << e.what() << std::endl;
+            return false;
+        }
 
         std::vector<std::future<bool>> futures;
         futures.reserve(n_batches);
@@ -3698,7 +4069,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             const size_t batch_start = batch_idx * BATCH_SIZE;
             const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_faces);
             const size_t batch_n     = batch_end - batch_start;
-            futures.push_back(pool.submit(batch_n, n_layers, opencl_config,
+            futures.push_back(pool->submit(batch_n,
                 [&run_batch_on_solver, batch_idx, batch_start, batch_n](
                     ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
                     return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
@@ -3857,35 +4228,49 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
         );
 
-        // Initialize temperature (equilibrium temperature for all layers)
+        // Initial subsurface temperature seed. Generic bodies get the smooth
+        // diurnal-mean reference profile (removes the body-fixed asteroid "seam";
+        // see the companion note on the other GPU persistent entry point); built-in
+        // Moon/Europa/A3GT keep the legacy per-face instantaneous-flux seed and stay
+        // byte-identical. Gated on "using_generic_body" (mirrors 710db0f).
         std::vector<float> T_initial(batch_n * n_layers);
-        for (size_t f = 0; f < batch_n; ++f) {
-            // Get initial flux to estimate equilibrium temperature
-            // Include ALL flux components (direct, reflected, IR) for accurate initialization
-            size_t global_f = batch_start + f;
-            double albedo = face_albedos[global_f];
-            double avg_flux = 0.0;
-            int n_samples = std::min(10, total_time_steps);
-            for (int t = 0; t < n_samples; ++t) {
-                size_t flux_idx = global_f * total_time_steps + t;
-                double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
-                avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
-            }
-            avg_flux /= n_samples;
-
-            // Equilibrium temperature from Stefan-Boltzmann
-            double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-            if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
-            if (T_eq > 400.0) T_eq = 400.0;
-
+        if (config.getProperty("using_generic_body") == "true") {
+            const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t idx = layer * batch_n + f;
-                // Linear interpolation between surface and deep temperature
-                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                const float Tl = static_cast<float>(T_seed[layer]);
+                for (size_t f = 0; f < batch_n; ++f) {
+                    T_initial[layer * batch_n + f] = Tl;
+                }
+            }
+        } else {
+            for (size_t f = 0; f < batch_n; ++f) {
+                // Get initial flux to estimate equilibrium temperature
+                // Include ALL flux components (direct, reflected, IR) for accurate initialization
+                size_t global_f = batch_start + f;
+                double albedo = face_albedos[global_f];
+                double avg_flux = 0.0;
+                int n_samples = std::min(10, total_time_steps);
+                for (int t = 0; t < n_samples; ++t) {
+                    size_t flux_idx = global_f * total_time_steps + t;
+                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                    // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                }
+                avg_flux /= n_samples;
+
+                // Equilibrium temperature from Stefan-Boltzmann
+                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
+                if (T_eq > 400.0) T_eq = 400.0;
+
+                for (size_t layer = 0; layer < n_layers; ++layer) {
+                    size_t idx = layer * batch_n + f;
+                    // Linear interpolation between surface and deep temperature
+                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                }
             }
         }
         solver.uploadInitialTemperature(T_initial);
@@ -3937,6 +4322,13 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
+        const double a_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar2 = planet.S;
+        const bool   has_angular2 = (planet.albedoCoef.size() >= 2 && S_solar2 > 0.0);
+        // Hayne OR Hapke gate (see prepare_flux above for rationale).
+        const bool   use_incidence2 = has_angular2 || (use_hapke && S_solar2 > 0.0);
+
         // Helper: prepare flux data in timestep-major layout for a range of timesteps.
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
@@ -3946,12 +4338,30 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double albedo = face_albedos[global_f];
+                    double base_A = face_albedos[global_f];
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
 
-                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + (1.0 - ir_albedo) * ir;
+                    // Incidence-angle correction (Hayne composes on map A0; Hapke
+                    // closed form supersedes, ignoring base_A).
+                    double albedo = use_incidence2
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar2, a_coef2, b_coef2,
+                                               use_hapke, hapke_w)
+                        : base_A;
+
+                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    // Deep radiation-coupling (pass 2): add the per-face time-mean
+                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
+                    // call is uniquely prepare_flux(0, equilibration_steps); the
+                    // output window already gets the time-varying indirect via the
+                    // coupling, so this avoids double-counting there.
+                    if (t_start == 0 && n_steps == equilibration_steps
+                            && equilibration_steps < total_time_steps
+                            && !eq_indirect_flux.empty()
+                            && global_f < eq_indirect_flux.size()) {
+                        absorbed += eq_indirect_flux[global_f];
+                    }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
             }
@@ -3984,6 +4394,40 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::vector<float> eq_output_discard;
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
                                                  equilibration_steps, eq_dt, equil_cycles);
+
+            // Snapshot the post-eq T(z) for the rad-coupling re-thermal hand-off
+            // (same purpose as the multi-GPU run_batch_on_solver path). This
+            // single-GPU inline loop previously had NO snapshot, so on
+            // single-GPU runs assembled_post_eq_T stayed all-zero and every
+            // re-thermal'd face started from a 0 K column — masked by the old
+            // [3,500] K clamp (the "3 K PSR" artifact), exposed as 0 K->runaway
+            // divergence once the clamp was removed. downloadAllTemps packs with
+            // stride = activeFaceCount(), so use that (not batch_n).
+            if (post_eq_T_out) {
+                std::vector<float> batch_T_post_eq;
+                try {
+                    solver.downloadAllTemps(batch_T_post_eq);
+                } catch (const std::exception& e) {
+                    std::cerr << "[GPU Thermal] WARNING: downloadAllTemps (post-eq) failed: "
+                              << e.what() << "\n";
+                    batch_T_post_eq.clear();
+                }
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_post_eq.size() == active * n_layers) {
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        const float* src = batch_T_post_eq.data() + layer * active;
+                        float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
+                        std::copy(src, src + batch_n, dst);
+                    }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: post-eq snapshot NOT captured"
+                                 " (download size " << batch_T_post_eq.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
+                }
+            }
 
             // Phase 2: output with fine dt (1 cycle, download results).
             // Accumulator runs over the entire output cycle: [0, output_steps).
@@ -4155,6 +4599,31 @@ post_batch_loop:
         }
     }
 
+    // Hand the assembled post-eq T(z) profile to the caller (rad-coupling
+    // iter loop). Safety net: a face with an all-zero column was never
+    // equilibrated, and the rad-coupling re-thermal would start it from 0 K
+    // and ramp it to a runaway (the bug that the missing single-GPU snapshot
+    // and the [3,500] K clamp together hid). Warn loudly if any survive so
+    // this class of bug can never silently corrupt a coupled run again.
+    if (post_eq_T_out) {
+        if (two_phase) {
+            size_t n_zero = 0;
+            for (size_t fc = 0; fc < n_faces; ++fc) {
+                bool all_zero = true;
+                for (size_t l = 0; l < n_layers; ++l) {
+                    if (assembled_post_eq_T[l * n_faces + fc] != 0.0f) { all_zero = false; break; }
+                }
+                if (all_zero) ++n_zero;
+            }
+            if (n_zero > 0) {
+                std::cerr << "[GPU Thermal] WARNING: " << n_zero << "/" << n_faces
+                          << " faces have an all-zero post-eq column; rad-coupling"
+                             " re-thermal of these faces would diverge\n";
+            }
+        }
+        *post_eq_T_out = assembled_post_eq_T;
+    }
+
     return true;
 }
 
@@ -4176,11 +4645,20 @@ post_batch_loop:
 bool runThermalForSelectedFaces_GPU(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<int>& face_indices,
-    const std::vector<std::vector<double>>& flux,
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    const std::vector<std::vector<double>>& indirect_flux_series,
+    const std::vector<float>& post_eq_T_state,
     const std::vector<double>& times,
     int total_time_steps,
+    int equilibration_steps,
     const thermal::Config& config,
-    std::vector<std::vector<double>>& surface_temps)
+    std::vector<std::vector<double>>& surface_temps,
+    int gpu_devices,
+    const std::vector<int>& gpu_device_ids,
+    int gpu_inter_batch_pause_ms,
+    void* shared_thermal_pool)
 {
     using namespace gpu::opencl;
 
@@ -4191,21 +4669,73 @@ bool runThermalForSelectedFaces_GPU(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
+    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
+    const size_t n_faces_total = mesh->faces.size();
 
-    // Calculate dt from times array
-    float dt = 0.0f;
-    if (total_time_steps > 1) {
-        dt = static_cast<float>(times[1] - times[0]);
+    // Directional-hemispheric (Hapke) albedo gate (re-read from config; this
+    // path rebuilds its own Planet). Kept consistent with iter-0's flux build
+    // so the rad-coupling re-thermal uses the SAME absorbed-solar composition.
+    // Default OFF → byte-identical Hayne-only path.
+    const bool   use_hapke = config.getPropertyBool("use_hapke_albedo", false)
+                             && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
+    const double hapke_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
+
+    // Two-phase detection (mirrors iter-0 setup at lines 3199-3217 of
+    // runThermalModelsForAllFaces_GPU_Persistent). When eq_dt != out_dt
+    // we run two solver calls: equilibration cycles at eq_dt, then one
+    // output cycle at out_dt — same as iter-0.
+    const int output_steps = total_time_steps - equilibration_steps;
+    float eq_dt = 0.0f;
+    float out_dt = 0.0f;
+    if (equilibration_steps > 1) {
+        eq_dt = static_cast<float>(times[1] - times[0]);
     }
+    if (output_steps > 1 && equilibration_steps < total_time_steps) {
+        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
+    } else if (equilibration_steps > 1) {
+        out_dt = eq_dt;
+    }
+    if (equilibration_steps <= 0) eq_dt = out_dt;
+    const bool two_phase = (equilibration_steps > 0 && output_steps > 0 &&
+                            std::abs(eq_dt - out_dt) > 1e-3f);
+    const float dt_single = two_phase
+        ? eq_dt
+        : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
+    if (two_phase) {
+        std::cout << "  [Re-thermal] Post-eq state-handoff: 1 output cycle x "
+                  << output_steps << " steps at out_dt="
+                  << std::fixed << std::setprecision(1) << out_dt
+                  << "s, +indirect_flux" << std::endl;
+    } else {
+        std::cout << "  [Re-thermal] Post-eq state-handoff: 1 cycle x "
+                  << total_time_steps << " steps at dt="
+                  << std::fixed << std::setprecision(1) << dt_single
+                  << "s, +indirect_flux" << std::endl;
+    }
+    (void)n_faces_total;  // currently unused — kept for future per-face bookkeeping
 
     // GPU memory constraint
     const size_t bytes_per_face = n_layers * 50 + total_time_steps * 8 * 2;
     const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;
     const size_t max_batch_size = std::min(n_selected, gpu_memory_limit / bytes_per_face);
-    const size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(50000));
+    size_t BATCH_SIZE = std::min(max_batch_size, static_cast<size_t>(50000));
+    // Re-equilibration with indirect flux (PTM_EQ_WITH_INDIRECT) folds long
+    // multi-cycle equilibration kernels into each batch. At the 50000-face
+    // default that blows past the macOS+AMD GPU command-buffer timeout
+    // (gpusKillClientExt). Cap the batch to iter-0's proven-safe width so each
+    // 750-step eq kernel matches the all-faces path's regime.
+    if (const char* e = std::getenv("PTM_EQ_WITH_INDIRECT");
+        e && std::atoi(e) != 0) {
+        size_t cap = 4000;
+        if (const char* b = std::getenv("PTM_EQ_RETHERMAL_BATCH")) {
+            const int v = std::atoi(b);
+            if (v > 0) cap = static_cast<size_t>(v);
+        }
+        BATCH_SIZE = std::min(BATCH_SIZE, cap);
+    }
 
     // Get reference material properties
     const auto& rho_ref = reference_profile.rho();
@@ -4217,22 +4747,14 @@ bool runThermalForSelectedFaces_GPU(
     // Process faces in batches
     size_t n_batches = (n_selected + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
-        size_t batch_start = batch_idx * BATCH_SIZE;
-        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
-        size_t batch_n = batch_end - batch_start;
-
-        // Initialize solver for this batch
-        ThermalOpenCLConfig opencl_config;
-        opencl_config.verbose = false;
-        opencl_config.work_group_size = 64;
-
-        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
-        if (!solver.initialize()) {
-            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver for selected faces" << std::endl;
-            return false;
-        }
-
+    // Per-batch worker: encapsulates the upload + equilibration + output-phase
+    // logic that was previously inline in the for-loop. Pulled out so it can
+    // be invoked from either the legacy single-GPU loop or the multi-GPU
+    // pool's submit() callback.
+    auto run_batch_on_solver = [&](ThermalOpenCLSolver& solver,
+                                   size_t batch_idx,
+                                   size_t batch_start,
+                                   size_t batch_n) -> bool {
         // Prepare mesh data in SoA layout: [layer * batch_n + face_in_batch]
         std::vector<float> z_grid_f(n_layers);
         for (size_t i = 0; i < n_layers; ++i) {
@@ -4290,60 +4812,355 @@ bool runThermalForSelectedFaces_GPU(
             static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
         );
 
-        // Initialize temperature from existing surface_temps (warm start)
-        std::vector<float> T_initial(batch_n * n_layers);
+        // -----------------------------------------------------------------
+        // Upload iter-0's post-eq T(z) for this batch's faces, then run
+        // ONLY the output cycle with combined_flux = iter-0 prepare_flux
+        // composition + indirect_flux. No eq phase here — the eq phase
+        // was iter-0's job, and re-running it from cold-start in each
+        // rad iter has been shown empirically to diverge from iter-0's
+        // converged state (May 2026 zero-indirect diagnostic). Reusing
+        // iter-0's post-eq state guarantees the output cycle starts from
+        // exactly the same point iter-0 did, so any temperature
+        // difference comes solely from the indirect-flux delta.
+        // -----------------------------------------------------------------
+        if (post_eq_T_state.size() != n_layers * n_faces_total) {
+            std::cerr << "[Re-thermal] FATAL: post_eq_T_state size "
+                      << post_eq_T_state.size() << " != n_layers * n_faces "
+                      << (n_layers * n_faces_total)
+                      << " — cannot proceed without iter-0's post-eq state."
+                      << std::endl;
+            return false;
+        }
+
+        // Gather per-batch slice of iter-0's post-eq T(z): layer-major
+        // SoA, indexed by global face id from face_indices.
+        std::vector<float> T_chunked(batch_n * n_layers);
         for (size_t f = 0; f < batch_n; ++f) {
-            size_t idx = batch_start + f;
-            int face_idx = face_indices[idx];
-
-            // Use existing surface temperature for initial estimate
-            double T_surface = (surface_temps[face_idx].empty()) ? T_deep_val : surface_temps[face_idx][0];
-            if (T_surface < 40.0) T_surface = 100.0;
-            if (T_surface > 400.0) T_surface = 400.0;
-
+            const int face_idx = face_indices[batch_start + f];
             for (size_t layer = 0; layer < n_layers; ++layer) {
-                size_t tidx = layer * batch_n + f;
-                // Linear interpolation between surface and deep temperature
-                double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                T_initial[tidx] = static_cast<float>(T_surface * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                T_chunked[layer * batch_n + f] =
+                    post_eq_T_state[layer * n_faces_total
+                                    + static_cast<size_t>(face_idx)];
             }
         }
-        solver.uploadInitialTemperature(T_initial);
+        solver.uploadAllTemps(T_chunked);
 
-        // Prepare flux data in timestep-major layout: [timestep * batch_n + face_in_batch]
-        std::vector<float> flux_all(static_cast<size_t>(total_time_steps) * batch_n);
-        for (int t = 0; t < total_time_steps; ++t) {
+        // Hayne (2017) parameters — same source as iter-0 (line 3597-3602).
+        const double a_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar = planet.S;
+        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+        // Hayne OR Hapke gate (both need S>0 to recover cos(theta) from flux).
+        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
+
+        // ----------------------------------------------------------------
+        // Optional: re-equilibrate the deep column WITH the indirect flux
+        // before the output cycle (env PTM_EQ_WITH_INDIRECT=1, cycles via
+        // PTM_EQ_INDIRECT_CYCLES, default 2).
+        //
+        // The post_eq_T_state handed in by iter-0 was equilibrated with ZERO
+        // indirect (the eq phase of runThermalModelsForAllFaces_GPU_Persistent
+        // omits it — the indirect is only known after the radiosity). For a
+        // permanently-shadowed floor whose surface flux is almost entirely
+        // indirect IR, that means the deep column settles to the bare
+        // direct+geothermal floor (~25 K) and then DRAINS the indirect-warmed
+        // surface downward during the output cycle, capping the summer max.
+        // Re-running a few equilibration cycles here with the indirect folded
+        // into the eq-window forcing lets the column settle to the correct
+        // (warmer) indirect-equilibrated state, starting from iter-0's already
+        // reasonable column (no cold-start divergence).
+        //
+        // The eq window [start-eq_days, start) precedes the output window and
+        // covers earlier orbits of the same (stationary) seasonal cycle, so
+        // each eq timestep's indirect is phase-mapped from the output-window
+        // indirect_flux_series at the matching annual phase.
+        static const bool eq_with_indirect = []() {
+            const char* e = std::getenv("PTM_EQ_WITH_INDIRECT");
+            return e && std::atoi(e) != 0;
+        }();
+        static const int eq_indirect_cycles = []() {
+            const char* e = std::getenv("PTM_EQ_INDIRECT_CYCLES");
+            const int v = e ? std::atoi(e) : 2;
+            return v > 0 ? v : 2;
+        }();
+        if (eq_with_indirect && two_phase && equilibration_steps > 0
+                && !indirect_flux_series.empty()) {
+            const double out_t0  = times[equilibration_steps];
+            const double cyc_sec = (total_time_steps > equilibration_steps + 1)
+                ? (times[total_time_steps - 1] - out_t0) : 0.0;
+            std::vector<float> eq_flux(static_cast<size_t>(equilibration_steps) * batch_n);
+            #pragma omp parallel for schedule(static)
+            for (int t = 0; t < equilibration_steps; ++t) {
+                // Phase-map this eq timestep onto an output-window timestep.
+                int map_out = 0;
+                if (cyc_sec > 0.0) {
+                    double frac = (times[t] - out_t0) / cyc_sec;   // < 0 for eq steps
+                    frac -= std::floor(frac);                      // wrap into [0,1)
+                    map_out = std::min(output_steps - 1,
+                                       std::max(0, static_cast<int>(
+                                           std::lround(frac * (output_steps - 1)))));
+                }
+                for (size_t f = 0; f < batch_n; ++f) {
+                    const int    global_f = face_indices[batch_start + f];
+                    const size_t flux_idx = static_cast<size_t>(global_f)
+                                          * total_time_steps + t;
+                    const double base_A   = planet.albedo;
+                    const double direct   = (flux_idx < direct_solar_values.size())
+                                          ? direct_solar_values[flux_idx] : 0.0;
+                    const double reflected = (flux_idx < primary_reflected_values.size())
+                                          ? primary_reflected_values[flux_idx] : 0.0;
+                    const double ir       = (flux_idx < primary_ir_values.size())
+                                          ? primary_ir_values[flux_idx] : 0.0;
+                    const double albedo = use_incidence
+                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                               use_hapke, hapke_w)
+                        : base_A;
+                    double absorbed = (1.0 - albedo) * direct
+                                    + (1.0 - albedo) * reflected
+                                    + planet.emissivity * ir;
+                    const auto& irow = indirect_flux_series[global_f];
+                    const int oidx = equilibration_steps + map_out;
+                    if (oidx < static_cast<int>(irow.size())) absorbed += irow[oidx];
+                    eq_flux[t * batch_n + f] = static_cast<float>(absorbed);
+                }
+            }
+            // Run the cycles as SEPARATE single-cycle dispatches (each
+            // equilibration_steps long, matching iter-0's safe kernel size)
+            // with an inter-cycle pause, instead of one (cycles+1)*steps
+            // mega-kernel that trips the macOS+AMD watchdog.
+            for (int c = 0; c < eq_indirect_cycles; ++c) {
+                std::vector<float> eq_discard;
+                solver.solvePersistentMultipleCycles(eq_flux, eq_discard,
+                                                     equilibration_steps, eq_dt,
+                                                     /*n_equil_cycles=*/0);
+                if (gpu_inter_batch_pause_ms > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(gpu_inter_batch_pause_ms));
+                }
+            }
+            if (batch_idx == 0) {
+                std::cout << "  [Re-thermal] Re-equilibrated WITH indirect flux ("
+                          << eq_indirect_cycles << " cycle(s) x " << equilibration_steps
+                          << " steps, phase-mapped) — PTM_EQ_WITH_INDIRECT" << std::endl;
+            }
+        }
+
+        // Build output-window flux. Same composition as iter-0's
+        // prepare_flux (Hayne on direct/reflected, ε on primary_ir)
+        // plus indirect_flux_series for this iter.
+        const int t_offset = two_phase ? equilibration_steps : 0;
+        const int n_out    = two_phase ? output_steps : total_time_steps;
+        const float dt_out = two_phase ? out_dt : dt_single;
+
+        std::vector<float> flux_out(static_cast<size_t>(n_out) * batch_n);
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < n_out; ++t) {
             for (size_t f = 0; f < batch_n; ++f) {
-                size_t idx = batch_start + f;
-                // flux[idx] is the pre-combined flux for this face (indexed by position in face_indices)
-                flux_all[t * batch_n + f] = static_cast<float>(flux[idx][t]);
+                const int    global_f = face_indices[batch_start + f];
+                const size_t flux_idx = static_cast<size_t>(global_f)
+                                      * total_time_steps + (t_offset + t);
+
+                const double base_A   = planet.albedo;
+                const double direct   = (flux_idx < direct_solar_values.size())
+                                      ? direct_solar_values[flux_idx] : 0.0;
+                const double reflected = (flux_idx < primary_reflected_values.size())
+                                      ? primary_reflected_values[flux_idx] : 0.0;
+                const double ir       = (flux_idx < primary_ir_values.size())
+                                      ? primary_ir_values[flux_idx] : 0.0;
+
+                const double albedo = use_incidence
+                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                           use_hapke, hapke_w)
+                    : base_A;
+
+                double absorbed = (1.0 - albedo) * direct
+                                + (1.0 - albedo) * reflected
+                                + planet.emissivity * ir;
+                if (!indirect_flux_series.empty()
+                    && static_cast<size_t>(global_f) < indirect_flux_series.size()
+                    && (t_offset + t) < static_cast<int>(indirect_flux_series[global_f].size())) {
+                    absorbed += indirect_flux_series[global_f][t_offset + t];
+                }
+                flux_out[t * batch_n + f] = static_cast<float>(absorbed);
             }
         }
 
-        // Equilibration phase: run multiple cycles to establish correct subsurface
-        // temperature profile before output. This matches the initial GPU thermal run
-        // behavior (runThermalModelsForAllFaces_GPU_Persistent) which also runs 5 cycles.
-        // Without this, the crude linear interpolation initial profile biases faces
-        // with higher daytime temperatures to retain excess subsurface heat at night.
-        int equil_cycles = 5;
-        if (equil_cycles > 0 && total_time_steps > 1) {
-            std::vector<float> equil_output_dummy;
-            for (int eq_cycle = 0; eq_cycle < equil_cycles; ++eq_cycle) {
-                solver.solvePersistentAllTimesteps(flux_all, equil_output_dummy, total_time_steps, dt);
-            }
-        }
-
-        // Output phase (temperatures now equilibrated)
+        // Single output cycle, no equilibration. The persistent kernel
+        // takes the just-uploaded post-eq state, integrates forward
+        // n_out timesteps at dt_out, and captures surface T per step.
+        // TODO(ice-stability): rad-coupling re-thermal does not update
+        // ice_acc->sum_E for selected faces; ice_depth.bin reflects
+        // only iter-0's flux BC on the re-thermal'd faces.
         std::vector<float> output_temps;
-        solver.solvePersistentAllTimesteps(flux_all, output_temps, total_time_steps, dt);
+        solver.solvePersistentMultipleCycles(flux_out, output_temps,
+                                             n_out, dt_out,
+                                             /*n_equil_cycles=*/0);
 
-        // Copy results back to surface_temps (transpose from timestep-major to face-major)
+        // Copy output surface T into surface_temps at the output-window
+        // slots. In two-phase mode, eq-window slots stay at 0 (matches
+        // iter-0). In single-phase, the full range is written.
+        //
+        // RE-THERMAL WARMUP GUARD: unlike iter-0 (which continues on-GPU from a
+        // pre-converged surface), this path uploadAllTemps()-seeds iter-0's
+        // post-eq T(z) and the GPU surfTemp Newton solve needs ~2 steps to
+        // re-converge the SURFACE from that upload — producing a spurious cold,
+        // MIN_TEMP-clamped transient in the first 1-2 recorded output steps.
+        // (Diagnosed via time-series: of all sub-40 K samples, ~50% land on
+        // step 0, ~50% on step 1, <1% on step >=2; excluding the first two steps
+        // recovers a night min that matches the rad-off baseline.) The deep
+        // column is seeded correctly, so only the surface needs the skip. iter-0
+        // already wrote physically-correct values for these warmup steps (no
+        // indirect flux, a negligible difference over 2 of 360 steps), so we
+        // keep those and overwrite only the settled steps.
+        constexpr int kReThermalWarmupSkip = 2;
         for (size_t f = 0; f < batch_n; ++f) {
-            size_t idx = batch_start + f;
-            int face_idx = face_indices[idx];
-            for (int t = 0; t < total_time_steps; ++t) {
-                surface_temps[face_idx][t] = static_cast<double>(output_temps[t * batch_n + f]);
+            const int face_idx = face_indices[batch_start + f];
+            for (int t = kReThermalWarmupSkip; t < n_out; ++t) {
+                surface_temps[face_idx][t_offset + t] =
+                    static_cast<double>(output_temps[t * batch_n + f]);
             }
+        }
+
+        (void)batch_idx;  // unused in single-GPU branch; kept for pool callback parity
+        return true;
+    };
+
+    // Multi-GPU dispatch (opt-in): mirrors the all-faces path. When enabled,
+    // the per-batch lambda above runs concurrently across N devices via the
+    // ThermalGPUDevicePool (~3x speedup measured on the 4-die W6800X Duo).
+    const bool use_multi_gpu =
+        (gpu_devices != 1) || !gpu_device_ids.empty();
+    if (use_multi_gpu) {
+        auto all_gpus = OpenCLContext::enumerateGPUs(/*only_available=*/true);
+        std::vector<OpenCLDeviceInfo> selected;
+        if (!gpu_device_ids.empty()) {
+            for (int id : gpu_device_ids) {
+                if (id < 0 || static_cast<size_t>(id) >= all_gpus.size()) {
+                    std::cerr << "[GPU Thermal] Invalid gpu_device_id " << id
+                              << " (only " << all_gpus.size()
+                              << " GPUs enumerated)" << std::endl;
+                    return false;
+                }
+                selected.push_back(all_gpus[id]);
+            }
+        } else if (gpu_devices == 0) {
+            selected = all_gpus;
+        } else {
+            const int n = std::min(gpu_devices,
+                                   static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n; ++i) selected.push_back(all_gpus[i]);
+        }
+        if (selected.empty()) {
+            std::cerr << "[GPU Thermal] No GPUs selected for selected-faces "
+                         "multi-GPU dispatch" << std::endl;
+            return false;
+        }
+
+        // Two paths: caller-supplied long-lived pool (preferred — eliminates
+        // per-iter context churn during radiation-thermal coupling) or
+        // function-local pool (legacy when caller passes nullptr).
+        ThermalGPUDevicePool* pool_ptr = nullptr;
+        std::unique_ptr<ThermalGPUDevicePool> local_pool;
+
+        if (shared_thermal_pool != nullptr) {
+            pool_ptr = static_cast<ThermalGPUDevicePool*>(shared_thermal_pool);
+            std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
+                         "(shared pool, " << pool_ptr->numDevices()
+                      << " device(s))" << std::endl;
+            if (BATCH_SIZE > pool_ptr->capacity()) {
+                std::cerr << "  [GPU Thermal Pool] Shared pool capacity "
+                          << pool_ptr->capacity() << " < required BATCH_SIZE "
+                          << BATCH_SIZE << "; falling back to local pool"
+                          << std::endl;
+                pool_ptr = nullptr;
+            }
+        }
+
+        if (pool_ptr == nullptr) {
+            std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
+                         "across " << selected.size() << " device(s)" << std::endl;
+
+            ThermalOpenCLConfig opencl_config;
+            opencl_config.verbose = false;
+            opencl_config.work_group_size = 64;
+
+            ThermalGPUPoolConfig pool_cfg;
+            pool_cfg.devices = selected;
+            pool_cfg.max_n_faces = BATCH_SIZE;
+            pool_cfg.n_layers = n_layers;
+            pool_cfg.solver_config = opencl_config;
+            pool_cfg.inter_batch_pause_ms = gpu_inter_batch_pause_ms;
+            pool_cfg.verbose = false;
+            try {
+                local_pool = std::make_unique<ThermalGPUDevicePool>(std::move(pool_cfg));
+            } catch (const std::exception& e) {
+                std::cerr << "  [GPU Thermal Pool] Construction failed: "
+                          << e.what() << std::endl;
+                return false;
+            }
+            pool_ptr = local_pool.get();
+        }
+
+        std::vector<std::future<bool>> futures;
+        futures.reserve(n_batches);
+        for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+            const size_t batch_start = batch_idx * BATCH_SIZE;
+            const size_t batch_end   = std::min(batch_start + BATCH_SIZE, n_selected);
+            const size_t batch_n     = batch_end - batch_start;
+            futures.push_back(pool_ptr->submit(batch_n,
+                [&run_batch_on_solver, batch_idx, batch_start, batch_n](
+                    ThermalOpenCLSolver& solver, size_t /*device_idx*/) -> bool {
+                    return run_batch_on_solver(solver, batch_idx, batch_start, batch_n);
+                }));
+        }
+
+        bool all_ok = true;
+        size_t completed = 0;
+        for (auto& f : futures) {
+            const bool ok = f.get();
+            ++completed;
+            std::cout << "\r  [GPU Thermal Pool] " << completed << "/" << n_batches
+                      << " re-thermal batches done" << std::flush;
+            // Heartbeat every batch — the re-thermal phase is exactly where
+            // the macOS+AMD driver wedged. Pinpointing the last completed
+            // batch index after a hang lets us correlate with GPU temps
+            // and decide whether to drop concurrency further.
+            writeHeartbeat("re_thermal batch " + std::to_string(completed)
+                           + "/" + std::to_string(n_batches)
+                           + (ok ? " ok" : " FAILED"));
+            all_ok = ok && all_ok;
+        }
+        std::cout << std::endl;
+        return all_ok;
+    }
+
+    // Legacy single-GPU serial-batches path (byte-identical to pre-multi-GPU
+    // behaviour when gpu_devices == 1).
+    for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * BATCH_SIZE;
+        size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
+        size_t batch_n = batch_end - batch_start;
+
+        // Initialize solver for this batch (single-device default path)
+        ThermalOpenCLConfig opencl_config;
+        opencl_config.verbose = false;
+        opencl_config.work_group_size = 64;
+
+        ThermalOpenCLSolver solver(batch_n, n_layers, opencl_config);
+        if (!solver.initialize()) {
+            std::cerr << "[GPU Thermal] Failed to initialize OpenCL solver for selected faces" << std::endl;
+            return false;
+        }
+
+        if (!run_batch_on_solver(solver, batch_idx, batch_start, batch_n)) {
+            return false;
+        }
+        // Inter-batch pause lets the macOS+AMD driver state settle between
+        // consecutive batches on the same device — important when each batch
+        // now carries multi-cycle eq kernels (PTM_EQ_WITH_INDIRECT).
+        if (gpu_inter_batch_pause_ms > 0 && batch_idx + 1 < n_batches) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(gpu_inter_batch_pause_ms));
         }
     }
 
@@ -4364,7 +5181,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     double,
     double,
     std::vector<std::vector<double>>*,
-    const std::vector<double>*)
+    const std::vector<double>*,
+    const std::vector<double>*,
+    ice::IceStabilityAccumulator*,
+    const std::string&,
+    const std::string&,
+    std::vector<float>*,
+    int,
+    const std::vector<int>&,
+    size_t,
+    int,
+    const std::vector<double>&)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -4374,11 +5201,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 bool runThermalForSelectedFaces_GPU(
     const std::shared_ptr<Mesh>&,
     const std::vector<int>&,
+    const std::vector<double>&,
+    const std::vector<double>&,
+    const std::vector<double>&,
     const std::vector<std::vector<double>>&,
+    const std::vector<float>&,
     const std::vector<double>&,
     int,
+    int,
     const thermal::Config&,
-    std::vector<std::vector<double>>&)
+    std::vector<std::vector<double>>&,
+    int,
+    const std::vector<int>&,
+    int,
+    void*)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -5393,15 +6229,24 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-verbose              Print detailed radiation progress\n";
     std::cout << "  --rad-view-factor-file F   Save/load view factors from file\n";
     std::cout << "  --rad-coupling-iter N      Max coupling iterations (default: 10)\n";
-    std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 2.0)\n";
-    std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] (default: 0.1)\n";
+    std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 0.5)\n";
+    std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] for LEGACY mode (default: 0.1)\n";
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
+    std::cout << "  --rad-coupling-select-mode MODE  Face-selection mode: 'physics' (default) or 'legacy'.\n";
+    std::cout << "                                   physics: ΔT predictor (1−α)·ΔF/(4εσT³) > temp_tol·safety.\n";
+    std::cout << "                                   legacy:  absolute |max indirect flux| > flux_tol.\n";
+    std::cout << "  --rad-coupling-select-safety F   Safety factor on predicted-ΔT threshold (default: 0.5).\n";
     std::cout << "  --rad-use-svd              Use SVD compression instead of ACA (slower)\n";
     std::cout << "  --rad-aca-tolerance T      ACA relative tolerance (default: 0.001)\n";
     std::cout << "  --rad-aca-max-rank R       ACA maximum rank before fallback (default: 50)\n";
     std::cout << "  --rad-hmatrix-threads N    Limit H-matrix build threads (0 = auto)\n";
     std::cout << "  --rad-captured-energy F    Target captured energy fraction (default: 0.99 = 99%)\n";
-    std::cout << "  --rad-max-neighbors N      Override max neighbors per face (disables adaptive)\n\n";
+    std::cout << "  --rad-max-neighbors N      Override max neighbors per face (disables adaptive)\n";
+    std::cout << "  --rad-gpu-devices N|auto   Number of GPUs for the radiosity pool (default: 1).\n";
+    std::cout << "                             1 = legacy single-GPU; auto = all enumerated GPUs.\n";
+    std::cout << "  --rad-gpu-device-ids 0,1,...  Explicit radiosity GPU indices (overrides --rad-gpu-devices).\n";
+    std::cout << "  --rad-gpu-batch-size N     Timesteps dispatched per pool round (default: auto = 4 * N_devices).\n";
+    std::cout << "  --rad-gpu-inter-batch-pause-ms N  Sleep between consecutive batches on same device (default: 0).\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Illumination Options\n";
@@ -6385,6 +7230,179 @@ bool writeStatisticsBinary(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Band-separated INDIRECT flux outputs (Paul's product, 2026-07-17 — Ada).
+//
+// Writes the two indirect radiosity bands as per-timestep frames + statistics,
+// mirroring the direct_solar / primary_ir components exactly (uint32 face-count
+// header + float32 payload; PTM-15-corrected statistics window):
+//   indirect_solar/ : absorbed multiply-scattered SOLAR indirect  (1-A)·Σ_j F_ij B^vis_j
+//   indirect_ir/    : absorbed thermal-IR indirect                   ε·Σ_j F_ij B^ir_j
+//
+// CONVENTION — ABSORBED flux at the face (W/m^2), NOT incident. This DIFFERS
+// from direct_solar/primary_reflected/primary_ir (which are stored incident,
+// with absorption applied at the surface BC). Rationale: the two-band radiosity
+// solve produces exactly these absorbed band fluxes; their SUM equals
+// indirect_flux_series — the value coupled into the thermal BC and dumped by
+// PTM_DUMP_QIND_SERIES ('QIDT'). Converting to incident would require a fragile
+// per-face division by (1-A_i) and ε_i that also breaks that sum-equality
+// cross-check. (No Smith beaming here — with rms_slope_deg > 0 the beamed IR
+// correction is added to the total but not the split, so vis+ir < total then.)
+//
+//   *_series : [face][ABSOLUTE step] absorbed band flux (exactly as coupled).
+//   frames   : output window [eq_steps, eq_steps+out_steps) -> _0000.._{out-1}.bin
+//   stats    : [stats_start, stats_start+stats_steps) (same window as the others)
+// Returns true on full success; warns and returns false on any failure.
+bool writeIndirectBandOutputs(
+    const std::string& output_dir,
+    const std::shared_ptr<Mesh>& mesh,
+    const std::vector<std::vector<double>>& indirect_solar_series,
+    const std::vector<std::vector<double>>& indirect_ir_series,
+    int eq_steps,
+    int out_steps,
+    int stats_start,
+    int stats_steps,
+    bool write_frames,
+    bool write_stats)
+{
+    if (!mesh || mesh->faces.empty()) {
+        std::cerr << "[indirect-bands] ERROR: empty mesh; skipping.\n";
+        return false;
+    }
+    const size_t F = mesh->faces.size();
+    if (indirect_solar_series.size() != F || indirect_ir_series.size() != F) {
+        std::cerr << "[indirect-bands] ERROR: series size ("
+                  << indirect_solar_series.size() << "/" << indirect_ir_series.size()
+                  << ") != face count (" << F << "); bands NOT written.\n";
+        return false;
+    }
+
+    bool ok = true;
+
+    // --- Per-timestep frames ------------------------------------------------
+    if (write_frames && out_steps > 0) {
+        try {
+            std::filesystem::create_directories(output_dir + "/indirect_solar");
+            std::filesystem::create_directories(output_dir + "/indirect_ir");
+        } catch (const std::exception& e) {
+            std::cerr << "[indirect-bands] ERROR mkdir: " << e.what() << "\n";
+            return false;
+        }
+
+        // Atomic tmp+rename writer (OneDrive-safe). Same on-disk format as the
+        // other component frames: uint32 face-count, then F float32 values.
+        auto write_frame = [&](const std::string& path,
+                               const std::vector<float>& buf) -> bool {
+            const uint32_t cnt = static_cast<uint32_t>(F);
+            const std::string tmp = path + ".tmp";
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                if (!out.is_open()) return false;
+                out.write(reinterpret_cast<const char*>(&cnt), sizeof(uint32_t));
+                out.write(reinterpret_cast<const char*>(buf.data()),
+                          static_cast<std::streamsize>(F) * sizeof(float));
+                out.flush();
+                if (!out.good()) return false;
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmp, path, ec);
+            if (ec) { std::error_code rm; std::filesystem::remove(tmp, rm); return false; }
+            return true;
+        };
+
+        std::vector<float> buf_vis(F), buf_ir(F);
+        int fail = 0;
+        for (int t = 0; t < out_steps; ++t) {
+            const int at = eq_steps + t;  // absolute step
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < F; ++f) {
+                const auto& rv = indirect_solar_series[f];
+                const auto& ri = indirect_ir_series[f];
+                buf_vis[f] = (at >= 0 && at < static_cast<int>(rv.size()))
+                    ? static_cast<float>(rv[at]) : 0.0f;
+                buf_ir[f]  = (at >= 0 && at < static_cast<int>(ri.size()))
+                    ? static_cast<float>(ri[at]) : 0.0f;
+            }
+            std::ostringstream ss; ss << std::setw(4) << std::setfill('0') << t;
+            const std::string ts = ss.str();
+            if (!write_frame(output_dir + "/indirect_solar/indirect_solar_" + ts + ".bin", buf_vis)) ++fail;
+            if (!write_frame(output_dir + "/indirect_ir/indirect_ir_" + ts + ".bin", buf_ir)) ++fail;
+        }
+        if (fail) {
+            std::cerr << "[indirect-bands] WARNING: " << fail << " frame write failure(s).\n";
+            ok = false;
+        } else {
+            std::cout << "[indirect-bands] Wrote " << out_steps
+                      << " frame(s) each to indirect_solar/ and indirect_ir/.\n";
+        }
+    }
+
+    // --- Statistics over the (PTM-15-corrected) integration window ----------
+    if (write_stats && stats_steps > 0) {
+        auto window_stats = [&](const std::vector<std::vector<double>>& series) {
+            Statistics s;
+            s.avg.assign(F, 0.0);
+            s.max.assign(F, std::numeric_limits<double>::lowest());
+            s.min.assign(F, std::numeric_limits<double>::max());
+            s.sum.assign(F, 0.0);
+            s.count.assign(F, 0u);
+            const int lo = stats_start;
+            const int hi = stats_start + stats_steps;  // one past end
+            #pragma omp parallel for schedule(static)
+            for (size_t f = 0; f < F; ++f) {
+                const auto& row = series[f];
+                double sum = 0.0; int vc = 0;
+                double mx = std::numeric_limits<double>::lowest();
+                double mn = std::numeric_limits<double>::max();
+                for (int t = std::max(0, lo); t < hi && t < static_cast<int>(row.size()); ++t) {
+                    const double v = row[t];
+                    sum += v; ++vc;
+                    if (v > mx) mx = v;
+                    if (v < mn) mn = v;
+                }
+                if (vc > 0) s.avg[f] = sum / vc;
+                s.sum[f] = sum; s.count[f] = static_cast<uint32_t>(vc);
+                s.max[f] = (mx == std::numeric_limits<double>::lowest()) ? 0.0 : mx;
+                s.min[f] = (mn == std::numeric_limits<double>::max()) ? 0.0 : mn;
+            }
+            return s;
+        };
+        if (!writeStatisticsBinary(output_dir, "indirect_solar", window_stats(indirect_solar_series), F)) ok = false;
+        if (!writeStatisticsBinary(output_dir, "indirect_ir",    window_stats(indirect_ir_series),    F)) ok = false;
+        if (ok) std::cout << "[indirect-bands] Wrote indirect_solar/indirect_ir statistics.\n";
+    }
+
+    // --- Patch metadata.txt components= (advisory; readers also glob dirs) ---
+    if (write_frames) {
+        const std::string meta_path = output_dir + "/metadata.txt";
+        std::ifstream mi(meta_path);
+        if (mi) {
+            std::vector<std::string> lines; std::string line;
+            bool patched = false;
+            while (std::getline(mi, line)) {
+                if (line.rfind("components=", 0) == 0
+                        && line.find("indirect_solar") == std::string::npos) {
+                    if (!line.empty() && line.back() != '=') line += ",";
+                    line += "indirect_solar,indirect_ir";
+                    patched = true;
+                }
+                lines.push_back(line);
+            }
+            mi.close();
+            if (patched) {
+                std::ofstream mo(meta_path, std::ios::trunc);
+                if (mo) { for (auto& l : lines) mo << l << "\n"; }
+                else { std::cerr << "[indirect-bands] WARNING: cannot rewrite metadata.txt\n"; ok = false; }
+            }
+        } else {
+            std::cerr << "[indirect-bands] WARNING: metadata.txt not found; "
+                         "components= not updated (dirs still written).\n";
+        }
+    }
+
+    return ok;
+}
+
 // Write merge-friendly raw statistics into <output_dir>/statistics/_raw/.
 // Produces:
 //   <data_type>_sum.bin    : uint32 N + N float64 (per-face sum)
@@ -6920,6 +7938,13 @@ void printBanner() {
 }
 
 int main(int argc, char** argv) {
+    // Line-buffer stdout so progress prints reach disk before a kernel hang
+    // can swallow them. The macOS+AMD OpenCL driver has wedged the box hard
+    // enough during multi-hour rad-coupling runs that the unified log
+    // captures nothing pre-reboot — line-buffering at least keeps the
+    // user-visible run log fresh up to the moment of the hang.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     printBanner();
 
     // ========================================================================
@@ -6997,6 +8022,10 @@ int main(int argc, char** argv) {
     int mesh_resolution = sim_config.mesh.resolution;
     int time_steps = sim_config.time.timesteps;
     std::string output_dir = sim_config.output.directory;
+    // Wire heartbeat to the output dir so post-mortem readers can see the
+    // last in-flight phase after a kernel hang / forced reboot.
+    setHeartbeatDir(output_dir);
+    writeHeartbeat("startup output_dir=" + output_dir);
     double integration_days = sim_config.thermal.integration_days;
     int integration_steps_cli = sim_config.thermal.integration_steps;
     double integration_offset_days = sim_config.thermal.integration_offset_days;
@@ -7104,8 +8133,10 @@ int main(int argc, char** argv) {
     std::string rad_view_factor_file = "";
     int rad_max_coupling_iter = 10;
     double rad_coupling_temp_tol = 2.0;     // Temperature convergence threshold [K]
-    double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2]
+    double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2] (legacy mode only)
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
+    std::string rad_coupling_select_mode = "physics";  // "physics" (default) or "legacy"
+    double rad_coupling_select_safety = 0.5;            // Safety factor on predicted-ΔT threshold
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -7124,6 +8155,16 @@ int main(int argc, char** argv) {
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
 
+    // Anisotropic (roughness-beamed) thermal emission (Smith 1967). 0 = OFF.
+    double rad_rms_slope_deg = 0.0;              // RMS micro-slope [deg]
+    double rad_beam_vf_threshold = 1e-7;         // Min renormalized VF to keep a beam pair
+
+    // Multi-GPU radiosity dispatch (mirrors thermal pool semantics).
+    int rad_gpu_devices = 1;                     // 1 = legacy single-GPU; >1 = pool
+    std::vector<int> rad_gpu_device_ids;         // Explicit indices (overrides rad_gpu_devices)
+    int rad_gpu_batch_size = 0;                  // 0 = auto = 4 * rad_gpu_devices
+    int rad_gpu_inter_batch_pause_ms = 0;        // Watchdog mitigation
+
     // Apply radiation settings from YAML config (before CLI override)
     enable_radiation_exchange = sim_config.radiation.enabled;
     rad_use_hmatrix = sim_config.radiation.use_hmatrix;
@@ -7134,6 +8175,8 @@ int main(int argc, char** argv) {
     rad_coupling_temp_tol = sim_config.radiation.coupling_temp_threshold;
     rad_coupling_flux_tol = sim_config.radiation.coupling_flux_threshold;
     rad_coupling_face_frac = sim_config.radiation.coupling_face_fraction;
+    rad_coupling_select_mode = sim_config.radiation.coupling_select_mode;
+    rad_coupling_select_safety = sim_config.radiation.coupling_select_safety;
     rad_use_aca = sim_config.radiation.use_aca;
     rad_aca_tolerance = sim_config.radiation.aca_tolerance;
     rad_aca_max_rank = sim_config.radiation.aca_max_rank;
@@ -7146,6 +8189,13 @@ int main(int argc, char** argv) {
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
     rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
+    rad_rms_slope_deg = sim_config.radiation.rms_slope_deg;
+    rad_beam_vf_threshold = sim_config.radiation.beam_vf_threshold;
+    // Multi-GPU radiosity (only consulted if rad_use_gpu == true).
+    rad_gpu_devices = sim_config.radiation.gpu_devices;
+    rad_gpu_device_ids = sim_config.radiation.gpu_device_ids;
+    rad_gpu_batch_size = sim_config.radiation.gpu_batch_size;
+    rad_gpu_inter_batch_pause_ms = sim_config.radiation.gpu_inter_batch_pause_ms;
 
     if (enable_radiation_exchange) {
         std::cout << "Radiation exchange enabled from config file" << std::endl;
@@ -7474,6 +8524,20 @@ int main(int argc, char** argv) {
             rad_coupling_flux_tol = std::stod(argv[++i]);
         } else if (arg == "--rad-coupling-face-frac" && i + 1 < argc) {
             rad_coupling_face_frac = std::stod(argv[++i]);
+        } else if (arg == "--rad-coupling-select-mode" && i + 1 < argc) {
+            rad_coupling_select_mode = argv[++i];
+            if (rad_coupling_select_mode != "physics" && rad_coupling_select_mode != "legacy") {
+                std::cerr << "Invalid --rad-coupling-select-mode '"
+                          << rad_coupling_select_mode
+                          << "': must be 'physics' or 'legacy'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation coupling face-selection mode: "
+                      << rad_coupling_select_mode << std::endl;
+        } else if (arg == "--rad-coupling-select-safety" && i + 1 < argc) {
+            rad_coupling_select_safety = std::stod(argv[++i]);
+            std::cout << "Radiation coupling select safety factor: "
+                      << rad_coupling_select_safety << std::endl;
         } else if (arg == "--rad-use-svd") {
             rad_use_aca = false;
             std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
@@ -7509,6 +8573,36 @@ int main(int argc, char** argv) {
         } else if (arg == "--rad-mc-rays" && i + 1 < argc) {
             rad_mc_rays_per_face = std::stoi(argv[++i]);
             std::cout << "MC rays per face: " << rad_mc_rays_per_face << std::endl;
+        } else if (arg == "--rad-gpu-devices" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto" || val == "all") {
+                rad_gpu_devices = 0;  // 0 = all available
+            } else {
+                rad_gpu_devices = std::stoi(val);
+            }
+            std::cout << "[Multi-GPU radiosity] gpu_devices = "
+                      << (rad_gpu_devices == 0 ? "auto"
+                                                : std::to_string(rad_gpu_devices))
+                      << std::endl;
+        } else if (arg == "--rad-gpu-device-ids" && i + 1 < argc) {
+            rad_gpu_device_ids.clear();
+            std::stringstream ss(argv[++i]);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty()) rad_gpu_device_ids.push_back(std::stoi(token));
+            }
+            std::cout << "[Multi-GPU radiosity] gpu_device_ids =";
+            for (int id : rad_gpu_device_ids) std::cout << " " << id;
+            std::cout << std::endl;
+        } else if (arg == "--rad-gpu-batch-size" && i + 1 < argc) {
+            rad_gpu_batch_size = std::stoi(argv[++i]);
+            std::cout << "[Multi-GPU radiosity] gpu_batch_size = "
+                      << rad_gpu_batch_size << " timesteps/dispatch"
+                      << std::endl;
+        } else if (arg == "--rad-gpu-inter-batch-pause-ms" && i + 1 < argc) {
+            rad_gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
+            std::cout << "[Multi-GPU radiosity] inter-batch pause = "
+                      << rad_gpu_inter_batch_pause_ms << " ms" << std::endl;
         }
         // ===== Generic Body Options =====
         else if (arg == "--generic-body-config" && i + 1 < argc) {
@@ -7731,6 +8825,71 @@ int main(int argc, char** argv) {
 
     // ========================================================================
     // PHASE 4c: Constant thermal inertia mode
+    // ========================================================================
+    // Optional scalar property overrides (sensitivity sweeps). Applied to the
+    // finalized Planet (Moon/SPICE path included) BEFORE the constant-TI block
+    // and BEFORE illumination albedo sync (~line 8814), so albedo flows to
+    // face_albedos / radiosity reflectance and ks/kd feed the constant-TI cp.
+    // Sentinel <0 leaves the body default untouched -> baseline runs unchanged.
+    // ========================================================================
+    {
+        const auto& tp = sim_config.thermophysical;
+        if (tp.albedo_override >= 0.0) {
+            std::cout << "Property override: albedo A0 " << planet.albedo
+                      << " -> " << tp.albedo_override << std::endl;
+            planet.albedo = tp.albedo_override;
+        }
+        if (tp.emissivity_override > 0.0) {
+            std::cout << "Property override: emissivity " << planet.emissivity
+                      << " -> " << tp.emissivity_override << std::endl;
+            planet.emissivity = tp.emissivity_override;
+        }
+        if (tp.ks_override > 0.0) {
+            std::cout << "Property override: ks " << planet.ks
+                      << " -> " << tp.ks_override << " W/m/K" << std::endl;
+            planet.ks = tp.ks_override;
+        }
+        if (tp.kd_override > 0.0) {
+            std::cout << "Property override: kd " << planet.kd
+                      << " -> " << tp.kd_override << " W/m/K" << std::endl;
+            planet.kd = tp.kd_override;
+        }
+
+        // Directional-hemispheric (Hapke) albedo gate. Opt-in; default OFF ->
+        // untouched baseline. When on, derive the single-scattering albedo w from
+        // config (albedo_hapke_w) or invert the body Bond albedo A0 for w such
+        // that the hemispherically-averaged A_h reproduces A0 at normal incidence
+        // (A_h(mu0=1) = 1 - gamma*(3)/(1+2*gamma)). We solve that 1-D monotone
+        // relation for w by bisection so the gate defaults to the body's own
+        // albedo rather than an arbitrary value.
+        if (tp.albedo_hapke) {
+            double w = tp.albedo_hapke_w;
+            if (w < 0.0) {
+                // Invert A_h(mu0=1; w) = A0 for w by bisection (A_h monotone in w).
+                double A0 = planet.albedo;
+                auto Ah_normal = [](double ww) {
+                    double gamma = std::sqrt(std::max(0.0, 1.0 - ww));
+                    double H = 3.0 / (1.0 + 2.0 * gamma);  // mu0 = 1
+                    return 1.0 - gamma * H;
+                };
+                double lo = 0.0, hi = 1.0;
+                for (int it = 0; it < 60; ++it) {
+                    double mid = 0.5 * (lo + hi);
+                    if (Ah_normal(mid) < A0) lo = mid; else hi = mid;
+                }
+                w = 0.5 * (lo + hi);
+                std::cout << "Hapke albedo gate: derived single-scattering w = "
+                          << w << " from Bond albedo A0 = " << A0
+                          << " (A_h at normal incidence)" << std::endl;
+            } else {
+                std::cout << "Hapke albedo gate: single-scattering w = " << w
+                          << " (from config)" << std::endl;
+            }
+            planet.use_hapke_albedo = true;
+            planet.hapke_albedo_w = std::max(0.0, std::min(1.0, w));
+        }
+    }
+
     // When thermophysical.constant_thermal_inertia > 0, override properties
     // so that TI = sqrt(k * rho * cp) is constant in temperature AND depth:
     //   chi = 0       (k = ks, constant in T)
@@ -7877,11 +9036,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        // If both primary + fallback failed → build default icosphere
+        // PTM-17: a REQUESTED mesh import that fails is FATAL. Never silently substitute
+        // a default icosphere for a specified import_file -- that runs the simulation on
+        // the wrong geometry without warning. (The legitimate procedural-icosphere path is
+        // the `else` branch below, taken only when no import_file is given.)
         if (!using_fallback_mesh && (!meshUtils.getMesh() || meshUtils.getMesh()->faces.empty())) {
-            std::cerr << "Using default icosphere mesh." << std::endl;
-            meshUtils.setMeshResolution(mesh_resolution);
-            meshUtils.setupMesh();
+            std::cerr << "FATAL: Failed to load mesh from file '" << mesh_file
+                      << "'. Refusing to substitute a default icosphere for a requested "
+                         "import. Check the path/format (legacy VTK 5.1 BINARY is not "
+                         "supported -- convert to PLY)." << std::endl;
+            return 1;
         }
     } else {
         // Procedural mesh path
@@ -8129,6 +9293,8 @@ int main(int argc, char** argv) {
             early_rad_config.force_hmatrix = rad_force_hmatrix;
             early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            early_rad_config.rms_slope_deg = rad_rms_slope_deg;
+            early_rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             if (rad_max_neighbors_override > 0) {
                 early_rad_config.max_neighbors = rad_max_neighbors_override;
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -8467,8 +9633,46 @@ int main(int argc, char** argv) {
         illumination_model->setExternalTimeGrid(external_ets);
     }
 
+    // Occluder-only geometry: a coarse ring/annulus (e.g. LOLA out to the
+    // physics horizon) added to the shadow-ray BVH so distant topography
+    // shadows the SfS core. NOT thermally solved / radiosity-coupled /
+    // output — the sim still runs entirely on `mesh` (the core). When
+    // mesh.occluder_file is empty this is skipped and behavior is
+    // byte-identical. See docs/extended-occluder-architecture.md.
+    if (!sim_config.mesh.occluder_file.empty()) {
+        const std::string& occ_file = sim_config.mesh.occluder_file;
+        std::cout << "Loading occluder mesh (shadow-only): " << occ_file << std::endl;
+        std::shared_ptr<Mesh> occ_mesh;
+        MeshUtils occMU;
+        if (occMU.importTriangulatedMesh(occ_file, mesh_scale_factor)) {
+            occ_mesh = occMU.getMesh();
+        } else {
+            occ_mesh = std::make_shared<Mesh>();
+            if (!loadAsciiDTMPLY(occ_file, occ_mesh)) {
+                occ_mesh.reset();
+            } else if (mesh_scale_factor != 1.0) {
+                for (auto& v : occ_mesh->vertices) {
+                    v[0] *= mesh_scale_factor;
+                    v[1] *= mesh_scale_factor;
+                    v[2] *= mesh_scale_factor;
+                }
+            }
+        }
+        if (occ_mesh && !occ_mesh->vertices.empty() && !occ_mesh->faces.empty()) {
+            illumination_model->setOccluderGeometry(occ_mesh->vertices,
+                                                    occ_mesh->faces);
+            std::cout << "Occluder mesh registered: "
+                      << occ_mesh->vertices.size() << " verts, "
+                      << occ_mesh->faces.size() << " tris (shadow BVH only)\n";
+        } else {
+            std::cerr << "WARNING: occluder_file set but could not be loaded ("
+                      << occ_file << "); proceeding WITHOUT distant-terrain "
+                      << "shadowing.\n";
+        }
+    }
+
     // Run illumination model for the full period but keep track of where the requested interval starts
-    std::cout << "Running illumination simulation for " << total_simulation_days 
+    std::cout << "Running illumination simulation for " << total_simulation_days
             << " days (including " << equilibration_days << " days equilibration)"
             << " starting at " << adjustedStartTime << std::endl;
 
@@ -8532,7 +9736,17 @@ int main(int argc, char** argv) {
     const size_t arrays_count = 3; // direct, reflected, ir (illum is reconstructed as direct+reflected)
     const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
     const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
-    const double STREAM_THRESHOLD_GB = 10.0;
+    // Max illumination footprint (GB) to EXTRACT into RAM; above this the thermal
+    // solver streams per-(face,timestep) from the in-RAM chunk store, which re-reads
+    // through every equilibration cycle and loses the flat-array fast path (~100x
+    // slower). Default 10 GB keeps very large meshes (e.g. lunar 500k, ~180 GB) on
+    // the streaming path. Override with PTM_RAM_ILLUM_MAX_GB to force smaller (ico6
+    // asteroid, ~15 GB) meshes to RAM-extract on high-memory boxes. Default unchanged.
+    double STREAM_THRESHOLD_GB = 10.0;
+    if (const char* ev = std::getenv("PTM_RAM_ILLUM_MAX_GB")) {
+        double ev_gb = std::atof(ev);
+        if (ev_gb > 0.0) STREAM_THRESHOLD_GB = ev_gb;
+    }
     bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
 
     // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
@@ -8636,9 +9850,72 @@ int main(int argc, char** argv) {
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
+    // Deep radiation-coupling (pass 2): per-global-face time-mean indirect flux
+    // loaded from a previous pass-1 run (thermal.eq_indirect_flux_file). Added to
+    // the EQUILIBRATION-phase forcing so the deep column equilibrates consistent
+    // with the wall-heating it receives during the output window. Empty = legacy.
+    std::vector<double> eq_indirect_vec;
+    if (!sim_config.thermal.eq_indirect_flux_file.empty()) {
+        const std::string& path = sim_config.thermal.eq_indirect_flux_file;
+        std::ifstream qin(path, std::ios::binary);
+        if (!qin) {
+            std::cerr << "Warning: cannot open eq_indirect_flux_file '" << path
+                      << "' — equilibration will not include indirect flux." << std::endl;
+        } else {
+            uint32_t magic = 0, nf = 0;
+            qin.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            qin.read(reinterpret_cast<char*>(&nf), sizeof(nf));
+            if (magic != 0x51494E44u) {  // 'QIND'
+                std::cerr << "Warning: eq_indirect_flux_file '" << path
+                          << "' bad magic (0x" << std::hex << magic << std::dec
+                          << "); ignoring." << std::endl;
+            } else if (nf != mesh->faces.size()) {
+                std::cerr << "Warning: eq_indirect_flux_file face count " << nf
+                          << " != mesh faces " << mesh->faces.size()
+                          << "; ignoring." << std::endl;
+            } else {
+                eq_indirect_vec.resize(nf);
+                qin.read(reinterpret_cast<char*>(eq_indirect_vec.data()),
+                         static_cast<std::streamsize>(nf) * sizeof(double));
+                double s = 0.0, mx = 0.0;
+                for (double q : eq_indirect_vec) { s += q; mx = std::max(mx, q); }
+                std::cout << "[Deep coupling] Loaded eq-indirect flux for " << nf
+                          << " faces from " << path << " (mean "
+                          << (s / std::max<uint32_t>(1, nf)) << ", max " << mx
+                          << " W/m^2) — added to equilibration forcing." << std::endl;
+            }
+        }
+    }
+
     // Time-varying indirect flux per face [face][timestep]
     // Declared at this scope so it's accessible for location export later
     std::vector<std::vector<double>> indirect_flux_series;
+
+    // Band-separated ABSORBED indirect radiosity flux (Paul's product): the
+    // multiply-scattered SOLAR (visible) and thermal-IR channels of the total
+    // held in indirect_flux_series, captured per timestep from the two-band
+    // solve. Same [face][ABSOLUTE step] layout as indirect_flux_series; left
+    // empty for gray / radoff runs (so those runs' outputs stay byte-identical).
+    // With no Smith beaming, indirect_solar_series + indirect_ir_series ==
+    // indirect_flux_series exactly (== the PTM_DUMP_QIND_SERIES 'QIDT' total).
+    std::vector<std::vector<double>> indirect_solar_series;  // (1-A)·Σ F·B_vis
+    std::vector<std::vector<double>> indirect_ir_series;     //   ε·Σ F·B_ir
+    // Set true once a two-band solve populated the per-timestep bands.
+    bool indirect_bands_available = false;
+    // Set true (once, with a warning) if any timestep went through the multi-GPU
+    // pool path, which runs GRAY radiosity and cannot produce the band split —
+    // the bands are then OMITTED rather than written as misleading zeros.
+    bool indirect_bands_batch_gap = false;
+
+    // Whole-mesh per-face T(z) at the END OF ITER-0'S EQUILIBRATION
+    // PHASE — i.e., the initial state iter-0 used for its output cycle.
+    // Filled by iter-0 when rad coupling is enabled; consumed by every
+    // rad-coupling re-thermal iter to skip its own eq phase and start
+    // from exactly iter-0's converged state. Layer-major SoA matching
+    // ThermalOpenCLSolver::buf_T_: [layer * n_faces + face_idx]. Stays
+    // empty for rad-off runs (never allocated).
+    std::vector<float> rad_post_eq_T;
+
 
     if (run_thermal_mesh) {
         // Configure OpenMP and setup thermal model
@@ -8682,6 +9959,41 @@ int main(int argc, char** argv) {
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {
             thermal_config.setProperty("using_generic_body", "true");
+
+            // Forward the fully-configured main Planet's thermophysical properties
+            // so the solvers (which rebuild a local Planet from the body NAME and
+            // otherwise fall back to Europa placeholder defaults) apply the real
+            // ks / ks->kd depth profile / cp0 / rho / H / cpCoeff (and any
+            // constant_thermal_inertia collapse already baked into `planet`).
+            // Applied by applyGenericBodyThermo() at each solver entry point;
+            // gated on "gb_thermo" so built-in Moon/Europa runs stay byte-identical.
+            thermal_config.setProperty("gb_thermo", "1");
+            thermal_config.setProperty("gb_ks",         planet.ks);
+            thermal_config.setProperty("gb_kd",         planet.kd);
+            thermal_config.setProperty("gb_cp0",        planet.cp0);
+            thermal_config.setProperty("gb_rhos",       planet.rhos);
+            thermal_config.setProperty("gb_rhod",       planet.rhod);
+            thermal_config.setProperty("gb_H",          planet.H);
+            thermal_config.setProperty("gb_albedo",     planet.albedo);
+            thermal_config.setProperty("gb_emissivity", planet.emissivity);
+            // Also forward the orbital/rotational scalars. The solver entry points
+            // rebuild a LOCAL Planet from the body NAME, which for a generic body
+            // resolves to Europa placeholder defaults -- so without these the
+            // subsurface grid and analytical equilibration used Europa's rotation
+            // period (day), solar constant (S), orbital period (year) and Qb
+            // instead of the generic body's. day drives the diurnal skin depth
+            // (grid resolution) and the equilibration diurnal period; S and the
+            // Bond albedo drive the equilibration forcing; year sets its duration.
+            thermal_config.setProperty("gb_day",  planet.day);
+            thermal_config.setProperty("gb_S",    planet.S);
+            thermal_config.setProperty("gb_year", planet.year);
+            thermal_config.setProperty("gb_Qb",   planet.Qb);
+            std::string gb_cpc;
+            for (size_t i = 0; i < planet.cpCoeff.size(); ++i) {
+                if (i) gb_cpc += ",";
+                gb_cpc += std::to_string(planet.cpCoeff[i]);
+            }
+            thermal_config.setProperty("gb_cpCoeff", gb_cpc);
         }
 
         // If using thermal model, add the maps to configuration
@@ -8716,6 +10028,19 @@ int main(int argc, char** argv) {
             thermal_config.setProperty(
                 "use_simd_batch",
                 config.getPropertyBool("use_simd_batch", true));
+        }
+
+        // Propagate the directional-hemispheric (Hapke) albedo gate into
+        // thermal_config. The gate is resolved imperatively onto the main-scope
+        // `planet` (single-scattering w derived/validated at the config block
+        // ~line 8548); the GPU thermal solver rebuilds its OWN Planet from
+        // config properties and would otherwise never see the gate. Only set
+        // these when the gate is on → thermal_config stays byte-identical for
+        // every non-Hapke run (default OFF path unchanged for Moon3D/A3GT/
+        // Europa/gate-off EMA).
+        if (planet.use_hapke_albedo && planet.hapke_albedo_w >= 0.0) {
+            thermal_config.setProperty("use_hapke_albedo", true);
+            thermal_config.setProperty("hapke_albedo_w", planet.hapke_albedo_w);
         }
 
         // Debug output to verify properties were set correctly
@@ -8799,7 +10124,14 @@ int main(int argc, char** argv) {
         const size_t arrays_count = 3; // direct, reflected, ir
         const size_t bytes_needed = total_values_est * bytes_per_value * arrays_count;
         const double memory_required_gb_est = static_cast<double>(bytes_needed) / (1024.0 * 1024.0 * 1024.0);
-        const double STREAM_THRESHOLD_GB = 10.0;
+        // Max illumination footprint (GB) to EXTRACT into RAM; above this we stream
+        // per-(face,timestep) (~100x slower, see the other STREAM_THRESHOLD_GB site).
+        // Default 10 GB unchanged; PTM_RAM_ILLUM_MAX_GB overrides for ico6 asteroids.
+        double STREAM_THRESHOLD_GB = 10.0;
+        if (const char* ev = std::getenv("PTM_RAM_ILLUM_MAX_GB")) {
+            double ev_gb = std::atof(ev);
+            if (ev_gb > 0.0) STREAM_THRESHOLD_GB = ev_gb;
+        }
         bool use_streamed_thermal = using_chunked_storage && (memory_required_gb_est > STREAM_THRESHOLD_GB);
 
         // IMPORTANT: Radiation exchange requires full illumination arrays for iterative coupling
@@ -8991,10 +10323,12 @@ int main(int argc, char** argv) {
                     ice_acc_ptr_a,
                     sim_config.thermal.initial_state_file,
                     sim_config.thermal.final_state_file,
+                    enable_radiation_exchange ? &rad_post_eq_T : nullptr,
                     sim_config.thermal.gpu_devices,
                     sim_config.thermal.gpu_device_ids,
                     sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms
+                    sim_config.thermal.gpu_inter_batch_pause_ms,
+                    eq_indirect_vec
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
@@ -9101,10 +10435,12 @@ int main(int argc, char** argv) {
                     ice_acc_ptr_b,
                     sim_config.thermal.initial_state_file,
                     sim_config.thermal.final_state_file,
+                    enable_radiation_exchange ? &rad_post_eq_T : nullptr,
                     sim_config.thermal.gpu_devices,
                     sim_config.thermal.gpu_device_ids,
                     sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms
+                    sim_config.thermal.gpu_inter_batch_pause_ms,
+                    eq_indirect_vec
                 );
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
@@ -9231,6 +10567,21 @@ int main(int argc, char** argv) {
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            rad_config.rms_slope_deg = rad_rms_slope_deg;
+            rad_config.beam_vf_threshold = rad_beam_vf_threshold;
+            // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
+            // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
+            // When ON, the per-face Bond albedo is sourced
+            // into the manager BEFORE prepare() (below), so prepare()'s initGPU can
+            // engage the single-GPU two-band gate for sparse Sum_j F_ij <= 1 meshes
+            // (PTM-11); H-matrix / Sum_j F_ij > 1 use the CPU two-band path.
+            rad_config.band_separated = sim_config.radiation.band_separated;
+            // Multi-GPU radiosity dispatch — pool is materialized inside
+            // RadiositySolver::initGPU() when gpu_devices > 1 and use_gpu = true.
+            rad_config.gpu_devices = rad_gpu_devices;
+            rad_config.gpu_device_ids = rad_gpu_device_ids;
+            rad_config.gpu_batch_size = rad_gpu_batch_size;
+            rad_config.gpu_inter_batch_pause_ms = rad_gpu_inter_batch_pause_ms;
             if (rad_max_neighbors_override > 0) {
                 rad_config.max_neighbors = rad_max_neighbors_override;
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -9273,7 +10624,86 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Prepare (classify faces, compute view factors if needed)
+            // Load per-face albedos for radiation coupling BEFORE prepare() (PTM-11).
+            // Must match the albedos used in the initial thermal solve. The per-face
+            // Bond albedo is a pure function of the config, the on-disk albedo map, and
+            // the mesh face count — it does NOT depend on prepare()'s Embree scene,
+            // face classification, or view-factor build — so sourcing it here is safe.
+            // Reused below by the physics-mode selector (ΔT/ΔF).
+            std::vector<double> face_albedos_rad(num_faces, planet.albedo);
+            {
+                std::string body_name_rad = thermal_config.getProperty("target_body_name");
+                if (!body_name_rad.empty() && std::islower(body_name_rad[0])) {
+                    body_name_rad[0] = std::toupper(body_name_rad[0]);
+                }
+                int mesh_res_rad = 5;
+                try {
+                    auto it = thermal_config.custom_properties.find("mesh_resolution");
+                    if (it != thermal_config.custom_properties.end()) {
+                        mesh_res_rad = std::stoi(it->second);
+                    }
+                } catch (...) {}
+
+                std::string albedo_filename = body_name_rad + "_Albedo_res" + std::to_string(mesh_res_rad) + ".bin";
+                std::string albedo_dir = thermal_config.getProperty("albedo_maps_directory");
+                if (albedo_dir.empty()) albedo_dir = "data/albedo_maps";
+                if (!albedo_dir.empty() && albedo_dir.back() != '/' && albedo_dir.back() != '\\') {
+                    albedo_dir += '/';
+                }
+
+                std::vector<std::string> albedo_search_paths = {
+                    albedo_dir + albedo_filename,
+                    "../data/albedo_maps/" + albedo_filename,
+                    "data/albedo_maps/" + albedo_filename
+                };
+
+                for (const auto& apath : albedo_search_paths) {
+                    auto loaded = importAlbedoMapFromFile(apath);
+                    if (!loaded.empty() && loaded.size() == num_faces) {
+                        face_albedos_rad = std::move(loaded);
+                        std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
+                        break;
+                    }
+                }
+            }
+
+            // D1/PTM-11: band-separated (two-band) radiosity. Source the SAME per-face
+            // Bond albedo the surface BC uses (face_albedos_rad) into the manager BEFORE
+            // prepare(). prepare() sequences setSolarAlbedo -> enableTwoBand -> initGPU
+            // (radiation_exchange.cpp:1471-1476 / 1613-1620), so with the albedo present
+            // at prepare() time two_band_ is set BEFORE initGPU and the single-GPU
+            // two-band gate (two_band_gpu_ok_) engages for sparse Sum_j F_ij <= 1 meshes.
+            // H-matrix / Sum_j F_ij > 1 meshes keep the row-norm-protected CPU two-band
+            // (initGPU emits the CPU-fallback notice). enableTwoBand is driven by
+            // config_.band_separated inside prepare() — no explicit call needed here (it
+            // would be a no-op before the solver exists). Default ON (D2, 2026-07-12);
+            // gray recovered exactly with band_separated:false (this block skipped).
+            if (rad_config.band_separated) {
+                rad_manager.setSolarAlbedo(face_albedos_rad);
+                std::cout << "  [radiation.band_separated] two-band radiosity ON: visible band "
+                             "uses per-face Bond albedo (scatter A_i / absorb 1-A_i), IR band 1-eps/eps."
+                          << std::endl;
+                // The per-face albedo sourced here is the STATIC base Bond albedo. When
+                // the BC uses an incidence-dependent albedo (Hayne angular / Hapke), the
+                // absorbed A_BC(θ) varies per timestep while the radiosity A is static —
+                // a residual per-face energy leak at grazing incidence. Wiring the
+                // per-timestep incidence-albedo update into the coupling loop
+                // (RadiationExchangeManager::setSolarAlbedo per timestep) is the remaining
+                // A2/D1 production step; warn rather than close energy silently-wrong.
+                const bool incidence_on =
+                    (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
+                if (incidence_on) {
+                    std::cout << "  [radiation.band_separated] WARNING: incidence-dependent albedo is "
+                                 "active; the two-band reflected-solar albedo is the STATIC base value, "
+                                 "so energy does not fully close at grazing incidence. Per-timestep "
+                                 "incidence-albedo update in the coupling loop is not yet wired."
+                              << std::endl;
+                }
+            }
+
+            // Prepare (classify faces, compute view factors if needed). two_band_ is now
+            // activated BEFORE initGPU (via config_.band_separated inside prepare()), so
+            // initGPU can set two_band_gpu_ok_ for sparse Sum_j F_ij <= 1 meshes (PTM-11).
             if (!rad_manager.prepare(illumination_series)) {
                 std::cout << "No faces need radiation exchange - skipping coupling loop" << std::endl;
             } else {
@@ -9310,6 +10740,18 @@ int main(int argc, char** argv) {
                 // Store previous iteration temperatures for convergence check
                 std::vector<std::vector<double>> prev_temps = surface_temps;
 
+                // Per-face max indirect flux from the previous iter — used by
+                // the physics-mode selector to compute ΔF (the change in
+                // indirect flux) rather than absolute flux. On iter 0 there
+                // is no prior, so the selector falls back to absolute flux.
+                std::vector<double> prev_max_indirect(num_faces, 0.0);
+
+                // Whether the physics-mode selector is active for this run.
+                const bool rad_coupling_physics_mode =
+                    (rad_coupling_select_mode == "physics");
+                std::cout << "  Face-selection mode: "
+                          << rad_coupling_select_mode << std::endl;
+
                 // Time-varying indirect flux per face [face][timestep]
                 // This is the key fix: indirect flux varies with time as wall temperatures change
                 // (indirect_flux_series declared at outer scope for location export)
@@ -9318,47 +10760,172 @@ int main(int argc, char** argv) {
                     indirect_flux_series[f].resize(total_time_steps, 0.0);
                 }
 
-                // Load per-face albedos for radiation coupling re-runs
-                // Must match the albedos used in the initial thermal solve
-                std::vector<double> face_albedos_rad(num_faces, planet.albedo);
-                {
-                    std::string body_name_rad = thermal_config.getProperty("target_body_name");
-                    if (!body_name_rad.empty() && std::islower(body_name_rad[0])) {
-                        body_name_rad[0] = std::toupper(body_name_rad[0]);
+                // Parallel band-separated series, allocated only when the solver
+                // runs two-band (avoids the ~2x indirect RAM otherwise). Same
+                // shape as indirect_flux_series; captured per timestep in Step 1.
+                if (rad_manager.isTwoBand()) {
+                    indirect_solar_series.resize(num_faces);
+                    indirect_ir_series.resize(num_faces);
+                    for (size_t f = 0; f < num_faces; f++) {
+                        indirect_solar_series[f].resize(total_time_steps, 0.0);
+                        indirect_ir_series[f].resize(total_time_steps, 0.0);
                     }
-                    int mesh_res_rad = 5;
-                    try {
-                        auto it = thermal_config.custom_properties.find("mesh_resolution");
-                        if (it != thermal_config.custom_properties.end()) {
-                            mesh_res_rad = std::stoi(it->second);
+                    std::cout << "  [indirect-bands] Two-band radiosity active: "
+                                 "capturing band-separated absorbed indirect flux "
+                                 "(indirect_solar + indirect_ir).\n";
+                } else {
+                    std::cout << "  [indirect-bands] Gray radiosity (not two-band): "
+                                 "band-separated indirect outputs OMITTED.\n";
+                }
+
+                // (Per-face albedos + two-band activation were sourced BEFORE prepare()
+                // above — PTM-11 — so the single-GPU two-band gate can engage for sparse
+                // Sum_j F_ij <= 1 meshes. The face_albedos_rad declared there is reused
+                // below by the physics-mode DeltaT/DeltaF selector.)
+
+                // Hoisted thermal GPU pool for radiation-coupling re-thermal.
+                // Created once before the iter loop and reused across every
+                // selected-faces re-thermal call. Eliminates per-iter OpenCL
+                // context create/destroy churn that wedged the macOS+AMD
+                // driver during multi-hour rad-on runs (SMC -108 forced
+                // reset; see memory/multi_gpu_thermal.md). Sized to the
+                // re-thermal hard cap (50000 faces) — actual batches narrow
+                // via setActiveFaceCount.
+                void* shared_rerun_pool = nullptr;
+#ifdef PTM_GPU_OPENCL
+                std::unique_ptr<gpu::opencl::ThermalGPUDevicePool> rerun_pool;
+                if (thermal_config.getPropertyBool("use_gpu_thermal", false)
+                    && (sim_config.thermal.gpu_devices != 1
+                        || !sim_config.thermal.gpu_device_ids.empty())) {
+                    auto all_gpus = gpu::opencl::OpenCLContext::enumerateGPUs();
+                    std::vector<gpu::opencl::OpenCLDeviceInfo> rerun_devs;
+                    if (!sim_config.thermal.gpu_device_ids.empty()) {
+                        for (int id : sim_config.thermal.gpu_device_ids) {
+                            if (id >= 0
+                                && static_cast<size_t>(id) < all_gpus.size()) {
+                                rerun_devs.push_back(all_gpus[id]);
+                            }
                         }
-                    } catch (...) {}
-
-                    std::string albedo_filename = body_name_rad + "_Albedo_res" + std::to_string(mesh_res_rad) + ".bin";
-                    std::string albedo_dir = thermal_config.getProperty("albedo_maps_directory");
-                    if (albedo_dir.empty()) albedo_dir = "data/albedo_maps";
-                    if (!albedo_dir.empty() && albedo_dir.back() != '/' && albedo_dir.back() != '\\') {
-                        albedo_dir += '/';
+                    } else if (sim_config.thermal.gpu_devices == 0) {
+                        rerun_devs = all_gpus;
+                    } else {
+                        const int n_req =
+                            std::min(sim_config.thermal.gpu_devices,
+                                     static_cast<int>(all_gpus.size()));
+                        for (int i = 0; i < n_req; ++i) {
+                            rerun_devs.push_back(all_gpus[i]);
+                        }
                     }
 
-                    std::vector<std::string> albedo_search_paths = {
-                        albedo_dir + albedo_filename,
-                        "../data/albedo_maps/" + albedo_filename,
-                        "data/albedo_maps/" + albedo_filename
-                    };
+                    // Cap re-thermal concurrency to 1 GPU by default.
+                    // Rationale (May 12, 2026 production campaign):
+                    //  * At N=2 (the previous default), ~25% of high-load
+                    //    winter windows (~640 K selected faces) hit the
+                    //    `gpusKillClientExt` hang and required the chunked
+                    //    runner's 3-attempt retry budget; 3 of 88 windows
+                    //    failed outright and needed a follow-up --resume.
+                    //  * At N=1, the May 12 recovery cleared all 3 failed
+                    //    windows in 81 minutes with zero retries.
+                    //  * Per-window wall at N=1 (~23 min) measured within
+                    //    noise of clean N=2 (~25 min) — the re-thermal
+                    //    phase isn't 2× slower because the inter-batch
+                    //    pause overhead is preserved across N and the
+                    //    kernel time is not the dominant cost. Net: N=1
+                    //    is the same speed and removes the failure mode.
+                    // Skip the cap when the user passed explicit
+                    // gpu_device_ids — that's an opt-in to expert config.
+                    // Override the default with PTM_RAD_RERUN_MAX_GPUS=N.
+                    {
+                        int rerun_max = 1;
+                        if (const char* env =
+                                std::getenv("PTM_RAD_RERUN_MAX_GPUS")) {
+                            int v = std::atoi(env);
+                            if (v > 0) rerun_max = v;
+                        }
+                        if (sim_config.thermal.gpu_device_ids.empty()
+                            && static_cast<int>(rerun_devs.size()) > rerun_max) {
+                            std::cout << "  [GPU Thermal Pool] Capping "
+                                         "re-thermal concurrency at "
+                                      << rerun_max << " device(s) (was "
+                                      << rerun_devs.size()
+                                      << ") to reduce macOS+AMD driver "
+                                         "pressure during rad-coupling. "
+                                         "Override: PTM_RAD_RERUN_MAX_GPUS env."
+                                      << std::endl;
+                            rerun_devs.resize(rerun_max);
+                        }
+                    }
 
-                    for (const auto& apath : albedo_search_paths) {
-                        auto loaded = importAlbedoMapFromFile(apath);
-                        if (!loaded.empty() && loaded.size() == num_faces) {
-                            face_albedos_rad = std::move(loaded);
-                            std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
-                            break;
+                    if (rerun_devs.size() >= 2) {
+                        // Match the n_layers and BATCH_SIZE that
+                        // runThermalForSelectedFaces_GPU computes internally.
+                        // BATCH_SIZE is hardcoded to min(memory-limit, 50000)
+                        // there; we size for the 50000 cap so the same pool
+                        // covers every iter's re-thermal regardless of the
+                        // selected-face count.
+                        thermal::Profile rerun_profile(planet, 0.0,
+                                                       thermal_config, false);
+                        const size_t rerun_n_layers = rerun_profile.z().size();
+                        constexpr size_t kRerunBatchCap = 50000;
+
+                        gpu::opencl::ThermalOpenCLConfig solver_cfg;
+                        solver_cfg.verbose = false;
+                        solver_cfg.work_group_size = 64;
+
+                        gpu::opencl::ThermalGPUPoolConfig pool_cfg;
+                        pool_cfg.devices = rerun_devs;
+                        pool_cfg.max_n_faces = kRerunBatchCap;
+                        pool_cfg.n_layers = rerun_n_layers;
+                        pool_cfg.solver_config = solver_cfg;
+                        pool_cfg.inter_batch_pause_ms =
+                            sim_config.thermal.gpu_inter_batch_pause_ms;
+                        pool_cfg.verbose = false;
+                        try {
+                            rerun_pool = std::make_unique<
+                                gpu::opencl::ThermalGPUDevicePool>(
+                                std::move(pool_cfg));
+                            shared_rerun_pool = rerun_pool.get();
+                            std::cout << "  [GPU Thermal Pool] Hoisted "
+                                         "re-thermal pool: "
+                                      << rerun_devs.size() << " device(s), "
+                                      << "capacity=" << kRerunBatchCap
+                                      << " faces, n_layers="
+                                      << rerun_n_layers << std::endl;
+                        } catch (const std::exception& e) {
+                            std::cerr << "  [GPU Thermal Pool] Hoisted pool "
+                                         "construction failed: " << e.what()
+                                      << " — re-thermal will build per-iter "
+                                         "pools instead" << std::endl;
+                            rerun_pool.reset();
+                            shared_rerun_pool = nullptr;
                         }
                     }
                 }
+#endif  // PTM_GPU_OPENCL
+
+                // Picard under-relaxation for the thermal–radiation coupling.
+                // Each iteration blends the freshly-computed indirect flux with
+                // the previous iterate: indirect = (1-ω)·prev + ω·new. Without
+                // it, clusters of mutually-facing faces ratchet their indirect
+                // flux up every iteration (1105→3046 W/m² over 5 iters, never
+                // converging) and a few peg the 500 K MAX_TEMP clamp. The fixed
+                // point is unchanged — ω only damps the path to it. With the
+                // near-field-accurate view factors (computeViewFactorRefined),
+                // Σ_j F_ij ≤ ~1 holds and the coupling already converges in one
+                // iteration, so under-relaxation is OFF by default (ω=1, the
+                // full Picard step) and retained only as an env-gated safety
+                // knob for pathological meshes. Tunable via PTM_RAD_COUPLING_RELAX.
+                double rad_relax = 1.0;
+                if (const char* e = std::getenv("PTM_RAD_COUPLING_RELAX")) {
+                    const double v = std::atof(e);
+                    if (v > 0.0 && v <= 1.0) rad_relax = v;
+                }
+                std::cout << "  Coupling under-relaxation ω = " << rad_relax << std::endl;
 
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
+                    writeHeartbeat("rad_iter " + std::to_string(iter + 1)
+                                   + " start (max=" + std::to_string(rad_max_coupling_iter) + ")");
 
                     // Step 1: Compute indirect flux at EVERY timestep
                     // This captures time-varying thermal emission from illuminated walls
@@ -9367,34 +10934,139 @@ int main(int argc, char** argv) {
 
                     thermal::ProgressBar flux_progress(total_time_steps, "Computing indirect flux", 50, true);
 
-                    // Sequential timestep loop - each solve uses all threads for H-matrix matvec
-                    // The H-matrix matvec is parallelized over ~2M blocks internally
-                    for (int t = 0; t < total_time_steps; t++) {
-                        // Extract temperatures at timestep t
-                        std::vector<double> temps_t(num_faces);
-                        std::vector<double> solar_t(num_faces);
+                    // Multi-GPU radiosity dispatch: when the pool is active,
+                    // process timesteps in batches sized to amortize per-batch
+                    // overhead across N GPUs concurrently. Single-GPU and CPU
+                    // paths use batch_size = 1 for byte-identical legacy behaviour.
+                    const bool use_pool_dispatch = rad_manager.hasGPUPool();
+                    int batch_size = 1;
+                    if (use_pool_dispatch) {
+                        batch_size = (rad_gpu_batch_size > 0)
+                            ? rad_gpu_batch_size
+                            : 4 * std::max(1, rad_gpu_devices);
+                        std::cout << "  [Multi-GPU radiosity] dispatching "
+                                  << batch_size << " timesteps/batch across "
+                                  << rad_gpu_devices << " GPUs" << std::endl;
+                    }
 
-                        #pragma omp parallel for schedule(static)
-                        for (size_t f = 0; f < num_faces; f++) {
-                            temps_t[f] = surface_temps[f][t];
-                            solar_t[f] = direct_solar_values[f * total_time_steps + t];
-                        }
+                    for (int t_start = 0; t_start < total_time_steps;
+                         t_start += batch_size) {
+                        const int t_end =
+                            std::min(t_start + batch_size, total_time_steps);
+                        const int n_batch = t_end - t_start;
 
-                        // Compute indirect flux at this timestep
-                        std::vector<double> indirect_t = rad_manager.computeIndirectFlux(temps_t, solar_t);
-
-                        // Store time-varying indirect flux and accumulate statistics
-                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
-                        for (size_t f = 0; f < num_faces; f++) {
-                            indirect_flux_series[f][t] = indirect_t[f];
-                            if (indirect_t[f] > max_indirect) {
-                                max_indirect = indirect_t[f];
+                        if (n_batch == 1 && !use_pool_dispatch) {
+                            // Legacy fast path: single timestep, no batch
+                            // wrapping. Preserves byte-identical behaviour
+                            // for CPU and single-GPU radiation paths.
+                            const int t = t_start;
+                            std::vector<double> temps_t(num_faces);
+                            std::vector<double> solar_t(num_faces);
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < num_faces; f++) {
+                                temps_t[f] = surface_temps[f][t];
+                                solar_t[f] = direct_solar_values[f * total_time_steps + t];
                             }
-                            total_indirect_sum += indirect_t[f];
+                            // Smith beamed emission needs the Sun direction.
+                            std::array<double, 3> s_hat = {0.0, 0.0, 0.0};
+                            if (rad_rms_slope_deg > 0.0 &&
+                                t < static_cast<int>(sun_positions.size())) {
+                                const auto& sp = sun_positions[t];
+                                double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+                                if (sl > 0.0) s_hat = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                            }
+                            std::vector<double> indirect_t =
+                                rad_manager.computeIndirectFlux(temps_t, solar_t, s_hat);
+                            const double w = (iter == 0) ? 1.0 : rad_relax;
+                            // Band-separated absorbed indirect (two-band only). The
+                            // manager refreshed these on the computeIndirectFlux call
+                            // above; capture the pointers before the parallel region.
+                            const bool have_bands =
+                                !indirect_solar_series.empty()
+                                && rad_manager.isTwoBand()
+                                && rad_manager.lastIndirectVisible().size() == num_faces
+                                && rad_manager.lastIndirectIR().size() == num_faces;
+                            const std::vector<double>* qvis =
+                                have_bands ? &rad_manager.lastIndirectVisible() : nullptr;
+                            const std::vector<double>* qir =
+                                have_bands ? &rad_manager.lastIndirectIR() : nullptr;
+                            if (have_bands) indirect_bands_available = true;
+                            #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                            for (size_t f = 0; f < num_faces; f++) {
+                                indirect_flux_series[f][t] =
+                                    (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
+                                if (have_bands) {
+                                    indirect_solar_series[f][t] =
+                                        (1.0 - w) * indirect_solar_series[f][t] + w * (*qvis)[f];
+                                    indirect_ir_series[f][t] =
+                                        (1.0 - w) * indirect_ir_series[f][t] + w * (*qir)[f];
+                                }
+                                if (indirect_t[f] > max_indirect) {
+                                    max_indirect = indirect_t[f];
+                                }
+                                total_indirect_sum += indirect_t[f];
+                            }
+                        } else {
+                            // Batched path: build [n_batch][num_faces] of
+                            // (T, Q_solar), dispatch to multi-GPU pool,
+                            // write back to indirect_flux_series.
+                            std::vector<std::vector<double>> temps_batch(n_batch);
+                            std::vector<std::vector<double>> solar_batch(n_batch);
+                            #pragma omp parallel for schedule(static)
+                            for (int j = 0; j < n_batch; j++) {
+                                const int t = t_start + j;
+                                temps_batch[j].resize(num_faces);
+                                solar_batch[j].resize(num_faces);
+                                for (size_t f = 0; f < num_faces; f++) {
+                                    temps_batch[j][f] = surface_temps[f][t];
+                                    solar_batch[j][f] = direct_solar_values[f * total_time_steps + t];
+                                }
+                            }
+
+                            // Per-timestep Sun directions for Smith beamed emission.
+                            std::vector<std::array<double, 3>> sun_dirs_batch;
+                            if (rad_rms_slope_deg > 0.0) {
+                                sun_dirs_batch.assign(n_batch, {0.0, 0.0, 0.0});
+                                for (int j = 0; j < n_batch; j++) {
+                                    const int t = t_start + j;
+                                    if (t >= static_cast<int>(sun_positions.size())) continue;
+                                    const auto& sp = sun_positions[t];
+                                    double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+                                    if (sl > 0.0) sun_dirs_batch[j] = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                                }
+                            }
+                            std::vector<std::vector<double>> indirect_batch =
+                                rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
+                                                                     sun_dirs_batch);
+
+                            // The multi-GPU pool path runs GRAY radiosity and does
+                            // not expose per-timestep band separation. Flag it once
+                            // so the band outputs are OMITTED (not misleading zeros).
+                            if (!indirect_solar_series.empty() && !indirect_bands_batch_gap) {
+                                indirect_bands_batch_gap = true;
+                                std::cerr << "  [indirect-bands] WARNING: multi-GPU pool "
+                                             "radiosity is GRAY; band-separated indirect "
+                                             "(indirect_solar/indirect_ir) will be OMITTED.\n";
+                            }
+
+                            for (int j = 0; j < n_batch; j++) {
+                                const int t = t_start + j;
+                                const auto& indirect_t = indirect_batch[j];
+                                const double w = (iter == 0) ? 1.0 : rad_relax;
+                                #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                                for (size_t f = 0; f < num_faces; f++) {
+                                    indirect_flux_series[f][t] =
+                                        (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
+                                    if (indirect_t[f] > max_indirect) {
+                                        max_indirect = indirect_t[f];
+                                    }
+                                    total_indirect_sum += indirect_t[f];
+                                }
+                            }
                         }
 
-                        if ((t + 1) % 10 == 0 || t == total_time_steps - 1) {
-                            flux_progress.update(t + 1);
+                        if (t_end % 10 == 0 || t_end == total_time_steps) {
+                            flux_progress.update(t_end);
                         }
                     }
                     flux_progress.finish();
@@ -9437,100 +11109,262 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Step 2: Identify faces that need thermal re-run
-                    // Include faces where max indirect flux over time exceeds threshold
-                    std::vector<int> faces_to_rerun;
+                    // Step 2: Per-face statistics + selection.
+                    //
+                    // Single pass over (face, timestep) computes everything
+                    // both the selector and the convergence check need:
+                    //   - max_indirect[f]: max over t of indirect_flux_series
+                    //   - max_T[f]:        max over t of surface_temps
+                    //   - observed_dT[f]:  max over t of |T_iter − T_iter-1|
+                    //                      (zero on iter 0 since prev_temps == surface_temps)
+                    //   - global max_temp_change (= max over f of observed_dT)
+                    //
+                    // Physics mode (default):
+                    //   ΔF[f]    = max(0, max_indirect[f] − prev_max_indirect[f])  (iter > 0)
+                    //              max_indirect[f]                                  (iter == 0)
+                    //   T_eff[f] = max(max_T[f], T_floor=40 K)
+                    //   pred_dT  = (1−α)·ΔF / (4εσ·T_eff³)   ← linearized radiative response
+                    //   select if max(pred_dT, observed_dT) > temp_tol·safety
+                    //
+                    //   This combines Phase A (predict future change from new
+                    //   indirect flux) and Phase B (don't drop a face that's
+                    //   still moving even if its flux didn't change). A face
+                    //   with stable flux AND stable past T is naturally frozen.
+                    //
+                    // Legacy mode:
+                    //   select if max_indirect[f] > rad_coupling_flux_tol
+                    //   (reproduces pre-2026-05-09 behavior byte-for-byte).
+                    std::vector<double> face_max_indirect(num_faces, 0.0);
+                    std::vector<double> observed_dT(num_faces, 0.0);
+                    std::vector<double> face_max_T(num_faces, 0.0);
+                    double max_temp_change = 0.0;
+                    double total_indirect_per_face_sum = 0.0;
+
+                    #pragma omp parallel for schedule(static) \
+                        reduction(max:max_temp_change) \
+                        reduction(+:total_indirect_per_face_sum)
                     for (size_t f = 0; f < num_faces; f++) {
-                        double max_face_indirect = 0.0;
+                        double mi = 0.0, mT = 0.0, odT = 0.0;
                         for (int t = 0; t < total_time_steps; t++) {
-                            if (indirect_flux_series[f][t] > max_face_indirect) {
-                                max_face_indirect = indirect_flux_series[f][t];
-                            }
+                            const double v = indirect_flux_series[f][t];
+                            if (v > mi) mi = v;
+                            const double T = surface_temps[f][t];
+                            if (T > mT) mT = T;
+                            const double dT = std::abs(T - prev_temps[f][t]);
+                            if (dT > odT) odT = dT;
                         }
-                        // Include face if max indirect flux over time exceeds threshold
-                        if (max_face_indirect > rad_coupling_flux_tol) {
-                            faces_to_rerun.push_back(static_cast<int>(f));
-                        }
+                        face_max_indirect[f] = mi;
+                        face_max_T[f]        = mT;
+                        observed_dT[f]       = odT;
+                        total_indirect_per_face_sum += mi;
+                        if (odT > max_temp_change) max_temp_change = odT;
                     }
 
-                    std::cout << "  Faces with significant indirect flux: " << faces_to_rerun.size()
-                              << " / " << num_faces << std::endl;
+                    // Pick faces to re-run.
+                    std::vector<int> faces_to_rerun;
+                    faces_to_rerun.reserve(num_faces / 4);
+                    int n_frozen_by_dT = 0;
+                    int n_frozen_by_freeze = 0;
+
+                    if (rad_coupling_physics_mode) {
+                        const double epsilon = planet.emissivity;
+                        const double sigma = 5.67051196e-8;
+                        const double T_floor = 40.0;
+                        const double pred_dT_threshold =
+                            rad_coupling_temp_tol * rad_coupling_select_safety;
+
+                        for (size_t f = 0; f < num_faces; f++) {
+                            const double dF = (iter == 0)
+                                ? face_max_indirect[f]
+                                : std::max(0.0, face_max_indirect[f] - prev_max_indirect[f]);
+                            const double T_eff = std::max(face_max_T[f], T_floor);
+                            const double dTdF = (1.0 - face_albedos_rad[f])
+                                              / (4.0 * epsilon * sigma * T_eff * T_eff * T_eff);
+                            const double pred_dT = dTdF * dF;
+
+                            // Phase A criterion: does the new indirect flux
+                            // imply a future T change above the threshold?
+                            // Phase B criterion: did the face's T already
+                            // change meaningfully in the previous re-thermal?
+                            const bool select = (pred_dT >= pred_dT_threshold)
+                                             || (iter > 0 && observed_dT[f] >= pred_dT_threshold);
+                            if (select) {
+                                faces_to_rerun.push_back(static_cast<int>(f));
+                            } else {
+                                if (iter > 0 && observed_dT[f] < pred_dT_threshold) {
+                                    ++n_frozen_by_freeze;
+                                }
+                                if (pred_dT < pred_dT_threshold) {
+                                    ++n_frozen_by_dT;
+                                }
+                            }
+                        }
+                        std::cout << "  Faces above predicted ΔT threshold ("
+                                  << pred_dT_threshold << " K): "
+                                  << faces_to_rerun.size() << " / " << num_faces
+                                  << "  (frozen: " << (num_faces - faces_to_rerun.size())
+                                  << ")" << std::endl;
+                    } else {
+                        for (size_t f = 0; f < num_faces; f++) {
+                            if (face_max_indirect[f] > rad_coupling_flux_tol) {
+                                faces_to_rerun.push_back(static_cast<int>(f));
+                            }
+                        }
+                        std::cout << "  Faces with significant indirect flux: "
+                                  << faces_to_rerun.size() << " / " << num_faces
+                                  << std::endl;
+                    }
 
                     if (faces_to_rerun.empty()) {
                         std::cout << "  No faces need re-run. Converged." << std::endl;
                         break;
                     }
 
-                    // Check convergence from previous iteration
+                    // Convergence check (skip on iter 0 — observed_dT is all 0
+                    // there because prev_temps == surface_temps).
                     if (iter > 0) {
-                        double max_temp_change = 0.0;
-                        int faces_changed = 0;
-
-                        for (size_t f = 0; f < num_faces; f++) {
-                            for (int t = 0; t < total_time_steps; t++) {
-                                double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                if (dT > max_temp_change) max_temp_change = dT;
-                                if (dT > rad_coupling_temp_tol) faces_changed++;
+                        // True face-fraction: count of faces whose max-over-t
+                        // ΔT exceeds rad_coupling_temp_tol. The legacy code
+                        // counted (face, timestep) samples and divided by
+                        // num_faces·total_time_steps, which is ~total_time_steps×
+                        // more permissive — keep that for legacy mode for
+                        // bit-equivalence; physics mode uses the truer metric.
+                        size_t faces_changing = 0;
+                        if (rad_coupling_physics_mode) {
+                            for (size_t f = 0; f < num_faces; f++) {
+                                if (observed_dT[f] > rad_coupling_temp_tol) ++faces_changing;
                             }
+                        } else {
+                            // Legacy sample-fraction (preserves byte-equivalence).
+                            size_t samples_changing = 0;
+                            for (size_t f = 0; f < num_faces; f++) {
+                                for (int t = 0; t < total_time_steps; t++) {
+                                    const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
+                                    if (dT > rad_coupling_temp_tol) ++samples_changing;
+                                }
+                            }
+                            faces_changing = samples_changing;  // reused below as a "count"
                         }
+                        const double frac_denom = rad_coupling_physics_mode
+                            ? static_cast<double>(num_faces)
+                            : static_cast<double>(num_faces) * total_time_steps;
+                        const double face_frac = static_cast<double>(faces_changing) / frac_denom;
 
-                        double face_frac = static_cast<double>(faces_changed) / (num_faces * total_time_steps);
                         std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
-                        std::cout << "  Samples still changing: " << std::scientific << std::setprecision(2)
+                        std::cout << (rad_coupling_physics_mode
+                                       ? "  Faces still changing:   "
+                                       : "  Samples still changing: ")
+                                  << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
 
-                        // Converge when BOTH conditions are met:
-                        // 1. Max temperature change is below threshold
-                        // 2. Fraction of samples still changing is below threshold
-                        if (max_temp_change < rad_coupling_temp_tol && face_frac < rad_coupling_face_frac) {
-                            std::cout << "  Converged!" << std::endl;
+                        // Converge when EITHER condition is met. The earlier
+                        // AND-conjunction blocked exit when a tiny handful of
+                        // pathological faces (typically PSR-floor edges with
+                        // extreme radiation feedback) oscillated by hundreds
+                        // of K, even after 99.99% of the mesh had settled.
+                        if (max_temp_change < rad_coupling_temp_tol) {
+                            std::cout << "  Converged on max-temperature criterion ("
+                                      << max_temp_change << " K < " << rad_coupling_temp_tol
+                                      << " K)" << std::endl;
+                            break;
+                        }
+                        if (face_frac < rad_coupling_face_frac) {
+                            std::cout << "  Converged on face-fraction criterion ("
+                                      << std::scientific << std::setprecision(2)
+                                      << (face_frac * 100) << "% < "
+                                      << (rad_coupling_face_frac * 100) << "%)"
+                                      << std::fixed << std::endl;
                             break;
                         }
                     }
 
-                    // Save previous temps for next iteration comparison
+                    // Save previous-iter snapshots for the NEXT iter.
                     prev_temps = surface_temps;
+                    prev_max_indirect = face_max_indirect;
+                    (void)total_indirect_per_face_sum;
+                    (void)n_frozen_by_dT;
+                    (void)n_frozen_by_freeze;
 
-                    // Step 3: Re-run thermal for selected faces with TIME-VARYING indirect flux
+                    // Step 3: Re-run thermal for selected faces with the updated
+                    // flux BC (= iter-0 flux composition + indirect_flux). The GPU
+                    // path mirrors iter-0's prepare_flux + cold-start + 2-eq+1-out
+                    // internally and consumes the raw arrays directly. The CPU
+                    // fallback still takes a pre-built combined_flux per face,
+                    // so we build that here with the SAME composition as iter-0
+                    // (Hayne for direct/reflected, ε for primary_ir, + indirect)
+                    // — this ensures both paths give physics-consistent results.
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
-
-                    // Build flux arrays with TIME-VARYING indirect contribution for all selected faces
-                    // Use per-face albedos to match the initial thermal solve
-                    std::vector<std::vector<double>> combined_flux(faces_to_rerun.size());
-                    for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
-                        int f = faces_to_rerun[idx];
-                        double face_albedo = face_albedos_rad[f];
-                        combined_flux[idx].resize(total_time_steps);
-                        for (int t = 0; t < total_time_steps; t++) {
-                            size_t flux_idx = static_cast<size_t>(f) * total_time_steps + t;
-                            // Direct + reflected solar (absorbed) with per-face albedo
-                            double solar_absorbed = (direct_solar_values[flux_idx] +
-                                                    primary_reflected_values[flux_idx]) * (1.0 - face_albedo);
-                            // Add absorbed IR
-                            double ir_absorbed = primary_ir_values[flux_idx] * planet.emissivity;
-                            // Add TIME-VARYING indirect radiation flux at this timestep
-                            combined_flux[idx][t] = solar_absorbed + ir_absorbed + indirect_flux_series[f][t];
-                        }
-                    }
 
                     // Check if GPU thermal is enabled
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
                     if (use_gpu_thermal_rerun && faces_to_rerun.size() >= 100) {
-                        // Use GPU thermal solver for radiation coupling re-runs
                         std::cout << "  Using GPU thermal solver..." << std::endl;
                         bool gpu_success = runThermalForSelectedFaces_GPU(
                             mesh,
                             faces_to_rerun,
-                            combined_flux,
+                            direct_solar_values,
+                            primary_reflected_values,
+                            primary_ir_values,
+                            indirect_flux_series,
+                            rad_post_eq_T,
                             times,
                             total_time_steps,
+                            equilibration_steps,
                             thermal_config,
-                            surface_temps
+                            surface_temps,
+                            sim_config.thermal.gpu_devices,
+                            sim_config.thermal.gpu_device_ids,
+                            sim_config.thermal.gpu_inter_batch_pause_ms,
+                            shared_rerun_pool
                         );
                         if (!gpu_success) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
                             use_gpu_thermal_rerun = false;
+                        }
+                    }
+
+                    // CPU path needs pre-built combined_flux per face. Build it
+                    // here with iter-0's composition + indirect_flux. Hayne is
+                    // applied per-timestep. Only built when GPU path is unused
+                    // or failed, to avoid wasting RAM (~5.2 GB for 1.8M faces ×
+                    // 960 steps × 8 bytes × 0.27 selection fraction).
+                    std::vector<std::vector<double>> combined_flux;
+                    if (!use_gpu_thermal_rerun) {
+                        // Hayne (2017) parameters — match iter-0.
+                        const double a_coef = (planet.albedoCoef.size() >= 2)
+                                            ? planet.albedoCoef[0] : 0.0;
+                        const double b_coef = (planet.albedoCoef.size() >= 2)
+                                            ? planet.albedoCoef[1] : 0.0;
+                        const double S_solar = planet.S;
+                        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+                        // Hapke gate (main-scope planet already carries the gate).
+                        const bool   use_hapke = planet.use_hapke_albedo
+                                               && planet.hapke_albedo_w >= 0.0;
+                        const double hapke_w   = planet.hapke_albedo_w;
+                        const bool   use_incidence = has_angular
+                                                   || (use_hapke && S_solar > 0.0);
+
+                        combined_flux.resize(faces_to_rerun.size());
+                        for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
+                            int f = faces_to_rerun[idx];
+                            const double base_A = planet.albedo;
+                            combined_flux[idx].resize(total_time_steps);
+                            for (int t = 0; t < total_time_steps; t++) {
+                                const size_t flux_idx = static_cast<size_t>(f)
+                                                      * total_time_steps + t;
+                                const double direct = direct_solar_values[flux_idx];
+                                const double reflected = primary_reflected_values[flux_idx];
+                                const double ir = primary_ir_values[flux_idx];
+                                const double albedo = use_incidence
+                                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
+                                                           use_hapke, hapke_w)
+                                    : base_A;
+                                combined_flux[idx][t] = (1.0 - albedo) * direct
+                                                      + (1.0 - albedo) * reflected
+                                                      + planet.emissivity * ir
+                                                      + indirect_flux_series[f][t];
+                            }
                         }
                     }
 
@@ -9576,6 +11410,126 @@ int main(int argc, char** argv) {
                 std::cout << "\n=== Radiation Exchange Complete ===" << std::endl;
                 std::cout << "  Mean indirect flux: " << stats.mean_indirect_flux << " W/m2" << std::endl;
                 std::cout << "  Max indirect flux: " << stats.max_indirect_flux << " W/m2" << std::endl;
+
+                // Deep radiation-coupling (pass 1): dump the per-face OUTPUT-window
+                // time-mean indirect flux <q_ind>[f] so a follow-up run can feed it
+                // into equilibration (thermal.eq_indirect_flux_file). Format:
+                // uint32 magic 'QIND', uint32 n_faces, n_faces float64.
+                if (!sim_config.thermal.indirect_mean_out_file.empty()
+                        && !indirect_flux_series.empty()) {
+                    const std::string& opath = sim_config.thermal.indirect_mean_out_file;
+                    const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                    const int out_lo = equilibration_steps;
+                    const int out_hi = total_time_steps;
+                    const int out_n = std::max(1, out_hi - out_lo);
+                    std::vector<double> q_ind_mean(nf, 0.0);
+                    #pragma omp parallel for schedule(static)
+                    for (uint32_t f = 0; f < nf; ++f) {
+                        const auto& row = indirect_flux_series[f];
+                        double s = 0.0;
+                        for (int t = out_lo; t < out_hi && t < static_cast<int>(row.size()); ++t)
+                            s += row[t];
+                        q_ind_mean[f] = s / out_n;
+                    }
+                    std::ofstream qo(opath, std::ios::binary);
+                    if (qo) {
+                        const uint32_t magic = 0x51494E44u;  // 'QIND'
+                        qo.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                        qo.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                        qo.write(reinterpret_cast<const char*>(q_ind_mean.data()),
+                                 static_cast<std::streamsize>(nf) * sizeof(double));
+                        double s = 0.0, mx = 0.0;
+                        for (double q : q_ind_mean) { s += q; mx = std::max(mx, q); }
+                        std::cout << "[Deep coupling] Wrote per-face mean indirect flux ("
+                                  << nf << " faces, mean " << (s / std::max<uint32_t>(1, nf))
+                                  << ", max " << mx << " W/m^2) -> " << opath << std::endl;
+                    } else {
+                        std::cerr << "Warning: cannot write indirect_mean_out_file '"
+                                  << opath << "'." << std::endl;
+                    }
+                }
+
+                // Per-timestep indirect-flux dump (env-gated) for offline flux
+                // analysis: PTM_DUMP_QIND_SERIES=<path>. Writes the per-face
+                // OUTPUT-window indirect (IR + reflected) radiosity flux series,
+                // aligned 1:1 with the saved direct_solar/illumination step files,
+                // so a script can form the total absorbed flux = direct + indirect
+                // and reduce it to per-face max/mean (the coupling effect on flux,
+                // which is otherwise visible only in temperature). Format:
+                // uint32 magic 'QIDT', uint32 n_faces, uint32 n_steps, then
+                // n_faces*n_steps float32 (face-major: all steps of face 0, ...).
+                if (const char* qsp = std::getenv("PTM_DUMP_QIND_SERIES")) {
+                    if (!indirect_flux_series.empty()) {
+                        const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = total_time_steps;
+                        const uint32_t ns = static_cast<uint32_t>(std::max(0, out_hi - out_lo));
+                        std::ofstream qo(qsp, std::ios::binary);
+                        if (qo) {
+                            const uint32_t magic = 0x51494454u;  // 'QIDT'
+                            qo.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                            qo.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                            qo.write(reinterpret_cast<const char*>(&ns), sizeof(ns));
+                            std::vector<float> rowbuf(ns);
+                            for (uint32_t f = 0; f < nf; ++f) {
+                                const auto& row = indirect_flux_series[f];
+                                for (uint32_t j = 0; j < ns; ++j) {
+                                    const int t = out_lo + static_cast<int>(j);
+                                    rowbuf[j] = (t < static_cast<int>(row.size()))
+                                        ? static_cast<float>(row[t]) : 0.0f;
+                                }
+                                qo.write(reinterpret_cast<const char*>(rowbuf.data()),
+                                         static_cast<std::streamsize>(ns) * sizeof(float));
+                            }
+                            std::cout << "[Deep coupling] Wrote per-timestep indirect flux series ("
+                                      << nf << " faces x " << ns << " steps) -> " << qsp << std::endl;
+                        } else {
+                            std::cerr << "Warning: cannot write PTM_DUMP_QIND_SERIES '"
+                                      << qsp << "'." << std::endl;
+                        }
+                    }
+                }
+
+                // Reflected-IR diagnostic (Lucey & Hayne 2021): for each face,
+                // the peak surface T over the output window and the radiosity
+                // indirect flux AT that instant. A follow-up script forms the
+                // apparent bolometric T = [(eps*sigma*T^4 + (1-eps)*I_inc)/sigma]^1/4
+                // (I_inc ~ Q_indirect/eps) to estimate the wall-IR reflected
+                // toward Diviner but absent from the emission-only comparison.
+                // Env-gated: PTM_DUMP_REFLIR=<path>. Format: uint32 magic 'RFIR',
+                // uint32 n_faces, then n_faces*(float64 Tpeak, float64 q_at_peak).
+                if (const char* rp = std::getenv("PTM_DUMP_REFLIR")) {
+                    if (!indirect_flux_series.empty() && !surface_temps.empty()) {
+                        const uint32_t nf = static_cast<uint32_t>(indirect_flux_series.size());
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = total_time_steps;
+                        std::vector<double> pk(static_cast<size_t>(nf) * 2, 0.0);
+                        #pragma omp parallel for schedule(static)
+                        for (uint32_t f = 0; f < nf; ++f) {
+                            const auto& Trow = surface_temps[f];
+                            const auto& Qrow = indirect_flux_series[f];
+                            double tmax = 0.0, qat = 0.0;
+                            for (int t = out_lo; t < out_hi && t < static_cast<int>(Trow.size()); ++t) {
+                                if (Trow[t] > tmax) {
+                                    tmax = Trow[t];
+                                    qat = (t < static_cast<int>(Qrow.size())) ? Qrow[t] : 0.0;
+                                }
+                            }
+                            pk[2 * f] = tmax;
+                            pk[2 * f + 1] = qat;
+                        }
+                        std::ofstream ro(rp, std::ios::binary);
+                        if (ro) {
+                            const uint32_t magic = 0x52464952u;  // 'RFIR'
+                            ro.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+                            ro.write(reinterpret_cast<const char*>(&nf), sizeof(nf));
+                            ro.write(reinterpret_cast<const char*>(pk.data()),
+                                     static_cast<std::streamsize>(nf) * 2 * sizeof(double));
+                            std::cout << "[Reflected-IR] Wrote per-face (Tpeak, q@peak) for "
+                                      << nf << " faces -> " << rp << std::endl;
+                        }
+                    }
+                }
             }
 
             std::cout << "=================================================\n" << std::endl;
@@ -9597,19 +11551,34 @@ int main(int argc, char** argv) {
     int stats_steps = 0;
     FilteredData stats_fd;
     {
-        const double steps_per_day_full = total_simulation_days > 0.0
-            ? static_cast<double>(total_time_steps) / total_simulation_days
-            : 0.0;
+        // PTM-15 fix: the integration (statistics) window lives entirely in the
+        // post-equilibration OUTPUT segment, which is sampled at the OUTPUT cadence.
+        // The blended full-run cadence total_time_steps/total_simulation_days mixes
+        // the (possibly coarse) equilibration cadence with the fine output cadence,
+        // so converting integration/offset DAYS -> steps with it under-counts the
+        // window for any decoupled-cadence run (equilibration_steps_per_day or
+        // eq_samples_per_diurnal_cycle set). That silently reduced the statistics
+        // _max/_min/_avg window below the written output frames: e.g. Moon3D 240 eq
+        // (4.06/day) + 360 out (12.19/day) gave 29.53*(600/88.59)=200 stats steps
+        // instead of 29.53*12.19=360, so direct_solar_max.bin was a max over only
+        // output frames [0,200) and under-reported the true per-frame max (which
+        // peaks near frame 215) for ~23% of faces. Use the output cadence; falls
+        // back to the blended cadence only if the output cadence is unavailable.
+        const double integ_steps_per_day = (output_steps_per_day > 0.0)
+            ? output_steps_per_day
+            : (total_simulation_days > 0.0
+                ? static_cast<double>(total_time_steps) / total_simulation_days
+                : 0.0);
 
         double integ_days_used = (integration_days > 0.0 ? integration_days : output_days);
         int integration_steps = (integration_steps_cli > 0)
             ? integration_steps_cli
-            : static_cast<int>(std::llround(integ_days_used * steps_per_day_full));
+            : static_cast<int>(std::llround(integ_days_used * integ_steps_per_day));
         if (integration_steps < 1) integration_steps = 1;
 
         int integration_offset_steps = (integration_offset_steps_cli >= 0)
             ? integration_offset_steps_cli
-            : static_cast<int>(std::llround(std::max(0.0, integration_offset_days) * steps_per_day_full));
+            : static_cast<int>(std::llround(std::max(0.0, integration_offset_days) * integ_steps_per_day));
         if (integration_offset_steps < 0) integration_offset_steps = 0;
 
         stats_start_step = equilibration_steps + integration_offset_steps;
@@ -9621,6 +11590,26 @@ int main(int argc, char** argv) {
         std::cout << "\n[Integration] Statistics interval\n"
                 << "  Start (abs step): " << stats_start_step << "\n"
                 << "  Duration (steps): " << stats_steps << "\n";
+
+        // Make silence impossible (PTM-15 archetype): the per-timestep output frames
+        // cover abs steps [equilibration_steps, equilibration_steps+time_steps); if the
+        // statistics window does NOT cover all of them, the _max/_min/_avg files are
+        // reduced over a STRICT SUBSET of the written frames — a consumer reading
+        // direct_solar_max.bin as a global per-face max would be wrong. Warn loudly.
+        {
+            const int out_first = equilibration_steps;
+            const int out_last  = equilibration_steps + time_steps; // one past end
+            const int stat_last = stats_start_step + stats_steps;   // one past end
+            if (stats_start_step > out_first || stat_last < out_last) {
+                std::cerr << "WARNING: statistics window [" << stats_start_step << ","
+                          << stat_last << ") does NOT cover all written output frames ["
+                          << out_first << "," << out_last << "); statistics/_max, _min and"
+                             " _avg are reduced over that SUBSET only and can under-report"
+                             " the per-frame extrema (PTM-15). Set integration_days >= the"
+                             " output span (and integration_offset_days=0) for a full-window"
+                             " reduction.\n";
+            }
+        }
 
         if (have_full_illum_arrays) {
             // Normal path: slice all arrays
@@ -10330,6 +12319,35 @@ int main(int argc, char** argv) {
         } else if (sim_config.thermal.compute_ice_stability) {
             std::cerr << "[Ice stability] WARNING: requested but accumulator not ready "
                          "(thermal solver path may not yet implement the hook)." << std::endl;
+        }
+    }
+
+    // ===== Band-separated INDIRECT flux outputs (Paul's product) =====
+    // indirect_solar (absorbed multiply-scattered solar) + indirect_ir (absorbed
+    // thermal-IR), per-timestep frames + statistics, mirroring direct_solar /
+    // primary_ir. ABSORBED convention (see writeIndirectBandOutputs). Emitted only
+    // for coupled two-band runs where the bands were captured; radoff / gray /
+    // multi-GPU-pool runs OMIT them (no radiosity band split available), which
+    // keeps those runs' pre-existing outputs byte-identical.
+    if (output_format == "binary" && run_thermal_mesh
+            && !indirect_solar_series.empty()) {
+        if (indirect_bands_available && !indirect_bands_batch_gap) {
+            const bool write_frames = !sim_config.output.skip_time_series;
+            bool ib_ok = writeIndirectBandOutputs(
+                output_dir, mesh,
+                indirect_solar_series, indirect_ir_series,
+                equilibration_steps, time_steps,   // frame window (output)
+                stats_start_step, stats_steps,     // stats window (PTM-15)
+                write_frames, compute_statistics);
+            if (!ib_ok) {
+                std::cerr << "[indirect-bands] WARNING: one or more indirect-band "
+                             "outputs failed to write.\n";
+            }
+        } else {
+            std::cerr << "[indirect-bands] Band-separated indirect outputs OMITTED "
+                         "(bands_available=" << indirect_bands_available
+                      << ", batch_gap=" << indirect_bands_batch_gap
+                      << "). The indirect_flux_series total is unaffected.\n";
         }
     }
 

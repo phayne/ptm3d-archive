@@ -137,12 +137,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 return false;
             }
 
-            // Try to load mesh from file using MeshUtils
+            // PTM-17: a REQUESTED mesh that fails to load is FATAL. Never silently fall
+            // back to a default icosphere for a specified mesh_file (that would run on the
+            // wrong geometry). The empty-mesh_file procedural path above is unaffected.
             if (!mesh_utils.loadMeshFromFile(mesh_file)) {
-                std::cerr << "Failed to load mesh from file: " << mesh_file << std::endl;
-                std::cerr << "Falling back to default mesh" << std::endl;
-                mesh_utils.setMeshResolution(4);
-                mesh_utils.setupMesh();
+                std::cerr << "FATAL: Failed to load mesh from file: " << mesh_file
+                          << " (refusing to substitute a default icosphere)." << std::endl;
+                return false;
             }
         }
 
