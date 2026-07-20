@@ -102,6 +102,24 @@ double PhotometricModel::reflectedIF(double cos_i, double cos_e,
     return M_PI * r * cos_i;
 }
 
+double PhotometricModel::geometricAlbedoFromW(double w) {
+    // Opposition-excluded isotropic disk integral (Hapke 1993):
+    //     p = w/8 + 0.49*r0 + 0.196*r0^2,   r0 = (1-gamma)/(1+gamma),
+    //     gamma = sqrt(1-w).
+    // The w/8 term is the singly-scattered contribution at zero phase; the two
+    // r0 terms are the isotropic multiple-scattering contribution. B0 and g are
+    // intentionally NOT included — this is the calibration/verification integral,
+    // not the bidirectional render (see header).
+    double ww = std::max(0.0, std::min(1.0, w));
+    double gamma = std::sqrt(std::max(0.0, 1.0 - ww));
+    double r0 = (1.0 - gamma) / (1.0 + gamma);
+    return ww / 8.0 + 0.49 * r0 + 0.196 * r0 * r0;
+}
+
+double PhotometricModel::geometricAlbedo() const {
+    return geometricAlbedoFromW(params_.hapke_w);
+}
+
 // ============================================================================
 // Individual reflectance models
 // ============================================================================
@@ -215,7 +233,11 @@ double PhotometricModel::thermalSpectralRadiance(double T_kelvin, double cos_e,
     double B = planckFunction(lambda_m, T_kelvin);
     // Convert from W/m^2/sr/m to W/m^2/sr/um
     B *= 1e-6;
-    return params_.emissivity * B * emissionPhase(cos_e);
+    // Camera-measured emitted radiance is view-angle independent for a
+    // Lambertian grey emitter: L = epsilon * B(lambda, T). No cos(emission)
+    // factor — that weighting belongs to emitted *flux*/radiosity, not to what
+    // a pixel measures. (cos_e > 0 is still required for the face to be visible.)
+    return params_.emissivity * B;
 }
 
 double PhotometricModel::thermalBroadbandRadiance(double T_kelvin, double cos_e) const {

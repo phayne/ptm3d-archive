@@ -34,7 +34,24 @@ struct CameraConfig {
     double look_at_lat_deg = 0.0;
     double look_at_lon_deg = 0.0;
 
-    // Up vector hint
+    // Up vector hint. In EXPLICIT mode (default) up_vector is used as-is for the
+    // LOOK_AT Gram-Schmidt.
+    //
+    // VELOCITY_POLE: up_vector recomputed per frame as the body-fixed axis
+    //   perpendicular to the spacecraft velocity and closest to the body
+    //   spin-axis positive direction (north pole, = body-fixed +Z by IAU/SPICE
+    //   convention): up = normalize(pole - (pole.v_hat) v_hat).
+    //
+    // BORESIGHT_POLE (EMA default): the pole projected off the camera BORESIGHT
+    //   rather than the velocity: up = normalize(pole - (pole.b_hat) b_hat),
+    //   where b_hat is the look direction (camera_pos -> look_at). This keeps
+    //   celestial north exactly in the image plane, independent of the flyby
+    //   velocity. Falls back to a fixed body axis when the pole is within 5 deg
+    //   of the boresight, forces north-up sign (up.pole > 0), and preserves a
+    //   right-handed (right, up, forward) frame so the image is not mirrored.
+    //   See CameraSimulator::renderFrame.
+    enum class UpMode { EXPLICIT, VELOCITY_POLE, BORESIGHT_POLE };
+    UpMode up_mode = UpMode::EXPLICIT;
     std::array<double, 3> up_vector{0.0, 0.0, 1.0};
 
     // Optics — pinhole geometry

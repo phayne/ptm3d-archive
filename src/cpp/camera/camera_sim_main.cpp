@@ -27,6 +27,13 @@ void printUsage(const char* prog) {
               << "                             where TARGET is 'sun' or 'primary' (or\n"
               << "                             'earth' as alias). For eclipse animations.\n"
               << "  --up X Y Z                Up vector [default: 0 0 1]\n"
+              << "  --up-velocity-pole        Per-frame up = body axis perpendicular to the\n"
+              << "                             spacecraft velocity and closest to the spin-axis\n"
+              << "                             positive direction (north pole). Overrides --up.\n"
+              << "  --up-boresight-pole       Per-frame up = north pole projected off the camera\n"
+              << "                             boresight: up = normalize(pole - (pole.b_hat)b_hat).\n"
+              << "                             Keeps north in the image plane; falls back to a\n"
+              << "                             fixed axis within 5 deg of the boresight. Overrides --up.\n"
               << "  --quaternion W X Y Z      Override pointing with quaternion (camera→body)\n"
               << "  --focal-mm F              Focal length in mm [default: 50]\n"
               << "  --sensor-mm W H           Sensor dimensions in mm [default: 36 24]\n"
@@ -169,6 +176,12 @@ int main(int argc, char* argv[]) {
             config.camera.up_vector[0] = std::stod(argv[++i]);
             config.camera.up_vector[1] = std::stod(argv[++i]);
             config.camera.up_vector[2] = std::stod(argv[++i]);
+        }
+        else if (arg == "--up-velocity-pole") {
+            config.camera.up_mode = ptm::CameraConfig::UpMode::VELOCITY_POLE;
+        }
+        else if (arg == "--up-boresight-pole") {
+            config.camera.up_mode = ptm::CameraConfig::UpMode::BORESIGHT_POLE;
         }
         else if (arg == "--focal-mm" && i+1 < argc) {
             config.camera.focal_length_mm = std::stod(argv[++i]);

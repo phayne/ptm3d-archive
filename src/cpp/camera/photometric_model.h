@@ -54,6 +54,22 @@ public:
     // Compute I/F (radiance factor) — dimensionless
     double reflectedIF(double cos_i, double cos_e, double alpha_rad) const;
 
+    // Opposition-excluded isotropic-multiple-scattering disk-integrated
+    // geometric albedo for the active Hapke single-scattering albedo w.
+    // Closed form (Hapke 1993, isotropic H-function approximation):
+    //     p = w/8 + 0.49*r0 + 0.196*r0^2,   r0 = (1-gamma)/(1+gamma),
+    //     gamma = sqrt(1-w).
+    // Deliberately EXCLUDES the opposition surge (B0) and the single-particle
+    // phase function (g): those describe the phase dependence AWAY from
+    // opposition and must not be folded into the disk integral used to
+    // calibrate w against a body's measured geometric albedo (doing so
+    // mis-fits w by ~4x). Static so it can be used to calibrate/verify w
+    // without constructing a model instance.
+    static double geometricAlbedoFromW(double w);
+
+    // Convenience: geometric albedo for this model's configured hapke_w.
+    double geometricAlbedo() const;
+
     // Compute thermal spectral radiance (W/m^2/sr/um) at wavelength lambda_um
     double thermalSpectralRadiance(double T_kelvin, double cos_e, double lambda_um) const;
 
