@@ -16,6 +16,7 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <unordered_map>
 #include <random>
 #include <limits>
 #include <cassert>
@@ -244,6 +245,52 @@ bool IlluminationModel::initializeScene(
             return false;
         }
 
+        // Occluder-only geometry: append the ring/annulus triangles to the
+        // ray-tracing BVH so distant topography shadows the core. They are
+        // shadow-only (boolean rtcOccluded path returns no face id), never
+        // thermally solved / radiosity-coupled / output. When there are no
+        // occluders, Vv/Ff alias the inputs verbatim → byte-identical to
+        // the pre-occluder behavior. See docs/extended-occluder-architecture.md
+        // PTM-18: interior-hole seal gate (env; also settable via setSealInteriorHoles). Compute the
+        // fill BEFORE the merge so the fills (CORE-vertex indices) append after core [+ occluder ring]
+        // in primID space. Default OFF -> no fill -> byte-identical (below preserves the input alias).
+        if (const char* sh = std::getenv("PTM_ILLUM_SEAL_HOLES"))
+            if (sh[0]=='1'||sh[0]=='t'||sh[0]=='T'||sh[0]=='y'||sh[0]=='Y') seal_interior_holes_ = true;
+        std::vector<std::array<int, 3>> seal_faces;
+        if (seal_interior_holes_)
+            seal_faces = buildInteriorHoleFill(vertices, faces);
+
+        std::vector<std::array<double, 3>> verts_merged;
+        std::vector<std::array<int, 3>>    faces_merged;
+        const std::vector<std::array<double, 3>>* Vsrc = &vertices;
+        const std::vector<std::array<int, 3>>*    Fsrc = &faces;
+        const bool have_occ = (!occluder_faces_.empty() && !occluder_vertices_.empty());
+        if (have_occ || !seal_faces.empty()) {
+            verts_merged = vertices;
+            faces_merged = faces;
+            faces_merged.reserve(faces.size()
+                                 + (have_occ ? occluder_faces_.size() : 0)
+                                 + seal_faces.size());
+            if (have_occ) {
+                const int voff = static_cast<int>(vertices.size());
+                verts_merged.insert(verts_merged.end(),
+                                    occluder_vertices_.begin(),
+                                    occluder_vertices_.end());
+                for (const auto& f : occluder_faces_)
+                    faces_merged.push_back({ f[0] + voff, f[1] + voff, f[2] + voff });
+                std::cout << "[IlluminationModel] + " << occluder_faces_.size()
+                          << " occluder triangles (shadow-only; core faces="
+                          << faces.size() << ")\n";
+            }
+            // Interior-hole fills reference CORE vertices (indices < vertices.size()); append verbatim
+            // as shadow-only occluders after the core [+ ring].
+            for (const auto& f : seal_faces) faces_merged.push_back(f);
+            Vsrc = &verts_merged;
+            Fsrc = &faces_merged;
+        }
+        const std::vector<std::array<double, 3>>& Vv = *Vsrc;
+        const std::vector<std::array<int, 3>>&    Ff = *Fsrc;
+
         if (!embree_device_) {
             embree_device_ = rtcNewDevice("");
             if (!embree_device_) {
@@ -276,7 +323,7 @@ bool IlluminationModel::initializeScene(
                                         -std::numeric_limits<double>::max(),
                                         -std::numeric_limits<double>::max() };
 
-        for (const auto& v : vertices) {
+        for (const auto& v : Vv) {
             bb_min[0] = std::min(bb_min[0], v[0]); bb_max[0] = std::max(bb_max[0], v[0]);
             bb_min[1] = std::min(bb_min[1], v[1]); bb_max[1] = std::max(bb_max[1], v[1]);
             bb_min[2] = std::min(bb_min[2], v[2]); bb_max[2] = std::max(bb_max[2], v[2]);
@@ -289,6 +336,243 @@ bool IlluminationModel::initializeScene(
         };
         scene_has_offset_ = true;
 
+        // Closed-vs-open mesh detection (topology, not shape). Count boundary
+        // edges: an undirected edge shared by exactly one triangle is a boundary
+        // edge. 0 boundary edges => watertight/closed; any => open patch. Uses the
+        // CORE faces only (an occluder ring is legitimately open and must NOT flip
+        // the body pre-check on for a closed core). O(edges) with a hash set.
+        // Gates the analytic body-occlusion pre-check on the CPU AND GPU paths;
+        // see the mesh_is_open_ note in the header and memory
+        // ptm-mu-gate-open-mesh-selfocclusion-fail.
+        {
+            const auto t_topo0 = std::chrono::steady_clock::now();
+            // Map each undirected edge (min,max vertex id) -> incidence count.
+            std::unordered_map<uint64_t, uint32_t> edge_count;
+            edge_count.reserve(faces.size() * 3);
+            auto edge_key = [](int a, int b) -> uint64_t {
+                uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+                uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+                return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+            };
+            for (const auto& f : faces) {
+                ++edge_count[edge_key(f[0], f[1])];
+                ++edge_count[edge_key(f[1], f[2])];
+                ++edge_count[edge_key(f[2], f[0])];
+            }
+            size_t boundary_edges = 0;
+            for (const auto& kv : edge_count) {
+                if (kv.second == 1) ++boundary_edges;
+            }
+            mesh_is_open_ = (boundary_edges > 0);
+
+            // Body-level occluding-sphere radius for the OPEN-mesh pre-check:
+            // min over core-face centroid radii (native units, matching runtime
+            // |fc|). See the body_radius_occ_native_ note in the header. Only
+            // meaningful/used when mesh_is_open_; harmless to compute for closed.
+            double r_min = std::numeric_limits<double>::max();
+            for (const auto& f : faces) {
+                const auto& a = vertices[f[0]];
+                const auto& b = vertices[f[1]];
+                const auto& c = vertices[f[2]];
+                const double cx = (a[0] + b[0] + c[0]) / 3.0;
+                const double cy = (a[1] + b[1] + c[1]) / 3.0;
+                const double cz = (a[2] + b[2] + c[2]) / 3.0;
+                const double rc = std::sqrt(cx*cx + cy*cy + cz*cz);
+                if (rc < r_min) r_min = rc;
+            }
+            body_radius_occ_native_ = (r_min == std::numeric_limits<double>::max())
+                                          ? 0.0 : r_min;
+
+            const auto t_topo1 = std::chrono::steady_clock::now();
+            const double topo_ms =
+                std::chrono::duration<double, std::milli>(t_topo1 - t_topo0).count();
+            std::cout << "[IlluminationModel] mesh topology: "
+                      << (mesh_is_open_ ? "OPEN patch" : "CLOSED (watertight)")
+                      << " (" << boundary_edges << " boundary edges / "
+                      << edge_count.size() << " unique edges, "
+                      << faces.size() << " core faces; detect "
+                      << topo_ms << " ms). Analytic body-occlusion pre-check "
+                      << (mesh_is_open_ ? "ENABLED (open: sole self-occlusion guard)."
+                                        : "DISABLED (closed: Embree self-occludes).")
+                      << " R_occ(body) = " << body_radius_occ_native_
+                      << " (native units).\n";
+        }
+
+        // PTM-13: build the local-horizon (skyline) field for the grazing DIRECT-sun shadow
+        // cull IF requested. Default OFF -> byte-identical (no build, no cull). Env knobs:
+        // PTM_ILLUM_HORIZON_CULL=1 enable; PTM_ILLUM_HORIZON_SLACK_DEG / _CELL_SCALE tune it.
+        // The cull is azimuth-specific and resolution-independent (see horizon_field.h); it is
+        // the physics fix for the mm-relief PSR leak that the single Embree shadow ray hops.
+        {
+            if (const char* he = std::getenv("PTM_ILLUM_HORIZON_CULL"))
+                if (he[0]=='1'||he[0]=='t'||he[0]=='T'||he[0]=='y'||he[0]=='Y') use_horizon_cull_ = true;
+            if (const char* se = std::getenv("PTM_ILLUM_HORIZON_SLACK_DEG")) horizon_slack_deg_ = std::atof(se);
+            if (const char* ce = std::getenv("PTM_ILLUM_HORIZON_CELL_SCALE")) horizon_cell_scale_ = std::atof(ce);
+        }
+        if (use_horizon_cull_) {
+            const size_t Fh = Ff.size();
+            // Local up = outward radial (direction of the selenocentric bbox center for a
+            // recentered planetary patch). A SINGLE global up is valid only for a small patch
+            // (curvature negligible) -- gated on angular extent below; warned + disabled otherwise.
+            std::array<double,3> up = scene_has_offset_ ? scene_origin_offset_
+                                                        : std::array<double,3>{{0.0,0.0,1.0}};
+            { double L = std::sqrt(up[0]*up[0]+up[1]*up[1]+up[2]*up[2]); if (L>0){up[0]/=L;up[1]/=L;up[2]/=L;} }
+            const double body_r = scene_has_offset_
+                ? std::sqrt(scene_origin_offset_[0]*scene_origin_offset_[0]
+                          + scene_origin_offset_[1]*scene_origin_offset_[1]
+                          + scene_origin_offset_[2]*scene_origin_offset_[2]) : 0.0;
+            std::vector<std::array<double,3>> fcs(Fh);
+            std::vector<double> pitches(Fh, 0.0);
+            std::array<double,3> bmin{{1e300,1e300,1e300}}, bmax{{-1e300,-1e300,-1e300}};
+            for (size_t f = 0; f < Fh; ++f) {
+                const auto& a = Vv[Ff[f][0]]; const auto& b = Vv[Ff[f][1]]; const auto& c = Vv[Ff[f][2]];
+                std::array<double,3> ctr{{(a[0]+b[0]+c[0])/3.0,(a[1]+b[1]+c[1])/3.0,(a[2]+b[2]+c[2])/3.0}};
+                if (scene_has_offset_) { ctr[0]-=scene_origin_offset_[0]; ctr[1]-=scene_origin_offset_[1]; ctr[2]-=scene_origin_offset_[2]; }
+                fcs[f] = ctr;
+                for (int k=0;k<3;++k){ bmin[k]=std::min(bmin[k],ctr[k]); bmax[k]=std::max(bmax[k],ctr[k]); }
+                const double dx=a[0]-b[0], dy=a[1]-b[1], dz=a[2]-b[2];
+                pitches[f] = std::sqrt(dx*dx+dy*dy+dz*dz);
+            }
+            const double extent = std::max({bmax[0]-bmin[0], bmax[1]-bmin[1], bmax[2]-bmin[2]});
+            std::nth_element(pitches.begin(), pitches.begin()+Fh/2, pitches.end());
+            const double med_pitch = (Fh>0 && pitches[Fh/2]>0.0) ? pitches[Fh/2] : 1.0;
+            const double cell = horizon_cell_scale_ * med_pitch;
+            const double gate = (body_r>0.0) ? body_r*(0.25*M_PI/180.0) : 1e300;  // 0.25 deg of arc
+            if (body_r>0.0 && extent>gate) {
+                std::cout << "[IlluminationModel] PTM-13 horizon cull DISABLED: mesh extent " << extent
+                          << " m exceeds the single-up validity limit " << gate << " m (0.25 deg arc at "
+                          << "body radius " << body_r << " m); curvature would invalidate the global-up "
+                          << "skyline. Keeping the Embree shadow test.\n";
+                use_horizon_cull_ = false;
+            } else {
+                horizon_direct_.setSlackDeg(horizon_slack_deg_);
+                horizon_direct_.build(fcs, up, cell);
+                std::cout << "[IlluminationModel] PTM-13 local-horizon direct-shadow cull ENABLED (cell="
+                          << cell*1000.0 << " mm, slack=" << horizon_slack_deg_ << " deg, " << Fh
+                          << " faces, azimuth-specific skyline; resolution-independent).\n";
+                if (use_gpu_ray_tracer_)
+                    std::cout << "[IlluminationModel] WARNING: the horizon cull applies on the CPU "
+                                 "illumination path only; GPU ray tracing is active, so the cull will "
+                                 "NOT engage. Set illumination.use_gpu:false to apply it (or add the GPU mirror).\n";
+            }
+        }
+
+        // PTM-13 P1: build the topological self-skip adjacency (source + N-ring edge neighbors) for
+        // the grazing DIRECT-sun shadow ray IF requested. Default OFF -> byte-identical (no build, no
+        // re-trace). Env knobs: PTM_ILLUM_TOPO_SELFSKIP=1 enable; PTM_ILLUM_SELFSKIP_RINGS=<n> depth.
+        // When ON, the CPU direct-solar occlusion starts the ray AT the face (eps_n=eps_d=0, tnear=0)
+        // and skips the source + its <= N edge rings by primID, so the ~mm-scale local rim occluder
+        // (present in the mesh) is detected instead of hopped by the 1 cm offset. See BUGS.md PTM-13.
+        {
+            if (const char* se = std::getenv("PTM_ILLUM_TOPO_SELFSKIP"))
+                if (se[0]=='1'||se[0]=='t'||se[0]=='T'||se[0]=='y'||se[0]=='Y') use_topo_selfskip_ = true;
+            if (const char* re = std::getenv("PTM_ILLUM_SELFSKIP_RINGS")) {
+                int rr = std::atoi(re); if (rr >= 1) selfskip_rings_ = rr;
+            }
+        }
+        if (use_topo_selfskip_) {
+            const auto t_ss0 = std::chrono::steady_clock::now();
+            buildSelfSkipAdjacency(Ff, faces.size());
+            const auto t_ss1 = std::chrono::steady_clock::now();
+            const size_t ncore = faces.size();
+            const double mean_nbr = (ncore > 0)
+                ? static_cast<double>(face_skip_nbr_.size()) / static_cast<double>(ncore) : 0.0;
+            std::cout << "[IlluminationModel] PTM-13 topological self-skip ENABLED (rings="
+                      << selfskip_rings_ << ", " << ncore << " core faces, mean " << mean_nbr
+                      << " skip-ids/face incl self; ray starts AT face, eps_n=eps_d=0, tnear=0; build "
+                      << std::chrono::duration<double, std::milli>(t_ss1 - t_ss0).count()
+                      << " ms). The mm-scale rim occluder is detected topologically instead of hopped "
+                         "by the 1 cm offset.\n";
+            if (use_gpu_ray_tracer_)
+                std::cout << "[IlluminationModel] WARNING: topological self-skip applies on the CPU "
+                             "illumination path only; GPU ray tracing is active, so it will NOT engage. "
+                             "Set illumination.use_gpu:false to apply it (or add the GPU mirror). The "
+                             "GPU batch shadow origin additionally uses eps_d=8x (see BUGS.md PTM-13).\n";
+        }
+
+        // PTM-13 rise-epsilon: build the per-core-face facet scale for the out-of-plane-rise
+        // self-relief discriminator IF requested. Default OFF -> byte-identical (no build, no
+        // re-trace). Env knobs: PTM_ILLUM_RISE_EPS=1 enable; PTM_ILLUM_RISE_KEPS=<k> the facet
+        // fraction (h_eps = k * local edge; default 0.2 -> ~0.5 mm at a 2.5 mm facet). Independent
+        // of the self-skip flag: it separates self-relief from a real occluder by out-of-plane RISE
+        // (self-relief ~0.12 mm vs the ~2.47 mm rim the 1 cm offset hops), not by distance or ring.
+        {
+            if (const char* re = std::getenv("PTM_ILLUM_RISE_EPS"))
+                if (re[0]=='1'||re[0]=='t'||re[0]=='T'||re[0]=='y'||re[0]=='Y') use_rise_eps_ = true;
+            if (const char* ke = std::getenv("PTM_ILLUM_RISE_KEPS")) {
+                double kk = std::atof(ke); if (kk > 0.0) rise_keps_ = kk;
+            }
+            // PTM-13 OPTION 3 multi-hit refinement (sub-mode). RISE_EPS2 implies RISE_EPS so the base
+            // build + CPU routing engage; the OR layer lives inside traceOccludedRiseEps.
+            if (const char* r2 = std::getenv("PTM_ILLUM_RISE_EPS2"))
+                if (r2[0]=='1'||r2[0]=='t'||r2[0]=='T'||r2[0]=='y'||r2[0]=='Y') { use_rise_eps2_ = true; use_rise_eps_ = true; }
+            if (const char* be = std::getenv("PTM_ILLUM_RISE_BARY_EPS")) {
+                double bb = std::atof(be); if (bb >= 0.0) rise_bary_eps_ = bb;
+            }
+            // PTM-13 Class-2 fix: absolute self-relief floor override (meters). >=0 replaces the
+            // edge-proportional h_eps with a fixed floor (0 => exact source-triangle-only exclusion).
+            // Default unset -> rise_habs_ stays -1.0 -> byte-identical (edge-proportional floor).
+            if (const char* ha = std::getenv("PTM_ILLUM_RISE_HABS")) {
+                double hh = std::atof(ha); if (hh >= 0.0) rise_habs_ = hh;
+            }
+        }
+        if (use_rise_eps_) {
+            const size_t ncore = faces.size();
+            face_edge_local_.assign(ncore, 0.0f);
+            auto elen = [](const std::array<double,3>& p, const std::array<double,3>& q) {
+                const double dx=p[0]-q[0], dy=p[1]-q[1], dz=p[2]-q[2];
+                return std::sqrt(dx*dx+dy*dy+dz*dz);
+            };
+            double sum_e = 0.0;
+            for (size_t c = 0; c < ncore; ++c) {
+                const auto& a = Vv[Ff[c][0]]; const auto& b = Vv[Ff[c][1]]; const auto& d = Vv[Ff[c][2]];
+                const double em = (elen(a,b) + elen(b,d) + elen(d,a)) / 3.0;
+                face_edge_local_[c] = static_cast<float>(em);
+                sum_e += em;
+            }
+            const double mean_e = (ncore > 0) ? sum_e / static_cast<double>(ncore) : 0.0;
+            std::cout << "[IlluminationModel] PTM-13 rise-epsilon self-relief discriminator ENABLED (k="
+                      << rise_keps_ << ", mean facet edge " << mean_e*1000.0 << " mm -> mean h_eps "
+                      << rise_keps_*mean_e*1000.0 << " mm, " << ncore << " core faces; ray marches from "
+                         "the centroid, a hit counts as a real occluder iff it rises >= h_eps out of the "
+                         "source face plane). Separates ~0.12 mm self-relief from the ~2.47 mm rim the "
+                         "1 cm offset hops.\n";
+            if (rise_habs_ >= 0.0) {
+                std::cout << "[IlluminationModel] PTM-13 Class-2 fix: ABSOLUTE self-relief floor "
+                             "OVERRIDE h_eps = " << rise_habs_*1000.0 << " mm (env PTM_ILLUM_RISE_HABS), "
+                             "replacing the edge-proportional " << rise_keps_ << "*edge (~"
+                          << rise_keps_*mean_e*1000.0 << " mm). h_abs=0 => exact source-triangle-only "
+                             "self-exclusion (resolved relief shadows; Paul's scale ruling). Phase-2 "
+                             "knob table: 0.2*edge kills 0.9% of grazing occlusions, h_abs=0 kills 100% "
+                             "with 0 acne.\n";
+            }
+            if (use_rise_eps2_) {
+                // OPTION 3: store the recentered double vertices of every core face so the OR layer can
+                // recompute a float64-interior test + the hit-triangle max-vertex rise per hit.
+                face_verts_local_.assign(ncore, {{{{0,0,0}},{{0,0,0}},{{0,0,0}}}});
+                for (size_t c = 0; c < ncore; ++c) {
+                    for (int k = 0; k < 3; ++k) {
+                        const auto& vv = Vv[Ff[c][k]];
+                        face_verts_local_[c][k] = {{ vv[0] - scene_origin_offset_[0],
+                                                     vv[1] - scene_origin_offset_[1],
+                                                     vv[2] - scene_origin_offset_[2] }};
+                    }
+                }
+                std::cout << "[IlluminationModel] PTM-13 rise-epsilon MULTI-HIT refinement (OPTION 3) "
+                             "ENABLED (bary_eps=" << rise_bary_eps_ << "): a hit ALSO blocks iff it is a "
+                             "float64-INTERIOR crossing whose TRIANGLE max-vertex rise >= h_eps (catches "
+                             "the near-coplanar occluder crossed near its shared edge; STEP-1 recall "
+                             "24%->84%, ~0 incremental acne). Strict superset of the base rise-eps blocks.\n";
+            }
+            if (use_topo_selfskip_)
+                std::cout << "[IlluminationModel] NOTE: both rise-epsilon and topological self-skip are "
+                             "enabled; rise-epsilon takes precedence on the CPU direct-solar path.\n";
+            if (use_gpu_ray_tracer_)
+                std::cout << "[IlluminationModel] WARNING: rise-epsilon applies on the CPU illumination "
+                             "path only; GPU ray tracing is active, so it will NOT engage. Set "
+                             "illumination.use_gpu:false to apply it (or add the GPU mirror).\n";
+        }
+
         RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);
         if (!geom) {
             std::cerr << "[IlluminationModel] Failed to create Embree geometry" << std::endl;
@@ -297,8 +581,8 @@ bool IlluminationModel::initializeScene(
         rtcSetGeometryBuildQuality(geom, RTC_BUILD_QUALITY_HIGH);
         rtcSetGeometryMask(geom, 0xFFFFFFFFu);
 
-        const size_t V = vertices.size();
-        const size_t F = faces.size();
+        const size_t V = Vv.size();
+        const size_t F = Ff.size();
 
         float* vbuf = static_cast<float*>(rtcSetNewGeometryBuffer(
             geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
@@ -309,9 +593,9 @@ bool IlluminationModel::initializeScene(
             return false;
         }
         for (size_t i = 0; i < V; ++i) {
-            vbuf[i*3 + 0] = static_cast<float>(vertices[i][0] - scene_origin_offset_[0]);
-            vbuf[i*3 + 1] = static_cast<float>(vertices[i][1] - scene_origin_offset_[1]);
-            vbuf[i*3 + 2] = static_cast<float>(vertices[i][2] - scene_origin_offset_[2]);
+            vbuf[i*3 + 0] = static_cast<float>(Vv[i][0] - scene_origin_offset_[0]);
+            vbuf[i*3 + 1] = static_cast<float>(Vv[i][1] - scene_origin_offset_[1]);
+            vbuf[i*3 + 2] = static_cast<float>(Vv[i][2] - scene_origin_offset_[2]);
         }
 
         uint32_t* ibuf = static_cast<uint32_t*>(rtcSetNewGeometryBuffer(
@@ -323,9 +607,9 @@ bool IlluminationModel::initializeScene(
             return false;
         }
         for (size_t i = 0; i < F; ++i) {
-            ibuf[i*3 + 0] = static_cast<uint32_t>(faces[i][0]);
-            ibuf[i*3 + 1] = static_cast<uint32_t>(faces[i][1]);
-            ibuf[i*3 + 2] = static_cast<uint32_t>(faces[i][2]);
+            ibuf[i*3 + 0] = static_cast<uint32_t>(Ff[i][0]);
+            ibuf[i*3 + 1] = static_cast<uint32_t>(Ff[i][1]);
+            ibuf[i*3 + 2] = static_cast<uint32_t>(Ff[i][2]);
         }
 
         rtcCommitGeometry(geom);
@@ -358,9 +642,9 @@ bool IlluminationModel::initializeScene(
                 std::vector<std::array<float, 3>> local_vertices(V);
                 for (size_t i = 0; i < V; ++i) {
                     local_vertices[i] = {{
-                        static_cast<float>(vertices[i][0] - scene_origin_offset_[0]),
-                        static_cast<float>(vertices[i][1] - scene_origin_offset_[1]),
-                        static_cast<float>(vertices[i][2] - scene_origin_offset_[2])
+                        static_cast<float>(Vv[i][0] - scene_origin_offset_[0]),
+                        static_cast<float>(Vv[i][1] - scene_origin_offset_[1]),
+                        static_cast<float>(Vv[i][2] - scene_origin_offset_[2])
                     }};
                 }
 
@@ -368,9 +652,9 @@ bool IlluminationModel::initializeScene(
                 std::vector<std::array<uint32_t, 3>> indices(F);
                 for (size_t i = 0; i < F; ++i) {
                     indices[i] = {{
-                        static_cast<uint32_t>(faces[i][0]),
-                        static_cast<uint32_t>(faces[i][1]),
-                        static_cast<uint32_t>(faces[i][2])
+                        static_cast<uint32_t>(Ff[i][0]),
+                        static_cast<uint32_t>(Ff[i][1]),
+                        static_cast<uint32_t>(Ff[i][2])
                     }};
                 }
 
@@ -810,6 +1094,402 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
     return blocked;
 }
 
+// PTM-13 P1: build the per-core-face self-skip CSR. For each CORE face c in [0, n_core), collect
+// c plus every face reachable within selfskip_rings_ edge-neighbor hops over the merged mesh
+// (primID space), sorted, into face_skip_nbr_[face_skip_off_[c] .. face_skip_off_[c+1]). This lets
+// the direct-solar occlusion re-trace skip self/near-neighbor hits by primID so it can start the
+// ray AT the face and still detect the mm-scale local occluder. Called only when the flag is set.
+void IlluminationModel::buildSelfSkipAdjacency(
+    const std::vector<std::array<int, 3>>& faces_all, size_t n_core)
+{
+    face_skip_off_.clear();
+    face_skip_nbr_.clear();
+    const size_t F = faces_all.size();
+    if (F == 0 || n_core == 0) return;
+
+    // Undirected-edge -> (up to two) incident faces, over the merged mesh.
+    auto ekey = [](int a, int b) -> uint64_t {
+        uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+        uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+        return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    };
+    std::unordered_map<uint64_t, std::pair<int,int>> edge_faces;
+    edge_faces.reserve(F * 3);
+    for (size_t f = 0; f < F; ++f) {
+        const auto& t = faces_all[f];
+        const int e[3][2] = { {t[0],t[1]}, {t[1],t[2]}, {t[2],t[0]} };
+        for (int k = 0; k < 3; ++k) {
+            const uint64_t key = ekey(e[k][0], e[k][1]);
+            auto it = edge_faces.find(key);
+            if (it == edge_faces.end()) edge_faces.emplace(key, std::make_pair(static_cast<int>(f), -1));
+            else if (it->second.second < 0) it->second.second = static_cast<int>(f);
+            // >2 faces on an edge (non-manifold): keep the first two; extra sharing is rare here.
+        }
+    }
+
+    // 1-ring (edge-adjacent) neighbors for every face, as a fixed [F][3] table (-1 = boundary).
+    std::vector<std::array<int,3>> nb1(F, {{-1,-1,-1}});
+    for (size_t f = 0; f < F; ++f) {
+        const auto& t = faces_all[f];
+        const int e[3][2] = { {t[0],t[1]}, {t[1],t[2]}, {t[2],t[0]} };
+        for (int k = 0; k < 3; ++k) {
+            auto it = edge_faces.find(ekey(e[k][0], e[k][1]));
+            int other = -1;
+            if (it != edge_faces.end()) {
+                if (it->second.first == static_cast<int>(f)) other = it->second.second;
+                else if (it->second.second == static_cast<int>(f)) other = it->second.first;
+            }
+            nb1[f][k] = other;
+        }
+    }
+
+    // BFS to selfskip_rings_ per core face, using a per-face generation stamp (no set allocation).
+    face_skip_off_.assign(n_core + 1, 0);
+    std::vector<int> stamp(F, -1), acc, frontier, nextf;
+    for (size_t c = 0; c < n_core; ++c) {
+        face_skip_off_[c] = static_cast<uint32_t>(face_skip_nbr_.size());
+        acc.clear(); frontier.clear();
+        const int gen = static_cast<int>(c);
+        stamp[c] = gen; acc.push_back(gen); frontier.push_back(gen);
+        for (int r = 0; r < selfskip_rings_; ++r) {
+            nextf.clear();
+            for (int f : frontier) {
+                for (int k = 0; k < 3; ++k) {
+                    const int nb = nb1[f][k];
+                    if (nb >= 0 && stamp[nb] != gen) { stamp[nb] = gen; acc.push_back(nb); nextf.push_back(nb); }
+                }
+            }
+            frontier.swap(nextf);
+        }
+        std::sort(acc.begin(), acc.end());
+        for (int x : acc) face_skip_nbr_.push_back(x);
+    }
+    face_skip_off_[n_core] = static_cast<uint32_t>(face_skip_nbr_.size());
+}
+
+// PTM-13 P1: occlusion test with topological self-skip. Per ray, march via rtcIntersect1, skipping
+// any hit whose primID is the source face or one of its <= selfskip_rings_ edge-neighbors, until the
+// first NON-neighbor hit (=> blocked) or no hit (=> clear). The callers pass origins AT the face and
+// zero geometric offset, so the ~mm local occluder present in the mesh is detected rather than hopped
+// by the 1 cm offset. CPU Embree only; used when use_topo_selfskip_ is set.
+std::vector<uint8_t> IlluminationModel::traceOccludedSelfSkip(
+    const std::vector<std::array<double, 3>>& origins,
+    const std::vector<std::array<double, 3>>& directions,
+    const std::vector<int>& src_faces)
+{
+    const size_t n = origins.size();
+    std::vector<uint8_t> blocked(n, 0);
+    if (n == 0 || !embree_scene_) return blocked;
+
+    auto in_skip = [&](int src, unsigned int prim) -> bool {
+        if (src < 0) return false;
+        if (static_cast<size_t>(src) + 1 >= face_skip_off_.size()) return static_cast<int>(prim) == src;
+        const uint32_t b = face_skip_off_[static_cast<size_t>(src)];
+        const uint32_t e = face_skip_off_[static_cast<size_t>(src) + 1];
+        return std::binary_search(face_skip_nbr_.begin() + b, face_skip_nbr_.begin() + e,
+                                  static_cast<int>(prim));
+    };
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        // Shift into Embree-local (recentered) space, as traceOccluded does.
+        const std::array<double,3> org_local = {
+            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
+                                    directions[i][1]*directions[i][1] +
+                                    directions[i][2]*directions[i][2]);
+        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+        const float dx = static_cast<float>(directions[i][0] * inv_dl);
+        const float dy = static_cast<float>(directions[i][1] * inv_dl);
+        const float dz = static_cast<float>(directions[i][2] * inv_dl);
+        const int src = (i < src_faces.size()) ? src_faces[i] : -1;
+
+        float tnear = 0.0f;
+        bool occ = false;
+        // Bounded march: the skip set is small (~1 + 3*rings), so a few iterations suffice; the
+        // cap guards degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
+        for (int iter = 0; iter < 64; ++iter) {
+            RTCRayHit rh{};
+            rh.ray.org_x = static_cast<float>(org_local[0]);
+            rh.ray.org_y = static_cast<float>(org_local[1]);
+            rh.ray.org_z = static_cast<float>(org_local[2]);
+            rh.ray.dir_x = dx; rh.ray.dir_y = dy; rh.ray.dir_z = dz;
+            rh.ray.tnear = tnear;
+            rh.ray.tfar  = 1.0e30f;
+            rh.ray.mask  = 0xFFFFFFFFu;
+            rh.ray.flags = 0;
+            rh.ray.time  = 0.0f;
+            rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+            rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+
+            RTCIntersectArguments args;
+            rtcInitIntersectArguments(&args);
+            args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+            rtcIntersect1(embree_scene_, &rh, &args);
+
+            if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
+            const unsigned int prim = rh.hit.primID;
+            const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
+            if (in_skip(src, prim)) {
+                const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
+                if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
+                tnear = t_next;
+                continue;
+            }
+            occ = true; break;  // first non-neighbor hit is a real occluder
+        }
+        blocked[i] = occ ? 1u : 0u;
+    }
+    return blocked;
+}
+
+// PTM-13 rise-epsilon occlusion test. Per ray, march via rtcIntersect1 from the TRUE face centroid
+// (callers pass origins AT the face, eps_n=eps_d=0) and reject a hit as self-relief iff its
+// out-of-plane rise above the source face's own tangent plane, dz = (P_hit - c_src)*n_src, is below
+// the facet-scaled floor h_eps = rise_keps_ * face_edge_local_[src]; the FIRST hit with dz >= h_eps
+// is a real occluder (=> blocked), no hit => clear. The origin IS the centroid so c_src = org_local
+// and dz = t_hit * (dir_hat . n_src). The origin primID is skipped (dz~0 there) for float robustness.
+// This separates the ~0.12 mm coplanar self-relief from the ~2.47 mm real rim occluder that the 1 cm
+// offset hops (BUGS.md PTM-13); it is resolution-independent (h_eps scales with the facet). CPU
+// Embree only; used when use_rise_eps_ is set.
+// OPTION 3 (use_rise_eps2_): the single hit-POINT dz misses a near-coplanar occluder CROSSED near its
+// shared edge (dz<h_eps) whose TRIANGLE rises >= h_eps farther along. When set, a would-be-skip hit
+// STILL blocks iff it is a genuine float64-INTERIOR crossing (double Moller-Trumbore, bary_min >
+// rise_bary_eps_) of a triangle whose max-vertex rise >= h_eps. The interior test rejects the float32
+// edge-clip artifacts that are the entire acne source; it is a strict superset of the base blocks.
+std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
+    const std::vector<std::array<double, 3>>& origins,
+    const std::vector<std::array<double, 3>>& directions,
+    const std::vector<int>& src_faces,
+    const std::vector<std::array<double, 3>>& src_normals)
+{
+    const size_t n = origins.size();
+    std::vector<uint8_t> blocked(n, 0);
+    if (n == 0 || !embree_scene_) return blocked;
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        // Shift into Embree-local (recentered) space, as traceOccluded / self-skip do. Under
+        // rise-epsilon the callers set eps_n=eps_d=0, so this origin IS the source centroid c_src.
+        const std::array<double,3> org_local = {
+            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
+                                    directions[i][1]*directions[i][1] +
+                                    directions[i][2]*directions[i][2]);
+        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+        const double ddx = directions[i][0] * inv_dl;
+        const double ddy = directions[i][1] * inv_dl;
+        const double ddz = directions[i][2] * inv_dl;
+
+        const int src = (i < src_faces.size()) ? src_faces[i] : -1;
+
+        // Source face effective outward normal (unit); defensive re-normalize.
+        std::array<double,3> ns = (i < src_normals.size()) ? src_normals[i]
+                                                           : std::array<double,3>{{0.0,0.0,0.0}};
+        {
+            const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
+            if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
+        }
+        // Per-facet self-relief floor: h_eps = rise_keps_ * local edge. Fallback 0 (unknown src)
+        // leaves only the origin-primID skip, so an unknown source still cannot self-light on its
+        // own facet; in practice src>=0 and face_edge_local_ is populated for every core face.
+        // Absolute floor override (Class-2 fix) when rise_habs_ >= 0, else the edge-proportional floor.
+        const double h_eps = (rise_habs_ >= 0.0)
+                           ? rise_habs_
+                           : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
+                              ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
+        // Ray-along component of the source normal: dz = t_hit * (dir_hat . n_src).
+        const double dir_dot_n = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
+
+        float tnear = 0.0f;   // start AT the centroid (~machine eps); src-primID + dz test guard self-hits
+        bool occ = false;
+        // Bounded march: at most a handful of near-coplanar self-relief hits; the cap guards
+        // degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
+        for (int iter = 0; iter < 64; ++iter) {
+            RTCRayHit rh{};
+            rh.ray.org_x = static_cast<float>(org_local[0]);
+            rh.ray.org_y = static_cast<float>(org_local[1]);
+            rh.ray.org_z = static_cast<float>(org_local[2]);
+            rh.ray.dir_x = static_cast<float>(ddx);
+            rh.ray.dir_y = static_cast<float>(ddy);
+            rh.ray.dir_z = static_cast<float>(ddz);
+            rh.ray.tnear = tnear;
+            rh.ray.tfar  = 1.0e30f;
+            rh.ray.mask  = 0xFFFFFFFFu;
+            rh.ray.flags = 0;
+            rh.ray.time  = 0.0f;
+            rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+            rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+
+            RTCIntersectArguments args;
+            rtcInitIntersectArguments(&args);
+            args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+            rtcIntersect1(embree_scene_, &rh, &args);
+
+            if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
+            const unsigned int prim = rh.hit.primID;
+            const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
+            // Out-of-plane rise of this hit above the source face's own tangent plane.
+            const double dz = static_cast<double>(t_hit) * dir_dot_n;
+            // Self-relief: the origin's own facet (dz~0; skipped by primID for float robustness) or
+            // any hit rising less than h_eps out of the plane. Skip it and march past it.
+            bool self_or_low = (static_cast<int>(prim) == src) || (dz < h_eps);
+            // OPTION 3 OR layer: a hit the single hit-POINT rise would skip STILL blocks iff it is a
+            // genuine float64-INTERIOR crossing of a triangle whose max-vertex out-of-plane rise
+            // >= h_eps -- i.e. the near-coplanar occluder crossed near its shared edge (dz<h_eps) whose
+            // TRIANGLE rises higher farther along. The interior test (double Moller-Trumbore, bary_min
+            // > rise_bary_eps_) rejects the float32 edge-clip artifacts that are the whole acne source
+            // (STEP-1: acne set is 100% edge-clip, bary<0; real occluders 89% interior). Never removes a
+            // block; only promotes a would-be-skip to a block -> strict superset, byte-identical when off.
+            if (self_or_low && use_rise_eps2_ && static_cast<int>(prim) != src &&
+                static_cast<size_t>(prim) < face_verts_local_.size()) {
+                const auto& tv = face_verts_local_[prim];
+                const std::array<double,3> A = tv[0], B = tv[1], Cc = tv[2];
+                // hit-triangle max-vertex rise above the source plane (org_local IS c_src)
+                double tri_max = -1.0e300;
+                for (int k = 0; k < 3; ++k) {
+                    const double rk = (tv[k][0]-org_local[0])*ns[0]
+                                    + (tv[k][1]-org_local[1])*ns[1]
+                                    + (tv[k][2]-org_local[2])*ns[2];
+                    if (rk > tri_max) tri_max = rk;
+                }
+                if (tri_max >= h_eps) {
+                    // double Moller-Trumbore of the marched ray vs this triangle -> barycentric interior
+                    const double e1x=B[0]-A[0], e1y=B[1]-A[1], e1z=B[2]-A[2];
+                    const double e2x=Cc[0]-A[0], e2y=Cc[1]-A[1], e2z=Cc[2]-A[2];
+                    const double px=ddy*e2z-ddz*e2y, py=ddz*e2x-ddx*e2z, pz=ddx*e2y-ddy*e2x;
+                    const double det=e1x*px+e1y*py+e1z*pz;
+                    if (std::fabs(det) > 1.0e-30) {
+                        const double invd=1.0/det;
+                        const double sx=org_local[0]-A[0], sy=org_local[1]-A[1], sz=org_local[2]-A[2];
+                        const double u=(sx*px+sy*py+sz*pz)*invd;
+                        const double qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
+                        const double vv=(ddx*qx+ddy*qy+ddz*qz)*invd;
+                        const double bmin=std::min(u, std::min(vv, 1.0-u-vv));
+                        if (bmin > rise_bary_eps_) self_or_low = false;  // real interior occluder
+                    }
+                }
+            }
+            if (self_or_low) {
+                const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
+                if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
+                tnear = t_next;
+                continue;
+            }
+            occ = true; break;  // first hit rising >= h_eps out of the plane is a real occluder
+        }
+        blocked[i] = occ ? 1u : 0u;
+    }
+    return blocked;
+}
+
+// PTM-18: fan-triangulate the SMALL INTERIOR boundary-edge loops of the core mesh (missing-triangle
+// holes / T-junction cracks) that let a low grazing sun thread through to shadowed floor faces via the
+// finite-disk penumbra path (the "crater-center flash"). The outer patch perimeter (the boundary
+// component whose spatial extent spans the mesh) is NOT a hole and is excluded. Only clean closed loops
+// are filled; open/non-manifold components are skipped WITH A WARNING (no silent no-op). Returns
+// occluder-only triangles in CORE vertex index space; initializeScene appends them to the shadow BVH.
+std::vector<std::array<int, 3>> IlluminationModel::buildInteriorHoleFill(
+    const std::vector<std::array<double, 3>>& vertices,
+    const std::vector<std::array<int, 3>>& faces) const
+{
+    std::vector<std::array<int, 3>> fills;
+    if (faces.empty() || vertices.empty()) return fills;
+
+    // 1. boundary edges = undirected edges incident to exactly one triangle.
+    auto edge_key = [](int a, int b) -> uint64_t {
+        uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+        uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+        return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    };
+    std::unordered_map<uint64_t, uint32_t> ecount;
+    ecount.reserve(faces.size() * 3);
+    for (const auto& f : faces) {
+        ++ecount[edge_key(f[0], f[1])];
+        ++ecount[edge_key(f[1], f[2])];
+        ++ecount[edge_key(f[2], f[0])];
+    }
+    std::vector<std::array<int, 2>> bedges;
+    for (const auto& kv : ecount) {
+        if (kv.second == 1)
+            bedges.push_back({ static_cast<int>(kv.first >> 32),
+                               static_cast<int>(kv.first & 0xffffffffu) });
+    }
+    if (bedges.empty()) return fills;  // watertight core -> nothing to seal
+
+    // 2. connected components of the boundary edges (union-find over boundary vertices).
+    std::unordered_map<int, int> parent;
+    for (const auto& e : bedges) {
+        if (!parent.count(e[0])) parent[e[0]] = e[0];
+        if (!parent.count(e[1])) parent[e[1]] = e[1];
+    }
+    auto find = [&](int x) -> int { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    for (const auto& e : bedges) { int ra = find(e[0]), rb = find(e[1]); if (ra != rb) parent[ra] = rb; }
+    std::unordered_map<int, std::vector<std::array<int, 2>>> comp;
+    for (const auto& e : bedges) comp[find(e[0])].push_back(e);
+
+    // Full-mesh bbox diagonal for the outer-perimeter test (spatial extent, resolution-independent).
+    std::array<double, 3> mn = { std::numeric_limits<double>::max(),
+                                 std::numeric_limits<double>::max(),
+                                 std::numeric_limits<double>::max() };
+    std::array<double, 3> mx = { std::numeric_limits<double>::lowest(),
+                                 std::numeric_limits<double>::lowest(),
+                                 std::numeric_limits<double>::lowest() };
+    for (const auto& v : vertices)
+        for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], v[k]); mx[k] = std::max(mx[k], v[k]); }
+    const double meshD = std::sqrt((mx[0]-mn[0])*(mx[0]-mn[0]) + (mx[1]-mn[1])*(mx[1]-mn[1]) + (mx[2]-mn[2])*(mx[2]-mn[2]));
+
+    int n_holes = 0, n_skip_outer = 0, n_skip_open = 0;
+    for (auto& kv : comp) {
+        const auto& edges = kv.second;
+        // component vertex adjacency + spatial extent
+        std::unordered_map<int, std::vector<int>> adj;
+        std::array<double, 3> cmn = { std::numeric_limits<double>::max(), std::numeric_limits<double>::max(), std::numeric_limits<double>::max() };
+        std::array<double, 3> cmx = { std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest() };
+        for (const auto& e : edges) { adj[e[0]].push_back(e[1]); adj[e[1]].push_back(e[0]); }
+        for (const auto& av : adj) {
+            const auto& v = vertices[av.first];
+            for (int k = 0; k < 3; ++k) { cmn[k] = std::min(cmn[k], v[k]); cmx[k] = std::max(cmx[k], v[k]); }
+        }
+        const double compD = std::sqrt((cmx[0]-cmn[0])*(cmx[0]-cmn[0]) + (cmx[1]-cmn[1])*(cmx[1]-cmn[1]) + (cmx[2]-cmn[2])*(cmx[2]-cmn[2]));
+        if (meshD > 0.0 && compD > 0.5 * meshD) { ++n_skip_outer; continue; }  // outer patch perimeter, not a hole
+
+        // A clean closed simple loop has every vertex at degree exactly 2.
+        bool closed = (adj.size() >= 3 && adj.size() <= 4096);
+        for (const auto& av : adj) if (av.second.size() != 2) { closed = false; break; }
+        if (!closed) { ++n_skip_open; continue; }
+
+        // Walk the loop in order, then fan-triangulate from the first vertex.
+        std::vector<int> loop; loop.reserve(adj.size());
+        int start = adj.begin()->first, prev = -1, cur = start;
+        while (true) {
+            loop.push_back(cur);
+            int nx = -1;
+            for (int w : adj[cur]) if (w != prev) { nx = w; break; }
+            if (nx < 0 || nx == start) break;
+            prev = cur; cur = nx;
+            if (loop.size() > adj.size() + 1) break;  // guard degenerate fans
+        }
+        if (loop.size() != adj.size()) { ++n_skip_open; continue; }  // not a single clean loop
+        for (size_t k = 1; k + 1 < loop.size(); ++k)
+            fills.push_back({ loop[0], loop[k], loop[k + 1] });
+        ++n_holes;
+    }
+
+    std::cout << "[IlluminationModel] PTM-18 interior hole-seal ENABLED: sealed " << n_holes
+              << " interior hole(s) -> " << fills.size() << " shadow-only fill triangle(s); excluded "
+              << n_skip_outer << " outer/spanning boundary component(s); skipped " << n_skip_open
+              << " open/non-manifold boundary component(s) (NOT sealed -- a residual grazing-sun flash "
+                 "may persist there; see BUGS.md PTM-18). Default OFF -> byte-identical.\n";
+    return fills;
+}
+
 // Batch ray tracing with 16-wide AVX-512 packets for maximum performance on supported hardware
 std::vector<int> IlluminationModel::intersectsFirstAVX512(
     const std::vector<std::array<double, 3>>& origins,
@@ -1126,7 +1806,8 @@ bool IlluminationModel::calculateIllumination(
                 face_normals[f],
                 sun_pos,
                 primary_pos,
-                constants::N_SOLAR_SAMPLES  // Number of solar samples (sqrt(N) should be integer)
+                constants::N_SOLAR_SAMPLES,  // Number of solar samples (sqrt(N) should be integer)
+                static_cast<int>(f)          // PTM-13 P1: source core-face id for topological self-skip
             );
             
             // Store illumination value
@@ -2104,8 +2785,15 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     const std::array<double, 3>& face_normal,
     const std::array<double, 3>& sun_position,        // SPICE in km
     const std::array<double, 3>& primary_position,    // SPICE in km
-    int num_samples)
+    int num_samples,
+    int src_face)                                     // PTM-13 P1: source core-face id (-1 = no self-skip)
 {
+    // PTM-13 P1: topological self-skip is active only with a valid mesh source face id (the lat/lon
+    // point path passes -1). Default OFF -> byte-identical. PTM-13 rise-epsilon is the independent
+    // rise-based discriminator (takes precedence when both are set). Either starts the ray AT the face.
+    const bool selfskip = use_topo_selfskip_ && src_face >= 0;
+    const bool riseeps  = use_rise_eps_ && src_face >= 0;
+    const bool at_face  = selfskip || riseeps;
     // Convert SPICE positions to meters for geometric tests
     const std::array<double,3> sun_pos_m     = kmToMeters(sun_position);
     const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
@@ -2141,20 +2829,53 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
 
-    // Analytical body-occlusion pre-check (same logic as batch path).
-    {
+    // Analytical body-occlusion pre-check (same logic as batch/GPU paths).
+    // TOPOLOGY GATE (not shape): run this cull ONLY on OPEN patch meshes. On a
+    // CLOSED (watertight) mesh the Embree BVH holds the full body and self-
+    // occludes, so this analytic sphere test is unnecessary and over-culls
+    // sunward-tilted grazing facets on shaped bodies -- disable it and let Embree
+    // do all occlusion (matching the GPU path, correct on closed bodies). On an
+    // OPEN micro-patch (lunar/Europa) the BVH has no far-side geometry, so shadow
+    // rays would pass THROUGH the bulk body; here the analytic body-sphere is the
+    // SOLE self-occlusion guard.
+    //
+    // Cull only when the body SPHERE actually lies BETWEEN the face and the sun,
+    // i.e. the forward ray (origin=fc, dir=sun) intersects the body sphere at
+    // t>0. This forward test -- NOT a bare |fc x sun| < R_occ line test -- is
+    // what distinguishes a genuine far-side/behind-the-limb face from a sunward-
+    // tilted face just past the geometric terminator whose grazing ray only comes
+    // near the near limb going AWAY from the body. The old bare-line test (with a
+    // 0.998*|fc| inset that masked it) wrongly culled mu>0 sunward facets once the
+    // inset was tightened. R_occ = body-level radius (min core-face centroid
+    // radius), which is relief-adaptive and never exceeds a face's own radius, so
+    // no lit face is culled. Ungated by mu -- the forward-intersection condition
+    // already excludes lit sunward facets. See mesh_is_open_ / body_radius_occ_
+    // notes and memory ptm-mu-gate-open-mesh-selfocclusion-fail.
+    if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
         const double fc_dot_sun = face_center[0]*sun_dir[0] + face_center[1]*sun_dir[1] + face_center[2]*sun_dir[2];
-        if (fc_dot_sun < 0.0) {
-            const double cx = face_center[1]*sun_dir[2] - face_center[2]*sun_dir[1];
-            const double cy = face_center[2]*sun_dir[0] - face_center[0]*sun_dir[2];
-            const double cz = face_center[0]*sun_dir[1] - face_center[1]*sun_dir[0];
-            const double closest_sq = cx*cx + cy*cy + cz*cz;
-            const double r_fc = vectorLength(face_center);
-            const double R_occ = 0.998 * r_fc;
-            if (closest_sq < R_occ * R_occ) {
-                return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+        if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+            const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+            double tb1, tb2;
+            if (raySphereIntersect(face_center, sun_dir, body_center,
+                                   body_radius_occ_native_, tb1, tb2)) {
+                if (tb1 > 0.0 || tb2 > 0.0) {
+                    return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
+                }
             }
         }
+    }
+
+    // PTM-13: local-horizon (skyline) cull of the grazing DIRECT sun. Azimuth-specific;
+    // catches the over-tessellation/grazing leak where the single Embree ray hops the mm
+    // rim. Gated (default OFF -> byte-identical). CPU path; built in initializeScene().
+    if (use_horizon_cull_ && horizon_direct_.built()) {
+        const std::array<double,3> p_local = {
+            face_center[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            face_center[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            face_center[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+        if (horizon_direct_.sunBelowLocalHorizon(p_local, sun_dir))
+            return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
 
     // Local up and elevation
@@ -2163,10 +2884,12 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     if (r_up > constants::EPSILON) { up[0]/=r_up; up[1]/=r_up; up[2]/=r_up; }
     const double sin_elev = dotProduct(sun_dir, up);
 
-    // Robust origin offsets (meters)
+    // Robust origin offsets (meters). PTM-13 P1/rise-epsilon: under self-skip or rise-epsilon the ray
+    // starts AT the face (eps_n=eps_d=0) and self/self-relief hits are rejected by primID / out-of-plane
+    // rise. Default OFF -> unchanged (2x/1x).
     const double eps_base = calculateSafeRayOffset(face_center, face_normal);
-    const double eps_n = 2.0 * eps_base;
-    const double eps_d = 1.0 * eps_base;
+    const double eps_n = at_face ? 0.0 : 2.0 * eps_base;
+    const double eps_d = at_face ? 0.0 : 1.0 * eps_base;
 
     std::array<double, 3> ray_origin_base = {
         face_center[0] + face_normal[0] * eps_n + sun_dir[0] * eps_d,
@@ -2187,11 +2910,18 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         if (use_geometric_horizon_ && checkLunarHorizon(ray_origin_base, sun_dir, vectorLength(face_center))) {
             return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
         }
-        // Terrain occlusion via Embree (unchanged)
+        // Terrain occlusion via Embree. PTM-13: rise-epsilon / self-skip re-trace when active (default OFF).
         {
             std::vector<std::array<double,3>> o(1, ray_origin_base);
             std::vector<std::array<double,3>> d(1, sun_dir);
-            auto occ = traceOccluded(o, d, /*coherent=*/true);
+            std::vector<uint8_t> occ;
+            if (riseeps)
+                occ = traceOccludedRiseEps(o, d, std::vector<int>(1, src_face),
+                                           std::vector<std::array<double,3>>(1, face_normal));
+            else if (selfskip)
+                occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, src_face));
+            else
+                occ = traceOccluded(o, d, /*coherent=*/true);
             if (!occ.empty() && occ[0] == 0) {
                 double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
                 double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
@@ -2259,7 +2989,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
             total_out++;
         }
 
-        // Start each survivor ray slightly along its own direction too
+        // Start each survivor ray slightly along its own direction too (eps_d=0 under self-skip)
         std::vector<std::array<double,3>> origins;
         origins.reserve(dirs.size());
         for (const auto& sd : dirs) {
@@ -2268,8 +2998,15 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
                                 ray_origin_base[2] + sd[2]*eps_d });
         }
 
-        // Terrain occlusion for survivors (coherent packet)
-        auto occ = traceOccluded(origins, dirs, /*coherent=*/true);
+        // Terrain occlusion for survivors. PTM-13: rise-epsilon / self-skip re-trace (default OFF).
+        std::vector<uint8_t> occ;
+        if (riseeps)
+            occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), src_face),
+                                       std::vector<std::array<double,3>>(dirs.size(), face_normal));
+        else if (selfskip)
+            occ = traceOccludedSelfSkip(origins, dirs, std::vector<int>(dirs.size(), src_face));
+        else
+            occ = traceOccluded(origins, dirs, /*coherent=*/true);
 
         size_t m = 0;
         for (uint32_t sidx = 0; sidx < total_out; ++sidx) {
@@ -2356,35 +3093,136 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     // We need to ensure normals point outward for topographic meshes
     std::vector<std::array<double, 3>> corrected_normals = mesh->face_normals;
     const std::vector<std::array<double, 3>>& face_centers = mesh->face_centers;
-    
-    // Check and fix normal orientations for topographic meshes
-    // This is essential for correct primary IR and reflection calculations
-    int flipped_count = 0;
-    for (size_t i = 0; i < corrected_normals.size(); i++) {
-        const auto& center = face_centers[i];
-        auto& normal = corrected_normals[i];
-        
-        // For a mesh centered at the origin, the face center vector
-        // should point in the same general direction as the normal (both outward)
-        double dot = center[0] * normal[0] + 
-                     center[1] * normal[1] + 
-                     center[2] * normal[2];
-        
-        // If dot product is negative, the normal points inward
-        if (dot < 0) {
-            // Flip the normal to point outward
-            normal[0] = -normal[0];
-            normal[1] = -normal[1];
-            normal[2] = -normal[2];
-            flipped_count++;
+
+    // PTM-Class1 fix (env PTM_ILLUM_TRUE_NORMALS): replace the per-face radial flip -- which REVERSES
+    // genuine overhang faces (true winding normal radial-negative), manufacturing mu>0 and spurious
+    // direct sun on the underside of ledges / rock-base slope breaks -- with a topology-propagated
+    // consistent orientation. On a consistently-wound manifold the winding normal IS the true outward
+    // (up to a per-connected-component global sign, resolved by majority radial-outward vote, which
+    // equals seeding from a definitely-up face and BFS across shared edges). The radial test only
+    // breaks ties per disconnected component. Default OFF -> byte-identical (radial flip below runs
+    // verbatim). Phase-2 census (scripts/ptm_illum_deepdive/phase2_overhang_census.csv): winding
+    // globally consistent (0/763,839 inconsistent manifold edges); 15,476 overhangs (3.0%), 90.1% of
+    // the >380K radoff hot tail. Applies to the ILLUMINATION normal only (direct-solar cos_inc + the
+    // rise-eps source normal); thermal-emission and view-factor normals are unchanged (radoff energy
+    // balance depends on the normal only via direct_solar, so this is the complete radoff fix; the VF
+    // path would need a rebuild and is out of scope).
+    bool use_true_normals = false;
+    if (const char* tn = std::getenv("PTM_ILLUM_TRUE_NORMALS"))
+        if (tn[0]=='1'||tn[0]=='t'||tn[0]=='T'||tn[0]=='y'||tn[0]=='Y') use_true_normals = true;
+
+    if (use_true_normals) {
+        const size_t nfc = mesh->faces.size();
+        // 1. raw winding normals from the mesh's own vertex order (BEFORE any flip)
+        std::vector<std::array<double,3>> nwv(nfc);
+        for (size_t i = 0; i < nfc; ++i) {
+            const auto& f = mesh->faces[i];
+            const auto& a = mesh->vertices[f[0]];
+            const auto& b = mesh->vertices[f[1]];
+            const auto& c = mesh->vertices[f[2]];
+            std::array<double,3> e1 = {{b[0]-a[0], b[1]-a[1], b[2]-a[2]}};
+            std::array<double,3> e2 = {{c[0]-a[0], c[1]-a[1], c[2]-a[2]}};
+            std::array<double,3> n = {{ e1[1]*e2[2]-e1[2]*e2[1],
+                                        e1[2]*e2[0]-e1[0]*e2[2],
+                                        e1[0]*e2[1]-e1[1]*e2[0] }};
+            double L = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            if (L > 0) { n[0]/=L; n[1]/=L; n[2]/=L; }
+            nwv[i] = n;
+        }
+        // 2. union-find connected components over shared edges + winding-consistency audit
+        std::vector<int> parent(nfc);
+        for (size_t i = 0; i < nfc; ++i) parent[i] = static_cast<int>(i);
+        auto uf_find = [&parent](int x){ while (parent[x]!=x){ parent[x]=parent[parent[x]]; x=parent[x]; } return x; };
+        auto uf_union = [&](int a,int b){ int ra=uf_find(a), rb=uf_find(b); if (ra!=rb) parent[ra]=rb; };
+        std::unordered_map<uint64_t,std::pair<int,int>> emap;  // undirected edge -> (last face, dir)
+        emap.reserve(nfc*3);
+        size_t inconsistent = 0;
+        for (size_t i = 0; i < nfc; ++i) {
+            const auto& f = mesh->faces[i];
+            const int vv[3] = { f[0], f[1], f[2] };
+            for (int e = 0; e < 3; ++e) {
+                int s = vv[e], d = vv[(e+1)%3];
+                int dir = (s < d) ? 1 : -1;
+                uint32_t lo = static_cast<uint32_t>(s < d ? s : d);
+                uint32_t hi = static_cast<uint32_t>(s < d ? d : s);
+                uint64_t key = (static_cast<uint64_t>(lo) << 32) | hi;
+                auto it = emap.find(key);
+                if (it == emap.end()) { emap.emplace(key, std::make_pair(static_cast<int>(i), dir)); }
+                else {
+                    uf_union(static_cast<int>(i), it->second.first);
+                    if (it->second.second == dir) ++inconsistent;  // same directed traversal => inconsistent
+                    it->second.first = static_cast<int>(i);        // track last (tolerate >2 fans)
+                }
+            }
+        }
+        // 3. per-component majority-outward global sign (== seed-from-up-face BFS on a consistent mesh)
+        std::unordered_map<int,long> vote;
+        for (size_t i = 0; i < nfc; ++i) {
+            const auto& c = face_centers[i];
+            double dr = c[0]*nwv[i][0] + c[1]*nwv[i][1] + c[2]*nwv[i][2];
+            vote[uf_find(static_cast<int>(i))] += (dr >= 0.0) ? 1 : -1;
+        }
+        // 4. winding-consistency gate: a junk (non-manifold / inconsistent) winding cannot be oriented
+        //    topologically -> WARN LOUDLY and fall back to the radial flip (never silently proceed).
+        if (inconsistent > nfc / 100) {
+            std::cout << "[IlluminationModel] PTM-Class1 TRUE normals REFUSED: winding INCONSISTENT ("
+                      << inconsistent << " same-direction manifold half-edges > 1% of " << nfc
+                      << " faces); falling back to the radial-flip orientation.\n";
+            use_true_normals = false;
+        } else {
+            int overhang = 0;
+            for (size_t i = 0; i < nfc; ++i) {
+                double S = (vote[uf_find(static_cast<int>(i))] >= 0) ? 1.0 : -1.0;
+                corrected_normals[i] = {{ S*nwv[i][0], S*nwv[i][1], S*nwv[i][2] }};
+                const auto& c = face_centers[i];
+                if (c[0]*corrected_normals[i][0] + c[1]*corrected_normals[i][1]
+                        + c[2]*corrected_normals[i][2] < 0.0)
+                    ++overhang;
+            }
+            std::cout << "[IlluminationModel] PTM-Class1 TRUE (winding-consistent) normals ENABLED "
+                         "(env PTM_ILLUM_TRUE_NORMALS): winding "
+                      << (inconsistent==0 ? "GLOBALLY CONSISTENT" : "near-consistent") << " ("
+                      << inconsistent << " inconsistent half-edges); " << overhang << " overhang faces ("
+                      << std::fixed << std::setprecision(2)
+                      << (100.0*overhang/std::max<size_t>(nfc,1)) << "%) keep their true radial-INWARD "
+                         "normal instead of being flipped outward -> darkens spurious direct sun on "
+                         "ledge undersides / rock-base slope breaks (Class 1). Illumination normal only; "
+                         "thermal/VF normals unchanged.\n";
         }
     }
-    
-    if (flipped_count > 0) {
-        std::cout << "Corrected " << flipped_count << " inward-pointing normals ("
-                  << std::fixed << std::setprecision(1) 
-                  << (100.0 * flipped_count / corrected_normals.size()) 
-                  << "% of faces)" << std::endl;
+
+    // Radial-flip orientation (default; and the fallback when TRUE normals are refused). Byte-identical
+    // to the historical path whenever PTM_ILLUM_TRUE_NORMALS is unset.
+    if (!use_true_normals) {
+        // Check and fix normal orientations for topographic meshes
+        // This is essential for correct primary IR and reflection calculations
+        int flipped_count = 0;
+        for (size_t i = 0; i < corrected_normals.size(); i++) {
+            const auto& center = face_centers[i];
+            auto& normal = corrected_normals[i];
+
+            // For a mesh centered at the origin, the face center vector
+            // should point in the same general direction as the normal (both outward)
+            double dot = center[0] * normal[0] +
+                         center[1] * normal[1] +
+                         center[2] * normal[2];
+
+            // If dot product is negative, the normal points inward
+            if (dot < 0) {
+                // Flip the normal to point outward
+                normal[0] = -normal[0];
+                normal[1] = -normal[1];
+                normal[2] = -normal[2];
+                flipped_count++;
+            }
+        }
+
+        if (flipped_count > 0) {
+            std::cout << "Corrected " << flipped_count << " inward-pointing normals ("
+                      << std::fixed << std::setprecision(1)
+                      << (100.0 * flipped_count / corrected_normals.size())
+                      << "% of faces)" << std::endl;
+        }
     }
     
     // Initialize Embree for ray tracing
@@ -2725,30 +3563,66 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // Analytical body-occlusion pre-check. A face whose center is behind
         // the terminator plane (dot(fc, sun_dir) < 0) AND whose shadow ray
-        // passes through the mean sphere (closest approach < R_mean) cannot
+        // passes through the occluding sphere (closest approach < R_occ) cannot
         // see the sun regardless of terrain-slope normal orientation. This
         // catches nightside faces that Embree's mesh trace misses, which
         // otherwise produce spurious illumination up to ~8° past the
         // terminator on topographic meshes.
-        {
+        //
+        // TOPOLOGY GATE (not shape): run this cull ONLY on OPEN patch meshes. On a
+        // CLOSED (watertight) mesh the Embree BVH self-occludes, so the pre-check
+        // is unnecessary and over-culls sunward-tilted grazing facets on shaped
+        // bodies -- disable it and let Embree do all occlusion. On an OPEN micro-
+        // patch the BVH has no far-side geometry, so the analytic body-sphere is
+        // the SOLE self-occlusion guard.
+        //
+        // Cull only when the body SPHERE lies BETWEEN the face and the sun: the
+        // forward ray (origin=fc, dir=sun) must intersect the body sphere at t>0.
+        // A bare |fc x sun| < R_occ line test culls sunward-tilted (mu>0) facets
+        // just past the terminator whose ray only grazes the near limb going away
+        // from the body -- the forward-intersection condition excludes them. R_occ
+        // = body-level radius (min core-face centroid radius), relief-adaptive and
+        // never larger than a face's own radius, so no lit face is culled. See
+        // mesh_is_open_ / body_radius_occ_ notes and memory
+        // ptm-mu-gate-open-mesh-selfocclusion-fail.
+        if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
             const double fc_dot_sun = fc[0]*sun_dir[0] + fc[1]*sun_dir[1] + fc[2]*sun_dir[2];
-            if (fc_dot_sun < 0.0) {
-                const double cx = fc[1]*sun_dir[2] - fc[2]*sun_dir[1];
-                const double cy = fc[2]*sun_dir[0] - fc[0]*sun_dir[2];
-                const double cz = fc[0]*sun_dir[1] - fc[1]*sun_dir[0];
-                const double closest_sq = cx*cx + cy*cy + cz*cz;
-                if (closest_sq < body_radius_m_ * body_radius_m_) {
-                    direct_solar_values[i] = enable_shadow_flux_
-                        ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
-                    continue;
+            if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+                const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+                double tb1, tb2;
+                if (raySphereIntersect(fc, sun_dir, body_center,
+                                       body_radius_occ_native_, tb1, tb2)) {
+                    if (tb1 > 0.0 || tb2 > 0.0) {
+                        direct_solar_values[i] = enable_shadow_flux_
+                            ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
+                        continue;
+                    }
                 }
             }
         }
 
-        // Robust origin:
+        // PTM-13: local-horizon (skyline) cull of the grazing DIRECT sun (mirror of the
+        // single-face path). Gated (default OFF -> byte-identical). CPU batch path.
+        if (use_horizon_cull_ && horizon_direct_.built()) {
+            const std::array<double,3> p_local = {
+                fc[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+                fc[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+                fc[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+            };
+            if (horizon_direct_.sunBelowLocalHorizon(p_local, sun_dir)) {
+                direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
+                continue;
+            }
+        }
+
+        // Robust origin. PTM-13 P1/rise-epsilon: with topological self-skip OR rise-epsilon the ray
+        // starts AT the face (eps_n=eps_d=0) and self/self-relief hits are rejected by primID / out-of-
+        // plane rise, so a real mm-scale local occluder is detected instead of hopped by the 1 cm
+        // offset. Default OFF -> unchanged (2x/1x).
+        const bool at_face = use_topo_selfskip_ || use_rise_eps_;
         const double eps_base = calculateSafeRayOffset(fc, fn);
-        const double eps_n = 2.0 * eps_base;
-        const double eps_d = 1.0 * eps_base;
+        const double eps_n = at_face ? 0.0 : 2.0 * eps_base;
+        const double eps_d = at_face ? 0.0 : 1.0 * eps_base;
 
         std::array<double, 3> ray_o = {
             fc[0] + fn[0] * eps_n + sun_dir[0] * eps_d,
@@ -2770,7 +3644,14 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
             if (!blocked) {
                 std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
-                auto occ = traceOccluded(o, d, /*coherent=*/true);
+                std::vector<uint8_t> occ;
+                if (use_rise_eps_)
+                    occ = traceOccludedRiseEps(o, d, std::vector<int>(1, static_cast<int>(i)),
+                                               std::vector<std::array<double,3>>(1, fn));
+                else if (use_topo_selfskip_)
+                    occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, static_cast<int>(i)));
+                else
+                    occ = traceOccluded(o, d, /*coherent=*/true);
                 if (!occ.empty() && occ[0] == 0) {
                     double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
                     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
@@ -2833,7 +3714,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             continue;
         }
 
-        // Start each sample a bit along its own direction as well
+        // Start each sample a bit along its own direction as well (eps_d=0 under self-skip -> at fc)
         std::vector<std::array<double,3>> origins; origins.reserve(dirs.size());
         for (const auto& sd : dirs) {
             origins.push_back({ ray_o[0] + sd[0]*eps_d,
@@ -2841,8 +3722,15 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
                                 ray_o[2] + sd[2]*eps_d });
         }
 
-        // Terrain occlusion for survivors
-        auto occ = traceOccluded(origins, dirs, /*coherent=*/true);
+        // Terrain occlusion for survivors. PTM-13: rise-epsilon / self-skip re-trace (default OFF -> traceOccluded).
+        std::vector<uint8_t> occ;
+        if (use_rise_eps_)
+            occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)),
+                                       std::vector<std::array<double,3>>(dirs.size(), fn));
+        else if (use_topo_selfskip_)
+            occ = traceOccludedSelfSkip(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)));
+        else
+            occ = traceOccluded(origins, dirs, /*coherent=*/true);
 
         // Accumulate cosine-weighted contributions for unblocked samples
         double sum_cos = 0.0;
@@ -2881,8 +3769,19 @@ double IlluminationModel::calculateSafeRayOffset(
     const std::array<double, 3>& face_center, 
     const std::array<double, 3>& /*face_normal*/) const 
 {
-    // Scale-aware offset in meters: robust across global meshes and DEM roughness
-    const double r = vectorLength(face_center);                     // local radius [m]
+    // Scale-aware offset in meters: robust across global meshes and DEM roughness.
+    // The radius MUST be measured in the same recentered frame the Embree/BVH scene
+    // lives in (scene_origin_offset_ is subtracted in initializeScene), exactly as the
+    // sibling estimate_tnear lambda in traceOccluded does. Using the raw selenocentric
+    // center here inflated the offset ~175x (1.74 m vs ~1 cm) on lunar meshes, lifting
+    // grazing-sun shadow rays ~3.5 m and lowering a 200 m-distant rim's apparent horizon
+    // by ~1 deg -> spurious illumination of permanently-shadowed crater floors.
+    const std::array<double, 3> c_local = {
+        face_center[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        face_center[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        face_center[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    const double r = vectorLength(c_local);                         // local radius [m]
     const double ulp = std::numeric_limits<double>::epsilon() * r;  // machine epsilon scaled
     const double scaled = std::max(1e-6 * r, 0.01);                 // 1 ppm of radius, min 1 cm
     return std::max(16.0 * ulp, scaled);
@@ -3918,6 +4817,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         bool below_horizon;     // Entire disk below horizon
         bool center_eclipsed;   // Center ray blocked by primary body
         bool needs_sampling;    // Needs finite-disk sampling
+        bool precheck_occluded; // Analytic body-occlusion pre-check culled it
+                                // (OPEN meshes only; see below)
     };
     std::vector<FaceInfo> face_info(n);
 
@@ -3939,6 +4840,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         if (fi.sun_dist_m <= constants::EPSILON) {
             fi.below_horizon = true;
             fi.needs_sampling = false;
+            fi.precheck_occluded = false;
             continue;
         }
 
@@ -3954,9 +4856,38 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         if (fi.cos_inc0 <= -s) {
             fi.below_horizon = true;
             fi.needs_sampling = false;
+            fi.precheck_occluded = false;
             continue;
         }
         fi.below_horizon = false;
+        fi.precheck_occluded = false;
+
+        // Analytic body-occlusion pre-check, TOPOLOGY-gated to OPEN meshes only,
+        // mirroring the CPU paths EXACTLY so CPU and GPU stay equivalent. On a
+        // CLOSED mesh the GPU BVH self-occludes (no pre-check needed, historical
+        // correct behavior); on an OPEN micro-patch the BVH has no far-side
+        // geometry, so without this the GPU path leaks sun through the bulk body.
+        // Cull only when the body sphere lies BETWEEN the face and the sun
+        // (forward ray-sphere hit at t>0); R_occ = body-level radius. This forward
+        // test excludes sunward-tilted (mu>0) facets just past the terminator so
+        // no lit face is lost. A culled face generates NO rays and routes to
+        // shadow-flux/zero. See memory ptm-mu-gate-open-mesh-selfocclusion-fail.
+        if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
+            const double fc_dot_sun = fc[0]*fi.sun_dir[0] + fc[1]*fi.sun_dir[1] + fc[2]*fi.sun_dir[2];
+            if (fc_dot_sun < 0.0) {  // cheap early-out; a forward hit implies this
+                const std::array<double,3> body_center = {0.0, 0.0, 0.0};
+                double tb1, tb2;
+                if (raySphereIntersect(fc, fi.sun_dir, body_center,
+                                       body_radius_occ_native_, tb1, tb2)) {
+                    if (tb1 > 0.0 || tb2 > 0.0) {
+                        fi.precheck_occluded = true;
+                        fi.needs_sampling = false;
+                        fi.center_eclipsed = false;
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Compute robust ray origin
         const double eps_base = calculateSafeRayOffset(fc, fn);
@@ -3996,7 +4927,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) {
         const FaceInfo& fi = face_info[i];
-        if (fi.below_horizon) {
+        if (fi.below_horizon || fi.precheck_occluded) {
             ray_counts[i] = 0;
         } else if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
             // Center ray fast path - just 1 ray
@@ -4040,7 +4971,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         fri.ray_start = ray_offsets[i];
         fri.ray_count = 0;
 
-        if (fi.below_horizon) continue;
+        if (fi.below_horizon || fi.precheck_occluded) continue;
 
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
@@ -4245,7 +5176,9 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
 
-        if (fi.below_horizon) {
+        if (fi.below_horizon || fi.precheck_occluded) {
+            // Below horizon, or culled by the analytic body-occlusion pre-check
+            // (OPEN meshes) -- no rays traced; treat as shadowed.
             direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }

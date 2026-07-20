@@ -10,6 +10,7 @@
 #include "../constants/physics_constants.h"
 #include "../thermal/thermal_model.h"
 #include "../mesh/mesh_utils.h"
+#include "../radiation/horizon_field.h"
 
 // Add these Embree headers
 #include <embree4/rtcore.h>
@@ -46,7 +47,48 @@ public:
     ~IlluminationModel();
 
     void setUseGeometricHorizon(bool enable) { use_geometric_horizon_ = enable; }
-    
+
+    // PTM-13: local-horizon (skyline) culling of the grazing DIRECT-sun shadow. Default OFF
+    // (byte-identical). Mirrors setUseGeometricHorizon. Also settable via env
+    // PTM_ILLUM_HORIZON_CULL=1 (+ PTM_ILLUM_HORIZON_SLACK_DEG / _CELL_SCALE tunables), read in
+    // initializeScene. CPU illumination path only (warns if GPU ray tracing is active).
+    void setHorizonCull(bool enable) { use_horizon_cull_ = enable; }
+    void setHorizonSlackDeg(double deg) { horizon_slack_deg_ = deg; }
+    void setHorizonCellScale(double s) { horizon_cell_scale_ = s; }
+
+    // PTM-13 P1: topological self-skip for the grazing DIRECT-sun shadow ray. When enabled, the CPU
+    // occlusion test starts the ray AT the face (eps_n=eps_d=0, tnear=0) and skips the source face +
+    // its <= selfskip_rings_ edge-neighbors by primID (an iterative rtcIntersect1 re-trace) instead
+    // of relying on a large geometric ray-origin offset, so a real mm-scale local rim occluder is
+    // detected rather than hopped by the 1 cm offset. Default OFF -> byte-identical. Also settable
+    // via env PTM_ILLUM_TOPO_SELFSKIP=1 (+ PTM_ILLUM_SELFSKIP_RINGS=<n>), read in initializeScene.
+    // CPU illumination path only (warns if GPU ray tracing is active). See BUGS.md PTM-13.
+    void setTopoSelfSkip(bool enable) { use_topo_selfskip_ = enable; }
+    void setSelfSkipRings(int rings) { if (rings >= 1) selfskip_rings_ = rings; }
+
+    // PTM-13 rise-epsilon: the physical self-relief discriminator for the grazing DIRECT-sun shadow
+    // ray. When enabled, the CPU occlusion test marches from the TRUE face centroid (eps_n=eps_d=0,
+    // tnear~0, NO metric offset, NO ring skip) and rejects a hit as self-relief iff its out-of-plane
+    // rise dz = (P_hit - c_src)*n_src is below a facet-scaled floor h_eps = rise_keps_ * local_edge(src);
+    // the FIRST hit rising >= h_eps out of the source tangent plane is a real occluder. Separates the
+    // ~0.12 mm coplanar self-relief from the ~2.47 mm real rim occluder the 1 cm offset hops (BUGS.md
+    // PTM-13). Resolution-independent (h_eps scales with the facet, so A3GT m-DEM occluders are always
+    // kept). Independent of the topological self-skip flag. Default OFF -> byte-identical. Also settable
+    // via env PTM_ILLUM_RISE_EPS=1 (+ PTM_ILLUM_RISE_KEPS=<k>), read in initializeScene. CPU path only
+    // (warns if GPU ray tracing is active). See BUGS.md PTM-13.
+    void setRiseEps(bool enable) { use_rise_eps_ = enable; }
+    void setRiseKeps(double k) { if (k > 0.0) rise_keps_ = k; }
+
+    // PTM-18: interior-hole seal for the grazing DIRECT-sun shadow. Small INTERIOR boundary-edge loops
+    // in the core mesh (missing triangles / T-junction cracks -- NOT the outer patch perimeter) let a
+    // low grazing sun thread through to shadowed floor faces via the finite-disk penumbra path, a
+    // spurious "flash" the rise-epsilon / true-normal fixes cannot touch (it is a mesh topology defect,
+    // not an occlusion-verdict error). When enabled, initializeScene() triangulates each small interior
+    // boundary loop and appends the fill triangles to the shadow BVH (occluder-only, like the ring);
+    // the standard occlusion then blocks the threaded rays. Default OFF -> byte-identical (no fill).
+    // Also settable via env PTM_ILLUM_SEAL_HOLES=1, read in initializeScene. See BUGS.md PTM-18.
+    void setSealInteriorHoles(bool enable) { seal_interior_holes_ = enable; }
+
     // Setup and configuration
     void setMeshResolution(int resolution);
     void setTimeSteps(int steps);
@@ -253,6 +295,22 @@ public:
     const std::string& getBVHCacheFile() const { return bvh_cache_file_; }
 
     /**
+     * Register occluder-only geometry (e.g. a coarse LOLA ring/annulus
+     * surrounding the SfS core). These triangles are appended to the
+     * ray-tracing BVH so distant topography shadows the core, but are
+     * NOT thermally solved, NOT in the radiosity matrix, and NOT output —
+     * they exist only to block direct-solar rays. Must be called BEFORE
+     * initializeScene()/calculateIlluminationFromMesh(). Empty = no-op
+     * (the core-only path is then byte-identical to before).
+     */
+    void setOccluderGeometry(
+        const std::vector<std::array<double, 3>>& vertices,
+        const std::vector<std::array<int, 3>>& faces) {
+        occluder_vertices_ = vertices;
+        occluder_faces_ = faces;
+    }
+
+    /**
      * @brief Check if GPU ray tracing is currently enabled and available
      */
     bool isGPURayTracingEnabled() const { return use_gpu_ray_tracer_; }
@@ -312,6 +370,44 @@ private:
         const std::vector<std::array<double, 3>>& origins,
         const std::vector<std::array<double, 3>>& directions,
         bool coherent = false);
+
+    // PTM-13 P1: occlusion test with topological self-skip. Per ray, iteratively rtcIntersect1 and
+    // skip any hit on the source face or its <= selfskip_rings_ edge-neighbors (face_skip_off_/
+    // face_skip_nbr_), returning blocked only on the first NON-neighbor hit. Callers pass origins AT
+    // the face (no geometric offset) so the near local occluder is detected. CPU path; used only
+    // when use_topo_selfskip_ is set. src_faces[i] = source core-face id for ray i (-1 = no skip).
+    std::vector<uint8_t> traceOccludedSelfSkip(
+        const std::vector<std::array<double, 3>>& origins,
+        const std::vector<std::array<double, 3>>& directions,
+        const std::vector<int>& src_faces);
+
+    // Build the per-core-face self-skip CSR (BFS over <= selfskip_rings_ edge rings of the merged
+    // mesh). Called from initializeScene when use_topo_selfskip_ is set. n_core = # illuminated
+    // (core) faces; faces_all = merged core+occluder connectivity (primID space).
+    void buildSelfSkipAdjacency(const std::vector<std::array<int, 3>>& faces_all, size_t n_core);
+
+    // PTM-13 rise-epsilon occlusion: march from the true centroid (tnear~0, no offset, no ring skip),
+    // rejecting a hit as self-relief iff its out-of-plane rise dz = (P_hit - c_src)*n_src < h_eps
+    // (per-face, = rise_keps_ * face_edge_local_[src]); the first hit with dz >= h_eps is a real
+    // occluder. Callers pass origins AT the face (eps_n=eps_d=0) so c_src = origin and dz =
+    // t_hit*(dir*n_src). The origin primID is also skipped (dz~0) for float robustness. CPU path; used
+    // when use_rise_eps_ is set. src_faces[i]/src_normals[i] = source core-face id / effective outward
+    // normal for ray i.
+    std::vector<uint8_t> traceOccludedRiseEps(
+        const std::vector<std::array<double, 3>>& origins,
+        const std::vector<std::array<double, 3>>& directions,
+        const std::vector<int>& src_faces,
+        const std::vector<std::array<double, 3>>& src_normals);
+
+    // PTM-18: build fan-triangulated fill for the SMALL INTERIOR boundary-edge loops of the core mesh
+    // (missing-triangle holes / T-junction cracks), EXCLUDING the outer patch perimeter (the boundary
+    // component whose spatial extent spans the mesh). Returns occluder-only triangles in CORE vertex
+    // index space (appended to the shadow BVH by initializeScene). Only well-formed closed loops are
+    // filled; open/non-manifold components are skipped with a warning (silence is not an option).
+    // Called from initializeScene when seal_interior_holes_ is set. See BUGS.md PTM-18.
+    std::vector<std::array<int, 3>> buildInteriorHoleFill(
+        const std::vector<std::array<double, 3>>& vertices,
+        const std::vector<std::array<int, 3>>& faces) const;
 
     bool checkLunarHorizon(
         const std::array<double, 3>& ray_origin,
@@ -449,7 +545,8 @@ private:
         const std::array<double, 3>& face_normal,
         const std::array<double, 3>& sun_position,
         const std::array<double, 3>& primary_position,
-        int num_samples = 9);  // Default to 9 samples (3x3 grid)
+        int num_samples = 9,     // Default to 9 samples (3x3 grid)
+        int src_face = -1);      // PTM-13 P1: source core-face id for topological self-skip (-1 = off)
 
     void calculatePrimaryIRBatch(
         const std::vector<std::array<double, 3>>& face_centers,
@@ -511,6 +608,104 @@ private:
     // Scene origin shift to improve numerical robustness (applied in Embree space)
     std::array<double,3> scene_origin_offset_{0.0, 0.0, 0.0};
     bool scene_has_offset_ = false;
+
+    // Mesh topology flag: true if the CORE mesh is an OPEN patch (has boundary
+    // edges belonging to exactly one triangle), false if watertight/closed (0
+    // boundary edges). Computed once in initializeScene() over the core faces
+    // (occluders excluded). Gates the analytic body-occlusion pre-check:
+    //   - CLOSED mesh (e.g. 623 Chimaera): the Embree BVH holds the full body and
+    //     self-occludes, so the analytic pre-check is DISABLED (it over-culls
+    //     sunward grazing facets on shaped bodies). This matches the GPU path,
+    //     which has never had a pre-check and is correct on closed bodies.
+    //   - OPEN mesh (e.g. the lunar/Europa micro-patch): the BVH has no far-side
+    //     geometry so shadow rays pass through the bulk body; the analytic body-
+    //     sphere is the SOLE self-occlusion guard, so the pre-check runs. It culls
+    //     a face only when the body sphere lies BETWEEN the face and the sun
+    //     (forward ray-sphere hit at t>0) -- NOT gated by mu, and NOT a bare
+    //     |fc x sun| < R line test, which would wrongly cull sunward-tilted facets
+    //     just past the terminator. Applied to the CPU AND GPU paths identically.
+    // See docs/illumination-model.md and memory
+    // ptm-mu-gate-open-mesh-selfocclusion-fail.
+    bool mesh_is_open_ = false;
+
+    // Body-level occluding-sphere radius (NATIVE mesh units, same units as the
+    // runtime face-center radius |fc|). Used by the OPEN-mesh analytic body-
+    // occlusion pre-check as the sphere the shadow ray must clear. Computed once
+    // in initializeScene() as min over core-face centroid radii -- the solid bulk
+    // of the body reaches down to its lowest face, so a shadow ray whose closest
+    // approach falls inside this sphere is blocked by the body. This REPLACES the
+    // former per-face 0.998*|fc| inset, which put the occluder ~0.2% (thousands of
+    // m on the Moon) BELOW the surface and left a ~3.6 deg blind band: on a near-
+    // tangent micro-patch the grazing night-side ray cleared the sunken sphere and
+    // leaked. min(|fc|) keys the sphere to the true body radius (relief-adaptive:
+    // it is the lowest crater floor) so tangent grazing rays are caught, while no
+    // face is ever culled by a sphere larger than its own radius (0 daytime loss).
+    // 0 until the scene is built.
+    double body_radius_occ_native_ = 0.0;
+
+    // PTM-13: local-horizon (skyline) direct-shadow cull. horizon_direct_ is a macroscopic
+    // running-max terrain-elevation grid built once in initializeScene() when use_horizon_cull_
+    // is set (env PTM_ILLUM_HORIZON_CULL=1 or setHorizonCull(true)); it culls the grazing-sun
+    // leak (spurious DIRECT sun inside PSRs) resolution-independently, where the single Embree
+    // shadow ray hops the mm rim. Azimuth-specific. Default OFF -> byte-identical. See
+    // BUGS.md PTM-13 and RUNBOOK-ptm13-validation.md.
+    radiation::HorizonField horizon_direct_;
+    bool   use_horizon_cull_ = false;
+    double horizon_slack_deg_ = 0.25;   // skyline slack (tunable; acne<->leak borderline)
+    double horizon_cell_scale_ = 1.0;   // height-grid cell = scale * median face pitch
+
+    // PTM-13 P1: topological self-skip adjacency (CSR). face_skip_off_[c]..[c+1] index into
+    // face_skip_nbr_ the sorted primIDs to skip for CORE face c (itself + <= selfskip_rings_ edge
+    // neighbors). Built in initializeScene when use_topo_selfskip_ is set; empty otherwise. Default
+    // OFF -> byte-identical (no build, no re-trace). See BUGS.md PTM-13, RUNBOOK-ptm13-validation.md.
+    std::vector<uint32_t> face_skip_off_;
+    std::vector<int>      face_skip_nbr_;
+    bool use_topo_selfskip_ = false;
+    int  selfskip_rings_ = 2;
+
+    // PTM-13 rise-epsilon: per-core-face local edge length [m] (mean of the 3 triangle edges), the
+    // facet scale for the out-of-plane-rise self-relief floor h_eps = rise_keps_ * face_edge_local_[c].
+    // Built in initializeScene when use_rise_eps_ is set; empty otherwise. Default OFF -> byte-identical.
+    // See BUGS.md PTM-13.
+    std::vector<float> face_edge_local_;
+    bool   use_rise_eps_ = false;
+    double rise_keps_    = 0.2;   // h_eps = rise_keps_ * local edge (~0.5 mm at a 2.5 mm facet)
+    // PTM-13 Class-2 fix: absolute self-relief floor override (meters). When >= 0 (env
+    // PTM_ILLUM_RISE_HABS), traceOccludedRiseEps uses h_eps = rise_habs_ INSTEAD of the
+    // edge-proportional rise_keps_*face_edge_local_[src]. Paul's scale ruling (2026-07-17): spatial
+    // scale is arbitrary (no lateral conduction), so resolved mesh relief SHOULD shadow and an
+    // edge-proportional floor is conceptually wrong; an absolute floor at numerical-noise scale (or 0
+    // = exact source-triangle-only self-exclusion) kills the grazing occlusion leak with no acne.
+    // Phase-2 knob table (scripts/ptm_illum_deepdive/phase2_knob_table_grazing.csv): 0.2*edge kills
+    // 0.9% of 8854 float64-confirmed grazing occlusions; h_abs=0 kills 100% with 0/778 grazing acne.
+    // Sentinel -1.0 => override OFF -> byte-identical (edge-proportional floor as before).
+    double rise_habs_    = -1.0;
+
+    // PTM-13 rise-epsilon MULTI-HIT refinement (OPTION 3, sub-mode of rise-eps): the single hit-POINT
+    // rise dz misses a near-coplanar occluder that is CROSSED near its shared edge (dz<h_eps) yet whose
+    // TRIANGLE rises >= h_eps at a farther vertex. When use_rise_eps2_ is set, traceOccludedRiseEps adds
+    // an OR layer: a hit ALSO counts as a real occluder iff it is a genuine FLOAT64-INTERIOR crossing
+    // (barycentric min > rise_bary_eps_, which rejects the float32 edge-clip artifacts that are the
+    // entire acne source) AND the hit TRIANGLE's max-vertex out-of-plane rise >= h_eps. Strict superset
+    // of the base rise-eps blocks (never removes a block), so ON only ever darkens more; requires the
+    // per-core-face recentered triangle vertices (face_verts_local_), built only when set. Implies
+    // use_rise_eps_ (base build + CPU routing). Default OFF -> byte-identical. STEP-1 measurement
+    // (scripts/ptm_riseeps2_multihit/): near-coplanar leak recall 24%->84%, ZERO incremental acne on
+    // open terrain AND steep grazing-lit walls. See BUGS.md PTM-13.
+    std::vector<std::array<std::array<double, 3>, 3>> face_verts_local_;  // per core face: 3 recentered verts
+    bool   use_rise_eps2_ = false;
+    double rise_bary_eps_ = 0.0;  // interior-crossing barycentric floor (>0 => strictly inside the tri)
+
+    // Occluder-only geometry (shadow ray-tracing); appended to the BVH in
+    // initializeScene(). Never thermally solved / output. See
+    // docs/extended-occluder-architecture.md.
+    std::vector<std::array<double, 3>> occluder_vertices_;
+    std::vector<std::array<int, 3>>    occluder_faces_;
+
+    // PTM-18: seal small interior mesh holes for the grazing-sun flash (env PTM_ILLUM_SEAL_HOLES=1 or
+    // setSealInteriorHoles). Fill triangles are appended to the shadow BVH like the occluder ring;
+    // never thermally solved / output. Default OFF -> byte-identical. See BUGS.md PTM-18.
+    bool seal_interior_holes_ = false;
     
     // Results storage
     std::vector<double> times_;  // Ephemeris times
