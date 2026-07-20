@@ -241,6 +241,45 @@ bool RadiosityOpenCLSolver::initialize() {
     return true;
 }
 
+bool RadiosityOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
+    if (initialized_) return true;
+
+    context_ = std::make_unique<OpenCLContext>();
+    if (!context_->initialize(device_handle)) {
+        if (config_.verbose) {
+            std::cerr << "Failed to initialize OpenCL context on device "
+                      << device_handle.name << "\n";
+        }
+        return false;
+    }
+
+    if (config_.verbose) {
+        printDeviceInfo(context_->deviceInfo());
+    }
+
+    try {
+        buildKernels();
+        createBuffers();
+    } catch (const std::exception& e) {
+        if (config_.verbose) {
+            std::cerr << "OpenCL initialization error on " << device_handle.name
+                      << ": " << e.what() << "\n";
+        }
+        release();
+        return false;
+    }
+
+    initialized_ = true;
+
+    if (config_.verbose) {
+        std::cout << "RadiosityOpenCLSolver initialized on "
+                  << device_handle.name
+                  << ": " << n_faces_ << " faces\n";
+    }
+
+    return true;
+}
+
 void RadiosityOpenCLSolver::buildKernels() {
     std::string source = getRadiosityKernelSource();
 

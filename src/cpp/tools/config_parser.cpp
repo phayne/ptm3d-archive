@@ -39,6 +39,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& mesh = root["mesh"];
             config.mesh.resolution = getWithDefault(mesh, "resolution", config.mesh.resolution);
             config.mesh.import_file = getWithDefault(mesh, "import_file", config.mesh.import_file);
+            config.mesh.occluder_file = getWithDefault(mesh, "occluder_file", config.mesh.occluder_file);
             config.mesh.scale_factor = getWithDefault(mesh, "scale_factor", config.mesh.scale_factor);
             config.mesh.export_basic = getWithDefault(mesh, "export_basic", config.mesh.export_basic);
             config.mesh.use_topographic = getWithDefault(mesh, "use_topographic", config.mesh.use_topographic);
@@ -52,6 +53,13 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& thermal = root["thermal"];
             config.thermal.run_thermal_mesh = getWithDefault(thermal, "run_thermal_mesh", config.thermal.run_thermal_mesh);
             config.thermal.threads = getWithDefault(thermal, "threads", config.thermal.threads);
+            // Depth-grid resolution. m = layers per upper skin depth; n = layer
+            // growth factor; b = skin depths to bottom layer. These were
+            // previously read only from --thermal-{m,n,b} CLI flags, with the
+            // YAML keys silently ignored — fixed here.
+            config.thermal.grid_m = getWithDefault(thermal, "thermal_m", config.thermal.grid_m);
+            config.thermal.grid_n = getWithDefault(thermal, "thermal_n", config.thermal.grid_n);
+            config.thermal.grid_b = getWithDefault(thermal, "thermal_b", config.thermal.grid_b);
             config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
             config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
@@ -86,6 +94,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
             config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
             config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
+            config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
                 const auto& is_node = thermal["ice_stability"];
@@ -163,6 +173,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_temp_threshold = getWithDefault(rad, "coupling_temp_threshold", config.radiation.coupling_temp_threshold);
             config.radiation.coupling_flux_threshold = getWithDefault(rad, "coupling_flux_threshold", config.radiation.coupling_flux_threshold);
             config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
+            config.radiation.coupling_select_mode = getWithDefault(rad, "coupling_select_mode", config.radiation.coupling_select_mode);
+            config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
             config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
             config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
             config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);
@@ -176,6 +188,23 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.use_cluster_cull = getWithDefault(rad, "use_cluster_cull", config.radiation.use_cluster_cull);
             config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
             config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
+            // Anisotropic roughness-beamed emission (Smith 1967); 0 = Lambertian.
+            config.radiation.rms_slope_deg = getWithDefault(rad, "rms_slope_deg", config.radiation.rms_slope_deg);
+            config.radiation.beam_vf_threshold = getWithDefault(rad, "beam_vf_threshold", config.radiation.beam_vf_threshold);
+            // Band-separated (visible + thermal-IR) radiosity (D1). Default OFF;
+            // Paul's default-flip (D2) is separate. See two-band-radiosity-derivation.tex.
+            config.radiation.band_separated = getWithDefault(rad, "band_separated", config.radiation.band_separated);
+
+            // Multi-GPU radiosity dispatch (mirrors thermal pool YAML keys).
+            config.radiation.gpu_devices = getWithDefault(rad, "gpu_devices", config.radiation.gpu_devices);
+            if (rad["gpu_device_ids"] && rad["gpu_device_ids"].IsSequence()) {
+                config.radiation.gpu_device_ids.clear();
+                for (const auto& v : rad["gpu_device_ids"]) {
+                    config.radiation.gpu_device_ids.push_back(v.as<int>());
+                }
+            }
+            config.radiation.gpu_batch_size = getWithDefault(rad, "gpu_batch_size", config.radiation.gpu_batch_size);
+            config.radiation.gpu_inter_batch_pause_ms = getWithDefault(rad, "gpu_inter_batch_pause_ms", config.radiation.gpu_inter_batch_pause_ms);
 
             // Resolve relative view_factor_file against the YAML file's directory so
             // the cache path is cwd-independent (GUI subprocess cwd is not necessarily
@@ -263,6 +292,29 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermophysical.constant_thermal_inertia = getWithDefault(
                 thermo, "constant_thermal_inertia",
                 config.thermophysical.constant_thermal_inertia);
+            // Optional scalar property overrides (sensitivity sweeps). Distinct
+            // keys (suffixed _override) so existing configs that carry ignored
+            // GUI scalars are unaffected; sentinel <0 leaves the body default.
+            config.thermophysical.albedo_override = getWithDefault(
+                thermo, "albedo_override", config.thermophysical.albedo_override);
+            config.thermophysical.emissivity_override = getWithDefault(
+                thermo, "emissivity_override", config.thermophysical.emissivity_override);
+            config.thermophysical.ks_override = getWithDefault(
+                thermo, "ks_override", config.thermophysical.ks_override);
+            config.thermophysical.kd_override = getWithDefault(
+                thermo, "kd_override", config.thermophysical.kd_override);
+
+            // Directional-hemispheric (Hapke) albedo gate. Two equivalent opt-in
+            // spellings: the previously-dead `incidence_angle_albedo` bool, or
+            // `albedo_model: hapke`. Default OFF -> the Hayne-polynomial/constant
+            // path is untouched and baseline runs stay byte-identical.
+            bool inc_alb = getWithDefault(thermo, "incidence_angle_albedo", false);
+            std::string albedo_model =
+                getWithDefault<std::string>(thermo, "albedo_model", std::string{});
+            for (auto& c : albedo_model) c = std::tolower(c);
+            config.thermophysical.albedo_hapke = (inc_alb || albedo_model == "hapke");
+            config.thermophysical.albedo_hapke_w = getWithDefault(
+                thermo, "albedo_hapke_w", config.thermophysical.albedo_hapke_w);
         }
 
         // Parse Advanced section
@@ -303,6 +355,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "resolution" << YAML::Value << config.mesh.resolution;
         if (!config.mesh.import_file.empty())
             out << YAML::Key << "import_file" << YAML::Value << config.mesh.import_file;
+        if (!config.mesh.occluder_file.empty())
+            out << YAML::Key << "occluder_file" << YAML::Value << config.mesh.occluder_file;
         out << YAML::Key << "scale_factor" << YAML::Value << config.mesh.scale_factor;
         out << YAML::Key << "export_basic" << YAML::Value << config.mesh.export_basic;
         out << YAML::Key << "use_topographic" << YAML::Value << config.mesh.use_topographic;
@@ -318,6 +372,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "thermal" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "run_thermal_mesh" << YAML::Value << config.thermal.run_thermal_mesh;
         out << YAML::Key << "threads" << YAML::Value << config.thermal.threads;
+        out << YAML::Key << "thermal_m" << YAML::Value << config.thermal.grid_m;
+        out << YAML::Key << "thermal_n" << YAML::Value << config.thermal.grid_n;
+        out << YAML::Key << "thermal_b" << YAML::Value << config.thermal.grid_b;
         out << YAML::Key << "equilibration_orbits" << YAML::Value << config.thermal.equilibration_orbits;
         out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
         out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;
@@ -479,6 +536,8 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.mesh.resolution = std::stoi(argv[++i]);
         } else if (arg == "--mesh-file" && i + 1 < argc) {
             config.mesh.import_file = argv[++i];
+        } else if (arg == "--occluder-file" && i + 1 < argc) {
+            config.mesh.occluder_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
             config.mesh.scale_factor = std::stod(argv[++i]);
         } else if (arg == "--export-basic-mesh") {
@@ -611,6 +670,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "mesh:\n";
     out << "  resolution: 5                       # Global mesh resolution\n";
     out << "  import_file: \"\"                     # Import custom mesh (OBJ, PLY, VTK)\n";
+    out << "  occluder_file: \"\"                   # Optional occluder-only ring/annulus PLY (shadow ray-tracing only; not solved/output)\n";
     out << "  scale_factor: 1.0                   # Scaling for imported meshes\n";
     out << "  export_basic: false                 # Export basic mesh to VTK\n";
     out << "  use_topographic: false              # Use pre-computed topographic mesh\n";

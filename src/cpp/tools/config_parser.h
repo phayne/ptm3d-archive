@@ -28,6 +28,11 @@ struct SimulationConfig {
     struct MeshParams {
         int resolution = 5;
         std::string import_file = "";
+        // Optional occluder-only mesh (coarse LOLA ring/annulus around the
+        // SfS core). Added to the illumination shadow-ray BVH ONLY — never
+        // thermally solved, radiosity-coupled, or output. Empty = none.
+        // See docs/extended-occluder-architecture.md.
+        std::string occluder_file = "";
         double scale_factor = 1.0;
         bool export_basic = false;
         bool use_topographic = false;
@@ -89,10 +94,20 @@ struct SimulationConfig {
         int integration_offset_steps = 0;
         bool debug = false;               // Enable thermal debug output for one equatorial face
         double debug_lat_threshold = 10.0; // Maximum latitude (deg) for debug face selection
-        // Grid parameters optimized vs Diviner (Hayne et al. 2017), RMS < 4K with 10 layers
-        int grid_m = 4;                   // Layers in upper skin depth (optimal: 4)
-        int grid_n = 10;                  // Layer growth factor (optimal: 10)
-        int grid_b = 5;                   // Skin depths to bottom (optimal: 5, minimum viable)
+        // Vertical depth-grid parameters. m = layers per upper skin depth;
+        // n = layer growth factor (in units used by the adaptive grid); b =
+        // skin depths to bottom layer. The defaults below give a bottom at
+        // ~b·δ_diurnal so the diurnal wave is fully damped before the
+        // bottom Neumann BC clips it. With the radiative-conductivity term
+        // χ(T/350)³ ~doubling K at deep temperatures, the effective skin
+        // depth at depth is ~1.5–2× the surface lattice value — so b needs
+        // to be ≥ ~10 for the wave to attenuate by exp(-5) below the BC.
+        // The previous defaults (m=4, n=10, b=5) gave only ~3 actual
+        // e-folds at depth, leaving a ~tens-of-K diurnal residual at the
+        // bottom that contaminated extrapolated location-export depths.
+        int grid_m = 10;                  // Layers in upper skin depth
+        int grid_n = 15;                  // Layer growth factor (only used by legacy non-adaptive path)
+        int grid_b = 15;                  // Skin depths to bottom (≈9 e-folds of damping at deep T; bottom amp <0.05 K)
         // Geothermal heat flow
         double geothermal_heat_flow = -1.0; // W/m², -1 = use planet default
         // Per-face heat flow mask (for localized endogenic heat)
@@ -112,6 +127,22 @@ struct SimulationConfig {
         //   (layer-major to match the GPU SoA layout).
         std::string initial_state_file = "";
         std::string final_state_file   = "";
+
+        // Deep radiation-coupling, two-pass scheme (fixes the cold-PSR-floor
+        // bias from equilibrating the deep column WITHOUT the radiosity
+        // indirect flux). Orchestrated as two binary runs:
+        //  - indirect_mean_out_file: if non-empty, after the radiation-coupling
+        //    Picard loop, write the per-face OUTPUT-window time-mean indirect
+        //    flux <q_ind>[f] (W/m^2) to this binary file.
+        //  - eq_indirect_flux_file: if non-empty, load per-face <q_ind>[f] from
+        //    this file and ADD it to the EQUILIBRATION-phase absorbed flux only
+        //    (the output window already gets the time-varying indirect via the
+        //    coupling), so the deep column equilibrates consistent with the
+        //    wall-heating forcing.
+        // Format: uint32 magic 0x51494E44 ('QIND'), uint32 n_faces, then
+        //   n_faces float64 values (per global face id).
+        std::string indirect_mean_out_file = "";
+        std::string eq_indirect_flux_file  = "";
 
         // Schorghofer & Taylor (2007) ice-stability output. When enabled,
         // the thermal solver accumulates time-averaged sublimation rate
@@ -194,6 +225,19 @@ struct SimulationConfig {
         double coupling_temp_threshold = 0.5;
         double coupling_flux_threshold = 0.1;
         double coupling_face_fraction = 0.01;
+        // Face-selection mode for the rad-thermal coupling re-thermal phase.
+        // "physics" (default): linearized ΔT predictor, ΔT ≈ (1−α)·ΔF / (4εσT³).
+        //                      Re-runs faces whose predicted T change exceeds
+        //                      coupling_temp_threshold·coupling_select_safety.
+        //                      Also implicitly freezes faces whose observed
+        //                      ΔT in the previous iter was below threshold.
+        // "legacy": absolute flux threshold (max indirect flux > coupling_flux_threshold).
+        //           Reproduces pre-2026-05-09 behavior for byte-identical re-runs.
+        std::string coupling_select_mode = "physics";
+        // Safety factor applied to the predicted-ΔT threshold. The predictor
+        // is a linearization that breaks down for ΔF ≳ T·few; multiplying the
+        // threshold by this factor (default 0.5) errs on the side of inclusion.
+        double coupling_select_safety = 0.5;
         bool use_hmatrix = false;
         bool use_aca = true;
         double aca_tolerance = 1e-3;
@@ -208,6 +252,22 @@ struct SimulationConfig {
         // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;
+        // Anisotropic (roughness-beamed) thermal emission, Smith 1967.
+        // 0 (default) = Lambertian, byte-identical. RMS micro-slope [deg].
+        double rms_slope_deg = 0.0;
+        double beam_vf_threshold = 1e-7;
+        // Band-separated (visible + thermal-IR) radiosity (D1). Production DEFAULT
+        // ON (D2, 2026-07-12); gray recovered exactly with band_separated:false.
+        // See docs/two-band-radiosity-derivation.tex.
+        bool band_separated = true;
+        // Multi-GPU radiosity dispatch (mirrors thermal pool config).
+        // Per-timestep solves are independent so the timestep-batch can be
+        // split across N GPUs. Default == 1 preserves legacy single-GPU
+        // behaviour byte-identically. Only consulted when use_gpu = true.
+        int gpu_devices = 1;
+        std::vector<int> gpu_device_ids;
+        int gpu_batch_size = 0;              // 0 = auto = 4 * gpu_devices
+        int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation (mac+AMD)
     } radiation;
 
     // Generic Body Configuration (for user-defined bodies)
@@ -273,6 +333,24 @@ struct SimulationConfig {
     struct ThermophysicalParams {
         bool albedo_explicit = false;
         double constant_thermal_inertia = -1.0;  // >0: constant TI mode (chi=0, cp=const)
+        // Optional scalar overrides applied to the body Planet after construction
+        // (Moon/SPICE path included). Sentinel <0 (or <0 for albedo) = leave the
+        // body default untouched. Used for property sensitivity sweeps.
+        double albedo_override = -1.0;      // >=0: override Bond albedo A0
+        double emissivity_override = -1.0;  // >0:  override emissivity
+        double ks_override = -1.0;          // >0:  override surface conductivity ks
+        double kd_override = -1.0;          // >0:  override deep conductivity kd
+
+        // Directional-hemispheric (Hapke) albedo model, OFF by default. When
+        // enabled, the absorbed-solar term uses the analytic closed form
+        //   A_h(mu0) = 1 - gamma * H(mu0, w),  gamma = sqrt(1-w),
+        //   H(mu0,w) = (1 + 2*mu0) / (1 + 2*mu0*gamma),  mu0 = cos(incidence),
+        // replacing the constant (1 - albedo). Gated so baseline (Moon3D / A3GT /
+        // Europa) runs stay byte-identical. Opt in via `incidence_angle_albedo:
+        // true` or `albedo_model: hapke` in the thermophysical section.
+        bool   albedo_hapke = false;        // gate: use A_h(i) closed form
+        double albedo_hapke_w = -1.0;       // single-scattering albedo w; <0 =
+                                            // derive from the Bond albedo A0.
     } thermophysical;
 
     // Legacy accessor (for compatibility)

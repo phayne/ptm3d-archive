@@ -14,6 +14,7 @@
 
 #include "radiation_config.h"
 #include "../mesh/mesh_utils.h"
+#include "horizon_field.h"
 
 // Forward declarations for Embree
 typedef struct RTCDeviceTy* RTCDevice;
@@ -57,6 +58,14 @@ struct HMatrixConfig {
 
     // Hierarchical subdivision control
     int max_hierarchical_levels = 2;      // Maximum levels of hierarchical subdivision beyond start depth
+
+    // Admissible-block subdivision (robustness fix for crater floor<->wall coupling).
+    // When ACA on a large admissible block would be too expensive (side > aca_cap) or
+    // ACA fails on a large block, bisect the FACE-INDEX LISTS and re-attempt ACA on
+    // compact sub-clusters instead of zeroing the block. OFF reproduces the exact old
+    // zero behavior for A/B verification. Env PTM_HMATRIX_SUBDIVIDE (1/0) overrides this.
+    bool subdivide_large_admissible = true;
+    int  subdiv_leaf_size = 500;          // leaf side; matches the old MAX_DIRECT_COMPUTE
 
     // Out-of-core (disk-backed) configuration for very large meshes
     bool use_out_of_core = false;         // Enable disk-backed storage during build
@@ -310,6 +319,19 @@ private:
         OctreeNode* col_node,
         int depth);
 
+    // Bounded recursive subdivision of a LARGE admissible block. Bisects the
+    // face-index lists directly (NOT octree children, which may be leaves),
+    // re-attempts ACA on compact sub-clusters, and computes small leaves as exact
+    // sparse. Returns a HierarchicalBlock wrapping the sub-blocks, a single leaf
+    // block, or (last resort at the depth cap) a ZeroBlock. Replaces the old
+    // "zero the large admissible block" fallback so crater floor<->wall coupling
+    // survives above ~100k faces. See buildBlock() admissible path.
+    std::unique_ptr<HMatrixBlock> buildAdmissibleSubdivided(
+        const std::vector<int>& row_faces,
+        const std::vector<int>& col_faces,
+        int subdiv_depth,
+        bool try_aca = true);
+
     // Compute sparse view factor submatrix for given row/col indices
     void computeViewFactorBlock(
         const std::vector<int>& row_faces,
@@ -361,6 +383,15 @@ private:
     // Compute view factor between two faces
     double computeViewFactor(int face_i, int face_j) const;
 
+    // Near-field-accurate view factor via area-to-area numerical quadrature.
+    // The M1 centroid estimator A_j*cos_i*cos_j/(pi*r^2) is a far-field
+    // approximation (valid only for r >> face size) and overshoots for close
+    // or adjacent pairs, which is what makes Sum_j F_ij exceed 1 and the
+    // radiosity coupling diverge. This double-integrates over both triangles,
+    // subdividing more finely as the pair gets closer, so the result is
+    // physically bounded (Sum_j F_ij <= 1) with no artificial cap.
+    double computeViewFactorRefined(int face_i, int face_j) const;
+
     // Visibility check
     bool isVisible(const std::array<double, 3>& p1,
                    const std::array<double, 3>& p2) const;
@@ -385,6 +416,28 @@ private:
     std::vector<std::array<double, 3>> face_centers_;
     std::vector<std::array<double, 3>> face_normals_;
     std::vector<double> face_areas_;
+
+    // Heightfield-horizon visibility (robust grazing-tangent occlusion; recovers
+    // crater floor<->rim coupling that the Embree thin-ray over-occludes on rough
+    // fine meshes). Built in build() when env PTM_HMATRIX_HORIZON_VIS=1; used in
+    // computeViewFactorRow/Column/Block instead of the Embree ray.
+    HorizonField horizon_;
+    bool use_horizon_vis_ = false;
+
+    // Smoothed (local-mean/macroscopic) face normals for the view-factor cosine
+    // terms. The raw per-facet normals on fine rough meshes tilt ~10deg off the
+    // macroscopic surface and decouple grazing floor<->rim pairs (their cosine
+    // lobes miss the rim); the macroscopic normal gives the resolution-independent
+    // VF (validated by bin/vf_hemisphere_mc). Built in build() when env
+    // PTM_HMATRIX_SMOOTH_NORMALS=1 (radius PTM_HMATRIX_SMOOTH_RADIUS, default ~300 m).
+    std::vector<std::array<double, 3>> smoothed_normals_;
+    bool use_smoothed_normals_ = false;
+    void computeSmoothedNormals(double radius);
+    // Accessor used by the view-factor cosine terms (NOT the cluster cull, which
+    // already averages over the cluster).
+    inline const std::array<double, 3>& vfNormal(int i) const {
+        return use_smoothed_normals_ ? smoothed_normals_[i] : face_normals_[i];
+    }
 
     // Spatial partitioning trees
     std::unique_ptr<QuadtreeNode> quadtree_root_;  // 2D quadtree (legacy)

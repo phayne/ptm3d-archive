@@ -1,0 +1,38 @@
+{
+  "dc_pass0": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "wall_s": 321.2
+  },
+  "dc_pass1": {
+    "N": 11158,
+    "bias": -8.5,
+    "rmse": 12.2,
+    "PSR_n": 11158,
+    "PSR_bias": -8.5,
+    "PSR_rmse": 12.2,
+    "wall_s": 322.9
+  },
+  "dc_pass2": {
+    "N": 11158,
+    "bias": -8.5,
+    "rmse": 12.2,
+    "PSR_n": 11158,
+    "PSR_bias": -8.5,
+    "PSR_rmse": 12.2,
+    "wall_s": 321.2
+  },
+  "dc_eq8_fix": {
+    "N": 11158,
+    "bias": -21.9,
+    "rmse": 23.4,
+    "PSR_n": 11158,
+    "PSR_bias": -21.9,
+    "PSR_rmse": 23.4,
+    "wall_s": 626.4
+  }
+}

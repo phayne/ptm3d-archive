@@ -1,0 +1,51 @@
+{
+  "haworth": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "lat": -87.45,
+    "lon": -2.1
+  },
+  "faustini": {
+    "N": 11157,
+    "bias": -12.0,
+    "rmse": 27.4,
+    "PSR_n": 9390,
+    "PSR_bias": -12.7,
+    "PSR_rmse": 28.4,
+    "sunlit_n": 1767,
+    "sunlit_bias": -8.0,
+    "sunlit_rmse": 21.7,
+    "lat": -87.3,
+    "lon": 84.0
+  },
+  "shackleton": {
+    "N": 11184,
+    "bias": -22.1,
+    "rmse": 36.3,
+    "PSR_n": 4025,
+    "PSR_bias": -30.5,
+    "PSR_rmse": 42.5,
+    "sunlit_n": 7159,
+    "sunlit_bias": -17.4,
+    "sunlit_rmse": 32.3,
+    "lat": -89.66,
+    "lon": 129.2
+  },
+  "sunlit": {
+    "N": 11162,
+    "bias": 10.7,
+    "rmse": 67.2,
+    "PSR_n": 4070,
+    "PSR_bias": 63.0,
+    "PSR_rmse": 102.5,
+    "sunlit_n": 7092,
+    "sunlit_bias": -19.3,
+    "sunlit_rmse": 33.0,
+    "lat": -88.181,
+    "lon": 6.041
+  }
+}

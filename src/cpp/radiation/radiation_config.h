@@ -51,6 +51,17 @@ struct RadiationConfig {
     double convergence_tolerance = 0.01; // Relative convergence criterion
     bool use_acceleration = true;        // Use Gauss-Seidel acceleration
 
+    // Band-separated (visible + thermal-IR) radiosity (PTM-07 fix). Production
+    // DEFAULT ON (D2, 2026-07-12): the visible band scatters/absorbs the per-face
+    // Bond albedo A_i (sourced from the surface albedo config) and the IR band
+    // keeps 1-eps/eps; their two absorbed indirect fluxes are summed. Requires a
+    // per-face albedo (setSolarAlbedo) — without one, enableTwoBand() warns LOUD and
+    // stays gray, so the default is safe. The legacy single gray-band solve is
+    // recovered EXACTLY (byte-identical at A=1-eps) by setting band_separated=false.
+    // The env PTM_RAD_TWO_BAND remains an equivalent activation path.
+    // See docs/two-band-radiosity-derivation.tex.
+    bool band_separated = true;
+
     // Multi-scattering control
     int max_bounces = 1;                 // Number of scattering bounces (1 = single)
 
@@ -61,6 +72,14 @@ struct RadiationConfig {
 
     // GPU acceleration options
     bool use_gpu = false;                // Use GPU for radiosity solver (requires OpenCL)
+
+    // Multi-GPU radiosity dispatch (enabled only when use_gpu = true).
+    // Mirrors the thermal pool's dispatch model: per-timestep solves are
+    // mutually independent, so the batch can be split across N GPUs.
+    int gpu_devices = 1;                 // 1 = legacy single-GPU; >1 = pool
+    std::vector<int> gpu_device_ids;     // Explicit device indices (overrides gpu_devices)
+    int gpu_batch_size = 0;              // Timesteps per pool batch (0 = auto = 4 * gpu_devices)
+    int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation, mirrors thermal pool
 
     // H-matrix compression options (for large meshes)
     bool use_hmatrix = false;            // Use hierarchical matrix compression
@@ -77,6 +96,18 @@ struct RadiationConfig {
     bool use_aca = true;                 // Use ACA by default (50-100x faster than SVD)
     double aca_tolerance = 1e-3;         // ACA relative tolerance for convergence
     int aca_max_rank = 50;               // Maximum rank before falling back to sparse
+
+    // H-matrix: bisect + re-ACA large admissible blocks instead of zeroing them
+    // (recovers crater floor<->wall IR coupling lost above ~100k faces). Default ON.
+    // Env PTM_HMATRIX_SUBDIVIDE (1/0) overrides this at build time.
+    bool hmatrix_subdivide_admissible = true;
+
+    // Anisotropic (roughness-beamed) thermal emission (Smith 1967).
+    // Sun-facing rough micro-facets beam thermal IR toward the Sun; for polar
+    // craters this enhances wall->floor IR (sun-dependent, amplifies the seasonal
+    // cycle). rms_slope_deg = 0 (default) => pure Lambertian, byte-identical.
+    double rms_slope_deg = 0.0;          // RMS micro-slope [deg]; 0 = OFF (Lambertian)
+    double beam_vf_threshold = 1e-7;     // Min renormalized VF to keep a beam pair
 
     // Thread control for H-matrix building
     int hmatrix_threads = 0;             // 0 = auto, >0 = manual thread limit

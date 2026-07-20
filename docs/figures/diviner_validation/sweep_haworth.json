@@ -1,0 +1,145 @@
+{
+  "base_repro": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "tag": "base_repro",
+    "desc": "no-op (rebuilt binary must match -8.7 K)",
+    "wall_s": 309.4
+  },
+  "eq4": {
+    "N": 11158,
+    "bias": -13.6,
+    "rmse": 16.1,
+    "PSR_n": 11158,
+    "PSR_bias": -13.6,
+    "PSR_rmse": 16.1,
+    "tag": "eq4",
+    "desc": "equilibration 4 orbits (control)",
+    "wall_s": 417.6
+  },
+  "alb008": {
+    "N": 11158,
+    "bias": -8.4,
+    "rmse": 12.0,
+    "PSR_n": 11158,
+    "PSR_bias": -8.4,
+    "PSR_rmse": 12.0,
+    "tag": "alb008",
+    "desc": "albedo 0.08",
+    "wall_s": 320.0
+  },
+  "alb018": {
+    "N": 11158,
+    "bias": -9.1,
+    "rmse": 12.6,
+    "PSR_n": 11158,
+    "PSR_bias": -9.1,
+    "PSR_rmse": 12.6,
+    "tag": "alb018",
+    "desc": "albedo 0.18",
+    "wall_s": 324.8
+  },
+  "alb025": {
+    "N": 11158,
+    "bias": -9.6,
+    "rmse": 13.1,
+    "PSR_n": 11158,
+    "PSR_bias": -9.6,
+    "PSR_rmse": 13.1,
+    "tag": "alb025",
+    "desc": "albedo 0.25",
+    "wall_s": 339.0
+  },
+  "ti40": {
+    "N": 11158,
+    "bias": -9.5,
+    "rmse": 12.9,
+    "PSR_n": 11158,
+    "PSR_bias": -9.5,
+    "PSR_rmse": 12.9,
+    "tag": "ti40",
+    "desc": "constant TI 40 SI",
+    "wall_s": 347.6
+  },
+  "ti100": {
+    "N": 11158,
+    "bias": -9.5,
+    "rmse": 12.9,
+    "PSR_n": 11158,
+    "PSR_bias": -9.5,
+    "PSR_rmse": 12.9,
+    "tag": "ti100",
+    "desc": "constant TI 100 SI",
+    "wall_s": 337.4
+  },
+  "ks2": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "tag": "ks2",
+    "desc": "k-scale TIx2 (k x4)",
+    "wall_s": 315.9
+  },
+  "ks4": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "tag": "ks4",
+    "desc": "k-scale TIx4 (k x16)",
+    "wall_s": 310.9
+  },
+  "ks0p5": {
+    "N": 11158,
+    "bias": -8.7,
+    "rmse": 12.3,
+    "PSR_n": 11158,
+    "PSR_bias": -8.7,
+    "PSR_rmse": 12.3,
+    "tag": "ks0p5",
+    "desc": "k-scale TIx0.5 (k x0.25)",
+    "wall_s": 314.9
+  },
+  "emis090": {
+    "N": 11158,
+    "bias": -8.8,
+    "rmse": 12.4,
+    "PSR_n": 11158,
+    "PSR_bias": -8.8,
+    "PSR_rmse": 12.4,
+    "tag": "emis090",
+    "desc": "emissivity 0.90",
+    "wall_s": 330.4
+  },
+  "eq6": {
+    "N": 11158,
+    "bias": -18.3,
+    "rmse": 20.1,
+    "PSR_n": 11158,
+    "PSR_bias": -18.3,
+    "PSR_rmse": 20.1,
+    "tag": "eq6",
+    "desc": "equilibration 6 orbits",
+    "wall_s": 526.5
+  },
+  "eq8": {
+    "N": 11158,
+    "bias": -22.5,
+    "rmse": 24.0,
+    "PSR_n": 11158,
+    "PSR_bias": -22.5,
+    "PSR_rmse": 24.0,
+    "tag": "eq8",
+    "desc": "equilibration 8 orbits",
+    "wall_s": 614.0
+  }
+}

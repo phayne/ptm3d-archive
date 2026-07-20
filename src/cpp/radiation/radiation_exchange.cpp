@@ -1,4 +1,5 @@
 #include "radiation_exchange.h"
+#include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../thermal/thermal_model.h"  // For ProgressBar
 
@@ -7,6 +8,7 @@
 
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/radiosity_opencl.h"
+#include "../gpu/radiosity_gpu_pool.h"
 #endif
 
 #include <iostream>
@@ -28,16 +30,321 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
     emissivity_ = emissivity;
     areas_ = areas;
 
+    // Optional radiation-emissivity override (PTM_RAD_EMISSIVITY) for consistency
+    // studies: forces the radiosity emissivity (and hence reflectivity = 1-eps below)
+    // to a single value, independent of the body/config-propagation path.
+    if (const char* re = std::getenv("PTM_RAD_EMISSIVITY")) {
+        double e = std::atof(re);
+        if (e > 0.0 && e <= 1.0 && !emissivity_.empty()) {
+            std::fill(emissivity_.begin(), emissivity_.end(), e);
+            std::cout << "  [PTM_RAD_EMISSIVITY] radiosity emissivity forced to " << e
+                      << " (reflectivity 1-eps=" << (1.0 - e) << ")" << std::endl;
+        }
+    }
+
     size_t n = emissivity.size();
     reflectivity_.resize(n);
     for (size_t i = 0; i < n; ++i) {
         reflectivity_[i] = 1.0 - emissivity_[i];
     }
 
+    // Albedo fix (PTM_SOLAR_ALBEDO): the reflected-SOLAR source should scatter the
+    // solar Bond albedo (~0.12), not the thermal reflectivity 1-eps (~0.05). When the
+    // env is set we fill a separate solar_reflectivity_ used only for the solar source
+    // (computeScatteredSolar + the solar_source term in solve); the thermal multiple-
+    // scattering rho*F*B keeps 1-eps. Unset => empty => byte-identical legacy behavior.
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) {
+            solar_reflectivity_.assign(n, a);
+            std::cout << "  [PTM_SOLAR_ALBEDO] reflected-solar source uses Bond albedo "
+                      << a << " (was 1-eps=" << (n ? reflectivity_[0] : 0.0) << ")\n";
+        }
+    }
+
+    // Band-separated (visible + thermal-IR) radiosity (PTM_RAD_TWO_BAND). See
+    // docs/two-band-radiosity-derivation.tex. OFF by default => the legacy single
+    // gray band runs, byte-identical to the committed behavior. When ON, the visible
+    // channel scatters/absorbs with the Bond albedo A (from PTM_SOLAR_ALBEDO above),
+    // the IR channel is unchanged, and their two absorbed indirect fluxes are summed.
+    // A Bond albedo is REQUIRED: if none was supplied we warn LOUDLY and fall back to
+    // gray rather than silently inventing one (there is no universal default albedo).
+    if (const char* tb = std::getenv("PTM_RAD_TWO_BAND")) {
+        if (tb[0] && tb[0] != '0') {
+            if (solar_reflectivity_.empty()) {
+                std::cerr << "  [PTM_RAD_TWO_BAND] WARNING: two-band radiosity requested but no "
+                             "Bond albedo supplied (PTM_SOLAR_ALBEDO unset); FALLING BACK to the "
+                             "gray path. Set PTM_SOLAR_ALBEDO=A to enable band separation.\n";
+            } else {
+                two_band_ = true;
+                std::cout << "  [PTM_RAD_TWO_BAND] band-separated radiosity ACTIVE: visible band "
+                             "reflects Bond A=" << solar_reflectivity_[0] << " / absorbs 1-A="
+                          << (1.0 - solar_reflectivity_[0]) << ";  IR band reflects 1-eps="
+                          << reflectivity_[0] << " / absorbs eps=" << emissivity_[0]
+                          << ".  Q_ind = Q_ind^vis + Q_ind^ir.\n";
+            }
+        }
+    }
+
     // Pre-allocate work arrays
     radiosity_.resize(n, 0.0);
     radiosity_new_.resize(n, 0.0);
     temp_vec_.resize(n, 0.0);
+
+    // PTM-12 per-partner corrected VF (full replacement). If PTM_HMATRIX_VF_REPLACE points
+    // at a symmetric CSR built from the occlusion-exact referee (assemble_vf2.py), REPLACE the
+    // stored H-matrix operator with it: fixes the near-field over-count AND the floor
+    // under-coupling in one reciprocal, ΣF<=1 matrix. Format: int32 n, float64 geomhash,
+    // int64 indptr[n+1], int64 nnz, int32 cols[nnz], float data[nnz]. FAIL-LOUD (abort) on any
+    // invariant violation (mesh-identity mismatch, rows>1, negatives) — a corrupt/mismatched
+    // correction must NEVER run silently (mirrors the Sinkhorn gate). Unset => byte-identical.
+    if (const char* vfr = std::getenv("PTM_HMATRIX_VF_REPLACE")) {
+        // Mesh-identity hash from the face areas (matches assemble_vf2.py GEOMHASH).
+        double meshHash = 0.0;
+        for (size_t i = 0; i < n; ++i) meshHash += areas_[i] + static_cast<double>(i + 1) * areas_[i] * 1e-9;
+        std::ifstream vf(vfr, std::ios::binary);
+        int32_t nn = 0; double geomhash = 0.0;
+        if (vf) { vf.read(reinterpret_cast<char*>(&nn), sizeof(nn));
+                  vf.read(reinterpret_cast<char*>(&geomhash), sizeof(geomhash)); }
+        if (!vf) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: cannot read CSR header from '" << vfr
+                      << "'. Refusing to run uncorrected when a correction was requested.\n";
+            std::exit(3);
+        }
+        if (static_cast<size_t>(nn) != n) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: CSR face count " << nn << " != mesh "
+                      << n << " (wrong mesh). Aborting.\n";
+            std::exit(3);
+        }
+        if (std::fabs(geomhash - meshHash) > 1e-3 * std::fabs(meshHash) + 1e-9) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: geometry-hash mismatch (CSR " << geomhash
+                      << " vs mesh " << meshHash << "). The corrected VF was built for a DIFFERENT mesh; "
+                      << "NEVER apply a foreign VF. Aborting.\n";
+            std::exit(3);
+        }
+        std::vector<int64_t> indptr(static_cast<size_t>(nn) + 1);
+        vf.read(reinterpret_cast<char*>(indptr.data()),
+                static_cast<std::streamsize>(indptr.size()) * sizeof(int64_t));
+        int64_t nnz = 0;
+        vf.read(reinterpret_cast<char*>(&nnz), sizeof(nnz));
+        std::vector<int32_t> cols(static_cast<size_t>(nnz));
+        vf.read(reinterpret_cast<char*>(cols.data()), static_cast<std::streamsize>(nnz) * sizeof(int32_t));
+        std::vector<float> data(static_cast<size_t>(nnz));
+        vf.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(nnz) * sizeof(float));
+        if (!vf) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: CSR read truncated. Aborting.\n";
+            std::exit(3);
+        }
+        double maxrs = 0.0; size_t nover = 0; double neg = 0.0;
+        for (int32_t i = 0; i < nn; ++i) {
+            double s = 0.0;
+            for (int64_t k = indptr[i]; k < indptr[i + 1]; ++k) { s += data[k]; if (data[k] < neg) neg = data[k]; }
+            if (s > 1.0 + 1e-6) ++nover;
+            maxrs = std::max(maxrs, s);
+        }
+        if (nover > 0 || neg < -1e-9) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: corrected VF violates invariants (rows>1="
+                      << nover << ", min entry=" << neg << "). A non-physical VF (ΣF>1 or negative F) "
+                      << "must not run — re-assemble. Aborting.\n";
+            std::exit(3);
+        }
+        F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
+                    std::move(indptr), std::move(cols), std::move(data));
+        std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
+                     "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
+                     "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
+                     "under-coupling; reciprocity by construction." << std::endl;
+    }
+
+    // PTM-12 row-sum correction (occlusion-aware referee). Install a symmetric
+    // diagonal-congruence wrapper D F D over F_op_ so the effective row sums match a
+    // reference (true occluded) row sum supplied via PTM_HMATRIX_ROWFIX (a raw file of
+    // n float64 = referee Sum_j F_ij per face, e.g. from scripts/ptm12_diag/mc_ref_raw).
+    //   PTM_HMATRIX_ROWFIX_MODE=damp (default): target_i = min(stored_i, ref_i) => reductions
+    //     only (fixes the near-field over-weight + the Sum F > 1 renorm runaway).
+    //   =full: target_i = ref_i => signed (also restores mild under-coupling).
+    // The wrapper preserves reciprocity and restores F_sky>0; the vf_row_norm_ block
+    // below then recomputes from the corrected operator (=> a no-op where target<=1).
+    // Unset => wrapper never installed => byte-identical.
+    if (const char* rf = std::getenv("PTM_HMATRIX_ROWFIX")) {
+        std::ifstream tf(rf, std::ios::binary);
+        std::vector<double> ref(n, 0.0);
+        if (tf) tf.read(reinterpret_cast<char*>(ref.data()),
+                        static_cast<std::streamsize>(n) * sizeof(double));
+        if (!tf) {
+            std::cerr << "  [PTM_HMATRIX_ROWFIX] WARNING: could not read " << n
+                      << " float64 referee row sums from '" << rf
+                      << "'; row-fix DISABLED, running UNCORRECTED (not silent).\n";
+        } else if (!F_op_) {
+            std::cerr << "  [PTM_HMATRIX_ROWFIX] WARNING: no view-factor operator; row-fix skipped.\n";
+        } else {
+            const char* modeEnv = std::getenv("PTM_HMATRIX_ROWFIX_MODE");
+            const bool full = (modeEnv && std::string(modeEnv) == "full");
+            const bool damp = !full;
+            std::vector<double> ones(n, 1.0), stored(n, 0.0);
+            F_op_->matvec(ones, stored);
+            // Targets. DAMP: reductions only (target=min(stored,ref)) -> a stable contraction.
+            // FULL: also RESTORE under-coupling (target=ref), but cap near-zero-stored rows at
+            // RCAP*stored (partial restoration) so d does not blow up as ~sqrt(ref/stored); the
+            // over-coupled rows still reduce to ref. target <= ref <= 1 ALWAYS (restoration never
+            // exceeds the referee truth).
+            const double RCAP  = std::getenv("PTM_HMATRIX_ROWFIX_RCAP")  ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_RCAP"))  : 4.0;
+            const double DMAX  = std::getenv("PTM_HMATRIX_ROWFIX_DMAX")  ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_DMAX"))  : 4.0;
+            const double RELAX = std::getenv("PTM_HMATRIX_ROWFIX_RELAX") ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_RELAX")) : (full ? 0.25 : 0.5);
+            std::vector<double> target(n, 0.0);
+            size_t n_capped = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double t = ref[i];
+                if (t < 0.0) t = 0.0;
+                if (damp) {
+                    target[i] = std::min(stored[i], t);
+                } else {
+                    double cap = RCAP * stored[i];        // partial-restoration cap for near-zero rows
+                    if (t > cap) { t = cap; ++n_capped; }
+                    target[i] = t;
+                }
+            }
+            // Symmetric Sinkhorn: rowsum(D F D)_i = d_i (F d)_i -> target_i. Stabilizations (FULL):
+            // (a) PTM-14 negative/zero guard (skip update where (F d)_i<=0), (b) under-relaxation,
+            // (c) clamp d in [DMIN, DMAX] to bound amplification (DMIN small so the over-count rows
+            // that need d~0.15 still reduce). The fail-loud gate below is the arbiter.
+            std::vector<double> d(n, 1.0), Fd(n, 0.0);
+            const int SINK_ITERS = full ? 300 : 50;
+            const double DMIN = 1e-3;
+            for (int it = 0; it < SINK_ITERS; ++it) {
+                F_op_->matvec(d, Fd);
+                for (size_t i = 0; i < n; ++i) {
+                    if (stored[i] <= 1e-12 || target[i] <= 0.0) { d[i] = 1.0; continue; }
+                    double g = Fd[i];
+                    if (g <= 1e-30) continue;             // negative/zero row-sum guard (ACA PTM-14)
+                    double rs = d[i] * g;
+                    if (rs > 1e-30) d[i] *= std::pow(target[i] / rs, RELAX);
+                    if (d[i] > DMAX) d[i] = DMAX; else if (d[i] < DMIN) d[i] = DMIN;
+                }
+            }
+            F_op_->matvec(d, Fd);
+            double maxres = 0.0; size_t nfix = 0; bool dfinite = true;
+            for (size_t i = 0; i < n; ++i) {
+                if (target[i] > 0.0) maxres = std::max(maxres, std::fabs(d[i] * Fd[i] - target[i]));
+                if (std::fabs(d[i] - 1.0) > 1e-6) ++nfix;
+                if (!std::isfinite(d[i])) dfinite = false;
+            }
+            // Fail-loud convergence GATE. The FULL-mode congruence can DIVERGE when it
+            // amplifies near-zero-stored rows (d_i>1 compounding via d_i d_j) or hits ACA
+            // far-field negative entries (PTM-14) -> row sums blow up to ~1e19, mean<0. A
+            // diverged D would make the coupled solve produce garbage (observed 2026-07-19:
+            // FULL ran ~14h to T=4.8e9 K). NEVER install a diverged correction: abort so the
+            // caller must switch to DAMP or fix the inputs. Tolerance explicit + logged.
+            const char* tolEnv = std::getenv("PTM_HMATRIX_ROWFIX_TOL");
+            const double tol = tolEnv ? std::atof(tolEnv) : 1e-2;
+            if (!dfinite || !std::isfinite(maxres) || maxres > tol) {
+                std::cerr << "  [PTM_HMATRIX_ROWFIX] FATAL: Sinkhorn did NOT converge for "
+                          << (damp ? "DAMP" : "FULL") << " mode (max|rowsum-target|=" << maxres
+                          << ", finite-d=" << (dfinite ? "yes" : "NO") << ", tolerance=" << tol
+                          << "). The corrected view-factor matrix is INVALID (near-zero-stored-row "
+                          << "amplification and/or ACA negative entries diverge the FULL congruence). "
+                          << "REFUSING to run on a diverged VF. Use PTM_HMATRIX_ROWFIX_MODE=damp, or "
+                          << "override PTM_HMATRIX_ROWFIX_TOL (NOT recommended)." << std::endl;
+                std::exit(2);
+            }
+            F_op_ = std::make_unique<CorrectedRowFixOperator>(std::move(F_op_), std::move(d));
+            std::cout << "  [PTM_HMATRIX_ROWFIX] " << (damp ? "DAMP" : "FULL")
+                      << " symmetric-congruence row-fix to referee '" << rf << "': "
+                      << nfix << "/" << n << " faces rescaled, Sinkhorn max|rowsum-target|="
+                      << maxres << " <= tol " << tol
+                      << " (converged; reciprocity-preserving; F_sky restored)." << std::endl;
+            if (full) {
+                std::cout << "  [PTM_HMATRIX_ROWFIX] FULL restoration: " << n_capped << "/" << n
+                          << " rows capped at " << RCAP << "*stored (partial restoration; referee "
+                          << "exceeds " << RCAP << "*stored on these near-zero-stored rows). d clamp ["
+                          << DMIN << "," << DMAX << "], under-relax " << RELAX
+                          << ". Corrected rowsum = target <= referee <= 1 everywhere." << std::endl;
+            }
+        }
+    }
+
+    // View-factor row normalization (energy conservation / radiosity stability).
+    // Compute the row sums Σ_j F_ij once via a single F·1 matvec. The M1 point
+    // estimator overshoots in the near field, so on fine/concave meshes some rows
+    // sum to > 1, which makes the radiosity gain > 1 and the coupling diverge.
+    // Store 1/max(1, Σ_j F_ij) and apply it after every F·x in the solve.
+    {
+        std::vector<double> ones(n, 1.0), rowsum(n, 0.0);
+        if (F_op_) F_op_->matvec(ones, rowsum);
+        vf_row_norm_.assign(n, 1.0);
+        size_t n_over = 0;
+        double max_rs = 0.0, sum_rs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double rs = rowsum[i];
+            if (rs > 1.0) { vf_row_norm_[i] = 1.0 / rs; ++n_over; }
+            max_rs = std::max(max_rs, rs);
+            sum_rs += rs;
+        }
+        std::cout << "[Radiosity] View-factor row sums Σ_j F_ij: max=" << max_rs
+                  << ", mean=" << (n ? sum_rs / static_cast<double>(n) : 0.0)
+                  << " (" << n_over << "/" << n
+                  << " rows > 1 renormalized for energy conservation)" << std::endl;
+        // Optional diagnostic: dump per-face VF row sums for completeness checks
+        // (e.g. is the floor<->distant-wall coupling captured?). Set the env var
+        // PTM_DUMP_VF_ROWSUMS to a path. Format: uint32 n, then n float64.
+        if (const char* dp = std::getenv("PTM_DUMP_VF_ROWSUMS")) {
+            std::ofstream ro(dp, std::ios::binary);
+            if (ro) {
+                uint32_t nn = static_cast<uint32_t>(n);
+                ro.write(reinterpret_cast<const char*>(&nn), sizeof(nn));
+                ro.write(reinterpret_cast<const char*>(rowsum.data()),
+                         static_cast<std::streamsize>(n) * sizeof(double));
+                std::cout << "[Radiosity] Dumped per-face VF row sums -> " << dp << std::endl;
+            }
+        }
+    }
+}
+
+void RadiositySolver::setSolarAlbedo(const std::vector<double>& solar_albedo) {
+    // Per-face, time-updatable visible Bond albedo A_i (A2). Sourced from the SAME
+    // albedo the surface BC absorbs with (per-face angular/Hapke), so the reflected
+    // A_i·Q_solar the enclosure receives matches the (1-A_i)·Q_solar the BC absorbs
+    // and energy closes per face. Size must match the face count.
+    if (solar_albedo.size() != emissivity_.size()) {
+        std::cerr << "  [RadiositySolver::setSolarAlbedo] WARNING: albedo size "
+                  << solar_albedo.size() << " != face count " << emissivity_.size()
+                  << "; ignored (keeping previous solar albedo)." << std::endl;
+        return;
+    }
+    solar_reflectivity_ = solar_albedo;
+    // No cache to invalidate (the visible solve is re-run each call). last_indirect_*
+    // are recomputed on the next solve().
+}
+
+void RadiositySolver::enableTwoBand() {
+    // D1: config-driven activation (no env). Never invents an albedo — the archetype.
+    if (solar_reflectivity_.empty()) {
+        std::cerr << "  [radiation.band_separated] WARNING: two-band requested via config but no "
+                     "per-face Bond albedo was supplied (setSolarAlbedo); staying GRAY.\n";
+        return;
+    }
+    if (!two_band_) {
+        two_band_ = true;
+        std::cout << "  [radiation.band_separated] band-separated radiosity ACTIVE (config): "
+                     "visible band absorbs 1-A_i, IR band absorbs eps_i; Q_ind = vis + ir.\n";
+#ifdef PTM_GPU_OPENCL
+        // Never substitute CPU for a GPU request silently. If the GPU solver was
+        // already initialized (initGPU ran) before two-band was enabled, the GPU
+        // two-band gate (two_band_gpu_ok_, set inside initGPU) never engaged, so
+        // every solve falls back to the CPU two-band path. Warn once so this perf
+        // substitution is visible. To engage the single-GPU two-band mirror,
+        // enable two-band BEFORE initGPU (source the per-face albedo before
+        // RadiationExchangeManager::prepare()); production radiosity is CPU-only
+        // for two-band until that ordering fix / the multi-GPU + H-matrix two-band
+        // mirror lands.
+        if (use_gpu_ && !two_band_gpu_ok_) {
+            std::cerr << "  [radiation.band_separated] WARNING: two-band was enabled AFTER GPU "
+                         "initialization; the single-GPU two-band path is NOT engaged -> running "
+                         "CPU two-band radiosity (correct results, slower). Enable two-band before "
+                         "initGPU to use the GPU two-band mirror.\n";
+        }
+#endif
+    }
 }
 
 RadiositySolver::RadiositySolver(const ViewFactorMatrix& F,
@@ -58,6 +365,10 @@ RadiositySolver::RadiositySolver(const HMatrixViewFactor& H,
     initCommon(emissivity, areas);
 }
 
+// Default destructor in the .cpp where forward-declared GPU types are
+// fully visible.
+RadiositySolver::~RadiositySolver() = default;
+
 void RadiositySolver::initGPU() {
 #ifdef PTM_GPU_OPENCL
     if (config_.verbose) {
@@ -71,6 +382,38 @@ void RadiositySolver::initGPU() {
             std::cout << "[RadiositySolver] GPU not requested, using CPU path" << std::endl;
         }
         return;
+    }
+
+    // Two-band radiosity on the GPU (B1). The GPU path mirrors the CPU two-band by
+    // running the two verified gray kernels twice per solve (IR: solar=0, normal
+    // ε/1-ε; visible: temps=0, properties ε←1-A, ρ←A, source=A·Q) and summing —
+    // see solveGPU(). BUT the GPU Jacobi kernel does not apply vf_row_norm_ inside
+    // its iteration, so it is only correct where every row sum Σ_j F_ij ≤ 1 (the
+    // usual case). If any row overshoots to Σ>1 (the M1 near-field case that PTM-08
+    // guards on the CPU), the GPU visible band would diverge, so we WARN and force
+    // the row-norm-protected CPU two-band solve rather than run it wrong.
+    if (two_band_) {
+        bool any_over = false;
+        for (double rn : vf_row_norm_) { if (rn < 1.0) { any_over = true; break; } }
+        if (any_over) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: mesh has Σ_j F_ij > 1 rows; the "
+                         "GPU Jacobi kernel omits the row-norm (would diverge in the visible "
+                         "band). Forcing the CPU two-band solve (row-norm protected).\n";
+            return;
+        }
+        if (use_hmatrix_ || !F_ptr_) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: GPU two-band needs a sparse VF "
+                         "(H-matrix here); using the CPU two-band solve.\n";
+            return;
+        }
+        // The multi-GPU pool two-band path is not implemented this pass; if a pool
+        // was requested, run single-GPU two-band (still GPU-accelerated) and say so.
+        if (config_.gpu_devices > 1 || !config_.gpu_device_ids.empty()) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: multi-GPU pool two-band not yet "
+                         "implemented; using the single-GPU two-band path.\n";
+        }
+        // Fall through to single-GPU initialization below; mark GPU two-band OK so
+        // solveGPU() runs the band-separated orchestration.
     }
 
     // GPU solver works best with sparse view factors, not H-matrix
@@ -88,14 +431,29 @@ void RadiositySolver::initGPU() {
     size_t n = emissivity_.size();
     size_t nnz = F_ptr_->numNonZeros();
 
-    // Hard limit: GPU SpMV with very large matrices is unreliable on AMD drivers
-    // Even if memory fits, kernel execution can crash with >100M non-zeros
-    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros max
-    if (nnz > MAX_GPU_NNZ) {
-        std::cout << "Note: Sparse matrix too large for reliable GPU radiosity solver\n";
+    // Soft limit: GPU SpMV with very large sparse matrices was historically
+    // unreliable on AMD drivers (kernel execution could crash with >100M
+    // non-zeros). The limit is bypassed when the user explicitly opts into
+    // the multi-GPU pool path (gpu_devices > 1 or gpu_device_ids set) —
+    // they are committing to the new code path and accept the risk for the
+    // larger meshes the pool was designed to handle.
+    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros default ceiling
+    // The multi-GPU pool two-band path is not implemented this pass, so two-band
+    // always uses the single-GPU path (want_pool forced false).
+    const bool want_pool = !two_band_
+                            && ((config_.gpu_devices > 1)
+                                || !config_.gpu_device_ids.empty());
+    if (nnz > MAX_GPU_NNZ && !want_pool) {
+        std::cout << "Note: Sparse matrix too large for reliable single-GPU radiosity solver\n";
         std::cout << "  Non-zeros: " << nnz / 1000000 << "M (limit: " << MAX_GPU_NNZ / 1000000 << "M)\n";
         std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        std::cout << "  Tip: enable the multi-GPU pool with radiation.gpu_devices > 1 to bypass this limit.\n";
         return;
+    }
+    if (nnz > MAX_GPU_NNZ && want_pool) {
+        std::cout << "Note: Sparse matrix has " << nnz / 1000000 << "M non-zeros (>"
+                  << MAX_GPU_NNZ / 1000000
+                  << "M soft limit); proceeding because multi-GPU pool was requested\n";
     }
 
     // Check if sparse matrix fits in GPU memory before attempting
@@ -112,55 +470,149 @@ void RadiositySolver::initGPU() {
     gpu_config.max_iterations = config_.max_iterations;
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
     gpu_config.verbose = config_.verbose;
+    // Two-band runs two solves per call with different sources; a cold start each
+    // solve keeps the visible band from warm-starting off the IR radiosity and makes
+    // the GPU result deterministic + comparable to the always-cold-started CPU path.
+    if (two_band_) gpu_config.warm_start = false;
 
-    gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
-
-    if (!gpu_solver_->initialize()) {
-        std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
-                  << "falling back to CPU\n";
-        gpu_solver_.reset();
-        return;
-    }
-
-    // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
-    // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
-    size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
-    size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
-
-    if (total_gpu_memory_needed > gpu_mem_limit) {
-        std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
-        std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-        std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
-        std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
-        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
-        gpu_solver_.reset();
-        return;
-    }
-
-    if (config_.verbose) {
-        std::cout << "GPU radiosity memory check passed:\n";
-        std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
-        std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
-        std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-        std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
-    }
-
-    // Upload view factor CSR data
-    gpu_solver_->uploadViewFactors(
-        F_ptr_->values(),
-        F_ptr_->colIndices(),
-        F_ptr_->rowPointers());
-
-    // Upload face properties (convert to float)
+    // When the multi-GPU pool is requested, skip the single-GPU solver path
+    // entirely — the pool's per-device persistent solvers will handle every
+    // solve via solveBatch(). Avoids redundant device 0 allocation and
+    // dodges the >100M-nnz single-GPU stability concerns the pool was
+    // designed to bypass.
     std::vector<float> emissivity_f(n);
     std::vector<float> reflectivity_f(n);
     for (size_t i = 0; i < n; ++i) {
         emissivity_f[i] = static_cast<float>(emissivity_[i]);
         reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
     }
-    gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
 
-    use_gpu_ = true;
+    if (!want_pool) {
+        gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
+
+        if (!gpu_solver_->initialize()) {
+            std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
+                      << "falling back to CPU\n";
+            gpu_solver_.reset();
+            return;
+        }
+
+        // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
+        // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
+        size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
+        size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
+
+        if (total_gpu_memory_needed > gpu_mem_limit) {
+            std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
+            std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+            std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
+            std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
+            std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+            gpu_solver_.reset();
+            return;
+        }
+
+        if (config_.verbose) {
+            std::cout << "GPU radiosity memory check passed:\n";
+            std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
+            std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
+            std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
+            std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
+        }
+
+        // Upload view factor CSR data
+        gpu_solver_->uploadViewFactors(
+            F_ptr_->values(),
+            F_ptr_->colIndices(),
+            F_ptr_->rowPointers());
+        gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+
+        use_gpu_ = true;
+        if (two_band_) {
+            two_band_gpu_ok_ = true;
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: single-GPU band-separated "
+                         "radiosity ENABLED (all Σ_j F_ij ≤ 1; IR solar=0 + visible ε←1-A/ρ←A).\n";
+        }
+    }
+
+    // Multi-GPU dispatch pool (only when gpu_devices > 1). The single-GPU
+    // path above stays in place even when the pool is active so that
+    // single-timestep solve() callers (the CPU fallback hook + direct
+    // computeIndirectFlux callers) still work; the batched solveBatch()
+    // path is what actually uses the pool.
+    if (want_pool) {
+        // Resolve which physical devices to use (mirrors the thermal pool).
+        std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
+            gpu::opencl::OpenCLContext::enumerateGPUs(true);
+        std::vector<gpu::opencl::OpenCLDeviceInfo> chosen;
+        if (!config_.gpu_device_ids.empty()) {
+            for (int id : config_.gpu_device_ids) {
+                if (id >= 0 && static_cast<size_t>(id) < all_gpus.size()) {
+                    chosen.push_back(all_gpus[id]);
+                } else {
+                    std::cerr << "Warning: rad-gpu-device-id " << id
+                              << " out of range (have " << all_gpus.size()
+                              << " GPUs); skipping\n";
+                }
+            }
+        } else {
+            const int n_req = (config_.gpu_devices == 0)
+                ? static_cast<int>(all_gpus.size())
+                : std::min<int>(config_.gpu_devices,
+                                static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n_req; ++i) chosen.push_back(all_gpus[i]);
+        }
+
+        if (chosen.size() < 2) {
+            if (config_.verbose) {
+                std::cout << "[Radiosity Pool] Pool not instantiated "
+                             "(only " << chosen.size() << " device(s) selected); "
+                             "single-GPU path remains active\n";
+            }
+        } else {
+            gpu::opencl::RadiosityGPUPoolConfig pool_cfg;
+            pool_cfg.devices = chosen;
+            pool_cfg.inter_batch_pause_ms = config_.gpu_inter_batch_pause_ms;
+            pool_cfg.verbose = config_.verbose;
+
+            gpu::opencl::RadiosityOpenCLConfig solver_cfg;
+            solver_cfg.max_iterations = config_.max_iterations;
+            solver_cfg.convergence_tolerance = config_.convergence_tolerance;
+            solver_cfg.verbose = config_.verbose;
+            // Cross-batch warm-start has no meaning across devices — disable
+            // it so each batch's first timestep starts from cold radiosity.
+            // Cost: typically 5-10 extra Jacobi iterations on the first
+            // timestep of each batch.
+            solver_cfg.warm_start = false;
+
+            gpu_pool_ = std::make_unique<gpu::opencl::RadiosityGPUDevicePool>(
+                std::move(pool_cfg));
+            if (!gpu_pool_->initialize(n, solver_cfg)) {
+                std::cerr << "Warning: Failed to initialize multi-GPU radiosity "
+                             "pool; falling back to single-GPU path\n";
+                gpu_pool_.reset();
+            } else if (!gpu_pool_->uploadStaticData(F_ptr_->values(),
+                                                     F_ptr_->colIndices(),
+                                                     F_ptr_->rowPointers(),
+                                                     emissivity_f,
+                                                     reflectivity_f)) {
+                std::cerr << "Warning: Failed to replicate radiosity static "
+                             "data to pool devices; falling back to "
+                             "single-GPU path\n";
+                gpu_pool_.reset();
+            } else {
+                pool_batch_size_ = (config_.gpu_batch_size > 0)
+                    ? config_.gpu_batch_size
+                    : 4 * static_cast<int>(gpu_pool_->numDevices());
+                if (config_.verbose) {
+                    std::cout << "[Radiosity Pool] Active: "
+                              << gpu_pool_->numDevices() << " GPU(s), "
+                              << "batch_size=" << pool_batch_size_
+                              << " timesteps per dispatch\n";
+                }
+            }
+        }
+    }
 
     if (config_.verbose) {
         std::cout << "GPU radiosity solver enabled\n";
@@ -168,11 +620,73 @@ void RadiositySolver::initGPU() {
 #endif
 }
 
+bool RadiositySolver::hasGPUPool() const {
 #ifdef PTM_GPU_OPENCL
+    return gpu_pool_ != nullptr;
+#else
+    return false;
+#endif
+}
+
+#ifdef PTM_GPU_OPENCL
+std::vector<double> RadiositySolver::solveGPUTwoBand(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux)
+{
+    // B1: band-separated radiosity on the GPU by reusing the verified gray kernels.
+    //   IR band      : normal properties (ε, 1-ε), solar = 0   -> Q_ind^ir = ε·(F·B_ir)
+    //   Visible band : properties (1-A, A), temps = 0, solar=Q -> Q_ind^vis = (1-A)·(F·B_vis)
+    // The row-norm is applied to the returned flux below (== 1 under the two-band GPU
+    // gate). The two solves cold-start (warm_start off), matching the CPU path.
+    const size_t n = temperatures.size();
+    std::vector<float> emiss_f(n), refl_f(n), visE_f(n), visR_f(n);
+    std::vector<float> temps_f(n), flux_f(n), zeros_f(n, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        emiss_f[i] = static_cast<float>(emissivity_[i]);
+        refl_f[i]  = static_cast<float>(reflectivity_[i]);
+        const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+        visR_f[i]  = static_cast<float>(A);
+        visE_f[i]  = static_cast<float>(1.0 - A);
+        temps_f[i] = static_cast<float>(temperatures[i]);
+        flux_f[i]  = static_cast<float>(solar_flux[i]);
+    }
+
+    // IR band (normal properties already uploaded), no solar source.
+    std::vector<float> ir_f;
+    gpu_solver_->solve(temps_f, zeros_f, ir_f);
+
+    // Visible band: swap to (1-A, A), no thermal emission (temps = 0), solar = Q.
+    gpu_solver_->uploadFaceProperties(visE_f, visR_f);
+    std::vector<float> vis_f;
+    gpu_solver_->solve(zeros_f, flux_f, vis_f);
+    // Restore the thermal/IR properties for the next call.
+    gpu_solver_->uploadFaceProperties(emiss_f, refl_f);
+
+    last_iterations_ = gpu_solver_->getLastIterations();
+    last_residual_   = gpu_solver_->getLastResidual();
+    converged_       = gpu_solver_->didConverge();
+
+    last_indirect_ir_.assign(n, 0.0);
+    last_indirect_vis_.assign(n, 0.0);
+    std::vector<double> indirect_flux(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        last_indirect_ir_[i]  = static_cast<double>(ir_f[i])  * norm;
+        last_indirect_vis_[i] = static_cast<double>(vis_f[i]) * norm;
+        indirect_flux[i] = last_indirect_ir_[i] + last_indirect_vis_[i];
+    }
+    return indirect_flux;
+}
+
 std::vector<double> RadiositySolver::solveGPU(
     const std::vector<double>& temperatures,
     const std::vector<double>& solar_flux)
 {
+    // Band-separated GPU solve when enabled (B1); otherwise the gray GPU path below.
+    if (two_band_gpu_ok_) {
+        return solveGPUTwoBand(temperatures, solar_flux);
+    }
+
     size_t n = temperatures.size();
 
     // Convert to float
@@ -192,34 +706,128 @@ std::vector<double> RadiositySolver::solveGPU(
     last_residual_ = gpu_solver_->getLastResidual();
     converged_ = gpu_solver_->didConverge();
 
-    // Convert back to double
+    // Convert back to double, applying the view-factor row normalization
+    // (Σ_j F_ij ≤ 1) for energy conservation / radiosity-gain stability.
     std::vector<double> indirect_flux(n);
     for (size_t i = 0; i < n; ++i) {
-        indirect_flux[i] = static_cast<double>(indirect_f[i]);
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        indirect_flux[i] = static_cast<double>(indirect_f[i]) * norm;
     }
 
     return indirect_flux;
 }
 #endif
 
+std::vector<std::vector<double>> RadiositySolver::solveBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep)
+{
+    const size_t n_steps = temperatures_per_timestep.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps);
+
+    // Single-device or CPU fallback: serial loop over solve(). Semantically
+    // identical to the caller running its own per-timestep loop.
+#ifdef PTM_GPU_OPENCL
+    if (!gpu_pool_) {
+#endif
+        for (size_t k = 0; k < n_steps; ++k) {
+            indirect_per_timestep[k] =
+                solve(temperatures_per_timestep[k], solar_flux_per_timestep[k]);
+        }
+        return indirect_per_timestep;
+#ifdef PTM_GPU_OPENCL
+    }
+
+    // Multi-GPU dispatch: split the n_steps timesteps round-robin across
+    // pool devices. Each device's worker iterates over its assigned slice
+    // and runs solve() (synchronous on that device).
+    const size_t n_dev = gpu_pool_->numDevices();
+    const size_t n = emissivity_.size();
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(n_dev);
+
+    // Round-robin assignment: timestep k goes to device k % n_dev. Keeps
+    // load balanced when n_steps is not a multiple of n_dev.
+    for (size_t d = 0; d < n_dev; ++d) {
+        // Build the per-device list of timestep indices to process.
+        std::vector<size_t> device_steps;
+        for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
+        if (device_steps.empty()) continue;
+
+        futures.push_back(gpu_pool_->submit(
+            [&temperatures_per_timestep, &solar_flux_per_timestep,
+             &indirect_per_timestep, device_steps, n,
+             &row_norm = vf_row_norm_](
+                gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                std::vector<float> temps_f(n), solar_f(n), indirect_f;
+                for (size_t k : device_steps) {
+                    const auto& temps_d = temperatures_per_timestep[k];
+                    const auto& solar_d = solar_flux_per_timestep[k];
+                    for (size_t i = 0; i < n; ++i) {
+                        temps_f[i] = static_cast<float>(temps_d[i]);
+                        solar_f[i] = static_cast<float>(solar_d[i]);
+                    }
+                    solver.solve(temps_f, solar_f, indirect_f);
+                    auto& out = indirect_per_timestep[k];
+                    out.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                        out[i] = static_cast<double>(indirect_f[i]) * norm;
+                    }
+                }
+                return true;
+            }));
+    }
+
+    bool all_ok = true;
+    for (auto& f : futures) {
+        if (!f.get()) all_ok = false;
+    }
+    if (!all_ok) {
+        std::cerr << "Warning: one or more multi-GPU radiosity batches "
+                     "returned failure; results may be incomplete\n";
+    }
+
+    // Aggregate convergence stats from any one solver — they are not strictly
+    // tracked across batches, but the caller uses these only for diagnostics.
+    last_iterations_ = 0;     // not aggregated; caller treats as advisory
+    last_residual_ = 0.0;
+    converged_ = all_ok;
+
+    return indirect_per_timestep;
+#endif
+}
+
 std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatures,
                                             const std::vector<double>& solar_flux) {
 #ifdef PTM_GPU_OPENCL
-    // Use GPU path if available
-    if (use_gpu_ && gpu_solver_) {
+    // Use GPU path if available. Guard: if two-band was activated but the GPU
+    // two-band path is NOT engaged (e.g. band separation enabled AFTER initGPU, or
+    // a Σ>1 mesh), fall through to the CPU two-band solve rather than silently
+    // running the gray GPU kernel for a two-band request.
+    if (use_gpu_ && gpu_solver_ && (two_band_gpu_ok_ || !two_band_)) {
         return solveGPU(temperatures, solar_flux);
     }
 #endif
 
     size_t n = temperatures.size();
 
+    // Band-separated (visible + thermal-IR) radiosity when requested. OFF by
+    // default => the gray path below runs, byte-identical to committed behavior.
+    if (two_band_) {
+        return solveTwoBand(temperatures, solar_flux);
+    }
+
     // Compute thermal emission: E_i = ε_i σ T_i^4
     auto emission = computeThermalEmission(temperatures);
 
-    // Compute reflected solar source: ρ_i Q_solar_i
+    // Compute reflected solar source: ρ_solar_i Q_solar_i (Bond albedo if set, else 1-eps)
     std::vector<double> solar_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
     for (size_t i = 0; i < n; ++i) {
-        solar_source[i] = reflectivity_[i] * solar_flux[i];
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        solar_source[i] = rs * solar_flux[i];
     }
 
     // Solve radiosity equation: B = E + ρ F B + ρ Q_solar
@@ -227,9 +835,9 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     std::vector<double> radiosity;
     // Use Jacobi for H-matrix (no row access), Gauss-Seidel for sparse
     if (config_.use_acceleration && !use_hmatrix_) {
-        radiosity = solveGaussSeidel(emission, solar_source);
+        radiosity = solveGaussSeidel(emission, solar_source, reflectivity_);
     } else {
-        radiosity = solveJacobi(emission, solar_source);
+        radiosity = solveJacobi(emission, solar_source, reflectivity_);
     }
 
     // Compute absorbed indirect flux at each face
@@ -237,15 +845,84 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     std::vector<double> indirect_flux(n, 0.0);
     std::vector<double> incoming(n, 0.0);
 
-    // incoming_i = Σ_j F_ij B_j
+    // incoming_i = Σ_j F_ij B_j  (renormalized so Σ_j F_ij ≤ 1)
     F_op_->matvec(radiosity, incoming);
 
     for (size_t i = 0; i < n; ++i) {
         // Absorbed flux = emissivity * incoming radiosity
         // (by Kirchhoff's law, absorptivity = emissivity)
-        indirect_flux[i] = emissivity_[i] * incoming[i];
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        indirect_flux[i] = emissivity_[i] * incoming[i] * norm;
     }
 
+    return indirect_flux;
+}
+
+// ---------------------------------------------------------------------------
+// Band-separated (visible + thermal-IR) radiosity. docs/two-band-radiosity-
+// derivation.tex, Eqs (4)-(6):
+//   Visible:    (I - A F) B_vis = A Q_solar        (no emission source, T-indep)
+//               Q_ind^vis_i = (1 - A_i) Σ_j F_ij B_vis_j
+//   Thermal-IR: (I - R F) B_ir  = ε σ T^4,  R=1-ε  (the existing gray channel)
+//               Q_ind^ir_i  = ε_i     Σ_j F_ij B_ir_j
+//   Surface BC receives Q_ind = Q_ind^vis + Q_ind^ir (the direct (1-A)Q_solar term
+//   stays in the caller's BC, so there is no double counting).
+// Same F operator, same Jacobi/GS kernel, same vf_row_norm renormalization as the
+// gray path. Reduces EXACTLY to the gray solve when A = 1-ε (limiting check (ii)).
+// ---------------------------------------------------------------------------
+std::vector<double> RadiositySolver::solveTwoBand(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux) {
+    size_t n = temperatures.size();
+    const std::vector<double> zero_source(n, 0.0);
+
+    // --- Thermal-IR band: (I - R F) B_ir = E, R = 1-eps, NO solar source ---
+    auto emission = computeThermalEmission(temperatures);
+    std::vector<double> B_ir;
+    if (config_.use_acceleration && !use_hmatrix_) {
+        B_ir = solveGaussSeidel(emission, zero_source, reflectivity_);
+    } else {
+        B_ir = solveJacobi(emission, zero_source, reflectivity_);
+    }
+    std::vector<double> incoming_ir(n, 0.0);
+    F_op_->matvec(B_ir, incoming_ir);
+    last_indirect_ir_.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        last_indirect_ir_[i] = emissivity_[i] * incoming_ir[i] * norm;
+    }
+
+    // --- Visible band: (I - A F) B_vis = A Q_solar, NO emission source ---
+    // A_i = solar_reflectivity_[i] (per-face Bond albedo; A2). B_vis is T-independent
+    // and converges in 1-2 SpMV, so it is re-solved directly each call (the visible
+    // cache was removed — see the header note; production for iter { for t } made it
+    // miss every call). scatter A_i / absorb (1 - A_i) per face closes energy exactly.
+    {
+        std::vector<double> vis_source(n);
+        for (size_t i = 0; i < n; ++i) {
+            vis_source[i] = solar_reflectivity_[i] * solar_flux[i];
+        }
+        std::vector<double> B_vis;
+        if (config_.use_acceleration && !use_hmatrix_) {
+            B_vis = solveGaussSeidel(zero_source, vis_source, solar_reflectivity_);
+        } else {
+            B_vis = solveJacobi(zero_source, vis_source, solar_reflectivity_);
+        }
+        std::vector<double> incoming_vis(n, 0.0);
+        F_op_->matvec(B_vis, incoming_vis);
+        last_indirect_vis_.assign(n, 0.0);
+        for (size_t i = 0; i < n; ++i) {
+            const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+            // Absorb scattered visible with the visible absorptivity (1 - A_i).
+            last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * incoming_vis[i] * norm;
+        }
+    }
+
+    // --- Sum the two absorbed indirect fluxes ---
+    std::vector<double> indirect_flux(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        indirect_flux[i] = last_indirect_vis_[i] + last_indirect_ir_[i];
+    }
     return indirect_flux;
 }
 
@@ -271,27 +948,31 @@ std::vector<double> RadiositySolver::computeScatteredSolar(
 
     size_t n = solar_flux.size();
 
-    // First bounce: ρ_i Q_solar_i leaves face i
+    // First bounce: ρ_solar_i Q_solar_i leaves face i (Bond albedo if set, else 1-eps)
     std::vector<double> scattered_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
     for (size_t i = 0; i < n; ++i) {
-        scattered_source[i] = reflectivity_[i] * solar_flux[i];
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        scattered_source[i] = rs * solar_flux[i];
     }
 
-    // Received scattered solar: F^T * (ρ Q_solar)
+    // Received scattered solar: F^T * (ρ Q_solar)  (renormalized so Σ_j F_ij ≤ 1)
     std::vector<double> received(n, 0.0);
     F_op_->matvec(scattered_source, received);
 
     // Absorbed scattered solar
     std::vector<double> absorbed(n);
     for (size_t i = 0; i < n; ++i) {
-        absorbed[i] = emissivity_[i] * received[i];
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        absorbed[i] = emissivity_[i] * received[i] * norm;
     }
 
     return absorbed;
 }
 
 std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emission,
-                                                  const std::vector<double>& solar_source) {
+                                                  const std::vector<double>& solar_source,
+                                                  const std::vector<double>& scatter_refl) {
     size_t n = emission.size();
 
     // Use local arrays instead of member arrays for thread safety
@@ -313,13 +994,17 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
         // B_new = E + ρ Q_solar + ρ F B
         // Note: matvec is internally parallelized over H-matrix blocks
         F_op_->matvec(radiosity, temp_vec);
+        // Renormalize Σ_j F_ij ≤ 1 so the radiosity gain ρ·Σ stays < 1 (stable).
+        for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) {
+            temp_vec[i] *= vf_row_norm_[i];
+        }
 
         double max_change = 0.0;
         double max_val = 0.0;
 
         // This loop is fast, no need to parallelize (would conflict with outer parallelism)
         for (size_t i = 0; i < n; ++i) {
-            radiosity_new[i] = emission[i] + solar_source[i] + reflectivity_[i] * temp_vec[i];
+            radiosity_new[i] = emission[i] + solar_source[i] + scatter_refl[i] * temp_vec[i];
 
             double change = std::abs(radiosity_new[i] - radiosity[i]);
             max_change = std::max(max_change, change);
@@ -349,12 +1034,13 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
 }
 
 std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>& emission,
-                                                       const std::vector<double>& solar_source) {
+                                                       const std::vector<double>& solar_source,
+                                                       const std::vector<double>& scatter_refl) {
     size_t n = emission.size();
 
     // Gauss-Seidel requires row access; fall back to Jacobi if not available
     if (!F_ptr_) {
-        return solveJacobi(emission, solar_source);
+        return solveJacobi(emission, solar_source, scatter_refl);
     }
 
     // Initialize radiosity with emission + solar source
@@ -384,8 +1070,16 @@ std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>&
                 sum += vals[k] * radiosity_[cols[k]];
             }
 
+            // Renormalize Σ_j F_ij ≤ 1 (BUGS.md PTM-08). The M1 estimator can
+            // overshoot to Σ_j F_ij > 1 on fine/concave meshes; without this the
+            // radiosity gain scatter_refl·Σ can exceed 1 and Gauss-Seidel diverges
+            // (severe in the two-band visible channel, A up to ~0.5 Europa/~0.9
+            // frost). Mirrors the Jacobi renormalization above (temp_vec *= norm),
+            // so the two kernels agree and ρ(A·F̂) < 1 holds for both bands.
+            if (i < vf_row_norm_.size()) sum *= vf_row_norm_[i];
+
             // Update B_i
-            double B_new = emission[i] + solar_source[i] + reflectivity_[i] * sum;
+            double B_new = emission[i] + solar_source[i] + scatter_refl[i] * sum;
 
             double change = std::abs(B_new - radiosity_[i]);
             max_change = std::max(max_change, change);
@@ -689,10 +1383,35 @@ bool RadiationExchangeManager::initializeScene() {
         rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0,
                                 RTC_FORMAT_FLOAT3, 3 * sizeof(float), n_verts));
 
+    // Recenter to the mesh bounding-box center before float32 conversion. At
+    // planetary-scale absolute coordinates (e.g. lunar selenocentric, |Z|~1.7e6 m)
+    // a float32 ulp (~0.1 m) exceeds a meter-scale patch's features, collapsing
+    // Embree's BVH and making visibility ray tracing pathologically slow. The
+    // H-matrix builder (HMatrixViewFactor::build) computes the IDENTICAL shift
+    // from the same mesh_->vertices and applies it to its ray origins, so rays
+    // and scene share one small-coordinate space. View factors depend only on
+    // relative geometry, so the constant shift is exact.
+    std::array<double,3> bbmin = {{ mesh_->vertices[0][0], mesh_->vertices[0][1], mesh_->vertices[0][2] }};
+    std::array<double,3> bbmax = bbmin;
+    for (size_t i = 1; i < n_verts; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            bbmin[k] = std::min(bbmin[k], mesh_->vertices[i][k]);
+            bbmax[k] = std::max(bbmax[k], mesh_->vertices[i][k]);
+        }
+    }
+    const std::array<double,3> origin_shift = {{
+        0.5 * (bbmin[0] + bbmax[0]),
+        0.5 * (bbmin[1] + bbmax[1]),
+        0.5 * (bbmin[2] + bbmax[2])
+    }};
+    std::cout << "  Radiation Embree scene recentered by ("
+              << origin_shift[0] << ", " << origin_shift[1] << ", " << origin_shift[2]
+              << ") for float32 precision" << std::endl;
+
     for (size_t i = 0; i < n_verts; ++i) {
-        vertices[3 * i + 0] = static_cast<float>(mesh_->vertices[i][0]);
-        vertices[3 * i + 1] = static_cast<float>(mesh_->vertices[i][1]);
-        vertices[3 * i + 2] = static_cast<float>(mesh_->vertices[i][2]);
+        vertices[3 * i + 0] = static_cast<float>(mesh_->vertices[i][0] - origin_shift[0]);
+        vertices[3 * i + 1] = static_cast<float>(mesh_->vertices[i][1] - origin_shift[1]);
+        vertices[3 * i + 2] = static_cast<float>(mesh_->vertices[i][2] - origin_shift[2]);
     }
 
     // Set indices
@@ -790,11 +1509,26 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
         hconfig.aca_tolerance = config_.aca_tolerance;
         hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
             std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
                       << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
         } else {
             std::cout << "  Using SVD compression" << std::endl;
         }
@@ -906,9 +1640,21 @@ bool RadiationExchangeManager::prepare(
         // CRITICAL: Set config and initialize GPU for loaded view factors
         // Without this, GPU memory check is skipped and GPU crashes on large matrices
         solver_->setConfig(config_);
+        // A2: apply the per-face Bond albedo (if set) before initGPU so the GPU
+        // path (once two-band-aware) sees it too.
+        if (!solar_albedo_.empty()) solver_->setSolarAlbedo(solar_albedo_);
+        // D1: config-driven two-band activation (before initGPU so the GPU gate sees it).
+        if (config_.band_separated) solver_->enableTwoBand();
         solver_->initGPU();
 
         is_active_ = true;
+        if (config_.rms_slope_deg > 0.0) {
+            chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+            buildChiTable();
+            buildBeamPairs();
+            beam_active_ = !beam_pairs_.empty();
+            configureSolarBeaming();
+        }
         return true;
     }
 
@@ -970,11 +1716,26 @@ bool RadiationExchangeManager::prepare(
         hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
         hconfig.aca_tolerance = config_.aca_tolerance;
         hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
         hconfig.hmatrix_threads = config_.hmatrix_threads;
 
         if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
             std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
                       << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
         } else {
             std::cout << "  Using SVD compression" << std::endl;
         }
@@ -1022,18 +1783,125 @@ bool RadiationExchangeManager::prepare(
     }
 
     solver_->setConfig(config_);
+    // A2: apply the per-face Bond albedo (if set) before initGPU.
+    if (!solar_albedo_.empty()) solver_->setSolarAlbedo(solar_albedo_);
+    // D1: config-driven two-band activation (before initGPU so the GPU gate sees it).
+    if (config_.band_separated) solver_->enableTwoBand();
 
     // Initialize GPU solver if requested (must be after setConfig)
     solver_->initGPU();
 
     is_active_ = true;
 
+    // Smith (1967) anisotropic beamed-emission setup (only when rms_slope_deg>0).
+    if (config_.rms_slope_deg > 0.0) {
+        chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+        buildChiTable();
+        buildBeamPairs();
+        beam_active_ = !beam_pairs_.empty();
+        configureSolarBeaming();
+    }
+
     return true;
+}
+
+bool RadiationExchangeManager::hasGPUPool() const {
+    return solver_ ? solver_->hasGPUPool() : false;
+}
+
+void RadiationExchangeManager::setSolarAlbedo(const std::vector<double>& solar_albedo) {
+    // A2: store the per-face Bond albedo and forward to the solver if it exists.
+    // If called before prepare() (solver_ not yet created) it is applied at solver
+    // creation; if called per-timestep after prepare() it retargets immediately.
+    solar_albedo_ = solar_albedo;
+    if (solver_ && !solar_albedo_.empty()) {
+        solver_->setSolarAlbedo(solar_albedo_);
+    }
+}
+
+void RadiationExchangeManager::enableTwoBand() {
+    if (solver_) solver_->enableTwoBand();
+}
+
+bool RadiationExchangeManager::isTwoBand() const {
+    return solver_ ? solver_->isTwoBand() : false;
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep) {
+    // Delegate to the Sun-aware overload with no Sun directions (beaming off).
+    return computeIndirectFluxBatch(temperatures_per_timestep,
+                                    solar_flux_per_timestep, {});
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep,
+    const std::vector<std::array<double, 3>>& sun_dirs) {
+
+    const size_t n_steps = temperatures_per_timestep.size();
+    const size_t n = mesh_->faces.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps,
+                                                            std::vector<double>(n, 0.0));
+
+    if (!is_active_ || !solver_ || n_steps == 0) {
+        return indirect_per_timestep;
+    }
+
+    auto raw_per_step = solver_->solveBatch(temperatures_per_timestep,
+                                             solar_flux_per_timestep);
+
+    const bool do_beam = beam_active_ && (sun_dirs.size() == n_steps);
+
+    // Map back to all faces using the exchange-face index list (same as
+    // computeIndirectFlux). Update aggregate stats from the last timestep.
+    double sum = 0.0;
+    double max_flux = 0.0;
+    for (size_t k = 0; k < n_steps; ++k) {
+        const auto& flux = raw_per_step[k];
+        if (flux.empty()) continue;
+        for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
+            int face_idx = classification_.exchange_face_indices[i];
+            indirect_per_timestep[k][face_idx] = flux[face_idx];
+        }
+        // Smith beamed-emission correction (per timestep, Sun-dependent).
+        if (do_beam) {
+            const auto& s = sun_dirs[k];
+            if (s[0] != 0.0 || s[1] != 0.0 || s[2] != 0.0) {
+                addBeamedFlux(temperatures_per_timestep[k], solar_flux_per_timestep[k],
+                              s, indirect_per_timestep[k]);
+            }
+        }
+    }
+    if (!raw_per_step.empty() && !raw_per_step.back().empty()) {
+        for (int idx : classification_.exchange_face_indices) {
+            sum += indirect_per_timestep.back()[idx];
+            max_flux = std::max(max_flux, indirect_per_timestep.back()[idx]);
+        }
+        stats_.mean_indirect_flux = sum / std::max(size_t(1),
+                                                    classification_.exchange_faces);
+        stats_.max_indirect_flux = max_flux;
+        stats_.solver_iterations = solver_->getLastIterations();
+        stats_.solver_residual = solver_->getLastResidual();
+    }
+
+    return indirect_per_timestep;
 }
 
 std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     const std::vector<double>& temperatures,
     const std::vector<double>& solar_flux) {
+    // Delegate to the Sun-aware overload with no Sun direction (beaming off).
+    return computeIndirectFlux(temperatures, solar_flux, {0.0, 0.0, 0.0});
+}
+
+std::vector<double> RadiationExchangeManager::computeIndirectFlux(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux,
+    const std::array<double, 3>& sun_dir) {
 
     size_t n = mesh_->faces.size();
     indirect_flux_.assign(n, 0.0);
@@ -1042,7 +1910,7 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
         return indirect_flux_;
     }
 
-    // Solve radiosity equation
+    // Solve radiosity equation (isotropic/Lambertian thermal emission)
     auto flux = solver_->solve(temperatures, solar_flux);
 
     // Map back to all faces
@@ -1051,7 +1919,30 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
         indirect_flux_[face_idx] = flux[face_idx];
     }
 
-    // Update statistics
+    // C1: per-band absorbed indirect flux (reflected-solar vis / thermal-IR),
+    // mapped to all faces. Only populated when the solver ran two-band.
+    if (solver_->isTwoBand()) {
+        const auto& qvis = solver_->lastIndirectVisible();
+        const auto& qir  = solver_->lastIndirectIR();
+        indirect_flux_vis_.assign(n, 0.0);
+        indirect_flux_ir_.assign(n, 0.0);
+        for (int face_idx : classification_.exchange_face_indices) {
+            if (face_idx < static_cast<int>(qvis.size())) indirect_flux_vis_[face_idx] = qvis[face_idx];
+            if (face_idx < static_cast<int>(qir.size()))  indirect_flux_ir_[face_idx]  = qir[face_idx];
+        }
+    } else {
+        indirect_flux_vis_.clear();
+        indirect_flux_ir_.clear();
+    }
+
+    // Smith (1967) anisotropic beamed-emission correction (Sun-dependent).
+    // Redistributes each sunlit wall's fixed total emission toward the floor.
+    const bool sun_valid = (sun_dir[0] != 0.0 || sun_dir[1] != 0.0 || sun_dir[2] != 0.0);
+    if (beam_active_ && sun_valid) {
+        addBeamedFlux(temperatures, solar_flux, sun_dir, indirect_flux_);
+    }
+
+    // Update statistics (after beaming so they reflect the corrected flux)
     double sum = 0.0;
     double max_flux = 0.0;
     for (int idx : classification_.exchange_face_indices) {
@@ -1065,6 +1956,160 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     stats_.solver_residual = solver_->getLastResidual();
 
     return indirect_flux_;
+}
+
+// ============================================================================
+// Smith (1967) anisotropic beamed thermal emission
+// The directional-emission math lives in smith_beaming.h (shared with the
+// standalone validator test_beam_chi.cpp).
+// ============================================================================
+
+void RadiationExchangeManager::buildChiTable() {
+    chi_ns_ = 24; chi_ne_ = 24; chi_npsi_ = 33;
+    chi_table_ = smith::buildChiTable(chi_w_rad_, chi_ns_, chi_ne_, chi_npsi_);
+}
+
+float RadiationExchangeManager::lookupChi(double cos_sun, double cos_e,
+                                          double cos_psi) const {
+    return smith::evalChi(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                          cos_sun, cos_e, cos_psi);
+}
+
+void RadiationExchangeManager::buildBeamPairs() {
+    beam_pairs_.clear();
+    if (classification_.exchange_face_indices.empty()) return;
+
+    // Receivers = the radiation-exchange (shadowed-floor) faces.
+    const std::vector<int>& receivers = classification_.exchange_face_indices;
+
+    // Geometric VF + Embree visibility for receiver rows. Backend-independent
+    // (works for H-matrix runs where per-row matrix access is unavailable), and
+    // uses the same F formula and row-normalization as the radiosity.
+    ViewFactorCalculator calc(mesh_, static_cast<RTCDevice>(device_),
+                              static_cast<RTCScene>(scene_), config_);
+    ViewFactorMatrix rows = calc.computeSubset(receivers);  // global row indexing
+
+    // Cache per-face mean normals (float) for the run-time beamed pass.
+    const auto& normals = calc.getFaceNormals();
+    const auto& centers = calc.getFaceCenters();
+    beam_normals_.resize(normals.size());
+    for (size_t f = 0; f < normals.size(); ++f) {
+        beam_normals_[f] = { static_cast<float>(normals[f][0]),
+                             static_cast<float>(normals[f][1]),
+                             static_cast<float>(normals[f][2]) };
+    }
+
+    const auto& shadow = classification_.shadow_fractions;
+    const double thresh = config_.beam_vf_threshold;
+
+    std::vector<int> cols;
+    std::vector<double> vals;
+    for (int i : receivers) {
+        rows.getRow(i, cols, vals);     // global receiver index
+        if (cols.empty()) continue;
+        double rowsum = 0.0;
+        for (double v : vals) rowsum += v;
+        double rownorm = 1.0 / std::max(1.0, rowsum);   // matches radiosity vf_row_norm
+        const auto& ci = centers[i];
+        for (size_t m = 0; m < cols.size(); ++m) {
+            int j = cols[m];
+            if (j < 0 || j >= static_cast<int>(shadow.size())) continue;
+            if (shadow[j] >= 0.99) continue;            // permanently shadowed -> not an emitter
+            double Fhat = vals[m] * rownorm;
+            if (Fhat <= thresh) continue;
+            const auto& cj = centers[j];
+            double dx = ci[0] - cj[0], dy = ci[1] - cj[1], dz = ci[2] - cj[2];
+            double r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < 1e-20) continue;
+            double inv = 1.0 / std::sqrt(r2);
+            double dirx = dx * inv, diry = dy * inv, dirz = dz * inv;
+            const auto& nj = normals[j];
+            double cos_e = nj[0] * dirx + nj[1] * diry + nj[2] * dirz;
+            if (cos_e <= 0.0) continue;                 // wall not emitting toward floor
+            BeamPair bp;
+            bp.i = i;
+            bp.j = j;
+            bp.Fhat_ij = static_cast<float>(Fhat);
+            bp.cos_e = static_cast<float>(cos_e);
+            bp.dir_ji = { static_cast<float>(dirx),
+                          static_cast<float>(diry),
+                          static_cast<float>(dirz) };
+            beam_pairs_.push_back(bp);
+        }
+    }
+
+    std::cout << "  Smith beamed emission: " << beam_pairs_.size()
+              << " wall->floor beam pairs (rms_slope = " << config_.rms_slope_deg
+              << " deg)" << std::endl;
+}
+
+void RadiationExchangeManager::configureSolarBeaming() {
+    beam_solar_ = false;
+    solar_albedo_beam_ = 0.0;
+    if (const char* bs = std::getenv("PTM_BEAM_SOLAR")) beam_solar_ = (std::atoi(bs) != 0);
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) solar_albedo_beam_ = a;
+    }
+    if (beam_solar_ && solar_albedo_beam_ <= 0.0) solar_albedo_beam_ = 0.12;  // default Bond
+    if (beam_solar_) {
+        std::cout << "  [PTM_BEAM_SOLAR] beaming reflected solar (Bond albedo "
+                  << solar_albedo_beam_ << ") toward the floor, in addition to thermal IR"
+                  << std::endl;
+    }
+}
+
+void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperatures,
+                                             const std::vector<double>& solar_flux,
+                                             const std::array<double, 3>& sun_dir,
+                                             std::vector<double>& flux) const {
+    // This is the ISOTHERMAL Smith-chi radiosity beaming. The anisothermal
+    // sub-facet hook (radiation/anisothermal_beaming.h aniso::enhancementBol) is
+    // DESIGNED but NOT wired here. HARD PREREQUISITE before wiring it (Fermi,
+    // 2026-07-05): first divide E_bol by a per-cos_sun closure table
+    // C(cos_sun) = int chi*E_bol cos dOmega / pi to close the ~+9%-at-grazing
+    // energy leak -- REQUIRED for energy balance. Do NOT re-fold E with chi's
+    // (m.s)(m.d) weight (Fermi: worse, +85% at grazing). See enhancementBol.
+    if (beam_pairs_.empty()) return;
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+
+    // Accumulate the signed (chi-1) corrections, then apply once per receiver so
+    // the result stays non-negative (absorbed flux). OpenMP-safe via atomic add
+    // on the receiver bucket would race the final clamp, so reduce into a local.
+    const size_t np = beam_pairs_.size();
+    #pragma omp parallel for schedule(static)
+    for (size_t k = 0; k < np; ++k) {
+        const BeamPair& bp = beam_pairs_[k];
+        const std::array<float, 3>& nj = beam_normals_[bp.j];
+        double cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
+        if (cos_sun <= 0.0) continue;   // wall mean in shadow this timestep -> no beaming
+        double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                             + bp.dir_ji[2] * sz);
+        double chi = lookupChi(cos_sun, static_cast<double>(bp.cos_e), cos_psi);
+        double delta = chi - 1.0;
+        if (delta == 0.0) continue;
+        double Tj = temperatures[bp.j];
+        double Ej = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj;   // thermal IR source
+        // Solar opposition beaming (PTM_BEAM_SOLAR): the reflected-solar source
+        // (albedo * incident sunlight) leaving the sunlit wall has the same m.s facet
+        // structure as its IR emission, so the floor (backscatter) gets the same chi
+        // enhancement. Absorbed at the floor with eps_i (consistent with the radiosity's
+        // solar handling). Off by default => byte-identical IR-only beaming.
+        double Sj = 0.0;
+        if (beam_solar_ && bp.j < static_cast<int>(solar_flux.size())) {
+            Sj = solar_albedo_beam_ * solar_flux[bp.j];
+        }
+        double dq = emissivity_[bp.i] * (Ej + Sj) * static_cast<double>(bp.Fhat_ij) * delta;
+        #pragma omp atomic
+        flux[bp.i] += dq;
+    }
+
+    // Keep absorbed indirect flux non-negative on the receiver set.
+    for (int i : classification_.exchange_face_indices) {
+        if (flux[i] < 0.0) flux[i] = 0.0;
+    }
 }
 
 void RadiationExchangeManager::setEmissivity(double emissivity) {

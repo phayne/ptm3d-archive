@@ -1,0 +1,72 @@
+# PTM3D — Known Limitations and Gotchas
+
+This document lists behaviors that can surprise users of PTM3D. None are correctness bugs in the
+core solver; they are modeling limitations, configuration gotchas, and workflow caveats. Reading
+the run log resolves several of them — always confirm what the run actually loaded (a mesh-load
+failure now aborts rather than silently substituting a default icosphere).
+
+## Configuration gotchas
+
+- **`constant_thermal_inertia > 0` silently disables the T-dependent conductivity term (`chi`).**
+  Selecting a constant thermal inertia forces `chi = 0` (and collapses `kd→ks`, `rhod→rhos`) by
+  design, so a `chi` you also set is dropped without warning. To use a real `chi > 0`, set
+  `constant_thermal_inertia: 0` and specify `ks/kd/rhos/rhod/cp0` directly.
+
+## Illumination
+
+- **Near-terminator direct illumination can be non-monotonic.** At grazing solar incidence (~90°)
+  the finite-solar-disk model can yield small, non-monotonic direct-flux values on near-terminator
+  faces (order ≤1 W/m²). Benign for energy balance, visible only in per-face direct flux at the
+  terminator.
+
+- **Residual "crater-center flash" on non-watertight meshes.** Grazing sunlight can thread small
+  interior mesh holes and briefly light floor faces. The interior-hole seal
+  (`PTM_ILLUM_SEAL_HOLES=1`) closes watertight interior hole loops, but **open and non-manifold
+  hole components are left unsealed**. Ensure meshes are watertight for micro-relief floor studies;
+  the seal is a mitigation, not a guarantee.
+
+## View factors / radiation
+
+- **Deep permanently-shadowed floors remain slightly under-coupled to warm walls.** Even with the
+  corrected view-factor operator, radiative coupling into the deepest cold-trap floors is a small
+  underestimate (a radiative-equilibrium effect of order ~1–2 K for most floors, less for the
+  deepest). Relevant when comparing modeled cold-trap floor temperatures to observations.
+
+- **Do not rebuild the `.vf` from a mesh that changed after the view-factor was built.** The VF
+  builder uses the mesh's raw winding; if the mesh face count or winding differs from the one the VF
+  was built against, radiation exchange is silently wrong (or a no-op). Reuse the baseline's paired
+  mesh + VF together, and confirm the load log shows matching dimensions **and Non-zeros > 0**.
+
+- **Low-rank (ACA) far-field view factors can carry tiny negative entries.** A physical view factor
+  is ≥ 0, but the low-rank far-field approximation does not preserve non-negativity, so near-zero
+  true entries reconstruct with small ± sign noise. The net row-sum effect is negligible on smooth
+  production meshes (~−3e-5), but can be larger on steep/rough geometry. Clamp reconstructed `F ≥ 0`
+  or tighten the ACA tolerance if it matters for your case.
+
+- **The view-factor occlusion test uses meter-scale thresholds — coarse for sub-meter meshes.** The
+  visibility test starts rays a fixed ~0.5 m offset and auto-passes pairs closer than ~12.5 cm. On
+  sub-meter meshes (face edges ≪ 1 m) most of the near field auto-passes, so genuinely-occluded near
+  pairs can still exchange radiation. Affects fine (sub-meter) meshes; the corrected-VF operator
+  mitigates the net magnitude.
+
+- **GPU two-band radiosity is limited to meshes with Σ_j F_ij ≤ 1.** The GPU Jacobi kernel does not
+  apply the row-sum renormalization, so on meshes whose centroid view-factor row sums exceed 1 the
+  solver warns and falls back to the (always-protected) CPU two-band solver. The CPU path is
+  unrestricted.
+
+## Output format
+
+- **`statistics/*.bin` files begin with a 4-byte header.** The layout is
+  `[int32 n_faces][float32 × n_faces]`. A custom reader must consume the leading `int32` (the
+  shipped `scripts/ptm_qa.py` reader does); reading the file as raw `float32` shifts every face by
+  one index and mislabels the first value.
+
+## Workflow / tooling
+
+- **The chunked runner can pick a stale binary.** `run_chunked_simulation.py` may prefer a build in
+  `~/dev/heat3d/ptm-build` if that directory exists, even if it is older than your in-tree build.
+  Pass `--ptm-bin` / `--merge-bin` explicitly to pin the binary you built.
+
+- **The A3GT batch tools depend on an external mesh helper.** `a3gt_v2_orchestrator.py` and
+  `run_a3gt_batch.py` expect a `dtm_to_ply_delaunay` binary on a fixed path; provide it (or adjust
+  the path) before running an A3GT batch.

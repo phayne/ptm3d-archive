@@ -127,6 +127,26 @@ ViewFactorMatrix computeMonteCarlo(
     avg_area /= static_cast<double>(n_faces);
     const double eps = 1e-4 * std::sqrt(std::max(avg_area, 1e-20));
 
+    // Recenter ray origins to the mesh bounding-box center, matching the Embree
+    // scene recentering in RadiationExchangeManager::initializeScene(). The scene
+    // vertices are shifted by this same bbox center for float32 precision; if the
+    // MC ray origins stayed at raw selenocentric coordinates (|Z|~1.7e6 m) they
+    // would start ~1.7e6 m outside the recentered BVH and EVERY ray would miss,
+    // producing an empty view-factor matrix (no radiation coupling). View factors
+    // are translation-invariant, so this constant shift is exact. The H-matrix
+    // builder already applies the identical shift; the MC path previously did not.
+    std::array<double, 3> bbmin = mesh->vertices[0];
+    std::array<double, 3> bbmax = mesh->vertices[0];
+    for (const auto& vtx : mesh->vertices) {
+        for (int k = 0; k < 3; ++k) {
+            bbmin[k] = std::min(bbmin[k], vtx[k]);
+            bbmax[k] = std::max(bbmax[k], vtx[k]);
+        }
+    }
+    const std::array<double, 3> origin_shift = {{0.5 * (bbmin[0] + bbmax[0]),
+                                                 0.5 * (bbmin[1] + bbmax[1]),
+                                                 0.5 * (bbmin[2] + bbmax[2])}};
+
     // ----- Per-face histograms: hit_face -> count -----
     // Written by one thread per source (OMP for is work-partitioned by source),
     // so no cross-thread contention on individual maps.
@@ -157,9 +177,9 @@ ViewFactorMatrix computeMonteCarlo(
             const auto& u = us[src];
             const auto& v = vs[src];
 
-            const float org_x = static_cast<float>(c[0] + eps * n[0]);
-            const float org_y = static_cast<float>(c[1] + eps * n[1]);
-            const float org_z = static_cast<float>(c[2] + eps * n[2]);
+            const float org_x = static_cast<float>(c[0] - origin_shift[0] + eps * n[0]);
+            const float org_y = static_cast<float>(c[1] - origin_shift[1] + eps * n[1]);
+            const float org_z = static_cast<float>(c[2] - origin_shift[2] + eps * n[2]);
 
             int sky_local = 0;
             const int src_int = static_cast<int>(src);
