@@ -42,6 +42,7 @@ we print the average so far and ``ETA = (N - i - 1) × avg``.
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
 import os
 import platform
@@ -49,6 +50,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 try:
     import yaml
@@ -318,6 +320,27 @@ def main():
                    default=Path(__file__).resolve().parent.parent
                             / "build" / "bin" / "ptm_merge_chunks",
                    help="Path to the ptm_merge_chunks binary.")
+    p.add_argument("--thermal-monitor", action="store_true",
+                   help="Spawn scripts/gpu_thermal_monitor.py as a sidecar; "
+                        "log GPU temperature/power/fan to "
+                        "<output-dir>/thermal.csv and gate chunk launches on "
+                        "<output-dir>/thermal.flag (cool-down between chunks "
+                        "if any GPU was hot during the previous chunk).")
+    p.add_argument("--thermal-hot-c", type=int, default=85,
+                   help="GPU temperature (C) above which we declare HOT and "
+                        "delay the next chunk launch. Default: 85.")
+    p.add_argument("--thermal-cool-c", type=int, default=75,
+                   help="GPU temperature (C) at/below which the cool-down "
+                        "dwell timer starts. Default: 75.")
+    p.add_argument("--thermal-cool-dwell-s", type=int, default=60,
+                   help="Seconds GPUs must hold at/below --thermal-cool-c "
+                        "before we clear thermal.flag and resume. Default: 60.")
+    p.add_argument("--thermal-poll-s", type=float, default=20.0,
+                   help="Sidecar sampling interval (seconds). Default: 20.")
+    p.add_argument("--thermal-max-wait-s", type=int, default=900,
+                   help="Hard cap on the inter-chunk thermal wait. After this "
+                        "many seconds we proceed regardless. Default: 900 "
+                        "(15 min).")
     args = p.parse_args()
 
     if not args.config.is_file():
@@ -401,6 +424,50 @@ def main():
     state_dir = args.output_dir / "_thermal_state"
     state_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional thermal-monitor sidecar. Logs per-GPU temperature/power
+    # to <output-dir>/thermal.csv and maintains <output-dir>/thermal.flag
+    # while any GPU is above --thermal-hot-c. We poll the flag at chunk
+    # boundaries below to enforce cool-downs without ever suspending the
+    # active worker (SIGSTOP on a process holding OpenCL command queues
+    # is exactly the failure mode we are mitigating).
+    flag_path = args.output_dir / "thermal.flag"
+    therm_proc: Optional[subprocess.Popen] = None
+    if args.thermal_monitor:
+        # Reset any stale flag from a prior run.
+        try:
+            flag_path.unlink()
+        except FileNotFoundError:
+            pass
+        mon_script = Path(__file__).resolve().parent / "gpu_thermal_monitor.py"
+        if not mon_script.is_file():
+            sys.exit(f"error: thermal monitor script not found at {mon_script}")
+        therm_cmd = [sys.executable, str(mon_script),
+                     "--log-dir", str(args.output_dir),
+                     "--interval", f"{args.thermal_poll_s:g}",
+                     "--hot-threshold-c", str(args.thermal_hot_c),
+                     "--cool-threshold-c", str(args.thermal_cool_c),
+                     "--cool-dwell-s", str(args.thermal_cool_dwell_s)]
+        therm_log = open(args.output_dir / "thermal_monitor.log", "a")
+        therm_proc = subprocess.Popen(therm_cmd, stdout=therm_log,
+                                      stderr=subprocess.STDOUT)
+        print(f"[chunked] thermal monitor started (PID {therm_proc.pid}); "
+              f"log {args.output_dir}/thermal_monitor.log; "
+              f"flag {flag_path}")
+
+        def _stop_monitor() -> None:
+            if therm_proc is None or therm_proc.poll() is not None:
+                return
+            try:
+                therm_proc.terminate()
+                try:
+                    therm_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    therm_proc.kill()
+            except Exception:
+                pass
+
+        atexit.register(_stop_monitor)
+
     chunk_walltimes: list[float] = []
     for i, info in enumerate(plan):
         cd = info["chunk_dir"]
@@ -409,6 +476,34 @@ def main():
             print(f"\n[chunked] chunk {i:03d}: complete (resume), skipping.")
             chunk_walltimes.append(0.0)
             continue
+
+        # Thermal gate. If the sidecar has the hot-flag up, hold here
+        # until the GPUs cool below --thermal-cool-c (capped by
+        # --thermal-max-wait-s). We only check between chunks because
+        # the active worker holds OpenCL command queues mid-chunk and
+        # SIGSTOPing it tends to provoke the very gpusKillClient hang
+        # we are trying to avoid.
+        if args.thermal_monitor and flag_path.exists():
+            t_wait_start = time.time()
+            announced = False
+            while flag_path.exists():
+                waited = time.time() - t_wait_start
+                if waited >= args.thermal_max_wait_s:
+                    print(f"[chunked] chunk {i:03d}: thermal cool-down hit "
+                          f"--thermal-max-wait-s ({args.thermal_max_wait_s}s); "
+                          f"proceeding while still hot.", flush=True)
+                    break
+                if not announced:
+                    print(f"[chunked] chunk {i:03d}: thermal.flag is set; "
+                          f"holding launch until GPUs cool below "
+                          f"{args.thermal_cool_c}C (max wait "
+                          f"{args.thermal_max_wait_s}s)...", flush=True)
+                    announced = True
+                time.sleep(min(15.0, args.thermal_poll_s))
+            if announced and not flag_path.exists():
+                cooled = time.time() - t_wait_start
+                print(f"[chunked] chunk {i:03d}: GPUs cool after {cooled:.0f}s; "
+                      f"resuming.", flush=True)
 
         # Wire up checkpoint files. Validate the previous chunk's
         # checkpoint magic up-front: OneDrive's lazy-fetch can leave a
@@ -449,11 +544,13 @@ def main():
         t0 = time.time()
         while attempt <= args.retries:
             if attempt > 0:
-                # Exponential-ish back-off: 30s, 60s, 120s, 240s, ... capped at 600s.
-                # On macOS+AMD we sometimes see the driver in a bad state for
-                # several minutes after a kernel hang; longer waits give it
-                # time to recover.
-                cooldown = min(600, 30 * (2 ** (attempt - 1)))
+                # Exponential-ish back-off: 120s, 240s, 480s, ... capped at 600s.
+                # On macOS+AMD the command-buffer pool sometimes stays wedged
+                # for several minutes after a kernel hang; the previous 30/60s
+                # base was too short — three quick retries all hit the same
+                # degraded driver state on lunar 1.8M-face workloads
+                # (A03MP012 Y05_winter / Y09_summer, 2026-05-13).
+                cooldown = min(600, 120 * (2 ** (attempt - 1)))
                 print(f"[chunked] chunk {i:03d}: retry {attempt}/{args.retries} "
                       f"after {last_failure}; "
                       f"waiting {cooldown}s for GPU to settle...",

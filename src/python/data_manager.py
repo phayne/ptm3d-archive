@@ -350,6 +350,122 @@ class DataManager:
         }
 
 
+def read_spk_body_id(
+    spk_path: str, fallback_naif_id: str = ""
+) -> Optional[str]:
+    """Read the body id actually stored in a downloaded SPK file.
+
+    HORIZONS writes small bodies into SPK files under either the old
+    ``2000000 + number`` or the new ``20000000 + number`` convention, and the
+    two are not interchangeable: spkpos/spkez fail with SPKINSUFFDATA if you
+    query the wrong one.  Rather than guess, read the segment summaries from
+    the SPK itself and return the body id that is genuinely present.
+
+    Robust to both conventions: whatever id the SPK declares is returned as-is.
+    The body (target) ids in HORIZONS small-body SPKs are large positive
+    integers; the only other id present is normally the Sun/SSB center
+    (0 or 10), which we ignore.
+
+    Parameters
+    ----------
+    spk_path : str
+        Path to the binary SPK file.
+    fallback_naif_id : str
+        Value to return if the SPK cannot be read (e.g. SPICE unavailable).
+
+    Returns
+    -------
+    str or None
+        The body id as a string, or ``fallback_naif_id`` (possibly empty) if
+        it could not be determined.
+    """
+    if not spk_path or not os.path.exists(spk_path):
+        return fallback_naif_id or None
+
+    ids: list[int] = []
+    try:
+        import spiceypy as sp
+
+        cell = sp.spkobj(spk_path)
+        ids = [cell[i] for i in range(len(cell))]
+    except Exception:
+        # Fall back to a minimal DAF traversal if spiceypy is unavailable or
+        # errors out.  This reads SPK segment summaries directly: each segment
+        # descriptor stores the target body id as the third integer component.
+        try:
+            ids = _daf_spk_body_ids(spk_path)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not read body id from SPK %s: %s", spk_path, exc)
+            return fallback_naif_id or None
+
+    # Ignore generic ephemeris centers (Solar System Barycenter / Sun).
+    body_ids = [i for i in ids if i not in (0, 10)]
+    if not body_ids:
+        body_ids = ids
+
+    if not body_ids:
+        return fallback_naif_id or None
+
+    if len(set(body_ids)) > 1:
+        logger.warning(
+            "SPK %s contains multiple body ids %s; using %s",
+            spk_path, sorted(set(body_ids)), max(body_ids),
+        )
+
+    # Prefer the largest id: HORIZONS small-body ids dwarf any incidental
+    # planetary center that might appear.
+    return str(max(body_ids))
+
+
+def _daf_spk_body_ids(spk_path: str) -> list[int]:
+    """Read SPK target body ids by walking the DAF structure directly.
+
+    This is a dependency-free fallback for read_spk_body_id used only when
+    spiceypy is not importable.  It parses the DAF file/summary records and
+    extracts the third integer component of each segment descriptor, which for
+    SPK files is the target body id.
+    """
+    import struct
+
+    with open(spk_path, "rb") as f:
+        file_record = f.read(1024)
+        if not file_record.startswith(b"DAF/SPK"):
+            raise ValueError("not a DAF/SPK file")
+
+        # Endianness marker lives at bytes 88..96 ("LTL-IEEE" / "BIG-IEEE").
+        bff = file_record[88:96].rstrip(b"\x00 ").decode("ascii", "replace")
+        endian = "<" if bff.startswith("LTL") else ">"
+
+        nd = struct.unpack(endian + "i", file_record[8:12])[0]
+        ni = struct.unpack(endian + "i", file_record[12:16])[0]
+        fward = struct.unpack(endian + "i", file_record[76:80])[0]
+
+        # Number of 8-byte words per descriptor (doubles + packed ints).
+        ss = nd + (ni + 1) // 2
+
+        body_ids: list[int] = []
+        record_no = fward
+        while record_no != 0:
+            f.seek((record_no - 1) * 1024)
+            rec = f.read(1024)
+            next_rec = struct.unpack(endian + "d", rec[0:8])[0]
+            nsum = int(struct.unpack(endian + "d", rec[16:24])[0])
+            offset = 24
+            for _ in range(nsum):
+                desc = rec[offset : offset + ss * 8]
+                offset += ss * 8
+                # Integer components follow the nd doubles; the SPK descriptor
+                # integers are [target, center, frame, type, baddr, eaddr].
+                int_off = nd * 8
+                target = struct.unpack(
+                    endian + "i", desc[int_off : int_off + 4]
+                )[0]
+                body_ids.append(target)
+            record_no = int(next_rec)
+
+    return body_ids
+
+
 def fetch_and_cache_body(
     query: str,
     cache_dir: str = "",
@@ -446,6 +562,10 @@ def fetch_and_cache_body(
     # Download SPK if using SPICE ephemeris
     spk_data = None
     spk_path = ""
+    # NAIF id used for SPK queries.  For SPICE mode this is overwritten with
+    # the id actually found inside the downloaded SPK (see read_spk_body_id),
+    # so it is robust to HORIZONS' old (2000000+N) vs new (20000000+N) scheme.
+    spk_naif_id = body.naif_id
     if ephemeris_source == "spice":
         try:
             print(f"Downloading SPK ephemeris ({spk_start} to {spk_stop})...")
@@ -461,6 +581,17 @@ def fetch_and_cache_body(
             with open(spk_path, "rb") as f:
                 spk_data = f.read()
             print(f"  SPK downloaded: {len(spk_data)} bytes")
+
+            # Read the body id actually stored in the SPK.  Computing it from
+            # the asteroid number is unreliable because HORIZONS migrated
+            # small-body SPK ids from 2000000+N to 20000000+N.
+            spk_body_id = read_spk_body_id(spk_path, fallback_naif_id=body.naif_id)
+            if spk_body_id:
+                spk_naif_id = spk_body_id
+                print(f"  SPK body id (read from file): {spk_naif_id}")
+            else:
+                print(f"  WARNING: could not read body id from SPK; "
+                      f"using HORIZONS record number {body.naif_id}")
         except RuntimeError as e:
             print(f"  SPK download failed: {e}")
             print("  Falling back to Keplerian ephemeris")
@@ -564,7 +695,7 @@ def fetch_and_cache_body(
         metakernel_file=mk_path_for_config,
         shape_mesh_file=shape_path,
         shape_type=shape_type,
-        naif_id=body.naif_id,
+        naif_id=spk_naif_id,
         body_type=body.body_type,
     )
 
@@ -575,7 +706,7 @@ def fetch_and_cache_body(
     # Store in cache
     dm.store_body(
         name=body.name,
-        naif_id=body.naif_id,
+        naif_id=spk_naif_id,
         body_type=body.body_type,
         config_yaml=config_yaml,
         spk_data=spk_data,

@@ -1,18 +1,18 @@
 generic_body:
   name: 623 Chimaera (A907 BC)
   ephemeris_source: spice
-  naif_id: '2000623'
+  naif_id: '20000623'
   shape:
     type: custom_mesh
     radius_km: 22.045
-    mesh_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape.obj
+    mesh_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj
   orbit:
     semi_major_axis_au: 2.46093257
     eccentricity: 0.11327891
     inclination_deg: 14.140915
     lon_ascending_node_deg: 308.459563
     arg_perihelion_deg: 124.123542
-    mean_anomaly_deg: 81.026767
+    mean_anomaly_deg: 81.026768
     epoch: '2000-01-01T12:00:00'
   spin:
     period_hours: 14.635
