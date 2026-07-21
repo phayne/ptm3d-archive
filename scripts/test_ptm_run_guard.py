@@ -109,6 +109,18 @@ check(len(g.preflight_consistency(timeout_s=10800, est_runtime_s=3600,
                                   profile=None)) == 2,
       "no profile uses conservative 300/8000 ceilings")
 
+# F6: batch != profile's batch_size_probe -> caveat
+prof6 = {"max_timesteps_per_dispatch": 400, "recommended_batch_size": 16000,
+         "batch_size_probe": 8000}
+check(len(g.preflight_consistency(timeout_s=10800, est_runtime_s=3600,
+                                  batch_size=12000, max_timesteps_per_dispatch=300,
+                                  profile=prof6)) == 1,
+      "F6: batch != batch_size_probe flags a caveat")
+check(g.preflight_consistency(timeout_s=10800, est_runtime_s=3600,
+                              batch_size=8000, max_timesteps_per_dispatch=300,
+                              profile=prof6) == [],
+      "F6: batch == batch_size_probe is clean")
+
 # --- R5 retry ladder --------------------------------------------------------
 check(g.is_abort_class(134) and g.is_abort_class(139),
       "134/139 recognized as abort-class")

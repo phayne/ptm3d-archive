@@ -7965,30 +7965,57 @@ void printBanner() {
 static int runGpuCalibration(int argc, char** argv) {
     using namespace gpu::opencl;
 
-    int    batch_size  = 8000;
-    int    n_layers    = 50;
-    int    probe_steps = 200;
-    double ceiling_s   = 25.0;
-    std::string profile_out;   // empty => resolved default path
+    // Fermi F3: the probe MUST be production-representative or the ceiling is
+    // unsafe. The kernel's von-Neumann substep count (Fo<0.49) is set by the
+    // MINIMUM near-surface dz and kappa at the OUTPUT dt: a uniform 1 cm grid
+    // @250 K yields ~2 substeps/step, but production cold-PSR fine grids hit
+    // 29-200x -- so a ceiling calibrated on a coarse grid could run ~100x
+    // longer in production and WEDGE. Defaults below are lunar-cold-PSR-ish
+    // (0.5 mm first layer, geometric grid, low TI props, hourly dt).
+    int    batch_size    = 8000;
+    int    n_layers      = 50;
+    double ceiling_s     = 25.0;
+    double dz0           = 5.0e-4;   // first-layer thickness [m] (fine near-surface)
+    double grid_ratio    = 1.2;      // geometric growth of dz with depth
+    double dt_output_s   = 3600.0;   // OUTPUT timestep [s]
+    double kc_probe      = 2.0e-3;   // near-surface conductivity [W/m/K]
+    double rho_probe     = 1100.0;   // density [kg/m^3]
+    double cp0_probe     = 600.0;    // heat capacity [J/kg/K]
+    int    probe_steps_1 = 30;       // two-point regression (F4): small point
+    int    probe_steps_2 = 120;      //                            large point
+    double safety_factor = 4.0;      // clamp: max_ts <= factor x conservative default
+    std::string profile_out;         // empty => resolved default path
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--batch-size"   && i + 1 < argc) batch_size  = std::stoi(argv[++i]);
-        else if (a == "--gpu-batch-size" && i + 1 < argc) batch_size = std::stoi(argv[++i]);
-        else if (a == "--n-layers"     && i + 1 < argc) n_layers    = std::stoi(argv[++i]);
-        else if (a == "--probe-steps"  && i + 1 < argc) probe_steps = std::stoi(argv[++i]);
-        else if (a == "--safe-ceiling-s" && i + 1 < argc) ceiling_s = std::stod(argv[++i]);
-        else if (a == "--profile-out"  && i + 1 < argc) profile_out = argv[++i];
+        if      (a == "--batch-size"      && i + 1 < argc) batch_size    = std::stoi(argv[++i]);
+        else if (a == "--gpu-batch-size"  && i + 1 < argc) batch_size    = std::stoi(argv[++i]);
+        else if (a == "--n-layers"        && i + 1 < argc) n_layers      = std::stoi(argv[++i]);
+        else if (a == "--safe-ceiling-s"  && i + 1 < argc) ceiling_s     = std::stod(argv[++i]);
+        else if (a == "--dz0"             && i + 1 < argc) dz0           = std::stod(argv[++i]);
+        else if (a == "--grid-ratio"      && i + 1 < argc) grid_ratio    = std::stod(argv[++i]);
+        else if (a == "--dt-output-s"     && i + 1 < argc) dt_output_s   = std::stod(argv[++i]);
+        else if (a == "--kc"              && i + 1 < argc) kc_probe      = std::stod(argv[++i]);
+        else if (a == "--rho"             && i + 1 < argc) rho_probe     = std::stod(argv[++i]);
+        else if (a == "--cp0"             && i + 1 < argc) cp0_probe     = std::stod(argv[++i]);
+        else if (a == "--probe-steps-1"   && i + 1 < argc) probe_steps_1 = std::stoi(argv[++i]);
+        else if (a == "--probe-steps-2"   && i + 1 < argc) probe_steps_2 = std::stoi(argv[++i]);
+        else if (a == "--safety-factor"   && i + 1 < argc) safety_factor = std::stod(argv[++i]);
+        else if (a == "--profile-out"     && i + 1 < argc) profile_out   = argv[++i];
     }
-    if (batch_size < 1 || n_layers < 2 || probe_steps < 1 || ceiling_s <= 0.0) {
-        std::cerr << "[calibrate-gpu] invalid parameters (batch_size>=1, "
-                     "n_layers>=2, probe_steps>=1, safe_ceiling_s>0)\n";
+    if (batch_size < 1 || n_layers < 2 || ceiling_s <= 0.0 || dz0 <= 0.0 ||
+        grid_ratio < 1.0 || dt_output_s <= 0.0 || probe_steps_1 < 1 ||
+        probe_steps_2 <= probe_steps_1 || safety_factor <= 0.0) {
+        std::cerr << "[calibrate-gpu] invalid parameters (need batch>=1, "
+                     "n_layers>=2, ceiling>0, dz0>0, ratio>=1, dt>0, "
+                     "0<steps1<steps2, safety>0)\n";
         return 2;
     }
 
-    std::cout << "[calibrate-gpu] probing batch_size=" << batch_size
-              << " n_layers=" << n_layers << " probe_steps=" << probe_steps
-              << " safe_ceiling_s=" << ceiling_s << "\n";
+    std::cout << "[calibrate-gpu] representative probe: batch=" << batch_size
+              << " n_layers=" << n_layers << " dz0=" << dz0 << " m ratio="
+              << grid_ratio << " dt=" << dt_output_s << " s (kc=" << kc_probe
+              << " rho=" << rho_probe << " cp0=" << cp0_probe << ")\n";
 
     ThermalOpenCLConfig cfg;
     ThermalOpenCLSolver solver(static_cast<size_t>(batch_size),
@@ -8002,53 +8029,81 @@ static int runGpuCalibration(int argc, char** argv) {
     const size_t nf = static_cast<size_t>(batch_size);
     const size_t nl = static_cast<size_t>(n_layers);
 
-    // Synthetic uniform workload: values need only be numerically valid, not
-    // physical — this is a TIMING probe, not a science run.
+    // Geometric near-surface grid (drives realistic substep counts).
     std::vector<float> z_grid(nl);
-    for (size_t i = 0; i < nl; ++i) z_grid[i] = 0.01f * static_cast<float>(i); // 1 cm spacing
-    std::vector<float> rho(nl * nf, 1800.0f);
-    std::vector<float> kc(nl * nf, 0.01f);
+    z_grid[0] = 0.0f;
+    double dz = dz0;
+    for (size_t i = 1; i < nl; ++i) {
+        z_grid[i] = z_grid[i - 1] + static_cast<float>(dz);
+        dz *= grid_ratio;
+    }
+    std::vector<float> rho(nl * nf, static_cast<float>(rho_probe));
+    std::vector<float> kc(nl * nf, static_cast<float>(kc_probe));
     std::vector<float> emissivity(nf, 0.95f);
-    std::vector<float> T_deep(nf, 250.0f);
+    std::vector<float> T_deep(nf, 100.0f);        // cold-PSR-ish deep temperature
     std::vector<float> Qb(nf, 0.0f);
     std::vector<float> cp_coeffs;                 // none: cp = cp0
-    std::vector<float> T_initial(nl * nf, 250.0f);
-    std::vector<float> flux(static_cast<size_t>(probe_steps) * nf, 300.0f);
+    std::vector<float> T_initial(nl * nf, 120.0f);
     std::vector<float> out_temps;
 
     solver.uploadMeshData(z_grid, rho, kc, emissivity, T_deep, Qb);
-    solver.setMaterialParams(/*cp0=*/600.0f, cp_coeffs, /*R350=*/2.7f);
-    solver.uploadInitialTemperature(T_initial);
+    solver.setMaterialParams(static_cast<float>(cp0_probe), cp_coeffs, /*R350=*/2.7f);
 
-    // Wall-clock around the solve so we can attribute host-side per-dispatch
-    // overhead separately from kernel time.
-    auto w0 = std::chrono::high_resolution_clock::now();
-    solver.solvePersistentAllTimesteps(flux, out_temps, probe_steps, /*dt=*/3600.0f);
-    auto w1 = std::chrono::high_resolution_clock::now();
-    double wall_s   = std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
-    double kernel_ms = solver.getLastKernelTimeMs();
-    double kernel_s  = kernel_ms / 1000.0;
+    // Two-point regression (F4): wall(P) ~= overhead + P * per_step. Running two
+    // point counts separates the fixed per-dispatch overhead (setup + H2D/D2H
+    // transfers, the INTERCEPT) from the per-timestep kernel cost (the SLOPE).
+    // getLastKernelTimeMs returns whole-call wall (incl. transfers), so a single
+    // point would attribute ~0 overhead and give a too-large ceiling; the slope
+    // from two points is transfer-inclusive and thus conservative (safe) for the
+    // ceiling, while the intercept gives the runner a REAL overhead for its ETA.
+    auto run_probe = [&](int steps) -> double {
+        solver.uploadInitialTemperature(T_initial);   // same start state each time
+        std::vector<float> flux(static_cast<size_t>(steps) * nf, 5.0f);  // faint cold flux
+        auto w0 = std::chrono::high_resolution_clock::now();
+        solver.solvePersistentAllTimesteps(flux, out_temps, steps,
+                                           static_cast<float>(dt_output_s));
+        auto w1 = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
+    };
+    double wall1 = run_probe(probe_steps_1);
+    double wall2 = run_probe(probe_steps_2);
 
-    if (kernel_ms <= 0.0) {
-        std::cerr << "[calibrate-gpu] probe reported non-positive kernel time ("
-                  << kernel_ms << " ms); refusing to write a bogus profile.\n";
+    double per_step_s = (wall2 - wall1) / static_cast<double>(probe_steps_2 - probe_steps_1);
+    if (per_step_s <= 0.0) {
+        std::cerr << "[calibrate-gpu] non-positive per-step slope (wall1=" << wall1
+                  << "s wall2=" << wall2 << "s); probe too noisy/small — refusing "
+                     "to write a bogus profile. Increase --probe-steps-2.\n";
         return 4;
     }
+    double overhead_per_batch_s = std::max(0.0, wall1 - probe_steps_1 * per_step_s);
+    double per_step_ms = per_step_s * 1000.0;
 
-    double per_step_ms = kernel_ms / static_cast<double>(probe_steps);
-    int max_ts = static_cast<int>(ceiling_s * 1000.0 / per_step_ms);
-    if (max_ts < 1) max_ts = 1;              // never below one timestep/dispatch
-    double overhead_per_batch_s = std::max(0.0, wall_s - kernel_s);
+    // Ceiling (F3): keep ONE dispatch under safe_ceiling_s of PURE stepping time.
+    long   max_ts_raw = static_cast<long>(ceiling_s / per_step_s);
+    int    conservative = gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+    long   cap = static_cast<long>(safety_factor * conservative);
+    int    max_ts = static_cast<int>(std::min<long>(max_ts_raw, cap));
+    if (max_ts < 1) max_ts = 1;
+    if (max_ts_raw > cap) {
+        std::cerr << "[calibrate-gpu] WARNING (F3): calibrated ceiling "
+                  << max_ts_raw << " timesteps/dispatch is >> " << safety_factor
+                  << "x the conservative default (" << conservative << "); this "
+                     "often means the probe grid is NOT representative of your "
+                     "production run (too-coarse near-surface dz => too-few "
+                     "substeps). CLAMPING to " << cap << ". Re-probe with --dz0 / "
+                     "--n-layers / --dt-output-s matched to your production config, "
+                     "or raise --safety-factor deliberately.\n";
+    }
 
     gpu::MachineProfile p;
-    p.valid                       = true;
-    p.safe_dispatch_ceiling_s     = ceiling_s;
-    p.max_timesteps_per_dispatch  = max_ts;
-    p.recommended_batch_size      = batch_size;
+    p.valid                        = true;
+    p.safe_dispatch_ceiling_s      = ceiling_s;
+    p.max_timesteps_per_dispatch   = max_ts;
+    p.recommended_batch_size       = batch_size;
     p.kernel_ms_per_step_per_batch = per_step_ms;
-    p.overhead_per_batch_s        = overhead_per_batch_s;
-    p.n_layers_probe              = n_layers;
-    p.batch_size_probe            = batch_size;
+    p.overhead_per_batch_s         = overhead_per_batch_s;
+    p.n_layers_probe               = n_layers;
+    p.batch_size_probe             = batch_size;
     {
         char hn[256] = {0};
         if (gethostname(hn, sizeof(hn) - 1) == 0) p.host = hn;
@@ -8059,11 +8114,13 @@ static int runGpuCalibration(int argc, char** argv) {
         p.created_utc = ts;
     }
 
-    std::cout << "[calibrate-gpu] kernel " << kernel_ms << " ms for " << probe_steps
-              << " timesteps => " << per_step_ms << " ms/timestep/batch; wall="
-              << wall_s << " s (overhead ~" << overhead_per_batch_s << " s/dispatch)\n";
+    std::cout << "[calibrate-gpu] two-point: wall(" << probe_steps_1 << ")=" << wall1
+              << "s wall(" << probe_steps_2 << ")=" << wall2 << "s => per-step="
+              << per_step_ms << " ms, overhead=" << overhead_per_batch_s
+              << " s/dispatch\n";
     std::cout << "[calibrate-gpu] => max_timesteps_per_dispatch=" << max_ts
-              << " (keeps one dispatch under " << ceiling_s << " s)\n";
+              << " (raw " << max_ts_raw << ", cap " << cap << ", keeps one dispatch "
+              << "under " << ceiling_s << " s of stepping)\n";
 
     if (!gpu::saveMachineProfile(p, profile_out)) {
         std::cerr << "[calibrate-gpu] FAILED to write profile.\n";

@@ -84,6 +84,10 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
     if (max_ts < 1) max_ts = 1;
     int n_sub = (n_timesteps + max_ts - 1) / max_ts;   // ceil
     if (n_sub < 1) n_sub = 1;
+    // Wedge-efficacy instrumentation (Fermi acceptance test D): when
+    // PTM_LOG_SUBDISPATCH is set, time each sub-dispatch's clFinish so a run
+    // can prove every command buffer stayed bounded. Logging only — inert.
+    static const bool log_sub = (std::getenv("PTM_LOG_SUBDISPATCH") != nullptr);
     cl_int err = CL_SUCCESS;
     for (int s = 0; s < n_sub; ++s) {
         int g0 = s * max_ts;
@@ -93,6 +97,7 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
         if (err != CL_SUCCESS) return err;
         err = clSetKernelArg(kernel, kArgTOffset, sizeof(int), &g0);
         if (err != CL_SUCCESS) return err;
+        auto t0 = std::chrono::high_resolution_clock::now();
         err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr,
                                      &global_size, &local_size, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) return err;
@@ -101,6 +106,14 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
         // enqueue + clFinish the pre-R2 code already performed.
         err = clFinish(queue);
         if (err != CL_SUCCESS) return err;
+        if (log_sub) {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::duration<double>>(
+                            t1 - t0).count() * 1000.0;
+            std::cerr << "[GPU Thermal][subdispatch] " << (s + 1) << "/" << n_sub
+                      << " steps [" << g0 << "," << (g0 + sub_n) << ") in "
+                      << ms << " ms\n";
+        }
     }
     return err;
 }
@@ -845,20 +858,42 @@ bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
 
 void ThermalOpenCLSolver::buildKernels() {
     std::string source;
+    const std::string embedded = getEmbeddedKernelSource();
 
-    // Try to load from file first
+    // Phase R / Fermi F5: the kernel source is single-sourced from the embedded
+    // string (see scripts/sync_cl_from_embedded.py). buildKernels() must NEVER
+    // silently swap in a different kernel: it (a) announces which source it
+    // compiled, (b) warns loudly instead of silently falling back when a
+    // requested kernel_path fails to open, and (c) warns loudly if a loaded
+    // external kernel DIVERGES from the validated embedded physics.
     if (!config_.kernel_path.empty()) {
         std::ifstream file(config_.kernel_path);
         if (file.is_open()) {
             std::stringstream buffer;
             buffer << file.rdbuf();
             source = buffer.str();
+            std::cout << "[GPU Thermal] compiling kernels from FILE: "
+                      << config_.kernel_path << "\n";
+            if (source != embedded) {
+                std::cerr << "[GPU Thermal] WARNING (F5): external kernel file '"
+                          << config_.kernel_path << "' DIFFERS from the validated "
+                             "embedded kernel source. The compiled physics may not "
+                             "match the byte-identity-validated solver. Leave "
+                             "kernel_path empty to use the embedded kernel, or run "
+                             "scripts/sync_cl_from_embedded.py to resync the .cl.\n";
+            }
+        } else {
+            std::cerr << "[GPU Thermal] WARNING (F5): kernel_path '"
+                      << config_.kernel_path << "' could not be opened; falling "
+                         "back to the embedded kernel source.\n";
         }
     }
 
     // Fall back to embedded source
     if (source.empty()) {
-        source = getEmbeddedKernelSource();
+        source = embedded;
+        std::cout << "[GPU Thermal] compiling kernels from EMBEDDED source "
+                     "(validated default)\n";
     }
 
     // Build program directly (avoid context_->buildProgram() which throws exceptions

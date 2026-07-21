@@ -223,6 +223,15 @@ def preflight_consistency(
             f"gpu_batch_size {batch_size} exceeds the host's proven-safe "
             f"recommendation {rec_batch}; the 200000-batch stage-B wedge on "
             f"2026-07-20 is exactly this")
+    # F6 (caveat): the profiled ceiling/overhead were measured AT batch_size_probe;
+    # a different batch changes per-batch kernel cost, so the profile may not apply.
+    probe_batch = (profile or {}).get("batch_size_probe", 0)
+    if probe_batch and batch_size != probe_batch:
+        problems.append(
+            f"gpu_batch_size {batch_size} != the profile's batch_size_probe "
+            f"{probe_batch}; the calibrated ceiling/overhead were measured at the "
+            f"probe batch and may not transfer. Re-run --calibrate-gpu with "
+            f"--batch-size {batch_size} for an exact profile.")
     return problems
 
 
