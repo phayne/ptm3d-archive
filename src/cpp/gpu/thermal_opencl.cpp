@@ -11,13 +11,99 @@
 #define PTM_OPENCL_NO_THROW
 
 #include "thermal_opencl.h"
+#include "machine_profile.h"   // Phase R (R2): per-host dispatch self-chunk ceiling
 #include <fstream>
 #include <sstream>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 
 namespace gpu {
 namespace opencl {
+
+// ---------------------------------------------------------------------------
+// Phase R (R2): in-solver dispatch self-chunking helpers.
+//
+// The persistent thermal kernel loops n_timesteps internally in ONE
+// clEnqueueNDRangeKernel. A single unbroken dispatch that runs too many
+// timesteps is exactly what tripped the macOS+AMD gpusKillClientExt
+// command-buffer watchdog on the year-long run (1560 steps in one dispatch vs
+// the proven-safe ~240). To stay under the host's watchdog ceiling WITHOUT an
+// external wrapper, a logical session of N output timesteps is split into
+// sub-dispatches of <= max_timesteps_per_dispatch, with a host clFinish
+// between them. State (the T(z) profile) is carried across sub-dispatches in
+// the persistent buf_T_; each sub-dispatch reads flux from / writes output to
+// the correct GLOBAL timestep slot via the kernel's t_offset arg. The split is
+// NUMERICALLY INERT: the exact same per-timestep Crank-Nicolson updates run in
+// the exact same order, and clFinish changes no computed value. When
+// n_timesteps <= max_timesteps_per_dispatch the split degenerates to a single
+// dispatch (t_offset==0), which is the pre-R2 code path bit-for-bit.
+// ---------------------------------------------------------------------------
+
+// Kernel-arg indices shared by both persistent-kernel callers (the arg list is
+// identical in solvePersistentAllTimesteps and solvePersistentMultipleCycles).
+static constexpr int kArgNTimesteps = 20;  // int n_timesteps
+static constexpr int kArgTOffset    = 25;  // int t_offset (Phase R, R2 — last arg)
+
+// The self-chunking ceiling: loaded once from the per-host machine profile
+// (R1), or a conservative default if none exists, with an env override for
+// ops/testing. Fail-loud: the source of the ceiling is announced once.
+static int gpuMaxTimestepsPerDispatch() {
+    static int cached = []() -> int {
+        if (const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH")) {
+            try {
+                int v = std::stoi(e);
+                if (v > 0) {
+                    std::cerr << "[GPU Thermal] dispatch self-chunk ceiling: " << v
+                              << " timesteps/launch (from "
+                                 "PTM_MAX_TIMESTEPS_PER_DISPATCH)\n";
+                    return v;
+                }
+            } catch (...) {}
+        }
+        gpu::MachineProfile p = gpu::loadMachineProfileOrDefault();
+        std::cerr << "[GPU Thermal] dispatch self-chunk ceiling: "
+                  << p.max_timesteps_per_dispatch << " timesteps/launch ("
+                  << (p.valid ? "from host profile" : "conservative default")
+                  << ")\n";
+        return p.max_timesteps_per_dispatch;
+    }();
+    return cached;
+}
+
+// Enqueue the persistent kernel over global output timesteps [0, n_timesteps),
+// self-chunked into sub-dispatches of <= max_ts each with a clFinish between.
+// The caller must have set every kernel arg EXCEPT kArgNTimesteps and
+// kArgTOffset (this function sets those per sub-dispatch). do_accumulate /
+// accum_start / accum_end are in the GLOBAL frame and are honored unchanged.
+// Returns CL_SUCCESS, or the first failing clEnqueue/clFinish error.
+static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
+                                           cl_command_queue queue,
+                                           int n_timesteps, int max_ts,
+                                           size_t global_size, size_t local_size) {
+    if (max_ts < 1) max_ts = 1;
+    int n_sub = (n_timesteps + max_ts - 1) / max_ts;   // ceil
+    if (n_sub < 1) n_sub = 1;
+    cl_int err = CL_SUCCESS;
+    for (int s = 0; s < n_sub; ++s) {
+        int g0 = s * max_ts;
+        int sub_n = n_timesteps - g0;
+        if (sub_n > max_ts) sub_n = max_ts;
+        err = clSetKernelArg(kernel, kArgNTimesteps, sizeof(int), &sub_n);
+        if (err != CL_SUCCESS) return err;
+        err = clSetKernelArg(kernel, kArgTOffset, sizeof(int), &g0);
+        if (err != CL_SUCCESS) return err;
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr,
+                                     &global_size, &local_size, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return err;
+        // Bounded command buffer: host sync between sub-dispatches. Inert
+        // (no computed value changes); for n_sub==1 this is exactly the single
+        // enqueue + clFinish the pre-R2 code already performed.
+        err = clFinish(queue);
+        if (err != CL_SUCCESS) return err;
+    }
+    return err;
+}
 
 // Embedded kernel source (generated from thermal_kernels.cl)
 // This avoids needing to distribute a separate .cl file
@@ -249,8 +335,17 @@ __kernel void persistentThermalKernel(
     // for every output timestep in [accum_start, accum_end).
     __global float* avg_E_accum,
     int do_accumulate,
-    int accum_start,
-    int accum_end)
+    int accum_start,   // first GLOBAL output timestep at which to accumulate
+    int accum_end,     // one past last GLOBAL output timestep to accumulate
+    // Phase R (R2): global timestep offset for in-solver dispatch
+    // self-chunking. A logical session of N output timesteps may be split by
+    // the host into sub-dispatches [0,s),[s,2s),... with a clFinish between
+    // them to keep each command buffer under the machine watchdog ceiling.
+    // Each sub-dispatch runs a LOCAL loop t in [0,n_timesteps) but reads flux
+    // from / writes output to the GLOBAL slot (t_offset + t), continuing the
+    // T(z) profile it inherits in T_global. t_offset == 0 (the un-chunked
+    // case) makes every indexed expression textually identical to pre-R2.
+    int t_offset)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -332,7 +427,8 @@ __kernel void persistentThermalKernel(
 
     // Process ALL output timesteps
     for (int t = 0; t < n_timesteps; ++t) {
-        float Q_surf = flux_all[t * n_faces + face];
+        int tg = t_offset + t;   // GLOBAL timestep (== t when un-chunked)
+        float Q_surf = flux_all[tg * n_faces + face];
 
         // Sub-stepping loop for numerical stability
         for (int substep = 0; substep < n_substeps; ++substep) {
@@ -552,7 +648,7 @@ __kernel void persistentThermalKernel(
         }  // End of sub-stepping loop
 
         // Store surface temperature after all sub-steps are complete
-        output_temps[t * n_faces + face] = T_local[0];
+        output_temps[tg * n_faces + face] = T_local[0];
 
         // Schorghofer & Taylor (2007) sublimation-rate accumulator (optional).
         // Constants match src/cpp/ice/ice_table.cpp:
@@ -561,7 +657,7 @@ __kernel void persistentThermalKernel(
         //   1/TT    = 1/273.16 K
         //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
         // Each face owns its column → no atomics required.
-        if (do_accumulate != 0 && t >= accum_start && t < accum_end) {
+        if (do_accumulate != 0 && tg >= accum_start && tg < accum_end) {
             for (int i = 0; i < n_layers; ++i) {
                 float Ti = T_local[i];
                 if (Ti > 30.0f) {
@@ -1175,22 +1271,23 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_int));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
+    // Phase R (R2): t_offset arg. Set once here; enqueuePersistentSelfChunked
+    // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
+    int t_offset_init = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
-    err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
-                                 &global_size, &local_size, 0, nullptr, nullptr);
+    // Phase R (R2): self-chunk the dispatch to stay under the host watchdog
+    // ceiling. n_timesteps <= ceiling degenerates to the pre-R2 single dispatch.
+    err = enqueuePersistentSelfChunked(persistent_kernel_, queue, n_timesteps,
+                                       gpuMaxTimestepsPerDispatch(),
+                                       global_size, local_size);
     if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel launch failed: " << clErrorString(err) << "\n";
-    }
-
-    // Wait for kernel completion and check for errors
-    err = clFinish(queue);
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel execution failed: " << clErrorString(err) << "\n";
+        std::cerr << "[GPU Thermal] Kernel launch/exec failed: " << clErrorString(err) << "\n";
     }
 
     // Download results
@@ -1396,30 +1493,40 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_zero));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
+    // Phase R (R2): t_offset arg. Set once here; enqueuePersistentSelfChunked
+    // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
+    int t_offset_init = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
+    // Phase R (R2): dispatch self-chunk ceiling for THIS session. Each cycle's
+    // n_timesteps is split into sub-dispatches of <= max_ts with a clFinish
+    // between them, keeping every command buffer under the host watchdog. The
+    // split is numerically inert (same CN steps, same order, host sync only);
+    // n_timesteps <= max_ts reproduces the pre-R2 single-dispatch-per-cycle
+    // path bit-for-bit.
+    const int max_ts = gpuMaxTimestepsPerDispatch();
+
     const int total_cycles = n_equil_cycles + 1;
     for (int cycle = 0; cycle < total_cycles; ++cycle) {
-        // Only accumulate on the FINAL cycle (the "output" cycle).
+        // Only accumulate on the FINAL cycle (the "output" cycle). The kernel
+        // gates accumulation on the GLOBAL timestep vs [accum_start, accum_end),
+        // so a self-chunked final cycle still accumulates each output step
+        // exactly once across its sub-dispatches.
         int do_accum_this_cycle = (enable_accum && cycle == total_cycles - 1) ? 1 : 0;
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgIdxDoAccumulate,
                                  sizeof(int), &do_accum_this_cycle));
-        err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
-                                     &global_size, &local_size, 0, nullptr, nullptr);
+        err = enqueuePersistentSelfChunked(persistent_kernel_, queue, n_timesteps,
+                                           max_ts, global_size, local_size);
         if (err != CL_SUCCESS) {
-            std::cerr << "[GPU Thermal] Kernel launch failed (cycle " << cycle
+            std::cerr << "[GPU Thermal] Kernel launch/exec failed (cycle " << cycle
                       << "): " << clErrorString(err) << "\n";
             break;
         }
-    }
-
-    err = clFinish(queue);
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel execution failed: " << clErrorString(err) << "\n";
     }
 
     // Read output ONCE after the final cycle.

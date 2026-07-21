@@ -16,6 +16,28 @@
 
 **PTM3D** is a high-performance computational framework for simulating surface and subsurface temperatures on planetary bodies. It combines ray-traced illumination modeling with SPICE ephemeris data and advanced thermophysical calculations to predict accurate thermal regimes on the Moon, Mercury, Europa, and other solar system objects.
 
+## Quickstart
+
+PTM3D's portable core is **CPU-first** (threaded); the OpenCL GPU path is an optional accelerator.
+A 16 GB laptop runs real science on 1k–100k-face meshes.
+
+```bash
+# Build the portable CPU core (see INSTALL.md for dependency setup incl. CSPICE):
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPTM_ENABLE_GPU=OFF \
+      -DPTM_ARCH_NATIVE=OFF -DCSPICE_ROOT="$CSPICE_ROOT"
+cmake --build build --target ptm_thermal_sim -j
+# Verify (analytic radiation gate):
+cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
+# Estimate a run's memory before launching:
+python3 scripts/ptm_mem_estimate.py --faces 100000 --steps 360
+```
+
+- **Full install (Linux/macOS, per-platform deps):** [`INSTALL.md`](INSTALL.md)
+- **10-minute laptop walkthrough:** [`TUTORIAL.md`](TUTORIAL.md)
+- **Portability status / known caveats:** [`docs/PORTABILITY-AUDIT.md`](docs/PORTABILITY-AUDIT.md)
+- **GPU build (OpenCL hosts):** add `-DPTM_ENABLE_GPU=ON`, then profile the host once with
+  `./build/bin/ptm_thermal_sim --calibrate-gpu`.
+
 ## Key Features
 
 - **Multi-body support**: Moon, Mercury, Europa, Enceladus, Titan, Mars, Ceres, plus a generic body interface for arbitrary objects with Keplerian or SPICE/Horizons ephemerides

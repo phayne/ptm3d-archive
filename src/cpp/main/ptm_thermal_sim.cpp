@@ -50,6 +50,13 @@
 #include "../gpu/thermal_gpu_pool.h"
 #endif
 
+// Per-host GPU dispatch profile (Phase R, R1). Dependency-free; safe to
+// include even in CPU-only builds (the calibration entry point is guarded by
+// PTM_GPU_OPENCL, but the profile record + loader are pure I/O).
+#include "../gpu/machine_profile.h"
+#include <unistd.h>   // gethostname
+#include <ctime>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -7937,6 +7944,138 @@ void printBanner() {
     std::cout << "\n";
 }
 
+// ============================================================================
+// Phase R (R1): `--calibrate-gpu` — measure this host's safe GPU dispatch
+// limits and write ~/.ptm3d/machine_profile.json (or $PTM_MACHINE_PROFILE).
+//
+// The measurement runs the SAME validated persistent-kernel path a production
+// solve uses (solvePersistentAllTimesteps) on a synthetic uniform workload, so
+// the timing reflects the real dispatch cost. The cost model is the FIXED one
+// ported from scripts/run_yearlong_wedge_safe.py mode calibrate:
+//   per-timestep kernel wall = kernel_ms / probe_steps   (one batch)
+//   dispatch of N timesteps   ~ N * per-timestep kernel wall
+//   max_timesteps_per_dispatch = floor(ceiling_s * 1000 / per_timestep_ms)
+// Host-side per-dispatch overhead (buffer create/upload/read) is measured as
+// (wall - kernel) around the solve call and recorded for the runner's
+// launch-time consistency check.
+//
+// Returns a process exit code (0 = profile written).
+// ============================================================================
+#ifdef PTM_GPU_OPENCL
+static int runGpuCalibration(int argc, char** argv) {
+    using namespace gpu::opencl;
+
+    int    batch_size  = 8000;
+    int    n_layers    = 50;
+    int    probe_steps = 200;
+    double ceiling_s   = 25.0;
+    std::string profile_out;   // empty => resolved default path
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--batch-size"   && i + 1 < argc) batch_size  = std::stoi(argv[++i]);
+        else if (a == "--gpu-batch-size" && i + 1 < argc) batch_size = std::stoi(argv[++i]);
+        else if (a == "--n-layers"     && i + 1 < argc) n_layers    = std::stoi(argv[++i]);
+        else if (a == "--probe-steps"  && i + 1 < argc) probe_steps = std::stoi(argv[++i]);
+        else if (a == "--safe-ceiling-s" && i + 1 < argc) ceiling_s = std::stod(argv[++i]);
+        else if (a == "--profile-out"  && i + 1 < argc) profile_out = argv[++i];
+    }
+    if (batch_size < 1 || n_layers < 2 || probe_steps < 1 || ceiling_s <= 0.0) {
+        std::cerr << "[calibrate-gpu] invalid parameters (batch_size>=1, "
+                     "n_layers>=2, probe_steps>=1, safe_ceiling_s>0)\n";
+        return 2;
+    }
+
+    std::cout << "[calibrate-gpu] probing batch_size=" << batch_size
+              << " n_layers=" << n_layers << " probe_steps=" << probe_steps
+              << " safe_ceiling_s=" << ceiling_s << "\n";
+
+    ThermalOpenCLConfig cfg;
+    ThermalOpenCLSolver solver(static_cast<size_t>(batch_size),
+                               static_cast<size_t>(n_layers), cfg);
+    if (!solver.initialize()) {
+        std::cerr << "[calibrate-gpu] OpenCL init FAILED — cannot profile this "
+                     "host (no usable GPU). No profile written.\n";
+        return 3;
+    }
+
+    const size_t nf = static_cast<size_t>(batch_size);
+    const size_t nl = static_cast<size_t>(n_layers);
+
+    // Synthetic uniform workload: values need only be numerically valid, not
+    // physical — this is a TIMING probe, not a science run.
+    std::vector<float> z_grid(nl);
+    for (size_t i = 0; i < nl; ++i) z_grid[i] = 0.01f * static_cast<float>(i); // 1 cm spacing
+    std::vector<float> rho(nl * nf, 1800.0f);
+    std::vector<float> kc(nl * nf, 0.01f);
+    std::vector<float> emissivity(nf, 0.95f);
+    std::vector<float> T_deep(nf, 250.0f);
+    std::vector<float> Qb(nf, 0.0f);
+    std::vector<float> cp_coeffs;                 // none: cp = cp0
+    std::vector<float> T_initial(nl * nf, 250.0f);
+    std::vector<float> flux(static_cast<size_t>(probe_steps) * nf, 300.0f);
+    std::vector<float> out_temps;
+
+    solver.uploadMeshData(z_grid, rho, kc, emissivity, T_deep, Qb);
+    solver.setMaterialParams(/*cp0=*/600.0f, cp_coeffs, /*R350=*/2.7f);
+    solver.uploadInitialTemperature(T_initial);
+
+    // Wall-clock around the solve so we can attribute host-side per-dispatch
+    // overhead separately from kernel time.
+    auto w0 = std::chrono::high_resolution_clock::now();
+    solver.solvePersistentAllTimesteps(flux, out_temps, probe_steps, /*dt=*/3600.0f);
+    auto w1 = std::chrono::high_resolution_clock::now();
+    double wall_s   = std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
+    double kernel_ms = solver.getLastKernelTimeMs();
+    double kernel_s  = kernel_ms / 1000.0;
+
+    if (kernel_ms <= 0.0) {
+        std::cerr << "[calibrate-gpu] probe reported non-positive kernel time ("
+                  << kernel_ms << " ms); refusing to write a bogus profile.\n";
+        return 4;
+    }
+
+    double per_step_ms = kernel_ms / static_cast<double>(probe_steps);
+    int max_ts = static_cast<int>(ceiling_s * 1000.0 / per_step_ms);
+    if (max_ts < 1) max_ts = 1;              // never below one timestep/dispatch
+    double overhead_per_batch_s = std::max(0.0, wall_s - kernel_s);
+
+    gpu::MachineProfile p;
+    p.valid                       = true;
+    p.safe_dispatch_ceiling_s     = ceiling_s;
+    p.max_timesteps_per_dispatch  = max_ts;
+    p.recommended_batch_size      = batch_size;
+    p.kernel_ms_per_step_per_batch = per_step_ms;
+    p.overhead_per_batch_s        = overhead_per_batch_s;
+    p.n_layers_probe              = n_layers;
+    p.batch_size_probe            = batch_size;
+    {
+        char hn[256] = {0};
+        if (gethostname(hn, sizeof(hn) - 1) == 0) p.host = hn;
+        p.device_name = solver.getDeviceInfo().name;
+        std::time_t t = std::time(nullptr);
+        char ts[32] = {0};
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+        p.created_utc = ts;
+    }
+
+    std::cout << "[calibrate-gpu] kernel " << kernel_ms << " ms for " << probe_steps
+              << " timesteps => " << per_step_ms << " ms/timestep/batch; wall="
+              << wall_s << " s (overhead ~" << overhead_per_batch_s << " s/dispatch)\n";
+    std::cout << "[calibrate-gpu] => max_timesteps_per_dispatch=" << max_ts
+              << " (keeps one dispatch under " << ceiling_s << " s)\n";
+
+    if (!gpu::saveMachineProfile(p, profile_out)) {
+        std::cerr << "[calibrate-gpu] FAILED to write profile.\n";
+        return 5;
+    }
+    std::string where = profile_out.empty()
+        ? gpu::machine_profile_detail::defaultProfilePath() : profile_out;
+    std::cout << "[calibrate-gpu] wrote profile to " << where << "\n";
+    return 0;
+}
+#endif  // PTM_GPU_OPENCL
+
 int main(int argc, char** argv) {
     // Line-buffer stdout so progress prints reach disk before a kernel hang
     // can swallow them. The macOS+AMD OpenCL driver has wedged the box hard
@@ -7990,6 +8129,17 @@ int main(int argc, char** argv) {
             std::cout << "Built without OpenCL support; --list-gpu-devices is a no-op." << std::endl;
 #endif
             return 0;
+        } else if (arg == "--calibrate-gpu") {
+            // Phase R (R1): measure this host's safe GPU dispatch limits and
+            // write ~/.ptm3d/machine_profile.json (or $PTM_MACHINE_PROFILE).
+#ifdef PTM_GPU_OPENCL
+            return runGpuCalibration(argc, argv);
+#else
+            std::cerr << "--calibrate-gpu requires an OpenCL-enabled build "
+                         "(ENABLE_GPU=ON). CPU-only builds do not need a GPU "
+                         "profile." << std::endl;
+            return 1;
+#endif
         }
     }
 
@@ -8011,11 +8161,28 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
+    // knob is first-class, but true per-output-step full-mesh checkpointing is
+    // architecturally incompatible with the batch-outer/time-inner GPU
+    // persistent solver (see config_parser.h + docs/PORTABILITY-AUDIT.md).
+    // Fail loud rather than silently no-op if a user sets it.
+    if (sim_config.thermal.checkpoint_every_output_steps > 0) {
+        std::cerr << "[Phase R/R4] WARNING: thermal.checkpoint_every_output_steps="
+                  << sim_config.thermal.checkpoint_every_output_steps
+                  << " is set, but per-output-step full-mesh checkpointing is NOT "
+                     "active on the GPU persistent solver (batch-outer/time-inner: "
+                     "no wall-clock moment holds all faces at the same output step; "
+                     "a partial dump is a resume footgun). Use the runner's chunk "
+                     "split (run_yearlong_wedge_safe.py --stage-b-nchunks) for "
+                     "blast-radius bounding. This knob is reserved for the CPU-first "
+                     "solver path (portability Phase 1)." << std::endl;
+    }
+
     // ========================================================================
     // PHASE 3: Map config to local variables (PRESERVED: All original variables)
     // ========================================================================
     // These maintain the exact same variable names and types as the original code
-    
+
     // Simulation parameters (from config or defaults)
     std::string start_time = sim_config.time.start_time;
     double duration_days = sim_config.time.duration_days;

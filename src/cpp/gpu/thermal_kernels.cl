@@ -502,8 +502,18 @@ __kernel void persistentThermalKernel(
     // n_layers * n_faces large but is otherwise unused when disabled.
     __global float* avg_E_accum,       // sum of E [n_layers * n_faces]
     int do_accumulate,                 // 0 = skip, 1 = accumulate during this kernel call
-    int accum_start,                   // first relative timestep at which to accumulate
-    int accum_end)                     // one past last relative timestep to accumulate
+    int accum_start,                   // first GLOBAL timestep at which to accumulate
+    int accum_end,                     // one past last GLOBAL timestep to accumulate
+    // Phase R (R2): global timestep offset for in-solver dispatch self-chunking.
+    // A single logical session of N timesteps may be split by the host into
+    // sub-dispatches [0,s), [s,2s), ... with a clFinish between them to keep
+    // each command buffer under the machine's watchdog ceiling. Each
+    // sub-dispatch runs a LOCAL loop t in [0, n_timesteps) but reads flux from
+    // and writes output to the GLOBAL slot (t_offset + t), and continues the
+    // T(z) profile it inherits in T_global from the previous sub-dispatch.
+    // t_offset == 0 (the whole-session, un-chunked case) makes every
+    // expression below textually identical to the pre-R2 kernel: (0 + t) == t.
+    int t_offset)                      // global index of this dispatch's local t=0
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -542,8 +552,11 @@ __kernel void persistentThermalKernel(
     // ========== TIMESTEP LOOP - ALL TIMESTEPS ON GPU ==========
     for (int t = 0; t < n_timesteps; ++t) {
 
+        // GLOBAL timestep index (== t when un-chunked, t_offset == 0).
+        int tg = t_offset + t;
+
         // Get flux for this timestep (coalesced read: timestep-major layout)
-        float Q_surf = flux_all[t * n_faces + face];
+        float Q_surf = flux_all[tg * n_faces + face];
 
         // Step 1: Update material properties k(T), cp(T), kappa(T)
         for (int i = 0; i < n_layers; ++i) {
@@ -635,7 +648,7 @@ __kernel void persistentThermalKernel(
         }
 
         // Step 4: Store surface temperature for this timestep
-        output_temps[t * n_faces + face] = T_local[0];
+        output_temps[tg * n_faces + face] = T_local[0];
 
         // Step 5: Schorghofer & Taylor (2007) sublimation-rate accumulator.
         // Optional. Constants match src/cpp/ice/ice_table.cpp:
@@ -644,7 +657,7 @@ __kernel void persistentThermalKernel(
         //   1/TT    = 1/273.16 K
         //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
         // Each face owns its column of avg_E_accum, so no atomics needed.
-        if (do_accumulate != 0 && t >= accum_start && t < accum_end) {
+        if (do_accumulate != 0 && tg >= accum_start && tg < accum_end) {
             for (int i = 0; i < n_layers; ++i) {
                 float Ti = T_local[i];
                 if (Ti > 30.0f) {

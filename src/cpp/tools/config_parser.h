@@ -128,6 +128,22 @@ struct SimulationConfig {
         std::string initial_state_file = "";
         std::string final_state_file   = "";
 
+        // Phase R (R4): mid-run thermal-state checkpoint cadence, in OUTPUT
+        // steps. 0 (default) = off = checkpoint only at chunk boundaries (the
+        // status quo). NOTE (architectural, documented in
+        // docs/PORTABILITY-AUDIT.md): true per-output-step full-mesh
+        // checkpointing is INCOMPATIBLE with the current GPU persistent
+        // solver, which is batch-outer/time-inner (each face-batch runs ALL
+        // timesteps before the next batch starts), so no single wall-clock
+        // moment holds all faces at the same output step. A partial full-mesh
+        // dump at a batch boundary would carry un-solved faces at 0 K and is a
+        // resume FOOTGUN (the zero-column runaway guarded in the GPU path). The
+        // sim therefore WARNS loudly if this is set > 0 rather than silently
+        // no-op'ing; blast-radius bounding today is the runner's chunk split
+        // (run_yearlong_wedge_safe.py --stage-b-nchunks). The natural home for
+        // per-step checkpointing is the CPU-first solver (Phase 1).
+        int checkpoint_every_output_steps = 0;
+
         // Deep radiation-coupling, two-pass scheme (fixes the cold-PSR-floor
         // bias from equilibrating the deep column WITHOUT the radiosity
         // indirect flux). Orchestrated as two binary runs:

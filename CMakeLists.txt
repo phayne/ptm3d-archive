@@ -206,6 +206,12 @@ endif()
 # General Optimization Flags
 # ============================================================================
 option(USE_AGGRESSIVE_OPTIMIZATIONS "Enable aggressive optimizations" ON)
+# Portability (Phase 1): -march=native (and -mcpu=apple-m1) tune the binary to
+# the BUILD host's exact CPU. Great for a local source build; wrong for a
+# redistributable binary and a SIGILL risk on a CI runner whose CPU differs.
+# PTM_ARCH_NATIVE defaults ON (this workstation's behavior is unchanged); CI /
+# packaging sets -DPTM_ARCH_NATIVE=OFF for a portable baseline.
+option(PTM_ARCH_NATIVE "Tune the binary to the build host's exact CPU (-march=native)" ON)
 
 if(USE_AGGRESSIVE_OPTIMIZATIONS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -213,24 +219,28 @@ if(USE_AGGRESSIVE_OPTIMIZATIONS)
         add_compile_options(-ffast-math)
         add_compile_options(-ftree-vectorize)
         add_compile_options(-funroll-loops)
-        
-        # Architecture-specific optimizations
-        if(APPLE)
-            execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
-            if(ARCH STREQUAL "arm64")
-                # Apple Silicon optimizations
-                add_compile_options(-mcpu=apple-m1)
-                message(STATUS "Apple Silicon detected, using M1 optimizations")
+
+        # Architecture-specific optimizations (only when PTM_ARCH_NATIVE is ON)
+        if(PTM_ARCH_NATIVE)
+            if(APPLE)
+                execute_process(COMMAND uname -m OUTPUT_VARIABLE ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+                if(ARCH STREQUAL "arm64")
+                    # Apple Silicon optimizations
+                    add_compile_options(-mcpu=apple-m1)
+                    message(STATUS "Apple Silicon detected, using M1 optimizations")
+                elseif(X86_64_ARCHITECTURE)
+                    # Intel Mac - use native optimizations (includes AVX-512 if available)
+                    add_compile_options(-march=native)
+                    message(STATUS "Intel Mac detected, using native optimizations")
+                endif()
             elseif(X86_64_ARCHITECTURE)
-                # Intel Mac - use native optimizations (includes AVX-512 if available)
+                # Linux/Unix x86-64
                 add_compile_options(-march=native)
-                message(STATUS "Intel Mac detected, using native optimizations")
             endif()
-        elseif(X86_64_ARCHITECTURE)
-            # Linux/Unix x86-64
-            add_compile_options(-march=native)
+        else()
+            message(STATUS "PTM_ARCH_NATIVE=OFF: portable baseline (no -march=native)")
         endif()
-        
+
         message(STATUS "Aggressive optimizations enabled")
     elseif(MSVC)
         add_compile_options(/O2 /fp:fast)
@@ -325,7 +335,30 @@ include_directories(${EIGEN3_INCLUDE_DIR})
 message(STATUS "Found Eigen3: ${EIGEN3_INCLUDE_DIR}")
 
 # SPICE Configuration
-set(CSPICE_ROOT "/Users/paha3326/software/cspice" CACHE PATH "Path to CSPICE installation")
+# Portability (Phase 1): resolve CSPICE from -DCSPICE_ROOT, then $CSPICE_ROOT /
+# $CSPICE_DIR, then a small set of common install prefixes. The old hardcoded
+# user path is kept ONLY as the last-resort fallback so this workstation still
+# configures, but it is no longer the primary default (it broke every other
+# host). find_library below FATAL_ERRORs with an actionable message if unfound.
+if(NOT DEFINED CSPICE_ROOT OR CSPICE_ROOT STREQUAL "")
+    if(DEFINED ENV{CSPICE_ROOT} AND NOT "$ENV{CSPICE_ROOT}" STREQUAL "")
+        set(_PTM_CSPICE_DEFAULT "$ENV{CSPICE_ROOT}")
+    elseif(DEFINED ENV{CSPICE_DIR} AND NOT "$ENV{CSPICE_DIR}" STREQUAL "")
+        set(_PTM_CSPICE_DEFAULT "$ENV{CSPICE_DIR}")
+    else()
+        set(_PTM_CSPICE_DEFAULT "")
+        foreach(_cand "/usr/local/cspice" "/opt/cspice" "$ENV{HOME}/cspice"
+                      "$ENV{HOME}/software/cspice" "/Users/paha3326/software/cspice")
+            if(EXISTS "${_cand}/lib" AND _PTM_CSPICE_DEFAULT STREQUAL "")
+                set(_PTM_CSPICE_DEFAULT "${_cand}")
+            endif()
+        endforeach()
+    endif()
+else()
+    set(_PTM_CSPICE_DEFAULT "${CSPICE_ROOT}")
+endif()
+set(CSPICE_ROOT "${_PTM_CSPICE_DEFAULT}" CACHE PATH
+    "Path to CSPICE installation (or set env CSPICE_ROOT / -DCSPICE_ROOT=)")
 set(CSPICE_INCLUDE_DIR "${CSPICE_ROOT}/include" CACHE PATH "Path to CSPICE headers")
 set(CSPICE_LIBRARY_DIR "${CSPICE_ROOT}/lib" CACHE PATH "Path to CSPICE libraries")
 
@@ -538,11 +571,21 @@ endif()
 # ============================================================================
 # GPU Acceleration (Optional)
 # ============================================================================
-option(ENABLE_GPU "Enable GPU acceleration for thermal solver" OFF)
+option(ENABLE_GPU "Enable GPU acceleration for thermal solver (legacy name)" OFF)
+# Portability (Phase 1): PTM_ENABLE_GPU is the documented option name. It
+# defaults to ENABLE_GPU's value so existing -DENABLE_GPU=ON invocations and
+# cached builds are byte-for-byte unchanged; a fresh checkout defaults OFF
+# (portable CPU core). Setting -DPTM_ENABLE_GPU=ON forces the GPU path on.
+option(PTM_ENABLE_GPU "Enable GPU acceleration (OpenCL); OFF = portable CPU core" ${ENABLE_GPU})
+if(PTM_ENABLE_GPU)
+    set(ENABLE_GPU ON)
+endif()
 set(GPU_BACKEND "AUTO" CACHE STRING "GPU backend: AUTO, HIP, CUDA, or NONE")
 
 if(ENABLE_GPU)
     message(STATUS "GPU acceleration enabled (backend: ${GPU_BACKEND})")
+else()
+    message(STATUS "GPU acceleration OFF - building the portable CPU-first core")
 endif()
 
 # ============================================================================
