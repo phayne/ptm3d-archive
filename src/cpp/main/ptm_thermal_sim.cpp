@@ -2724,6 +2724,33 @@ bool runThermalModelsForAllFaces(
     return success;
 }
 
+// Phase R / Fermi PORT-EQ-01: per-face mean-flux equilibration seed.
+// The legacy Moon/Europa/A3GT seed derives T(z,0) from the INSTANTANEOUS
+// absorbed flux over the first 10 equilibration steps with a hard 100 K
+// nightside floor — so a PSR floor (which never sees the sun) is stamped at
+// ~100 K and, with no radiation to drain it, its deep column holds ~50 K across
+// the whole run (the 2026-07-21 radoff-PSR-warmth finding). When
+// PTM_EQ_PERFACE_FLUX is set, each column is instead seeded from ITS OWN
+// time-mean absorbed flux (the DC term of the forcing provider — the degenerate
+// case of the Fourier-seed architecture) plus Qb, so a PSR floor cold-starts at
+// the geothermal steady state T_geo=(Qb/(eps*sigma))^0.25 (~24.7 K on the Moon),
+// while sunlit faces (mean flux ~ clear-sky) equilibrate to ~the same state as
+// before. Default OFF => byte-identical to every established baseline.
+static bool eqPerfaceFluxMode() {
+    static bool mode = []() {
+        const char* e = std::getenv("PTM_EQ_PERFACE_FLUX");
+        const bool on = (e && std::string(e) != "0" && e[0] != '\0');
+        std::cerr << "[eq-seed] equilibration seed: "
+                  << (on ? "PER-FACE time-mean absorbed flux (PSR floors cold-start "
+                           "at the geothermal steady state) [PTM_EQ_PERFACE_FLUX=1]"
+                         : "LEGACY first-10-step instantaneous flux with 100 K "
+                           "nightside floor [PTM_EQ_PERFACE_FLUX unset]")
+                  << std::endl;
+        return on;
+    }();
+    return mode;
+}
+
 // =============================================================================
 // SIMD Batch Thermal Solver (SIMD-over-pixels)
 // Processes 8 faces at once using AVX-512 (or 4 with AVX2)
@@ -3716,11 +3743,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
             }
         } else {
+            const bool perface = eqPerfaceFluxMode();
             for (size_t f = 0; f < batch_n; ++f) {
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = std::min(10, total_time_steps);
+                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -3730,14 +3758,24 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
                 avg_flux /= n_samples;
 
-                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-                if (T_eq < 40.0) T_eq = 100.0;
-                if (T_eq > 400.0) T_eq = 400.0;
-
-                for (size_t layer = 0; layer < n_layers; ++layer) {
-                    size_t idx = layer * batch_n + f;
-                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                if (perface) {
+                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // absorbed flux + Qb. PSR floors (mean ~0) cold-start at the
+                    // geothermal steady state ~24.7 K; sunlit ~unchanged after eq.
+                    // Isothermal at the diurnal-mean equilibrium (no warm floor).
+                    double T_eq = std::sqrt(std::sqrt(
+                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                    for (size_t layer = 0; layer < n_layers; ++layer)
+                        T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
+                } else {
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    if (T_eq < 40.0) T_eq = 100.0;
+                    if (T_eq > 400.0) T_eq = 400.0;
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        size_t idx = layer * batch_n + f;
+                        double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                        T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    }
                 }
             }
         }
@@ -4250,13 +4288,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
             }
         } else {
+            const bool perface = eqPerfaceFluxMode();
             for (size_t f = 0; f < batch_n; ++f) {
                 // Get initial flux to estimate equilibrium temperature
                 // Include ALL flux components (direct, reflected, IR) for accurate initialization
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = std::min(10, total_time_steps);
+                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -4267,16 +4306,26 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
                 avg_flux /= n_samples;
 
-                // Equilibrium temperature from Stefan-Boltzmann
-                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-                if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
-                if (T_eq > 400.0) T_eq = 400.0;
+                if (perface) {
+                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // absorbed flux + Qb (PSR floors cold-start at the geothermal
+                    // steady state ~24.7 K; sunlit ~unchanged after equilibration).
+                    double T_eq = std::sqrt(std::sqrt(
+                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                    for (size_t layer = 0; layer < n_layers; ++layer)
+                        T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
+                } else {
+                    // Equilibrium temperature from Stefan-Boltzmann
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
+                    if (T_eq > 400.0) T_eq = 400.0;
 
-                for (size_t layer = 0; layer < n_layers; ++layer) {
-                    size_t idx = layer * batch_n + f;
-                    // Linear interpolation between surface and deep temperature
-                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        size_t idx = layer * batch_n + f;
+                        // Linear interpolation between surface and deep temperature
+                        double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                        T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    }
                 }
             }
         }
