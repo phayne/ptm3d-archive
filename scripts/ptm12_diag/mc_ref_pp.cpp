@@ -22,18 +22,70 @@ static V3 cross(const V3&a,const V3&b){return{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0
 static V3 nrm(const V3&a){double L=std::sqrt(dot(a,a));return L>0?V3{{a[0]/L,a[1]/L,a[2]/L}}:a;}
 static double halton(int i,int b){double f=1,r=0; while(i>0){f/=b; r+=f*(i%b); i/=b;} return r;}
 int main(int argc,char**argv){
-    if(argc<5){fprintf(stderr,"usage: mc_ref mesh.ply tmax.bin facelist.txt nrays [offset_m] [keps]\n");return 2;}
+    if(argc<5){fprintf(stderr,"usage: mc_ref mesh.ply tmax.bin facelist.txt nrays [offset_m] [keps] [min_hits_or_legacy_frac] [outbin]\n");return 2;}
     const char* ply=argv[1]; const char* tf=argv[2]; const char* fl=argv[3]; int NR=atoi(argv[4]);
-    double OFF=(argc>5)?atof(argv[5]):1e-4; double KEPS=(argc>6)?atof(argv[6]):0.2; double THR=(argc>7)?atof(argv[7]):1e-5; const char* OUTB=(argc>8)?argv[8]:"pp_out.bin";
+    double OFF=(argc>5)?atof(argv[5]):1e-4; double KEPS=(argc>6)?atof(argv[6]):0.2;
+    double THR_ARG=(argc>7)?atof(argv[7]):1e-5; const char* OUTB=(argc>8)?argv[8]:"pp_out.bin";
+    // 2026-07-21 fix (Sagan-approved, Fig-8/Haworth VF design): the keep-rule was a FIXED
+    // FRACTION of rays (hits/tot>=THR), so raising NR with THR held fixed made the absolute
+    // detection floor STRICTER, not looser -- measured on haworth_radcore_r32c.ply: 200k vs
+    // 2M rays made the far-field-below-threshold fraction WORSE (99.4%->99.9%), and >99% of a
+    // floor face's aggregate far-crater-wall flux was silently dropped either way. Fix: keep by
+    // an ABSOLUTE minimum hit count, independent of NR. Backward-compatible dual interpretation
+    // (no new CLI flag): THR_ARG>=1 is read directly as an integer min-hit-count (NEW calls,
+    // e.g. "1"); THR_ARG<1 is treated as the OLD fractional convention and converted ONCE to
+    // its equivalent absolute count at THIS run's NR -- so an old-style invocation at the
+    // HISTORICAL NR=200000, THR=1e-5 reproduces MIN_HITS=2 exactly (byte-identical moon3d
+    // regression), it just no longer silently re-scales if NR changes.
+    long MIN_HITS = (THR_ARG>=1.0) ? (long)llround(THR_ARG)
+                                    : std::max(1L, (long)llround(THR_ARG*NR));
+    fprintf(stderr,"# keep-rule: MIN_HITS=%ld (from THR_ARG=%.6g, NR=%d)\n",MIN_HITS,THR_ARG,NR);
+    // ---- format-aware PLY header parse (2026-07-21 fix: the original hardcoded
+    // 48-byte-double vertices + 2 trailing float32 face scalars, which matches the
+    // moon3d mesh but SILENTLY MISPARSES the Haworth LOLA-DEM meshes, which use
+    // float32 x/y/z/nx/ny/nz (24 B/vertex) and NO trailing face scalars. Parse the
+    // actual property list per element instead of assuming a fixed layout. ----
     std::ifstream f(ply,std::ios::binary); std::string line; size_t nv=0,nf=0;
+    struct Prop{std::string name,type;}; // scalar props only (list prop handled separately)
+    std::vector<Prop> vprops; int n_face_scalars=0; std::vector<std::string> face_scalar_types;
+    std::string cur_elem;
     while(std::getline(f,line)){ if(!line.empty()&&line.back()=='\r')line.pop_back();
         std::istringstream is(line); std::string t; is>>t;
-        if(t=="element"){std::string w;size_t n;is>>w>>n; if(w=="vertex")nv=n; if(w=="face")nf=n;}
+        if(t=="element"){std::string w;size_t n;is>>w>>n; if(w=="vertex")nv=n; if(w=="face")nf=n; cur_elem=w;}
+        else if(t=="property"){
+            std::string a; is>>a;
+            if(a=="list"){ /* vertex_indices list -- assumed uchar-count/int-index, standard */ }
+            else if(cur_elem=="vertex"){ std::string nm; is>>nm; vprops.push_back({nm,a}); }
+            else if(cur_elem=="face"){ n_face_scalars++; face_scalar_types.push_back(a); }
+        }
         else if(t=="end_header")break; }
-    std::vector<V3> Vv(nv); std::vector<double> bf(6);
-    for(size_t i=0;i<nv;++i){ f.read((char*)bf.data(),48); Vv[i]={{bf[0],bf[1],bf[2]}}; }
+    auto typesize=[](const std::string&t)->int{
+        if(t=="float"||t=="float32"||t=="int"||t=="int32"||t=="uint"||t=="uint32")return 4;
+        if(t=="double"||t=="float64")return 8;
+        if(t=="short"||t=="ushort"||t=="int16"||t=="uint16")return 2;
+        if(t=="char"||t=="uchar"||t=="int8"||t=="uint8")return 1;
+        return 4; };
+    int vstride=0; int x_off=-1,y_off=-1,z_off=-1; bool v_is_double=false;
+    for(size_t i=0;i<vprops.size();++i){
+        if(vprops[i].name=="x"){x_off=vstride; v_is_double=(vprops[i].type=="double"||vprops[i].type=="float64");}
+        if(vprops[i].name=="y")y_off=vstride;
+        if(vprops[i].name=="z")z_off=vstride;
+        vstride+=typesize(vprops[i].type);
+    }
+    if(x_off<0||y_off<0||z_off<0){fprintf(stderr,"ERROR: vertex x/y/z not found in PLY header\n");return 2;}
+    int face_scalar_bytes=0; for(auto&t:face_scalar_types) face_scalar_bytes+=typesize(t);
+    fprintf(stderr,"# PLY parse: nv=%zu nf=%zu vstride=%d (double=%d) face_scalar_bytes=%d (n=%d)\n",
+            nv,nf,vstride,(int)v_is_double,face_scalar_bytes,n_face_scalars);
+    std::vector<V3> Vv(nv);
+    { std::vector<char> raw(vstride);
+      for(size_t i=0;i<nv;++i){ f.read(raw.data(),vstride);
+          auto rd=[&](int off)->double{ return v_is_double? *(double*)(raw.data()+off) : (double)*(float*)(raw.data()+off); };
+          Vv[i]={{rd(x_off),rd(y_off),rd(z_off)}}; } }
     std::vector<std::array<int,3>> Fc(nf);
-    for(size_t i=0;i<nf;++i){ unsigned char c; f.read((char*)&c,1); int id[3]; f.read((char*)id,12); float ll[2]; f.read((char*)ll,8); Fc[i]={{id[0],id[1],id[2]}}; }
+    { std::vector<char> tail(face_scalar_bytes>0?face_scalar_bytes:1);
+      for(size_t i=0;i<nf;++i){ unsigned char c; f.read((char*)&c,1); int id[3]; f.read((char*)id,12);
+          if(face_scalar_bytes>0) f.read(tail.data(),face_scalar_bytes);
+          Fc[i]={{id[0],id[1],id[2]}}; } }
     std::vector<V3> ctr(nf),nn(nf); std::vector<double> edge(nf);
     for(size_t i=0;i<nf;++i){ const V3&a=Vv[Fc[i][0]],&b=Vv[Fc[i][1]],&c=Vv[Fc[i][2]];
         ctr[i]={{(a[0]+b[0]+c[0])/3,(a[1]+b[1]+c[1])/3,(a[2]+b[2]+c[2])/3}};
@@ -84,9 +136,9 @@ int main(int argc,char**argv){
         }
         double SumF=double(terr)/tot, Fsky=1.0-SumF, Fw=double(warm)/tot, Qir_abs=EPS*EPS*(Qir/tot);
         printf("%7ld %.4f %.4f %.4f %.1f\n",pf,SumF,Fsky,Fw,Qir_abs);
-        { static FILE* fb=fopen(OUTB,"wb"); int nnz=0; for(auto&kv:hits){ if((double)kv.second/tot>=THR) nnz++; }
+        { static FILE* fb=fopen(OUTB,"wb"); int nnz=0; for(auto&kv:hits){ if(kv.second>=MIN_HITS) nnz++; }
           int src=(int)pf; fwrite(&src,4,1,fb); fwrite(&nnz,4,1,fb);
-          for(auto&kv:hits){ double F=(double)kv.second/tot; if(F>=THR){ int j=kv.first; float ff=(float)F; fwrite(&j,4,1,fb); fwrite(&ff,4,1,fb);} }
+          for(auto&kv:hits){ double F=(double)kv.second/tot; if(kv.second>=MIN_HITS){ int j=kv.first; float ff=(float)F; fwrite(&j,4,1,fb); fwrite(&ff,4,1,fb);} }
           fflush(fb); }
     }
     rtcReleaseScene(sc);rtcReleaseDevice(dev); return 0;
