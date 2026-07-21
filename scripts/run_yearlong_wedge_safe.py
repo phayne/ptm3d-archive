@@ -293,7 +293,8 @@ def gate_check_by_mode(mode: str, log_path: Path) -> list[str]:
 def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
                     duration_days: float, timesteps: int,
                     equilibration_orbits, gpu_batch_size: int,
-                    initial_state_file, final_state_file: Path) -> Path:
+                    initial_state_file, final_state_file: Path,
+                    skip_time_series: bool = True) -> Path:
     cfg = _deep_copy(base_cfg)
     sim = cfg.setdefault("simulation", {})
     sim["start_time"] = fmt_iso8601(start_time)
@@ -313,7 +314,15 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
     out = cfg.setdefault("output", {})
     out["directory"] = str(chunk_dir)
     out["write_raw_stats"] = True
-    out["skip_time_series"] = True
+    # 2026-07-21 (Luna): was hardcoded True unconditionally -- silently
+    # discarded a base config's own `output.skip_time_series: false` with NO
+    # warning, which would have defeated a rigorous (per-step-frame) Diviner
+    # comparison run without any indication the frames were never written.
+    # Default True preserves every existing caller's behavior exactly
+    # (moon3d yearlong, Haworth production both rely on the old hardcoded
+    # True); pass skip_time_series=False (via the new --keep-time-series CLI
+    # flag) to retain per-step frames for BOTH stages.
+    out["skip_time_series"] = bool(skip_time_series)
     out["skip_mesh"] = (initial_state_file is not None)
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -603,7 +612,8 @@ def mode_run(args):
         cfg_a = make_stage_yaml(base_cfg, chunk_a, start, a_days, a_out_steps,
                                 equilibration_orbits=eq_orbits,
                                 gpu_batch_size=args.stage_a_batch_size,
-                                initial_state_file=None, final_state_file=state_a)
+                                initial_state_file=None, final_state_file=state_a,
+                                skip_time_series=not args.keep_time_series)
         ok = run_with_retry(args.ptm_bin, cfg_a, args.output_dir / "chunk_000.log",
                             args.retries, args.chunk_timeout_min, ledger, "chunk_000",
                             expect_hole_seal_count=args.expect_hole_seal_count)
@@ -635,7 +645,8 @@ def mode_run(args):
                                 equilibration_orbits=None,  # inherited but will be
                                                             # force-zeroed by the code
                                 gpu_batch_size=args.stage_b_batch_size,
-                                initial_state_file=prev_state, final_state_file=this_state)
+                                initial_state_file=prev_state, final_state_file=this_state,
+                                skip_time_series=not args.keep_time_series)
         ok = run_with_retry(args.ptm_bin, cfg_b, args.output_dir / f"{label}.log",
                             args.retries, args.chunk_timeout_min, ledger, label,
                             expect_hole_seal_count=args.expect_hole_seal_count)
@@ -704,6 +715,15 @@ def main():
                         "(mesh-specific -- moon3d seals 30; verify a new mesh's own count with "
                         "a dedicated probe run before trusting a different value here, "
                         "2026-07-21 finding). Pass -1 to skip this specific check entirely.")
+    p.add_argument("--keep-time-series", action="store_true",
+                   help="Write output.skip_time_series=false into BOTH stage configs "
+                        "(default: false here, i.e. skip_time_series=true, matching the "
+                        "prior hardcoded behavior byte-for-byte). Retains per-step frames "
+                        "(temperature/, illumination/, etc.) needed for diviner_compare.py "
+                        "--max-mode rigorous. WARNING: substantially increases disk usage "
+                        "and is NOT stitched across chunks by ptm_merge_chunks (which only "
+                        "merges statistics/_raw accumulators) -- point downstream tools at "
+                        "the individual chunk dirs, or stitch frame files manually.")
     p.add_argument("--gates", choices=["coupled", "radoff", "auto"], default="auto",
                    help="post-chunk radiation gate set. 'coupled' = require the "
                         "VF/two-band banners (default for radiation-enabled runs); "
