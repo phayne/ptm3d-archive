@@ -182,9 +182,21 @@ def scrape_cycle_stats(log_path: Path):
     return cycles, nlayers, hung
 
 
-def gate_check_common(log_path: Path) -> list[str]:
+def gate_check_common(log_path: Path, expect_hole_seal_count: int | None = 30) -> list[str]:
     """Same illumination/VF banners the other addon drivers gate on.
-    Returns a list of problems (empty = clean)."""
+    Returns a list of problems (empty = clean).
+
+    `expect_hole_seal_count`: PTM-18 interior-hole-seal count is MESH-SPECIFIC
+    (2026-07-21 finding: moon3d seals 30, haworth_radcore_r32c legitimately
+    seals 140 -- verified via a dedicated hole-census probe before launch, not
+    guessed). The original hardcoded "sealed 30" gate false-failed a healthy
+    Haworth chunk_000 that had already completed correctly (rc=0), which would
+    have burned a full ~18-min retry loop for nothing. Pass the mesh's OWN
+    verified count here; default 30 preserves prior behavior for moon3d
+    callers that don't pass this. None = skip the hole-seal check entirely
+    (accept ENABLED with any positive count) if the count hasn't been
+    independently verified for a new mesh.
+    """
     text = log_path.read_text(errors="replace")
     problems = []
     if re.search(r"does not match mesh face count|Empty view factor matrix", text):
@@ -197,8 +209,11 @@ def gate_check_common(log_path: Path) -> list[str]:
         problems.append("rise-eps k=0.20 did not engage")
     if "ABSOLUTE self-relief floor OVERRIDE h_eps = 0.00 mm" not in text:
         problems.append("RISE_HABS h_eps=0 did not engage")
-    if "PTM-18 interior hole-seal ENABLED: sealed 30 interior hole" not in text:
-        problems.append("PTM-18 seal count != 30")
+    if expect_hole_seal_count is not None:
+        if f"PTM-18 interior hole-seal ENABLED: sealed {expect_hole_seal_count} interior hole" not in text:
+            problems.append(f"PTM-18 seal count != {expect_hole_seal_count}")
+    elif not re.search(r"PTM-18 interior hole-seal ENABLED: sealed \d+ interior hole", text):
+        problems.append("PTM-18 hole-seal banner missing entirely")
     return problems
 
 
@@ -213,8 +228,22 @@ def gate_check_radiation(log_path: Path) -> list[str]:
         problems.append("VF_REPLACE did not engage")
     if "mesh-hash OK" not in text:
         problems.append("corrected-VF mesh-hash NOT OK")
-    if not re.search(r"REPLACED H-matrix .*max ΣF=1(\.0+)?, rows>1=0", text):
+    # 2026-07-21 fix: the old regex hardcoded "max ΣF=1(.0+)?" -- true for moon3d
+    # (whose tight concave micro-crater geometry saturates at least one row against
+    # the ΣF<=1 cap) but NOT a general invariant. Haworth's r32c core is much more
+    # open (mostly sky-facing) and legitimately never approaches the cap (observed
+    # max ΣF=0.2067, rows>1=0) -- the OLD regex false-failed that healthy build.
+    # The actual invariants are: rows>1=0 (no cap violation) AND max ΣF<=1
+    # (numerically, not exactly "==1"). Parse and check both directly.
+    m = re.search(r"REPLACED H-matrix .*max ΣF=([\d.]+),\s*rows>1=(\d+)", text)
+    if not m:
         problems.append("corrected-VF invariants (max SigmaF<=1, rows>1=0) not confirmed")
+    else:
+        max_sigf, n_over1 = float(m.group(1)), int(m.group(2))
+        if max_sigf > 1.0 + 1e-6:
+            problems.append(f"corrected-VF max SigmaF={max_sigf} > 1")
+        if n_over1 != 0:
+            problems.append(f"corrected-VF rows>1={n_over1} (expected 0)")
     return problems
 
 
@@ -299,7 +328,8 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
 # --------------------------------------------------------------------------
 
 def run_with_retry(ptm_bin: Path, cfg_path: Path, log_path: Path,
-                    retries: int, timeout_min: float, ledger: Ledger, label: str):
+                    retries: int, timeout_min: float, ledger: Ledger, label: str,
+                    expect_hole_seal_count: int | None = 30):
     """NOTE (2026-07-20, post-mortem on the batch=200000 stage-B wedge): each
     attempt's log is now written to a PER-ATTEMPT file (log_path with
     '_attemptN' inserted before the suffix) and log_path itself is left
@@ -332,7 +362,7 @@ def run_with_retry(ptm_bin: Path, cfg_path: Path, log_path: Path,
             continue
         import shutil
         shutil.copy2(attempt_log, log_path)
-        problems = gate_check_common(attempt_log)
+        problems = gate_check_common(attempt_log, expect_hole_seal_count=expect_hole_seal_count)
         if ret.returncode == 0 and not problems:
             ledger.record(stage=label, event="attempt_ok", attempt=attempt,
                           wall_s=round(time.time() - t0, 1), log=str(attempt_log))
@@ -575,7 +605,8 @@ def mode_run(args):
                                 gpu_batch_size=args.stage_a_batch_size,
                                 initial_state_file=None, final_state_file=state_a)
         ok = run_with_retry(args.ptm_bin, cfg_a, args.output_dir / "chunk_000.log",
-                            args.retries, args.chunk_timeout_min, ledger, "chunk_000")
+                            args.retries, args.chunk_timeout_min, ledger, "chunk_000",
+                            expect_hole_seal_count=args.expect_hole_seal_count)
         if not ok or not is_valid_checkpoint(state_a) or not chunk_is_complete(chunk_a):
             ledger.record(event="ABORT", reason="chunk_000 failed or produced no valid checkpoint")
             sys.exit("[run] chunk_000 (equilibration stage) FAILED after retries -- see log + ledger.")
@@ -606,7 +637,8 @@ def mode_run(args):
                                 gpu_batch_size=args.stage_b_batch_size,
                                 initial_state_file=prev_state, final_state_file=this_state)
         ok = run_with_retry(args.ptm_bin, cfg_b, args.output_dir / f"{label}.log",
-                            args.retries, args.chunk_timeout_min, ledger, label)
+                            args.retries, args.chunk_timeout_min, ledger, label,
+                            expect_hole_seal_count=args.expect_hole_seal_count)
         if not ok or not chunk_is_complete(cdir):
             ledger.record(event="ABORT", reason=f"{label} failed")
             sys.exit(f"[run] {label} (output stage) FAILED after retries -- see log + ledger.")
@@ -667,6 +699,11 @@ def main():
     p.add_argument("--strict-preflight", action="store_true",
                    help="ABORT (not warn) on a launch-time consistency "
                         "contradiction vs the machine profile (Phase R, R3d)")
+    p.add_argument("--expect-hole-seal-count", type=int, default=30,
+                   help="PTM-18 interior-hole-seal count the gate expects in the log banner "
+                        "(mesh-specific -- moon3d seals 30; verify a new mesh's own count with "
+                        "a dedicated probe run before trusting a different value here, "
+                        "2026-07-21 finding). Pass -1 to skip this specific check entirely.")
     p.add_argument("--gates", choices=["coupled", "radoff", "auto"], default="auto",
                    help="post-chunk radiation gate set. 'coupled' = require the "
                         "VF/two-band banners (default for radiation-enabled runs); "
@@ -714,6 +751,8 @@ def main():
                         "UNRELATED failure mode is worth ~45-140 extra "
                         "minutes -- it is not needed to fix the wedge itself.")
     args = p.parse_args()
+    if args.expect_hole_seal_count is not None and args.expect_hole_seal_count < 0:
+        args.expect_hole_seal_count = None  # -1 sentinel -> skip this specific check
 
     if not args.ptm_bin.is_file():
         sys.exit(f"error: ptm_thermal_sim not found at {args.ptm_bin}")
