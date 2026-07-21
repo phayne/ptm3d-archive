@@ -235,7 +235,12 @@ __kernel void persistentThermalKernel(
     // from / writes output to the GLOBAL slot (t_offset + t), continuing the
     // T(z) profile it inherits in T_global. t_offset == 0 (the un-chunked
     // case) makes every indexed expression textually identical to pre-R2.
-    int t_offset)
+    int t_offset,
+    // Phase R (R2 fix, PORT-R2-01): per-face frozen von-Neumann substep count.
+    // Written on the first sub-dispatch of a session (t_offset==0), read on the
+    // rest, so a self-chunked session integrates with the SAME substep count as
+    // the un-chunked dispatch would. Re-derived at each cycle entry.
+    __global int* n_substeps_frozen)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -271,49 +276,65 @@ __kernel void persistentThermalKernel(
     float T_geo = (Q_bottom > 0.0f)
         ? native_sqrt(native_sqrt(Q_bottom / (eps * sigma))) : 0.0f;
 
-    // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
-    // Need to compute kappa first to get stable dt
-    // Use initial temperature to estimate kappa
-    float max_kappa = 0.0f;
-    float min_dz2 = 1e10f;
-    for (int i = 0; i < n_layers; ++i) {
-        float k_val = compute_k(T_local[i], kc_local[i], R350);
-        float cp_val = compute_cp(T_local[i], cp0, cp_coeffs, n_cp_coeffs);
-        if (cp_val <= 0.0f) cp_val = 800.0f;
-        float kappa_val = k_val / (rho_local[i] * cp_val);
-        if (kappa_val > max_kappa) max_kappa = kappa_val;
+    // Sub-step count per output interval. Phase R (R2 fix, PORT-R2-01): the
+    // von-Neumann count depends on the session-ENTRY T (kappa falls as the
+    // surface warms), so a self-chunked session MUST reuse one count across its
+    // sub-dispatches or the integration drifts (~0.02 K, ceiling-dependent =>
+    // fails bit-identity). Derive-and-FREEZE on the first sub-dispatch
+    // (t_offset==0), reuse on the rest. Because t_offset resets to 0 at each
+    // cycle's entry, each cycle re-derives from ITS entry T — identical to the
+    // pre-R2 single-dispatch-per-cycle behavior (this is what keeps multi-cycle
+    // unsplit==pre-R2). The frozen value is the INT; dt is recomputed from the
+    // SAME int below (bit-exact), never cached as a float.
+    int n_substeps;
+    if (t_offset == 0) {
+        // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
+        // Need to compute kappa first to get stable dt
+        // Use initial temperature to estimate kappa
+        float max_kappa = 0.0f;
+        float min_dz2 = 1e10f;
+        for (int i = 0; i < n_layers; ++i) {
+            float k_val = compute_k(T_local[i], kc_local[i], R350);
+            float cp_val = compute_cp(T_local[i], cp0, cp_coeffs, n_cp_coeffs);
+            if (cp_val <= 0.0f) cp_val = 800.0f;
+            float kappa_val = k_val / (rho_local[i] * cp_val);
+            if (kappa_val > max_kappa) max_kappa = kappa_val;
 
-        if (i > 0) {
-            float dz = z[i] - z[i-1];
-            float dz2 = dz * dz;
-            if (dz2 < min_dz2) min_dz2 = dz2;
+            if (i > 0) {
+                float dz = z[i] - z[i-1];
+                float dz2 = dz * dz;
+                if (dz2 < min_dz2) min_dz2 = dz2;
+            }
         }
+
+        // Stable dt: Fo = kappa * dt / dz^2 < 0.49
+        float dt_stable = 0.49f * min_dz2 / max_kappa;
+
+        // Clamp dt_stable to reasonable range. The lower bound is the
+        // larger of:
+        //   - 1 second (legacy floor for fine-event resolution), and
+        //   - dt_output / N_SUBSTEPS_MAX, which caps per-output-step
+        //     substeps to a value that keeps the persistent kernel below
+        //     the macOS GPU-watchdog timeout (~5–10 s default).
+        // Without this second floor, very cold checkpoint states (24 K
+        // PSR floors) yield tiny cp(T), large kappa = k/(rho·cp), tiny
+        // dt_stable per the CFL criterion, and worst-case work-items
+        // accumulate enough substeps that the kernel never finishes
+        // within the watchdog window — causing the AMD driver to abort
+        // with gpusKillClientExt.
+        const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
+        float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
+        if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
+        dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
+
+        // Number of sub-steps per output interval (capped above by the
+        // dt_stable floor)
+        n_substeps = (int)ceil(dt_output / dt_stable);
+        n_substeps_frozen[face] = n_substeps;   // FREEZE for later sub-dispatches
+    } else {
+        n_substeps = n_substeps_frozen[face];    // reuse this session's frozen count
     }
-
-    // Stable dt: Fo = kappa * dt / dz^2 < 0.49
-    float dt_stable = 0.49f * min_dz2 / max_kappa;
-
-    // Clamp dt_stable to reasonable range. The lower bound is the
-    // larger of:
-    //   - 1 second (legacy floor for fine-event resolution), and
-    //   - dt_output / N_SUBSTEPS_MAX, which caps per-output-step
-    //     substeps to a value that keeps the persistent kernel below
-    //     the macOS GPU-watchdog timeout (~5–10 s default).
-    // Without this second floor, very cold checkpoint states (24 K
-    // PSR floors) yield tiny cp(T), large kappa = k/(rho·cp), tiny
-    // dt_stable per the CFL criterion, and worst-case work-items
-    // accumulate enough substeps that the kernel never finishes
-    // within the watchdog window — causing the AMD driver to abort
-    // with gpusKillClientExt.
-    const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
-    float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
-    if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
-    dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
-
-    // Number of sub-steps per output interval (capped above by the
-    // dt_stable floor)
-    int n_substeps = (int)ceil(dt_output / dt_stable);
-    float dt = dt_output / (float)n_substeps;  // Actual sub-step size
+    float dt = dt_output / (float)n_substeps;  // Actual sub-step size (bit-exact)
 
     // Process ALL output timesteps
     for (int t = 0; t < n_timesteps; ++t) {
