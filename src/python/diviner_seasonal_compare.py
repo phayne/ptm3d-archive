@@ -322,6 +322,19 @@ def main(argv=None):
                          "topography + Diviner summer Tbol,max over a wide ROI, "
                          "comparison window outlined) above the 4x3 grid. Single "
                          "site only; the 4x3 comparison grid is unchanged.")
+    ap.add_argument("--pubclean", action="store_true",
+                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
+                         "checklist P2.8, 2026-07-22): suppress the figure suptitle, "
+                         "the per-column titles (Diviner/PTM3D/model-Div), and the "
+                         "bias/RMSE text box. Axis labels, colorbars, and legends are "
+                         "unaffected. Default OFF -- no behavior change for existing "
+                         "callers/figures.")
+    ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
+                    help="With --pubclean, pin the saved canvas to this exact pixel "
+                         "size at 300 dpi (e.g. 2311x2974, the annotated sibling's own "
+                         "shipped size) instead of letting the tight-bbox crop shrink "
+                         "when the title/stat-box text is removed -- so the manuscript "
+                         "can swap the two files 1:1 without a layout reflow.")
     args = ap.parse_args(argv)
     for spec in args.run_dir:
         if "=" not in spec:
@@ -398,12 +411,13 @@ def main(argv=None):
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                              label="K" if c < 2 else "$\\Delta$K")
                 if c > 0: ax.tick_params(labelleft=False)
-                if r == 0:
+                if r == 0 and not args.pubclean:
                     ax.set_title(["Diviner", "PTM3D", "model$-$Div"][c], fontsize=10)
             axes[r, 0].set_ylabel(f"{season} {stat_name}\ny (km)", fontsize=9)
-            axes[r, 2].text(0.03, 0.96, f"bias {st['bias']:+.1f}\nRMSE {st['rmse']:.1f}",
-                            transform=axes[r, 2].transAxes, va="top", fontsize=7.5,
-                            bbox=dict(fc="white", ec="0.7", alpha=0.85))
+            if not args.pubclean:
+                axes[r, 2].text(0.03, 0.96, f"bias {st['bias']:+.1f}\nRMSE {st['rmse']:.1f}",
+                                transform=axes[r, 2].transAxes, va="top", fontsize=7.5,
+                                bbox=dict(fc="white", ec="0.7", alpha=0.85))
         for c in range(3):
             axes[3, c].set_xlabel("x (km)")
         slug = disp.lower().replace(" ", "_")
@@ -413,6 +427,27 @@ def main(argv=None):
             # Match the paper's Fig. 8: no overall suptitle; GridSpec + tight bbox.
             for fmt, dpi in ((".png", 300), (".pdf", None)):
                 fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
+        elif args.pubclean:
+            fig.tight_layout(rect=(0, 0, 1, 1))
+            if args.pubclean_canvas_px:
+                # Pin the canvas to the annotated sibling's own shipped pixel size
+                # (tight-bbox alone crops SHORTER once the suptitle/titles/stat box
+                # are gone, since there's less content at the top edge -- pinning
+                # keeps the two files swappable 1:1 without a manuscript reflow).
+                wpx, hpx = (int(v) for v in args.pubclean_canvas_px.lower().split("x"))
+                w_in, h_in = wpx / 300.0, hpx / 300.0
+                fig.set_size_inches(w_in, h_in)
+                # rcParams["savefig.bbox"]="tight" (ptm_pubstyle) still crops by
+                # default even when bbox_inches is left unset; passing None does
+                # NOT disable it (None just falls back to the rcParam). Pass an
+                # explicit full-canvas Bbox to force the pinned size verbatim.
+                from matplotlib.transforms import Bbox
+                full = Bbox([[0, 0], [w_in, h_in]])
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches=full)
+            else:
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi)
         else:
             fig.suptitle(f"PTM3D vs Diviner seasonal $T_{{bol}}$ — {disp}",
                          fontsize=12, fontweight="bold", y=0.995)

@@ -69,7 +69,8 @@ def panel_data(grids, season, stat):
     return dvm[valid], model[valid]
 
 
-def make_figure(run_dir: Path, label: str, out_stem: str):
+def make_figure(run_dir: Path, label: str, out_stem: str,
+                 pubclean: bool = False, pubclean_canvas_px: str | None = None):
     grids = load_run(run_dir)
     fig, axes = plt.subplots(2, 2, figsize=(9.0, 9.0))
     for ax, (season, stat, title) in zip(axes.ravel(), PANELS):
@@ -95,28 +96,59 @@ def make_figure(run_dir: Path, label: str, out_stem: str):
 
         ax.set_xlim(vlo, vhi); ax.set_ylim(vlo, vhi)
         ax.set_aspect("equal")
-        ax.set_title(title)
+        if not pubclean:
+            ax.set_title(title)
         ax.set_xlabel("Diviner $T_\\mathrm{bol}$ (K)")
         ax.set_ylabel("PTM3D $T_\\mathrm{bol}$ (K)")
 
-    fig.suptitle(f"PTM3D vs Diviner $T_\\mathrm{{bol}}$ — Haworth SE rim, corrected ring ({label})",
-                 fontsize=13, fontweight="bold", y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    if not pubclean:
+        fig.suptitle(f"PTM3D vs Diviner $T_\\mathrm{{bol}}$ — Haworth SE rim, corrected ring ({label})",
+                     fontsize=13, fontweight="bold", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 1) if pubclean else (0, 0, 1, 0.97))
     out = OUTDIR / out_stem
-    for fmt, dpi in ((".png", 300), (".pdf", None)):
-        fig.savefig(out.with_suffix(fmt), dpi=dpi)
+    if pubclean and pubclean_canvas_px:
+        # Pin to the annotated sibling's own shipped pixel size (see
+        # diviner_seasonal_compare.py's --pubclean-canvas-px for why: the
+        # rcParam "savefig.bbox"="tight" (ptm_pubstyle) still auto-crops even
+        # with bbox_inches unset, and crops SHORTER once title/panel-title
+        # text is gone -- pin explicitly so the manuscript swap is 1:1).
+        from matplotlib.transforms import Bbox
+        wpx, hpx = (int(v) for v in pubclean_canvas_px.lower().split("x"))
+        w_in, h_in = wpx / 300.0, hpx / 300.0
+        fig.set_size_inches(w_in, h_in)
+        full = Bbox([[0, 0], [w_in, h_in]])
+        for fmt, dpi in ((".png", 300), (".pdf", None)):
+            fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches=full)
+    else:
+        for fmt, dpi in ((".png", 300), (".pdf", None)):
+            fig.savefig(out.with_suffix(fmt), dpi=dpi)
     plt.close(fig)
     print(f"wrote {out.with_suffix('.png')}")
     print(f"wrote {out.with_suffix('.pdf')}")
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pubclean", action="store_true",
+                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
+                         "checklist P2.8, 2026-07-22): suppress the suptitle and the "
+                         "4 panel titles. Axis labels are unaffected. Writes "
+                         "*_pubclean.{png,pdf} instead of the default filenames.")
+    ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
+                    help="With --pubclean, pin the saved canvas to this exact pixel "
+                         "size at 300 dpi so it matches the annotated sibling's own "
+                         "shipped size 1:1 (e.g. 2517x2654).")
+    args = ap.parse_args()
     apply_style()
     sp.furnsh(D.METAKERNEL)
+    suffix = "_pubclean" if args.pubclean else ""
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/coupled"),
-                "coupled", "fig8_hybrid_coupled_rigorous_ringfix_scatter")
+                "coupled", f"fig8_hybrid_coupled_rigorous_ringfix_scatter{suffix}",
+                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px)
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/radoff"),
-                "radoff", "fig8_hybrid_radoff_rigorous_ringfix_scatter")
+                "radoff", f"fig8_hybrid_radoff_rigorous_ringfix_scatter{suffix}",
+                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px)
     sp.kclear()
 
 
