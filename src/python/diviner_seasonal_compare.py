@@ -62,6 +62,16 @@ RUN_OVERRIDE = {"haworth": "divval_haworth_r32c",
 # OUTSIDE OUTROOT (e.g. the two-band run in ~/dev/heat3d) can be wired in
 # without touching the defaults above.
 RUN_DIR_ABS: dict = {}
+# Explicit (lat0, lon0) center overrides, keyed by site key. EMPTY by default
+# (NO behavior change vs the committed script / SITES table above); populated
+# only via --center SITE=LAT,LON. 2026-07-22 finding: the hardcoded "sunlit"
+# entry here (-88.181, 6.041) is a DIFFERENT point (~2.5 km away) from the
+# fig8_hybrid mesh's actual build center (-88.1, 6.3, per Paul's site spec
+# "88.1 S 6.3 E" and the mesh session note's independently-verified 22.00 km
+# distance-to-Haworth check) -- use --center sunlit=-88.1,6.3 for that mesh,
+# NOT the stale table default. Flagged rather than silently edited above,
+# since 3 other scripts share this same hardcoded tuple.
+CENTER_OVERRIDE: dict = {}
 WINDOW_KM, CELL_M, CORE_KM = 15.0, 250.0, 15.0
 # Manuscript Fig. 8 site-overview row (--overview): wider-region LOLA topography +
 # Diviner summer Tbol,max context, with the CORE_KM comparison window outlined.
@@ -294,6 +304,11 @@ def main(argv=None):
     ap.add_argument("--run-dir", action="append", default=[], metavar="SITE=PATH",
                     help="Explicit absolute run-directory override for a site key "
                          "(repeatable). Does NOT change the built-in defaults.")
+    ap.add_argument("--center", action="append", default=[], metavar="SITE=LAT,LON",
+                    help="Explicit (lat0,lon0) center override for a site key "
+                         "(repeatable). Does NOT change the built-in SITES defaults; "
+                         "use when the mesh's actual build center differs from the "
+                         "table (e.g. --center sunlit=-88.1,6.3 for fig8_hybrid).")
     ap.add_argument("--site", action="append", default=[], metavar="KEY",
                     help="Restrict to these site key(s) (repeatable). Default: all.")
     ap.add_argument("--outdir", default=None,
@@ -313,6 +328,12 @@ def main(argv=None):
             ap.error(f"--run-dir expects SITE=PATH, got {spec!r}")
         k, p = spec.split("=", 1)
         RUN_DIR_ABS[k] = p
+    for spec in args.center:
+        if "=" not in spec or "," not in spec:
+            ap.error(f"--center expects SITE=LAT,LON, got {spec!r}")
+        k, ll = spec.split("=", 1)
+        latstr, lonstr = ll.split(",", 1)
+        CENTER_OVERRIDE[k] = (float(latstr), float(lonstr))
     site_filter = set(args.site) or None
     tag = args.tag
     outdir = (Path(args.outdir) if args.outdir
@@ -328,6 +349,11 @@ def main(argv=None):
     sp.furnsh(METAKERNEL)
     summary = {}
     for disp, key, lat0, lon0 in sites:
+        if key in CENTER_OVERRIDE:
+            olat, olon = CENTER_OVERRIDE[key]
+            print(f"[{key}] CENTER OVERRIDE: table default ({lat0},{lon0}) -> "
+                  f"({olat},{olon}) via --center")
+            lat0, lon0 = olat, olon
         run = resolve_run(key)
         if not (run / "mesh.ply").exists():
             print(f"skip {key}: no run"); continue
