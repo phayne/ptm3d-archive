@@ -18,6 +18,15 @@ contours read as the primary signal. NO on-figure data tables/annotations
 Per Fermi's finding, winter-max stratification on the winter Diviner reference
 is noise-selecting -- the scatter sidesteps this entirely by not stratifying
 at all: every panel plots ALL valid core cells, no PSR/sunlit split.
+
+--log-density (2026-07-22, additive, default OFF, Paul's ask on manuscript v4
+review): switches the filled-contour levels from linear spacing
+(np.linspace(0.05*max, max, 7)) to half-decade LOG spacing in counts/bin
+(LogNorm), so both the dense 1:1 core and the sparse tails read -- a linear
+7-step ladder over a plane whose density can span 2-3 decades makes every
+level above the first look empty. Everything else (panels, axis ranges,
+equal aspect, 1:1 line, thinned low-alpha gray points, single sequential
+blue hue) is byte-for-byte the same code path.
 """
 from __future__ import annotations
 import sys
@@ -26,7 +35,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, LogNorm
 import numpy as np
 import spiceypy as sp
 
@@ -52,6 +61,24 @@ BLUES = LinearSegmentedColormap.from_list(
     "ptm_seq_blue", ["#fcfcfb", "#cde2fb", "#86b6ef", "#3987e5", "#184f95", "#0d366b"])
 
 
+def _log_density_levels(hmax: float, floor: float = 2.0, step_decades: float = 0.5):
+    """Half-decade-spaced filled-contour levels in [floor, hmax] counts/bin.
+
+    `floor` keeps the lowest contour a few counts/bin above single-point
+    noise (Paul's sanity ask) rather than 0.05*max, which for a sparse panel
+    (e.g. winter-max) can be well under 1 count and fill the plane with
+    contour lines around individual scattered points. Returns None if the
+    panel's peak density never reaches even the floor (nothing sensible to
+    contour -- the low-alpha scatter still shows the points).
+    """
+    if hmax < floor:
+        return None
+    n_steps = max(1, int(np.ceil(np.log10(hmax / floor) / step_decades)))
+    levels = floor * 10.0 ** (step_decades * np.arange(0, n_steps + 1))
+    levels[-1] = max(levels[-1], hmax)  # last level covers the true peak
+    return levels
+
+
 def load_run(run_dir: Path):
     smask, wmask, _ = D.season_masks(run_dir)
     g_sum = D.model_seasonal(run_dir, LA, LO, smask)
@@ -70,7 +97,8 @@ def panel_data(grids, season, stat):
 
 
 def make_figure(run_dir: Path, label: str, out_stem: str,
-                 pubclean: bool = False, pubclean_canvas_px: str | None = None):
+                 pubclean: bool = False, pubclean_canvas_px: str | None = None,
+                 log_density: bool = False):
     grids = load_run(run_dir)
     fig, axes = plt.subplots(2, 2, figsize=(9.0, 9.0))
     for ax, (season, stat, title) in zip(axes.ravel(), PANELS):
@@ -85,7 +113,15 @@ def make_figure(run_dir: Path, label: str, out_stem: str,
         H, xe, ye = np.histogram2d(x, y, bins=bins, range=[[vlo, vhi], [vlo, vhi]])
         cx = 0.5 * (xe[:-1] + xe[1:]); cy = 0.5 * (ye[:-1] + ye[1:])
         Hs = H.T
-        if Hs.max() > 0:
+        if log_density:
+            levels = _log_density_levels(Hs.max())
+            if levels is not None:
+                norm = LogNorm(vmin=levels[0], vmax=levels[-1])
+                ax.contourf(cx, cy, Hs, levels=levels, cmap=BLUES, norm=norm,
+                            alpha=0.85, extend="max")
+                ax.contour(cx, cy, Hs, levels=levels, colors="#184f95",
+                           linewidths=0.6, alpha=0.5)
+        elif Hs.max() > 0:
             levels = np.linspace(Hs.max() * 0.05, Hs.max(), 7)
             ax.contourf(cx, cy, Hs, levels=levels, cmap=BLUES, alpha=0.85, extend="max")
             ax.contour(cx, cy, Hs, levels=levels, colors="#184f95", linewidths=0.6, alpha=0.5)
@@ -139,16 +175,26 @@ def main():
                     help="With --pubclean, pin the saved canvas to this exact pixel "
                          "size at 300 dpi so it matches the annotated sibling's own "
                          "shipped size 1:1 (e.g. 2517x2654).")
+    ap.add_argument("--log-density", action="store_true",
+                    help="Additive, default OFF (2026-07-22): filled-contour levels "
+                         "at half-decade log spacing in counts/bin (LogNorm) instead "
+                         "of the default 7-step linear ladder, so both the dense 1:1 "
+                         "core and sparse tails read. Everything else (panels, axis "
+                         "ranges, equal aspect, 1:1 line, gray points, blue hue) is "
+                         "unchanged. Writes *_logd.{png,pdf} (or *_logd_pubclean with "
+                         "--pubclean) instead of the default filenames.")
     args = ap.parse_args()
     apply_style()
     sp.furnsh(D.METAKERNEL)
-    suffix = "_pubclean" if args.pubclean else ""
+    suffix = ("_logd" if args.log_density else "") + ("_pubclean" if args.pubclean else "")
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/coupled"),
                 "coupled", f"fig8_hybrid_coupled_rigorous_ringfix_scatter{suffix}",
-                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px)
+                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
+                log_density=args.log_density)
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/radoff"),
                 "radoff", f"fig8_hybrid_radoff_rigorous_ringfix_scatter{suffix}",
-                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px)
+                pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
+                log_density=args.log_density)
     sp.kclear()
 
 
