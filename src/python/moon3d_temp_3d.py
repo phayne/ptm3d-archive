@@ -32,7 +32,7 @@ import pyvista as pv
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, DOUBLE_W, panel_label
+from ptm_pubstyle import apply_style, DOUBLE_W, panel_label, savefig_pinned
 
 
 def load_stat(stat_dir: Path, name: str) -> np.ndarray:
@@ -137,6 +137,16 @@ def main() -> int:
                     help="draw faces whose coupled MAX-T exceeds this (K) in neutral "
                          "gray and exclude them from the color scale (view-factor "
                          "over-count artifacts); 0 = keep all")
+    ap.add_argument("--pubclean", action="store_true",
+                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
+                         "manuscript v4 review, 2026-07-22): suppress the upper "
+                         "suptitle only. Panel titles/colorbars/labels unaffected. "
+                         "Additive, default OFF -- no other change to this script.")
+    ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
+                    help="With --pubclean, pin the saved canvas to this exact pixel "
+                         "size at 300 dpi so it matches the annotated (titled) "
+                         "sibling's own shipped size 1:1 (the tight-bbox crop "
+                         "otherwise shrinks once the suptitle is removed).")
     a = ap.parse_args()
 
     full = pv.read(a.ply)               # connectivity only (points are float32)
@@ -195,14 +205,20 @@ def main() -> int:
     axR.text2D(0.03, 0.95, "(b)", transform=axR.transAxes,
                fontsize=10, fontweight="bold", va="top")
 
-    fig.suptitle("Moon3D 509k — radiative coupling on the thermal field",
-                 fontsize=13, fontweight="bold", y=0.98)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if not a.pubclean:
+        fig.suptitle("Moon3D 509k — radiative coupling on the thermal field",
+                     fontsize=13, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=(0, 0, 1, 1) if a.pubclean else (0, 0, 1, 0.95))
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=300)
-    if out.suffix == ".png":
-        fig.savefig(out.with_suffix(".pdf"))
-    print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
+    if a.pubclean_canvas_px:
+        w, h = (int(v) for v in a.pubclean_canvas_px.lower().split("x"))
+        written = savefig_pinned(fig, out.with_suffix(""), canvas_px=(w, h))
+        print(f"wrote {written[0]} (+pdf)  [pinned canvas {w}x{h}px]")
+    else:
+        fig.savefig(out, dpi=300)
+        if out.suffix == ".png":
+            fig.savefig(out.with_suffix(".pdf"))
+        print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
     dg = diff[good]
     print(f"  Δ{field_name}T (non-over-count faces): min={dg.min():+.1f} "
           f"max={dg.max():+.1f} mean={dg.mean():+.2f} K")
