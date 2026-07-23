@@ -950,6 +950,25 @@ def main() -> int:
                         "drops below this many GB. The site in progress is "
                         "allowed to finish; the campaign then stops cleanly "
                         "(resumable) rather than filling the disk.")
+    p.add_argument("--window-filter", nargs="+", default=[],
+                   help="Restrict which window TAGS from --schedule are "
+                        "actually SIMULATED (e.g. Y00_summer), for a fast "
+                        "single-window validation run. Deliberately does NOT "
+                        "trim the schedule object itself -- plan_and_build_mesh "
+                        "still sees the FULL schedule, so R_ext/horizon "
+                        "geometry (extended_mesh_params) is computed exactly "
+                        "as the full production run would, and matches the "
+                        "cached mesh/ring filenames. 2026-07-23 incident: a "
+                        "hand-trimmed schedule file changed sun_elev_min_deg "
+                        "(4.2127 vs the full schedule's 4.1884 deg for "
+                        "A03MP026) and therefore R_ext (27.1522 vs the cached "
+                        "27.3108 km) -- a cache-miss that fell through to the "
+                        "catalog-based VRT rebuild path (dem_catalog_lola.json "
+                        "is an empty stub, dem_root=_empty_demroot -- that "
+                        "fallback is non-functional for ANY site, not an "
+                        "A03MP026-specific bug) and failed loudly with a "
+                        "relative-path GDAL open error. --window-filter is the "
+                        "fix: always plan against the untouched schedule.")
     args = p.parse_args()
 
     # Tear down the in-flight chunk runner + GPU sim if we're interrupted
@@ -999,6 +1018,19 @@ def main() -> int:
     # action == run
     schedule = json.loads(args.schedule.read_text())
     windows = schedule["windows"]
+    if args.window_filter:
+        wanted_tags = set(args.window_filter)
+        all_tags = [w["tag"] for w in windows]
+        windows = [w for w in windows if w["tag"] in wanted_tags]
+        if not windows:
+            sys.exit(f"--window-filter {sorted(wanted_tags)} matched no windows "
+                     f"in the schedule (available: {all_tags})")
+        print(f"--window-filter: simulating {[w['tag'] for w in windows]} of "
+              f"{len(all_tags)} scheduled windows ({all_tags}). NOTE: "
+              f"plan_and_build_mesh below still uses the FULL, untouched "
+              f"`schedule` object for R_ext/horizon geometry -- only this "
+              f"local `windows` list (which windows actually get simulated) "
+              f"is filtered.")
     template_path = TEMPLATE_RAD if args.radiation else TEMPLATE
     template_text = template_path.read_text()
 
