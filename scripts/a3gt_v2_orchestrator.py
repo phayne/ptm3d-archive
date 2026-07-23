@@ -724,14 +724,23 @@ def read_hmat_dims(path: Path) -> tuple[int, int] | None:
     same field ORDER and WIDTH -- confirmed empirically 2026-07-23 against
     46/48 sites' rad_corering-generation VFs, whose n_rows matched their
     current core mesh face count to within a few hundred faces)."""
+    dims_blocks = read_hmat_dims_and_blocks(path)
+    return None if dims_blocks is None else dims_blocks[:2]
+
+
+def read_hmat_dims_and_blocks(path: Path) -> tuple[int, int, int] | None:
+    """Return (n_rows, n_cols, num_blocks) from a .hmat file's 32-byte
+    header. num_blocks==0 is Ada's "truly empty" base VF signature (matches
+    the current HMATRIX_MAGIC/VERSION=2 layout -- confirmed via direct hex
+    dump of A03MP026_base_empty.vf, 2026-07-23)."""
     import struct
     try:
         with open(path, "rb") as f:
             raw = f.read(32)
         if len(raw) < 32:
             return None
-        _magic, _version, n_rows, n_cols, _num_blocks = struct.unpack(HMAT_HEADER_STRUCT, raw)
-        return int(n_rows), int(n_cols)
+        _magic, _version, n_rows, n_cols, num_blocks = struct.unpack(HMAT_HEADER_STRUCT, raw)
+        return int(n_rows), int(n_cols), int(num_blocks)
     except OSError:
         return None
 
@@ -752,23 +761,26 @@ def stage_base_vf(site_id: str, core_mesh: Path, vf_target: Path,
     if n_faces <= 0:
         return False, f"could not read face count from core mesh {core_mesh}"
     candidate = None
-    for ext in (".hmat", ".vf"):
-        c = vf_base_dir / f"{site_id}{ext}"
+    for pattern in (f"{site_id}_base_empty.vf",  # Ada's naming (base_vf_manifest.tsv)
+                    f"{site_id}.hmat", f"{site_id}.vf"):
+        c = vf_base_dir / pattern
         if c.is_file():
             candidate = c
             break
     if candidate is None:
-        return False, f"no base VF staged at {vf_base_dir}/{site_id}.{{hmat,vf}}"
+        return False, (f"no base VF staged at {vf_base_dir}/{site_id}"
+                       f"_base_empty.vf (or .hmat/.vf)")
     size_mb = candidate.stat().st_size / 1e6
     if size_mb > vf_base_max_mb:
         return False, (f"base VF {candidate} is {size_mb:.0f} MB > "
                        f"--vf-base-max-mb {vf_base_max_mb:g} -- refusing "
                        f"(multi-GB-VF wedge profile; see 2026-07-03 incident)")
-    dims = read_hmat_dims(candidate)
-    if dims is None:
+    dims_blocks = read_hmat_dims_and_blocks(candidate)
+    if dims_blocks is None:
         return False, f"could not parse .hmat header from {candidate}"
-    if dims[0] != n_faces:
-        return False, (f"base VF {candidate} n_rows={dims[0]} != core mesh "
+    n_rows, _n_cols, num_blocks = dims_blocks
+    if n_rows != n_faces:
+        return False, (f"base VF {candidate} n_rows={n_rows} != core mesh "
                        f"face count {n_faces} -- refusing (face-count "
                        f"mismatch is the documented VF-rebuild-fallback "
                        f"wedge trigger)")
@@ -781,14 +793,24 @@ def stage_base_vf(site_id: str, core_mesh: Path, vf_target: Path,
             fo.write(b)
     if vf_target.stat().st_size != candidate.stat().st_size:
         return False, f"staged copy size mismatch ({candidate} -> {vf_target})"
-    return True, f"staged from {candidate} ({size_mb:.1f} MB, n_faces={n_faces})"
+    return True, (f"staged from {candidate} ({size_mb:.2f} MB, n_faces={n_faces}, "
+                  f"num_blocks={num_blocks}{' TRULY EMPTY' if num_blocks == 0 else ''})")
 
 
 def vf_replace_path(vf_replace_dir: Path | None, site_id: str) -> Path | None:
     if vf_replace_dir is None:
         return None
-    for ext in (".csr", ".vf"):
-        c = vf_replace_dir / f"{site_id}{ext}"
+    # Ada's assemble_and_verify.sh layout: <vf_replace_dir>/<site>/<site>_corrected_vf.csr
+    # (a per-site subdirectory, alongside her sweep/ scratch) -- checked first.
+    # Flat <vf_replace_dir>/<site>.csr (or .vf) is also accepted for a simpler
+    # staging layout if one is ever used instead.
+    candidates = [
+        vf_replace_dir / site_id / f"{site_id}_corrected_vf.csr",
+        vf_replace_dir / f"{site_id}_corrected_vf.csr",
+        vf_replace_dir / f"{site_id}.csr",
+        vf_replace_dir / f"{site_id}.vf",
+    ]
+    for c in candidates:
         if c.is_file():
             return c
     return None
