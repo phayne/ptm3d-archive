@@ -17,15 +17,64 @@ Usage: assemble_vf_haworth.py <mesh.ply> <sweep_chunks_glob> <nrays> <min_hits> 
 import numpy as np, glob, time, sys, argparse
 from pathlib import Path
 
-sys.path.insert(0, "/Users/paha3326/projects/ptm/src/python")
-import pyvista as pv
-from moon3d_temp_3d import tri_faces
+_PLY_NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+           "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
+           "char": "i1", "uchar": "u1", "int8": "i1", "uint8": "u1",
+           "short": "<i2", "ushort": "<u2", "int16": "<i2", "uint16": "<u2"}
+
+
+def read_ply_geometry(path):
+    """Header-aware PLY vertex+face reader (PLY face order), reading vertices in
+    their NATIVE precision widened to float64.
+
+    PTM-23 fix: the old path used pyvista's ``mesh.points``, which VTK downcasts
+    to float32; the resulting float32 areas made the VF_REPLACE geomhash
+    (Sum_i area_i + (i+1)*area_i*1e-9) differ from the C++ sim's float64
+    ``areas_`` by ~1e-4 (A03MP026: 1.37e-4 of the 1e-3 gate) -- fine here but
+    liable to trip the gate on a larger/higher-area mesh. Reading float64 in the
+    same PLY face order the C++ loader uses makes the two hashes agree to
+    round-off. Also drops the pyvista/VTK dependency (runs in the base python)."""
+    raw = open(path, "rb").read()
+    he = raw.find(b"end_header")
+    he = raw.index(b"\n", he) + 1
+    nv = nf = 0
+    cur = None
+    vprops = []          # (name, np-type) in header order
+    face_trailing = []   # scalar props after the vertex_indices list
+    fcnt_t, fidx_t = "uchar", "int"
+    for ln in raw[:he].split(b"\n"):
+        p = ln.decode("latin1").split()
+        if not p:
+            continue
+        if p[0] == "element":
+            cur = p[1]
+            if p[1] == "vertex":
+                nv = int(p[2])
+            elif p[1] == "face":
+                nf = int(p[2])
+        elif p[0] == "property":
+            if p[1] == "list":
+                if cur == "face":
+                    fcnt_t, fidx_t = p[2], p[3]
+            elif cur == "vertex":
+                vprops.append((p[2], _PLY_NP[p[1]]))
+            elif cur == "face":
+                face_trailing.append(_PLY_NP[p[1]])
+    vdt = np.dtype(vprops)
+    V = np.frombuffer(raw, dtype=vdt, count=nv, offset=he)
+    xyz = np.stack([V["x"].astype(np.float64),
+                    V["y"].astype(np.float64),
+                    V["z"].astype(np.float64)], axis=1)
+    ffields = [("c", _PLY_NP[fcnt_t]), ("i", _PLY_NP[fidx_t], 3)]
+    ffields += [("t%d" % k, t) for k, t in enumerate(face_trailing)]
+    fdt = np.dtype(ffields)
+    F = np.frombuffer(raw, dtype=fdt, count=nf, offset=he + nv * vdt.itemsize)
+    assert (F["c"] == 3).all(), "non-triangle faces; assembler expects a triangulated mesh"
+    return xyz, F["i"].astype(np.int64)
 
 
 def face_areas(mesh_path):
-    mesh = pv.read(mesh_path)
-    f = tri_faces(mesh)
-    v = np.asarray(mesh.points, dtype=np.float64)
+    v, f = read_ply_geometry(mesh_path)
     p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
     area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
     ctr = (p0 + p1 + p2) / 3.0
