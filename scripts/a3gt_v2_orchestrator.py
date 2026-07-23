@@ -1083,7 +1083,22 @@ def main() -> int:
         # check only runs here, at the top of the per-site loop, between
         # sites). Stops the campaign cleanly (resumable) instead of filling
         # the disk mid-unattended-run.
+        #
+        # 2026-07-23 finding: a SINGLE A03MP026 CSR build+delete+GPU-window
+        # cycle left ~90 GB locked in local Time Machine snapshots (hourly
+        # auto-snapshots capturing the churn) even though the live files on
+        # disk accounted for only ~13 GB -- `shutil.disk_usage().free`
+        # reports the OS-visible free space, which is suppressed by exactly
+        # this. Over 4 unattended days of repeated multi-GB CSR churn this
+        # could trip --min-free-gb on PURGEABLE, not real, pressure. Thin
+        # local snapshots (best-effort; a no-op if tmutil is absent/fails)
+        # before trusting the free-space reading.
         if args.min_free_gb is not None:
+            try:
+                subprocess.run(["tmutil", "thinlocalsnapshots", "/", "50000000000", "4"],
+                               capture_output=True, timeout=120)
+            except Exception:
+                pass  # best-effort; never let snapshot thinning itself block a launch
             free_gb = shutil.disk_usage(OUTPUT_ROOT).free / 1e9
             if free_gb < args.min_free_gb:
                 print(f"\nSTOPPING: free space {free_gb:.1f} GB < "
@@ -1210,7 +1225,26 @@ def main() -> int:
         # so the GUI Results Browser can read the site (mesh.ply at site root,
         # statistics/{temperature,illumination,ice_depth}*.bin populated).
         # Skip if any window failed -- the user should debug first.
-        if site_windows_ok == len(windows) and not args.dry_run:
+        #
+        # CRITICAL: also skip whenever --window-filter narrowed `windows`
+        # below the schedule's real count. `site_windows_ok == len(windows)`
+        # only sees the FILTERED list, so a single-window validation run
+        # (e.g. V1: --window-filter Y00_summer) would satisfy "all windows
+        # complete" after just 1/8 windows, merge+composite the site, and
+        # (per a3gt_v2_merge_sparse.py) DELETE the per-window directory --
+        # silently corrupting site_is_composited()'s resume state for the
+        # REAL full-schedule campaign run later (it would see this site as
+        # permanently "done" with only 1 of 8 windows ever having run).
+        # 2026-07-23 incident: exactly this happened on A03MP026's first
+        # --window-filter run; caught before the real campaign launched.
+        if args.window_filter:
+            print(f"  [{sid}] --window-filter active ({args.window_filter}) -- "
+                  f"this is a partial/validation run; SKIPPING the composite "
+                  f"merge (would corrupt resume state for the remaining "
+                  f"{len(schedule['windows']) - len(windows)} window(s) not "
+                  f"run this pass). Re-run WITHOUT --window-filter to "
+                  f"composite this site for real.")
+        elif site_windows_ok == len(windows) and not args.dry_run:
             site_dir = OUTPUT_ROOT / sid
             print(f"  [{sid}] all windows complete; running composite merge")
             # core+ring architecture: thermal output is natively the core
