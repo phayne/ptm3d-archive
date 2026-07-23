@@ -128,6 +128,25 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 option(ENABLE_AVX2 "Enable AVX2 SIMD instructions" ON)
 option(ENABLE_AVX512 "Enable AVX512 instructions" ON)
 
+# Portability (Phase 1): PTM_ARCH_NATIVE tunes the binary to the BUILD host's
+# exact CPU (-march=native / -mcpu=apple-m1) AND, on x86, selects AVX2/AVX-512.
+# Great for a local source build; wrong for a redistributable binary and a
+# SIGILL risk on any CI runner / target CPU that lacks those ISAs. Declared
+# HERE, before the SIMD block, so it can gate ISA selection. Defaults ON (this
+# workstation's behavior is unchanged); CI / packaging sets -DPTM_ARCH_NATIVE=OFF.
+option(PTM_ARCH_NATIVE "Tune the binary to the build host's exact CPU (-march=native + AVX)" ON)
+if(NOT PTM_ARCH_NATIVE)
+    # Portable baseline: emit generic x86-64 only. AVX2/AVX-512 are NOT part of
+    # the x86-64 baseline and SIGILL on hosts that lack them (e.g. GitHub CI
+    # runners without AVX-512 -- the round-3 "Illegal instruction" at radiation
+    # setup). Force the ISA options off so NO target -- the global
+    # add_compile_options below or any per-file append -- emits -mavx*. The
+    # native profile keeps full AVX detection.
+    set(ENABLE_AVX2 OFF)
+    set(ENABLE_AVX512 OFF)
+    message(STATUS "PTM_ARCH_NATIVE=OFF: portable x86-64 baseline; AVX2/AVX-512 disabled")
+endif()
+
 include(CheckCXXCompilerFlag)
 
 # Detect architecture
@@ -206,12 +225,8 @@ endif()
 # General Optimization Flags
 # ============================================================================
 option(USE_AGGRESSIVE_OPTIMIZATIONS "Enable aggressive optimizations" ON)
-# Portability (Phase 1): -march=native (and -mcpu=apple-m1) tune the binary to
-# the BUILD host's exact CPU. Great for a local source build; wrong for a
-# redistributable binary and a SIGILL risk on a CI runner whose CPU differs.
-# PTM_ARCH_NATIVE defaults ON (this workstation's behavior is unchanged); CI /
-# packaging sets -DPTM_ARCH_NATIVE=OFF for a portable baseline.
-option(PTM_ARCH_NATIVE "Tune the binary to the build host's exact CPU (-march=native)" ON)
+# PTM_ARCH_NATIVE is declared above (before the SIMD block) so it can gate ISA
+# selection; -march=native / -mcpu=apple-m1 are applied below when it is ON.
 
 if(USE_AGGRESSIVE_OPTIMIZATIONS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
