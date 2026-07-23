@@ -105,12 +105,14 @@ endif()
 
 # Optimization flags
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    # -fno-finite-math-only MUST follow -ffast-math: finite-math-only otherwise
+    # turns std::isnan/std::isfinite guards into no-ops (see top-level CMakeLists).
     if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
-        target_compile_options(exosphere_core PRIVATE -O3 -ffast-math -march=native)
+        target_compile_options(exosphere_core PRIVATE -O3 -ffast-math -fno-finite-math-only -march=native)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-        target_compile_options(exosphere_core PRIVATE -O3 -march=native -mtune=native -ffast-math)
+        target_compile_options(exosphere_core PRIVATE -O3 -march=native -mtune=native -ffast-math -fno-finite-math-only)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        target_compile_options(exosphere_core PRIVATE -O3 -march=native -ffast-math)
+        target_compile_options(exosphere_core PRIVATE -O3 -march=native -ffast-math -fno-finite-math-only)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Intel")
         target_compile_options(exosphere_core PRIVATE -O3 -xHost -fp-model=fast)
     elseif(MSVC)

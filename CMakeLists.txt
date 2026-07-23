@@ -216,7 +216,13 @@ option(PTM_ARCH_NATIVE "Tune the binary to the build host's exact CPU (-march=na
 if(USE_AGGRESSIVE_OPTIMIZATIONS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         add_compile_options(-O3)
-        add_compile_options(-ffast-math)
+        # -ffast-math implies -ffinite-math-only, which makes the compiler assume
+        # NaN/Inf never occur and silently turns every std::isnan/std::isfinite
+        # fail-loud guard into a constant-false no-op (verified: isnan(0.0/0.0)
+        # returns 0 under bare -ffast-math). -fno-finite-math-only keeps the
+        # reassociation/FMA/reciprocal speedups but restores correct NaN/Inf
+        # semantics so the guards work. MUST follow -ffast-math to override it.
+        add_compile_options(-ffast-math -fno-finite-math-only)
         add_compile_options(-ftree-vectorize)
         add_compile_options(-funroll-loops)
 

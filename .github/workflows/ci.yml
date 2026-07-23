@@ -36,7 +36,7 @@ jobs:
         os: [ ubuntu-latest, macos-latest ]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # --- Pure-CPU unit tests that need NO third-party deps (fast gate) ------
       # These are the Phase R tests validated locally on 2026-07-21; they must
@@ -76,6 +76,11 @@ jobs:
           cd "$HOME/cspice_install"
           if [ "${{ runner.os }}" = "Linux" ]; then
             URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z"
+          elif [ "$(uname -m)" = "arm64" ]; then
+            # macos-latest is Apple Silicon (arm64). The x86_64 AppleC package
+            # links fine at configure (find_library only stats the file) but its
+            # static libcspice.a is x86_64 and will NOT link into an arm64 binary.
+            URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacM1_OSX_clang_64bit/packages/cspice.tar.Z"
           else
             URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacIntel_OSX_AppleC_64bit/packages/cspice.tar.Z"
           fi

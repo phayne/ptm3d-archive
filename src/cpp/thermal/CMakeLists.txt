@@ -43,7 +43,9 @@ install(FILES
 
 # Apply additional optimization flags for thermal calculations
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(thermal PRIVATE -O3 -ffast-math -ftree-vectorize)
+    # -fno-finite-math-only MUST follow -ffast-math: without it, finite-math-only
+    # makes std::isnan/std::isfinite guards in the thermal solver no-ops.
+    target_compile_options(thermal PRIVATE -O3 -ffast-math -fno-finite-math-only -ftree-vectorize)
     
     # Enable interprocedural optimization if supported
     include(CheckIPOSupported)
