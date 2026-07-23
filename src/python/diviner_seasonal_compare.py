@@ -255,12 +255,19 @@ def _context_grids(lat0, lon0):
     return EL, DT, ext
 
 
-def _figure_with_overview(lat0, lon0):
+def _figure_with_overview(lat0, lon0, pubclean=False):
     """Manuscript Fig. 8 layout: a 1x2 site-overview row (LEFT = LOLA topography,
     RIGHT = Diviner summer Tbol,max, both over a wide ROI, with the CORE_KM
     comparison window outlined by a cyan circle + center cross) ABOVE an empty 4x3
     axes grid. Returns (fig, axes4x3); the caller fills the 4x3 exactly as in the
-    default layout so the comparison grid is unchanged."""
+    default layout so the comparison grid is unchanged.
+
+    pubclean (2026-07-22, additive, default OFF): suppress the two overview-panel
+    titles ("LOLA topography" / "Diviner summer Tbol,max"), matching the same
+    no-on-figure-identity-text treatment already applied to the 4x3 grid's
+    per-column titles under --pubclean -- axis labels and colorbar labels (which
+    already say "Elevation (m)" / "T (K)") are unaffected, and the caption carries
+    the panel identity instead."""
     import matplotlib.gridspec as gridspec
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LightSource
@@ -278,13 +285,15 @@ def _figure_with_overview(lat0, lon0):
                vmin=e0, vmax=e1)
     fig.colorbar(ScalarMappable(Normalize(e0, e1), "terrain"), ax=axT, shrink=0.85,
                  pad=0.03, label="Elevation (m)")
-    axT.set_title("LOLA topography", fontsize=11)
+    if not pubclean:
+        axT.set_title("LOLA topography", fontsize=11)
     axD = fig.add_subplot(topgs[0, 1])
     dl, dh = np.nanpercentile(DT[np.isfinite(DT)], [2, 98])
     imD = axD.imshow(DT, origin="lower", extent=cext, cmap="inferno",
                      vmin=dl, vmax=dh)
     fig.colorbar(imD, ax=axD, shrink=0.85, pad=0.03, label="$T$ (K)")
-    axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
+    if not pubclean:
+        axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
     for ax in (axT, axD):
         th = np.linspace(0, 2 * np.pi, 100)
         ax.plot(CORE_KM * np.cos(th), CORE_KM * np.sin(th), "c-", lw=1.4)
@@ -391,7 +400,7 @@ def main(argv=None):
         # per-site figure: 4 rows x 3 cols, optionally with the manuscript Fig. 8
         # site-overview row (LOLA topo + Diviner summer Tbol,max) prepended above.
         if args.overview:
-            fig, axes = _figure_with_overview(lat0, lon0)
+            fig, axes = _figure_with_overview(lat0, lon0, pubclean=args.pubclean)
         else:
             fig, axes = plt.subplots(4, 3, figsize=(8.0, 10.2))
         for r, (season, stat_name, model, dvm, st, g) in enumerate(rows):
@@ -425,8 +434,40 @@ def main(argv=None):
         out = outdir / f"{stem}{tag}"
         if args.overview:
             # Match the paper's Fig. 8: no overall suptitle; GridSpec + tight bbox.
-            for fmt, dpi in ((".png", 300), (".pdf", None)):
-                fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
+            # --overview never adds a suptitle itself, so this branch is safe
+            # regardless of --pubclean; but --pubclean + --pubclean-canvas-px
+            # still needs the same pinned-canvas treatment as the non-overview
+            # path below (2026-07-22, additive: --overview + --pubclean was never
+            # exercised together before this, so this is new, not a regression).
+            if args.pubclean and args.pubclean_canvas_px:
+                # tight_layout() is a no-op here (confirmed: matplotlib warns
+                # "Axes that are not compatible with tight_layout" and the
+                # rendered output was pixel-identical with/without the call) --
+                # the nested outer/topgs/gs GridSpec plus the standalone
+                # fig.colorbar() axes aren't the simple single-level grid
+                # tight_layout knows how to repack. A naive uncropped full-Bbox
+                # save at the pin target therefore keeps the ORIGINAL (title-
+                # sized) top margin even though the two overview titles are
+                # gone under --pubclean, leaving a large blank gap. Fix: measure
+                # the actual tight content bbox directly (get_tightbbox) and
+                # center a fixed-size (w_in, h_in) window on it, so the pin
+                # target is filled the same way a natural tight crop would fill
+                # it, instead of showing raw canvas margin.
+                wpx, hpx = (int(v) for v in args.pubclean_canvas_px.lower().split("x"))
+                w_in, h_in = wpx / 300.0, hpx / 300.0
+                fig.set_size_inches(w_in, h_in)
+                fig.canvas.draw()
+                tbb = fig.get_tightbbox(fig.canvas.get_renderer())
+                cx = tbb.x0 + tbb.width / 2.0
+                cy = tbb.y0 + tbb.height / 2.0
+                from matplotlib.transforms import Bbox
+                full = Bbox([[cx - w_in / 2.0, cy - h_in / 2.0],
+                             [cx + w_in / 2.0, cy + h_in / 2.0]])
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches=full)
+            else:
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
         elif args.pubclean:
             fig.tight_layout(rect=(0, 0, 1, 1))
             if args.pubclean_canvas_px:

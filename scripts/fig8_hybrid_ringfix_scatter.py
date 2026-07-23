@@ -98,7 +98,7 @@ def panel_data(grids, season, stat):
 
 def make_figure(run_dir: Path, label: str, out_stem: str,
                  pubclean: bool = False, pubclean_canvas_px: str | None = None,
-                 log_density: bool = False):
+                 log_density: bool = False, panel_labels: bool = False):
     grids = load_run(run_dir)
     fig, axes = plt.subplots(2, 2, figsize=(9.0, 9.0))
     for ax, (season, stat, title) in zip(axes.ravel(), PANELS):
@@ -134,6 +134,16 @@ def make_figure(run_dir: Path, label: str, out_stem: str,
         ax.set_aspect("equal")
         if not pubclean:
             ax.set_title(title)
+        if panel_labels:
+            # In-panel text naming the quantity (Paul's explicit ask, 2026-07-22):
+            # plain text, axes-fraction top-left, no box/background -- distinct
+            # from an on-figure title/stat-box (Paul confirmed in-panel labels
+            # are fine under the no-on-figure-notes rule; titles/stat notes are
+            # not). Independent of --pubclean so it also works standalone, but
+            # the intended use is alongside --pubclean once the ax.set_title
+            # above is suppressed.
+            ax.text(0.04, 0.96, title, transform=ax.transAxes, va="top", ha="left",
+                    fontsize=11, color="0.15", zorder=6)
         ax.set_xlabel("Diviner $T_\\mathrm{bol}$ (K)")
         ax.set_ylabel("PTM3D $T_\\mathrm{bol}$ (K)")
 
@@ -183,18 +193,29 @@ def main():
                          "ranges, equal aspect, 1:1 line, gray points, blue hue) is "
                          "unchanged. Writes *_logd.{png,pdf} (or *_logd_pubclean with "
                          "--pubclean) instead of the default filenames.")
+    ap.add_argument("--panel-labels", action="store_true",
+                    help="Additive, default OFF (2026-07-22, Paul's explicit ask on "
+                         "manuscript v4 review): add an in-panel text label (top-left "
+                         "corner, axes-fraction placement, plain text, no box) naming "
+                         "each panel's quantity ('Summer max', 'Summer mean', 'Winter "
+                         "max', 'Winter mean'). Distinct from an on-figure title/stat "
+                         "box -- those stay suppressed under --pubclean; Paul confirmed "
+                         "in-panel labels are fine under the no-on-figure-notes rule. "
+                         "Appends _v2 to the output filename suffix.")
     args = ap.parse_args()
     apply_style()
     sp.furnsh(D.METAKERNEL)
-    suffix = ("_logd" if args.log_density else "") + ("_pubclean" if args.pubclean else "")
+    suffix = (("_logd" if args.log_density else "")
+              + ("_pubclean" if args.pubclean else "")
+              + ("_v2" if args.panel_labels else ""))
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/coupled"),
                 "coupled", f"fig8_hybrid_coupled_rigorous_ringfix_scatter{suffix}",
                 pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
-                log_density=args.log_density)
+                log_density=args.log_density, panel_labels=args.panel_labels)
     make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/radoff"),
                 "radoff", f"fig8_hybrid_radoff_rigorous_ringfix_scatter{suffix}",
                 pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
-                log_density=args.log_density)
+                log_density=args.log_density, panel_labels=args.panel_labels)
     sp.kclear()
 
 
