@@ -72,6 +72,27 @@ RUN_DIR_ABS: dict = {}
 # NOT the stale table default. Flagged rather than silently edited above,
 # since 3 other scripts share this same hardcoded tuple.
 CENTER_OVERRIDE: dict = {}
+# Small, unobtrusive white in-panel crater-name labels for the --overview LOLA
+# topography panel, (name, dx, dy, ha) with dx/dy in km relative to the site
+# center and `ha` the matplotlib text horizontal-alignment anchor -- keyed by
+# site so this is a no-op for haworth/faustini/shackleton. Positions for
+# "sunlit" derived from the real crater centers (Haworth: SITES table
+# -87.45,-2.1; Shoemaker: data/locations/locations_lunar_psr_south.txt
+# -88.1,50 -- the project's own PSR reference list) run through this module's
+# own TO_XY projection, THEN visually cross-checked against the actual LOLA
+# raster at both the 30km (--overview) and a wider 60km diagnostic extent
+# (2026-07-28, manuscript v5 Fig. 8 review): Haworth is confirmed as the
+# ~25km-radius basin dominating the upper-left/center of the panel (the
+# "sunlit" site sits on its south rim, consistent with the site's "Haworth SE
+# rim" name); Shoemaker's catalog center (dx=+38, dy=-18 km) falls just
+# outside the 30km half-width, but its ~25km rim visibly clips into the
+# panel's lower-right corner in the wider check -- matching Paul's own
+# expectation that only a rim portion is visible there. Shoemaker's label
+# uses ha="right" anchored near the panel edge (not "center") because the
+# full word at fontsize 8 bold otherwise ran past the axis frame on the right
+# (caught on the first render -- see session note).
+CRATER_LABELS = {"sunlit": [("Haworth", -15.0, 22.0, "center"),
+                            ("Shoemaker", 28.0, -19.0, "right")]}
 WINDOW_KM, CELL_M, CORE_KM = 15.0, 250.0, 15.0
 # Manuscript Fig. 8 site-overview row (--overview): wider-region LOLA topography +
 # Diviner summer Tbol,max context, with the CORE_KM comparison window outlined.
@@ -255,7 +276,7 @@ def _context_grids(lat0, lon0):
     return EL, DT, ext
 
 
-def _figure_with_overview(lat0, lon0, pubclean=False):
+def _figure_with_overview(lat0, lon0, pubclean=False, id_labels=False, site_key=None):
     """Manuscript Fig. 8 layout: a 1x2 site-overview row (LEFT = LOLA topography,
     RIGHT = Diviner summer Tbol,max, both over a wide ROI, with the CORE_KM
     comparison window outlined by a cyan circle + center cross) ABOVE an empty 4x3
@@ -267,7 +288,15 @@ def _figure_with_overview(lat0, lon0, pubclean=False):
     no-on-figure-identity-text treatment already applied to the 4x3 grid's
     per-column titles under --pubclean -- axis labels and colorbar labels (which
     already say "Elevation (m)" / "T (K)") are unaffected, and the caption carries
-    the panel identity instead."""
+    the panel identity instead.
+
+    id_labels (2026-07-28, additive, default OFF -- manuscript v5 Fig. 8 review):
+    Paul's content-identification labels, allowed under the no-on-figure-notes
+    rule (it bars data/stat annotations, not identity): re-adds the two overview
+    titles even under pubclean, using the NEW wording "LOLA topography" /
+    "Diviner $T_\\mathrm{bol}$" (replacing "Diviner summer $T_{bol,max}$"), and
+    draws small unobtrusive white crater-name labels (no boxes/arrows) inside the
+    LOLA topography panel from CRATER_LABELS[site_key] if present."""
     import matplotlib.gridspec as gridspec
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LightSource
@@ -285,14 +314,20 @@ def _figure_with_overview(lat0, lon0, pubclean=False):
                vmin=e0, vmax=e1)
     fig.colorbar(ScalarMappable(Normalize(e0, e1), "terrain"), ax=axT, shrink=0.85,
                  pad=0.03, label="Elevation (m)")
-    if not pubclean:
+    if id_labels or not pubclean:
         axT.set_title("LOLA topography", fontsize=11)
+    if id_labels:
+        for name, dx, dy, ha in CRATER_LABELS.get(site_key, []):
+            axT.text(dx, dy, name, color="white", fontsize=8, fontweight="bold",
+                     ha=ha, va="center", zorder=5)
     axD = fig.add_subplot(topgs[0, 1])
     dl, dh = np.nanpercentile(DT[np.isfinite(DT)], [2, 98])
     imD = axD.imshow(DT, origin="lower", extent=cext, cmap="inferno",
                      vmin=dl, vmax=dh)
     fig.colorbar(imD, ax=axD, shrink=0.85, pad=0.03, label="$T$ (K)")
-    if not pubclean:
+    if id_labels:
+        axD.set_title(r"Diviner $T_\mathrm{bol}$", fontsize=11)
+    elif not pubclean:
         axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
     for ax in (axT, axD):
         th = np.linspace(0, 2 * np.pi, 100)
@@ -344,6 +379,17 @@ def main(argv=None):
                          "shipped size) instead of letting the tight-bbox crop shrink "
                          "when the title/stat-box text is removed -- so the manuscript "
                          "can swap the two files 1:1 without a layout reflow.")
+    ap.add_argument("--id-labels", action="store_true",
+                    help="Content-IDENTIFICATION labels (Paul's manuscript v5 Fig. 8 "
+                         "review, 2026-07-28) -- allowed under the no-on-figure-notes "
+                         "rule, which bars data/stat annotations, not identity. Works "
+                         "WITH --pubclean (keeps the suptitle/stat-box suppressed) and "
+                         "adds: small per-column headers 'Diviner'/'model'/'difference' "
+                         "on the 4x3 grid's top row; '--overview' panel titles 'LOLA "
+                         "topography' / 'Diviner $T_\\mathrm{bol}$' (new wording, "
+                         "replaces the old 'Diviner summer $T_{bol,max}$'); and small "
+                         "white crater-name labels inside the LOLA panel from "
+                         "CRATER_LABELS. Default OFF -- no behavior change otherwise.")
     args = ap.parse_args(argv)
     for spec in args.run_dir:
         if "=" not in spec:
@@ -400,7 +446,8 @@ def main(argv=None):
         # per-site figure: 4 rows x 3 cols, optionally with the manuscript Fig. 8
         # site-overview row (LOLA topo + Diviner summer Tbol,max) prepended above.
         if args.overview:
-            fig, axes = _figure_with_overview(lat0, lon0, pubclean=args.pubclean)
+            fig, axes = _figure_with_overview(lat0, lon0, pubclean=args.pubclean,
+                                              id_labels=args.id_labels, site_key=key)
         else:
             fig, axes = plt.subplots(4, 3, figsize=(8.0, 10.2))
         for r, (season, stat_name, model, dvm, st, g) in enumerate(rows):
@@ -420,8 +467,11 @@ def main(argv=None):
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
                              label="K" if c < 2 else "$\\Delta$K")
                 if c > 0: ax.tick_params(labelleft=False)
-                if r == 0 and not args.pubclean:
-                    ax.set_title(["Diviner", "PTM3D", "model$-$Div"][c], fontsize=10)
+                if r == 0:
+                    if args.id_labels:
+                        ax.set_title(["Diviner", "model", "difference"][c], fontsize=9)
+                    elif not args.pubclean:
+                        ax.set_title(["Diviner", "PTM3D", "model$-$Div"][c], fontsize=10)
             axes[r, 0].set_ylabel(f"{season} {stat_name}\ny (km)", fontsize=9)
             if not args.pubclean:
                 axes[r, 2].text(0.03, 0.96, f"bias {st['bias']:+.1f}\nRMSE {st['rmse']:.1f}",
