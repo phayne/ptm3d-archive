@@ -29,6 +29,7 @@ guard is a useless guard.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -45,8 +46,24 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+LEDGER_PATH: Path | None = None  # set from --ledger; None => no ledger writes
+
+
 def log(msg: str) -> None:
     print(f"[cputime-guard {_ts()}] {msg}", flush=True)
+
+
+def ledger_write(entry: dict) -> None:
+    if LEDGER_PATH is None:
+        return
+    entry = dict(entry)
+    entry["ts"] = datetime.now().isoformat(timespec="seconds")
+    entry["source"] = "a3gt_cputime_stall_guard"
+    try:
+        with open(LEDGER_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        log(f"WARNING: could not write ledger {LEDGER_PATH}: {e}")
 
 
 def parse_cputime(s: str) -> float:
@@ -68,15 +85,74 @@ def parse_cputime(s: str) -> float:
     return days * 86400.0 + h * 3600.0 + m * 60.0 + sec
 
 
-def pids_for(pattern: str) -> list[int]:
+ORCHESTRATOR_MARKER = "a3gt_v2_orchestrator"  # hard exclusion; never kill this, ever
+
+
+def full_command(pid: int) -> str | None:
+    """Full command line (ps -o command=) for `pid`, or None if it's gone."""
     try:
-        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True,
-                           text=True, timeout=10)
-        if r.returncode != 0:
-            return []
-        return [int(x) for x in r.stdout.split()]
+        r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        out = r.stdout.strip()
+        return out or None
     except Exception:
-        return []
+        return None
+
+
+def parent_pid(pid: int) -> int | None:
+    try:
+        r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+        out = r.stdout.strip()
+        return int(out) if out else None
+    except Exception:
+        return None
+
+
+def pids_for(pattern: str) -> dict[int, str]:
+    """Return {pid: full_command} for processes whose ACTUAL COMMAND NAME
+    (comm -- i.e. the executable itself, argv[0]'s basename) matches
+    `pattern` EXACTLY, plus each match's DIRECT PARENT process if (and only
+    if) that specific parent's own command confirms it is
+    run_chunked_simulation.py.
+
+    2026-07-27 incident: the previous version used `pgrep -f pattern`
+    (substring-anywhere-in-the-full-command-line). The orchestrator's own
+    argv legitimately contains the literal string "ptm_thermal_sim" as the
+    VALUE of --ptm-bin (it launches the binary itself, elsewhere, via its
+    run_chunked child) -- `pgrep -f ptm_thermal_sim` matched the
+    ORCHESTRATOR process too, and when the guard killed it, the resume
+    mechanism the entire unattended-campaign design depends on died with it.
+    The GPU then sat idle ~2h with nothing left alive to notice or recover.
+
+    `pgrep -x` (exact comm match) cannot match the orchestrator: its comm is
+    the python interpreter (e.g. "Python"/"python3"), never
+    "ptm_thermal_sim". A hard string-exclusion on ORCHESTRATOR_MARKER is
+    ALSO applied to every candidate (sim match and parent alike) as
+    defense-in-depth, so no future pattern/parent-matching change can
+    silently reintroduce this failure mode."""
+    targets: dict[int, str] = {}
+    try:
+        r = subprocess.run(["pgrep", "-x", pattern], capture_output=True,
+                           text=True, timeout=10)
+        sim_pids = [int(x) for x in r.stdout.split()] if r.returncode == 0 else []
+    except Exception:
+        sim_pids = []
+
+    for pid in sim_pids:
+        cmd = full_command(pid)
+        if cmd is None or ORCHESTRATOR_MARKER in cmd:
+            continue
+        targets[pid] = cmd
+        ppid = parent_pid(pid)
+        if ppid is None or ppid in targets:
+            continue
+        pcmd = full_command(ppid)
+        if pcmd is None or ORCHESTRATOR_MARKER in pcmd:
+            continue
+        if "run_chunked_simulation.py" in pcmd:
+            targets[ppid] = pcmd
+    return targets
 
 
 def cputime_seconds(pids: list[int]) -> float | None:
@@ -99,11 +175,18 @@ def cputime_seconds(pids: list[int]) -> float | None:
     return total if alive else None
 
 
-def kill_pids(pids: list[int], dry_run: bool) -> None:
-    for pid in pids:
+def kill_pids(targets: dict[int, str], dry_run: bool, reason: str = "") -> None:
+    """Kill each pid in `targets`, logging (own log + ledger) the FULL
+    pid -> command mapping and why, so a kill is always auditable after the
+    fact -- never just a bare PID number."""
+    for pid, cmd in targets.items():
+        if ORCHESTRATOR_MARKER in cmd:  # belt-and-suspenders; should be
+            log(f"REFUSING to kill pid {pid} -- command contains "
+                f"{ORCHESTRATOR_MARKER!r} (orchestrator, never a kill target): {cmd}")
+            continue
         try:
             if dry_run:
-                log(f"DRY-RUN would SIGKILL pid {pid}")
+                log(f"DRY-RUN would SIGKILL pid {pid}: {cmd}")
                 continue
             # SIGCONT first so a SIGSTOPped/soft-hung process is resumed enough
             # to receive and act on the kill promptly, then SIGKILL.
@@ -112,7 +195,9 @@ def kill_pids(pids: list[int], dry_run: bool) -> None:
             except ProcessLookupError:
                 pass
             os.kill(pid, signal.SIGKILL)
-            log(f"SIGKILL sent to pid {pid}")
+            log(f"SIGKILL sent to pid {pid}: {cmd}")
+            ledger_write({"event": "guard_kill", "pid": pid, "command": cmd,
+                          "reason": reason})
         except ProcessLookupError:
             log(f"pid {pid} already gone")
         except Exception as e:  # pragma: no cover
@@ -123,25 +208,57 @@ def monitor(pattern: str, stall_limit_s: float, poll_s: float,
             dry_run: bool, max_ticks: int | None = None) -> int:
     """Watch `pattern`'s aggregate CPU time; kill on freeze > stall_limit_s.
     Returns 0 if it killed a stalled process, 1 if the process exited on its
-    own, 2 if max_ticks elapsed with the process healthy (used by the drill)."""
+    own, 2 if max_ticks elapsed with the process healthy (used by the drill).
+
+    2026-07-27 incident (2nd bug found investigating the 1st): this guard is
+    ARMED ONCE and runs continuously for the whole campaign, watching
+    whatever `pattern`-matching process happens to be alive at any moment --
+    but a SINGLE long-lived StallWatchdog was reused across WINDOW
+    TRANSITIONS too. When window N finishes (its pids gone, aggregate
+    cputime having climbed to some peak, e.g. 335564s) and window N+1 starts
+    (BRAND NEW pids, cputime starting fresh near 0), `StallWatchdog.update()`
+    compares the new small value against the OLD peak and reports "FROZEN"
+    from the very first sample of window N+1 -- regardless of whether it is
+    healthy. Confirmed from the raw log: Y05_summer's cputime climbed
+    steadily and genuinely (2377 -> 4947 -> ... -> 32741s over 17 real
+    minutes, unmistakably real computation) yet was labeled FROZEN
+    throughout, purely because it never caught up to window Y00_winter's
+    stale 335564s baseline. Every window in this campaign runs ~2+ hours,
+    which EXCEEDS the 90-min stall limit -- left unfixed, this would have
+    killed EVERY SUBSEQUENT HEALTHY WINDOW shortly after it started, forever.
+    Fix: track the pid SET (not just the cputime scalar) and start a FRESH
+    StallWatchdog whenever it changes -- a new pid set is definitionally a
+    new computation with no claim on the old one's progress history."""
     wd = StallWatchdog(stall_limit_s)
+    last_pid_set: frozenset[int] = frozenset()
     log(f"monitoring pattern={pattern!r}  stall_limit={stall_limit_s:.0f}s  "
         f"poll={poll_s:.0f}s  dry_run={dry_run}")
     ticks = 0
     while True:
-        pids = pids_for(pattern)
-        cpu = cputime_seconds(pids)
+        targets = pids_for(pattern)
+        pid_set = frozenset(targets.keys())
+        if pid_set and pid_set != last_pid_set:
+            log(f"pid set changed ({sorted(last_pid_set)} -> {sorted(pid_set)}) "
+                f"-- starting a FRESH stall baseline (a new window/process has "
+                f"no claim on the previous one's cputime history)")
+            wd = StallWatchdog(stall_limit_s)
+            last_pid_set = pid_set
+        cpu = cputime_seconds(list(targets.keys()))
         if cpu is None:
             log(f"no process matches {pattern!r} -- exited (nothing to kill)")
             return 1
         advanced = wd.update(cpu)
         quiet = wd.seconds_since_progress()
-        log(f"pids={pids} cputime={cpu:.2f}s "
+        log(f"pids={sorted(targets.keys())} cputime={cpu:.2f}s "
             f"{'advanced' if advanced else 'FROZEN'} quiet={quiet:.0f}s")
         if wd.is_stalled():
-            log(f"STALL: CPU time frozen {quiet:.0f}s >= {stall_limit_s:.0f}s "
-                f"-- KILLING {pids} (soft hang; orchestrator resume re-runs it)")
-            kill_pids(pids, dry_run)
+            log(f"STALL: CPU time frozen {quiet:.0f}s >= {stall_limit_s:.0f}s -- "
+                f"KILLING {sorted(targets.keys())} (soft hang; orchestrator "
+                f"resume re-runs it)")
+            for pid, cmd in targets.items():
+                log(f"  killing pid {pid}: {cmd}")
+            kill_pids(targets, dry_run,
+                     reason=f"cputime frozen {quiet:.0f}s >= {stall_limit_s:.0f}s")
             return 0
         ticks += 1
         if max_ticks is not None and ticks >= max_ticks:
@@ -204,7 +321,7 @@ def drill() -> int:
             if wd.is_stalled():
                 dt = time.time() - t_start
                 log(f"DRILL: stall detected after {dt:.1f}s -> issuing kill")
-                kill_pids([pid], dry_run=False)
+                kill_pids({pid: f"(drill burner) {sys.executable} -c ..."}, dry_run=False)
                 killed = True
                 break
             time.sleep(poll)
@@ -242,14 +359,29 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--drill", action="store_true",
                     help="run the SIGSTOP live-fire self-test and exit")
-    ap.add_argument("--pattern", help="pgrep -f pattern of the process to guard")
+    ap.add_argument("--pattern",
+                    help="EXACT process name (comm, i.e. the executable's own "
+                         "basename -- matched via `pgrep -x`, NOT a substring "
+                         "of the full command line) of the process to guard. "
+                         "Its direct parent is also included as a kill target "
+                         "iff that parent's own command confirms it is "
+                         "run_chunked_simulation.py. A process whose command "
+                         "contains 'a3gt_v2_orchestrator' is NEVER a target, "
+                         "regardless of pattern (2026-07-27 incident).")
     ap.add_argument("--stall-min", type=float, default=30.0,
                     help="kill if CPU time freezes for this many minutes (default 30)")
     ap.add_argument("--poll-sec", type=float, default=60.0,
                     help="sample interval in seconds (default 60)")
     ap.add_argument("--dry-run", action="store_true",
                     help="log the kill decision but do not actually kill")
+    ap.add_argument("--ledger", type=Path, default=None,
+                    help="Append a structured guard_kill event (pid, full "
+                         "command, reason) to this JSONL file on every kill, "
+                         "in addition to the guard's own stdout log.")
     a = ap.parse_args()
+
+    global LEDGER_PATH
+    LEDGER_PATH = a.ledger
 
     if a.drill:
         rc = drill()
