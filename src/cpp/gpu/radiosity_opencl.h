@@ -170,6 +170,14 @@ private:
     // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.
     void enqueueSpMV(cl_mem x, cl_mem y, size_t global_size, size_t local_size);
 
+public:
+    // Benchmark the isolated SpMV kernel (single-buffer path only): run the
+    // chosen kernel n_reps times back-to-back with clFinish fences, return total
+    // milliseconds. mode 0 = scalar (one work-item/row), 1 = vector (one
+    // wavefront/row, coalesced). Uses the uploaded CSR + buf_radiosity_ as x.
+    double benchmarkSpMV(int n_reps, int mode);
+private:
+
     // Release the chunked CSR sub-buffers and reset the chunked state (PTM-25).
     void releaseChunkBuffers();
 

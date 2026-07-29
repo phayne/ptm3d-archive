@@ -81,6 +81,34 @@ int main(int argc, char** argv) {
         solver.uploadFaceProperties(emiss, refl);
         std::printf("  upload done (%.0f ms)\n", now_ms() - t0); std::fflush(stdout);
 
+        // SpMV micro-benchmark: isolate kernel time (no Jacobi, no transfers).
+        // Single-buffer only. GPU float(values+cols)=8 B/nnz; CPU double+int=12.
+        if (std::getenv("PTM_ESC_BENCH")) {
+            const int reps = 20;
+            const double gpu_bytes = (double)nnz * 8.0;      // float vals + int cols
+            const double cpu_bytes = (double)nnz * 12.0;     // double vals + int cols
+            double ms_s = solver.benchmarkSpMV(reps, 0) / reps;
+            double ms_v = solver.benchmarkSpMV(reps, 1) / reps;
+            std::printf("  BENCH GPU scalar SpMV: %.2f ms  %.1f GB/s\n", ms_s, gpu_bytes/(ms_s/1e3)/1e9);
+            std::printf("  BENCH GPU vector SpMV: %.2f ms  %.1f GB/s  (speedup %.2fx)\n",
+                        ms_v, gpu_bytes/(ms_v/1e3)/1e9, ms_s/ms_v);
+            // CPU matvec, OpenMP, same CSR (double values). x = temps (arbitrary).
+            std::vector<double> y(n);
+            double c0 = now_ms();
+            for (int r = 0; r < reps; ++r) {
+                #pragma omp parallel for schedule(static)
+                for (long long i = 0; i < (long long)n; ++i) {
+                    double s = 0.0;
+                    for (long long k = rowptr[i]; k < rowptr[i+1]; ++k) s += vals[k] * temps[cols[k]];
+                    y[i] = s;
+                }
+            }
+            double ms_c = (now_ms() - c0) / reps;
+            std::printf("  BENCH CPU matvec (OMP): %.2f ms  %.1f GB/s  (GPU-vector vs CPU: %.2fx)\n",
+                        ms_c, cpu_bytes/(ms_c/1e3)/1e9, ms_c/ms_v);
+            std::fflush(stdout);
+        }
+
         for (int s = 0; s < n_solves; ++s) {
             double ts = now_ms();
             solver.solve(temps, solar, gpu_out);

@@ -232,6 +232,9 @@ if(GPU_BACKEND_USED STREQUAL "OPENCL")
     # escalation of the single-GPU radiosity SpMV to retire the 100M-nnz folklore.
     add_executable(gpu_spmv_escalation gpu_spmv_escalation.cpp)
     target_link_libraries(gpu_spmv_escalation PRIVATE ptm_gpu)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(gpu_spmv_escalation PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     set_target_properties(gpu_spmv_escalation PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 

@@ -721,6 +721,61 @@ void RadiosityOpenCLSolver::releaseChunkBuffers()
     use_chunked_csr_ = false;
 }
 
+double RadiosityOpenCLSolver::benchmarkSpMV(int n_reps, int mode)
+{
+    cl_command_queue queue = context_->queue();
+    cl_int err;
+    auto ck = [](cl_int e, const char* op) {
+        if (e != CL_SUCCESS)
+            throw std::runtime_error(std::string(op) + ": " + clErrorString(e));
+    };
+    const int n_faces = static_cast<int>(n_faces_);
+    auto tick = []() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now().time_since_epoch())
+                   .count() / 1000.0;
+    };
+
+    if (mode == 0) {
+        const size_t local_size = config_.work_group_size;
+        const size_t gs = ((n_faces_ + local_size - 1) / local_size) * local_size;
+        clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
+        clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
+        clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
+        clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
+        clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
+        clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces);
+        clFinish(queue);
+        const double t0 = tick();
+        for (int r = 0; r < n_reps; ++r) {
+            err = clEnqueueNDRangeKernel(queue, spmv_kernel_, 1, nullptr,
+                                         &gs, &local_size, 0, nullptr, nullptr);
+            ck(err, "scalar spmv");
+        }
+        clFinish(queue);
+        return tick() - t0;
+    } else {
+        const size_t warp = 64;  // AMD wavefront: coalesced cooperative row reads
+        const size_t gs = n_faces_ * warp;
+        clSetKernelArg(spmv_vector_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
+        clSetKernelArg(spmv_vector_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
+        clSetKernelArg(spmv_vector_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
+        clSetKernelArg(spmv_vector_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
+        clSetKernelArg(spmv_vector_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
+        clSetKernelArg(spmv_vector_kernel_, 5, sizeof(int), &n_faces);
+        clSetKernelArg(spmv_vector_kernel_, 6, warp * sizeof(float), nullptr);
+        clFinish(queue);
+        const double t0 = tick();
+        for (int r = 0; r < n_reps; ++r) {
+            err = clEnqueueNDRangeKernel(queue, spmv_vector_kernel_, 1, nullptr,
+                                         &gs, &warp, 0, nullptr, nullptr);
+            ck(err, "vector spmv");
+        }
+        clFinish(queue);
+        return tick() - t0;
+    }
+}
+
 void RadiosityOpenCLSolver::enqueueSpMV(cl_mem x, cl_mem y,
                                         size_t global_size, size_t local_size)
 {
