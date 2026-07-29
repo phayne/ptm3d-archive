@@ -29,7 +29,8 @@ conda-forge packaging (Phase 4).
 | OpenCL | optional | only for `PTM_ENABLE_GPU=ON` |
 
 Minimum useful machine: a **16 GB laptop** runs real science on **1k–100k-face meshes**
-(low-res bodies, asteroids). The 500k micro-crater class is workstation/cluster-scale. See
+(low-res bodies, asteroids). The 500k–1M-face class (micro-craters, high-resolution DEM
+sites) is workstation/cluster-scale, GPU recommended. See
 `docs/PORTABILITY-AUDIT.md` §4 for the memory scaling table, and estimate a run with:
 ```bash
 python3 scripts/ptm_mem_estimate.py --faces 100000 --steps 360   # -> ~0.80 GiB, OK on 16 GB

@@ -103,6 +103,13 @@ The resident-memory driver is `faces × timesteps × 3 flux components × 8 B`
 | 100k faces | 360 | ~0.9 GB | 16 GB laptop |
 | 100k faces | 1440 | ~3.5 GB | 16 GB laptop (borderline — stream) |
 | 500k faces | 1440 | ~17 GB | workstation / cluster |
+| 1M faces (high-res DEM site) | 360 | ~8.6 GB (+ sparse VF, ~8 GB†) | workstation; GPU recommended |
+
+† Sparse view-factor size with radiation exchange on: ~8 B per nonzero, and the
+partner count per face is **terrain-dependent** — measured ~1,040 partners/face
+(20 GB at 2.4M faces) on one polar site vs. 4.8 GB at 140k faces on a
+denser-coupled site. The ~8 GB figure scales the former; budget from your own
+mesh with a small test build.
 
 GPU (OpenCL) acceleration is optional: build with `-DPTM_ENABLE_GPU=ON` and
 profile the host once with `./build/bin/ptm_thermal_sim --calibrate-gpu`.
