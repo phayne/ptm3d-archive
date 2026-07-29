@@ -35,8 +35,10 @@ sunlight and thermal emission from surrounding terrain.*
   eclipses, and primary-body reflected + IR flux (e.g. Earthshine, Jupiter-shine)
 - **Thermal**: Crank-Nicolson conduction with T-dependent k(T), cp(T), adaptive
   depth grids, and FFT spectral equilibration for fast spin-up
-- **Radiation exchange**: sparse or H-matrix-compressed view factors with a
-  two-band (solar/IR) radiosity solver and adaptive thermal coupling
+- **Radiation exchange**: face-to-face view factors, stored sparsely or in
+  hierarchically compressed ("H-matrix") form to stay affordable at large face
+  counts, driving a two-band (solar/IR) radiosity solver coupled to the
+  thermal model
 - **Ice**: subsurface ice-stability depth (vapor diffusion), and a full Europa
   exosphere/ice-evolution research module
 - **Meshes**: built-in icosphere generator, PLY/OBJ/VTK import, DEM-to-mesh and
@@ -47,7 +49,8 @@ sunlight and thermal emission from surrounding terrain.*
 ## Validation
 
 - **Ingersoll et al. (1992)** analytic bowl-crater radiation: `test_bowl_crater`
-  passes with <0.5% view-factor error (this gate runs in CI)
+  passes with <0.5% view-factor error (the automated build-and-test checks run
+  this same test on every code change)
 - **Lunar Diviner** radiometer: RMS <4 K against measured bolometric temperatures
 - **Hayne et al. (2017)** 1D thermophysical model: reproduces the lunar
   equatorial diurnal cycle (noon ~388 K, night ~99 K) —
@@ -93,8 +96,9 @@ the outputs in [TUTORIAL.md](TUTORIAL.md) and [docs/tutorials/](docs/tutorials/)
 
 ## Hardware guidance
 
-The resident-memory driver is `faces × timesteps × 3 flux components × 8 B`
-(plus the view-factor matrix when radiation is on). Estimate any run with
+The dominant memory cost is the stored illumination time series:
+`faces × timesteps × 3 flux components × 8 bytes` (plus the view-factor matrix
+when radiation is on). Estimate any run with
 `python3 scripts/ptm_mem_estimate.py --faces N --steps M`.
 
 | Mesh size | Steps | Resident memory | Runs on |
@@ -105,11 +109,12 @@ The resident-memory driver is `faces × timesteps × 3 flux components × 8 B`
 | 500k faces | 1440 | ~17 GB | workstation / cluster |
 | 1M faces (high-res DEM site) | 360 | ~8.6 GB (+ sparse VF, ~8 GB†) | workstation; GPU recommended |
 
-† Sparse view-factor size with radiation exchange on: ~8 B per nonzero, and the
-partner count per face is **terrain-dependent** — measured ~1,040 partners/face
-(20 GB at 2.4M faces) on one polar site vs. 4.8 GB at 140k faces on a
-denser-coupled site. The ~8 GB figure scales the former; budget from your own
-mesh with a small test build.
+† Size of the sparse view-factor matrix when radiation exchange is on: about
+8 bytes per stored matrix entry, and the number of radiatively coupled partner
+faces per face is **terrain-dependent** — measured ~1,040 partners per face
+(20 GB at 2.4M faces) on one polar site vs. 4.8 GB at 140k faces on a site
+where each face couples to more of its surroundings. The ~8 GB figure scales
+the former; budget from your own mesh with a small test build.
 
 GPU (OpenCL) acceleration is optional: build with `-DPTM_ENABLE_GPU=ON` and
 profile the host once with `./build/bin/ptm_thermal_sim --calibrate-gpu`.

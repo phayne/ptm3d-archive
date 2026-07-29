@@ -79,7 +79,7 @@ output:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `include_primary_reflection` | bool | true | Include reflected light |
-| `use_batch_processing` | bool | true | Use SIMD batching |
+| `use_batch_processing` | bool | true | Trace illumination rays in vectorized batches (faster; identical results) |
 | `albedo_map` | string | "" | Path to albedo map |
 
 ### radiation

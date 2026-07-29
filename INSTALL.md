@@ -1,7 +1,8 @@
 # Installing PTM3D
 
-PTM3D is a C++/OpenCL planetary thermophysical model. The **portable core is CPU-first**
-(threaded); the GPU (OpenCL) path is an **optional accelerator** where it exists. This guide
+PTM3D is a planetary thermophysical model written in C++. The **core model runs entirely on
+ordinary CPUs** (using all available cores); the GPU (OpenCL) path is an **optional
+accelerator** where suitable hardware exists. This guide
 covers a source build on Linux and macOS. On **Windows, use WSL2** (Ubuntu) and follow the
 Linux instructions — a native MSVC build is planned (portability plan Phase 2), as is
 conda-forge packaging (Phase 4).
@@ -45,7 +46,7 @@ sudo apt-get install -y cmake g++ libomp-dev libeigen3-dev libcfitsio-dev \
                         libyaml-cpp-dev libembree-dev pkg-config
 ```
 If `libembree-dev` is Embree 3 on your image, install Embree 4 from the official release tarball
-and point CMake at it (`-Dembree_DIR=` or the `EMBREE_INCLUDE_DIRS`/`EMBREE_LIBRARIES` cache vars).
+and point CMake at it (the `-Dembree_DIR=` or `EMBREE_INCLUDE_DIRS`/`EMBREE_LIBRARIES` settings).
 
 ### macOS (Homebrew)
 ```bash
@@ -63,7 +64,8 @@ cp cspice/lib/cspice.a cspice/lib/libcspice.a
 export CSPICE_ROOT="$PWD/cspice"
 ```
 PTM3D resolves CSPICE from `-DCSPICE_ROOT=`, then `$CSPICE_ROOT`/`$CSPICE_DIR`, then common
-prefixes. It FATAL_ERRORs with an actionable message if it can't find `libcspice.a`.
+prefixes. If it cannot find `libcspice.a`, the configure step stops with a clear error message
+saying what to set.
 
 ## 3. Configure & build
 
@@ -93,7 +95,8 @@ On macOS the legacy `-DENABLE_GPU=ON` still works (it is the compatibility alias
 
 Building links against the CSPICE **library** (§2); *running* additionally needs SPICE
 **kernel data** (ephemerides, orientation, leapseconds). These are large binary files that
-are not in git — fetch them from NASA NAIF with the bundled, stdlib-only script:
+are not kept in the repository — fetch them from NASA NAIF with the bundled Python script
+(no extra Python packages required):
 
 ```bash
 python3 scripts/fetch_kernels.py                  # Moon + Mercury set (~45 MB)
@@ -112,17 +115,18 @@ data/kernels/
 └── spk/de440s.bsp                   # planetary ephemeris
 ```
 
-Downloads are resumable and SHA-256-verified; re-running the script skips completed files.
+Interrupted downloads resume where they left off, every file is verified against a known
+checksum (SHA-256), and re-running the script skips files that are already complete.
 
 Two things to know:
 
-- The kernel directory is compiled in as `SPICE_KERNELS_DIR` (CMake cache variable,
+- The kernel directory is built into the binary as `SPICE_KERNELS_DIR` (a CMake setting,
   default `<source-dir>/data/kernels`). Override at configure time with
   `-DSPICE_KERNELS_DIR=/abs/path` if you keep kernels elsewhere.
-- The shipped metakernels use **repo-root-relative** paths
-  (`PATH_VALUES = ('data/kernels')`), which SPICE resolves against the *current working
-  directory* — so **run `ptm_thermal_sim` from the repository root** (as all examples and
-  tutorials do), or edit `PATH_VALUES` to an absolute path.
+- The shipped metakernels use paths **relative to the repository root**
+  (`PATH_VALUES = ('data/kernels')`), which SPICE interprets relative to the directory the
+  program is started from — so **run `ptm_thermal_sim` from the repository root** (as all
+  examples and tutorials do), or edit `PATH_VALUES` to an absolute path.
 
 Small bodies driven by JPL Horizons (`generic_body` configs) cache their own ephemerides
 under `data/horizons_cache/` and need only `lsk/naif0012.tls` from the above.
@@ -134,7 +138,7 @@ under `data/horizons_cache/` and need only `lsk/naif0012.tls` from the above.
 cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
 # Spectral equilibration:
 cmake --build build --target test_equilibration_dt -j && ./build/bin/test_equilibration_dt
-# Phase R runtime-robustness unit tests (no deps):
+# Runtime-robustness unit tests (no external libraries needed):
 c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp_mp
 python3 scripts/test_ptm_run_guard.py
 ```
@@ -152,8 +156,9 @@ after fetching kernels per §4):
 - Configs under `examples/campaigns/` are internal production-campaign artifacts with
   machine-specific absolute paths and are **not runnable from a clone** (see the README
   there). Everything directly in `examples/` uses relative paths.
-- `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` dir; build the individual
-  test targets directly (as in §4).
-- The GPU path is macOS+AMD-tested; the Phase R machine profile + solver self-chunking guard against
-  the driver command-buffer watchdog. On an un-profiled host the solver uses conservative defaults
-  and warns.
+- `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
+  individual test programs directly (as in §5).
+- The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
+  calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
+  driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver
+  falls back to conservative limits and says so in the log.

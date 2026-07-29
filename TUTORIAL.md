@@ -40,8 +40,9 @@ Expected (verified 2026-07-29, CPU-only build):
 ```
 
 The view-factor error vs. the analytic bowl-crater solution is **<0.5%** and
-reciprocity holds to machine precision. This is the same gate CI runs
-(`Result: PASSED` appears once per tested crater configuration).
+reciprocity holds to machine precision. The automated build-and-test checks run
+this same test on every code change (`Result: PASSED` appears once per tested
+crater configuration).
 
 ## Step 2 — A global Moon diurnal run (thermal, CPU)
 
@@ -69,9 +70,9 @@ the coupled run, then compare crater-floor temperatures:
 ./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
 ```
 
-Expected: the coupled run builds (and saves) an H-matrix view-factor set, the
-coupling loop converges, and shadowed floor faces come out warmer than the
-control — walkthrough and verified numbers in
+Expected: the coupled run computes (and saves for reuse) the face-to-face view
+factors, the radiation–temperature iteration converges, and shadowed floor
+faces come out warmer than the control — walkthrough and verified numbers in
 [docs/tutorials/04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md).
 
 ## What you exercised

@@ -128,8 +128,8 @@ src/cpp/
 |--------|-------------|-------------|
 | **thermal** | `thermal::Model`, `thermal::Profile`, `thermal::Config` | 1D Crank-Nicolson heat conduction with temperature-dependent properties, adaptive depth grids, and FFT-based spectral equilibration for fast spin-up |
 | **illumination** | `IlluminationModel` | Shadow ray tracing (Embree), finite solar disk integration, primary-body reflected and thermal IR flux, eclipse geometry via SPICE |
-| **radiation** | `RadiationExchangeManager`, `RadiositySolver`, `ViewFactorMatrix`, `HMatrixViewFactor` | Sparse or H-matrix compressed view factors, Jacobi/Gauss-Seidel radiosity iteration, adaptive thermal-radiation coupling |
-| **gpu** | `ThermalOpenCLSolver`, `RadiosityOpenCLSolver`, `BVHRayTracer` | GPU-accelerated thermal solver (register-based Thomas algorithm), radiosity (SpMV Jacobi), and BVH shadow ray tracing |
+| **radiation** | `RadiationExchangeManager`, `RadiositySolver`, `ViewFactorMatrix`, `HMatrixViewFactor` | Face-to-face view factors stored as a sparse matrix (compressed sparse row, "CSR", format) or in hierarchically compressed ("H-matrix") form; Jacobi/Gauss-Seidel radiosity iteration; adaptive thermal-radiation coupling |
+| **gpu** | `ThermalOpenCLSolver`, `RadiosityOpenCLSolver`, `BVHRayTracer` | GPU-accelerated thermal solver (tridiagonal Thomas-algorithm solve), radiosity (sparse matrix–vector Jacobi iteration), and shadow ray tracing |
 | **orbital** | `GenericBody`, `KeplerPropagator` | Keplerian orbit propagation, SPICE/Horizons ephemeris, body-fixed coordinate frames, spin state |
 | **mesh** | `ptm::Mesh` | Icosphere generation, PLY/OBJ/VTK import, face normals/areas/centers, VTK export |
 | **ice** | Ice stability solver | Vapor diffusion and Newton-Raphson ice table depth |
@@ -153,7 +153,7 @@ src/cpp/
 **Radiation Exchange**:
 - Radiosity equation: $B_i = \varepsilon_i \sigma T_i^4 + \rho_i \sum_j F_{ij} B_j + \rho_i Q_{\text{solar},i}$
 - View factor methods: centroid (far field) and subdivision (near field), selected adaptively by dimensionless separation $N_s = r/\sqrt{A}$
-- H-matrix compression with octree spatial partitioning, ACA low-rank approximation, and $O(N \log N)$ matrix-vector products
+- Hierarchical-matrix ("H-matrix") compression with octree spatial partitioning, low-rank block compression by adaptive cross approximation (ACA), and $O(N \log N)$ matrix–vector multiplication cost
 - Adaptive thermal-radiation coupling: selective face re-run, warm-start solver, convergence on temperature and flux criteria
 
 **Exosphere Model**:
