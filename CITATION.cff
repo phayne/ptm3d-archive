@@ -1,0 +1,44 @@
+# Citation metadata for PTM3D (Citation File Format, https://citation-file-format.github.io/)
+cff-version: 1.2.0
+message: "If you use PTM3D in your research, please cite it as below."
+title: "PTM3D: Planetary Thermophysical Model 3D"
+type: software
+authors:
+  - family-names: Hayne
+    given-names: Paul O.
+    affiliation: "University of Colorado Boulder"
+    email: paul.hayne@colorado.edu
+repository-code: "https://github.com/phayne/ptm3d"
+url: "https://github.com/phayne/ptm3d"
+license: MIT
+version: v1.0-rc1
+date-released: "2026-07-29"
+# doi: 10.5281/zenodo.XXXXXXX   # <- uncomment and fill after the Zenodo deposit
+keywords:
+  - planetary science
+  - thermal model
+  - thermophysical
+  - Moon
+  - Europa
+  - permanently shadowed regions
+  - radiosity
+  - SPICE
+references:
+  - type: article
+    title: "Global regolith thermophysical properties of the Moon from the Diviner Lunar Radiometer Experiment"
+    authors:
+      - family-names: Hayne
+        given-names: Paul O.
+    journal: "Journal of Geophysical Research: Planets"
+    volume: 122
+    year: 2017
+    doi: 10.1002/2017JE005387
+  - type: article
+    title: "Fast hierarchical low-rank view factor matrices for thermal irradiance on planetary surfaces"
+    authors:
+      - family-names: Potter
+        given-names: Samuel F.
+    journal: "Journal of Computational Physics: X"
+    volume: 17
+    year: 2023
+    doi: 10.1016/j.jcpx.2023.100130
