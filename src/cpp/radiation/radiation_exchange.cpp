@@ -148,12 +148,32 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                       << "must not run — re-assemble. Aborting.\n";
             std::exit(3);
         }
-        F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
-                    std::move(indptr), std::move(cols), std::move(data));
-        std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
-                     "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
-                     "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
-                     "under-coupling; reciprocity by construction." << std::endl;
+        // Route the corrected CSR: default = CPU SparseVFOperator (unchanged);
+        // PTM_HMATRIX_VF_REPLACE_GPU = build a ViewFactorMatrix and set F_ptr_ so
+        // initGPU + the multi-GPU pool + the chunked-vector kernel run it. The
+        // invariant checks above (mesh-hash, ΣF<=1, non-negativity) are identical
+        // for both routes. Gate unset => this branch is not taken => byte-identical.
+        if (std::getenv("PTM_HMATRIX_VF_REPLACE_GPU")) {
+            std::vector<double> data_d(data.begin(), data.end());  // float -> double
+            data.clear(); data.shrink_to_fit();
+            owned_vf_ = std::make_unique<ViewFactorMatrix>();
+            owned_vf_->setFromCSR(static_cast<size_t>(nn),
+                                  std::move(indptr), std::move(cols), std::move(data_d));
+            F_ptr_ = owned_vf_.get();
+            F_op_ = std::make_unique<ViewFactorOperator>(*owned_vf_);  // CPU fallback, same matrix
+            use_hmatrix_ = false;  // corrected VF is now a sparse ViewFactorMatrix, not H-matrix
+            std::cout << "  [PTM_HMATRIX_VF_REPLACE_GPU] Routed corrected VF to the GPU F_ptr_ path "
+                         "(nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, min entry=" << neg
+                      << ", mesh-hash OK); initGPU will use the chunked-vector radiosity pool."
+                      << std::endl;
+        } else {
+            F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
+                        std::move(indptr), std::move(cols), std::move(data));
+            std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
+                         "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
+                         "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
+                         "under-coupling; reciprocity by construction." << std::endl;
+        }
     }
 
     // PTM-12 row-sum correction (occlusion-aware referee). Install a symmetric
@@ -431,41 +451,35 @@ void RadiositySolver::initGPU() {
     size_t n = emissivity_.size();
     size_t nnz = F_ptr_->numNonZeros();
 
-    // Soft limit: GPU SpMV with very large sparse matrices was historically
-    // unreliable on AMD drivers (kernel execution could crash with >100M
-    // non-zeros). The limit is bypassed when the user explicitly opts into
-    // the multi-GPU pool path (gpu_devices > 1 or gpu_device_ids set) —
-    // they are committing to the new code path and accept the risk for the
-    // larger meshes the pool was designed to handle.
-    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros default ceiling
-    // The multi-GPU pool two-band path is not implemented this pass, so two-band
-    // always uses the single-GPU path (want_pool forced false).
-    const bool want_pool = !two_band_
-                            && ((config_.gpu_devices > 1)
-                                || !config_.gpu_device_ids.empty());
-    if (nnz > MAX_GPU_NNZ && !want_pool) {
-        std::cout << "Note: Sparse matrix too large for reliable single-GPU radiosity solver\n";
-        std::cout << "  Non-zeros: " << nnz / 1000000 << "M (limit: " << MAX_GPU_NNZ / 1000000 << "M)\n";
-        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
-        std::cout << "  Tip: enable the multi-GPU pool with radiation.gpu_devices > 1 to bypass this limit.\n";
-        return;
-    }
-    if (nnz > MAX_GPU_NNZ && want_pool) {
-        std::cout << "Note: Sparse matrix has " << nnz / 1000000 << "M non-zeros (>"
-                  << MAX_GPU_NNZ / 1000000
-                  << "M soft limit); proceeding because multi-GPU pool was requested\n";
-    }
+    // The multi-GPU pool handles both gray and two-band (2d): the per-device
+    // solvers do the IR + visible solve with per-band capture in solveBatch().
+    const bool want_pool = (config_.gpu_devices > 1)
+                            || !config_.gpu_device_ids.empty();
 
-    // Check if sparse matrix fits in GPU memory before attempting
-    // CSR format requires: nnz * sizeof(float) for values
-    //                    + nnz * sizeof(int) for column indices
-    //                    + (n+1) * sizeof(int) for row pointers
-    // Plus working buffers: 7 * n * sizeof(float) for vectors
-    size_t csr_memory = nnz * sizeof(float) + nnz * sizeof(int) + (n + 1) * sizeof(int);
-    size_t working_memory = 7 * n * sizeof(float);  // radiosity vectors, temps, etc.
-    size_t total_gpu_memory_needed = csr_memory + working_memory;
+    // Device footprint. The single-GPU solver and every pool device each hold a
+    // FULL replica of the CSR. The 32-bit addressing wall (PTM-25) is handled by
+    // the solver's chunked sub-buffers, so there is NO per-buffer nnz ceiling
+    // here (the old 100M-nnz "soft limit" is retired) -- the only question is
+    // whether the replica + working buffers fit a device's VRAM.
+    const size_t csr_bytes = nnz * sizeof(float)      // values (float on device)
+                           + nnz * sizeof(int)        // column indices
+                           + (n + 1) * sizeof(int);   // row pointers (int32 on device)
+    const size_t working_bytes = 12 * n * sizeof(float);  // ~11 state buffers + margin
+    const size_t needed_bytes = csr_bytes + working_bytes;
 
-    // Create temporary solver just to check GPU memory
+    // Real VRAM-fit check (replaces the old fixed 50%-of-total folklore, which
+    // wrongly rejected multi-GB CSRs that fit comfortably): the replica must fit
+    // with a reserve for the driver + kernel scratch (15% of VRAM, min 2 GB).
+    auto deviceReserve = [](size_t global_mem) -> size_t {
+        return std::max<size_t>((global_mem / 100) * 15,
+                                static_cast<size_t>(2) * 1024 * 1024 * 1024);
+    };
+    auto fitsDevice = [&](size_t global_mem) -> bool {
+        return global_mem > deviceReserve(global_mem)
+            && needed_bytes <= global_mem - deviceReserve(global_mem);
+    };
+    auto gb = [](size_t b) -> double { return b / (1024.0 * 1024.0 * 1024.0); };
+
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
@@ -475,11 +489,6 @@ void RadiositySolver::initGPU() {
     // the GPU result deterministic + comparable to the always-cold-started CPU path.
     if (two_band_) gpu_config.warm_start = false;
 
-    // When the multi-GPU pool is requested, skip the single-GPU solver path
-    // entirely — the pool's per-device persistent solvers will handle every
-    // solve via solveBatch(). Avoids redundant device 0 allocation and
-    // dodges the >100M-nnz single-GPU stability concerns the pool was
-    // designed to bypass.
     std::vector<float> emissivity_f(n);
     std::vector<float> reflectivity_f(n);
     for (size_t i = 0; i < n; ++i) {
@@ -487,59 +496,60 @@ void RadiositySolver::initGPU() {
         reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
     }
 
-    if (!want_pool) {
+    // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
+    // Every failure is loud (never a silent drop to CPU); the CSR upload is
+    // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25).
+    auto try_single_gpu = [&]() -> bool {
         gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
-
         if (!gpu_solver_->initialize()) {
-            std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
-                      << "falling back to CPU\n";
+            std::cerr << "[Radiosity] single-GPU solver failed to initialize.\n";
             gpu_solver_.reset();
-            return;
+            return false;
         }
-
-        // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
-        // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
-        size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
-        size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
-
-        if (total_gpu_memory_needed > gpu_mem_limit) {
-            std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
-            std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-            std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
-            std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
-            std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        // Fault injection (test-only, fail-loud): force the single-GPU rung to
+        // fail so the degrade to CPU can be exercised deliberately.
+        if (std::getenv("PTM_RAD_FORCE_SINGLE_FAIL")) {
+            std::cerr << "[Radiosity] PTM_RAD_FORCE_SINGLE_FAIL set: forcing single-GPU "
+                         "rung failure (test); degrading to CPU radiosity.\n";
             gpu_solver_.reset();
-            return;
+            return false;
         }
-
-        if (config_.verbose) {
-            std::cout << "GPU radiosity memory check passed:\n";
-            std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
-            std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
-            std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-            std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
+        const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
+        if (!fitsDevice(dev_mem)) {
+            std::cout << "[Radiosity] single-GPU: CSR replica + working "
+                      << gb(needed_bytes) << " GB does not fit device ("
+                      << gb(dev_mem) << " GB VRAM, reserve "
+                      << gb(deviceReserve(dev_mem)) << " GB).\n";
+            gpu_solver_.reset();
+            return false;
         }
-
-        // Upload view factor CSR data
-        gpu_solver_->uploadViewFactors(
-            F_ptr_->values(),
-            F_ptr_->colIndices(),
-            F_ptr_->rowPointers());
-        gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
-
+        try {
+            gpu_solver_->uploadViewFactors(F_ptr_->values(),
+                                           F_ptr_->colIndices(),
+                                           F_ptr_->rowPointers());
+            gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+        } catch (const std::exception& e) {
+            std::cerr << "[Radiosity] single-GPU CSR upload failed: " << e.what() << "\n";
+            gpu_solver_.reset();
+            return false;
+        }
         use_gpu_ = true;
         if (two_band_) {
             two_band_gpu_ok_ = true;
             std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: single-GPU band-separated "
                          "radiosity ENABLED (all Σ_j F_ij ≤ 1; IR solar=0 + visible ε←1-A/ρ←A).\n";
         }
-    }
+        std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
+                  << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
+                  << " GB device).\n";
+        return true;
+    };
 
-    // Multi-GPU dispatch pool (only when gpu_devices > 1). The single-GPU
-    // path above stays in place even when the pool is active so that
-    // single-timestep solve() callers (the CPU fallback hook + direct
-    // computeIndirectFlux callers) still work; the batched solveBatch()
-    // path is what actually uses the pool.
+    // ---- Degrade ladder: multi-GPU pool -> single-GPU -> CPU ----
+    // Every downgrade warns (never silent) and the ACTIVE RUNG is always named.
+
+    // Rung 1: multi-GPU pool (only when gpu_devices > 1 / device_ids set, and not
+    // two-band -- 2d). On any failure we fall through to the single-GPU rung.
     if (want_pool) {
         // Resolve which physical devices to use (mirrors the thermal pool).
         std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
@@ -563,13 +573,33 @@ void RadiositySolver::initGPU() {
             for (int i = 0; i < n_req; ++i) chosen.push_back(all_gpus[i]);
         }
 
-        if (chosen.size() < 2) {
-            if (config_.verbose) {
-                std::cout << "[Radiosity Pool] Pool not instantiated "
-                             "(only " << chosen.size() << " device(s) selected); "
-                             "single-GPU path remains active\n";
+        bool pool_ok = chosen.size() >= 2;
+        if (!pool_ok) {
+            std::cout << "[Radiosity] multi-GPU pool: only " << chosen.size()
+                      << " device(s) selected; degrading to single-GPU.\n";
+        }
+        // Real per-device fit: each device replicates the full CSR.
+        size_t min_dev = pool_ok ? chosen.front().global_mem_size : 0;
+        if (pool_ok) {
+            for (const auto& d : chosen) min_dev = std::min(min_dev, d.global_mem_size);
+            if (!fitsDevice(min_dev)) {
+                pool_ok = false;
+                std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
+                          << " GB does not fit the smallest device (" << gb(min_dev)
+                          << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
+                          << " GB); degrading to single-GPU.\n";
             }
-        } else {
+        }
+
+        // Fault injection (test-only, fail-loud): force the multi-GPU pool rung
+        // to fail so the degrade to single-GPU can be exercised deliberately.
+        if (pool_ok && std::getenv("PTM_RAD_FORCE_POOL_FAIL")) {
+            std::cout << "[Radiosity] PTM_RAD_FORCE_POOL_FAIL set: forcing multi-GPU "
+                         "pool failure (test); degrading to single-GPU.\n";
+            pool_ok = false;
+        }
+
+        if (pool_ok) {
             gpu::opencl::RadiosityGPUPoolConfig pool_cfg;
             pool_cfg.devices = chosen;
             pool_cfg.inter_batch_pause_ms = config_.gpu_inter_batch_pause_ms;
@@ -579,43 +609,47 @@ void RadiositySolver::initGPU() {
             solver_cfg.max_iterations = config_.max_iterations;
             solver_cfg.convergence_tolerance = config_.convergence_tolerance;
             solver_cfg.verbose = config_.verbose;
-            // Cross-batch warm-start has no meaning across devices — disable
-            // it so each batch's first timestep starts from cold radiosity.
-            // Cost: typically 5-10 extra Jacobi iterations on the first
-            // timestep of each batch.
+            // Cross-batch warm-start has no meaning across devices — disable it.
             solver_cfg.warm_start = false;
 
             gpu_pool_ = std::make_unique<gpu::opencl::RadiosityGPUDevicePool>(
                 std::move(pool_cfg));
-            if (!gpu_pool_->initialize(n, solver_cfg)) {
-                std::cerr << "Warning: Failed to initialize multi-GPU radiosity "
-                             "pool; falling back to single-GPU path\n";
-                gpu_pool_.reset();
-            } else if (!gpu_pool_->uploadStaticData(F_ptr_->values(),
+            bool ok = gpu_pool_->initialize(n, solver_cfg);
+            if (ok) {
+                try {
+                    ok = gpu_pool_->uploadStaticData(F_ptr_->values(),
                                                      F_ptr_->colIndices(),
                                                      F_ptr_->rowPointers(),
-                                                     emissivity_f,
-                                                     reflectivity_f)) {
-                std::cerr << "Warning: Failed to replicate radiosity static "
-                             "data to pool devices; falling back to "
-                             "single-GPU path\n";
+                                                     emissivity_f, reflectivity_f);
+                } catch (const std::exception& e) {
+                    std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
+                              << e.what() << "\n";
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                std::cout << "[Radiosity] multi-GPU pool init/upload failed; "
+                             "degrading to single-GPU.\n";
                 gpu_pool_.reset();
             } else {
                 pool_batch_size_ = (config_.gpu_batch_size > 0)
                     ? config_.gpu_batch_size
                     : 4 * static_cast<int>(gpu_pool_->numDevices());
-                if (config_.verbose) {
-                    std::cout << "[Radiosity Pool] Active: "
-                              << gpu_pool_->numDevices() << " GPU(s), "
-                              << "batch_size=" << pool_batch_size_
-                              << " timesteps per dispatch\n";
-                }
+                std::cout << "[Radiosity] ACTIVE RUNG: multi-GPU pool, "
+                          << gpu_pool_->numDevices() << " device(s); CSR replica "
+                          << gb(needed_bytes) << " GB/device (smallest device "
+                          << gb(min_dev) << " GB VRAM); batch_size="
+                          << pool_batch_size_ << " timesteps/dispatch.\n";
+                return;  // pool active -- done
             }
         }
+        // Fall through: any pool failure degrades to the single-GPU rung.
     }
 
-    if (config_.verbose) {
-        std::cout << "GPU radiosity solver enabled\n";
+    // Rung 2: single-GPU. Rung 3 (CPU) is implicit when this returns false.
+    if (!try_single_gpu()) {
+        std::cout << "[Radiosity] ACTIVE RUNG: CPU radiosity (no GPU rung available; "
+                     "normal for very large meshes or headless devices).\n";
     }
 #endif
 }
@@ -739,10 +773,37 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     }
 
     // Multi-GPU dispatch: split the n_steps timesteps round-robin across
-    // pool devices. Each device's worker iterates over its assigned slice
-    // and runs solve() (synchronous on that device).
+    // pool devices. Timesteps are striped WHOLE (never split), so each device
+    // solves an independent set of timesteps against its full CSR replica -->
+    // the per-timestep result is identical to the single-GPU path.
     const size_t n_dev = gpu_pool_->numDevices();
     const size_t n = emissivity_.size();
+    const bool tb = two_band_;
+
+    // Two-band per-band batch storage (pool path). Pre-size to n_steps so the
+    // device workers write disjoint timestep slots without racing.
+    if (tb) {
+        last_indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        last_indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        last_indirect_ir_batch_.clear();
+        last_indirect_vis_batch_.clear();
+    }
+
+    // Two property sets, built once (read-only, shared across workers): IR uses
+    // (eps, 1-eps); visible uses (1-A, A) from the per-face Bond albedo. Mirrors
+    // solveGPUTwoBand exactly so the pool per-band == single-GPU per-band.
+    std::vector<float> emiss_f, refl_f, visE_f, visR_f;
+    if (tb) {
+        emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            emiss_f[i] = static_cast<float>(emissivity_[i]);
+            refl_f[i]  = static_cast<float>(reflectivity_[i]);
+            const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+            visR_f[i] = static_cast<float>(A);
+            visE_f[i] = static_cast<float>(1.0 - A);
+        }
+    }
 
     std::vector<std::future<bool>> futures;
     futures.reserve(n_dev);
@@ -755,29 +816,67 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
         if (device_steps.empty()) continue;
 
-        futures.push_back(gpu_pool_->submit(
-            [&temperatures_per_timestep, &solar_flux_per_timestep,
-             &indirect_per_timestep, device_steps, n,
-             &row_norm = vf_row_norm_](
-                gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
-                std::vector<float> temps_f(n), solar_f(n), indirect_f;
-                for (size_t k : device_steps) {
-                    const auto& temps_d = temperatures_per_timestep[k];
-                    const auto& solar_d = solar_flux_per_timestep[k];
-                    for (size_t i = 0; i < n; ++i) {
-                        temps_f[i] = static_cast<float>(temps_d[i]);
-                        solar_f[i] = static_cast<float>(solar_d[i]);
+        if (tb) {
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n, &row_norm = vf_row_norm_,
+                 &emiss_f, &refl_f, &visE_f, &visR_f,
+                 &ir_batch = last_indirect_ir_batch_,
+                 &vis_batch = last_indirect_vis_batch_](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), zeros_f(n, 0.0f), ir_f, vis_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            solar_f[i] = static_cast<float>(solar_d[i]);
+                        }
+                        // IR band (device holds IR props), then visible, then
+                        // restore IR -- identical sequence to solveGPUTwoBand.
+                        solver.solve(temps_f, zeros_f, ir_f);
+                        solver.uploadFaceProperties(visE_f, visR_f);
+                        solver.solve(zeros_f, solar_f, vis_f);
+                        solver.uploadFaceProperties(emiss_f, refl_f);
+                        auto& out = indirect_per_timestep[k]; out.resize(n);
+                        auto& obi = ir_batch[k];
+                        auto& obv = vis_batch[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                            const double vir  = static_cast<double>(ir_f[i])  * norm;
+                            const double vvis = static_cast<double>(vis_f[i]) * norm;
+                            obi[i] = vir;
+                            obv[i] = vvis;
+                            out[i] = vir + vvis;
+                        }
                     }
-                    solver.solve(temps_f, solar_f, indirect_f);
-                    auto& out = indirect_per_timestep[k];
-                    out.resize(n);
-                    for (size_t i = 0; i < n; ++i) {
-                        const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
-                        out[i] = static_cast<double>(indirect_f[i]) * norm;
+                    return true;
+                }));
+        } else {
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n,
+                 &row_norm = vf_row_norm_](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), indirect_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            solar_f[i] = static_cast<float>(solar_d[i]);
+                        }
+                        solver.solve(temps_f, solar_f, indirect_f);
+                        auto& out = indirect_per_timestep[k];
+                        out.resize(n);
+                        for (size_t i = 0; i < n; ++i) {
+                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                            out[i] = static_cast<double>(indirect_f[i]) * norm;
+                        }
                     }
-                }
-                return true;
-            }));
+                    return true;
+                }));
+        }
     }
 
     bool all_ok = true;
@@ -1945,6 +2044,21 @@ RadiationExchangeManager::computeIndirectFluxBatch(
 
     const bool do_beam = beam_active_ && (sun_dirs.size() == n_steps);
 
+    // Per-band batch (two-band pool path): the solver captured absorbed IR and
+    // visible per timestep. Map them to exchange faces, mirroring the summed
+    // mapping. NO beaming is applied to the bands (matches the single-GPU
+    // solveGPUTwoBand bands, which are pure radiosity). Empty on the gray path.
+    const auto& ir_raw  = solver_->lastIndirectIRBatch();
+    const auto& vis_raw = solver_->lastIndirectVisibleBatch();
+    const bool have_band_batch = (ir_raw.size() == n_steps && vis_raw.size() == n_steps);
+    if (have_band_batch) {
+        indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        indirect_ir_batch_.clear();
+        indirect_vis_batch_.clear();
+    }
+
     // Map back to all faces using the exchange-face index list (same as
     // computeIndirectFlux). Update aggregate stats from the last timestep.
     double sum = 0.0;
@@ -1955,6 +2069,12 @@ RadiationExchangeManager::computeIndirectFluxBatch(
         for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
             int face_idx = classification_.exchange_face_indices[i];
             indirect_per_timestep[k][face_idx] = flux[face_idx];
+        }
+        if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
+            for (int face_idx : classification_.exchange_face_indices) {
+                indirect_ir_batch_[k][face_idx]  = ir_raw[k][face_idx];
+                indirect_vis_batch_[k][face_idx] = vis_raw[k][face_idx];
+            }
         }
         // Smith beamed-emission correction (per timestep, Sun-dependent).
         if (do_beam) {

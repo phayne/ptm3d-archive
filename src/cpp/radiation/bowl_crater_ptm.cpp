@@ -548,7 +548,7 @@ int main(int argc, char** argv) {
             #pragma omp parallel for schedule(static)
             for (long i = 0; i < (long)nf; ++i) {
                 double s = 0.0;
-                for (int k = F_rp[i]; k < F_rp[i + 1]; ++k) s += F_val[k] * x[F_col[k]];
+                for (int64_t k = F_rp[i]; k < F_rp[i + 1]; ++k) s += F_val[k] * x[F_col[k]];
                 out[i] = s;
             }
         };

@@ -260,6 +260,12 @@ public:
     const std::vector<double>& lastIndirectVisible() const { return last_indirect_vis_; }
     const std::vector<double>& lastIndirectIR() const { return last_indirect_ir_; }
 
+    // Per-band batch results from the last two-band solveBatch() (multi-GPU pool
+    // path), indexed [timestep][face]. Empty on the gray path and on the
+    // single-timestep two-band path (use lastIndirect{Visible,IR}() there).
+    const std::vector<std::vector<double>>& lastIndirectVisibleBatch() const { return last_indirect_vis_batch_; }
+    const std::vector<std::vector<double>>& lastIndirectIRBatch() const { return last_indirect_ir_batch_; }
+
     // Get convergence information from last solve
     int getLastIterations() const { return last_iterations_; }
     // Per-band sweep counts from the last two-band solve (Fermi's measurement).
@@ -330,6 +336,9 @@ private:
     // Data members
     std::unique_ptr<IViewFactorOperator> F_op_;
     const ViewFactorMatrix* F_ptr_ = nullptr;  // For row access in Gauss-Seidel
+    // Owns a ViewFactorMatrix built from a VF_REPLACE corrected CSR when routed
+    // to the GPU pool (PTM_HMATRIX_VF_REPLACE_GPU); F_ptr_ points into it.
+    std::unique_ptr<ViewFactorMatrix> owned_vf_;
     bool use_hmatrix_ = false;
     std::vector<double> emissivity_;
     std::vector<double> reflectivity_;  // 1 - emissivity (thermal reflectivity)
@@ -358,6 +367,8 @@ private:
     // device); do not call concurrently on the same RadiositySolver.
     std::vector<double> last_indirect_vis_;
     std::vector<double> last_indirect_ir_;
+    std::vector<std::vector<double>> last_indirect_vis_batch_;  // [step][face], pool two-band
+    std::vector<std::vector<double>> last_indirect_ir_batch_;   // [step][face], pool two-band
     // Final normalized incoming (F·B·vf_row_norm) from the last solveJacobi call.
     // solveTwoBand recovers the incoming from the fixed-point identity
     // (B−E−source)/refl instead of a second SpMV; this is the fallback where
@@ -535,6 +546,12 @@ public:
     const std::vector<double>& lastIndirectVisible() const { return indirect_flux_vis_; }
     const std::vector<double>& lastIndirectIR() const { return indirect_flux_ir_; }
 
+    // Per-band batch results from the last computeIndirectFluxBatch() (multi-GPU
+    // pool two-band path), indexed [timestep][face], 0 on non-exchange faces.
+    // Empty on the gray pool path. Their per-timestep sum equals the batch total.
+    const std::vector<std::vector<double>>& lastIndirectVisibleBatch() const { return indirect_vis_batch_; }
+    const std::vector<std::vector<double>>& lastIndirectIRBatch() const { return indirect_ir_batch_; }
+
     // Get face classification
     const FaceClassification& getClassification() const { return classification_; }
 
@@ -617,6 +634,8 @@ private:
     // computeIndirectFlux[Batch]() only when the solver runs two-band.
     std::vector<double> indirect_flux_vis_;
     std::vector<double> indirect_flux_ir_;
+    std::vector<std::vector<double>> indirect_vis_batch_;  // [step][face], pool two-band
+    std::vector<std::vector<double>> indirect_ir_batch_;   // [step][face], pool two-band
 
     // --- Smith (1967) anisotropic beamed thermal emission ---------------------
     // All inactive unless config_.rms_slope_deg > 0 (beam_active_ == false).

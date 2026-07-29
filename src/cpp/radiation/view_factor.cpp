@@ -400,7 +400,7 @@ void ViewFactorMatrix::buildFromTriplets(size_t n_faces,
     std::fill(row_counts.begin(), row_counts.end(), 0);
     for (size_t k = 0; k < nnz; ++k) {
         int row = row_indices[k];
-        int pos = row_ptrs_[row] + row_counts[row];
+        int64_t pos = row_ptrs_[row] + row_counts[row];
         values_[pos] = values[k];
         col_indices_[pos] = col_indices[k];
         row_counts[row]++;
@@ -409,14 +409,14 @@ void ViewFactorMatrix::buildFromTriplets(size_t n_faces,
     // Sort each row by column index for efficient access
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < n_faces; ++i) {
-        int start = row_ptrs_[i];
-        int end = row_ptrs_[i + 1];
+        int64_t start = row_ptrs_[i];
+        int64_t end = row_ptrs_[i + 1];
         if (end - start > 1) {
             // Simple insertion sort for small arrays
-            for (int j = start + 1; j < end; ++j) {
+            for (int64_t j = start + 1; j < end; ++j) {
                 int col = col_indices_[j];
                 double val = values_[j];
-                int k = j - 1;
+                int64_t k = j - 1;
                 while (k >= start && col_indices_[k] > col) {
                     col_indices_[k + 1] = col_indices_[k];
                     values_[k + 1] = values_[k];
@@ -429,11 +429,22 @@ void ViewFactorMatrix::buildFromTriplets(size_t n_faces,
     }
 }
 
+void ViewFactorMatrix::setFromCSR(size_t n_faces,
+                                  std::vector<int64_t>&& row_ptrs,
+                                  std::vector<int>&& col_indices,
+                                  std::vector<double>&& values) {
+    n_rows_ = n_faces;
+    n_cols_ = n_faces;
+    row_ptrs_ = std::move(row_ptrs);
+    col_indices_ = std::move(col_indices);
+    values_ = std::move(values);
+}
+
 double ViewFactorMatrix::get(int row, int col) const {
     if (row < 0 || row >= static_cast<int>(n_rows_)) return 0.0;
 
-    int start = row_ptrs_[row];
-    int end = row_ptrs_[row + 1];
+    int64_t start = row_ptrs_[row];
+    int64_t end = row_ptrs_[row + 1];
 
     // Binary search for column
     auto it = std::lower_bound(col_indices_.begin() + start,
@@ -450,13 +461,13 @@ void ViewFactorMatrix::getRow(int row, std::vector<int>& cols, std::vector<doubl
 
     if (row < 0 || row >= static_cast<int>(n_rows_)) return;
 
-    int start = row_ptrs_[row];
-    int end = row_ptrs_[row + 1];
+    int64_t start = row_ptrs_[row];
+    int64_t end = row_ptrs_[row + 1];
 
     cols.reserve(end - start);
     vals.reserve(end - start);
 
-    for (int i = start; i < end; ++i) {
+    for (int64_t i = start; i < end; ++i) {
         cols.push_back(col_indices_[i]);
         vals.push_back(values_[i]);
     }
@@ -464,7 +475,7 @@ void ViewFactorMatrix::getRow(int row, std::vector<int>& cols, std::vector<doubl
 
 int ViewFactorMatrix::getRowNNZ(int row) const {
     if (row < 0 || row >= static_cast<int>(n_rows_)) return 0;
-    return row_ptrs_[row + 1] - row_ptrs_[row];
+    return static_cast<int>(row_ptrs_[row + 1] - row_ptrs_[row]);
 }
 
 void ViewFactorMatrix::matvec(const std::vector<double>& x, std::vector<double>& y) const {
@@ -473,9 +484,9 @@ void ViewFactorMatrix::matvec(const std::vector<double>& x, std::vector<double>&
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n_rows_; ++i) {
         double sum = 0.0;
-        int start = row_ptrs_[i];
-        int end = row_ptrs_[i + 1];
-        for (int k = start; k < end; ++k) {
+        int64_t start = row_ptrs_[i];
+        int64_t end = row_ptrs_[i + 1];
+        for (int64_t k = start; k < end; ++k) {
             sum += values_[k] * x[col_indices_[k]];
         }
         y[i] = sum;
@@ -487,9 +498,9 @@ void ViewFactorMatrix::matvecTranspose(const std::vector<double>& x, std::vector
 
     // This is less efficient but correct for sparse transpose
     for (size_t i = 0; i < n_rows_; ++i) {
-        int start = row_ptrs_[i];
-        int end = row_ptrs_[i + 1];
-        for (int k = start; k < end; ++k) {
+        int64_t start = row_ptrs_[i];
+        int64_t end = row_ptrs_[i + 1];
+        for (int64_t k = start; k < end; ++k) {
             #pragma omp atomic
             y[col_indices_[k]] += values_[k] * x[i];
         }
@@ -502,9 +513,9 @@ std::vector<double> ViewFactorMatrix::rowSums() const {
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n_rows_; ++i) {
         double sum = 0.0;
-        int start = row_ptrs_[i];
-        int end = row_ptrs_[i + 1];
-        for (int k = start; k < end; ++k) {
+        int64_t start = row_ptrs_[i];
+        int64_t end = row_ptrs_[i + 1];
+        for (int64_t k = start; k < end; ++k) {
             sum += values_[k];
         }
         sums[i] = sum;
@@ -523,7 +534,7 @@ void ViewFactorMatrix::clear() {
 size_t ViewFactorMatrix::memoryUsage() const {
     return values_.size() * sizeof(double) +
            col_indices_.size() * sizeof(int) +
-           row_ptrs_.size() * sizeof(int);
+           row_ptrs_.size() * sizeof(int64_t);
 }
 
 // Magic number for sparse view factor file format: "VFFM" = View Factor File Matrix
@@ -547,9 +558,26 @@ bool ViewFactorMatrix::writeBinary(const std::string& filename) const {
     file.write(reinterpret_cast<const char*>(&ncols), sizeof(uint64_t));
     file.write(reinterpret_cast<const char*>(&nnz), sizeof(uint64_t));
 
-    // Write row pointers
-    file.write(reinterpret_cast<const char*>(row_ptrs_.data()),
-               row_ptrs_.size() * sizeof(int));
+    // Write row pointers as int32 (the on-disk .vf format is v1/int32 for
+    // backward compatibility with every existing .vf file). row_ptrs_ is int64
+    // in memory; fail loud rather than silently truncate if this CSR is too
+    // large to serialize -- a > 2^31-nnz matrix is an in-memory GPU/VF_REPLACE
+    // object, never written to the legacy .vf format.
+    {
+        std::vector<int32_t> rp32(row_ptrs_.size());
+        for (size_t i = 0; i < row_ptrs_.size(); ++i) {
+            if (row_ptrs_[i] > static_cast<int64_t>(INT32_MAX)) {
+                std::cerr << "ViewFactorMatrix::writeBinary: row pointer "
+                          << row_ptrs_[i] << " exceeds INT32_MAX; this CSR ("
+                          << values_.size() << " nnz) is too large for the int32 "
+                          << ".vf format. Aborting write." << std::endl;
+                return false;
+            }
+            rp32[i] = static_cast<int32_t>(row_ptrs_[i]);
+        }
+        file.write(reinterpret_cast<const char*>(rp32.data()),
+                   rp32.size() * sizeof(int32_t));
+    }
 
     // Write column indices
     file.write(reinterpret_cast<const char*>(col_indices_.data()),
@@ -590,10 +618,17 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
     n_rows_ = nrows;
     n_cols_ = ncols;
 
-    // Read row pointers
-    row_ptrs_.resize(nrows + 1);
-    file.read(reinterpret_cast<char*>(row_ptrs_.data()),
-              row_ptrs_.size() * sizeof(int));
+    // Read row pointers (on-disk v1 format stores them as int32) and widen to
+    // the int64 in-memory representation. Byte-for-byte compatible with every
+    // existing .vf file.
+    {
+        std::vector<int32_t> rp32(nrows + 1);
+        file.read(reinterpret_cast<char*>(rp32.data()),
+                  rp32.size() * sizeof(int32_t));
+        row_ptrs_.resize(nrows + 1);
+        for (size_t i = 0; i < rp32.size(); ++i)
+            row_ptrs_[i] = static_cast<int64_t>(rp32[i]);
+    }
 
     // Read column indices
     col_indices_.resize(nnz);

@@ -89,7 +89,7 @@ public:
     bool uploadStaticData(
         const std::vector<double>& csr_values,
         const std::vector<int>& csr_col_indices,
-        const std::vector<int>& csr_row_ptrs,
+        const std::vector<int64_t>& csr_row_ptrs,
         const std::vector<float>& emissivity,
         const std::vector<float>& reflectivity);
 
