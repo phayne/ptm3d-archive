@@ -1,0 +1,52 @@
+# Global Moon diurnal run on a res-5 icosphere (20,480 faces) WITH real LOLA
+# topography and the Diviner-derived property/albedo maps — the GUI's default
+# global-Moon setup, with repository-relative paths.
+#
+# Requires the fetched datasets (see data/README.md):
+#     python3 scripts/fetch_kernels.py
+#     python3 scripts/fetch_data.py --core     # topo + property maps + albedo maps
+# Run from the repository root:
+#     ./build/bin/ptm_thermal_sim --config examples/moon_global_topo_res5.yaml
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 240
+  body: Moon
+mesh:
+  resolution: 5
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: true         # load data/topo/moon/topo_moon_ico5.bin
+  topo_directory: data/topo
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false
+  compute_statistics: true
+  use_default_property_map: true
+  property_maps_directory: data/property_maps
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: true
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/moon_global_topo_res5
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false

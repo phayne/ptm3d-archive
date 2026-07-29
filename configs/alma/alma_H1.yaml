@@ -37,18 +37,18 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
   albedo_map: ''
-  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/alma/alma_H1
+  directory: output/alma/alma_H1
   format: binary
   vtk_mode: thermal
   include_primary_ir: false
   thermal_vtk_file: ''
   complete_vtk_file: ''
   no_maps: false
-  locations_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/configs/alma/alma_H1_locations.csv
-  depths_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/configs/alma/alma_depths.txt
+  locations_file: configs/alma/alma_H1_locations.csv
+  depths_file: configs/alma/alma_depths.txt
   series_output: ''
   location_data: ''
 visualization:

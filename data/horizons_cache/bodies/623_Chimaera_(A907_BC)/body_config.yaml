@@ -5,7 +5,7 @@ generic_body:
   shape:
     type: custom_mesh
     radius_km: 22.045
-    mesh_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj
+    mesh_file: data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj
   orbit:
     semi_major_axis_au: 2.46093257
     eccentricity: 0.11327891
@@ -29,5 +29,5 @@ generic_body:
     H: 0.05
     cp0: 800.0
     Qb: 0.0
-  spice_metakernel: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/metakernel.tm
-  spk_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/ephemeris.spk
+  spice_metakernel: data/horizons_cache/bodies/623_Chimaera_(A907_BC)/metakernel.tm
+  spk_file: data/horizons_cache/bodies/623_Chimaera_(A907_BC)/ephemeris.spk

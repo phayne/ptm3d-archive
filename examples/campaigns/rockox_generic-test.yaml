@@ -1,0 +1,120 @@
+simulation:
+  start_time: '2025-01-01T00:00:00'
+  duration_days: 2.0
+  timesteps: 144
+  body: 13294 Rockox (1998 QO105)
+mesh:
+  resolution: 6
+  import_file: ''
+  scale_factor: 1.0
+  export_basic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 10
+  use_gpu: true
+  compute_statistics: true
+  thermal_inertia_map: ''
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: false
+  albedo: 0.05
+  use_default_emissivity: false
+  emissivity: 0.95
+  incidence_angle_albedo: false
+  use_default_ks: false
+  ks: 0.005
+  use_default_kd: false
+  kd: 0.2
+  use_default_H: false
+  H: 0.05
+  use_default_rhos: false
+  rhos: 1300.0
+  use_default_rhod: false
+  rhod: 2000.0
+  use_default_cp0: false
+  cp0: 800.0
+  use_default_Qb: false
+  Qb: 0.0
+radiation:
+  enabled: false
+  min_shadow_fraction: 0.3
+  verbose: false
+  use_gpu: true
+  view_factor_file: ''
+  max_coupling_iterations: 10
+  coupling_temp_threshold: 0.5
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+  use_hmatrix: false
+  use_aca: true
+  aca_tolerance: 0.001
+  aca_max_rank: 50
+  hmatrix_threads: 0
+  adaptive_neighbors: true
+  captured_energy_target: 0.95
+  max_neighbors: 500
+  min_neighbors: 20
+illumination:
+  include_primary_reflection: false
+  use_batch_processing: true
+  albedo_map: ''
+  albedo_maps_directory: ''
+  positions_file: ''
+output:
+  directory: output/rockox_test
+  format: binary
+  vtk_mode: both
+  include_primary_ir: false
+  thermal_vtk_file: ''
+  complete_vtk_file: ''
+  locations_file: ''
+  depths_file: ''
+  series_output: ''
+  location_data: ''
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0
+generic_body:
+  name: 13294 Rockox (1998 QO105)
+  config_file: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/body_config.yaml
+  ephemeris_source: spice
+  spice_metakernel: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
+  naif_id: '2013294'
+  shape:
+    type: spherical
+    radius_km: 2.619
+    mesh_scale: 1.0
+    semi_axes_km:
+    - 0.001
+    - 0.001
+    - 0.001
+  orbit:
+    semi_major_axis_au: 2.257283
+    eccentricity: 0.09831723
+    inclination_deg: 5.7402
+    lon_ascending_node_deg: 48.9086
+    arg_perihelion_deg: 148.8711
+    mean_anomaly_deg: 286.9534
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 3.2431
+    pole_ra_deg: 0.0
+    pole_dec_deg: 0.0
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.05
+    emissivity: 0.95
+    ks: 0.005
+    kd: 0.2
+    rhos: 1300.0
+    rhod: 2000.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0

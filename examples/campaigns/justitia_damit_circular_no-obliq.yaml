@@ -1,0 +1,108 @@
+simulation:
+  start_time: '2034-10-30T00:00:00'
+  duration_days: 1.381567485537868
+  timesteps: 144
+  body: 269 Justitia (A887 SA)
+mesh:
+  resolution: 5
+  import_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
+  scale_factor: 1.0
+  export_basic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 2.0
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 30.0
+  use_gpu: true
+  compute_statistics: true
+  thermal_inertia_map: ''
+  h_parameter_map: ''
+  use_default_property_map: false
+  property_maps_directory: data/property_maps
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: 1545.15
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  constant_thermal_inertia: 100.0
+  use_default_albedo: false
+  albedo: 0.03
+  use_default_emissivity: false
+  emissivity: 0.95
+  incidence_angle_albedo: false
+  use_default_ks: false
+  ks: 0.01
+  use_default_kd: false
+  kd: 0.01
+  use_default_H: false
+  H: 0.05
+  use_default_rhos: false
+  rhos: 1500.0
+  use_default_rhod: false
+  rhod: 1500.0
+  use_default_cp0: false
+  cp0: 666.6666666666666
+  use_default_Qb: false
+  Qb: 0.0
+  use_default_chi: false
+  chi: 0.0
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_batch_processing: true
+  albedo_map: ''
+  albedo_maps_directory: ''
+  positions_file: ''
+output:
+  directory: output/damit_circular_no-obliq
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+  thermal_vtk_file: ''
+  complete_vtk_file: ''
+  locations_file: ''
+  depths_file: ''
+  series_output: ''
+  location_data: ''
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0
+generic_body:
+  name: 269 Justitia (A887 SA)
+  config_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml
+  ephemeris_source: keplerian
+  naif_id: '2000269'
+  shape:
+    type: custom_mesh
+    radius_km: 25.364
+    mesh_scale: 1.0
+    mesh_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
+  orbit:
+    semi_major_axis_au: 2.615691
+    eccentricity: 0.0
+    inclination_deg: 5.4777
+    lon_ascending_node_deg: 156.8494
+    arg_perihelion_deg: 120.1423
+    mean_anomaly_deg: 249.11
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 33.128
+    pole_ra_deg: 276.7850269182955
+    pole_dec_deg: 71.47873359089398
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.03
+    emissivity: 0.95
+    ks: 0.01
+    kd: 0.01
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.05
+    cp0: 666.6666666666666
+    Qb: 0.0
+    chi: 0.0

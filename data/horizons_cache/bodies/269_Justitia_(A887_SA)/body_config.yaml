@@ -5,7 +5,7 @@ generic_body:
   shape:
     type: custom_mesh
     radius_km: 25.364
-    mesh_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
+    mesh_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
   orbit:
     semi_major_axis_au: 2.6156911
     eccentricity: 0.21425815

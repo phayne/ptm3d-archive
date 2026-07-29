@@ -1,0 +1,99 @@
+# Mons-Mouton candidate landing site, 18.6-yr lunar nodal cycle.
+#
+# This config is intended to be driven by the chunked-run orchestrator:
+#
+#   python3 scripts/run_chunked_simulation.py \
+#       --config examples/moon_mm_site1_18yr.yaml \
+#       --total-days 6798.5 \
+#       --output-dir output/mm_site1_18yr \
+#       [--resume]
+#
+# The orchestrator probes available RAM, splits the 18.6-year time
+# window into ~4 chunks of ~4.5 yr each, runs ptm_thermal_sim on each
+# chunk (warm-starting from the previous chunk's final thermal state),
+# and merges the per-chunk raw statistics into a single set of final
+# stats via build/bin/ptm_merge_chunks.
+#
+# Cadence below (1 sample/day) is preserved per-chunk: each chunk has
+# its own duration_days and timesteps set so that timesteps /
+# duration_days = 1.0/d.
+simulation:
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 6798.5            # 18.61-yr lunar nodal cycle
+  timesteps: 6799                  # 1 sample/day
+  body: Moon
+mesh:
+  resolution: 9                    # ignored when import_file is set
+  import_file: data/dem/mons_mouton/A3GT_MM01_84.251S_29.162E_R5km_core0.1_pts4400k.ply
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  use_gpu: true
+  equilibration_orbits: 2.0
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 120.0
+  compute_statistics: true
+  use_default_property_map: true
+  property_maps_directory: data/property_maps
+  thermal_inertia_map: ''
+  h_parameter_map: ''
+  compute_ice_stability: true
+  ice_stability:
+    flux_threshold_kgm2s: 3.0e-14
+    grain_hop_length_um: 75.0
+    geothermal_gradient_K_per_m: 0.0
+    sublimation_enthalpy_kJmol: 51.058
+    n_depth_subsamples: -1
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  integration_days: -1.0
+  integration_steps: -1
+  integration_offset_days: 0.0
+  integration_offset_steps: 0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+  use_default_ks: true
+  ks: 0.00074
+  use_default_kd: true
+  kd: 0.0034
+  use_default_H: true
+  H: 0.06
+  use_default_rhos: true
+  rhos: 1100.0
+  use_default_rhod: true
+  rhod: 1800.0
+  use_default_cp0: true
+  cp0: 800.0
+  use_default_Qb: true
+  Qb: 0.018
+  use_default_chi: true
+  chi: 2.7
+  constant_thermal_inertia: -1.0
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_map: ''
+  positions_file: ''
+output:
+  # Per-chunk dirs are placed under <output-dir>/chunk_NNN/ by the
+  # orchestrator; the merged statistics land in <output-dir>/statistics/.
+  # The 'directory' here is overwritten per chunk; leave a placeholder.
+  directory: output/A3GT_MM01_18yr
+  format: binary
+  vtk_mode: thermal
+  include_primary_ir: false
+  skip_time_series: true
+  write_raw_stats: true
+advanced:
+  verbose: false
+  default_visible_albedo: -1.0

@@ -1,62 +1,92 @@
-# PTM3D laptop tutorial (SKELETON)
+# PTM3D laptop tutorial
 
-> **Status:** skeleton (portability Phase 1). The commands and structure are laid out; the
-> numeric expected-outputs marked `[verify]` still need a confirmed run on a 16 GB laptop-class
-> machine (they were not runnable during the overnight build, which shared the GPU with a
-> production job). Treat `[verify]` values as placeholders until confirmed.
+A 10-minute, 16 GB-friendly walkthrough of PTM3D's three core capabilities.
+Everything here stays under ~13k faces / ~240 steps (see the memory table in
+[README.md](README.md) and `scripts/ptm_mem_estimate.py`). Build first with
+[INSTALL.md](INSTALL.md) (the CPU core is fine for all of this), fetch SPICE
+kernels once with `python3 scripts/fetch_kernels.py`, and run every command
+**from the repository root**.
 
-A 10-minute, 16 GB-friendly walkthrough of PTM3D's three core capabilities. Everything here stays
-under ~100k faces / ~360 steps (see `docs/PORTABILITY-AUDIT.md` §4 and `scripts/ptm_mem_estimate.py`).
-Build first with `INSTALL.md` (CPU core is fine for all of this).
+Numbered deep-dive tutorials live in [docs/tutorials/](docs/tutorials/).
 
 ## 0. Estimate before you run
+
 ```bash
-python3 scripts/ptm_mem_estimate.py --faces 40000 --steps 360   # expect: OK on 16 GB
+python3 scripts/ptm_mem_estimate.py --faces 40000 --steps 360
+# -> TOTAL resident est. : 0.32 GiB ... verdict : OK
 ```
 
 ## Step 1 — Radiation, validated: the Ingersoll bowl crater
-The analytic gate. No mesh or SPICE needed.
+
+Comparison to the analytic solution that validates the numerical model (Ingersoll, Svitek & Murray 1992). No mesh or SPICE needed.
+
 ```bash
 cmake --build build --target test_bowl_crater -j
 ./build/bin/test_bowl_crater
 ```
-Expected: the printed max-temperature ratio matches Ingersoll & Svitek (1992) within tolerance,
-and the test prints `PASS`. This is the same gate CI runs. `[verify: exact PASS line]`
 
-## Step 2 — A 1k-face asteroid diurnal run (thermal, CPU)
-Generate a small icosphere "asteroid" and run one diurnal cycle. The icosphere mesh generator
-ships with the repo (`ptm-mesh` tooling / the icosphere path).
-```bash
-# 2a. Generate a low-res sphere (~1k faces). [verify: exact generator invocation]
-#     e.g. an ico3/ico4 icosphere written to /tmp/asteroid_1k.ply
-# 2b. Run a single diurnal cycle with a modest thermal inertia:
-./build/bin/ptm_thermal_sim --config examples/<asteroid_1k_diurnal>.yaml
-```
-Expected wall time: minutes on a laptop CPU. Output: `statistics/` with per-face Tmax/Tavg.
-Inspect with the analysis tooling:
-```bash
-python3 -c "import sys; sys.path.insert(0,'scripts')"   # or use the ptm-analyze skill
-```
-`[verify: a relativized examples/asteroid_1k_diurnal.yaml is added (Phase 1 §4)]`
+Expected (verified 2026-07-29, CPU-only build):
 
-## Step 3 — A small crater with radiosity (the decimated Moon mesh)
-Uses the spared small tutorial mesh `moon3d_c_cartesian_NEW_dec` (~57 MB VF — laptop-sized).
-```bash
-# 3a. Confirm/point at the decimated mesh + its compact view-factor matrix.
-# 3b. Run with inter-face radiation (radiosity) ON:
-./build/bin/ptm_thermal_sim --config examples/<moon3d_dec_radiosity>.yaml
 ```
-Expected: warmer crater floors than a no-radiosity run (self-heating), and VF row-sums ≤ 1 in the
-load banner. `[verify: relativized dec config + the compact VF path]`
+  F_wall (analytical)  = 0.137931
+  F_terrain (computed) = 0.138611
+  Error: 0.492713%
+--- Reciprocity Test ---
+  Max relative residual (full scan): ~7e-14%
+  Result: PASSED
+--- Radiosity Solver Test ---
+  Iterations: 2
+  Converged: YES
+```
+
+The view-factor error vs. the analytic bowl-crater solution is **<0.5%** and
+reciprocity holds to machine precision. The automated build-and-test checks run
+this same test on every code change (`Result: PASSED` appears once per tested
+crater configuration).
+
+## Step 2 — A global Moon diurnal run (thermal, CPU)
+
+The quickstart config: one lunation on a 1280-face icosphere.
+
+```bash
+./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
+```
+
+Expected: seconds-to-minutes of wall time; `output/quickstart_moon_diurnal/`
+with `statistics/*.bin` per-face extremes — equatorial noon Tmax ≈ 388 K,
+night Tmin ≈ 92 K (verified values and how to read the binaries:
+[docs/tutorials/02_lunar_diurnal_icosphere.md](docs/tutorials/02_lunar_diurnal_icosphere.md)
+and [docs/tutorials/06_interpreting_outputs.md](docs/tutorials/06_interpreting_outputs.md)).
+
+## Step 3 — A polar crater with radiosity (shipped mesh)
+
+Uses the shipped 12,800-face bowl-crater mesh at 80°N
+(`data/meshes/lunar_crater_80N.ply`) — small enough for a laptop, shadowed
+enough that inter-face radiation matters. Run the radiation-off control and
+the coupled run, then compare crater-floor temperatures:
+
+```bash
+./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_radoff.yaml
+./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
+```
+
+Expected: the coupled run computes (and saves for reuse) the face-to-face view
+factors, the radiation–temperature iteration converges, and shadowed floor
+faces come out warmer than the control — walkthrough and verified numbers in
+[docs/tutorials/04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md).
 
 ## What you exercised
+
 - Analytic radiation correctness (bowl crater).
-- The threaded CPU thermal solver on a real (if tiny) body.
-- Inter-face radiosity self-heating on a decimated crater mesh — all within a laptop's RAM.
+- The threaded CPU thermal solver on a real global body with SPICE ephemerides.
+- Inter-face radiosity self-heating on a polar crater mesh — all within a
+  laptop's RAM.
 
 ## Next
+
+- Interpreting every output file: [docs/tutorials/06_interpreting_outputs.md](docs/tutorials/06_interpreting_outputs.md).
 - Scale up faces/steps only after `ptm_mem_estimate.py` says `OK` for your RAM.
-- For production multi-site campaigns, see the chunked runner + SLURM array pattern
-  (portability plan §"Cluster story").
+- Environment variables (validated illumination fixes, radiosity band
+  separation): [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
 - GPU acceleration (optional): build with `-DPTM_ENABLE_GPU=ON` and run
   `ptm_thermal_sim --calibrate-gpu` once per host.

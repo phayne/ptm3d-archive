@@ -26,7 +26,7 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
   albedo_map: ''
-  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
   directory: output

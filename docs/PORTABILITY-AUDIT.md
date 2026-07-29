@@ -87,6 +87,12 @@ path above the cap. This was sized on the 384 GB workstation. Scaling law and 16
 | 1e5   | 1440  | 3          | ~3.5 GB            | borderline; stream or reduce cadence |
 | 5e5   | 360   | 3          | ~4.3 GB            | workstation-class |
 | 5e5   | 1440  | 3          | ~17 GB             | exceeds 16 GB — stream / chunk |
+| 1e6   | 360   | 3          | ~8.6 GB            | large DEM site — workstation, GPU recommended; sparse VF adds ~8 GB (terrain-dependent¹) |
+
+¹ Sparse-VF footprint = nnz × ~8 B with a terrain-dependent partner count:
+measured ~1,040 partners/face (2.5B nnz, ~20 GB) at 2.4M faces on one polar
+site, vs. 4.8 GB at 140k faces on a denser-coupled site. The 1e6 figure scales
+the former linearly.
 
 Phase-1 disposition: a **memory estimator that computes this product and WARNS (or refuses w/o
 `--allow-oversubscribe`) before the big allocation**, defaulting the streaming cap sensibly on

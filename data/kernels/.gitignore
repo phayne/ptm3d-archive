@@ -1,0 +1,6 @@
+# Binary SPICE kernels are fetched by scripts/fetch_kernels.py, never committed.
+lsk/
+pck/
+spk/
+fk/
+*.part

@@ -1584,7 +1584,23 @@ class RadiationTab(BaseConfigTab):
 
 
 class ThermophysicalTab(BaseConfigTab):
-    """Thermophysical properties configuration tab"""
+    """Thermophysical properties configuration tab
+
+    Engine reality check (config_parser.cpp, "Parse Thermophysical
+    section"): for BUILT-IN bodies the engine ignores plain scalar keys in
+    the thermophysical YAML section and honors only the *_override keys --
+    which exist for albedo, emissivity, ks and kd. The remaining properties
+    (H, rhos, rhod, cp0, Qb, chi) can only be customized through
+    generic_body.surface, i.e. with a Custom/HORIZONS body. This tab
+    therefore DISABLES those six rows when a built-in body is selected
+    instead of silently accepting values the engine would never see (the
+    old behavior wrote dead placeholders like `cp0: 800.0`).
+    """
+
+    # Properties with an engine *_override path for built-in bodies
+    BUILTIN_OVERRIDABLE = ("albedo", "emissivity", "ks", "kd")
+    # Properties with NO engine path for built-in bodies
+    BUILTIN_UNSUPPORTED = ("H", "rhos", "rhod", "cp0", "Qb", "chi")
 
     # Default properties by body (matches planetary_properties.h)
     BODY_DEFAULTS = {
@@ -1671,10 +1687,14 @@ class ThermophysicalTab(BaseConfigTab):
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        # Info label
-        info = QLabel("Properties shown are defaults for the selected body. Uncheck to customize.")
-        info.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
-        layout.addWidget(info)
+        # Info label (text is kept in sync by _update_builtin_support)
+        self.info_label = QLabel(
+            "Properties shown are defaults for the selected body. "
+            "Uncheck to customize.")
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet(
+            "color: #64b5f6; font-size: 10px; padding: 5px;")
+        layout.addWidget(self.info_label)
 
         # Preset dropdown (replaces 9 buttons)
         preset_row = QHBoxLayout()
@@ -1902,11 +1922,67 @@ class ThermophysicalTab(BaseConfigTab):
             self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
 
         self._update_ti_display(defaults)
+        # Re-apply engine-support gating: a preset may have unchecked rows
+        # that a built-in body cannot actually customize.
+        self._update_builtin_support()
         self.value_changed.emit()
 
     def on_body_changed(self, body_name):
         """Update displayed defaults when body selection changes"""
         self.update_to_body_defaults(body_name)
+        self._update_builtin_support()
+
+    def _update_builtin_support(self):
+        """Enable/disable rows according to what the ENGINE can honor.
+
+        Built-in body: only albedo/emissivity/ks/kd reach the engine (via
+        *_override keys written at save time); the other six rows are forced
+        back to 'Use Default' and disabled so no input dies silently.
+        Custom/HORIZONS body: everything is enabled (values are written to
+        generic_body.surface, which the engine reads)."""
+        generic = getattr(self.config_manager, "generic_body_active",
+                          lambda: False)()
+        unsupported_tip = (
+            "Not customizable for built-in bodies: the engine has no "
+            "override key for this property (config_parser.cpp reads only "
+            "albedo/emissivity/ks/kd overrides). Use a Custom or HORIZONS "
+            "body to set it via generic_body.surface.")
+        for attr in self.BUILTIN_UNSUPPORTED:
+            vkey = f"thermophysical.{attr}"
+            dkey = f"thermophysical.use_default_{attr}"
+            cb = self.widgets.get(dkey)
+            vw = self.widgets.get(vkey)
+            if generic:
+                if cb is not None:
+                    cb.setEnabled(True)
+                    cb.setToolTip("Use body-specific default value")
+                if vw is not None and cb is not None:
+                    vw.setEnabled(not cb.isChecked())
+                if vw is not None:
+                    vw.setToolTip("")
+            else:
+                if cb is not None and not cb.isChecked():
+                    # revert a custom value the engine cannot receive
+                    cb.setChecked(True)
+                if cb is not None:
+                    cb.setEnabled(False)
+                    cb.setToolTip(unsupported_tip)
+                if vw is not None:
+                    vw.setEnabled(False)
+                    vw.setToolTip(unsupported_tip)
+        if hasattr(self, "info_label"):
+            if generic:
+                self.info_label.setText(
+                    "Properties shown are defaults for the selected body. "
+                    "Uncheck 'Use Default' to customize (values are written "
+                    "to generic_body.surface).")
+            else:
+                self.info_label.setText(
+                    "Properties shown are defaults for the selected body. "
+                    "For built-in bodies the engine accepts custom values "
+                    "for Bond albedo, emissivity, ks and kd only (saved as "
+                    "*_override keys); the grayed-out properties require a "
+                    "Custom or HORIZONS body.")
 
     def update_to_body_defaults(self, body_name=None):
         """Update all fields to show body defaults"""
@@ -1996,6 +2072,7 @@ class ThermophysicalTab(BaseConfigTab):
             )
 
         self.update_to_body_defaults()
+        self._update_builtin_support()
 
     def _load_horizons_defaults(self, body_name):
         """Try to load thermophysical defaults from a cached HORIZONS body config."""
@@ -2966,6 +3043,126 @@ class OutputTab(BaseConfigTab):
         self.widgets["output.series_output"].setText(out.get("series_output", ""))
 
 
+class EngineFlagsTab(BaseConfigTab):
+    """Advanced: engine environment flags (PTM_*) for ptm_thermal_sim.
+
+    The engine gates a number of physics fixes and diagnostics behind
+    environment variables so that old runs stay byte-identical. The GUI
+    applies the recommended-ON set by default (gui_core.preflight.
+    RECOMMENDED_ENGINE_ENV); this table lets an advanced user override a
+    value, add extra flags (e.g. PTM_HMATRIX_THREADS), or clear a value
+    (blank = do not set). Stored under config key 'engine_env'; consumed by
+    build_engine_env() at launch, ignored by the C++ YAML parser.
+    """
+
+    def init_ui(self):
+        from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        self._QTableWidgetItem = QTableWidgetItem
+        self._loading = False
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        info = QLabel(
+            "Environment flags passed to the simulation engine. The rows "
+            "below are the recommended physics-fix set (applied by default). "
+            "Blank value = flag is not set. Only change these if you know "
+            "the engine gate you are targeting."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
+        layout.addWidget(info)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Variable", "Value"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(240)
+        self.table.cellChanged.connect(self._on_cell_changed)
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Flag")
+        add_btn.clicked.connect(self._add_row)
+        btn_row.addWidget(add_btn)
+        rm_btn = QPushButton("Remove Selected")
+        rm_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(rm_btn)
+        reset_btn = QPushButton("Restore Recommended")
+        reset_btn.clicked.connect(self._restore_recommended)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+
+    # -- table <-> config ---------------------------------------------------
+
+    def _set_rows(self, env_dict):
+        self._loading = True
+        try:
+            self.table.setRowCount(0)
+            for key in sorted(env_dict):
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, self._QTableWidgetItem(str(key)))
+                self.table.setItem(r, 1, self._QTableWidgetItem(str(env_dict[key])))
+        finally:
+            self._loading = False
+
+    def _collect_rows(self):
+        env = {}
+        for r in range(self.table.rowCount()):
+            key_item = self.table.item(r, 0)
+            val_item = self.table.item(r, 1)
+            key = key_item.text().strip() if key_item else ""
+            val = val_item.text().strip() if val_item else ""
+            if key:
+                env[key] = val
+        return env
+
+    def _write_back(self):
+        self.config_manager.set_value("engine_env", self._collect_rows())
+        self.value_changed.emit()
+
+    def _on_cell_changed(self, _row, _col):
+        if not self._loading:
+            self._write_back()
+
+    def _add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, self._QTableWidgetItem("PTM_"))
+        self.table.setItem(r, 1, self._QTableWidgetItem(""))
+
+    def _remove_selected(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()},
+                      reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+        if rows:
+            self._write_back()
+
+    def _restore_recommended(self):
+        from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+        self._set_rows(dict(RECOMMENDED_ENGINE_ENV))
+        self._write_back()
+
+    def load_from_config(self):
+        from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+        env = self.config_manager.get_value("engine_env", None)
+        if not isinstance(env, dict) or not env:
+            env = dict(RECOMMENDED_ENGINE_ENV)
+        self._set_rows(env)
+
+
 class ConfigurationPanel(QWidget):
     """Main configuration panel with tabs and YAML preview"""
 
@@ -2993,6 +3190,7 @@ class ConfigurationPanel(QWidget):
         self.tabs["radiation"] = RadiationTab(self.config_manager)
         self.tabs["illumination"] = IlluminationTab(self.config_manager)
         self.tabs["output"] = OutputTab(self.config_manager)
+        self.tabs["engine_flags"] = EngineFlagsTab(self.config_manager)
 
         # HORIZONS panel (may not be available if imports fail)
         self._horizons_panel = None
@@ -3020,6 +3218,7 @@ class ConfigurationPanel(QWidget):
             ("illumination", "Illumination"),
             ("radiation", "Radiation"),
             ("output", "Output"),
+            ("engine_flags", "Engine Flags"),
         ]
 
         for key, label in tab_order:

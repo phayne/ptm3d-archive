@@ -2,6 +2,11 @@
 
 This document describes all configuration options for PTM3D simulations.
 
+> Runtime behavior is also influenced by `PTM_*` **environment variables**
+> (validated illumination fixes, radiosity band separation, memory/GPU knobs) —
+> see [ENVIRONMENT.md](ENVIRONMENT.md) for the complete table, including the
+> recommended-ON set used by production-validated runs.
+
 ## YAML Configuration Files
 
 PTM3D supports YAML configuration files for easier setup of complex simulations.
@@ -74,7 +79,7 @@ output:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `include_primary_reflection` | bool | true | Include reflected light |
-| `use_batch_processing` | bool | true | Use SIMD batching |
+| `use_batch_processing` | bool | true | Trace illumination rays in vectorized batches (faster; identical results) |
 | `albedo_map` | string | "" | Path to albedo map |
 
 ### radiation

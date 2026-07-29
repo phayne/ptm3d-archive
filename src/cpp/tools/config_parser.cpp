@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,6 +20,110 @@ T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaul
     if (node && node[key]) return node[key].as<T>();
     return defaultVal;
 }
+
+namespace {
+// ---------------- Data-path resolution (PTM_DATA_ROOT contract) ----------------
+// One contract for every data-path config key (see docs/ENVIRONMENT.md and
+// data/README.md):
+//   1. An ABSOLUTE path in the config always wins (back-compat with campaign
+//      YAMLs).
+//   2. If $PTM_DATA_ROOT is set, a relative "data/..." reference resolves
+//      under it (PTM_DATA_ROOT points AT the data directory).
+//   3. Otherwise the repository's data/ directory; the repository root is
+//      found by walking up from the YAML file's directory (then from the
+//      current working directory) to the directory containing
+//      data/data_manifest.json.
+//   4. If a REQUIRED input still cannot be found, stop with a clear error
+//      that names the dataset and the exact fetch command, rather than
+//      failing later with a bare file-open error.
+
+// Map a "data/..." path prefix to the dataset name in data/data_manifest.json.
+std::string datasetForPath(const std::string& p) {
+    static const struct { const char* prefix; const char* dataset; } kMap[] = {
+        {"data/topo/",            "moon-topo"},
+        {"data/property_maps/",   "moon-property-maps"},
+        {"data/albedo_maps/",     "albedo-maps"},
+        {"data/dem/validation/",  "validation-meshes"},
+        {"data/dem/copernicus/",  "copernicus-dem"},
+        {"data/meshes/moon3d",    "moon3d-mesh"},
+    };
+    for (const auto& m : kMap)
+        if (p.rfind(m.prefix, 0) == 0) return m.dataset;
+    return "";
+}
+
+std::filesystem::path findRepoRootForData(const std::string& yaml_file) {
+    std::error_code ec;
+    auto probe = [&ec](std::filesystem::path dir) -> std::filesystem::path {
+        for (int i = 0; i < 10 && !dir.empty(); ++i) {
+            if (std::filesystem::exists(dir / "data" / "data_manifest.json", ec))
+                return dir;
+            auto parent = dir.parent_path();
+            if (parent == dir) break;
+            dir = parent;
+        }
+        return {};
+    };
+    auto abs = std::filesystem::absolute(yaml_file, ec);
+    if (!ec) {
+        auto r = probe(abs.parent_path());
+        if (!r.empty()) return r;
+    }
+    auto cwd = std::filesystem::current_path(ec);
+    if (!ec) return probe(cwd);
+    return {};
+}
+
+// Resolve one path-valued config entry. `must_exist` = the key is a required
+// input in this configuration (its feature is enabled and the value non-empty).
+std::string resolveDataPath(const std::string& value,
+                            const std::filesystem::path& repo_root,
+                            bool must_exist,
+                            const char* key_name) {
+    if (value.empty()) return value;
+    std::filesystem::path p(value);
+    if (p.is_absolute()) return value;                      // rule 1
+    std::error_code ec;
+    const bool is_data_rel = (value.rfind("data/", 0) == 0);
+    const char* env_root = std::getenv("PTM_DATA_ROOT");
+    std::filesystem::path resolved;
+    if (is_data_rel && env_root && *env_root) {             // rule 2
+        resolved = std::filesystem::path(env_root) / value.substr(5);
+    } else if (std::filesystem::exists(p, ec)) {
+        return value;                                       // resolves from cwd as before
+    } else if (is_data_rel && !repo_root.empty()) {         // rule 3
+        resolved = repo_root / value;
+    } else {
+        resolved = p;
+    }
+    if (std::filesystem::exists(resolved, ec))
+        return resolved.lexically_normal().string();
+    if (must_exist) {                                       // rule 4
+        const std::string ds = datasetForPath(value);
+        std::cerr << "ERROR: " << key_name << " = '" << value << "' not found";
+        if (is_data_rel && env_root && *env_root)
+            std::cerr << " under PTM_DATA_ROOT=" << env_root;
+        else if (!repo_root.empty())
+            std::cerr << " under " << (repo_root / "data").string()
+                      << " (and PTM_DATA_ROOT is not set)";
+        else
+            std::cerr << " (PTM_DATA_ROOT not set; no repository data/ directory located)";
+        std::cerr << ".\n";
+        if (!ds.empty())
+            std::cerr << "  Fetch it with: python3 scripts/fetch_data.py --dataset "
+                      << ds << "\n";
+        else if (value.rfind("data/kernels", 0) == 0)
+            std::cerr << "  Fetch it with: python3 scripts/fetch_kernels.py\n";
+        else if (value.rfind("data/external/", 0) == 0)
+            std::cerr << "  This path is an external-dataset placeholder (not distributed);"
+                         " see data/external/README.md.\n";
+        std::cerr << "  Data location contract: data/README.md, docs/ENVIRONMENT.md"
+                  << std::endl;
+        std::exit(1);
+    }
+    return resolved.lexically_normal().string();
+}
+} // namespace
 
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     SimulationConfig config;
@@ -329,8 +434,60 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.advanced.default_visible_albedo = getWithDefault(adv, "default_visible_albedo", config.advanced.default_visible_albedo);
         }
 
+        // ---- Apply the PTM_DATA_ROOT resolution contract to every data-path
+        // key (rules + actionable errors: see the helpers above). Required
+        // inputs are only enforced when their feature is actually in use, so
+        // configs that merely carry a default directory keep working.
+        {
+            const auto repo_root = findRepoRootForData(filename);
+            auto& C = config;
+            C.mesh.import_file = resolveDataPath(
+                C.mesh.import_file, repo_root, true, "mesh.import_file");
+            C.mesh.occluder_file = resolveDataPath(
+                C.mesh.occluder_file, repo_root, true, "mesh.occluder_file");
+            C.mesh.topo_directory = resolveDataPath(
+                C.mesh.topo_directory, repo_root, C.mesh.use_topographic,
+                "mesh.topo_directory");
+            C.thermal.thermal_inertia_map = resolveDataPath(
+                C.thermal.thermal_inertia_map, repo_root, true,
+                "thermal.thermal_inertia_map");
+            C.thermal.h_parameter_map = resolveDataPath(
+                C.thermal.h_parameter_map, repo_root, true,
+                "thermal.h_parameter_map");
+            C.thermal.heat_flow_mask_file = resolveDataPath(
+                C.thermal.heat_flow_mask_file, repo_root, true,
+                "thermal.heat_flow_mask_file");
+            // Property/albedo map DIRECTORIES: resolve, but never hard-fail on
+            // the directory alone — the runtime falls back to uniform defaults
+            // when maps are absent (existing behavior), except the albedo dir
+            // when the config explicitly turns the albedo map on.
+            C.thermal.property_maps_directory = resolveDataPath(
+                C.thermal.property_maps_directory, repo_root, false,
+                "thermal.property_maps_directory");
+            C.illumination.albedo_maps_directory = resolveDataPath(
+                C.illumination.albedo_maps_directory, repo_root,
+                C.illumination.use_albedo_map, "illumination.albedo_maps_directory");
+            C.illumination.albedo_map = resolveDataPath(
+                C.illumination.albedo_map, repo_root,
+                C.illumination.use_albedo_map, "illumination.albedo_map");
+            // Caches / outputs (created on demand): resolve only.
+            C.illumination.bvh_cache_file = resolveDataPath(
+                C.illumination.bvh_cache_file, repo_root, false,
+                "illumination.bvh_cache_file");
+            // view_factor_file already has config-dir-relative resolution above
+            // (it is created on first run, so no existence requirement).
+            C.output.locations_file = resolveDataPath(
+                C.output.locations_file, repo_root, true, "output.locations_file");
+            C.output.depths_file = resolveDataPath(
+                C.output.depths_file, repo_root, true, "output.depths_file");
+            // Generic-body shape mesh: resolve without an existence requirement
+            // (the Horizons pipeline can populate it after config load).
+            C.generic_body.mesh_file = resolveDataPath(
+                C.generic_body.mesh_file, repo_root, false, "generic_body.mesh_file");
+        }
+
         std::cout << "Successfully loaded configuration from: " << filename << std::endl;
-        
+
     } catch (const YAML::Exception& e) {
         last_error_ = std::string("YAML parsing error: ") + e.what();
         throw std::runtime_error(last_error_);

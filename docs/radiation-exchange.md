@@ -111,7 +111,7 @@ The resulting view factor matrix is stored in Compressed Sparse Row (CSR) format
 - `col_indices_`: column indices (face $j$)
 - `row_ptrs_`: row pointers (size $N+1$)
 
-Operations: `matvec` ($\mathbf{y} = F\mathbf{x}$), `matvecTranspose` ($\mathbf{y} = F^T\mathbf{x}$), `get(i,j)`, `getRow(i)`, and `rowSums` (for verifying the sum rule).
+Operations: `matvec` (matrix–vector multiplication, $\mathbf{y} = F\mathbf{x}$), `matvecTranspose` ($\mathbf{y} = F^T\mathbf{x}$), `get(i,j)`, `getRow(i)`, and `rowSums` (for verifying the sum rule).
 
 ## 5. H-Matrix Compression
 
@@ -187,7 +187,7 @@ Used when the view factor operator is an H-matrix (no efficient row access) or w
 
 $$\mathbf{B}^{(k+1)} = \mathbf{E} + \rho\, \mathbf{Q}_{\text{solar}} + \rho\, F\, \mathbf{B}^{(k)}$$
 
-initialized with $\mathbf{B}^{(0)} = \mathbf{E} + \rho\,\mathbf{Q}_{\text{solar}}$ (no inter-face contribution). The core operation each iteration is a single matrix-vector product $F \mathbf{B}^{(k)}$, which is $O(N \log N)$ for the H-matrix or $O(\text{nnz})$ for the sparse matrix.
+initialized with $\mathbf{B}^{(0)} = \mathbf{E} + \rho\,\mathbf{Q}_{\text{solar}}$ (no inter-face contribution). The core operation each iteration is a single matrix-vector product $F \mathbf{B}^{(k)}$, which is $O(N \log N)$ for the H-matrix or $O(\text{nnz})$ for the sparse matrix (nnz = the number of stored nonzero entries).
 
 ### 6.2 Gauss-Seidel Iteration
 
@@ -368,8 +368,9 @@ IlluminationModel
 
 ## 10.9 Radiance-weighted view-factor pruning (adjustable, default OFF)
 
-The corrected per-partner CSR is large because a face couples to many partners,
-most contributing a tiny view factor. A *geometry* cutoff (drop small `F_ij`, or
+The corrected per-partner sparse matrix (CSR format, §4) is large because a face
+couples to many partners, most contributing a tiny view factor. A *geometry*
+cutoff (drop small `F_ij`, or
 drop by distance) is physically wrong — a large, directly-lit distant wall can
 matter more than a small nearby slope. The principled cutoff is on **radiative
 contribution**, weighting each view factor by the radiance the partner emits:
@@ -381,17 +382,19 @@ contribution**, weighting each view factor by the radiance the partner emits:
 Cold faint partners (PSR walls, `σT⁴ ≈ 1.4 W/m²` at 70 K) fall away; warm faint
 partners (sunlit rims, `≈ 850–1200 W/m²`) survive — the all-scales physics, with
 the illumination pattern in the weight. This is **provably optimal** for a given
-kept-nnz: it drops exactly the lowest-contribution entries. True `F` values are
-kept (no renormalization); the discarded mass is bounded and **reported**.
+number of retained matrix entries: it drops exactly the lowest-contribution
+ones. True `F` values are kept (no renormalization); the discarded contribution
+is bounded and **reported**.
 
 **Where it lives.** Assembly-time, in `scripts/ptm12_diag/assemble_vf_haworth.py`
 (the sim is unchanged — it just loads whatever CSR it is given):
 
-- `--radiance-prune-eps ε` — threshold in W/m². **`0.0` (default) = no pruning,
-  byte-identical.** Also settable via env `PTM_RADIANCE_PRUNE_EPS` (require-env
-  compatible), and documented in the radiation config as `radiation.radiance_prune_eps`
-  (the runners propagate it to the assembler; the sim parses and **logs** it for
-  provenance but does not prune — see "Config key and precedence" below).
+- `--radiance-prune-eps ε` — threshold in W/m². **`0.0` (default) = no pruning;
+  the output is numerically identical to the last digit.** Also settable via the
+  environment variable `PTM_RADIANCE_PRUNE_EPS`, and documented in the radiation
+  config as `radiation.radiance_prune_eps` (the runners propagate it to the
+  assembler; the sim parses and **logs** it for provenance but does not prune —
+  see "Config key and precedence" below).
 - `--radiance-weight PATH` — the per-face `R` source, **two documented paths**:
   1. a **prior-run stats directory** (`temperature_max.bin` +
      `direct_solar_max.bin`) — exact radiance from a completed coupled/radoff run;
@@ -416,7 +419,7 @@ the sim additionally logs a one-line summary of that receipt (eps + max discarde
 contribution).
 
 **Mandatory receipt.** Every pruned assembly prints and writes
-`<out>.csr.prune_receipt.json`: nnz kept/dropped, size, predicted speedup, the
+`<out>.csr.prune_receipt.json`: matrix entries kept/dropped, size, predicted speedup, the
 per-receiving-face **discarded contribution** (W/m², max/p99/mean) and its
 **ΔT bound** `ΔT ≈ dQ/(4σT³)` at the face's own temperature — *so the user sees
 the trade before running.* The ΔT bound is a **loose upper bound** (it uses the
@@ -425,13 +428,16 @@ partner's *max* radiance, timing-decoupled), so the measured ΔT is smaller — 
 governs adoption.
 
 **Measured counter-example — AGT / MP026 (the cautionary receipt).** On the
-diffuse South-Pole terrain, `ε = 1e-3` gives **3.2× fewer nnz** (and ~2.0×
+diffuse South-Pole terrain, `ε = 1e-3` gives **3.2× fewer stored matrix entries** (and ~2.0×
 radiosity wall-time), but the Y00_summer window **FAILED** the < 1 K bar against
 the full-fidelity baseline: per-face `T_max` off by **mean 3.3 K / max 22.6 K on
 PSR floors** (n≈101 k faces < 120 K), while warm rims passed (< 0.6 K). The floors
 are radiation-dominated and heated by the *aggregate* of many faint partners, so
-dropping them cools the coldest, most science-critical faces. Evidence:
-`~/projects/a3gt/prune_test/verdict.json`. **Guidance:** pruning does **not** pay
+dropping them cools the coldest, most science-critical faces. (Evidence lives in
+the internal A3GT campaign archive; the numbers above are from its
+`verdict.json`. Any pruned assembly reproduces the same accounting in its own
+`<out>.csr.prune_receipt.json` — the receipt format described earlier in this
+section.) **Guidance:** pruning does **not** pay
 on diffuse polar terrain; it pays on **isolated-crater or warm-body** terrain
 where a face's coupling is dominated by a few high-radiance partners. Default OFF
 for all sims; enable only with a per-terrain window test and the receipt in hand.
