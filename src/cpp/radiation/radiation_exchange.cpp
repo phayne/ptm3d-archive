@@ -487,6 +487,14 @@ void RadiositySolver::initGPU() {
             gpu_solver_.reset();
             return false;
         }
+        // Fault injection (test-only, fail-loud): force the single-GPU rung to
+        // fail so the degrade to CPU can be exercised deliberately.
+        if (std::getenv("PTM_RAD_FORCE_SINGLE_FAIL")) {
+            std::cerr << "[Radiosity] PTM_RAD_FORCE_SINGLE_FAIL set: forcing single-GPU "
+                         "rung failure (test); degrading to CPU radiosity.\n";
+            gpu_solver_.reset();
+            return false;
+        }
         const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
         if (!fitsDevice(dev_mem)) {
             std::cout << "[Radiosity] single-GPU: CSR replica + working "
@@ -562,6 +570,14 @@ void RadiositySolver::initGPU() {
                           << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
                           << " GB); degrading to single-GPU.\n";
             }
+        }
+
+        // Fault injection (test-only, fail-loud): force the multi-GPU pool rung
+        // to fail so the degrade to single-GPU can be exercised deliberately.
+        if (pool_ok && std::getenv("PTM_RAD_FORCE_POOL_FAIL")) {
+            std::cout << "[Radiosity] PTM_RAD_FORCE_POOL_FAIL set: forcing multi-GPU "
+                         "pool failure (test); degrading to single-GPU.\n";
+            pool_ok = false;
         }
 
         if (pool_ok) {
