@@ -8,6 +8,7 @@
 #include "../orbital/body_fixed_frame.h"
 #include "../orbital/generic_body.h"
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <iostream>
 #include <fstream>
@@ -2380,6 +2381,27 @@ std::pair<double, double> IlluminationModel::latLonFromCartesian(double x, doubl
 bool IlluminationModel::initialize_spice(bool verbose) {
     static bool spice_initialized = false;
 
+    // Resolve the kernel directory if it was not set explicitly:
+    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
+    // variable; default <repo>/data/kernels). Fail loud rather than fall back
+    // to a developer-machine path (portability audit P0, PORT-02).
+    if (kernels_path_.empty()) {
+        const char* env_kernels = std::getenv("PTM_SPICE_KERNELS");
+        if (env_kernels && *env_kernels) {
+            kernels_path_ = env_kernels;
+        } else {
+            kernels_path_ = ptm_thermal::config::SPICE_KERNELS_DIR;
+        }
+    }
+    if (kernels_path_.empty()) {
+        std::cerr << "Error: SPICE kernel directory is unresolved (empty).\n"
+                  << "  Resolution order: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
+                  << "  compiled-in SPICE_KERNELS_DIR (CMake; default <repo>/data/kernels).\n"
+                  << "  Populate the kernel directory with: python3 scripts/fetch_kernels.py\n"
+                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+        return false;
+    }
+
     // If using Keplerian propagation, skip full SPICE initialization
     // but still load the leapseconds kernel for time conversion
     if (use_keplerian_) {
@@ -2420,7 +2442,11 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             std::string meta_kernel = kernels_path_ + "/" + meta_kernel_filename_;
             
             if (!std::filesystem::exists(meta_kernel)) {
-                std::cerr << "Error: SPICE meta-kernel not found: " << meta_kernel << std::endl;
+                std::cerr << "Error: SPICE meta-kernel not found: " << meta_kernel << "\n"
+                          << "  Kernel dir resolution: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
+                          << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
+                          << "  python3 scripts/fetch_kernels.py  (see INSTALL.md \"SPICE kernel data\")."
+                          << std::endl;
                 // Try falling back to default meta-kernel if different
                 if (meta_kernel_filename_ != "europa.tm") {
                     std::cerr << "Attempting to fall back to default europa.tm" << std::endl;

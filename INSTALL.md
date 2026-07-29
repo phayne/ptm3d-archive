@@ -2,8 +2,9 @@
 
 PTM3D is a C++/OpenCL planetary thermophysical model. The **portable core is CPU-first**
 (threaded); the GPU (OpenCL) path is an **optional accelerator** where it exists. This guide
-covers a source build on Linux and macOS. Windows and conda-forge packaging are planned
-(portability plan Phases 2 and 4).
+covers a source build on Linux and macOS. On **Windows, use WSL2** (Ubuntu) and follow the
+Linux instructions — a native MSVC build is planned (portability plan Phase 2), as is
+conda-forge packaging (Phase 4).
 
 > **TL;DR (Linux/macOS, CPU-only):**
 > ```bash
@@ -87,7 +88,45 @@ cmake --build build --target ptm_thermal_sim -j
 On macOS the legacy `-DENABLE_GPU=ON` still works (it is the compatibility alias for
 `PTM_ENABLE_GPU`). Apple Silicon has no OpenCL future — use the CPU core there.
 
-## 4. Verify the build (correctness gates)
+## 4. SPICE kernel data
+
+Building links against the CSPICE **library** (§2); *running* additionally needs SPICE
+**kernel data** (ephemerides, orientation, leapseconds). These are large binary files that
+are not in git — fetch them from NASA NAIF with the bundled, stdlib-only script:
+
+```bash
+python3 scripts/fetch_kernels.py                  # Moon + Mercury set (~45 MB)
+python3 scripts/fetch_kernels.py --bodies europa  # also jup365.bsp for Europa (large)
+```
+
+This populates `data/kernels/` with the layout the binary expects:
+
+```
+data/kernels/
+├── moon.tm  europa.tm  mercury.tm   # metakernel templates (shipped with the repo)
+├── lsk/naif0012.tls                 # leapseconds (required even in Keplerian mode)
+├── pck/pck00011.tpc                 # body orientation/shape constants
+├── pck/moon_pa_de440_200625.bpc     # lunar principal-axes orientation
+├── fk/moon_de440_250416.tf          # MOON_PA / MOON_ME frame definitions
+└── spk/de440s.bsp                   # planetary ephemeris
+```
+
+Downloads are resumable and SHA-256-verified; re-running the script skips completed files.
+
+Two things to know:
+
+- The kernel directory is compiled in as `SPICE_KERNELS_DIR` (CMake cache variable,
+  default `<source-dir>/data/kernels`). Override at configure time with
+  `-DSPICE_KERNELS_DIR=/abs/path` if you keep kernels elsewhere.
+- The shipped metakernels use **repo-root-relative** paths
+  (`PATH_VALUES = ('data/kernels')`), which SPICE resolves against the *current working
+  directory* — so **run `ptm_thermal_sim` from the repository root** (as all examples and
+  tutorials do), or edit `PATH_VALUES` to an absolute path.
+
+Small bodies driven by JPL Horizons (`generic_body` configs) cache their own ephemerides
+under `data/horizons_cache/` and need only `lsk/naif0012.tls` from the above.
+
+## 5. Verify the build (correctness gates)
 
 ```bash
 # Radiation gate (Ingersoll bowl crater — analytic):
@@ -99,18 +138,19 @@ c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp
 python3 scripts/test_ptm_run_guard.py
 ```
 
-## 5. Run something
+## 6. Run something
 
-See `TUTORIAL.md` for a 10-minute laptop walkthrough (bowl crater → 1k-face asteroid diurnal run
-→ small crater with radiosity). A single run:
+See `TUTORIAL.md` for a 10-minute laptop walkthrough. The quickstart (from the repo root,
+after fetching kernels per §4):
 ```bash
-./build/bin/ptm_thermal_sim --config examples/<a-relative-example>.yaml
+./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-## 6. Known caveats (from the portability audit)
+## 7. Known caveats (from the portability audit)
 
-- Many shipped `examples/*.yaml` still carry absolute machine paths (being relativized to
-  `PTM_DATA_ROOT` — `docs/PORTABILITY-AUDIT.md` §1a). Prefer the tutorial's configs until then.
+- Configs under `examples/campaigns/` are internal production-campaign artifacts with
+  machine-specific absolute paths and are **not runnable from a clone** (see the README
+  there). Everything directly in `examples/` uses relative paths.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` dir; build the individual
   test targets directly (as in §4).
 - The GPU path is macOS+AMD-tested; the Phase R machine profile + solver self-chunking guard against

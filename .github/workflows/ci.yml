@@ -120,9 +120,30 @@ jobs:
             echo "::warning::test_exosphere_physics build wiring needs shakeout"
           [ -x ./build/bin/test_exosphere_physics ] && ./build/bin/test_exosphere_physics || true
 
-      # --- Small end-to-end asteroid smoke (1k-face sphere, minutes) ---------
-      # TODO(first-push): point --config at a shipped RELATIVE 1k-face asteroid
-      # diurnal example once the example set is relativized (Phase 1 §4). Until
-      # then this step is a placeholder so the intent is captured in-repo.
-      - name: End-to-end asteroid smoke (placeholder)
-        run: echo "::notice::1k-face asteroid smoke pending relativized example config"
+      # --- End-to-end smoke: global Moon diurnal on an ico3 sphere (CPU) -----
+      # Runs the shipped quickstart config exactly as a new user would:
+      # fetch SPICE kernels from NAIF (~45 MB), run from the repo root,
+      # then assert the per-face temperature statistics are physically sane.
+      - name: Fetch SPICE kernels (NAIF, ~45 MB)
+        run: python3 scripts/fetch_kernels.py
+
+      - name: End-to-end Moon diurnal smoke (quickstart config)
+        run: ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
+
+      - name: Check smoke-run statistics are physically sane
+        run: |
+          python3 - <<'EOF'
+          import struct, array
+          def load(p):
+              b = open(p, 'rb').read()
+              n = struct.unpack('<i', b[:4])[0]
+              a = array.array('f'); a.frombytes(b[4:4+4*n])
+              return list(a)
+          tmax = load('output/quickstart_moon_diurnal/statistics/temperature_max.bin')
+          tmin = load('output/quickstart_moon_diurnal/statistics/temperature_min.bin')
+          assert len(tmax) == 1280, f"expected 1280 faces, got {len(tmax)}"
+          # Reference (2026-07-29, this config): max(Tmax)=388.5 K, min(Tmin)=65.2 K
+          assert 370 < max(tmax) < 410, f"equatorial noon Tmax {max(tmax):.1f} K out of range"
+          assert 50 < min(tmin) < 110, f"night-side Tmin {min(tmin):.1f} K out of range"
+          print(f"OK: Tmax {max(tmax):.1f} K, Tmin {min(tmin):.1f} K over {len(tmax)} faces")
+          EOF

@@ -1170,8 +1170,12 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     if (config_.use_out_of_core || auto_enable_out_of_core) {
         std::string ooc_path = config_.out_of_core_path;
         if (ooc_path.empty()) {
-            // Use temp directory
-            ooc_path = "/tmp/hmatrix_" + std::to_string(getpid());
+            // Scratch location: honor $TMPDIR (POSIX; /tmp may be unwritable or
+            // small on shared hosts), fall back to /tmp.
+            const char* tmpdir = std::getenv("TMPDIR");
+            std::string tmp_base = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
+            while (tmp_base.size() > 1 && tmp_base.back() == '/') tmp_base.pop_back();
+            ooc_path = tmp_base + "/hmatrix_" + std::to_string(getpid());
         }
         if (!initOutOfCore(ooc_path)) {
             std::cerr << "WARNING: Failed to initialize out-of-core storage, continuing in-memory" << std::endl;

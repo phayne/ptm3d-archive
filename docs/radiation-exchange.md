@@ -414,8 +414,11 @@ radiosity wall-time), but the Y00_summer window **FAILED** the < 1 K bar against
 the full-fidelity baseline: per-face `T_max` off by **mean 3.3 K / max 22.6 K on
 PSR floors** (n≈101 k faces < 120 K), while warm rims passed (< 0.6 K). The floors
 are radiation-dominated and heated by the *aggregate* of many faint partners, so
-dropping them cools the coldest, most science-critical faces. Evidence:
-`~/projects/a3gt/prune_test/verdict.json`. **Guidance:** pruning does **not** pay
+dropping them cools the coldest, most science-critical faces. (Evidence lives in
+the internal A3GT campaign archive; the numbers above are from its
+`verdict.json`. Any pruned assembly reproduces the same accounting in its own
+`<out>.csr.prune_receipt.json` — the receipt format described earlier in this
+section.) **Guidance:** pruning does **not** pay
 on diffuse polar terrain; it pays on **isolated-crater or warm-body** terrain
 where a face's coupling is dominated by a few high-radiance partners. Default OFF
 for all sims; enable only with a per-terrain window test and the receipt in hand.
