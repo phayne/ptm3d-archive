@@ -138,6 +138,11 @@ If you use PTM3D in your research, please cite it (machine-readable metadata in
 }
 ```
 
+The supporting science datasets (fetched by `scripts/fetch_data.py`) are
+archived on Zenodo: concept DOI
+[10.5281/zenodo.21693403](https://doi.org/10.5281/zenodo.21693403)
+(v1: [10.5281/zenodo.21693404](https://doi.org/10.5281/zenodo.21693404), CC-BY-4.0).
+
 Heritage methods: Hayne et al. (2017, [10.1002/2017JE005387](https://doi.org/10.1002/2017JE005387));
 Hayne & Aharonson (2015, [10.1002/2015JE004887](https://doi.org/10.1002/2015JE004887));
 Vasavada et al. (2012, [10.1029/2011JE003987](https://doi.org/10.1029/2011JE003987));

@@ -1,7 +1,9 @@
 {
   "manifest_version": 1,
-  "comment": "PTM3D science-data catalog, consumed by scripts/fetch_data.py. base_url is a placeholder until the public (Zenodo) deposit is published; pass --base-url to fetch from a staging copy. SHA-256 checksums and sizes are pinned from the staged v1 archives (2026-07-29).",
-  "base_url": "ZENODO_PLACEHOLDER",
+  "comment": "PTM3D science-data catalog, consumed by scripts/fetch_data.py. Published deposit: 'Supporting data for Planetary Thermophysical Model 3D (PTM3D)' on Zenodo, CC-BY-4.0. SHA-256 checksums and sizes pinned from the staged v1 archives (2026-07-29) and verified against the live deposit.",
+  "doi": "10.5281/zenodo.21693404",
+  "concept_doi": "10.5281/zenodo.21693403",
+  "base_url": "https://zenodo.org/records/21693404/files",
   "datasets": {
     "moon-topo": {
       "description": "Moon global icosphere topography ico3-ico9 (LOLA-derived)",

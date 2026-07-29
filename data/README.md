@@ -15,6 +15,13 @@ The catalog is `data/data_manifest.json`: for every dataset it records the
 files, download URLs, sizes, and SHA-256 checksums (downloads are resumable
 and verified, exactly like `scripts/fetch_kernels.py` for SPICE kernels).
 
+The datasets are archived on Zenodo as *Supporting data for Planetary
+Thermophysical Model 3D (PTM3D)* — concept DOI
+[10.5281/zenodo.21693403](https://doi.org/10.5281/zenodo.21693403)
+(v1: [10.5281/zenodo.21693404](https://doi.org/10.5281/zenodo.21693404)),
+license CC-BY-4.0. Please cite the data DOI (and the per-dataset source
+citations in each subdirectory README) alongside the software.
+
 | Subdirectory | Contents | How it gets here |
 |---|---|---|
 | `kernels/` | SPICE kernels | `scripts/fetch_kernels.py` |
