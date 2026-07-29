@@ -9333,6 +9333,23 @@ int main(int argc, char** argv) {
             }
             topo_loaded = meshUtils.checkForTopographicMesh(
                 topo_dir, mesh_resolution, sim_config.time.body);
+            if (!topo_loaded) {
+                // Fail loud rather than silently substituting a smooth sphere:
+                // a topography-requested run on the wrong geometry is a wasted
+                // (and misleading) simulation. Name the fix.
+                std::string body_lc = sim_config.time.body;
+                for (auto& c : body_lc) c = std::tolower(c);
+                std::cerr << "ERROR: mesh.use_topographic is set, but no topography grid for "
+                          << sim_config.time.body << " ico" << mesh_resolution
+                          << " was found under '" << topo_dir << "' (expected e.g. "
+                          << topo_dir << "/" << body_lc << "/topo_" << body_lc
+                          << "_ico" << mesh_resolution << ".bin).\n";
+                if (body_lc == "moon")
+                    std::cerr << "  Fetch it with: python3 scripts/fetch_data.py --dataset moon-topo\n";
+                std::cerr << "  Data location contract: data/README.md, docs/ENVIRONMENT.md ($PTM_DATA_ROOT)."
+                          << std::endl;
+                return 1;
+            }
         }
 
         if (!topo_loaded) {
