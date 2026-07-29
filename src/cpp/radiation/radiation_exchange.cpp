@@ -884,12 +884,19 @@ std::vector<double> RadiositySolver::solveTwoBand(
     } else {
         B_ir = solveJacobi(emission, zero_source, reflectivity_);
     }
-    std::vector<double> incoming_ir(n, 0.0);
-    F_op_->matvec(B_ir, incoming_ir);
+    // Fixed-point identity (avoids a full extra SpMV per solve): at convergence
+    // B_ir = E + reflectivity·(F·B_ir·vf_row_norm), so the normalized incoming
+    // (F·B_ir·vf_row_norm) = (B_ir − E)/reflectivity. Guard reflectivity→0
+    // (blackbody) with the last Jacobi normalized incoming. Error vs the direct
+    // matvec is O(residual/reflectivity) -- within the radiosity tolerance.
+    constexpr double REFL_GUARD = 1e-9;
     last_indirect_ir_.assign(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
-        last_indirect_ir_[i] = emissivity_[i] * incoming_ir[i] * norm;
+        const double refl = reflectivity_[i];
+        const double inc_norm = (refl > REFL_GUARD)
+            ? (B_ir[i] - emission[i]) / refl
+            : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
+        last_indirect_ir_[i] = emissivity_[i] * inc_norm;
     }
 
     // --- Visible band: (I - A F) B_vis = A Q_solar, NO emission source ---
@@ -908,13 +915,17 @@ std::vector<double> RadiositySolver::solveTwoBand(
         } else {
             B_vis = solveJacobi(zero_source, vis_source, solar_reflectivity_);
         }
-        std::vector<double> incoming_vis(n, 0.0);
-        F_op_->matvec(B_vis, incoming_vis);
+        // Same identity for the visible band (no emission source):
+        // B_vis = vis_source + A·(F·B_vis·vf_row_norm), so the normalized incoming
+        // (F·B_vis·vf_row_norm) = (B_vis − vis_source)/A_i. Guard A_i→0.
         last_indirect_vis_.assign(n, 0.0);
         for (size_t i = 0; i < n; ++i) {
-            const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+            const double sr = solar_reflectivity_[i];
+            const double inc_norm = (sr > REFL_GUARD)
+                ? (B_vis[i] - vis_source[i]) / sr
+                : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
             // Absorb scattered visible with the visible absorptivity (1 - A_i).
-            last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * incoming_vis[i] * norm;
+            last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * inc_norm;
         }
     }
 
@@ -1029,6 +1040,10 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
     last_residual_ = local_residual;
     last_iterations_ = local_iterations;
     converged_ = local_converged;
+    // temp_vec holds F·B·vf_row_norm from the final iteration -- the normalized
+    // incoming. solveTwoBand uses the (B−E−source)/refl identity for this, and
+    // falls back to this array where refl→0 (see the header note).
+    last_jacobi_incoming_ = temp_vec;
 
     return radiosity;
 }

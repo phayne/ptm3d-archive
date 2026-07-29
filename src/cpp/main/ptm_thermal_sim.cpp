@@ -11222,6 +11222,12 @@ int main(int argc, char** argv) {
                                   << rad_gpu_devices << " GPUs" << std::endl;
                     }
 
+                    // Hoisted out of the per-timestep loop: these two num_faces-sized
+                    // buffers (~38 MB at 2.4M faces) were re-allocated + freed every
+                    // timestep on the single-timestep fast path. They are fully
+                    // overwritten each step below, so reuse is behavior-identical.
+                    std::vector<double> temps_t(num_faces);
+                    std::vector<double> solar_t(num_faces);
                     for (int t_start = 0; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -11233,8 +11239,6 @@ int main(int argc, char** argv) {
                             // wrapping. Preserves byte-identical behaviour
                             // for CPU and single-GPU radiation paths.
                             const int t = t_start;
-                            std::vector<double> temps_t(num_faces);
-                            std::vector<double> solar_t(num_faces);
                             #pragma omp parallel for schedule(static)
                             for (size_t f = 0; f < num_faces; f++) {
                                 temps_t[f] = surface_temps[f][t];
@@ -11350,8 +11354,10 @@ int main(int argc, char** argv) {
 
                     // Diagnostic: compare indirect flux for high vs low topographic elevation
                     // Uses radial distance from body center as elevation proxy (works on spherical bodies)
-                    // Low-elevation faces (valleys/craters) should receive MORE indirect flux
-                    {
+                    // Low-elevation faces (valleys/craters) should receive MORE indirect flux.
+                    // Gated on verbose: it std::sorts all num_faces radii every coupling
+                    // iteration purely for the two printed averages -- skip when quiet.
+                    if (rad_verbose) {
                         std::vector<double> radii(num_faces);
                         for (size_t f = 0; f < num_faces; f++) {
                             const auto& c = mesh->face_centers[f];
@@ -11493,63 +11499,11 @@ int main(int argc, char** argv) {
                         break;
                     }
 
-                    // Convergence check (skip on iter 0 — observed_dT is all 0
-                    // there because prev_temps == surface_temps).
-                    if (iter > 0) {
-                        // True face-fraction: count of faces whose max-over-t
-                        // ΔT exceeds rad_coupling_temp_tol. The legacy code
-                        // counted (face, timestep) samples and divided by
-                        // num_faces·total_time_steps, which is ~total_time_steps×
-                        // more permissive — keep that for legacy mode for
-                        // bit-equivalence; physics mode uses the truer metric.
-                        size_t faces_changing = 0;
-                        if (rad_coupling_physics_mode) {
-                            for (size_t f = 0; f < num_faces; f++) {
-                                if (observed_dT[f] > rad_coupling_temp_tol) ++faces_changing;
-                            }
-                        } else {
-                            // Legacy sample-fraction (preserves byte-equivalence).
-                            size_t samples_changing = 0;
-                            for (size_t f = 0; f < num_faces; f++) {
-                                for (int t = 0; t < total_time_steps; t++) {
-                                    const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                    if (dT > rad_coupling_temp_tol) ++samples_changing;
-                                }
-                            }
-                            faces_changing = samples_changing;  // reused below as a "count"
-                        }
-                        const double frac_denom = rad_coupling_physics_mode
-                            ? static_cast<double>(num_faces)
-                            : static_cast<double>(num_faces) * total_time_steps;
-                        const double face_frac = static_cast<double>(faces_changing) / frac_denom;
-
-                        std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
-                        std::cout << (rad_coupling_physics_mode
-                                       ? "  Faces still changing:   "
-                                       : "  Samples still changing: ")
-                                  << std::scientific << std::setprecision(2)
-                                  << (face_frac * 100) << "%" << std::fixed << std::endl;
-
-                        // Converge when EITHER condition is met. The earlier
-                        // AND-conjunction blocked exit when a tiny handful of
-                        // pathological faces (typically PSR-floor edges with
-                        // extreme radiation feedback) oscillated by hundreds
-                        // of K, even after 99.99% of the mesh had settled.
-                        if (max_temp_change < rad_coupling_temp_tol) {
-                            std::cout << "  Converged on max-temperature criterion ("
-                                      << max_temp_change << " K < " << rad_coupling_temp_tol
-                                      << " K)" << std::endl;
-                            break;
-                        }
-                        if (face_frac < rad_coupling_face_frac) {
-                            std::cout << "  Converged on face-fraction criterion ("
-                                      << std::scientific << std::setprecision(2)
-                                      << (face_frac * 100) << "% < "
-                                      << (rad_coupling_face_frac * 100) << "%)"
-                                      << std::fixed << std::endl;
-                            break;
-                        }
-                    }
+                    // NOTE: the convergence check MOVED to AFTER the re-thermal
+                    // (end of this loop body) so a converged window stops BEFORE
+                    // running one more redundant indirect (radiosity) pass whose
+                    // result the skipped re-thermal would ignore. observed_dT here
+                    // is still computed above and drives face SELECTION (Phase B).
 
                     // Save previous-iter snapshots for the NEXT iter.
                     prev_temps = surface_temps;
@@ -11557,6 +11511,8 @@ int main(int argc, char** argv) {
                     (void)total_indirect_per_face_sum;
                     (void)n_frozen_by_dT;
                     (void)n_frozen_by_freeze;
+                    (void)max_temp_change;  // consumer (old pre-radiosity check) moved
+                                            // post-re-thermal; kept in the stats reduction
 
                     // Step 3: Re-run thermal for selected faces with the updated
                     // flux BC (= iter-0 flux composition + indirect_flux). The GPU
@@ -11675,6 +11631,56 @@ int main(int argc, char** argv) {
                             }
                         }
                         rerun_progress.finish();
+                    }
+
+                    // ---- Post-re-thermal convergence check (MOVED here from before
+                    // the radiosity pass). Measures the temperature change this
+                    // re-thermal actually produced (surface_temps vs the prev_temps
+                    // snapshot taken just before it) -- the same quantity the old
+                    // pre-radiosity check measured one iteration later, so the
+                    // converge decision is identical but we stop BEFORE the next
+                    // iteration's redundant indirect pass. Fermi verified that skipped
+                    // pass changes 0 temperatures; the band-separated indirect OUTPUT
+                    // arrays (indirect_solar/ir) are thus one Picard step stale, within
+                    // rad_coupling_temp_tol. Iteration cap (max_coupling_iterations)
+                    // unchanged. ----
+                    {
+                        double max_change_post = 0.0;
+                        size_t count_changing = 0;  // faces (physics) / samples (legacy)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            double odT = 0.0;
+                            for (int t = 0; t < total_time_steps; t++) {
+                                const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
+                                if (dT > odT) odT = dT;
+                                if (!rad_coupling_physics_mode && dT > rad_coupling_temp_tol) ++count_changing;
+                            }
+                            if (odT > max_change_post) max_change_post = odT;
+                            if (rad_coupling_physics_mode && odT > rad_coupling_temp_tol) ++count_changing;
+                        }
+                        const double frac_denom = rad_coupling_physics_mode
+                            ? static_cast<double>(num_faces)
+                            : static_cast<double>(num_faces) * total_time_steps;
+                        const double face_frac = static_cast<double>(count_changing) / frac_denom;
+                        std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        std::cout << (rad_coupling_physics_mode
+                                       ? "  Faces still changing:   "
+                                       : "  Samples still changing: ")
+                                  << std::scientific << std::setprecision(2)
+                                  << (face_frac * 100) << "%" << std::fixed << std::endl;
+                        if (max_change_post < rad_coupling_temp_tol) {
+                            std::cout << "  Converged on max-temperature criterion ("
+                                      << max_change_post << " K < " << rad_coupling_temp_tol
+                                      << " K)" << std::endl;
+                            break;
+                        }
+                        if (face_frac < rad_coupling_face_frac) {
+                            std::cout << "  Converged on face-fraction criterion ("
+                                      << std::scientific << std::setprecision(2)
+                                      << (face_frac * 100) << "% < "
+                                      << (rad_coupling_face_frac * 100) << "%)"
+                                      << std::fixed << std::endl;
+                            break;
+                        }
                     }
                 }
 

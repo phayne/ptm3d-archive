@@ -116,8 +116,14 @@ public:
                      std::vector<int32_t> cols, std::vector<float> data)
         : n_(n), indptr_(std::move(indptr)), cols_(std::move(cols)), data_(std::move(data)) {}
     void matvec(const std::vector<double>& x, std::vector<double>& y) const override {
-        y.assign(n_, 0.0);
-        #pragma omp parallel for schedule(static)
+        // Every y[i] is fully overwritten below, so the old y.assign(n_,0.0) was a
+        // dead full-vector memset; resize() only guarantees the size (no-op when the
+        // caller pre-sized y). schedule(guided) balances the highly variable per-row
+        // nnz (floor faces couple to ~1000s of partners, rims to a handful) that
+        // schedule(static) left imbalanced. Both are bit-identical: each y[i] is the
+        // same in-order row sum regardless of which thread computes it.
+        y.resize(n_);
+        #pragma omp parallel for schedule(guided)
         for (long i = 0; i < static_cast<long>(n_); ++i) {
             double s = 0.0;
             const int64_t e = indptr_[i + 1];
@@ -310,6 +316,12 @@ private:
     // device); do not call concurrently on the same RadiositySolver.
     std::vector<double> last_indirect_vis_;
     std::vector<double> last_indirect_ir_;
+    // Final normalized incoming (F·B·vf_row_norm) from the last solveJacobi call.
+    // solveTwoBand recovers the incoming from the fixed-point identity
+    // (B−E−source)/refl instead of a second SpMV; this is the fallback where
+    // refl→0 (blackbody) makes that division ill-posed. Written non-thread-safely
+    // like last_iterations_/last_residual_ (the two-band solves are sequential).
+    std::vector<double> last_jacobi_incoming_;
     // NOTE (B2/B3): the previous single-slot visible cache (keyed on the last
     // solar_flux) was REMOVED. In production the coupling loop nests for iter { for t },
     // so consecutive solve() calls carry different solar_flux and the cache MISSED
