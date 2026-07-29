@@ -1,0 +1,50 @@
+# PTM3D quickstart: global Moon diurnal run on a small icosphere (ico3, 1280 faces).
+#
+# Laptop-friendly (CPU-only, < 1 GB RAM, minutes of wall time). All paths are
+# relative — run FROM THE REPOSITORY ROOT after fetching SPICE kernels:
+#
+#     python3 scripts/fetch_kernels.py          # once (~45 MB from NAIF)
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
+#
+# Outputs land in output/quickstart_moon_diurnal/ (per-face statistics binaries).
+# See docs/tutorials/ for a walkthrough of the outputs.
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53          # one synodic lunar day
+  timesteps: 240                # ~3 h output cadence
+  body: Moon
+mesh:
+  resolution: 3                 # icosphere subdivision level (1280 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0                    # 0 = auto-detect
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false
+  compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0    # -1 = body default
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+radiation:
+  enabled: false                # no inter-face radiation on a convex sphere
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/quickstart_moon_diurnal
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
