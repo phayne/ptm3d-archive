@@ -170,6 +170,9 @@ private:
     // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.
     void enqueueSpMV(cl_mem x, cl_mem y, size_t global_size, size_t local_size);
 
+    // Release the chunked CSR sub-buffers and reset the chunked state (PTM-25).
+    void releaseChunkBuffers();
+
     size_t n_faces_;
     size_t nnz_;  // Number of non-zeros in view factor matrix
     RadiosityOpenCLConfig config_;

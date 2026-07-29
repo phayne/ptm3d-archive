@@ -496,13 +496,7 @@ void RadiosityOpenCLSolver::uploadViewFactors(
     // a single row cannot fit a chunk).
     {
         // Release any chunk buffers from a previous upload.
-        for (auto& ch : csr_chunks_) {
-            if (ch.values) clReleaseMemObject(ch.values);
-            if (ch.col_indices) clReleaseMemObject(ch.col_indices);
-            if (ch.row_ptrs) clReleaseMemObject(ch.row_ptrs);
-        }
-        csr_chunks_.clear();
-        use_chunked_csr_ = false;
+        releaseChunkBuffers();
 
         cl_device_id dev = context_->device();
         cl_uint address_bits = 64;
@@ -714,6 +708,17 @@ void RadiosityOpenCLSolver::buildChunkedCsr(
                   << " non-zeros in " << csr_chunks_.size()
                   << " chunk(s) (budget " << max_chunk_nnz << " nnz/chunk)\n";
     }
+}
+
+void RadiosityOpenCLSolver::releaseChunkBuffers()
+{
+    for (auto& ch : csr_chunks_) {
+        if (ch.values) clReleaseMemObject(ch.values);
+        if (ch.col_indices) clReleaseMemObject(ch.col_indices);
+        if (ch.row_ptrs) clReleaseMemObject(ch.row_ptrs);
+    }
+    csr_chunks_.clear();
+    use_chunked_csr_ = false;
 }
 
 void RadiosityOpenCLSolver::enqueueSpMV(cl_mem x, cl_mem y,
@@ -1117,13 +1122,7 @@ void RadiosityOpenCLSolver::release() {
     if (buf_csr_row_ptrs_) { clReleaseMemObject(buf_csr_row_ptrs_); buf_csr_row_ptrs_ = nullptr; }
 
     // Release chunked CSR sub-buffers (PTM-25)
-    for (auto& ch : csr_chunks_) {
-        if (ch.values) clReleaseMemObject(ch.values);
-        if (ch.col_indices) clReleaseMemObject(ch.col_indices);
-        if (ch.row_ptrs) clReleaseMemObject(ch.row_ptrs);
-    }
-    csr_chunks_.clear();
-    use_chunked_csr_ = false;
+    releaseChunkBuffers();
 
     // Release state buffers
     if (buf_radiosity_) { clReleaseMemObject(buf_radiosity_); buf_radiosity_ = nullptr; }
