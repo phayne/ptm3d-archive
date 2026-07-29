@@ -18,7 +18,7 @@ python3 scripts/ptm_mem_estimate.py --faces 40000 --steps 360
 
 ## Step 1 — Radiation, validated: the Ingersoll bowl crater
 
-The analytic gate (Ingersoll, Svitek & Murray 1992). No mesh or SPICE needed.
+Comparison to the analytic solution that validates the numerical model (Ingersoll, Svitek & Murray 1992). No mesh or SPICE needed.
 
 ```bash
 cmake --build build --target test_bowl_crater -j
