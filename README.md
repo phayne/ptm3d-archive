@@ -27,7 +27,7 @@ sunlight and thermal emission from surrounding terrain.*
 
 ## What it does
 
-- **Bodies**: Moon, Mercury, Europa, Mars, Ceres, Enceladus — plus any
+- **Bodies**: Moon, Mercury, Europa — plus any
   body via Keplerian elements, SPICE kernels, or JPL Horizons
 - **Illumination**: Embree ray-traced shadows with finite solar disk penumbra,
   eclipses, and primary-body reflected + IR flux (e.g. Earthshine, Jupiter-shine)
