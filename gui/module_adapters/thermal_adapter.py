@@ -3,7 +3,6 @@ Thermal module adapter for the unified dashboard.
 Composes the same classes used by the standalone PTM3DMainWindow.
 """
 
-import tempfile
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -13,7 +12,10 @@ from PyQt6.QtCore import Qt
 
 from dashboard_core.module_interface import AbstractModule
 from gui_core.config_manager import ConfigManager
-from gui_core.simulation_runner import SimulationThread
+from gui_core.simulation_runner import SimulationRunner, SimulationThread
+from gui_core.preflight import (
+    run_preflight, confirm_preflight, resolve_path
+)
 from gui_panels.config_panel import ConfigurationPanel
 from gui_panels.visualization_panel import VisualizationPanel
 from gui_panels.results_panel import ResultsPanel
@@ -32,7 +34,7 @@ class ThermalModule(AbstractModule):
         super().__init__()
         self._console = console_panel
         self._sim_thread = None
-        self._temp_config_file = None
+        self._run_config_file = None
 
         # Create components (same classes as PTM3DMainWindow)
         self._cm = ConfigManager()
@@ -142,20 +144,37 @@ class ThermalModule(AbstractModule):
             )
             return
 
-        # Save config to temp file
+        # Pre-flight (paths, dataless cloud files, disk, VF guard, exe)
+        config_dict = self._cm.get_config()
+        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
+        for line in report.summary_lines():
+            self._console.append_info(f"[THERMAL][preflight] {line}")
+        if not confirm_preflight(self._widget, report):
+            self._console.append_warning(
+                "[THERMAL] Launch canceled by pre-flight check")
+            return
+
+        # Write the run config BESIDE the output directory, never a temp
+        # file: the engine resolves a relative radiation.view_factor_file
+        # against the YAML's own directory, so a config in /var/folders/...
+        # silently missed the VF cache and triggered an (hours-long, and per
+        # PTM-19 potentially wrong) rebuild. save_run_yaml absolutizes all
+        # path fields against the project root for the same reason.
         try:
-            fd, path = tempfile.mkstemp(suffix=".yaml", prefix="ptm3d_")
-            import os
-            os.close(fd)
-            self._cm.save_to_yaml(path)
-            self._temp_config_file = path
+            out_dir = resolve_path(
+                self._cm.get_value("output.directory", "output"),
+                report.project_root)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            run_config = out_dir / "run_config.yaml"
+            self._cm.save_run_yaml(run_config, report.project_root)
+            self._run_config_file = str(run_config)
+            self._console.append_info(f"[THERMAL] Run config: {run_config}")
         except Exception as e:
             self._console.append_error(f"[THERMAL] Failed to save config: {e}")
             return
 
-        config_dict = self._cm.get_config()
         self._sim_thread = SimulationThread(
-            self._temp_config_file, config_dict=config_dict
+            self._run_config_file, config_dict=config_dict
         )
         self._sim_thread.output_ready.connect(
             lambda t: self._console.append_output(f"[THERMAL] {t}")
@@ -164,6 +183,11 @@ class ThermalModule(AbstractModule):
             lambda t: self._console.append_error(f"[THERMAL] {t}")
         )
         self._sim_thread.progress_update.connect(self._on_progress)
+        self._sim_thread.heartbeat.connect(
+            lambda msg, stalled: (self._console.append_warning(
+                f"[THERMAL][watchdog] {msg}") if stalled else
+                self._console.append_info(f"[THERMAL][watchdog] {msg}"))
+        )
         self._sim_thread.finished.connect(self._on_finished)
 
         self._set_status("running")
@@ -221,11 +245,5 @@ class ThermalModule(AbstractModule):
             self._set_status("failed")
 
         self._sim_thread = None
-
-        # Clean up temp config
-        if self._temp_config_file:
-            try:
-                Path(self._temp_config_file).unlink(missing_ok=True)
-            except Exception:
-                pass
-            self._temp_config_file = None
+        # The run config lives beside the output data on purpose (it
+        # documents exactly what produced the run) -- no cleanup.

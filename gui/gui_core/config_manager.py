@@ -7,6 +7,8 @@ import yaml
 from copy import deepcopy
 from pathlib import Path
 
+from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+
 
 def detect_hardware_capabilities():
     """Detect GPU (OpenCL) and CPU SIMD capabilities.
@@ -208,6 +210,13 @@ class ConfigManager:
             "verbose": False,
             "default_visible_albedo": -1.0
         },
+        # Engine environment flags (PTM_*) passed to ptm_thermal_sim.
+        # Prefilled with the recommended-ON physics fix set; edited via the
+        # Engine Flags tab. A blank value means "do not set". The C++ YAML
+        # parser ignores this section -- it is consumed by the GUI runner
+        # (gui_core.preflight.build_engine_env) and kept in the YAML so a
+        # saved project documents exactly what the run had set.
+        "engine_env": dict(RECOMMENDED_ENGINE_ENV),
         "generic_body": {
             "name": "",
             "config_file": "",  # Path to HORIZONS-generated body_config.yaml
@@ -271,13 +280,31 @@ class ConfigManager:
             "output": {"directory": "output/crater_radex"}
         },
         "gpu_accelerated": {
-            "thermal": {"use_gpu": True, "use_gpu_illumination": True},
+            # NOTE: no use_gpu_illumination key -- that was a dead key nothing
+            # consumed (illumination GPU is illumination.use_gpu in the engine
+            # YAML, and CPU illumination is both correct and faster on the
+            # reference Mac Pro for lunar workloads).
+            "thermal": {"use_gpu": True},
             "radiation": {"enabled": True, "use_gpu": True}
         }
     }
 
+    # Properties with an engine-side *_override key for BUILT-IN bodies
+    # (config_parser.cpp reads albedo/emissivity/ks/kd_override; the other
+    # thermophysical scalars have no override path outside generic_body).
+    ENGINE_OVERRIDE_KEYS = ("albedo", "emissivity", "ks", "kd")
+
     def __init__(self):
         self.config = deepcopy(self.DEFAULT_CONFIG)
+
+    def generic_body_active(self):
+        """True when the config carries real generic-body data (the engine
+        then reads thermophysical values from generic_body.surface)."""
+        gb = self.config.get("generic_body", {}) or {}
+        return bool(
+            gb.get("config_file") or gb.get("name")
+            or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+        )
 
     def get_config(self):
         """Get the current configuration"""
@@ -364,6 +391,16 @@ class ConfigManager:
                     # infer that the user set a custom value (backwards compat)
                     self.config["thermophysical"][flag_name] = False
 
+            # Round-trip the engine override keys (what save now writes for
+            # built-in bodies): albedo_override: 0.3 -> albedo=0.3 with
+            # use_default_albedo=False so the UI shows the custom value.
+            for prop_name in self.ENGINE_OVERRIDE_KEYS:
+                override_key = f"{prop_name}_override"
+                if override_key in loaded_thermo:
+                    self.config["thermophysical"][prop_name] = \
+                        loaded_thermo[override_key]
+                    self.config["thermophysical"][f"use_default_{prop_name}"] = False
+
     @staticmethod
     def _strip_sentinels(d):
         """Remove sentinel values (-1.0, empty strings) from nested dict for clean YAML."""
@@ -395,8 +432,38 @@ class ConfigManager:
           as expected by the C++ parser (config_parser.cpp:133)
         """
         from copy import deepcopy as _dc
+        generic_active = self.generic_body_active()
         out = {}
         for k, v in self.config.items():
+            if k == "thermophysical" and not generic_active:
+                # Built-in body: the C++ parser IGNORES plain scalar keys in
+                # this section (albedo, ks, ...); it reads only
+                # use_default_albedo, incidence_angle_albedo / albedo_model,
+                # constant_thermal_inertia, and the *_override keys
+                # (config_parser.cpp "Parse Thermophysical section"). Emit
+                # ONLY keys the engine (or the GUI round-trip) actually
+                # consumes -- the old behavior wrote dead placeholders like
+                # `cp0: 800.0` + `use_default_cp0: true` that looked like
+                # live settings.
+                thermo = v if isinstance(v, dict) else {}
+                cleaned = {
+                    "use_default_albedo": thermo.get("use_default_albedo", True),
+                    "incidence_angle_albedo": thermo.get(
+                        "incidence_angle_albedo", False),
+                    "constant_thermal_inertia": thermo.get(
+                        "constant_thermal_inertia", -1.0),
+                }
+                for key in self.ENGINE_OVERRIDE_KEYS:
+                    if not thermo.get(f"use_default_{key}", True):
+                        val = thermo.get(key)
+                        if val is not None:
+                            cleaned[f"{key}_override"] = val
+                # The remaining properties (H, rhos, rhod, cp0, Qb, chi) have
+                # NO engine override path for built-in bodies; the UI disables
+                # them (see ThermophysicalTab) so nothing is silently dropped
+                # here.
+                out[k] = cleaned
+                continue
             if k == "generic_body":
                 # Include generic_body when it carries real data
                 gb = v if isinstance(v, dict) else {}
@@ -508,6 +575,21 @@ class ConfigManager:
         """Save configuration to YAML file"""
         with open(filename, 'w') as f:
             yaml.dump(self._config_for_yaml(), f, default_flow_style=False, sort_keys=False)
+
+    def save_run_yaml(self, filename, project_root):
+        """Write the engine-facing YAML with every path field absolutized
+        against `project_root`.
+
+        Use this whenever the YAML is written somewhere other than the
+        user's project directory (e.g. the dashboard writing the run config
+        beside the output dir): the engine resolves a relative
+        radiation.view_factor_file against the YAML's OWN directory
+        (config_parser.cpp), so a config that moves must carry absolute
+        paths. The old tempfile approach silently broke the VF cache."""
+        from gui_core.preflight import absolutize_config_paths
+        data = absolutize_config_paths(self._config_for_yaml(), project_root)
+        with open(filename, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
     def generate_yaml(self):
         """Generate YAML string for preview"""

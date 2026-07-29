@@ -2,6 +2,25 @@
 
 Modern PyQt6-based graphical user interface for the Planetary Thermophysical Model simulation suite.
 
+## Supported entry point
+
+**`python run_gui.py` is the ONE supported way to launch the PTM3D GUI** (the
+thermal simulation application, `ptm3d_gui.py`). The other launchers
+(`run_dashboard.py`, `run_exosphere_gui.py`, `run_viewshed_gui.py`) are
+experimental and get less testing.
+
+The old PyQt5 application (`ptm_config_gui.py` and its modules) has been moved
+to `legacy/`. It does not run with the PyQt6-only dependencies in
+`requirements.txt` and is kept only for reference — do not use it, and do not
+copy configuration code from it (its YAML schema has drifted from the engine).
+
+Before a simulation launches, the GUI now runs a pre-flight check
+(`gui_core/preflight.py`): paths must exist and be readable, cloud-synced
+paths (`/Library/CloudStorage/...`) require an explicit override, and
+"dataless" cloud placeholder files (evicted from local disk) block the launch
+— reading one hangs the engine indefinitely. Keep simulation input data on a
+local disk, not in a cloud-synced folder.
+
 ## Features
 
 ### 1. Simulation Configuration

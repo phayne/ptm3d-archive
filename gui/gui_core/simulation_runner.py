@@ -4,12 +4,16 @@ Handles simulation execution in background thread
 """
 
 import subprocess
+import signal
 import sys
 import os
 import re
 import select
+import time
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from gui_core.preflight import build_engine_env, find_project_root
 
 
 class SimulationThread(QThread):
@@ -18,75 +22,32 @@ class SimulationThread(QThread):
     output_ready = pyqtSignal(str)
     error_ready = pyqtSignal(str)
     progress_update = pyqtSignal(float)
+    # Stall watchdog: (message, stalled). Emitted every WATCHDOG_INTERVAL_S
+    # while the child's CPU clock is not advancing (blocked on file I/O --
+    # e.g. a dehydrated cloud file -- or a wedged GPU), and once when
+    # progress resumes. Lets the GUI distinguish "computing" from "hung".
+    heartbeat = pyqtSignal(str, bool)
     finished = pyqtSignal(int)  # Exit code
+
+    WATCHDOG_INTERVAL_S = 30.0   # child cputime sampling cadence
+    STALL_CPU_DELTA_S = 0.5      # < this much CPU advance per interval = stalled
 
     def __init__(self, config_file, working_dir=None, config_dict=None):
         super().__init__()
         self.config_file = config_file
         self.working_dir = working_dir
-        self.config_dict = config_dict  # Full config for extracting radiation options
+        self.config_dict = config_dict  # Full config for engine env + CLI options
         self.process = None
         self._stop_requested = False
 
-    def _build_radiation_args(self):
-        """Build command-line arguments for radiation options (not in YAML parser)"""
-        args = []
-        if not self.config_dict:
-            return args
-
-        rad = self.config_dict.get("radiation", {})
-        if not rad.get("enabled", False):
-            return args
-
-        # Enable radiation exchange
-        args.append("--radiation-exchange")
-
-        # H-matrix compression
-        if rad.get("use_hmatrix", False):
-            args.append("--rad-hmatrix")
-
-        # GPU radiosity
-        if rad.get("use_gpu", False):
-            args.append("--rad-use-gpu")
-
-        # Verbose output
-        if rad.get("verbose", False):
-            args.append("--rad-verbose")
-
-        # View factor file
-        vf_file = rad.get("view_factor_file", "")
-        if vf_file:
-            args.extend(["--rad-view-factor-file", str(vf_file)])
-
-        # Coupling parameters
-        max_iter = rad.get("max_coupling_iterations", 10)
-        if max_iter != 10:
-            args.extend(["--rad-coupling-iter", str(max_iter)])
-
-        temp_tol = rad.get("coupling_temp_threshold", 0.5)
-        if temp_tol != 0.5:
-            args.extend(["--rad-coupling-temp-tol", str(temp_tol)])
-
-        flux_tol = rad.get("coupling_flux_threshold", 0.1)
-        if flux_tol != 0.1:
-            args.extend(["--rad-coupling-flux-tol", str(flux_tol)])
-
-        face_frac = rad.get("coupling_face_fraction", 0.01)
-        if face_frac != 0.01:
-            args.extend(["--rad-coupling-face-frac", str(face_frac)])
-
-        # ACA parameters (if not using ACA, use SVD)
-        if not rad.get("use_aca", True):
-            args.append("--rad-use-svd")
-        else:
-            aca_tol = rad.get("aca_tolerance", 0.001)
-            if aca_tol != 0.001:
-                args.extend(["--rad-aca-tolerance", str(aca_tol)])
-            aca_rank = rad.get("aca_max_rank", 50)
-            if aca_rank != 50:
-                args.extend(["--rad-aca-max-rank", str(aca_rank)])
-
-        return args
+    # NOTE: radiation options are deliberately NOT duplicated as command-line
+    # flags. config_parser.cpp reads the complete radiation section from the
+    # YAML itself (enabled, use_hmatrix, use_gpu, view_factor_file, coupling
+    # and ACA parameters, band_separated, gpu_devices, ...). The old
+    # _build_radiation_args copied a subset onto the CLI "because they were
+    # not in the YAML parser" -- that has been false for a long time, and the
+    # CLI copy risked silently overriding the YAML whenever GUI and engine
+    # defaults diverged. YAML is the single source of truth now.
 
     def _build_gpu_thermal_args(self):
         """Build command-line arguments for GPU thermal options (not in YAML parser)"""
@@ -122,16 +83,28 @@ class SimulationThread(QThread):
                 self.finished.emit(-1)
                 return
 
-            # Build command with config file and additional CLI args for radiation/GPU
+            # Build command with config file and additional CLI args for GPU/
+            # generic-body options (radiation comes from the YAML -- see note
+            # above _build_gpu_thermal_args).
             command = [str(executable), "--config", str(self.config_file)]
-            command.extend(self._build_radiation_args())
             command.extend(self._build_gpu_thermal_args())
             command.extend(self._build_generic_body_args())
 
-            # Pass current Python executable to subprocess so C++ can invoke it
-            # This ensures the correct Python environment (conda/venv) is used
-            env = os.environ.copy()
-            env["PYTHON_EXECUTABLE"] = sys.executable
+            # Pin the subprocess cwd to the project root (derived from the
+            # executable location) so relative config paths (data/...,
+            # output/...) resolve deterministically instead of against
+            # wherever the GUI happened to be launched from.
+            if self.working_dir is None:
+                self.working_dir = str(find_project_root(executable))
+
+            # Engine environment: inherited env + the recommended-ON physics
+            # fix flags + the user's Engine Flags table (config['engine_env']).
+            # build_engine_env also sets PYTHON_EXECUTABLE so C++ can invoke
+            # the correct Python (conda/venv).
+            env, applied = build_engine_env(self.config_dict or {})
+            self.output_ready.emit(f"[run] cwd: {self.working_dir}")
+            if applied:
+                self.output_ready.emit("[run] engine env: " + " ".join(applied))
 
             self.process = subprocess.Popen(
                 command,
@@ -140,7 +113,8 @@ class SimulationThread(QThread):
                 universal_newlines=False,
                 bufsize=0,
                 cwd=self.working_dir,
-                env=env
+                env=env,
+                start_new_session=True  # own process group: clean group kill
             )
 
             stdout_buffer = bytearray()
@@ -173,6 +147,14 @@ class SimulationThread(QThread):
                 buf.clear()
                 buf.extend(remainder)
 
+            # Stall watchdog state: sample the child's CPU clock every
+            # WATCHDOG_INTERVAL_S. A process blocked in a file read (e.g. a
+            # dehydrated cloud-synced file) accumulates no CPU time, which is
+            # otherwise indistinguishable from long computation.
+            next_watchdog = time.monotonic() + self.WATCHDOG_INTERVAL_S
+            last_cputime = None
+            stall_since = None
+
             # Pump both pipes
             while not self._stop_requested:
                 if self.process.poll() is not None:
@@ -183,6 +165,27 @@ class SimulationThread(QThread):
                     if tail_err:
                         stderr_buffer.extend(tail_err)
                     break
+
+                now = time.monotonic()
+                if now >= next_watchdog:
+                    next_watchdog = now + self.WATCHDOG_INTERVAL_S
+                    cpu = self._sample_cputime(self.process.pid)
+                    if cpu is not None:
+                        if (last_cputime is not None
+                                and (cpu - last_cputime) < self.STALL_CPU_DELTA_S):
+                            if stall_since is None:
+                                stall_since = now - self.WATCHDOG_INTERVAL_S
+                            mins = (now - stall_since) / 60.0
+                            self.heartbeat.emit(
+                                f"No progress for {mins:.1f} min (CPU idle) -- "
+                                "likely blocked on file I/O (cloud-synced or "
+                                "dataless file?)", True)
+                        else:
+                            if stall_since is not None:
+                                self.heartbeat.emit(
+                                    "Progress resumed (CPU active)", False)
+                            stall_since = None
+                        last_cputime = cpu
 
                 readable, _, _ = select.select(
                     [self.process.stdout, self.process.stderr], [], [], 0.1
@@ -216,15 +219,64 @@ class SimulationThread(QThread):
             self.finished.emit(-1)
 
     def stop(self):
-        """Stop the running simulation"""
+        """Stop the running simulation.
+
+        The child is launched with start_new_session=True, so signal the
+        whole process group: TERM first, KILL after 5 s. A process stuck in
+        an uninterruptible cloud-file read may not die instantly even on
+        KILL; the final wait is bounded so this never hangs the caller.
+        """
         self._stop_requested = True
         if self.process and self.process.poll() is None:
-            self.process.terminate()
+            self._signal_group(signal.SIGTERM)
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+                self._signal_group(signal.SIGKILL)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass  # bounded: do not hang the GUI on a stuck process
+
+    def _signal_group(self, sig):
+        """Send `sig` to the child's process group (fallback: child only)."""
+        try:
+            os.killpg(os.getpgid(self.process.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                if sig == signal.SIGKILL:
+                    self.process.kill()
+                else:
+                    self.process.terminate()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sample_cputime(pid):
+        """Child CPU time in seconds via ps (portable on macOS/Linux).
+        Returns None if unavailable."""
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "cputime=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        except Exception:
+            return None
+        if not out:
+            return None
+        # Format: [[dd-]hh:]mm:ss[.ff]
+        try:
+            days = 0
+            if "-" in out:
+                d, out = out.split("-", 1)
+                days = int(d)
+            parts = [float(p) for p in out.split(":")]
+            while len(parts) < 3:
+                parts.insert(0, 0.0)
+            h, m, s = parts[-3], parts[-2], parts[-1]
+            return days * 86400.0 + h * 3600.0 + m * 60.0 + s
+        except (ValueError, IndexError):
+            return None
 
     def _is_progress_line(self, text):
         """Check if line is a progress/info update (not an error)"""

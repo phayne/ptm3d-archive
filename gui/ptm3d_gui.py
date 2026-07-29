@@ -26,6 +26,7 @@ from PyQt6.QtGui import QAction, QIcon, QFont, QKeySequence, QPalette, QColor
 from gui_core.config_manager import ConfigManager
 from gui_core.styles import ModernStyle
 from gui_core.simulation_runner import SimulationRunner, SimulationThread, CameraSimThread
+from gui_core.preflight import run_preflight, confirm_preflight
 
 # Panels
 from gui_panels.config_panel import ConfigurationPanel
@@ -611,9 +612,22 @@ class PTM3DMainWindow(QMainWindow):
             # Save current state
             self.save_project()
 
-        # Create simulation thread with config dict for radiation/GPU command-line args
+        # Pre-flight validation: paths exist and are readable, no dataless
+        # (cloud placeholder) files, cloud-path override, disk space, VF
+        # face-count guard, executable fingerprint. A config that fails
+        # pre-flight would previously hang or crash mid-run with no
+        # diagnosis (e.g. an OneDrive topo_directory of evicted files).
+        config_dict = self.config_manager.get_config()
+        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
+        for line in report.summary_lines():
+            self.console_panel.append_info(f"[preflight] {line}")
+        if not confirm_preflight(self, report):
+            self.console_panel.append_warning("Launch canceled by pre-flight check")
+            return
+
+        # Create simulation thread (cwd is pinned to the project root and the
+        # engine env flags are applied inside SimulationThread)
         try:
-            config_dict = self.config_manager.get_config()
             self.simulation_thread = SimulationThread(
                 self.current_project_file,
                 config_dict=config_dict
@@ -621,6 +635,7 @@ class PTM3DMainWindow(QMainWindow):
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
             self.simulation_thread.error_ready.connect(self.on_simulation_error)
             self.simulation_thread.progress_update.connect(self.on_simulation_progress)
+            self.simulation_thread.heartbeat.connect(self.on_simulation_heartbeat)
             self.simulation_thread.finished.connect(self.on_simulation_finished)
 
             # Update UI
@@ -661,15 +676,29 @@ class PTM3DMainWindow(QMainWindow):
         """Handle simulation progress update"""
         self.progress_bar.setValue(int(percent))
 
+    def on_simulation_heartbeat(self, message, stalled):
+        """Watchdog heartbeat: distinguish a hung file read from computation."""
+        if stalled:
+            self.status_label.setText(f"STALLED -- {message}")
+            self.console_panel.append_warning(f"[watchdog] {message}")
+        else:
+            self.status_label.setText("Simulation running")
+            self.console_panel.append_info(f"[watchdog] {message}")
+
     def on_simulation_finished(self, exit_code):
         """Handle simulation completion"""
         if exit_code == 0:
             self.console_panel.append_success("Simulation completed successfully")
             self.update_simulation_status("completed")
 
-            # Auto-load results
+            # Auto-load results. Resolve a relative output directory against
+            # the same project root the engine ran in (SimulationThread pins
+            # its cwd there), NOT against the GUI's own cwd.
+            from gui_core.preflight import find_project_root, resolve_path
             config = self.config_manager.get_config()
-            output_dir = Path(config["output"]["directory"])
+            exe = SimulationRunner.find_ptm_executable()
+            root = find_project_root(exe) if exe else Path.cwd()
+            output_dir = resolve_path(config["output"]["directory"], root)
             if output_dir.exists():
                 self.results_panel.load_results(str(output_dir))
                 self.current_results_dir = str(output_dir)
@@ -940,8 +969,14 @@ class PTM3DMainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+            # stop() escalates TERM -> KILL on the child's process group.
+            # Bound the thread wait so a child stuck in an uninterruptible
+            # cloud-file read cannot hang the GUI on exit (the reader thread
+            # is a daemon of this process and dies with it; the process
+            # group has already been signaled).
             self.simulation_thread.stop()
-            self.simulation_thread.wait()
+            if not self.simulation_thread.wait(7000):
+                self.simulation_thread.wait(2000)
 
         # Clean up visualization
         self.viz_panel.cleanup()
