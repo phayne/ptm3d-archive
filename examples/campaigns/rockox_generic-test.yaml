@@ -68,7 +68,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/rockox_test
+  directory: output/rockox_test
   format: binary
   vtk_mode: both
   include_primary_ir: false
@@ -83,9 +83,9 @@ advanced:
   default_visible_albedo: -1.0
 generic_body:
   name: 13294 Rockox (1998 QO105)
-  config_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/body_config.yaml
+  config_file: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/body_config.yaml
   ephemeris_source: spice
-  spice_metakernel: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
+  spice_metakernel: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
   naif_id: '2013294'
   shape:
     type: spherical

@@ -43,7 +43,7 @@ thermal:
   equilibration_samples_per_diurnal_cycle: 120.0
   compute_statistics: true
   use_default_property_map: true
-  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps
+  property_maps_directory: data/property_maps
   thermal_inertia_map: ''
   h_parameter_map: ''
   compute_ice_stability: true

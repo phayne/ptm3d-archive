@@ -8,7 +8,7 @@ mesh:
   import_file: ''
   scale_factor: 1.0
   use_topographic: true
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo/moon
+  topo_directory: data/topo/moon
 thermal:
   run_thermal_mesh: true
   threads: 0
@@ -20,7 +20,7 @@ thermal:
   thermal_inertia_map: ''
   h_parameter_map: ''
   use_default_property_map: false
-  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps/moon
+  property_maps_directory: data/property_maps/moon
   enable_shadow_flux: false
   crater_dd_ratio: 8.0
   integration_days: -1.0
@@ -74,11 +74,11 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
   albedo_map: ''
-  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  albedo_maps_directory: data/albedo_maps
   positions_file: ''
   use_albedo_map: true
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/moon_ico6_hpar-test
+  directory: output/moon_ico6_hpar-test
   format: binary
   vtk_mode: both
   include_primary_ir: false

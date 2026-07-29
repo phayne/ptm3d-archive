@@ -10,7 +10,7 @@ mesh:
   import_file: ''
   scale_factor: 1.0
   use_topographic: true
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
+  topo_directory: data/topo
 thermal:
   run_thermal_mesh: true
   threads: 0

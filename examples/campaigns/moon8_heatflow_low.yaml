@@ -9,7 +9,7 @@ mesh:
   scale_factor: 1.0
   export_basic: false
   use_topographic: true
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
+  topo_directory: data/topo
 thermal:
   run_thermal_mesh: true
   threads: 0
@@ -67,17 +67,17 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
   albedo_map: ''
-  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/moon8_global_heat-flow-high
+  directory: output/moon8_global_heat-flow-high
   format: binary
   vtk_mode: thermal
   include_primary_ir: true
   thermal_vtk_file: ''
   complete_vtk_file: ''
-  locations_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/locations/locations_lunar_psr_south.txt
-  depths_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/locations/depths.txt
+  locations_file: data/locations/locations_lunar_psr_south.txt
+  depths_file: data/locations/depths.txt
   series_output: ''
   location_data: ''
   no_maps: false

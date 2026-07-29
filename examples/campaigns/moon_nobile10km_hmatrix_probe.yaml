@@ -5,7 +5,7 @@ simulation:
   body: Moon
 mesh:
   resolution: 5
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/nobile_roi10km_2M.ply
+  import_file: data/external/dtm/nobile_roi10km_2M.ply
   scale_factor: 1.0
 thermal:
   run_thermal_mesh: true
