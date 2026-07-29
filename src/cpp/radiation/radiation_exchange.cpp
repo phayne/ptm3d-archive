@@ -876,19 +876,45 @@ std::vector<double> RadiositySolver::solveTwoBand(
     size_t n = temperatures.size();
     const std::vector<double> zero_source(n, 0.0);
 
-    // --- Thermal-IR band: (I - R F) B_ir = E, R = 1-eps, NO solar source ---
+    // --- Solve both bands ---
+    //   IR:      (I - R F) B_ir  = E          (R = 1-eps, no solar source)
+    //   Visible: (I - A F) B_vis = A Q_solar  (A = solar_reflectivity_, no emission)
+    // vis_source (A_i Q_solar) is needed by both the solve and the identity below.
     auto emission = computeThermalEmission(temperatures);
-    std::vector<double> B_ir;
-    if (config_.use_acceleration && !use_hmatrix_) {
-        B_ir = solveGaussSeidel(emission, zero_source, reflectivity_);
-    } else {
-        B_ir = solveJacobi(emission, zero_source, reflectivity_);
+    std::vector<double> vis_source(n);
+    for (size_t i = 0; i < n; ++i) {
+        vis_source[i] = solar_reflectivity_[i] * solar_flux[i];
     }
-    // Fixed-point identity (avoids a full extra SpMV per solve): at convergence
-    // B_ir = E + reflectivity·(F·B_ir·vf_row_norm), so the normalized incoming
-    // (F·B_ir·vf_row_norm) = (B_ir − E)/reflectivity. Guard reflectivity→0
-    // (blackbody) with the last Jacobi normalized incoming. Error vs the direct
-    // matvec is O(residual/reflectivity) -- within the radiosity tolerance.
+    std::vector<double> B_ir, B_vis;
+    // Gauss-Seidel is the effective solver ONLY when it can actually access rows
+    // (F_ptr_ set); the SparseVFOperator VF_REPLACE path has F_ptr_==null so GS
+    // falls back to Jacobi -- there we use the Tier-2 fused two-band Jacobi (one
+    // width-2 matvec per iteration + per-band freeze), byte-identical to two
+    // separate solveJacobi() calls but sharing the CSR traversal.
+    const bool use_gs = config_.use_acceleration && !use_hmatrix_ && (F_ptr_ != nullptr);
+    if (use_gs) {
+        B_ir  = solveGaussSeidel(emission, zero_source, reflectivity_);
+        last_iterations_ir_ = last_iterations_;
+        B_vis = solveGaussSeidel(zero_source, vis_source, solar_reflectivity_);
+        last_iterations_vis_ = last_iterations_;
+    } else {
+        solveTwoBandJacobiFused(emission, vis_source, B_ir, B_vis);
+    }
+    // Per-band sweep counts (Fermi's decisive measurement). Logged once/process to
+    // avoid per-timestep spam; representative of the fused solve's band balance.
+    static bool s_logged_band_sweeps = false;
+    if (!s_logged_band_sweeps) {
+        s_logged_band_sweeps = true;
+        std::cout << "[two-band] per-band Jacobi sweeps (first solve): IR="
+                  << last_iterations_ir_ << " visible=" << last_iterations_vis_
+                  << (use_gs ? " (Gauss-Seidel, separate)"
+                             : " (fused width-2 matvec while both iterate; freeze after)")
+                  << std::endl;
+    }
+
+    // Fixed-point identity (Tier 1 #2), applied to each converged band: the
+    // normalized incoming F·B·vf_row_norm = (B − E − source)/refl (avoids a second
+    // SpMV). Guard refl→0 (blackbody) with the last Jacobi normalized incoming.
     constexpr double REFL_GUARD = 1e-9;
     last_indirect_ir_.assign(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
@@ -898,35 +924,14 @@ std::vector<double> RadiositySolver::solveTwoBand(
             : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
         last_indirect_ir_[i] = emissivity_[i] * inc_norm;
     }
-
-    // --- Visible band: (I - A F) B_vis = A Q_solar, NO emission source ---
-    // A_i = solar_reflectivity_[i] (per-face Bond albedo; A2). B_vis is T-independent
-    // and converges in 1-2 SpMV, so it is re-solved directly each call (the visible
-    // cache was removed — see the header note; production for iter { for t } made it
-    // miss every call). scatter A_i / absorb (1 - A_i) per face closes energy exactly.
-    {
-        std::vector<double> vis_source(n);
-        for (size_t i = 0; i < n; ++i) {
-            vis_source[i] = solar_reflectivity_[i] * solar_flux[i];
-        }
-        std::vector<double> B_vis;
-        if (config_.use_acceleration && !use_hmatrix_) {
-            B_vis = solveGaussSeidel(zero_source, vis_source, solar_reflectivity_);
-        } else {
-            B_vis = solveJacobi(zero_source, vis_source, solar_reflectivity_);
-        }
-        // Same identity for the visible band (no emission source):
-        // B_vis = vis_source + A·(F·B_vis·vf_row_norm), so the normalized incoming
-        // (F·B_vis·vf_row_norm) = (B_vis − vis_source)/A_i. Guard A_i→0.
-        last_indirect_vis_.assign(n, 0.0);
-        for (size_t i = 0; i < n; ++i) {
-            const double sr = solar_reflectivity_[i];
-            const double inc_norm = (sr > REFL_GUARD)
-                ? (B_vis[i] - vis_source[i]) / sr
-                : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
-            // Absorb scattered visible with the visible absorptivity (1 - A_i).
-            last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * inc_norm;
-        }
+    last_indirect_vis_.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const double sr = solar_reflectivity_[i];
+        const double inc_norm = (sr > REFL_GUARD)
+            ? (B_vis[i] - vis_source[i]) / sr
+            : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
+        // Absorb scattered visible with the visible absorptivity (1 - A_i).
+        last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * inc_norm;
     }
 
     // --- Sum the two absorbed indirect fluxes ---
@@ -1046,6 +1051,75 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
     last_jacobi_incoming_ = temp_vec;
 
     return radiosity;
+}
+
+// Tier 2: fused two-band Jacobi. Byte-identical to
+//   B_ir  = solveJacobi(emission,   0,          reflectivity_)
+//   B_vis = solveJacobi(0,          vis_source, solar_reflectivity_)
+// run separately -- same per-band init/update/normalization/convergence and the
+// same per-band sweep count -- but while BOTH bands are still iterating it drives
+// them through one width-2 matvec (matvec2), reading the CSR once for both. The
+// instant a band's rel-residual drops below tolerance it is FROZEN (its converged
+// radiosity is kept, its matvec skipped), so the slower band finishes on a single-
+// band matvec exactly as it would alone. Only the effective-Jacobi path uses this
+// (see solveTwoBand); the arithmetic here mirrors solveJacobi() line-for-line.
+void RadiositySolver::solveTwoBandJacobiFused(
+    const std::vector<double>& emission,
+    const std::vector<double>& vis_source,
+    std::vector<double>& B_ir, std::vector<double>& B_vis) {
+    const size_t n = emission.size();
+    std::vector<double> r_ir(n), rn_ir(n), tv_ir(n);
+    std::vector<double> r_vis(n), rn_vis(n), tv_vis(n);
+    for (size_t i = 0; i < n; ++i) {
+        r_ir[i]  = emission[i];    // IR init  = emission + 0 (solveJacobi: E + solar_source)
+        r_vis[i] = vis_source[i];  // vis init = 0 + vis_source
+    }
+    bool conv_ir = false, conv_vis = false;
+    int it_ir = 0, it_vis = 0;
+    const double tol = config_.convergence_tolerance;
+    for (int iter = 0; iter < config_.max_iterations && !(conv_ir && conv_vis); ++iter) {
+        if (!conv_ir && !conv_vis) {
+            F_op_->matvec2(r_ir, r_vis, tv_ir, tv_vis);   // shared traversal
+        } else if (!conv_ir) {
+            F_op_->matvec(r_ir, tv_ir);
+        } else {
+            F_op_->matvec(r_vis, tv_vis);
+        }
+        if (!conv_ir) {
+            for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) tv_ir[i] *= vf_row_norm_[i];
+            double max_change = 0.0, max_val = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                rn_ir[i] = emission[i] + reflectivity_[i] * tv_ir[i];
+                max_change = std::max(max_change, std::abs(rn_ir[i] - r_ir[i]));
+                max_val    = std::max(max_val,    std::abs(rn_ir[i]));
+            }
+            std::swap(r_ir, rn_ir);
+            it_ir = iter + 1;
+            const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            if (rel < tol) conv_ir = true;
+        }
+        if (!conv_vis) {
+            for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) tv_vis[i] *= vf_row_norm_[i];
+            double max_change = 0.0, max_val = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                rn_vis[i] = vis_source[i] + solar_reflectivity_[i] * tv_vis[i];
+                max_change = std::max(max_change, std::abs(rn_vis[i] - r_vis[i]));
+                max_val    = std::max(max_val,    std::abs(rn_vis[i]));
+            }
+            std::swap(r_vis, rn_vis);
+            it_vis = iter + 1;
+            const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            if (rel < tol) conv_vis = true;
+        }
+    }
+    // Dead-path fallback source for the #2 identity (refl→0 only): match
+    // solveJacobi()'s final-call state (the visible band was solved last).
+    last_jacobi_incoming_ = tv_vis;
+    last_iterations_ir_  = it_ir;
+    last_iterations_vis_ = it_vis;
+    last_iterations_     = it_vis;  // aggregate getter: last band solved, as before
+    B_ir  = std::move(r_ir);
+    B_vis = std::move(r_vis);
 }
 
 std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>& emission,
