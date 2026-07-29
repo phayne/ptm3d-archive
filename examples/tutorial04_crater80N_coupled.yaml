@@ -1,0 +1,59 @@
+# Tutorial 04: lunar 80N bowl crater WITH inter-face radiation exchange
+# (radiosity). Compare against tutorial04_crater80N_radoff.yaml — radiation
+# warms the shadowed crater floor (docs/tutorials/04_crater_radiosity.md).
+# Run from the repo root after `python3 scripts/fetch_kernels.py`.
+#
+# The first run builds an H-matrix view-factor set for the 12,800-face mesh
+# and SAVES it to radiation.view_factor_file; later runs reload it.
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  albedo: 0.12
+  use_default_emissivity: true
+  emissivity: 0.95
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  use_gpu: false
+  use_hmatrix: true
+  use_aca: true
+  aca_tolerance: 0.001
+  hmatrix_threads: 0
+  # NOTE: view_factor_file resolves relative to THIS CONFIG's directory
+  # (unlike output.directory, which is cwd-relative) — ../output/ puts the
+  # ~35 MB .vf in the repo-root output/ alongside the run outputs.
+  view_factor_file: ../output/tutorial04_crater80N.vf   # built on first run, reused after
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/tutorial04_crater80N_coupled
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
