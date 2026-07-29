@@ -26,5 +26,5 @@ generic_body:
     H: 0.05
     cp0: 800.0
     Qb: 0.0
-  spice_metakernel: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
-  spk_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk
+  spice_metakernel: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
+  spk_file: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk

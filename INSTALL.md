@@ -131,6 +131,11 @@ Two things to know:
 Small bodies driven by JPL Horizons (`generic_body` configs) cache their own ephemerides
 under `data/horizons_cache/` and need only `lsk/naif0012.tls` from the above.
 
+**Science datasets** (lunar topography, property maps, albedo maps, validation meshes) are
+fetched the same way with `python3 scripts/fetch_data.py --core` (~1.7 GB) — see
+`data/README.md` for the catalog, and `$PTM_DATA_ROOT` in `docs/ENVIRONMENT.md` to keep
+the data outside the repository. The quickstart example needs only the SPICE kernels.
+
 ## 5. Verify the build (correctness gates)
 
 ```bash

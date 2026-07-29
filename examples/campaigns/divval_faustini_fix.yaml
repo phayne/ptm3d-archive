@@ -5,8 +5,8 @@ simulation:
   body: Moon
 mesh:
   resolution: 9
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/faustini_radcore_r25.ply
-  occluder_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/faustini_ring_25_200.ply
+  import_file: data/dem/validation/meshes/faustini_radcore_r25.ply
+  occluder_file: data/dem/validation/meshes/faustini_ring_25_200.ply
   scale_factor: 1.0
   use_topographic: false
 thermal:
@@ -21,7 +21,7 @@ thermal:
   equilibration_samples_per_diurnal_cycle: 30.0
   compute_statistics: true
   use_default_property_map: true
-  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps
+  property_maps_directory: data/property_maps
   thermal_inertia_map: ''
   h_parameter_map: ''
   enable_shadow_flux: false
@@ -31,7 +31,7 @@ thermal:
   integration_offset_days: 0.0
   integration_offset_steps: 0
   geothermal_heat_flow: -1.0
-  eq_indirect_flux_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/faustini_qind.bin
+  eq_indirect_flux_file: output/faustini_qind.bin
 thermophysical:
   use_default_albedo: true
   albedo: 0.12
@@ -60,7 +60,7 @@ radiation:
   min_shadow_fraction: 0.8
   verbose: false
   use_gpu: true
-  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/validation/meshes/faustini_radcore_r25.vf
+  view_factor_file: data/dem/validation/meshes/faustini_radcore_r25.vf
   max_coupling_iterations: 5
   coupling_temp_threshold: 2.0
   coupling_flux_threshold: 0.1
@@ -81,7 +81,7 @@ illumination:
   albedo_map: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/divval_faustini_fix
+  directory: output/divval_faustini_fix
   format: binary
   vtk_mode: thermal
   include_primary_ir: false

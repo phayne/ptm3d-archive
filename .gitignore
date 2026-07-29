@@ -47,17 +47,30 @@ CLAUDE.md
 output/
 results/
 
-# Large data
+# Large data — dataset CONTENTS are ignored (distributed via
+# scripts/fetch_data.py + data/data_manifest.json), but the per-dataset
+# provenance README.md files are tracked (hence the ** / !**/ / !README.md
+# triplets). data/kernels is handled by data/kernels/.gitignore; data/spice
+# (1.6 MB mission SPKs) is tracked.
 data/maps/*.fits
-# data/kernels: binary kernels are ignored via data/kernels/.gitignore;
-# the metakernel templates (*.tm) + README ship with the repo.
 data/meshes/moon3d_cartesian_double.ply
 data/alma/
-data/dem/
-data/spice/
-data/topo/
+data/dem/**
+!data/dem/**/
+!data/dem/**/README.md
+data/topo/**
+!data/topo/**/
+!data/topo/**/README.md
+data/property_maps/**
+!data/property_maps/**/
+!data/property_maps/**/README.md
+data/albedo_maps/**
+!data/albedo_maps/**/
+!data/albedo_maps/**/README.md
+data/external/**
+!data/external/**/
+!data/external/**/README.md
 data/jwst/
-data/property_maps/
 
 # Local caches and outputs
 .cache/

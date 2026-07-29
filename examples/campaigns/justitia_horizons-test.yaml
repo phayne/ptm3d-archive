@@ -68,7 +68,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/justitia_test
+  directory: output/justitia_test
   format: binary
   vtk_mode: both
   include_primary_ir: false
@@ -83,4 +83,4 @@ advanced:
   default_visible_albedo: -1.0
 generic_body:
   name: 269 Justitia (A887 SA)
-  config_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml
+  config_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml

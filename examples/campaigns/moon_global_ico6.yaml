@@ -7,7 +7,7 @@ mesh:
   resolution: 6
   import_file: ''
   scale_factor: 1.0
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
+  topo_directory: data/topo
   use_topographic: true
 thermal:
   run_thermal_mesh: true
@@ -72,7 +72,7 @@ illumination:
   albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/moon_global_ico6
+  directory: output/moon_global_ico6
   format: binary
   vtk_mode: both
   include_primary_ir: false

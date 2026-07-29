@@ -1,0 +1,100 @@
+{
+  "manifest_version": 1,
+  "comment": "PTM3D science-data catalog, consumed by scripts/fetch_data.py. base_url is a placeholder until the public (Zenodo) deposit is published; pass --base-url to fetch from a staging copy. SHA-256 checksums and sizes are pinned from the staged v1 archives (2026-07-29).",
+  "base_url": "ZENODO_PLACEHOLDER",
+  "datasets": {
+    "moon-topo": {
+      "description": "Moon global icosphere topography ico3-ico9 (LOLA-derived)",
+      "tier": "core",
+      "attribution": "Derived from LRO LOLA LDEM (Smith et al. 2010); NASA PDS public domain",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "moon_topo_ico3-9.tar.gz",
+          "sha256": "576afdab3da143f953169d76042b068addeaeb753ddc4b5f4fac3e96109b8a95",
+          "size": 545527971,
+          "archive": true,
+          "unpack_to": "data/topo/moon/"
+        }
+      ]
+    },
+    "moon-property-maps": {
+      "description": "Diviner-derived lunar property maps: H-parameter, maria mask, TI@273K (ico3-ico9)",
+      "tier": "core",
+      "attribution": "Diviner heritage (Hayne et al. 2017; Paige et al. 2010); NASA PDS public domain",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "moon_property_maps.tar.gz",
+          "sha256": "404bcc1224f73717ac6c076e587a8e87df8b1250ba42871effe0bc4224718680",
+          "size": 41482713,
+          "archive": true,
+          "unpack_to": "data/property_maps/moon/"
+        }
+      ]
+    },
+    "albedo-maps": {
+      "description": "Moon + Europa Bond-albedo maps (per-face binaries res3-res9 + source FITS)",
+      "tier": "core",
+      "attribution": "Derived from NASA PDS mission data (LRO; Voyager/Galileo)",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "albedo_maps.tar.gz",
+          "sha256": "d557198f194cf612a8c518ff20b54664d28056900316b93295f40b9a86053d96",
+          "size": 142698802,
+          "archive": true,
+          "unpack_to": "data/albedo_maps/"
+        }
+      ]
+    },
+    "validation-meshes": {
+      "description": "Diviner-validation crater meshes + view factors (Haworth/Faustini/Shackleton/sunlit) + LOLA 20 m rasters",
+      "tier": "core",
+      "attribution": "Derived from LRO LOLA (Smith et al. 2010); validation vs Diviner (Paige et al. 2010)",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "validation_meshes.tar.gz",
+          "sha256": "7e1ee9c0f3d632d06d9c5539578b3b81992805d109bb39c11bd036d07e7fa4f9",
+          "size": 618003042,
+          "archive": true,
+          "unpack_to": "data/dem/validation/"
+        }
+      ]
+    },
+    "copernicus-dem": {
+      "description": "Copernicus crater DEM crop (SLDEM2015 512 ppd) + hillshade/color products",
+      "tier": "core",
+      "attribution": "SLDEM2015 (Barker et al. 2016); NASA PDS public domain",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "copernicus_dem.tar.gz",
+          "sha256": "4ff87e2a498b8f9fdec9a7aa6f434ee80427fbed0c7c394dfbb9f251168b8e95",
+          "size": 86181891,
+          "archive": true,
+          "unpack_to": "data/dem/copernicus/"
+        }
+      ]
+    },
+    "moon3d-mesh": {
+      "description": "Moon3D 500k-face global terrain mesh (LOLA-derived PLY)",
+      "tier": "core",
+      "attribution": "Derived from LRO LOLA LDEM (Smith et al. 2010); NASA PDS public domain",
+      "license": "CC-BY-4.0",
+      "files": [
+        {
+          "name": "moon3d_cartesian_double.ply",
+          "sha256": "92bd16e925cd195502055c426e169f9d3059b7fac86db8845627ed2f3d68fe66",
+          "size": 32269608,
+          "archive": false,
+          "unpack_to": "data/meshes/"
+        }
+      ]
+    }
+  },
+  "planned_optional_datasets": {
+    "comment": "Not yet staged (very large; hydration + deposit deferred to the P2/P4 upload session): moon-topo-hires (topo_moon_ico10/ico11, ~9.2 GB) and diviner-seasonal-full (raw .txt exports, ~1.7 GB). They will be added as tier=optional entries with pinned hashes when deposited."
+  }
+}

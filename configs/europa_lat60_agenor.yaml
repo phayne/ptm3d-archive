@@ -6,13 +6,13 @@ illumination:
   use_batch_processing: true
 mesh:
   export_basic: false
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Agenor_DEM_750m_SOCET.ply
+  import_file: data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.ply
   latitude_override: 60.0
   resolution: 5
   scale_factor: 1.0
   use_topographic: false
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/europa_lat60_agenor
+  directory: output/europa_lat60_agenor
   format: binary
   include_primary_ir: false
   vtk_mode: both
@@ -34,7 +34,7 @@ radiation:
   use_gpu: true
   use_hmatrix: false
   verbose: false
-  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Agenor_DEM_750m_SOCET.vf
+  view_factor_file: data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.vf
 simulation:
   body: Europa
   duration_days: 3.55

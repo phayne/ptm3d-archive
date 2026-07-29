@@ -24,7 +24,7 @@ simulation:
   body: Moon
 mesh:
   resolution: 9                    # ignored when import_file is set
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/dem/mons_mouton/A3GT_MM02_84.370S_31.977E_R5km_core0.1_pts4400k.ply
+  import_file: data/dem/mons_mouton/A3GT_MM02_84.370S_31.977E_R5km_core0.1_pts4400k.ply
   scale_factor: 1.0
   use_topographic: false
 thermal:
@@ -36,7 +36,7 @@ thermal:
   equilibration_samples_per_diurnal_cycle: 120.0
   compute_statistics: true
   use_default_property_map: true
-  property_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/property_maps
+  property_maps_directory: data/property_maps
   thermal_inertia_map: ''
   h_parameter_map: ''
   compute_ice_stability: true
@@ -88,7 +88,7 @@ output:
   # Per-chunk dirs are placed under <output-dir>/chunk_NNN/ by the
   # orchestrator; the merged statistics land in <output-dir>/statistics/.
   # The 'directory' here is overwritten per chunk; leave a placeholder.
-  directory: /Users/paha3326/Research/moon/artemis/a3gt/A3GT_MM02_18yr
+  directory: output/A3GT_MM02_18yr
   format: binary
   vtk_mode: thermal
   include_primary_ir: false

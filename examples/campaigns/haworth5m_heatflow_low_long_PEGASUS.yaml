@@ -5,11 +5,11 @@ simulation:
   body: Moon
 mesh:
   resolution: 9
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/haworth-5m/haworth-5m-pegasus2.ply
+  import_file: data/external/dtm/haworth-5m/haworth-5m-pegasus2.ply
   scale_factor: 1.0
   export_basic: false
   use_topographic: false
-  topo_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/topo
+  topo_directory: data/topo
 thermal:
   run_thermal_mesh: true
   threads: 0
@@ -49,7 +49,7 @@ radiation:
   min_shadow_fraction: 0.8
   verbose: false
   use_gpu: true
-  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/haworth-5m/haworth-5m-pegasus2.vf
+  view_factor_file: data/external/dtm/haworth-5m/haworth-5m-pegasus2.vf
   max_coupling_iterations: 5
   coupling_temp_threshold: 2.0
   coupling_flux_threshold: 0.1
@@ -67,17 +67,17 @@ illumination:
   include_primary_reflection: true
   use_batch_processing: true
   albedo_map: ''
-  albedo_maps_directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/albedo_maps
+  albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output/haworth5m-pegasus2/2030sep-heatflow-low
+  directory: output/haworth5m-pegasus2/2030sep-heatflow-low
   format: binary
   vtk_mode: thermal
   include_primary_ir: true
   thermal_vtk_file: ''
   complete_vtk_file: ''
   locations_file: ''
-  depths_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/locations/depths.txt
+  depths_file: data/locations/depths.txt
   series_output: ''
   location_data: ''
   no_maps: false

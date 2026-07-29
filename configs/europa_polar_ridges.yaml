@@ -5,7 +5,7 @@ simulation:
   body: Europa
 mesh:
   resolution: 5
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Ridges_DEM_60m_SOCET.ply
+  import_file: data/external/sutton_DEMs/Ridges_DEM_60m_SOCET.ply
   scale_factor: 1.0
   export_basic: false
   use_topographic: false
@@ -44,7 +44,7 @@ radiation:
   min_shadow_fraction: 0.3
   verbose: false
   use_gpu: true
-  view_factor_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE/Ridges_DEM_60m_SOCET.vf
+  view_factor_file: data/external/sutton_DEMs/Ridges_DEM_60m_SOCET.vf
   max_coupling_iterations: 10
   coupling_temp_threshold: 0.5
   coupling_flux_threshold: 0.1
@@ -63,7 +63,7 @@ illumination:
   use_batch_processing: true
   use_albedo_map: false
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/output/europa_polar_ridges
+  directory: output/europa_polar_ridges
   format: binary
   vtk_mode: both
   include_primary_ir: false

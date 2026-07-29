@@ -83,4 +83,4 @@ advanced:
   default_visible_albedo: -1.0
 generic_body:
   name: 4 Vesta (A807 FA)
-  config_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/4_Vesta_(A807_FA)/body_config.yaml
+  config_file: data/horizons_cache/bodies/4_Vesta_(A807_FA)/body_config.yaml

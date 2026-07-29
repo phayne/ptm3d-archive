@@ -5,7 +5,7 @@ simulation:
   body: Moon
 mesh:
   resolution: 5
-  import_file: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/LDEM_80S_20M__amundsen_2Mpts.ply
+  import_file: data/external/dtm/LDEM_80S_20M__amundsen_2Mpts.ply
   scale_factor: 1.0
 thermal:
   run_thermal_mesh: true
@@ -70,7 +70,7 @@ illumination:
   albedo_maps_directory: data/albedo_maps
   positions_file: ''
 output:
-  directory: /Users/paha3326/Research/moon/diviner/amundsen
+  directory: output/amundsen
   format: binary
   vtk_mode: both
   include_primary_ir: false
