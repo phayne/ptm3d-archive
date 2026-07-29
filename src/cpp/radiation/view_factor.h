@@ -50,6 +50,14 @@ public:
                            const std::vector<int>& col_indices,
                            const std::vector<double>& values);
 
+    // Adopt a pre-built CSR directly (no COO round-trip). Moves the arrays in;
+    // row_ptrs is int64 so > 2^31-nnz matrices are supported (GPU pool). Used to
+    // route a VF_REPLACE corrected CSR into the GPU F_ptr_ path.
+    void setFromCSR(size_t n_faces,
+                    std::vector<int64_t>&& row_ptrs,
+                    std::vector<int>&& col_indices,
+                    std::vector<double>&& values);
+
     // Access elements
     double get(int row, int col) const;
 

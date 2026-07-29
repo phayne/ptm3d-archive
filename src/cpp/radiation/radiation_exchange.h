@@ -336,6 +336,9 @@ private:
     // Data members
     std::unique_ptr<IViewFactorOperator> F_op_;
     const ViewFactorMatrix* F_ptr_ = nullptr;  // For row access in Gauss-Seidel
+    // Owns a ViewFactorMatrix built from a VF_REPLACE corrected CSR when routed
+    // to the GPU pool (PTM_HMATRIX_VF_REPLACE_GPU); F_ptr_ points into it.
+    std::unique_ptr<ViewFactorMatrix> owned_vf_;
     bool use_hmatrix_ = false;
     std::vector<double> emissivity_;
     std::vector<double> reflectivity_;  // 1 - emissivity (thermal reflectivity)

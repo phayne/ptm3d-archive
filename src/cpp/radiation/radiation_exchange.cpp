@@ -148,12 +148,32 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                       << "must not run — re-assemble. Aborting.\n";
             std::exit(3);
         }
-        F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
-                    std::move(indptr), std::move(cols), std::move(data));
-        std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
-                     "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
-                     "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
-                     "under-coupling; reciprocity by construction." << std::endl;
+        // Route the corrected CSR: default = CPU SparseVFOperator (unchanged);
+        // PTM_HMATRIX_VF_REPLACE_GPU = build a ViewFactorMatrix and set F_ptr_ so
+        // initGPU + the multi-GPU pool + the chunked-vector kernel run it. The
+        // invariant checks above (mesh-hash, ΣF<=1, non-negativity) are identical
+        // for both routes. Gate unset => this branch is not taken => byte-identical.
+        if (std::getenv("PTM_HMATRIX_VF_REPLACE_GPU")) {
+            std::vector<double> data_d(data.begin(), data.end());  // float -> double
+            data.clear(); data.shrink_to_fit();
+            owned_vf_ = std::make_unique<ViewFactorMatrix>();
+            owned_vf_->setFromCSR(static_cast<size_t>(nn),
+                                  std::move(indptr), std::move(cols), std::move(data_d));
+            F_ptr_ = owned_vf_.get();
+            F_op_ = std::make_unique<ViewFactorOperator>(*owned_vf_);  // CPU fallback, same matrix
+            use_hmatrix_ = false;  // corrected VF is now a sparse ViewFactorMatrix, not H-matrix
+            std::cout << "  [PTM_HMATRIX_VF_REPLACE_GPU] Routed corrected VF to the GPU F_ptr_ path "
+                         "(nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, min entry=" << neg
+                      << ", mesh-hash OK); initGPU will use the chunked-vector radiosity pool."
+                      << std::endl;
+        } else {
+            F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
+                        std::move(indptr), std::move(cols), std::move(data));
+            std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
+                         "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
+                         "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
+                         "under-coupling; reciprocity by construction." << std::endl;
+        }
     }
 
     // PTM-12 row-sum correction (occlusion-aware referee). Install a symmetric

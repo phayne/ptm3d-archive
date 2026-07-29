@@ -429,6 +429,17 @@ void ViewFactorMatrix::buildFromTriplets(size_t n_faces,
     }
 }
 
+void ViewFactorMatrix::setFromCSR(size_t n_faces,
+                                  std::vector<int64_t>&& row_ptrs,
+                                  std::vector<int>&& col_indices,
+                                  std::vector<double>&& values) {
+    n_rows_ = n_faces;
+    n_cols_ = n_faces;
+    row_ptrs_ = std::move(row_ptrs);
+    col_indices_ = std::move(col_indices);
+    values_ = std::move(values);
+}
+
 double ViewFactorMatrix::get(int row, int col) const {
     if (row < 0 || row >= static_cast<int>(n_rows_)) return 0.0;
 
