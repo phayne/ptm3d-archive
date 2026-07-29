@@ -174,6 +174,39 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                          "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
                          "under-coupling; reciprocity by construction." << std::endl;
         }
+        // If a radiance-prune receipt sidecar sits next to the CSR, surface a
+        // one-line provenance summary (eps + max discarded flux). The CSR was
+        // pruned at ASSEMBLY time (assemble_vf_haworth.py); this just reports the
+        // trade that was accepted. Minimal line-based parse; absent or
+        // unparseable => silent (the CSR itself remains authoritative).
+        {
+            const std::string rcpt = std::string(vfr) + ".prune_receipt.json";
+            std::ifstream rf2(rcpt);
+            if (rf2) {
+                auto num_after_colon = [](const std::string& s) -> double {
+                    size_t c = s.find(':');
+                    return (c == std::string::npos) ? 0.0 : std::atof(s.c_str() + c + 1);
+                };
+                double eps = 0.0, dmax = 0.0;
+                bool have_eps = false, have_dmax = false, in_disc = false;
+                std::string line;
+                while (std::getline(rf2, line)) {
+                    if (line.find("\"radiance_prune_eps_Wm2\"") != std::string::npos) {
+                        eps = num_after_colon(line); have_eps = true;
+                    } else if (line.find("\"discarded_contribution_Wm2\"") != std::string::npos) {
+                        in_disc = true;  // its "max" is the very next occurrence
+                    } else if (in_disc && line.find("\"max\"") != std::string::npos) {
+                        dmax = num_after_colon(line); have_dmax = true; in_disc = false;
+                    }
+                }
+                if (have_eps) {
+                    std::cout << "  [PTM_HMATRIX_VF_REPLACE] radiance-prune receipt: eps=" << eps
+                              << " W/m^2, max discarded contribution=";
+                    if (have_dmax) std::cout << dmax << " W/m^2"; else std::cout << "n/a";
+                    std::cout << " (from " << rcpt << ")." << std::endl;
+                }
+            }
+        }
     }
 
     // PTM-12 row-sum correction (occlusion-aware referee). Install a symmetric

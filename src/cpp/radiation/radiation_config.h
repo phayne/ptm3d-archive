@@ -109,6 +109,13 @@ struct RadiationConfig {
     double rms_slope_deg = 0.0;          // RMS micro-slope [deg]; 0 = OFF (Lambertian)
     double beam_vf_threshold = 1e-7;     // Min renormalized VF to keep a beam pair
 
+    // Radiance-weighted view-factor pruning epsilon [W/m^2]. Applied at VF
+    // ASSEMBLY time (assemble_vf_haworth.py); the sim does NOT prune -- it records
+    // the configured value for provenance/logging only. 0.0 (default) = OFF,
+    // byte-identical. DISTINCT from visibility_threshold (a build-time storage
+    // floor). See docs/radiation-exchange.md 10.9.
+    double radiance_prune_eps = 0.0;
+
     // Thread control for H-matrix building
     int hmatrix_threads = 0;             // 0 = auto, >0 = manual thread limit
 

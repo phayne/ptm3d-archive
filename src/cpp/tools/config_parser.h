@@ -272,6 +272,13 @@ struct SimulationConfig {
         // 0 (default) = Lambertian, byte-identical. RMS micro-slope [deg].
         double rms_slope_deg = 0.0;
         double beam_vf_threshold = 1e-7;
+        // Radiance-weighted view-factor pruning threshold [W/m^2], applied at VF
+        // ASSEMBLY time (scripts/ptm12_diag/assemble_vf_haworth.py) -- NOT in the
+        // sim. 0.0 (default) = no pruning, byte-identical. DISTINCT from
+        // visibility_threshold (a build-time storage floor). The runners propagate
+        // this to the assembler via PTM_RADIANCE_PRUNE_EPS; env overrides config.
+        // See docs/radiation-exchange.md 10.9.
+        double radiance_prune_eps = 0.0;
         // Band-separated (visible + thermal-IR) radiosity (D1). Production DEFAULT
         // ON (D2, 2026-07-12); gray recovered exactly with band_separated:false.
         // See docs/two-band-radiosity-derivation.tex.
