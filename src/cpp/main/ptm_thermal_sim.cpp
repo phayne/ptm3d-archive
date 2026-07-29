@@ -50,6 +50,13 @@
 #include "../gpu/thermal_gpu_pool.h"
 #endif
 
+// Per-host GPU dispatch profile (Phase R, R1). Dependency-free; safe to
+// include even in CPU-only builds (the calibration entry point is guarded by
+// PTM_GPU_OPENCL, but the profile record + loader are pure I/O).
+#include "../gpu/machine_profile.h"
+#include <unistd.h>   // gethostname
+#include <ctime>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -2717,6 +2724,33 @@ bool runThermalModelsForAllFaces(
     return success;
 }
 
+// Phase R / Fermi PORT-EQ-01: per-face mean-flux equilibration seed.
+// The legacy Moon/Europa/A3GT seed derives T(z,0) from the INSTANTANEOUS
+// absorbed flux over the first 10 equilibration steps with a hard 100 K
+// nightside floor — so a PSR floor (which never sees the sun) is stamped at
+// ~100 K and, with no radiation to drain it, its deep column holds ~50 K across
+// the whole run (the 2026-07-21 radoff-PSR-warmth finding). When
+// PTM_EQ_PERFACE_FLUX is set, each column is instead seeded from ITS OWN
+// time-mean absorbed flux (the DC term of the forcing provider — the degenerate
+// case of the Fourier-seed architecture) plus Qb, so a PSR floor cold-starts at
+// the geothermal steady state T_geo=(Qb/(eps*sigma))^0.25 (~24.7 K on the Moon),
+// while sunlit faces (mean flux ~ clear-sky) equilibrate to ~the same state as
+// before. Default OFF => byte-identical to every established baseline.
+static bool eqPerfaceFluxMode() {
+    static bool mode = []() {
+        const char* e = std::getenv("PTM_EQ_PERFACE_FLUX");
+        const bool on = (e && std::string(e) != "0" && e[0] != '\0');
+        std::cerr << "[eq-seed] equilibration seed: "
+                  << (on ? "PER-FACE time-mean absorbed flux (PSR floors cold-start "
+                           "at the geothermal steady state) [PTM_EQ_PERFACE_FLUX=1]"
+                         : "LEGACY first-10-step instantaneous flux with 100 K "
+                           "nightside floor [PTM_EQ_PERFACE_FLUX unset]")
+                  << std::endl;
+        return on;
+    }();
+    return mode;
+}
+
 // =============================================================================
 // SIMD Batch Thermal Solver (SIMD-over-pixels)
 // Processes 8 faces at once using AVX-512 (or 4 with AVX2)
@@ -3709,11 +3743,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
             }
         } else {
+            const bool perface = eqPerfaceFluxMode();
             for (size_t f = 0; f < batch_n; ++f) {
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = std::min(10, total_time_steps);
+                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -3723,14 +3758,24 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
                 avg_flux /= n_samples;
 
-                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-                if (T_eq < 40.0) T_eq = 100.0;
-                if (T_eq > 400.0) T_eq = 400.0;
-
-                for (size_t layer = 0; layer < n_layers; ++layer) {
-                    size_t idx = layer * batch_n + f;
-                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                if (perface) {
+                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // absorbed flux + Qb. PSR floors (mean ~0) cold-start at the
+                    // geothermal steady state ~24.7 K; sunlit ~unchanged after eq.
+                    // Isothermal at the diurnal-mean equilibrium (no warm floor).
+                    double T_eq = std::sqrt(std::sqrt(
+                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                    for (size_t layer = 0; layer < n_layers; ++layer)
+                        T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
+                } else {
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    if (T_eq < 40.0) T_eq = 100.0;
+                    if (T_eq > 400.0) T_eq = 400.0;
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        size_t idx = layer * batch_n + f;
+                        double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                        T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    }
                 }
             }
         }
@@ -4243,13 +4288,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
             }
         } else {
+            const bool perface = eqPerfaceFluxMode();
             for (size_t f = 0; f < batch_n; ++f) {
                 // Get initial flux to estimate equilibrium temperature
                 // Include ALL flux components (direct, reflected, IR) for accurate initialization
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = std::min(10, total_time_steps);
+                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -4260,16 +4306,26 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 }
                 avg_flux /= n_samples;
 
-                // Equilibrium temperature from Stefan-Boltzmann
-                double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
-                if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
-                if (T_eq > 400.0) T_eq = 400.0;
+                if (perface) {
+                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // absorbed flux + Qb (PSR floors cold-start at the geothermal
+                    // steady state ~24.7 K; sunlit ~unchanged after equilibration).
+                    double T_eq = std::sqrt(std::sqrt(
+                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                    for (size_t layer = 0; layer < n_layers; ++layer)
+                        T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
+                } else {
+                    // Equilibrium temperature from Stefan-Boltzmann
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
+                    if (T_eq > 400.0) T_eq = 400.0;
 
-                for (size_t layer = 0; layer < n_layers; ++layer) {
-                    size_t idx = layer * batch_n + f;
-                    // Linear interpolation between surface and deep temperature
-                    double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
-                    T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        size_t idx = layer * batch_n + f;
+                        // Linear interpolation between surface and deep temperature
+                        double depth_frac = z_grid[layer] / z_grid[n_layers - 1];
+                        T_initial[idx] = static_cast<float>(T_eq * (1.0 - depth_frac) + T_deep_val * depth_frac);
+                    }
                 }
             }
         }
@@ -7937,6 +7993,195 @@ void printBanner() {
     std::cout << "\n";
 }
 
+// ============================================================================
+// Phase R (R1): `--calibrate-gpu` — measure this host's safe GPU dispatch
+// limits and write ~/.ptm3d/machine_profile.json (or $PTM_MACHINE_PROFILE).
+//
+// The measurement runs the SAME validated persistent-kernel path a production
+// solve uses (solvePersistentAllTimesteps) on a synthetic uniform workload, so
+// the timing reflects the real dispatch cost. The cost model is the FIXED one
+// ported from scripts/run_yearlong_wedge_safe.py mode calibrate:
+//   per-timestep kernel wall = kernel_ms / probe_steps   (one batch)
+//   dispatch of N timesteps   ~ N * per-timestep kernel wall
+//   max_timesteps_per_dispatch = floor(ceiling_s * 1000 / per_timestep_ms)
+// Host-side per-dispatch overhead (buffer create/upload/read) is measured as
+// (wall - kernel) around the solve call and recorded for the runner's
+// launch-time consistency check.
+//
+// Returns a process exit code (0 = profile written).
+// ============================================================================
+#ifdef PTM_GPU_OPENCL
+static int runGpuCalibration(int argc, char** argv) {
+    using namespace gpu::opencl;
+
+    // Fermi F3: the probe MUST be production-representative or the ceiling is
+    // unsafe. The kernel's von-Neumann substep count (Fo<0.49) is set by the
+    // MINIMUM near-surface dz and kappa at the OUTPUT dt: a uniform 1 cm grid
+    // @250 K yields ~2 substeps/step, but production cold-PSR fine grids hit
+    // 29-200x -- so a ceiling calibrated on a coarse grid could run ~100x
+    // longer in production and WEDGE. Defaults below are lunar-cold-PSR-ish
+    // (0.5 mm first layer, geometric grid, low TI props, hourly dt).
+    int    batch_size    = 8000;
+    int    n_layers      = 50;
+    double ceiling_s     = 25.0;
+    double dz0           = 5.0e-4;   // first-layer thickness [m] (fine near-surface)
+    double grid_ratio    = 1.2;      // geometric growth of dz with depth
+    double dt_output_s   = 3600.0;   // OUTPUT timestep [s]
+    double kc_probe      = 2.0e-3;   // near-surface conductivity [W/m/K]
+    double rho_probe     = 1100.0;   // density [kg/m^3]
+    double cp0_probe     = 600.0;    // heat capacity [J/kg/K]
+    int    probe_steps_1 = 30;       // two-point regression (F4): small point
+    int    probe_steps_2 = 120;      //                            large point
+    double safety_factor = 4.0;      // clamp: max_ts <= factor x conservative default
+    std::string profile_out;         // empty => resolved default path
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if      (a == "--batch-size"      && i + 1 < argc) batch_size    = std::stoi(argv[++i]);
+        else if (a == "--gpu-batch-size"  && i + 1 < argc) batch_size    = std::stoi(argv[++i]);
+        else if (a == "--n-layers"        && i + 1 < argc) n_layers      = std::stoi(argv[++i]);
+        else if (a == "--safe-ceiling-s"  && i + 1 < argc) ceiling_s     = std::stod(argv[++i]);
+        else if (a == "--dz0"             && i + 1 < argc) dz0           = std::stod(argv[++i]);
+        else if (a == "--grid-ratio"      && i + 1 < argc) grid_ratio    = std::stod(argv[++i]);
+        else if (a == "--dt-output-s"     && i + 1 < argc) dt_output_s   = std::stod(argv[++i]);
+        else if (a == "--kc"              && i + 1 < argc) kc_probe      = std::stod(argv[++i]);
+        else if (a == "--rho"             && i + 1 < argc) rho_probe     = std::stod(argv[++i]);
+        else if (a == "--cp0"             && i + 1 < argc) cp0_probe     = std::stod(argv[++i]);
+        else if (a == "--probe-steps-1"   && i + 1 < argc) probe_steps_1 = std::stoi(argv[++i]);
+        else if (a == "--probe-steps-2"   && i + 1 < argc) probe_steps_2 = std::stoi(argv[++i]);
+        else if (a == "--safety-factor"   && i + 1 < argc) safety_factor = std::stod(argv[++i]);
+        else if (a == "--profile-out"     && i + 1 < argc) profile_out   = argv[++i];
+    }
+    if (batch_size < 1 || n_layers < 2 || ceiling_s <= 0.0 || dz0 <= 0.0 ||
+        grid_ratio < 1.0 || dt_output_s <= 0.0 || probe_steps_1 < 1 ||
+        probe_steps_2 <= probe_steps_1 || safety_factor <= 0.0) {
+        std::cerr << "[calibrate-gpu] invalid parameters (need batch>=1, "
+                     "n_layers>=2, ceiling>0, dz0>0, ratio>=1, dt>0, "
+                     "0<steps1<steps2, safety>0)\n";
+        return 2;
+    }
+
+    std::cout << "[calibrate-gpu] representative probe: batch=" << batch_size
+              << " n_layers=" << n_layers << " dz0=" << dz0 << " m ratio="
+              << grid_ratio << " dt=" << dt_output_s << " s (kc=" << kc_probe
+              << " rho=" << rho_probe << " cp0=" << cp0_probe << ")\n";
+
+    ThermalOpenCLConfig cfg;
+    ThermalOpenCLSolver solver(static_cast<size_t>(batch_size),
+                               static_cast<size_t>(n_layers), cfg);
+    if (!solver.initialize()) {
+        std::cerr << "[calibrate-gpu] OpenCL init FAILED — cannot profile this "
+                     "host (no usable GPU). No profile written.\n";
+        return 3;
+    }
+
+    const size_t nf = static_cast<size_t>(batch_size);
+    const size_t nl = static_cast<size_t>(n_layers);
+
+    // Geometric near-surface grid (drives realistic substep counts).
+    std::vector<float> z_grid(nl);
+    z_grid[0] = 0.0f;
+    double dz = dz0;
+    for (size_t i = 1; i < nl; ++i) {
+        z_grid[i] = z_grid[i - 1] + static_cast<float>(dz);
+        dz *= grid_ratio;
+    }
+    std::vector<float> rho(nl * nf, static_cast<float>(rho_probe));
+    std::vector<float> kc(nl * nf, static_cast<float>(kc_probe));
+    std::vector<float> emissivity(nf, 0.95f);
+    std::vector<float> T_deep(nf, 100.0f);        // cold-PSR-ish deep temperature
+    std::vector<float> Qb(nf, 0.0f);
+    std::vector<float> cp_coeffs;                 // none: cp = cp0
+    std::vector<float> T_initial(nl * nf, 120.0f);
+    std::vector<float> out_temps;
+
+    solver.uploadMeshData(z_grid, rho, kc, emissivity, T_deep, Qb);
+    solver.setMaterialParams(static_cast<float>(cp0_probe), cp_coeffs, /*R350=*/2.7f);
+
+    // Two-point regression (F4): wall(P) ~= overhead + P * per_step. Running two
+    // point counts separates the fixed per-dispatch overhead (setup + H2D/D2H
+    // transfers, the INTERCEPT) from the per-timestep kernel cost (the SLOPE).
+    // getLastKernelTimeMs returns whole-call wall (incl. transfers), so a single
+    // point would attribute ~0 overhead and give a too-large ceiling; the slope
+    // from two points is transfer-inclusive and thus conservative (safe) for the
+    // ceiling, while the intercept gives the runner a REAL overhead for its ETA.
+    auto run_probe = [&](int steps) -> double {
+        solver.uploadInitialTemperature(T_initial);   // same start state each time
+        std::vector<float> flux(static_cast<size_t>(steps) * nf, 5.0f);  // faint cold flux
+        auto w0 = std::chrono::high_resolution_clock::now();
+        solver.solvePersistentAllTimesteps(flux, out_temps, steps,
+                                           static_cast<float>(dt_output_s));
+        auto w1 = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
+    };
+    double wall1 = run_probe(probe_steps_1);
+    double wall2 = run_probe(probe_steps_2);
+
+    double per_step_s = (wall2 - wall1) / static_cast<double>(probe_steps_2 - probe_steps_1);
+    if (per_step_s <= 0.0) {
+        std::cerr << "[calibrate-gpu] non-positive per-step slope (wall1=" << wall1
+                  << "s wall2=" << wall2 << "s); probe too noisy/small — refusing "
+                     "to write a bogus profile. Increase --probe-steps-2.\n";
+        return 4;
+    }
+    double overhead_per_batch_s = std::max(0.0, wall1 - probe_steps_1 * per_step_s);
+    double per_step_ms = per_step_s * 1000.0;
+
+    // Ceiling (F3): keep ONE dispatch under safe_ceiling_s of PURE stepping time.
+    long   max_ts_raw = static_cast<long>(ceiling_s / per_step_s);
+    int    conservative = gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+    long   cap = static_cast<long>(safety_factor * conservative);
+    int    max_ts = static_cast<int>(std::min<long>(max_ts_raw, cap));
+    if (max_ts < 1) max_ts = 1;
+    if (max_ts_raw > cap) {
+        std::cerr << "[calibrate-gpu] WARNING (F3): calibrated ceiling "
+                  << max_ts_raw << " timesteps/dispatch is >> " << safety_factor
+                  << "x the conservative default (" << conservative << "); this "
+                     "often means the probe grid is NOT representative of your "
+                     "production run (too-coarse near-surface dz => too-few "
+                     "substeps). CLAMPING to " << cap << ". Re-probe with --dz0 / "
+                     "--n-layers / --dt-output-s matched to your production config, "
+                     "or raise --safety-factor deliberately.\n";
+    }
+
+    gpu::MachineProfile p;
+    p.valid                        = true;
+    p.safe_dispatch_ceiling_s      = ceiling_s;
+    p.max_timesteps_per_dispatch   = max_ts;
+    p.recommended_batch_size       = batch_size;
+    p.kernel_ms_per_step_per_batch = per_step_ms;
+    p.overhead_per_batch_s         = overhead_per_batch_s;
+    p.n_layers_probe               = n_layers;
+    p.batch_size_probe             = batch_size;
+    {
+        char hn[256] = {0};
+        if (gethostname(hn, sizeof(hn) - 1) == 0) p.host = hn;
+        p.device_name = solver.getDeviceInfo().name;
+        std::time_t t = std::time(nullptr);
+        char ts[32] = {0};
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+        p.created_utc = ts;
+    }
+
+    std::cout << "[calibrate-gpu] two-point: wall(" << probe_steps_1 << ")=" << wall1
+              << "s wall(" << probe_steps_2 << ")=" << wall2 << "s => per-step="
+              << per_step_ms << " ms, overhead=" << overhead_per_batch_s
+              << " s/dispatch\n";
+    std::cout << "[calibrate-gpu] => max_timesteps_per_dispatch=" << max_ts
+              << " (raw " << max_ts_raw << ", cap " << cap << ", keeps one dispatch "
+              << "under " << ceiling_s << " s of stepping)\n";
+
+    if (!gpu::saveMachineProfile(p, profile_out)) {
+        std::cerr << "[calibrate-gpu] FAILED to write profile.\n";
+        return 5;
+    }
+    std::string where = profile_out.empty()
+        ? gpu::machine_profile_detail::defaultProfilePath() : profile_out;
+    std::cout << "[calibrate-gpu] wrote profile to " << where << "\n";
+    return 0;
+}
+#endif  // PTM_GPU_OPENCL
+
 int main(int argc, char** argv) {
     // Line-buffer stdout so progress prints reach disk before a kernel hang
     // can swallow them. The macOS+AMD OpenCL driver has wedged the box hard
@@ -7990,6 +8235,17 @@ int main(int argc, char** argv) {
             std::cout << "Built without OpenCL support; --list-gpu-devices is a no-op." << std::endl;
 #endif
             return 0;
+        } else if (arg == "--calibrate-gpu") {
+            // Phase R (R1): measure this host's safe GPU dispatch limits and
+            // write ~/.ptm3d/machine_profile.json (or $PTM_MACHINE_PROFILE).
+#ifdef PTM_GPU_OPENCL
+            return runGpuCalibration(argc, argv);
+#else
+            std::cerr << "--calibrate-gpu requires an OpenCL-enabled build "
+                         "(ENABLE_GPU=ON). CPU-only builds do not need a GPU "
+                         "profile." << std::endl;
+            return 1;
+#endif
         }
     }
 
@@ -8011,11 +8267,28 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
+    // knob is first-class, but true per-output-step full-mesh checkpointing is
+    // architecturally incompatible with the batch-outer/time-inner GPU
+    // persistent solver (see config_parser.h + docs/PORTABILITY-AUDIT.md).
+    // Fail loud rather than silently no-op if a user sets it.
+    if (sim_config.thermal.checkpoint_every_output_steps > 0) {
+        std::cerr << "[Phase R/R4] WARNING: thermal.checkpoint_every_output_steps="
+                  << sim_config.thermal.checkpoint_every_output_steps
+                  << " is set, but per-output-step full-mesh checkpointing is NOT "
+                     "active on the GPU persistent solver (batch-outer/time-inner: "
+                     "no wall-clock moment holds all faces at the same output step; "
+                     "a partial dump is a resume footgun). Use the runner's chunk "
+                     "split (run_yearlong_wedge_safe.py --stage-b-nchunks) for "
+                     "blast-radius bounding. This knob is reserved for the CPU-first "
+                     "solver path (portability Phase 1)." << std::endl;
+    }
+
     // ========================================================================
     // PHASE 3: Map config to local variables (PRESERVED: All original variables)
     // ========================================================================
     // These maintain the exact same variable names and types as the original code
-    
+
     // Simulation parameters (from config or defaults)
     std::string start_time = sim_config.time.start_time;
     double duration_days = sim_config.time.duration_days;
@@ -10949,6 +11222,12 @@ int main(int argc, char** argv) {
                                   << rad_gpu_devices << " GPUs" << std::endl;
                     }
 
+                    // Hoisted out of the per-timestep loop: these two num_faces-sized
+                    // buffers (~38 MB at 2.4M faces) were re-allocated + freed every
+                    // timestep on the single-timestep fast path. They are fully
+                    // overwritten each step below, so reuse is behavior-identical.
+                    std::vector<double> temps_t(num_faces);
+                    std::vector<double> solar_t(num_faces);
                     for (int t_start = 0; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -10960,8 +11239,6 @@ int main(int argc, char** argv) {
                             // wrapping. Preserves byte-identical behaviour
                             // for CPU and single-GPU radiation paths.
                             const int t = t_start;
-                            std::vector<double> temps_t(num_faces);
-                            std::vector<double> solar_t(num_faces);
                             #pragma omp parallel for schedule(static)
                             for (size_t f = 0; f < num_faces; f++) {
                                 temps_t[f] = surface_temps[f][t];
@@ -11077,8 +11354,10 @@ int main(int argc, char** argv) {
 
                     // Diagnostic: compare indirect flux for high vs low topographic elevation
                     // Uses radial distance from body center as elevation proxy (works on spherical bodies)
-                    // Low-elevation faces (valleys/craters) should receive MORE indirect flux
-                    {
+                    // Low-elevation faces (valleys/craters) should receive MORE indirect flux.
+                    // Gated on verbose: it std::sorts all num_faces radii every coupling
+                    // iteration purely for the two printed averages -- skip when quiet.
+                    if (rad_verbose) {
                         std::vector<double> radii(num_faces);
                         for (size_t f = 0; f < num_faces; f++) {
                             const auto& c = mesh->face_centers[f];
@@ -11220,63 +11499,11 @@ int main(int argc, char** argv) {
                         break;
                     }
 
-                    // Convergence check (skip on iter 0 — observed_dT is all 0
-                    // there because prev_temps == surface_temps).
-                    if (iter > 0) {
-                        // True face-fraction: count of faces whose max-over-t
-                        // ΔT exceeds rad_coupling_temp_tol. The legacy code
-                        // counted (face, timestep) samples and divided by
-                        // num_faces·total_time_steps, which is ~total_time_steps×
-                        // more permissive — keep that for legacy mode for
-                        // bit-equivalence; physics mode uses the truer metric.
-                        size_t faces_changing = 0;
-                        if (rad_coupling_physics_mode) {
-                            for (size_t f = 0; f < num_faces; f++) {
-                                if (observed_dT[f] > rad_coupling_temp_tol) ++faces_changing;
-                            }
-                        } else {
-                            // Legacy sample-fraction (preserves byte-equivalence).
-                            size_t samples_changing = 0;
-                            for (size_t f = 0; f < num_faces; f++) {
-                                for (int t = 0; t < total_time_steps; t++) {
-                                    const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                    if (dT > rad_coupling_temp_tol) ++samples_changing;
-                                }
-                            }
-                            faces_changing = samples_changing;  // reused below as a "count"
-                        }
-                        const double frac_denom = rad_coupling_physics_mode
-                            ? static_cast<double>(num_faces)
-                            : static_cast<double>(num_faces) * total_time_steps;
-                        const double face_frac = static_cast<double>(faces_changing) / frac_denom;
-
-                        std::cout << "  Max temperature change: " << max_temp_change << " K" << std::endl;
-                        std::cout << (rad_coupling_physics_mode
-                                       ? "  Faces still changing:   "
-                                       : "  Samples still changing: ")
-                                  << std::scientific << std::setprecision(2)
-                                  << (face_frac * 100) << "%" << std::fixed << std::endl;
-
-                        // Converge when EITHER condition is met. The earlier
-                        // AND-conjunction blocked exit when a tiny handful of
-                        // pathological faces (typically PSR-floor edges with
-                        // extreme radiation feedback) oscillated by hundreds
-                        // of K, even after 99.99% of the mesh had settled.
-                        if (max_temp_change < rad_coupling_temp_tol) {
-                            std::cout << "  Converged on max-temperature criterion ("
-                                      << max_temp_change << " K < " << rad_coupling_temp_tol
-                                      << " K)" << std::endl;
-                            break;
-                        }
-                        if (face_frac < rad_coupling_face_frac) {
-                            std::cout << "  Converged on face-fraction criterion ("
-                                      << std::scientific << std::setprecision(2)
-                                      << (face_frac * 100) << "% < "
-                                      << (rad_coupling_face_frac * 100) << "%)"
-                                      << std::fixed << std::endl;
-                            break;
-                        }
-                    }
+                    // NOTE: the convergence check MOVED to AFTER the re-thermal
+                    // (end of this loop body) so a converged window stops BEFORE
+                    // running one more redundant indirect (radiosity) pass whose
+                    // result the skipped re-thermal would ignore. observed_dT here
+                    // is still computed above and drives face SELECTION (Phase B).
 
                     // Save previous-iter snapshots for the NEXT iter.
                     prev_temps = surface_temps;
@@ -11284,6 +11511,8 @@ int main(int argc, char** argv) {
                     (void)total_indirect_per_face_sum;
                     (void)n_frozen_by_dT;
                     (void)n_frozen_by_freeze;
+                    (void)max_temp_change;  // consumer (old pre-radiosity check) moved
+                                            // post-re-thermal; kept in the stats reduction
 
                     // Step 3: Re-run thermal for selected faces with the updated
                     // flux BC (= iter-0 flux composition + indirect_flux). The GPU
@@ -11402,6 +11631,56 @@ int main(int argc, char** argv) {
                             }
                         }
                         rerun_progress.finish();
+                    }
+
+                    // ---- Post-re-thermal convergence check (MOVED here from before
+                    // the radiosity pass). Measures the temperature change this
+                    // re-thermal actually produced (surface_temps vs the prev_temps
+                    // snapshot taken just before it) -- the same quantity the old
+                    // pre-radiosity check measured one iteration later, so the
+                    // converge decision is identical but we stop BEFORE the next
+                    // iteration's redundant indirect pass. Fermi verified that skipped
+                    // pass changes 0 temperatures; the band-separated indirect OUTPUT
+                    // arrays (indirect_solar/ir) are thus one Picard step stale, within
+                    // rad_coupling_temp_tol. Iteration cap (max_coupling_iterations)
+                    // unchanged. ----
+                    {
+                        double max_change_post = 0.0;
+                        size_t count_changing = 0;  // faces (physics) / samples (legacy)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            double odT = 0.0;
+                            for (int t = 0; t < total_time_steps; t++) {
+                                const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
+                                if (dT > odT) odT = dT;
+                                if (!rad_coupling_physics_mode && dT > rad_coupling_temp_tol) ++count_changing;
+                            }
+                            if (odT > max_change_post) max_change_post = odT;
+                            if (rad_coupling_physics_mode && odT > rad_coupling_temp_tol) ++count_changing;
+                        }
+                        const double frac_denom = rad_coupling_physics_mode
+                            ? static_cast<double>(num_faces)
+                            : static_cast<double>(num_faces) * total_time_steps;
+                        const double face_frac = static_cast<double>(count_changing) / frac_denom;
+                        std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        std::cout << (rad_coupling_physics_mode
+                                       ? "  Faces still changing:   "
+                                       : "  Samples still changing: ")
+                                  << std::scientific << std::setprecision(2)
+                                  << (face_frac * 100) << "%" << std::fixed << std::endl;
+                        if (max_change_post < rad_coupling_temp_tol) {
+                            std::cout << "  Converged on max-temperature criterion ("
+                                      << max_change_post << " K < " << rad_coupling_temp_tol
+                                      << " K)" << std::endl;
+                            break;
+                        }
+                        if (face_frac < rad_coupling_face_frac) {
+                            std::cout << "  Converged on face-fraction criterion ("
+                                      << std::scientific << std::setprecision(2)
+                                      << (face_frac * 100) << "% < "
+                                      << (rad_coupling_face_frac * 100) << "%)"
+                                      << std::fixed << std::endl;
+                            break;
+                        }
                     }
                 }
 

@@ -257,6 +257,28 @@ public:
     // New setter method for controlling progress bar visibility
     void setShowProgress(bool show) { show_progress_ = show; }
 
+    /**
+     * Register occluder-only geometry (e.g. a coarse LOLA ring/annulus
+     * surrounding the SfS core). These triangles are appended to the
+     * ray-tracing BVH so distant topography shadows the core, but are
+     * NOT thermally solved, NOT in the radiosity matrix, and NOT output —
+     * they exist only to block direct-solar rays. Must be called BEFORE
+     * initializeScene()/calculateIlluminationFromMesh(). Empty = no-op
+     * (the core-only path is then byte-identical to before).
+     *
+     * CPU (Embree) feature: this only sets occluder_vertices_/occluder_faces_,
+     * which initializeScene() appends to the Embree shadow BVH. It must NOT
+     * live inside the #ifdef PTM_GPU_OPENCL block — the portable CPU-only build
+     * calls it unconditionally (ptm_thermal_sim.cpp), and gating it there
+     * silently drops distant-terrain shadowing on CPU builds.
+     */
+    void setOccluderGeometry(
+        const std::vector<std::array<double, 3>>& vertices,
+        const std::vector<std::array<int, 3>>& faces) {
+        occluder_vertices_ = vertices;
+        occluder_faces_ = faces;
+    }
+
     // GPU ray tracing support
 #ifdef PTM_GPU_OPENCL
     /**
@@ -293,22 +315,6 @@ public:
      */
     void setBVHCacheFile(const std::string& path) { bvh_cache_file_ = path; }
     const std::string& getBVHCacheFile() const { return bvh_cache_file_; }
-
-    /**
-     * Register occluder-only geometry (e.g. a coarse LOLA ring/annulus
-     * surrounding the SfS core). These triangles are appended to the
-     * ray-tracing BVH so distant topography shadows the core, but are
-     * NOT thermally solved, NOT in the radiosity matrix, and NOT output —
-     * they exist only to block direct-solar rays. Must be called BEFORE
-     * initializeScene()/calculateIlluminationFromMesh(). Empty = no-op
-     * (the core-only path is then byte-identical to before).
-     */
-    void setOccluderGeometry(
-        const std::vector<std::array<double, 3>>& vertices,
-        const std::vector<std::array<int, 3>>& faces) {
-        occluder_vertices_ = vertices;
-        occluder_faces_ = faces;
-    }
 
     /**
      * @brief Check if GPU ray tracing is currently enabled and available
@@ -784,10 +790,16 @@ private:
     bool show_progress_ = true;
 
     // GPU ray tracing members
+    // use_gpu_ray_tracer_ is always declared (defaults false) so the CPU-only
+    // build (PTM_ENABLE_GPU=OFF => PTM_GPU_OPENCL undefined) can still reference
+    // it in the shared code paths (e.g. the CPU/GPU-mirror warnings and the
+    // isGPURayTracingEnabled() accessor). The GPU-specific handles below stay
+    // GPU-only. On a CPU build nothing ever sets it true, so the guarded
+    // branches elide with zero behavior change.
+    bool use_gpu_ray_tracer_ = false;
 #ifdef PTM_GPU_OPENCL
     std::unique_ptr<gpu::opencl::BVHBuilder> gpu_bvh_;
     std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;
-    bool use_gpu_ray_tracer_ = false;
     bool gpu_mesh_uploaded_ = false;
 
     // Multi-GPU dispatch config (defaults preserve single-GPU behaviour).

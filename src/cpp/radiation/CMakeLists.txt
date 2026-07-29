@@ -105,6 +105,19 @@ set_target_properties(vf_rowsum_dump PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Emit a correctly-dimensioned, current-format (HMAT/v2) EMPTY base .vf (nnz=0)
+# via the production serializer, so a rolling-VF site can satisfy the VF-load
+# gate without the multi-GB build (overridden by PTM_HMATRIX_VF_REPLACE). See
+# BUGS PTM-24 (stale MFFV/v1 base -> silent recompute wedge).
+add_executable(make_empty_vf make_empty_vf.cpp)
+target_link_libraries(make_empty_vf PRIVATE radiation mesh_utils)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(make_empty_vf PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(make_empty_vf PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Apply a saved H-matrix to an arbitrary per-face vector (y = F*v), to diagnose
 # WHERE a face's view-factor coupling points (e.g. floor -> warm rim).
 add_executable(vf_apply vf_apply.cpp)

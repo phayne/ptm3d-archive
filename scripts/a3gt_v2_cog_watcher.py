@@ -261,6 +261,24 @@ def main():
                              'actively running. Default: skip.')
     parser.add_argument('--once', action='store_true',
                         help='Convert at most one site then exit')
+    parser.add_argument('--forever', action='store_true',
+                        help="Never exit just because every CURRENTLY-existing "
+                             "site directory is complete -- keep polling for "
+                             "NEW site directories a live campaign creates over "
+                             "its lifetime. Without this, the watcher's default "
+                             "behavior (designed for a static, already-fully- "
+                             "populated production tree) exits the moment it "
+                             "sees total>0 and complete==total, e.g. the instant "
+                             "it starts against a root with exactly one "
+                             "already-converted site and nothing else yet -- "
+                             "which is exactly the case right after wiring this "
+                             "in as a campaign's automatic post-composite step "
+                             "(2026-07-28: it exited within 1 poll on a "
+                             "one-site-so-far AGT root, never around to catch "
+                             "site #2). Overrides --once if both are given "
+                             "(a single explicit --once conversion still exits "
+                             "after one, --forever only affects the "
+                             "'nothing to do right now' exit).")
     parser.add_argument('--dry-run', action='store_true',
                         help='Classify and report; do not convert')
     args = parser.parse_args()
@@ -297,14 +315,15 @@ def main():
                 print(f"[{ts()}]   blocked  {s:12s} {r}", flush=True)
             break
 
-        if complete and len(complete) == total and total > 0:
+        if complete and len(complete) == total and total > 0 and not args.forever:
             print(f"[{ts()}] all {total} sites complete; exiting", flush=True)
             break
 
         if not ready:
             blocked_report = ', '.join(f'{s}({r})' for s, r in blocked)
             line = (f"[{ts()}] done={len(complete)}/{total} "
-                    f"blocked={len(blocked)} | {blocked_report}")
+                    f"blocked={len(blocked)} | {blocked_report}"
+                    + (" -- waiting for more sites (--forever)" if args.forever else ""))
             # Only re-print blocked state when it changes (keeps log readable)
             if line != last_blocked_report:
                 print(line, flush=True)

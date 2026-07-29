@@ -43,14 +43,28 @@ install(FILES
 
 # Apply additional optimization flags for thermal calculations
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(thermal PRIVATE -O3 -ffast-math -ftree-vectorize)
+    # -fno-finite-math-only MUST follow -ffast-math: without it, finite-math-only
+    # makes std::isnan/std::isfinite guards in the thermal solver no-ops.
+    target_compile_options(thermal PRIVATE -O3 -ffast-math -fno-finite-math-only -ftree-vectorize)
     
-    # Enable interprocedural optimization if supported
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT IPO_SUPPORTED)
-    if(IPO_SUPPORTED)
-        message(STATUS "Interprocedural optimization enabled for thermal library")
-        set_target_properties(thermal PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+    # Interprocedural optimization (LTO) — native/production profile only.
+    # Under clang, INTERPROCEDURAL_OPTIMIZATION emits LLVM-bitcode objects into
+    # libthermal.a; GNU ld (the Linux default) cannot read bitcode without the
+    # LLVM/gold plugin and fails the final link with "file format not
+    # recognized". Apple ld handles it via libLTO, which is why macOS never hit
+    # it. Gate LTO to PTM_ARCH_NATIVE=ON so the native build keeps it
+    # (byte-identical to before), while the portable/CPU profile
+    # (PTM_ARCH_NATIVE=OFF, used by CI) links with stock ld.
+    if(PTM_ARCH_NATIVE)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT IPO_SUPPORTED)
+        if(IPO_SUPPORTED)
+            message(STATUS "Interprocedural optimization enabled for thermal library")
+            set_target_properties(thermal PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif()
+    else()
+        message(STATUS "PTM_ARCH_NATIVE=OFF: LTO disabled for thermal library "
+                       "(portable link; GNU ld cannot read clang LTO bitcode)")
     endif()
 endif()
 

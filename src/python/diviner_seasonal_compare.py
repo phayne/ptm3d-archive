@@ -62,6 +62,37 @@ RUN_OVERRIDE = {"haworth": "divval_haworth_r32c",
 # OUTSIDE OUTROOT (e.g. the two-band run in ~/dev/heat3d) can be wired in
 # without touching the defaults above.
 RUN_DIR_ABS: dict = {}
+# Explicit (lat0, lon0) center overrides, keyed by site key. EMPTY by default
+# (NO behavior change vs the committed script / SITES table above); populated
+# only via --center SITE=LAT,LON. 2026-07-22 finding: the hardcoded "sunlit"
+# entry here (-88.181, 6.041) is a DIFFERENT point (~2.5 km away) from the
+# fig8_hybrid mesh's actual build center (-88.1, 6.3, per Paul's site spec
+# "88.1 S 6.3 E" and the mesh session note's independently-verified 22.00 km
+# distance-to-Haworth check) -- use --center sunlit=-88.1,6.3 for that mesh,
+# NOT the stale table default. Flagged rather than silently edited above,
+# since 3 other scripts share this same hardcoded tuple.
+CENTER_OVERRIDE: dict = {}
+# Small, unobtrusive white in-panel crater-name labels for the --overview LOLA
+# topography panel, (name, dx, dy, ha) with dx/dy in km relative to the site
+# center and `ha` the matplotlib text horizontal-alignment anchor -- keyed by
+# site so this is a no-op for haworth/faustini/shackleton. Positions for
+# "sunlit" derived from the real crater centers (Haworth: SITES table
+# -87.45,-2.1; Shoemaker: data/locations/locations_lunar_psr_south.txt
+# -88.1,50 -- the project's own PSR reference list) run through this module's
+# own TO_XY projection, THEN visually cross-checked against the actual LOLA
+# raster at both the 30km (--overview) and a wider 60km diagnostic extent
+# (2026-07-28, manuscript v5 Fig. 8 review): Haworth is confirmed as the
+# ~25km-radius basin dominating the upper-left/center of the panel (the
+# "sunlit" site sits on its south rim, consistent with the site's "Haworth SE
+# rim" name); Shoemaker's catalog center (dx=+38, dy=-18 km) falls just
+# outside the 30km half-width, but its ~25km rim visibly clips into the
+# panel's lower-right corner in the wider check -- matching Paul's own
+# expectation that only a rim portion is visible there. Shoemaker's label
+# uses ha="right" anchored near the panel edge (not "center") because the
+# full word at fontsize 8 bold otherwise ran past the axis frame on the right
+# (caught on the first render -- see session note).
+CRATER_LABELS = {"sunlit": [("Haworth", -15.0, 22.0, "center"),
+                            ("Shoemaker", 28.0, -19.0, "right")]}
 WINDOW_KM, CELL_M, CORE_KM = 15.0, 250.0, 15.0
 # Manuscript Fig. 8 site-overview row (--overview): wider-region LOLA topography +
 # Diviner summer Tbol,max context, with the CORE_KM comparison window outlined.
@@ -245,12 +276,27 @@ def _context_grids(lat0, lon0):
     return EL, DT, ext
 
 
-def _figure_with_overview(lat0, lon0):
+def _figure_with_overview(lat0, lon0, pubclean=False, id_labels=False, site_key=None):
     """Manuscript Fig. 8 layout: a 1x2 site-overview row (LEFT = LOLA topography,
     RIGHT = Diviner summer Tbol,max, both over a wide ROI, with the CORE_KM
     comparison window outlined by a cyan circle + center cross) ABOVE an empty 4x3
     axes grid. Returns (fig, axes4x3); the caller fills the 4x3 exactly as in the
-    default layout so the comparison grid is unchanged."""
+    default layout so the comparison grid is unchanged.
+
+    pubclean (2026-07-22, additive, default OFF): suppress the two overview-panel
+    titles ("LOLA topography" / "Diviner summer Tbol,max"), matching the same
+    no-on-figure-identity-text treatment already applied to the 4x3 grid's
+    per-column titles under --pubclean -- axis labels and colorbar labels (which
+    already say "Elevation (m)" / "T (K)") are unaffected, and the caption carries
+    the panel identity instead.
+
+    id_labels (2026-07-28, additive, default OFF -- manuscript v5 Fig. 8 review):
+    Paul's content-identification labels, allowed under the no-on-figure-notes
+    rule (it bars data/stat annotations, not identity): re-adds the two overview
+    titles even under pubclean, using the NEW wording "LOLA topography" /
+    "Diviner $T_\\mathrm{bol}$" (replacing "Diviner summer $T_{bol,max}$"), and
+    draws small unobtrusive white crater-name labels (no boxes/arrows) inside the
+    LOLA topography panel from CRATER_LABELS[site_key] if present."""
     import matplotlib.gridspec as gridspec
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LightSource
@@ -268,13 +314,21 @@ def _figure_with_overview(lat0, lon0):
                vmin=e0, vmax=e1)
     fig.colorbar(ScalarMappable(Normalize(e0, e1), "terrain"), ax=axT, shrink=0.85,
                  pad=0.03, label="Elevation (m)")
-    axT.set_title("LOLA topography", fontsize=11)
+    if id_labels or not pubclean:
+        axT.set_title("LOLA topography", fontsize=11)
+    if id_labels:
+        for name, dx, dy, ha in CRATER_LABELS.get(site_key, []):
+            axT.text(dx, dy, name, color="white", fontsize=8, fontweight="bold",
+                     ha=ha, va="center", zorder=5)
     axD = fig.add_subplot(topgs[0, 1])
     dl, dh = np.nanpercentile(DT[np.isfinite(DT)], [2, 98])
     imD = axD.imshow(DT, origin="lower", extent=cext, cmap="inferno",
                      vmin=dl, vmax=dh)
     fig.colorbar(imD, ax=axD, shrink=0.85, pad=0.03, label="$T$ (K)")
-    axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
+    if id_labels:
+        axD.set_title(r"Diviner $T_\mathrm{bol}$", fontsize=11)
+    elif not pubclean:
+        axD.set_title("Diviner summer $T_{bol,max}$", fontsize=11)
     for ax in (axT, axD):
         th = np.linspace(0, 2 * np.pi, 100)
         ax.plot(CORE_KM * np.cos(th), CORE_KM * np.sin(th), "c-", lw=1.4)
@@ -294,6 +348,11 @@ def main(argv=None):
     ap.add_argument("--run-dir", action="append", default=[], metavar="SITE=PATH",
                     help="Explicit absolute run-directory override for a site key "
                          "(repeatable). Does NOT change the built-in defaults.")
+    ap.add_argument("--center", action="append", default=[], metavar="SITE=LAT,LON",
+                    help="Explicit (lat0,lon0) center override for a site key "
+                         "(repeatable). Does NOT change the built-in SITES defaults; "
+                         "use when the mesh's actual build center differs from the "
+                         "table (e.g. --center sunlit=-88.1,6.3 for fig8_hybrid).")
     ap.add_argument("--site", action="append", default=[], metavar="KEY",
                     help="Restrict to these site key(s) (repeatable). Default: all.")
     ap.add_argument("--outdir", default=None,
@@ -307,12 +366,42 @@ def main(argv=None):
                          "topography + Diviner summer Tbol,max over a wide ROI, "
                          "comparison window outlined) above the 4x3 grid. Single "
                          "site only; the 4x3 comparison grid is unchanged.")
+    ap.add_argument("--pubclean", action="store_true",
+                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
+                         "checklist P2.8, 2026-07-22): suppress the figure suptitle, "
+                         "the per-column titles (Diviner/PTM3D/model-Div), and the "
+                         "bias/RMSE text box. Axis labels, colorbars, and legends are "
+                         "unaffected. Default OFF -- no behavior change for existing "
+                         "callers/figures.")
+    ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
+                    help="With --pubclean, pin the saved canvas to this exact pixel "
+                         "size at 300 dpi (e.g. 2311x2974, the annotated sibling's own "
+                         "shipped size) instead of letting the tight-bbox crop shrink "
+                         "when the title/stat-box text is removed -- so the manuscript "
+                         "can swap the two files 1:1 without a layout reflow.")
+    ap.add_argument("--id-labels", action="store_true",
+                    help="Content-IDENTIFICATION labels (Paul's manuscript v5 Fig. 8 "
+                         "review, 2026-07-28) -- allowed under the no-on-figure-notes "
+                         "rule, which bars data/stat annotations, not identity. Works "
+                         "WITH --pubclean (keeps the suptitle/stat-box suppressed) and "
+                         "adds: small per-column headers 'Diviner'/'model'/'difference' "
+                         "on the 4x3 grid's top row; '--overview' panel titles 'LOLA "
+                         "topography' / 'Diviner $T_\\mathrm{bol}$' (new wording, "
+                         "replaces the old 'Diviner summer $T_{bol,max}$'); and small "
+                         "white crater-name labels inside the LOLA panel from "
+                         "CRATER_LABELS. Default OFF -- no behavior change otherwise.")
     args = ap.parse_args(argv)
     for spec in args.run_dir:
         if "=" not in spec:
             ap.error(f"--run-dir expects SITE=PATH, got {spec!r}")
         k, p = spec.split("=", 1)
         RUN_DIR_ABS[k] = p
+    for spec in args.center:
+        if "=" not in spec or "," not in spec:
+            ap.error(f"--center expects SITE=LAT,LON, got {spec!r}")
+        k, ll = spec.split("=", 1)
+        latstr, lonstr = ll.split(",", 1)
+        CENTER_OVERRIDE[k] = (float(latstr), float(lonstr))
     site_filter = set(args.site) or None
     tag = args.tag
     outdir = (Path(args.outdir) if args.outdir
@@ -328,6 +417,11 @@ def main(argv=None):
     sp.furnsh(METAKERNEL)
     summary = {}
     for disp, key, lat0, lon0 in sites:
+        if key in CENTER_OVERRIDE:
+            olat, olon = CENTER_OVERRIDE[key]
+            print(f"[{key}] CENTER OVERRIDE: table default ({lat0},{lon0}) -> "
+                  f"({olat},{olon}) via --center")
+            lat0, lon0 = olat, olon
         run = resolve_run(key)
         if not (run / "mesh.ply").exists():
             print(f"skip {key}: no run"); continue
@@ -352,7 +446,8 @@ def main(argv=None):
         # per-site figure: 4 rows x 3 cols, optionally with the manuscript Fig. 8
         # site-overview row (LOLA topo + Diviner summer Tbol,max) prepended above.
         if args.overview:
-            fig, axes = _figure_with_overview(lat0, lon0)
+            fig, axes = _figure_with_overview(lat0, lon0, pubclean=args.pubclean,
+                                              id_labels=args.id_labels, site_key=key)
         else:
             fig, axes = plt.subplots(4, 3, figsize=(8.0, 10.2))
         for r, (season, stat_name, model, dvm, st, g) in enumerate(rows):
@@ -373,11 +468,15 @@ def main(argv=None):
                              label="K" if c < 2 else "$\\Delta$K")
                 if c > 0: ax.tick_params(labelleft=False)
                 if r == 0:
-                    ax.set_title(["Diviner", "PTM3D", "model$-$Div"][c], fontsize=10)
+                    if args.id_labels:
+                        ax.set_title(["Diviner", "model", "difference"][c], fontsize=9)
+                    elif not args.pubclean:
+                        ax.set_title(["Diviner", "PTM3D", "model$-$Div"][c], fontsize=10)
             axes[r, 0].set_ylabel(f"{season} {stat_name}\ny (km)", fontsize=9)
-            axes[r, 2].text(0.03, 0.96, f"bias {st['bias']:+.1f}\nRMSE {st['rmse']:.1f}",
-                            transform=axes[r, 2].transAxes, va="top", fontsize=7.5,
-                            bbox=dict(fc="white", ec="0.7", alpha=0.85))
+            if not args.pubclean:
+                axes[r, 2].text(0.03, 0.96, f"bias {st['bias']:+.1f}\nRMSE {st['rmse']:.1f}",
+                                transform=axes[r, 2].transAxes, va="top", fontsize=7.5,
+                                bbox=dict(fc="white", ec="0.7", alpha=0.85))
         for c in range(3):
             axes[3, c].set_xlabel("x (km)")
         slug = disp.lower().replace(" ", "_")
@@ -385,8 +484,61 @@ def main(argv=None):
         out = outdir / f"{stem}{tag}"
         if args.overview:
             # Match the paper's Fig. 8: no overall suptitle; GridSpec + tight bbox.
-            for fmt, dpi in ((".png", 300), (".pdf", None)):
-                fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
+            # --overview never adds a suptitle itself, so this branch is safe
+            # regardless of --pubclean; but --pubclean + --pubclean-canvas-px
+            # still needs the same pinned-canvas treatment as the non-overview
+            # path below (2026-07-22, additive: --overview + --pubclean was never
+            # exercised together before this, so this is new, not a regression).
+            if args.pubclean and args.pubclean_canvas_px:
+                # tight_layout() is a no-op here (confirmed: matplotlib warns
+                # "Axes that are not compatible with tight_layout" and the
+                # rendered output was pixel-identical with/without the call) --
+                # the nested outer/topgs/gs GridSpec plus the standalone
+                # fig.colorbar() axes aren't the simple single-level grid
+                # tight_layout knows how to repack. A naive uncropped full-Bbox
+                # save at the pin target therefore keeps the ORIGINAL (title-
+                # sized) top margin even though the two overview titles are
+                # gone under --pubclean, leaving a large blank gap. Fix: measure
+                # the actual tight content bbox directly (get_tightbbox) and
+                # center a fixed-size (w_in, h_in) window on it, so the pin
+                # target is filled the same way a natural tight crop would fill
+                # it, instead of showing raw canvas margin.
+                wpx, hpx = (int(v) for v in args.pubclean_canvas_px.lower().split("x"))
+                w_in, h_in = wpx / 300.0, hpx / 300.0
+                fig.set_size_inches(w_in, h_in)
+                fig.canvas.draw()
+                tbb = fig.get_tightbbox(fig.canvas.get_renderer())
+                cx = tbb.x0 + tbb.width / 2.0
+                cy = tbb.y0 + tbb.height / 2.0
+                from matplotlib.transforms import Bbox
+                full = Bbox([[cx - w_in / 2.0, cy - h_in / 2.0],
+                             [cx + w_in / 2.0, cy + h_in / 2.0]])
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches=full)
+            else:
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches="tight")
+        elif args.pubclean:
+            fig.tight_layout(rect=(0, 0, 1, 1))
+            if args.pubclean_canvas_px:
+                # Pin the canvas to the annotated sibling's own shipped pixel size
+                # (tight-bbox alone crops SHORTER once the suptitle/titles/stat box
+                # are gone, since there's less content at the top edge -- pinning
+                # keeps the two files swappable 1:1 without a manuscript reflow).
+                wpx, hpx = (int(v) for v in args.pubclean_canvas_px.lower().split("x"))
+                w_in, h_in = wpx / 300.0, hpx / 300.0
+                fig.set_size_inches(w_in, h_in)
+                # rcParams["savefig.bbox"]="tight" (ptm_pubstyle) still crops by
+                # default even when bbox_inches is left unset; passing None does
+                # NOT disable it (None just falls back to the rcParam). Pass an
+                # explicit full-canvas Bbox to force the pinned size verbatim.
+                from matplotlib.transforms import Bbox
+                full = Bbox([[0, 0], [w_in, h_in]])
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi, bbox_inches=full)
+            else:
+                for fmt, dpi in ((".png", 300), (".pdf", None)):
+                    fig.savefig(out.with_suffix(fmt), dpi=dpi)
         else:
             fig.suptitle(f"PTM3D vs Diviner seasonal $T_{{bol}}$ — {disp}",
                          fontsize=12, fontweight="bold", y=0.995)

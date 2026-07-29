@@ -25,6 +25,7 @@
 #include "../ice/ice_table.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -277,9 +278,13 @@ int main(int argc, char** argv) {
     double ell_um = 75.0;
 
     bool reading_chunks = false;
+    bool allow_nonstandard_names = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--chunks") { reading_chunks = true; continue; }
+        if (a == "--allow-nonstandard-names") {
+            allow_nonstandard_names = true; reading_chunks = false; continue;
+        }
         if (a == "--output" && i + 1 < argc) {
             outdir = argv[++i]; reading_chunks = false; continue;
         }
@@ -302,6 +307,37 @@ int main(int argc, char** argv) {
             std::cerr << "Not a directory: " << cd << "\n"; return 2;
         }
     }
+
+    // Defensive guard (2026-07-21): refuse chunk dirs whose name isn't the
+    // canonical chunk_<NNN> the writers emit. This tool takes an EXPLICIT
+    // chunk list (no glob), but a shell glob `chunk_*` in a re-merge command
+    // would sweep in QUARANTINED dirs such as chunk_001_NOVF_GARBAGE and
+    // silently corrupt the time-mean statistics (a max survives a cold garbage
+    // chunk, a mean does not — the 2026-07-21 near-miss). Fail loud instead.
+    // --allow-nonstandard-names overrides for a deliberate non-canonical merge.
+    if (!allow_nonstandard_names) {
+        auto is_canonical = [](const std::string& name) {
+            if (name.rfind("chunk_", 0) != 0 || name.size() <= 6) return false;
+            for (size_t k = 6; k < name.size(); ++k)
+                if (!std::isdigit(static_cast<unsigned char>(name[k]))) return false;
+            return true;
+        };
+        bool bad = false;
+        for (const auto& cd : chunk_dirs) {
+            const std::string base = cd.filename().string();
+            if (!is_canonical(base)) {
+                std::cerr << "ERROR: chunk dir '" << cd.string()
+                          << "' has a non-canonical name (expected chunk_<NNN>). "
+                             "This is the shell-glob-swept-a-quarantine-dir footgun "
+                             "(e.g. chunk_*_GARBAGE); refusing to merge it into the "
+                             "statistics. Pass an explicit canonical chunk list, or "
+                             "--allow-nonstandard-names to override.\n";
+                bad = true;
+            }
+        }
+        if (bad) return 2;
+    }
+
     fs::create_directories(outdir / "statistics");
 
     // Determine N (face count) from chunk 0.

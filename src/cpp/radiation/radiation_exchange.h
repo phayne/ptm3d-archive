@@ -31,6 +31,16 @@ class IViewFactorOperator {
 public:
     virtual ~IViewFactorOperator() = default;
     virtual void matvec(const std::vector<double>& x, std::vector<double>& y) const = 0;
+    // Fused width-2 matvec: y1 = F·x1, y2 = F·x2 in ONE structural traversal (each
+    // row's indices/values are read once, feeding two dot products) -- halves the
+    // operator's memory-bandwidth reads for the two-band radiosity while both bands
+    // iterate. Default = two separate matvecs, so it is bit-identical for every
+    // operator; SparseVFOperator overrides it with the single-traversal kernel.
+    virtual void matvec2(const std::vector<double>& x1, const std::vector<double>& x2,
+                         std::vector<double>& y1, std::vector<double>& y2) const {
+        matvec(x1, y1);
+        matvec(x2, y2);
+    }
     virtual size_t numRows() const = 0;
     virtual size_t numCols() const = 0;
     virtual void getRow(int row, std::vector<int>& cols, std::vector<double>& vals) const = 0;
@@ -116,13 +126,38 @@ public:
                      std::vector<int32_t> cols, std::vector<float> data)
         : n_(n), indptr_(std::move(indptr)), cols_(std::move(cols)), data_(std::move(data)) {}
     void matvec(const std::vector<double>& x, std::vector<double>& y) const override {
-        y.assign(n_, 0.0);
-        #pragma omp parallel for schedule(static)
+        // Every y[i] is fully overwritten below, so the old y.assign(n_,0.0) was a
+        // dead full-vector memset; resize() only guarantees the size (no-op when the
+        // caller pre-sized y). schedule(guided) balances the highly variable per-row
+        // nnz (floor faces couple to ~1000s of partners, rims to a handful) that
+        // schedule(static) left imbalanced. Both are bit-identical: each y[i] is the
+        // same in-order row sum regardless of which thread computes it.
+        y.resize(n_);
+        #pragma omp parallel for schedule(guided)
         for (long i = 0; i < static_cast<long>(n_); ++i) {
             double s = 0.0;
             const int64_t e = indptr_[i + 1];
             for (int64_t k = indptr_[i]; k < e; ++k) s += static_cast<double>(data_[k]) * x[cols_[k]];
             y[i] = s;
+        }
+    }
+    // Fused width-2 traversal: read each row's (col,val) once, accumulate two dot
+    // products. Byte-identical to two matvec() calls -- per-row sums are the same
+    // in-order accumulation; only the CSR bandwidth read is halved.
+    void matvec2(const std::vector<double>& x1, const std::vector<double>& x2,
+                 std::vector<double>& y1, std::vector<double>& y2) const override {
+        y1.resize(n_); y2.resize(n_);
+        #pragma omp parallel for schedule(guided)
+        for (long i = 0; i < static_cast<long>(n_); ++i) {
+            double s1 = 0.0, s2 = 0.0;
+            const int64_t e = indptr_[i + 1];
+            for (int64_t k = indptr_[i]; k < e; ++k) {
+                const double v = static_cast<double>(data_[k]);
+                const int32_t c = cols_[k];
+                s1 += v * x1[c];
+                s2 += v * x2[c];
+            }
+            y1[i] = s1; y2[i] = s2;
         }
     }
     size_t numRows() const override { return n_; }
@@ -227,6 +262,9 @@ public:
 
     // Get convergence information from last solve
     int getLastIterations() const { return last_iterations_; }
+    // Per-band sweep counts from the last two-band solve (Fermi's measurement).
+    int getLastIterationsIR() const { return last_iterations_ir_; }
+    int getLastIterationsVis() const { return last_iterations_vis_; }
     double getLastResidual() const { return last_residual_; }
     bool didConverge() const { return converged_; }
 
@@ -252,6 +290,16 @@ private:
     std::vector<double> solveJacobi(const std::vector<double>& emission,
                                     const std::vector<double>& solar_source,
                                     const std::vector<double>& scatter_refl);
+
+    // Fused two-band Jacobi (Tier 2): runs the IR band (source=emission, refl=
+    // reflectivity_) and visible band (source=vis_source, refl=solar_reflectivity_)
+    // together, sharing ONE width-2 matvec (matvec2) per iteration while both are
+    // unconverged, and FREEZING each band the instant it converges so each runs
+    // exactly its own sweep count. BYTE-IDENTICAL to two separate solveJacobi()
+    // calls; only the shared CSR traversal is saved. Sets last_iterations_ir_/vis_.
+    void solveTwoBandJacobiFused(const std::vector<double>& emission,
+                                 const std::vector<double>& vis_source,
+                                 std::vector<double>& B_ir, std::vector<double>& B_vis);
 
     // Gauss-Seidel iteration (faster convergence). scatter_refl as in solveJacobi.
     std::vector<double> solveGaussSeidel(const std::vector<double>& emission,
@@ -310,6 +358,12 @@ private:
     // device); do not call concurrently on the same RadiositySolver.
     std::vector<double> last_indirect_vis_;
     std::vector<double> last_indirect_ir_;
+    // Final normalized incoming (F·B·vf_row_norm) from the last solveJacobi call.
+    // solveTwoBand recovers the incoming from the fixed-point identity
+    // (B−E−source)/refl instead of a second SpMV; this is the fallback where
+    // refl→0 (blackbody) makes that division ill-posed. Written non-thread-safely
+    // like last_iterations_/last_residual_ (the two-band solves are sequential).
+    std::vector<double> last_jacobi_incoming_;
     // NOTE (B2/B3): the previous single-slot visible cache (keyed on the last
     // solar_flux) was REMOVED. In production the coupling loop nests for iter { for t },
     // so consecutive solve() calls carry different solar_flux and the cache MISSED
@@ -339,6 +393,8 @@ private:
 
     // Convergence tracking
     int last_iterations_ = 0;
+    int last_iterations_ir_ = 0;
+    int last_iterations_vis_ = 0;
     double last_residual_ = 0.0;
     bool converged_ = false;
 

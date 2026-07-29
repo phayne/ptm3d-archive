@@ -8,6 +8,8 @@
 #include <sstream>
 #include <iomanip>
 #include <limits>
+#include <filesystem>  // std::filesystem::path etc. (used below); libstdc++
+                       // does not pull this in transitively the way libc++ does
 #include "../constants/constants.h"
 #include "../constants/numeric_constants.h"  // Direct include for RAD_TO_DEG
 #include "../thermal/thermal_model.h"

@@ -279,6 +279,19 @@ public:
     size_t numRows() const { return n_rows_; }
     size_t numCols() const { return n_cols_; }
 
+    // Configure an EMPTY (nnz=0) n x n matrix with no blocks. Lets a tool emit a
+    // correctly-dimensioned base .vf via writeBinary WITHOUT the multi-GB build:
+    // it satisfies the VF-load gate (ptm_thermal_sim only rebuilds when the file
+    // is MISSING or fails to load) and is overridden at run time by
+    // PTM_HMATRIX_VF_REPLACE. All block/nnz stats are zeroed so writeBinary emits
+    // a valid HMAT/v2 file that readBinary loads back with numRows()==n, nnz==0.
+    void setEmptyDimensions(size_t n) {
+        n_rows_ = n; n_cols_ = n;
+        root_blocks_.clear();
+        num_zero_blocks_ = num_sparse_blocks_ = num_lowrank_blocks_ =
+            num_dense_blocks_ = num_hierarchical_blocks_ = total_nnz_ = 0;
+    }
+
     // Memory usage
     size_t memoryBytes() const;
     double compressionRatio() const;  // Memory savings vs dense

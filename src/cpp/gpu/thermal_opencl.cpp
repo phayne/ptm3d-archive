@@ -11,13 +11,112 @@
 #define PTM_OPENCL_NO_THROW
 
 #include "thermal_opencl.h"
+#include "machine_profile.h"   // Phase R (R2): per-host dispatch self-chunk ceiling
 #include <fstream>
 #include <sstream>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 
 namespace gpu {
 namespace opencl {
+
+// ---------------------------------------------------------------------------
+// Phase R (R2): in-solver dispatch self-chunking helpers.
+//
+// The persistent thermal kernel loops n_timesteps internally in ONE
+// clEnqueueNDRangeKernel. A single unbroken dispatch that runs too many
+// timesteps is exactly what tripped the macOS+AMD gpusKillClientExt
+// command-buffer watchdog on the year-long run (1560 steps in one dispatch vs
+// the proven-safe ~240). To stay under the host's watchdog ceiling WITHOUT an
+// external wrapper, a logical session of N output timesteps is split into
+// sub-dispatches of <= max_timesteps_per_dispatch, with a host clFinish
+// between them. State (the T(z) profile) is carried across sub-dispatches in
+// the persistent buf_T_; each sub-dispatch reads flux from / writes output to
+// the correct GLOBAL timestep slot via the kernel's t_offset arg. The split is
+// NUMERICALLY INERT: the exact same per-timestep Crank-Nicolson updates run in
+// the exact same order, and clFinish changes no computed value. When
+// n_timesteps <= max_timesteps_per_dispatch the split degenerates to a single
+// dispatch (t_offset==0), which is the pre-R2 code path bit-for-bit.
+// ---------------------------------------------------------------------------
+
+// Kernel-arg indices shared by both persistent-kernel callers (the arg list is
+// identical in solvePersistentAllTimesteps and solvePersistentMultipleCycles).
+static constexpr int kArgNTimesteps = 20;  // int n_timesteps
+static constexpr int kArgTOffset    = 25;  // int t_offset (Phase R, R2 — last arg)
+
+// The self-chunking ceiling: loaded once from the per-host machine profile
+// (R1), or a conservative default if none exists, with an env override for
+// ops/testing. Fail-loud: the source of the ceiling is announced once.
+static int gpuMaxTimestepsPerDispatch() {
+    static int cached = []() -> int {
+        if (const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH")) {
+            try {
+                int v = std::stoi(e);
+                if (v > 0) {
+                    std::cerr << "[GPU Thermal] dispatch self-chunk ceiling: " << v
+                              << " timesteps/launch (from "
+                                 "PTM_MAX_TIMESTEPS_PER_DISPATCH)\n";
+                    return v;
+                }
+            } catch (...) {}
+        }
+        gpu::MachineProfile p = gpu::loadMachineProfileOrDefault();
+        std::cerr << "[GPU Thermal] dispatch self-chunk ceiling: "
+                  << p.max_timesteps_per_dispatch << " timesteps/launch ("
+                  << (p.valid ? "from host profile" : "conservative default")
+                  << ")\n";
+        return p.max_timesteps_per_dispatch;
+    }();
+    return cached;
+}
+
+// Enqueue the persistent kernel over global output timesteps [0, n_timesteps),
+// self-chunked into sub-dispatches of <= max_ts each with a clFinish between.
+// The caller must have set every kernel arg EXCEPT kArgNTimesteps and
+// kArgTOffset (this function sets those per sub-dispatch). do_accumulate /
+// accum_start / accum_end are in the GLOBAL frame and are honored unchanged.
+// Returns CL_SUCCESS, or the first failing clEnqueue/clFinish error.
+static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
+                                           cl_command_queue queue,
+                                           int n_timesteps, int max_ts,
+                                           size_t global_size, size_t local_size) {
+    if (max_ts < 1) max_ts = 1;
+    int n_sub = (n_timesteps + max_ts - 1) / max_ts;   // ceil
+    if (n_sub < 1) n_sub = 1;
+    // Wedge-efficacy instrumentation (Fermi acceptance test D): when
+    // PTM_LOG_SUBDISPATCH is set, time each sub-dispatch's clFinish so a run
+    // can prove every command buffer stayed bounded. Logging only — inert.
+    static const bool log_sub = (std::getenv("PTM_LOG_SUBDISPATCH") != nullptr);
+    cl_int err = CL_SUCCESS;
+    for (int s = 0; s < n_sub; ++s) {
+        int g0 = s * max_ts;
+        int sub_n = n_timesteps - g0;
+        if (sub_n > max_ts) sub_n = max_ts;
+        err = clSetKernelArg(kernel, kArgNTimesteps, sizeof(int), &sub_n);
+        if (err != CL_SUCCESS) return err;
+        err = clSetKernelArg(kernel, kArgTOffset, sizeof(int), &g0);
+        if (err != CL_SUCCESS) return err;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr,
+                                     &global_size, &local_size, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) return err;
+        // Bounded command buffer: host sync between sub-dispatches. Inert
+        // (no computed value changes); for n_sub==1 this is exactly the single
+        // enqueue + clFinish the pre-R2 code already performed.
+        err = clFinish(queue);
+        if (err != CL_SUCCESS) return err;
+        if (log_sub) {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration_cast<std::chrono::duration<double>>(
+                            t1 - t0).count() * 1000.0;
+            std::cerr << "[GPU Thermal][subdispatch] " << (s + 1) << "/" << n_sub
+                      << " steps [" << g0 << "," << (g0 + sub_n) << ") in "
+                      << ms << " ms\n";
+        }
+    }
+    return err;
+}
 
 // Embedded kernel source (generated from thermal_kernels.cl)
 // This avoids needing to distribute a separate .cl file
@@ -249,8 +348,22 @@ __kernel void persistentThermalKernel(
     // for every output timestep in [accum_start, accum_end).
     __global float* avg_E_accum,
     int do_accumulate,
-    int accum_start,
-    int accum_end)
+    int accum_start,   // first GLOBAL output timestep at which to accumulate
+    int accum_end,     // one past last GLOBAL output timestep to accumulate
+    // Phase R (R2): global timestep offset for in-solver dispatch
+    // self-chunking. A logical session of N output timesteps may be split by
+    // the host into sub-dispatches [0,s),[s,2s),... with a clFinish between
+    // them to keep each command buffer under the machine watchdog ceiling.
+    // Each sub-dispatch runs a LOCAL loop t in [0,n_timesteps) but reads flux
+    // from / writes output to the GLOBAL slot (t_offset + t), continuing the
+    // T(z) profile it inherits in T_global. t_offset == 0 (the un-chunked
+    // case) makes every indexed expression textually identical to pre-R2.
+    int t_offset,
+    // Phase R (R2 fix, PORT-R2-01): per-face frozen von-Neumann substep count.
+    // Written on the first sub-dispatch of a session (t_offset==0), read on the
+    // rest, so a self-chunked session integrates with the SAME substep count as
+    // the un-chunked dispatch would. Re-derived at each cycle entry.
+    __global int* n_substeps_frozen)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -286,53 +399,70 @@ __kernel void persistentThermalKernel(
     float T_geo = (Q_bottom > 0.0f)
         ? native_sqrt(native_sqrt(Q_bottom / (eps * sigma))) : 0.0f;
 
-    // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
-    // Need to compute kappa first to get stable dt
-    // Use initial temperature to estimate kappa
-    float max_kappa = 0.0f;
-    float min_dz2 = 1e10f;
-    for (int i = 0; i < n_layers; ++i) {
-        float k_val = compute_k(T_local[i], kc_local[i], R350);
-        float cp_val = compute_cp(T_local[i], cp0, cp_coeffs, n_cp_coeffs);
-        if (cp_val <= 0.0f) cp_val = 800.0f;
-        float kappa_val = k_val / (rho_local[i] * cp_val);
-        if (kappa_val > max_kappa) max_kappa = kappa_val;
+    // Sub-step count per output interval. Phase R (R2 fix, PORT-R2-01): the
+    // von-Neumann count depends on the session-ENTRY T (kappa falls as the
+    // surface warms), so a self-chunked session MUST reuse one count across its
+    // sub-dispatches or the integration drifts (~0.02 K, ceiling-dependent =>
+    // fails bit-identity). Derive-and-FREEZE on the first sub-dispatch
+    // (t_offset==0), reuse on the rest. Because t_offset resets to 0 at each
+    // cycle's entry, each cycle re-derives from ITS entry T — identical to the
+    // pre-R2 single-dispatch-per-cycle behavior (this is what keeps multi-cycle
+    // unsplit==pre-R2). The frozen value is the INT; dt is recomputed from the
+    // SAME int below (bit-exact), never cached as a float.
+    int n_substeps;
+    if (t_offset == 0) {
+        // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
+        // Need to compute kappa first to get stable dt
+        // Use initial temperature to estimate kappa
+        float max_kappa = 0.0f;
+        float min_dz2 = 1e10f;
+        for (int i = 0; i < n_layers; ++i) {
+            float k_val = compute_k(T_local[i], kc_local[i], R350);
+            float cp_val = compute_cp(T_local[i], cp0, cp_coeffs, n_cp_coeffs);
+            if (cp_val <= 0.0f) cp_val = 800.0f;
+            float kappa_val = k_val / (rho_local[i] * cp_val);
+            if (kappa_val > max_kappa) max_kappa = kappa_val;
 
-        if (i > 0) {
-            float dz = z[i] - z[i-1];
-            float dz2 = dz * dz;
-            if (dz2 < min_dz2) min_dz2 = dz2;
+            if (i > 0) {
+                float dz = z[i] - z[i-1];
+                float dz2 = dz * dz;
+                if (dz2 < min_dz2) min_dz2 = dz2;
+            }
         }
+
+        // Stable dt: Fo = kappa * dt / dz^2 < 0.49
+        float dt_stable = 0.49f * min_dz2 / max_kappa;
+
+        // Clamp dt_stable to reasonable range. The lower bound is the
+        // larger of:
+        //   - 1 second (legacy floor for fine-event resolution), and
+        //   - dt_output / N_SUBSTEPS_MAX, which caps per-output-step
+        //     substeps to a value that keeps the persistent kernel below
+        //     the macOS GPU-watchdog timeout (~5–10 s default).
+        // Without this second floor, very cold checkpoint states (24 K
+        // PSR floors) yield tiny cp(T), large kappa = k/(rho·cp), tiny
+        // dt_stable per the CFL criterion, and worst-case work-items
+        // accumulate enough substeps that the kernel never finishes
+        // within the watchdog window — causing the AMD driver to abort
+        // with gpusKillClientExt.
+        const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
+        float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
+        if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
+        dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
+
+        // Number of sub-steps per output interval (capped above by the
+        // dt_stable floor)
+        n_substeps = (int)ceil(dt_output / dt_stable);
+        n_substeps_frozen[face] = n_substeps;   // FREEZE for later sub-dispatches
+    } else {
+        n_substeps = n_substeps_frozen[face];    // reuse this session's frozen count
     }
-
-    // Stable dt: Fo = kappa * dt / dz^2 < 0.49
-    float dt_stable = 0.49f * min_dz2 / max_kappa;
-
-    // Clamp dt_stable to reasonable range. The lower bound is the
-    // larger of:
-    //   - 1 second (legacy floor for fine-event resolution), and
-    //   - dt_output / N_SUBSTEPS_MAX, which caps per-output-step
-    //     substeps to a value that keeps the persistent kernel below
-    //     the macOS GPU-watchdog timeout (~5–10 s default).
-    // Without this second floor, very cold checkpoint states (24 K
-    // PSR floors) yield tiny cp(T), large kappa = k/(rho·cp), tiny
-    // dt_stable per the CFL criterion, and worst-case work-items
-    // accumulate enough substeps that the kernel never finishes
-    // within the watchdog window — causing the AMD driver to abort
-    // with gpusKillClientExt.
-    const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
-    float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
-    if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
-    dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
-
-    // Number of sub-steps per output interval (capped above by the
-    // dt_stable floor)
-    int n_substeps = (int)ceil(dt_output / dt_stable);
-    float dt = dt_output / (float)n_substeps;  // Actual sub-step size
+    float dt = dt_output / (float)n_substeps;  // Actual sub-step size (bit-exact)
 
     // Process ALL output timesteps
     for (int t = 0; t < n_timesteps; ++t) {
-        float Q_surf = flux_all[t * n_faces + face];
+        int tg = t_offset + t;   // GLOBAL timestep (== t when un-chunked)
+        float Q_surf = flux_all[tg * n_faces + face];
 
         // Sub-stepping loop for numerical stability
         for (int substep = 0; substep < n_substeps; ++substep) {
@@ -552,7 +682,7 @@ __kernel void persistentThermalKernel(
         }  // End of sub-stepping loop
 
         // Store surface temperature after all sub-steps are complete
-        output_temps[t * n_faces + face] = T_local[0];
+        output_temps[tg * n_faces + face] = T_local[0];
 
         // Schorghofer & Taylor (2007) sublimation-rate accumulator (optional).
         // Constants match src/cpp/ice/ice_table.cpp:
@@ -561,7 +691,7 @@ __kernel void persistentThermalKernel(
         //   1/TT    = 1/273.16 K
         //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
         // Each face owns its column → no atomics required.
-        if (do_accumulate != 0 && t >= accum_start && t < accum_end) {
+        if (do_accumulate != 0 && tg >= accum_start && tg < accum_end) {
             for (int i = 0; i < n_layers; ++i) {
                 float Ti = T_local[i];
                 if (Ti > 30.0f) {
@@ -749,20 +879,42 @@ bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
 
 void ThermalOpenCLSolver::buildKernels() {
     std::string source;
+    const std::string embedded = getEmbeddedKernelSource();
 
-    // Try to load from file first
+    // Phase R / Fermi F5: the kernel source is single-sourced from the embedded
+    // string (see scripts/sync_cl_from_embedded.py). buildKernels() must NEVER
+    // silently swap in a different kernel: it (a) announces which source it
+    // compiled, (b) warns loudly instead of silently falling back when a
+    // requested kernel_path fails to open, and (c) warns loudly if a loaded
+    // external kernel DIVERGES from the validated embedded physics.
     if (!config_.kernel_path.empty()) {
         std::ifstream file(config_.kernel_path);
         if (file.is_open()) {
             std::stringstream buffer;
             buffer << file.rdbuf();
             source = buffer.str();
+            std::cout << "[GPU Thermal] compiling kernels from FILE: "
+                      << config_.kernel_path << "\n";
+            if (source != embedded) {
+                std::cerr << "[GPU Thermal] WARNING (F5): external kernel file '"
+                          << config_.kernel_path << "' DIFFERS from the validated "
+                             "embedded kernel source. The compiled physics may not "
+                             "match the byte-identity-validated solver. Leave "
+                             "kernel_path empty to use the embedded kernel, or run "
+                             "scripts/sync_cl_from_embedded.py to resync the .cl.\n";
+            }
+        } else {
+            std::cerr << "[GPU Thermal] WARNING (F5): kernel_path '"
+                      << config_.kernel_path << "' could not be opened; falling "
+                         "back to the embedded kernel source.\n";
         }
     }
 
     // Fall back to embedded source
     if (source.empty()) {
-        source = getEmbeddedKernelSource();
+        source = embedded;
+        std::cout << "[GPU Thermal] compiling kernels from EMBEDDED source "
+                     "(validated default)\n";
     }
 
     // Build program directly (avoid context_->buildProgram() which throws exceptions
@@ -873,6 +1025,18 @@ void ThermalOpenCLSolver::createBuffers() {
 
     buf_Qb_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
                             n_faces_ * sizeof(float), nullptr, &err);
+    CL_CHECK(err);
+
+    // Phase R (R2 fix, Fermi PORT-R2-01): per-face frozen von-Neumann substep
+    // count. The persistent kernel derives n_substeps from the session-ENTRY
+    // T; a self-chunked session must reuse the SAME count across its
+    // sub-dispatches or the integration drifts (the count depends on T, which
+    // warms across the session). The kernel writes this on the first
+    // sub-dispatch (t_offset==0) and reads it on the rest; the inter-
+    // sub-dispatch clFinish makes the write visible. Re-derived at each cycle
+    // entry (t_offset resets to 0 per cycle) => identical to pre-R2 behavior.
+    buf_n_substeps_frozen_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                            n_faces_ * sizeof(int), nullptr, &err);
     CL_CHECK(err);
 
     // Placeholder for cp_coeffs (will resize when setMaterialParams is called)
@@ -1175,22 +1339,25 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_int));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
+    // Phase R (R2): t_offset arg. Set once here; enqueuePersistentSelfChunked
+    // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
+    int t_offset_init = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
+    // Phase R (R2 fix, PORT-R2-01): per-face frozen substep-count buffer (arg 26).
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
-    err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
-                                 &global_size, &local_size, 0, nullptr, nullptr);
+    // Phase R (R2): self-chunk the dispatch to stay under the host watchdog
+    // ceiling. n_timesteps <= ceiling degenerates to the pre-R2 single dispatch.
+    err = enqueuePersistentSelfChunked(persistent_kernel_, queue, n_timesteps,
+                                       gpuMaxTimestepsPerDispatch(),
+                                       global_size, local_size);
     if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel launch failed: " << clErrorString(err) << "\n";
-    }
-
-    // Wait for kernel completion and check for errors
-    err = clFinish(queue);
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel execution failed: " << clErrorString(err) << "\n";
+        std::cerr << "[GPU Thermal] Kernel launch/exec failed: " << clErrorString(err) << "\n";
     }
 
     // Download results
@@ -1396,30 +1563,42 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &do_accum_zero));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_start_eff));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &accum_end_eff));
+    // Phase R (R2): t_offset arg. Set once here; enqueuePersistentSelfChunked
+    // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
+    int t_offset_init = 0;
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
+    // Phase R (R2 fix, PORT-R2-01): per-face frozen substep-count buffer (arg 26).
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
     size_t local_size = config_.work_group_size;
 
+    // Phase R (R2): dispatch self-chunk ceiling for THIS session. Each cycle's
+    // n_timesteps is split into sub-dispatches of <= max_ts with a clFinish
+    // between them, keeping every command buffer under the host watchdog. The
+    // split is numerically inert (same CN steps, same order, host sync only);
+    // n_timesteps <= max_ts reproduces the pre-R2 single-dispatch-per-cycle
+    // path bit-for-bit.
+    const int max_ts = gpuMaxTimestepsPerDispatch();
+
     const int total_cycles = n_equil_cycles + 1;
     for (int cycle = 0; cycle < total_cycles; ++cycle) {
-        // Only accumulate on the FINAL cycle (the "output" cycle).
+        // Only accumulate on the FINAL cycle (the "output" cycle). The kernel
+        // gates accumulation on the GLOBAL timestep vs [accum_start, accum_end),
+        // so a self-chunked final cycle still accumulates each output step
+        // exactly once across its sub-dispatches.
         int do_accum_this_cycle = (enable_accum && cycle == total_cycles - 1) ? 1 : 0;
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgIdxDoAccumulate,
                                  sizeof(int), &do_accum_this_cycle));
-        err = clEnqueueNDRangeKernel(queue, persistent_kernel_, 1, nullptr,
-                                     &global_size, &local_size, 0, nullptr, nullptr);
+        err = enqueuePersistentSelfChunked(persistent_kernel_, queue, n_timesteps,
+                                           max_ts, global_size, local_size);
         if (err != CL_SUCCESS) {
-            std::cerr << "[GPU Thermal] Kernel launch failed (cycle " << cycle
+            std::cerr << "[GPU Thermal] Kernel launch/exec failed (cycle " << cycle
                       << "): " << clErrorString(err) << "\n";
             break;
         }
-    }
-
-    err = clFinish(queue);
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU Thermal] Kernel execution failed: " << clErrorString(err) << "\n";
     }
 
     // Read output ONCE after the final cycle.
@@ -1496,6 +1675,7 @@ void ThermalOpenCLSolver::release() {
     if (buf_z_) { clReleaseMemObject(buf_z_); buf_z_ = nullptr; }
     if (buf_T_deep_) { clReleaseMemObject(buf_T_deep_); buf_T_deep_ = nullptr; }
     if (buf_Qb_) { clReleaseMemObject(buf_Qb_); buf_Qb_ = nullptr; }
+    if (buf_n_substeps_frozen_) { clReleaseMemObject(buf_n_substeps_frozen_); buf_n_substeps_frozen_ = nullptr; }
     if (buf_cp_coeffs_) { clReleaseMemObject(buf_cp_coeffs_); buf_cp_coeffs_ = nullptr; }
 
     // Release context (via unique_ptr)

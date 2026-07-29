@@ -112,6 +112,19 @@ radiation:
   # Per-site view-factor cache: rendered to <site_dir>/view_factors.hmat by
   # the orchestrator. The first window builds it; subsequent windows load it.
   view_factor_file: '{{ vf_file }}'
+  # Radiance-weighted VF pruning (Paul's adjustable knob) -- DEFAULT 0.0 = NO
+  # PRUNING. When >0 (W/m^2), the VF ASSEMBLER (assemble_vf_haworth.py) keeps a
+  # partner j for face i only if F_ij * R_j >= this eps, where R_j = sigma*
+  # T_max,j^4 + albedo*direct_solar_max,j (radiance the partner emits/reflects).
+  # This shrinks the corrected CSR; it is applied at assembly time, NOT in the
+  # sim -- the pipeline propagates this value to the assembler as env
+  # PTM_RADIANCE_PRUNE_EPS (require-env compatible) or --radiance-prune-eps.
+  # ** CAUTION (measured, A03MP026): eps=1e-3 -> 3.2x fewer nnz but the Y00_summer
+  #    window FAILED the <1 K bar -- PSR-floor Tmax off by mean 3.3 K / max 22.6 K
+  #    (rims fine, <0.6 K). Diffuse polar terrain does NOT prune safely; it pays on
+  #    isolated-crater / warm-body terrain. Every assembly emits a receipt with the
+  #    nnz/speedup + discarded-contribution + dT bound so you see the trade first. **
+  radiance_prune_eps: 0.0
   verbose: true
   # GPU radiosity: dispatches the per-timestep "Computing indirect flux"
   # loop across all 4 W6800X dies (mirrors thermal multi-GPU pool). The

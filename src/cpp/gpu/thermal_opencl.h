@@ -259,6 +259,7 @@ private:
     cl_mem buf_z_ = nullptr;           // Depth grid [n_layers]
     cl_mem buf_T_deep_ = nullptr;      // Deep boundary temp
     cl_mem buf_Qb_ = nullptr;          // Bottom heat flux
+    cl_mem buf_n_substeps_frozen_ = nullptr;  // per-face frozen substep count (R2 fix)
     cl_mem buf_cp_coeffs_ = nullptr;   // cp polynomial coefficients
 
     // Material parameters

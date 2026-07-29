@@ -32,7 +32,7 @@ import pyvista as pv
 from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, DOUBLE_W, panel_label
+from ptm_pubstyle import apply_style, DOUBLE_W, panel_label, savefig_pinned
 
 
 def load_stat(stat_dir: Path, name: str) -> np.ndarray:
@@ -83,7 +83,8 @@ def centroids(v: np.ndarray, f: np.ndarray) -> np.ndarray:
 
 
 def render_panel(ax, v, f, fc_vals, cmap, norm, elev, azim, title, cbar_label,
-                 zexag=3.0, mask=None, mask_color=(0.7, 0.7, 0.7, 1.0)):
+                 zexag=3.0, mask=None, mask_color=(0.7, 0.7, 0.7, 1.0),
+                 show_title=True):
     """Flat-shaded Poly3DCollection colored by per-face fc_vals.
 
     Vertical relief is exaggerated by `zexag` for legibility (the real patch
@@ -91,6 +92,13 @@ def render_panel(ax, v, f, fc_vals, cmap, norm, elev, azim, title, cbar_label,
     true (exaggerated) data extents rather than a forced cube. Faces flagged
     in `mask` (view-factor over-count artifacts) are drawn in a neutral gray
     so they neither color-code as false-hot nor drive the color scale.
+
+    `show_title` (default True, backward compatible for all other callers --
+    moon3d_indirect_bands.py, moon3d_temp_3d_angles.py, the latitude montage,
+    etc.): set False to suppress the per-panel header (manuscript v4, Fig. 12
+    "temp_3d_native_twoband_v3" review round, 2026-07-27 -- Paul's ask to move
+    panel identification into the caption, matching the suptitle already
+    suppressed under --pubclean).
     """
     v = v.copy()
     v[:, 2] *= zexag
@@ -115,7 +123,8 @@ def render_panel(ax, v, f, fc_vals, cmap, norm, elev, azim, title, cbar_label,
         pass
     ax.view_init(elev=elev, azim=azim)
     ax.set_axis_off()
-    ax.set_title(title, pad=-2)
+    if show_title:
+        ax.set_title(title, pad=-2)
     cb = ax.figure.colorbar(sm, ax=ax, shrink=0.5, pad=-0.02, aspect=16)
     cb.set_label(cbar_label)
     return pc
@@ -137,6 +146,22 @@ def main() -> int:
                     help="draw faces whose coupled MAX-T exceeds this (K) in neutral "
                          "gray and exclude them from the color scale (view-factor "
                          "over-count artifacts); 0 = keep all")
+    ap.add_argument("--pubclean", action="store_true",
+                    help="Publication-clean variant (Paul's no-on-figure-notes rule): "
+                         "suppress the upper suptitle AND the two per-panel headers "
+                         "(content identification moves to the caption instead, "
+                         "manuscript v4 review round 2, 2026-07-27). Colorbars/axis "
+                         "labels unaffected. Additive, default OFF. NOTE: the first "
+                         "pubclean pass (2026-07-22, temp_3d_native_twoband_v2) "
+                         "suppressed the suptitle only -- this flag now ALSO drops "
+                         "panel titles, matching the sibling scripts' --pubclean "
+                         "convention (diviner_seasonal_compare.py etc.); does not "
+                         "affect the already-shipped _v2 files.")
+    ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
+                    help="With --pubclean, pin the saved canvas to this exact pixel "
+                         "size at 300 dpi so it matches the annotated (titled) "
+                         "sibling's own shipped size 1:1 (the tight-bbox crop "
+                         "otherwise shrinks once the suptitle is removed).")
     a = ap.parse_args()
 
     full = pv.read(a.ply)               # connectivity only (points are float32)
@@ -178,9 +203,17 @@ def main() -> int:
     axL = fig.add_subplot(1, 2, 1, projection="3d", computed_zorder=False)
     axR = fig.add_subplot(1, 2, 2, projection="3d", computed_zorder=False)
 
+    # Left-panel colorbar label: mathtext subscript matching the selected
+    # field (avg/min/max), e.g. "$T_\mathrm{avg}$ (K)" -- Paul's ask, manuscript
+    # v4 review round 2 (2026-07-27), replacing the generic "T (K)" so the
+    # colorbar itself carries the field identity now that the panel header
+    # (which used to say "Radiatively-coupled mean T") is suppressed under
+    # --pubclean.
+    cbar_label_L = rf"$T_\mathrm{{{a.field}}}$ (K)"
     nL = Normalize(np.percentile(coupled_d[good], 1), np.percentile(coupled_d[good], 99))
     render_panel(axL, vd, fd, coupled_d, "inferno", nL, a.elev, a.azim,
-                 f"Radiatively-coupled {field_name} T", "T (K)", mask=hot)
+                 f"Radiatively-coupled {field_name} T", cbar_label_L, mask=hot,
+                 show_title=not a.pubclean)
     axL.text2D(0.03, 0.95, "(a)", transform=axL.transAxes,
                fontsize=10, fontweight="bold", va="top")
 
@@ -191,18 +224,25 @@ def main() -> int:
     else:
         nR = Normalize(0.0, dmax); cmapR = "hot"
     render_panel(axR, vd, fd, diff_d, cmapR, nR, a.elev, a.azim,
-                 f"Coupling effect (Δ{field_name} T)", "ΔT (K)", mask=hot)
+                 f"Coupling effect (Δ{field_name} T)", "ΔT (K)", mask=hot,
+                 show_title=not a.pubclean)
     axR.text2D(0.03, 0.95, "(b)", transform=axR.transAxes,
                fontsize=10, fontweight="bold", va="top")
 
-    fig.suptitle("Moon3D 509k — radiative coupling on the thermal field",
-                 fontsize=13, fontweight="bold", y=0.98)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if not a.pubclean:
+        fig.suptitle("Moon3D 509k — radiative coupling on the thermal field",
+                     fontsize=13, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=(0, 0, 1, 1) if a.pubclean else (0, 0, 1, 0.95))
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=300)
-    if out.suffix == ".png":
-        fig.savefig(out.with_suffix(".pdf"))
-    print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
+    if a.pubclean_canvas_px:
+        w, h = (int(v) for v in a.pubclean_canvas_px.lower().split("x"))
+        written = savefig_pinned(fig, out.with_suffix(""), canvas_px=(w, h))
+        print(f"wrote {written[0]} (+pdf)  [pinned canvas {w}x{h}px]")
+    else:
+        fig.savefig(out, dpi=300)
+        if out.suffix == ".png":
+            fig.savefig(out.with_suffix(".pdf"))
+        print(f"wrote {out}" + (" (+pdf)" if out.suffix == ".png" else ""))
     dg = diff[good]
     print(f"  Δ{field_name}T (non-over-count faces): min={dg.min():+.1f} "
           f"max={dg.max():+.1f} mean={dg.mean():+.2f} K")
