@@ -293,7 +293,9 @@ def check_env_completeness(env, required=None):
         sys.path.insert(0, str(find_project_root() / "scripts"))
         import ptm_run_guard  # noqa: F401
         if hasattr(ptm_run_guard, "check_env_completeness"):
-            return list(ptm_run_guard.check_env_completeness(env, required))
+            # ptm_run_guard signature (Phase R): (required, env=None) --
+            # required first, env second.
+            return list(ptm_run_guard.check_env_completeness(required, env))
     except Exception:
         pass
     finally:
