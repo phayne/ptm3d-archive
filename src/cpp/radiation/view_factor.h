@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <cstdint>
 #include <omp.h>
 
 #include "radiation_config.h"
@@ -72,7 +73,11 @@ public:
     // Get raw data for advanced operations
     const std::vector<double>& values() const { return values_; }
     const std::vector<int>& colIndices() const { return col_indices_; }
-    const std::vector<int>& rowPointers() const { return row_ptrs_; }
+    // Row pointers are int64 so a CSR with > 2^31 non-zeros does not overflow
+    // (the GPU radiosity path needs this). The on-disk .vf format keeps int32
+    // row pointers (writeBinary/readBinary convert), so existing .vf files are
+    // read byte-for-byte identically.
+    const std::vector<int64_t>& rowPointers() const { return row_ptrs_; }
 
     // Compute row sums (useful for checking sum rule: sum_j F_ij + F_sky = 1)
     std::vector<double> rowSums() const;
@@ -94,7 +99,8 @@ private:
     size_t n_cols_ = 0;
     std::vector<double> values_;      // Non-zero values
     std::vector<int> col_indices_;    // Column indices
-    std::vector<int> row_ptrs_;       // Row pointers (size = n_rows + 1)
+    std::vector<int64_t> row_ptrs_;   // Row pointers (size = n_rows + 1); int64
+                                      // so CSRs with > 2^31 nnz do not overflow
 };
 
 // View factor calculator using Embree for visibility

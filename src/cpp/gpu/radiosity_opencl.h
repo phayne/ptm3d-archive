@@ -15,6 +15,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdint>
 
 namespace gpu {
 namespace opencl {
@@ -87,7 +88,7 @@ public:
     void uploadViewFactors(
         const std::vector<double>& values,
         const std::vector<int>& col_indices,
-        const std::vector<int>& row_ptrs);
+        const std::vector<int64_t>& row_ptrs);
 
     /**
      * @brief Upload face properties (call once at start)
@@ -163,7 +164,7 @@ private:
     // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
     void buildChunkedCsr(const std::vector<double>& values,
                          const std::vector<int>& col_indices,
-                         const std::vector<int>& row_ptrs,
+                         const std::vector<int64_t>& row_ptrs,
                          size_t max_chunk_nnz);
 
     // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.

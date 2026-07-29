@@ -469,7 +469,7 @@ void RadiosityOpenCLSolver::createBuffers() {
 void RadiosityOpenCLSolver::uploadViewFactors(
     const std::vector<double>& values,
     const std::vector<int>& col_indices,
-    const std::vector<int>& row_ptrs)
+    const std::vector<int64_t>& row_ptrs)
 {
     if (!initialized_) {
         throw std::runtime_error("RadiosityOpenCLSolver not initialized");
@@ -570,6 +570,15 @@ void RadiosityOpenCLSolver::uploadViewFactors(
                                       row_ptrs.size() * sizeof(int), nullptr, &err);
     checkErr(err, "clCreateBuffer(csr_row_ptrs)");
 
+    // The GPU SpMV kernel indexes row_ptrs as int32. This single-buffer path is
+    // only taken when nnz_ <= the per-chunk budget (< 2^31), so every row
+    // pointer fits int32; convert the int64 host array down. (Values above the
+    // budget go through buildChunkedCsr instead.)
+    std::vector<int> row_ptrs32(row_ptrs.size());
+    for (size_t i = 0; i < row_ptrs.size(); ++i) {
+        row_ptrs32[i] = static_cast<int>(row_ptrs[i]);
+    }
+
     // Upload CSR data
     err = clEnqueueWriteBuffer(queue, buf_csr_values_, CL_FALSE, 0,
                                nnz_ * sizeof(float),
@@ -582,8 +591,8 @@ void RadiosityOpenCLSolver::uploadViewFactors(
     checkErr(err, "clEnqueueWriteBuffer(csr_col_indices)");
 
     err = clEnqueueWriteBuffer(queue, buf_csr_row_ptrs_, CL_TRUE, 0,
-                               row_ptrs.size() * sizeof(int),
-                               row_ptrs.data(), 0, nullptr, nullptr);
+                               row_ptrs32.size() * sizeof(int),
+                               row_ptrs32.data(), 0, nullptr, nullptr);
     checkErr(err, "clEnqueueWriteBuffer(csr_row_ptrs)");
 
     view_factors_uploaded_ = true;
@@ -599,7 +608,7 @@ void RadiosityOpenCLSolver::uploadViewFactors(
 void RadiosityOpenCLSolver::buildChunkedCsr(
     const std::vector<double>& values,
     const std::vector<int>& col_indices,
-    const std::vector<int>& row_ptrs,
+    const std::vector<int64_t>& row_ptrs,
     size_t max_chunk_nnz)
 {
     cl_context ctx = context_->context();
@@ -655,13 +664,15 @@ void RadiosityOpenCLSolver::buildChunkedCsr(
         chunk.n_rows = chunk_rows;
         chunk.nnz = chunk_nnz;
 
-        // Chunk-local row_ptrs (subtract base so the first entry is 0). Each
-        // value is <= chunk_nnz <= max_chunk_nnz < 2^31, so int is safe.
+        // Chunk-local row_ptrs (subtract base so the first entry is 0). base can
+        // exceed int32 for a large matrix, so subtract in int64 first; each
+        // resulting value is <= chunk_nnz <= max_chunk_nnz < 2^31, so int is safe.
         std::vector<int> local_rowptr(static_cast<size_t>(chunk_rows) + 1);
         for (int r = 0; r <= chunk_rows; ++r) {
-            local_rowptr[static_cast<size_t>(r)] =
+            const int64_t local =
                 row_ptrs[chunk_row_begin + static_cast<size_t>(r)] -
-                static_cast<int>(base);
+                static_cast<int64_t>(base);
+            local_rowptr[static_cast<size_t>(r)] = static_cast<int>(local);
         }
 
         // Convert this chunk's values slice to float.

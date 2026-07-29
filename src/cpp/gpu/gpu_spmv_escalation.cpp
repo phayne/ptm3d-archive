@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <cmath>
 #include <chrono>
 #include <random>
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
     // --- synthetic SigmaF<=1 CSR (double values, int cols/rowptrs) ---
     std::printf("building synthetic CSR ...\n"); std::fflush(stdout);
     double t0 = now_ms();
-    std::vector<int> rowptr(n + 1); std::vector<int> cols; std::vector<double> vals;
+    std::vector<int64_t> rowptr(n + 1); std::vector<int> cols; std::vector<double> vals;
     cols.reserve(nnz); vals.reserve(nnz);
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<long long> col_d(0, static_cast<long long>(n) - 1);
@@ -56,7 +57,7 @@ int main(int argc, char** argv) {
         // normalize so Sum_j F_ij = 0.5 (<=1, matches the capped VF regime)
         const double scale = (rowsum > 0) ? 0.5 / rowsum : 0.0;
         for (size_t k = start; k < cols.size(); ++k) vals[k] *= scale;
-        rowptr[i + 1] = static_cast<int>(cols.size());
+        rowptr[i + 1] = static_cast<int64_t>(cols.size());
     }
     std::printf("  CSR built (%.0f ms). host mem ~%.1f GB\n", now_ms() - t0,
                 (vals.size() * 8.0 + cols.size() * 4.0 + rowptr.size() * 4.0) / 1e9);
@@ -111,14 +112,14 @@ int main(int argc, char** argv) {
         std::vector<double> E(n), src(n), B(n), Bn(n), FB(n);
         for (size_t i = 0; i < n; ++i) { double T = temps[i]; E[i] = 0.95 * SIG * T*T*T*T; src[i] = 0.05 * solar[i]; B[i] = E[i] + src[i]; }
         for (int it = 0; it < 100; ++it) {
-            for (size_t i = 0; i < n; ++i) { double s = 0; for (int k = rowptr[i]; k < rowptr[i+1]; ++k) s += vals[k] * B[cols[k]]; FB[i] = s; }
+            for (size_t i = 0; i < n; ++i) { double s = 0; for (int64_t k = rowptr[i]; k < rowptr[i+1]; ++k) s += vals[k] * B[cols[k]]; FB[i] = s; }
             double mc = 0, mv = 0;
             for (size_t i = 0; i < n; ++i) { Bn[i] = E[i] + src[i] + 0.05 * FB[i]; mc = std::max(mc, std::fabs(Bn[i]-B[i])); mv = std::max(mv, std::fabs(Bn[i])); }
             std::swap(B, Bn);
             if ((mv > 1e-10 ? mc/mv : mc) < 1e-4) break;
         }
         // GPU output convention: absorbed indirect ~ eps * (F B). Compare the shape.
-        for (size_t i = 0; i < n; ++i) { double s = 0; for (int k = rowptr[i]; k < rowptr[i+1]; ++k) s += vals[k] * B[cols[k]]; double cpu = 0.95 * s; max_absdiff = std::max(max_absdiff, std::fabs(cpu - (double)gpu_out[i])); }
+        for (size_t i = 0; i < n; ++i) { double s = 0; for (int64_t k = rowptr[i]; k < rowptr[i+1]; ++k) s += vals[k] * B[cols[k]]; double cpu = 0.95 * s; max_absdiff = std::max(max_absdiff, std::fabs(cpu - (double)gpu_out[i])); }
     }
 
     std::printf("RESULT rung n_faces=%zu nnz=%lld STATUS=%s converged_iters=%d resid=%.2e "
