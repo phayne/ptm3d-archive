@@ -17,9 +17,7 @@
 **PTM3D** predicts surface and subsurface temperatures on planetary bodies by
 coupling ray-traced illumination (Intel Embree + NASA SPICE ephemerides) with a
 1D Crank-Nicolson thermal solver and full inter-face thermal radiation exchange
-on arbitrary 3D terrain. It is built for the hard cases: permanently shadowed
-lunar craters, Europa's ice shell, Mercury's extremes, and irregular small
-bodies.
+on arbitrary 3D terrain. It is built for physical accuracy and computational speed across a range of planetary thermal environments, from permanently shadowed craters to icy satellite surfaces and asteroids.
 
 ![Lunar polar crater temperatures](docs/figures/temp_3d_native_twoband_v3.png)
 *A lunar south-polar crater in PTM3D: (a) diurnal-mean surface temperature on
@@ -29,7 +27,7 @@ sunlight and thermal emission from surrounding terrain.*
 
 ## What it does
 
-- **Bodies**: Moon, Mercury, Europa, Mars, Ceres, Enceladus, Titan — plus any
+- **Bodies**: Moon, Mercury, Europa, Mars, Ceres, Enceladus — plus any
   body via Keplerian elements, SPICE kernels, or JPL Horizons
 - **Illumination**: Embree ray-traced shadows with finite solar disk penumbra,
   eclipses, and primary-body reflected + IR flux (e.g. Earthshine, Jupiter-shine)
