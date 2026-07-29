@@ -392,8 +392,9 @@ is bounded and **reported**.
 - `--radiance-prune-eps ε` — threshold in W/m². **`0.0` (default) = no pruning;
   the output is numerically identical to the last digit.** Also settable via the
   environment variable `PTM_RADIANCE_PRUNE_EPS`, and documented in the radiation
-  config as `radiation.radiance_prune_eps`
-  (the pipeline propagates it to the assembler; it is not read by the sim).
+  config as `radiation.radiance_prune_eps` (the runners propagate it to the
+  assembler; the sim parses and **logs** it for provenance but does not prune —
+  see "Config key and precedence" below).
 - `--radiance-weight PATH` — the per-face `R` source, **two documented paths**:
   1. a **prior-run stats directory** (`temperature_max.bin` +
      `direct_solar_max.bin`) — exact radiance from a completed coupled/radoff run;
@@ -401,6 +402,21 @@ is bounded and **reported**.
      without a full thermal run (illumination-only pass → `direct_solar_max`,
      `T_eq = ((1−A)·direct_solar_max/εσ)^¼`, `R ≈ σT_eq⁴ + A₀·direct_solar_max`).
 - `--radiance-albedo A₀` — visible-band albedo (default 0.12).
+
+**Config key and precedence.** The same threshold is exposed as
+`radiation.radiance_prune_eps` (float, default `0.0` = off) in the sim config
+(parsed in `config_parser.cpp`, stored on the radiation config, distinct from the
+build-time `visibility_threshold` storage floor). The sim does **not** prune — it
+logs the effective value at radiation init (`radiance-prune epsilon: X W/m²
+(assembly-time; 0=off)`) for provenance. The runners (e.g.
+`scripts/run_yearlong_wedge_safe.py`) read the config key and export it as
+`PTM_RADIANCE_PRUNE_EPS` for the VF-assembly step they invoke. Precedence is
+**env overrides config**: an already-set `PTM_RADIANCE_PRUNE_EPS` is left untouched
+(it wins), and the runner fills the env from the config only when it is unset; a
+config value of `0.0` exports nothing, so the default path is byte-identical. When
+a `<csr>.prune_receipt.json` sidecar accompanies a `PTM_HMATRIX_VF_REPLACE` CSR,
+the sim additionally logs a one-line summary of that receipt (eps + max discarded
+contribution).
 
 **Mandatory receipt.** Every pruned assembly prints and writes
 `<out>.csr.prune_receipt.json`: matrix entries kept/dropped, size, predicted speedup, the

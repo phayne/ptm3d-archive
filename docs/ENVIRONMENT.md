@@ -104,7 +104,8 @@ Status tags:
 | `PTM_DUMP_QIND_SERIES` | unset | Write the per-face indirect-flux time series (binary, 'QIDT' marker; single-precision values, all timesteps of face 0, then face 1, ...). | [internal] |
 | `PTM_DUMP_REFLIR` | unset | Write each face's peak temperature and the indirect flux at that moment (binary, 'RFIR' marker). | [internal] |
 | `PTM_VF_ROBUST`, `PTM_VF_NLIFT`, `PTM_VF_MSAMPLE`, `PTM_VF_IGNORE_NEAR`, `PTM_VF_MC_LIFT` | unset | Settings for the standalone view-factor checking tools (`vf_face_probe`, `vf_hemisphere_mc`), which recompute individual view factors by independent Monte Carlo ray tracing for comparison. | [internal] |
-| `PTM_PP_RING_PLY`, `PTM_RADIANCE_PRUNE_EPS` | unset | PTM-12 diagnostic pipeline (`scripts/ptm12_diag/`). | [internal] |
+| `PTM_PP_RING_PLY` | unset | PTM-12 diagnostic pipeline (`scripts/ptm12_diag/`). | [internal] |
+| `PTM_RADIANCE_PRUNE_EPS` | unset (off) | Radiance-weighted view-factor pruning threshold (W/m²) applied at VF **assembly** (`scripts/ptm12_diag/assemble_vf_haworth.py`): keep partner j for face i only if F_ij·R_j ≥ ε. Also exposed as the config key `radiation.radiance_prune_eps` (see [configuration.md](configuration.md)); when both are set the **env var takes precedence** and the runners propagate the config value into it only when it is unset. The sim does **not** prune — it logs the effective ε at radiation init. `0`/unset = off (numerically identical to the last digit). See [radiation-exchange.md §10.9](radiation-exchange.md). | [experimental] |
 | `PTM_A3GT_REPO`, `PTM_A3GT_MESH_DIR`, `PTM_A3GT_TEMPLATE_RAD` | unset | A3GT campaign-runner plumbing (`scripts/a3gt_*`). | [internal] |
 
 ## See also

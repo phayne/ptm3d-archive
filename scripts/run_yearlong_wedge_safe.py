@@ -95,6 +95,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import sys
@@ -386,9 +387,46 @@ def run_with_retry(ptm_bin: Path, cfg_path: Path, log_path: Path,
 # Modes
 # --------------------------------------------------------------------------
 
+def _export_radiance_prune_eps(base_cfg: dict) -> None:
+    """Propagate radiation.radiance_prune_eps from the config into the environment
+    as PTM_RADIANCE_PRUNE_EPS so any VF-ASSEMBLY step this runner invokes
+    (scripts/ptm12_diag/assemble_vf_haworth.py reads that env var as its default)
+    sees it. The sim itself does not prune -- it only logs the value.
+
+    Precedence: an already-set env var WINS over the config (require-env
+    compatible); we fill it from the config ONLY when unset. To keep the default
+    case byte-for-byte unchanged we export NOTHING when the config value is 0.0
+    (off). Every override/mismatch is reported so the choice is never silent.
+    """
+    rad = base_cfg.get("radiation", {}) or {}
+    try:
+        cfg_eps = float(rad.get("radiance_prune_eps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        print("[run] WARNING: radiation.radiance_prune_eps is not a number; "
+              "ignoring (no PTM_RADIANCE_PRUNE_EPS exported).", flush=True)
+        return
+    env_eps = os.environ.get("PTM_RADIANCE_PRUNE_EPS")
+    if env_eps not in (None, ""):
+        try:
+            env_val = float(env_eps)
+        except ValueError:
+            env_val = None
+        if cfg_eps > 0.0 and (env_val is None or env_val != cfg_eps):
+            print(f"[run] NOTE: PTM_RADIANCE_PRUNE_EPS={env_eps} is already set and "
+                  f"OVERRIDES radiation.radiance_prune_eps={cfg_eps} from the config "
+                  f"(env wins at VF-assembly time).", flush=True)
+        return
+    if cfg_eps > 0.0:
+        os.environ["PTM_RADIANCE_PRUNE_EPS"] = repr(cfg_eps)
+        print(f"[run] exporting PTM_RADIANCE_PRUNE_EPS={cfg_eps} from "
+              f"radiation.radiance_prune_eps for any VF-assembly step "
+              f"(sim logs only; assembly prunes).", flush=True)
+
+
 def mode_calibrate(args):
     with open(args.config) as f:
         base_cfg = yaml.safe_load(f)
+    _export_radiance_prune_eps(base_cfg)
     sim = base_cfg.get("simulation", {})
     start = parse_iso8601(str(sim.get("start_time", "2030-09-01T00:00:00")))
     output_steps_per_day = float(sim.get("timesteps", 1)) / float(sim.get("duration_days", 1))
@@ -522,6 +560,7 @@ def mode_run(args):
 
     with open(args.config) as f:
         base_cfg = yaml.safe_load(f)
+    _export_radiance_prune_eps(base_cfg)
     sim = base_cfg.get("simulation", {})
     start = parse_iso8601(str(sim.get("start_time", "2030-09-01T00:00:00")))
     total_output_steps = int(sim.get("timesteps"))

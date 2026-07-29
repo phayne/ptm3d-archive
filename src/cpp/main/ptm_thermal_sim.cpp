@@ -8431,6 +8431,7 @@ int main(int argc, char** argv) {
     // Anisotropic (roughness-beamed) thermal emission (Smith 1967). 0 = OFF.
     double rad_rms_slope_deg = 0.0;              // RMS micro-slope [deg]
     double rad_beam_vf_threshold = 1e-7;         // Min renormalized VF to keep a beam pair
+    double rad_radiance_prune_eps = 0.0;         // Radiance-prune eps [W/m^2] (assembly-time; 0 = off)
 
     // Multi-GPU radiosity dispatch (mirrors thermal pool semantics).
     int rad_gpu_devices = 1;                     // 1 = legacy single-GPU; >1 = pool
@@ -8464,6 +8465,7 @@ int main(int argc, char** argv) {
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
     rad_rms_slope_deg = sim_config.radiation.rms_slope_deg;
     rad_beam_vf_threshold = sim_config.radiation.beam_vf_threshold;
+    rad_radiance_prune_eps = sim_config.radiation.radiance_prune_eps;
     // Multi-GPU radiosity (only consulted if rad_use_gpu == true).
     rad_gpu_devices = sim_config.radiation.gpu_devices;
     rad_gpu_device_ids = sim_config.radiation.gpu_device_ids;
@@ -8474,6 +8476,27 @@ int main(int argc, char** argv) {
         std::cout << "Radiation exchange enabled from config file" << std::endl;
         if (rad_use_hmatrix) {
             std::cout << "  H-matrix compression: enabled" << std::endl;
+        }
+        // Radiance-weighted VF pruning is applied at VF ASSEMBLY, not in the sim;
+        // we only surface the effective epsilon for provenance. An env override
+        // (PTM_RADIANCE_PRUNE_EPS) wins over the config at assembly time, so if it
+        // is set AND differs, report that it overrides -- never silently.
+        {
+            const char* eps_env = std::getenv("PTM_RADIANCE_PRUNE_EPS");
+            double eps_cfg = rad_radiance_prune_eps;
+            double eps_eff = eps_cfg;
+            bool from_env = false;
+            if (eps_env && *eps_env) {
+                eps_eff = std::atof(eps_env);
+                from_env = (eps_eff != eps_cfg);
+            }
+            std::cout << "  radiance-prune epsilon: " << eps_eff
+                      << " W/m^2 (assembly-time; 0=off)";
+            if (from_env) {
+                std::cout << " [env PTM_RADIANCE_PRUNE_EPS overrides config "
+                          << eps_cfg << "]";
+            }
+            std::cout << std::endl;
         }
     }
 
@@ -9585,6 +9608,7 @@ int main(int argc, char** argv) {
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
             early_rad_config.rms_slope_deg = rad_rms_slope_deg;
             early_rad_config.beam_vf_threshold = rad_beam_vf_threshold;
+            early_rad_config.radiance_prune_eps = rad_radiance_prune_eps;
             if (rad_max_neighbors_override > 0) {
                 early_rad_config.max_neighbors = rad_max_neighbors_override;
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
@@ -10859,6 +10883,7 @@ int main(int argc, char** argv) {
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
+            rad_config.radiance_prune_eps = rad_radiance_prune_eps;
             // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
             // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
             // When ON, the per-face Bond albedo is sourced

@@ -297,6 +297,10 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // Anisotropic roughness-beamed emission (Smith 1967); 0 = Lambertian.
             config.radiation.rms_slope_deg = getWithDefault(rad, "rms_slope_deg", config.radiation.rms_slope_deg);
             config.radiation.beam_vf_threshold = getWithDefault(rad, "beam_vf_threshold", config.radiation.beam_vf_threshold);
+            // Radiance-weighted VF pruning epsilon [W/m^2] (assembly-time; 0 = off).
+            // Distinct from visibility_threshold. The runners propagate it to the
+            // assembler via PTM_RADIANCE_PRUNE_EPS; the sim only logs it.
+            config.radiation.radiance_prune_eps = getWithDefault(rad, "radiance_prune_eps", config.radiation.radiance_prune_eps);
             // Band-separated (visible + thermal-IR) radiosity (D1). Default OFF;
             // Paul's default-flip (D2) is separate. See two-band-radiosity-derivation.tex.
             config.radiation.band_separated = getWithDefault(rad, "band_separated", config.radiation.band_separated);
