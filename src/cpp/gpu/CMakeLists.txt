@@ -228,6 +228,13 @@ install(FILES
 
 # Install OpenCL-specific headers if using OpenCL
 if(GPU_BACKEND_USED STREQUAL "OPENCL")
+    # Stage-1 harness for the multi-GPU two-band radiosity project: stepwise nnz
+    # escalation of the single-GPU radiosity SpMV to retire the 100M-nnz folklore.
+    add_executable(gpu_spmv_escalation gpu_spmv_escalation.cpp)
+    target_link_libraries(gpu_spmv_escalation PRIVATE ptm_gpu)
+    set_target_properties(gpu_spmv_escalation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
     install(FILES
         opencl_config.h
         thermal_opencl.h

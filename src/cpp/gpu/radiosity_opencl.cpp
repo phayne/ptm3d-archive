@@ -451,6 +451,48 @@ void RadiosityOpenCLSolver::uploadViewFactors(
         return;
     }
 
+    // PTM-25 fail-loud guard. The SpMV kernel (radiosity_kernels.cl) addresses
+    // the CSR values/col_indices buffers with a signed-int32 byte offset. On a
+    // 32-bit-addressing device (W6800X/macOS reports CL_DEVICE_ADDRESS_BITS=32),
+    // a single indexed buffer >= 2^31 bytes overflows that offset and the driver
+    // aborts the PROCESS (uncatchable SIGABRT, exit 134) mid-solve() -- the
+    // clCreateBuffer + DMA writes succeed first, so the failure is silent until
+    // the kernel runs. Turn that into a clear, catchable error naming the wall.
+    // Below the wall this branch is not taken => byte-identical behavior.
+    {
+        cl_device_id dev = context_->device();
+        cl_uint address_bits = 64;
+        cl_ulong max_alloc = 0;
+        clGetDeviceInfo(dev, CL_DEVICE_ADDRESS_BITS, sizeof(address_bits),
+                        &address_bits, nullptr);
+        clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc),
+                        &max_alloc, nullptr);
+        const unsigned long long biggest =
+            static_cast<unsigned long long>(nnz_) *
+            std::max(sizeof(float), sizeof(int));
+        const unsigned long long addr_wall =
+            (address_bits <= 32) ? (1ull << 31) : ~0ull;
+        unsigned long long wall = addr_wall;
+        if (max_alloc != 0 && static_cast<unsigned long long>(max_alloc) < wall)
+            wall = static_cast<unsigned long long>(max_alloc);
+        if (biggest >= wall) {
+            std::ostringstream oss;
+            oss << "RadiosityOpenCLSolver: CSR of " << nnz_
+                << " non-zeros needs " << (biggest / (1024.0 * 1024.0))
+                << " MB per indexed buffer, but this GPU (ADDRESS_BITS="
+                << address_bits << ", MAX_MEM_ALLOC="
+                << (max_alloc / (1024.0 * 1024.0))
+                << " MB) caps a single CSR buffer at "
+                << (wall / (1024.0 * 1024.0)) << " MB (~" << (wall / 4)
+                << " nnz). Above this the SpMV kernel's 32-bit byte offset "
+                << "overflows and the driver aborts the process (SIGABRT). "
+                << "See BUGS.md PTM-25. Fix: chunk the CSR into sub-buffers "
+                << "below the wall, row-partition across devices, or use CPU "
+                << "radiosity for this workload.";
+            throw std::runtime_error(oss.str());
+        }
+    }
+
     cl_context ctx = context_->context();
     cl_command_queue queue = context_->queue();
     cl_int err;
