@@ -48,6 +48,39 @@ __kernel void spmv_kernel(
 }
 
 /**
+ * Chunked SpMV (PTM-25 workaround for the 2^31-byte single-buffer wall).
+ *
+ * Identical math to spmv_kernel, but operates on ONE row-chunk whose values /
+ * col_indices buffers each stay below 2^31 bytes, so the int j byte offset
+ * cannot overflow. Chunk-local row_ptrs start at 0; col_indices remain GLOBAL
+ * column indices into the full radiosity vector x[n_faces]. The chunk owns
+ * global rows [row_offset, row_offset + n_rows_chunk); results are written to
+ * the global output y at that offset. Bit-identical to spmv_kernel because the
+ * per-row summation order is unchanged.
+ */
+__kernel void spmv_chunk_kernel(
+    __global const float* values,       /* chunk-local values [chunk nnz] */
+    __global const int* col_indices,    /* GLOBAL column indices [chunk nnz] */
+    __global const int* row_ptrs,       /* chunk-local row_ptrs [n_rows_chunk+1], starts at 0 */
+    __global const float* x,            /* full radiosity vector [n_faces] */
+    __global float* y,                  /* full output vector [n_faces] */
+    int row_offset,                     /* global row = row_offset + local row */
+    int n_rows_chunk)
+{
+    int lr = get_global_id(0);
+    if (lr >= n_rows_chunk) return;
+
+    int row_start = row_ptrs[lr];
+    int row_end = row_ptrs[lr + 1];
+
+    float sum = 0.0f;
+    for (int j = row_start; j < row_end; ++j) {
+        sum += values[j] * x[col_indices[j]];
+    }
+    y[row_offset + lr] = sum;
+}
+
+/**
  * @brief Compute thermal emission: E = epsilon * sigma * T^4
  *
  * Each work item handles one face.

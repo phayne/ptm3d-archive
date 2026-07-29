@@ -10,6 +10,7 @@
 #include <sstream>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 
@@ -46,6 +47,34 @@ __kernel void spmv_kernel(
         sum += values[j] * x[col_indices[j]];
     }
     y[row] = sum;
+}
+
+// Chunked SpMV (PTM-25 workaround for the 2^31-byte single-buffer wall).
+// Identical math to spmv_kernel but on ONE row-chunk whose values/col_indices
+// buffers each stay below 2^31 bytes, so the int j byte offset cannot overflow.
+// Chunk-local row_ptrs start at 0; col_indices remain GLOBAL indices into the
+// full radiosity vector x[n_faces]. Bit-identical to spmv_kernel (same per-row
+// summation order).
+__kernel void spmv_chunk_kernel(
+    __global const float* values,
+    __global const int* col_indices,
+    __global const int* row_ptrs,
+    __global const float* x,
+    __global float* y,
+    int row_offset,
+    int n_rows_chunk)
+{
+    int lr = get_global_id(0);
+    if (lr >= n_rows_chunk) return;
+
+    int row_start = row_ptrs[lr];
+    int row_end = row_ptrs[lr + 1];
+
+    float sum = 0.0f;
+    for (int j = row_start; j < row_end; ++j) {
+        sum += values[j] * x[col_indices[j]];
+    }
+    y[row_offset + lr] = sum;
 }
 
 // CSR-Vector SpMV: One work group per row
@@ -350,6 +379,11 @@ void RadiosityOpenCLSolver::buildKernels() {
         throw std::runtime_error(std::string("Failed to create indirect_flux_kernel: ") + clErrorString(err));
     }
 
+    spmv_chunk_kernel_ = clCreateKernel(program_, "spmv_chunk_kernel", &err);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error(std::string("Failed to create spmv_chunk_kernel: ") + clErrorString(err));
+    }
+
     // Query optimal work group size from CSR-Vector kernel
     // Use preferred work group size multiple (wavefront/warp size)
     size_t preferred_wg = 0;
@@ -451,15 +485,25 @@ void RadiosityOpenCLSolver::uploadViewFactors(
         return;
     }
 
-    // PTM-25 fail-loud guard. The SpMV kernel (radiosity_kernels.cl) addresses
-    // the CSR values/col_indices buffers with a signed-int32 byte offset. On a
-    // 32-bit-addressing device (W6800X/macOS reports CL_DEVICE_ADDRESS_BITS=32),
-    // a single indexed buffer >= 2^31 bytes overflows that offset and the driver
-    // aborts the PROCESS (uncatchable SIGABRT, exit 134) mid-solve() -- the
-    // clCreateBuffer + DMA writes succeed first, so the failure is silent until
-    // the kernel runs. Turn that into a clear, catchable error naming the wall.
-    // Below the wall this branch is not taken => byte-identical behavior.
+    // PTM-25: choose the single-buffer path or the chunked path. The SpMV kernel
+    // addresses the CSR values/col_indices buffers with a signed-int32 byte
+    // offset; on a 32-bit-addressing device (W6800X/macOS reports
+    // CL_DEVICE_ADDRESS_BITS=32) a single indexed buffer >= 2^31 bytes overflows
+    // that offset and the driver aborts the PROCESS (uncatchable SIGABRT) once
+    // the kernel runs. Below the per-chunk budget we use the single-buffer path
+    // unchanged (byte-identical); above it we split the matrix on row boundaries
+    // into sub-buffers each below the wall (buildChunkedCsr, which fails loud if
+    // a single row cannot fit a chunk).
     {
+        // Release any chunk buffers from a previous upload.
+        for (auto& ch : csr_chunks_) {
+            if (ch.values) clReleaseMemObject(ch.values);
+            if (ch.col_indices) clReleaseMemObject(ch.col_indices);
+            if (ch.row_ptrs) clReleaseMemObject(ch.row_ptrs);
+        }
+        csr_chunks_.clear();
+        use_chunked_csr_ = false;
+
         cl_device_id dev = context_->device();
         cl_uint address_bits = 64;
         cl_ulong max_alloc = 0;
@@ -467,29 +511,32 @@ void RadiosityOpenCLSolver::uploadViewFactors(
                         &address_bits, nullptr);
         clGetDeviceInfo(dev, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc),
                         &max_alloc, nullptr);
-        const unsigned long long biggest =
-            static_cast<unsigned long long>(nnz_) *
-            std::max(sizeof(float), sizeof(int));
+        const unsigned long long elem =
+            static_cast<unsigned long long>(std::max(sizeof(float), sizeof(int)));
         const unsigned long long addr_wall =
             (address_bits <= 32) ? (1ull << 31) : ~0ull;
         unsigned long long wall = addr_wall;
         if (max_alloc != 0 && static_cast<unsigned long long>(max_alloc) < wall)
             wall = static_cast<unsigned long long>(max_alloc);
-        if (biggest >= wall) {
-            std::ostringstream oss;
-            oss << "RadiosityOpenCLSolver: CSR of " << nnz_
-                << " non-zeros needs " << (biggest / (1024.0 * 1024.0))
-                << " MB per indexed buffer, but this GPU (ADDRESS_BITS="
-                << address_bits << ", MAX_MEM_ALLOC="
-                << (max_alloc / (1024.0 * 1024.0))
-                << " MB) caps a single CSR buffer at "
-                << (wall / (1024.0 * 1024.0)) << " MB (~" << (wall / 4)
-                << " nnz). Above this the SpMV kernel's 32-bit byte offset "
-                << "overflows and the driver aborts the process (SIGABRT). "
-                << "See BUGS.md PTM-25. Fix: chunk the CSR into sub-buffers "
-                << "below the wall, row-partition across devices, or use CPU "
-                << "radiosity for this workload.";
-            throw std::runtime_error(oss.str());
+
+        // Per-chunk budget: stay under the measured-safe point (530M nnz =
+        // 2.120 GB completed; 540M = 2.160 GB aborted; hard wall 2^31 =
+        // 2.147 GB). Default 2.0 GB/buffer leaves ~120 MB margin.
+        // PTM_RADIOSITY_CHUNK_NNZ lowers the per-chunk nnz cap (oracle/testing).
+        unsigned long long budget_bytes = 2000000000ull;
+        if (budget_bytes > wall) budget_bytes = wall;
+        size_t max_chunk_nnz = static_cast<size_t>(budget_bytes / elem);
+        if (const char* e = std::getenv("PTM_RADIOSITY_CHUNK_NNZ")) {
+            unsigned long long v = std::strtoull(e, nullptr, 10);
+            if (v > 0 && v < static_cast<unsigned long long>(max_chunk_nnz))
+                max_chunk_nnz = static_cast<size_t>(v);
+        }
+
+        if (nnz_ > max_chunk_nnz) {
+            use_chunked_csr_ = true;
+            buildChunkedCsr(values, col_indices, row_ptrs, max_chunk_nnz);
+            view_factors_uploaded_ = true;
+            return;
         }
     }
 
@@ -546,6 +593,172 @@ void RadiosityOpenCLSolver::uploadViewFactors(
                         row_ptrs.size() * sizeof(int)) / (1024 * 1024);
         std::cout << "Uploaded view factor matrix to GPU: "
                   << nnz_ << " non-zeros (" << mem_mb << " MB)\n";
+    }
+}
+
+void RadiosityOpenCLSolver::buildChunkedCsr(
+    const std::vector<double>& values,
+    const std::vector<int>& col_indices,
+    const std::vector<int>& row_ptrs,
+    size_t max_chunk_nnz)
+{
+    cl_context ctx = context_->context();
+    cl_command_queue queue = context_->queue();
+    cl_int err;
+    auto checkErr = [](cl_int e, const char* op) {
+        if (e != CL_SUCCESS) {
+            throw std::runtime_error(std::string(op) + " failed: " + clErrorString(e));
+        }
+    };
+
+    const size_t n = n_faces_;
+    // Partition rows greedily so each chunk's nnz <= max_chunk_nnz. Row-boundary
+    // chunks keep the chunk-local row_ptrs (and thus the SpMV byte offset) below
+    // the wall. col_indices stay GLOBAL (index the full radiosity vector).
+    size_t row = 0;
+    while (row < n) {
+        const size_t chunk_row_begin = row;
+        const size_t base = static_cast<size_t>(row_ptrs[chunk_row_begin]);
+
+        size_t next = chunk_row_begin;
+        while (next < n) {
+            const size_t nnz_if_add =
+                static_cast<size_t>(row_ptrs[next + 1]) - base;
+            if (nnz_if_add > max_chunk_nnz) {
+                if (next == chunk_row_begin) {
+                    // A single row exceeds the budget: it cannot be split on a row
+                    // boundary. Fail loud (PTM-25 backstop) rather than abort.
+                    const size_t row_nnz =
+                        static_cast<size_t>(row_ptrs[next + 1]) -
+                        static_cast<size_t>(row_ptrs[next]);
+                    throw std::runtime_error(
+                        "RadiosityOpenCLSolver: row " + std::to_string(next) +
+                        " has " + std::to_string(row_nnz) +
+                        " non-zeros, exceeding the per-chunk budget of " +
+                        std::to_string(max_chunk_nnz) +
+                        " nnz (2^31-byte GPU addressing wall, PTM-25). This "
+                        "matrix cannot run on this GPU without a wider SpMV "
+                        "kernel; use CPU radiosity.");
+                }
+                break;
+            }
+            ++next;
+        }
+
+        const size_t chunk_row_end = next;
+        const int chunk_rows = static_cast<int>(chunk_row_end - chunk_row_begin);
+        const size_t chunk_nnz =
+            static_cast<size_t>(row_ptrs[chunk_row_end]) - base;
+
+        CsrChunk chunk;
+        chunk.row_offset = static_cast<int>(chunk_row_begin);
+        chunk.n_rows = chunk_rows;
+        chunk.nnz = chunk_nnz;
+
+        // Chunk-local row_ptrs (subtract base so the first entry is 0). Each
+        // value is <= chunk_nnz <= max_chunk_nnz < 2^31, so int is safe.
+        std::vector<int> local_rowptr(static_cast<size_t>(chunk_rows) + 1);
+        for (int r = 0; r <= chunk_rows; ++r) {
+            local_rowptr[static_cast<size_t>(r)] =
+                row_ptrs[chunk_row_begin + static_cast<size_t>(r)] -
+                static_cast<int>(base);
+        }
+
+        // Convert this chunk's values slice to float.
+        std::vector<float> vals_f(chunk_nnz);
+        for (size_t k = 0; k < chunk_nnz; ++k) {
+            vals_f[k] = static_cast<float>(values[base + k]);
+        }
+
+        chunk.values = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                      chunk_nnz * sizeof(float), nullptr, &err);
+        checkErr(err, "clCreateBuffer(chunk values)");
+        chunk.col_indices = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                           chunk_nnz * sizeof(int), nullptr, &err);
+        checkErr(err, "clCreateBuffer(chunk col_indices)");
+        chunk.row_ptrs = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                        (static_cast<size_t>(chunk_rows) + 1) * sizeof(int),
+                                        nullptr, &err);
+        checkErr(err, "clCreateBuffer(chunk row_ptrs)");
+
+        err = clEnqueueWriteBuffer(queue, chunk.values, CL_FALSE, 0,
+                                   chunk_nnz * sizeof(float),
+                                   vals_f.data(), 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueWriteBuffer(chunk values)");
+        err = clEnqueueWriteBuffer(queue, chunk.col_indices, CL_FALSE, 0,
+                                   chunk_nnz * sizeof(int),
+                                   col_indices.data() + base, 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueWriteBuffer(chunk col_indices)");
+        err = clEnqueueWriteBuffer(queue, chunk.row_ptrs, CL_TRUE, 0,
+                                   (static_cast<size_t>(chunk_rows) + 1) * sizeof(int),
+                                   local_rowptr.data(), 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueWriteBuffer(chunk row_ptrs)");
+
+        csr_chunks_.push_back(chunk);
+        row = chunk_row_end;
+    }
+
+    if (config_.verbose) {
+        std::cout << "Uploaded CHUNKED view factor matrix to GPU: " << nnz_
+                  << " non-zeros in " << csr_chunks_.size()
+                  << " chunk(s) (budget " << max_chunk_nnz << " nnz/chunk)\n";
+    }
+}
+
+void RadiosityOpenCLSolver::enqueueSpMV(cl_mem x, cl_mem y,
+                                        size_t global_size, size_t local_size)
+{
+    cl_command_queue queue = context_->queue();
+    cl_int err;
+    auto checkErr = [](cl_int e, const char* op) {
+        if (e != CL_SUCCESS) {
+            throw std::runtime_error(std::string(op) + " failed: " + clErrorString(e));
+        }
+    };
+    const int n_faces = static_cast<int>(n_faces_);
+
+    if (!use_chunked_csr_) {
+        // Single-buffer path (unchanged; byte-identical to the pre-chunk code).
+        err = clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
+        checkErr(err, "clSetKernelArg(spmv_kernel,csr_values)");
+        err = clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
+        checkErr(err, "clSetKernelArg(spmv_kernel,csr_col_indices)");
+        err = clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
+        checkErr(err, "clSetKernelArg(spmv_kernel,csr_row_ptrs)");
+        err = clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &x);
+        checkErr(err, "clSetKernelArg(spmv_kernel,x)");
+        err = clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &y);
+        checkErr(err, "clSetKernelArg(spmv_kernel,y)");
+        err = clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces);
+        checkErr(err, "clSetKernelArg(spmv_kernel,n_faces)");
+        err = clEnqueueNDRangeKernel(queue, spmv_kernel_, 1, nullptr,
+                                     &global_size, &local_size, 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueNDRangeKernel(spmv_kernel)");
+        return;
+    }
+
+    // Chunked path (PTM-25): one launch per row-chunk. Bit-identical to the
+    // single-buffer SpMV -- same per-row summation order, just split buffers.
+    for (const CsrChunk& ch : csr_chunks_) {
+        err = clSetKernelArg(spmv_chunk_kernel_, 0, sizeof(cl_mem), &ch.values);
+        checkErr(err, "clSetKernelArg(spmv_chunk,values)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 1, sizeof(cl_mem), &ch.col_indices);
+        checkErr(err, "clSetKernelArg(spmv_chunk,col_indices)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 2, sizeof(cl_mem), &ch.row_ptrs);
+        checkErr(err, "clSetKernelArg(spmv_chunk,row_ptrs)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 3, sizeof(cl_mem), &x);
+        checkErr(err, "clSetKernelArg(spmv_chunk,x)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 4, sizeof(cl_mem), &y);
+        checkErr(err, "clSetKernelArg(spmv_chunk,y)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 5, sizeof(int), &ch.row_offset);
+        checkErr(err, "clSetKernelArg(spmv_chunk,row_offset)");
+        err = clSetKernelArg(spmv_chunk_kernel_, 6, sizeof(int), &ch.n_rows);
+        checkErr(err, "clSetKernelArg(spmv_chunk,n_rows)");
+        size_t gsz = ((static_cast<size_t>(ch.n_rows) + local_size - 1) /
+                      local_size) * local_size;
+        err = clEnqueueNDRangeKernel(queue, spmv_chunk_kernel_, 1, nullptr,
+                                     &gsz, &local_size, 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueNDRangeKernel(spmv_chunk_kernel)");
     }
 }
 
@@ -685,16 +898,8 @@ void RadiosityOpenCLSolver::solve(
         return;
     }
 
-    // Set up SpMV kernel args (these don't change during iteration)
-    err = clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
-    checkErr(err, "clSetKernelArg(spmv_kernel,csr_values)");
-    err = clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
-    checkErr(err, "clSetKernelArg(spmv_kernel,csr_col_indices)");
-    err = clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
-    checkErr(err, "clSetKernelArg(spmv_kernel,csr_row_ptrs)");
-    // Arg 3 (input x) and 4 (output y) will be set per iteration
-    err = clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces);
-    checkErr(err, "clSetKernelArg(spmv_kernel,n_faces)");
+    // SpMV kernel args are set inside enqueueSpMV (which also dispatches to the
+    // chunked path when the matrix exceeds the single-buffer wall, PTM-25).
 
     // Jacobi iteration with periodic convergence checking
     // Checking every iteration causes PCIe latency overhead; check every N iterations
@@ -706,15 +911,8 @@ void RadiosityOpenCLSolver::solve(
     const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
-        // SpMV: F_B = F * radiosity
-        err = clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
-        checkErr(err, "clSetKernelArg(spmv_kernel,radiosity)");
-        err = clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
-        checkErr(err, "clSetKernelArg(spmv_kernel,F_B)");
-
-        err = clEnqueueNDRangeKernel(queue, spmv_kernel_, 1, nullptr,
-                                     &global_size, &local_size, 0, nullptr, nullptr);
-        checkErr(err, "clEnqueueNDRangeKernel(spmv_kernel)");
+        // SpMV: F_B = F * radiosity (single-buffer or chunked, PTM-25)
+        enqueueSpMV(buf_radiosity_, buf_F_B_, global_size, local_size);
 
         // Jacobi update: B_new = E + rho*Q_solar + rho*F*B
         {
@@ -760,15 +958,8 @@ void RadiosityOpenCLSolver::solve(
         }
     }
 
-    // Compute final SpMV to get F * B_final
-    err = clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
-    checkErr(err, "clSetKernelArg(spmv_kernel,radiosity,final)");
-    err = clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
-    checkErr(err, "clSetKernelArg(spmv_kernel,F_B,final)");
-
-    err = clEnqueueNDRangeKernel(queue, spmv_kernel_, 1, nullptr,
-                                 &global_size, &local_size, 0, nullptr, nullptr);
-    checkErr(err, "clEnqueueNDRangeKernel(spmv_kernel,final)");
+    // Compute final SpMV to get F * B_final (single-buffer or chunked, PTM-25)
+    enqueueSpMV(buf_radiosity_, buf_F_B_, global_size, local_size);
 
     // Compute indirect flux: Q_indirect = eps * (F * B)
     {
@@ -898,6 +1089,10 @@ void RadiosityOpenCLSolver::release() {
         clReleaseKernel(indirect_flux_kernel_);
         indirect_flux_kernel_ = nullptr;
     }
+    if (spmv_chunk_kernel_) {
+        clReleaseKernel(spmv_chunk_kernel_);
+        spmv_chunk_kernel_ = nullptr;
+    }
 
     // Release program
     if (program_) {
@@ -909,6 +1104,15 @@ void RadiosityOpenCLSolver::release() {
     if (buf_csr_values_) { clReleaseMemObject(buf_csr_values_); buf_csr_values_ = nullptr; }
     if (buf_csr_col_indices_) { clReleaseMemObject(buf_csr_col_indices_); buf_csr_col_indices_ = nullptr; }
     if (buf_csr_row_ptrs_) { clReleaseMemObject(buf_csr_row_ptrs_); buf_csr_row_ptrs_ = nullptr; }
+
+    // Release chunked CSR sub-buffers (PTM-25)
+    for (auto& ch : csr_chunks_) {
+        if (ch.values) clReleaseMemObject(ch.values);
+        if (ch.col_indices) clReleaseMemObject(ch.col_indices);
+        if (ch.row_ptrs) clReleaseMemObject(ch.row_ptrs);
+    }
+    csr_chunks_.clear();
+    use_chunked_csr_ = false;
 
     // Release state buffers
     if (buf_radiosity_) { clReleaseMemObject(buf_radiosity_); buf_radiosity_ = nullptr; }

@@ -159,6 +159,16 @@ private:
     // Compute max residual from change buffer (CPU reduction)
     double computeMaxResidual();
 
+    // Build the chunked CSR sub-buffers (PTM-25) when the matrix exceeds the
+    // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
+    void buildChunkedCsr(const std::vector<double>& values,
+                         const std::vector<int>& col_indices,
+                         const std::vector<int>& row_ptrs,
+                         size_t max_chunk_nnz);
+
+    // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.
+    void enqueueSpMV(cl_mem x, cl_mem y, size_t global_size, size_t local_size);
+
     size_t n_faces_;
     size_t nnz_;  // Number of non-zeros in view factor matrix
     RadiosityOpenCLConfig config_;
@@ -175,11 +185,28 @@ private:
     cl_kernel emission_kernel_ = nullptr;       // Compute thermal emission
     cl_kernel solar_source_kernel_ = nullptr;   // Compute reflected solar
     cl_kernel indirect_flux_kernel_ = nullptr;  // Compute absorbed indirect flux
+    cl_kernel spmv_chunk_kernel_ = nullptr;     // Chunked CSR SpMV (PTM-25 workaround)
 
     // CSR matrix buffers (view factors)
     cl_mem buf_csr_values_ = nullptr;      // float [nnz]
     cl_mem buf_csr_col_indices_ = nullptr; // int [nnz]
     cl_mem buf_csr_row_ptrs_ = nullptr;    // int [n_faces + 1]
+
+    // Chunked CSR (PTM-25): used only when a single values/col_indices buffer
+    // would reach the 2^31-byte GPU addressing wall. The matrix is split on ROW
+    // boundaries into sub-buffers each below the wall; the SpMV runs one launch
+    // per chunk. Below the wall csr_chunks_ is empty and the single-buffer path
+    // above is used unchanged (byte-identical).
+    struct CsrChunk {
+        cl_mem values = nullptr;      // float [nnz_chunk]  (chunk-local)
+        cl_mem col_indices = nullptr; // int [nnz_chunk]    (GLOBAL column indices)
+        cl_mem row_ptrs = nullptr;    // int [n_rows+1]     (chunk-local, starts at 0)
+        int row_offset = 0;           // global row index of this chunk's first row
+        int n_rows = 0;               // rows owned by this chunk
+        size_t nnz = 0;               // non-zeros in this chunk
+    };
+    std::vector<CsrChunk> csr_chunks_;
+    bool use_chunked_csr_ = false;
 
     // State buffers
     cl_mem buf_radiosity_ = nullptr;       // float [n_faces] - current radiosity

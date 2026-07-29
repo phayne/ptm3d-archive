@@ -97,6 +97,13 @@ int main(int argc, char** argv) {
     size_t nbad = 0; float omin = 1e30f, omax = -1e30f;
     for (size_t i = 0; i < n; ++i) { float v = gpu_out[i]; if (!std::isfinite(v)) ++nbad; if (v < omin) omin = v; if (v > omax) omax = v; }
 
+    // Optional GPU-output dump (bit-identity oracle: diff single vs chunked path).
+    if (const char* dump = std::getenv("PTM_ESC_DUMP")) {
+        std::FILE* f = std::fopen(dump, "wb");
+        if (f) { std::fwrite(gpu_out.data(), sizeof(float), n, f); std::fclose(f);
+                 std::printf("  dumped %zu floats to %s\n", n, dump); std::fflush(stdout); }
+    }
+
     // --- small-scale CPU cross-check (mirror: E=eps sig T^4, src=rho Q, B=E+src+rho F B) ---
     double max_absdiff = -1.0;
     if (cpu_check) {
