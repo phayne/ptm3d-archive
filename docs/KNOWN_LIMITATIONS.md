@@ -32,10 +32,12 @@ failure now aborts rather than silently substituting a default icosphere).
   underestimate (a radiative-equilibrium effect of order ~1–2 K for most floors, less for the
   deepest). Relevant when comparing modeled cold-trap floor temperatures to observations.
 
-- **Do not rebuild the `.vf` from a mesh that changed after the view-factor was built.** The VF
-  builder uses the mesh's raw winding; if the mesh face count or winding differs from the one the VF
-  was built against, radiation exchange is silently wrong (or a no-op). Reuse the baseline's paired
-  mesh + VF together, and confirm the load log shows matching dimensions **and Non-zeros > 0**.
+- **Do not rebuild the `.vf` from a mesh that changed after the view factors were built.** The
+  view-factor builder uses the mesh's raw vertex ordering ("winding"); if the mesh face count or
+  winding differs from the one the view factors were built against, radiation exchange is silently
+  wrong (or silently does nothing). Reuse the paired mesh + view-factor file together, and confirm
+  the load log shows matching dimensions **and Non-zeros > 0** (a nonzero count of stored matrix
+  entries).
 
 - **Low-rank (ACA) far-field view factors can carry tiny negative entries.** A physical view factor
   is ≥ 0, but the low-rank far-field approximation does not preserve non-negativity, so near-zero
@@ -63,8 +65,9 @@ failure now aborts rather than silently substituting a default icosphere).
 
 ## Workflow / tooling
 
-- **The chunked runner can pick a stale binary.** `run_chunked_simulation.py` may prefer a build in
-  `~/dev/heat3d/ptm-build` if that directory exists, even if it is older than your in-tree build.
+- **The chunked runner can pick an out-of-date executable.** `run_chunked_simulation.py` may prefer
+  a build in `~/dev/heat3d/ptm-build` if that directory exists, even if it is older than your
+  in-tree build.
   Pass `--ptm-bin` / `--merge-bin` explicitly to pin the binary you built.
 
 - **The A3GT batch tools depend on an external mesh helper.** `a3gt_v2_orchestrator.py` and

@@ -31,10 +31,10 @@ Every `.bin` (statistics and per-timestep alike) is:
 
 | bytes | content |
 |---|---|
-| 0–3 | `int32` (little-endian): number of faces `n` |
-| 4–(4+4n) | `n × float32`, one value per mesh face, in mesh face order |
+| 0–3 | `int32` (a 4-byte integer, little-endian byte order): number of faces `n` |
+| 4–(4+4n) | `n × float32` (single-precision, 4 bytes each), one value per mesh face, in mesh face order |
 
-Reader (stdlib only):
+Reader (Python standard library only — no extra packages):
 
 ```python
 import struct, array

@@ -38,9 +38,12 @@ H-matrix saved to .../output/tutorial04_crater80N.vf (36278242 bytes)
   Converged on face-fraction criterion (2.34e-02% < 1.00e+00%)
 ```
 
-Row sums well below 1 (an open crater sees mostly sky) and convergence in ~3
-coupling iterations are the expected health signs. A second coupled run skips
-the build and reports `Loaded view factors from: .../tutorial04_crater80N.vf`.
+(The "H-matrix" in the log is a hierarchically compressed storage scheme that
+keeps the face-to-face view-factor matrix affordable; see
+[../radiation-exchange.md](../radiation-exchange.md).) Row sums well below 1
+(an open crater sees mostly sky) and convergence in ~3 coupling iterations are
+the expected health signs. A second coupled run skips the view-factor
+computation and reports `Loaded view factors from: .../tutorial04_crater80N.vf`.
 
 Note: two-band (visible/IR-separated) radiosity is the default
 (`radiation.band_separated`), which is why the coupled run also writes

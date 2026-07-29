@@ -9,8 +9,9 @@ Simulates one full lunar day (29.53 Earth days) of surface temperatures over
 the entire Moon on a level-3 icosphere (1280 faces, ~480 km face pitch):
 
 1. **Illumination**: for each of 480 timesteps (240 equilibration + 240
-   output), Embree shadow rays from every face toward the SPICE Sun position,
-   plus Earth reflected light and Earth thermal IR.
+   output), shadow rays are traced (using the Embree ray-tracing library) from
+   every face toward the Sun's SPICE-computed position, plus Earth reflected
+   light and Earth thermal IR.
 2. **Thermal**: a 1D Crank-Nicolson conduction column under every face with
    lunar regolith properties (density/conductivity increasing with depth,
    T-dependent k and cp), spun up over one equilibration lunation.
@@ -27,7 +28,7 @@ python3 scripts/fetch_kernels.py     # once (~45 MB from NAIF)
 Watch for these lines (elided): `Mesh created with 642 vertices and 1280
 faces`, `Initializing SPICE with meta-kernel`, the illumination progress bar,
 and `[Statistics] Exported to output/quickstart_moon_diurnal/statistics`.
-Exit code 0.
+The program should finish without errors (exit code 0).
 
 ## Check the result
 
