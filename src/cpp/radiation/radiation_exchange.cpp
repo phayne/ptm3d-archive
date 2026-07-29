@@ -431,41 +431,36 @@ void RadiositySolver::initGPU() {
     size_t n = emissivity_.size();
     size_t nnz = F_ptr_->numNonZeros();
 
-    // Soft limit: GPU SpMV with very large sparse matrices was historically
-    // unreliable on AMD drivers (kernel execution could crash with >100M
-    // non-zeros). The limit is bypassed when the user explicitly opts into
-    // the multi-GPU pool path (gpu_devices > 1 or gpu_device_ids set) —
-    // they are committing to the new code path and accept the risk for the
-    // larger meshes the pool was designed to handle.
-    const size_t MAX_GPU_NNZ = 100000000;  // 100M non-zeros default ceiling
-    // The multi-GPU pool two-band path is not implemented this pass, so two-band
-    // always uses the single-GPU path (want_pool forced false).
+    // The multi-GPU pool two-band path is not implemented yet (2d), so two-band
+    // forces the single-GPU rung (want_pool false).
     const bool want_pool = !two_band_
                             && ((config_.gpu_devices > 1)
                                 || !config_.gpu_device_ids.empty());
-    if (nnz > MAX_GPU_NNZ && !want_pool) {
-        std::cout << "Note: Sparse matrix too large for reliable single-GPU radiosity solver\n";
-        std::cout << "  Non-zeros: " << nnz / 1000000 << "M (limit: " << MAX_GPU_NNZ / 1000000 << "M)\n";
-        std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
-        std::cout << "  Tip: enable the multi-GPU pool with radiation.gpu_devices > 1 to bypass this limit.\n";
-        return;
-    }
-    if (nnz > MAX_GPU_NNZ && want_pool) {
-        std::cout << "Note: Sparse matrix has " << nnz / 1000000 << "M non-zeros (>"
-                  << MAX_GPU_NNZ / 1000000
-                  << "M soft limit); proceeding because multi-GPU pool was requested\n";
-    }
 
-    // Check if sparse matrix fits in GPU memory before attempting
-    // CSR format requires: nnz * sizeof(float) for values
-    //                    + nnz * sizeof(int) for column indices
-    //                    + (n+1) * sizeof(int) for row pointers
-    // Plus working buffers: 7 * n * sizeof(float) for vectors
-    size_t csr_memory = nnz * sizeof(float) + nnz * sizeof(int) + (n + 1) * sizeof(int);
-    size_t working_memory = 7 * n * sizeof(float);  // radiosity vectors, temps, etc.
-    size_t total_gpu_memory_needed = csr_memory + working_memory;
+    // Device footprint. The single-GPU solver and every pool device each hold a
+    // FULL replica of the CSR. The 32-bit addressing wall (PTM-25) is handled by
+    // the solver's chunked sub-buffers, so there is NO per-buffer nnz ceiling
+    // here (the old 100M-nnz "soft limit" is retired) -- the only question is
+    // whether the replica + working buffers fit a device's VRAM.
+    const size_t csr_bytes = nnz * sizeof(float)      // values (float on device)
+                           + nnz * sizeof(int)        // column indices
+                           + (n + 1) * sizeof(int);   // row pointers (int32 on device)
+    const size_t working_bytes = 12 * n * sizeof(float);  // ~11 state buffers + margin
+    const size_t needed_bytes = csr_bytes + working_bytes;
 
-    // Create temporary solver just to check GPU memory
+    // Real VRAM-fit check (replaces the old fixed 50%-of-total folklore, which
+    // wrongly rejected multi-GB CSRs that fit comfortably): the replica must fit
+    // with a reserve for the driver + kernel scratch (15% of VRAM, min 2 GB).
+    auto deviceReserve = [](size_t global_mem) -> size_t {
+        return std::max<size_t>((global_mem / 100) * 15,
+                                static_cast<size_t>(2) * 1024 * 1024 * 1024);
+    };
+    auto fitsDevice = [&](size_t global_mem) -> bool {
+        return global_mem > deviceReserve(global_mem)
+            && needed_bytes <= global_mem - deviceReserve(global_mem);
+    };
+    auto gb = [](size_t b) -> double { return b / (1024.0 * 1024.0 * 1024.0); };
+
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
@@ -475,11 +470,6 @@ void RadiositySolver::initGPU() {
     // the GPU result deterministic + comparable to the always-cold-started CPU path.
     if (two_band_) gpu_config.warm_start = false;
 
-    // When the multi-GPU pool is requested, skip the single-GPU solver path
-    // entirely — the pool's per-device persistent solvers will handle every
-    // solve via solveBatch(). Avoids redundant device 0 allocation and
-    // dodges the >100M-nnz single-GPU stability concerns the pool was
-    // designed to bypass.
     std::vector<float> emissivity_f(n);
     std::vector<float> reflectivity_f(n);
     for (size_t i = 0; i < n; ++i) {
@@ -487,59 +477,52 @@ void RadiositySolver::initGPU() {
         reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
     }
 
-    if (!want_pool) {
+    // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
+    // Every failure is loud (never a silent drop to CPU); the CSR upload is
+    // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25).
+    auto try_single_gpu = [&]() -> bool {
         gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
-
         if (!gpu_solver_->initialize()) {
-            std::cerr << "Warning: Failed to initialize GPU radiosity solver; "
-                      << "falling back to CPU\n";
+            std::cerr << "[Radiosity] single-GPU solver failed to initialize.\n";
             gpu_solver_.reset();
-            return;
+            return false;
         }
-
-        // Check GPU memory availability (use 50% threshold to leave headroom for kernel execution)
-        // Note: 70% was too aggressive - kernels need additional working memory beyond buffers
-        size_t gpu_mem_available = gpu_solver_->getDeviceInfo().global_mem_size;
-        size_t gpu_mem_limit = static_cast<size_t>(gpu_mem_available * 0.50);
-
-        if (total_gpu_memory_needed > gpu_mem_limit) {
-            std::cout << "Note: Sparse matrix too large for GPU radiosity solver\n";
-            std::cout << "  Required GPU memory: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-            std::cout << "  GPU memory limit (50%): " << gpu_mem_limit / (1024*1024) << " MB\n";
-            std::cout << "  GPU total memory: " << gpu_mem_available / (1024*1024) << " MB\n";
-            std::cout << "  Using CPU radiosity solver instead (this is normal for large meshes)\n";
+        const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
+        if (!fitsDevice(dev_mem)) {
+            std::cout << "[Radiosity] single-GPU: CSR replica + working "
+                      << gb(needed_bytes) << " GB does not fit device ("
+                      << gb(dev_mem) << " GB VRAM, reserve "
+                      << gb(deviceReserve(dev_mem)) << " GB).\n";
             gpu_solver_.reset();
-            return;
+            return false;
         }
-
-        if (config_.verbose) {
-            std::cout << "GPU radiosity memory check passed:\n";
-            std::cout << "  CSR matrix: " << csr_memory / (1024*1024) << " MB\n";
-            std::cout << "  Working buffers: " << working_memory / (1024*1024) << " MB\n";
-            std::cout << "  Total required: " << total_gpu_memory_needed / (1024*1024) << " MB\n";
-            std::cout << "  GPU available: " << gpu_mem_available / (1024*1024) << " MB\n";
+        try {
+            gpu_solver_->uploadViewFactors(F_ptr_->values(),
+                                           F_ptr_->colIndices(),
+                                           F_ptr_->rowPointers());
+            gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+        } catch (const std::exception& e) {
+            std::cerr << "[Radiosity] single-GPU CSR upload failed: " << e.what() << "\n";
+            gpu_solver_.reset();
+            return false;
         }
-
-        // Upload view factor CSR data
-        gpu_solver_->uploadViewFactors(
-            F_ptr_->values(),
-            F_ptr_->colIndices(),
-            F_ptr_->rowPointers());
-        gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
-
         use_gpu_ = true;
         if (two_band_) {
             two_band_gpu_ok_ = true;
             std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: single-GPU band-separated "
                          "radiosity ENABLED (all Σ_j F_ij ≤ 1; IR solar=0 + visible ε←1-A/ρ←A).\n";
         }
-    }
+        std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
+                  << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
+                  << " GB device).\n";
+        return true;
+    };
 
-    // Multi-GPU dispatch pool (only when gpu_devices > 1). The single-GPU
-    // path above stays in place even when the pool is active so that
-    // single-timestep solve() callers (the CPU fallback hook + direct
-    // computeIndirectFlux callers) still work; the batched solveBatch()
-    // path is what actually uses the pool.
+    // ---- Degrade ladder: multi-GPU pool -> single-GPU -> CPU ----
+    // Every downgrade warns (never silent) and the ACTIVE RUNG is always named.
+
+    // Rung 1: multi-GPU pool (only when gpu_devices > 1 / device_ids set, and not
+    // two-band -- 2d). On any failure we fall through to the single-GPU rung.
     if (want_pool) {
         // Resolve which physical devices to use (mirrors the thermal pool).
         std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
@@ -563,13 +546,25 @@ void RadiositySolver::initGPU() {
             for (int i = 0; i < n_req; ++i) chosen.push_back(all_gpus[i]);
         }
 
-        if (chosen.size() < 2) {
-            if (config_.verbose) {
-                std::cout << "[Radiosity Pool] Pool not instantiated "
-                             "(only " << chosen.size() << " device(s) selected); "
-                             "single-GPU path remains active\n";
+        bool pool_ok = chosen.size() >= 2;
+        if (!pool_ok) {
+            std::cout << "[Radiosity] multi-GPU pool: only " << chosen.size()
+                      << " device(s) selected; degrading to single-GPU.\n";
+        }
+        // Real per-device fit: each device replicates the full CSR.
+        size_t min_dev = pool_ok ? chosen.front().global_mem_size : 0;
+        if (pool_ok) {
+            for (const auto& d : chosen) min_dev = std::min(min_dev, d.global_mem_size);
+            if (!fitsDevice(min_dev)) {
+                pool_ok = false;
+                std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
+                          << " GB does not fit the smallest device (" << gb(min_dev)
+                          << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
+                          << " GB); degrading to single-GPU.\n";
             }
-        } else {
+        }
+
+        if (pool_ok) {
             gpu::opencl::RadiosityGPUPoolConfig pool_cfg;
             pool_cfg.devices = chosen;
             pool_cfg.inter_batch_pause_ms = config_.gpu_inter_batch_pause_ms;
@@ -579,43 +574,47 @@ void RadiositySolver::initGPU() {
             solver_cfg.max_iterations = config_.max_iterations;
             solver_cfg.convergence_tolerance = config_.convergence_tolerance;
             solver_cfg.verbose = config_.verbose;
-            // Cross-batch warm-start has no meaning across devices — disable
-            // it so each batch's first timestep starts from cold radiosity.
-            // Cost: typically 5-10 extra Jacobi iterations on the first
-            // timestep of each batch.
+            // Cross-batch warm-start has no meaning across devices — disable it.
             solver_cfg.warm_start = false;
 
             gpu_pool_ = std::make_unique<gpu::opencl::RadiosityGPUDevicePool>(
                 std::move(pool_cfg));
-            if (!gpu_pool_->initialize(n, solver_cfg)) {
-                std::cerr << "Warning: Failed to initialize multi-GPU radiosity "
-                             "pool; falling back to single-GPU path\n";
-                gpu_pool_.reset();
-            } else if (!gpu_pool_->uploadStaticData(F_ptr_->values(),
+            bool ok = gpu_pool_->initialize(n, solver_cfg);
+            if (ok) {
+                try {
+                    ok = gpu_pool_->uploadStaticData(F_ptr_->values(),
                                                      F_ptr_->colIndices(),
                                                      F_ptr_->rowPointers(),
-                                                     emissivity_f,
-                                                     reflectivity_f)) {
-                std::cerr << "Warning: Failed to replicate radiosity static "
-                             "data to pool devices; falling back to "
-                             "single-GPU path\n";
+                                                     emissivity_f, reflectivity_f);
+                } catch (const std::exception& e) {
+                    std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
+                              << e.what() << "\n";
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                std::cout << "[Radiosity] multi-GPU pool init/upload failed; "
+                             "degrading to single-GPU.\n";
                 gpu_pool_.reset();
             } else {
                 pool_batch_size_ = (config_.gpu_batch_size > 0)
                     ? config_.gpu_batch_size
                     : 4 * static_cast<int>(gpu_pool_->numDevices());
-                if (config_.verbose) {
-                    std::cout << "[Radiosity Pool] Active: "
-                              << gpu_pool_->numDevices() << " GPU(s), "
-                              << "batch_size=" << pool_batch_size_
-                              << " timesteps per dispatch\n";
-                }
+                std::cout << "[Radiosity] ACTIVE RUNG: multi-GPU pool, "
+                          << gpu_pool_->numDevices() << " device(s); CSR replica "
+                          << gb(needed_bytes) << " GB/device (smallest device "
+                          << gb(min_dev) << " GB VRAM); batch_size="
+                          << pool_batch_size_ << " timesteps/dispatch.\n";
+                return;  // pool active -- done
             }
         }
+        // Fall through: any pool failure degrades to the single-GPU rung.
     }
 
-    if (config_.verbose) {
-        std::cout << "GPU radiosity solver enabled\n";
+    // Rung 2: single-GPU. Rung 3 (CPU) is implicit when this returns false.
+    if (!try_single_gpu()) {
+        std::cout << "[Radiosity] ACTIVE RUNG: CPU radiosity (no GPU rung available; "
+                     "normal for very large meshes or headless devices).\n";
     }
 #endif
 }

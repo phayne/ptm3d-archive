@@ -73,8 +73,19 @@ bool RadiosityGPUDevicePool::uploadStaticData(
         DeviceSlot* slot = slots_[i].get();
         if (!slot->healthy || !slot->solver) continue;
 
-        slot->solver->uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
-        slot->solver->uploadFaceProperties(emissivity, reflectivity);
+        // uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25). Every
+        // device holds the full CSR replica, so a failure on any device means
+        // the pool cannot serve this matrix -- fail loud rather than run a
+        // partially-loaded pool.
+        try {
+            slot->solver->uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
+            slot->solver->uploadFaceProperties(emissivity, reflectivity);
+        } catch (const std::exception& e) {
+            std::cerr << "[Radiosity Pool] Static-data upload failed on device " << i
+                      << " (" << slot->handle.name << "): " << e.what() << "\n";
+            slot->healthy = false;
+            return false;
+        }
 
         if (cfg_.verbose) {
             std::cout << "[Radiosity Pool] Static data uploaded to device " << i
