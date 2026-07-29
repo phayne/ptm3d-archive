@@ -11316,24 +11316,47 @@ int main(int argc, char** argv) {
                                 rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
                                                                      sun_dirs_batch);
 
-                            // The multi-GPU pool path runs GRAY radiosity and does
-                            // not expose per-timestep band separation. Flag it once
-                            // so the band outputs are OMITTED (not misleading zeros).
-                            if (!indirect_solar_series.empty() && !indirect_bands_batch_gap) {
+                            // Two-band pool (2d): per-band batch results, mapped to
+                            // full faces. indirect_solar = visible band, indirect_ir
+                            // = IR band (same convention as the single-timestep path).
+                            const auto& irb  = rad_manager.lastIndirectIRBatch();
+                            const auto& visb = rad_manager.lastIndirectVisibleBatch();
+                            const bool have_bands_batch =
+                                !indirect_solar_series.empty()
+                                && rad_manager.isTwoBand()
+                                && irb.size() == static_cast<size_t>(n_batch)
+                                && visb.size() == static_cast<size_t>(n_batch);
+                            if (have_bands_batch) {
+                                indirect_bands_available = true;
+                            } else if (!indirect_solar_series.empty()
+                                       && rad_manager.isTwoBand()
+                                       && !indirect_bands_batch_gap) {
+                                // Two-band requested but the pool returned no bands:
+                                // OMIT rather than write misleading zeros (fail-loud).
                                 indirect_bands_batch_gap = true;
                                 std::cerr << "  [indirect-bands] WARNING: multi-GPU pool "
-                                             "radiosity is GRAY; band-separated indirect "
-                                             "(indirect_solar/indirect_ir) will be OMITTED.\n";
+                                             "radiosity produced no band separation; "
+                                             "indirect_solar/indirect_ir will be OMITTED.\n";
                             }
 
                             for (int j = 0; j < n_batch; j++) {
                                 const int t = t_start + j;
                                 const auto& indirect_t = indirect_batch[j];
                                 const double w = (iter == 0) ? 1.0 : rad_relax;
+                                const std::vector<double>* qir =
+                                    have_bands_batch ? &irb[j] : nullptr;
+                                const std::vector<double>* qvis =
+                                    have_bands_batch ? &visb[j] : nullptr;
                                 #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                                 for (size_t f = 0; f < num_faces; f++) {
                                     indirect_flux_series[f][t] =
                                         (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
+                                    if (have_bands_batch) {
+                                        indirect_solar_series[f][t] =
+                                            (1.0 - w) * indirect_solar_series[f][t] + w * (*qvis)[f];
+                                        indirect_ir_series[f][t] =
+                                            (1.0 - w) * indirect_ir_series[f][t] + w * (*qir)[f];
+                                    }
                                     if (indirect_t[f] > max_indirect) {
                                         max_indirect = indirect_t[f];
                                     }

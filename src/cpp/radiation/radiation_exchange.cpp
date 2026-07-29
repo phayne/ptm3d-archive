@@ -431,11 +431,10 @@ void RadiositySolver::initGPU() {
     size_t n = emissivity_.size();
     size_t nnz = F_ptr_->numNonZeros();
 
-    // The multi-GPU pool two-band path is not implemented yet (2d), so two-band
-    // forces the single-GPU rung (want_pool false).
-    const bool want_pool = !two_band_
-                            && ((config_.gpu_devices > 1)
-                                || !config_.gpu_device_ids.empty());
+    // The multi-GPU pool handles both gray and two-band (2d): the per-device
+    // solvers do the IR + visible solve with per-band capture in solveBatch().
+    const bool want_pool = (config_.gpu_devices > 1)
+                            || !config_.gpu_device_ids.empty();
 
     // Device footprint. The single-GPU solver and every pool device each hold a
     // FULL replica of the CSR. The 32-bit addressing wall (PTM-25) is handled by
@@ -754,10 +753,37 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     }
 
     // Multi-GPU dispatch: split the n_steps timesteps round-robin across
-    // pool devices. Each device's worker iterates over its assigned slice
-    // and runs solve() (synchronous on that device).
+    // pool devices. Timesteps are striped WHOLE (never split), so each device
+    // solves an independent set of timesteps against its full CSR replica -->
+    // the per-timestep result is identical to the single-GPU path.
     const size_t n_dev = gpu_pool_->numDevices();
     const size_t n = emissivity_.size();
+    const bool tb = two_band_;
+
+    // Two-band per-band batch storage (pool path). Pre-size to n_steps so the
+    // device workers write disjoint timestep slots without racing.
+    if (tb) {
+        last_indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        last_indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        last_indirect_ir_batch_.clear();
+        last_indirect_vis_batch_.clear();
+    }
+
+    // Two property sets, built once (read-only, shared across workers): IR uses
+    // (eps, 1-eps); visible uses (1-A, A) from the per-face Bond albedo. Mirrors
+    // solveGPUTwoBand exactly so the pool per-band == single-GPU per-band.
+    std::vector<float> emiss_f, refl_f, visE_f, visR_f;
+    if (tb) {
+        emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            emiss_f[i] = static_cast<float>(emissivity_[i]);
+            refl_f[i]  = static_cast<float>(reflectivity_[i]);
+            const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+            visR_f[i] = static_cast<float>(A);
+            visE_f[i] = static_cast<float>(1.0 - A);
+        }
+    }
 
     std::vector<std::future<bool>> futures;
     futures.reserve(n_dev);
@@ -770,29 +796,67 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
         if (device_steps.empty()) continue;
 
-        futures.push_back(gpu_pool_->submit(
-            [&temperatures_per_timestep, &solar_flux_per_timestep,
-             &indirect_per_timestep, device_steps, n,
-             &row_norm = vf_row_norm_](
-                gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
-                std::vector<float> temps_f(n), solar_f(n), indirect_f;
-                for (size_t k : device_steps) {
-                    const auto& temps_d = temperatures_per_timestep[k];
-                    const auto& solar_d = solar_flux_per_timestep[k];
-                    for (size_t i = 0; i < n; ++i) {
-                        temps_f[i] = static_cast<float>(temps_d[i]);
-                        solar_f[i] = static_cast<float>(solar_d[i]);
+        if (tb) {
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n, &row_norm = vf_row_norm_,
+                 &emiss_f, &refl_f, &visE_f, &visR_f,
+                 &ir_batch = last_indirect_ir_batch_,
+                 &vis_batch = last_indirect_vis_batch_](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), zeros_f(n, 0.0f), ir_f, vis_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            solar_f[i] = static_cast<float>(solar_d[i]);
+                        }
+                        // IR band (device holds IR props), then visible, then
+                        // restore IR -- identical sequence to solveGPUTwoBand.
+                        solver.solve(temps_f, zeros_f, ir_f);
+                        solver.uploadFaceProperties(visE_f, visR_f);
+                        solver.solve(zeros_f, solar_f, vis_f);
+                        solver.uploadFaceProperties(emiss_f, refl_f);
+                        auto& out = indirect_per_timestep[k]; out.resize(n);
+                        auto& obi = ir_batch[k];
+                        auto& obv = vis_batch[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                            const double vir  = static_cast<double>(ir_f[i])  * norm;
+                            const double vvis = static_cast<double>(vis_f[i]) * norm;
+                            obi[i] = vir;
+                            obv[i] = vvis;
+                            out[i] = vir + vvis;
+                        }
                     }
-                    solver.solve(temps_f, solar_f, indirect_f);
-                    auto& out = indirect_per_timestep[k];
-                    out.resize(n);
-                    for (size_t i = 0; i < n; ++i) {
-                        const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
-                        out[i] = static_cast<double>(indirect_f[i]) * norm;
+                    return true;
+                }));
+        } else {
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n,
+                 &row_norm = vf_row_norm_](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), indirect_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            solar_f[i] = static_cast<float>(solar_d[i]);
+                        }
+                        solver.solve(temps_f, solar_f, indirect_f);
+                        auto& out = indirect_per_timestep[k];
+                        out.resize(n);
+                        for (size_t i = 0; i < n; ++i) {
+                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
+                            out[i] = static_cast<double>(indirect_f[i]) * norm;
+                        }
                     }
-                }
-                return true;
-            }));
+                    return true;
+                }));
+        }
     }
 
     bool all_ok = true;
@@ -1960,6 +2024,21 @@ RadiationExchangeManager::computeIndirectFluxBatch(
 
     const bool do_beam = beam_active_ && (sun_dirs.size() == n_steps);
 
+    // Per-band batch (two-band pool path): the solver captured absorbed IR and
+    // visible per timestep. Map them to exchange faces, mirroring the summed
+    // mapping. NO beaming is applied to the bands (matches the single-GPU
+    // solveGPUTwoBand bands, which are pure radiosity). Empty on the gray path.
+    const auto& ir_raw  = solver_->lastIndirectIRBatch();
+    const auto& vis_raw = solver_->lastIndirectVisibleBatch();
+    const bool have_band_batch = (ir_raw.size() == n_steps && vis_raw.size() == n_steps);
+    if (have_band_batch) {
+        indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        indirect_ir_batch_.clear();
+        indirect_vis_batch_.clear();
+    }
+
     // Map back to all faces using the exchange-face index list (same as
     // computeIndirectFlux). Update aggregate stats from the last timestep.
     double sum = 0.0;
@@ -1970,6 +2049,12 @@ RadiationExchangeManager::computeIndirectFluxBatch(
         for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
             int face_idx = classification_.exchange_face_indices[i];
             indirect_per_timestep[k][face_idx] = flux[face_idx];
+        }
+        if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
+            for (int face_idx : classification_.exchange_face_indices) {
+                indirect_ir_batch_[k][face_idx]  = ir_raw[k][face_idx];
+                indirect_vis_batch_[k][face_idx] = vis_raw[k][face_idx];
+            }
         }
         // Smith beamed-emission correction (per timestep, Sun-dependent).
         if (do_beam) {
