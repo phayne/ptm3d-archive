@@ -81,6 +81,42 @@ __kernel void spmv_chunk_kernel(
 }
 
 /**
+ * Chunked CSR-Vector SpMV: PTM-25 chunking + wavefront-per-row coalescing.
+ * ~5x the scalar chunked kernel's bandwidth. Bit-identical per row to
+ * spmv_vector_kernel (same stride + tree reduction).
+ */
+__kernel void spmv_vector_chunk_kernel(
+    __global const float* values,
+    __global const int* col_indices,
+    __global const int* row_ptrs,
+    __global const float* x,
+    __global float* y,
+    int row_offset,
+    int n_rows_chunk,
+    __local float* shared_sum)
+{
+    int lr = get_group_id(0);
+    int lid = get_local_id(0);
+    int warp = get_local_size(0);
+    if (lr >= n_rows_chunk) return;
+
+    int row_start = row_ptrs[lr];
+    int row_end = row_ptrs[lr + 1];
+
+    float sum = 0.0f;
+    for (int j = row_start + lid; j < row_end; j += warp) {
+        sum += values[j] * x[col_indices[j]];
+    }
+    shared_sum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = warp / 2; s > 0; s >>= 1) {
+        if (lid < s) shared_sum[lid] += shared_sum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) y[row_offset + lr] = shared_sum[0];
+}
+
+/**
  * @brief Compute thermal emission: E = epsilon * sigma * T^4
  *
  * Each work item handles one face.

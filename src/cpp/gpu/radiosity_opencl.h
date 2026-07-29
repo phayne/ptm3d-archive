@@ -198,6 +198,7 @@ private:
     cl_kernel solar_source_kernel_ = nullptr;   // Compute reflected solar
     cl_kernel indirect_flux_kernel_ = nullptr;  // Compute absorbed indirect flux
     cl_kernel spmv_chunk_kernel_ = nullptr;     // Chunked CSR SpMV (PTM-25 workaround)
+    cl_kernel spmv_vector_chunk_kernel_ = nullptr;  // Chunked CSR-Vector SpMV (coalesced)
 
     // CSR matrix buffers (view factors)
     cl_mem buf_csr_values_ = nullptr;      // float [nnz]

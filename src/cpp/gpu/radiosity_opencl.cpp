@@ -77,6 +77,42 @@ __kernel void spmv_chunk_kernel(
     y[row_offset + lr] = sum;
 }
 
+// Chunked CSR-Vector SpMV (PTM-25 chunking + wavefront-per-row coalescing).
+// One work-group per chunk-local row; the wavefront strides the row so global
+// loads coalesce (~5x the scalar kernel's bandwidth). Same per-row tree
+// reduction as spmv_vector_kernel, so single-buffer and chunked vector paths
+// are bit-identical for a given row.
+__kernel void spmv_vector_chunk_kernel(
+    __global const float* values,
+    __global const int* col_indices,
+    __global const int* row_ptrs,   /* chunk-local, starts at 0 */
+    __global const float* x,        /* full radiosity [n_faces] */
+    __global float* y,              /* full output [n_faces] */
+    int row_offset,
+    int n_rows_chunk,
+    __local float* shared_sum)
+{
+    int lr = get_group_id(0);
+    int lid = get_local_id(0);
+    int warp = get_local_size(0);
+    if (lr >= n_rows_chunk) return;
+
+    int row_start = row_ptrs[lr];
+    int row_end = row_ptrs[lr + 1];
+
+    float sum = 0.0f;
+    for (int j = row_start + lid; j < row_end; j += warp) {
+        sum += values[j] * x[col_indices[j]];
+    }
+    shared_sum[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = warp / 2; s > 0; s >>= 1) {
+        if (lid < s) shared_sum[lid] += shared_sum[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) y[row_offset + lr] = shared_sum[0];
+}
+
 // CSR-Vector SpMV: One work group per row
 // Better warp utilization - threads cooperatively process row elements
 // Work group size should match wavefront/warp size (64 for AMD, 32 for NVIDIA)
@@ -382,6 +418,11 @@ void RadiosityOpenCLSolver::buildKernels() {
     spmv_chunk_kernel_ = clCreateKernel(program_, "spmv_chunk_kernel", &err);
     if (err != CL_SUCCESS) {
         throw std::runtime_error(std::string("Failed to create spmv_chunk_kernel: ") + clErrorString(err));
+    }
+
+    spmv_vector_chunk_kernel_ = clCreateKernel(program_, "spmv_vector_chunk_kernel", &err);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error(std::string("Failed to create spmv_vector_chunk_kernel: ") + clErrorString(err));
     }
 
     // Query optimal work group size from CSR-Vector kernel
@@ -788,48 +829,61 @@ void RadiosityOpenCLSolver::enqueueSpMV(cl_mem x, cl_mem y,
     };
     const int n_faces = static_cast<int>(n_faces_);
 
+    // CSR-Vector SpMV: one wavefront (64) per row, cooperative coalesced reads +
+    // local tree reduction -- ~5x the scalar kernel's bandwidth (measured). The
+    // vector reduction sums each row in a different float order than the scalar
+    // spmv_kernel, so production GPU results differ from the old scalar path at
+    // ~float epsilon (both are valid float32 SpMV; the scalar kernel is retained
+    // for benchmarkSpMV). single-buffer and chunked vector paths are bit-
+    // identical to each other for a given row (same stride + reduction).
+    (void)global_size; (void)local_size;
+    const size_t warp = 64;
+    const size_t local_bytes = warp * sizeof(float);
+
     if (!use_chunked_csr_) {
-        // Single-buffer path (unchanged; byte-identical to the pre-chunk code).
-        err = clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
-        checkErr(err, "clSetKernelArg(spmv_kernel,csr_values)");
-        err = clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
-        checkErr(err, "clSetKernelArg(spmv_kernel,csr_col_indices)");
-        err = clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
-        checkErr(err, "clSetKernelArg(spmv_kernel,csr_row_ptrs)");
-        err = clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &x);
-        checkErr(err, "clSetKernelArg(spmv_kernel,x)");
-        err = clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &y);
-        checkErr(err, "clSetKernelArg(spmv_kernel,y)");
-        err = clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces);
-        checkErr(err, "clSetKernelArg(spmv_kernel,n_faces)");
-        err = clEnqueueNDRangeKernel(queue, spmv_kernel_, 1, nullptr,
-                                     &global_size, &local_size, 0, nullptr, nullptr);
-        checkErr(err, "clEnqueueNDRangeKernel(spmv_kernel)");
+        const size_t gs = n_faces_ * warp;
+        err = clSetKernelArg(spmv_vector_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
+        checkErr(err, "clSetKernelArg(spmv_vector,csr_values)");
+        err = clSetKernelArg(spmv_vector_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
+        checkErr(err, "clSetKernelArg(spmv_vector,csr_col_indices)");
+        err = clSetKernelArg(spmv_vector_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
+        checkErr(err, "clSetKernelArg(spmv_vector,csr_row_ptrs)");
+        err = clSetKernelArg(spmv_vector_kernel_, 3, sizeof(cl_mem), &x);
+        checkErr(err, "clSetKernelArg(spmv_vector,x)");
+        err = clSetKernelArg(spmv_vector_kernel_, 4, sizeof(cl_mem), &y);
+        checkErr(err, "clSetKernelArg(spmv_vector,y)");
+        err = clSetKernelArg(spmv_vector_kernel_, 5, sizeof(int), &n_faces);
+        checkErr(err, "clSetKernelArg(spmv_vector,n_faces)");
+        err = clSetKernelArg(spmv_vector_kernel_, 6, local_bytes, nullptr);
+        checkErr(err, "clSetKernelArg(spmv_vector,shared)");
+        err = clEnqueueNDRangeKernel(queue, spmv_vector_kernel_, 1, nullptr,
+                                     &gs, &warp, 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueNDRangeKernel(spmv_vector_kernel)");
         return;
     }
 
-    // Chunked path (PTM-25): one launch per row-chunk. Bit-identical to the
-    // single-buffer SpMV -- same per-row summation order, just split buffers.
+    // Chunked path (PTM-25) + vector coalescing: one wavefront per chunk-local row.
     for (const CsrChunk& ch : csr_chunks_) {
-        err = clSetKernelArg(spmv_chunk_kernel_, 0, sizeof(cl_mem), &ch.values);
-        checkErr(err, "clSetKernelArg(spmv_chunk,values)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 1, sizeof(cl_mem), &ch.col_indices);
-        checkErr(err, "clSetKernelArg(spmv_chunk,col_indices)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 2, sizeof(cl_mem), &ch.row_ptrs);
-        checkErr(err, "clSetKernelArg(spmv_chunk,row_ptrs)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 3, sizeof(cl_mem), &x);
-        checkErr(err, "clSetKernelArg(spmv_chunk,x)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 4, sizeof(cl_mem), &y);
-        checkErr(err, "clSetKernelArg(spmv_chunk,y)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 5, sizeof(int), &ch.row_offset);
-        checkErr(err, "clSetKernelArg(spmv_chunk,row_offset)");
-        err = clSetKernelArg(spmv_chunk_kernel_, 6, sizeof(int), &ch.n_rows);
-        checkErr(err, "clSetKernelArg(spmv_chunk,n_rows)");
-        size_t gsz = ((static_cast<size_t>(ch.n_rows) + local_size - 1) /
-                      local_size) * local_size;
-        err = clEnqueueNDRangeKernel(queue, spmv_chunk_kernel_, 1, nullptr,
-                                     &gsz, &local_size, 0, nullptr, nullptr);
-        checkErr(err, "clEnqueueNDRangeKernel(spmv_chunk_kernel)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 0, sizeof(cl_mem), &ch.values);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,values)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 1, sizeof(cl_mem), &ch.col_indices);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,col_indices)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 2, sizeof(cl_mem), &ch.row_ptrs);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,row_ptrs)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 3, sizeof(cl_mem), &x);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,x)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 4, sizeof(cl_mem), &y);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,y)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 5, sizeof(int), &ch.row_offset);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,row_offset)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 6, sizeof(int), &ch.n_rows);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,n_rows)");
+        err = clSetKernelArg(spmv_vector_chunk_kernel_, 7, local_bytes, nullptr);
+        checkErr(err, "clSetKernelArg(spmv_vchunk,shared)");
+        const size_t gsz = static_cast<size_t>(ch.n_rows) * warp;
+        err = clEnqueueNDRangeKernel(queue, spmv_vector_chunk_kernel_, 1, nullptr,
+                                     &gsz, &warp, 0, nullptr, nullptr);
+        checkErr(err, "clEnqueueNDRangeKernel(spmv_vector_chunk_kernel)");
     }
 }
 
@@ -1163,6 +1217,10 @@ void RadiosityOpenCLSolver::release() {
     if (spmv_chunk_kernel_) {
         clReleaseKernel(spmv_chunk_kernel_);
         spmv_chunk_kernel_ = nullptr;
+    }
+    if (spmv_vector_chunk_kernel_) {
+        clReleaseKernel(spmv_vector_chunk_kernel_);
+        spmv_vector_chunk_kernel_ = nullptr;
     }
 
     // Release program
