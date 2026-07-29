@@ -14,8 +14,84 @@ uses the SAME NRAYS the sweep actually ran at (passed explicitly, no silent defa
 Usage: assemble_vf_haworth.py <mesh.ply> <sweep_chunks_glob> <nrays> <min_hits> <out.csr>
   [--floor-idx floor_idx.npy]   # for the before/after floor-far-wall-aggregate report
 """
-import numpy as np, glob, time, sys, argparse
+import numpy as np, glob, time, sys, argparse, os, json
 from pathlib import Path
+
+SIGMA = 5.670374419e-8  # Stefan-Boltzmann
+
+
+def load_radiance_weight(path, N, albedo):
+    """Per-face radiance R_j (W/m^2) for radiance-weighted pruning. Two documented
+    input paths:
+      - a stats DIR from a prior run: R = sigma*T_max^4 + albedo*direct_solar_max
+        (reads temperature_max.bin + direct_solar_max.bin);
+      - a .npy or raw float32/float64 .bin of per-face R (e.g. a cheap
+        illumination-proxy: R ~= sigma*T_eq^4 + albedo*direct_solar_max).
+    Returns (R, T_face_or_None); T_face (the receiving-face temperature, for the
+    dT-bound) is available only from the stats-dir path."""
+    p = Path(path)
+
+    def _rd(fp):
+        d = np.fromfile(fp, dtype=np.float32)
+        return (d[1:] if len(d) == N + 1 else d).astype(np.float64)
+
+    if p.is_dir():
+        Tm = _rd(p / "temperature_max.bin")
+        Ds = _rd(p / "direct_solar_max.bin")
+        if len(Tm) != N or len(Ds) != N:
+            raise SystemExit(f"radiance-weight stats dir face count {len(Tm)}/{len(Ds)} != mesh {N}")
+        return SIGMA * Tm ** 4 + albedo * Ds, Tm
+    if p.suffix == ".npy":
+        R = np.load(p).astype(np.float64)
+    else:
+        R = _rd(p)
+    if len(R) != N:
+        raise SystemExit(f"radiance-weight length {len(R)} != mesh face count {N}")
+    return R, None
+
+
+def radiance_prune(rows, cols, F, N, eps, R, Tface, area, out_csr):
+    """Keep entry (i,j) iff F_ij * R_j >= eps (W/m^2). Returns (keep_mask, receipt).
+    Writes the receipt sidecar json AND prints it -- the user sees the trade before
+    the run. Discarded contribution and dT bound are per RECEIVING face i (=rows)."""
+    contrib = F * R[cols]                       # W/m^2 each partner contributes to i
+    keep = contrib >= eps
+    dropped = ~keep
+    disc = np.zeros(N)                           # per-receiving-face discarded flux (W/m^2)
+    np.add.at(disc, rows[dropped], contrib[dropped])
+    Tb = np.maximum(Tface if Tface is not None else np.full(N, 40.0), 20.0)
+    dT = disc / (4.0 * SIGMA * Tb ** 3)          # a-priori (loose) dT bound, K
+    nnz0 = int(len(F)); nnz1 = int(keep.sum())
+    receipt = {
+        "radiance_prune_eps_Wm2": float(eps),
+        "nnz_before": nnz0, "nnz_after": nnz1, "nnz_dropped": nnz0 - nnz1,
+        "kept_fraction": round(nnz1 / max(nnz0, 1), 5),
+        "predicted_speedup_nnz": round(nnz0 / max(nnz1, 1), 2),
+        "discarded_contribution_Wm2": {
+            "max": float(disc.max()), "p99": float(np.percentile(disc, 99)),
+            "mean": float(disc.mean())},
+        "dT_bound_K": {
+            "max": float(dT.max()), "p99": float(np.percentile(dT, 99)),
+            "mean": float(dT.mean()),
+            "T_source": "face T_max (stats dir)" if Tface is not None else "reference 40 K floor",
+            "caveat": "loose UPPER bound (partner MAX radiance, timing-decoupled)."},
+        "MEASURED_AGT_counter_example": (
+            "MP026 radiance eps=1e-3 (3.2x nnz) MEASURED FAIL: PSR-floor Tmax mean 3.3 K / "
+            "max 22.6 K cold (rims pass, <0.6 K). Diffuse polar terrain does NOT prune "
+            "safely; isolated-crater / warm-body terrain is where it pays. "
+            "See ~/projects/a3gt/prune_test/verdict.json."),
+    }
+    with open(str(out_csr) + ".prune_receipt.json", "w") as fh:
+        json.dump(receipt, fh, indent=2)
+    print("[radiance-prune] RECEIPT (also written to " + str(out_csr) + ".prune_receipt.json):")
+    print("  eps=%.4g W/m^2  nnz %d -> %d (keep %.2f%%, drop %d)  predicted speedup %.2fx"
+          % (eps, nnz0, nnz1, 100 * nnz1 / max(nnz0, 1), nnz0 - nnz1, nnz0 / max(nnz1, 1)))
+    print("  discarded contribution/face (W/m^2): max=%.3f p99=%.4f mean=%.5f"
+          % (disc.max(), np.percentile(disc, 99), disc.mean()))
+    print("  a-priori dT bound (K, %s): max=%.2f p99=%.3f mean=%.4f  [LOOSE upper bound]"
+          % (receipt["dT_bound_K"]["T_source"], dT.max(), np.percentile(dT, 99), dT.mean()))
+    print("  CAUTION: measured AGT MP026 3.2x -> PSR floor mean 3.3 K / max 22.6 K (verdict.json).")
+    return keep, receipt
 
 _PLY_NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
            "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
@@ -91,6 +167,18 @@ def main():
     ap.add_argument("--floor-idx", default=None)
     ap.add_argument("--old-thr-frac", type=float, default=1e-5,
                     help="the OLD (buggy) fractional threshold, for the before/after report")
+    ap.add_argument("--radiance-prune-eps", type=float,
+                    default=float(os.environ.get("PTM_RADIANCE_PRUNE_EPS", "0.0")),
+                    help="Radiance-weighted VF pruning threshold in W/m^2 (Paul's adjustable knob). "
+                         "Keep partner j for face i iff F_ij * R_j >= eps (R_j = sigma*T_max,j^4 + "
+                         "albedo*direct_solar_max,j). 0.0 (DEFAULT) = NO PRUNING, byte-identical. "
+                         "Env PTM_RADIANCE_PRUNE_EPS sets the default (require-env compatible).")
+    ap.add_argument("--radiance-weight", default=None,
+                    help="Per-face radiance source when pruning: a prior-run stats DIR "
+                         "(temperature_max.bin + direct_solar_max.bin) OR a .npy/.bin of per-face R "
+                         "(W/m^2, e.g. an illumination-proxy). Required when --radiance-prune-eps>0.")
+    ap.add_argument("--radiance-albedo", type=float, default=0.12,
+                    help="A0 for the visible-band radiance weight (reflected solar). Default 0.12.")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -167,6 +255,20 @@ def main():
     print(f"[assemble] symmetric-cap sweeps={it+1} -> SigmaF max={rs.max():.4f} (#>1={(rs>1.0+1e-6).sum()}) "
           f"mean={rs.mean():.4f}  {time.time()-t0:.0f}s")
 
+    # ---- optional radiance-weighted pruning (Paul's adjustable knob; DEFAULT OFF) ----
+    # Applied to the FINAL symmetric, SigmaF<=1-capped operator so F values are the true
+    # view factors the sim uses. eps=0 -> untouched (byte-identical). Keeping true F (no
+    # renormalization); discarded mass is bounded and REPORTED in the receipt.
+    if a.radiance_prune_eps > 0.0:
+        if not a.radiance_weight:
+            raise SystemExit("--radiance-prune-eps > 0 requires --radiance-weight (stats dir or R file)")
+        R, Tface = load_radiance_weight(a.radiance_weight, N, a.radiance_albedo)
+        keep, _ = radiance_prune(rows, cols, F, N, a.radiance_prune_eps, R, Tface, area, a.out_csr)
+        rows = rows[keep]; cols = cols[keep]; F = F[keep]
+        rs = np.zeros(N); np.add.at(rs, rows, F)
+        print(f"[radiance-prune] applied: kept nnz={len(F)}  post-prune SigmaF max={rs.max():.4f} "
+              f"mean={rs.mean():.4f}  {time.time()-t0:.0f}s")
+
     o2 = np.argsort(rows, kind="stable"); rows = rows[o2]; cols = cols[o2]; F = F[o2]
     indptr = np.zeros(N + 1, dtype=np.int64); np.add.at(indptr, rows + 1, 1); indptr = np.cumsum(indptr)
     out = a.out_csr
@@ -177,7 +279,6 @@ def main():
         np.array([len(F)], dtype=np.int64).tofile(fh)
         cols.astype(np.int32).tofile(fh)
         F.astype(np.float32).tofile(fh)
-    import os
     print(f"[assemble] wrote {out}  nnz={len(F)}  {os.path.getsize(out)/1e9:.3f} GB  geomhash={GEOMHASH:.6f}  {time.time()-t0:.0f}s")
     np.save(str(Path(out).with_suffix(".rowsum.npy")), rs)
 

@@ -366,6 +366,60 @@ IlluminationModel
 --rad-hmatrix-threads N        Limit H-matrix build threads (0 = auto)
 ```
 
+## 10.9 Radiance-weighted view-factor pruning (adjustable, default OFF)
+
+The corrected per-partner CSR is large because a face couples to many partners,
+most contributing a tiny view factor. A *geometry* cutoff (drop small `F_ij`, or
+drop by distance) is physically wrong — a large, directly-lit distant wall can
+matter more than a small nearby slope. The principled cutoff is on **radiative
+contribution**, weighting each view factor by the radiance the partner emits:
+
+> keep partner `j` for receiving face `i` iff `F_ij · R_j ≥ ε` (W/m²), where
+> `R_j = σ·T_max,j⁴ + A₀·direct_solar_max,j` — the max IR + reflected-solar
+> radiance `j` presents over the cycle.
+
+Cold faint partners (PSR walls, `σT⁴ ≈ 1.4 W/m²` at 70 K) fall away; warm faint
+partners (sunlit rims, `≈ 850–1200 W/m²`) survive — the all-scales physics, with
+the illumination pattern in the weight. This is **provably optimal** for a given
+kept-nnz: it drops exactly the lowest-contribution entries. True `F` values are
+kept (no renormalization); the discarded mass is bounded and **reported**.
+
+**Where it lives.** Assembly-time, in `scripts/ptm12_diag/assemble_vf_haworth.py`
+(the sim is unchanged — it just loads whatever CSR it is given):
+
+- `--radiance-prune-eps ε` — threshold in W/m². **`0.0` (default) = no pruning,
+  byte-identical.** Also settable via env `PTM_RADIANCE_PRUNE_EPS` (require-env
+  compatible), and documented in the radiation config as `radiation.radiance_prune_eps`
+  (the pipeline propagates it to the assembler; it is not read by the sim).
+- `--radiance-weight PATH` — the per-face `R` source, **two documented paths**:
+  1. a **prior-run stats directory** (`temperature_max.bin` +
+     `direct_solar_max.bin`) — exact radiance from a completed coupled/radoff run;
+  2. a **`.npy`/`.bin` of per-face `R`** — a cheap *illumination-proxy* built
+     without a full thermal run (illumination-only pass → `direct_solar_max`,
+     `T_eq = ((1−A)·direct_solar_max/εσ)^¼`, `R ≈ σT_eq⁴ + A₀·direct_solar_max`).
+- `--radiance-albedo A₀` — visible-band albedo (default 0.12).
+
+**Mandatory receipt.** Every pruned assembly prints and writes
+`<out>.csr.prune_receipt.json`: nnz kept/dropped, size, predicted speedup, the
+per-receiving-face **discarded contribution** (W/m², max/p99/mean) and its
+**ΔT bound** `ΔT ≈ dQ/(4σT³)` at the face's own temperature — *so the user sees
+the trade before running.* The ΔT bound is a **loose upper bound** (it uses the
+partner's *max* radiance, timing-decoupled), so the measured ΔT is smaller — but
+"smaller than a large loose bound" is not "safe," which is why a real window test
+governs adoption.
+
+**Measured counter-example — AGT / MP026 (the cautionary receipt).** On the
+diffuse South-Pole terrain, `ε = 1e-3` gives **3.2× fewer nnz** (and ~2.0×
+radiosity wall-time), but the Y00_summer window **FAILED** the < 1 K bar against
+the full-fidelity baseline: per-face `T_max` off by **mean 3.3 K / max 22.6 K on
+PSR floors** (n≈101 k faces < 120 K), while warm rims passed (< 0.6 K). The floors
+are radiation-dominated and heated by the *aggregate* of many faint partners, so
+dropping them cools the coldest, most science-critical faces. Evidence:
+`~/projects/a3gt/prune_test/verdict.json`. **Guidance:** pruning does **not** pay
+on diffuse polar terrain; it pays on **isolated-crater or warm-body** terrain
+where a face's coupling is dominated by a few high-radiance partners. Default OFF
+for all sims; enable only with a per-terrain window test and the receipt in hand.
+
 ## 11. References
 
 - Potter, S. F., Bertone, S., Schörghofer, N., & Mazarico, E. (2023). Fast hierarchical low-rank view factor matrices for thermal irradiance on planetary surfaces. *Journal of Computational Physics: X*, 17, 100130. https://doi.org/10.1016/j.jcpx.2023.100130
