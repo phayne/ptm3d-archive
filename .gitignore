@@ -49,7 +49,8 @@ results/
 
 # Large data
 data/maps/*.fits
-data/kernels/
+# data/kernels: binary kernels are ignored via data/kernels/.gitignore;
+# the metakernel templates (*.tm) + README ship with the repo.
 data/meshes/moon3d_cartesian_double.ply
 data/alma/
 data/dem/
