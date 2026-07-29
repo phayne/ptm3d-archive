@@ -23,6 +23,7 @@ Status tags:
 
 | Variable | Default | Effect | Status |
 |---|---|---|---|
+| `PTM_DATA_ROOT` | unset | Points at the science-data directory when it lives outside the repository. Every relative `data/...` path in a config resolves in this order: an absolute config path always wins → `$PTM_DATA_ROOT` → the repository's `data/` (found by walking up from the config file to the directory containing `data/data_manifest.json`). If a required input is still missing, the program stops with an error naming the dataset and the exact `scripts/fetch_data.py` command. | [standard] |
 | `PTM_SPICE_KERNELS` | unset | Overrides the SPICE kernel directory when none was set by config/CLI (resolution: explicit setting → this env → compiled-in `SPICE_KERNELS_DIR`, default `<repo>/data/kernels`). If no directory resolves, the program stops with a clear error rather than continuing silently. | [standard] |
 | `PTM_ALBEDO_MAPS_DIR` | unset | Overrides the albedo/property FITS map directory (else the config's `albedo_maps_directory`). | [standard] |
 | `PTM_MACHINE_PROFILE` | `~/.ptm3d/machine_profile.json` | Path to the per-host GPU machine profile written by `--calibrate-gpu`. | [standard] |
