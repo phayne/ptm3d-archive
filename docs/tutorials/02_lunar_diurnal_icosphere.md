@@ -25,7 +25,7 @@ python3 scripts/fetch_kernels.py     # once (~45 MB from NAIF)
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-Watch for these lines (elided): `Mesh created with 642 vertices and 1280
+Watch for these lines: `Mesh created with 642 vertices and 1280
 faces`, `Initializing SPICE with meta-kernel`, the illumination progress bar,
 and `[Statistics] Exported to output/quickstart_moon_diurnal/statistics`.
 The program should finish without errors (exit code 0).
