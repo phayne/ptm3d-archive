@@ -605,7 +605,12 @@ private:
     int mesh_resolution_ = 32;
     int time_steps_ = 24;
     double albedo_ = 0.5;
-    std::string kernels_path_ = "/Users/paha3326/software/cspice/data";
+    // SPICE kernel directory. Intentionally EMPTY by default: it is resolved in
+    // initialize_spice() from (in order) an explicit setKernelsPath() call,
+    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
+    // var, default <repo>/data/kernels). Never a hardcoded developer path
+    // (portability audit P0, PORT-02).
+    std::string kernels_path_;
     
     // Embree ray tracing resources
     RTCDevice embree_device_ = nullptr;

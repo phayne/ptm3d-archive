@@ -1,5 +1,7 @@
 #include "camera_simulator.h"
 #include "camera_yaml.h"
+#include "config.h"    // For SPICE_KERNELS_DIR
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -357,9 +359,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Default kernels path
+    // Resolve the SPICE kernel directory: --kernels-path, then $PTM_SPICE_KERNELS,
+    // then the compiled-in SPICE_KERNELS_DIR (CMake cache variable; default
+    // <repo>/data/kernels). Fail loud rather than fall back to a developer-machine
+    // path (portability audit P0, PORT-03).
     if (config.kernels_path.empty()) {
-        config.kernels_path = "/Users/paha3326/software/cspice/data";
+        const char* env_kernels = std::getenv("PTM_SPICE_KERNELS");
+        if (env_kernels && *env_kernels) {
+            config.kernels_path = env_kernels;
+        } else {
+            config.kernels_path = ptm_thermal::config::SPICE_KERNELS_DIR;
+        }
+    }
+    if (config.kernels_path.empty() || !fs::exists(config.kernels_path)) {
+        std::cerr << "Error: SPICE kernel directory not found: '" << config.kernels_path << "'\n"
+                  << "  Resolution order: --kernels-path DIR, $PTM_SPICE_KERNELS,\n"
+                  << "  compiled-in SPICE_KERNELS_DIR (CMake; default <repo>/data/kernels).\n"
+                  << "  Populate it with: python3 scripts/fetch_kernels.py\n"
+                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+        return 1;
     }
 
     // Run
