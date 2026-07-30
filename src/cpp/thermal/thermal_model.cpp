@@ -558,10 +558,6 @@ double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_a
     // describes A0(lon, lat); the (a, b) coefficients describe how A varies
     // with solar zenith angle θ. Returning the bare map value would silently
     // drop the high-θ correction, biasing high-latitude nighttime cooling.
-
-    // Clamp incidence angle to [0, pi/2] - beyond pi/2 is not illuminated
-    double theta = std::max(0.0, std::min(incidence_angle, M_PI / 2.0));
-
     double A0 = albedo;  // Body-default base albedo
     if (using_albedo_map && albedo_map) {
         double map_value = albedo_map->getValue(lon, lat);
@@ -569,6 +565,25 @@ double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_a
             A0 = map_value;
         }
     }
+    return albedoWithIncidenceFromA0(A0, incidence_angle);
+}
+
+// Per-face variant: A0 supplied directly (e.g. from a loaded per-face albedo
+// vector), bypassing the internal spatial-map lookup. Applies the IDENTICAL
+// angular model as the (lon, lat) overload, so the CPU mesh flux path can
+// compose the incidence albedo on each face's OWN A0 (matching the GPU path)
+// without loading a lon/lat SpatialMap onto the thermal planet.
+double Planet::getAlbedoWithIncidence(double A0, double incidence_angle) const {
+    return albedoWithIncidenceFromA0(A0, incidence_angle);
+}
+
+// Shared core: normal-incidence Bond albedo A0 + solar incidence angle ->
+// effective visible albedo. Factored out so both getAlbedoWithIncidence
+// overloads apply the EXACT same angular model (byte-identical to the
+// pre-refactor single-function path).
+double Planet::albedoWithIncidenceFromA0(double A0, double incidence_angle) const {
+    // Clamp incidence angle to [0, pi/2] - beyond pi/2 is not illuminated
+    double theta = std::max(0.0, std::min(incidence_angle, M_PI / 2.0));
 
     // Directional-hemispheric (Hapke) albedo branch (opt-in, gated). Returns the
     // ANALYTIC closed form A_h(mu0) = 1 - gamma*H(mu0,w), which is guaranteed in
@@ -577,13 +592,21 @@ double Planet::getAlbedoWithIncidence(double lon, double lat, double incidence_a
     // incidence and violates energy conservation). Independent of the Hayne
     // polynomial below, so the baseline path is untouched when the gate is off.
     if (use_hapke_albedo && hapke_albedo_w >= 0.0) {
-        double w = std::max(0.0, std::min(1.0, hapke_albedo_w));
-        double gamma = std::sqrt(std::max(0.0, 1.0 - w));
+        // Per-face albedo scaling: anchor the Hapke directional curve to THIS
+        // face's Bond albedo A0 (looked up from the map above), not the body-
+        // average single-scattering w. gamma = (1-A0)/(1+2*A0) is the exact
+        // inverse of A_h(mu0=1)=A0, so A_h(1)=A0 per face; the gate flag
+        // (hapke_albedo_w >= 0) still selects the branch. This mirrors the GPU
+        // flux path (ptm_thermal_sim hapkeWFromA0 -> w -> gamma=sqrt(1-w)), so
+        // CPU==GPU on mapped faces. No-map runs (A0==body albedo everywhere)
+        // reduce to the former body-w result -> byte-identical.
+        double a0c = std::max(1e-6, std::min(1.0 - 1e-6, A0));
+        double gamma = (1.0 - a0c) / (1.0 + 2.0 * a0c);
         double mu0 = std::cos(theta);            // theta already clamped to [0, pi/2]
         mu0 = std::max(0.0, std::min(1.0, mu0));
         double H = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
         double A_h = 1.0 - gamma * H;
-        // Analytic guard: A_h(i) MUST be in [0, 1] for all i and all w.
+        // Analytic guard: A_h(i) MUST be in [0, 1] for all i and all A0.
         assert(A_h >= -1e-9 && A_h <= 1.0 + 1e-9 &&
                "Hapke A_h(i) out of [0,1] — closed-form energy-conservation guard");
         return std::max(0.0, std::min(1.0, A_h));
