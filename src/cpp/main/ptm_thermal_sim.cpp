@@ -671,6 +671,39 @@ static inline double applyIncidenceAlbedo(double A0,
     return A;
 }
 
+// ---- Fix A (BUGS.md PTM-28): instantaneous heliocentric solar constant --------
+// applyIncidenceAlbedo() and the CPU incidence block recover the solar incidence
+// as cos(theta) = direct_flux / S. direct_solar was formed by the illumination
+// model as S_inst * <cos>, with S_inst = SOLAR_CONSTANT / dist_au^2
+// (illumination_model.cpp:3812). Recovering with a FIXED planet.S (the 1-AU
+// value) makes cos_theta exceed 1 whenever the instantaneous insolation exceeds
+// planet.S (perihelion + near-normal incidence), pinning the albedo to A0 across
+// a super-solar-constant plateau; under the Hapke branch that plateau edge is a
+// C1 (derivative) kink in absorbed flux which the GPU coarse time-integrator
+// amplifies into a non-physical diurnal sawtooth (PTM-28). Feeding the per-
+// timestep S_inst makes cos_theta <= 1 by construction so the plateau/kink never
+// forms. g_solar_irr_per_step is filled ONCE in main() from the sun positions;
+// left EMPTY (or env PTM_LEGACY_FIXED_SOLARCONST=1) every site falls back to the
+// fixed planet.S == the legacy path (byte-identical). Read-only during the
+// thermal dispatch (safe under the OpenMP flux-prep loops).
+static std::vector<double> g_solar_irr_per_step;   // per-timestep S_inst (W/m^2)
+
+static inline bool legacyFixedSolarConst() {
+    static bool legacy = []() {
+        const char* e = std::getenv("PTM_LEGACY_FIXED_SOLARCONST");
+        return (e && std::string(e) != "0" && e[0] != '\0');
+    }();
+    return legacy;
+}
+
+// Instantaneous solar constant for ABSOLUTE timestep t; falls back to `fixed`
+// (planet.S, the legacy 1-AU value) when the per-step table is unset/short.
+static inline double solarConstForStep(int t, double fixed) {
+    if (t >= 0 && static_cast<size_t>(t) < g_solar_irr_per_step.size())
+        return g_solar_irr_per_step[t];
+    return fixed;
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -1516,8 +1549,11 @@ std::vector<double> calculateAbsorbedFlux(
             // Compute incidence-dependent albedo if enabled and face is illuminated
             if (use_incidence_albedo && direct_flux > 0.0) {
                 // Compute incidence angle from direct flux
-                // direct_flux = S * cos(theta), so cos(theta) = direct_flux / S
-                double cos_theta = direct_flux / solar_constant;
+                // direct_flux = S_inst * cos(theta), so cos(theta) = direct_flux / S_inst.
+                // PTM-28 Fix A: use the per-timestep instantaneous solar constant (falls
+                // back to the fixed solar_constant when the table is unset/legacy).
+                double cos_theta = direct_flux /
+                                   solarConstForStep(static_cast<int>(t), solar_constant);
                 // Clamp to valid range [0, 1] to handle numerical issues
                 cos_theta = std::min(1.0, std::max(0.0, cos_theta));
                 double incidence_angle = std::acos(cos_theta);
@@ -3848,8 +3884,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     // A_h(mu0) = 1 - gamma*H(mu0,w), which supersedes Hayne and
                     // ignores base_A (w already encodes the body Bond albedo).
                     double albedo = use_incidence
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
-                                               use_hapke, hapke_w)
+                        ? applyIncidenceAlbedo(base_A, direct,
+                                               solarConstForStep(t_start + t, S_solar),
+                                               a_coef, b_coef, use_hapke, hapke_w)
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
@@ -4402,8 +4439,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     // Incidence-angle correction (Hayne composes on map A0; Hapke
                     // closed form supersedes, ignoring base_A).
                     double albedo = use_incidence2
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar2, a_coef2, b_coef2,
-                                               use_hapke, hapke_w)
+                        ? applyIncidenceAlbedo(base_A, direct,
+                                               solarConstForStep(t_start + t, S_solar2),
+                                               a_coef2, b_coef2, use_hapke, hapke_w)
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
@@ -4968,8 +5006,9 @@ bool runThermalForSelectedFaces_GPU(
                     const double ir       = (flux_idx < primary_ir_values.size())
                                           ? primary_ir_values[flux_idx] : 0.0;
                     const double albedo = use_incidence
-                        ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
-                                               use_hapke, hapke_w)
+                        ? applyIncidenceAlbedo(base_A, direct,
+                                               solarConstForStep(t, S_solar),
+                                               a_coef, b_coef, use_hapke, hapke_w)
                         : base_A;
                     double absorbed = (1.0 - albedo) * direct
                                     + (1.0 - albedo) * reflected
@@ -5025,8 +5064,9 @@ bool runThermalForSelectedFaces_GPU(
                                       ? primary_ir_values[flux_idx] : 0.0;
 
                 const double albedo = use_incidence
-                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
-                                           use_hapke, hapke_w)
+                    ? applyIncidenceAlbedo(base_A, direct,
+                                           solarConstForStep(t_offset + t, S_solar),
+                                           a_coef, b_coef, use_hapke, hapke_w)
                     : base_A;
 
                 double absorbed = (1.0 - albedo) * direct
@@ -10066,6 +10106,46 @@ int main(int argc, char** argv) {
     const auto& sun_positions = illumination_model->getSunPositions();
     const auto& primary_positions = illumination_model->getPrimaryPositions();
 
+    // Fix A (BUGS.md PTM-28): build the per-timestep instantaneous solar constant
+    // table used by the incidence-angle albedo (Hayne + Hapke). direct_solar was
+    // formed as (SOLAR_CONSTANT/dist_au^2)*<cos>, so recovering cos with the same
+    // instantaneous S keeps cos<=1 and removes the super-solar-constant albedo
+    // plateau + Hapke C1-kink -> GPU sawtooth. Default ON; the legacy env leaves
+    // the table EMPTY so every incidence site falls back to the fixed planet.S.
+    g_solar_irr_per_step.clear();
+    if (legacyFixedSolarConst()) {
+        std::cerr << "[solar-const] PTM_LEGACY_FIXED_SOLARCONST=1: incidence albedo "
+                     "uses the FIXED 1-AU solar constant (legacy; PTM-28 sawtooth "
+                     "may reappear near perihelion under GPU+Hapke)\n";
+    } else {
+        g_solar_irr_per_step.assign(static_cast<size_t>(total_time_steps), 0.0);
+        size_t n_ok = 0; double s_min = 1e30, s_max = 0.0;
+        for (int t = 0; t < total_time_steps; ++t) {
+            if (static_cast<size_t>(t) < sun_positions.size()) {
+                const auto& sp = sun_positions[t];
+                const double d_km = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+                const double d_au = d_km / constants::KM_PER_AU;
+                if (d_au > 0.0) {
+                    const double s = constants::SOLAR_CONSTANT / (d_au * d_au);
+                    g_solar_irr_per_step[t] = s;
+                    s_min = std::min(s_min, s); s_max = std::max(s_max, s);
+                    ++n_ok;
+                }
+            }
+        }
+        if (n_ok != static_cast<size_t>(total_time_steps)) {
+            std::cerr << "[solar-const] WARNING: only " << n_ok << "/" << total_time_steps
+                      << " timesteps have a valid sun distance; the rest fall back to the "
+                         "fixed 1-AU solar constant (PTM-28 incidence fix partially inactive)\n";
+        }
+        if (n_ok > 0) {
+            std::cerr << "[solar-const] incidence albedo uses the INSTANTANEOUS heliocentric "
+                         "solar constant (PTM-28 fix, default ON); S_inst range ["
+                      << std::fixed << std::setprecision(1) << s_min << ", " << s_max
+                      << "] W/m^2\n";
+        }
+    }
+
     // Calculate the number of faces
     size_t num_faces = mesh->faces.size();
 
@@ -11680,8 +11760,9 @@ int main(int argc, char** argv) {
                                 const double reflected = primary_reflected_values[flux_idx];
                                 const double ir = primary_ir_values[flux_idx];
                                 const double albedo = use_incidence
-                                    ? applyIncidenceAlbedo(base_A, direct, S_solar, a_coef, b_coef,
-                                                           use_hapke, hapke_w)
+                                    ? applyIncidenceAlbedo(base_A, direct,
+                                                           solarConstForStep(t, S_solar),
+                                                           a_coef, b_coef, use_hapke, hapke_w)
                                     : base_A;
                                 combined_flux[idx][t] = (1.0 - albedo) * direct
                                                       + (1.0 - albedo) * reflected
