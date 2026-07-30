@@ -5600,7 +5600,25 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
     // Parse the ISO time string to get seconds since J2000
     double et;
     str2et_c(iso_time.c_str(), &et);
-    
+
+    // Fail loud rather than propagate an uninitialized epoch. If the leapseconds
+    // kernel (or the whole metakernel) never loaded, str2et_c is a silent no-op
+    // under erract=RETURN and `et` is left uninitialized; printing/using it would
+    // produce a garbled start time and an epoch driven by stack garbage instead
+    // of the requested start_time (see BUGS.md PTM-27).
+    if (failed_c()) {
+        SpiceChar short_msg[81] = {0};
+        getmsg_c("SHORT", 81, short_msg);
+        reset_c();
+        std::cerr << "\nFATAL: SPICE str2et_c failed for start_time '" << iso_time << "': "
+                  << short_msg << "\n"
+                  << "  The SPICE leapseconds/ephemeris kernels are not loaded, so the absolute\n"
+                  << "  epoch cannot be resolved. Populate the kernel directory with:\n"
+                  << "      python3 scripts/fetch_kernels.py\n"
+                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+        std::exit(1);
+    }
+
     // Apply the offset in seconds
     double adjusted_et = et + days_offset * 86400.0;
     
@@ -9708,7 +9726,18 @@ int main(int argc, char** argv) {
                 << ") and planet albedo (" << planet.albedo << "). Using planet value." << std::endl;
         default_visible_albedo = planet.albedo;
     }
-    illumination_model->initialize_spice(verbose);
+    // Load SPICE kernels for the CONFIGURED body/metakernel. This must run after
+    // setPlanetaryBody()/setGenericBody() above so the correct per-body metakernel
+    // (e.g. moon.tm, not the europa.tm default) is furnsh'd. A failure here (missing
+    // or unresolved kernels) is fatal: without an ephemeris the absolute epoch and
+    // Sun/primary positions cannot be computed. Do not proceed with rc=0 (BUGS.md PTM-27).
+    if (!illumination_model->initialize_spice(verbose)) {
+        std::cerr << "\nFATAL: SPICE initialization failed for body '" << planet.name << "'.\n"
+                  << "  Cannot resolve the absolute epoch/ephemeris without SPICE kernels.\n"
+                  << "  Populate the kernel directory with:  python3 scripts/fetch_kernels.py\n"
+                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+        return 1;
+    }
     illumination_model->setAlbedo(default_visible_albedo);
     illumination_model->setKernelsPath(SPICE_KERNELS_DIR);
     if (!using_generic_body) {

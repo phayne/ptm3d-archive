@@ -164,9 +164,15 @@ IlluminationModel::IlluminationModel(bool debug_output)
     
     // Get kernels path from config
     kernels_path_ = ptm_thermal::config::SPICE_KERNELS_DIR;
-    
-    // Initialize SPICE
-    initialize_spice(); // FIXED: changed from initializeSpice() to initialize_spice()
+
+    // NOTE: Do NOT initialize SPICE here. At construction the target body is not
+    // yet known, so meta_kernel_filename_ is still the "europa.tm" default. Eagerly
+    // furnsh'ing it (a) loads the wrong metakernel for every non-Europa body, and
+    // (b) — because a partial/failed load latches a SPICE error and the one-shot
+    // `spice_initialized` guard — permanently blocks the correct per-body metakernel
+    // from ever loading, silently producing a garbage epoch (BUGS.md PTM-27).
+    // SPICE is initialized lazily/explicitly AFTER setPlanetaryBody()/setGenericBody()
+    // has set the correct metakernel (see initialize_spice() callers).
 }
 
 IlluminationModel::~IlluminationModel() {
@@ -2462,18 +2468,41 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             }
             
             furnsh_c(meta_kernel.c_str());
+
+            // Fail loud if furnsh could not load the metakernel or any kernel it
+            // references. Under erract=RETURN a missing file (e.g. europa.tm's
+            // jup365.bsp, which the default Moon kernel fetch omits) does NOT throw:
+            // it latches a SPICE error and leaves subsequent str2et_c/spkpos_c as
+            // silent no-ops, producing a garbage epoch. Do not cache a failed init
+            // (leave spice_initialized false) and return false so the caller aborts
+            // instead of running with an uninitialized epoch (BUGS.md PTM-27).
+            if (failed_c()) {
+                SpiceChar short_msg[81] = {0};
+                SpiceChar long_msg[1841] = {0};
+                getmsg_c("SHORT", 81, short_msg);
+                getmsg_c("LONG", 1841, long_msg);
+                reset_c();
+                std::cerr << "Error: SPICE furnsh_c failed while loading metakernel '"
+                          << meta_kernel << "': " << short_msg << "\n"
+                          << "  " << long_msg << "\n"
+                          << "  A referenced kernel is missing or unresolved. Populate the kernel\n"
+                          << "  directory with:  python3 scripts/fetch_kernels.py\n"
+                          << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+                return false;
+            }
+
             // Only print detailed messages if verbose mode is enabled
             if (verbose) {
                 std::cout << "Loaded SPICE meta-kernel: " << meta_kernel_filename_ << std::endl;
-                std::cout << "Set planetary body to " << target_body_name_ 
-                        << " with primary " << primary_body_name_ 
+                std::cout << "Set planetary body to " << target_body_name_
+                        << " with primary " << primary_body_name_
                         << " using meta-kernel " << meta_kernel_filename_ << std::endl;
             }
             // Only run diagnostic checks if verbose mode is enabled
             if (verbose) {
                 debugSpice();
             }
-            
+
             spice_initialized = true;
             return true;
         } catch (const std::exception& e) {
