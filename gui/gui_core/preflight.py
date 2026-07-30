@@ -191,6 +191,25 @@ def resolve_path(value, project_root):
     return p
 
 
+def resolve_data_path(value, project_root, env=None):
+    """Resolve a DATA-path config value exactly like the engine's
+    PTM_DATA_ROOT contract (config_parser.cpp): an absolute path wins; a
+    relative "data/..." reference resolves under $PTM_DATA_ROOT when set
+    (PTM_DATA_ROOT points AT the data directory); otherwise under the
+    project root. Non-"data/..." relative values fall back to the project
+    root like resolve_path."""
+    env = env if env is not None else os.environ
+    p = Path(str(value)).expanduser()
+    if p.is_absolute():
+        return p
+    value_s = str(value).replace("\\", "/")
+    data_root = env.get("PTM_DATA_ROOT", "")
+    if data_root and (value_s == "data" or value_s.startswith("data/")):
+        rest = value_s[5:] if value_s.startswith("data/") else ""
+        return (Path(data_root) / rest) if rest else Path(data_root)
+    return Path(project_root) / p
+
+
 def find_project_root(executable=None):
     """Derive the repo/project root from the engine executable location
     (<root>/build/bin/ptm_thermal_sim). Fallback: two levels above gui_core."""
@@ -347,6 +366,7 @@ def absolutize_config_paths(config, project_root):
         "radiation.view_factor_file",
         "output.directory",
     ]
+    data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)
     for dotted in path_fields:
         val = get_config_value(cfg, dotted)
         if not val:
@@ -355,7 +375,10 @@ def absolutize_config_paths(config, project_root):
         parent = cfg
         for k in parts[:-1]:
             parent = parent.setdefault(k, {})
-        parent[parts[-1]] = str(resolve_path(val, project_root))
+        # Data-path keys follow the engine's PTM_DATA_ROOT contract;
+        # output/VF keys resolve against the project root as before.
+        resolver = resolve_data_path if dotted in data_fields else resolve_path
+        parent[parts[-1]] = str(resolver(val, project_root))
     return cfg
 
 
@@ -385,11 +408,14 @@ def run_preflight(config, find_executable, project_root=None):
         report.warnings.append(f"could not fingerprint executable: {e}")
 
     # -- Individual file fields ---------------------------------------------
+    # Data paths follow the engine's PTM_DATA_ROOT contract (absolute wins ->
+    # $PTM_DATA_ROOT for "data/..." -> repo data/), so the preflight looks in
+    # exactly the place the engine will.
     for dotted in _FILE_FIELDS:
         val = get_config_value(config, dotted)
         if not val:
             continue
-        p = resolve_path(val, project_root)
+        p = resolve_data_path(val, project_root)
         if not p.exists():
             report.errors.append(f"{dotted}: file not found: {p}")
             continue
@@ -402,7 +428,13 @@ def run_preflight(config, find_executable, project_root=None):
             report.dataless.append((dotted, str(p)))
 
     # -- Data directories (existence + dataless scan) ------------------------
+    # Requirement gating mirrors the engine (config_parser.cpp): each data
+    # directory is REQUIRED only when its feature is actually in use, and
+    # the property-map directory NEVER hard-fails (the engine falls back to
+    # uniform body defaults).
     mesh = config.get("mesh", {})
+    illum = config.get("illumination", {})
+    therm = config.get("thermal", {})
     for dotted in _DATA_DIR_FIELDS:
         val = get_config_value(config, dotted)
         if not val:
@@ -410,9 +442,23 @@ def run_preflight(config, find_executable, project_root=None):
         # topo dir only matters if topographic meshes are enabled
         if dotted == "mesh.topo_directory" and not mesh.get("use_topographic", False):
             continue
-        d = resolve_path(val, project_root)
+        # albedo dir only matters if map loading is enabled
+        if dotted == "illumination.albedo_maps_directory" and \
+                illum.get("use_albedo_map", True) is False:
+            continue
+        soft = False
+        if dotted == "thermal.property_maps_directory":
+            if not therm.get("use_default_property_map", False):
+                continue  # feature off: directory is irrelevant
+            soft = True   # engine falls back to uniform defaults
+        d = resolve_data_path(val, project_root)
         if not d.exists():
-            report.errors.append(f"{dotted}: directory not found: {d}")
+            if soft:
+                report.warnings.append(
+                    f"{dotted}: directory not found: {d} -- the engine will "
+                    "fall back to uniform body defaults")
+            else:
+                report.errors.append(f"{dotted}: directory not found: {d}")
             continue
         if not d.is_dir():
             report.errors.append(f"{dotted}: not a directory: {d}")

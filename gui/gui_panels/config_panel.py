@@ -889,6 +889,8 @@ class MeshTab(BaseConfigTab):
     """Mesh configuration tab"""
 
     def init_ui(self):
+        from PyQt6.QtWidgets import QRadioButton, QButtonGroup
+
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -905,8 +907,52 @@ class MeshTab(BaseConfigTab):
                            info_key="mesh.resolution")
         self.add_bool_field(global_layout, 1, "Use Topographic Mesh", "mesh.use_topographic",
                             "Use pre-computed topographic meshes (requires DEM data)")
-        self.add_directory_field(global_layout, 2, "Topographic Directory:", "mesh.topo_directory",
-                                 "Directory containing pre-computed topographic meshes")
+
+        # --- Topography source: built-in dataset vs custom path -------------
+        src_label = QLabel("Topography source:")
+        global_layout.addWidget(src_label, 2, 0)
+        src_container = QWidget()
+        src_layout = QHBoxLayout(src_container)
+        src_layout.setContentsMargins(0, 0, 0, 0)
+        self.topo_builtin_radio = QRadioButton("Built-in (recommended)")
+        self.topo_builtin_radio.setToolTip(
+            "Ship-with-PTM3D topography (data/topo, resolved via "
+            "PTM_DATA_ROOT or the repository data directory) -- no "
+            "navigation needed. Fetched on demand if missing.")
+        self.topo_custom_radio = QRadioButton("Custom path…")
+        self.topo_custom_radio.setToolTip(
+            "Point at your own directory of pre-computed topography grids")
+        self._topo_src_group = QButtonGroup(src_container)
+        self._topo_src_group.addButton(self.topo_builtin_radio)
+        self._topo_src_group.addButton(self.topo_custom_radio)
+        src_layout.addWidget(self.topo_builtin_radio)
+        src_layout.addWidget(self.topo_custom_radio)
+        src_layout.addStretch()
+        global_layout.addWidget(src_container, 2, 1)
+        self.topo_builtin_radio.toggled.connect(self._on_topo_source_toggled)
+
+        # Read-only display of what built-in mode will actually load, plus a
+        # fetch button when the dataset is not on disk.
+        resolved_label = QLabel("Resolves to:")
+        global_layout.addWidget(resolved_label, 3, 0)
+        resolved_container = QWidget()
+        resolved_layout = QHBoxLayout(resolved_container)
+        resolved_layout.setContentsMargins(0, 0, 0, 0)
+        self.topo_resolved_edit = QLineEdit()
+        self.topo_resolved_edit.setReadOnly(True)
+        self.topo_resolved_edit.setPlaceholderText(
+            "(select Built-in to see the resolved dataset path)")
+        resolved_layout.addWidget(self.topo_resolved_edit)
+        self.topo_fetch_btn = QPushButton("Fetch…")
+        self.topo_fetch_btn.setMaximumWidth(80)
+        self.topo_fetch_btn.setVisible(False)
+        self.topo_fetch_btn.clicked.connect(self._on_topo_fetch)
+        resolved_layout.addWidget(self.topo_fetch_btn)
+        global_layout.addWidget(resolved_container, 3, 1)
+
+        self.add_directory_field(global_layout, 4, "Topographic Directory:", "mesh.topo_directory",
+                                 "Directory containing pre-computed topographic meshes "
+                                 "(enabled in Custom mode)")
 
         global_group.setLayout(global_layout)
         layout.addWidget(global_group)
@@ -938,7 +984,90 @@ class MeshTab(BaseConfigTab):
         has_custom = bool(text.strip())
         self.widgets["mesh.resolution"].setEnabled(not has_custom)
         self.widgets["mesh.use_topographic"].setEnabled(not has_custom)
-        self.widgets["mesh.topo_directory"].setEnabled(not has_custom)
+        if has_custom:
+            self.topo_builtin_radio.setEnabled(False)
+            self.topo_custom_radio.setEnabled(False)
+            self.widgets["mesh.topo_directory"].setEnabled(False)
+        else:
+            self.topo_custom_radio.setEnabled(True)
+            self._apply_topo_source_enabled()
+            # refresh re-applies the body-support gating on the builtin radio
+            self.refresh_builtin_topo()
+
+    # -- topography source (built-in vs custom) ------------------------------
+
+    def _current_body(self):
+        body = self.config_manager.get_value("simulation.body", "") or ""
+        return body[4:] if body.startswith("[H] ") else body
+
+    def _project_root(self):
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        return find_project_root(SimulationRunner.find_ptm_executable())
+
+    def _on_topo_source_toggled(self, _checked):
+        source = "builtin" if self.topo_builtin_radio.isChecked() else "custom"
+        self.config_manager.set_value("mesh.topo_source", source)
+        if source == "builtin":
+            # Canonical relative reference; the engine resolves it through
+            # its PTM_DATA_ROOT contract (portable saved configs).
+            self.widgets["mesh.topo_directory"].setText("data/topo")
+        self._apply_topo_source_enabled()
+        self.refresh_builtin_topo()
+        self.value_changed.emit()
+
+    def _apply_topo_source_enabled(self):
+        builtin = self.topo_builtin_radio.isChecked()
+        self.widgets["mesh.topo_directory"].setEnabled(not builtin)
+
+    def refresh_builtin_topo(self):
+        """Update the read-only resolved-path display (body- and
+        resolution-aware). Called on body change, resolution change, and
+        mode toggle."""
+        from gui_core import datasets
+        body = self._current_body()
+        res = self.widgets["mesh.resolution"].value()
+        root = self._project_root()
+        status = datasets.topo_status(body, res, root)
+        supported = status.state != datasets.STATE_UNSUPPORTED
+
+        self.topo_builtin_radio.setEnabled(
+            supported and self.widgets["mesh.use_topographic"].isEnabled())
+        self.topo_builtin_radio.setToolTip(
+            status.detail if not supported else
+            "Ship-with-PTM3D topography (data/topo), fetched on demand")
+
+        if not self.topo_builtin_radio.isChecked():
+            self.topo_resolved_edit.setText("")
+            self.topo_fetch_btn.setVisible(False)
+            self._topo_status = status
+            return
+        if not supported:
+            self.topo_resolved_edit.setText(f"UNAVAILABLE -- {status.detail}")
+            self.topo_fetch_btn.setVisible(False)
+        elif status.state == datasets.STATE_OK:
+            note = f"  ({status.detail})" if status.detail else ""
+            self.topo_resolved_edit.setText(f"{status.resolved}{note}")
+            self.topo_fetch_btn.setVisible(False)
+        else:
+            tag = ("NOT ON DISK" if status.state == datasets.STATE_MISSING
+                   else "DATALESS (cloud placeholder)")
+            self.topo_resolved_edit.setText(
+                f"{tag}: {status.resolved} -- use Fetch")
+            self.topo_fetch_btn.setVisible(bool(status.dataset))
+        self._topo_status = status
+
+    def _on_topo_fetch(self):
+        from gui_panels.fetch_dialog import FetchDialog
+        status = getattr(self, "_topo_status", None)
+        if not status or not status.dataset:
+            return
+        dlg = FetchDialog(status.dataset, self._project_root(), parent=self)
+        dlg.exec()
+        self.refresh_builtin_topo()
+
+    def on_body_changed(self, _body_name):
+        self.refresh_builtin_topo()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -949,6 +1078,17 @@ class MeshTab(BaseConfigTab):
         self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
         self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
         self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
+
+        source = mesh.get("topo_source", "builtin")
+        self.topo_builtin_radio.blockSignals(True)
+        self.topo_custom_radio.blockSignals(True)
+        self.topo_builtin_radio.setChecked(source == "builtin")
+        self.topo_custom_radio.setChecked(source != "builtin")
+        self.topo_builtin_radio.blockSignals(False)
+        self.topo_custom_radio.blockSignals(False)
+        self._apply_topo_source_enabled()
+        self.refresh_builtin_topo()
+
         # Set initial enabled/disabled state based on custom mesh
         self._on_import_file_changed(mesh.get("import_file", ""))
 
@@ -2906,28 +3046,68 @@ class IlluminationTab(BaseConfigTab):
         layout.addWidget(illum_group)
 
         # Albedo
+        from PyQt6.QtWidgets import QRadioButton, QButtonGroup
+
         albedo_group = QGroupBox("Albedo Configuration")
         albedo_layout = QGridLayout()
         albedo_layout.setColumnStretch(1, 1)
 
-        self.add_bool_field(albedo_layout, 0, "Use Spatially-Varying Albedo Map",
-                            "illumination.use_albedo_map",
-                            "Load a spatially-varying albedo map instead of using the uniform albedo from Properties. "
-                            "When disabled, all faces use the constant albedo set in thermophysical properties.",
-                            info_key="illumination.use_albedo_map")
-        self.add_file_field(albedo_layout, 1, "Albedo Map:", "illumination.albedo_map",
+        src_label = QLabel("Albedo source:")
+        albedo_layout.addWidget(src_label, 0, 0)
+        src_container = QWidget()
+        src_layout = QHBoxLayout(src_container)
+        src_layout.setContentsMargins(0, 0, 0, 0)
+        self.albedo_builtin_radio = QRadioButton("Built-in (recommended)")
+        self.albedo_builtin_radio.setToolTip(
+            "Ship-with-PTM3D Bond-albedo map for the selected body "
+            "(data/albedo_maps/<Body>_Albedo_res<N>.bin, resolved via "
+            "PTM_DATA_ROOT or the repository data directory). Fetched on "
+            "demand if missing.")
+        self.albedo_custom_radio = QRadioButton("Custom path…")
+        self.albedo_custom_radio.setToolTip(
+            "Point at your own albedo map file or directory")
+        self.albedo_none_radio = QRadioButton("None (uniform albedo)")
+        self.albedo_none_radio.setToolTip(
+            "No spatially-varying map: all faces use the constant albedo "
+            "from the Properties tab")
+        self._albedo_src_group = QButtonGroup(src_container)
+        for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
+                   self.albedo_none_radio):
+            self._albedo_src_group.addButton(rb)
+            src_layout.addWidget(rb)
+        src_layout.addStretch()
+        albedo_layout.addWidget(src_container, 0, 1)
+        self.albedo_builtin_radio.toggled.connect(self._on_albedo_source_toggled)
+        self.albedo_none_radio.toggled.connect(self._on_albedo_source_toggled)
+
+        resolved_label = QLabel("Resolves to:")
+        albedo_layout.addWidget(resolved_label, 1, 0)
+        resolved_container = QWidget()
+        resolved_layout = QHBoxLayout(resolved_container)
+        resolved_layout.setContentsMargins(0, 0, 0, 0)
+        self.albedo_resolved_edit = QLineEdit()
+        self.albedo_resolved_edit.setReadOnly(True)
+        self.albedo_resolved_edit.setPlaceholderText(
+            "(select Built-in to see the resolved dataset path)")
+        resolved_layout.addWidget(self.albedo_resolved_edit)
+        self.albedo_fetch_btn = QPushButton("Fetch…")
+        self.albedo_fetch_btn.setMaximumWidth(80)
+        self.albedo_fetch_btn.setVisible(False)
+        self.albedo_fetch_btn.clicked.connect(self._on_albedo_fetch)
+        resolved_layout.addWidget(self.albedo_fetch_btn)
+        albedo_layout.addWidget(resolved_container, 1, 1)
+
+        self.add_file_field(albedo_layout, 2, "Albedo Map:", "illumination.albedo_map",
                             "FITS Files (*.fits *.fit);;All Files (*)",
-                            "Path to single albedo map file",
+                            "Path to single albedo map file (Custom mode)",
                             info_key="illumination.albedo_map")
-        self.add_directory_field(albedo_layout, 2, "Albedo Maps Directory:", "illumination.albedo_maps_directory",
-                                 "Directory containing multiple albedo maps",
+        self.add_directory_field(albedo_layout, 3, "Albedo Maps Directory:", "illumination.albedo_maps_directory",
+                                 "Directory containing multiple albedo maps (Custom mode)",
                                  info_key="illumination.albedo_maps_directory")
 
         albedo_group.setLayout(albedo_layout)
         layout.addWidget(albedo_group)
 
-        # Connect checkbox to enable/disable albedo map fields
-        self.widgets["illumination.use_albedo_map"].toggled.connect(self._on_albedo_map_toggled)
         self._albedo_map_field_keys = ["illumination.albedo_map", "illumination.albedo_maps_directory"]
 
         # Positions
@@ -2946,12 +3126,99 @@ class IlluminationTab(BaseConfigTab):
         layout.addStretch()
         self.create_scroll_area(content)
 
-    def _on_albedo_map_toggled(self, enabled):
-        """Enable/disable albedo map fields based on checkbox state."""
+    # -- albedo source (built-in / custom / none) ----------------------------
+
+    def _current_body(self):
+        body = self.config_manager.get_value("simulation.body", "") or ""
+        return body[4:] if body.startswith("[H] ") else body
+
+    def _project_root(self):
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        return find_project_root(SimulationRunner.find_ptm_executable())
+
+    def _current_source(self):
+        if self.albedo_builtin_radio.isChecked():
+            return "builtin"
+        if self.albedo_none_radio.isChecked():
+            return "none"
+        return "custom"
+
+    def _on_albedo_source_toggled(self, _checked):
+        source = self._current_source()
+        self.config_manager.set_value("illumination.albedo_source", source)
+        self.config_manager.set_value("illumination.use_albedo_map",
+                                      source != "none")
+        if source in ("builtin", "none"):
+            # concrete values are enforced at save time (_config_for_yaml);
+            # mirror them in the widgets so the YAML preview matches
+            dir_value = "data/albedo_maps" if source == "builtin" else ""
+            for key, val in (("illumination.albedo_map", ""),
+                             ("illumination.albedo_maps_directory", dir_value)):
+                w = self.widgets.get(key)
+                if w is not None and w.text() != val:
+                    w.setText(val)
+        self._apply_albedo_source_enabled()
+        self.refresh_builtin_albedo()
+        self.value_changed.emit()
+
+    def _apply_albedo_source_enabled(self):
+        custom = self.albedo_custom_radio.isChecked()
         for key in self._albedo_map_field_keys:
             widget = self.widgets.get(key)
             if widget is not None:
-                widget.setEnabled(enabled)
+                widget.setEnabled(custom)
+
+    def refresh_builtin_albedo(self):
+        """Update the read-only resolved-path display (body- and
+        resolution-aware)."""
+        from gui_core import datasets
+        body = self._current_body()
+        res = self.config_manager.get_value("mesh.resolution", 5)
+        root = self._project_root()
+        status = datasets.albedo_status(body, res, root)
+        supported = status.state != datasets.STATE_UNSUPPORTED
+
+        self.albedo_builtin_radio.setEnabled(supported)
+        self.albedo_builtin_radio.setToolTip(
+            status.detail if not supported else
+            "Ship-with-PTM3D Bond-albedo map for the selected body, "
+            "fetched on demand")
+        # A body without built-in albedo cannot stay in Built-in mode --
+        # fall over to None (uniform albedo) rather than promising a map
+        # that does not exist.
+        if not supported and self.albedo_builtin_radio.isChecked():
+            self.albedo_none_radio.setChecked(True)
+            return  # toggled handler re-enters refresh
+
+        if not self.albedo_builtin_radio.isChecked():
+            self.albedo_resolved_edit.setText("")
+            self.albedo_fetch_btn.setVisible(False)
+            self._albedo_status = status
+            return
+        if status.state == datasets.STATE_OK:
+            note = f"  ({status.detail})" if status.detail else ""
+            self.albedo_resolved_edit.setText(f"{status.resolved}{note}")
+            self.albedo_fetch_btn.setVisible(False)
+        else:
+            tag = ("NOT ON DISK" if status.state == datasets.STATE_MISSING
+                   else "DATALESS (cloud placeholder)")
+            self.albedo_resolved_edit.setText(
+                f"{tag}: {status.resolved} -- use Fetch")
+            self.albedo_fetch_btn.setVisible(bool(status.dataset))
+        self._albedo_status = status
+
+    def _on_albedo_fetch(self):
+        from gui_panels.fetch_dialog import FetchDialog
+        status = getattr(self, "_albedo_status", None)
+        if not status or not status.dataset:
+            return
+        dlg = FetchDialog(status.dataset, self._project_root(), parent=self)
+        dlg.exec()
+        self.refresh_builtin_albedo()
+
+    def on_body_changed(self, _body_name):
+        self.refresh_builtin_albedo()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -2963,11 +3230,18 @@ class IlluminationTab(BaseConfigTab):
         self.widgets["illumination.albedo_maps_directory"].setText(illum["albedo_maps_directory"])
         self.widgets["illumination.positions_file"].setText(illum["positions_file"])
 
-        # Update albedo map field enable state
-        use_map = illum.get("use_albedo_map", True)
-        if "illumination.use_albedo_map" in self.widgets:
-            self.widgets["illumination.use_albedo_map"].setChecked(use_map)
-        self._on_albedo_map_toggled(use_map)
+        source = illum.get("albedo_source", "builtin")
+        for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
+                   self.albedo_none_radio):
+            rb.blockSignals(True)
+        self.albedo_builtin_radio.setChecked(source == "builtin")
+        self.albedo_custom_radio.setChecked(source == "custom")
+        self.albedo_none_radio.setChecked(source == "none")
+        for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
+                   self.albedo_none_radio):
+            rb.blockSignals(False)
+        self._apply_albedo_source_enabled()
+        self.refresh_builtin_albedo()
 
 
 class OutputTab(BaseConfigTab):
@@ -3255,6 +3529,22 @@ class ConfigurationPanel(QWidget):
             self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
                 self.tabs["thermal"].on_body_changed
             )
+            # Built-in dataset displays are body-aware
+            self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
+                self.tabs["mesh"].on_body_changed
+            )
+            self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
+                self.tabs["illumination"].on_body_changed
+            )
+
+        # Built-in dataset displays are resolution-aware: switching the mesh
+        # resolution live-updates the resolved topo/albedo paths.
+        if "mesh.resolution" in self.tabs["mesh"].widgets:
+            res_widget = self.tabs["mesh"].widgets["mesh.resolution"]
+            res_widget.valueChanged.connect(
+                lambda _v: self.tabs["mesh"].refresh_builtin_topo())
+            res_widget.valueChanged.connect(
+                lambda _v: self.tabs["illumination"].refresh_builtin_albedo())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:
@@ -3336,17 +3626,16 @@ class ConfigurationPanel(QWidget):
                 "illumination.include_primary_reflection"
             ].setChecked(False)
 
-        # Clear body-specific albedo maps (would load Europa maps otherwise)
-        self.config_manager.set_value("illumination.albedo_map", "")
-        self.config_manager.set_value("illumination.albedo_maps_directory", "")
-        if "illumination.albedo_map" in self.tabs["illumination"].widgets:
-            self.tabs["illumination"].widgets["illumination.albedo_map"].blockSignals(True)
-            self.tabs["illumination"].widgets["illumination.albedo_map"].setText("")
-            self.tabs["illumination"].widgets["illumination.albedo_map"].blockSignals(False)
-        if "illumination.albedo_maps_directory" in self.tabs["illumination"].widgets:
-            self.tabs["illumination"].widgets["illumination.albedo_maps_directory"].blockSignals(True)
-            self.tabs["illumination"].widgets["illumination.albedo_maps_directory"].setText("")
-            self.tabs["illumination"].widgets["illumination.albedo_maps_directory"].blockSignals(False)
+        # No built-in albedo maps for HORIZONS bodies: switch the albedo
+        # source to None (uniform albedo). The radio handler clears the map
+        # fields and sets use_albedo_map: false consistently.
+        illum_tab = self.tabs["illumination"]
+        if hasattr(illum_tab, "albedo_none_radio"):
+            illum_tab.albedo_none_radio.setChecked(True)
+        else:
+            self.config_manager.set_value("illumination.albedo_source", "none")
+            self.config_manager.set_value("illumination.albedo_map", "")
+            self.config_manager.set_value("illumination.albedo_maps_directory", "")
 
         # Switch back to simulation tab
         sim_idx = self.stacked_widget.indexOf(self.tabs["simulation"])
