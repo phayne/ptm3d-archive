@@ -13,7 +13,11 @@ url: "https://github.com/phayne/ptm3d"
 license: MIT
 version: v1.0-rc1
 date-released: "2026-07-29"
-# doi: 10.5281/zenodo.XXXXXXX   # <- uncomment and fill after the Zenodo deposit
+# doi: 10.5281/zenodo.XXXXXXX   # <- software-deposit DOI slot; fill when the CODE itself is deposited
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21693403"
+    description: "Supporting data for PTM3D (concept DOI; always resolves to the latest data deposit; v1 = 10.5281/zenodo.21693404). Fetched by scripts/fetch_data.py."
 keywords:
   - planetary science
   - thermal model
