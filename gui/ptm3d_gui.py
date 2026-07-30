@@ -715,7 +715,21 @@ class PTM3DMainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_action.setEnabled(False)
         self.progress_bar.setVisible(False)
+        # Drop our reference to the worker thread ONLY after it has fully
+        # terminated. SimulationThread.finished is a custom pyqtSignal
+        # emitted from *inside* run() just before it returns, so this slot
+        # (on_simulation_finished -> reset_simulation_ui) can execute while
+        # the QThread is still winding down. Deallocating the wrapper then
+        # triggers "QThread: Destroyed while thread is still running" and
+        # SIGABRT -- reliably on fast-exiting runs (e.g. topography enabled
+        # but no topography data, where the engine fails loud in <1 s).
+        # wait() returns promptly because run() has essentially completed;
+        # holding `thread` across the wait keeps the wrapper alive until the
+        # OS thread is truly finished, so the later GC is safe.
+        thread = self.simulation_thread
         self.simulation_thread = None
+        if thread is not None:
+            thread.wait()
 
     # === Camera Simulation ===
 
