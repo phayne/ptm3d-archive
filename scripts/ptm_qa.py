@@ -494,6 +494,28 @@ def _hunks(argv, repo):
     return files
 
 
+def _git_path(repo, rel):
+    """Resolve a path inside the REAL git dir, worktree-safe.
+
+    In a linked worktree, `<repo>/.git` is a gitfile (a text file), not a directory,
+    so `os.path.join(repo, ".git", rel)` writes into a "Not a directory" error. Ask git
+    for the actual git dir instead: `git rev-parse --git-path <rel>` returns the correct
+    location for both a normal checkout (`.git/<rel>`) and a worktree
+    (`<main>/.git/worktrees/<name>/<rel>`). Falls back to the naive join only if git is
+    unavailable (not a repo at all), preserving the prior behavior there.
+    """
+    git = "/Library/Developer/CommandLineTools/usr/bin/git"
+    try:
+        out = subprocess.run([git, "rev-parse", "--git-path", rel], cwd=repo,
+                             capture_output=True, text=True, timeout=60)
+        p = out.stdout.strip()
+        if out.returncode == 0 and p:
+            return p if os.path.isabs(p) else os.path.join(repo, p)
+    except Exception:
+        pass
+    return os.path.join(repo, ".git", rel)
+
+
 def cmd_precommit(args):
     """Catch pre-existing edits riding along in your commit.
 
@@ -506,7 +528,7 @@ def cmd_precommit(args):
             precommit --verify       (after `git add`, before `git commit`)
     """
     repo = os.environ.get("PTM", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    snap = args.snapshot_file or os.path.join(repo, ".git", "ptm_precommit_snapshot.json")
+    snap = args.snapshot_file or _git_path(repo, "ptm_precommit_snapshot.json")
 
     if args.snapshot:
         pre = _hunks(["diff", "HEAD", "-U0"], repo)
