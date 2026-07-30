@@ -99,6 +99,13 @@ class ConfigManager:
             "resolution": 5,
             "import_file": "",
             "scale_factor": 1.0,
+            "use_topographic": False,
+            # Built-in topography ships under data/topo (engine appends
+            # <body>/topo_<body>_ico<N>.bin per its search order).
+            "topo_directory": "data/topo",
+            # GUI-synthetic dataset-source mode: "builtin" | "custom".
+            # Stripped at save time; inferred on load (see load_from_yaml).
+            "topo_source": "builtin",
         },
         "thermal": {
             "run_thermal_mesh": True,
@@ -190,8 +197,12 @@ class ConfigManager:
         "illumination": {
             "include_primary_reflection": True,
             "use_batch_processing": True,
+            "use_albedo_map": True,   # engine default: auto-load body maps
             "albedo_map": "",
             "albedo_maps_directory": "data/albedo_maps",
+            # GUI-synthetic dataset-source mode: "builtin" | "custom" | "none".
+            # Stripped at save time; inferred on load (see load_from_yaml).
+            "albedo_source": "builtin",
             "positions_file": ""
         },
         "output": {
@@ -368,6 +379,37 @@ class ConfigManager:
             therm["property_map_kind"] = 0
         self.config["thermal"] = therm
 
+        # Derive the synthetic dataset-source modes from the loaded engine
+        # keys, so existing configs keep their explicit paths (Custom) and
+        # only canonical built-in references select Built-in. No behavior
+        # change for old configs.
+        loaded_mesh = (loaded or {}).get("mesh", {}) or {}
+        mesh_cfg = self.config.get("mesh", {})
+        topo_dir = str(loaded_mesh.get("topo_directory", "") or "")
+        if "topo_directory" not in loaded_mesh or \
+                topo_dir.rstrip("/") in ("", "data/topo"):
+            mesh_cfg["topo_source"] = "builtin"
+            mesh_cfg.setdefault("topo_directory", "data/topo")
+        else:
+            mesh_cfg["topo_source"] = "custom"
+        self.config["mesh"] = mesh_cfg
+
+        loaded_illum = (loaded or {}).get("illumination", {}) or {}
+        illum_cfg = self.config.get("illumination", {})
+        albedo_map = str(loaded_illum.get("albedo_map", "") or "")
+        albedo_dir = str(loaded_illum.get("albedo_maps_directory", "") or "")
+        use_map = loaded_illum.get("use_albedo_map", True)
+        if use_map is False or (
+                "albedo_maps_directory" in loaded_illum
+                and not albedo_dir and not albedo_map):
+            illum_cfg["albedo_source"] = "none"
+        elif albedo_map or (
+                albedo_dir and albedo_dir.rstrip("/") != "data/albedo_maps"):
+            illum_cfg["albedo_source"] = "custom"
+        else:
+            illum_cfg["albedo_source"] = "builtin"
+        self.config["illumination"] = illum_cfg
+
         # Auto-detect custom thermophysical values from loaded YAML
         # If the YAML contains a thermophysical property, set use_default_* to False
         if loaded and "thermophysical" in loaded:
@@ -435,6 +477,37 @@ class ConfigManager:
         generic_active = self.generic_body_active()
         out = {}
         for k, v in self.config.items():
+            if k == "mesh":
+                # Translate the GUI-synthetic topo_source mode into concrete
+                # engine keys, then strip it. Built-in mode writes the
+                # canonical RELATIVE reference (data/topo) so the saved
+                # config stays portable -- the engine resolves it through
+                # its PTM_DATA_ROOT contract on whatever machine runs it.
+                mesh = _dc(v) if isinstance(v, dict) else {}
+                source = mesh.pop("topo_source", "builtin")
+                if source == "builtin":
+                    mesh["topo_directory"] = "data/topo"
+                out[k] = mesh
+                continue
+            if k == "illumination":
+                # Same translation for albedo_source:
+                #   builtin -> use_albedo_map: true, directory data/albedo_maps
+                #   none    -> use_albedo_map: false, both paths cleared
+                #   custom  -> user paths kept as typed
+                illum = _dc(v) if isinstance(v, dict) else {}
+                source = illum.pop("albedo_source", "builtin")
+                if source == "builtin":
+                    illum["use_albedo_map"] = True
+                    illum["albedo_map"] = ""
+                    illum["albedo_maps_directory"] = "data/albedo_maps"
+                elif source == "none":
+                    illum["use_albedo_map"] = False
+                    illum["albedo_map"] = ""
+                    illum["albedo_maps_directory"] = ""
+                else:
+                    illum["use_albedo_map"] = True
+                out[k] = illum
+                continue
             if k == "thermophysical" and not generic_active:
                 # Built-in body: the C++ parser IGNORES plain scalar keys in
                 # this section (albedo, ks, ...); it reads only
