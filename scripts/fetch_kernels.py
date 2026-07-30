@@ -38,8 +38,17 @@ import argparse
 import hashlib
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
+
+# Bounded retry for transient NAIF failures (connect timeout, reset, 5xx).
+# Each retry resumes from the .part left by the previous attempt, and the
+# pinned-sha256 check below is unchanged, so this adds resilience without
+# weakening integrity. A genuine hash mismatch is not transient: it is still
+# reported and still fails after the attempts are exhausted.
+FETCH_RETRIES = 5
+FETCH_RETRY_DELAY = 10  # seconds between attempts
 
 NAIF = "https://naif.jpl.nasa.gov/pub/naif/generic_kernels"
 
@@ -88,7 +97,27 @@ def remote_size(url):
         return int(cl) if cl is not None else None
 
 
-def download(url, dest, expected_sha=None):
+def download(url, dest, expected_sha=None,
+             retries=FETCH_RETRIES, delay=FETCH_RETRY_DELAY):
+    """Download url -> dest with bounded retry on transient network failure.
+
+    Wraps _download_once, which already resumes from a .part file, so each
+    retry continues where the last left off rather than starting over. The
+    pinned-sha256 verification inside _download_once is untouched; a corrupt
+    or changed file still fails, just after the retries are exhausted.
+    """
+    for attempt in range(1, retries + 1):
+        if _download_once(url, dest, expected_sha):
+            return True
+        if attempt < retries:
+            print(f"  retry {attempt}/{retries - 1} in {delay}s "
+                  f"(transient failure fetching {url})")
+            time.sleep(delay)
+    print(f"  giving up on {url} after {retries} attempts.")
+    return False
+
+
+def _download_once(url, dest, expected_sha=None):
     """Download url -> dest with .part resume. Returns True on success."""
     part = dest + ".part"
     try:
