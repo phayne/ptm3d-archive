@@ -635,11 +635,36 @@ bool runThermalModelsForAllFacesBatchSoA(
 // Planet::getAlbedoWithIncidence() (thermal_model.cpp:579-589), replicated
 // here because the GPU flux build runs host-side per-timestep and cannot
 // call a Planet method inside the hot OpenMP loop cheaply. Guaranteed in
-// [0,1] for w in [0,1], mu0 in [0,1]. A0 is unused in the Hapke branch (the
-// gate derives w so A_h(mu0=1) == body A0 already; see the bisection at the
-// config gate). Returns A0 for the unilluminated / normal-incidence cases,
-// which matches both the CPU reference (calculateAbsorbedFlux) and the
-// A_h(mu0=1)==A0 construction.
+// [0,1] for w in [0,1], mu0 in [0,1].
+//
+// PTM-29 fix (2026-07-30): the Hapke branch is now CONTINUOUS at cos_theta>=1,
+// matching the CPU reference Planet::getAlbedoWithIncidence (thermal_model.cpp:
+// 579-589), which clamps mu0 to [0,1] and ALWAYS evaluates A_h in the Hapke
+// branch. The old `cos_theta>=1 -> return A0` short-circuit returned the
+// PER-FACE A0, but A_h(mu0->1) is anchored to the BODY-average A0 by the
+// config-gate w — so for any face whose local albedo != the body A0 it was a
+// step discontinuity. PTM-28 Fix A pushed cos_theta to 1.00002 at the diurnal
+// insolation peak, firing that branch for exactly one output step per cycle and
+// spiking the absorbed flux (measured +70 W/m^2 on a dark face) into the
+// multi-K noon notch the GPU flux path showed but the CPU never did. Evaluating
+// A_h at mu0=1 removes the discontinuity and makes the GPU flux albedo match the
+// CPU reference. Hayne branch is already continuous there (theta=0 -> A0), so it
+// is unchanged. PTM_LEGACY_ALBEDO_NORMAL_A0=1 restores the old short-circuit for
+// byte-identity regression against the pre-fix baseline.
+static inline bool legacyAlbedoNormalA0() {
+    static bool legacy = []() {
+        const char* e = std::getenv("PTM_LEGACY_ALBEDO_NORMAL_A0");
+        bool on = (e && std::string(e) != "0" && e[0] != '\0');
+        if (on) {
+            std::cerr << "[Thermal] PTM_LEGACY_ALBEDO_NORMAL_A0=1: Hapke incidence "
+                         "albedo returns per-face A0 at cos_theta>=1 (pre-PTM-29 "
+                         "discontinuity restored)\n";
+        }
+        return on;
+    }();
+    return legacy;
+}
+
 static inline double applyIncidenceAlbedo(double A0,
                                           double direct_flux,
                                           double solar_constant,
@@ -649,19 +674,25 @@ static inline double applyIncidenceAlbedo(double A0,
                                           double hapke_w = -1.0) {
     if (solar_constant <= 0.0 || direct_flux <= 0.0) return A0;
     double cos_theta = direct_flux / solar_constant;
-    if (cos_theta >= 1.0) return A0;
-    if (cos_theta <  0.0) cos_theta = 0.0;
     if (use_hapke && hapke_w >= 0.0) {
         // Analytic directional-hemispheric albedo A_h(mu0) = 1 - gamma*H(mu0,w).
+        // PTM-29: clamp mu0 to [0,1] and evaluate A_h here for ALL cos_theta
+        // (continuous with the CPU reference). The legacy escape hatch restores
+        // the old per-face-A0 short-circuit at cos_theta>=1.
+        if (legacyAlbedoNormalA0() && cos_theta >= 1.0) return A0;
+        double mu0 = cos_theta;
+        if (mu0 > 1.0) mu0 = 1.0;
+        if (mu0 < 0.0) mu0 = 0.0;
         const double w     = std::max(0.0, std::min(1.0, hapke_w));
         const double gamma = std::sqrt(std::max(0.0, 1.0 - w));
-        const double mu0   = cos_theta;  // already clamped to [0,1)
         const double H     = (1.0 + 2.0 * mu0) / (1.0 + 2.0 * mu0 * gamma);
         double A_h = 1.0 - gamma * H;
         if (A_h < 0.0) A_h = 0.0;
         if (A_h > 1.0) A_h = 1.0;
         return A_h;
     }
+    if (cos_theta >= 1.0) return A0;
+    if (cos_theta <  0.0) cos_theta = 0.0;
     const double theta = std::acos(cos_theta);
     const double t45 = theta / (M_PI / 4.0);
     const double t90 = theta / (M_PI / 2.0);
