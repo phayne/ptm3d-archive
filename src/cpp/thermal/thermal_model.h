@@ -394,6 +394,17 @@ public:
     // and a, b are coefficients from albedoCoef[0], albedoCoef[1]
     // If using_albedo_map is true, returns the map value unchanged (no angle correction)
     double getAlbedoWithIncidence(double lon, double lat, double incidence_angle) const;
+
+    // Per-face variant: A0 supplied directly (bypasses the internal spatial-map
+    // lookup), same angular model. Lets the CPU mesh flux path compose the
+    // incidence albedo on each face's own Bond albedo A0.
+    double getAlbedoWithIncidence(double A0, double incidence_angle) const;
+
+private:
+    // Shared angular model used by both getAlbedoWithIncidence overloads.
+    double albedoWithIncidenceFromA0(double A0, double incidence_angle) const;
+
+public:
 };
 
 // Profile class
