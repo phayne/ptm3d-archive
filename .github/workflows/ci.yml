@@ -69,26 +69,49 @@ jobs:
           brew update
           brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
 
-      - name: Fetch CSPICE (NAIF)
+      # Cache the extracted CSPICE toolkit so a warm run restores it and NEVER
+      # hits NAIF. Keyed on OS + arch + a bumpable version string: bump `-v1`
+      # (e.g. when NAIF ships a new toolkit) to invalidate every cache entry.
+      - name: Cache CSPICE toolkit
+        id: cache-cspice
+        uses: actions/cache@v4
+        with:
+          path: ~/cspice_install
+          key: cspice-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Fetch CSPICE (NAIF, on cache miss)
         run: |
           set -e
           mkdir -p "$HOME/cspice_install"
           cd "$HOME/cspice_install"
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z"
-          elif [ "$(uname -m)" = "arm64" ]; then
-            # macos-latest is Apple Silicon (arm64). The x86_64 AppleC package
-            # links fine at configure (find_library only stats the file) but its
-            # static libcspice.a is x86_64 and will NOT link into an arm64 binary.
-            URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacM1_OSX_clang_64bit/packages/cspice.tar.Z"
+          # Only touch NAIF if the cache did not already restore the static lib.
+          if [ ! -f cspice/lib/libcspice.a ]; then
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z"
+            elif [ "$(uname -m)" = "arm64" ]; then
+              # macos-latest is Apple Silicon (arm64). The x86_64 AppleC package
+              # links fine at configure (find_library only stats the file) but its
+              # static libcspice.a is x86_64 and will NOT link into an arm64 binary.
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacM1_OSX_clang_64bit/packages/cspice.tar.Z"
+            else
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacIntel_OSX_AppleC_64bit/packages/cspice.tar.Z"
+            fi
+            # Retry transient NAIF failures (the curl(28) connect-timeout that
+            # flaked this job, plus resets/5xx mid-transfer). Plain --retry does
+            # NOT cover a bare connect timeout; --retry-all-errors is what makes
+            # exit-28 retryable. It needs curl >= 7.71 — GitHub's ubuntu-latest
+            # and macos-latest runners ship curl >= 8, so the flag is present.
+            curl --retry 5 --retry-all-errors --retry-delay 10 \
+                 --connect-timeout 30 --max-time 600 -sSL "$URL" -o cspice.tar.Z
+            gzip -d cspice.tar.Z
+            tar xf cspice.tar
+            # NAIF ships lib/cspice.a; CMake's find_library wants libcspice.a.
+            if [ -f cspice/lib/cspice.a ]; then cp cspice/lib/cspice.a cspice/lib/libcspice.a; fi
           else
-            URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacIntel_OSX_AppleC_64bit/packages/cspice.tar.Z"
+            echo "CSPICE restored from cache — skipping NAIF download."
           fi
-          curl -sSL "$URL" -o cspice.tar.Z
-          gzip -d cspice.tar.Z
-          tar xf cspice.tar
-          # NAIF ships lib/cspice.a; CMake's find_library wants libcspice.a.
-          if [ -f cspice/lib/cspice.a ]; then cp cspice/lib/cspice.a cspice/lib/libcspice.a; fi
+          # Export CSPICE_ROOT on BOTH the cache-hit and cache-miss paths (this
+          # line is outside the download guard, so it runs on every invocation).
           echo "CSPICE_ROOT=$HOME/cspice_install/cspice" >> "$GITHUB_ENV"
 
       # --- Configure + build the portable CPU core ---------------------------
