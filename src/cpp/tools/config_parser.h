@@ -75,6 +75,14 @@ struct SimulationConfig {
         size_t gpu_batch_size = 0;
         int    gpu_inter_batch_pause_ms = 0;
 
+        // Phase R (auto-calibrate): default ON. When true and no matching host
+        // machine profile exists, the GPU solver probes THIS run's grid inline
+        // (once) to inject a representative dispatch self-chunk ceiling before the
+        // main solve. false (or env PTM_NO_AUTO_CALIBRATE, or an explicit
+        // PTM_MAX_TIMESTEPS_PER_DISPATCH) restores the profile/conservative path.
+        // Numerically inert: affects dispatch batching only, never physics.
+        bool auto_calibrate_gpu = true;
+
         // Per-face thermal property map: a per-face binary float32 array (one
         // value per mesh face, in face-index order) overriding the body-default
         // H-parameter (or, equivalently, the depth-weighted thermal inertia).

@@ -48,6 +48,10 @@ int main() {
         p.overhead_per_batch_s = 43.6;
         p.n_layers_probe = 50;
         p.batch_size_probe = 8000;
+        p.dz_min_probe = 5.0e-4;
+        p.dt_output_probe_s = 3600.0;
+        p.kappa_probe = 3.03e-9;
+        p.is_run_grid = 1;
         p.host = "TestHost.local";
         p.device_name = "Synthetic GPU";
         p.created_utc = "2026-07-21T05:00:00Z";
@@ -62,8 +66,47 @@ int main() {
         CHECK(approx(q.kernel_ms_per_step_per_batch, 0.0539), "round-trip kernel cost");
         CHECK(approx(q.overhead_per_batch_s, 43.6), "round-trip overhead");
         CHECK(q.n_layers_probe == 50, "round-trip n_layers_probe");
+        CHECK(approx(q.dz_min_probe, 5.0e-4), "round-trip dz_min_probe (v2)");
+        CHECK(approx(q.dt_output_probe_s, 3600.0), "round-trip dt_output_probe_s (v2)");
+        CHECK(approx(q.kappa_probe, 3.03e-9), "round-trip kappa_probe (v2)");
+        CHECK(q.is_run_grid == 1, "round-trip is_run_grid (v2)");
         CHECK(q.host == "TestHost.local", "round-trip host string");
         CHECK(q.device_name == "Synthetic GPU", "round-trip device string");
+    }
+
+    // 2b. gridMatchesProfile: the reuse/re-calibrate decision (auto-calibrate).
+    {
+        MachineProfile s;                 // a representative stored profile
+        s.n_layers_probe    = 50;
+        s.batch_size_probe  = 8000;
+        s.dz_min_probe      = 5.0e-4;     // S = dt*kappa/dz^2 = 3600*3.0e-9/2.5e-7 = 43.2
+        s.dt_output_probe_s = 3600.0;
+        s.kappa_probe       = 3.0e-9;
+        s.is_run_grid       = 1;
+        std::string why;
+
+        // Exact grid => match.
+        CHECK(gridMatchesProfile(50, 5.0e-4, 3600.0, 3.0e-9, 8000, s, why),
+              "gridMatchesProfile: exact grid matches");
+        // S within +20% (dt 3600->4320) => still a match (tolerance is 25%).
+        CHECK(gridMatchesProfile(50, 5.0e-4, 4320.0, 3.0e-9, 8000, s, why),
+              "gridMatchesProfile: S +20% within tolerance matches");
+        // S +50% (dt 3600->5400) => mismatch.
+        CHECK(!gridMatchesProfile(50, 5.0e-4, 5400.0, 3.0e-9, 8000, s, why),
+              "gridMatchesProfile: S +50% is a mismatch");
+        // n_layers differs => mismatch (must be exact).
+        CHECK(!gridMatchesProfile(48, 5.0e-4, 3600.0, 3.0e-9, 8000, s, why),
+              "gridMatchesProfile: n_layers mismatch");
+        // batch differs > 2x => mismatch.
+        CHECK(!gridMatchesProfile(50, 5.0e-4, 3600.0, 3.0e-9, 20000, s, why),
+              "gridMatchesProfile: batch >2x is a mismatch");
+        // batch within 2x => match (16000 = 2x of 8000, at the boundary).
+        CHECK(gridMatchesProfile(50, 5.0e-4, 3600.0, 3.0e-9, 16000, s, why),
+              "gridMatchesProfile: batch 2x within tolerance matches");
+        // A pre-v2 profile (no grid provenance) never matches => safe re-calibrate.
+        MachineProfile old = s; old.is_run_grid = 0; old.dz_min_probe = 0.0;
+        CHECK(!gridMatchesProfile(50, 5.0e-4, 3600.0, 3.0e-9, 8000, old, why),
+              "gridMatchesProfile: pre-v2 profile never matches (safe re-calibrate)");
     }
 
     // 3. Missing file => load fails; load-or-default returns conservative default.

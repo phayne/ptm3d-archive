@@ -3358,6 +3358,457 @@ bool addThermalDataToVTK(
 
 // ========== GPU PERSISTENT THERMAL SOLVER ==========
 #ifdef PTM_GPU_OPENCL
+
+// ============================================================================
+// Phase R (auto-calibrate): representative, in-run GPU dispatch calibration.
+//
+// The dispatch self-chunk ceiling (max_timesteps_per_dispatch) is a WEDGE knob,
+// not a physics knob: it only bounds how many timesteps one clEnqueueNDRangeKernel
+// runs before a host clFinish, and enqueuePersistentSelfChunked keeps that split
+// NUMERICALLY INERT (same CN updates, same order). A conservative default is safe
+// but slow; a hand-run `--calibrate-gpu` on a generic grid is fast but can be
+// non-representative (F3). The auto path below probes THIS run's actual grid and
+// thermophysical props right before the main solve, injects the measured ceiling
+// in-process (setDispatchCeilingOverride, which the consumer honors ahead of its
+// static cache), and caches it grid-keyed so alternating bodies/resolutions do
+// not re-probe every run. Default ON; opt out with PTM_NO_AUTO_CALIBRATE or
+// config auto_calibrate_gpu:false; PTM_MAX_TIMESTEPS_PER_DISPATCH always wins.
+// ============================================================================
+
+// Restore std::cout's format flags/precision on scope exit. The GPU thermal path
+// leaves std::cout in std::fixed + setprecision(1) (the two-phase dt banner), which
+// would otherwise round the calibration's small grid numbers (dz_min~1e-3 m,
+// kappa~1e-9) to "0.0" in the log. Setting defaultfloat + precision(6) for the
+// duration of a calibration log keeps the printed values honest.
+struct CoutFmtGuard {
+    std::ios::fmtflags f;
+    std::streamsize    p;
+    CoutFmtGuard() : f(std::cout.flags()), p(std::cout.precision()) {
+        std::cout << std::defaultfloat << std::setprecision(6);
+    }
+    ~CoutFmtGuard() { std::cout.flags(f); std::cout.precision(p); }
+};
+
+// Probe description passed to calibrateGpuCore. The manual --calibrate-gpu path
+// synthesizes a generic grid (is_run_grid=false); the auto path fills it from the
+// LOADED run's actual grid + near-surface props (is_run_grid=true), which is what
+// makes the ceiling representative and stops the F3 clamp from firing.
+struct CalibrationProbe {
+    std::vector<float> z_grid;        // actual depth grid z(nl) [m], z_grid[0]=0
+    int    n_layers      = 0;
+    int    batch         = 0;         // faces per single dispatch (per-device load)
+    double dt_output_s   = 0.0;       // worst-case dt the run will pass to the kernel
+    double kc            = 0.0;       // near-surface conductivity [W/m/K]
+    double rho           = 0.0;       // near-surface density [kg/m^3]
+    double cp0           = 0.0;       // BASE heat capacity [J/kg/K] (may be 0 when
+                                      // cp is fully given by cp_coeffs, e.g. Moon)
+    std::vector<float> cp_coeffs;     // cp(T) polynomial coeffs (production kernel)
+    double R350          = 2.7f;      // radiative-conductivity coeff (Hayne 2017)
+    double cp_eff        = 0.0;       // effective near-surface cp for the kappa
+                                      // signature (caller evaluates cp(T_rep));
+                                      // must be > 0 (never divide kappa by 0)
+    double emissivity    = 0.95;
+    double T_deep        = 100.0;     // deep boundary temp [K] (probe only)
+    double T_initial     = 120.0;     // uniform initial temp [K] (probe only)
+    double ceiling_s     = 25.0;      // safe per-dispatch wall budget
+    double safety_factor = 4.0;       // F3 clamp (generic path only)
+    int    probe_steps_1 = 30;
+    int    probe_steps_2 = 120;
+    double probe_budget_s = 15.0;     // wedge guard: abort if 30-step wall exceeds this
+    bool   is_run_grid   = false;     // true relaxes the F3 4x clamp -> INFO
+};
+
+// Measure this host's safe dispatch ceiling for the given probe, filling `out`.
+// Runs the SAME validated persistent-kernel path a production solve uses, so the
+// timing reflects real dispatch cost. Return codes: 0 ok; 2 bad params; 3 OpenCL
+// init fail; 4 non-positive slope (probe too noisy); 6 budget abort (grid too
+// slow to probe safely). NUMERICALLY INERT: nothing here changes a production
+// computed value — it only measures wall time and sets a dispatch-batching ceiling.
+static int calibrateGpuCore(const CalibrationProbe& pr, gpu::MachineProfile& out) {
+    using namespace gpu::opencl;
+    CoutFmtGuard _cout_fmt;   // honest small-number logging; restored on return
+    if (pr.batch < 1 || pr.n_layers < 2 || pr.ceiling_s <= 0.0 ||
+        pr.dt_output_s <= 0.0 || pr.probe_steps_1 < 1 ||
+        pr.probe_steps_2 <= pr.probe_steps_1 || pr.safety_factor <= 0.0 ||
+        static_cast<int>(pr.z_grid.size()) != pr.n_layers ||
+        pr.kc <= 0.0 || pr.rho <= 0.0 || pr.cp_eff <= 0.0 ||
+        (pr.cp0 <= 0.0 && pr.cp_coeffs.empty())) {
+        std::cerr << "[calibrate-gpu] invalid probe parameters (need batch>=1, "
+                     "n_layers>=2 == z_grid size, ceiling>0, dt>0, "
+                     "0<steps1<steps2, safety>0, kc/rho/cp_eff>0, and cp0>0 OR "
+                     "cp_coeffs non-empty)\n";
+        return 2;
+    }
+
+    const size_t nf = static_cast<size_t>(pr.batch);
+    const size_t nl = static_cast<size_t>(pr.n_layers);
+
+    ThermalOpenCLConfig cfg;
+    ThermalOpenCLSolver solver(nf, nl, cfg);
+    if (!solver.initialize()) {
+        std::cerr << "[calibrate-gpu] OpenCL init FAILED — cannot profile this "
+                     "host (no usable GPU). No profile written.\n";
+        return 3;
+    }
+
+    std::vector<float> rho(nl * nf, static_cast<float>(pr.rho));
+    std::vector<float> kc(nl * nf, static_cast<float>(pr.kc));
+    std::vector<float> emissivity(nf, static_cast<float>(pr.emissivity));
+    std::vector<float> T_deep(nf, static_cast<float>(pr.T_deep));
+    std::vector<float> Qb(nf, 0.0f);
+    std::vector<float> T_initial(nl * nf, static_cast<float>(pr.T_initial));
+    std::vector<float> out_temps;
+
+    solver.uploadMeshData(pr.z_grid, rho, kc, emissivity, T_deep, Qb);
+    // Mirror the production kernel's heat-capacity model: base cp0 + cp(T)
+    // polynomial + R350, so the probe's per-step substep count is representative.
+    solver.setMaterialParams(static_cast<float>(pr.cp0), pr.cp_coeffs,
+                             static_cast<float>(pr.R350));
+
+    // Two-point regression: wall(P) ~= overhead + P * per_step. Two point counts
+    // separate the fixed per-dispatch overhead (INTERCEPT) from the per-timestep
+    // kernel cost (SLOPE). The slope is transfer-inclusive and thus conservative
+    // (safe) for the ceiling.
+    auto run_probe = [&](int steps) -> double {
+        solver.uploadInitialTemperature(T_initial);   // same start state each time
+        std::vector<float> flux(static_cast<size_t>(steps) * nf, 5.0f);  // faint cold flux
+        auto w0 = std::chrono::high_resolution_clock::now();
+        solver.solvePersistentAllTimesteps(flux, out_temps, steps,
+                                           static_cast<float>(pr.dt_output_s));
+        auto w1 = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
+    };
+
+    double wall1 = run_probe(pr.probe_steps_1);
+    // Wedge budget guard: if the SMALL point already blew the budget, the LARGE
+    // point (~4x steps) would be far worse — abort before running it.
+    if (wall1 > pr.probe_budget_s) {
+        std::cerr << "[calibrate-gpu] WARNING: probe budget exceeded ("
+                  << pr.probe_steps_1 << "-step wall " << wall1 << "s > "
+                  << pr.probe_budget_s << "s budget); aborting the probe to avoid a "
+                     "slow/wedge-prone launch. Falling back to the conservative "
+                     "ceiling.\n";
+        return 6;
+    }
+    double wall2 = run_probe(pr.probe_steps_2);
+
+    double per_step_s = (wall2 - wall1) /
+                        static_cast<double>(pr.probe_steps_2 - pr.probe_steps_1);
+    if (per_step_s <= 0.0) {
+        std::cerr << "[calibrate-gpu] non-positive per-step slope (wall1=" << wall1
+                  << "s wall2=" << wall2 << "s); probe too noisy/small — refusing "
+                     "to write a bogus profile. Increase --probe-steps-2.\n";
+        return 4;
+    }
+    double overhead_per_batch_s = std::max(0.0, wall1 - pr.probe_steps_1 * per_step_s);
+    double per_step_ms = per_step_s * 1000.0;
+
+    // Ceiling: keep ONE dispatch under safe_ceiling_s of PURE stepping time.
+    long max_ts_raw   = static_cast<long>(pr.ceiling_s / per_step_s);
+    int  conservative = gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+    int  max_ts = 0;
+    long cap = 0;
+    if (pr.is_run_grid) {
+        // Representative grid: max_ts_raw already keeps ONE dispatch under
+        // ceiling_s for THIS grid — that IS the binding safety bound, so the 4x
+        // clamp is redundant. Keep only a LOOSE absolute sanity cap to catch a
+        // degenerate (near-zero-slope) measurement, and log at INFO (F3 must not
+        // fire on a representative grid — that is the acceptance criterion).
+        constexpr long kAbsSanityCap = 50000;
+        cap = kAbsSanityCap;
+        max_ts = static_cast<int>(std::min<long>(max_ts_raw, cap));
+        if (max_ts < 1) max_ts = 1;
+        if (max_ts_raw > cap) {
+            std::cout << "[calibrate-gpu] INFO: representative-grid ceiling "
+                      << max_ts_raw << " exceeds the absolute sanity cap " << cap
+                      << " — clamping (measurement may be degenerate).\n";
+        } else {
+            std::cout << "[calibrate-gpu] INFO (F3): representative grid — ceiling "
+                      << max_ts << " keeps one dispatch under " << pr.ceiling_s
+                      << " s; 4x clamp not applied.\n";
+        }
+    } else {
+        // Generic/synthetic probe grid: cannot be trusted to represent
+        // production, so keep the conservative 4x clamp + loud WARNING.
+        cap = static_cast<long>(pr.safety_factor * conservative);
+        max_ts = static_cast<int>(std::min<long>(max_ts_raw, cap));
+        if (max_ts < 1) max_ts = 1;
+        if (max_ts_raw > cap) {
+            std::cerr << "[calibrate-gpu] WARNING (F3): calibrated ceiling "
+                      << max_ts_raw << " timesteps/dispatch is >> " << pr.safety_factor
+                      << "x the conservative default (" << conservative << "); this "
+                         "often means the probe grid is NOT representative of your "
+                         "production run (too-coarse near-surface dz => too-few "
+                         "substeps). CLAMPING to " << cap << ". Re-probe with --dz0 / "
+                         "--n-layers / --dt-output-s matched to your production config, "
+                         "or use the automatic in-run calibration.\n";
+        }
+    }
+
+    out = gpu::MachineProfile();
+    out.valid                        = true;
+    out.safe_dispatch_ceiling_s      = pr.ceiling_s;
+    out.max_timesteps_per_dispatch   = max_ts;
+    out.recommended_batch_size       = pr.batch;
+    out.kernel_ms_per_step_per_batch = per_step_ms;
+    out.overhead_per_batch_s         = overhead_per_batch_s;
+    out.n_layers_probe               = pr.n_layers;
+    out.batch_size_probe             = pr.batch;
+    double dz_min = 0.0;
+    for (size_t i = 1; i < pr.z_grid.size(); ++i) {
+        double d = static_cast<double>(pr.z_grid[i]) - static_cast<double>(pr.z_grid[i - 1]);
+        if (d > 0.0 && (dz_min == 0.0 || d < dz_min)) dz_min = d;
+    }
+    out.dz_min_probe                 = dz_min;
+    out.dt_output_probe_s            = pr.dt_output_s;
+    out.kappa_probe                  = pr.kc / (pr.rho * pr.cp_eff);
+    out.is_run_grid                  = pr.is_run_grid ? 1 : 0;
+    {
+        char hn[256] = {0};
+        if (gethostname(hn, sizeof(hn) - 1) == 0) out.host = hn;
+        out.device_name = solver.getDeviceInfo().name;
+        std::time_t t = std::time(nullptr);
+        char ts[32] = {0};
+        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+        out.created_utc = ts;
+    }
+
+    std::cout << "[calibrate-gpu] two-point: wall(" << pr.probe_steps_1 << ")=" << wall1
+              << "s wall(" << pr.probe_steps_2 << ")=" << wall2 << "s => per-step="
+              << per_step_ms << " ms, overhead=" << overhead_per_batch_s
+              << " s/dispatch\n";
+    std::cout << "[calibrate-gpu] => max_timesteps_per_dispatch=" << max_ts
+              << " (raw " << max_ts_raw << ", cap " << cap << ", keeps one dispatch "
+              << "under " << pr.ceiling_s << " s of stepping)\n";
+    return 0;
+}
+
+// Ensure THIS run's grid has a representative dispatch ceiling injected before
+// the main GPU solve. Idempotent per process/grid. Reaching this code implies
+// use_gpu==true, so "GPU requested" holds by construction. Never throws; never
+// crashes the run — on any failure it fails LOUD and leaves the conservative
+// ceiling in force. See the module header above for the policy.
+static void ensureGpuCalibrated(const thermal::Config& config,
+                                const thermal::Planet& planet,
+                                const thermal::Profile& reference_profile,
+                                size_t batch, double dt_worst_s) {
+    using namespace gpu::opencl;
+    CoutFmtGuard _cout_fmt;   // honest small-number logging; restored on return
+
+    // (1) Operator's explicit ceiling always wins — skip auto entirely; the
+    //     static consumer path honors PTM_MAX_TIMESTEPS_PER_DISPATCH with its
+    //     own log line.
+    if (const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH")) {
+        if (e[0] != '\0') return;
+    }
+
+    // Grid signature from the LIVE run.
+    const auto& z      = reference_profile.z();
+    const auto& kc_ref = reference_profile.kc();
+    const auto& rho_ref = reference_profile.rho();
+    const auto& T_ref  = reference_profile.T();
+    if (z.size() < 2 || kc_ref.empty() || rho_ref.empty()) {
+        std::cerr << "[auto-calibrate] WARNING: reference grid is empty/degenerate; "
+                     "skipping auto-calibration (conservative ceiling in force).\n";
+        return;
+    }
+    const int    n_layers = static_cast<int>(z.size());
+    const double kc0 = kc_ref[0], rho0 = rho_ref[0];
+    // Effective near-surface heat capacity. planet.cp0 is only the BASE term and
+    // is 0 for bodies whose cp is a cp(T) polynomial (e.g. the Moon), so evaluate
+    // the real cp(T) at a representative near-surface temperature. This drives the
+    // stability ratio S in the grid signature; the probe itself uses the full
+    // cp0 + cp_coeffs model below so its per-step substep count is representative.
+    const double T_rep = (!T_ref.empty() && T_ref[0] > 0.0) ? T_ref[0] : 250.0;
+    // cp(T) = cp0 + T*(c0 + T*(c1 + ...)) via Horner — the SAME evaluation the GPU
+    // kernel's compute_cp uses (thermal_opencl.cpp) and thermal_model.cpp's
+    // representative estimate.
+    double cp_eff = planet.cp0;
+    if (!planet.cpCoeff.empty()) {
+        double result = planet.cpCoeff.back();
+        for (int j = static_cast<int>(planet.cpCoeff.size()) - 2; j >= 0; --j)
+            result = result * T_rep + planet.cpCoeff[j];
+        cp_eff = planet.cp0 + T_rep * result;
+    }
+    if (cp_eff <= 0.0) cp_eff = (planet.cp0 > 0.0) ? planet.cp0 : 600.0;
+    if (kc0 <= 0.0 || rho0 <= 0.0 || cp_eff <= 0.0 || dt_worst_s <= 0.0) {
+        std::cerr << "[auto-calibrate] WARNING: non-positive grid property (kc0="
+                  << kc0 << ", rho0=" << rho0 << ", cp_eff=" << cp_eff << ", dt="
+                  << dt_worst_s << "); skipping auto-calibration (conservative "
+                     "ceiling in force).\n";
+        return;
+    }
+    double dz_min = 0.0;
+    for (int i = 1; i < n_layers; ++i) {
+        double d = static_cast<double>(z[i]) - static_cast<double>(z[i - 1]);
+        if (d > 0.0 && (dz_min == 0.0 || d < dz_min)) dz_min = d;
+    }
+    if (dz_min <= 0.0) {
+        std::cerr << "[auto-calibrate] WARNING: non-increasing depth grid "
+                     "(dz_min<=0); skipping auto-calibration (conservative "
+                     "ceiling in force).\n";
+        return;
+    }
+    const double kappa  = kc0 / (rho0 * cp_eff);
+    const int    ibatch = static_cast<int>(batch);
+
+    // (2) Opt-out: env or config. Restore today's exact behavior (the static
+    //     profile/conservative consumer path, banner and all).
+    bool opted_out = false;
+    if (const char* e = std::getenv("PTM_NO_AUTO_CALIBRATE")) {
+        if (e[0] != '\0') opted_out = true;
+    }
+    if (!config.getPropertyBool("auto_calibrate_gpu", true)) opted_out = true;
+    if (opted_out) {
+        std::cout << "[auto-calibrate] disabled (opt-out); using host machine "
+                     "profile or conservative default for the dispatch ceiling.\n";
+        return;
+    }
+
+    // (3) In-process idempotency: once calibrated for THIS grid this process,
+    //     reuse the already-set override (the selective-rethermal solve benefits
+    //     without a redundant probe). Key on the grid only — batch is excluded so
+    //     a smaller-batch rethermal reuses the larger-batch ceiling (safe:
+    //     per-step cost is ~flat above GPU saturation, so a bigger-batch ceiling
+    //     is conservative for a smaller batch).
+    static std::string g_calibrated_key;
+    char keybuf[160];
+    std::snprintf(keybuf, sizeof(keybuf), "nl%d_dz%.4e_dt%.2f_k%.4e",
+                  n_layers, dz_min, dt_worst_s, kappa);
+    const std::string key = keybuf;
+    if (g_calibrated_key == key) return;
+
+    const int cons = gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+
+    // Reuse a matching profile: inject its ceiling in-process and mark this grid
+    // done. Shared by every no-re-probe path below (explicit / default / sidecar).
+    auto reuse_profile = [&](int max_ts, const std::string& how) {
+        std::cout << "[auto-calibrate] reusing " << how << ": ceiling " << max_ts
+                  << " timesteps/dispatch.\n";
+        setDispatchCeilingOverride(max_ts);
+        g_calibrated_key = key;
+    };
+
+    // (4) Explicit hand-tuned profile (PTM_MACHINE_PROFILE): authoritative.
+    const char* explicit_profile = std::getenv("PTM_MACHINE_PROFILE");
+    const bool  has_explicit = explicit_profile && explicit_profile[0] != '\0';
+    if (has_explicit) {
+        gpu::MachineProfile hp;
+        if (gpu::loadMachineProfile(hp, explicit_profile)) {
+            std::string reason;
+            if (gpu::gridMatchesProfile(n_layers, dz_min, dt_worst_s, kappa, ibatch,
+                                        hp, reason)) {
+                reuse_profile(hp.max_timesteps_per_dispatch,
+                              "explicit PTM_MACHINE_PROFILE (grid matches)");
+                return;
+            }
+            // Present but mismatched: DO NOT overwrite a hand-tuned file.
+            std::cerr << "[auto-calibrate] WARNING: explicit PTM_MACHINE_PROFILE "
+                         "grid mismatch (" << reason << "); NOT overwriting a "
+                         "hand-tuned profile. Using the conservative ceiling "
+                      << cons << " timesteps/dispatch for safety.\n";
+            setDispatchCeilingOverride(cons);
+            g_calibrated_key = key;
+            return;
+        }
+        // Explicit path set but missing/corrupt: fall through and CREATE it.
+    }
+
+    // (5a) Default/host profile: reuse if it is a representative match.
+    {
+        gpu::MachineProfile dp;
+        std::string reason;
+        if (gpu::loadMachineProfile(dp, "") &&
+            gpu::gridMatchesProfile(n_layers, dz_min, dt_worst_s, kappa, ibatch,
+                                    dp, reason)) {
+            reuse_profile(dp.max_timesteps_per_dispatch,
+                          "host profile for this grid (no re-probe)");
+            return;
+        }
+    }
+    // (5b) Sidecar cache: reuse a prior probe for a matching grid (no re-probe).
+    {
+        gpu::MachineProfile cpf;
+        std::string matched;
+        if (gpu::loadMatchingCachedProfile(n_layers, dz_min, dt_worst_s, kappa,
+                                           ibatch, cpf, matched)) {
+            reuse_profile(cpf.max_timesteps_per_dispatch,
+                          "cached host profile for this grid (no re-probe) [" +
+                              matched + "]");
+            return;
+        }
+    }
+
+    // (6) No usable/matching profile -> calibrate this run's grid in-process.
+    //     Pre-seed the override to the conservative ceiling BEFORE the probe:
+    //     this (a) suppresses the alarming loadMachineProfileOrDefault stderr
+    //     banner the static cache would otherwise emit when the probe dispatches,
+    //     and (b) governs the probe's own launches at the safe conservative
+    //     ceiling.
+    setDispatchCeilingOverride(cons);
+
+    std::cout << "[auto-calibrate] no matching host profile; measuring this run's "
+                 "grid (n_layers=" << n_layers << ", dz_min=" << dz_min
+              << " m, dt=" << dt_worst_s << " s, kappa=" << kappa
+              << " m^2/s, batch=" << ibatch << ") before the main solve ...\n";
+
+    CalibrationProbe pr;
+    pr.z_grid.resize(n_layers);
+    for (int i = 0; i < n_layers; ++i) pr.z_grid[i] = static_cast<float>(z[i]);
+    pr.n_layers   = n_layers;
+    pr.batch      = ibatch;
+    pr.dt_output_s = dt_worst_s;
+    pr.kc = kc0; pr.rho = rho0;
+    pr.cp0 = planet.cp0;             // base term (may be 0 for cp(T) bodies)
+    pr.cp_coeffs.assign(planet.cpCoeff.begin(), planet.cpCoeff.end());
+    pr.R350 = reference_profile.R350_val;
+    pr.cp_eff = cp_eff;              // effective cp used for the S signature
+    pr.emissivity = (planet.emissivity > 0.0) ? planet.emissivity : 0.95;
+    pr.ceiling_s  = 25.0;             // documented survivable per-dispatch window
+    pr.is_run_grid = true;
+    pr.probe_budget_s = 15.0;
+
+    gpu::MachineProfile out;
+    int rc = 4;
+    try {
+        rc = calibrateGpuCore(pr, out);
+    } catch (const std::exception& ex) {
+        std::cerr << "[auto-calibrate] WARNING: probe threw (" << ex.what()
+                  << "); using conservative ceiling " << cons << ".\n";
+        rc = 7;
+    } catch (...) {
+        std::cerr << "[auto-calibrate] WARNING: probe threw; using conservative "
+                     "ceiling " << cons << ".\n";
+        rc = 7;
+    }
+
+    if (rc != 0) {
+        std::cerr << "[auto-calibrate] WARNING: calibration failed (rc=" << rc
+                  << "); the run continues with the conservative ceiling " << cons
+                  << " timesteps/dispatch (slower, but safe).\n";
+        g_calibrated_key = key;   // leave override at the conservative value
+        return;
+    }
+
+    // Success: inject the representative ceiling in-process and persist it.
+    setDispatchCeilingOverride(out.max_timesteps_per_dispatch);
+    g_calibrated_key = key;
+
+    std::string cache_file = gpu::calibCacheFileForGrid(n_layers, dz_min,
+                                                        dt_worst_s, kappa, ibatch);
+    bool saved_cache = !cache_file.empty() && gpu::saveMachineProfile(out, cache_file);
+    std::string default_path = has_explicit ? std::string(explicit_profile)
+                                            : std::string("");
+    bool saved_default = gpu::saveMachineProfile(out, default_path);
+
+    std::cout << "[auto-calibrate] representative ceiling = "
+              << out.max_timesteps_per_dispatch << " timesteps/dispatch (per-step "
+              << out.kernel_ms_per_step_per_batch << " ms, keeps one dispatch under "
+              << out.safe_dispatch_ceiling_s << " s)"
+              << (saved_cache ? "" : " [cache write skipped]")
+              << (saved_default ? "" : " [profile write skipped]") << "\n";
+}
+
 /**
  * @brief GPU-accelerated thermal solver using persistent kernel
  *
@@ -3549,6 +4000,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     std::cout << "[GPU Thermal] Using batch size: " << BATCH_SIZE
               << " (n_layers=" << n_layers << ")" << std::endl;
+
+    // Phase R (auto-calibrate): inject a representative dispatch ceiling for THIS
+    // run's grid before the main solve. Bind on the WORST-CASE (largest) dt the
+    // run will pass to the persistent kernel (more substeps => slower step =>
+    // smaller, safer ceiling). No-op / cheap cache-hit when already calibrated,
+    // opted out, or an env ceiling is set. Numerically inert (batching only).
+    ensureGpuCalibrated(config, planet, reference_profile, BATCH_SIZE,
+                        static_cast<double>(std::max(eq_dt, out_dt)));
 
     // Prepare face albedos - handle custom meshes (FITS interpolation) vs standard icospheres (binary files)
     std::vector<double> face_albedos(n_faces, default_visible_albedo);
@@ -4931,6 +5390,14 @@ bool runThermalForSelectedFaces_GPU(
         }
         BATCH_SIZE = std::min(BATCH_SIZE, cap);
     }
+
+    // Phase R (auto-calibrate): ensure a representative dispatch ceiling is in
+    // force for the selective re-thermal solve too. In a coupled run the main
+    // solve above has already calibrated this grid, so the grid-keyed idempotency
+    // guard makes this a cheap no-op (no redundant probe); a standalone re-thermal
+    // self-calibrates. Numerically inert (batching only).
+    ensureGpuCalibrated(config, planet, reference_profile, BATCH_SIZE,
+                        static_cast<double>(std::max(eq_dt, out_dt)));
 
     // Get reference material properties
     const auto& rho_ref = reference_profile.rho();
@@ -8172,15 +8639,15 @@ void printBanner() {
 // ============================================================================
 #ifdef PTM_GPU_OPENCL
 static int runGpuCalibration(int argc, char** argv) {
-    using namespace gpu::opencl;
-
     // Fermi F3: the probe MUST be production-representative or the ceiling is
     // unsafe. The kernel's von-Neumann substep count (Fo<0.49) is set by the
     // MINIMUM near-surface dz and kappa at the OUTPUT dt: a uniform 1 cm grid
     // @250 K yields ~2 substeps/step, but production cold-PSR fine grids hit
     // 29-200x -- so a ceiling calibrated on a coarse grid could run ~100x
     // longer in production and WEDGE. Defaults below are lunar-cold-PSR-ish
-    // (0.5 mm first layer, geometric grid, low TI props, hourly dt).
+    // (0.5 mm first layer, geometric grid, low TI props, hourly dt). For a
+    // guaranteed-representative ceiling, prefer the automatic in-run calibration
+    // (default ON) which probes the LOADED run's own grid instead of these.
     int    batch_size    = 8000;
     int    n_layers      = 50;
     double ceiling_s     = 25.0;
@@ -8226,110 +8693,36 @@ static int runGpuCalibration(int argc, char** argv) {
               << grid_ratio << " dt=" << dt_output_s << " s (kc=" << kc_probe
               << " rho=" << rho_probe << " cp0=" << cp0_probe << ")\n";
 
-    ThermalOpenCLConfig cfg;
-    ThermalOpenCLSolver solver(static_cast<size_t>(batch_size),
-                               static_cast<size_t>(n_layers), cfg);
-    if (!solver.initialize()) {
-        std::cerr << "[calibrate-gpu] OpenCL init FAILED — cannot profile this "
-                     "host (no usable GPU). No profile written.\n";
-        return 3;
-    }
-
-    const size_t nf = static_cast<size_t>(batch_size);
-    const size_t nl = static_cast<size_t>(n_layers);
-
-    // Geometric near-surface grid (drives realistic substep counts).
-    std::vector<float> z_grid(nl);
-    z_grid[0] = 0.0f;
-    double dz = dz0;
-    for (size_t i = 1; i < nl; ++i) {
-        z_grid[i] = z_grid[i - 1] + static_cast<float>(dz);
-        dz *= grid_ratio;
-    }
-    std::vector<float> rho(nl * nf, static_cast<float>(rho_probe));
-    std::vector<float> kc(nl * nf, static_cast<float>(kc_probe));
-    std::vector<float> emissivity(nf, 0.95f);
-    std::vector<float> T_deep(nf, 100.0f);        // cold-PSR-ish deep temperature
-    std::vector<float> Qb(nf, 0.0f);
-    std::vector<float> cp_coeffs;                 // none: cp = cp0
-    std::vector<float> T_initial(nl * nf, 120.0f);
-    std::vector<float> out_temps;
-
-    solver.uploadMeshData(z_grid, rho, kc, emissivity, T_deep, Qb);
-    solver.setMaterialParams(static_cast<float>(cp0_probe), cp_coeffs, /*R350=*/2.7f);
-
-    // Two-point regression (F4): wall(P) ~= overhead + P * per_step. Running two
-    // point counts separates the fixed per-dispatch overhead (setup + H2D/D2H
-    // transfers, the INTERCEPT) from the per-timestep kernel cost (the SLOPE).
-    // getLastKernelTimeMs returns whole-call wall (incl. transfers), so a single
-    // point would attribute ~0 overhead and give a too-large ceiling; the slope
-    // from two points is transfer-inclusive and thus conservative (safe) for the
-    // ceiling, while the intercept gives the runner a REAL overhead for its ETA.
-    auto run_probe = [&](int steps) -> double {
-        solver.uploadInitialTemperature(T_initial);   // same start state each time
-        std::vector<float> flux(static_cast<size_t>(steps) * nf, 5.0f);  // faint cold flux
-        auto w0 = std::chrono::high_resolution_clock::now();
-        solver.solvePersistentAllTimesteps(flux, out_temps, steps,
-                                           static_cast<float>(dt_output_s));
-        auto w1 = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration_cast<std::chrono::duration<double>>(w1 - w0).count();
-    };
-    double wall1 = run_probe(probe_steps_1);
-    double wall2 = run_probe(probe_steps_2);
-
-    double per_step_s = (wall2 - wall1) / static_cast<double>(probe_steps_2 - probe_steps_1);
-    if (per_step_s <= 0.0) {
-        std::cerr << "[calibrate-gpu] non-positive per-step slope (wall1=" << wall1
-                  << "s wall2=" << wall2 << "s); probe too noisy/small — refusing "
-                     "to write a bogus profile. Increase --probe-steps-2.\n";
-        return 4;
-    }
-    double overhead_per_batch_s = std::max(0.0, wall1 - probe_steps_1 * per_step_s);
-    double per_step_ms = per_step_s * 1000.0;
-
-    // Ceiling (F3): keep ONE dispatch under safe_ceiling_s of PURE stepping time.
-    long   max_ts_raw = static_cast<long>(ceiling_s / per_step_s);
-    int    conservative = gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
-    long   cap = static_cast<long>(safety_factor * conservative);
-    int    max_ts = static_cast<int>(std::min<long>(max_ts_raw, cap));
-    if (max_ts < 1) max_ts = 1;
-    if (max_ts_raw > cap) {
-        std::cerr << "[calibrate-gpu] WARNING (F3): calibrated ceiling "
-                  << max_ts_raw << " timesteps/dispatch is >> " << safety_factor
-                  << "x the conservative default (" << conservative << "); this "
-                     "often means the probe grid is NOT representative of your "
-                     "production run (too-coarse near-surface dz => too-few "
-                     "substeps). CLAMPING to " << cap << ". Re-probe with --dz0 / "
-                     "--n-layers / --dt-output-s matched to your production config, "
-                     "or raise --safety-factor deliberately.\n";
+    // Build the manual probe: synthesized geometric grid, is_run_grid=false (keeps
+    // the conservative 4x F3 clamp). No wedge budget guard on the manual path —
+    // the operator explicitly asked to probe — so keep prior behavior.
+    CalibrationProbe pr;
+    pr.n_layers    = n_layers;
+    pr.batch       = batch_size;
+    pr.dt_output_s = dt_output_s;
+    pr.kc = kc_probe; pr.rho = rho_probe; pr.cp0 = cp0_probe;
+    pr.cp_eff = cp0_probe;           // constant cp (no polynomial) on the manual path
+    pr.R350 = 2.7;                   // cp_coeffs left empty
+    pr.emissivity  = 0.95;
+    pr.ceiling_s   = ceiling_s;
+    pr.safety_factor = safety_factor;
+    pr.probe_steps_1 = probe_steps_1;
+    pr.probe_steps_2 = probe_steps_2;
+    pr.is_run_grid = false;
+    pr.probe_budget_s = 1e300;      // effectively no budget guard for manual probe
+    pr.z_grid.resize(static_cast<size_t>(n_layers));
+    pr.z_grid[0] = 0.0f;
+    {
+        double dz = dz0;
+        for (int i = 1; i < n_layers; ++i) {
+            pr.z_grid[i] = pr.z_grid[i - 1] + static_cast<float>(dz);
+            dz *= grid_ratio;
+        }
     }
 
     gpu::MachineProfile p;
-    p.valid                        = true;
-    p.safe_dispatch_ceiling_s      = ceiling_s;
-    p.max_timesteps_per_dispatch   = max_ts;
-    p.recommended_batch_size       = batch_size;
-    p.kernel_ms_per_step_per_batch = per_step_ms;
-    p.overhead_per_batch_s         = overhead_per_batch_s;
-    p.n_layers_probe               = n_layers;
-    p.batch_size_probe             = batch_size;
-    {
-        char hn[256] = {0};
-        if (gethostname(hn, sizeof(hn) - 1) == 0) p.host = hn;
-        p.device_name = solver.getDeviceInfo().name;
-        std::time_t t = std::time(nullptr);
-        char ts[32] = {0};
-        std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-        p.created_utc = ts;
-    }
-
-    std::cout << "[calibrate-gpu] two-point: wall(" << probe_steps_1 << ")=" << wall1
-              << "s wall(" << probe_steps_2 << ")=" << wall2 << "s => per-step="
-              << per_step_ms << " ms, overhead=" << overhead_per_batch_s
-              << " s/dispatch\n";
-    std::cout << "[calibrate-gpu] => max_timesteps_per_dispatch=" << max_ts
-              << " (raw " << max_ts_raw << ", cap " << cap << ", keeps one dispatch "
-              << "under " << ceiling_s << " s of stepping)\n";
+    int rc = calibrateGpuCore(pr, p);
+    if (rc != 0) return rc;
 
     if (!gpu::saveMachineProfile(p, profile_out)) {
         std::cerr << "[calibrate-gpu] FAILED to write profile.\n";
@@ -10471,6 +10864,10 @@ int main(int argc, char** argv) {
         // Add albedo maps directory to config properties
         thermal_config.setProperty("albedo_maps_directory", albedo_maps_directory);
         thermal_config.setProperty("use_albedo_map", std::string(use_albedo_map ? "1" : "0"));
+        // Phase R (auto-calibrate): forward the opt-out so the GPU solvers can read
+        // it via getPropertyBool. Default true (on); PTM_NO_AUTO_CALIBRATE also opts
+        // out at the solver.
+        thermal_config.setProperty("auto_calibrate_gpu", sim_config.thermal.auto_calibrate_gpu);
 
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {
