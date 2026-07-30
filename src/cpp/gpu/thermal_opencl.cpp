@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
 
 namespace gpu {
 namespace opencl {
@@ -45,10 +46,33 @@ namespace opencl {
 static constexpr int kArgNTimesteps = 20;  // int n_timesteps
 static constexpr int kArgTOffset    = 25;  // int t_offset (Phase R, R2 — last arg)
 
-// The self-chunking ceiling: loaded once from the per-host machine profile
-// (R1), or a conservative default if none exists, with an env override for
-// ops/testing. Fail-loud: the source of the ceiling is announced once.
+// In-process override of the self-chunk ceiling, set by the auto-calibrate path
+// (ptm_thermal_sim.cpp ensureGpuCalibrated) via setDispatchCeilingOverride().
+// Checked BEFORE the static cache so the probe's own dispatch — which latches a
+// conservative value into `cached` below — cannot defeat the calibrated ceiling.
+// -1 = unset. Atomic: the value is written from the (single-threaded) calibrate
+// helper and read from the solver worker threads.
+static std::atomic<int> g_dispatch_ceiling_override{-1};
+
+void setDispatchCeilingOverride(int max_timesteps_per_dispatch) {
+    // The operator's explicit ceiling always wins; never override it.
+    if (const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH")) {
+        if (e[0] != '\0') return;
+    }
+    g_dispatch_ceiling_override.store(
+        max_timesteps_per_dispatch > 0 ? max_timesteps_per_dispatch : -1,
+        std::memory_order_relaxed);
+}
+
+// The self-chunking ceiling: an in-process override (auto-calibrate) wins first;
+// otherwise loaded once from the per-host machine profile (R1), or a
+// conservative default if none exists, with an env override for ops/testing.
+// Fail-loud: the source of the ceiling is announced once.
 static int gpuMaxTimestepsPerDispatch() {
+    // Auto-calibrate override (silent here — ensureGpuCalibrated does the INFO
+    // logging so the ceiling's provenance is announced exactly once, on stdout).
+    int ov = g_dispatch_ceiling_override.load(std::memory_order_relaxed);
+    if (ov > 0) return ov;
     static int cached = []() -> int {
         if (const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH")) {
             try {

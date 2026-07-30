@@ -184,6 +184,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             }
             config.thermal.gpu_inter_batch_pause_ms = getWithDefault(
                 thermal, "gpu_inter_batch_pause_ms", config.thermal.gpu_inter_batch_pause_ms);
+            config.thermal.auto_calibrate_gpu = getWithDefault(
+                thermal, "auto_calibrate_gpu", config.thermal.auto_calibrate_gpu);
             config.thermal.thermal_inertia_map = getWithDefault(thermal, "thermal_inertia_map", config.thermal.thermal_inertia_map);
             config.thermal.h_parameter_map = getWithDefault(thermal, "h_parameter_map", config.thermal.h_parameter_map);
             config.thermal.use_default_property_map = getWithDefault(thermal, "use_default_property_map", config.thermal.use_default_property_map);
@@ -555,6 +557,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.thermal.gpu_inter_batch_pause_ms != 0)
             out << YAML::Key << "gpu_inter_batch_pause_ms" << YAML::Value
                 << config.thermal.gpu_inter_batch_pause_ms;
+        if (!config.thermal.auto_calibrate_gpu)   // default true → emit only when opted out
+            out << YAML::Key << "auto_calibrate_gpu" << YAML::Value
+                << config.thermal.auto_calibrate_gpu;
         if (!config.thermal.thermal_inertia_map.empty())
             out << YAML::Key << "thermal_inertia_map" << YAML::Value << config.thermal.thermal_inertia_map;
         if (!config.thermal.h_parameter_map.empty())

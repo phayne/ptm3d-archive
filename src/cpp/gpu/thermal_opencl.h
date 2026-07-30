@@ -281,6 +281,22 @@ private:
 std::string getEmbeddedKernelSource();
 
 /**
+ * @brief In-process override of the per-dispatch self-chunk ceiling.
+ *
+ * The consumer gpuMaxTimestepsPerDispatch() (thermal_opencl.cpp) honors a
+ * positive override set here BEFORE consulting its static env/profile cache.
+ * This lets the in-run auto-calibration inject the ceiling it measured for the
+ * loaded run's grid without a disk round-trip — necessary because the probe
+ * itself dispatches the persistent kernel, which would otherwise latch a
+ * conservative ceiling into that static cache and defeat the calibrated value.
+ *
+ * A non-positive @p max_timesteps_per_dispatch clears the override. This is a
+ * no-op when PTM_MAX_TIMESTEPS_PER_DISPATCH is set in the environment — the
+ * operator's explicit ceiling always wins. Thread-safe (atomic).
+ */
+void setDispatchCeilingOverride(int max_timesteps_per_dispatch);
+
+/**
  * @brief Check if OpenCL is available on this system
  */
 bool isOpenCLAvailable();
