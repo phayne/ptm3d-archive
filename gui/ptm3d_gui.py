@@ -633,6 +633,7 @@ class PTM3DMainWindow(QMainWindow):
                 config_dict=config_dict
             )
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
+            self.simulation_thread.warning_ready.connect(self.on_simulation_warning)
             self.simulation_thread.error_ready.connect(self.on_simulation_error)
             self.simulation_thread.progress_update.connect(self.on_simulation_progress)
             self.simulation_thread.heartbeat.connect(self.on_simulation_heartbeat)
@@ -665,11 +666,15 @@ class PTM3DMainWindow(QMainWindow):
             self.simulation_thread.stop()
 
     def on_simulation_output(self, text):
-        """Handle simulation stdout"""
+        """Handle an informational simulation line"""
         self.console_panel.append_output(text)
 
+    def on_simulation_warning(self, text):
+        """Handle a warning line (e.g. machine-profile conservative defaults)"""
+        self.console_panel.append_warning(text)
+
     def on_simulation_error(self, text):
-        """Handle simulation stderr"""
+        """Handle a genuine-error line"""
         self.console_panel.append_error(text)
 
     def on_simulation_progress(self, percent):

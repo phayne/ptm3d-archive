@@ -179,6 +179,9 @@ class ThermalModule(AbstractModule):
         self._sim_thread.output_ready.connect(
             lambda t: self._console.append_output(f"[THERMAL] {t}")
         )
+        self._sim_thread.warning_ready.connect(
+            lambda t: self._console.append_warning(f"[THERMAL] {t}")
+        )
         self._sim_thread.error_ready.connect(
             lambda t: self._console.append_error(f"[THERMAL] {t}")
         )

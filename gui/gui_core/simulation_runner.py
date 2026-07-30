@@ -19,8 +19,9 @@ from gui_core.preflight import build_engine_env, find_project_root
 class SimulationThread(QThread):
     """Thread for running PTM simulations without blocking GUI"""
 
-    output_ready = pyqtSignal(str)
-    error_ready = pyqtSignal(str)
+    output_ready = pyqtSignal(str)    # info  (white)
+    warning_ready = pyqtSignal(str)   # warn  (yellow)
+    error_ready = pyqtSignal(str)     # error (red) -- genuine failures only
     progress_update = pyqtSignal(float)
     # Stall watchdog: (message, stalled). Emitted every WATCHDOG_INTERVAL_S
     # while the child's CPU clock is not advancing (blocked on file I/O --
@@ -28,6 +29,32 @@ class SimulationThread(QThread):
     # progress resumes. Lets the GUI distinguish "computing" from "hung".
     heartbeat = pyqtSignal(str, bool)
     finished = pyqtSignal(int)  # Exit code
+
+    # --- Severity classification -------------------------------------------
+    # The engine writes many INFORMATIONAL and WARNING banners to stderr
+    # ([eq-seed] equilibration seed..., [machine-profile] ...CONSERVATIVE
+    # defaults, [GPU Thermal] dispatch self-chunk ceiling..., progress). A
+    # successful run therefore emits stderr lines that are NOT errors, so
+    # routing purely by "came from stderr" mislabels a good run as failed.
+    # Classify by CONTENT/severity instead, on both streams.
+    #
+    # Genuine-failure signatures (red) are kept narrow so normal banners are
+    # never shown as errors; a real failure also carries a non-zero exit
+    # code, which the GUI surfaces red independently.
+    _ERROR_RE = re.compile(
+        r'(?<![A-Za-z])(?:FATAL|ERROR)\s*:'          # "ERROR:" / "FATAL:"
+        r'|traceback \(most recent call last\)'
+        r'|segmentation fault|abort trap|bus error|core dumped'
+        r'|terminate called|what\(\):|std::bad_alloc|std::runtime_error'
+        r'|uncaught exception|assertion failed'
+        r'|simulation failed',
+        re.IGNORECASE)
+    _WARN_RE = re.compile(
+        r'(?<![A-Za-z])warn(?:ing)?\b'               # "WARNING" / "warn:"
+        r'|conservative defaults|no usable gpu profile'
+        r'|falling back|fall back to|fallback|deprecat'
+        r'|spice error|spice\(',                     # engine SPICE diagnostics
+        re.IGNORECASE)
 
     WATCHDOG_INTERVAL_S = 30.0   # child cputime sampling cadence
     STALL_CPU_DELTA_S = 0.5      # < this much CPU advance per interval = stalled
@@ -137,12 +164,10 @@ class SimulationThread(QThread):
                     if progress is not None:
                         self.progress_update.emit(progress)
 
-                    # Route output
-                    if is_stderr and self._is_progress_line(decoded):
-                        self.output_ready.emit(decoded)
-                    else:
-                        signal = self.error_ready if is_stderr else self.output_ready
-                        signal.emit(decoded)
+                    # Route by severity/content, NOT by stream (see class
+                    # docstring): the engine emits info/warning banners on
+                    # stderr during successful runs.
+                    self._emit_classified(decoded)
 
                 buf.clear()
                 buf.extend(remainder)
@@ -201,13 +226,14 @@ class SimulationThread(QThread):
                         stderr_buffer.extend(data)
                         drain_buffer(stderr_buffer, is_stderr=True)
 
-            # Emit remaining content
+            # Emit remaining content (classified, so a genuine error in the
+            # final chunk still surfaces red).
             for buf, is_stderr in [(stdout_buffer, False), (stderr_buffer, True)]:
                 if buf:
                     try:
                         tail = buf.decode('utf-8', errors='replace').strip()
                         if tail:
-                            self.output_ready.emit(tail)
+                            self._emit_classified(tail)
                     except Exception:
                         pass
 
@@ -278,8 +304,35 @@ class SimulationThread(QThread):
         except (ValueError, IndexError):
             return None
 
+    def classify_severity(self, text):
+        """Classify a single output line as 'error' | 'warning' | 'info'
+        by its CONTENT (works for stdout and stderr alike). Genuine failure
+        signatures -> error (red); explicit warnings and known
+        conservative-fallback banners -> warning (yellow); everything else,
+        including the engine's [eq-seed]/[machine-profile]/[GPU Thermal]
+        banners and progress lines -> info (white)."""
+        if self._ERROR_RE.search(text):
+            return "error"
+        if self._WARN_RE.search(text):
+            return "warning"
+        return "info"
+
+    # Back-compat alias (kept private-style for internal callers/tests).
+    _classify_severity = classify_severity
+
+    def _emit_classified(self, text):
+        sev = self.classify_severity(text)
+        if sev == "error":
+            self.error_ready.emit(text)
+        elif sev == "warning":
+            self.warning_ready.emit(text)
+        else:
+            self.output_ready.emit(text)
+
     def _is_progress_line(self, text):
-        """Check if line is a progress/info update (not an error)"""
+        """Check if line is a progress/info update (not an error).
+
+        Retained for reference; routing now goes through classify_severity."""
         tl = text.lower()
 
         # Progress bars with percentages
