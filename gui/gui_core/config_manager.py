@@ -93,7 +93,10 @@ class ConfigManager:
             "start_time": "2025-01-01T00:00:00",
             "duration_days": 3.55,
             "timesteps": 144,
-            "body": "Europa"
+            # Default body is Moon: the best-validated built-in body (Diviner),
+            # and the least surprising starting point for a new project. A
+            # first-launch picker (ptm3d_gui.py) lets the user choose explicitly.
+            "body": "Moon"
         },
         "mesh": {
             "resolution": 5,
@@ -262,17 +265,21 @@ class ConfigManager:
     }
 
     PRESETS = {
-        "europa_quick": {
-            "simulation": {"body": "Europa", "duration_days": 0.5, "timesteps": 24},
+        # Generic (body-agnostic) presets: they layer on top of the default
+        # body, so a "quick" or "highres" run follows whatever body is the
+        # current default (Moon) rather than hardcoding one. Renamed from the
+        # old europa_quick / europa_highres.
+        "quick": {
+            "simulation": {"duration_days": 0.5, "timesteps": 24},
             "mesh": {"resolution": 4},
             "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
             "output": {"directory": "output/quick_test", "vtk_mode": "thermal"}
         },
-        "europa_highres": {
-            "simulation": {"body": "Europa", "duration_days": 3.55, "timesteps": 144},
+        "highres": {
+            "simulation": {"duration_days": 3.55, "timesteps": 144},
             "mesh": {"resolution": 7},
             "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/europa_high_res"},
+            "output": {"directory": "output/highres"},
             "advanced": {"verbose": True}
         },
         "moon_thermal": {

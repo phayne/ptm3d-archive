@@ -57,6 +57,10 @@ class PTM3DMainWindow(QMainWindow):
         self.apply_style()
         self.restore_window_state()
 
+        # On first launch, ask for the target body once the event loop is up so
+        # the default (Moon) is an explicit choice, not a silent one.
+        QTimer.singleShot(0, self._maybe_show_body_picker)
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("PTM3D - Planetary Thermophysical Model")
@@ -121,11 +125,12 @@ class PTM3DMainWindow(QMainWindow):
         self.results_panel = ResultsPanel()
         self.left_tabs.addTab(self.results_panel, "Results Browser")
 
-        # Camera Simulation Panel
+        # Camera Simulation Panel — an advanced tool, hidden by default. It is
+        # created here so its wiring (console, run/stop) is in place, but the
+        # tab is only added when the user enables it via View > Show Camera Tool.
         self.camera_panel = CameraPanel(
             config_manager=self.config_manager,
             console_panel=getattr(self, 'console_panel', None))
-        self.left_tabs.addTab(self.camera_panel, "Camera")
         self.camera_panel.run_requested.connect(self._launch_camera_sim)
         self.camera_panel.stop_requested.connect(self._stop_camera_sim)
         self.camera_sim_thread = None
@@ -133,6 +138,45 @@ class PTM3DMainWindow(QMainWindow):
         layout.addWidget(self.left_tabs)
 
         return left_widget
+
+    def set_camera_tab_visible(self, visible):
+        """Show or hide the (advanced) Camera tool tab. The panel widget is
+        kept alive either way; only its presence in the tab bar changes."""
+        idx = self.left_tabs.indexOf(self.camera_panel)
+        if visible and idx < 0:
+            self.left_tabs.addTab(self.camera_panel, "Camera")
+        elif not visible and idx >= 0:
+            self.left_tabs.removeTab(idx)
+
+    def _maybe_show_body_picker(self):
+        """On first launch only, prompt for the target body so the default
+        (Moon) is an explicit choice rather than a silent one. Selecting the
+        body drives the Simulation-tab combo, which updates every body-aware
+        tab exactly as a manual selection would. Shown once, tracked in
+        QSettings; choosing Cancel keeps the current default."""
+        if self.settings.value("bodyPickerShown", False, type=bool):
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        from gui_panels.config_panel import SimulationTab
+        bodies = list(SimulationTab.BUILTIN_BODIES)
+        current = self.config_manager.get_value("simulation.body", "Moon")
+        default_idx = bodies.index(current) if current in bodies else 0
+        body, ok = QInputDialog.getItem(
+            self, "Select target body",
+            "Choose the planetary body for this project.\n"
+            "You can change it any time on the Simulation tab.",
+            bodies, default_idx, False)
+        # Mark as shown regardless of choice so it never nags again.
+        self.settings.setValue("bodyPickerShown", True)
+        if ok and body:
+            combo = self.config_panel.tabs["simulation"].widgets.get(
+                "simulation.body")
+            if combo is not None:
+                # setCurrentText fires the normal change signals -> updates the
+                # config and every body-aware tab.
+                combo.setCurrentText(body)
+            else:
+                self.config_manager.set_value("simulation.body", body)
 
     def create_right_panel(self):
         """Create the right panel with visualization"""
@@ -237,6 +281,15 @@ class PTM3DMainWindow(QMainWindow):
         toggle_console_action.setShortcut(QKeySequence("Ctrl+`"))
         toggle_console_action.triggered.connect(self.toggle_console)
         view_menu.addAction(toggle_console_action)
+
+        view_menu.addSeparator()
+
+        # Advanced tools: the Camera simulator tab is hidden by default.
+        self.show_camera_action = QAction("Show &Camera Tool", self)
+        self.show_camera_action.setCheckable(True)
+        self.show_camera_action.setChecked(False)
+        self.show_camera_action.toggled.connect(self.set_camera_tab_visible)
+        view_menu.addAction(self.show_camera_action)
 
         view_menu.addSeparator()
 
@@ -588,18 +641,31 @@ class PTM3DMainWindow(QMainWindow):
             )
             return
 
-        # Need to save config first
+        # Auto-save so the run never blocks on a forced "save before running"
+        # dialog. If the project has no file yet, write it into the output
+        # directory as config.yaml, with every path absolutized against the
+        # project root (save_run_yaml) so paths resolve regardless of where the
+        # YAML lives. If a project file is already open, save in place. The
+        # manual Save button still uses save_to_yaml (relative paths), so this
+        # does NOT change what a hand-saved project YAML looks like.
+        config_dict = self.config_manager.get_config()
         if not self.current_project_file:
-            reply = QMessageBox.question(
-                self, "Save Required",
-                "Please save the project before running the simulation.",
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel
-            )
-            if reply == QMessageBox.StandardButton.Save:
-                self.save_project_as()
-                if not self.current_project_file:
-                    return
-            else:
+            from gui_core.preflight import find_project_root, resolve_path
+            exe = SimulationRunner.find_ptm_executable()
+            root = find_project_root(exe) if exe else Path.cwd()
+            output_dir = resolve_path(config_dict["output"]["directory"], root)
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                auto_path = str(output_dir / "config.yaml")
+                self.config_manager.save_run_yaml(auto_path, root)
+                self.current_project_file = auto_path
+                self.unsaved_changes = False
+                self.update_window_title()
+                self.add_recent_file(auto_path)
+                self.console_panel.append_info(f"Auto-saved project to: {auto_path}")
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error", f"Failed to auto-save project:\n{str(e)}")
                 return
         else:
             # Save current state
@@ -610,7 +676,6 @@ class PTM3DMainWindow(QMainWindow):
         # face-count guard, executable fingerprint. A config that fails
         # pre-flight would previously hang or crash mid-run with no
         # diagnosis (e.g. an OneDrive topo_directory of evicted files).
-        config_dict = self.config_manager.get_config()
         report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
         for line in report.summary_lines():
             self.console_panel.append_info(f"[preflight] {line}")

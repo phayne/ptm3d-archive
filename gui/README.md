@@ -165,7 +165,7 @@ simulation:
   start_time: "2030-04-10T00:00:00"
   duration_days: 3.55
   timesteps: 144
-  body: Europa
+  body: Moon
 
 mesh:
   resolution: 5
