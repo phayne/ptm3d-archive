@@ -642,34 +642,36 @@ class PTM3DMainWindow(QMainWindow):
             return
 
         # Auto-save so the run never blocks on a forced "save before running"
-        # dialog. If the project has no file yet, write it into the output
-        # directory as config.yaml, with every path absolutized against the
-        # project root (save_run_yaml) so paths resolve regardless of where the
-        # YAML lives. If a project file is already open, save in place. The
-        # manual Save button still uses save_to_yaml (relative paths), so this
-        # does NOT change what a hand-saved project YAML looks like.
+        # dialog. If a project file is already open, save in place and run it
+        # as-is (unchanged behavior). If there is no project file yet, write an
+        # engine-facing config into the output directory with every path
+        # absolutized against the project root (save_run_yaml) and run THAT --
+        # absolutized paths resolve regardless of the YAML's location, so no
+        # relative-path is ever mis-resolved against the output dir. We do not
+        # promote the auto-saved file to "the project file", so a subsequent run
+        # re-writes it absolutized rather than as a relative-path save_to_yaml.
+        # The manual Save button still uses save_to_yaml (relative paths), so
+        # this does NOT change what a hand-saved project YAML looks like.
         config_dict = self.config_manager.get_config()
-        if not self.current_project_file:
+        if self.current_project_file:
+            self.save_project()
+            run_config_path = self.current_project_file
+        else:
             from gui_core.preflight import find_project_root, resolve_path
             exe = SimulationRunner.find_ptm_executable()
             root = find_project_root(exe) if exe else Path.cwd()
             output_dir = resolve_path(config_dict["output"]["directory"], root)
             try:
                 output_dir.mkdir(parents=True, exist_ok=True)
-                auto_path = str(output_dir / "config.yaml")
-                self.config_manager.save_run_yaml(auto_path, root)
-                self.current_project_file = auto_path
-                self.unsaved_changes = False
-                self.update_window_title()
-                self.add_recent_file(auto_path)
-                self.console_panel.append_info(f"Auto-saved project to: {auto_path}")
+                run_config_path = str(output_dir / "config.yaml")
+                self.config_manager.save_run_yaml(run_config_path, root)
+                self.add_recent_file(run_config_path)
+                self.console_panel.append_info(
+                    f"Auto-saved run config to: {run_config_path}")
             except Exception as e:
                 QMessageBox.critical(
-                    self, "Error", f"Failed to auto-save project:\n{str(e)}")
+                    self, "Error", f"Failed to write run config:\n{str(e)}")
                 return
-        else:
-            # Save current state
-            self.save_project()
 
         # Pre-flight validation: paths exist and are readable, no dataless
         # (cloud placeholder) files, cloud-path override, disk space, VF
@@ -687,7 +689,7 @@ class PTM3DMainWindow(QMainWindow):
         # engine env flags are applied inside SimulationThread)
         try:
             self.simulation_thread = SimulationThread(
-                self.current_project_file,
+                run_config_path,
                 config_dict=config_dict
             )
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
