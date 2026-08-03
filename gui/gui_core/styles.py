@@ -419,11 +419,11 @@ class ModernStyle:
             }}
 
             QSplitter::handle:horizontal {{
-                width: 2px;
+                width: 6px;
             }}
 
             QSplitter::handle:vertical {{
-                height: 2px;
+                height: 6px;
             }}
 
             QSplitter::handle:hover {{

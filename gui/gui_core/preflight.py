@@ -710,12 +710,13 @@ def run_preflight(config, find_executable, project_root=None):
         vf_val = rad.get("view_factor_file", "")
         if not vf_val:
             report.vf_rebuild_warning = (
-                "Radiation is enabled with NO view-factor file. The engine will "
-                "BUILD view factors from the current mesh. PTM-19: for meshes "
-                "whose stored VF was built with a different winding convention "
-                "(some meshes were built with inward-facing winding), a rebuild "
-                "produces WRONG physics. Point radiation.view_factor_file at the "
-                "existing .vf unless you are certain a rebuild is intended.")
+                "Radiation exchange is on but no view-factor file is set. "
+                "PTM3D will build the view-factor matrix (which facets see which, "
+                "for facet-to-facet radiation) from the current mesh before the "
+                "run starts. For large meshes this can take a long time and a "
+                "lot of disk space — see the estimate below. If you already have "
+                "a view-factor file built for this exact mesh, set "
+                "radiation.view_factor_file to it to reuse it and skip the build.")
         else:
             vf_path = resolve_path(vf_val, project_root)
             if not vf_path.exists():

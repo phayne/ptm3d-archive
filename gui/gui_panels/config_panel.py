@@ -1827,13 +1827,17 @@ class ThermophysicalTab(BaseConfigTab):
         "Moon": {
             "albedo": 0.12, "emissivity": 0.95, "Qb": 0.018,
             "ks": 7.4e-4, "kd": 3.4e-3, "rhos": 1100.0, "rhod": 1800.0,
-            "H": 0.06, "cp0": -3.6125, "incidence_angle_albedo": True,
+            # Global model -> default Hayne (2017) angular albedo (False); Hapke
+            # is opt-in (Paul's ruling). Was True (Hapke).
+            "H": 0.06, "cp0": -3.6125, "incidence_angle_albedo": False,
             "chi": 2.7, "rAU": 1.0, "cpCoeff": [2.7431, 2.3616e-3, -1.2340e-5, 8.9093e-9],
         },
         "Mercury": {
             "albedo": 0.07, "emissivity": 0.93, "Qb": 0.02,
             "ks": 0.002, "kd": 2.0, "rhos": 1800.0, "rhod": 2200.0,
-            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": True,
+            # Global model -> default Hayne (2017) angular albedo (False); Hapke
+            # is opt-in (Paul's ruling). Was True (Hapke).
+            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": False,
             "chi": 2.7, "rAU": 0.387, "cpCoeff": [0.25, 0.0],
         },
         "Enceladus": {
@@ -1940,10 +1944,31 @@ class ThermophysicalTab(BaseConfigTab):
                                        "thermophysical.use_default_emissivity", 0.0, 1.0, 3,
                                        "Thermal emissivity for IR radiation (0-1)",
                                        info_key="thermophysical.emissivity")
-        self.add_bool_field(surface_layout, 2, "Incidence-Angle Dependent Albedo",
-                            "thermophysical.incidence_angle_albedo",
-                            "Albedo increases at grazing angles (Hayne et al. 2017)",
-                            info_key="thermophysical.incidence_angle_albedo")
+        # Incidence-angle albedo MODEL selector (Hayne 2017 vs Hapke). The
+        # engine key is a single boolean (incidence_angle_albedo): false ->
+        # Hayne (2017) angular albedo, true -> Hapke directional model. There
+        # is no separate "off" state — false already selects the Hayne angular
+        # model, which is the default for global bodies (Paul's ruling).
+        ica_label = QLabel("Incidence-Angle Albedo:")
+        self._apply_tooltip(ica_label, "thermophysical.incidence_angle_albedo")
+        surface_layout.addWidget(ica_label, 2, 0)
+
+        self.incidence_combo = QComboBox()
+        self.incidence_combo.addItem("Hayne (2017)", False)
+        self.incidence_combo.addItem("Hapke", True)
+        self.incidence_combo.setToolTip(
+            "Angular albedo model.\n"
+            "Hayne (2017): albedo increases toward grazing incidence per the "
+            "lunar Hayne et al. (2017) fit — the default for global bodies.\n"
+            "Hapke: directional (photometric) albedo model — opt-in.\n"
+            "Sets the engine key incidence_angle_albedo (Hayne = false, "
+            "Hapke = true).")
+        self.incidence_combo.currentIndexChanged.connect(
+            self._on_incidence_model_changed)
+        surface_layout.addWidget(self.incidence_combo, 2, 1)
+        # Registered under the engine key so the existing body-preset / load
+        # paths keep finding it; the value it holds is the Hayne/Hapke boolean.
+        self.widgets["thermophysical.incidence_angle_albedo"] = self.incidence_combo
 
         surface_section.add_widget(surface_widget)
         layout.addWidget(surface_section)
@@ -2127,13 +2152,10 @@ class ThermophysicalTab(BaseConfigTab):
                 self.config_manager.set_value(value_key, defaults[attr])
                 self.config_manager.set_value(default_key, False)
 
-        # Incidence angle albedo
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            ica = defaults.get("incidence_angle_albedo", False)
-            self.widgets["thermophysical.incidence_angle_albedo"].blockSignals(True)
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(ica)
-            self.widgets["thermophysical.incidence_angle_albedo"].blockSignals(False)
-            self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
+        # Incidence-angle albedo model (Hayne=False / Hapke=True)
+        ica = defaults.get("incidence_angle_albedo", False)
+        self._set_incidence_model(ica)
+        self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
 
         self._update_ti_display(defaults)
         # Re-apply engine-support gating: a preset may have unchecked rows
@@ -2198,6 +2220,21 @@ class ThermophysicalTab(BaseConfigTab):
                     "*_override keys); the grayed-out properties require a "
                     "Custom or HORIZONS body.")
 
+    def _on_incidence_model_changed(self, _idx):
+        """Selector changed -> write the Hayne/Hapke boolean to config."""
+        use_hapke = bool(self.incidence_combo.currentData())
+        self.config_manager.set_value(
+            "thermophysical.incidence_angle_albedo", use_hapke)
+        self.value_changed.emit()
+
+    def _set_incidence_model(self, use_hapke):
+        """Reflect a boolean incidence_angle_albedo into the selector without
+        emitting a change: Hayne (False) -> index 0, Hapke (True) -> index 1."""
+        idx = 1 if use_hapke else 0
+        self.incidence_combo.blockSignals(True)
+        self.incidence_combo.setCurrentIndex(idx)
+        self.incidence_combo.blockSignals(False)
+
     def update_to_body_defaults(self, body_name=None):
         """Update all fields to show body defaults"""
         if body_name is None:
@@ -2246,11 +2283,10 @@ class ThermophysicalTab(BaseConfigTab):
                     self.widgets[value_key].setValue(defaults.get(attr, 0.0))
                     self.widgets[value_key].blockSignals(False)
 
-        # Update incidence angle albedo checkbox
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
-                defaults.get("incidence_angle_albedo", False)
-            )
+        # Update incidence-angle albedo model selector + config (Hayne / Hapke)
+        ica = defaults.get("incidence_angle_albedo", False)
+        self._set_incidence_model(ica)
+        self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
 
         self._update_ti_display(defaults)
 
@@ -2280,10 +2316,7 @@ class ThermophysicalTab(BaseConfigTab):
                 self.widgets[default_key].setChecked(use_default)
                 self.widgets[value_key].setEnabled(not use_default)
 
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
-                thermo.get("incidence_angle_albedo", True)
-            )
+        self._set_incidence_model(thermo.get("incidence_angle_albedo", False))
 
         self.update_to_body_defaults()
         self._update_builtin_support()

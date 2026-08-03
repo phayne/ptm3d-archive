@@ -61,6 +61,10 @@ class PTM3DMainWindow(QMainWindow):
         # the default (Moon) is an explicit choice, not a silent one.
         QTimer.singleShot(0, self._maybe_show_body_picker)
 
+        # Give the docked console a comfortable default height once laid out
+        # (first launch only; a saved window state wins).
+        QTimer.singleShot(0, self._apply_default_console_height)
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("PTM3D - Planetary Thermophysical Model")
@@ -73,8 +77,13 @@ class PTM3DMainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Create main horizontal splitter
+        # Create main horizontal splitter. A wide, non-collapsible handle makes
+        # the config <-> visualization boundary easy to grab and drag (a 2px
+        # handle is nearly impossible to find); the visualization side takes the
+        # extra space when the window is resized.
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setChildrenCollapsible(False)
 
         # Left panel: Configuration and Results Browser
         self.left_panel = self.create_left_panel()
@@ -84,7 +93,10 @@ class PTM3DMainWindow(QMainWindow):
         self.right_panel = self.create_right_panel()
         self.main_splitter.addWidget(self.right_panel)
 
-        # Set initial splitter sizes (40% left, 60% right)
+        # Set initial splitter sizes (40% left, 60% right) and let the viz
+        # (right) side absorb resize; the config column stays draggable.
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([560, 840])
 
         main_layout.addWidget(self.main_splitter)
@@ -203,8 +215,12 @@ class PTM3DMainWindow(QMainWindow):
 
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.console_dock)
 
-        # Set initial size
-        self.console_dock.setMinimumHeight(200)
+        # Docked and visible on launch, tall enough to read output comfortably.
+        # A readable minimum floor plus a taller default height applied once the
+        # window is laid out (see _apply_default_console_height, only when there
+        # is no saved window state to restore).
+        self.console_dock.setVisible(True)
+        self.console_dock.setMinimumHeight(240)
 
     def create_menu_bar(self):
         """Create application menu bar"""
@@ -444,6 +460,9 @@ class PTM3DMainWindow(QMainWindow):
         """Apply modern styling"""
         self.setStyleSheet(ModernStyle.get_stylesheet())
 
+    # Comfortable default height (px) for the docked console on first launch.
+    DEFAULT_CONSOLE_HEIGHT = 340
+
     def restore_window_state(self):
         """Restore window geometry and state"""
         geometry = self.settings.value("geometry")
@@ -451,8 +470,24 @@ class PTM3DMainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
         state = self.settings.value("windowState")
+        self._had_saved_window_state = bool(state)
         if state:
             self.restoreState(state)
+
+    def _apply_default_console_height(self):
+        """Give the docked console a comfortable default height on first launch.
+
+        Runs once the event loop is up (so the window has a real size). Skipped
+        when a saved window state was restored, so a user's own console size is
+        never overridden."""
+        if getattr(self, "_had_saved_window_state", False):
+            return
+        try:
+            self.resizeDocks([self.console_dock],
+                             [self.DEFAULT_CONSOLE_HEIGHT],
+                             Qt.Orientation.Vertical)
+        except Exception:
+            pass
 
     def save_window_state(self):
         """Save window geometry and state"""
@@ -868,6 +903,9 @@ class PTM3DMainWindow(QMainWindow):
         self.main_splitter.setSizes([560, 840])
         self.console_dock.setVisible(True)
         self.console_dock.setFloating(False)
+        self.resizeDocks([self.console_dock],
+                         [self.DEFAULT_CONSOLE_HEIGHT],
+                         Qt.Orientation.Vertical)
         self.status_label.setText("Layout reset to defaults")
 
     # === Visualization Operations ===

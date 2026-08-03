@@ -91,7 +91,12 @@ class ConfigManager:
     DEFAULT_CONFIG = {
         "simulation": {
             "start_time": "2025-01-01T00:00:00",
-            "duration_days": 3.55,
+            # Default duration = one synodic period of the default body (Moon).
+            # 29.530588 d matches gui_tooltips.BODY_SYNODIC_PERIODS["Moon"]; the
+            # Simulation tab makes this body-aware (a body change re-sets the
+            # duration to that body's synodic period). Keeping it here so a fresh
+            # project — and its saved YAML — starts at one full lunar day.
+            "duration_days": 29.530588,
             "timesteps": 144,
             # Default body is Moon: the best-validated built-in body (Diviner),
             # and the least surprising starting point for a new project. A
@@ -151,7 +156,11 @@ class ConfigManager:
             "albedo": 0.12,  # Display value (updated based on body)
             "use_default_emissivity": True,
             "emissivity": 0.95,
-            "incidence_angle_albedo": True,  # Enable angle-dependent albedo
+            # Incidence-angle albedo model: false = Hayne (2017) angular albedo
+            # (the default for global bodies, per Paul's ruling); true = Hapke
+            # directional model (opt-in). Maps to engine key incidence_angle_albedo
+            # (config_parser.cpp: false->Hayne/constant, true->Hapke).
+            "incidence_angle_albedo": False,
             # Thermal conductivity
             "use_default_ks": True,
             "ks": 7.4e-4,  # Surface conductivity (W/m/K)
