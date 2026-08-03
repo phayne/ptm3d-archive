@@ -43,8 +43,8 @@
       "files": [
         {
           "name": "albedo_maps.tar.gz",
-          "sha256": "d557198f194cf612a8c518ff20b54664d28056900316b93295f40b9a86053d96",
-          "size": 142698802,
+          "sha256": "d252942937bafecf0d13cd349bd424cbd638f53561d05e5a51d4e9cf097f0802",
+          "size": 142700632,
           "archive": true,
           "unpack_to": "data/albedo_maps/"
         }
