@@ -1857,9 +1857,11 @@ class ThermophysicalTab(BaseConfigTab):
         "Mercury": {
             "albedo": 0.07, "emissivity": 0.93, "Qb": 0.02,
             "ks": 0.002, "kd": 2.0, "rhos": 1800.0, "rhod": 2200.0,
-            # Global model -> default Hayne (2017) angular albedo (False); Hapke
-            # is opt-in (Paul's ruling). Was True (Hapke).
-            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": False,
+            # Mercury defaults to Hapke (True) per Paul's ruling: the Hayne
+            # (2017) angular-albedo fit is lunar-calibrated, so it is NOT the
+            # right default for Mercury. Moon stays Hayne (False); Mercury is
+            # the deliberate exception.
+            "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": True,
             "chi": 2.7, "rAU": 0.387, "cpCoeff": [0.25, 0.0],
         },
         "Enceladus": {
@@ -2317,6 +2319,14 @@ class ThermophysicalTab(BaseConfigTab):
         config = self.config_manager.get_config()
         thermo = config.get("thermophysical", {})
 
+        # Snapshot the saved incidence-albedo model choice up front. `thermo`
+        # is a live reference into the config dict, and BOTH the checkbox loop
+        # below (setChecked -> stateChanged -> on_default_toggled ->
+        # update_to_body_defaults) and the explicit seed further down call
+        # set_value on this key, so it must be read before any of that runs.
+        has_saved_ica = "incidence_angle_albedo" in thermo
+        saved_ica = bool(thermo.get("incidence_angle_albedo", False))
+
         properties = [
             ("thermophysical.albedo", "thermophysical.use_default_albedo", "albedo", "use_default_albedo"),
             ("thermophysical.emissivity", "thermophysical.use_default_emissivity", "emissivity", "use_default_emissivity"),
@@ -2338,9 +2348,20 @@ class ThermophysicalTab(BaseConfigTab):
                 self.widgets[default_key].setChecked(use_default)
                 self.widgets[value_key].setEnabled(not use_default)
 
-        self._set_incidence_model(thermo.get("incidence_angle_albedo", False))
-
+        # Seed body defaults first (this re-applies the body's default
+        # incidence-albedo model), THEN let an explicit saved choice win.
+        # update_to_body_defaults() unconditionally writes the body's default
+        # incidence_angle_albedo (there is no per-property "Use Default"
+        # checkbox gating it, unlike the numeric rows above), so a saved
+        # per-project Hayne/Hapke selection would be clobbered on reload
+        # unless we re-apply it afterward. See PTM-33.
         self.update_to_body_defaults()
+
+        if has_saved_ica:
+            self._set_incidence_model(saved_ica)
+            self.config_manager.set_value(
+                "thermophysical.incidence_angle_albedo", saved_ica)
+
         self._update_builtin_support()
 
     def _load_horizons_defaults(self, body_name):
