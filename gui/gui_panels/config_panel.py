@@ -1716,8 +1716,60 @@ class RadiationTab(BaseConfigTab):
         sparse_section.add_widget(sparse_widget)
         layout.addWidget(sparse_section)
 
+        # Advisory pre-run cost estimate (disk + solve time), updated live as
+        # radiation / mesh / body fields change. Order-of-magnitude only.
+        self.vf_estimate_label = QLabel("")
+        self.vf_estimate_label.setWordWrap(True)
+        self.vf_estimate_label.setObjectName("vfEstimateLabel")
+        self.vf_estimate_label.setStyleSheet(
+            "color: #64B5F6; font-size: 11px; padding: 6px; "
+            "border: 1px solid #444; border-radius: 4px;")
+        layout.addWidget(self.vf_estimate_label)
+
         layout.addStretch()
         self.create_scroll_area(content)
+
+        # Recompute the estimate whenever a radiation field changes.
+        self.value_changed.connect(self.update_vf_estimate)
+        self.update_vf_estimate()
+
+    def _project_root(self):
+        from pathlib import Path
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            return find_project_root(SimulationRunner.find_ptm_executable())
+        except Exception:
+            return Path.cwd()
+
+    def update_vf_estimate(self):
+        """Refresh the advisory view-factor cost label from the current config."""
+        from gui_core.preflight import estimate_vf_cost
+        if not self.config_manager.get_value("radiation.enabled", False):
+            self.vf_estimate_label.setText(
+                "Enable radiation exchange to see a view-factor cost estimate.")
+            return
+        try:
+            est = estimate_vf_cost(self.config_manager.get_config(),
+                                   self._project_root())
+        except Exception as e:  # advisory only -- never break the tab
+            self.vf_estimate_label.setText(
+                f"View-factor cost estimate unavailable: {e}")
+            return
+        if not est.available:
+            self.vf_estimate_label.setText(
+                est.lines[0] if est.lines else "View-factor cost: not estimable.")
+            return
+        text = est.headline()
+        for line in est.lines:
+            text += f"\n{line}"
+        for w in est.warnings:
+            text += f"\n⚠ {w}"
+        self.vf_estimate_label.setText(text)
+
+    def on_body_changed(self, _body_name=None):
+        """Body change affects the mesh face count -> refresh the estimate."""
+        self.update_vf_estimate()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -1742,6 +1794,7 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        self.update_vf_estimate()
 
 
 class ThermophysicalTab(BaseConfigTab):
@@ -3600,6 +3653,9 @@ class ConfigurationPanel(QWidget):
             self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
                 self.tabs["illumination"].on_body_changed
             )
+            self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
+                self.tabs["radiation"].on_body_changed
+            )
             # The Body tab appears only for a custom/generic body; a body change
             # (e.g. selecting a HORIZONS body) must re-evaluate nav visibility.
             self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
@@ -3614,6 +3670,9 @@ class ConfigurationPanel(QWidget):
                 lambda _v: self.tabs["mesh"].refresh_builtin_topo())
             res_widget.valueChanged.connect(
                 lambda _v: self.tabs["illumination"].refresh_builtin_albedo())
+            # Mesh resolution changes the face count -> refresh the VF estimate.
+            res_widget.valueChanged.connect(
+                lambda _v: self.tabs["radiation"].update_vf_estimate())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:

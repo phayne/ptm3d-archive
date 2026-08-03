@@ -103,6 +103,7 @@ class PreflightReport:
     warnings: list = field(default_factory=list)     # non-blocking
     info: list = field(default_factory=list)         # console notes (exe hash etc.)
     vf_rebuild_warning: str = ""                     # PTM-19 guard text, if triggered
+    vf_cost_line: str = ""                           # advisory VF cost headline
     executable: Path = None
     project_root: Path = None
 
@@ -120,6 +121,8 @@ class PreflightReport:
             out.append(f"CLOUD: {f_}: {p}")
         if self.vf_rebuild_warning:
             out.append(f"VF-GUARD: {self.vf_rebuild_warning}")
+        if self.vf_cost_line:
+            out.append(f"VF-COST: {self.vf_cost_line}")
         for w in self.warnings:
             out.append(f"WARNING: {w}")
         for i in self.info:
@@ -301,6 +304,208 @@ def _ply_face_count(ply_path):
         if line.strip() == "end_header":
             break
     return None
+
+
+# --------------------------------------------------------------------------
+# Pre-run view-factor cost estimate (advisory: warns, never blocks).
+# --------------------------------------------------------------------------
+
+# 8 bytes per stored nonzero: int32 column index + float32 value.
+_VF_BYTES_PER_NNZ = 8
+# Radiosity-SpMV throughput (nonzeros/second) from 32/48 min per window at
+# 2.48e9 nnz on the reference Mac Pro. Order-of-magnitude only.
+_VF_THROUGHPUT_GPU = 1.3e6
+_VF_THROUGHPUT_CPU = 8.6e5
+# Single-GPU SpMV hard wall: a signed-int32 byte offset into a 4-byte-element
+# OpenCL buffer caps one buffer at 2^31 bytes = 536,870,912 nonzeros.
+VF_SINGLE_GPU_NNZ_WALL = 536_870_912
+# Partners-per-face heuristic (the dominant uncertainty): smooth/convex 5-20,
+# local-rough DEM 30-80, global/high-roughness lunar 100-150. Default 105.
+_VF_PARTNERS_DEFAULT = 105
+_VF_PARTNERS_LOW = 20
+_VF_PARTNERS_HIGH = 150
+
+
+def read_vf_nnz(vf_path):
+    """True stored-nonzero count from a sparse (VFFM) VF header, or None.
+
+    Only the sparse format stores nnz in the header (u64 at byte offset 24);
+    the H-matrix format stores compressed blocks with no single nnz field."""
+    try:
+        with open(vf_path, "rb") as f:
+            header = f.read(32)
+    except OSError:
+        return None
+    if len(header) < 32:
+        return None
+    magic, _version = struct.unpack("<II", header[:8])
+    if magic != 0x5646464D:  # 'VFFM' sparse
+        return None
+    (nnz,) = struct.unpack("<Q", header[24:32])
+    return int(nnz)
+
+
+def _fmt_duration(seconds):
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60.0:.1f} min"
+    return f"{seconds / 3600.0:.1f} h"
+
+
+def _fmt_disk_gb(gb):
+    if gb < 1.0:
+        return f"{gb * 1000.0:.0f} MB"
+    if gb >= 1000.0:
+        return f"{gb / 1000.0:.2f} TB"
+    return f"{gb:.1f} GB"
+
+
+@dataclass
+class VFCostEstimate:
+    """Advisory view-factor disk/solve estimate. See estimate_vf_cost."""
+    available: bool = False
+    mode: str = "unavailable"   # "header-exact" | "heuristic" | "unavailable"
+    n_faces: int = None
+    nnz_mid: int = None
+    nnz_low: int = None
+    nnz_high: int = None
+    disk_gb_mid: float = None
+    disk_gb_low: float = None
+    disk_gb_high: float = None
+    wall_s_mid: float = None
+    throughput_label: str = ""
+    free_gb: float = None
+    lines: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+    def headline(self):
+        if not self.available:
+            return "View-factor cost: not estimable for this config"
+        if self.mode == "header-exact":
+            return (f"View-factor cost ~{_fmt_disk_gb(self.disk_gb_mid)} disk, "
+                    f"~{_fmt_duration(self.wall_s_mid)} solve/window "
+                    f"({self.throughput_label}; nnz exact from VF header)")
+        return (f"View-factor cost ~{_fmt_disk_gb(self.disk_gb_mid)} disk "
+                f"({_fmt_disk_gb(self.disk_gb_low)}-{_fmt_disk_gb(self.disk_gb_high)}), "
+                f"~{_fmt_duration(self.wall_s_mid)} solve/window "
+                f"({self.throughput_label}; approximate, order-of-magnitude)")
+
+
+def estimate_vf_cost(config, project_root=None):
+    """Advisory pre-run estimate of view-factor disk + radiosity-solve cost.
+
+    Radiosity coupling stores a sparse face-to-face matrix; its size scales as
+    ``nnz = n_faces * (partners per face)``. Disk = 8 bytes/nnz (int32 column +
+    float32 value). Solve wall time = nnz / throughput. The view-factor *build*
+    time is reported as a SEPARATE, "highly variable" line and never folded in.
+
+    Numbers are order-of-magnitude from the partners/face heuristic UNLESS an
+    existing sparse VF file is configured, in which case the true nnz is read
+    from its header (exact). Advisory only: warns, never blocks. Returns a
+    VFCostEstimate.
+    """
+    est = VFCostEstimate()
+    rad = config.get("radiation", {}) if isinstance(config, dict) else {}
+    if not rad.get("enabled", False):
+        est.lines = ["Radiation disabled - no view-factor cost."]
+        return est
+
+    use_gpu = bool(rad.get("use_gpu", True))
+    est.throughput_label = "GPU" if use_gpu else "CPU"
+    throughput = _VF_THROUGHPUT_GPU if use_gpu else _VF_THROUGHPUT_CPU
+
+    # Prefer the true nnz from an existing sparse VF file.
+    nnz_true = None
+    vf_val = str(rad.get("view_factor_file", "") or "")
+    if vf_val and project_root is not None:
+        try:
+            vf_path = resolve_path(vf_val, project_root)
+            if vf_path.exists():
+                nnz_true = read_vf_nnz(vf_path)
+        except OSError:
+            nnz_true = None
+
+    if nnz_true is not None:
+        est.available = True
+        est.mode = "header-exact"
+        est.nnz_mid = est.nnz_low = est.nnz_high = nnz_true
+    else:
+        n_faces = expected_face_count(config)
+        if not n_faces:
+            est.lines = [
+                "View-factor cost: mesh face count not derivable from this "
+                "config (imported non-PLY mesh or topography tile) and no "
+                "existing VF file to read -- cannot estimate."]
+            return est
+        est.available = True
+        est.mode = "heuristic"
+        est.n_faces = int(n_faces)
+        est.nnz_mid = int(n_faces * _VF_PARTNERS_DEFAULT)
+        est.nnz_low = int(n_faces * _VF_PARTNERS_LOW)
+        est.nnz_high = int(n_faces * _VF_PARTNERS_HIGH)
+
+    est.disk_gb_mid = est.nnz_mid * _VF_BYTES_PER_NNZ / 1e9
+    est.disk_gb_low = est.nnz_low * _VF_BYTES_PER_NNZ / 1e9
+    est.disk_gb_high = est.nnz_high * _VF_BYTES_PER_NNZ / 1e9
+    est.wall_s_mid = est.nnz_mid / throughput
+
+    lines = []
+    if est.mode == "header-exact":
+        lines.append(
+            f"Existing VF file: {est.nnz_mid:,} nonzeros (from header, exact).")
+        lines.append(
+            f"  Disk (already on disk): ~{_fmt_disk_gb(est.disk_gb_mid)} "
+            f"(8 bytes/nonzero).")
+    else:
+        lines.append(
+            f"Mesh faces: {est.n_faces:,}. Assuming ~{_VF_PARTNERS_DEFAULT} "
+            f"partners/face (band {_VF_PARTNERS_LOW}-{_VF_PARTNERS_HIGH}; "
+            f"smooth-convex can be 5-20).")
+        lines.append(
+            f"  Nonzeros: ~{est.nnz_mid:,} "
+            f"({est.nnz_low:,}-{est.nnz_high:,}).")
+        lines.append(
+            f"  Disk: ~{_fmt_disk_gb(est.disk_gb_mid)} "
+            f"({_fmt_disk_gb(est.disk_gb_low)}-{_fmt_disk_gb(est.disk_gb_high)}) "
+            f"at 8 bytes/nonzero.")
+    lines.append(
+        f"  Radiosity solve: ~{_fmt_duration(est.wall_s_mid)}/window "
+        f"({est.throughput_label}, ~{throughput:.1e} nonzeros/s).")
+    lines.append(
+        "  View-factor BUILD time is SEPARATE and HIGHLY VARIABLE (minutes to "
+        "hours; depends on mesh + occlusion) -- not included above.")
+    if est.mode == "header-exact":
+        lines.append(
+            "Approximate - order-of-magnitude (nnz exact; disk/time from "
+            "throughput).")
+    else:
+        lines.append(
+            "Approximate - order-of-magnitude; disk can be +/-3-5x from the "
+            "partners/face heuristic.")
+
+    # Threshold warnings (warn, never block).
+    if est.nnz_mid > VF_SINGLE_GPU_NNZ_WALL:
+        est.warnings.append(
+            f"estimated nonzeros (~{est.nnz_mid:,}) exceed the single-GPU "
+            f"radiosity wall ({VF_SINGLE_GPU_NNZ_WALL:,} = 2^31-byte SpMV "
+            f"offset) -- single-GPU radiosity needs the chunked/int64 path or "
+            f"multi-GPU, otherwise it cannot allocate.")
+    if project_root is not None:
+        try:
+            probe = project_root
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            est.free_gb = shutil.disk_usage(str(probe)).free / 1e9
+            if est.disk_gb_high > est.free_gb:
+                est.warnings.append(
+                    f"estimated view-factor disk (up to ~{est.disk_gb_high:.1f} "
+                    f"GB) may exceed free space (~{est.free_gb:.1f} GB).")
+        except OSError:
+            pass
+
+    est.lines = lines
+    return est
 
 
 def check_env_completeness(env, required=None):
@@ -538,6 +743,14 @@ def run_preflight(config, find_executable, project_root=None):
                             f"view factors: {vf_path.name} ({fmt}, {n_vf} faces"
                             + ("" if n_mesh is None else ", matches mesh") + ")")
 
+    # -- View-factor cost estimate (advisory: warns, never blocks) -----------
+    if rad.get("enabled", False):
+        est = estimate_vf_cost(config, project_root)
+        if est.available:
+            report.vf_cost_line = est.headline()
+            report.info.extend(est.lines)
+            report.warnings.extend(est.warnings)
+
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
     problems = check_env_completeness(env)
@@ -611,7 +824,10 @@ def confirm_preflight(parent, report):
         msg = QMessageBox(parent)
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setWindowTitle("View-factor rebuild")
-        msg.setText(report.vf_rebuild_warning)
+        text = report.vf_rebuild_warning
+        if report.vf_cost_line:
+            text += f"\n\nEstimated {report.vf_cost_line}"
+        msg.setText(text)
         override = QCheckBox("Proceed and let the engine build view factors "
                              "from the current mesh")
         msg.setCheckBox(override)
