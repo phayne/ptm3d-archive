@@ -16,11 +16,20 @@ the repository root ('data/kernels'), so run ptm_thermal_sim FROM THE REPO
 ROOT (SPICE resolves relative metakernel paths against the current working
 directory). See INSTALL.md, section "SPICE kernel data".
 
-Default download set (Moon + Mercury capable, ~45 MB):
+Core download set (Moon + Mercury capable, ~45 MB):
     naif0012.tls, pck00011.tpc, de440s.bsp, moon_pa_de440_200625.bpc,
     moon_de440_250416.tf
-Add --bodies europa to also fetch jup365.bsp (Jupiter/Galilean ephemeris,
-~130 MB) needed by europa.tm.
+The Galilean ephemeris jup365.bsp (Jupiter/Europa position, ~130 MB) is the
+extra that europa.tm requires.
+
+By default (--bodies auto) the script fetches the core set and, when europa.tm
+is present in the kernel directory, ALSO fetches jup365.bsp — so a bare
+`python3 scripts/fetch_kernels.py` pulls exactly what the installed metakernels
+need. This matters because the engine's "missing kernel" errors tell the user
+to run that bare command, and a Europa config ships europa.tm whose jup365.bsp
+dependency the Moon-only default would otherwise omit (leaving the run to fail
+on the same missing kernel again). Pass --bodies moon/europa/all to force a set
+regardless of which .tm files are present.
 
 Downloads are resumable: an interrupted transfer leaves a .part file that is
 continued with an HTTP Range request on the next run; completed files whose
@@ -28,8 +37,9 @@ size matches the server's are skipped. SHA-256 of every completed file is
 printed (and checked against a pinned value where one is recorded below).
 
 Usage:
-    python3 scripts/fetch_kernels.py                 # Moon/Mercury set
-    python3 scripts/fetch_kernels.py --bodies europa # + Galilean ephemeris
+    python3 scripts/fetch_kernels.py                 # auto: core + Galilean if europa.tm present
+    python3 scripts/fetch_kernels.py --bodies moon   # force Moon/Mercury core only
+    python3 scripts/fetch_kernels.py --bodies europa # force core + Galilean ephemeris
     python3 scripts/fetch_kernels.py --bodies all
     python3 scripts/fetch_kernels.py --dest /path/to/kernels
 """
@@ -189,18 +199,42 @@ def verify(dest, expected_sha):
     return True
 
 
+def select_kernels(bodies, dest):
+    """Return the kernels to fetch for the requested --bodies mode.
+
+    bodies == "auto" (the default): the core set, plus the Galilean ephemeris
+    (jup365.bsp) when europa.tm is present in `dest` -- i.e. fetch exactly what
+    the installed metakernels require. This lets a bare invocation satisfy a
+    Europa config (which ships europa.tm) without the user having to know to add
+    --bodies europa; otherwise the run fails again on the same missing kernel.
+    The auto-addition is announced, never silent.
+
+    An explicit bodies value (moon/europa/all) forces that set regardless of
+    which .tm files are present.
+    """
+    kernels = list(KERNELS_CORE)
+    if bodies in ("europa", "all"):
+        kernels += KERNELS_EUROPA
+    elif bodies == "auto" and os.path.exists(os.path.join(dest, "europa.tm")):
+        print("europa.tm present in kernel directory -> also fetching the "
+              "Galilean ephemeris jup365.bsp (europa.tm requires it).")
+        kernels += KERNELS_EUROPA
+    return kernels
+
+
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dest", default=os.path.join(repo_root, "data", "kernels"),
                     help="kernel directory (default: <repo>/data/kernels)")
-    ap.add_argument("--bodies", default="moon", choices=["moon", "europa", "all"],
-                    help="moon = Moon/Mercury set (default); europa/all adds jup365.bsp")
+    ap.add_argument("--bodies", default="auto",
+                    choices=["auto", "moon", "europa", "all"],
+                    help="auto (default) = core set + Galilean ephemeris when "
+                         "europa.tm is present; moon = core only; europa/all "
+                         "add jup365.bsp unconditionally")
     args = ap.parse_args()
 
-    kernels = list(KERNELS_CORE)
-    if args.bodies in ("europa", "all"):
-        kernels += KERNELS_EUROPA
+    kernels = select_kernels(args.bodies, args.dest)
 
     print(f"Kernel directory: {args.dest}")
     ok = True
@@ -218,6 +252,15 @@ def main():
     if not tm_present:
         print("WARNING: no metakernel templates found — expected them to ship "
               "with the repo in data/kernels/.")
+    # europa.tm cannot resolve without the Galilean ephemeris; a Europa run that
+    # loses this race fails on the same missing kernel again. Do not let that
+    # gap pass silently even when the user forced a set that omits it.
+    if "europa.tm" in tm_present and not os.path.exists(
+            os.path.join(args.dest, "spk", "jup365.bsp")):
+        print("WARNING: europa.tm is present but spk/jup365.bsp is missing — a "
+              "Europa simulation will fail with an unresolved-kernel error.\n"
+              "         Fetch it with:  python3 scripts/fetch_kernels.py "
+              "--bodies europa")
     print("NOTE: the shipped metakernels use repo-root-relative paths "
           "(PATH_VALUES = 'data/kernels'); run ptm_thermal_sim from the "
           "repository root, or edit PATH_VALUES to an absolute path.")
