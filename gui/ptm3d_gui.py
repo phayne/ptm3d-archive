@@ -34,7 +34,6 @@ from gui_panels.visualization_panel import VisualizationPanel
 from gui_panels.results_panel import ResultsPanel
 from gui_panels.console_panel import ConsolePanel
 from gui_panels.camera_panel import CameraPanel
-from gui_panels.batch_dashboard_panel import BatchDashboardPanel
 
 
 class PTM3DMainWindow(QMainWindow):
@@ -130,12 +129,6 @@ class PTM3DMainWindow(QMainWindow):
         self.camera_panel.run_requested.connect(self._launch_camera_sim)
         self.camera_panel.stop_requested.connect(self._stop_camera_sim)
         self.camera_sim_thread = None
-
-        # Batch Runs panel — monitor and control multi-site batch jobs
-        # (e.g. run_a3gt_batch.py). Read-only view of in-flight runs +
-        # pause / stop controls; does not own the orchestrator process.
-        self.batch_panel = BatchDashboardPanel()
-        self.left_tabs.addTab(self.batch_panel, "Batch Runs")
 
         layout.addWidget(self.left_tabs)
 

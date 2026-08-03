@@ -1,7 +1,8 @@
 """
 PTM3D Unified Dashboard
-Single-window application with sidebar navigation for DEM/Mesh, Thermal,
-Exosphere, and Viewshed modules.
+Single-window application with sidebar navigation for the DEM/Mesh and
+Thermal modules. (The Exosphere and Viewshed modules are Paul-only tools kept
+under gui/_private_tools/ and are not part of the public distribution.)
 """
 
 import sys
@@ -143,8 +144,7 @@ class UnifiedDashboard(QMainWindow):
         view_menu.addSeparator()
 
         # Module shortcuts
-        for i, label in enumerate(["DEM/Mesh", "Thermal", "Exosphere",
-                                    "Viewshed"]):
+        for i, label in enumerate(["DEM/Mesh", "Thermal"]):
             action = QAction(label, self,
                              shortcut=QKeySequence(f"Ctrl+{i + 1}"),
                              triggered=lambda checked, idx=i:
@@ -198,8 +198,6 @@ class UnifiedDashboard(QMainWindow):
         modules_info = [
             ("DEM", "DEM/Mesh Tools"),
             ("THM", "Thermal Simulation"),
-            ("EXO", "Exosphere Model"),
-            ("VIS", "Viewshed Analysis"),
         ]
 
         # Try to import real adapters; fall back to placeholders
@@ -224,13 +222,11 @@ class UnifiedDashboard(QMainWindow):
     def _load_adapters(self):
         """Try to import module adapters. Returns list of modules or None."""
         import traceback
-        adapters = [None, None, None, None]
+        adapters = [None, None]
 
         loader_info = [
             (0, "DEM", "module_adapters.dem_adapter", "DEMModule"),
             (1, "Thermal", "module_adapters.thermal_adapter", "ThermalModule"),
-            (2, "Exosphere", "module_adapters.exosphere_adapter", "ExosphereModule"),
-            (3, "Viewshed", "module_adapters.viewshed_adapter", "ViewshedModule"),
         ]
 
         for idx, label, module_path, class_name in loader_info:
@@ -284,7 +280,7 @@ class UnifiedDashboard(QMainWindow):
             self._run_action.setEnabled(not running)
             self._stop_action.setEnabled(running)
         else:
-            names = ["DEM/Mesh", "Thermal", "Exosphere", "Viewshed"]
+            names = ["DEM/Mesh", "Thermal"]
             self._module_label.setText(
                 f"  {names[index] if index < len(names) else '?'}  "
             )
@@ -375,7 +371,7 @@ class UnifiedDashboard(QMainWindow):
             f"PTM3D Dashboard v{self.APP_VERSION}\n\n"
             "Planetary Thermophysical Model 3D\n"
             "Unified simulation and analysis suite\n\n"
-            "Modules: DEM/Mesh, Thermal, Exosphere, Viewshed\n\n"
+            "Modules: DEM/Mesh, Thermal\n\n"
             "University of Colorado Boulder"
         )
 

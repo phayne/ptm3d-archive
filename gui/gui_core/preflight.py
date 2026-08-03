@@ -507,10 +507,10 @@ def run_preflight(config, find_executable, project_root=None):
             report.vf_rebuild_warning = (
                 "Radiation is enabled with NO view-factor file. The engine will "
                 "BUILD view factors from the current mesh. PTM-19: for meshes "
-                "whose stored VF was built with different winding conventions "
-                "(e.g. the moon3d meshes), a rebuild produces WRONG physics. "
-                "Point radiation.view_factor_file at the existing .vf unless you "
-                "are certain a rebuild is intended.")
+                "whose stored VF was built with a different winding convention "
+                "(some meshes were built with inward-facing winding), a rebuild "
+                "produces WRONG physics. Point radiation.view_factor_file at the "
+                "existing .vf unless you are certain a rebuild is intended.")
         else:
             vf_path = resolve_path(vf_val, project_root)
             if not vf_path.exists():

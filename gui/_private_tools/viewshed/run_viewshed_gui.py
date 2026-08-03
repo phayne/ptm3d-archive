@@ -20,10 +20,15 @@ if "QT_PLUGIN_PATH" not in os.environ:
     except ImportError:
         pass
 
-# Ensure gui/ is importable
-gui_dir = str(Path(__file__).parent)
-if gui_dir not in sys.path:
-    sys.path.insert(0, gui_dir)
+# This tool lives under gui/_private_tools/viewshed/ (not part of the public
+# build). It needs BOTH its own package dir (viewshed_gui, viewshed_core,
+# viewshed_panels) and the parent gui/ dir (gui_core, gui_panels,
+# dashboard_core) on sys.path.
+tool_dir = Path(__file__).resolve().parent   # _private_tools/viewshed
+gui_dir = tool_dir.parents[1]                 # gui/
+for _p in (str(tool_dir), str(gui_dir)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from viewshed_gui import main
 

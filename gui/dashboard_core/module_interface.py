@@ -1,6 +1,8 @@
 """
 Abstract base class for all dashboard modules.
-Each module (DEM, Thermal, Exosphere, Viewshed) implements this interface.
+Each module (DEM, Thermal) implements this interface. (The Exosphere and
+Viewshed modules were moved to gui/_private_tools/ and are not part of the
+public build, but still implement this interface for future standalone use.)
 """
 
 from PyQt6.QtCore import QObject, pyqtSignal

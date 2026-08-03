@@ -5,14 +5,17 @@ Modern PyQt6-based graphical user interface for the Planetary Thermophysical Mod
 ## Supported entry point
 
 **`python run_gui.py` is the ONE supported way to launch the PTM3D GUI** (the
-thermal simulation application, `ptm3d_gui.py`). The other launchers
-(`run_dashboard.py`, `run_exosphere_gui.py`, `run_viewshed_gui.py`) are
-experimental and get less testing.
+thermal simulation application, `ptm3d_gui.py`). Run it from the `gui/`
+directory:
 
-The old PyQt5 application (`ptm_config_gui.py` and its modules) has been moved
-to `legacy/`. It does not run with the PyQt6-only dependencies in
-`requirements.txt` and is kept only for reference — do not use it, and do not
-copy configuration code from it (its YAML schema has drifted from the engine).
+```bash
+cd gui/
+python run_gui.py
+```
+
+An optional multi-module launcher (`run_dashboard.py`) bundles the DEM/mesh
+tools alongside the thermal app; it is a convenience wrapper and gets less
+testing than `run_gui.py`.
 
 Before a simulation launches, the GUI now runs a pre-flight check
 (`gui_core/preflight.py`): paths must exist and be readable, cloud-synced
@@ -218,6 +221,26 @@ output:
 1. Extend `PyVistaWidget` in `gui_panels/visualization_panel.py`
 2. Add controls to the visualization panel
 3. Connect signals to main window
+
+## Building a distribution package
+
+Build a public/colleague tarball with `git archive`, which honors the
+repository `.gitattributes` `export-ignore` rules:
+
+```bash
+git archive --format=tar.gz -o ptm3d.tar.gz HEAD
+```
+
+This excludes per-developer settings (`.claude/`, `gui/.claude/`) and the
+Paul-only tools staged under `gui/_private_tools/` (batch runs, exosphere,
+viewshed). A raw `tar`/`cp -r` of the working tree does **not** honor those
+rules and would leak the excluded paths — use `git archive`.
+
+Some input datasets (SPICE kernels, DEMs, view factors) are large and are not
+bundled; see the top-level data/distribution docs. If the GUI is run against a
+cloud-synced folder whose files have been evicted to the cloud ("dataless"
+placeholders), the pre-flight check will block the launch rather than let the
+engine hang reading them — keep input data on a local disk.
 
 ## License
 

@@ -29,6 +29,26 @@ except ImportError:
     from camera_presets import CAMERA_PRESETS, PRESET_NAMES, RESOLUTION_SCALES
 
 
+def default_cspice_kernels_dir():
+    """Resolve a portable default SPICE kernels directory (GUI-CAM-1).
+
+    Search order: the ``$CSPICE_DATA`` environment variable, then the
+    project's ``data/kernels`` directory, else blank. A blank result means
+    "let ptm_camera_sim use its own default" -- no ``--kernels-path`` is
+    passed (see the launch-command builder). Never hardcode a per-developer
+    absolute path here: the old default (``/Users/.../software/cspice/data``)
+    was dead on every other machine, with no fallback or warning.
+    """
+    env = os.environ.get("CSPICE_DATA", "").strip()
+    if env and Path(env).is_dir():
+        return env
+    # gui/gui_panels/camera_panel.py -> project root is parents[2]
+    project_kernels = Path(__file__).resolve().parents[2] / "data" / "kernels"
+    if project_kernels.is_dir():
+        return str(project_kernels)
+    return ""
+
+
 class CameraPanel(QWidget):
     """Camera simulation configuration and launch panel."""
 
@@ -837,7 +857,7 @@ class CameraPanel(QWidget):
         lay.addWidget(self.target_frame_edit, 2, 3)
 
         lay.addWidget(QLabel("SPICE kernels:"), 3, 0)
-        self.kernels_edit = QLineEdit("/Users/paha3326/software/cspice/data")
+        self.kernels_edit = QLineEdit(default_cspice_kernels_dir())
         lay.addWidget(self.kernels_edit, 3, 1, 1, 2)
         kern_browse = QPushButton("Browse")
         kern_browse.clicked.connect(lambda: self._browse_dir(self.kernels_edit))
