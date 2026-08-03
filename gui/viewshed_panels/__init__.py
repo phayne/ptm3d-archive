@@ -1,1 +1,0 @@
-# Viewshed GUI panel modules

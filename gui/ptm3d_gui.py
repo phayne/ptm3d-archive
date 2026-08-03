@@ -34,7 +34,6 @@ from gui_panels.visualization_panel import VisualizationPanel
 from gui_panels.results_panel import ResultsPanel
 from gui_panels.console_panel import ConsolePanel
 from gui_panels.camera_panel import CameraPanel
-from gui_panels.batch_dashboard_panel import BatchDashboardPanel
 
 
 class PTM3DMainWindow(QMainWindow):
@@ -58,6 +57,14 @@ class PTM3DMainWindow(QMainWindow):
         self.apply_style()
         self.restore_window_state()
 
+        # On first launch, ask for the target body once the event loop is up so
+        # the default (Moon) is an explicit choice, not a silent one.
+        QTimer.singleShot(0, self._maybe_show_body_picker)
+
+        # Give the docked console a comfortable default height once laid out
+        # (first launch only; a saved window state wins).
+        QTimer.singleShot(0, self._apply_default_console_height)
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("PTM3D - Planetary Thermophysical Model")
@@ -70,8 +77,13 @@ class PTM3DMainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Create main horizontal splitter
+        # Create main horizontal splitter. A wide, non-collapsible handle makes
+        # the config <-> visualization boundary easy to grab and drag (a 2px
+        # handle is nearly impossible to find); the visualization side takes the
+        # extra space when the window is resized.
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setChildrenCollapsible(False)
 
         # Left panel: Configuration and Results Browser
         self.left_panel = self.create_left_panel()
@@ -81,7 +93,10 @@ class PTM3DMainWindow(QMainWindow):
         self.right_panel = self.create_right_panel()
         self.main_splitter.addWidget(self.right_panel)
 
-        # Set initial splitter sizes (40% left, 60% right)
+        # Set initial splitter sizes (40% left, 60% right) and let the viz
+        # (right) side absorb resize; the config column stays draggable.
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([560, 840])
 
         main_layout.addWidget(self.main_splitter)
@@ -122,24 +137,58 @@ class PTM3DMainWindow(QMainWindow):
         self.results_panel = ResultsPanel()
         self.left_tabs.addTab(self.results_panel, "Results Browser")
 
-        # Camera Simulation Panel
+        # Camera Simulation Panel — an advanced tool, hidden by default. It is
+        # created here so its wiring (console, run/stop) is in place, but the
+        # tab is only added when the user enables it via View > Show Camera Tool.
         self.camera_panel = CameraPanel(
             config_manager=self.config_manager,
             console_panel=getattr(self, 'console_panel', None))
-        self.left_tabs.addTab(self.camera_panel, "Camera")
         self.camera_panel.run_requested.connect(self._launch_camera_sim)
         self.camera_panel.stop_requested.connect(self._stop_camera_sim)
         self.camera_sim_thread = None
 
-        # Batch Runs panel — monitor and control multi-site batch jobs
-        # (e.g. run_a3gt_batch.py). Read-only view of in-flight runs +
-        # pause / stop controls; does not own the orchestrator process.
-        self.batch_panel = BatchDashboardPanel()
-        self.left_tabs.addTab(self.batch_panel, "Batch Runs")
-
         layout.addWidget(self.left_tabs)
 
         return left_widget
+
+    def set_camera_tab_visible(self, visible):
+        """Show or hide the (advanced) Camera tool tab. The panel widget is
+        kept alive either way; only its presence in the tab bar changes."""
+        idx = self.left_tabs.indexOf(self.camera_panel)
+        if visible and idx < 0:
+            self.left_tabs.addTab(self.camera_panel, "Camera")
+        elif not visible and idx >= 0:
+            self.left_tabs.removeTab(idx)
+
+    def _maybe_show_body_picker(self):
+        """On first launch only, prompt for the target body so the default
+        (Moon) is an explicit choice rather than a silent one. Selecting the
+        body drives the Simulation-tab combo, which updates every body-aware
+        tab exactly as a manual selection would. Shown once, tracked in
+        QSettings; choosing Cancel keeps the current default."""
+        if self.settings.value("bodyPickerShown", False, type=bool):
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        from gui_panels.config_panel import SimulationTab
+        bodies = list(SimulationTab.BUILTIN_BODIES)
+        current = self.config_manager.get_value("simulation.body", "Moon")
+        default_idx = bodies.index(current) if current in bodies else 0
+        body, ok = QInputDialog.getItem(
+            self, "Select target body",
+            "Choose the planetary body for this project.\n"
+            "You can change it any time on the Simulation tab.",
+            bodies, default_idx, False)
+        # Mark as shown regardless of choice so it never nags again.
+        self.settings.setValue("bodyPickerShown", True)
+        if ok and body:
+            combo = self.config_panel.tabs["simulation"].widgets.get(
+                "simulation.body")
+            if combo is not None:
+                # setCurrentText fires the normal change signals -> updates the
+                # config and every body-aware tab.
+                combo.setCurrentText(body)
+            else:
+                self.config_manager.set_value("simulation.body", body)
 
     def create_right_panel(self):
         """Create the right panel with visualization"""
@@ -166,8 +215,12 @@ class PTM3DMainWindow(QMainWindow):
 
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.console_dock)
 
-        # Set initial size
-        self.console_dock.setMinimumHeight(200)
+        # Docked and visible on launch, tall enough to read output comfortably.
+        # A readable minimum floor plus a taller default height applied once the
+        # window is laid out (see _apply_default_console_height, only when there
+        # is no saved window state to restore).
+        self.console_dock.setVisible(True)
+        self.console_dock.setMinimumHeight(240)
 
     def create_menu_bar(self):
         """Create application menu bar"""
@@ -244,6 +297,15 @@ class PTM3DMainWindow(QMainWindow):
         toggle_console_action.setShortcut(QKeySequence("Ctrl+`"))
         toggle_console_action.triggered.connect(self.toggle_console)
         view_menu.addAction(toggle_console_action)
+
+        view_menu.addSeparator()
+
+        # Advanced tools: the Camera simulator tab is hidden by default.
+        self.show_camera_action = QAction("Show &Camera Tool", self)
+        self.show_camera_action.setCheckable(True)
+        self.show_camera_action.setChecked(False)
+        self.show_camera_action.toggled.connect(self.set_camera_tab_visible)
+        view_menu.addAction(self.show_camera_action)
 
         view_menu.addSeparator()
 
@@ -398,6 +460,9 @@ class PTM3DMainWindow(QMainWindow):
         """Apply modern styling"""
         self.setStyleSheet(ModernStyle.get_stylesheet())
 
+    # Comfortable default height (px) for the docked console on first launch.
+    DEFAULT_CONSOLE_HEIGHT = 340
+
     def restore_window_state(self):
         """Restore window geometry and state"""
         geometry = self.settings.value("geometry")
@@ -405,8 +470,24 @@ class PTM3DMainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
         state = self.settings.value("windowState")
+        self._had_saved_window_state = bool(state)
         if state:
             self.restoreState(state)
+
+    def _apply_default_console_height(self):
+        """Give the docked console a comfortable default height on first launch.
+
+        Runs once the event loop is up (so the window has a real size). Skipped
+        when a saved window state was restored, so a user's own console size is
+        never overridden."""
+        if getattr(self, "_had_saved_window_state", False):
+            return
+        try:
+            self.resizeDocks([self.console_dock],
+                             [self.DEFAULT_CONSOLE_HEIGHT],
+                             Qt.Orientation.Vertical)
+        except Exception:
+            pass
 
     def save_window_state(self):
         """Save window geometry and state"""
@@ -595,29 +676,43 @@ class PTM3DMainWindow(QMainWindow):
             )
             return
 
-        # Need to save config first
-        if not self.current_project_file:
-            reply = QMessageBox.question(
-                self, "Save Required",
-                "Please save the project before running the simulation.",
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel
-            )
-            if reply == QMessageBox.StandardButton.Save:
-                self.save_project_as()
-                if not self.current_project_file:
-                    return
-            else:
-                return
-        else:
-            # Save current state
+        # Auto-save so the run never blocks on a forced "save before running"
+        # dialog. If a project file is already open, save in place and run it
+        # as-is (unchanged behavior). If there is no project file yet, write an
+        # engine-facing config into the output directory with every path
+        # absolutized against the project root (save_run_yaml) and run THAT --
+        # absolutized paths resolve regardless of the YAML's location, so no
+        # relative-path is ever mis-resolved against the output dir. We do not
+        # promote the auto-saved file to "the project file", so a subsequent run
+        # re-writes it absolutized rather than as a relative-path save_to_yaml.
+        # The manual Save button still uses save_to_yaml (relative paths), so
+        # this does NOT change what a hand-saved project YAML looks like.
+        config_dict = self.config_manager.get_config()
+        if self.current_project_file:
             self.save_project()
+            run_config_path = self.current_project_file
+        else:
+            from gui_core.preflight import find_project_root, resolve_path
+            exe = SimulationRunner.find_ptm_executable()
+            root = find_project_root(exe) if exe else Path.cwd()
+            output_dir = resolve_path(config_dict["output"]["directory"], root)
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                run_config_path = str(output_dir / "config.yaml")
+                self.config_manager.save_run_yaml(run_config_path, root)
+                self.add_recent_file(run_config_path)
+                self.console_panel.append_info(
+                    f"Auto-saved run config to: {run_config_path}")
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error", f"Failed to write run config:\n{str(e)}")
+                return
 
         # Pre-flight validation: paths exist and are readable, no dataless
         # (cloud placeholder) files, cloud-path override, disk space, VF
         # face-count guard, executable fingerprint. A config that fails
         # pre-flight would previously hang or crash mid-run with no
         # diagnosis (e.g. an OneDrive topo_directory of evicted files).
-        config_dict = self.config_manager.get_config()
         report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
         for line in report.summary_lines():
             self.console_panel.append_info(f"[preflight] {line}")
@@ -629,7 +724,7 @@ class PTM3DMainWindow(QMainWindow):
         # engine env flags are applied inside SimulationThread)
         try:
             self.simulation_thread = SimulationThread(
-                self.current_project_file,
+                run_config_path,
                 config_dict=config_dict
             )
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
@@ -808,6 +903,9 @@ class PTM3DMainWindow(QMainWindow):
         self.main_splitter.setSizes([560, 840])
         self.console_dock.setVisible(True)
         self.console_dock.setFloating(False)
+        self.resizeDocks([self.console_dock],
+                         [self.DEFAULT_CONSOLE_HEIGHT],
+                         Qt.Orientation.Vertical)
         self.status_label.setText("Layout reset to defaults")
 
     # === Visualization Operations ===

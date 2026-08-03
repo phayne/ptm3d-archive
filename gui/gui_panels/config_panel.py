@@ -330,8 +330,8 @@ class SimulationTab(BaseConfigTab):
     CUSTOM_BODY = "Custom Body..."
     BROWSE_HORIZONS = "Browse HORIZONS..."
 
-    # Standard built-in bodies
-    BUILTIN_BODIES = ["Europa", "Moon", "Mercury", "Enceladus", "Titan", "Mars", "Ceres"]
+    # Standard built-in bodies (Moon first: the default and best-validated body)
+    BUILTIN_BODIES = ["Moon", "Europa", "Mercury", "Enceladus", "Titan", "Mars", "Ceres"]
 
     def init_ui(self):
         self._syncing = False
@@ -699,7 +699,7 @@ class SimulationTab(BaseConfigTab):
             # Revert to previous selection
             combo = self.widgets["simulation.body"]
             config = self.config_manager.get_config()
-            prev = config.get("simulation", {}).get("body", "Europa")
+            prev = config.get("simulation", {}).get("body", "Moon")
             idx = combo.findText(prev)
             if idx >= 0:
                 combo.blockSignals(True)
@@ -728,7 +728,7 @@ class SimulationTab(BaseConfigTab):
             # Revert combo (the HORIZONS tab will set the body when selected)
             combo = self.widgets["simulation.body"]
             config = self.config_manager.get_config()
-            prev = config.get("simulation", {}).get("body", "Europa")
+            prev = config.get("simulation", {}).get("body", "Moon")
             idx = combo.findText(prev)
             if idx >= 0:
                 combo.blockSignals(True)
@@ -846,7 +846,7 @@ class SimulationTab(BaseConfigTab):
 
             # Update synodic period for the loaded body
             self._current_synodic_days = self._get_synodic_period_days(
-                sim.get("body", "Europa")
+                sim.get("body", "Moon")
             )
 
             # Set duration spinbox in current display units (use saved value, not synodic default)
@@ -1147,10 +1147,22 @@ class ThermalTab(BaseConfigTab):
         control_layout.addWidget(eq_container, 2, 1)
         self.widgets["thermal.equilibration_orbits"] = self.eq_spin
 
-        # Row 3: Equilibration cadence mode
-        # Decouples equilibration time-step cadence from output cadence.
-        # For large meshes with fine output cadence, this dramatically reduces
-        # illumination memory and compute (up to 50x measured).
+        # Compute Statistics stays in Model Control.
+        self.add_bool_field(control_layout, 3, "Compute Statistics", "thermal.compute_statistics",
+                            "Calculate min/max/mean temperature statistics",
+                            info_key="thermal.compute_statistics")
+
+        control_group.setLayout(control_layout)
+        layout.addWidget(control_group)
+
+        # Equilibration cadence — an expert knob, grouped under "Advanced
+        # thermal" (collapsed) below. Decouples equilibration time-step cadence
+        # from output cadence; for large meshes with fine output cadence this
+        # dramatically reduces illumination memory and compute (up to 50x).
+        cad_group = QGroupBox("Equilibration Cadence")
+        cad_layout = QGridLayout()
+        cad_layout.setColumnStretch(1, 1)
+
         cad_label = QLabel("Eq. Cadence:")
         cad_label.setToolTip(
             "Time-step cadence during equilibration phase (separate from output cadence).\n"
@@ -1158,7 +1170,7 @@ class ThermalTab(BaseConfigTab):
             "Accuracy tiers set samples per diurnal cycle of the target body.\n"
             "Custom: set explicit steps per Earth-day."
         )
-        control_layout.addWidget(cad_label, 3, 0)
+        cad_layout.addWidget(cad_label, 0, 0)
 
         cad_container = QWidget()
         cad_hlayout = QHBoxLayout(cad_container)
@@ -1197,7 +1209,7 @@ class ThermalTab(BaseConfigTab):
         self.eq_cadence_spin.valueChanged.connect(self._on_eq_cadence_value_changed)
         cad_hlayout.addWidget(self.eq_cadence_spin)
 
-        control_layout.addWidget(cad_container, 3, 1)
+        cad_layout.addWidget(cad_container, 0, 1)
 
         # Live readout of the effective cadence (body-aware)
         self.eq_cadence_readout = QLabel("")
@@ -1207,14 +1219,9 @@ class ThermalTab(BaseConfigTab):
             "'samples per diurnal cycle' is body-independent; 'steps per Earth-day' is what\n"
             "PTM3D uses internally and depends on the body's synodic day."
         )
-        control_layout.addWidget(self.eq_cadence_readout, 4, 1)
+        cad_layout.addWidget(self.eq_cadence_readout, 1, 1)
 
-        self.add_bool_field(control_layout, 5, "Compute Statistics", "thermal.compute_statistics",
-                            "Calculate min/max/mean temperature statistics",
-                            info_key="thermal.compute_statistics")
-
-        control_group.setLayout(control_layout)
-        layout.addWidget(control_group)
+        cad_group.setLayout(cad_layout)
 
         # GPU Acceleration
         gpu_group = QGroupBox("GPU Acceleration")
@@ -1229,20 +1236,26 @@ class ThermalTab(BaseConfigTab):
         layout.addWidget(gpu_group)
 
 
-        # Integration Window
+        # Integration Window (advanced)
         integ_group = QGroupBox("Integration Window")
         integ_layout = QGridLayout()
         integ_layout.setColumnStretch(1, 1)
 
         self.add_double_field(integ_layout, 0, "Integration Days:", "thermal.integration_days",
-                              -1.0, 10000.0, 2, "Integration window in days (-1 = auto)",
+                              -1.0, 10000.0, 2, "Integration window in days (-1 = automatic)",
                               info_key="thermal.integration_days")
         self.add_int_field(integ_layout, 1, "Integration Steps:", "thermal.integration_steps",
-                           -1, 100000, "Integration steps override (-1 = auto)",
+                           -1, 100000, "Integration steps override (-1 = automatic)",
                            info_key="thermal.integration_steps")
 
+        integ_note = QLabel(
+            "Leave at -1 for automatic (integrate over the full simulation "
+            "duration / timesteps). Set a positive value only to override.")
+        integ_note.setStyleSheet("color: gray; font-size: 10px;")
+        integ_note.setWordWrap(True)
+        integ_layout.addWidget(integ_note, 2, 0, 1, 2)
+
         integ_group.setLayout(integ_layout)
-        layout.addWidget(integ_group)
 
         # Property Maps
         maps_group = QGroupBox("Thermal Property Maps")
@@ -1288,7 +1301,15 @@ class ThermalTab(BaseConfigTab):
         )
 
         maps_group.setLayout(maps_layout)
-        layout.addWidget(maps_group)
+
+        # Collect the expert thermal knobs (equilibration cadence, integration
+        # window, property maps) under one collapsed section so the Thermal tab
+        # leads with the common controls.
+        adv_thermal = CollapsibleSection("Advanced thermal", collapsed=True)
+        adv_thermal.add_widget(cad_group)
+        adv_thermal.add_widget(integ_group)
+        adv_thermal.add_widget(maps_group)
+        layout.addWidget(adv_thermal)
 
         # Wire enable/disable based on mode
         self.widgets["thermal.property_map_mode"].currentIndexChanged.connect(
@@ -1695,8 +1716,81 @@ class RadiationTab(BaseConfigTab):
         sparse_section.add_widget(sparse_widget)
         layout.addWidget(sparse_section)
 
+        # Advisory pre-run cost estimate (disk + solve time), updated live as
+        # radiation / mesh / body fields change. Order-of-magnitude only.
+        self.vf_estimate_label = QLabel("")
+        self.vf_estimate_label.setWordWrap(True)
+        self.vf_estimate_label.setObjectName("vfEstimateLabel")
+        self.vf_estimate_label.setStyleSheet(
+            "color: #64B5F6; font-size: 11px; padding: 6px; "
+            "border: 1px solid #444; border-radius: 4px;")
+        layout.addWidget(self.vf_estimate_label)
+
+        # The H-matrix compression sub-options (ACA method, ACA tolerance/rank,
+        # build threads) only take effect when H-matrix compression is enabled:
+        # in the engine ACA is simply the compression method *inside* the
+        # H-matrix path (radiation_exchange.cpp: compression_method = use_aca ?
+        # ACA : SVD). Grey them out when H-matrix is off so the panel reflects
+        # that dependency. This never changes the saved YAML — disabled widgets
+        # keep their stored values.
+        self.widgets["radiation.use_hmatrix"].toggled.connect(
+            self._update_hmatrix_suboptions)
+
         layout.addStretch()
         self.create_scroll_area(content)
+
+        self._update_hmatrix_suboptions()
+
+        # Recompute the estimate whenever a radiation field changes.
+        self.value_changed.connect(self.update_vf_estimate)
+        self.update_vf_estimate()
+
+    def _update_hmatrix_suboptions(self, _checked=None):
+        """Enable the H-matrix compression sub-fields only when H-matrix is on."""
+        on = self.widgets["radiation.use_hmatrix"].isChecked()
+        for key in ("radiation.use_aca", "radiation.aca_tolerance",
+                    "radiation.aca_max_rank", "radiation.hmatrix_threads"):
+            w = self.widgets.get(key)
+            if w is not None:
+                w.setEnabled(on)
+
+    def _project_root(self):
+        from pathlib import Path
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            return find_project_root(SimulationRunner.find_ptm_executable())
+        except Exception:
+            return Path.cwd()
+
+    def update_vf_estimate(self):
+        """Refresh the advisory view-factor cost label from the current config."""
+        from gui_core.preflight import estimate_vf_cost
+        if not self.config_manager.get_value("radiation.enabled", False):
+            self.vf_estimate_label.setText(
+                "Enable radiation exchange to see a view-factor cost estimate.")
+            return
+        try:
+            est = estimate_vf_cost(self.config_manager.get_config(),
+                                   self._project_root())
+        except Exception as e:  # advisory only -- never break the tab
+            self.vf_estimate_label.setText(
+                f"View-factor cost estimate unavailable: {e}")
+            return
+        if not est.available:
+            self.vf_estimate_label.setText(
+                est.lines[0] if est.lines else "View-factor cost: not estimable.")
+            return
+        text = est.headline()
+        for line in est.lines:
+            text += f"\n{line}"
+        for w in est.warnings:
+            text += f"\n⚠ {w}"
+        self.vf_estimate_label.setText(text)
+
+    def on_body_changed(self, _body_name=None):
+        """Body change affects the mesh face count -> refresh the estimate."""
+        self.update_vf_estimate()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -1721,6 +1815,8 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        self._update_hmatrix_suboptions()
+        self.update_vf_estimate()
 
 
 class ThermophysicalTab(BaseConfigTab):
@@ -1753,12 +1849,18 @@ class ThermophysicalTab(BaseConfigTab):
         "Moon": {
             "albedo": 0.12, "emissivity": 0.95, "Qb": 0.018,
             "ks": 7.4e-4, "kd": 3.4e-3, "rhos": 1100.0, "rhod": 1800.0,
-            "H": 0.06, "cp0": -3.6125, "incidence_angle_albedo": True,
+            # Global model -> default Hayne (2017) angular albedo (False); Hapke
+            # is opt-in (Paul's ruling). Was True (Hapke).
+            "H": 0.06, "cp0": -3.6125, "incidence_angle_albedo": False,
             "chi": 2.7, "rAU": 1.0, "cpCoeff": [2.7431, 2.3616e-3, -1.2340e-5, 8.9093e-9],
         },
         "Mercury": {
             "albedo": 0.07, "emissivity": 0.93, "Qb": 0.02,
             "ks": 0.002, "kd": 2.0, "rhos": 1800.0, "rhod": 2200.0,
+            # Mercury defaults to Hapke (True) per Paul's ruling: the Hayne
+            # (2017) angular-albedo fit is lunar-calibrated, so it is NOT the
+            # right default for Mercury. Moon stays Hayne (False); Mercury is
+            # the deliberate exception.
             "H": 0.1, "cp0": 800.0, "incidence_angle_albedo": True,
             "chi": 2.7, "rAU": 0.387, "cpCoeff": [0.25, 0.0],
         },
@@ -1866,10 +1968,31 @@ class ThermophysicalTab(BaseConfigTab):
                                        "thermophysical.use_default_emissivity", 0.0, 1.0, 3,
                                        "Thermal emissivity for IR radiation (0-1)",
                                        info_key="thermophysical.emissivity")
-        self.add_bool_field(surface_layout, 2, "Incidence-Angle Dependent Albedo",
-                            "thermophysical.incidence_angle_albedo",
-                            "Albedo increases at grazing angles (Hayne et al. 2017)",
-                            info_key="thermophysical.incidence_angle_albedo")
+        # Incidence-angle albedo MODEL selector (Hayne 2017 vs Hapke). The
+        # engine key is a single boolean (incidence_angle_albedo): false ->
+        # Hayne (2017) angular albedo, true -> Hapke directional model. There
+        # is no separate "off" state — false already selects the Hayne angular
+        # model, which is the default for global bodies (Paul's ruling).
+        ica_label = QLabel("Incidence-Angle Albedo:")
+        self._apply_tooltip(ica_label, "thermophysical.incidence_angle_albedo")
+        surface_layout.addWidget(ica_label, 2, 0)
+
+        self.incidence_combo = QComboBox()
+        self.incidence_combo.addItem("Hayne (2017)", False)
+        self.incidence_combo.addItem("Hapke", True)
+        self.incidence_combo.setToolTip(
+            "Angular albedo model.\n"
+            "Hayne (2017): albedo increases toward grazing incidence per the "
+            "lunar Hayne et al. (2017) fit — the default for global bodies.\n"
+            "Hapke: directional (photometric) albedo model — opt-in.\n"
+            "Sets the engine key incidence_angle_albedo (Hayne = false, "
+            "Hapke = true).")
+        self.incidence_combo.currentIndexChanged.connect(
+            self._on_incidence_model_changed)
+        surface_layout.addWidget(self.incidence_combo, 2, 1)
+        # Registered under the engine key so the existing body-preset / load
+        # paths keep finding it; the value it holds is the Hayne/Hapke boolean.
+        self.widgets["thermophysical.incidence_angle_albedo"] = self.incidence_combo
 
         surface_section.add_widget(surface_widget)
         layout.addWidget(surface_section)
@@ -2053,13 +2176,10 @@ class ThermophysicalTab(BaseConfigTab):
                 self.config_manager.set_value(value_key, defaults[attr])
                 self.config_manager.set_value(default_key, False)
 
-        # Incidence angle albedo
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            ica = defaults.get("incidence_angle_albedo", False)
-            self.widgets["thermophysical.incidence_angle_albedo"].blockSignals(True)
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(ica)
-            self.widgets["thermophysical.incidence_angle_albedo"].blockSignals(False)
-            self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
+        # Incidence-angle albedo model (Hayne=False / Hapke=True)
+        ica = defaults.get("incidence_angle_albedo", False)
+        self._set_incidence_model(ica)
+        self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
 
         self._update_ti_display(defaults)
         # Re-apply engine-support gating: a preset may have unchecked rows
@@ -2124,11 +2244,26 @@ class ThermophysicalTab(BaseConfigTab):
                     "*_override keys); the grayed-out properties require a "
                     "Custom or HORIZONS body.")
 
+    def _on_incidence_model_changed(self, _idx):
+        """Selector changed -> write the Hayne/Hapke boolean to config."""
+        use_hapke = bool(self.incidence_combo.currentData())
+        self.config_manager.set_value(
+            "thermophysical.incidence_angle_albedo", use_hapke)
+        self.value_changed.emit()
+
+    def _set_incidence_model(self, use_hapke):
+        """Reflect a boolean incidence_angle_albedo into the selector without
+        emitting a change: Hayne (False) -> index 0, Hapke (True) -> index 1."""
+        idx = 1 if use_hapke else 0
+        self.incidence_combo.blockSignals(True)
+        self.incidence_combo.setCurrentIndex(idx)
+        self.incidence_combo.blockSignals(False)
+
     def update_to_body_defaults(self, body_name=None):
         """Update all fields to show body defaults"""
         if body_name is None:
             config = self.config_manager.get_config()
-            body_name = config.get("simulation", {}).get("body", "Europa")
+            body_name = config.get("simulation", {}).get("body", "Moon")
 
         # Strip [H] prefix for HORIZONS bodies
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
@@ -2172,11 +2307,10 @@ class ThermophysicalTab(BaseConfigTab):
                     self.widgets[value_key].setValue(defaults.get(attr, 0.0))
                     self.widgets[value_key].blockSignals(False)
 
-        # Update incidence angle albedo checkbox
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
-                defaults.get("incidence_angle_albedo", False)
-            )
+        # Update incidence-angle albedo model selector + config (Hayne / Hapke)
+        ica = defaults.get("incidence_angle_albedo", False)
+        self._set_incidence_model(ica)
+        self.config_manager.set_value("thermophysical.incidence_angle_albedo", ica)
 
         self._update_ti_display(defaults)
 
@@ -2184,6 +2318,14 @@ class ThermophysicalTab(BaseConfigTab):
         """Load values from configuration"""
         config = self.config_manager.get_config()
         thermo = config.get("thermophysical", {})
+
+        # Snapshot the saved incidence-albedo model choice up front. `thermo`
+        # is a live reference into the config dict, and BOTH the checkbox loop
+        # below (setChecked -> stateChanged -> on_default_toggled ->
+        # update_to_body_defaults) and the explicit seed further down call
+        # set_value on this key, so it must be read before any of that runs.
+        has_saved_ica = "incidence_angle_albedo" in thermo
+        saved_ica = bool(thermo.get("incidence_angle_albedo", False))
 
         properties = [
             ("thermophysical.albedo", "thermophysical.use_default_albedo", "albedo", "use_default_albedo"),
@@ -2206,12 +2348,20 @@ class ThermophysicalTab(BaseConfigTab):
                 self.widgets[default_key].setChecked(use_default)
                 self.widgets[value_key].setEnabled(not use_default)
 
-        if "thermophysical.incidence_angle_albedo" in self.widgets:
-            self.widgets["thermophysical.incidence_angle_albedo"].setChecked(
-                thermo.get("incidence_angle_albedo", True)
-            )
-
+        # Seed body defaults first (this re-applies the body's default
+        # incidence-albedo model), THEN let an explicit saved choice win.
+        # update_to_body_defaults() unconditionally writes the body's default
+        # incidence_angle_albedo (there is no per-property "Use Default"
+        # checkbox gating it, unlike the numeric rows above), so a saved
+        # per-project Hayne/Hapke selection would be clobbered on reload
+        # unless we re-apply it afterward. See PTM-33.
         self.update_to_body_defaults()
+
+        if has_saved_ica:
+            self._set_incidence_model(saved_ica)
+            self.config_manager.set_value(
+                "thermophysical.incidence_angle_albedo", saved_ica)
+
         self._update_builtin_support()
 
     def _load_horizons_defaults(self, body_name):
@@ -2263,7 +2413,7 @@ class ThermophysicalTab(BaseConfigTab):
     def _get_current_body_defaults(self):
         """Return the BODY_DEFAULTS dict for the currently selected body."""
         config = self.config_manager.get_config()
-        body_name = config.get("simulation", {}).get("body", "Europa")
+        body_name = config.get("simulation", {}).get("body", "Moon")
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
         if body_name.startswith("[H] "):
             hd = self._load_horizons_defaults(clean_name)
@@ -3016,7 +3166,7 @@ class BodyDefinitionTab(BaseConfigTab):
         self._update_obliquity_display()
 
         # Update banner based on current body
-        body = config.get("simulation", {}).get("body", "Europa")
+        body = config.get("simulation", {}).get("body", "Moon")
         self.on_body_changed(body)
 
 
@@ -3038,9 +3188,6 @@ class IlluminationTab(BaseConfigTab):
         self.add_bool_field(illum_layout, 0, "Include Reflected Sunlight from Primary Body", "illumination.include_primary_reflection",
                             "Include reflected solar radiation from the primary body (e.g., Jupiter for Europa)",
                             info_key="illumination.include_primary_reflection")
-        self.add_bool_field(illum_layout, 1, "Use Batch Processing", "illumination.use_batch_processing",
-                            "Use batch processing for ray tracing",
-                            info_key="illumination.use_batch_processing")
 
         illum_group.setLayout(illum_layout)
         layout.addWidget(illum_group)
@@ -3110,18 +3257,30 @@ class IlluminationTab(BaseConfigTab):
 
         self._albedo_map_field_keys = ["illumination.albedo_map", "illumination.albedo_maps_directory"]
 
-        # Positions
+        # Advanced illumination (collapsed): batch ray-tracing + precomputed
+        # Sun/Primary positions — expert knobs most runs never touch.
+        adv_illum = CollapsibleSection("Advanced illumination", collapsed=True)
+
+        batch_group = QGroupBox("Ray Tracing")
+        batch_layout = QGridLayout()
+        batch_layout.setColumnStretch(1, 1)
+        self.add_bool_field(batch_layout, 0, "Use Batch Processing", "illumination.use_batch_processing",
+                            "Use batch processing for ray tracing",
+                            info_key="illumination.use_batch_processing")
+        batch_group.setLayout(batch_layout)
+        adv_illum.add_widget(batch_group)
+
         pos_group = QGroupBox("Precomputed Positions")
         pos_layout = QGridLayout()
         pos_layout.setColumnStretch(1, 1)
-
         self.add_file_field(pos_layout, 0, "Positions File:", "illumination.positions_file",
                             "Binary Files (*.bin);;All Files (*)",
                             "Precomputed Sun/Primary positions",
                             info_key="illumination.positions_file")
-
         pos_group.setLayout(pos_layout)
-        layout.addWidget(pos_group)
+        adv_illum.add_widget(pos_group)
+
+        layout.addWidget(adv_illum)
 
         layout.addStretch()
         self.create_scroll_area(content)
@@ -3483,36 +3642,70 @@ class ConfigurationPanel(QWidget):
 
         self.stacked_widget = QStackedWidget()
 
+        # Basic tabs come first, then the advanced-only tabs. Basic = what a
+        # scientist needs for a standard thermal run; Advanced reveals the
+        # expert/body-specific machinery. This is a VISIBILITY filter over the
+        # existing nav-rail machinery — no tab is removed, so nothing about the
+        # saved YAML changes.
         tab_order = [
             ("simulation", "Simulation"),
-            ("body_definition", "Body"),
             ("mesh", "Mesh"),
             ("thermophysical", "Properties"),
             ("thermal", "Thermal"),
+            ("output", "Output"),
+            ("body_definition", "Body"),
             ("illumination", "Illumination"),
             ("radiation", "Radiation"),
-            ("output", "Output"),
             ("engine_flags", "Engine Flags"),
         ]
+
+        # Nav keys revealed only when "Advanced options" is checked. The Body
+        # tab has an extra gate (built-in bodies never show it) applied in
+        # _apply_tab_visibility. "__horizons__" is the HORIZONS search page.
+        self._advanced_nav_keys = {
+            "body_definition", "illumination", "radiation",
+            "engine_flags", "__horizons__",
+        }
+        self._nav_keys = []
 
         for key, label in tab_order:
             self.nav_rail.addItem(label)
             self.stacked_widget.addWidget(self.tabs[key])
+            self._nav_keys.append(key)
 
         if self._horizons_panel:
             self.nav_rail.addItem("HORIZONS")
             self.stacked_widget.addWidget(self._horizons_panel)
+            self._nav_keys.append("__horizons__")
 
         self.nav_rail.currentRowChanged.connect(self.stacked_widget.setCurrentIndex)
         self.nav_rail.setCurrentRow(0)
+
+        # Basic / Advanced disclosure toggle above the nav rail.
+        self.advanced_toggle = QCheckBox("Advanced options")
+        self.advanced_toggle.setToolTip(
+            "Reveal expert tabs: Body (custom bodies only), Illumination, "
+            "Radiation, Engine Flags, and HORIZONS.")
+        self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
 
         # Container for nav rail + content
         nav_container = QWidget()
         nav_layout = QHBoxLayout(nav_container)
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(0)
-        nav_layout.addWidget(self.nav_rail)
+
+        nav_column = QWidget()
+        nav_col_layout = QVBoxLayout(nav_column)
+        nav_col_layout.setContentsMargins(0, 0, 0, 0)
+        nav_col_layout.setSpacing(4)
+        nav_col_layout.addWidget(self.advanced_toggle)
+        nav_col_layout.addWidget(self.nav_rail, stretch=1)
+
+        nav_layout.addWidget(nav_column)
         nav_layout.addWidget(self.stacked_widget, stretch=1)
+
+        # Apply the initial Basic/Advanced visibility (Basic by default).
+        self._apply_tab_visibility()
 
         # Connect tab change signals
         for tab in self.tabs.values():
@@ -3536,6 +3729,14 @@ class ConfigurationPanel(QWidget):
             self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
                 self.tabs["illumination"].on_body_changed
             )
+            self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
+                self.tabs["radiation"].on_body_changed
+            )
+            # The Body tab appears only for a custom/generic body; a body change
+            # (e.g. selecting a HORIZONS body) must re-evaluate nav visibility.
+            self.tabs["simulation"].widgets["simulation.body"].currentTextChanged.connect(
+                lambda _t: self._apply_tab_visibility()
+            )
 
         # Built-in dataset displays are resolution-aware: switching the mesh
         # resolution live-updates the resolved topo/albedo paths.
@@ -3545,6 +3746,9 @@ class ConfigurationPanel(QWidget):
                 lambda _v: self.tabs["mesh"].refresh_builtin_topo())
             res_widget.valueChanged.connect(
                 lambda _v: self.tabs["illumination"].refresh_builtin_albedo())
+            # Mesh resolution changes the face count -> refresh the VF estimate.
+            res_widget.valueChanged.connect(
+                lambda _v: self.tabs["radiation"].update_vf_estimate())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:
@@ -3582,6 +3786,44 @@ class ConfigurationPanel(QWidget):
         """Handle configuration value changes"""
         self.update_preview()
         self.config_changed.emit()
+
+    def _on_advanced_toggled(self, _checked):
+        """Basic/Advanced disclosure toggled — re-apply nav-rail visibility."""
+        self._apply_tab_visibility()
+
+    def _apply_tab_visibility(self):
+        """Show/hide nav-rail tabs per the Basic/Advanced toggle.
+
+        Pure visibility over the existing nav-rail + stacked-widget machinery:
+        every tab still exists and still loads/saves, so this never changes the
+        configuration or the saved YAML. Advanced tabs appear only when the
+        toggle is on; the Body tab additionally stays hidden for built-in
+        bodies (it is only meaningful for a custom/generic body).
+        """
+        if not hasattr(self, "advanced_toggle"):
+            return
+        advanced = self.advanced_toggle.isChecked()
+        generic_active = self.config_manager.generic_body_active()
+        for row, key in enumerate(self._nav_keys):
+            item = self.nav_rail.item(row)
+            if item is None:
+                continue
+            if key == "body_definition":
+                hidden = not (advanced and generic_active)
+            elif key in self._advanced_nav_keys:
+                hidden = not advanced
+            else:
+                hidden = False
+            item.setHidden(hidden)
+        # If the current selection just got hidden, jump to the first visible.
+        cur = self.nav_rail.currentRow()
+        cur_item = self.nav_rail.item(cur) if cur >= 0 else None
+        if cur_item is None or cur_item.isHidden():
+            for row in range(self.nav_rail.count()):
+                it = self.nav_rail.item(row)
+                if it is not None and not it.isHidden():
+                    self.nav_rail.setCurrentRow(row)
+                    break
 
     def update_preview(self):
         """Update YAML preview"""
@@ -3637,6 +3879,10 @@ class ConfigurationPanel(QWidget):
             self.config_manager.set_value("illumination.albedo_map", "")
             self.config_manager.set_value("illumination.albedo_maps_directory", "")
 
+        # A generic body is now active — refresh nav visibility so the Body
+        # tab can appear (when Advanced is on).
+        self._apply_tab_visibility()
+
         # Switch back to simulation tab
         sim_idx = self.stacked_widget.indexOf(self.tabs["simulation"])
         if sim_idx >= 0:
@@ -3650,3 +3896,6 @@ class ConfigurationPanel(QWidget):
         for tab in self.tabs.values():
             tab.load_from_config()
         self.update_preview()
+        # Re-evaluate Body-tab visibility (a loaded project may carry a
+        # generic body).
+        self._apply_tab_visibility()

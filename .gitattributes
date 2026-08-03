@@ -1,0 +1,12 @@
+# Files excluded from `git archive` distribution tarballs (the public build).
+#
+# The recommended way to build a public/colleague package is:
+#     git archive --format=tar.gz -o ptm3d.tar.gz HEAD
+# which honors the `export-ignore` rules below. A raw `tar`/`cp -r` of the
+# working tree does NOT honor them and would leak the excluded paths.
+
+# Per-developer Claude/agent settings (may carry local paths and commands).
+# Already gitignored, so absent from a clean checkout; belt-and-suspenders for
+# archives built from a working tree.
+.claude/           export-ignore
+gui/.claude/       export-ignore
