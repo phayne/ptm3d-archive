@@ -2446,12 +2446,21 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             
             // Use the meta-kernel filename from properties
             std::string meta_kernel = kernels_path_ + "/" + meta_kernel_filename_;
-            
+
+            // A Europa/Galilean metakernel (europa.tm) references jup365.bsp,
+            // which the default Moon kernel fetch omits. Point the user at the
+            // fetch set that actually includes it, so the bare command in the
+            // hint does not leave them failing on the same missing kernel.
+            const bool galilean_metakernel =
+                (meta_kernel_filename_.find("europa") != std::string::npos);
+            const char* fetch_bodies_flag = galilean_metakernel ? " --bodies europa" : "";
+
             if (!std::filesystem::exists(meta_kernel)) {
                 std::cerr << "Error: SPICE meta-kernel not found: " << meta_kernel << "\n"
                           << "  Kernel dir resolution: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
                           << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
-                          << "  python3 scripts/fetch_kernels.py  (see INSTALL.md \"SPICE kernel data\")."
+                          << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag
+                          << "  (see INSTALL.md \"SPICE kernel data\")."
                           << std::endl;
                 // Try falling back to default meta-kernel if different
                 if (meta_kernel_filename_ != "europa.tm") {
@@ -2486,7 +2495,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                           << meta_kernel << "': " << short_msg << "\n"
                           << "  " << long_msg << "\n"
                           << "  A referenced kernel is missing or unresolved. Populate the kernel\n"
-                          << "  directory with:  python3 scripts/fetch_kernels.py\n"
+                          << "  directory with:  python3 scripts/fetch_kernels.py" << fetch_bodies_flag << "\n"
                           << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
                 return false;
             }
