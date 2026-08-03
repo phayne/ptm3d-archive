@@ -1,1 +1,0 @@
-# Viewshed GUI core modules

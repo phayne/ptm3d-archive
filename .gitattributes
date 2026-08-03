@@ -10,8 +10,3 @@
 # archives built from a working tree.
 .claude/           export-ignore
 gui/.claude/       export-ignore
-
-# Paul-only tools (batch runs, exosphere, viewshed) staged for future
-# standalone GUIs. Tracked in git for recoverability but not shipped in the
-# public distribution. See gui/_private_tools/README.md.
-gui/_private_tools/ export-ignore
