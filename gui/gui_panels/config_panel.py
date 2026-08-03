@@ -1726,12 +1726,33 @@ class RadiationTab(BaseConfigTab):
             "border: 1px solid #444; border-radius: 4px;")
         layout.addWidget(self.vf_estimate_label)
 
+        # The H-matrix compression sub-options (ACA method, ACA tolerance/rank,
+        # build threads) only take effect when H-matrix compression is enabled:
+        # in the engine ACA is simply the compression method *inside* the
+        # H-matrix path (radiation_exchange.cpp: compression_method = use_aca ?
+        # ACA : SVD). Grey them out when H-matrix is off so the panel reflects
+        # that dependency. This never changes the saved YAML — disabled widgets
+        # keep their stored values.
+        self.widgets["radiation.use_hmatrix"].toggled.connect(
+            self._update_hmatrix_suboptions)
+
         layout.addStretch()
         self.create_scroll_area(content)
+
+        self._update_hmatrix_suboptions()
 
         # Recompute the estimate whenever a radiation field changes.
         self.value_changed.connect(self.update_vf_estimate)
         self.update_vf_estimate()
+
+    def _update_hmatrix_suboptions(self, _checked=None):
+        """Enable the H-matrix compression sub-fields only when H-matrix is on."""
+        on = self.widgets["radiation.use_hmatrix"].isChecked()
+        for key in ("radiation.use_aca", "radiation.aca_tolerance",
+                    "radiation.aca_max_rank", "radiation.hmatrix_threads"):
+            w = self.widgets.get(key)
+            if w is not None:
+                w.setEnabled(on)
 
     def _project_root(self):
         from pathlib import Path
@@ -1794,6 +1815,7 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        self._update_hmatrix_suboptions()
         self.update_vf_estimate()
 
 
