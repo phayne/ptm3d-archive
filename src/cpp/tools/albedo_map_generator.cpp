@@ -481,8 +481,12 @@ int main(int argc, char** argv) {
                 }
                 
                 // Use the improved bilinear interpolation which now properly handles
-                // wraparound at the 0°/360° boundary for cylindrical maps
-                double map_albedo = albedo_map.getValue(lon, -lat);
+                // wraparound at the 0°/360° boundary for cylindrical maps.
+                // Sample at the face's physical +latitude (north positive) to match every
+                // runtime sampling path (thermal ptm_thermal_sim.cpp, thermal_model.cpp,
+                // albedo_manager.cpp all use getValue(lon, +lat)). PTM-35: the previous
+                // getValue(lon, -lat) flipped the hemisphere in the baked per-face bins.
+                double map_albedo = albedo_map.getValue(lon, lat);
                 
                 // Store valid albedo values
                 if (map_albedo != albedo_map.getMissingValue() && 
@@ -518,16 +522,16 @@ int main(int argc, char** argv) {
             std::cout << "Performing bilinear interpolation at face centers..." << std::endl;
             for (size_t f = 0; f < num_faces; f++) {
                 if (face_albedos[f] == DEFAULT_ALBEDO) {
-                    // Get face center lat/lon - FLIP LATITUDE for map lookup
-                    double lat = mesh->latitudes[f]; // Negate latitude
+                    // Get face center lat/lon (physical +latitude, north positive)
+                    double lat = mesh->latitudes[f];
                     double lon = mesh->longitudes[f];
-                    
+
                     // Normalize longitude to [0,360] range for map lookup
                     while (lon < 0) lon += 360.0;
                     while (lon >= 360.0) lon -= 360.0;
-                    
-                    // Get interpolated albedo value
-                    double map_albedo = albedo_map.getValue(lon, -lat);
+
+                    // Get interpolated albedo value at the physical +latitude (PTM-35 fix)
+                    double map_albedo = albedo_map.getValue(lon, lat);
                     
                     // Use map value if physically valid (0-1 range)
                     if (map_albedo != albedo_map.getMissingValue() && 
