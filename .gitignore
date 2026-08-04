@@ -135,3 +135,9 @@ data/diviner_seasonal/*.txt
 # C++ readers, so meshes are re-pinned here) and ad-hoc dump files.
 tmp/
 tmp_illum_*.txt
+
+# internal working notes — never ship
+SESSION-NOTES-*.md
+TASK-*.md
+RUNBOOK-*.md
+TICKET-*.md
