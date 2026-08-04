@@ -1605,15 +1605,40 @@ std::vector<double> calculateAbsorbedFlux(
                                  (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
 
     if (use_incidence_albedo) {
+        // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
+        // initialized to), not the Planet's, and say so when they differ. On
+        // the CPU path the two agree today -- `planet` here IS the main-scope
+        // Planet -- but the GPU path rebuilds its Planet, and a banner that can
+        // silently mean two things is exactly what PTM-55 is.
+        if (std::abs(planet->albedo - default_visible_albedo) > 1e-9) {
+            // PTM-09 class: std::cerr/std::cout inherit whatever precision the
+            // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
+            // so a diagnostic that exists to show a DISAGREEMENT would print
+            // two identical numbers. Format explicitly, then restore.
+            std::ios_base::fmtflags f(std::cerr.flags());
+            std::streamsize pr = std::cerr.precision();
+            std::cerr << std::defaultfloat << std::setprecision(6)
+                      << "[albedo] WARNING: Planet(\"" << planet->name
+                      << "\") carries albedo " << planet->albedo
+                      << ", which DISAGREES with the operative "
+                      << default_visible_albedo
+                      << " used to build face_albedos. See BUGS.md PTM-55."
+                      << std::endl;
+            std::cerr.flags(f);
+            std::cerr.precision(pr);
+        }
         if (use_hapke_albedo) {
             std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
                          "1 - gamma*H(mu0,w)" << std::endl;
-            std::cout << "  Base albedo A0 = " << planet->albedo
-                      << ", single-scattering w = " << planet->hapke_albedo_w
+            std::cout << "  Base albedo A0 = " << std::defaultfloat
+                      << std::setprecision(6) << default_visible_albedo
+                      << " (operative), single-scattering w = " << planet->hapke_albedo_w
                       << std::endl;
         } else {
             std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-            std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
+            std::cout << "  Base albedo A0 = " << std::defaultfloat
+                      << std::setprecision(6) << default_visible_albedo
+                      << " (operative)" << std::endl;
             std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
                       << ", b = " << planet->albedoCoef[1] << std::endl;
         }
@@ -3157,6 +3182,38 @@ bool runThermalModelsForAllFacesBatchSoA(
     // Create progress bar
     thermal::ProgressBar progressBar(static_cast<int>(n_faces), "SIMD Batch thermal", 50, true);
 
+    // ------------------------------------------------------------------
+    // PTM-51 diagnostic (env PTM_DUMP_EQ_SEED=<path.csv>, default OFF).
+    //
+    // PTM-51 documents a real, measured residual: Moon topographic faces with
+    // EXACTLY zero absorbed flux equilibrate to ~63.6 K against T_geo = 24.04 K.
+    // Its stated MECHANISM -- an active 50 K cap on the seed's deep column --
+    // was disputed (Fermi, 2026-08-04) as ~20x too small to supply that heat,
+    // with the analytic clear-sky EQUILIBRATION FORCING proposed instead. The
+    // two hypotheses make opposite, checkable predictions for a zero-flux face:
+    //   PTM-51 as written : T_deep - T_surf_est = 50 K   and eq forcing = 0
+    //   Fermi             : T_deep - T_surf_est ~ 2.5 K  and eq forcing > 0
+    // This dump writes both quantities per face so the question is settled by
+    // measurement rather than by arithmetic on either side. Zero cost and
+    // byte-identical when the variable is unset.
+    // ------------------------------------------------------------------
+    const char* eq_seed_dump_path = std::getenv("PTM_DUMP_EQ_SEED");
+    const bool dump_eq_seed = (eq_seed_dump_path != nullptr && *eq_seed_dump_path != '\0');
+    std::vector<double> dbg_avg_flux, dbg_T_surf_est, dbg_dT_geo,
+                        dbg_eqflux_sum, dbg_eqflux_max;
+    std::vector<long long> dbg_eqflux_n;
+    if (dump_eq_seed) {
+        dbg_avg_flux.assign(n_faces, 0.0);
+        dbg_T_surf_est.assign(n_faces, 0.0);
+        dbg_dT_geo.assign(n_faces, 0.0);
+        dbg_eqflux_sum.assign(n_faces, 0.0);
+        dbg_eqflux_max.assign(n_faces, 0.0);
+        dbg_eqflux_n.assign(n_faces, 0);
+        std::cout << "[PTM-51 dump] PTM_DUMP_EQ_SEED=" << eq_seed_dump_path
+                  << " -- per-face equilibration seed + forcing will be written"
+                  << std::endl;
+    }
+
     bool success = true;
 
     #pragma omp parallel num_threads(thermal_threads)
@@ -3309,6 +3366,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double skin_d = thermal::skinDepth(planet.day, kappa0);
                 const double inv_skin = (skin_d > 0.0) ? (1.0 / skin_d) : 0.0;
 
+                if (dump_eq_seed) {                       // PTM-51 diagnostic
+                    dbg_avg_flux[global_f]   = avg_flux;
+                    dbg_T_surf_est[global_f] = T_surf_est;
+                    dbg_dT_geo[global_f]     = delta_T_geo;   // == T_deep - T_surf_est
+                }
+
                 batch.T_eq_init[f] = T_surf_est;
                 for (int layer = 0; layer < n_layers; ++layer) {
                     const double z_layer = ref_profile.z()[layer];
@@ -3395,6 +3458,15 @@ bool runThermalModelsForAllFacesBatchSoA(
                         const double flux_factor = (cos_zen > 0.0) ? cos_zen : 0.0;
                         flux_vec[f] = planetary_absorption * flux_factor;
                     }
+                    if (dump_eq_seed) {                   // PTM-51 diagnostic
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const size_t gf = start_face + f;
+                            dbg_eqflux_sum[gf] += flux_vec[f];
+                            if (flux_vec[f] > dbg_eqflux_max[gf])
+                                dbg_eqflux_max[gf] = flux_vec[f];
+                            ++dbg_eqflux_n[gf];
+                        }
+                    }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
                 }
@@ -3458,6 +3530,52 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // PTM-51 diagnostic: write the per-face seed terms and the analytic
+    // equilibration forcing that actually drove the column.
+    if (dump_eq_seed) {
+        std::ofstream fh(eq_seed_dump_path);
+        if (!fh) {
+            std::cerr << "[PTM-51 dump] WARNING: cannot open '" << eq_seed_dump_path
+                      << "' for writing; NO dump produced." << std::endl;
+        } else {
+            fh << std::setprecision(10);
+            fh << "# PTM-51 equilibration-seed diagnostic\n"
+               << "# body=" << planet.name
+               << " emissivity=" << planet.emissivity
+               << " Qb=" << planet.Qb
+               << " kd=" << planet.kd
+               << " albedo=" << planet.albedo
+               << " S=" << planet.S
+               << " grid_depth_m=" << ref_profile.z().back()
+               << " n_layers=" << n_layers
+               << " T_geo=" << std::pow(planet.Qb / (planet.emissivity * SIGMA_SB), 0.25)
+               << "\n";
+            fh << "face,lat_deg,lon_deg,avg_flux_Wm2,T_surf_est_K,"
+                  "T_deep_minus_T_surf_K,eq_forcing_mean_Wm2,eq_forcing_max_Wm2,"
+                  "eq_substeps,T_surf_final_K\n";
+            for (size_t gf = 0; gf < n_faces; ++gf) {
+                const double eqmean = (dbg_eqflux_n[gf] > 0)
+                    ? dbg_eqflux_sum[gf] / static_cast<double>(dbg_eqflux_n[gf]) : 0.0;
+                double t_final = 0.0;
+                if (surface_temps_out && gf < surface_temps_out->size() &&
+                    !(*surface_temps_out)[gf].empty())
+                    t_final = (*surface_temps_out)[gf].back();
+                fh << gf << ','
+                   << (gf < mesh->latitudes.size()  ? mesh->latitudes[gf]  : 0.0) << ','
+                   << (gf < mesh->longitudes.size() ? mesh->longitudes[gf] : 0.0) << ','
+                   << dbg_avg_flux[gf] << ','
+                   << dbg_T_surf_est[gf] << ','
+                   << dbg_dT_geo[gf] << ','
+                   << eqmean << ','
+                   << dbg_eqflux_max[gf] << ','
+                   << dbg_eqflux_n[gf] << ','
+                   << t_final << '\n';
+            }
+            std::cout << "[PTM-51 dump] wrote " << n_faces << " rows to "
+                      << eq_seed_dump_path << std::endl;
+        }
+    }
 
     // Never substitute silently (see bad_flux_faces above).
     if (bad_flux_faces.load() > 0) {
@@ -4130,8 +4248,37 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // gate-ON run is verifiable from stdout — proves the branch FIRES.
         std::cout << "[GPU Thermal] Using directional-hemispheric (Hapke) albedo "
                      "A_h(i) = 1 - gamma*H(mu0,w)" << std::endl;
-        std::cout << "[GPU Thermal]   Base albedo A0 = " << planet.albedo
-                  << ", single-scattering w = " << hapke_w << std::endl;
+        // PTM-55: this banner used to print `planet.albedo` -- the albedo of the
+        // Planet REBUILT two lines above from the body name, which inherits the
+        // body default and never re-reads the configured value. That is not the
+        // number the physics uses: face_albedos is initialized from
+        // default_visible_albedo (below), and each face's Hapke w is derived
+        // from ITS OWN face_albedos entry. A lunar campaign log therefore
+        // carried two different values for one quantity ("A0 = 0.12" from the
+        // main scope, "A0 = 0.1" here) with no way for a reader to tell which
+        // the solver saw. Report the operative value, and say where it came
+        // from -- per PTM-05.
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << std::defaultfloat
+                  << std::setprecision(6) << default_visible_albedo
+                  << " (operative: face_albedos is initialized to this; a loaded "
+                     "albedo map supersedes it per face), single-scattering w = "
+                  << hapke_w << std::endl;
+        if (std::abs(planet.albedo - default_visible_albedo) > 1e-9) {
+            // Explicit precision -- see the CPU sibling: the inherited stream
+            // state can print two different values identically (PTM-09 class).
+            std::ios_base::fmtflags f(std::cerr.flags());
+            std::streamsize pr = std::cerr.precision();
+            std::cerr << std::defaultfloat << std::setprecision(6)
+                      << "[GPU Thermal] WARNING: the solver-scope Planet(\""
+                      << planet.name << "\") carries albedo " << planet.albedo
+                      << ", which DISAGREES with the operative "
+                      << default_visible_albedo
+                      << ". The operative value is what the flux uses; the "
+                         "solver-scope Planet's albedo is used for nothing else. "
+                         "See BUGS.md PTM-55." << std::endl;
+            std::cerr.flags(f);
+            std::cerr.precision(pr);
+        }
     }
 
     // ---- Optional initial / final thermal-state checkpoint -------------
@@ -7070,6 +7217,203 @@ bool validateMesh(const std::shared_ptr<ptm::Mesh>& mesh) {
     return true;
 }
 
+// ============================================================================
+// PTM-37: state the mesh length unit, and REFUSE to run when it is a guess.
+//
+// PTM3D mesh units are not uniform and nothing on Mesh records which it has:
+// global icosphere meshes are built in KILOMETERS (mesh_utils.cpp scales
+// vertices to body_radius_km_) while DEM/site meshes are in METERS. Three
+// separate places in illumination_model.cpp re-derive the unit with the same
+// ad-hoc test, `|face_center| > 10000` -> meters (kmToNativeScale :74,
+// calculatePrimaryIRBatch :4070, calculatePrimaryReflectedBatch :4218). That
+// heuristic is a 1000x error waiting to happen: getting it backwards is what
+// PTM-36 was (Jupiter's shadow shrank 1000x and every Europa eclipse vanished).
+//
+// This does not fix the substrate -- Mesh still carries no unit -- but it
+// makes the guess VISIBLE and refuses the cases where it is unsafe:
+//
+//   1. The mesh STRADDLES the 10,000 discriminator (some faces above, some
+//      below). Every consumer classifies from ONE face, so different call
+//      sites can reach opposite conclusions about the same mesh. Fatal.
+//   2. The body radius CONTRADICTS the heuristic. This is the gas-giant
+//      landmine named in the ledger: a Jupiter-centered mesh in km has
+//      |face_center| ~ 71,492 > 10,000, so the heuristic calls it meters and
+//      is wrong by 1000x. Fatal.
+//   3. The median sits in the ambiguous band around the discriminator
+//      (10,000/50 .. 10,000*50) and NO body radius confirms it. Fatal.
+//
+// A body radius that CONFIRMS the heuristic resolves case 3: the Moon and
+// Europa icospheres (1737.4 km, 1560.8 km) both land in the ambiguous band by
+// magnitude alone, and are only unambiguous because the radius agrees to
+// ~0.1%. That confirmation is why this guard can be strict without refusing
+// the two most common meshes in the project.
+// ============================================================================
+namespace {
+
+struct MeshUnitReport {
+    bool fatal = false;
+    bool meters = false;         // heuristic verdict (the one consumers use)
+    double median = 0.0;
+    double lo = 0.0, hi = 0.0;
+    std::string message;         // reason, when fatal
+};
+
+MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
+                                     double body_radius_km) {
+    // The discriminator every consumer already uses, and the margin within
+    // which we refuse to trust it unaided.
+    constexpr double kDiscriminator = 10000.0;
+    constexpr double kAmbiguousFactor = 50.0;
+    // A body-centered mesh's |face_center| is the body radius to within
+    // topography and figure flattening; a factor of 2 is generous for both.
+    constexpr double kRadiusTolLo = 0.5, kRadiusTolHi = 2.0;
+
+    MeshUnitReport r;
+    const auto& fc = mesh->face_centers;
+    if (fc.empty()) return r;   // nothing to say; validateMesh already objected
+
+    std::vector<double> mag;
+    mag.reserve(fc.size());
+    for (const auto& c : fc)
+        mag.push_back(std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]));
+    const size_t mid = mag.size() / 2;
+    std::nth_element(mag.begin(), mag.begin() + mid, mag.end());
+    r.median = mag[mid];
+    r.lo = *std::min_element(mag.begin(), mag.end());
+    r.hi = *std::max_element(mag.begin(), mag.end());
+    r.meters = (r.median > kDiscriminator);
+
+    // Median |vertex|, as an independent witness of the same geometry. These
+    // two must agree: face centers ARE vertex averages. They disagree when
+    // something rescaled one array and not the other -- see PTM-65, where
+    // mesh.scale_factor scales the vertices and leaves face_centers /
+    // face_areas / face_normals at the loader's values, then prints "Applied
+    // scale factor". Checking it here turns a silent 1000x geometry error
+    // into a refusal.
+    double vmedian = 0.0;
+    if (!mesh->vertices.empty()) {
+        std::vector<double> vmag;
+        vmag.reserve(mesh->vertices.size());
+        for (const auto& v : mesh->vertices)
+            vmag.push_back(std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]));
+        const size_t vmid = vmag.size() / 2;
+        std::nth_element(vmag.begin(), vmag.begin() + vmid, vmag.end());
+        vmedian = vmag[vmid];
+    }
+
+    std::ostringstream unit_line;
+    unit_line << "[mesh-units] inferred " << (r.meters ? "METERS" : "KILOMETERS")
+              << ": median |face_center| = " << std::setprecision(10) << r.median
+              << " (range " << r.lo << " .. " << r.hi << "), "
+              << mesh->faces.size() << " faces";
+    if (body_radius_km > 0.0)
+        unit_line << ", R_body = " << body_radius_km << " km";
+    else
+        unit_line << ", R_body UNKNOWN";
+    std::cout << unit_line.str() << std::endl;
+
+    // -- 0. face centers vs vertices ---------------------------------------
+    // Tolerance is deliberately loose: a triangle centroid sits INSIDE the
+    // sphere its vertices lie on, so the ratio is coarseness-dependent --
+    // measured on icospheres, 0.795 (res 0, 20 faces), 0.944 (res 1),
+    // 0.985 (res 2), 0.999 (res 4). A tight gate would refuse coarse meshes.
+    // [0.5, 2.0] cannot false-positive on any real surface mesh and still
+    // catches every unit-scale (>=1000x) mismatch with three orders of
+    // margin. It is NOT meant to catch a small scale slip.
+    if (vmedian > 0.0 && r.median > 0.0) {
+        const double ratio = r.median / vmedian;
+        if (ratio < 0.5 || ratio > 2.0) {
+            std::ostringstream m;
+            m << "the mesh is INTERNALLY INCONSISTENT: median |face_center| = "
+              << r.median << " but median |vertex| = " << vmedian
+              << " (ratio " << ratio << "). Face centers are vertex averages, so "
+                 "these cannot legitimately differ. Something rescaled one array "
+                 "and not the other -- if mesh.scale_factor is set, that is PTM-65 "
+                 "(the vertices are scaled, the face centers/areas/normals are not, "
+                 "and the run prints 'Applied scale factor' anyway).";
+            r.fatal = true; r.message = m.str();
+            return r;
+        }
+    }
+
+    // -- 1. straddle -------------------------------------------------------
+    if (r.lo <= kDiscriminator && r.hi > kDiscriminator) {
+        std::ostringstream m;
+        m << "mesh face centers STRADDLE the " << kDiscriminator
+          << " unit discriminator (min " << r.lo << ", max " << r.hi
+          << "). Consumers classify the whole mesh from a single face, so "
+             "different code paths would reach opposite conclusions about "
+             "this one mesh.";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    // -- 2/3. body-radius cross-check --------------------------------------
+    const bool have_R = (body_radius_km > 0.0);
+    bool radius_says_km = false, radius_says_m = false;
+    if (have_R) {
+        const double ratio_km = r.median / body_radius_km;
+        const double ratio_m  = (r.median / 1000.0) / body_radius_km;
+        radius_says_km = (ratio_km >= kRadiusTolLo && ratio_km <= kRadiusTolHi);
+        radius_says_m  = (ratio_m  >= kRadiusTolLo && ratio_m  <= kRadiusTolHi);
+        if (radius_says_km || radius_says_m) {
+            std::cout << "[mesh-units]   confirmed by R_body: |face_center| / R_body = "
+                      << (radius_says_km ? ratio_km : ratio_m) << " assuming "
+                      << (radius_says_km ? "KILOMETERS" : "METERS") << std::endl;
+        }
+    }
+
+    if ((radius_says_km || radius_says_m) && (radius_says_m != r.meters)) {
+        std::ostringstream m;
+        m << "the body radius CONTRADICTS the |face_center| > " << kDiscriminator
+          << " heuristic. R_body = " << body_radius_km << " km and the median "
+          << "|face_center| is " << r.median << ", which is "
+          << (radius_says_km ? "KILOMETERS" : "METERS") << " -- but the heuristic "
+          << "every consumer uses says " << (r.meters ? "METERS" : "KILOMETERS")
+          << ". Running would scale SPICE positions and shadow radii by 1000x in "
+             "the wrong direction (this is PTM-36).";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    const bool in_ambiguous_band =
+        (r.median > kDiscriminator / kAmbiguousFactor) &&
+        (r.median < kDiscriminator * kAmbiguousFactor);
+    if (in_ambiguous_band && !(radius_says_km || radius_says_m)) {
+        std::ostringstream m;
+        m << "median |face_center| = " << r.median << " sits in the ambiguous band ("
+          << (kDiscriminator / kAmbiguousFactor) << " .. " << (kDiscriminator * kAmbiguousFactor)
+          << ") around the " << kDiscriminator << " unit discriminator, and ";
+        if (have_R)
+            m << "the body radius (" << body_radius_km << " km) does not confirm either "
+                 "unit (|face_center|/R_body = " << (r.median / body_radius_km)
+              << " as km, " << ((r.median / 1000.0) / body_radius_km) << " as m). ";
+        else
+            m << "no body radius is available to confirm it. ";
+        m << "PTM3D cannot tell kilometers from meters here, and a wrong guess is a "
+             "1000x error in every SPICE-derived length.";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    if (!(radius_says_km || radius_says_m)) {
+        // Outside the band, so the magnitude alone is decisive -- but nothing
+        // corroborates it. Say so rather than implying more confidence than
+        // we have (a locally recentered patch would land here).
+        std::cout << "[mesh-units]   WARNING: unit inferred from magnitude ALONE; "
+                     "no body radius corroborates it";
+        if (have_R)
+            std::cout << " (R_body = " << body_radius_km << " km gives ratio "
+                      << (r.meters ? (r.median / 1000.0) / body_radius_km
+                                   : r.median / body_radius_km)
+                      << ", outside " << kRadiusTolLo << ".." << kRadiusTolHi << ")";
+        std::cout << ". If this mesh is not body-centered, check it." << std::endl;
+    }
+    return r;
+}
+
+}  // namespace
+
 // Display usage information
 void showUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n\n";
@@ -9052,7 +9396,17 @@ int main(int argc, char** argv) {
     // PHASE 2: Initialize configuration with defaults
     // ========================================================================
     ptm::SimulationConfig sim_config;  // Starts with default values
-    
+
+    // PTM-42: apply the config's `engine_env:` block BEFORE anything reads the
+    // environment. This must precede loadFromYAML (which reads PTM_DATA_ROOT)
+    // and every solver/illumination construction (which latch their gates on
+    // first call). The process environment wins on a conflict, and every
+    // variable is echoed with its disposition -- see
+    // ConfigParser::applyEngineEnv.
+    if (has_config_file) {
+        ptm::ConfigParser::applyEngineEnv(config_file);
+    }
+
     // If config file specified, load it
     if (has_config_file) {
         try {
@@ -9060,9 +9414,23 @@ int main(int argc, char** argv) {
             sim_config = parser.loadFromYAML(config_file);
             std::cout << "✓ Configuration loaded from: " << config_file << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: Failed to load config file: " << e.what() << std::endl;
-            std::cerr << "Continuing with default configuration..." << std::endl;
-            // Continue with defaults - don't exit
+            // PTM-66: this used to warn and CONTINUE. `sim_config` is still at
+            // its constructor defaults here, so continuing ran the whole
+            // simulation on built-in defaults -- default body, mesh, timesteps,
+            // thermophysical properties and output directory -- and exited 0.
+            // Demonstrated 2026-08-04: a config whose only defect was one
+            // rejected enum value produced a complete 12-step Moon icosphere
+            // run, wrote statistics to the DEFAULT output/ directory rather
+            // than the config's, and returned 0, so no wrapper or orchestrator
+            // could detect it. Defaults exist for the NO-CONFIG case; an
+            // operator who passed --config asked for that file specifically.
+            std::cerr << "FATAL: failed to load config file '" << config_file
+                      << "': " << e.what() << "\n"
+                      << "  Refusing to run. Continuing on built-in defaults would "
+                         "silently replace the body, mesh, timesteps, thermophysical "
+                         "properties and output directory you configured.\n"
+                      << "  See BUGS.md PTM-66." << std::endl;
+            return 1;
         }
     }
 
@@ -10225,6 +10593,33 @@ int main(int argc, char** argv) {
     if (!validateMesh(mesh)) {
         std::cerr << "Mesh validation failed. Exiting." << std::endl;
         return 1;
+    }
+
+    // PTM-37: state the inferred mesh length unit (and the body radius that
+    // does or does not corroborate it), and refuse to run when the inference
+    // is a coin flip. See inspectMeshLengthUnit for the three fatal cases.
+    {
+        const double R_for_units = using_generic_body
+            ? generic_body.shape.meanRadiusKm()
+            : planet.body_radius_km;
+        MeshUnitReport units = inspectMeshLengthUnit(mesh, R_for_units);
+        if (units.fatal) {
+            // Do NOT recommend mesh.scale_factor here. It scales the vertices
+            // and leaves face_centers/face_areas/face_normals at the loader's
+            // values (PTM-65), which is precisely the internal inconsistency
+            // case 0 above refuses -- so the advice would send the operator
+            // straight back into this same FATAL, one case earlier.
+            std::cerr << "FATAL [mesh-units]: " << units.message << "\n"
+                      << "  Refusing to run. Rescale the mesh FILE so its face centers "
+                         "are unambiguously meters or kilometers (regenerate it, or "
+                         "rewrite the vertices with a mesh tool), or supply the body "
+                         "radius via the generic-body shape block.\n"
+                      << "  mesh.scale_factor will NOT fix this: it scales the vertices "
+                         "only and leaves face centers/areas/normals unscaled, which is "
+                         "itself a fatal inconsistency here (BUGS.md PTM-65).\n"
+                      << "  See BUGS.md PTM-37 and PTM-36." << std::endl;
+            return 1;
+        }
     }
 
     // ----------------------------------------------------------------------

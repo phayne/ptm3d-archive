@@ -23,6 +23,8 @@
 #include <cassert>
 #include <array>
 #include <mutex>
+#include <set>
+#include <string>
 
 // Conditionally include x86-specific SIMD headers
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -76,6 +78,38 @@ inline double kmToNativeScale(const std::array<double,3>& face_center) {
                                + face_center[1]*face_center[1]
                                + face_center[2]*face_center[2]);
     return (mag > 10000.0) ? 1000.0 : 1.0;   // meters : kilometers
+}
+
+// PTM-45(ii): ONE definition of the penumbral "heavy" solar-disk sample count.
+//
+// It used to be spelled three different ways -- single face max(64, baseN*4)
+// (:3082), CPU batch max(64, baseN) (:3836), GPU batch max(64, N) (:5017) --
+// which agree at the default N_SOLAR_SAMPLES = 9 (all 64) and diverge above 16
+// samples, at which point the single-face and batch paths would sample the
+// SAME geometry differently. The *4 spelling is adopted because "heavy" should
+// scale with the requested base count; it is the finer of the two, so
+// unifying on it can only improve the batch paths, never coarsen them.
+inline uint32_t heavySolarSamples(int num_samples) {
+    const uint32_t baseN = static_cast<uint32_t>(std::max(1, num_samples));
+    return std::max<uint32_t>(64u, baseN * 4u);
+}
+
+// PTM-45(i) / rule 7: an unrecognized primary body is a silent substitution in
+// four different places. Say it ONCE per (body, context) instead of never.
+inline void warnUnknownPrimaryOnce(const std::string& body,
+                                   const char* context,
+                                   const char* consequence) {
+    static std::mutex mtx;
+    static std::set<std::string> seen;
+    const std::string key = body + "|" + context;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!seen.insert(key).second) return;
+    }
+    std::cerr << "[illumination] WARNING: primary body '" << body
+              << "' is not one of EARTH / JUPITER / SATURN / MARS. " << context
+              << ": " << consequence
+              << " (warned once; see BUGS.md PTM-45)." << std::endl;
 }
 
 // PTM-38: does the primary body overlap ANY part of the finite solar disk seen
@@ -3079,7 +3113,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
     const uint32_t baseN   = static_cast<uint32_t>(std::max(1, num_samples));
-    uint32_t heavyN        = std::max<uint32_t>(64, baseN * 4);
+    uint32_t heavyN        = heavySolarSamples(num_samples);   // PTM-45(ii)
     // PTM-38: in the penumbra, 8 samples quantize the eclipsed fraction at
     // ~12.5 % (~21 K near half-obscuration). Start heavy when the primary
     // overlaps the disk. Outside an eclipse this is the old initialN exactly.
@@ -3834,7 +3868,9 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         // primary overlaps the disk. Untouched -> byte-identical -- outside an
         // eclipse.
         const uint32_t baseN = static_cast<uint32_t>(std::max(8, num_samples));
-        const uint32_t N = eclipse_partial ? std::max<uint32_t>(64, baseN) : baseN;
+        // PTM-45(ii): ONE heavyN definition, shared with the single-face and
+        // GPU batch paths. Identical at the default 9 samples (all 64).
+        const uint32_t N = eclipse_partial ? heavySolarSamples(num_samples) : baseN;
         std::vector<std::array<double, 3>> dirs; dirs.reserve(N);
         std::vector<uint8_t> skip; skip.reserve(N);
 
@@ -4083,7 +4119,10 @@ void IlluminationModel::calculatePrimaryIRBatch(
     } else if (primary_body_name_ == "MARS") {
         primary_ir_flux = constants::MARS_IR_FLUX;
     } else {
-        // Unknown primary body, no IR flux
+        // PTM-45(i): unknown primary body -> no IR flux. Behavior unchanged;
+        // the single-face path now agrees, and both say so.
+        warnUnknownPrimaryOnce(primary_body_name_, "primary IR heating (batch)",
+                               "contributing 0 W/m^2 for every face");
         return;
     }
     
@@ -4230,6 +4269,12 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
         primary_albedo = constants::SATURN_BOND_ALBEDO;
     } else if (primary_body_name_ == "MARS") {
         primary_albedo = constants::MARS_BOND_ALBEDO;
+    } else {
+        // PTM-45(i), same class: a substituted Bond albedo. Value UNCHANGED
+        // (both reflected paths already agree on 0.3); it just no longer
+        // happens silently.
+        warnUnknownPrimaryOnce(primary_body_name_, "primary reflected light (batch)",
+                               "substituting a Bond albedo of 0.3");
     }
     
     // Process each face in parallel
@@ -4413,16 +4458,22 @@ double IlluminationModel::calculatePrimaryHeating(
         primary_ir_flux = constants::MARS_IR_FLUX;
     }
     else {
-        // Default calculation for other bodies based on temperature
-        // Using Stefan-Boltzmann law: flux = sigma * T^4
-        double primary_temp = 0.0;
-        if (primary_body_name_ == "JUPITER") primary_temp = constants::JUPITER_TEMPERATURE;
-        else if (primary_body_name_ == "EARTH") primary_temp = constants::EARTH_TEMPERATURE;
-        else if (primary_body_name_ == "SATURN") primary_temp = constants::SATURN_TEMPERATURE;
-        else if (primary_body_name_ == "MARS") primary_temp = constants::MARS_TEMPERATURE;
-        else primary_temp = 250.0; // Default temperature
-        
-        primary_ir_flux = constants::STEFAN_BOLTZMANN * std::pow(primary_temp, 4.0);
+        // PTM-45(i): unknown primary body.
+        //
+        // This used to fall through to primary_temp = 250 K and emit
+        // sigma*250^4 = 221 W/m^2 with no warning, while the batch path
+        // (calculatePrimaryIRBatch) returned 0.0 for the SAME body. Two paths,
+        // two answers, both silent. The four per-body branches that preceded
+        // the 250 K line -- JUPITER / EARTH / SATURN / MARS -- were dead: the
+        // if-chain above already claims all four, so nothing could reach them.
+        // That dead code is the only reason the 250 K default never produced a
+        // wrong number.
+        //
+        // Unified on the batch path's behavior (0.0), and now it warns.
+        warnUnknownPrimaryOnce(primary_body_name_, "primary IR heating",
+                               "contributing 0 W/m^2, matching the batch path "
+                               "(it used to silently assume 250 K here)");
+        return 0.0;
     }
     
     // Apply the appropriate IR flux, scaled by view factor
@@ -4484,6 +4535,10 @@ double IlluminationModel::calculatePrimaryReflectedLight(
         primary_albedo = constants::MARS_BOND_ALBEDO;
     }
     else {
+        // PTM-45(i), same class as the batch path above: substituted value,
+        // UNCHANGED at 0.3, now announced.
+        warnUnknownPrimaryOnce(primary_body_name_, "primary reflected light",
+                               "substituting a Bond albedo of 0.3");
         primary_albedo = 0.3; // Default albedo for other bodies
     }
 
@@ -5014,7 +5069,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     // PTM-38: penumbral faces are sampled heavily (mirrors the CPU paths exactly
     // so CPU and GPU stay equivalent). Only faces the primary actually overlaps
     // pay for it, so a run without an eclipse is byte-identical.
-    const uint32_t heavyN = std::max<uint32_t>(64, N);
+    const uint32_t heavyN = heavySolarSamples(num_samples);   // PTM-45(ii)
 
     // ==== PHASE 1: Generate all rays (parallel, CPU) ====
     // We'll collect all rays from all faces, then batch them to GPU.

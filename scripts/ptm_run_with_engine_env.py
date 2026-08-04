@@ -3,15 +3,20 @@
 
 PTM3D configs may carry an ``engine_env:`` mapping recording the environment
 variables a run needs (``PTM_ILLUM_TRUE_NORMALS``, ``PTM_ILLUM_RISE_HABS``, ...).
-**The engine does not read that block** -- it is documentation only -- so a
-regression pair launched by hand can silently end up with two different
-illumination configurations while looking identical on paper.  That is exactly
-how a do-no-harm comparison turns into a false positive.
 
-This runner reads the block and exports it, so a config and the environment it
-was validated under cannot drift apart.  It prints the environment it applied
-and refuses to run if a variable is already set to a *different* value in the
-caller's environment.
+**Since 2026-08-04 the engine reads and applies that block itself**
+(``ConfigParser::applyEngineEnv``, PTM-42), so for ``ptm_thermal_sim`` this
+runner is no longer required.  It is kept because it still does two things the
+engine deliberately does not:
+
+* it **refuses to run** on a conflicting pre-set variable, where the engine
+  lets the process environment win and only logs the conflict; and
+* it applies the block to *any* binary or wrapper, not just ``ptm_thermal_sim``.
+
+Before that change the block was documentation only, so a regression pair
+launched by hand could silently end up with two different illumination
+configurations while looking identical on paper -- which is exactly how a
+do-no-harm comparison turns into a false positive.
 
 Usage
 -----

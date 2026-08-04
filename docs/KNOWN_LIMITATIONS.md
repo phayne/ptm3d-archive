@@ -5,7 +5,31 @@ core solver; they are modeling limitations, configuration gotchas, and workflow 
 the run log resolves several of them — always confirm what the run actually loaded (a mesh-load
 failure now aborts rather than silently substituting a default icosphere).
 
+**`PTM-nn` identifiers** appearing in source comments and in the notes below reference the
+project's internal issue ledger, which is not distributed. The limitations relevant to released
+functionality are summarized in this file; no lookup elsewhere is required to use PTM3D.
+
 ## Configuration gotchas
+
+- **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
+  body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
+  `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,
+  `kd_override`, `incidence_angle_albedo`, `albedo_model`, `albedo_hapke_w` and
+  `conductivity_model`. Plain-named properties (`ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`, `Qb`,
+  `chi`, `albedo`, `emissivity`) and every `use_default_*` flag other than `use_default_albedo`
+  are **decorative there** — they are honored only under `generic_body.surface:`. Editing them on
+  a named body changes nothing. As of v1.0.3 the engine prints one `[config] WARNING:` line naming
+  every such key it found, instead of dropping them in silence; **it does not start honoring
+  them**, because doing so would change results for the 130+ shipped configs that carry them.
+  There is still no config route to a non-default `H` on a named body except `h_parameter_map`.
+  (PTM-67)
+
+- **A malformed config file is now fatal.** Previously a YAML parse failure — a bad scalar, a
+  malformed document, a rejected enum value — was downgraded to a `Warning:` and the entire
+  simulation ran on built-in defaults (default body, mesh, timesteps, properties **and output
+  directory**) exiting 0, so no orchestrator could detect it. `--config` with an unloadable file
+  now prints `FATAL:` and returns 1. If you relied on the old behavior, omit `--config`
+  deliberately rather than passing a broken one. (PTM-66)
 
 - **`constant_thermal_inertia > 0` silently disables the T-dependent conductivity term (`chi`).**
   Selecting a constant thermal inertia forces `chi = 0` (and collapses `kd→ks`, `rhod→rhos`) by
@@ -79,6 +103,21 @@ failure now aborts rather than silently substituting a default icosphere).
   `[int32 n_faces][float32 × n_faces]`. A custom reader must consume the leading `int32` (the
   shipped `scripts/ptm_qa.py` reader does); reading the file as raw `float32` shifts every face by
   one index and mislabels the first value.
+
+## Physical constants
+
+- **Saturn-shine and Mars-shine changed in v1.0.3; this is a correction, not a regression.** The
+  four primary-body `(TEMPERATURE, IR_FLUX)` constants are consumed as *emitter-surface* fluxes and
+  must therefore satisfy `IR_FLUX = σT⁴`. Three of the four did not. `SATURN_IR_FLUX` was 15.0
+  W/m² — almost exactly the *solar* constant at Saturn (1361/9.58² = 14.83), i.e. a solar value
+  entered for thermal emission — and is now σ(95 K)⁴ = **4.62 W/m² (÷3.25)**. `MARS_IR_FLUX` was
+  70.0 and is now σ(210 K)⁴ = **110.3 W/m² (×1.58)**. Any run with Saturn or Mars as the primary
+  will produce different primary-IR heating than a pre-v1.0.3 build. **No published PTM3D result
+  is affected**: every campaign to date used Jupiter (flux unchanged) or the Sun alone, and no
+  Saturn- or Mars-primary baseline exists to regress against — so this is validated by arithmetic,
+  not by comparison. Earth was already consistent (0.1%); Jupiter's *temperature* constant moved
+  124.4 → 124.90 K purely to make its pair self-consistent, and is read by nothing. A load-time
+  check now warns if any pair drifts more than 5% apart. (PTM-43)
 
 ## Workflow / tooling
 

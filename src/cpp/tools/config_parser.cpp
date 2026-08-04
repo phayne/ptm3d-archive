@@ -10,6 +10,9 @@
 #include <yaml-cpp/yaml.h>
 #endif
 
+// std::sort, for the PTM-67 unread-key report (deterministic key order).
+#include <algorithm>
+
 namespace ptm {
 
 #ifdef HAVE_YAML_CPP
@@ -123,13 +126,168 @@ std::string resolveDataPath(const std::string& value,
     }
     return resolved.lexically_normal().string();
 }
+
+// ---------------------------------------------------------------------------
+// PTM-67: report, ONCE and in ONE line, every key under `thermophysical:` that
+// this parser does not read.
+//
+// Most of the block is decorative. `ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`,
+// `Qb`, `chi`, `albedo` and `emissivity` are read only under
+// `generic_body.surface` -- under `thermophysical:` they are dropped here, at
+// the parser, with nothing printed. Every `use_default_<key>` flag except
+// `use_default_albedo` is likewise unread, which is worse than merely inert:
+// the flag implies an implemented "false" branch that does not exist.
+// Measured 2026-08-04: 19 distinct dead keys across the 132 shipped configs;
+// `use_default_rhos: false` + `rhos: 900.0` ran at rhos = 1100 (the Moon
+// default) and the run's own banner said so.
+//
+// This WARNS; it does not fail, and it does NOT alias the dead keys to the
+// live ones. Making them live would change results for every config in the
+// repository and needs its own gate. Naming them costs nothing and ends the
+// silence, which is the actual defect.
+void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
+    if (!thermo || !thermo.IsMap()) return;
+
+    // The keys loadFromYAML actually consumes from root["thermophysical"].
+    // INVARIANT: every `getWithDefault(thermo, "K", ...)` in the
+    // `root["thermophysical"]` block must appear here. There is no way to
+    // derive this list -- the reads are individual statements -- so it is
+    // maintained by hand and this comment is the contract.
+    //
+    // NOTE `conductivity_model` is listed although THIS branch does not yet
+    // read it: `feat/martinez-conductivity` adds its reader to the same block,
+    // and the released binary is the merged tree. On a hygiene-only build the
+    // key is therefore accepted without comment -- the one deliberate
+    // false-negative in this list, recorded here rather than left to be
+    // rediscovered.
+    static const char* const kRead[] = {
+        "albedo_hapke_w",
+        "albedo_model",
+        "albedo_override",
+        "conductivity_model",
+        "constant_thermal_inertia",
+        "emissivity_override",
+        "incidence_angle_albedo",
+        "kd_override",
+        "ks_override",
+        "use_default_albedo",
+    };
+
+    std::vector<std::string> dead;
+    for (const auto& kv : thermo) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        bool is_read = false;
+        for (const char* r : kRead) { if (key == r) { is_read = true; break; } }
+        if (!is_read) dead.push_back(key);
+    }
+    if (dead.empty()) return;
+
+    std::sort(dead.begin(), dead.end());   // deterministic output
+    std::ostringstream line;
+    line << "[config] WARNING: " << dead.size()
+         << " key(s) under `thermophysical:` are read by nothing and have NO effect: ";
+    for (size_t i = 0; i < dead.size(); ++i)
+        line << (i ? ", " : "") << dead[i];
+    line << " -- editing them changes no result. Named properties are honored only under "
+            "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
+            "See BUGS.md PTM-67.";
+    std::cerr << line.str() << std::endl;
+}
 } // namespace
+
+// ---------------------------------------------------------------------------
+// PTM-42: apply the config's `engine_env:` block to the process environment.
+//
+// Static-initialization audit (2026-08-04, before writing this): every
+// std::getenv() call under src/cpp/ (105 of them) sits inside a function body.
+// The only cached read is a function-local static,
+// gpu/thermal_opencl.cpp:114 `static const bool log_sub = ...`, which is
+// latched on FIRST CALL inside the GPU dispatch loop, not at load time. There
+// is no namespace-scope object whose constructor reads the environment, so no
+// variable is consumed before main(). Applying here -- ahead of loadFromYAML,
+// which itself reads PTM_DATA_ROOT -- is therefore early enough for all of
+// them. If that audit ever stops holding, the correct response is to move the
+// call earlier, not to widen a tolerance.
+// ---------------------------------------------------------------------------
+int ConfigParser::applyEngineEnv(const std::string& filename) {
+    YAML::Node root;
+    try {
+        root = YAML::LoadFile(filename);
+    } catch (const std::exception& e) {
+        // Do not fail here: loadFromYAML reports the parse error a moment
+        // later with its own message. But do not stay silent either -- a
+        // config we cannot read is a config whose engine_env we did not apply.
+        std::cerr << "[engine_env] WARNING: cannot read '" << filename
+                  << "' (" << e.what() << "); NO engine_env variables applied."
+                  << std::endl;
+        return 0;
+    }
+
+    if (!root["engine_env"]) return 0;   // no block: nothing declared, nothing to say
+    const YAML::Node& block = root["engine_env"];
+    if (!block.IsMap()) {
+        std::cerr << "[engine_env] WARNING: 'engine_env' in " << filename
+                  << " is not a mapping; ignoring it. Expected 'KEY: value' pairs."
+                  << std::endl;
+        return 0;
+    }
+
+    std::cout << "[engine_env] " << block.size() << " variable(s) declared in "
+              << filename << std::endl;
+
+    int applied = 0, conflicts = 0;
+    for (auto it = block.begin(); it != block.end(); ++it) {
+        std::string key;
+        std::string val;
+        try {
+            key = it->first.as<std::string>();
+            val = it->second.as<std::string>();
+        } catch (const std::exception&) {
+            std::cerr << "[engine_env]   WARNING: skipping a non-scalar entry in "
+                         "engine_env (keys and values must be plain scalars)."
+                      << std::endl;
+            continue;
+        }
+        if (key.empty()) {
+            std::cerr << "[engine_env]   WARNING: skipping an empty key." << std::endl;
+            continue;
+        }
+
+        const char* prior = std::getenv(key.c_str());
+        if (prior != nullptr && val != prior) {
+            // The process environment wins. Say so loudly: this is exactly the
+            // situation where a run silently gets an environment its config
+            // does not describe.
+            std::cerr << "[engine_env]   CONFLICT: " << key << " = '" << prior
+                      << "' in the process environment overrides the config's '"
+                      << val << "'. The PROCESS value is used." << std::endl;
+            ++conflicts;
+            continue;
+        }
+        if (prior != nullptr) {
+            std::cout << "[engine_env]   " << key << "=" << val
+                      << " (already set in the environment, identical)" << std::endl;
+            continue;
+        }
+        if (::setenv(key.c_str(), val.c_str(), /*overwrite=*/1) != 0) {
+            std::cerr << "[engine_env]   WARNING: setenv(" << key
+                      << ") failed; this variable is NOT active." << std::endl;
+            continue;
+        }
+        std::cout << "[engine_env]   " << key << "=" << val << " (applied)" << std::endl;
+        ++applied;
+    }
+    std::cout << "[engine_env] applied " << applied << ", conflicts " << conflicts
+              << std::endl;
+    return applied;
+}
 
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     SimulationConfig config;
     try {
         YAML::Node root = YAML::LoadFile(filename);
-        
+
         // Parse Time section
         if (root["simulation"]) {
             const auto& sim = root["simulation"];
@@ -398,6 +556,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         // Parse Thermophysical section (GUI-written overrides)
         if (root["thermophysical"]) {
             const auto& thermo = root["thermophysical"];
+            // PTM-67: say which of these keys are decorative BEFORE reading the
+            // ones that are not. One line, whatever the count.
+            warnUnreadThermophysicalKeys(thermo);
             bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
             config.thermophysical_albedo_explicit = !use_default_albedo;
             config.thermophysical.albedo_explicit = !use_default_albedo;
@@ -675,6 +836,16 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     last_error_ = "YAML support not available. Please install yaml-cpp library.";
     throw std::runtime_error(last_error_);
+}
+
+// PTM-42 fallback. Without yaml-cpp we cannot read the block at all -- but a
+// silently unapplied engine_env is the whole bug, so say so.
+int ConfigParser::applyEngineEnv(const std::string& filename) {
+    std::cerr << "[engine_env] WARNING: this build has no YAML support, so any "
+                 "engine_env block in " << filename << " is NOT applied. "
+                 "Export those variables yourself (or use "
+                 "scripts/ptm_run_with_engine_env.py)." << std::endl;
+    return 0;
 }
 
 bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfig& config) {
