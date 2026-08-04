@@ -88,7 +88,19 @@ failure now aborts rather than silently substituting a default icosphere).
   validate against the CPU solver before trusting results, and should treat the whole file as
   unverified, not just this function. (PTM-62)
 
-- **`src/cpp/gpu/thermal_kernels.cl` is a reference copy, not the kernel that runs.** The OpenCL
-  solver compiles the embedded string in `thermal_opencl.cpp`; editing the `.cl` file changes
-  nothing at runtime. In particular the `.cl` copy implements only the Hayne conductivity law and
-  is not a parity reference for `conductivity_model: martinez2021`.
+- **`src/cpp/gpu/thermal_kernels.cl` is a generated mirror, not the kernel that runs.** The OpenCL
+  solver compiles the embedded string in `thermal_opencl.cpp::getEmbeddedKernelSource()`; editing
+  the `.cl` file by hand changes nothing at runtime and will be overwritten. The `.cl` is
+  regenerated verbatim from that string by `scripts/sync_cl_from_embedded.py`, and CI enforces
+  `--check`, so it does track the live kernel (including `conductivity_model: martinez2021`) — but
+  read it as a mirror, and make kernel edits in `thermal_opencl.cpp`.
+
+- **`src/cpp/gpu/radiosity_kernels.cl` has no such mirror check and has drifted. (PTM-70)** The
+  radiosity solver likewise compiles an embedded `R"CL_SOURCE(...)"` string
+  (`radiosity_opencl.cpp::buildKernels()`), but `scripts/sync_cl_from_embedded.py` and the CI check
+  cover only the thermal pair, and the on-disk `radiosity_kernels.cl` is now ~2 kB divergent from
+  the string that actually compiles. Unlike the thermal case there is **no** `kernel_path` /
+  external-load path in the radiosity solver, so a stale file cannot swap in wrong physics at
+  runtime — but the file is copied to the build tree and installed to `share/ptm/kernels`, where a
+  reader would reasonably take it for the kernel. Treat it as out of date until the sync tool is
+  generalized to both pairs.
