@@ -619,7 +619,7 @@ static std::vector<double> parseCsvDoubles(const std::string& csv) {
 
 // Format a double for a Config property WITHOUT the 6-decimal truncation that
 // Config::setProperty(key, double) inflicts via std::to_string -- harmless for
-// 7.4e-4, silently zero for 1e-8 (BUGS.md PTM-58).
+// 7.4e-4, silently zero for 1e-8 (BUGS.md PTM-60).
 static std::string fullPrecision(double v) {
     std::ostringstream os;
     os.precision(17);
@@ -11191,7 +11191,7 @@ int main(int argc, char** argv) {
         // not the raw request, so the solver sees exactly what main() computed.
         //
         // Values go through fullPrecision() rather than the Config double setter,
-        // which truncates at 6 decimals (BUGS.md PTM-58).
+        // which truncates at 6 decimals (BUGS.md PTM-60).
         {
             const auto& tp = sim_config.thermophysical;
             auto fwd = [&thermal_config](const char* key, double value) {
