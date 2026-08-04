@@ -60,6 +60,23 @@ inline std::array<double,3> kmToMeters(const std::array<double,3>& vkm) {
 inline std::array<double,3> metersToKm(const std::array<double,3>& vm) {
     return { vm[0]/1000.0, vm[1]/1000.0, vm[2]/1000.0 };
 }
+// PTM-36: km -> MESH-NATIVE scale factor for the primary-body (eclipse) shadow sphere.
+//
+// PTM3D mesh units are NOT uniform: global icosphere meshes are built in KM
+// (mesh_utils.cpp createIcosphereMesh scales vertices to body_radius_km_) while
+// DEM/site meshes are in METERS. raySphereIntersect() is unit-agnostic -- the ray
+// origin, the sphere center and the sphere RADIUS must all share one unit -- so the
+// primary position and primary_radius_ (always km, see setPrimaryBody) must be
+// converted with the SAME factor. Converting only the center (kmToMeters) shrank
+// Jupiter's shadow 1000x and deleted every Europa eclipse; same for Earth/Moon.
+// Uses the identical |face_center| > 10000 discriminator already trusted by
+// calculatePrimaryIRBatch and calculatePrimaryReflectedBatch.
+inline double kmToNativeScale(const std::array<double,3>& face_center) {
+    const double mag = std::sqrt(face_center[0]*face_center[0]
+                               + face_center[1]*face_center[1]
+                               + face_center[2]*face_center[2]);
+    return (mag > 10000.0) ? 1000.0 : 1.0;   // meters : kilometers
+}
 } // anonymous namespace
 
 namespace {
@@ -2860,7 +2877,15 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     const bool at_face  = selfskip || riseeps;
     // Convert SPICE positions to meters for geometric tests
     const std::array<double,3> sun_pos_m     = kmToMeters(sun_position);
-    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
+    const double km_to_native = kmToNativeScale(face_center);
+    const std::array<double,3> primary_pos_n = {
+        primary_position[0] * km_to_native,
+        primary_position[1] * km_to_native,
+        primary_position[2] * km_to_native
+    };
+    const double primary_radius_n = primary_radius_ * km_to_native;
 
     // Geometry in meters: vector from face to Sun (meters)
     std::array<double, 3> sun_rel_m = {
@@ -2873,6 +2898,9 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
     std::array<double, 3> sun_dir = { sun_rel_m[0]/sun_dist_m, sun_rel_m[1]/sun_dist_m, sun_rel_m[2]/sun_dist_m };
+    // PTM-36: ray parameters t from raySphereIntersect are in MESH-NATIVE units
+    // (sun_dir is a unit vector), so the "nearer than the Sun" bound must be too.
+    const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
 
     // Solar angular radius uses km distance
     const std::array<double,3> face_center_km = metersToKm(face_center);
@@ -2965,8 +2993,8 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     if (sin_elev > 2.0 * std::sin(disk_ang) && cos_inc0 > 0.10) {
         if (!primary_is_sun_) {
             double t1, t2;
-            if (raySphereIntersect(ray_origin_base, sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
-                if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) {
+            if (raySphereIntersect(ray_origin_base, sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
+                if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) {
                     return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
                 }
             }
@@ -3043,8 +3071,8 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
             // Eclipse clip
             if (!primary_is_sun_) {
                 double t1, t2;
-                if (raySphereIntersect(ray_origin_base, sd, primary_pos_m, primary_radius_, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) sskip = true;
+                if (raySphereIntersect(ray_origin_base, sd, primary_pos_n, primary_radius_n, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) sskip = true;
                 }
             }
 
@@ -3570,9 +3598,18 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
     if (n == 0) return;
 
     // Convert SPICE positions from km to meters for direction computation
-    // (face_centers are in meters, SPICE returns km)
+    // (SPICE returns km; the Sun is far enough that the mesh-unit mismatch on
+    // global km meshes is a ~1e-9 direction error, and sun_dist_km below is exact)
     const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
-    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
+    const double km_to_native = kmToNativeScale(face_centers[0]);
+    const std::array<double,3> primary_pos_n = {
+        primary_position[0] * km_to_native,
+        primary_position[1] * km_to_native,
+        primary_position[2] * km_to_native
+    };
+    const double primary_radius_n = primary_radius_ * km_to_native;
 
     auto hash32 = [](uint32_t x) -> uint32_t {
         x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
@@ -3607,6 +3644,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         double sun_dist_m = vectorLength(sun_rel);
         if (sun_dist_m <= constants::EPSILON) { direct_solar_values[i] = 0.0; continue; }
         std::array<double, 3> sun_dir = { sun_rel[0]/sun_dist_m, sun_rel[1]/sun_dist_m, sun_rel[2]/sun_dist_m };
+        // PTM-36: ray parameters t are in MESH-NATIVE units (sun_dir is unit).
+        const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
 
         // Incidence cosine
         double cos_inc0 = dotProduct(fn, sun_dir);
@@ -3698,11 +3737,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         if (cos_inc0 > 0.0) {
             bool blocked = false;
 
-            // Eclipse on center ray (meters for sphere intersection)
+            // Eclipse on center ray (mesh-native units for sphere intersection)
             if (!primary_is_sun_) {
                 double t1, t2;
-                if (raySphereIntersect(ray_o, sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) blocked = true;
+                if (raySphereIntersect(ray_o, sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) blocked = true;
                 }
             }
 
@@ -3760,11 +3799,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
             bool sskip = false;
 
-            // Eclipse clip (before occlusion) — use meters
+            // Eclipse clip (before occlusion) — mesh-native units
             if (!primary_is_sun_) {
                 double t1, t2;
-                if (raySphereIntersect(ray_o, sd, primary_pos_m, primary_radius_, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist_m) || (t2 > 0.0 && t2 < sun_dist_m)) sskip = true;
+                if (raySphereIntersect(ray_o, sd, primary_pos_n, primary_radius_n, t1, t2)) {
+                    if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) sskip = true;
                 }
             }
 
@@ -4854,7 +4893,16 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
 
     // Convert SPICE positions from km to meters for direction computation
     const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
-    const std::array<double,3> primary_pos_m = kmToMeters(primary_position);
+    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
+    // Kept identical to the CPU batch path so CPU/GPU stay equivalent.
+    const double km_to_native = kmToNativeScale(face_centers[0]);
+    const std::array<double,3> primary_pos_n = {
+        primary_position[0] * km_to_native,
+        primary_position[1] * km_to_native,
+        primary_position[2] * km_to_native
+    };
+    const double primary_radius_n = primary_radius_ * km_to_native;
 
     // Hash function for decorrelation
     auto hash32 = [](uint32_t x) -> uint32_t {
@@ -4874,8 +4922,9 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     struct FaceInfo {
         std::array<double, 3> sun_dir;
         std::array<double, 3> ray_origin;
-        double sun_dist_m;   // meters — for eclipse checks
+        double sun_dist_m;   // meters — for the ray geometry
         double sun_dist_km;  // km — for angular size and irradiance
+        double sun_dist_n;   // mesh-native units — far bound for eclipse checks (PTM-36)
         double cos_inc0;
         double disk_scale;
         bool below_horizon;     // Entire disk below horizon
@@ -4900,6 +4949,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         };
         fi.sun_dist_m = vectorLength(sun_rel);
         fi.sun_dist_km = fi.sun_dist_m / 1000.0;
+        fi.sun_dist_n = fi.sun_dist_m * (km_to_native / 1000.0);  // PTM-36
 
         if (fi.sun_dist_m <= constants::EPSILON) {
             fi.below_horizon = true;
@@ -4964,12 +5014,12 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             fc[2] + fn[2] * eps_n + fi.sun_dir[2] * eps_d
         };
 
-        // Check eclipse on center ray (meters)
+        // Check eclipse on center ray (mesh-native units)
         fi.center_eclipsed = false;
         if (!primary_is_sun_ && fi.cos_inc0 > 0.0) {
             double t1, t2;
-            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_pos_m, primary_radius_, t1, t2)) {
-                if ((t1 > 0.0 && t1 < fi.sun_dist_m) || (t2 > 0.0 && t2 < fi.sun_dist_m)) {
+            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
+                if ((t1 > 0.0 && t1 < fi.sun_dist_n) || (t2 > 0.0 && t2 < fi.sun_dist_n)) {
                     fi.center_eclipsed = true;
                 }
             }
@@ -5137,12 +5187,12 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
                 if (l <= constants::EPSILON) continue;
                 sd[0] /= l; sd[1] /= l; sd[2] /= l;
 
-                // Check eclipse (meters)
+                // Check eclipse (mesh-native units)
                 bool eclipsed = false;
                 if (!primary_is_sun_) {
                     double t1, t2;
-                    if (raySphereIntersect(fi.ray_origin, sd, primary_pos_m, primary_radius_, t1, t2)) {
-                        if ((t1 > 0.0 && t1 < fi.sun_dist_m) || (t2 > 0.0 && t2 < fi.sun_dist_m)) {
+                    if (raySphereIntersect(fi.ray_origin, sd, primary_pos_n, primary_radius_n, t1, t2)) {
+                        if ((t1 > 0.0 && t1 < fi.sun_dist_n) || (t2 > 0.0 && t2 < fi.sun_dist_n)) {
                             eclipsed = true;
                         }
                     }
