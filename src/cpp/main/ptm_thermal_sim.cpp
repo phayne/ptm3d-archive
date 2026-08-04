@@ -9301,9 +9301,23 @@ int main(int argc, char** argv) {
             sim_config = parser.loadFromYAML(config_file);
             std::cout << "✓ Configuration loaded from: " << config_file << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: Failed to load config file: " << e.what() << std::endl;
-            std::cerr << "Continuing with default configuration..." << std::endl;
-            // Continue with defaults - don't exit
+            // PTM-66: this used to warn and CONTINUE. `sim_config` is still at
+            // its constructor defaults here, so continuing ran the whole
+            // simulation on built-in defaults -- default body, mesh, timesteps,
+            // thermophysical properties and output directory -- and exited 0.
+            // Demonstrated 2026-08-04: a config whose only defect was one
+            // rejected enum value produced a complete 12-step Moon icosphere
+            // run, wrote statistics to the DEFAULT output/ directory rather
+            // than the config's, and returned 0, so no wrapper or orchestrator
+            // could detect it. Defaults exist for the NO-CONFIG case; an
+            // operator who passed --config asked for that file specifically.
+            std::cerr << "FATAL: failed to load config file '" << config_file
+                      << "': " << e.what() << "\n"
+                      << "  Refusing to run. Continuing on built-in defaults would "
+                         "silently replace the body, mesh, timesteps, thermophysical "
+                         "properties and output directory you configured.\n"
+                      << "  See BUGS.md PTM-66." << std::endl;
+            return 1;
         }
     }
 
@@ -10461,11 +10475,19 @@ int main(int argc, char** argv) {
             : planet.body_radius_km;
         MeshUnitReport units = inspectMeshLengthUnit(mesh, R_for_units);
         if (units.fatal) {
+            // Do NOT recommend mesh.scale_factor here. It scales the vertices
+            // and leaves face_centers/face_areas/face_normals at the loader's
+            // values (PTM-65), which is precisely the internal inconsistency
+            // case 0 above refuses -- so the advice would send the operator
+            // straight back into this same FATAL, one case earlier.
             std::cerr << "FATAL [mesh-units]: " << units.message << "\n"
-                      << "  Refusing to run. Fix the mesh (rescale it so its face "
-                         "centers are unambiguously meters or kilometers, or set "
-                         "mesh.scale_factor), or supply the body radius via the "
-                         "generic-body shape block.\n"
+                      << "  Refusing to run. Rescale the mesh FILE so its face centers "
+                         "are unambiguously meters or kilometers (regenerate it, or "
+                         "rewrite the vertices with a mesh tool), or supply the body "
+                         "radius via the generic-body shape block.\n"
+                      << "  mesh.scale_factor will NOT fix this: it scales the vertices "
+                         "only and leaves face centers/areas/normals unscaled, which is "
+                         "itself a fatal inconsistency here (BUGS.md PTM-65).\n"
                       << "  See BUGS.md PTM-37 and PTM-36." << std::endl;
             return 1;
         }

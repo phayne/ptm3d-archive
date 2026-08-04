@@ -10,6 +10,9 @@
 #include <yaml-cpp/yaml.h>
 #endif
 
+// std::sort, for the PTM-67 unread-key report (deterministic key order).
+#include <algorithm>
+
 namespace ptm {
 
 #ifdef HAVE_YAML_CPP
@@ -122,6 +125,74 @@ std::string resolveDataPath(const std::string& value,
         std::exit(1);
     }
     return resolved.lexically_normal().string();
+}
+
+// ---------------------------------------------------------------------------
+// PTM-67: report, ONCE and in ONE line, every key under `thermophysical:` that
+// this parser does not read.
+//
+// Most of the block is decorative. `ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`,
+// `Qb`, `chi`, `albedo` and `emissivity` are read only under
+// `generic_body.surface` -- under `thermophysical:` they are dropped here, at
+// the parser, with nothing printed. Every `use_default_<key>` flag except
+// `use_default_albedo` is likewise unread, which is worse than merely inert:
+// the flag implies an implemented "false" branch that does not exist.
+// Measured 2026-08-04: 19 distinct dead keys across the 132 shipped configs;
+// `use_default_rhos: false` + `rhos: 900.0` ran at rhos = 1100 (the Moon
+// default) and the run's own banner said so.
+//
+// This WARNS; it does not fail, and it does NOT alias the dead keys to the
+// live ones. Making them live would change results for every config in the
+// repository and needs its own gate. Naming them costs nothing and ends the
+// silence, which is the actual defect.
+void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
+    if (!thermo || !thermo.IsMap()) return;
+
+    // The keys loadFromYAML actually consumes from root["thermophysical"].
+    // INVARIANT: every `getWithDefault(thermo, "K", ...)` in the
+    // `root["thermophysical"]` block must appear here. There is no way to
+    // derive this list -- the reads are individual statements -- so it is
+    // maintained by hand and this comment is the contract.
+    //
+    // NOTE `conductivity_model` is listed although THIS branch does not yet
+    // read it: `feat/martinez-conductivity` adds its reader to the same block,
+    // and the released binary is the merged tree. On a hygiene-only build the
+    // key is therefore accepted without comment -- the one deliberate
+    // false-negative in this list, recorded here rather than left to be
+    // rediscovered.
+    static const char* const kRead[] = {
+        "albedo_hapke_w",
+        "albedo_model",
+        "albedo_override",
+        "conductivity_model",
+        "constant_thermal_inertia",
+        "emissivity_override",
+        "incidence_angle_albedo",
+        "kd_override",
+        "ks_override",
+        "use_default_albedo",
+    };
+
+    std::vector<std::string> dead;
+    for (const auto& kv : thermo) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        bool is_read = false;
+        for (const char* r : kRead) { if (key == r) { is_read = true; break; } }
+        if (!is_read) dead.push_back(key);
+    }
+    if (dead.empty()) return;
+
+    std::sort(dead.begin(), dead.end());   // deterministic output
+    std::ostringstream line;
+    line << "[config] WARNING: " << dead.size()
+         << " key(s) under `thermophysical:` are read by nothing and have NO effect: ";
+    for (size_t i = 0; i < dead.size(); ++i)
+        line << (i ? ", " : "") << dead[i];
+    line << " -- editing them changes no result. Named properties are honored only under "
+            "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
+            "See BUGS.md PTM-67.";
+    std::cerr << line.str() << std::endl;
 }
 } // namespace
 
@@ -485,6 +556,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         // Parse Thermophysical section (GUI-written overrides)
         if (root["thermophysical"]) {
             const auto& thermo = root["thermophysical"];
+            // PTM-67: say which of these keys are decorative BEFORE reading the
+            // ones that are not. One line, whatever the count.
+            warnUnreadThermophysicalKeys(thermo);
             bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
             config.thermophysical_albedo_explicit = !use_default_albedo;
             config.thermophysical.albedo_explicit = !use_default_albedo;

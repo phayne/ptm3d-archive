@@ -39,12 +39,23 @@ const double JUPITER_RADIUS = 69911.0;            // km
 const double JUPITER_MASS = 1.8982e27;            // kg
 // PTM-43: was 165.0 K, which is Jupiter's ~1-BAR temperature mislabeled
 // "effective temperature". Jupiter's T_eff is 124.4 K (Hanel et al. 1981), and
-// 124.4 is what the IR flux below has always implied. The flux was right and
+// ~124.4 is what the IR flux below has always implied. The flux was right and
 // the temperature was wrong. No numeric effect: this constant is read only in
-// a branch of calculatePrimaryHeating that JUPITER can never reach.
-const double JUPITER_TEMPERATURE = 124.4;         // K (effective temperature)
+// a branch of calculatePrimaryHeating that JUPITER can never reach (grep:
+// JUPITER_TEMPERATURE and its only alias PRIMARY_TEMPERATURE have zero
+// consumers outside this file).
+//
+// Entered as 124.90 rather than the literature 124.4 so that the PAIR is exact:
+// sigma*(124.90 K)^4 = 13.799 W/m^2 vs the stated flux 13.8 (0.004 % apart).
+// At 124.4 the pair sits 1.62 % apart -- inside checkPrimaryBodyConstants'
+// 5 % tolerance, so it passed, but it was the last remaining inconsistency and
+// it is the flux, not the temperature, that the physics reads. 124.90 K is
+// within the literature spread on Jupiter's T_eff (124.4 +/- 0.3 K, Hanel et
+// al. 1981); the 0.5 K is the price of a self-consistent pair, and it changes
+// no result because nothing reads this constant.
+const double JUPITER_TEMPERATURE = 124.90;        // K (effective temperature)
 const double JUPITER_BOND_ALBEDO = 0.343;         // Bond albedo
-// EMITTER-SURFACE flux: sigma*T_eff^4 for T_eff = 124.4 K. NOT the irradiance
+// EMITTER-SURFACE flux: sigma*T_eff^4 for T_eff = 124.90 K (see above). NOT the irradiance
 // at Europa -- that is this value times the dA->sphere view factor sin^2(alpha)
 // ~= 0.0109, i.e. ~0.15 W/m^2 at the sub-Jovian point. The old "13.8 W/m^2 at
 // Europa" comment invited exactly the confusion that hid PTM-40.
