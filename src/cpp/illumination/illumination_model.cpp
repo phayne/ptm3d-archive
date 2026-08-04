@@ -77,6 +77,44 @@ inline double kmToNativeScale(const std::array<double,3>& face_center) {
                                + face_center[2]*face_center[2]);
     return (mag > 10000.0) ? 1000.0 : 1.0;   // meters : kilometers
 }
+
+// PTM-38: does the primary body overlap ANY part of the finite solar disk seen
+// from this ray origin?  True in the penumbra AND in the umbra; false when the
+// Sun is completely clear of the primary.
+//
+// The center-ray fast paths test only the ray to the disk CENTER, which the
+// primary does not cover until roughly half the disk is already gone.  Left
+// ungated, a face 40 % obscured takes the fast path and reports FULL sun, so no
+// amount of fixing the sampling denominator can produce a penumbra.  This test
+// is a strict superset of the center-ray test (a center hit implies
+// sep < ang_primary < ang_primary + disk_ang), so vetoing the fast path on it
+// only ever routes MORE faces into the finite-disk sampling that already
+// handles partial obscuration correctly -- and it is exactly false whenever no
+// eclipse is in progress, which keeps every non-eclipse run byte-identical.
+//
+// All lengths in mesh-native units (see kmToNativeScale); disk_ang in radians.
+inline bool primaryDiskOverlap(const std::array<double,3>& ray_origin,
+                               const std::array<double,3>& sun_dir,
+                               const std::array<double,3>& primary_pos_n,
+                               double primary_radius_n,
+                               double sun_dist_n,
+                               double disk_ang)
+{
+    const std::array<double,3> pc = { primary_pos_n[0] - ray_origin[0],
+                                      primary_pos_n[1] - ray_origin[1],
+                                      primary_pos_n[2] - ray_origin[2] };
+    const double d = std::sqrt(pc[0]*pc[0] + pc[1]*pc[1] + pc[2]*pc[2]);
+    if (d <= primary_radius_n) return true;      // inside the primary (degenerate)
+    if (d >= sun_dist_n)       return false;     // primary is farther than the Sun
+    const double along = pc[0]*sun_dir[0] + pc[1]*sun_dir[1] + pc[2]*sun_dir[2];
+    if (along <= 0.0)          return false;     // primary is behind the face
+    double cs = along / d;
+    if (cs >  1.0) cs =  1.0;
+    if (cs < -1.0) cs = -1.0;
+    const double sep   = std::acos(cs);                        // Sun-center vs primary-center
+    const double ang_p = std::asin(primary_radius_n / d);      // primary angular radius
+    return sep < (ang_p + disk_ang);
+}
 } // anonymous namespace
 
 namespace {
@@ -2989,16 +3027,21 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         face_center[2] + face_normal[2] * eps_n + sun_dir[2] * eps_d
     };
 
+    // PTM-38: is the primary anywhere on the solar disk (penumbra OR umbra)?
+    // See primaryDiskOverlap(). False outside an eclipse -> byte-identical.
+    const bool eclipse_partial = (!primary_is_sun_) &&
+        primaryDiskOverlap(ray_origin_base, sun_dir, primary_pos_n, primary_radius_n,
+                           sun_dist_n, disk_ang);
+
     // Center-ray fast path; use meters for eclipse/horizon
-    if (sin_elev > 2.0 * std::sin(disk_ang) && cos_inc0 > 0.10) {
-        if (!primary_is_sun_) {
-            double t1, t2;
-            if (raySphereIntersect(ray_origin_base, sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
-                if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) {
-                    return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
-                }
-            }
-        }
+    // PTM-38: !eclipse_partial vetoes the fast path for the WHOLE eclipse. The
+    // old center-ray test broke the penumbra at both ends: before the primary
+    // covered the disk center it returned FULL sun, and the moment it did it
+    // returned ZERO -- while the limb of the Sun was still visible. Falling
+    // through to the finite-disk sampler is correct at both ends, and in full
+    // umbra the sampler returns exactly the same 0 / shadow-flux this branch did
+    // (every sample is eclipse-skipped, so sum_cos == 0).
+    if (!eclipse_partial && sin_elev > 2.0 * std::sin(disk_ang) && cos_inc0 > 0.10) {
         if (use_geometric_horizon_ && checkLunarHorizon(ray_origin_base, sun_dir, vectorLength(face_center))) {
             return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
         }
@@ -3036,8 +3079,11 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
     const uint32_t baseN   = static_cast<uint32_t>(std::max(1, num_samples));
-    uint32_t initialN      = std::max<uint32_t>(8, baseN);
     uint32_t heavyN        = std::max<uint32_t>(64, baseN * 4);
+    // PTM-38: in the penumbra, 8 samples quantize the eclipsed fraction at
+    // ~12.5 % (~21 K near half-obscuration). Start heavy when the primary
+    // overlaps the disk. Outside an eclipse this is the old initialN exactly.
+    uint32_t initialN      = eclipse_partial ? heavyN : std::max<uint32_t>(8, baseN);
 
     auto sample_and_accumulate = [&](uint32_t N, double& sum_cos_out,
                                      uint32_t& total_out, uint32_t& visible_out,
@@ -3733,17 +3779,22 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             fc[2] + fn[2] * eps_n + sun_dir[2] * eps_d
         };
 
+        // PTM-38: is the primary anywhere on the solar disk (penumbra OR umbra)?
+        // Computed once per face and used twice: to veto the center-ray fast path
+        // (which would otherwise report full sun for any face less than ~50 %
+        // obscured) and to escalate the disk sampling below. False whenever no
+        // eclipse is in progress -> byte-identical outside eclipses.
+        const bool eclipse_partial = (!primary_is_sun_) &&
+            primaryDiskOverlap(ray_o, sun_dir, primary_pos_n, primary_radius_n,
+                               sun_dist_n, disk_ang);
+
         // Center-ray fast path only if center is above horizon
         if (cos_inc0 > 0.0) {
-            bool blocked = false;
-
-            // Eclipse on center ray (mesh-native units for sphere intersection)
-            if (!primary_is_sun_) {
-                double t1, t2;
-                if (raySphereIntersect(ray_o, sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
-                    if ((t1 > 0.0 && t1 < sun_dist_n) || (t2 > 0.0 && t2 < sun_dist_n)) blocked = true;
-                }
-            }
+            // PTM-38: any overlap of the primary with the solar disk sends this
+            // face to the finite-disk sampler. The old center-ray-only test is a
+            // strict subset of eclipse_partial, so this is never less
+            // conservative than before.
+            bool blocked = eclipse_partial;
 
             if (!blocked) {
                 std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
@@ -3777,7 +3828,13 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         double uoff = u01(seed ^ 0x85EBCA6Bu);
         double voff = u01(seed ^ 0xC2B2AE35u);
 
-        const uint32_t N = std::max(8, num_samples);
+        // PTM-38: 8 samples quantize the eclipsed fraction at ~12.5 %, which is
+        // ~21 K of error near half-obscuration. Escalate to the same heavy count
+        // the single-face path uses (illumination_model.cpp heavyN) whenever the
+        // primary overlaps the disk. Untouched -> byte-identical -- outside an
+        // eclipse.
+        const uint32_t baseN = static_cast<uint32_t>(std::max(8, num_samples));
+        const uint32_t N = eclipse_partial ? std::max<uint32_t>(64, baseN) : baseN;
         std::vector<std::array<double, 3>> dirs; dirs.reserve(N);
         std::vector<uint8_t> skip; skip.reserve(N);
 
@@ -3858,7 +3915,16 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
         double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
-        double flux = solar_irr * (sum_cos / double(total_out));
+        // PTM-38: normalize by the ATTEMPTED disk samples, not the survivors.
+        // total_out counts only the samples that were NOT eclipse-skipped, so a
+        // face with 95 % of the solar disk behind the primary renormalized its
+        // 5 % of surviving samples back up to FULL SUN -- the eclipse was a step
+        // function at totality instead of a ramp through the penumbra.
+        // Terrain-blocked samples were always (correctly) kept in the
+        // denominator; only the eclipse-skipped ones were deleted. skip.size()
+        // == total_out whenever nothing is eclipse-skipped, so this is exactly a
+        // no-op outside an eclipse.
+        double flux = solar_irr * (sum_cos / double(skip.size()));
         if (flux <= 0.0 && enable_shadow_flux_) {
             flux = calculateShadowFlux(fc, fn, sun_pos_m);
         }
@@ -4912,6 +4978,10 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     auto u01 = [&](uint32_t s) -> double { return (hash32(s) & 0xFFFFFFU) / double(0x1000000U); };
 
     const uint32_t N = std::max(8, num_samples);
+    // PTM-38: penumbral faces are sampled heavily (mirrors the CPU paths exactly
+    // so CPU and GPU stay equivalent). Only faces the primary actually overlaps
+    // pay for it, so a run without an eclipse is byte-identical.
+    const uint32_t heavyN = std::max<uint32_t>(64, N);
 
     // ==== PHASE 1: Generate all rays (parallel, CPU) ====
     // We'll collect all rays from all faces, then batch them to GPU.
@@ -4928,7 +4998,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         double cos_inc0;
         double disk_scale;
         bool below_horizon;     // Entire disk below horizon
-        bool center_eclipsed;   // Center ray blocked by primary body
+        bool eclipse_overlap;   // PTM-38: primary overlaps ANY part of the solar
+                                // disk (penumbra or umbra), not just the center ray
         bool needs_sampling;    // Needs finite-disk sampling
         bool precheck_occluded; // Analytic body-occlusion pre-check culled it
                                 // (OPEN meshes only; see below)
@@ -4996,7 +5067,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
                     if (tb1 > 0.0 || tb2 > 0.0) {
                         fi.precheck_occluded = true;
                         fi.needs_sampling = false;
-                        fi.center_eclipsed = false;
+                        fi.eclipse_overlap = false;
                         continue;
                     }
                 }
@@ -5014,19 +5085,19 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             fc[2] + fn[2] * eps_n + fi.sun_dir[2] * eps_d
         };
 
-        // Check eclipse on center ray (mesh-native units)
-        fi.center_eclipsed = false;
+        // PTM-38: eclipse test on the WHOLE solar disk, not just the center ray
+        // (mesh-native units). The center-ray-only test reported full sun for
+        // every face less than ~50 % obscured. Strict superset of the old test.
+        fi.eclipse_overlap = false;
         if (!primary_is_sun_ && fi.cos_inc0 > 0.0) {
-            double t1, t2;
-            if (raySphereIntersect(fi.ray_origin, fi.sun_dir, primary_pos_n, primary_radius_n, t1, t2)) {
-                if ((t1 > 0.0 && t1 < fi.sun_dist_n) || (t2 > 0.0 && t2 < fi.sun_dist_n)) {
-                    fi.center_eclipsed = true;
-                }
-            }
+            fi.eclipse_overlap = primaryDiskOverlap(fi.ray_origin, fi.sun_dir,
+                                                    primary_pos_n, primary_radius_n,
+                                                    fi.sun_dist_n,
+                                                    std::asin(fi.disk_scale));
         }
 
         // Determine if we need sampling (if center is below horizon or might be blocked)
-        fi.needs_sampling = (fi.cos_inc0 <= 0.0) || fi.center_eclipsed;
+        fi.needs_sampling = (fi.cos_inc0 <= 0.0) || fi.eclipse_overlap;
     }
 
     // ==== Collect rays for all faces ====
@@ -5043,12 +5114,15 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const FaceInfo& fi = face_info[i];
         if (fi.below_horizon || fi.precheck_occluded) {
             ray_counts[i] = 0;
-        } else if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+        } else if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.eclipse_overlap) {
             // Center ray fast path - just 1 ray
             ray_counts[i] = 1;
         } else {
-            // Disk sampling - estimate N rays (actual may be less due to eclipse filtering)
-            ray_counts[i] = N;
+            // Disk sampling - estimate N rays (actual may be less due to eclipse filtering).
+            // PTM-38: penumbral faces are sampled with heavyN; this expression must
+            // stay identical to the per-face Nf used in PHASE 1b or the ray offsets
+            // computed from it will not line up.
+            ray_counts[i] = fi.eclipse_overlap ? heavyN : N;
         }
     }
 
@@ -5099,7 +5173,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             };
         };
 
-        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.eclipse_overlap) {
             // Center ray fast path - single ray
             size_t idx = fri.ray_start;
             auto local_origin = apply_offset(fi.ray_origin);
@@ -5135,16 +5209,18 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             double uoff = u01(seed ^ 0x85EBCA6Bu);
             double voff = u01(seed ^ 0xC2B2AE35u);
 
-            fri.eclipse_skip.reserve(N);
-            fri.ray_dirs.reserve(N);
+            // PTM-38: heavy sampling for penumbral faces (must match ray_counts[i])
+            const uint32_t Nf = fi.eclipse_overlap ? heavyN : N;
+            fri.eclipse_skip.reserve(Nf);
+            fri.ray_dirs.reserve(Nf);
 
             size_t idx = fri.ray_start;
             const double eps_base = calculateSafeRayOffset(fc, fn);
             const double eps_d = 8.0 * eps_base;
 
-            for (uint32_t k = 0; k < N; ++k) {
+            for (uint32_t k = 0; k < Nf; ++k) {
                 // Hammersley sampling
-                double su = double(k) / double(N);
+                double su = double(k) / double(Nf);
                 double sv = 0.0;
                 uint32_t bits = k;
                 double inv = 0.5;
@@ -5306,7 +5382,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         double sun_dist_au = fi.sun_dist_km / constants::KM_PER_AU;
         double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
-        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.center_eclipsed) {
+        if (!fi.needs_sampling && fi.cos_inc0 > 0.0 && !fi.eclipse_overlap) {
             // Center ray result
             bool blocked = (fri.ray_start < occluded.size()) && (occluded[fri.ray_start] != 0);
             if (!blocked) {
@@ -5336,7 +5412,14 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             if (total_valid == 0) {
                 direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             } else {
-                double flux = solar_irr * (sum_cos / double(total_valid));
+                // PTM-38: normalize by the ATTEMPTED disk samples, not the
+                // survivors. total_valid counts only the non-eclipse-skipped
+                // samples, so a 95 %-obscured face renormalized its surviving
+                // 5 % back up to full sun. Terrain-blocked samples were always
+                // kept in the denominator; only eclipse-skipped ones were
+                // dropped. Identical to total_valid outside an eclipse. Mirrors
+                // the CPU batch path exactly.
+                double flux = solar_irr * (sum_cos / double(fri.eclipse_skip.size()));
                 if (flux <= 0.0 && enable_shadow_flux_) {
                     flux = calculateShadowFlux(fc, fn, sun_pos_m);
                 }
