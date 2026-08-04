@@ -30,14 +30,21 @@ const double JUPITER_RADIUS = 69911.0;            // km
 const double JUPITER_MASS = 1.8982e27;            // kg
 const double JUPITER_TEMPERATURE = 165.0;         // K (effective temperature)
 const double JUPITER_BOND_ALBEDO = 0.343;         // Bond albedo
-const double JUPITER_IR_FLUX = 13.8;              // W/m^2 at Europa
+// EMITTER-SURFACE flux: sigma*T_eff^4 for T_eff = 124.5 K. NOT the irradiance
+// at Europa -- that is this value times the dA->sphere view factor sin^2(alpha)
+// ~= 0.0109, i.e. ~0.15 W/m^2 at the sub-Jovian point. The old "13.8 W/m^2 at
+// Europa" comment invited exactly the confusion that hid PTM-40.
+const double JUPITER_IR_FLUX = 13.8;              // W/m^2 leaving Jupiter's surface
 
 // ---- Earth Constants ----
 const double EARTH_RADIUS = 6371.0;               // km
 const double EARTH_MASS = 5.972e24;               // kg
 const double EARTH_TEMPERATURE = 255.0;           // K (effective temperature)
 const double EARTH_BOND_ALBEDO = 0.306;           // Bond albedo
-const double EARTH_IR_FLUX = 240.0;               // W/m^2 at Earth distance from Sun
+// EMITTER-SURFACE flux: sigma*T_eff^4 for T_eff = 255 K (Earth's mean OLR).
+// The old "at Earth distance from Sun" comment was wrong twice over -- the solar
+// constant there is 1361, not 240 -- but the VALUE is correct for its use.
+const double EARTH_IR_FLUX = 240.0;               // W/m^2 leaving Earth's surface
 
 // ---- Mars Constants ----
 const double MARS_RADIUS = 3389.5;                // km
