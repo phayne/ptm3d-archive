@@ -584,10 +584,48 @@ bool runThermalModel(const std::string&, const std::vector<double>&, const std::
 std::vector<double> runThermalModelForFace(const std::vector<double>&, const std::vector<double>&,
     double, const thermal::Config&, int);
     
-// Apply main()-forwarded generic-body thermophysical props to a solver's local
-// Planet (defined below near the solver bodies; forward-declared for the per-face
-// path above the definition). See the definition for why this is needed.
-static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config);
+// Apply main()-forwarded thermophysical properties to a solver's local Planet
+// (defined below near the solver bodies; forward-declared for the per-face path
+// above the definition). See the definition for why this is needed.
+static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config);
+
+// PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
+// applies a user-configured scalar override to a solver-local Planet; main()
+// FAILS the run if an override was configured and this stayed at zero, so an
+// override can never again be announced in the log and then silently ignored.
+static std::atomic<int> g_thermo_override_applied{0};
+
+// PTM-53: the SINGLE definition of "the user asked for a thermophysical
+// override". The forwarding block and the tripwire both call this, so a knob
+// added to one can never be missing from the other -- which is the failure mode
+// that would quietly re-open PTM-53 for the next property someone adds.
+static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp) {
+    return (tp.ks_override              > 0.0)
+        || (tp.kd_override              > 0.0)
+        || (tp.emissivity_override      > 0.0)
+        || (tp.albedo_override         >= 0.0)
+        || (tp.constant_thermal_inertia > 0.0);
+}
+
+// Parse a comma-separated list of doubles ("" => empty). Shared by the
+// generic-body cpCoeff forwarding and the override cpCoeff forwarding.
+static std::vector<double> parseCsvDoubles(const std::string& csv) {
+    std::vector<double> out;
+    std::stringstream ss(csv);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) if (!tok.empty()) out.push_back(std::stod(tok));
+    return out;
+}
+
+// Format a double for a Config property WITHOUT the 6-decimal truncation that
+// Config::setProperty(key, double) inflicts via std::to_string -- harmless for
+// 7.4e-4, silently zero for 1e-8 (BUGS.md PTM-60).
+static std::string fullPrecision(double v) {
+    std::ostringstream os;
+    os.precision(17);
+    os << v;
+    return os.str();
+}
 
 bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
@@ -1697,7 +1735,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     try {
         const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
-        applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
+        applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
 
         // Override basal heat flow if specified (per-face or global)
         if (Qb_override >= 0.0) {
@@ -2338,28 +2376,103 @@ std::vector<double> runThermalModelForFace(
 // asteroid runs. Gated on "gb_thermo": built-in Moon/Europa runs (which do not
 // set it) are byte-identical untouched. Call right after the local Planet is
 // built and BEFORE reference_profile, so the depth grid / cp / kc all pick it up.
-static void applyGenericBodyThermo(thermal::Planet& planet, const thermal::Config& config) {
-    if (config.getProperty("gb_thermo", "").empty()) return;  // only generic bodies
+//
+// PTM-53: the SECOND block below fixes the defect this gate created. The
+// gb_thermo gate is correct for what it does -- it repairs a generic body whose
+// name-resolved Planet is a placeholder -- but it also meant that the explicit
+// scalar overrides (thermophysical.{ks,kd,emissivity,albedo}_override and the
+// constant_thermal_inertia collapse), which main() resolves onto the MAIN-scope
+// Planet and announces in the log, never reached a NAMED body's solver at all.
+// A Moon run printed "Property override: ks 0.00074 -> 0.00148 W/m/K" and then
+// solved with 0.00074: byte-identical output, announced success, zero effect.
+// Those overrides are therefore forwarded per-knob and applied here on EVERY
+// path. A config that sets no override forwards nothing, so baseline runs stay
+// byte-identical.
+static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config) {
     double v;
-    if ((v = config.getPropertyDouble("gb_ks",   -1.0)) >  0.0) planet.ks   = v;
-    if ((v = config.getPropertyDouble("gb_kd",   -1.0)) >  0.0) planet.kd   = v;
-    if ((v = config.getPropertyDouble("gb_cp0",  -1.0)) >= 0.0) planet.cp0  = v;
-    if ((v = config.getPropertyDouble("gb_rhos", -1.0)) >  0.0) planet.rhos = v;
-    if ((v = config.getPropertyDouble("gb_rhod", -1.0)) >  0.0) planet.rhod = v;
-    if ((v = config.getPropertyDouble("gb_H",    -1.0)) >  0.0) planet.H    = v;
-    if ((v = config.getPropertyDouble("gb_albedo",     -1.0)) >= 0.0) planet.albedo     = v;
-    if ((v = config.getPropertyDouble("gb_emissivity", -1.0)) >  0.0) planet.emissivity = v;
-    // Orbital/rotational scalars (see main): the name-resolved local Planet
-    // otherwise carries Europa placeholder values for these on the generic path.
-    if ((v = config.getPropertyDouble("gb_day",  -1.0)) >  0.0) planet.day  = v;
-    if ((v = config.getPropertyDouble("gb_S",    -1.0)) >  0.0) planet.S    = v;
-    if ((v = config.getPropertyDouble("gb_year", -1.0)) >  0.0) planet.year = v;
-    if ((v = config.getPropertyDouble("gb_Qb",   -2.0)) >= 0.0) planet.Qb   = v;
-    // cpCoeff forwarded as a comma-separated list; empty string => constant cp.
-    planet.cpCoeff.clear();
-    std::stringstream ss(config.getProperty("gb_cpCoeff", ""));
-    std::string tok;
-    while (std::getline(ss, tok, ',')) if (!tok.empty()) planet.cpCoeff.push_back(std::stod(tok));
+    // ---- generic bodies: repair the placeholder-resolved Planet -------------
+    if (!config.getProperty("gb_thermo", "").empty()) {
+        if ((v = config.getPropertyDouble("gb_ks",   -1.0)) >  0.0) planet.ks   = v;
+        if ((v = config.getPropertyDouble("gb_kd",   -1.0)) >  0.0) planet.kd   = v;
+        if ((v = config.getPropertyDouble("gb_cp0",  -1.0)) >= 0.0) planet.cp0  = v;
+        if ((v = config.getPropertyDouble("gb_rhos", -1.0)) >  0.0) planet.rhos = v;
+        if ((v = config.getPropertyDouble("gb_rhod", -1.0)) >  0.0) planet.rhod = v;
+        if ((v = config.getPropertyDouble("gb_H",    -1.0)) >  0.0) planet.H    = v;
+        if ((v = config.getPropertyDouble("gb_albedo",     -1.0)) >= 0.0) planet.albedo     = v;
+        if ((v = config.getPropertyDouble("gb_emissivity", -1.0)) >  0.0) planet.emissivity = v;
+        // Orbital/rotational scalars (see main): the name-resolved local Planet
+        // otherwise carries Europa placeholder values for these on the generic path.
+        if ((v = config.getPropertyDouble("gb_day",  -1.0)) >  0.0) planet.day  = v;
+        if ((v = config.getPropertyDouble("gb_S",    -1.0)) >  0.0) planet.S    = v;
+        if ((v = config.getPropertyDouble("gb_year", -1.0)) >  0.0) planet.year = v;
+        if ((v = config.getPropertyDouble("gb_Qb",   -2.0)) >= 0.0) planet.Qb   = v;
+        // cpCoeff forwarded as a comma-separated list; empty string => constant cp.
+        planet.cpCoeff = parseCsvDoubles(config.getProperty("gb_cpCoeff", ""));
+    }
+
+    // ---- PTM-53: explicit user overrides, on EVERY body -------------------
+    // "ovr_thermo" is the one-lookup fast path (mirroring the gb_thermo gate
+    // above): this function runs PER FACE on the scalar CPU path, so the
+    // overwhelmingly common no-override case must not pay for seven map probes
+    // and an ostringstream.
+    if (config.getProperty("ovr_thermo", "").empty()) return;
+
+    // Presence of a key IS the request (main forwards a key only when the
+    // matching config knob is set), so there is no sentinel to mis-read and an
+    // override of any magnitude survives -- including one that would round to
+    // zero in a sentinel comparison.
+    static const struct { const char* key; double thermal::Planet::* field;
+                          const char* label; const char* unit; } kScalarOverrides[] = {
+        {"ovr_ks",         &thermal::Planet::ks,         "ks",         " W/m/K"},
+        {"ovr_kd",         &thermal::Planet::kd,         "kd",         " W/m/K"},
+        {"ovr_rhod",       &thermal::Planet::rhod,       "rhod",       " kg/m^3"},
+        {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
+        {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
+        {"ovr_albedo",     &thermal::Planet::albedo,     "albedo A0",  ""},
+    };
+
+    // Only build the echo string on the one call that will actually print it.
+    static std::atomic<bool> logged{false};
+    const bool want_echo = !logged.load(std::memory_order_relaxed);
+    std::ostringstream echo;
+    int applied = 0;
+    const auto& props = config.custom_properties;
+
+    for (const auto& ovr : kScalarOverrides) {
+        auto it = props.find(ovr.key);
+        if (it == props.end()) continue;
+        v = std::stod(it->second);
+        if (want_echo) {
+            if (applied) echo << "; ";
+            echo << ovr.label << ' ' << planet.*ovr.field << " -> " << v << ovr.unit;
+        }
+        planet.*ovr.field = v;
+        ++applied;
+    }
+    // cpCoeff: an EMPTY forwarded list is meaningful (constant-TI mode wants
+    // cp(T) collapsed to cp0), so the key's presence -- not its content -- is
+    // the trigger.
+    {
+        auto it = props.find("ovr_cpCoeff");
+        if (it != props.end()) {
+            std::vector<double> coeff = parseCsvDoubles(it->second);
+            if (want_echo && coeff != planet.cpCoeff) {
+                if (applied) echo << "; ";
+                echo << "cpCoeff[" << planet.cpCoeff.size() << "] -> [" << coeff.size() << "]";
+            }
+            planet.cpCoeff = std::move(coeff);
+            ++applied;
+        }
+    }
+
+    if (applied > 0) {
+        g_thermo_override_applied.fetch_add(applied, std::memory_order_relaxed);
+        // Echo ONCE per process. This line is the proof the override reached the
+        // SOLVER -- the banner main() prints only proves it reached main.
+        if (want_echo && !logged.exchange(true, std::memory_order_relaxed)) {
+            std::cout << "[Thermo override] applied at solver: " << echo.str() << std::endl;
+        }
+    }
 }
 
 // Streamed thermal path: read illumination on demand; no giant buffers
@@ -2905,7 +3018,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // albedo and drifted from the standard path by up to ~115 K at
     // albedo-sensitive faces (spatial map + high-incidence terminator).
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
     // Per-face albedo scaling (defect #1): propagate the Hapke directional-albedo
     // gate from config to THIS mesh-flux planet. Without this the CPU SIMD-batch
     // path left use_hapke_albedo default-OFF and always ran Hayne, even when the
@@ -3997,7 +4110,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -4448,7 +4561,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // surfaces as the body-fixed "seam" in the spinning-asteroid flybys. The
         // smooth seed removes it at the source and matches the CPU path.
         //
-        // Gated on "using_generic_body" (mirrors applyGenericBodyThermo / 710db0f):
+        // Gated on "using_generic_body" (mirrors applyConfiguredThermo / 710db0f):
         // built-in Moon/Europa/A3GT runs keep the legacy seed and stay
         // byte-identical to their established baselines.
         std::vector<float> T_initial(batch_n * n_layers);
@@ -5446,7 +5559,7 @@ bool runThermalForSelectedFaces_GPU(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyGenericBodyThermo(planet, config);   // apply configured ks/kd/cp0/... (generic bodies)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -9813,26 +9926,32 @@ int main(int argc, char** argv) {
     // and BEFORE illumination albedo sync (~line 8814), so albedo flows to
     // face_albedos / radiosity reflectance and ks/kd feed the constant-TI cp.
     // Sentinel <0 leaves the body default untouched -> baseline runs unchanged.
+    //
+    // PTM-53: these banners describe the REQUEST, not the outcome. What the
+    // solver ends up using is echoed separately by applyConfiguredThermo()
+    // ("[Thermo override] applied at solver: ..."), and a run that requests an
+    // override no solver ever applies is FAILED at the tripwire below. Do not
+    // reword these back into a claim of success.
     // ========================================================================
     {
         const auto& tp = sim_config.thermophysical;
         if (tp.albedo_override >= 0.0) {
-            std::cout << "Property override: albedo A0 " << planet.albedo
+            std::cout << "Property override (requested): albedo A0 " << planet.albedo
                       << " -> " << tp.albedo_override << std::endl;
             planet.albedo = tp.albedo_override;
         }
         if (tp.emissivity_override > 0.0) {
-            std::cout << "Property override: emissivity " << planet.emissivity
+            std::cout << "Property override (requested): emissivity " << planet.emissivity
                       << " -> " << tp.emissivity_override << std::endl;
             planet.emissivity = tp.emissivity_override;
         }
         if (tp.ks_override > 0.0) {
-            std::cout << "Property override: ks " << planet.ks
+            std::cout << "Property override (requested): ks " << planet.ks
                       << " -> " << tp.ks_override << " W/m/K" << std::endl;
             planet.ks = tp.ks_override;
         }
         if (tp.kd_override > 0.0) {
-            std::cout << "Property override: kd " << planet.kd
+            std::cout << "Property override (requested): kd " << planet.kd
                       << " -> " << tp.kd_override << " W/m/K" << std::endl;
             planet.kd = tp.kd_override;
         }
@@ -9903,6 +10022,16 @@ int main(int argc, char** argv) {
                           << old_rhod << " -> " << rhos_val << " kg/m^3"
                           << std::endl;
             }
+        } else {
+            // Rule 7: this used to fall through silently, leaving the run at the
+            // body defaults while the user believed a constant TI was in force.
+            std::cerr << "\nFATAL: thermophysical.constant_thermal_inertia = " << constant_ti
+                      << " requires ks > 0 and rhos > 0 to derive cp = TI^2/(ks*rhos),\n"
+                      << "  but the resolved body has ks = " << ks_val
+                      << " and rhos = " << rhos_val << ".\n"
+                      << "  Refusing to run with the body defaults under a constant-TI banner."
+                      << std::endl;
+            return 1;
         }
     }
 
@@ -11011,8 +11140,10 @@ int main(int argc, char** argv) {
             // otherwise fall back to Europa placeholder defaults) apply the real
             // ks / ks->kd depth profile / cp0 / rho / H / cpCoeff (and any
             // constant_thermal_inertia collapse already baked into `planet`).
-            // Applied by applyGenericBodyThermo() at each solver entry point;
+            // Applied by applyConfiguredThermo() at each solver entry point;
             // gated on "gb_thermo" so built-in Moon/Europa runs stay byte-identical.
+            // (User-requested scalar overrides are forwarded separately, below,
+            //  on EVERY body -- see PTM-53.)
             thermal_config.setProperty("gb_thermo", "1");
             thermal_config.setProperty("gb_ks",         planet.ks);
             thermal_config.setProperty("gb_kd",         planet.kd);
@@ -11040,6 +11171,68 @@ int main(int argc, char** argv) {
                 gb_cpc += std::to_string(planet.cpCoeff[i]);
             }
             thermal_config.setProperty("gb_cpCoeff", gb_cpc);
+        }
+
+        // ====================================================================
+        // PTM-53: forward the user's EXPLICIT scalar overrides to the solvers,
+        // on named bodies (Moon/Europa/Mercury) as well as generic ones.
+        // ====================================================================
+        // Every mesh solver entry point rebuilds a local Planet from the body
+        // NAME, so anything main() resolved onto `planet` is lost unless it is
+        // forwarded. Before this block that forwarding existed only inside the
+        // `using_generic_body` branch above, which made ks_override/kd_override/
+        // emissivity_override -- and the whole constant_thermal_inertia collapse
+        // -- silent no-ops on the Moon while the log announced them. A lunar
+        // conductivity sweep measured nothing and said it had worked.
+        //
+        // Forwarded PER KNOB and only when the user actually set that knob, so a
+        // config with no overrides forwards no keys and stays byte-identical.
+        // The value sent is the RESOLVED planet.* (post constant-TI collapse),
+        // not the raw request, so the solver sees exactly what main() computed.
+        //
+        // Values go through fullPrecision() rather than the Config double setter,
+        // which truncates at 6 decimals (BUGS.md PTM-60).
+        {
+            const auto& tp = sim_config.thermophysical;
+            auto fwd = [&thermal_config](const char* key, double value) {
+                thermal_config.setProperty(key, fullPrecision(value));
+            };
+            if (thermoOverrideRequested(tp)) {
+                thermal_config.setProperty("ovr_thermo", "1");  // solver-side fast-path gate
+            }
+            if (tp.ks_override         > 0.0) fwd("ovr_ks",         planet.ks);
+            if (tp.kd_override         > 0.0) fwd("ovr_kd",         planet.kd);
+            if (tp.emissivity_override > 0.0) fwd("ovr_emissivity", planet.emissivity);
+            if (tp.albedo_override    >= 0.0) fwd("ovr_albedo",     planet.albedo);
+            // Rule 7: albedo_override is the one knob a per-face albedo MAP can
+            // out-rank. When a map loads, its per-face value governs the
+            // absorbed-solar flux and the override survives only as the
+            // equilibration seed / uncovered-face fallback (<=0.51 K on Moon
+            // ico5). Say so rather than let an albedo sweep quietly flatline.
+            if (tp.albedo_override >= 0.0 && (use_albedo_map || !albedo_map_file.empty())) {
+                std::cout << "WARNING: thermophysical.albedo_override = " << tp.albedo_override
+                          << " is set AND a per-face albedo map is configured.\n"
+                          << "  If the map loads, ITS per-face albedo governs the absorbed solar "
+                             "flux; the override then only\n"
+                          << "  sets the equilibration seed and the fallback for uncovered faces. "
+                             "Check the albedo-load lines\n"
+                          << "  below, and set use_albedo_map: false to sweep albedo directly "
+                             "(docs/KNOWN_LIMITATIONS.md)." << std::endl;
+            }
+            if (tp.constant_thermal_inertia > 0.0) {
+                // The collapse is cp0 + an emptied cp(T) polynomial + kd->ks +
+                // rhod->rhos. chi=0 already reaches the solver via
+                // thermal_config.chi; these four did not.
+                fwd("ovr_cp0",  planet.cp0);
+                fwd("ovr_kd",   planet.kd);
+                fwd("ovr_rhod", planet.rhod);
+                std::string cpc;
+                for (size_t i = 0; i < planet.cpCoeff.size(); ++i) {
+                    if (i) cpc += ",";
+                    cpc += fullPrecision(planet.cpCoeff[i]);
+                }
+                thermal_config.setProperty("ovr_cpCoeff", cpc);
+            }
         }
 
         // If using thermal model, add the maps to configuration
@@ -11553,6 +11746,36 @@ int main(int argc, char** argv) {
         if (!thermal_success && surface_temps.empty()) {
             std::cerr << "Error during thermal mesh simulation" << std::endl;
             return 1;
+        }
+
+        // ====================================================================
+        // PTM-53 rule-7 tripwire: an override that was requested but never
+        // applied must FAIL, not sail through with a reassuring banner.
+        // ====================================================================
+        // This is what PTM-53 was: the log said "Property override: ks 0.00074
+        // -> 0.00148 W/m/K" and the temperature field came out byte-identical to
+        // the un-overridden run. It fires before any statistics are exported, so
+        // a run that cannot honor the request produces no misleading output.
+        // It will also catch the regression of a FUTURE fifth solver entry point
+        // that forgets to call applyConfiguredThermo().
+        {
+            const auto& tp = sim_config.thermophysical;
+            if (thermoOverrideRequested(tp)
+                && g_thermo_override_applied.load(std::memory_order_relaxed) == 0) {
+                std::cerr << "\nFATAL: a thermophysical override was configured but NO thermal "
+                             "solver applied it.\n"
+                          << "  Requested:"
+                          << (tp.ks_override              > 0.0 ? " ks_override"         : "")
+                          << (tp.kd_override              > 0.0 ? " kd_override"         : "")
+                          << (tp.emissivity_override      > 0.0 ? " emissivity_override" : "")
+                          << (tp.albedo_override         >= 0.0 ? " albedo_override"     : "")
+                          << (tp.constant_thermal_inertia > 0.0 ? " constant_thermal_inertia" : "")
+                          << "\n"
+                          << "  The run would have reported the override and silently used the "
+                             "body defaults (BUGS.md PTM-53).\n"
+                          << "  Refusing to write results." << std::endl;
+                return 1;
+            }
         }
 
         // Free the combined illumination_values array (~61 GB for ico9×1560).

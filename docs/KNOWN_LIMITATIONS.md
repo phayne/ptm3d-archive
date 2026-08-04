@@ -12,6 +12,23 @@ failure now aborts rather than silently substituting a default icosphere).
   design, so a `chi` you also set is dropped without warning. To use a real `chi > 0`, set
   `constant_thermal_inertia: 0` and specify `ks/kd/rhos/rhod/cp0` directly.
 
+- **`albedo_override` is nearly inert when a per-face albedo map is loaded.** With
+  `use_albedo_map: true` (or any `albedo_map:`), the map's per-face albedo is what the absorbed-solar
+  flux uses; `albedo_override` then only sets the equilibration seed and the fallback for faces the
+  map does not cover. Measured effect on a global Moon ico5 run: ≤0.51 K. To sweep albedo, disable
+  the map (`use_albedo_map: false`) or scale the map itself. `ks_override`, `kd_override` and
+  `emissivity_override` are unaffected by this and apply in full.
+
+- **A requested property override that no solver applies now aborts the run.** `ks_override`,
+  `kd_override`, `emissivity_override`, `albedo_override` and `constant_thermal_inertia` were
+  previously reported in the log and then ignored on built-in bodies (Moon/Europa/Mercury) for every
+  mesh run — the sweep measured nothing and said it had worked. They now apply on all bodies, and a
+  run that cannot apply a configured override exits non-zero before writing any statistics. Confirm
+  from the log line `[Thermo override] applied at solver: …`, which reports the value the **solver**
+  used; the earlier `Property override (requested): …` line reports only what was asked for.
+  Conductivity/emissivity/constant-TI results produced on built-in bodies before this fix are not
+  what their configs claim.
+
 ## Illumination
 
 - **Near-terminator direct illumination can be non-monotonic.** At grazing solar incidence (~90°)
