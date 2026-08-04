@@ -392,9 +392,12 @@ struct SimulationConfig {
         //                            (PSRs) where the Hayne form is extrapolated
         //                            below its ~150 K laboratory floor.
         // Stored as the RAW string. The parser reports an unrecognised value on
-        // stderr but does not throw (a throw is swallowed -- BUGS.md PTM-66);
-        // ptm_thermal_sim.cpp validates this string right after config load and
-        // exits 1, so an unknown law can never be silently replaced by Hayne.
+        // stderr but does not throw; ptm_thermal_sim.cpp validates this string
+        // right after config load and exits 1, so an unknown law can never be
+        // silently replaced by Hayne. (The original reason for not throwing was
+        // that a throw was swallowed -- BUGS.md PTM-66. That is fixed in this
+        // release; the two-step is kept for the better message. See
+        // config_parser.cpp.)
         // NOTE selecting martinez2021 makes ks/kd INERT for conduction (Eq. 10
         // depends on rho(z) only) -- the engine says so at startup.
         std::string conductivity_model = "hayne2017";

@@ -186,11 +186,11 @@ dominates the coupled case (worth +25 K in the R0−R1 ladder) is absent by cons
 | **PTM-62** | HIP/CUDA backend computes `k = kc + R350*T^3` (additive) where every other path uses `kc*(1 + R350*T^3)` — ~700× too large at noon. Dead on macOS/OpenCL, **live on any HIP/CUDA host**. |
 | **PTM-63** | `thermal_model.cpp:853`'s comment documents that same wrong formula (code is correct). Probable origin of PTM-62. |
 | **PTM-64** | A bare `cmake -DCMAKE_BUILD_TYPE=Release` silently builds a CPU-only binary; configure prints nothing, and the failure only surfaces ~40 s into a run, after which the chunked runner burns two pointless retries. Cost me one aborted run. |
-| **PTM-65** | `std::cout` carries `std::fixed << setprecision(1)` forward, so any number printed after ~line 10450 is rendered at one decimal. My own new banner printed `ks (0.0)` for 7.4e-4 and `H=0.1` for 0.06 before I caught it. |
+| **PTM-69** | `std::cout` carries `std::fixed << setprecision(1)` forward, so any number printed after ~line 10450 is rendered at one decimal. My own new banner printed `ks (0.0)` for 7.4e-4 and `H=0.1` for 0.06 before I caught it. *(Filed as PTM-65 on 2026-08-04; renumbered to PTM-69 the same day — `fix/release-hygiene` had already claimed 65 for the `mesh.scale_factor` bug in `f2a50c8` at 07:22, and had baked that id into two source comments.)* |
 | **PTM-66** | **A malformed YAML config is downgraded to a warning and the entire simulation runs on built-in defaults, exiting 0.** Demonstrated with a config whose only defect was a bad `conductivity_model` value: full run, default output dir, exit 0. This is why the new field is validated in `main`, not by throwing from the parser. |
 | **PTM-67** | **Most of the `thermophysical:` block is never read**: `ks, kd, H, rhos, rhod, cp0, Qb, chi, albedo, emissivity` are parsed nowhere, each sitting next to a `use_default_*` flag implying a branch that does not exist. Demonstrated: `use_default_rhos: false` + `rhos: 900.0` ran at 1100. Strictly worse than PTM-53 — dropped at the parser, silently. |
 
-PTM-65, PTM-66 and PTM-67 were each found by *my own* code failing to do what its
+PTM-69, PTM-66 and PTM-67 were each found by *my own* code failing to do what its
 banner said, which is the same archetype the ledger exists for.
 
 ---

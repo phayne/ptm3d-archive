@@ -432,15 +432,24 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // Regolith conductivity law. Default "hayne2017" = the historical
             // path (byte-identical). An unrecognised value must be FATAL.
             //
-            // Deliberately NOT a `throw`: ptm_thermal_sim.cpp catches every
-            // loadFromYAML exception, prints "Warning: Failed to load config
-            // file ... Continuing with default configuration", and then runs
-            // the WHOLE simulation on built-in defaults with exit code 0
-            // (BUGS.md PTM-66). A throw here would be downgraded to a warning
-            // and the run would quietly proceed on Hayne -- the exact silent
-            // substitution this validation exists to prevent. So: report here,
-            // keep the raw string, and let the caller's explicit check kill the
-            // process (ptm_thermal_sim.cpp, immediately after config load).
+            // Deliberately NOT a `throw`, and the reason CHANGED during this
+            // release -- read both halves before touching it.
+            //
+            // When this was written, ptm_thermal_sim.cpp caught every
+            // loadFromYAML exception, printed "Warning: Failed to load config
+            // file ... Continuing with default configuration", and ran the
+            // WHOLE simulation on built-in defaults with exit code 0
+            // (BUGS.md PTM-66). A throw here would have been downgraded to a
+            // warning and the run would have proceeded quietly on Hayne.
+            // PTM-66 is FIXED on fix/release-hygiene in this same release, so
+            // that is no longer true: a throw would now be fatal.
+            //
+            // The two-step is kept anyway, deliberately: the parser names the
+            // offending key and the valid values while it still has the file
+            // in hand, and `main` issues one FATAL and one exit code. Folding
+            // it into a throw would replace a specific diagnosis with a generic
+            // "failed to load config file". If you change this to a throw,
+            // check that the message survives.
             {
                 std::string cm = getWithDefault<std::string>(
                     thermo, "conductivity_model",

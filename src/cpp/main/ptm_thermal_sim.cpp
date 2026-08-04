@@ -8830,11 +8830,15 @@ int main(int argc, char** argv) {
     }
 
     // Validate the conductivity-law selector HERE, before anything else runs.
-    // It cannot be validated by throwing from the parser: the catch above
-    // downgrades any parse exception to a warning and then runs the whole
-    // simulation on built-in defaults with exit code 0 (BUGS.md PTM-66). An
-    // unrecognised law must never be silently substituted with Hayne -- that
+    // An unrecognised law must never be silently substituted with Hayne -- that
     // would attribute an entire campaign to the wrong physics.
+    //
+    // Historically this could not be done by throwing from the parser: the catch
+    // above downgraded any parse exception to a warning and then ran the whole
+    // simulation on built-in defaults with exit code 0 (BUGS.md PTM-66). PTM-66
+    // is fixed in this same release, so a throw would now be fatal -- but this
+    // check stays, because it names the offending value and the valid set
+    // instead of emitting a generic "failed to load config file".
     {
         thermal::ConductivityModel cm_probe;
         if (!thermal::parseConductivityModel(
@@ -10934,6 +10938,77 @@ int main(int argc, char** argv) {
                     std::cerr << err.str();
                     return 1;
                 }
+                // ---- composition guard 1: constant_thermal_inertia (FATAL) ----
+                // `constant_thermal_inertia` means "TI is constant in temperature
+                // AND depth". It delivers that by SOLVING for cp from ks:
+                //   cp = TI^2 / (ks * rhos)   (:9777)
+                // and zeroing chi so that k == ks at every T. Under martinez2021
+                // k is NOT ks -- it is Eq. 10, a function of T -- so that cp is
+                // derived from a conductivity the run will not use, and the
+                // delivered TI = sqrt(k_mart(T)*rho*cp) both misses the request
+                // and varies with temperature. The two options contradict each
+                // other by construction; there is no value of cp that satisfies
+                // both. Refuse rather than silently deliver a different TI than
+                // the one the operator asked for and the banner announced.
+                const double c_ti = sim_config.thermophysical.constant_thermal_inertia;
+                if (c_ti > 0.0) {
+                    const double cp_c = (planet.ks > 0.0 && planet.rhos > 0.0)
+                        ? (c_ti * c_ti) / (planet.ks * planet.rhos) : 0.0;
+                    std::ostringstream err;
+                    err.precision(4);
+                    err << "FATAL: thermophysical.constant_thermal_inertia ("
+                        << c_ti << " SI) and conductivity_model martinez2021 are "
+                           "mutually contradictory.\n"
+                           "  constant_thermal_inertia derives cp = TI^2/(ks*rhos) = "
+                        << cp_c << " J/kg/K and zeroes chi so that k == ks = "
+                        << planet.ks << " W/m/K at every temperature.\n"
+                           "  martinez2021 ignores ks entirely: k = Eq.10(T, rho). The run "
+                           "would therefore integrate TI = sqrt(k_mart(T)*rho*cp), which is "
+                           "neither constant nor equal to the requested value:\n";
+                    if (cp_c > 0.0) {
+                        for (double Tp : {50.0, 100.0, 200.0, 380.0}) {
+                            const double kg = thermal::martinezK(Tp, planet.rhos);
+                            const double G  = std::sqrt(kg * planet.rhos * cp_c);
+                            err << "      T = " << Tp << " K  ->  TI = " << G
+                                << " SI  (" << ((G / c_ti - 1.0) * 100.0)
+                                << " % vs the requested " << c_ti << ")\n";
+                        }
+                    }
+                    err << "  Choose one: drop constant_thermal_inertia (set it to 0 and "
+                           "give ks/kd/rhos/rhod/cp0 directly), or use "
+                           "conductivity_model: hayne2017.\n";
+                    std::cout << cmb.str();
+                    std::cerr << err.str();
+                    return 1;
+                }
+
+                // ---- composition guard 2: ks/kd overrides (WARNING) ----
+                // ks_override/kd_override DO reach the solver (that is the PTM-53
+                // fix) and DO print "Property override: ks ... -> ...", but Eq. 10
+                // never reads ks or kd. Left unsaid, a conductivity sweep driven by
+                // ks_override under martinez2021 would run N identical simulations
+                // and report them as a sweep -- the PTM-53 archetype re-entering by
+                // the other door.
+                {
+                    const auto& tpo = sim_config.thermophysical;
+                    if (tpo.ks_override > 0.0 || tpo.kd_override > 0.0) {
+                        cmb << "  WARNING: thermophysical.";
+                        if (tpo.ks_override > 0.0 && tpo.kd_override > 0.0)
+                            cmb << "ks_override (" << tpo.ks_override << ") and kd_override ("
+                                << tpo.kd_override << ") are";
+                        else if (tpo.ks_override > 0.0)
+                            cmb << "ks_override (" << tpo.ks_override << ") is";
+                        else
+                            cmb << "kd_override (" << tpo.kd_override << ") is";
+                        cmb << " set, but INERT under conductivity_model martinez2021:\n"
+                               "           Eq. 10 depends on rho(z) and T only, so this run is "
+                               "IDENTICAL to one without the override.\n"
+                               "           A conductivity sweep parameterized by ks/kd will "
+                               "produce N identical results here. Sweep rhos/rhod instead, or "
+                               "use conductivity_model: hayne2017.\n";
+                    }
+                }
+
                 // Outside the paper's fitted density span the law is an
                 // extrapolation. Say so; do not stop.
                 if (rho_lo < 1100.0 || std::max(planet.rhos, planet.rhod) > 1800.0) {

@@ -73,3 +73,22 @@ failure now aborts rather than silently substituting a default icosphere).
 - **The A3GT batch tools depend on an external mesh helper.** `a3gt_v2_orchestrator.py` and
   `run_a3gt_batch.py` expect a `dtm_to_ply_delaunay` binary on a fixed path; provide it (or adjust
   the path) before running an A3GT batch.
+
+## GPU backends
+
+- **The HIP and CUDA backends are UNTESTED. Only the OpenCL backend is exercised.** Every PTM3D
+  result to date was produced on macOS with `GPU_BACKEND=OPENCL`, whose kernel is the string in
+  `thermal_opencl.cpp::getEmbeddedKernelSource()`. `src/cpp/gpu/thermal_kernels.cpp` is compiled
+  **only** by the HIP/CUDA paths, so nothing in it has ever executed here and there is no baseline
+  to regress it against. In v1.0.3 its `computeK()` was corrected from `k = kc + χ(T/350)³` to the
+  Hayne multiplicative form `k = kc·(1 + χ(T/350)³)` that the CPU, `.cl` and embedded-OpenCL paths
+  all use — the additive form was ~700× too large at lunar noon and would have made any HIP/CUDA
+  run silently and grossly wrong. **This correction is textual and could not be runtime-tested on
+  the development machine (no HIP/CUDA hardware).** Anyone bringing up a HIP or CUDA host should
+  validate against the CPU solver before trusting results, and should treat the whole file as
+  unverified, not just this function. (PTM-62)
+
+- **`src/cpp/gpu/thermal_kernels.cl` is a reference copy, not the kernel that runs.** The OpenCL
+  solver compiles the embedded string in `thermal_opencl.cpp`; editing the `.cl` file changes
+  nothing at runtime. In particular the `.cl` copy implements only the Hayne conductivity law and
+  is not a parity reference for `conductivity_model: martinez2021`.
