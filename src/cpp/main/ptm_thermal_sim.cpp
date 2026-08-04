@@ -1567,15 +1567,40 @@ std::vector<double> calculateAbsorbedFlux(
                                  (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
 
     if (use_incidence_albedo) {
+        // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
+        // initialized to), not the Planet's, and say so when they differ. On
+        // the CPU path the two agree today -- `planet` here IS the main-scope
+        // Planet -- but the GPU path rebuilds its Planet, and a banner that can
+        // silently mean two things is exactly what PTM-55 is.
+        if (std::abs(planet->albedo - default_visible_albedo) > 1e-9) {
+            // PTM-09 class: std::cerr/std::cout inherit whatever precision the
+            // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
+            // so a diagnostic that exists to show a DISAGREEMENT would print
+            // two identical numbers. Format explicitly, then restore.
+            std::ios_base::fmtflags f(std::cerr.flags());
+            std::streamsize pr = std::cerr.precision();
+            std::cerr << std::defaultfloat << std::setprecision(6)
+                      << "[albedo] WARNING: Planet(\"" << planet->name
+                      << "\") carries albedo " << planet->albedo
+                      << ", which DISAGREES with the operative "
+                      << default_visible_albedo
+                      << " used to build face_albedos. See BUGS.md PTM-55."
+                      << std::endl;
+            std::cerr.flags(f);
+            std::cerr.precision(pr);
+        }
         if (use_hapke_albedo) {
             std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
                          "1 - gamma*H(mu0,w)" << std::endl;
-            std::cout << "  Base albedo A0 = " << planet->albedo
-                      << ", single-scattering w = " << planet->hapke_albedo_w
+            std::cout << "  Base albedo A0 = " << std::defaultfloat
+                      << std::setprecision(6) << default_visible_albedo
+                      << " (operative), single-scattering w = " << planet->hapke_albedo_w
                       << std::endl;
         } else {
             std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-            std::cout << "  Base albedo A0 = " << planet->albedo << std::endl;
+            std::cout << "  Base albedo A0 = " << std::defaultfloat
+                      << std::setprecision(6) << default_visible_albedo
+                      << " (operative)" << std::endl;
             std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
                       << ", b = " << planet->albedoCoef[1] << std::endl;
         }
@@ -4017,8 +4042,37 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // gate-ON run is verifiable from stdout — proves the branch FIRES.
         std::cout << "[GPU Thermal] Using directional-hemispheric (Hapke) albedo "
                      "A_h(i) = 1 - gamma*H(mu0,w)" << std::endl;
-        std::cout << "[GPU Thermal]   Base albedo A0 = " << planet.albedo
-                  << ", single-scattering w = " << hapke_w << std::endl;
+        // PTM-55: this banner used to print `planet.albedo` -- the albedo of the
+        // Planet REBUILT two lines above from the body name, which inherits the
+        // body default and never re-reads the configured value. That is not the
+        // number the physics uses: face_albedos is initialized from
+        // default_visible_albedo (below), and each face's Hapke w is derived
+        // from ITS OWN face_albedos entry. A lunar campaign log therefore
+        // carried two different values for one quantity ("A0 = 0.12" from the
+        // main scope, "A0 = 0.1" here) with no way for a reader to tell which
+        // the solver saw. Report the operative value, and say where it came
+        // from -- per PTM-05.
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << std::defaultfloat
+                  << std::setprecision(6) << default_visible_albedo
+                  << " (operative: face_albedos is initialized to this; a loaded "
+                     "albedo map supersedes it per face), single-scattering w = "
+                  << hapke_w << std::endl;
+        if (std::abs(planet.albedo - default_visible_albedo) > 1e-9) {
+            // Explicit precision -- see the CPU sibling: the inherited stream
+            // state can print two different values identically (PTM-09 class).
+            std::ios_base::fmtflags f(std::cerr.flags());
+            std::streamsize pr = std::cerr.precision();
+            std::cerr << std::defaultfloat << std::setprecision(6)
+                      << "[GPU Thermal] WARNING: the solver-scope Planet(\""
+                      << planet.name << "\") carries albedo " << planet.albedo
+                      << ", which DISAGREES with the operative "
+                      << default_visible_albedo
+                      << ". The operative value is what the flux uses; the "
+                         "solver-scope Planet's albedo is used for nothing else. "
+                         "See BUGS.md PTM-55." << std::endl;
+            std::cerr.flags(f);
+            std::cerr.precision(pr);
+        }
     }
 
     // ---- Optional initial / final thermal-state checkpoint -------------
