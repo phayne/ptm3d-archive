@@ -3069,6 +3069,38 @@ bool runThermalModelsForAllFacesBatchSoA(
     // Create progress bar
     thermal::ProgressBar progressBar(static_cast<int>(n_faces), "SIMD Batch thermal", 50, true);
 
+    // ------------------------------------------------------------------
+    // PTM-51 diagnostic (env PTM_DUMP_EQ_SEED=<path.csv>, default OFF).
+    //
+    // PTM-51 documents a real, measured residual: Moon topographic faces with
+    // EXACTLY zero absorbed flux equilibrate to ~63.6 K against T_geo = 24.04 K.
+    // Its stated MECHANISM -- an active 50 K cap on the seed's deep column --
+    // was disputed (Fermi, 2026-08-04) as ~20x too small to supply that heat,
+    // with the analytic clear-sky EQUILIBRATION FORCING proposed instead. The
+    // two hypotheses make opposite, checkable predictions for a zero-flux face:
+    //   PTM-51 as written : T_deep - T_surf_est = 50 K   and eq forcing = 0
+    //   Fermi             : T_deep - T_surf_est ~ 2.5 K  and eq forcing > 0
+    // This dump writes both quantities per face so the question is settled by
+    // measurement rather than by arithmetic on either side. Zero cost and
+    // byte-identical when the variable is unset.
+    // ------------------------------------------------------------------
+    const char* eq_seed_dump_path = std::getenv("PTM_DUMP_EQ_SEED");
+    const bool dump_eq_seed = (eq_seed_dump_path != nullptr && *eq_seed_dump_path != '\0');
+    std::vector<double> dbg_avg_flux, dbg_T_surf_est, dbg_dT_geo,
+                        dbg_eqflux_sum, dbg_eqflux_max;
+    std::vector<long long> dbg_eqflux_n;
+    if (dump_eq_seed) {
+        dbg_avg_flux.assign(n_faces, 0.0);
+        dbg_T_surf_est.assign(n_faces, 0.0);
+        dbg_dT_geo.assign(n_faces, 0.0);
+        dbg_eqflux_sum.assign(n_faces, 0.0);
+        dbg_eqflux_max.assign(n_faces, 0.0);
+        dbg_eqflux_n.assign(n_faces, 0);
+        std::cout << "[PTM-51 dump] PTM_DUMP_EQ_SEED=" << eq_seed_dump_path
+                  << " -- per-face equilibration seed + forcing will be written"
+                  << std::endl;
+    }
+
     bool success = true;
 
     #pragma omp parallel num_threads(thermal_threads)
@@ -3221,6 +3253,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double skin_d = thermal::skinDepth(planet.day, kappa0);
                 const double inv_skin = (skin_d > 0.0) ? (1.0 / skin_d) : 0.0;
 
+                if (dump_eq_seed) {                       // PTM-51 diagnostic
+                    dbg_avg_flux[global_f]   = avg_flux;
+                    dbg_T_surf_est[global_f] = T_surf_est;
+                    dbg_dT_geo[global_f]     = delta_T_geo;   // == T_deep - T_surf_est
+                }
+
                 batch.T_eq_init[f] = T_surf_est;
                 for (int layer = 0; layer < n_layers; ++layer) {
                     const double z_layer = ref_profile.z()[layer];
@@ -3307,6 +3345,15 @@ bool runThermalModelsForAllFacesBatchSoA(
                         const double flux_factor = (cos_zen > 0.0) ? cos_zen : 0.0;
                         flux_vec[f] = planetary_absorption * flux_factor;
                     }
+                    if (dump_eq_seed) {                   // PTM-51 diagnostic
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const size_t gf = start_face + f;
+                            dbg_eqflux_sum[gf] += flux_vec[f];
+                            if (flux_vec[f] > dbg_eqflux_max[gf])
+                                dbg_eqflux_max[gf] = flux_vec[f];
+                            ++dbg_eqflux_n[gf];
+                        }
+                    }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
                 }
@@ -3370,6 +3417,52 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // PTM-51 diagnostic: write the per-face seed terms and the analytic
+    // equilibration forcing that actually drove the column.
+    if (dump_eq_seed) {
+        std::ofstream fh(eq_seed_dump_path);
+        if (!fh) {
+            std::cerr << "[PTM-51 dump] WARNING: cannot open '" << eq_seed_dump_path
+                      << "' for writing; NO dump produced." << std::endl;
+        } else {
+            fh << std::setprecision(10);
+            fh << "# PTM-51 equilibration-seed diagnostic\n"
+               << "# body=" << planet.name
+               << " emissivity=" << planet.emissivity
+               << " Qb=" << planet.Qb
+               << " kd=" << planet.kd
+               << " albedo=" << planet.albedo
+               << " S=" << planet.S
+               << " grid_depth_m=" << ref_profile.z().back()
+               << " n_layers=" << n_layers
+               << " T_geo=" << std::pow(planet.Qb / (planet.emissivity * SIGMA_SB), 0.25)
+               << "\n";
+            fh << "face,lat_deg,lon_deg,avg_flux_Wm2,T_surf_est_K,"
+                  "T_deep_minus_T_surf_K,eq_forcing_mean_Wm2,eq_forcing_max_Wm2,"
+                  "eq_substeps,T_surf_final_K\n";
+            for (size_t gf = 0; gf < n_faces; ++gf) {
+                const double eqmean = (dbg_eqflux_n[gf] > 0)
+                    ? dbg_eqflux_sum[gf] / static_cast<double>(dbg_eqflux_n[gf]) : 0.0;
+                double t_final = 0.0;
+                if (surface_temps_out && gf < surface_temps_out->size() &&
+                    !(*surface_temps_out)[gf].empty())
+                    t_final = (*surface_temps_out)[gf].back();
+                fh << gf << ','
+                   << (gf < mesh->latitudes.size()  ? mesh->latitudes[gf]  : 0.0) << ','
+                   << (gf < mesh->longitudes.size() ? mesh->longitudes[gf] : 0.0) << ','
+                   << dbg_avg_flux[gf] << ','
+                   << dbg_T_surf_est[gf] << ','
+                   << dbg_dT_geo[gf] << ','
+                   << eqmean << ','
+                   << dbg_eqflux_max[gf] << ','
+                   << dbg_eqflux_n[gf] << ','
+                   << t_final << '\n';
+            }
+            std::cout << "[PTM-51 dump] wrote " << n_faces << " rows to "
+                      << eq_seed_dump_path << std::endl;
+        }
+    }
 
     // Never substitute silently (see bad_flux_faces above).
     if (bad_flux_faces.load() > 0) {
