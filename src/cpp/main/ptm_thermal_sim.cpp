@@ -838,9 +838,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // eq phase entirely, and run only the output cycle with the updated
     // (indirect-augmented) flux BC. This avoids re-running eq from a
     // cold-start in every rad iter, which numerically diverges from
-    // iter-0's converged state. In single-phase configs (eq_dt == out_dt)
-    // there is no separate eq end-point, so the buffer is filled at the
-    // final cycle's end (same as final_state_file dump).
+    // iter-0's converged state. In single-phase configs (eq_dt == out_dt,
+    // which includes EVERY warm-start chunk) there is no separate eq phase,
+    // so the buffer is filled immediately BEFORE the output cycle — the state
+    // that cycle actually starts from. (It previously was not filled at all on
+    // that path, despite this comment claiming otherwise: BUGS.md PTM-78.)
     std::vector<float>* post_eq_T_out = nullptr,
     // Multi-GPU controls (see config_parser.h thermal.gpu_*).
     //   gpu_devices == 1 (default) AND gpu_device_ids empty → legacy
@@ -902,7 +904,17 @@ bool runThermalForSelectedFaces_GPU(
     int gpu_devices = 1,
     const std::vector<int>& gpu_device_ids = {},
     int gpu_inter_batch_pause_ms = 0,
-    void* shared_thermal_pool = nullptr);
+    void* shared_thermal_pool = nullptr,
+    // Optional POST-COUPLING state hand-back (BUGS.md PTM-57). When non-null,
+    // the T(z) column AT THE END of this call's output cycle is written into
+    // final_T_inout (layer-major, GLOBAL face indexing, size n_layers ×
+    // n_faces) for every face this call re-thermal'd, and the corresponding
+    // final_T_touched[global_f] byte is set to 1. The chunked-run orchestrator
+    // uses it to archive the coupled end-of-window state instead of iter-0's
+    // un-coupled one. Faces never re-thermal'd keep iter-0's column, which is
+    // correct for them — indirect did not move their temperature.
+    std::vector<float>* final_T_inout = nullptr,
+    std::vector<uint8_t>* final_T_touched = nullptr);
 
 void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
@@ -4332,6 +4344,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << expected * sizeof(float) / (1024.0*1024.0) << " MiB)\n";
     }
 
+    // A warm-start chunk is one that resumes from a checkpoint. It forces
+    // equilibration_orbits=0 upstream (main, "[chunked] thermal.initial_state_file
+    // is set"), so it ALWAYS lands on the single-phase solver branch below.
+    const bool warm_start_run = !initial_state_file.empty();
+
     // Whole-mesh buffer to receive the final T(z) profile, if requested.
     // Filled per-batch and dumped at the end.
     std::vector<float> assembled_final_T;
@@ -4934,13 +4951,71 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*accum_start*/ 0,
                                                  /*accum_end*/   output_steps);
         } else {
+            // ---- Single-phase (legacy dt, and EVERY warm-start chunk) ----
+            // Two defects used to live on exactly this branch (BUGS.md PTM-78,
+            // and the mechanism behind PTM-54/PTM-57):
+            //
+            //  1. equil_cycles == 1 made solvePersistentMultipleCycles run
+            //     total_cycles = n_equil_cycles + 1 = 2 passes over the chunk's
+            //     OWN flux sequence and report the second. A chunked
+            //     continuation therefore replayed its window instead of
+            //     continuing the trajectory. A warm start's loaded T(z) is
+            //     already equilibrated — that is the entire premise of the
+            //     checkpoint — so it integrates the window exactly once.
+            //
+            //  2. post_eq_T_out was filled ONLY in the two_phase branch above,
+            //     so on this branch the rad-coupling re-thermal was handed an
+            //     all-zero T(z) column for every selected face. The function's
+            //     own doc comment already promised the single-phase fill; the
+            //     code never did it.
+            const int sp_equil_cycles = warm_start_run ? 0 : equil_cycles;
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Running " << equil_cycles
-                          << " equilibration cycles + 1 output cycle..." << std::endl;
+                std::cout << "[GPU Thermal] Running " << sp_equil_cycles
+                          << " equilibration cycles + 1 output cycle"
+                          << (warm_start_run
+                                  ? " (warm start: window integrated ONCE)" : "")
+                          << "..." << std::endl;
             }
             auto flux_all = prepare_flux(0, total_time_steps);
+            // Pre-cycles, output discarded. Splitting one (n+1)-cycle call into
+            // an n-cycle call plus a 1-cycle call is numerically inert: buf_T_
+            // persists across calls, kernel/flux/dt are identical, and only the
+            // final cycle ever accumulated. It buys the snapshot point below.
+            if (sp_equil_cycles > 0) {
+                std::vector<float> sp_discard;
+                solver.solvePersistentMultipleCycles(flux_all, sp_discard,
+                                                     total_time_steps, dt,
+                                                     sp_equil_cycles - 1);
+            }
+            // Snapshot the state the OUTPUT cycle is about to start from — the
+            // single-phase analogue of the two-phase post-eq snapshot above.
+            if (post_eq_T_out) {
+                std::vector<float> batch_T_pre_out;
+                try {
+                    solver.downloadAllTemps(batch_T_pre_out);
+                } catch (const std::exception& e) {
+                    std::cerr << "[GPU Thermal] WARNING: downloadAllTemps (single-phase "
+                                 "pre-output) failed: " << e.what() << "\n";
+                    batch_T_pre_out.clear();
+                }
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_pre_out.size() == active * n_layers) {
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        const float* src = batch_T_pre_out.data() + layer * active;
+                        float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
+                        std::copy(src, src + batch_n, dst);
+                    }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: single-phase pre-output snapshot"
+                                 " NOT captured (download size " << batch_T_pre_out.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
+                }
+            }
             solver.solvePersistentMultipleCycles(flux_all, output_temps,
-                                                 total_time_steps, dt, equil_cycles,
+                                                 total_time_steps, dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ equilibration_steps,
                                                  /*accum_end*/   total_time_steps);
@@ -5487,17 +5562,54 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*accum_start*/ 0,
                                                  /*accum_end*/   output_steps);
         } else {
-            // ---- Single-phase (legacy) ----
+            // ---- Single-phase (legacy dt, and EVERY warm-start chunk) ----
             // Accumulator runs only on the FINAL cycle, and only for relative
             // timesteps in the output portion of the trajectory:
             //   [equilibration_steps, total_time_steps).
+            // See the identical block in the multi-GPU worker above for why a
+            // warm start uses 0 pre-cycles and why the snapshot is taken here.
+            const int sp_equil_cycles = warm_start_run ? 0 : equil_cycles;
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Running " << equil_cycles
-                          << " equilibration cycles + 1 output cycle..." << std::endl;
+                std::cout << "[GPU Thermal] Running " << sp_equil_cycles
+                          << " equilibration cycles + 1 output cycle"
+                          << (warm_start_run
+                                  ? " (warm start: window integrated ONCE)" : "")
+                          << "..." << std::endl;
             }
             auto flux_all = prepare_flux(0, total_time_steps);
+            if (sp_equil_cycles > 0) {
+                std::vector<float> sp_discard;
+                solver.solvePersistentMultipleCycles(flux_all, sp_discard,
+                                                     total_time_steps, dt,
+                                                     sp_equil_cycles - 1);
+            }
+            if (post_eq_T_out) {
+                std::vector<float> batch_T_pre_out;
+                try {
+                    solver.downloadAllTemps(batch_T_pre_out);
+                } catch (const std::exception& e) {
+                    std::cerr << "[GPU Thermal] WARNING: downloadAllTemps (single-phase "
+                                 "pre-output) failed: " << e.what() << "\n";
+                    batch_T_pre_out.clear();
+                }
+                const size_t active = solver.activeFaceCount();
+                if (active >= batch_n && n_layers > 0 &&
+                    batch_T_pre_out.size() == active * n_layers) {
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        const float* src = batch_T_pre_out.data() + layer * active;
+                        float*       dst = assembled_post_eq_T.data() + layer * n_faces + batch_start;
+                        std::copy(src, src + batch_n, dst);
+                    }
+                } else {
+                    std::cerr << "[GPU Thermal] WARNING: single-phase pre-output snapshot"
+                                 " NOT captured (download size " << batch_T_pre_out.size()
+                              << ", active=" << active << ", batch_n=" << batch_n
+                              << ", n_layers=" << n_layers << "); rad-coupling"
+                                 " re-thermal would start from a zero column\n";
+                }
+            }
             solver.solvePersistentMultipleCycles(flux_all, output_temps,
-                                                 total_time_steps, dt, equil_cycles,
+                                                 total_time_steps, dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ equilibration_steps,
                                                  /*accum_end*/   total_time_steps);
@@ -5650,20 +5762,25 @@ post_batch_loop:
     // and the [3,500] K clamp together hid). Warn loudly if any survive so
     // this class of bug can never silently corrupt a coupled run again.
     if (post_eq_T_out) {
-        if (two_phase) {
-            size_t n_zero = 0;
-            for (size_t fc = 0; fc < n_faces; ++fc) {
-                bool all_zero = true;
-                for (size_t l = 0; l < n_layers; ++l) {
-                    if (assembled_post_eq_T[l * n_faces + fc] != 0.0f) { all_zero = false; break; }
-                }
-                if (all_zero) ++n_zero;
+        // The `two_phase` gate that used to wrap this check is REMOVED: the
+        // single-phase branch never filled assembled_post_eq_T at all, so the
+        // one configuration where every column was zero was also the one
+        // configuration the tripwire declined to inspect. That is how a
+        // warm-start chunk shipped a coupled run whose re-thermal started from
+        // 0 K (BUGS.md PTM-78).
+        size_t n_zero = 0;
+        for (size_t fc = 0; fc < n_faces; ++fc) {
+            bool all_zero = true;
+            for (size_t l = 0; l < n_layers; ++l) {
+                if (assembled_post_eq_T[l * n_faces + fc] != 0.0f) { all_zero = false; break; }
             }
-            if (n_zero > 0) {
-                std::cerr << "[GPU Thermal] WARNING: " << n_zero << "/" << n_faces
-                          << " faces have an all-zero post-eq column; rad-coupling"
-                             " re-thermal of these faces would diverge\n";
-            }
+            if (all_zero) ++n_zero;
+        }
+        if (n_zero > 0) {
+            std::cerr << "[GPU Thermal] WARNING: " << n_zero << "/" << n_faces
+                      << " faces have an all-zero post-eq column; rad-coupling"
+                         " re-thermal of these faces would diverge"
+                      << (two_phase ? "" : " (single-phase path)") << "\n";
         }
         *post_eq_T_out = assembled_post_eq_T;
     }
@@ -5703,7 +5820,9 @@ bool runThermalForSelectedFaces_GPU(
     int gpu_devices,
     const std::vector<int>& gpu_device_ids,
     int gpu_inter_batch_pause_ms,
-    void* shared_thermal_pool)
+    void* shared_thermal_pool,
+    std::vector<float>* final_T_inout,
+    std::vector<uint8_t>* final_T_touched)
 {
     using namespace gpu::opencl;
 
@@ -6062,23 +6181,72 @@ bool runThermalForSelectedFaces_GPU(
                                              n_out, dt_out,
                                              /*n_equil_cycles=*/0);
 
+        // Hand the POST-COUPLING end-of-window column back to the caller so a
+        // chunk checkpoint archives the coupled state, not iter-0's un-coupled
+        // one (BUGS.md PTM-57). downloadAllTemps strides by activeFaceCount(),
+        // which EXCEEDS batch_n whenever the shared re-thermal pool was
+        // allocated wider than this batch — using batch_n as the stride there
+        // reads the wrong faces, and gating on `size == batch_n*n_layers`
+        // silently captures nothing. Use the active stride and say so on failure.
+        if (final_T_inout && final_T_touched) {
+            std::vector<float> batch_T_final;
+            try {
+                solver.downloadAllTemps(batch_T_final);
+            } catch (const std::exception& e) {
+                std::cerr << "[Re-thermal] WARNING: downloadAllTemps (post-coupling "
+                             "state) failed: " << e.what() << "\n";
+                batch_T_final.clear();
+            }
+            const size_t active = solver.activeFaceCount();
+            if (active >= batch_n && n_layers > 0 &&
+                batch_T_final.size() == active * n_layers) {
+                for (size_t f = 0; f < batch_n; ++f) {
+                    const size_t gf = static_cast<size_t>(face_indices[batch_start + f]);
+                    for (size_t layer = 0; layer < n_layers; ++layer) {
+                        (*final_T_inout)[layer * n_faces_total + gf] =
+                            batch_T_final[layer * active + f];
+                    }
+                    (*final_T_touched)[gf] = 1;
+                }
+            } else {
+                std::cerr << "[Re-thermal] WARNING: post-coupling state NOT captured for"
+                             " batch " << batch_idx << " (download size "
+                          << batch_T_final.size() << ", active=" << active
+                          << ", batch_n=" << batch_n << ", n_layers=" << n_layers
+                          << "); the chunk checkpoint keeps iter-0's un-coupled column"
+                             " for these faces (BUGS.md PTM-57)\n";
+            }
+        }
+
         // Copy output surface T into surface_temps at the output-window
         // slots. In two-phase mode, eq-window slots stay at 0 (matches
         // iter-0). In single-phase, the full range is written.
         //
-        // RE-THERMAL WARMUP GUARD: unlike iter-0 (which continues on-GPU from a
-        // pre-converged surface), this path uploadAllTemps()-seeds iter-0's
-        // post-eq T(z) and the GPU surfTemp Newton solve needs ~2 steps to
-        // re-converge the SURFACE from that upload — producing a spurious cold,
-        // MIN_TEMP-clamped transient in the first 1-2 recorded output steps.
-        // (Diagnosed via time-series: of all sub-40 K samples, ~50% land on
-        // step 0, ~50% on step 1, <1% on step >=2; excluding the first two steps
-        // recovers a night min that matches the rad-off baseline.) The deep
-        // column is seeded correctly, so only the surface needs the skip. iter-0
-        // already wrote physically-correct values for these warmup steps (no
-        // indirect flux, a negligible difference over 2 of 360 steps), so we
-        // keep those and overwrite only the settled steps.
-        constexpr int kReThermalWarmupSkip = 2;
+        // RE-THERMAL WARMUP SKIP (PTM-54). This used to be a hard-coded 2:
+        // the first 2 recorded steps of every re-thermal were LEFT at iter-0's
+        // UN-COUPLED values, which is exactly the "first two frames of every
+        // chunk are un-coupled" artifact. Its stated justification was a
+        // "spurious cold, MIN_TEMP-clamped transient" — but the kernel
+        // recomputes k/cp/kappa from T_local every substep and starts the
+        // surface Newton solve from a physics guess (equilibrium T, or T1 at
+        // night), so it carries NO state across uploadAllTemps that could need
+        // 2 steps to settle. The transient it was masking was the ZERO T(z)
+        // seed (post-eq snapshot never captured; see PTM-78) being clamped to
+        // the old [3,500] K floor — a seed bug, symptomatically patched here.
+        // With a correct seed there is nothing to skip. Default 0; set
+        // PTM_RETHERMAL_WARMUP_SKIP=2 to restore the legacy mask.
+        static const int kReThermalWarmupSkip = []() {
+            const char* e = std::getenv("PTM_RETHERMAL_WARMUP_SKIP");
+            const int v = e ? std::atoi(e) : 0;
+            return v > 0 ? v : 0;
+        }();
+        if (batch_idx == 0 && kReThermalWarmupSkip > 0) {
+            std::cout << "  [Re-thermal] PTM_RETHERMAL_WARMUP_SKIP="
+                      << kReThermalWarmupSkip << ": the first "
+                      << kReThermalWarmupSkip << " output step(s) keep iter-0's"
+                         " UN-COUPLED temperature (legacy PTM-54 behaviour)"
+                      << std::endl;
+        }
         for (size_t f = 0; f < batch_n; ++f) {
             const int face_idx = face_indices[batch_start + f];
             for (int t = kReThermalWarmupSkip; t < n_out; ++t) {
@@ -6087,7 +6255,6 @@ bool runThermalForSelectedFaces_GPU(
             }
         }
 
-        (void)batch_idx;  // unused in single-GPU branch; kept for pool callback parity
         return true;
     };
 
@@ -6281,7 +6448,9 @@ bool runThermalForSelectedFaces_GPU(
     int,
     const std::vector<int>&,
     int,
-    void*)
+    void*,
+    std::vector<float>*,
+    std::vector<uint8_t>*)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -11363,6 +11532,26 @@ int main(int argc, char** argv) {
         use_streamed_thermal = false;
     }
 
+    // BUGS.md PTM-76: the T(z) checkpoint is read and written ONLY by the GPU
+    // persistent solver. On any CPU path both keys are dropped — no file, no
+    // error — so a chunked / warm-start run silently degrades into a set of
+    // independent COLD-STARTED runs that still exit 0. Refuse: a request this
+    // consequential must not be answered with a different simulation.
+    if (!config.getPropertyBool("use_gpu_thermal", false)
+        && (!sim_config.thermal.initial_state_file.empty()
+            || !sim_config.thermal.final_state_file.empty())) {
+        std::cerr << "\nFATAL: thermal.initial_state_file / thermal.final_state_file are set,"
+                     " but this run will not take the GPU persistent solver.\n"
+                  << "  Only that solver reads or writes the T(z) checkpoint (BUGS.md PTM-76);"
+                     " on a CPU path the request is silently dropped and every chunk"
+                     " cold-starts.\n"
+                  << "  Set thermal.use_gpu: true, or drop the checkpoint keys and run the"
+                     " window in one piece.\n"
+                  << "  Refusing to run a chunked workflow that cannot hand state over."
+                  << std::endl;
+        return 1;
+    }
+
     // If using chunked storage, extract the data now (SKIP if we plan to stream)
     if (using_chunked_storage && !use_streamed_thermal) {
         std::cout << "Detected chunked storage. Extracting illumination data..." << std::endl;
@@ -12577,6 +12766,52 @@ int main(int argc, char** argv) {
                 std::cout << "  Max iterations: " << rad_max_coupling_iter << std::endl;
                 std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
 
+                // ---- Re-thermal SEED tripwire (BUGS.md PTM-78) --------------
+                // Every coupling iteration re-integrates the selected faces
+                // from rad_post_eq_T. If that hand-off is empty or all-zero the
+                // whole coupled field is garbage, and it used to happen in
+                // SILENCE on every warm-start chunk. Refuse to produce results
+                // rather than write a plausible-looking wrong answer.
+                if (rad_post_eq_T.empty()) {
+                    std::cerr << "\nFATAL: radiation coupling is enabled but the thermal solver"
+                                 " returned no post-equilibration T(z) hand-off.\n"
+                              << "  Every coupling iteration would re-thermal from an undefined"
+                                 " state (BUGS.md PTM-78).\n"
+                              << "  Refusing to write results." << std::endl;
+                    return 1;
+                }
+                {
+                    const size_t nl_seed = rad_post_eq_T.size() / std::max<size_t>(1, num_faces);
+                    size_t n_cold_seed = 0;
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        if (rad_post_eq_T[f] < 1.0f) ++n_cold_seed;   // layer 0
+                    }
+                    if (n_cold_seed > 0) {
+                        std::cerr << "\nFATAL: " << n_cold_seed << "/" << num_faces
+                                  << " faces carry a sub-1 K surface in the post-equilibration"
+                                     " hand-off (n_layers=" << nl_seed << ").\n"
+                                  << "  The radiation re-thermal would integrate them from a dead"
+                                     " column and report the ramp as physics (BUGS.md PTM-78).\n"
+                                  << "  Refusing to write results." << std::endl;
+                        return 1;
+                    }
+                    std::cout << "  Re-thermal seed: OK (" << num_faces
+                              << " faces, no dead columns)" << std::endl;
+                }
+
+                // Post-coupling end-of-window T(z), assembled across coupling
+                // iterations from whichever faces each iteration re-thermal'd.
+                // Only allocated when a checkpoint was actually requested.
+                const bool want_post_coupling_state =
+                    !sim_config.thermal.final_state_file.empty();
+                std::vector<float>  rad_final_T;
+                std::vector<uint8_t> rad_final_touched;
+                if (want_post_coupling_state) {
+                    const size_t nl_state = rad_post_eq_T.size() / std::max<size_t>(1, num_faces);
+                    rad_final_T.assign(nl_state * num_faces, 0.0f);
+                    rad_final_touched.assign(num_faces, 0);
+                }
+
                 // Store previous iteration temperatures for convergence check
                 std::vector<std::vector<double>> prev_temps = surface_temps;
 
@@ -13136,7 +13371,9 @@ int main(int argc, char** argv) {
                             sim_config.thermal.gpu_devices,
                             sim_config.thermal.gpu_device_ids,
                             sim_config.thermal.gpu_inter_batch_pause_ms,
-                            shared_rerun_pool
+                            shared_rerun_pool,
+                            want_post_coupling_state ? &rad_final_T       : nullptr,
+                            want_post_coupling_state ? &rad_final_touched : nullptr
                         );
                         if (!gpu_success) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
@@ -13191,6 +13428,18 @@ int main(int argc, char** argv) {
                     }
 
                     if (!use_gpu_thermal_rerun) {
+                        // The CPU re-thermal returns surface temperatures only —
+                        // runThermalModelWithMatchedTimes keeps no T(z) column —
+                        // so a chunk checkpoint written after a CPU re-thermal
+                        // still carries iter-0's UN-COUPLED column on these faces.
+                        // Say so; do not let it pass in silence (BUGS.md PTM-57).
+                        if (want_post_coupling_state) {
+                            std::cerr << "  [Re-thermal] WARNING: CPU re-thermal path — no T(z)"
+                                         " column is available, so the chunk checkpoint keeps"
+                                         " iter-0's UN-COUPLED column for these "
+                                      << faces_to_rerun.size() << " faces (BUGS.md PTM-57)."
+                                         " The next chunk will cold-start them.\n";
+                        }
                         // CPU path: OpenMP parallel loop
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
@@ -13273,6 +13522,84 @@ int main(int argc, char** argv) {
                                       << (rad_coupling_face_frac * 100) << "%)"
                                       << std::fixed << std::endl;
                             break;
+                        }
+                    }
+                }
+
+                // ---- PTM-57: re-archive the checkpoint POST-coupling --------
+                // thermal.final_state_file was already written by the iter-0
+                // solver, which returns BEFORE this block runs — so on disk it
+                // holds the UN-COUPLED column, and the next chunk cold-starts
+                // its whole 30-layer column on exactly the faces where indirect
+                // radiation sets the temperature (measured: 24.36 K archived vs
+                // 39.5 K in the concurrent output frame on a PSR floor).
+                // Overwrite it with iter-0's column patched by the coupled
+                // end-of-window column on every face the re-thermal touched.
+                // Faces never re-thermal'd keep iter-0's column, which is the
+                // right answer for them. Writing here (rather than deferring
+                // the first write) keeps an un-coupled run byte-identical and
+                // leaves a usable checkpoint if the coupling stage dies.
+                if (want_post_coupling_state) {
+                    const std::string& spath = sim_config.thermal.final_state_file;
+                    size_t n_touched = 0;
+                    for (uint8_t b : rad_final_touched) n_touched += (b != 0);
+
+                    std::ifstream sin(spath, std::ios::binary);
+                    uint32_t magic = 0, f_nf = 0, f_nl = 0;
+                    std::vector<float> merged;
+                    bool ok = false;
+                    if (sin) {
+                        sin.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+                        sin.read(reinterpret_cast<char*>(&f_nf),  sizeof(uint32_t));
+                        sin.read(reinterpret_cast<char*>(&f_nl),  sizeof(uint32_t));
+                        if (sin && magic == 0x50544D54u
+                                && f_nf == static_cast<uint32_t>(num_faces)
+                                && static_cast<size_t>(f_nl) * f_nf == rad_final_T.size()) {
+                            merged.resize(rad_final_T.size());
+                            sin.read(reinterpret_cast<char*>(merged.data()),
+                                     static_cast<std::streamsize>(merged.size()) * sizeof(float));
+                            ok = static_cast<bool>(sin);
+                        }
+                    }
+                    if (!ok) {
+                        std::cerr << "[PTM-57] WARNING: cannot re-read the iter-0 checkpoint '"
+                                  << spath << "' (magic=0x" << std::hex << magic << std::dec
+                                  << ", faces=" << f_nf << ", layers=" << f_nl
+                                  << "); the archived state stays PRE-COUPLING and the next"
+                                     " chunk will cold-start its radiation-fed faces.\n";
+                    } else if (n_touched == 0) {
+                        std::cout << "[PTM-57] No face was re-thermal'd; the checkpoint is"
+                                     " already the coupled state." << std::endl;
+                    } else {
+                        for (size_t f = 0; f < num_faces; ++f) {
+                            if (!rad_final_touched[f]) continue;
+                            for (uint32_t l = 0; l < f_nl; ++l) {
+                                merged[static_cast<size_t>(l) * num_faces + f] =
+                                    rad_final_T[static_cast<size_t>(l) * num_faces + f];
+                            }
+                        }
+                        std::ofstream so(spath, std::ios::binary | std::ios::trunc);
+                        if (!so) {
+                            std::cerr << "[PTM-57] WARNING: cannot reopen '" << spath
+                                      << "' for the post-coupling rewrite; the archived state"
+                                         " stays PRE-COUPLING.\n";
+                        } else {
+                            const uint32_t m = 0x50544D54u;
+                            const uint32_t nf = static_cast<uint32_t>(num_faces);
+                            so.write(reinterpret_cast<const char*>(&m),    sizeof(uint32_t));
+                            so.write(reinterpret_cast<const char*>(&nf),   sizeof(uint32_t));
+                            so.write(reinterpret_cast<const char*>(&f_nl), sizeof(uint32_t));
+                            so.write(reinterpret_cast<const char*>(merged.data()),
+                                     static_cast<std::streamsize>(merged.size()) * sizeof(float));
+                            if (!so.good()) {
+                                std::cerr << "[PTM-57] WARNING: short write on the post-coupling"
+                                             " checkpoint rewrite.\n";
+                            } else {
+                                std::cout << "[PTM-57] Re-archived POST-coupling T(z) checkpoint: "
+                                          << n_touched << "/" << num_faces
+                                          << " faces carry the coupled column -> " << spath
+                                          << std::endl;
+                            }
                         }
                     }
                 }
