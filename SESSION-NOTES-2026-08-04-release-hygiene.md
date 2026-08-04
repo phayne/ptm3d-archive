@@ -7,7 +7,7 @@ CPU only — the GPU was owned by another agent (one exception, disclosed below)
 | # | ledger id | commit | outcome |
 |---|---|---|---|
 | 1 | PTM-42 (+PTM-52) | `72c9cc5` | engine reads and applies `engine_env:`; process env wins, everything logged |
-| 2 | PTM-37 | `14bd635` | mesh unit stated at startup; four fatal cases; found **PTM-57** |
+| 2 | PTM-37 | `14bd635` | mesh unit stated at startup; four fatal cases; found **PTM-65** |
 | 3 | PTM-43 | `62e9cc1` | four (T, IR flux) pairs corrected + load-time consistency check |
 | 4 | PTM-45 | `44987cc` | one unknown-primary behavior, one `heavyN`, no silent defaults |
 | 5 | PTM-55 | `eb5779a` | **log** defect on this tree; campaign flag raised (see below) |
@@ -173,7 +173,7 @@ the view factors, or the solver kernels.
 
 ## New bugs filed
 
-- **PTM-57** — `mesh.scale_factor` scales the vertices and leaves `face_centers` / `face_areas` /
+- **PTM-65** — `mesh.scale_factor` scales the vertices and leaves `face_centers` / `face_areas` /
   `face_normals` at the loader's values, then prints "Applied scale factor". Measured: crater mesh +
   `scale_factor: 0.005` → `|vertex|` 8687, `|face_center|` 1737400, ratio exactly 200. No shipped
   config sets it ≠ 1.0. Item 2's guard now refuses such a mesh.

@@ -7172,7 +7172,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
 
     // Median |vertex|, as an independent witness of the same geometry. These
     // two must agree: face centers ARE vertex averages. They disagree when
-    // something rescaled one array and not the other -- see PTM-57, where
+    // something rescaled one array and not the other -- see PTM-65, where
     // mesh.scale_factor scales the vertices and leaves face_centers /
     // face_areas / face_normals at the loader's values, then prints "Applied
     // scale factor". Checking it here turns a silent 1000x geometry error
@@ -7215,7 +7215,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
               << r.median << " but median |vertex| = " << vmedian
               << " (ratio " << ratio << "). Face centers are vertex averages, so "
                  "these cannot legitimately differ. Something rescaled one array "
-                 "and not the other -- if mesh.scale_factor is set, that is PTM-57 "
+                 "and not the other -- if mesh.scale_factor is set, that is PTM-65 "
                  "(the vertices are scaled, the face centers/areas/normals are not, "
                  "and the run prints 'Applied scale factor' anyway).";
             r.fatal = true; r.message = m.str();
