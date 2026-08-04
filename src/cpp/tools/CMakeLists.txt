@@ -120,6 +120,15 @@ else()
     message(STATUS "  GDAL_LIBRARIES: ${GDAL_LIBRARIES}")
 endif()
 
+# Conductivity-model anchor tests (Hayne 2017 vs Martinez & Siegler 2021).
+# Header-only under test, so no link against `thermal` is required -- which
+# also means this test cannot be silently satisfied by a stale library.
+add_executable(test_conductivity_model test_conductivity_model.cpp)
+set_target_properties(test_conductivity_model
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration large-dt accuracy test
 add_executable(test_equilibration_dt test_equilibration_dt.cpp)
 target_link_libraries(test_equilibration_dt

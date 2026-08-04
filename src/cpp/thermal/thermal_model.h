@@ -13,6 +13,7 @@
 #include "eigen_config.h"
 #include <map>       // Add this for std::map
 #include "planetary_properties.h"  // Add this include
+#include "conductivity_model.h"    // Selectable k(T,rho) laws (Hayne 2017 / Martinez 2021)
 #include "../maps/spatial_map.h"  // Add this include for SpatialMap class
 
 namespace thermal {
@@ -220,6 +221,20 @@ public:
     // Method to get R350
     double getR350() const { return R350(chi); }
 
+    // Regolith conductivity law. DEFAULT MUST REMAIN Hayne2017: every result in
+    // this repository was produced with it, and the byte-identity regression
+    // depends on the default path being untouched.
+    //
+    // This lives on Config, NOT on Planet, and that is deliberate. Config is
+    // built once in main and PASSED to every solver entry point, whereas every
+    // solver entry point REBUILDS its own `thermal::Planet(body_name)` and so
+    // discards anything the config put on the main-scope Planet. That is the
+    // exact mechanism of BUGS.md PTM-53, which made `ks_override`/`kd_override`
+    // silent no-ops on the Moon/Europa mesh+GPU path while still printing an
+    // override banner. Putting the selector on Config sidesteps it by
+    // construction; engagement is still proven by byte-difference, not assumed.
+    ConductivityModel conductivity_model = ConductivityModel::Hayne2017;
+
     // Material property update interval
     int MATERIAL_UPDATE_INTERVAL = 1;
 
@@ -414,6 +429,9 @@ public:
     double emissivity;
     double chi;
     double R350_val;
+    // Conductivity law in force for this profile (copied from Config at
+    // construction so the hot loops need no Config lookup).
+    ConductivityModel cond_model = ConductivityModel::Hayne2017;
     int nlayers;
     double day;
     const Config* config;
@@ -717,6 +735,9 @@ struct ThermalBatchSoA {
     // Material parameters (shared across all faces in batch)
     double cp0;              // Base heat capacity
     double R350_val;         // Radiative conductivity coefficient (Hayne 2017)
+    // Conductivity law for this batch. Default Hayne2017 so a batch that is
+    // zero-initialised or built by older code keeps the historical behaviour.
+    ConductivityModel cond_model = ConductivityModel::Hayne2017;
     double rho_s;            // Surface density
     double rho_d;            // Deep density
     double k_s;              // Surface conductivity

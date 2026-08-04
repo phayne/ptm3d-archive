@@ -177,6 +177,21 @@ void Profile::update_k() {
     k().resize(T().size());
     const size_t n = T().size();
 
+    // Martinez & Siegler (2021) Eq. 10: k = (A1*rho-A2)*k_am(T) + (B1*rho-B2)*T^3.
+    // Scalar-only on purpose. k_am(T) is a 9-term Laurent polynomial; hand-
+    // vectorising it would buy little here (this loop is ~10-64 layers) and
+    // would add a second numerical expression to keep in step with the OpenCL
+    // mirror. Taking the branch OUTSIDE the SIMD blocks also guarantees the
+    // Hayne path below is textually and bit-for-bit unchanged.
+    if (cond_model == ConductivityModel::Martinez2021) {
+        const auto& rho_v = rho();
+        #pragma omp parallel for schedule(static) if(n > 1000 && !omp_in_parallel())
+        for (size_t i = 0; i < n; i++) {
+            k()[i] = martinezK(T()[i], rho_v[i]);
+        }
+        return;
+    }
+
 #if defined(AVX512_ENABLED)
     // AVX-512 implementation with OpenMP
     const size_t vec_size = 8;
@@ -684,6 +699,7 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     this->emissivity = planet.emissivity;
     this->chi = config.chi;
     this->R350_val = config.getR350();
+    this->cond_model = config.conductivity_model;
     this->day = planet.day;
 
     // Calculate a baseline κ for skin depth using a representative cp value
@@ -775,7 +791,13 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
     // Deep temperature: use Hayne et al. (2017) conductivity formula
     // k_deep = kd * (1 + R350 * T^3) at T ~ T_avg
     double T_deep_estimate = T_avg;
-    double k_deep = planet.kd * (1.0 + R350_val * pow3(T_deep_estimate));
+    // Deep conductivity for the geothermal-gradient seed. Under Martinez the
+    // deep k depends on rho_d, not on kd (kd does not enter Eq. 10 at all), so
+    // using the Hayne expression here would seed a gradient inconsistent with
+    // the law actually being integrated.
+    double k_deep = (cond_model == ConductivityModel::Martinez2021)
+                        ? martinezK(T_deep_estimate, planet.rhod)
+                        : planet.kd * (1.0 + R350_val * pow3(T_deep_estimate));
     double gradient = planet.Qb / k_deep;  // K/m
     double depth = z().back();
 
@@ -857,10 +879,32 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     static thread_local size_t s_material_step_counter = 0;
     const bool do_material_refresh = (mat_interval <= 1) || ((s_material_step_counter % mat_interval) == 0);
 
-    const bool temp_dep_k  = (R350_val != 0.0);
+    // Martinez & Siegler (2021) makes k temperature-dependent through the
+    // SOLID term, so it is temperature-dependent even when R350 == 0.
+    const bool martinez    = (cond_model == ConductivityModel::Martinez2021);
+    const bool temp_dep_k  = martinez || (R350_val != 0.0);
     const bool temp_dep_cp = !planet.cpCoeff.empty();
 
-    if ((temp_dep_k || temp_dep_cp) && do_material_refresh) {
+    // Martinez path: scalar, kept out of the SIMD block below so that block
+    // stays textually and bit-for-bit identical for the default Hayne law.
+    if (martinez && do_material_refresh) {
+        const size_t deg = planet.cpCoeff.size();
+        for (size_t i = 0; i < n_tot; ++i) {
+            const double Ti = grid.T[i];
+            grid.k[i] = martinezK(Ti, grid.rho[i]);
+            if (temp_dep_cp) {
+                double result = planet.cpCoeff[deg - 1];
+                for (int j = static_cast<int>(deg) - 2; j >= 0; --j) {
+                    result = result * Ti + planet.cpCoeff[j];
+                }
+                grid.cp[i] = planet.cp0 + Ti * result;
+            }
+            const double cpused = temp_dep_cp ? grid.cp[i] : planet.cp0;
+            grid.kappa[i] = grid.k[i] / (grid.rho[i] * cpused);
+        }
+    }
+
+    if (!martinez && (temp_dep_k || temp_dep_cp) && do_material_refresh) {
         const size_t n = n_tot;
     #if defined(AVX512_ENABLED)
         const size_t VS = 8;
@@ -2272,6 +2316,7 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
     // Store material parameters
     cp0 = planet.cp0;
     R350_val = config.getR350();
+    cond_model = config.conductivity_model;
     rho_s = planet.rhos;
     rho_d = planet.rhod;
     k_s = planet.ks;
@@ -2475,6 +2520,31 @@ void updateMaterialPropertiesBatchSIMD(ThermalBatchSoA& batch) {
     const double cp0_val = batch.cp0;
     const int n_coeffs = batch.n_cp_coeffs;
     const double* coeffs = batch.cp_coeffs;
+
+    // Martinez & Siegler (2021): scalar over the whole batch, taken before the
+    // SIMD blocks so those stay bit-for-bit unchanged for the default law.
+    if (batch.cond_model == ConductivityModel::Martinez2021) {
+        for (int layer = 0; layer < n; ++layer) {
+            double* T_ptr     = batch.layer_ptr(batch.T, layer);
+            double* k_ptr     = batch.layer_ptr(batch.k, layer);
+            double* cp_ptr    = batch.layer_ptr(batch.cp, layer);
+            double* kappa_ptr = batch.layer_ptr(batch.kappa, layer);
+            double* rho_ptr   = batch.layer_ptr(batch.rho, layer);
+            for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
+                const double Tf = T_ptr[f];
+                k_ptr[f] = martinezK(Tf, rho_ptr[f]);
+                double cpv = cp0_val;
+                if (n_coeffs > 0) {
+                    double result = coeffs[n_coeffs - 1];
+                    for (int j = n_coeffs - 2; j >= 0; --j) result = result * Tf + coeffs[j];
+                    cpv = cp0_val + Tf * result;
+                }
+                cp_ptr[f] = cpv;
+                kappa_ptr[f] = k_ptr[f] / (rho_ptr[f] * cpv);
+            }
+        }
+        return;
+    }
 
 #if defined(AVX512_ENABLED)
     __m512d one = _mm512_set1_pd(1.0);

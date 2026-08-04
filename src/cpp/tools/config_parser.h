@@ -382,6 +382,22 @@ struct SimulationConfig {
         bool   albedo_hapke = false;        // gate: use A_h(i) closed form
         double albedo_hapke_w = -1.0;       // single-scattering albedo w; <0 =
                                             // derive from the Bond albedo A0.
+
+        // Regolith thermal-conductivity law.
+        //   "hayne2017"    (default) k = kc(z) * (1 + chi*(T/350)^3)
+        //   "martinez2021"           k = (A1*rho-A2)*k_am(T) + (B1*rho-B2)*T^3
+        //                            Martinez & Siegler (2021), JGR Planets 126,
+        //                            e2021JE006829. Temperature-dependent SOLID
+        //                            conduction; intended for ultracold regolith
+        //                            (PSRs) where the Hayne form is extrapolated
+        //                            below its ~150 K laboratory floor.
+        // Stored as the RAW string. The parser reports an unrecognised value on
+        // stderr but does not throw (a throw is swallowed -- BUGS.md PTM-66);
+        // ptm_thermal_sim.cpp validates this string right after config load and
+        // exits 1, so an unknown law can never be silently replaced by Hayne.
+        // NOTE selecting martinez2021 makes ks/kd INERT for conduction (Eq. 10
+        // depends on rho(z) only) -- the engine says so at startup.
+        std::string conductivity_model = "hayne2017";
     } thermophysical;
 
     // Legacy accessor (for compatibility)

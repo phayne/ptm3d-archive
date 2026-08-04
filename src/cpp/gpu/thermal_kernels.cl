@@ -1,5 +1,14 @@
 
 // Embedded OpenCL kernel source for PTM thermal solver
+//
+// NOTE (2026-08): this file is a REFERENCE COPY. The kernel the solver actually
+// compiles is the string returned by
+// src/cpp/gpu/thermal_opencl.cpp::getEmbeddedKernelSource(); editing this file
+// changes nothing at runtime. In particular this copy implements ONLY the
+// Hayne et al. (2017) conductivity law -- the selectable Martinez & Siegler
+// (2021) law (thermophysical.conductivity_model) lives in the embedded source
+// and in src/cpp/thermal/conductivity_model.h. Do not use this file as a parity
+// reference for k(T).
 #define MAX_LAYERS 64
 
 #ifndef SIGMA

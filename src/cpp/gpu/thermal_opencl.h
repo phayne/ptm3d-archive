@@ -82,12 +82,20 @@ public:
 
     /**
      * @brief Set material property parameters
+     *
+     * `cond_model` selects the regolith conductivity law: 0 = Hayne et al.
+     * (2017) k = kc*(1+R350*T^3) (the historical default), 1 = Martinez &
+     * Siegler (2021) Eq. 10. It is INTENTIONALLY not defaulted: a defaulted
+     * argument would let a new GPU entry point silently run Hayne while the
+     * config asked for Martinez, which is precisely the failure mode of
+     * BUGS.md PTM-53. Make the compiler ask.
      */
     void setMaterialParams(
         float cp0,
         const std::vector<float>& cp_coeffs,
         float R350,
-        float sigma = 5.67051196e-8f);
+        float sigma,
+        int cond_model);
 
     /**
      * @brief Upload initial temperature profile
@@ -265,6 +273,8 @@ private:
     // Material parameters
     float cp0_ = 0.0f;
     float R350_ = 0.0f;
+    // Conductivity law passed to every kernel (0 = Hayne 2017, 1 = Martinez 2021).
+    int   cond_model_ = 0;
     float sigma_ = 5.67051196e-8f;
     int n_cp_coeffs_ = 0;
 

@@ -3404,6 +3404,10 @@ struct CalibrationProbe {
                                       // cp is fully given by cp_coeffs, e.g. Moon)
     std::vector<float> cp_coeffs;     // cp(T) polynomial coeffs (production kernel)
     double R350          = 2.7f;      // radiative-conductivity coeff (Hayne 2017)
+    int    cond_model    = 0;         // conductivity law: 0 = Hayne 2017, 1 = Martinez 2021.
+                                      // The probe must integrate the SAME law as the run,
+                                      // or its measured substep count (and hence the safe
+                                      // dispatch ceiling) is unrepresentative.
     double cp_eff        = 0.0;       // effective near-surface cp for the kappa
                                       // signature (caller evaluates cp(T_rep));
                                       // must be > 0 (never divide kappa by 0)
@@ -3463,7 +3467,8 @@ static int calibrateGpuCore(const CalibrationProbe& pr, gpu::MachineProfile& out
     // Mirror the production kernel's heat-capacity model: base cp0 + cp(T)
     // polynomial + R350, so the probe's per-step substep count is representative.
     solver.setMaterialParams(static_cast<float>(pr.cp0), pr.cp_coeffs,
-                             static_cast<float>(pr.R350));
+                             static_cast<float>(pr.R350),
+                             5.67051196e-8f, pr.cond_model);
 
     // Two-point regression: wall(P) ~= overhead + P * per_step. Two point counts
     // separate the fixed per-dispatch overhead (INTERCEPT) from the per-timestep
@@ -3762,6 +3767,7 @@ static void ensureGpuCalibrated(const thermal::Config& config,
     pr.cp0 = planet.cp0;             // base term (may be 0 for cp(T) bodies)
     pr.cp_coeffs.assign(planet.cpCoeff.begin(), planet.cpCoeff.end());
     pr.R350 = reference_profile.R350_val;
+    pr.cond_model = static_cast<int>(config.conductivity_model);
     pr.cp_eff = cp_eff;              // effective cp used for the S signature
     pr.emissivity = (planet.emissivity > 0.0) ? planet.emissivity : 0.95;
     pr.ceiling_s  = 25.0;             // documented survivable per-dispatch window
@@ -4298,7 +4304,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8)
+            static_cast<float>(5.67051196e-8),
+            static_cast<int>(config.conductivity_model)
         );
 
         // Initial subsurface temperature seed.
@@ -4856,7 +4863,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
+            static_cast<float>(5.67051196e-8),
+            static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
         // Initial subsurface temperature seed. Generic bodies get the smooth
@@ -5471,7 +5479,8 @@ bool runThermalForSelectedFaces_GPU(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8)  // Stefan-Boltzmann
+            static_cast<float>(5.67051196e-8),
+            static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
         // -----------------------------------------------------------------
@@ -8820,6 +8829,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Validate the conductivity-law selector HERE, before anything else runs.
+    // It cannot be validated by throwing from the parser: the catch above
+    // downgrades any parse exception to a warning and then runs the whole
+    // simulation on built-in defaults with exit code 0 (BUGS.md PTM-66). An
+    // unrecognised law must never be silently substituted with Hayne -- that
+    // would attribute an entire campaign to the wrong physics.
+    {
+        thermal::ConductivityModel cm_probe;
+        if (!thermal::parseConductivityModel(
+                sim_config.thermophysical.conductivity_model, cm_probe)) {
+            std::cerr << "FATAL: unknown thermophysical.conductivity_model '"
+                      << sim_config.thermophysical.conductivity_model
+                      << "'. Valid values: hayne2017 (default) | martinez2021.\n";
+            return 1;
+        }
+    }
+
     // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
     // knob is first-class, but true per-output-step full-mesh checkpointing is
     // architecturally incompatible with the batch-outer/time-inner GPU
@@ -10849,6 +10875,80 @@ int main(int argc, char** argv) {
         thermal_config.NYEARSEQ = 2;
         thermal_config.sigma = 5.67e-8;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
+
+        // ---- Regolith conductivity law (thermophysical.conductivity_model) ----
+        // Placed on thermal_config, which is built ONCE here and PASSED to every
+        // solver entry point. It is deliberately NOT placed on `planet`: every
+        // mesh/GPU solver entry point rebuilds its own thermal::Planet(body) and
+        // discards main-scope Planet edits, which is exactly how ks_override/
+        // kd_override became silent no-ops on the Moon path (BUGS.md PTM-53).
+        {
+            thermal::ConductivityModel cm = thermal::ConductivityModel::Hayne2017;
+            if (!thermal::parseConductivityModel(
+                    sim_config.thermophysical.conductivity_model, cm)) {
+                std::cerr << "FATAL: unknown thermophysical.conductivity_model '"
+                          << sim_config.thermophysical.conductivity_model
+                          << "'. Valid: hayne2017 | martinez2021.\n";
+                return 1;
+            }
+            thermal_config.conductivity_model = cm;
+
+            // Print through a LOCAL stream. std::cout arrives here carrying
+            // `std::fixed << std::setprecision(1)` from an earlier banner
+            // (:10725 and friends), which rendered ks = 7.4e-4 as "0.0" and
+            // H = 0.06 as "0.1" -- a run reporting numbers that are not the
+            // numbers it used, i.e. exactly the PTM-05/PTM-55 archetype. A
+            // local ostringstream starts in the default format and cannot be
+            // affected by whatever std::cout's state happens to be.
+            std::ostringstream cmb;
+            if (cm == thermal::ConductivityModel::Martinez2021) {
+                cmb << "Conductivity model: MARTINEZ2021 "
+                             "(Martinez & Siegler 2021, JGR Planets 126, e2021JE006829, Eq. 10)\n"
+                    << "  k(T,rho) = (A1*rho - A2)*k_am(T) + (B1*rho - B2)*T^3, "
+                       "A1=5.0821e-6 A2=5.1e-3 B1=2.0022e-13 B2=1.953e-10\n"
+                    << "  NOTE ks (" << planet.ks << " W/m/K) and kd (" << planet.kd
+                    << " W/m/K) are INERT under this law: Eq. 10 depends on rho(z) only.\n"
+                    << "  NOTE chi (" << thermal_config.chi
+                    << ") is INERT too; the T^3 term uses the paper's own B(rho).\n"
+                    << "  rho(z) profile still comes from the config: rhos="
+                    << planet.rhos << " rhod=" << planet.rhod
+                    << " H=" << planet.H << " m.\n";
+                // The paper re-tuned H to 5.6 cm together with A(rho)/B(rho).
+                // Running with a different H is legitimate (it isolates the
+                // conductivity law) but is NOT a reproduction of their figures.
+                if (std::abs(planet.H - 0.056) > 1e-9) {
+                    cmb << "  NOTE H=" << planet.H << " m, not the paper's retuned "
+                           "0.056 m. This isolates the conductivity law but does NOT "
+                           "reproduce Martinez et al.'s published curves.\n";
+                }
+                // Eq. 10 returns a NEGATIVE conductivity below rho ~ 1003.5
+                // kg/m^3. Refuse rather than integrate a negative diffusivity.
+                const double rho_lo = std::min(planet.rhos, planet.rhod);
+                if (!thermal::martinezDensityIsValid(rho_lo)) {
+                    std::ostringstream err;
+                    err << "FATAL: conductivity_model martinez2021 is invalid for "
+                           "density " << rho_lo << " kg/m^3 -- Eq. 10 gives a NEGATIVE "
+                           "conductivity below " << thermal::kMartinezRhoMin
+                        << " kg/m^3. Raise rhos/rhod or use hayne2017.\n";
+                    std::cout << cmb.str();
+                    std::cerr << err.str();
+                    return 1;
+                }
+                // Outside the paper's fitted density span the law is an
+                // extrapolation. Say so; do not stop.
+                if (rho_lo < 1100.0 || std::max(planet.rhos, planet.rhod) > 1800.0) {
+                    cmb << "  WARNING: rho span [" << rho_lo << ", "
+                        << std::max(planet.rhos, planet.rhod)
+                        << "] kg/m^3 extends outside the paper's fitted range "
+                           "1100-1800 kg/m^3; Eq. 10 is extrapolated there.\n";
+                }
+            } else {
+                cmb << "Conductivity model: HAYNE2017 (default) "
+                       "k = kc(z)*(1 + chi*(T/350)^3), chi="
+                    << thermal_config.chi << "\n";
+            }
+            std::cout << cmb.str() << std::flush;
+        }
 
         // Set thermal debug options from CLI (use local variables set during arg parsing)
         thermal_config.THERMAL_DEBUG = thermal_debug;

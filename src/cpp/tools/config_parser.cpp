@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include "../thermal/conductivity_model.h"
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -427,6 +428,31 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermophysical.albedo_hapke = (inc_alb || albedo_model == "hapke");
             config.thermophysical.albedo_hapke_w = getWithDefault(
                 thermo, "albedo_hapke_w", config.thermophysical.albedo_hapke_w);
+
+            // Regolith conductivity law. Default "hayne2017" = the historical
+            // path (byte-identical). An unrecognised value must be FATAL.
+            //
+            // Deliberately NOT a `throw`: ptm_thermal_sim.cpp catches every
+            // loadFromYAML exception, prints "Warning: Failed to load config
+            // file ... Continuing with default configuration", and then runs
+            // the WHOLE simulation on built-in defaults with exit code 0
+            // (BUGS.md PTM-66). A throw here would be downgraded to a warning
+            // and the run would quietly proceed on Hayne -- the exact silent
+            // substitution this validation exists to prevent. So: report here,
+            // keep the raw string, and let the caller's explicit check kill the
+            // process (ptm_thermal_sim.cpp, immediately after config load).
+            {
+                std::string cm = getWithDefault<std::string>(
+                    thermo, "conductivity_model",
+                    config.thermophysical.conductivity_model);
+                thermal::ConductivityModel probe;
+                if (!thermal::parseConductivityModel(cm, probe)) {
+                    std::cerr << "ERROR: unknown thermophysical.conductivity_model '"
+                              << cm << "'. Valid values: hayne2017 (default) | "
+                                 "martinez2021." << std::endl;
+                }
+                config.thermophysical.conductivity_model = cm;
+            }
         }
 
         // Parse Advanced section
