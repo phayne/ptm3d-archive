@@ -6,7 +6,58 @@
 #define SIGMA 5.67051196e-8f
 #endif
 
-inline float compute_k(float T, float kc, float R350) {
+// --------------------------------------------------------------------------
+// Regolith conductivity laws. DEVICE MIRROR of
+// src/cpp/thermal/conductivity_model.h -- keep the two in step; both are
+// checked against the paper's published values by
+// src/cpp/tools/test_conductivity_model.cpp.
+//
+//   cond_model == 0 : Hayne et al. (2017)      k = kc*(1 + R350*T^3)   [DEFAULT]
+//   cond_model == 1 : Martinez & Siegler (2021) JGR Planets 126, e2021JE006829
+//                     Eq. 10: k = (A1*rho-A2)*k_am(T) + (B1*rho-B2)*T^3
+//                     Eq.  9: k_am(T) = Ac + Bc/T^4 + Cc/T^3 + Dc/T^2 + Ec/T
+//                                     + Fc*T + Gc*T^2 + Hc*T^3 + Ic*T^4
+//
+// `rho` is already a per-node buffer on this path (see the kernels below), so
+// Martinez needs NO new device buffer. The T floor of 2.7 K is PTM3D's own
+// ABSOLUTE_ZERO_K: Eq. 9 diverges negative as T -> 0 and the solver never lets
+// a node below the CMB, so the clamp is a domain restriction, not a fudge.
+// --------------------------------------------------------------------------
+#define PTM_MARTINEZ_TMIN 2.7f
+
+// Eq. 9 without the domain clamp; callers pass t >= PTM_MARTINEZ_TMIN. Split
+// out so martinez_k does not re-clamp a value it has already clamped, in a
+// loop that runs per node, per substep, per timestep.
+inline float martinez_kam_at_or_above(float t) {
+    float it = 1.0f / t;
+    float it2 = it * it;
+    float it3 = it2 * it;
+    float it4 = it2 * it2;
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float t4 = t2 * t2;
+    return -0.203297f
+         + (-11.472f)     * it4
+         + ( 22.5793f)    * it3
+         + (-14.3084f)    * it2
+         + (  3.41742f)   * it
+         + (  0.01101f)   * t
+         + ( -2.8049e-5f) * t2
+         + (  3.35837e-8f)* t3
+         + (-1.40021e-11f)* t4;
+}
+
+inline float martinez_k(float T, float rho) {
+    float t = fmax(T, PTM_MARTINEZ_TMIN);
+    float a = 5.0821e-6f  * rho - 5.1e-3f;
+    float b = 2.0022e-13f * rho - 1.953e-10f;
+    return a * martinez_kam_at_or_above(t) + b * (t * t * t);
+}
+
+// cond_model==0 reproduces the historical `kc * (1 + R350*T^3)` expression
+// exactly (same operations, same order), so the default path is unchanged.
+inline float compute_k_model(float T, float kc, float rho, float R350, int cond_model) {
+    if (cond_model == 1) return martinez_k(T, rho);
     float T3 = T * T * T;
     return kc * (1.0f + R350 * T3);
 }
@@ -36,7 +87,8 @@ __kernel void materialUpdateKernel(
     int n_cp_coeffs,
     float cp0,
     int n_faces,
-    int n_layers)
+    int n_layers,
+    int cond_model)          // 0 = Hayne 2017 (default), 1 = Martinez 2021
 {
     int idx = get_global_id(0);
     int total = n_faces * n_layers;
@@ -46,7 +98,7 @@ __kernel void materialUpdateKernel(
     float kc_val = kc[idx];
     float rho_val = rho[idx];
 
-    float k_val = compute_k(T_val, kc_val, R350);
+    float k_val = compute_k_model(T_val, kc_val, rho_val, R350, cond_model);
     float cp_val = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
     if (cp_val <= 0.0f) cp_val = 800.0f;
 
@@ -74,7 +126,8 @@ __kernel void combinedThermalKernel(
     float sigma,
     float dt,
     int n_faces,
-    int n_layers)
+    int n_layers,
+    int cond_model)          // 0 = Hayne 2017 (default), 1 = Martinez 2021
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -97,7 +150,7 @@ __kernel void combinedThermalKernel(
         float rho_val = rho[idx];
 
         T_local[i] = T_val;
-        k_local[i] = compute_k(T_val, kc_val, R350);
+        k_local[i] = compute_k_model(T_val, kc_val, rho_val, R350, cond_model);
         cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
         if (cp_local[i] <= 0.0f) cp_local[i] = 800.0f;
         kappa_local[i] = k_local[i] / (rho_val * cp_local[i]);
@@ -240,7 +293,11 @@ __kernel void persistentThermalKernel(
     // Written on the first sub-dispatch of a session (t_offset==0), read on the
     // rest, so a self-chunked session integrates with the SAME substep count as
     // the un-chunked dispatch would. Re-derived at each cycle entry.
-    __global int* n_substeps_frozen)
+    __global int* n_substeps_frozen,
+    // Regolith conductivity law: 0 = Hayne 2017 (default), 1 = Martinez &
+    // Siegler 2021. Appended LAST on purpose so the hard-coded arg indices
+    // kArgNTimesteps(20) / kArgTOffset(25) above stay valid.
+    int cond_model)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -294,7 +351,7 @@ __kernel void persistentThermalKernel(
         float max_kappa = 0.0f;
         float min_dz2 = 1e10f;
         for (int i = 0; i < n_layers; ++i) {
-            float k_val = compute_k(T_local[i], kc_local[i], R350);
+            float k_val = compute_k_model(T_local[i], kc_local[i], rho_local[i], R350, cond_model);
             float cp_val = compute_cp(T_local[i], cp0, cp_coeffs, n_cp_coeffs);
             if (cp_val <= 0.0f) cp_val = 800.0f;
             float kappa_val = k_val / (rho_local[i] * cp_val);
@@ -346,7 +403,7 @@ __kernel void persistentThermalKernel(
             // Material properties (updated each sub-step)
             for (int i = 0; i < n_layers; ++i) {
                 float T_val = T_local[i];
-                k_local[i] = compute_k(T_val, kc_local[i], R350);
+                k_local[i] = compute_k_model(T_val, kc_local[i], rho_local[i], R350, cond_model);
                 cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
                 // Guard against invalid cp values (e.g., negative from polynomial at extreme T)
                 if (cp_local[i] <= 0.0f || !isfinite(cp_local[i])) {
@@ -417,7 +474,7 @@ __kernel void persistentThermalKernel(
                 // This matches CPU order: surfTemp() → material refresh → Thomas solve
                 // Without this, k_local[0] would use OLD T[0] and the coupling between
                 // layers 0 and 1 in the tridiagonal system would be wrong.
-                k_local[0] = compute_k(T_surf, kc_local[0], R350);
+                k_local[0] = compute_k_model(T_surf, kc_local[0], rho_local[0], R350, cond_model);
                 cp_local[0] = compute_cp(T_surf, cp0, cp_coeffs, n_cp_coeffs);
                 if (cp_local[0] <= 0.0f || !isfinite(cp_local[0])) {
                     cp_local[0] = 800.0f;

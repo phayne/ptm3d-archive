@@ -1,0 +1,223 @@
+{
+  "generator": "/Users/paha3326/Projects/ptm-martinez/scripts/plot_conductivity_models.py",
+  "git_sha": "b9f3a4b",
+  "model_martinez": {
+    "reference": "Martinez & Siegler (2021) JGR Planets 126, e2021JE006829, Eqs. 9-10",
+    "A1": 5.0821e-06,
+    "A2": 0.0051,
+    "B1": 2.0022e-13,
+    "B2": 1.953e-10,
+    "kam_coeffs": [
+      -0.203297,
+      -11.472,
+      22.5793,
+      -14.3084,
+      3.41742,
+      0.01101,
+      -2.8049e-05,
+      3.35837e-08,
+      -1.40021e-11
+    ],
+    "T_floor_K": 2.7
+  },
+  "model_hayne": {
+    "reference": "Hayne et al. (2017) JGR Planets 122, 2371",
+    "ks": 0.00074,
+    "kd": 0.0034,
+    "rhos": 1100.0,
+    "rhod": 1800.0,
+    "chi": 2.7,
+    "H_m": 0.06
+  },
+  "table": [
+    {
+      "T_K": 30,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0007412582157434401,
+      "k_martinez_W_m_K": 9.946707624129981e-05,
+      "ratio_martinez_over_hayne": 0.13418681119310086
+    },
+    {
+      "T_K": 60,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0007500657259475216,
+      "k_martinez_W_m_K": 0.0002095943819139445,
+      "ratio_martinez_over_hayne": 0.2794346877390966
+    },
+    {
+      "T_K": 100,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0007866005830903788,
+      "k_martinez_W_m_K": 0.0003594130044617197,
+      "ratio_martinez_over_hayne": 0.4569193211752602
+    },
+    {
+      "T_K": 150,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0008972769679300289,
+      "k_martinez_W_m_K": 0.0005477724851078097,
+      "ratio_martinez_over_hayne": 0.6104831670554213
+    },
+    {
+      "T_K": 200,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0011128046647230316,
+      "k_martinez_W_m_K": 0.0007583626280168502,
+      "ratio_martinez_over_hayne": 0.6814876429419
+    },
+    {
+      "T_K": 250,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0014681341107871716,
+      "k_martinez_W_m_K": 0.0010171352615976556,
+      "ratio_martinez_over_hayne": 0.6928081393410965
+    },
+    {
+      "T_K": 300,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.0019982157434402324,
+      "k_martinez_W_m_K": 0.0013499976393238234,
+      "ratio_martinez_over_hayne": 0.6756015429042698
+    },
+    {
+      "T_K": 350,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.002737999999999999,
+      "k_martinez_W_m_K": 0.0017821177734435745,
+      "ratio_martinez_over_hayne": 0.6508830436243883
+    },
+    {
+      "T_K": 400,
+      "rho_kg_m3": 1100,
+      "k_hayne_W_m_K": 0.003722437317784255,
+      "k_martinez_W_m_K": 0.00233774484063779,
+      "ratio_martinez_over_hayne": 0.6280145617144496
+    },
+    {
+      "T_K": 30,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.0015025504373177843,
+      "k_martinez_W_m_K": 0.00030534896960505325,
+      "ratio_martinez_over_hayne": 0.20322044573101608
+    },
+    {
+      "T_K": 60,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.0015204034985422737,
+      "k_martinez_W_m_K": 0.0006415678796622496,
+      "ratio_martinez_over_hayne": 0.42197211482173613
+    },
+    {
+      "T_K": 100,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.0015944606413994167,
+      "k_martinez_W_m_K": 0.001092820424247123,
+      "ratio_martinez_over_hayne": 0.6853856381729078
+    },
+    {
+      "T_K": 150,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.0018188046647230319,
+      "k_martinez_W_m_K": 0.0016439567298984115,
+      "ratio_martinez_over_hayne": 0.903866567853098
+    },
+    {
+      "T_K": 200,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.002255685131195335,
+      "k_martinez_W_m_K": 0.002237170627790232,
+      "ratio_martinez_over_hayne": 0.9917920709991594
+    },
+    {
+      "T_K": 250,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.002975947521865889,
+      "k_martinez_W_m_K": 0.002943466621029625,
+      "ratio_martinez_over_hayne": 0.9890855263415738
+    },
+    {
+      "T_K": 300,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.004050437317784256,
+      "k_martinez_W_m_K": 0.00383371223327769,
+      "ratio_martinez_over_hayne": 0.9464934110805786
+    },
+    {
+      "T_K": 350,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.005549999999999999,
+      "k_martinez_W_m_K": 0.004976503288798182,
+      "ratio_martinez_over_hayne": 0.8966672592429157
+    },
+    {
+      "T_K": 400,
+      "rho_kg_m3": 1300,
+      "k_hayne_W_m_K": 0.007545481049562681,
+      "k_martinez_W_m_K": 0.006437612016345122,
+      "ratio_martinez_over_hayne": 0.853174499287654
+    },
+    {
+      "T_K": 30,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.0034057809912536444,
+      "k_martinez_W_m_K": 0.000820053703014437,
+      "ratio_martinez_over_hayne": 0.2407828645237053
+    },
+    {
+      "T_K": 60,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.0034462479300291543,
+      "k_martinez_W_m_K": 0.0017215016240330124,
+      "ratio_martinez_over_hayne": 0.4995292442637605
+    },
+    {
+      "T_K": 100,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.0036141107871720114,
+      "k_martinez_W_m_K": 0.0029263389737106318,
+      "ratio_martinez_over_hayne": 0.8096981930098631
+    },
+    {
+      "T_K": 150,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.004122623906705539,
+      "k_martinez_W_m_K": 0.004384417341874915,
+      "ratio_martinez_over_hayne": 1.0635016535812454
+    },
+    {
+      "T_K": 200,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.005112886297376093,
+      "k_martinez_W_m_K": 0.005934190627223686,
+      "ratio_martinez_over_hayne": 1.1606341862656093
+    },
+    {
+      "T_K": 250,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.006745481049562682,
+      "k_martinez_W_m_K": 0.007759295019609548,
+      "ratio_martinez_over_hayne": 1.1502952810330098
+    },
+    {
+      "T_K": 300,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.009180991253644313,
+      "k_martinez_W_m_K": 0.010042998718162357,
+      "ratio_martinez_over_hayne": 1.093890457000041
+    },
+    {
+      "T_K": 350,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.01258,
+      "k_martinez_W_m_K": 0.012962467077184701,
+      "ratio_martinez_over_hayne": 1.0304027883294675
+    },
+    {
+      "T_K": 400,
+      "rho_kg_m3": 1800,
+      "k_hayne_W_m_K": 0.017103090379008742,
+      "k_martinez_W_m_K": 0.01668727995561345,
+      "ratio_martinez_over_hayne": 0.9756879947318975
+    }
+  ]
+}

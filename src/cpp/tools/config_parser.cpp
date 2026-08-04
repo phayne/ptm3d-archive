@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include "../thermal/conductivity_model.h"
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -588,6 +589,40 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermophysical.albedo_hapke = (inc_alb || albedo_model == "hapke");
             config.thermophysical.albedo_hapke_w = getWithDefault(
                 thermo, "albedo_hapke_w", config.thermophysical.albedo_hapke_w);
+
+            // Regolith conductivity law. Default "hayne2017" = the historical
+            // path (byte-identical). An unrecognised value must be FATAL.
+            //
+            // Deliberately NOT a `throw`, and the reason CHANGED during this
+            // release -- read both halves before touching it.
+            //
+            // When this was written, ptm_thermal_sim.cpp caught every
+            // loadFromYAML exception, printed "Warning: Failed to load config
+            // file ... Continuing with default configuration", and ran the
+            // WHOLE simulation on built-in defaults with exit code 0
+            // (BUGS.md PTM-66). A throw here would have been downgraded to a
+            // warning and the run would have proceeded quietly on Hayne.
+            // PTM-66 is FIXED on fix/release-hygiene in this same release, so
+            // that is no longer true: a throw would now be fatal.
+            //
+            // The two-step is kept anyway, deliberately: the parser names the
+            // offending key and the valid values while it still has the file
+            // in hand, and `main` issues one FATAL and one exit code. Folding
+            // it into a throw would replace a specific diagnosis with a generic
+            // "failed to load config file". If you change this to a throw,
+            // check that the message survives.
+            {
+                std::string cm = getWithDefault<std::string>(
+                    thermo, "conductivity_model",
+                    config.thermophysical.conductivity_model);
+                thermal::ConductivityModel probe;
+                if (!thermal::parseConductivityModel(cm, probe)) {
+                    std::cerr << "ERROR: unknown thermophysical.conductivity_model '"
+                              << cm << "'. Valid values: hayne2017 (default) | "
+                                 "martinez2021." << std::endl;
+                }
+                config.thermophysical.conductivity_model = cm;
+            }
         }
 
         // Parse Advanced section

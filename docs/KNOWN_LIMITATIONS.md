@@ -129,3 +129,34 @@ functionality are summarized in this file; no lookup elsewhere is required to us
 - **The A3GT batch tools depend on an external mesh helper.** `a3gt_v2_orchestrator.py` and
   `run_a3gt_batch.py` expect a `dtm_to_ply_delaunay` binary on a fixed path; provide it (or adjust
   the path) before running an A3GT batch.
+
+## GPU backends
+
+- **The HIP and CUDA backends are UNTESTED. Only the OpenCL backend is exercised.** Every PTM3D
+  result to date was produced on macOS with `GPU_BACKEND=OPENCL`, whose kernel is the string in
+  `thermal_opencl.cpp::getEmbeddedKernelSource()`. `src/cpp/gpu/thermal_kernels.cpp` is compiled
+  **only** by the HIP/CUDA paths, so nothing in it has ever executed here and there is no baseline
+  to regress it against. In v1.0.3 its `computeK()` was corrected from `k = kc + χ(T/350)³` to the
+  Hayne multiplicative form `k = kc·(1 + χ(T/350)³)` that the CPU, `.cl` and embedded-OpenCL paths
+  all use — the additive form was ~700× too large at lunar noon and would have made any HIP/CUDA
+  run silently and grossly wrong. **This correction is textual and could not be runtime-tested on
+  the development machine (no HIP/CUDA hardware).** Anyone bringing up a HIP or CUDA host should
+  validate against the CPU solver before trusting results, and should treat the whole file as
+  unverified, not just this function. (PTM-62)
+
+- **`src/cpp/gpu/thermal_kernels.cl` is a generated mirror, not the kernel that runs.** The OpenCL
+  solver compiles the embedded string in `thermal_opencl.cpp::getEmbeddedKernelSource()`; editing
+  the `.cl` file by hand changes nothing at runtime and will be overwritten. The `.cl` is
+  regenerated verbatim from that string by `scripts/sync_cl_from_embedded.py`, and CI enforces
+  `--check`, so it does track the live kernel (including `conductivity_model: martinez2021`) — but
+  read it as a mirror, and make kernel edits in `thermal_opencl.cpp`.
+
+- **`src/cpp/gpu/radiosity_kernels.cl` has no such mirror check and has drifted. (PTM-70)** The
+  radiosity solver likewise compiles an embedded `R"CL_SOURCE(...)"` string
+  (`radiosity_opencl.cpp::buildKernels()`), but `scripts/sync_cl_from_embedded.py` and the CI check
+  cover only the thermal pair, and the on-disk `radiosity_kernels.cl` is now ~2 kB divergent from
+  the string that actually compiles. Unlike the thermal case there is **no** `kernel_path` /
+  external-load path in the radiosity solver, so a stale file cannot swap in wrong physics at
+  runtime — but the file is copied to the build tree and installed to `share/ptm/kernels`, where a
+  reader would reasonably take it for the kernel. Treat it as out of date until the sync tool is
+  generalized to both pairs.

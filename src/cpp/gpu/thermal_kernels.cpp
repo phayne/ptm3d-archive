@@ -42,13 +42,29 @@ float evalPolynomial(float T, const float* coeffs, int n_coeffs, float base) {
 }
 
 /**
- * @brief Compute k(T) = kc + R350 * T^3
+ * @brief Compute k(T) = kc * (1 + R350 * T^3)   [Hayne et al. (2017)]
+ *
+ * PTM-62: this returned `kc + R350*T^3` -- ADDITIVE, not multiplicative -- and
+ * its own doc comment stated that wrong formula, so the two agreed with each
+ * other and with nothing else. Every other path in PTM3D uses the
+ * multiplicative Hayne form: `thermal_model.cpp` (CPU profile/grid/batch),
+ * `thermal_kernels.cl`, and the LIVE OpenCL kernel string in
+ * `thermal_opencl.cpp::getEmbeddedKernelSource()`. With R350 = chi/350^3 =
+ * 6.297e-8 and kc ~ 1.5e-3 W/m/K, the correct k(350 K) is 5.6e-3; the additive
+ * form gave 1.5e-3 + 2.7 = 2.70 W/m/K, ~480x too large, and ~700x at lunar noon.
+ *
+ * NOT RUNTIME-TESTED. This translation unit is compiled only by the HIP and
+ * CUDA backends (`src/cpp/gpu/CMakeLists.txt:69,:106` configure_file(... .cu
+ * COPYONLY)); the macOS/OpenCL build used for every PTM3D result to date never
+ * compiles it, so no baseline exists to regress and the fix cannot be executed
+ * on this machine. It is a textual correction to match the three live
+ * implementations. See docs/KNOWN_LIMITATIONS.md.
  */
 __device__ __forceinline__
 float computeK(float T, float kc, float R350) {
     float T2 = T * T;
     float T3 = T2 * T;
-    return kc + R350 * T3;
+    return kc * (1.0f + R350 * T3);
 }
 
 // ============================================================================
@@ -77,7 +93,7 @@ void materialUpdateKernel(
 
     float Ti = T[idx];
 
-    // k(T) = kc + R350 * T^3
+    // k(T) = kc * (1 + R350 * T^3)   [PTM-62: was stated additively]
     float ki = computeK(Ti, kc[idx], R350);
     k[idx] = ki;
 
@@ -450,7 +466,7 @@ void combinedThermalKernel(
         float rho_i = rho[idx];
         rho_local[i] = rho_i;
 
-        // k(T) = kc + R350 * T^3
+        // k(T) = kc * (1 + R350 * T^3)   [PTM-62: was stated additively]
         float ki = computeK(Ti, kc_i, R350);
         k_local[i] = ki;
 
