@@ -6957,6 +6957,203 @@ bool validateMesh(const std::shared_ptr<ptm::Mesh>& mesh) {
     return true;
 }
 
+// ============================================================================
+// PTM-37: state the mesh length unit, and REFUSE to run when it is a guess.
+//
+// PTM3D mesh units are not uniform and nothing on Mesh records which it has:
+// global icosphere meshes are built in KILOMETERS (mesh_utils.cpp scales
+// vertices to body_radius_km_) while DEM/site meshes are in METERS. Three
+// separate places in illumination_model.cpp re-derive the unit with the same
+// ad-hoc test, `|face_center| > 10000` -> meters (kmToNativeScale :74,
+// calculatePrimaryIRBatch :4070, calculatePrimaryReflectedBatch :4218). That
+// heuristic is a 1000x error waiting to happen: getting it backwards is what
+// PTM-36 was (Jupiter's shadow shrank 1000x and every Europa eclipse vanished).
+//
+// This does not fix the substrate -- Mesh still carries no unit -- but it
+// makes the guess VISIBLE and refuses the cases where it is unsafe:
+//
+//   1. The mesh STRADDLES the 10,000 discriminator (some faces above, some
+//      below). Every consumer classifies from ONE face, so different call
+//      sites can reach opposite conclusions about the same mesh. Fatal.
+//   2. The body radius CONTRADICTS the heuristic. This is the gas-giant
+//      landmine named in the ledger: a Jupiter-centered mesh in km has
+//      |face_center| ~ 71,492 > 10,000, so the heuristic calls it meters and
+//      is wrong by 1000x. Fatal.
+//   3. The median sits in the ambiguous band around the discriminator
+//      (10,000/50 .. 10,000*50) and NO body radius confirms it. Fatal.
+//
+// A body radius that CONFIRMS the heuristic resolves case 3: the Moon and
+// Europa icospheres (1737.4 km, 1560.8 km) both land in the ambiguous band by
+// magnitude alone, and are only unambiguous because the radius agrees to
+// ~0.1%. That confirmation is why this guard can be strict without refusing
+// the two most common meshes in the project.
+// ============================================================================
+namespace {
+
+struct MeshUnitReport {
+    bool fatal = false;
+    bool meters = false;         // heuristic verdict (the one consumers use)
+    double median = 0.0;
+    double lo = 0.0, hi = 0.0;
+    std::string message;         // reason, when fatal
+};
+
+MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
+                                     double body_radius_km) {
+    // The discriminator every consumer already uses, and the margin within
+    // which we refuse to trust it unaided.
+    constexpr double kDiscriminator = 10000.0;
+    constexpr double kAmbiguousFactor = 50.0;
+    // A body-centered mesh's |face_center| is the body radius to within
+    // topography and figure flattening; a factor of 2 is generous for both.
+    constexpr double kRadiusTolLo = 0.5, kRadiusTolHi = 2.0;
+
+    MeshUnitReport r;
+    const auto& fc = mesh->face_centers;
+    if (fc.empty()) return r;   // nothing to say; validateMesh already objected
+
+    std::vector<double> mag;
+    mag.reserve(fc.size());
+    for (const auto& c : fc)
+        mag.push_back(std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]));
+    const size_t mid = mag.size() / 2;
+    std::nth_element(mag.begin(), mag.begin() + mid, mag.end());
+    r.median = mag[mid];
+    r.lo = *std::min_element(mag.begin(), mag.end());
+    r.hi = *std::max_element(mag.begin(), mag.end());
+    r.meters = (r.median > kDiscriminator);
+
+    // Median |vertex|, as an independent witness of the same geometry. These
+    // two must agree: face centers ARE vertex averages. They disagree when
+    // something rescaled one array and not the other -- see PTM-57, where
+    // mesh.scale_factor scales the vertices and leaves face_centers /
+    // face_areas / face_normals at the loader's values, then prints "Applied
+    // scale factor". Checking it here turns a silent 1000x geometry error
+    // into a refusal.
+    double vmedian = 0.0;
+    if (!mesh->vertices.empty()) {
+        std::vector<double> vmag;
+        vmag.reserve(mesh->vertices.size());
+        for (const auto& v : mesh->vertices)
+            vmag.push_back(std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]));
+        const size_t vmid = vmag.size() / 2;
+        std::nth_element(vmag.begin(), vmag.begin() + vmid, vmag.end());
+        vmedian = vmag[vmid];
+    }
+
+    std::ostringstream unit_line;
+    unit_line << "[mesh-units] inferred " << (r.meters ? "METERS" : "KILOMETERS")
+              << ": median |face_center| = " << std::setprecision(10) << r.median
+              << " (range " << r.lo << " .. " << r.hi << "), "
+              << mesh->faces.size() << " faces";
+    if (body_radius_km > 0.0)
+        unit_line << ", R_body = " << body_radius_km << " km";
+    else
+        unit_line << ", R_body UNKNOWN";
+    std::cout << unit_line.str() << std::endl;
+
+    // -- 0. face centers vs vertices ---------------------------------------
+    // Tolerance is deliberately loose: a triangle centroid sits INSIDE the
+    // sphere its vertices lie on, so the ratio is coarseness-dependent --
+    // measured on icospheres, 0.795 (res 0, 20 faces), 0.944 (res 1),
+    // 0.985 (res 2), 0.999 (res 4). A tight gate would refuse coarse meshes.
+    // [0.5, 2.0] cannot false-positive on any real surface mesh and still
+    // catches every unit-scale (>=1000x) mismatch with three orders of
+    // margin. It is NOT meant to catch a small scale slip.
+    if (vmedian > 0.0 && r.median > 0.0) {
+        const double ratio = r.median / vmedian;
+        if (ratio < 0.5 || ratio > 2.0) {
+            std::ostringstream m;
+            m << "the mesh is INTERNALLY INCONSISTENT: median |face_center| = "
+              << r.median << " but median |vertex| = " << vmedian
+              << " (ratio " << ratio << "). Face centers are vertex averages, so "
+                 "these cannot legitimately differ. Something rescaled one array "
+                 "and not the other -- if mesh.scale_factor is set, that is PTM-57 "
+                 "(the vertices are scaled, the face centers/areas/normals are not, "
+                 "and the run prints 'Applied scale factor' anyway).";
+            r.fatal = true; r.message = m.str();
+            return r;
+        }
+    }
+
+    // -- 1. straddle -------------------------------------------------------
+    if (r.lo <= kDiscriminator && r.hi > kDiscriminator) {
+        std::ostringstream m;
+        m << "mesh face centers STRADDLE the " << kDiscriminator
+          << " unit discriminator (min " << r.lo << ", max " << r.hi
+          << "). Consumers classify the whole mesh from a single face, so "
+             "different code paths would reach opposite conclusions about "
+             "this one mesh.";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    // -- 2/3. body-radius cross-check --------------------------------------
+    const bool have_R = (body_radius_km > 0.0);
+    bool radius_says_km = false, radius_says_m = false;
+    if (have_R) {
+        const double ratio_km = r.median / body_radius_km;
+        const double ratio_m  = (r.median / 1000.0) / body_radius_km;
+        radius_says_km = (ratio_km >= kRadiusTolLo && ratio_km <= kRadiusTolHi);
+        radius_says_m  = (ratio_m  >= kRadiusTolLo && ratio_m  <= kRadiusTolHi);
+        if (radius_says_km || radius_says_m) {
+            std::cout << "[mesh-units]   confirmed by R_body: |face_center| / R_body = "
+                      << (radius_says_km ? ratio_km : ratio_m) << " assuming "
+                      << (radius_says_km ? "KILOMETERS" : "METERS") << std::endl;
+        }
+    }
+
+    if ((radius_says_km || radius_says_m) && (radius_says_m != r.meters)) {
+        std::ostringstream m;
+        m << "the body radius CONTRADICTS the |face_center| > " << kDiscriminator
+          << " heuristic. R_body = " << body_radius_km << " km and the median "
+          << "|face_center| is " << r.median << ", which is "
+          << (radius_says_km ? "KILOMETERS" : "METERS") << " -- but the heuristic "
+          << "every consumer uses says " << (r.meters ? "METERS" : "KILOMETERS")
+          << ". Running would scale SPICE positions and shadow radii by 1000x in "
+             "the wrong direction (this is PTM-36).";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    const bool in_ambiguous_band =
+        (r.median > kDiscriminator / kAmbiguousFactor) &&
+        (r.median < kDiscriminator * kAmbiguousFactor);
+    if (in_ambiguous_band && !(radius_says_km || radius_says_m)) {
+        std::ostringstream m;
+        m << "median |face_center| = " << r.median << " sits in the ambiguous band ("
+          << (kDiscriminator / kAmbiguousFactor) << " .. " << (kDiscriminator * kAmbiguousFactor)
+          << ") around the " << kDiscriminator << " unit discriminator, and ";
+        if (have_R)
+            m << "the body radius (" << body_radius_km << " km) does not confirm either "
+                 "unit (|face_center|/R_body = " << (r.median / body_radius_km)
+              << " as km, " << ((r.median / 1000.0) / body_radius_km) << " as m). ";
+        else
+            m << "no body radius is available to confirm it. ";
+        m << "PTM3D cannot tell kilometers from meters here, and a wrong guess is a "
+             "1000x error in every SPICE-derived length.";
+        r.fatal = true; r.message = m.str();
+        return r;
+    }
+
+    if (!(radius_says_km || radius_says_m)) {
+        // Outside the band, so the magnitude alone is decisive -- but nothing
+        // corroborates it. Say so rather than implying more confidence than
+        // we have (a locally recentered patch would land here).
+        std::cout << "[mesh-units]   WARNING: unit inferred from magnitude ALONE; "
+                     "no body radius corroborates it";
+        if (have_R)
+            std::cout << " (R_body = " << body_radius_km << " km gives ratio "
+                      << (r.meters ? (r.median / 1000.0) / body_radius_km
+                                   : r.median / body_radius_km)
+                      << ", outside " << kRadiusTolLo << ".." << kRadiusTolHi << ")";
+        std::cout << ". If this mesh is not body-centered, check it." << std::endl;
+    }
+    return r;
+}
+
+}  // namespace
+
 // Display usage information
 void showUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n\n";
@@ -10106,6 +10303,25 @@ int main(int argc, char** argv) {
     if (!validateMesh(mesh)) {
         std::cerr << "Mesh validation failed. Exiting." << std::endl;
         return 1;
+    }
+
+    // PTM-37: state the inferred mesh length unit (and the body radius that
+    // does or does not corroborate it), and refuse to run when the inference
+    // is a coin flip. See inspectMeshLengthUnit for the three fatal cases.
+    {
+        const double R_for_units = using_generic_body
+            ? generic_body.shape.meanRadiusKm()
+            : planet.body_radius_km;
+        MeshUnitReport units = inspectMeshLengthUnit(mesh, R_for_units);
+        if (units.fatal) {
+            std::cerr << "FATAL [mesh-units]: " << units.message << "\n"
+                      << "  Refusing to run. Fix the mesh (rescale it so its face "
+                         "centers are unambiguously meters or kilometers, or set "
+                         "mesh.scale_factor), or supply the body radius via the "
+                         "generic-body shape block.\n"
+                      << "  See BUGS.md PTM-37 and PTM-36." << std::endl;
+            return 1;
+        }
     }
 
     // ----------------------------------------------------------------------
