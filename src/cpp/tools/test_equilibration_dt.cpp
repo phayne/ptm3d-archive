@@ -130,6 +130,21 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
     }
 }
 
+// The one number this program is a GATE on.
+//
+// docs/thermal-model.md states the production default
+// EQUILIBRATION_STEPS_PER_DAY = 192 was chosen against a "1 K production
+// target": at that cadence the worst-case per-layer error against the
+// Fourier-stable reference, over all four test latitudes, must stay below 1 K.
+// Until 2026-08 this program computed that number, printed it, and returned 0
+// unconditionally -- so a regression that doubled the error would still have
+// exited 0 and been read as a pass by INSTALL.md's battery and by CI. The
+// remaining cadences (768/384/96/48/24) are reported for the convergence trend
+// and are NOT gated: they exist to show the dt^2 scaling, and 24 steps/day is
+// knowingly far outside the target.
+constexpr int    kGateStepsPerDay = 192;
+constexpr double kGateMaxAbsDT_K  = 1.0;
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -173,9 +188,16 @@ int main(int argc, char** argv)
     const double latitudes_deg[] = { 0.0, 30.0, 60.0, 85.0 };
     const int candidate_steps_per_day[] = { 768, 384, 192, 96, 48, 24 };
 
+    // Gate bookkeeping: worst max|dT| at the production cadence, over latitudes.
+    double gate_worst_dT = -1.0;
+    double gate_worst_lat = 0.0;
+    int    gate_samples = 0;
+
     std::printf("\n=== Equilibration accuracy test (Moon, %d days) ===\n", days);
     std::printf("Reference: Fourier-stable dt (mirrors fastEquilibrate)\n");
     std::printf("Candidate: dt = planet.day / N\n");
+    std::printf("GATE: max|dT| at N=%d steps/day must be < %.3f K at every latitude\n",
+                kGateStepsPerDay, kGateMaxAbsDT_K);
     if (!csv_dir.empty()) {
         std::printf("CSV output: %s\n", csv_dir.c_str());
     }
@@ -228,8 +250,17 @@ int main(int argc, char** argv)
                         csv_dir.empty() ? nullptr : &rec, record_last_days);
             auto s = compare(ref_profile, cand);
             std::printf("  N=%3d steps/day (dt=%8.1f s): surf=%7.3f K  deep=%7.3f K  "
-                        "max|dT|=%7.3f  mean|dT|=%6.3f\n",
-                        N, dt_large, s.surf, s.deep_T, s.max_abs_diff, s.mean_abs_diff);
+                        "max|dT|=%7.3f  mean|dT|=%6.3f%s\n",
+                        N, dt_large, s.surf, s.deep_T, s.max_abs_diff, s.mean_abs_diff,
+                        N == kGateStepsPerDay ? "   <-- gated" : "");
+
+            if (N == kGateStepsPerDay) {
+                ++gate_samples;
+                if (s.max_abs_diff > gate_worst_dT) {
+                    gate_worst_dT = s.max_abs_diff;
+                    gate_worst_lat = lat_deg;
+                }
+            }
 
             if (!csv_dir.empty()) {
                 char buf[256];
@@ -251,5 +282,28 @@ int main(int argc, char** argv)
         std::printf("\n");
     }
 
+    // ---- Verdict ---------------------------------------------------------
+    // Printed on ONE greppable line, and reflected in the exit status. CI greps
+    // for "[test_equilibration_dt] PASS".
+    const int expected_samples =
+        static_cast<int>(sizeof(latitudes_deg) / sizeof(latitudes_deg[0]));
+    if (gate_samples != expected_samples) {
+        std::printf("[test_equilibration_dt] FAIL: the gated cadence N=%d was evaluated "
+                    "at %d of %d latitudes -- the candidate list no longer contains the "
+                    "production cadence, so this program is not testing what it claims.\n",
+                    kGateStepsPerDay, gate_samples, expected_samples);
+        return 1;
+    }
+    if (!(gate_worst_dT < kGateMaxAbsDT_K)) {
+        std::printf("[test_equilibration_dt] FAIL: worst max|dT| at N=%d steps/day = "
+                    "%.3f K at latitude %.1f deg, tolerance %.3f K "
+                    "(docs/thermal-model.md, 1 K production target).\n",
+                    kGateStepsPerDay, gate_worst_dT, gate_worst_lat, kGateMaxAbsDT_K);
+        return 1;
+    }
+    std::printf("[test_equilibration_dt] PASS: worst max|dT| at N=%d steps/day = %.3f K "
+                "at latitude %.1f deg, tolerance %.3f K (%d/%d latitudes checked).\n",
+                kGateStepsPerDay, gate_worst_dT, gate_worst_lat, kGateMaxAbsDT_K,
+                gate_samples, expected_samples);
     return 0;
 }

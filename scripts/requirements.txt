@@ -1,0 +1,24 @@
+# Python dependencies for the helper scripts in scripts/ and src/python/.
+#
+# The PTM3D ENGINE ITSELF NEEDS NONE OF THESE. `ptm_thermal_sim`, the tests and
+# `scripts/fetch_kernels.py` are C++ / standard-library only; install this file
+# only if you want the analysis, QA and plotting tooling.
+#
+#     python3 -m pip install -r scripts/requirements.txt
+#
+# Versions are deliberately unpinned (lower bounds only): these are analysis
+# helpers, not part of the validated numerical path.
+
+numpy>=1.20          # every analysis script; statistics/*.bin readers
+matplotlib>=3.4      # all figure scripts
+scipy>=1.7           # fitting, interpolation, filtering
+astropy>=5.0         # FITS maps: albedo map verification/re-registration, ALMA tools
+pyyaml>=5.4          # scripts that read/write PTM3D YAML configs
+spiceypy>=5.0        # scripts that need SPICE geometry outside the engine
+
+# Not required by the core tooling; install as needed for specific scripts:
+#   pillow, imageio      image/animation output (camera + movie scripts)
+#   pyvista              3D mesh visualization (the GUI ships its own gui/requirements.txt)
+#   astroquery           JPL Horizons queries (small-body ephemerides)
+#   gdal / rasterio      DEM ingestion (build_lola_ring.py, ptm_cog.py) -- system GDAL
+#   psutil, requests     run guards and downloads

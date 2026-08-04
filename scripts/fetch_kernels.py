@@ -16,11 +16,13 @@ the repository root ('data/kernels'), so run ptm_thermal_sim FROM THE REPO
 ROOT (SPICE resolves relative metakernel paths against the current working
 directory). See INSTALL.md, section "SPICE kernel data".
 
-Core download set (Moon + Mercury capable, ~45 MB):
+Core download set (Moon + Mercury capable, ~44 MB):
     naif0012.tls, pck00011.tpc, de440s.bsp, moon_pa_de440_200625.bpc,
     moon_de440_250416.tf
-The Galilean ephemeris jup365.bsp (Jupiter/Europa position, ~130 MB) is the
-extra that europa.tm requires.
+The Galilean ephemeris jup365.bsp (Jupiter/Europa position, 1.1 GB) is the
+extra that europa.tm requires. Because europa.tm ships with the repository,
+the DEFAULT (--bodies auto) download is therefore ~1.15 GB, not ~44 MB; pass
+--bodies moon for the Moon/Mercury core alone.
 
 By default (--bodies auto) the script fetches the core set and, when europa.tm
 is present in the kernel directory, ALSO fetches jup365.bsp — so a bare

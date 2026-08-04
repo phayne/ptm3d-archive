@@ -375,7 +375,7 @@ def main(argv=None):
                 f"ema_ti_fit fit: cannot resolve a body number from --sweep-root "
                 f"{a.sweep_root!r} (expected a '<num><name>' component such as "
                 f"'623chimaera' with an entry in HAPKE_DEFAULTS). Refusing to guess "
-                f"the albedo -- see BUGS.md EMA-02.")
+                f"the albedo -- see EMA-02 in the project issue ledger.")
         p_nom = _drv.disk_p_from_w(_drv.HAPKE_DEFAULTS[num]['w'])
         results = []
         for ti_true in a.truth_ti:

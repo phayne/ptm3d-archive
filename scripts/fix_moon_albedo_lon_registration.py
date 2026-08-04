@@ -10,7 +10,7 @@ reader (``src/cpp/maps/fits_reader.cpp:193``) honors the (wrong) header, so the
 albedo is sampled 180 deg off: the dark nearside maria land on the bright farside
 highlands and vice-versa.
 
-Ground truth used to prove it (see BUGS.md PTM-34 / SESSION-NOTES):
+Ground truth used to prove it (summarized in docs/KNOWN_LIMITATIONS.md, PTM-34):
   * The topographic mesh (topo_moon_ico*.bin) is CORRECT vs IAU_MOON -- South
     Pole-Aitken basin (53S, 191E) is the deepest point (-5.9 km), every nearside
     mare is low, the farside is high.
@@ -185,14 +185,16 @@ def main(argv=None):
     # the correction in HISTORY so the provenance is not silent.
     header.add_history("PTM-34: rolled longitude axis by nx/2 (+180 deg) to correct "
                        "a -180..180-centered raster mislabeled as 0..360 east. "
-                       "Now data col 0 = IAU_MOON lon 0. See BUGS.md PTM-34.")
+                       "Now data col 0 = IAU_MOON lon 0. "
+                       "See docs/KNOWN_LIMITATIONS.md, PTM-34.")
     fits.writeto(path, rolled.astype(orig_dtype), header, overwrite=True)
     print(f"[fix-moon-albedo] WROTE corrected map -> {path} (dtype {orig_dtype}, "
           "longitude-only change)")
     print("[fix-moon-albedo] NOTE: per-face camera .bin maps (Moon_Albedo_res*.bin, "
           "Moon_Albedo_res9_camera.bin) were sampled from the OLD FITS and are also "
           "180 deg off; regenerate them from this corrected FITS before any camera "
-          "render (BUGS.md PTM-34). The thermal loader collapses .bin to a uniform "
+          "render (docs/KNOWN_LIMITATIONS.md, PTM-35). The thermal loader collapses .bin "
+          "to a uniform "
           "mean, so thermal runs are unaffected by the .bin.")
     print("[fix-moon-albedo] NOTE: the distributed copy (fetch_data.py --dataset "
           "albedo-maps / Zenodo) is STILL the mislabeled file; re-fetching will "

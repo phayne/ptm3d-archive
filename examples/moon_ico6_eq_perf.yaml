@@ -24,26 +24,7 @@ thermal:
   geothermal_heat_flow: -1.0
 thermophysical:
   use_default_albedo: true
-  albedo: 0.12
-  use_default_emissivity: true
-  emissivity: 0.95
   incidence_angle_albedo: true
-  use_default_ks: true
-  ks: 0.00074
-  use_default_kd: true
-  kd: 0.0034
-  use_default_H: true
-  H: 0.06
-  use_default_rhos: true
-  rhos: 1100.0
-  use_default_rhod: true
-  rhod: 1800.0
-  use_default_cp0: true
-  cp0: 800.0
-  use_default_Qb: true
-  Qb: 0.018
-  use_default_chi: true
-  chi: 2.7
 radiation:
   enabled: false
 illumination:

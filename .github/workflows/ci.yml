@@ -133,9 +133,15 @@ jobs:
           ./build/bin/test_bowl_crater
 
       - name: Build + run spectral-equilibration test
+        # The program's exit status is now a real gate (worst max|dT| at the
+        # production cadence N=192 steps/day vs the 1 K target). Grep the verdict
+        # line as well: a future edit that drops the assertion would otherwise
+        # exit 0 again and this step would silently stop testing anything.
         run: |
           cmake --build build --target test_equilibration_dt -j2
-          ./build/bin/test_equilibration_dt
+          ./build/bin/test_equilibration_dt | tee eq_dt.log
+          grep -q '\[test_equilibration_dt\] PASS' eq_dt.log \
+            || { echo '::error::test_equilibration_dt printed no PASS verdict'; exit 1; }
 
       - name: Build + run exosphere unit test
         run: |
@@ -145,10 +151,12 @@ jobs:
 
       # --- End-to-end smoke: global Moon diurnal on an ico3 sphere (CPU) -----
       # Runs the shipped quickstart config exactly as a new user would:
-      # fetch SPICE kernels from NAIF (~45 MB), run from the repo root,
+      # fetch the Moon/Mercury SPICE core from NAIF (~44 MB), run from the repo root,
       # then assert the per-face temperature statistics are physically sane.
-      - name: Fetch SPICE kernels (NAIF, ~45 MB)
-        run: python3 scripts/fetch_kernels.py
+      - name: Fetch SPICE kernels (NAIF, Moon/Mercury core, ~44 MB)
+        # --bodies moon: the bare command would also pull jup365.bsp (1.1 GB)
+        # because europa.tm ships in data/kernels/. The smoke test is Moon-only.
+        run: python3 scripts/fetch_kernels.py --bodies moon
 
       - name: End-to-end Moon diurnal smoke (quickstart config)
         run: ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml

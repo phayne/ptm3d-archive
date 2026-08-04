@@ -176,7 +176,7 @@ bool checkPrimaryBodyConstants(double rel_tol) {
                       << " W/m^2 (" << (rel * 100.0) << " % apart, tolerance "
                       << (rel_tol * 100.0) << " %).\n"
                       << "  These constants are EMITTER-SURFACE quantities and must "
-                         "agree. One of the two is wrong; see BUGS.md PTM-43."
+                         "agree. One of the two is wrong; see docs/KNOWN_LIMITATIONS.md (PTM-43)."
                       << std::endl;
         }
     }

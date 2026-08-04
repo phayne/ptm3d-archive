@@ -101,7 +101,7 @@ def mesh_face_count(run_dir):
 def stat(run_dir, name):
     """Read a statistics binary.
 
-    FORMAT (undocumented until 2026-07-09, see BUGS.md PTM-06):
+    FORMAT (see docs/KNOWN_LIMITATIONS.md, PTM-06):
         [int32 n_faces][float32 x n_faces]
     The naive `np.fromfile(p, dtype="<f4")` recipe -- which is what `ptm-analyze`'s
     SKILL.md prescribed -- reads that 4-byte header as a *temperature* and shifts every

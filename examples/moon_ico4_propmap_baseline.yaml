@@ -21,15 +21,6 @@ thermal:
   geothermal_heat_flow: -1.0
 thermophysical:
   use_default_albedo: true
-  use_default_emissivity: true
-  use_default_ks: true
-  use_default_kd: true
-  use_default_H: true
-  use_default_rhos: true
-  use_default_rhod: true
-  use_default_cp0: true
-  use_default_Qb: true
-  use_default_chi: true
 radiation:
   enabled: false
 illumination:

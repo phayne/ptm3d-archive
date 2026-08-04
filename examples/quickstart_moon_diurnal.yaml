@@ -3,7 +3,8 @@
 # Laptop-friendly (CPU-only, < 1 GB RAM, minutes of wall time). All paths are
 # relative — run FROM THE REPOSITORY ROOT after fetching SPICE kernels:
 #
-#     python3 scripts/fetch_kernels.py          # once (~45 MB from NAIF)
+#     python3 scripts/fetch_kernels.py --bodies moon   # once, ~44 MB from NAIF
+#     (the bare command also fetches the 1.1 GB Galilean ephemeris for europa.tm)
 #     ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 #
 # Outputs land in output/quickstart_moon_diurnal/ (per-face statistics binaries).
@@ -30,10 +31,14 @@ thermal:
   crater_dd_ratio: 8.0
   geothermal_heat_flow: -1.0    # -1 = body default
 thermophysical:
+  # On a BUILT-IN body (Moon/Europa/Mercury) this block reads only:
+  #   use_default_albedo, constant_thermal_inertia, incidence_angle_albedo,
+  #   albedo_model, albedo_hapke_w, conductivity_model, and the *_override keys
+  #   (albedo_override / emissivity_override / ks_override / kd_override).
+  # Plainly-named properties (albedo, emissivity, ks, kd, H, rhos, ...) are
+  # honored only under `generic_body.surface:`; here they change nothing and the
+  # run warns about them. See docs/KNOWN_LIMITATIONS.md (PTM-67).
   use_default_albedo: true
-  albedo: 0.12
-  use_default_emissivity: true
-  emissivity: 0.95
   incidence_angle_albedo: true
 radiation:
   enabled: false                # no inter-face radiation on a convex sphere
