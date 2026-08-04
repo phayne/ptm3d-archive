@@ -19,6 +19,33 @@ Status tags:
   production recipe; understand the linked notes before using.
 - **[internal]** — diagnostics and campaign-runner plumbing; not for end users.
 
+## Setting them from the config: the `engine_env:` block
+
+A config may declare the variables its run needs, and **the engine applies them
+itself** at startup (since 2026-08-04; before that the block was documentation
+only, and a regression pair could silently run under two different environments
+— internal bug PTM-42):
+
+```yaml
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+```
+
+Rules:
+
+- The block is applied **before** the configuration itself is parsed, so it can
+  even set `PTM_DATA_ROOT`.
+- **The process environment wins.** A variable already exported to a different
+  value is left alone and the disagreement is printed as `CONFLICT`, so a
+  deliberate command-line override still works.
+- Every variable is echoed with its disposition (`applied`, `already set`,
+  `CONFLICT`), so the run log records the environment the physics actually saw.
+- The block is only read by `ptm_thermal_sim`. Other binaries and the analysis
+  scripts still need the variables exported.
+
 ## Paths and data
 
 | Variable | Default | Effect | Status |

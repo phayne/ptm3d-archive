@@ -8939,7 +8939,17 @@ int main(int argc, char** argv) {
     // PHASE 2: Initialize configuration with defaults
     // ========================================================================
     ptm::SimulationConfig sim_config;  // Starts with default values
-    
+
+    // PTM-42: apply the config's `engine_env:` block BEFORE anything reads the
+    // environment. This must precede loadFromYAML (which reads PTM_DATA_ROOT)
+    // and every solver/illumination construction (which latch their gates on
+    // first call). The process environment wins on a conflict, and every
+    // variable is echoed with its disposition -- see
+    // ConfigParser::applyEngineEnv.
+    if (has_config_file) {
+        ptm::ConfigParser::applyEngineEnv(config_file);
+    }
+
     // If config file specified, load it
     if (has_config_file) {
         try {

@@ -3484,8 +3484,11 @@ class EngineFlagsTab(BaseConfigTab):
     applies the recommended-ON set by default (gui_core.preflight.
     RECOMMENDED_ENGINE_ENV); this table lets an advanced user override a
     value, add extra flags (e.g. PTM_HMATRIX_THREADS), or clear a value
-    (blank = do not set). Stored under config key 'engine_env'; consumed by
-    build_engine_env() at launch, ignored by the C++ YAML parser.
+    (blank = do not set). Stored under config key 'engine_env'; exported by
+    build_engine_env() at launch AND read by the engine itself at startup
+    (ConfigParser::applyEngineEnv, PTM-42). The two agree by construction --
+    the engine leaves an already-exported variable alone -- so a GUI launch
+    logs them as "already set (identical)".
     """
 
     def init_ui(self):

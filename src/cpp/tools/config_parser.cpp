@@ -125,11 +125,98 @@ std::string resolveDataPath(const std::string& value,
 }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// PTM-42: apply the config's `engine_env:` block to the process environment.
+//
+// Static-initialization audit (2026-08-04, before writing this): every
+// std::getenv() call under src/cpp/ (105 of them) sits inside a function body.
+// The only cached read is a function-local static,
+// gpu/thermal_opencl.cpp:114 `static const bool log_sub = ...`, which is
+// latched on FIRST CALL inside the GPU dispatch loop, not at load time. There
+// is no namespace-scope object whose constructor reads the environment, so no
+// variable is consumed before main(). Applying here -- ahead of loadFromYAML,
+// which itself reads PTM_DATA_ROOT -- is therefore early enough for all of
+// them. If that audit ever stops holding, the correct response is to move the
+// call earlier, not to widen a tolerance.
+// ---------------------------------------------------------------------------
+int ConfigParser::applyEngineEnv(const std::string& filename) {
+    YAML::Node root;
+    try {
+        root = YAML::LoadFile(filename);
+    } catch (const std::exception& e) {
+        // Do not fail here: loadFromYAML reports the parse error a moment
+        // later with its own message. But do not stay silent either -- a
+        // config we cannot read is a config whose engine_env we did not apply.
+        std::cerr << "[engine_env] WARNING: cannot read '" << filename
+                  << "' (" << e.what() << "); NO engine_env variables applied."
+                  << std::endl;
+        return 0;
+    }
+
+    if (!root["engine_env"]) return 0;   // no block: nothing declared, nothing to say
+    const YAML::Node& block = root["engine_env"];
+    if (!block.IsMap()) {
+        std::cerr << "[engine_env] WARNING: 'engine_env' in " << filename
+                  << " is not a mapping; ignoring it. Expected 'KEY: value' pairs."
+                  << std::endl;
+        return 0;
+    }
+
+    std::cout << "[engine_env] " << block.size() << " variable(s) declared in "
+              << filename << std::endl;
+
+    int applied = 0, conflicts = 0;
+    for (auto it = block.begin(); it != block.end(); ++it) {
+        std::string key;
+        std::string val;
+        try {
+            key = it->first.as<std::string>();
+            val = it->second.as<std::string>();
+        } catch (const std::exception&) {
+            std::cerr << "[engine_env]   WARNING: skipping a non-scalar entry in "
+                         "engine_env (keys and values must be plain scalars)."
+                      << std::endl;
+            continue;
+        }
+        if (key.empty()) {
+            std::cerr << "[engine_env]   WARNING: skipping an empty key." << std::endl;
+            continue;
+        }
+
+        const char* prior = std::getenv(key.c_str());
+        if (prior != nullptr && val != prior) {
+            // The process environment wins. Say so loudly: this is exactly the
+            // situation where a run silently gets an environment its config
+            // does not describe.
+            std::cerr << "[engine_env]   CONFLICT: " << key << " = '" << prior
+                      << "' in the process environment overrides the config's '"
+                      << val << "'. The PROCESS value is used." << std::endl;
+            ++conflicts;
+            continue;
+        }
+        if (prior != nullptr) {
+            std::cout << "[engine_env]   " << key << "=" << val
+                      << " (already set in the environment, identical)" << std::endl;
+            continue;
+        }
+        if (::setenv(key.c_str(), val.c_str(), /*overwrite=*/1) != 0) {
+            std::cerr << "[engine_env]   WARNING: setenv(" << key
+                      << ") failed; this variable is NOT active." << std::endl;
+            continue;
+        }
+        std::cout << "[engine_env]   " << key << "=" << val << " (applied)" << std::endl;
+        ++applied;
+    }
+    std::cout << "[engine_env] applied " << applied << ", conflicts " << conflicts
+              << std::endl;
+    return applied;
+}
+
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     SimulationConfig config;
     try {
         YAML::Node root = YAML::LoadFile(filename);
-        
+
         // Parse Time section
         if (root["simulation"]) {
             const auto& sim = root["simulation"];
@@ -675,6 +762,16 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     last_error_ = "YAML support not available. Please install yaml-cpp library.";
     throw std::runtime_error(last_error_);
+}
+
+// PTM-42 fallback. Without yaml-cpp we cannot read the block at all -- but a
+// silently unapplied engine_env is the whole bug, so say so.
+int ConfigParser::applyEngineEnv(const std::string& filename) {
+    std::cerr << "[engine_env] WARNING: this build has no YAML support, so any "
+                 "engine_env block in " << filename << " is NOT applied. "
+                 "Export those variables yourself (or use "
+                 "scripts/ptm_run_with_engine_env.py)." << std::endl;
+    return 0;
 }
 
 bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfig& config) {

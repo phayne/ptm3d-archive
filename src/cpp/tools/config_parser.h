@@ -418,7 +418,32 @@ public:
      * @throws std::runtime_error if file cannot be parsed
      */
     SimulationConfig loadFromYAML(const std::string& filename);
-    
+
+    /**
+     * @brief Apply a config's `engine_env:` block to the process environment (PTM-42).
+     *
+     * PTM3D configs may carry an `engine_env:` mapping recording the environment
+     * variables a run needs (`PTM_ILLUM_TRUE_NORMALS`, `PTM_EQ_PERFACE_FLUX`, ...).
+     * Until 2026-08-04 nothing in the engine read that block: it was documentation
+     * applied only if a human remembered to export it, and a regression pair could
+     * silently end up with two different illumination configurations while looking
+     * identical on paper (BUGS.md PTM-42, which absorbs PTM-52).
+     *
+     * Contract:
+     *  - The PROCESS environment always WINS. A variable already set to a different
+     *    value is left alone and the conflict is logged, so a deliberate
+     *    command-line override (or `scripts/ptm_run_with_engine_env.py`) still works
+     *    and nothing changes under a caller's feet.
+     *  - Every variable is logged with its disposition (applied / already set /
+     *    conflict), so the run log records the environment the physics actually saw.
+     *  - Call this BEFORE loadFromYAML and before any solver construction: several
+     *    gated features latch their variable on first call.
+     *
+     * @param filename Path to the YAML configuration file
+     * @return number of variables newly applied to the environment
+     */
+    static int applyEngineEnv(const std::string& filename);
+
     /**
      * @brief Save configuration to YAML file
      * @param filename Path to output YAML file
