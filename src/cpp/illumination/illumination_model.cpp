@@ -3828,8 +3828,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         double uoff = u01(seed ^ 0x85EBCA6Bu);
         double voff = u01(seed ^ 0xC2B2AE35u);
 
-        // PTM-38: 8 samples quantize the eclipsed fraction at ~12.5 %, which is
-        // ~21 K of error near half-obscuration. Escalate to the same heavy count
+        // PTM-38: the default 9 samples (constants::N_SOLAR_SAMPLES) quantize the
+        // eclipsed fraction at ~11 %, ~21 K near half-obscuration. Escalate to the same heavy count
         // the single-face path uses (illumination_model.cpp heavyN) whenever the
         // primary overlaps the disk. Untouched -> byte-identical -- outside an
         // eclipse.
@@ -4370,8 +4370,27 @@ double IlluminationModel::calculatePrimaryHeating(
     double primary_angular_radius = std::asin(primary_radius_ / primary_distance);
     double solid_angle = 2 * M_PI * (1.0 - std::cos(primary_angular_radius));
 
-    // View factor calculation using the solid angle and Lambert's cosine law
-    double view_factor = solid_angle / (4 * M_PI) * cos_angle;
+    // PTM-40: view factor from a differential area to a sphere.
+    //
+    // The correct factor is F_dA->sphere = sin^2(alpha) * cos(theta), which for
+    // a sphere of uniform radiosity J gives E = J * F (by reciprocity,
+    // A_dA * F_dA->S = A_S * F_S->dA). Since Omega = 2*pi*(1 - cos alpha), that
+    // is Omega/pi to better than 0.3 % for alpha <= 6 deg (Jupiter from Europa,
+    // the largest primary disk PTM3D models).
+    //
+    // The old divisor was 4*pi, i.e. Omega/(4*pi) = the fraction of the FULL
+    // SPHERE of directions the primary covers. That is not an irradiance view
+    // factor, and it made every primary-IR flux 4x too low: Jupiter at the
+    // sub-Jovian Europa face read 0.037 W/m^2 instead of 0.150, and Earth at the
+    // sub-Earth lunar face 0.017 instead of 0.066.
+    //
+    // The IR flux constants this multiplies are EMITTER-SURFACE fluxes, which is
+    // what J has to be: JUPITER_IR_FLUX 13.8 = sigma*(124.5 K)^4 and
+    // EARTH_IR_FLUX 240 = sigma*(255 K)^4, both matching the body's effective
+    // temperature, not any at-target irradiance. (SATURN_IR_FLUX and
+    // MARS_IR_FLUX do NOT match their own stated temperatures -- see BUGS PTM-43;
+    // Titan/Enceladus/Phobos-class runs are affected by that, not by this fix.)
+    double view_factor = solid_angle / M_PI * cos_angle;
     
     // Use appropriate IR flux based on the primary body
     double primary_ir_flux = 0.0;
@@ -4478,6 +4497,20 @@ double IlluminationModel::calculatePrimaryReflectedLight(
     double solar_flux_at_primary = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
     // Calculate reflected flux
+    //
+    // PTM-40 note -- deliberately NOT given the x4 that calculatePrimaryHeating
+    // just got, because here the 4*pi is not (only) a view-factor error and the
+    // two errors currently cancel. The emitter radiosity of a sphere reflecting
+    // a beam is J = A*F*pi*R^2 / (4*pi*R^2) = A*F/4, not A*F; this expression
+    // uses A*F, so the spurious 1/4 in Omega/(4*pi) is exactly the 1/4 that
+    // belongs in J. At full phase it already returns the correct
+    // isotropic-equivalent value (0.0469 W/m^2 at the sub-Jovian Europa face).
+    // Multiplying by 4 would give 0.1875 W/m^2 = 1.50x the Lambert-sphere truth
+    // of 0.1247, so a blanket x4 here would replace an underestimate with an
+    // overestimate. The term IS low -- 2.7x vs a Lambert sphere, ~6x vs
+    // Jupiter's real geometric albedo of 0.52 -- but fixing it means replacing
+    // the radiosity AND the ad-hoc (1+cos)/2 phase function together, which
+    // changes the phase dependence and needs its own gate. Tracked as PTM-41.
     double reflected_flux = solar_flux_at_primary * primary_albedo * phase_function *
                            (solid_angle / (4.0 * M_PI)) * cos_angle;
     
