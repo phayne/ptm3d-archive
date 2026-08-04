@@ -2983,7 +2983,47 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // Progress tracking
     std::atomic<size_t> completed_batches{0};
+    // Faces whose time-mean absorbed flux came back negative or non-finite. The
+    // seed below substitutes 0 for those so it cannot emit a NaN column; that
+    // substitution is reported after the loop rather than applied silently.
+    std::atomic<size_t> bad_flux_faces{0};
     auto start_time = std::chrono::high_resolution_clock::now();
+
+    // PTM-47: this CPU path has its OWN equilibration seed and does not read
+    // PTM_EQ_PERFACE_FLUX / PTM_EQ_LEGACY_SEED -- those gate the GPU persistent
+    // path only (eqPerfaceFluxMode() call sites). Before this banner existed a
+    // config could set PTM_EQ_PERFACE_FLUX in engine_env, run on CPU, and get
+    // no per-face seed and no message at all. State the seed every run, and
+    // warn if a caller set a toggle we are not going to honor.
+    {
+        const int seed_window = std::min(100, total_time_steps);
+        std::cerr << "[eq-seed] equilibration seed: CPU SIMD-batch per-face "
+                     "steady state T=((<F_abs>+Qb)/(eps*sigma))^0.25, <F_abs> "
+                     "averaged over the first " << seed_window
+                  << " forcing step(s), blended surface->deep over the skin "
+                     "depth [CPU batch path; not env-selectable]" << std::endl;
+        const char* e_perface = std::getenv("PTM_EQ_PERFACE_FLUX");
+        const char* e_legacy  = std::getenv("PTM_EQ_LEGACY_SEED");
+        if ((e_perface && e_perface[0] != '\0') ||
+            (e_legacy  && e_legacy[0]  != '\0')) {
+            std::cerr << "[eq-seed] WARNING: PTM_EQ_PERFACE_FLUX / "
+                         "PTM_EQ_LEGACY_SEED are GPU-only toggles and have NO "
+                         "effect on this CPU SIMD-batch run (PTM-47). The seed "
+                         "named above is the one actually used." << std::endl;
+        }
+    }
+
+    // Loop-invariant radiative denominator for the seed below. Guard it ONCE and
+    // loudly: with emissivity <= 0 the old seed divided by zero, got +inf, and
+    // silently clamped every face to 400 K. Refuse the run instead.
+    const double sb_denom = planet.emissivity * SIGMA_SB;
+    if (!(sb_denom > 0.0)) {
+        std::cerr << "ERROR: emissivity must be > 0 for the thermal seed "
+                     "(got " << planet.emissivity << "). Refusing to run: the "
+                     "surface energy balance eps*sigma*T^4 = F_abs + Qb has no "
+                     "solution." << std::endl;
+        return false;
+    }
 
     // Create progress bar
     thermal::ProgressBar progressBar(static_cast<int>(n_faces), "SIMD Batch thermal", 50, true);
@@ -3059,12 +3099,38 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
                 avg_flux /= std::max(1, flux_avg_window);
 
-                double T_surf_est = 200.0;
-                if (avg_flux > 0) {
-                    double ratio = avg_flux / (planet.emissivity * SIGMA_SB);
-                    T_surf_est = std::sqrt(std::sqrt(ratio));
-                    T_surf_est = std::max(50.0, std::min(400.0, T_surf_est));
+                // PTM-46: seed the column at the steady state this face can
+                // actually hold, eps*sigma*T^4 = <F_abs> + Qb. Including the
+                // interior heat flux makes the expression CONTINUOUS as
+                // avg_flux -> 0 and lands a never-lit face exactly on the
+                // geothermal floor the solver itself enforces every step
+                // (ThermalBatchSoA::advanceTimestep, thermal_model.cpp:2426,
+                // T_geo = (Qb/(eps*sigma))^0.25) -- so the seed and the floor
+                // now agree instead of fighting.
+                //
+                // What this replaces: a `T_surf_est = 200.0` zero-flux fallback
+                // plus a 50 K floor, i.e. a 150 K step at avg_flux -> 0+. A face
+                // with 1e-30 W/m^2 seeded at 50 K; a face with exactly 0.0
+                // seeded at 200 K. On Europa that stamped every polar-night face
+                // that cannot see Jupiter at 200 K, and ice drains it so slowly
+                // that a whole orbit of equilibration still left an 85-face
+                // 119 K patch embedded in a 47-105 K polar night. The 50 K floor
+                // was the same defect one step down: it pinned the rest of the
+                // polar night at 50 K against a physical 27.7 K (PTM-48).
+                //
+                // Same expression as the GPU per-face seed. Qb is taken per face
+                // (batch.Qb[f], already overridden above from face_Qb) so the
+                // seed matches the per-face floor the solver will apply; with no
+                // face_Qb map this is identically planet.Qb.
+                const double qb_face = batch.Qb[f];
+                double flux_for_seed = avg_flux;
+                if (!(flux_for_seed >= 0.0)) {   // also catches NaN
+                    flux_for_seed = 0.0;
+                    ++bad_flux_faces;
                 }
+                const double ratio = (flux_for_seed + std::max(0.0, qb_face))
+                                   / sb_denom;
+                double T_surf_est = std::min(400.0, std::sqrt(std::sqrt(ratio)));
 
                 // Deep temperature: geothermal gradient on top of surface avg,
                 // capped to prevent runaway (same formula as Profile::init_T).
@@ -3237,6 +3303,17 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // Never substitute silently (see bad_flux_faces above).
+    if (bad_flux_faces.load() > 0) {
+        std::cerr << "WARNING: " << bad_flux_faces.load() << " of " << n_faces
+                  << " faces had a negative or non-finite time-mean absorbed "
+                     "flux; their equilibration seed used 0 W/m^2 instead, so "
+                     "they cold-started at the geothermal steady state. "
+                     "Absorbed flux should never be negative -- treat this as "
+                     "an upstream flux/albedo-map defect, not a seed issue."
+                  << std::endl;
+    }
 
     // End timing
     auto end_time = std::chrono::high_resolution_clock::now();
