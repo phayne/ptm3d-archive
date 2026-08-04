@@ -13,9 +13,25 @@ CPU only — the GPU was owned by another agent (one exception, disclosed below)
 | 5 | PTM-55 | `eb5779a` | **log** defect on this tree; campaign flag raised (see below) |
 | 6 | PTM-51 | `05e9840` | diagnosis only — **Fermi's mechanism confirmed**, PTM-51's refuted |
 
-Final binary: `ptm_thermal_sim` md5 `da57d81080bb8a810f6cd906faeee983`;
-`libconstants.dylib` `a905b99567fcbf3901ee723a68811d39`;
-`libillumination_model.dylib` `f9142e7846468e7995e7fa6b066bf2a5`.
+Binary provenance, final tree (`f2a50c8`, Release, `ENABLE_GPU=ON`, OpenCL):
+
+| artifact | md5 | moved by |
+|---|---|---|
+| `build/bin/ptm_thermal_sim` | `91c9b43196d473b8bfe0d238c2ad2f57` | items 1, 2, 5, 6 (and the id-correction commit) |
+| `libconstants.dylib` | `a905b99567fcbf3901ee723a68811d39` | item 3 only |
+| `libillumination_model.dylib` | `f9142e7846468e7995e7fa6b066bf2a5` | item 4 only |
+| `libthermal.dylib` | `61baffc89c38d7e4edcf69159460fa61` | unchanged from the parent |
+| `libmesh_utils.dylib` | `5c96f806c72ef00d6ad142b018799a91` | unchanged from the parent |
+| `libptm_gpu.dylib` | `97047b3adf97fb10c78257ea63076b07` | unchanged from the parent |
+| `liborbital.dylib` | `6ffcf97de25f604568b425b5250983d8` | unchanged from the parent |
+| `libspatial_maps.dylib` | `61ff97a6853b25083975da071e88ed77` | unchanged from the parent |
+| `libice_table.dylib` | `34c767fdfe39f0003d8032cd486bf45f` | unchanged from the parent |
+
+The exe md5 alone would misreport items 3 and 4: they land entirely in
+`libconstants.dylib` and `libillumination_model.dylib`, which the exe links dynamically.
+Item 6 at `05e9840` produced exe md5 `da57d81080bb8a810f6cd906faeee983`; `f2a50c8` (a comment-only
+ledger-id correction in `ptm_thermal_sim.cpp`) moved it to the value above.
+
 Parent reference build (pristine `d691d47`, worktree `/Users/paha3326/Projects/ptm-hygiene-parent`):
 exe md5 `54089d9b809ae802f38cb012f176c028`.
 
