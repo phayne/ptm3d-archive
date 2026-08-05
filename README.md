@@ -192,7 +192,7 @@ Topography, property and albedo maps, and the validation crater meshes are too
 large for git; they are archived on Zenodo and fetched on demand:
 
 ```bash
-python3 scripts/fetch_data.py --list          # the catalog: 6 core datasets, ~1.5 GB
+python3 scripts/fetch_data.py --list          # the catalog: 6 core datasets, ~1.5 GB compressed
 python3 scripts/fetch_data.py --core          # fetch all of them (resumable, SHA-256 verified)
 export PTM_DATA_ROOT=/big/disk/ptm3d-data     # optional: keep the data outside the clone
 ```
