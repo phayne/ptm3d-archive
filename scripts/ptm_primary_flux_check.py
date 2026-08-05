@@ -83,6 +83,64 @@ def read_body_positions(path):
     return utc, sun, pri
 
 
+def read_mesh(path):
+    """Face centroids and OUTWARD geometric face normals, mesh's own units.
+
+    The normal is the vertex cross product, flipped to point away from the body
+    centre.  On a convex global icosphere that is exactly the normal the engine
+    uses; on a DEM patch it is not necessarily so, which is why the horizon
+    census below is only offered for global meshes.
+    """
+    with open(path, "rb") as fh:
+        header = b""
+        while b"end_header" not in header:
+            chunk = fh.readline()
+            if not chunk:
+                raise SystemExit("mesh.ply: no end_header")
+            header += chunk
+        text = header.decode("ascii", "replace")
+        n_vert = n_face = 0
+        for line in text.splitlines():
+            if line.startswith("element vertex"):
+                n_vert = int(line.split()[2])
+            elif line.startswith("element face"):
+                n_face = int(line.split()[2])
+        verts = np.frombuffer(fh.read(n_vert * 6 * 8), dtype="<f8").reshape(n_vert, 6)[:, :3]
+        blob = fh.read()
+    cent = np.empty((n_face, 3))
+    norm = np.empty((n_face, 3))
+    off = 0
+    for i in range(n_face):
+        cnt = blob[off]
+        off += 1
+        idx = struct.unpack_from("<%di" % cnt, blob, off)
+        off += 4 * cnt + 8
+        p3 = verts[list(idx)]
+        cent[i] = p3.mean(axis=0)
+        nv = np.cross(p3[1] - p3[0], p3[2] - p3[0])
+        nl = np.linalg.norm(nv)
+        nv = nv / nl if nl > 0 else np.array([0.0, 0.0, 1.0])
+        if nv @ cent[i] < 0:
+            nv = -nv
+        norm[i] = nv
+    return cent, norm
+
+
+def horizon_mean_g(t):
+    t = np.clip(t, -1.0, 1.0)
+    s = np.sqrt(np.maximum(0.0, 1.0 - t * t))
+    return (t * (np.pi / 2) + t * t * s + t * np.arcsin(t) + (2.0 / 3.0) * s ** 3) / np.pi
+
+
+def disk_mean_cos_above_horizon(c0, alpha):
+    """Mirror of ptm::disk::diskMeanCosAboveHorizon."""
+    c = np.clip(c0, -1.0, 1.0)
+    h = np.arcsin(c)
+    out = np.where(h >= alpha, c, np.where(h <= -alpha, 0.0,
+                   np.sin(alpha * horizon_mean_g(h / np.maximum(alpha, 1e-300)))))
+    return out
+
+
 def read_centroids(path):
     """Face centroids in the mesh's own units."""
     with open(path, "rb") as fh:
@@ -231,6 +289,52 @@ def cmd_compare(args):
     return 0
 
 
+def cmd_horizon(args):
+    """Fermi F1 acceptance: no face whose analytic horizon clip A > 0 may be
+    reported with primary_ir == 0, and the engine's `below horizon` census must
+    equal the purely geometric count."""
+    run = args.run_dir
+    radius, _bond, _ir = PRIMARY[args.primary]
+    utc, sun, pri = read_body_positions(os.path.join(run, "body_positions.csv"))
+    cent, norm = read_mesh(os.path.join(run, "mesh.ply"))
+    if np.linalg.norm(cent[0]) > 10000.0:
+        cent = cent / 1000.0
+
+    nt = min(len(utc), n_steps(run, "primary_ir"))
+    bad = 0
+    apos = 0
+    below_geom_step0 = None
+    worst_A = 0.0
+    for t in range(nt):
+        ir = read_bin(os.path.join(run, "primary_ir", "primary_ir_%04d.bin" % t))
+        rel = pri[t] - cent
+        dist = np.linalg.norm(rel, axis=1)
+        pdir = rel / dist[:, None]
+        c0 = np.einsum("ij,ij->i", norm, pdir)
+        sin_alpha = np.clip(radius / dist, -1.0, 1.0)
+        alpha = np.arcsin(sin_alpha)
+        A = disk_mean_cos_above_horizon(c0, alpha)
+        if t == 0:
+            below_geom_step0 = int(np.count_nonzero(A <= 0.0))
+        m = A > 0.0
+        apos += int(np.count_nonzero(m))
+        z = m & (ir <= 0.0)
+        nz = int(np.count_nonzero(z))
+        bad += nz
+        if nz:
+            worst_A = max(worst_A, float(A[z].max()))
+
+    print("  steps                        : %d" % nt)
+    print("  face-steps with A > 0        : %d" % apos)
+    print("  ... of those, primary_ir == 0: %d   <-- Fermi F1 acceptance: must be 0"
+          % bad)
+    if bad:
+        print("  largest analytic A among them: %.6g" % worst_A)
+    print("  geometric 'below horizon' at step 0 (A <= 0): %d" % below_geom_step0)
+    print("     compare with the engine census printed by PTM_PRIMARY_DISK_STATS=1")
+    return 0 if bad == 0 else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -251,6 +355,12 @@ def main(argv=None):
     c.add_argument("before_dir")
     c.add_argument("after_dir")
     c.set_defaults(func=cmd_compare)
+
+    h = sub.add_parser("horizon", help="Fermi F1 acceptance: A>0 faces must not "
+                                       "be zeroed, census == geometric count")
+    h.add_argument("run_dir")
+    h.add_argument("--primary", default="JUPITER", choices=sorted(PRIMARY))
+    h.set_defaults(func=cmd_horizon)
 
     args = ap.parse_args(argv)
     return args.func(args)

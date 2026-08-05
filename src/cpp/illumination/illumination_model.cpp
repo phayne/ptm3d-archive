@@ -113,6 +113,21 @@ inline void warnUnknownPrimaryOnce(const std::string& body,
               << " (warned once; see docs/KNOWN_LIMITATIONS.md, PTM-45)." << std::endl;
 }
 
+// PTM-44 / Fermi F1: the horizon-oriented 5-point probe found nothing above the
+// face's horizon while the analytic clip still says the disk is (barely) lit.
+// Rule 7: the fallback keeps the analytic value, and it announces itself.
+inline void warnPrimaryProbeUnderflowOnce() {
+    static std::once_flag once;
+    std::call_once(once, [](){
+        std::cerr << "[illumination] NOTE: primary-disk probe found no "
+                     "above-horizon sample on a face whose analytic horizon "
+                     "clip is still positive (a ~sin^3(alpha)/2 sliver at the "
+                     "bottom of the band). Keeping the analytic, unoccluded "
+                     "value there; the flux involved is ~0. Warned once."
+                  << std::endl;
+    });
+}
+
 // PTM-38: does the primary body overlap ANY part of the finite solar disk seen
 // from this ray origin?  True in the penumbra AND in the umbra; false when the
 // Sun is completely clear of the primary.
@@ -4155,11 +4170,17 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         return e && std::atoi(e) != 0;
     }();
     size_t n_below = 0, n_full = 0, n_dark = 0, n_sampled = 0;
+    // Fermi F1 accounting: faces whose analytic clip A is POSITIVE but which end
+    // at zero anyway, and why. On a closed convex mesh the limb legitimately
+    // blocks grazing rays, so this is not expected to be zero -- but it must be
+    // attributable to rays, never to a probe that simply missed the crescent.
+    size_t n_zero_by_rays = 0, n_probe_underflow = 0;
 
     const uint32_t N_SAMP = ptm::disk::PRIMARY_DISK_SAMPLES;
 
     #pragma omp parallel for schedule(dynamic) \
-        reduction(+:n_below, n_full, n_dark, n_sampled)
+        reduction(+:n_below, n_full, n_dark, n_sampled, n_zero_by_rays, \
+                    n_probe_underflow)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
 
@@ -4204,8 +4225,29 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // centre ray did. Mesh-native units.
         const float tfar_dist = static_cast<float>((dist - primary_radius_) * km_to_native);
 
+        // Fermi F1: the probe basis is oriented to the HORIZON, not arbitrarily.
+        // u points along the horizon gradient, so probe (+1, 0) is the disk's
+        // HIGHEST point. With an arbitrary basis (createCoordinateSystem) all
+        // five probes can miss a thin above-horizon crescent, probes_up comes
+        // back 0, and the face is zeroed even though the analytic clip A says
+        // it is lit -- measured at 10851 of 1082503 A>0 face-steps on the
+        // Europa arm before this fix.
         std::array<double, 3> u, v;
-        createCoordinateSystem(dir, u, v);
+        {
+            std::array<double, 3> up = { fn[0] - c0*dir[0],
+                                         fn[1] - c0*dir[1],
+                                         fn[2] - c0*dir[2] };
+            const double ul = vectorLength(up);
+            if (ul > 1.0e-12) {
+                u = { up[0]/ul, up[1]/ul, up[2]/ul };
+                v = crossProduct(dir, u);          // orthonormal: |dir x u| = 1
+            } else {
+                // fn parallel to dir: no horizon gradient exists, and the disk
+                // is entirely above the horizon anyway (|c0| = 1), so any basis
+                // will do.
+                createCoordinateSystem(dir, u, v);
+            }
+        }
 
         // Direction toward the disk point offset by (dx, dy) in units of the
         // disk's angular radius. Same construction (and same sin(alpha) scale)
@@ -4254,15 +4296,37 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             if (!occluded(sd)) ++probes_clear;
         }
 
-        if (probes_up == 0) { ++n_below; continue; }   // nothing above the horizon
-        if (!always_sample && probes_clear == probes_up) {
-            primary_vis_mean_cos_[i] = A;              // fully visible
+        // Everything below is a SHORT-CIRCUIT of the sampler, so all of it is
+        // gated on !always_sample: PTM_PRIMARY_DISK_ALWAYS_SAMPLE has to mean
+        // "always sample", or the ALWAYS_SAMPLE arm is not an upper bound on
+        // the fast path's error (Fermi F1).
+        if (!always_sample && probes_up == 0) {
+            // With the horizon-oriented basis this is confined to a sliver of
+            // width ~sin^3(alpha)/2 in cos(theta_0) at the very bottom of the
+            // band (5.6e-4 of 0.208 at Jupiter/Europa), where the probe rim
+            // sits at atan(sin alpha) rather than alpha and so falls just
+            // short of the true rim. A is essentially zero there. Keep the
+            // analytic value rather than discarding it -- "no probe above the
+            // horizon" is absence of terrain evidence, not evidence of
+            // blockage -- and say so once. It is NOT counted as n_below, so
+            // the census stays comparable with the geometric count.
+            warnPrimaryProbeUnderflowOnce();
+            primary_vis_mean_cos_[i] = A;
             ++n_full;
+            ++n_probe_underflow;
             continue;
         }
-        if (!always_sample && probes_clear == 0) {
-            ++n_dark;
-            continue;                                  // fully occluded -> 0
+        if (!always_sample) {
+            if (probes_up > 0 && probes_clear == probes_up) {
+                primary_vis_mean_cos_[i] = A;          // fully visible
+                ++n_full;
+                continue;
+            }
+            if (probes_clear == 0) {
+                ++n_dark;
+                ++n_zero_by_rays;
+                continue;                              // fully occluded -> 0
+            }
         }
         ++n_sampled;
 
@@ -4281,7 +4345,8 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             w_total += w;
             if (!occluded(sd)) w_clear += w;
         }
-        if (w_total <= 0.0) continue;
+        if (w_total <= 0.0) { ++n_zero_by_rays; continue; }
+        if (w_clear <= 0.0) ++n_zero_by_rays;
         primary_vis_mean_cos_[i] = A * (w_clear / w_total);
     }
 
@@ -4294,7 +4359,9 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         std::cerr << "[illumination] primary disk: " << num_faces << " faces -- "
                   << n_below << " below horizon, " << n_full << " fully visible, "
                   << n_dark << " fully occluded, " << n_sampled << " sampled ("
-                  << N_SAMP << " rays each)" << std::endl;
+                  << N_SAMP << " rays each); A>0 zeroed BY RAYS " << n_zero_by_rays
+                  << ", probe-underflow fallbacks " << n_probe_underflow
+                  << std::endl;
     }
 }
 
