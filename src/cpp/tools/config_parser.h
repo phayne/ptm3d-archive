@@ -241,6 +241,28 @@ struct SimulationConfig {
     // Radiation Exchange
     struct RadiationParams {
         bool enabled = false;
+        // PTM-98 — which faces keep the indirect flux the radiosity solve already
+        // computed for them. The solve always covers ALL faces; this set is only
+        // a post-solve copy mask.
+        //
+        //   "all" (default): every face keeps its flux. Window-INDEPENDENT.
+        //   "shadow": legacy gate, keep only faces shadowed at least
+        //       min_shadow_fraction of the time. The shadow fraction is measured
+        //       over the run's OWN illumination series, whose length is
+        //       n_equilibration_steps + n_output_steps -- and a warm-started chunk
+        //       has NO equilibration samples. So a chunked run reclassifies faces
+        //       out of radiation exchange and zeroes their indirect flux: measured
+        //       82.38 K / 6367 faces > 1 K on a 3-chunk lunation of the 12,800-face
+        //       lunar_crater_80N gate, with 361 faces at exactly 0 W/m^2 where the
+        //       single-shot gives 18.1 mean / 63.0 max. Provided ONLY to reproduce
+        //       published runs; combine with coupling_mode: legacy.
+        //
+        // Override without editing a config: PTM_EXCHANGE_SELECTION=all|shadow
+        // or --rad-exchange-selection <mode>.
+        std::string exchange_selection = "all";
+        // Consulted ONLY when exchange_selection == "shadow". Before PTM-99 this
+        // key parsed but was never bridged into radiation::RadiationConfig, so the
+        // hard-coded 0.3 always won silently.
         double min_shadow_fraction = 0.3;
         bool verbose = false;
         bool use_gpu = false;
@@ -261,7 +283,41 @@ struct SimulationConfig {
         // Safety factor applied to the predicted-ΔT threshold. The predictor
         // is a linearization that breaks down for ΔF ≳ T·few; multiplying the
         // threshold by this factor (default 0.5) errs on the side of inclusion.
+        // NOTE: only consulted when coupling_mode == "legacy" (see below).
         double coupling_select_safety = 0.5;
+        // PTM-89 — decomposition (chunking) independence of the Picard coupling.
+        //
+        // Every input to the shipped face-selection and exit decisions is a
+        // max OVER THE WINDOW, so a 30-step window and a 60-step window select
+        // different faces and stop after a different number of iterations: the
+        // converged field then depends on where the chunk boundaries fell.
+        // Measured on the 12,800-face lunar_crater_80N gate (60 frames, seam at
+        // 30): single-shot vs 2-chunk differed by up to 41.4 K, 28 faces > 1 K.
+        //
+        //   "bounded" (default): the selection threshold is the ABSOLUTE
+        //       coupling_select_dt (default 0 K = re-thermal every face that
+        //       carries any indirect flux), and the unbounded
+        //       coupling_face_fraction OR-exit is disabled. Same gate: chunk A
+        //       becomes BIT-IDENTICAL to the single-shot and the whole-run
+        //       residual falls to 0.014 K, below the 0.029 K radiation-free
+        //       chunking floor set by the float32 checkpoint.
+        //   "fixed":   as "bounded", and the early exit on
+        //       coupling_temp_threshold is disabled too, so every window runs
+        //       exactly max_coupling_iterations sweeps. This is the only
+        //       stopping rule that cannot depend on the window by construction.
+        //   "legacy":  pre-PTM-89 behavior, bit-for-bit. Threshold is
+        //       coupling_temp_threshold·coupling_select_safety and the
+        //       face-fraction OR-exit is live. Provided to REPRODUCE published
+        //       runs; it re-introduces the defect.
+        //
+        // Override without editing a config: PTM_COUPLING_MODE=bounded|fixed|legacy
+        // or --rad-coupling-mode <mode>.
+        std::string coupling_mode = "bounded";
+        // Absolute predicted-ΔT selection threshold [K], "bounded"/"fixed" only.
+        // 0 = select every face with any indirect flux (decomposition-independent).
+        // >0 trades accuracy for speed and RE-INTRODUCES PTM-89 at that magnitude;
+        // the run warns when it is set.
+        double coupling_select_dt = 0.0;
         bool use_hmatrix = false;
         bool use_aca = true;
         double aca_tolerance = 1e-3;

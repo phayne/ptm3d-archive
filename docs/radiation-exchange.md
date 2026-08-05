@@ -272,9 +272,139 @@ Starting from the surface temperatures $T_i(t)$ computed by the initial thermal 
 | $\tau_Q$ | `--rad-coupling-flux-tol` | 0.1 W/m$^2$ | Indirect flux threshold (legacy mode only) |
 | $f_{\text{threshold}}$ | `--rad-coupling-face-frac` | 0.01 (1%) | Convergence threshold on faces (physics) or samples (legacy) still changing |
 | select mode | `--rad-coupling-select-mode` | `physics` | Face-selection criterion: `physics` (default) or `legacy` |
-| $s$ | `--rad-coupling-select-safety` | 0.5 | Safety factor on the predicted-ΔT threshold |
+| $s$ | `--rad-coupling-select-safety` | 0.5 | Safety factor on the predicted-ΔT threshold — **`coupling_mode: legacy` only** |
+| coupling mode | `--rad-coupling-mode` | `bounded` | `bounded` \| `fixed` \| `legacy` — see §7.2.1 |
+| exchange selection | `--rad-exchange-selection` | `all` | `all` \| `shadow` — see §7.2.2 |
+| $\tau_{\text{sel}}$ | `--rad-coupling-select-dt` | 0 K | Absolute predicted-ΔT selection threshold, `bounded`/`fixed` only |
 
-Convergence is satisfied when **either** the temperature or face-fraction criterion is met (changed from AND in May 2026).
+In `bounded` (default) the loop stops when the max per-face temperature change falls
+below $\tau_T$, or at $k_{\max}$. In `legacy` it also stops when the *fraction* of
+faces still changing falls below $f_{\text{threshold}}$ (either/or, changed from AND
+in May 2026). In `fixed` it always runs $k_{\max}$ iterations.
+
+### 7.2.1 Chunk-decomposition independence (PTM-89)
+
+Every input to the shipped (pre-2026-08-05) selection and exit decisions is a maximum
+**over the output window**: $\max_t Q_{\text{indirect},i}$, $\max_t T_i$,
+$\max_{i,t}|T^k - T^{k-1}|$, and the count of faces whose window-max change exceeds
+$\tau_T$. A half-length window therefore scores every face lower than the full window,
+selects fewer faces, and can stop an iteration earlier — so **the converged field
+depended on where the chunk boundaries fell**. Two mechanisms, both real:
+
+1. **Selection.** With $\tau_T\cdot s = 1$ K, a face whose window-max indirect flux
+   sits near the threshold is re-thermal'd in a 60-step window and frozen in the
+   30-step half. Measured on the 12 800-face `lunar_crater_80N` gate (60 frames,
+   29.53 d, seam at frame 30): the single-shot selected 2578/2578/2547 faces and the
+   first chunk 2559/2559/2380, for a peak single-shot-vs-2-chunk difference of
+   **41.4 K**, 28 faces above 1 K.
+2. **Exit.** The face-fraction criterion has **no error bound** — it stops while up to
+   $f_{\text{threshold}}$ of the mesh is still moving by an arbitrary amount — and its
+   count is also a window maximum, so a short window reaches it first.
+
+`bounded` removes both: the selection threshold becomes the absolute
+$\tau_{\text{sel}}$ (default 0, i.e. re-thermal every face carrying any indirect flux)
+and the face-fraction exit is disabled. On the same gate, the first chunk then becomes
+**bit-identical** to the single-shot over all 30 × 12 800 samples, and the whole-run
+residual falls to **0.014 K** — below the **0.029 K** radiation-free chunking floor set
+by the `float32` 30-layer checkpoint. Cost on that gate: +2.4 % face-re-thermals
+(7703 → 7889) and no wall-time change outside run-to-run noise.
+
+`fixed` additionally disables the early exit on $\tau_T$, because *any* data-driven
+stopping rule is a function of the window. It is the only mode whose iteration count
+cannot depend on the decomposition by construction; on the gate it costs +70 %
+face-re-thermals (7703 → 13 141, 3 iterations → 5) for the same 0.014 K residual, so
+`bounded` is the default and `fixed` is for when the iteration counts must be provably
+equal.
+
+`legacy` reproduces pre-PTM-89 behavior bit-for-bit (verified: byte-identical output
+trees against the `8fbedd4` build on the same gate, coupled and radoff, single-shot and
+2-chunk). Use it to reproduce a published run, and only for that: it re-introduces the
+defect. It can be selected without editing a config via `PTM_COUPLING_MODE=legacy`.
+
+Setting $\tau_{\text{sel}} > 0$ trades accuracy for speed on very large meshes and
+re-introduces the dependence at up to that magnitude per face; the run warns when it
+is set, and warns that `coupling_face_fraction` is inert, rather than ignoring either
+in silence.
+
+**Not covered by the measurement above:** the Moon `lunar_crater_80N` gate only. The
+ratio (faces carrying any indirect flux)/(faces above the 1 K predicted-ΔT threshold)
+is a property of the mesh — 1.02–1.05 here — and has **not** been measured on the
+140 k-face `fig8_hybrid` production mesh, where the shipped threshold selected 48 % of
+faces. The worst case is a full-mesh re-thermal per iteration, i.e. ≤ 2.1× the
+re-thermal component of the coupling stage on that mesh.
+
+### 7.2.2 The radiation-exchange face set (PTM-98)
+
+`RadiositySolver::solve()` returns the absorbed indirect flux $Q_{\text{indirect},i}$
+for **every** face — the classification never enters the solve. The *exchange set* is
+applied afterwards, as a copy mask deciding which of those computed values survive
+into the thermal step. Everything it excludes is silently reset to exactly
+0 W/m$^2$.
+
+| knob | flag | default | meaning |
+|---|---|---|---|
+| exchange selection | `--rad-exchange-selection` | `all` | `all` \| `shadow` |
+| $f_{\text{shadow}}$ | `--rad-min-shadow-fraction` | 0.3 | `shadow` mode only |
+
+The pre-2026-08-05 gate (`shadow`) kept a face only if it was in shadow for at least
+$f_{\text{shadow}}$ of the run's **own illumination series**, whose length is
+
+$$N = n_{\text{equilibration steps}} + n_{\text{output steps}}$$
+
+and a **warm-started chunk has no equilibration steps at all**. So the criterion is a
+function of the chunk plan. Chunk 0 is accidentally protected — its ~120 equilibration
+samples span several diurnal cycles, so nearly every face clears 0.3 — while every
+resumed chunk is scored on its output window alone. A chunk that happens to fall in
+local daytime therefore reclassifies faces *out of radiation exchange entirely*.
+
+Measured on the 12 800-face `lunar_crater_80N` gate (60 frames, 29.53 d), per-face
+$|T_{\text{chunked}} - T_{\text{single}}|$ over all frames:
+
+| decomposition | `shadow` (pre-fix) | `all` (default) | `all` + `coupling_mode: fixed` | radoff null |
+|---|---|---|---|---|
+| 3 × 20 frames | **82.383 K**, 6367 faces > 1 K | 0.081 K, 0 > 1 K | **0.011 K** | 0.040 K |
+| 6 × 10 frames | **82.383 K**, 26 063 faces > 1 K | 0.081 K, 0 > 1 K | **0.015 K** | 0.040 K |
+| 2 × 30 frames | clean | clean | clean | 0.029 K |
+
+In the 3-chunk case the last chunk kept only 2265 of 12 800 faces, and **361 faces
+received exactly 0 W/m$^2$ in both bands** where the single-shot gives 17.5 W/m$^2$
+mean / 63.0 W/m$^2$ max of thermal IR. Note the 2-chunk row: a 30-frame window still
+spans enough night for every face to clear the gate, so **a 2-chunk test cannot detect
+this** — decomposition independence must be certified at ≥ 3 chunks.
+
+`all` (default) keeps every face's computed flux. This is the only setting with a
+physical justification: the radiosity solution is a self-consistent global linear
+solve, so discarding part of its output is data loss, not an approximation. It is also
+free — the exchange set never gated the solve, only the copy. Measured on the affected
+chunk: radiosity sweeps unchanged (IR = 2, visible = 2), re-thermal 2265 faces/51 ms →
+2626 faces/52 ms, wall time 1.776 s → 1.791 s (+0.8 %, inside the run-to-run spread)
+for a 5.65× larger exchange set. The exact upper bound is the equivalent single-shot's
+cost, because the set is now window-independent and identical to it.
+
+Correcting the mask **also changes single-shot results** for any window that was being
+truncated (a short warm-started window, or `equilibration_orbits: 0`): the previously
+zeroed faces warm, by construction. On a 10-frame example, 284 faces recovered
+12.3 W/m$^2$ mean IR and warmed by +2.84 K mean / +60.2 K max, and 0 of 2840 masked
+face-frames got colder — restoring a positive absorbed flux can only warm.
+
+The residual 0.081 K under `all` is **not** this defect: it is the PTM-89 exit
+criterion (§7.2.1), which is still a window maximum in `bounded` — the 20-frame chunk
+exits after 2 Picard sweeps where the single-shot takes 3. `coupling_mode: fixed`
+removes it, giving the 0.011 K figures above.
+
+`shadow` reproduces the pre-fix behavior bit-for-bit (verified byte-identical output
+trees, coupled and radoff, single-shot and 3-chunk) and is provided only to reproduce
+published runs; pair it with `coupling_mode: legacy`. It warns, naming the number of
+faces it is about to zero. `min_shadow_fraction` was parsed but never bridged into
+`RadiationConfig` before this change (PTM-99), so the hard-coded 0.3 always won
+silently; it is now plumbed and warns when set in `all` mode, where it is inert.
+Selectable without editing a config via `PTM_EXCHANGE_SELECTION=shadow`.
+
+**Not covered:** the Moon `lunar_crater_80N` gate only, GPU re-thermal path only, no
+non-Moon body, no CPU coupled path, and no production-mesh (140 k/509 k-face) cost
+measurement. The Smith beamed-emission receiver and emitter sets (`rms_slope_deg > 0`)
+are still selected from window-scoped shadow fractions and remain
+decomposition-dependent; beaming is off by default and the run now warns when it is on.
 
 ### 7.3 Optimizations
 

@@ -1661,8 +1661,14 @@ class RadiationTab(BaseConfigTab):
         self.add_double_field(coupling_layout, 2, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
                               0.01, 10.0, 2, "Flux change threshold",
                               info_key="radiation.coupling_flux_threshold")
-        self.add_double_field(coupling_layout, 3, "Face Fraction:", "radiation.coupling_face_fraction",
-                              0.001, 0.1, 3, "Fraction of faces still changing to stop")
+        self.add_double_field(coupling_layout, 3, "Face Fraction (legacy mode only):",
+                              "radiation.coupling_face_fraction",
+                              0.001, 0.1, 3,
+                              "Fraction of faces still changing to stop. IGNORED unless "
+                              "radiation.coupling_mode is 'legacy': this exit criterion has "
+                              "no error bound and made a coupled run's answer depend on how "
+                              "the window was chunked (PTM-89). The engine prints a warning "
+                              "if you change it without also setting coupling_mode: legacy.")
 
         coupling_section.add_widget(coupling_widget)
         layout.addWidget(coupling_section)

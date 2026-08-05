@@ -432,6 +432,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         if (root["radiation"]) {
             const auto& rad = root["radiation"];
             config.radiation.enabled = getWithDefault(rad, "enabled", config.radiation.enabled);
+            config.radiation.exchange_selection = getWithDefault(rad, "exchange_selection", config.radiation.exchange_selection);
             config.radiation.min_shadow_fraction = getWithDefault(rad, "min_shadow_fraction", config.radiation.min_shadow_fraction);
             config.radiation.verbose = getWithDefault(rad, "verbose", config.radiation.verbose);
             config.radiation.use_gpu = getWithDefault(rad, "use_gpu", config.radiation.use_gpu);
@@ -442,6 +443,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
             config.radiation.coupling_select_mode = getWithDefault(rad, "coupling_select_mode", config.radiation.coupling_select_mode);
             config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
+            config.radiation.coupling_mode = getWithDefault(rad, "coupling_mode", config.radiation.coupling_mode);
+            config.radiation.coupling_select_dt = getWithDefault(rad, "coupling_select_dt", config.radiation.coupling_select_dt);
             config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
             config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
             config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);

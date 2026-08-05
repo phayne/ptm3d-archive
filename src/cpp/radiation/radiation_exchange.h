@@ -247,6 +247,44 @@ public:
     // TICKET-two-band-radiosity-production.md and docs/two-band-radiosity-derivation.tex.
     void setSolarAlbedo(const std::vector<double>& solar_albedo);
 
+    // PTM-106: per-face DIRECT-BEAM source albedo A_src,i for the visible band.
+    //
+    // The visible band has TWO distinct reflectances and they are not the same
+    // physical quantity:
+    //   (1) SOURCE      -- the fraction of the collimated DIRECT solar beam that
+    //                      face i scatters into the enclosure. The surface BC
+    //                      absorbs (1 - A(theta_i)) Q_i, so by construction the
+    //                      enclosure must receive A(theta_i) Q_i. When the BC uses
+    //                      an incidence-dependent albedo (Hayne 2017 / Hapke),
+    //                      A(theta_i) is per-face AND per-timestep.
+    //   (2) OPERATOR    -- the fraction of DIFFUSE inter-face flux that face i
+    //                      re-scatters, and (1 - A) the fraction it absorbs. Diffuse
+    //                      incidence has no single theta, so the hemispheric/Bond
+    //                      value (solar_reflectivity_, set by setSolarAlbedo) is the
+    //                      correct reflectance here and is left UNCHANGED.
+    //
+    // Before PTM-106 the source used (2) -- the static base albedo -- so at grazing
+    // incidence a Hayne body scattered with 0.12 while its BC absorbed with ~0.60:
+    // (A(theta) - A0) Q of reflected sunlight vanished from the budget instead of
+    // reaching the shadowed floors. Call this per timestep with the SAME albedo the
+    // BC used. Empty (the default, or after clearSolarSourceAlbedo()) => the source
+    // falls back to solar_reflectivity_, i.e. the exact legacy behavior.
+    void setSolarSourceAlbedo(const std::vector<double>& source_albedo);
+
+    // Per-timestep source albedo for solveBatch() (multi-GPU pool path), indexed
+    // [timestep][face]. Must have the same outer length as the batch handed to
+    // solveBatch(); a mismatch WARNS and is ignored (never silently mis-pairs).
+    void setSolarSourceAlbedoBatch(const std::vector<std::vector<double>>& source_albedo);
+
+    // Drop any source-albedo override (restores the legacy static-albedo source).
+    void clearSolarSourceAlbedo();
+
+    // True iff a direct-beam source albedo is currently installed (single-timestep
+    // or batch). Public observable for the banner / regression tests.
+    bool hasSolarSourceAlbedo() const {
+        return !solar_albedo_source_.empty() || !solar_albedo_source_batch_.empty();
+    }
+
     // Activate band-separated (two-band) radiosity from config (D1), independent of
     // the PTM_RAD_TWO_BAND env. Requires a per-face Bond albedo already supplied via
     // setSolarAlbedo(); if none is set this WARNS and stays gray (never invents one).
@@ -348,6 +386,28 @@ private:
     // In two-band mode this same per-face value is the visible Bond albedo A for the
     // whole visible channel (scatter A, absorb 1-A), not just the first-bounce source.
     std::vector<double> solar_reflectivity_;
+    // PTM-106: per-face DIRECT-BEAM source albedo A_src (see setSolarSourceAlbedo).
+    // Empty => the source falls back to solar_reflectivity_ (legacy, byte-identical).
+    std::vector<double> solar_albedo_source_;
+    std::vector<std::vector<double>> solar_albedo_source_batch_;
+    // PTM-106 GPU representability guard. The GPU kernel hard-wires
+    //   solar_source[i] = reflectivity[i] * solar_flux[i],
+    // so a source albedo different from the operator albedo is expressed by
+    // pre-scaling the uploaded flux by A_src/A_op. That factor is undefined where
+    // A_op -> 0. false => the GPU two-band path is REFUSED (loudly) and the exact
+    // CPU two-band solve runs instead; never a silent wrong-albedo GPU solve.
+    bool src_albedo_gpu_ok_ = true;
+    void checkSourceAlbedoGPURepresentable();
+    // Per-face visible-band SOURCE reflectance for a SINGLE-timestep solve: the
+    // installed direct-beam albedo, else the operator albedo (legacy fallback --
+    // returns solar_reflectivity_ ITSELF so callers can compare by address/value
+    // and take a bitwise-legacy path). Deliberately does NOT consult the batch: a
+    // single-timestep solve has no timestep index, and silently handing it
+    // batch[0] would pair one timestep's albedo with another's flux.
+    const std::vector<double>& visSourceAlbedoSingle() const {
+        if (!solar_albedo_source_.empty()) return solar_albedo_source_;
+        return solar_reflectivity_;
+    }
     std::vector<double> areas_;
 
     // --- Band-separated (two-band) radiosity state -----------------------------
@@ -530,6 +590,16 @@ public:
     // mesh face count.
     void setSolarAlbedo(const std::vector<double>& solar_albedo);
 
+    // PTM-106: per-face DIRECT-BEAM source albedo for the visible band, forwarded to
+    // the solver. Call per timestep with the SAME effective albedo A(theta) the
+    // surface BC absorbed with; the enclosure then receives exactly the A(theta) Q
+    // the BC did not absorb. Not stored across prepare() -- the solver must exist.
+    // See RadiositySolver::setSolarSourceAlbedo for the source/operator distinction.
+    void setSolarSourceAlbedo(const std::vector<double>& source_albedo);
+
+    // Per-timestep source albedo for the batched (multi-GPU pool) path.
+    void setSolarSourceAlbedoBatch(const std::vector<std::vector<double>>& source_albedo);
+
     // Activate band-separated (two-band) radiosity on the underlying solver (D1),
     // e.g. after per-face albedo has been sourced post-prepare(). Two-band enabled
     // this late uses the CPU two-band solve (the GPU two-band gate is set at
@@ -616,6 +686,47 @@ private:
     // Face classification
     FaceClassification classification_;
     bool is_active_ = false;
+
+    // PTM-98: true when every face keeps the flux the radiosity solve computed
+    // for it, i.e. the post-solve copy mask is the identity. Then the write-back
+    // is a whole-vector move instead of a scatter, and no face can be left
+    // holding a stale or zero value that the solver actually filled in.
+    bool writeBackAll() const {
+        return classification_.exchange_faces == classification_.total_faces;
+    }
+
+    // PTM-98: copy one solver result (indexed by GLOBAL face id, length >= dst)
+    // into a destination already sized and zero-filled. Total when every face
+    // participates; otherwise only the classified subset survives, which is the
+    // pre-PTM-98 behavior kept for reproduction. Single definition so the total
+    // and per-band write-backs cannot drift apart.
+    void writeBackFlux(const std::vector<double>& src,
+                       std::vector<double>& dst) const {
+        const size_t n = dst.size();
+        if (writeBackAll() && src.size() >= n) {
+            std::copy(src.begin(), src.begin() + n, dst.begin());
+            return;
+        }
+        for (int face_idx : classification_.exchange_face_indices) {
+            if (face_idx >= 0 && static_cast<size_t>(face_idx) < src.size()) {
+                dst[face_idx] = src[face_idx];
+            }
+        }
+    }
+
+    // Overload for a source we own: steals the buffer instead of copying it.
+    void writeBackFlux(std::vector<double>&& src, std::vector<double>& dst) const {
+        if (writeBackAll() && src.size() == dst.size()) {
+            dst = std::move(src);
+            return;
+        }
+        writeBackFlux(static_cast<const std::vector<double>&>(src), dst);
+    }
+
+    // Receivers for the Smith (1967) beamed-emission pass: the shadowed-floor
+    // faces. Kept separate from classification_.exchange_face_indices, which is
+    // all faces by default since PTM-98. Built in buildBeamPairs().
+    std::vector<int> beam_receivers_;
 
     // Face properties
     std::vector<double> emissivity_;

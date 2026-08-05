@@ -6,9 +6,15 @@
 [`examples/tutorial04_crater80N_coupled.yaml`](../../examples/tutorial04_crater80N_coupled.yaml)
 **Mesh:** `data/meshes/lunar_crater_80N.ply` — a 12,800-face bowl crater at
 80°N, shipped with the repo.
-**Cost:** ~10 s (control) + ~13 s (coupled, incl. the view-factor build) on a
-many-core workstation; a few minutes on a laptop. <1 GB RAM; the saved
-view-factor file is ~35 MB.
+**Cost (measured 2026-08-05, 48-core workstation, CPU-only build):** 7.8 s
+(control) + 14.1 s (coupled, including the view-factor build); a few minutes on
+a laptop. <1 GB RAM; the saved view-factor file is 36,278,242 bytes (~35 MB).
+
+> **If you are on the `v1.0.3` tag exactly, the coupled run aborts** with
+> `FATAL: ... no post-equilibration T(z) hand-off` and exit 1 — a guard that
+> fired on the CPU solver, which it was never meant to cover. Fixed after the
+> tag (PTM-94); on current `main` the coupled run completes. Everything below
+> was measured on the fixed build.
 
 ## The physics question
 
@@ -26,23 +32,33 @@ identical runs.
 ./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
 ```
 
-In the coupled run, watch for (elided):
+In the coupled run, watch for (elided, measured 2026-08-05):
 
 ```
 Radiation exchange enabled from config file
 Building H-matrix view factor for 12800 faces...
 H-matrix saved to .../output/tutorial04_crater80N.vf (36278242 bytes)
 [Radiosity] View-factor row sums Σ_j F_ij: max=0.140, mean=0.027 (0/12800 rows > 1 ...)
+Faces requiring radiation exchange: 12800 / 12800
 --- Radiation Iteration 1 ---
---- Radiation Iteration 3 ---
-  Converged on face-fraction criterion (2.34e-02% < 1.00e+00%)
+  Re-running thermal model for 2578 faces...
+--- Radiation Iteration 4 ---
+  Re-running thermal model for 1942 faces...
+  Converged on max-temperature criterion (0.20 K < 2.00 K)
+Simulation completed in 14.061 seconds
 ```
+
+On the CPU solver the run also prints a `[Re-thermal] WARNING:` saying each
+coupling iteration re-equilibrates the selected faces from scratch rather than
+resuming a saved post-equilibration column, so CPU and GPU coupled fields can
+differ. That is expected on this path, not a fault.
 
 (The "H-matrix" in the log is a hierarchically compressed storage scheme that
 keeps the face-to-face view-factor matrix affordable; see
 [../radiation-exchange.md](../radiation-exchange.md).) Row sums well below 1
-(an open crater sees mostly sky) and convergence in ~3 coupling iterations are
-the expected health signs. A second coupled run skips the view-factor
+(an open crater sees mostly sky) and convergence in a handful of coupling
+iterations (4 here) are the expected health signs. A second coupled run skips
+the view-factor
 computation and reports `Loaded view factors from: .../tutorial04_crater80N.vf`.
 
 Note: two-band (visible/IR-separated) radiosity is the default
@@ -59,28 +75,44 @@ def load(p):
     b = open(p, 'rb').read(); n = struct.unpack('<i', b[:4])[0]
     a = array.array('f'); a.frombytes(b[4:4+4*n]); return list(a)
 base = 'output/tutorial04_crater80N_%s/statistics/%s.bin'
-shad = [i for i, v in enumerate(load(base % ('radoff', 'direct_solar_max'))) if v < 50.0]
-for name in ('temperature_min', 'temperature_avg'):
+# The "shadowed set" is DEFINED HERE: faces whose peak direct solar flux in the
+# CONTROL run is < 50 W/m2. Print the population — it is part of the result, and
+# it moves when the illumination model changes.
+dsm  = load(base % ('radoff', 'direct_solar_max'))
+shad = [i for i, v in enumerate(dsm) if v < 50.0]
+print(f"shadowed set: {len(shad)}/{len(dsm)} faces (direct_solar_max < 50 W/m2, control run)")
+for name in ('temperature_min', 'temperature_avg', 'temperature_max'):
     off = load(base % ('radoff', name)); on = load(base % ('coupled', name))
+    d = [on[i] - off[i] for i in range(len(off))]
     print(f"{name}: shadowed-face mean {st.mean(off[i] for i in shad):.1f} K "
-          f"-> {st.mean(on[i] for i in shad):.1f} K with radiation")
+          f"-> {st.mean(on[i] for i in shad):.1f} K with radiation "
+          f"| largest single-face change {max(d):+.1f} K "
+          f"| median over ALL faces {st.median(d):+.2f} K")
 EOF
 ```
 
-Verified result (2026-07-29, CPU-only build; 1671/12800 faces with
-`direct_solar_max` < 50 W/m²):
+Verified result (2026-08-05, CPU-only build). **Shadowed set: 1,422 of 12,800
+faces**, by the criterion in the snippet above (`direct_solar_max < 50 W/m²` in
+the control run):
 
-| Quantity (shadowed faces) | radiation OFF | radiation ON | effect |
+| Quantity (1,422 shadowed faces) | radiation OFF | radiation ON | effect |
 |---|---:|---:|---:|
-| mean T_avg | 67.6 K | 102.1 K | **+34.5 K** |
-| mean T_min | 65.9 K | 74.4 K | +8.5 K |
-| largest single-face ΔT_avg | | | +37.1 K |
-| largest single-face ΔT_max | | | +94.0 K |
+| mean T_avg | 66.3 K | 108.3 K | **+42.0 K** |
+| mean T_min | 64.6 K | 74.4 K | +9.7 K |
+| mean T_max | 69.2 K | 154.9 K | +85.8 K |
+| largest single-face ΔT_avg | | | +43.1 K |
+| largest single-face ΔT_max | | | +88.0 K |
 
 The **median face on the mesh changes by 0.00 K** — flat sunlit terrain
 outside the crater doesn't care — while the shadowed floor and walls warm by
 tens of kelvin. That asymmetry is the signature of correctly-scoped radiation
 exchange (and why cold-trap studies cannot skip it).
+
+Quote the **population and the criterion** whenever you quote these numbers.
+Both moved between builds: the same criterion selected 1,671 faces on
+2026-07-29 and selects 1,422 today, because the illumination model changed
+underneath it, so a bare "+34.5 K vs +42.0 K" comparison across dates would be
+comparing two different sets of faces as well as two different builds.
 
 ## Things to try
 

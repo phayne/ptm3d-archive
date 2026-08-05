@@ -47,21 +47,25 @@ for name in ('temperature_max', 'temperature_min', 'temperature_avg'):
 EOF
 ```
 
-Verified output (2026-07-29, CPU-only build):
+Verified output (2026-08-05, v1.0.3, CPU-only build):
 
 ```
-temperature_max: min=149.8  median=372.5  max=388.5 K
-temperature_min: min=65.2   median=92.2   max=95.7 K
-temperature_avg: min=96.0   median=203.8  max=212.8 K
+temperature_max: min=182.0  median=369.8  max=385.0 K
+temperature_min: min=66.3   median=92.6   max=95.9 K
+temperature_avg: min=107.2  median=208.1  max=216.4 K
 ```
 
 Physical sanity checks:
 
-- **Equatorial noon ~388 K**: radiative balance at ~0.98 AU with Bond albedo
+- **Equatorial noon ~385 K**: radiative balance at ~0.98 AU with Bond albedo
   0.12 gives $T \approx (0.88 \cdot S/\sigma)^{1/4} \approx 387$ K. ✓
-- **Night ~92 K**: the classic Diviner-era lunar nighttime plateau (thermal
+- **Night ~93 K**: the classic Diviner-era lunar nighttime plateau (thermal
   inertia of the upper regolith). ✓
-- **Polar Tmax ~150 K**: grazing incidence at the poles. ✓
+- **Polar Tmax ~182 K**: grazing incidence at the poles. ✓
+
+These values are build-dependent and are re-verified per release: the same table
+on a pre-v1.0.3 binary read `min=149.8 median=372.5 max=388.5 K` for
+`temperature_max`. Check your version before treating a difference as a problem.
 
 ## Things to try
 

@@ -795,6 +795,364 @@ static inline double solarConstForStep(int t, double fixed) {
     return fixed;
 }
 
+// ---- BUGS.md PTM-107(a): observable effective surface albedo -----------------
+// The BC's operative visible albedo A(theta) was computed per face per timestep and
+// then thrown away, so no external energy-closure audit could reconstruct it -- an
+// auditor had to treat it as a free parameter (that is what made the PTM-105
+// investigation and Fermi's 11.4% closure residual un-decidable). Accumulate the
+// flux-weighted mean per face here, at the ONE place the BC actually decides it,
+// and write it beside the other statistics.
+//   A_eff,f = sum_t A_f(t) Q_f(t) / sum_t Q_f(t)     (Q = direct solar, W/m^2)
+// Faces that never see the Sun have sum_t Q = 0 and are written as NaN (they have
+// no operative direct-beam albedo -- writing A0 there would invent a number).
+static std::vector<double> g_eff_albedo_num;   // sum_t A*Q per face
+static std::vector<double> g_eff_albedo_den;   // sum_t Q   per face
+static bool g_eff_albedo_valid = false;
+
+// ---- Accumulation WINDOW (Fermi condition C2) --------------------------------
+// Every other statistics/*.bin is reduced over the INTEGRATION window
+// [stats_start_step, stats_start_step + stats_steps). The albedo accumulators
+// originally swept the whole flux table -- equilibration steps included -- so
+// effective_albedo.bin described a different window from every file next to it.
+// Measured on lunar_crater_80N (coupled, Hayne): global flux-weighted A_eff over
+// eq+output was 0.5433 at 4 equilibration orbits and 0.5297 at 1, against 0.5269
+// for the integration window in both -- so the file's value drifted with a knob
+// that cannot change it, and injected -3.09 pp (4 orbits) / -0.53 pp (1 orbit) of
+// spurious residual into an area-weighted closure audit that used it. With the
+// window aligned, A_eff is identical at 1 and 4 orbits (max per-face difference
+// 1.1e-6, below the run's own ET-round-trip floor of 5e-5 in the direct beam).
+// Both the BC-side accumulator (below)
+// and the radiosity source-side accumulator (the PTM-106 self-check, in the
+// coupling loop) now reduce over exactly this window, so the file is window-
+// consistent AND the self-check still compares like with like.
+// Set once in main() from the SAME helper the statistics export uses; never a
+// second copy of the recipe.
+static int  g_aeff_win_start = 0;
+static int  g_aeff_win_steps = 0;
+static bool g_aeff_win_set   = false;
+
+// The integration (statistics) window, in ABSOLUTE step indices. Extracted from
+// the statistics-export site so the albedo accumulators can be told the window
+// BEFORE the thermal solve without a second copy of the recipe (the PTM-106c
+// class: two spellings of one formula, agreeing today, drifting later). The
+// export site now calls this same function; its printed banner is unchanged.
+struct IntegrationWindow { int start = 0; int steps = 0; };
+
+static IntegrationWindow computeIntegrationWindow(int equilibration_steps,
+                                                  int total_time_steps,
+                                                  double output_steps_per_day,
+                                                  double total_simulation_days,
+                                                  double integration_days,
+                                                  double output_days,
+                                                  int integration_steps_cli,
+                                                  int integration_offset_steps_cli,
+                                                  double integration_offset_days) {
+    // PTM-15 fix: the integration (statistics) window lives entirely in the
+    // post-equilibration OUTPUT segment, which is sampled at the OUTPUT cadence.
+    // The blended full-run cadence total_time_steps/total_simulation_days mixes
+    // the (possibly coarse) equilibration cadence with the fine output cadence,
+    // so converting integration/offset DAYS -> steps with it under-counts the
+    // window for any decoupled-cadence run (equilibration_steps_per_day or
+    // eq_samples_per_diurnal_cycle set). That silently reduced the statistics
+    // _max/_min/_avg window below the written output frames: e.g. Moon3D 240 eq
+    // (4.06/day) + 360 out (12.19/day) gave 29.53*(600/88.59)=200 stats steps
+    // instead of 29.53*12.19=360, so direct_solar_max.bin was a max over only
+    // output frames [0,200) and under-reported the true per-frame max (which
+    // peaks near frame 215) for ~23% of faces. Use the output cadence; falls
+    // back to the blended cadence only if the output cadence is unavailable.
+    const double integ_steps_per_day = (output_steps_per_day > 0.0)
+        ? output_steps_per_day
+        : (total_simulation_days > 0.0
+            ? static_cast<double>(total_time_steps) / total_simulation_days
+            : 0.0);
+
+    double integ_days_used = (integration_days > 0.0 ? integration_days : output_days);
+    int integration_steps = (integration_steps_cli > 0)
+        ? integration_steps_cli
+        : static_cast<int>(std::llround(integ_days_used * integ_steps_per_day));
+    if (integration_steps < 1) integration_steps = 1;
+
+    int integration_offset_steps = (integration_offset_steps_cli >= 0)
+        ? integration_offset_steps_cli
+        : static_cast<int>(std::llround(std::max(0.0, integration_offset_days) * integ_steps_per_day));
+    if (integration_offset_steps < 0) integration_offset_steps = 0;
+
+    IntegrationWindow w;
+    w.start = equilibration_steps + integration_offset_steps;
+    if (w.start >= total_time_steps) w.start = std::max(0, total_time_steps - 1);
+
+    w.steps = std::min(integration_steps, std::max(0, total_time_steps - w.start));
+    if (w.steps < 1) w.steps = std::min(1, total_time_steps);
+    return w;
+}
+
+static void setEffectiveAlbedoWindow(int start_step, int n_steps) {
+    g_aeff_win_start = start_step;
+    g_aeff_win_steps = n_steps;
+    g_aeff_win_set   = true;
+}
+
+// True when ABSOLUTE timestep t belongs to the integration window. Before the
+// window is published (it is derived after the step counts are known) nothing
+// accumulates: a silent "accumulate everything" default is exactly the eq+output
+// contamination this condition exists to remove, so refuse rather than guess --
+// writeEffectiveAlbedo() warns loudly if that ever happens.
+static inline bool aeffStepInWindow(int t) {
+    return g_aeff_win_set && t >= g_aeff_win_start
+                          && t <  g_aeff_win_start + g_aeff_win_steps;
+}
+
+// ---- Fermi condition C1: the same accumulation on the GPU thermal path --------
+// The CPU accumulates A_eff inside calculateAbsorbedFlux, which the GPU solver
+// never calls -- it builds its absorbed flux in prepare_flux() instead (two copies:
+// the multi-GPU batch worker and the single-GPU serial loop). Every production
+// lunar/Europa run is GPU, so both effective_albedo.bin and the PTM-106 self-check
+// were absent exactly where they matter.
+//
+// This is deliberately a SEPARATE read-only pass rather than a hook inside
+// prepare_flux: prepare_flux is parallel over TIMESTEPS, so per-face accumulation
+// there would be a data race (or need atomics on the hot path), and any edit inside
+// it risks perturbing the flux array the solver integrates. Here nothing is written
+// except the two accumulators, the recipe is character-for-character prepare_flux's
+// (same applyIncidenceAlbedo, same per-face w, same solarConstForStep), and the loop
+// is parallel over FACES so face f is touched by exactly one thread.
+//
+// Called once per whole-mesh GPU thermal solve, before the batch dispatch, so it
+// covers the single-GPU serial path and the multi-GPU pool path identically and
+// exactly once. The selected-face re-thermal deliberately does NOT accumulate: it
+// re-integrates a SUBSET with the same albedos, so accumulating there would
+// double-weight those faces.
+static void accumulateEffectiveAlbedoGPU(size_t n_faces,
+                                         int total_time_steps,
+                                         const std::vector<double>& direct_solar_values,
+                                         const std::vector<double>& face_albedos,
+                                         const std::vector<double>& face_w,
+                                         bool use_incidence,
+                                         bool use_hapke,
+                                         double a_coef,
+                                         double b_coef,
+                                         double S_solar) {
+    if (n_faces == 0 || total_time_steps <= 0) return;
+    if (!g_aeff_win_set) {
+        std::cerr << "[GPU Thermal] WARNING: integration window not published before the "
+                     "thermal solve; skipping the PTM-107(a) effective-albedo accumulation "
+                     "(statistics/effective_albedo.bin will be absent and the PTM-106 "
+                     "self-check will report SKIPPED)." << std::endl;
+        return;
+    }
+    const int t0 = std::max(0, g_aeff_win_start);
+    const int t1 = std::min(total_time_steps, g_aeff_win_start + g_aeff_win_steps);
+    if (t1 <= t0) return;
+
+    std::vector<double> num(n_faces, 0.0), den(n_faces, 0.0);
+    #pragma omp parallel for schedule(static)
+    for (long long fi = 0; fi < static_cast<long long>(n_faces); ++fi) {
+        const size_t f = static_cast<size_t>(fi);
+        const double base_A = (f < face_albedos.size()) ? face_albedos[f] : 0.0;
+        const double w_f    = (f < face_w.size()) ? face_w[f] : -1.0;
+        double a_num = 0.0, a_den = 0.0;
+        for (int t = t0; t < t1; ++t) {
+            const size_t idx = f * static_cast<size_t>(total_time_steps)
+                             + static_cast<size_t>(t);
+            const double direct = (idx < direct_solar_values.size())
+                                ? direct_solar_values[idx] : 0.0;
+            if (direct <= 0.0) continue;
+            const double albedo = use_incidence
+                ? applyIncidenceAlbedo(base_A, direct, solarConstForStep(t, S_solar),
+                                       a_coef, b_coef, use_hapke, w_f)
+                : base_A;
+            a_num += albedo * direct;
+            a_den += direct;
+        }
+        num[f] = a_num;
+        den[f] = a_den;
+    }
+    g_eff_albedo_num = std::move(num);
+    g_eff_albedo_den = std::move(den);
+    g_eff_albedo_valid = true;
+}
+
+// PTM-106 self-check. The whole claim of the fix is one identity:
+//   the albedo the radiosity SCATTERS the direct beam with
+//     == the albedo the surface BC did NOT absorb with.
+// Both sides are now computed, so verify rather than assert by eye: the coupling
+// loop accumulates its installed source albedo with the SAME flux weighting the BC
+// uses above, and the two per-face vectors are differenced at the end of the run.
+// A wrong recipe (Hayne where the BC runs Hapke, planet.S where the BC uses the
+// per-step S_inst, a stale per-face A0) shows up here as a large residual instead
+// of as a plausible-looking temperature shift nobody can falsify.
+static std::vector<double> g_src_albedo_num;   // sum_t A_src*Q per face
+static std::vector<double> g_src_albedo_den;
+static bool g_src_albedo_valid = false;
+// Set by the coupling loop when the PTM-106 source override is actually ACTIVE
+// (two-band + incidence-dependent BC + no legacy hatch). Without it the report
+// below cannot tell "this run has no identity to verify" (radiation off, gray
+// radiosity, constant albedo, legacy hatch -- each of which prints its own
+// banner) from "the identity exists and the check silently did not run", which
+// is precisely the GPU defect this file's C1 change fixes.
+static bool g_ptm106_expected = false;
+
+static void reportSourceAlbedoConsistency() {
+    // Rule 7: a self-check that cannot run must SAY SO. This used to return in
+    // silence, which is how the whole check went missing on the GPU thermal path
+    // for every production run (Fermi, 2026-08-05): g_eff_albedo_valid was set
+    // only inside the CPU calculateAbsorbedFlux, so a GPU run printed nothing at
+    // all and looked exactly like a run where the check had passed.
+    if (!g_src_albedo_valid || !g_eff_albedo_valid) {
+        // Nothing to verify when the PTM-106 override was never active (radiation
+        // off, gray radiosity, no incidence-dependent albedo, legacy hatch): the
+        // source IS the operator by construction, and each of those paths already
+        // announces which albedo feeds the radiosity.
+        if (!g_ptm106_expected) return;
+        std::cerr << "  [radiation.PTM-106] WARNING: source-vs-BC albedo self-check SKIPPED "
+                     "although the PTM-106 source override IS active -- "
+                  << (g_src_albedo_valid
+                        ? "the surface-BC effective-albedo accumulator is EMPTY (no thermal "
+                          "flux path published it; streamed thermal storage does not)"
+                        : "the radiosity source-albedo accumulator is EMPTY (the coupling loop "
+                          "installed no per-timestep A(theta) inside the integration window)")
+                  << ". The fix is installed but UNVERIFIED for this run -- do not quote it as "
+                     "consistent." << std::endl;
+        return;
+    }
+    const size_t n = std::min(g_src_albedo_den.size(), g_eff_albedo_den.size());
+    double max_abs = 0.0;
+    size_t worst = 0, n_cmp = 0;
+    for (size_t f = 0; f < n; ++f) {
+        if (g_src_albedo_den[f] <= 0.0 || g_eff_albedo_den[f] <= 0.0) continue;
+        const double a_src = g_src_albedo_num[f] / g_src_albedo_den[f];
+        const double a_bc  = g_eff_albedo_num[f] / g_eff_albedo_den[f];
+        const double d = std::abs(a_src - a_bc);
+        if (d > max_abs) { max_abs = d; worst = f; }
+        ++n_cmp;
+    }
+    if (n_cmp == 0) {
+        std::cerr << "  [radiation.PTM-106] WARNING: source-vs-BC albedo self-check had NO "
+                     "comparable faces (accumulators empty). The fix may be installed but "
+                     "UNVERIFIED for this run -- do not quote it as consistent." << std::endl;
+        return;
+    }
+    std::ios_base::fmtflags fl(std::cout.flags());
+    std::streamsize pr = std::cout.precision();
+    std::cout << "[albedo] PTM-106 source-vs-BC albedo self-check over " << n_cmp
+              << " ever-lit faces: max |A_radiosity - A_BC| = "
+              << std::scientific << std::setprecision(3) << max_abs
+              << " (face " << worst << ")";
+    if (max_abs > 1e-9) {
+        std::cout << "  <-- NOT CONSISTENT; the visible source is NOT the BC albedo."
+                  << std::endl;
+        std::cerr << "  [radiation.PTM-106] WARNING: radiosity source albedo disagrees with the "
+                     "surface-BC albedo by up to " << max_abs
+                  << "; reflected-solar energy does not close per face." << std::endl;
+    } else {
+        std::cout << "  -> consistent." << std::endl;
+    }
+    std::cout.flags(fl);
+    std::cout.precision(pr);
+}
+
+// Write statistics/effective_albedo.bin (uint32 n + float32[n]) and report the
+// global flux-weighted scalar. Returns false if there is nothing to write.
+static bool writeEffectiveAlbedo(const std::string& output_dir) {
+    if (!g_eff_albedo_valid || g_eff_albedo_den.empty()) {
+        // Rule 7: an output the caller asked for that silently does not appear is
+        // indistinguishable from one that appeared and read zero. Say which.
+        std::cerr << "WARNING: statistics/effective_albedo.bin NOT written -- the per-face "
+                     "effective-albedo accumulator was never filled (no thermal flux path "
+                     "published it; streamed thermal storage does not). Any energy-closure "
+                     "audit of this run has to treat the BC albedo as a free parameter again "
+                     "(BUGS.md PTM-107a)." << std::endl;
+        return false;
+    }
+    if (!g_aeff_win_set) {
+        std::cerr << "WARNING: statistics/effective_albedo.bin NOT written -- the integration "
+                     "window was never published, so the accumulation window cannot be stated "
+                     "and would not be comparable with the other statistics/*.bin files."
+                  << std::endl;
+        return false;
+    }
+    const size_t n = g_eff_albedo_den.size();
+    std::vector<double> a_eff(n);
+    double num_tot = 0.0, den_tot = 0.0;
+    size_t n_lit = 0;
+    for (size_t f = 0; f < n; ++f) {
+        if (g_eff_albedo_den[f] > 0.0) {
+            a_eff[f] = g_eff_albedo_num[f] / g_eff_albedo_den[f];
+            num_tot += g_eff_albedo_num[f];
+            den_tot += g_eff_albedo_den[f];
+            ++n_lit;
+        } else {
+            a_eff[f] = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+    try {
+        std::filesystem::create_directories(output_dir + "/statistics");
+        const std::string fn = output_dir + "/statistics/effective_albedo.bin";
+        std::ofstream out(fn, std::ios::binary);
+        if (!out) {
+            std::cerr << "WARNING: could not open " << fn
+                      << " for the PTM-107(a) effective-albedo output." << std::endl;
+            return false;
+        }
+        // SAME on-disk convention as every other statistics/*.bin: uint32 face
+        // count, then float32[n]. Writing float64 here would silently mis-parse in
+        // every existing reader (scripts/ptm_analyze, the GUI) at exactly half the
+        // face count -- the PTM-67 class.
+        const uint32_t n32 = static_cast<uint32_t>(n);
+        out.write(reinterpret_cast<const char*>(&n32), sizeof(n32));
+        std::vector<float> a_eff_f(n);
+        for (size_t f = 0; f < n; ++f) a_eff_f[f] = static_cast<float>(a_eff[f]);
+        out.write(reinterpret_cast<const char*>(a_eff_f.data()),
+                  static_cast<std::streamsize>(n * sizeof(float)));
+        out.close();
+        std::ios_base::fmtflags fl(std::cout.flags());
+        std::streamsize pr = std::cout.precision();
+        std::cout << "[albedo] PTM-107(a) effective surface albedo (flux-weighted over the "
+                     "DIRECT beam, the value the BC absorbed with): global A_eff = "
+                  << std::defaultfloat << std::setprecision(6)
+                  << (den_tot > 0.0 ? num_tot / den_tot
+                                    : std::numeric_limits<double>::quiet_NaN())
+                  << " over " << n_lit << "/" << n << " ever-lit faces; per-face -> "
+                  << fn << " (uint32 n + float32[" << n
+                  << "], NaN where never lit).\n"
+                  << "          Reduced over the INTEGRATION window, abs steps ["
+                  << g_aeff_win_start << ","
+                  << (g_aeff_win_start + g_aeff_win_steps)
+                  << ") -- the same window as every other statistics/*.bin, so a closure "
+                     "audit may divide the two directly." << std::endl;
+        std::cout.flags(fl);
+        std::cout.precision(pr);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "WARNING: PTM-107(a) effective-albedo output failed: "
+                  << e.what() << std::endl;
+        return false;
+    }
+}
+
+// ---- BUGS.md PTM-106: radiosity visible-band SOURCE albedo -------------------
+// The surface BC absorbs (1 - A(theta)) Q with the incidence-dependent Hayne/Hapke
+// albedo, so the enclosure must receive A(theta) Q. Before this fix the two-band
+// radiosity built its visible source from the STATIC base albedo A0 instead (0.12
+// on the Moon vs ~0.6 at 80N grazing incidence), so (A(theta) - A0) Q of reflected
+// sunlight left the budget entirely rather than reaching the shadowed floors.
+// DEFAULT = FIXED. PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1 restores the pre-fix source
+// for A/B work; it is announced loudly because it reinstates a known energy leak.
+static inline bool legacyRadiosityStaticAlbedo() {
+    static bool legacy = []() {
+        const char* e = std::getenv("PTM_LEGACY_RADIOSITY_STATIC_ALBEDO");
+        bool on = (e && std::string(e) != "0" && e[0] != '\0');
+        if (on) {
+            std::cerr << "[radiation.PTM-106] PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1: the two-band "
+                         "visible SOURCE reverts to the STATIC base albedo. This REINSTATES the "
+                         "PTM-106 energy leak at grazing incidence (reflected sunlight is lost "
+                         "from the budget). Use for A/B comparison only.\n";
+        }
+        return on;
+    }();
+    return legacy;
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -1656,6 +2014,13 @@ std::vector<double> calculateAbsorbedFlux(
         }
     }
 
+    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized here
+    // (not in the parallel region) and published to the file-scope globals after the
+    // loop, so a run that calls calculateAbsorbedFlux more than once reports the
+    // LAST (operative) composition rather than a silent mixture.
+    std::vector<double> eff_alb_num(num_faces, 0.0);
+    std::vector<double> eff_alb_den(num_faces, 0.0);
+
     // Apply albedo to calculate absorbed flux for each face at each time step
     #pragma omp parallel for schedule(dynamic, 1000)
     for (size_t f = 0; f < num_faces; f++) {
@@ -1715,6 +2080,19 @@ std::vector<double> calculateAbsorbedFlux(
                 }
             }
 
+            // PTM-107(a): record the OPERATIVE albedo the BC just decided on, flux-
+            // weighted by the direct beam. Per-face accumulators under an omp loop
+            // that is parallel over FACES, so face f is touched by one thread only.
+            // C2: only over the INTEGRATION window (t is the ABSOLUTE step index --
+            // this array spans equilibration + output). Sweeping the equilibration
+            // block too made this file describe a different window from every other
+            // statistics/*.bin and injected an equilibration-length-dependent
+            // residual into any closure audit that used it.
+            if (direct_flux > 0.0 && aeffStepInWindow(static_cast<int>(t))) {
+                eff_alb_num[f] += visible_albedo * direct_flux;
+                eff_alb_den[f] += direct_flux;
+            }
+
             // Apply appropriate albedo to each component
             double absorbed_direct = direct_flux * (1.0 - visible_albedo);
             double absorbed_reflected = primary_reflected_values[idx] * (1.0 - visible_albedo);
@@ -1724,6 +2102,11 @@ std::vector<double> calculateAbsorbedFlux(
             absorbed_flux[idx] = absorbed_direct + absorbed_reflected + absorbed_ir;
         }
     }
+
+    // PTM-107(a): publish the operative effective albedo for the statistics writer.
+    g_eff_albedo_num = std::move(eff_alb_num);
+    g_eff_albedo_den = std::move(eff_alb_den);
+    g_eff_albedo_valid = true;
 
     return absorbed_flux;
 }
@@ -4611,6 +4994,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // below. Inert when Hapke is off (Hayne/constant-albedo paths ignore it).
     std::vector<double> face_w(n_faces);
     for (size_t f = 0; f < n_faces; ++f) face_w[f] = hapkeWFromA0(face_albedos[f]);
+
+    // PTM-107(a) on the GPU path (Fermi condition C1). OUTPUT-ONLY: reads the flux
+    // table and face_albedos/face_w, writes only the two file-scope accumulators.
+    // The incidence gate is reproduced here from the SAME planet fields the batch
+    // workers use for their own `use_incidence` (see prepare_flux below) so the
+    // recorded albedo is the one the solver actually absorbed with.
+    {
+        const double aeff_a = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double aeff_b = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double aeff_S = planet.S;
+        const bool   aeff_incidence = (planet.albedoCoef.size() >= 2 && aeff_S > 0.0)
+                                    || (use_hapke && aeff_S > 0.0);
+        accumulateEffectiveAlbedoGPU(n_faces, total_time_steps, direct_solar_values,
+                                     face_albedos, face_w, aeff_incidence, use_hapke,
+                                     aeff_a, aeff_b, aeff_S);
+    }
 
     // Process faces in batches
     size_t n_batches = (n_faces + BATCH_SIZE - 1) / BATCH_SIZE;
@@ -7683,6 +8082,19 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 0.5)\n";
     std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] for LEGACY mode (default: 0.1)\n";
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
+    std::cout << "                                   LEGACY coupling mode only (see --rad-coupling-mode).\n";
+    std::cout << "  --rad-coupling-mode MODE   PTM-89 chunk-decomposition independence:\n";
+    std::cout << "                                   bounded (default): absolute selection threshold, no\n";
+    std::cout << "                                     face-fraction exit -- a chunked run reproduces the\n";
+    std::cout << "                                     single-shot field.\n";
+    std::cout << "                                   fixed:   as bounded, and always runs coupling-iter\n";
+    std::cout << "                                     sweeps (iteration count cannot depend on the window).\n";
+    std::cout << "                                   legacy:  pre-2026-08-05 behavior, bit-for-bit. Use ONLY\n";
+    std::cout << "                                     to reproduce a published run; it re-introduces the\n";
+    std::cout << "                                     chunk dependence. Env: PTM_COUPLING_MODE.\n";
+    std::cout << "  --rad-coupling-select-dt K Absolute predicted-ΔT selection threshold for bounded/fixed\n";
+    std::cout << "                                   (default: 0 = every face carrying indirect flux). >0\n";
+    std::cout << "                                   trades accuracy for speed and warns.\n";
     std::cout << "  --rad-coupling-select-mode MODE  Face-selection mode: 'physics' (default) or 'legacy'.\n";
     std::cout << "                                   physics: ΔT predictor (1−α)·ΔF/(4εσT³) > temp_tol·safety.\n";
     std::cout << "                                   legacy:  absolute |max indirect flux| > flux_tol.\n";
@@ -9776,6 +10188,12 @@ int main(int argc, char** argv) {
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
     std::string rad_coupling_select_mode = "physics";  // "physics" (default) or "legacy"
     double rad_coupling_select_safety = 0.5;            // Safety factor on predicted-ΔT threshold
+    // PTM-89: "bounded" (default) | "fixed" | "legacy". See config_parser.h.
+    std::string rad_coupling_mode = "bounded";
+    double rad_coupling_select_dt = 0.0;    // Absolute predicted-ΔT selection threshold [K]
+    // PTM-98: "all" (default) | "shadow". Radiation-exchange face set. See config_parser.h.
+    std::string rad_exchange_selection = "all";
+    double rad_min_shadow_fraction = 0.3;   // "shadow" mode only (PTM-99: now plumbed)
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -9817,6 +10235,10 @@ int main(int argc, char** argv) {
     rad_coupling_face_frac = sim_config.radiation.coupling_face_fraction;
     rad_coupling_select_mode = sim_config.radiation.coupling_select_mode;
     rad_coupling_select_safety = sim_config.radiation.coupling_select_safety;
+    rad_coupling_mode = sim_config.radiation.coupling_mode;
+    rad_coupling_select_dt = sim_config.radiation.coupling_select_dt;
+    rad_exchange_selection = sim_config.radiation.exchange_selection;
+    rad_min_shadow_fraction = sim_config.radiation.min_shadow_fraction;
     rad_use_aca = sim_config.radiation.use_aca;
     rad_aca_tolerance = sim_config.radiation.aca_tolerance;
     rad_aca_max_rank = sim_config.radiation.aca_max_rank;
@@ -10200,6 +10622,31 @@ int main(int argc, char** argv) {
             rad_coupling_select_safety = std::stod(argv[++i]);
             std::cout << "Radiation coupling select safety factor: "
                       << rad_coupling_select_safety << std::endl;
+        } else if (arg == "--rad-coupling-mode" && i + 1 < argc) {
+            rad_coupling_mode = argv[++i];
+            if (rad_coupling_mode != "bounded" && rad_coupling_mode != "fixed"
+                    && rad_coupling_mode != "legacy") {
+                std::cerr << "Invalid --rad-coupling-mode '" << rad_coupling_mode
+                          << "': must be 'bounded', 'fixed' or 'legacy'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation coupling mode: " << rad_coupling_mode << std::endl;
+        } else if (arg == "--rad-coupling-select-dt" && i + 1 < argc) {
+            rad_coupling_select_dt = std::stod(argv[++i]);
+            std::cout << "Radiation coupling selection threshold: "
+                      << rad_coupling_select_dt << " K" << std::endl;
+        } else if (arg == "--rad-exchange-selection" && i + 1 < argc) {
+            rad_exchange_selection = argv[++i];
+            if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+                std::cerr << "Invalid --rad-exchange-selection '" << rad_exchange_selection
+                          << "': must be 'all' or 'shadow'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation exchange selection: " << rad_exchange_selection << std::endl;
+        } else if (arg == "--rad-min-shadow-fraction" && i + 1 < argc) {
+            rad_min_shadow_fraction = std::stod(argv[++i]);
+            std::cout << "Radiation min shadow fraction: " << rad_min_shadow_fraction
+                      << " (exchange_selection: shadow only)" << std::endl;
         } else if (arg == "--rad-use-svd") {
             rad_use_aca = false;
             std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
@@ -10273,6 +10720,88 @@ int main(int argc, char** argv) {
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // PTM-89 coupling-mode resolution, AT CONFIG TIME.
+    //
+    // Resolved and validated here — before the illumination pass — so a typo in
+    // the mode costs nothing instead of surfacing after minutes to hours of ray
+    // tracing (the failure shape of the *other* PTM-80). The env override lets a
+    // published run be reproduced without editing its config.
+    // ----------------------------------------------------------------------
+    {
+        if (const char* e = std::getenv("PTM_COUPLING_MODE")) {
+            const std::string v(e);
+            if (v != rad_coupling_mode) {
+                std::cout << "[coupling] PTM_COUPLING_MODE overrides coupling mode '"
+                          << rad_coupling_mode << "' -> '" << v << "'" << std::endl;
+            }
+            rad_coupling_mode = v;
+        }
+        if (rad_coupling_mode != "bounded" && rad_coupling_mode != "fixed"
+                && rad_coupling_mode != "legacy") {
+            std::cerr << "FATAL [coupling]: radiation.coupling_mode='" << rad_coupling_mode
+                      << "' is not one of bounded|fixed|legacy.\n"
+                         "  bounded (default) = PTM-89 fix: absolute selection threshold, no"
+                         " face-fraction exit.\n"
+                         "  fixed             = as bounded, plus a fixed iteration count.\n"
+                         "  legacy            = pre-PTM-89 behavior, for reproducing published"
+                         " runs." << std::endl;
+            return 1;
+        }
+        if (rad_coupling_select_dt < 0.0) {
+            std::cerr << "FATAL [coupling]: radiation.coupling_select_dt="
+                      << rad_coupling_select_dt << " K must be >= 0." << std::endl;
+            return 1;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // PTM-98 exchange-selection resolution, AT CONFIG TIME (same rationale as
+    // the coupling-mode block above: a typo must cost nothing).
+    // ----------------------------------------------------------------------
+    {
+        if (const char* e = std::getenv("PTM_EXCHANGE_SELECTION")) {
+            const std::string v(e);
+            if (v != rad_exchange_selection) {
+                std::cout << "[exchange] PTM_EXCHANGE_SELECTION overrides exchange selection '"
+                          << rad_exchange_selection << "' -> '" << v << "'" << std::endl;
+            }
+            rad_exchange_selection = v;
+        }
+        if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+            std::cerr << "FATAL [exchange]: radiation.exchange_selection='"
+                      << rad_exchange_selection << "' is not one of all|shadow.\n"
+                         "  all (default) = PTM-98 fix: every face keeps the indirect flux the\n"
+                         "                  radiosity solve computed for it. Window-independent.\n"
+                         "  shadow        = pre-PTM-98 shadow-fraction gate, for reproducing\n"
+                         "                  published runs. Window-DEPENDENT." << std::endl;
+            return 1;
+        }
+        if (rad_exchange_selection == "shadow") {
+            std::cout << "[exchange] WARNING: radiation.exchange_selection='shadow' re-introduces"
+                         " PTM-98 — the set of faces that receive indirect flux is measured over"
+                         " THIS window (equilibration + output steps), so the result depends on"
+                         " how the run was chunked. Use it only to reproduce a pre-PTM-98 run,"
+                         " and pair it with coupling_mode: legacy." << std::endl;
+            if (rad_coupling_mode != "legacy") {
+                std::cout << "[exchange] NOTE: exchange_selection='shadow' with coupling_mode='"
+                          << rad_coupling_mode << "' reproduces NEITHER the pre-PTM-98 nor the"
+                             " current behavior exactly; pre-PTM-98 reproduction needs"
+                             " coupling_mode: legacy as well." << std::endl;
+            }
+            if (!(rad_min_shadow_fraction >= 0.0 && rad_min_shadow_fraction <= 1.0)) {
+                std::cerr << "FATAL [exchange]: radiation.min_shadow_fraction="
+                          << rad_min_shadow_fraction << " must be in [0, 1]." << std::endl;
+                return 1;
+            }
+        } else if (rad_min_shadow_fraction != 0.3) {
+            std::cout << "[exchange] WARNING: radiation.min_shadow_fraction="
+                      << rad_min_shadow_fraction << " is IGNORED under"
+                         " exchange_selection='all' (every face participates). Set"
+                         " exchange_selection: shadow to make it live." << std::endl;
         }
     }
 
@@ -11372,6 +11901,20 @@ int main(int argc, char** argv) {
         equilibration_steps = std::max(0, total_time_steps - time_steps);
         eq_steps_per_day = output_steps_per_day;
         user_set_eq_cadence = false;
+    }
+
+    // Publish the integration (statistics) window NOW, before any flux table is
+    // built, so the effective-albedo accumulators on both the CPU and the GPU
+    // thermal paths reduce over exactly the window every other statistics/*.bin
+    // uses (Fermi condition C2). Same helper the statistics export calls below;
+    // the export cross-checks the two and warns if they ever disagree.
+    {
+        const IntegrationWindow aeff_iw = computeIntegrationWindow(
+            equilibration_steps, total_time_steps, output_steps_per_day,
+            total_simulation_days, integration_days, output_days,
+            integration_steps_cli, integration_offset_steps_cli,
+            integration_offset_days);
+        setEffectiveAlbedoWindow(aeff_iw.start, aeff_iw.steps);
     }
 
     // Build the ET grid: coarse equilibration block followed by fine output block.
@@ -12665,6 +13208,14 @@ int main(int argc, char** argv) {
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             rad_config.radiance_prune_eps = rad_radiance_prune_eps;
+            // PTM-98 / PTM-99: radiation-exchange face set. min_shadow_fraction
+            // parsed but was never bridged here before PTM-99, so the hard-coded
+            // 0.3 always won; it is now forwarded and only consulted in "shadow".
+            rad_config.exchange_selection =
+                (rad_exchange_selection == "shadow")
+                    ? radiation::RadiationConfig::ExchangeSelection::Shadow
+                    : radiation::RadiationConfig::ExchangeSelection::All;
+            rad_config.min_shadow_fraction = rad_min_shadow_fraction;
             // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
             // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
             // When ON, the per-face Bond albedo is sourced
@@ -12779,20 +13330,62 @@ int main(int argc, char** argv) {
                 std::cout << "  [radiation.band_separated] two-band radiosity ON: visible band "
                              "uses per-face Bond albedo (scatter A_i / absorb 1-A_i), IR band 1-eps/eps."
                           << std::endl;
-                // The per-face albedo sourced here is the STATIC base Bond albedo. When
-                // the BC uses an incidence-dependent albedo (Hayne angular / Hapke), the
-                // absorbed A_BC(θ) varies per timestep while the radiosity A is static —
-                // a residual per-face energy leak at grazing incidence. Wiring the
-                // per-timestep incidence-albedo update into the coupling loop
-                // (RadiationExchangeManager::setSolarAlbedo per timestep) is the remaining
-                // A2/D1 production step; warn rather than close energy silently-wrong.
+                // BUGS.md PTM-106. The albedo above is the STATIC base Bond albedo A0. It
+                // remains the correct reflectance for the DIFFUSE inter-face exchange
+                // (the operator and the absorptivity), but NOT for the first bounce of
+                // the collimated direct beam, which the surface BC reflects with the
+                // incidence-dependent A(theta). The coupling loop below now installs
+                // A(theta) per timestep as the visible-band SOURCE albedo. Say which
+                // albedo feeds the radiosity, every run -- never leave it inferable only
+                // from source.
                 const bool incidence_on =
                     (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
                 if (incidence_on) {
-                    std::cout << "  [radiation.band_separated] WARNING: incidence-dependent albedo is "
-                                 "active; the two-band reflected-solar albedo is the STATIC base value, "
-                                 "so energy does not fully close at grazing incidence. Per-timestep "
-                                 "incidence-albedo update in the coupling loop is not yet wired."
+                    if (legacyRadiosityStaticAlbedo()) {
+                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: LEGACY "
+                                     "(static base A0) -- incidence-dependent albedo is active, so "
+                                     "reflected sunlight (A(theta)-A0)*Q is LOST from the budget at "
+                                     "grazing incidence. Diffuse operator/absorptivity = A0."
+                                  << std::endl;
+                    } else {
+                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: FIXED -- "
+                                     "the visible-band SOURCE uses the same per-face, per-timestep "
+                                     "A(theta) the surface BC absorbs with ("
+                                  << (planet.use_hapke_albedo ? "Hapke" : "Hayne 2017")
+                                  << "); the diffuse operator/absorptivity keep the Bond value A0."
+                                  << std::endl;
+                    }
+                } else {
+                    std::cout << "  [radiation.band_separated] PTM-106 source albedo: base A0 "
+                                 "(no incidence-dependent albedo on this body -- source == "
+                                 "operator == A0 by construction)." << std::endl;
+                }
+            } else {
+                // Fermi condition C3. The PTM-106 fix lives entirely inside the
+                // two-band solve; on the GRAY path the visible source is not even
+                // formed from a Bond albedo. setSolarAlbedo() is called only in the
+                // branch above, so solar_reflectivity_ stays EMPTY here and
+                // RadiositySolver::solve() falls back to
+                //   solar_source[i] = reflectivity_[i] * Q_i = (1 - eps_i) * Q_i,
+                // i.e. ~0.05 on the Moon -- not A0 = 0.12, and certainly not
+                // A(theta) ~ 0.6 at grazing incidence. Do not let that be inferable
+                // only from the source.
+                const bool incidence_on_gray =
+                    (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
+                if (incidence_on_gray) {
+                    std::cerr << "  [radiation.band_separated] WARNING: GRAY radiosity "
+                                 "(band_separated: false) with an incidence-dependent surface BC ("
+                              << (planet.use_hapke_albedo ? "Hapke" : "Hayne 2017")
+                              << "). The PTM-106 visible-source consistency fix does NOT apply on "
+                                 "the gray path: the gray solve has no separate visible band, and "
+                                 "with no per-face Bond albedo installed its reflected-solar "
+                                 "source falls back to the THERMAL reflectivity 1-eps = "
+                              << std::defaultfloat << std::setprecision(6)
+                              << (1.0 - planet.emissivity)
+                              << " (not A0 = " << default_visible_albedo
+                              << ", and not the BC's A(theta)). Reflected sunlight in the "
+                                 "enclosure is therefore understated for this run. Set "
+                                 "band_separated: true for the incidence-consistent source."
                               << std::endl;
                 }
             }
@@ -12832,6 +13425,76 @@ int main(int argc, char** argv) {
                 std::cout << "\nStarting radiation-thermal coupling iterations..." << std::endl;
                 std::cout << "  Max iterations: " << rad_max_coupling_iter << std::endl;
                 std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
+
+                // ---- PTM-89: decomposition (chunking) independence ----------
+                // Mode was resolved and validated at config time (above).
+                const bool rad_coupling_legacy_mode = (rad_coupling_mode == "legacy");
+                const bool rad_coupling_fixed_iters = (rad_coupling_mode == "fixed");
+                // std::cout arrives here carrying a `fixed`/`setprecision(1)`
+                // left over from an earlier progress line (BUGS.md PTM-69), which
+                // would print a 0.05 threshold as "0.1". A diagnostic that lies
+                // about the number it is warning you about is worse than none, so
+                // pin the format for this block and restore it afterwards.
+                const std::ios_base::fmtflags rad_banner_flags = std::cout.flags();
+                const std::streamsize rad_banner_prec = std::cout.precision();
+                std::cout << std::defaultfloat << std::setprecision(6);
+                std::cout << "  Coupling mode: " << rad_coupling_mode
+                          << (rad_coupling_legacy_mode
+                                  ? "  (PRE-PTM-89: window-dependent selection + unbounded"
+                                    " face-fraction exit -- results depend on how the window"
+                                    " was chunked)"
+                                  : "  (PTM-89: absolute selection threshold, no face-fraction"
+                                    " exit)")
+                          << std::endl;
+                if (!rad_coupling_legacy_mode) {
+                    std::cout << "  Selection threshold: " << rad_coupling_select_dt
+                              << " K (absolute predicted ΔT; 0 = every face carrying"
+                                 " indirect flux)" << std::endl;
+                    if (rad_coupling_select_dt > 0.0) {
+                        std::cout << "  WARNING [PTM-89]: coupling_select_dt > 0 re-introduces"
+                                     " chunk-decomposition dependence at up to ~"
+                                  << rad_coupling_select_dt
+                                  << " K per face. Set 0 for decomposition independence."
+                                  << std::endl;
+                    }
+                    if (rad_coupling_fixed_iters) {
+                        std::cout << "  Early exit on coupling_temp_threshold DISABLED: every"
+                                     " window runs exactly " << rad_max_coupling_iter
+                                  << " sweeps." << std::endl;
+                    }
+                    // These two knobs are inert here; say so rather than letting a
+                    // config author believe they are doing something. Compared
+                    // against the struct defaults so the test cannot drift if a
+                    // default is ever retuned.
+                    const auto rad_defaults = decltype(sim_config.radiation){};
+                    if (std::abs(rad_coupling_face_frac
+                                 - rad_defaults.coupling_face_fraction) > 1e-12) {
+                        std::cout << "  WARNING [PTM-89]: radiation.coupling_face_fraction="
+                                  << rad_coupling_face_frac
+                                  << " is IGNORED in coupling_mode='" << rad_coupling_mode
+                                  << "' (the face-fraction exit has no error bound). Use"
+                                     " coupling_mode: legacy to restore it." << std::endl;
+                    }
+                    if (std::abs(rad_coupling_select_safety
+                                 - rad_defaults.coupling_select_safety) > 1e-12) {
+                        std::cout << "  WARNING [PTM-89]: radiation.coupling_select_safety="
+                                  << rad_coupling_select_safety
+                                  << " is IGNORED in coupling_mode='" << rad_coupling_mode
+                                  << "' (the selection threshold is the absolute"
+                                     " coupling_select_dt there, not a fraction of"
+                                     " coupling_temp_threshold)." << std::endl;
+                    }
+                    if (rad_coupling_select_mode != "physics") {
+                        std::cout << "  WARNING [PTM-89]: coupling_select_mode='"
+                                  << rad_coupling_select_mode
+                                  << "' selects on an absolute flux threshold taken over the"
+                                     " window, which remains chunk-dependent. Only"
+                                     " coupling_select_mode: physics is decomposition-"
+                                     "independent." << std::endl;
+                    }
+                }
+                std::cout.flags(rad_banner_flags);
+                std::cout.precision(rad_banner_prec);
 
                 // ---- Re-thermal SEED tripwire (BUGS.md PTM-78) --------------
                 // Every GPU coupling iteration re-integrates the selected faces
@@ -13118,6 +13781,71 @@ int main(int argc, char** argv) {
                     // overwritten each step below, so reuse is behavior-identical.
                     std::vector<double> temps_t(num_faces);
                     std::vector<double> solar_t(num_faces);
+
+                    // --- PTM-106: per-timestep visible-band SOURCE albedo ------------
+                    // A(theta) is the albedo the surface BC reflects the DIRECT beam
+                    // with, so it is exactly what the enclosure must receive. Recipe is
+                    // character-for-character the one the coupled CPU re-thermal uses to
+                    // rebuild combined_flux below, so source == 1 - BC absorptivity by
+                    // construction on every face and every timestep.
+                    const double ptm106_a_coef = (planet.albedoCoef.size() >= 2)
+                                               ? planet.albedoCoef[0] : 0.0;
+                    const double ptm106_b_coef = (planet.albedoCoef.size() >= 2)
+                                               ? planet.albedoCoef[1] : 0.0;
+                    const double ptm106_S      = planet.S;
+                    const bool   ptm106_hapke  = planet.use_hapke_albedo
+                                               && planet.hapke_albedo_w >= 0.0;
+                    const bool   ptm106_incidence =
+                        (planet.albedoCoef.size() >= 2 && ptm106_S > 0.0)
+                        || (ptm106_hapke && ptm106_S > 0.0);
+                    // Active only where it can mean anything: two-band radiosity ON and
+                    // an incidence-dependent BC. Otherwise source == operator == A0 and
+                    // installing it would be a no-op that only risks drift.
+                    const bool ptm106_active = rad_config.band_separated
+                                             && ptm106_incidence
+                                             && !legacyRadiosityStaticAlbedo();
+                    std::vector<double> srcalb_t;
+                    if (ptm106_active) srcalb_t.resize(num_faces);
+                    // Self-check accumulators (see reportSourceAlbedoConsistency).
+                    // Filled on coupling iteration 0 only -- every iteration sweeps the
+                    // same timesteps, so accumulating them all would just re-weight the
+                    // identical sum and hide nothing.
+                    // NOTE: this block runs once per COUPLING ITERATION, not once per
+                    // run -- clearing unconditionally here would wipe iteration 0's
+                    // accumulation on iteration 1 and leave the self-check with nothing
+                    // to compare (it silently reported nothing until this was caught).
+                    if (ptm106_active && iter == 0) {
+                        g_src_albedo_num.assign(num_faces, 0.0);
+                        g_src_albedo_den.assign(num_faces, 0.0);
+                        // Record that the identity EXISTS for this run, so a
+                        // self-check that fails to run is reported as a defect
+                        // rather than as silence (see reportSourceAlbedoConsistency).
+                        g_ptm106_expected = true;
+                    }
+                    auto ptm106_fill = [&](std::vector<double>& out, int t,
+                                           const std::vector<double>& q,
+                                           bool accumulate) {
+                        const double S_t = solarConstForStep(t, ptm106_S);
+                        #pragma omp parallel for schedule(static)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            const double base_A = (f < face_albedos_rad.size())
+                                                ? face_albedos_rad[f] : planet.albedo;
+                            out[f] = applyIncidenceAlbedo(base_A, q[f], S_t,
+                                                          ptm106_a_coef, ptm106_b_coef,
+                                                          ptm106_hapke,
+                                                          hapkeWFromA0(base_A));
+                            // C2: same INTEGRATION window as the BC-side accumulator.
+                            // The coupling loop sweeps every absolute timestep,
+                            // equilibration included; restricting one side and not
+                            // the other would turn a 1-ulp identity into a spurious
+                            // several-percent "inconsistency".
+                            if (accumulate && q[f] > 0.0 && aeffStepInWindow(t)) {
+                                g_src_albedo_num[f] += out[f] * q[f];
+                                g_src_albedo_den[f] += q[f];
+                            }
+                        }
+                        if (accumulate) g_src_albedo_valid = true;
+                    };
                     for (int t_start = 0; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -13141,6 +13869,11 @@ int main(int argc, char** argv) {
                                 const auto& sp = sun_positions[t];
                                 double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
                                 if (sl > 0.0) s_hat = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                            }
+                            // PTM-106: install A(theta) for THIS timestep before solving.
+                            if (ptm106_active) {
+                                ptm106_fill(srcalb_t, t, solar_t, iter == 0);
+                                rad_manager.setSolarSourceAlbedo(srcalb_t);
                             }
                             std::vector<double> indirect_t =
                                 rad_manager.computeIndirectFlux(temps_t, solar_t, s_hat);
@@ -13201,6 +13934,18 @@ int main(int argc, char** argv) {
                                     double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
                                     if (sl > 0.0) sun_dirs_batch[j] = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
                                 }
+                            }
+                            // PTM-106: per-timestep A(theta) for the batched (pool) path.
+                            // Built here so timestep j pairs with solar_batch[j]; the
+                            // solver refuses the pool rather than mis-pair on a mismatch.
+                            if (ptm106_active) {
+                                std::vector<std::vector<double>> srcalb_batch(n_batch);
+                                for (int j = 0; j < n_batch; j++) {
+                                    srcalb_batch[j].resize(num_faces);
+                                    ptm106_fill(srcalb_batch[j], t_start + j,
+                                                solar_batch[j], iter == 0);
+                                }
+                                rad_manager.setSolarSourceAlbedoBatch(srcalb_batch);
                             }
                             std::vector<std::vector<double>> indirect_batch =
                                 rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
@@ -13362,8 +14107,18 @@ int main(int argc, char** argv) {
                         const double epsilon = planet.emissivity;
                         const double sigma = 5.67051196e-8;
                         const double T_floor = 40.0;
-                        const double pred_dT_threshold =
-                            rad_coupling_temp_tol * rad_coupling_select_safety;
+                        // PTM-89: in legacy mode the threshold is a fraction of
+                        // the convergence tolerance -- ~1 K -- and both of the
+                        // quantities compared against it are maxima OVER THE
+                        // WINDOW, so a half-length window scores every face
+                        // lower and freezes faces the full window re-thermals.
+                        // In bounded/fixed mode the threshold is absolute
+                        // (default 0), so the decision is "does this face carry
+                        // any indirect flux", which no longer depends on where
+                        // the window boundaries fell.
+                        const double pred_dT_threshold = rad_coupling_legacy_mode
+                            ? rad_coupling_temp_tol * rad_coupling_select_safety
+                            : rad_coupling_select_dt;
 
                         for (size_t f = 0; f < num_faces; f++) {
                             const double dF = (iter == 0)
@@ -13378,8 +14133,14 @@ int main(int argc, char** argv) {
                             // imply a future T change above the threshold?
                             // Phase B criterion: did the face's T already
                             // change meaningfully in the previous re-thermal?
-                            const bool select = (pred_dT >= pred_dT_threshold)
-                                             || (iter > 0 && observed_dT[f] >= pred_dT_threshold);
+                            // Comparison is strict in bounded/fixed mode so that
+                            // a zero threshold still freezes the faces that carry
+                            // no flux at all (>= 0 would select all of them).
+                            const bool select = rad_coupling_legacy_mode
+                                ? ((pred_dT >= pred_dT_threshold)
+                                   || (iter > 0 && observed_dT[f] >= pred_dT_threshold))
+                                : ((pred_dT > pred_dT_threshold)
+                                   || (iter > 0 && observed_dT[f] > pred_dT_threshold));
                             if (select) {
                                 faces_to_rerun.push_back(static_cast<int>(f));
                             } else {
@@ -13611,13 +14372,25 @@ int main(int argc, char** argv) {
                                        : "  Samples still changing: ")
                                   << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
-                        if (max_change_post < rad_coupling_temp_tol) {
+                        // PTM-89: the max-temperature exit bounds the residual on
+                        // EVERY face by rad_coupling_temp_tol. "fixed" mode drops
+                        // it as well, because any data-driven stopping rule is a
+                        // function of the window and so can stop a short window
+                        // an iteration earlier than a long one.
+                        if (max_change_post < rad_coupling_temp_tol
+                                && !rad_coupling_fixed_iters) {
                             std::cout << "  Converged on max-temperature criterion ("
                                       << max_change_post << " K < " << rad_coupling_temp_tol
                                       << " K)" << std::endl;
                             break;
                         }
-                        if (face_frac < rad_coupling_face_frac) {
+                        // PTM-89: the face-fraction exit has NO error bound -- it
+                        // stops while up to coupling_face_fraction of the mesh is
+                        // still moving by an arbitrary amount, and the count is a
+                        // max over the window, so a short window reaches it first.
+                        // Retained only under coupling_mode: legacy.
+                        if (rad_coupling_legacy_mode
+                                && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
                                       << (face_frac * 100) << "% < "
@@ -13852,41 +14625,30 @@ int main(int argc, char** argv) {
     int stats_steps = 0;
     FilteredData stats_fd;
     {
-        // PTM-15 fix: the integration (statistics) window lives entirely in the
-        // post-equilibration OUTPUT segment, which is sampled at the OUTPUT cadence.
-        // The blended full-run cadence total_time_steps/total_simulation_days mixes
-        // the (possibly coarse) equilibration cadence with the fine output cadence,
-        // so converting integration/offset DAYS -> steps with it under-counts the
-        // window for any decoupled-cadence run (equilibration_steps_per_day or
-        // eq_samples_per_diurnal_cycle set). That silently reduced the statistics
-        // _max/_min/_avg window below the written output frames: e.g. Moon3D 240 eq
-        // (4.06/day) + 360 out (12.19/day) gave 29.53*(600/88.59)=200 stats steps
-        // instead of 29.53*12.19=360, so direct_solar_max.bin was a max over only
-        // output frames [0,200) and under-reported the true per-frame max (which
-        // peaks near frame 215) for ~23% of faces. Use the output cadence; falls
-        // back to the blended cadence only if the output cadence is unavailable.
-        const double integ_steps_per_day = (output_steps_per_day > 0.0)
-            ? output_steps_per_day
-            : (total_simulation_days > 0.0
-                ? static_cast<double>(total_time_steps) / total_simulation_days
-                : 0.0);
+        // The window math lives in computeIntegrationWindow() (see its PTM-15 note),
+        // shared with the early publication that drives the effective-albedo
+        // accumulators. Same inputs, same call, so the two can never diverge.
+        const IntegrationWindow iw = computeIntegrationWindow(
+            equilibration_steps, total_time_steps, output_steps_per_day,
+            total_simulation_days, integration_days, output_days,
+            integration_steps_cli, integration_offset_steps_cli,
+            integration_offset_days);
+        stats_start_step = iw.start;
+        stats_steps      = iw.steps;
 
-        double integ_days_used = (integration_days > 0.0 ? integration_days : output_days);
-        int integration_steps = (integration_steps_cli > 0)
-            ? integration_steps_cli
-            : static_cast<int>(std::llround(integ_days_used * integ_steps_per_day));
-        if (integration_steps < 1) integration_steps = 1;
-
-        int integration_offset_steps = (integration_offset_steps_cli >= 0)
-            ? integration_offset_steps_cli
-            : static_cast<int>(std::llround(std::max(0.0, integration_offset_days) * integ_steps_per_day));
-        if (integration_offset_steps < 0) integration_offset_steps = 0;
-
-        stats_start_step = equilibration_steps + integration_offset_steps;
-        if (stats_start_step >= total_time_steps) stats_start_step = std::max(0, total_time_steps - 1);
-
-        stats_steps = std::min(integration_steps, std::max(0, total_time_steps - stats_start_step));
-        if (stats_steps < 1) stats_steps = std::min(1, total_time_steps);
+        // The accumulators were told this window before the solve. If anything
+        // upstream changed the step counts in between, the file would silently
+        // describe a different window from its neighbours -- fail loudly instead.
+        if (g_aeff_win_set &&
+            (g_aeff_win_start != stats_start_step || g_aeff_win_steps != stats_steps)) {
+            std::cerr << "WARNING: the effective-albedo accumulation window ["
+                      << g_aeff_win_start << ","
+                      << (g_aeff_win_start + g_aeff_win_steps)
+                      << ") does NOT match the statistics window [" << stats_start_step
+                      << "," << (stats_start_step + stats_steps)
+                      << "); statistics/effective_albedo.bin is NOT comparable with the "
+                         "other statistics/*.bin files for this run.\n";
+        }
 
         std::cout << "\n[Integration] Statistics interval\n"
                 << "  Start (abs step): " << stats_start_step << "\n"
@@ -14544,6 +15306,16 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::cerr << "WARNING: Exception during statistics export: " << e.what() << std::endl;
+        }
+
+        // PTM-107(a): the operative per-face effective albedo, so an external energy-
+        // closure audit no longer has to treat the BC albedo as a free parameter.
+        // Only meaningful for a run that actually integrated a thermal model --
+        // an illumination-only run has no surface BC and therefore no operative
+        // absorbed-beam albedo to report.
+        if (run_thermal_mesh) {
+            writeEffectiveAlbedo(output_dir);
+            reportSourceAlbedoConsistency();
         }
 
         // Schorghofer & Taylor (2007) ice-stability output. Computed only

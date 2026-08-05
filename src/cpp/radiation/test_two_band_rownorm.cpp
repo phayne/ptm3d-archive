@@ -392,6 +392,12 @@ int main() {
     std::printf("  N=%d  eps=%.3f  S=%.1f  (face 0 = shadowed floor, Q_solar=0)\n\n", N, EPS, S);
 
     int n_fail = 0;
+    // BUGS.md PTM-102: jac_ok was computed, printed as "JACOBI FAILED (unexpected)"
+    // and then dropped on the floor -- the exit code was n_fail + a2 + b1 + b1b and
+    // never saw it, so a run in which the protected Jacobi reference failed on all
+    // 4 configs still exited 0. Count it separately (so the GS!=JAC summary keeps
+    // meaning what it says) and add it to the exit code.
+    int n_jac_fail = 0;
     for (const auto& c : cfgs) {
         // Two-band requires PTM_SOLAR_ALBEDO (Bond albedo) + PTM_RAD_TWO_BAND, read
         // once in initCommon at construction. Set per-config before constructing.
@@ -422,6 +428,7 @@ int main() {
         const char* verdict = agree ? "GS==JAC(fixed)"
                               : (!gs.converged ? "GS_DIVERGED(bug)" : "GS_OVERCOUPLED(bug)");
         if (!agree) ++n_fail;
+        if (!jac_ok) ++n_jac_fail;
 
         std::printf("   GS : conv=%d iters=%d  q_vis_floor=%.6g  q_vis_max=%.6g\n",
                     gs.converged, gs.iters, gs.q_vis_floor, gs.b_vis_max);
@@ -439,13 +446,15 @@ int main() {
 
     std::printf("=== SUMMARY: %d/%zu configs where GS != Jacobi (0 == PTM-08 fixed) ===\n",
                 n_fail, cfgs.size());
+    std::printf("    JACOBI reference failures: %d/%zu (must be 0 -- Jacobi is the "
+                "protected reference)\n", n_jac_fail, cfgs.size());
     std::printf("    artifact: %s\n\n", csv.c_str());
 
     int a2_fail = runA2();
     int b1_fail = runB1();
     int b1b_fail = runB1b();
 
-    std::printf("=== OVERALL: A0/A1 fails=%d  A2 fails=%d  B1 fails=%d  B1b fails=%d ===\n",
-                n_fail, a2_fail, b1_fail, b1b_fail);
-    return n_fail + a2_fail + b1_fail + b1b_fail;
+    std::printf("=== OVERALL: A0/A1 fails=%d  JACOBI fails=%d  A2 fails=%d  B1 fails=%d  "
+                "B1b fails=%d ===\n", n_fail, n_jac_fail, a2_fail, b1_fail, b1b_fail);
+    return n_fail + n_jac_fail + a2_fail + b1_fail + b1b_fail;
 }
