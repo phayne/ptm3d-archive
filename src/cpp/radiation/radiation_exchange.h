@@ -617,6 +617,47 @@ private:
     FaceClassification classification_;
     bool is_active_ = false;
 
+    // PTM-98: true when every face keeps the flux the radiosity solve computed
+    // for it, i.e. the post-solve copy mask is the identity. Then the write-back
+    // is a whole-vector move instead of a scatter, and no face can be left
+    // holding a stale or zero value that the solver actually filled in.
+    bool writeBackAll() const {
+        return classification_.exchange_faces == classification_.total_faces;
+    }
+
+    // PTM-98: copy one solver result (indexed by GLOBAL face id, length >= dst)
+    // into a destination already sized and zero-filled. Total when every face
+    // participates; otherwise only the classified subset survives, which is the
+    // pre-PTM-98 behavior kept for reproduction. Single definition so the total
+    // and per-band write-backs cannot drift apart.
+    void writeBackFlux(const std::vector<double>& src,
+                       std::vector<double>& dst) const {
+        const size_t n = dst.size();
+        if (writeBackAll() && src.size() >= n) {
+            std::copy(src.begin(), src.begin() + n, dst.begin());
+            return;
+        }
+        for (int face_idx : classification_.exchange_face_indices) {
+            if (face_idx >= 0 && static_cast<size_t>(face_idx) < src.size()) {
+                dst[face_idx] = src[face_idx];
+            }
+        }
+    }
+
+    // Overload for a source we own: steals the buffer instead of copying it.
+    void writeBackFlux(std::vector<double>&& src, std::vector<double>& dst) const {
+        if (writeBackAll() && src.size() == dst.size()) {
+            dst = std::move(src);
+            return;
+        }
+        writeBackFlux(static_cast<const std::vector<double>&>(src), dst);
+    }
+
+    // Receivers for the Smith (1967) beamed-emission pass: the shadowed-floor
+    // faces. Kept separate from classification_.exchange_face_indices, which is
+    // all faces by default since PTM-98. Built in buildBeamPairs().
+    std::vector<int> beam_receivers_;
+
     // Face properties
     std::vector<double> emissivity_;
     std::vector<double> areas_;

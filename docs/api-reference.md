@@ -106,6 +106,9 @@ struct RadiationConfig {
     double coupling_face_fraction = 0.01;  // legacy coupling_mode only
     std::string coupling_mode = "bounded"; // bounded | fixed | legacy (PTM-89)
     double coupling_select_dt = 0.0;       // K, bounded/fixed only
+    // PTM-98: which faces keep the flux the radiosity solve already computed.
+    ExchangeSelection exchange_selection = ExchangeSelection::All;  // All | Shadow
+    double min_shadow_fraction = 0.3;      // Shadow only (PTM-99: now plumbed)
     std::string view_factor_file;
     bool verbose = false;
 };
@@ -113,6 +116,13 @@ struct RadiationConfig {
 
 `coupling_mode` controls whether the Picard coupling's face selection and exit
 criteria are decomposition-independent; see `docs/radiation-exchange.md` §7.2.1.
+
+`exchange_selection` controls which faces keep their computed indirect flux. The
+radiosity solve always covers every face; this is a post-solve mask. `Shadow` (the
+pre-PTM-98 behavior) measures each face's shadow fraction over the CURRENT window
+— equilibration steps plus output steps — so splitting a run into chunks silently
+zeroes the indirect flux on faces that happen to be lit for most of a chunk. See
+`docs/radiation-exchange.md` §7.2.2.
 
 ## Utility Functions
 

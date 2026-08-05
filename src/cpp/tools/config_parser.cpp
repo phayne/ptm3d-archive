@@ -432,6 +432,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         if (root["radiation"]) {
             const auto& rad = root["radiation"];
             config.radiation.enabled = getWithDefault(rad, "enabled", config.radiation.enabled);
+            config.radiation.exchange_selection = getWithDefault(rad, "exchange_selection", config.radiation.exchange_selection);
             config.radiation.min_shadow_fraction = getWithDefault(rad, "min_shadow_fraction", config.radiation.min_shadow_fraction);
             config.radiation.verbose = getWithDefault(rad, "verbose", config.radiation.verbose);
             config.radiation.use_gpu = getWithDefault(rad, "use_gpu", config.radiation.use_gpu);

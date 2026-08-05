@@ -9792,6 +9792,9 @@ int main(int argc, char** argv) {
     // PTM-89: "bounded" (default) | "fixed" | "legacy". See config_parser.h.
     std::string rad_coupling_mode = "bounded";
     double rad_coupling_select_dt = 0.0;    // Absolute predicted-ΔT selection threshold [K]
+    // PTM-98: "all" (default) | "shadow". Radiation-exchange face set. See config_parser.h.
+    std::string rad_exchange_selection = "all";
+    double rad_min_shadow_fraction = 0.3;   // "shadow" mode only (PTM-99: now plumbed)
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -9835,6 +9838,8 @@ int main(int argc, char** argv) {
     rad_coupling_select_safety = sim_config.radiation.coupling_select_safety;
     rad_coupling_mode = sim_config.radiation.coupling_mode;
     rad_coupling_select_dt = sim_config.radiation.coupling_select_dt;
+    rad_exchange_selection = sim_config.radiation.exchange_selection;
+    rad_min_shadow_fraction = sim_config.radiation.min_shadow_fraction;
     rad_use_aca = sim_config.radiation.use_aca;
     rad_aca_tolerance = sim_config.radiation.aca_tolerance;
     rad_aca_max_rank = sim_config.radiation.aca_max_rank;
@@ -10231,6 +10236,18 @@ int main(int argc, char** argv) {
             rad_coupling_select_dt = std::stod(argv[++i]);
             std::cout << "Radiation coupling selection threshold: "
                       << rad_coupling_select_dt << " K" << std::endl;
+        } else if (arg == "--rad-exchange-selection" && i + 1 < argc) {
+            rad_exchange_selection = argv[++i];
+            if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+                std::cerr << "Invalid --rad-exchange-selection '" << rad_exchange_selection
+                          << "': must be 'all' or 'shadow'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation exchange selection: " << rad_exchange_selection << std::endl;
+        } else if (arg == "--rad-min-shadow-fraction" && i + 1 < argc) {
+            rad_min_shadow_fraction = std::stod(argv[++i]);
+            std::cout << "Radiation min shadow fraction: " << rad_min_shadow_fraction
+                      << " (exchange_selection: shadow only)" << std::endl;
         } else if (arg == "--rad-use-svd") {
             rad_use_aca = false;
             std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
@@ -10339,6 +10356,53 @@ int main(int argc, char** argv) {
             std::cerr << "FATAL [coupling]: radiation.coupling_select_dt="
                       << rad_coupling_select_dt << " K must be >= 0." << std::endl;
             return 1;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // PTM-98 exchange-selection resolution, AT CONFIG TIME (same rationale as
+    // the coupling-mode block above: a typo must cost nothing).
+    // ----------------------------------------------------------------------
+    {
+        if (const char* e = std::getenv("PTM_EXCHANGE_SELECTION")) {
+            const std::string v(e);
+            if (v != rad_exchange_selection) {
+                std::cout << "[exchange] PTM_EXCHANGE_SELECTION overrides exchange selection '"
+                          << rad_exchange_selection << "' -> '" << v << "'" << std::endl;
+            }
+            rad_exchange_selection = v;
+        }
+        if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+            std::cerr << "FATAL [exchange]: radiation.exchange_selection='"
+                      << rad_exchange_selection << "' is not one of all|shadow.\n"
+                         "  all (default) = PTM-98 fix: every face keeps the indirect flux the\n"
+                         "                  radiosity solve computed for it. Window-independent.\n"
+                         "  shadow        = pre-PTM-98 shadow-fraction gate, for reproducing\n"
+                         "                  published runs. Window-DEPENDENT." << std::endl;
+            return 1;
+        }
+        if (rad_exchange_selection == "shadow") {
+            std::cout << "[exchange] WARNING: radiation.exchange_selection='shadow' re-introduces"
+                         " PTM-98 — the set of faces that receive indirect flux is measured over"
+                         " THIS window (equilibration + output steps), so the result depends on"
+                         " how the run was chunked. Use it only to reproduce a pre-PTM-98 run,"
+                         " and pair it with coupling_mode: legacy." << std::endl;
+            if (rad_coupling_mode != "legacy") {
+                std::cout << "[exchange] NOTE: exchange_selection='shadow' with coupling_mode='"
+                          << rad_coupling_mode << "' reproduces NEITHER the pre-PTM-98 nor the"
+                             " current behavior exactly; pre-PTM-98 reproduction needs"
+                             " coupling_mode: legacy as well." << std::endl;
+            }
+            if (!(rad_min_shadow_fraction >= 0.0 && rad_min_shadow_fraction <= 1.0)) {
+                std::cerr << "FATAL [exchange]: radiation.min_shadow_fraction="
+                          << rad_min_shadow_fraction << " must be in [0, 1]." << std::endl;
+                return 1;
+            }
+        } else if (rad_min_shadow_fraction != 0.3) {
+            std::cout << "[exchange] WARNING: radiation.min_shadow_fraction="
+                      << rad_min_shadow_fraction << " is IGNORED under"
+                         " exchange_selection='all' (every face participates). Set"
+                         " exchange_selection: shadow to make it live." << std::endl;
         }
     }
 
@@ -12714,6 +12778,14 @@ int main(int argc, char** argv) {
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             rad_config.radiance_prune_eps = rad_radiance_prune_eps;
+            // PTM-98 / PTM-99: radiation-exchange face set. min_shadow_fraction
+            // parsed but was never bridged here before PTM-99, so the hard-coded
+            // 0.3 always won; it is now forwarded and only consulted in "shadow".
+            rad_config.exchange_selection =
+                (rad_exchange_selection == "shadow")
+                    ? radiation::RadiationConfig::ExchangeSelection::Shadow
+                    : radiation::RadiationConfig::ExchangeSelection::All;
+            rad_config.min_shadow_fraction = rad_min_shadow_fraction;
             // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
             // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
             // When ON, the per-face Bond albedo is sourced

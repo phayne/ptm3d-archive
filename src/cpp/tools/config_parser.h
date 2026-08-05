@@ -241,6 +241,28 @@ struct SimulationConfig {
     // Radiation Exchange
     struct RadiationParams {
         bool enabled = false;
+        // PTM-98 — which faces keep the indirect flux the radiosity solve already
+        // computed for them. The solve always covers ALL faces; this set is only
+        // a post-solve copy mask.
+        //
+        //   "all" (default): every face keeps its flux. Window-INDEPENDENT.
+        //   "shadow": legacy gate, keep only faces shadowed at least
+        //       min_shadow_fraction of the time. The shadow fraction is measured
+        //       over the run's OWN illumination series, whose length is
+        //       n_equilibration_steps + n_output_steps -- and a warm-started chunk
+        //       has NO equilibration samples. So a chunked run reclassifies faces
+        //       out of radiation exchange and zeroes their indirect flux: measured
+        //       82.38 K / 6367 faces > 1 K on a 3-chunk lunation of the 12,800-face
+        //       lunar_crater_80N gate, with 361 faces at exactly 0 W/m^2 where the
+        //       single-shot gives 18.1 mean / 63.0 max. Provided ONLY to reproduce
+        //       published runs; combine with coupling_mode: legacy.
+        //
+        // Override without editing a config: PTM_EXCHANGE_SELECTION=all|shadow
+        // or --rad-exchange-selection <mode>.
+        std::string exchange_selection = "all";
+        // Consulted ONLY when exchange_selection == "shadow". Before PTM-99 this
+        // key parsed but was never bridged into radiation::RadiationConfig, so the
+        // hard-coded 0.3 always won silently.
         double min_shadow_fraction = 0.3;
         bool verbose = false;
         bool use_gpu = false;

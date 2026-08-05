@@ -282,6 +282,13 @@ radiation:
                                  # makes the answer depend on the chunk plan.
   coupling_select_dt: 0.0        # K; 0 = re-thermal every face carrying
                                  # indirect flux (decomposition-independent)
+  exchange_selection: all        # all | shadow (PTM-98; see
+                                 # docs/radiation-exchange.md 7.2.2).
+                                 # `shadow` reproduces pre-2026-08-05 runs: it
+                                 # drops faces that are lit for most of THIS
+                                 # window out of radiation exchange entirely,
+                                 # so a chunked run zeroes their indirect flux.
+  min_shadow_fraction: 0.3       # exchange_selection: shadow only
 
 output:
   directory: "output/simulation"
