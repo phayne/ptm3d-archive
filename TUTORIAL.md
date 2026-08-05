@@ -40,9 +40,10 @@ Expected (verified 2026-07-29, CPU-only build):
 ```
 
 The view-factor error vs. the analytic bowl-crater solution is **<0.5%** and
-reciprocity holds to machine precision. The automated build-and-test checks run
-this same test on every code change (`Result: PASSED` appears once per tested
-crater configuration).
+reciprocity holds to machine precision (`Result: PASSED` appears once per tested
+crater configuration). This is the gate every radiation change has to pass; the
+repository's CI workflow (`.github/workflows/ci.yml`) builds and runs it on
+Linux and macOS.
 
 ## Step 2 — A global Moon diurnal run (thermal, CPU)
 
@@ -53,8 +54,8 @@ The quickstart config: one lunation on a 1280-face icosphere.
 ```
 
 Expected: seconds-to-minutes of wall time; `output/quickstart_moon_diurnal/`
-with `statistics/*.bin` per-face extremes — equatorial noon Tmax ≈ 388 K,
-night Tmin ≈ 92 K (verified values and how to read the binaries:
+with `statistics/*.bin` per-face extremes — equatorial noon Tmax ≈ 385 K,
+median night Tmin ≈ 93 K (verified values and how to read the binaries:
 [docs/tutorials/02_lunar_diurnal_icosphere.md](docs/tutorials/02_lunar_diurnal_icosphere.md)
 and [docs/tutorials/06_interpreting_outputs.md](docs/tutorials/06_interpreting_outputs.md)).
 
