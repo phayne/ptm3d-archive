@@ -92,12 +92,12 @@ from:
 
 The two sum to the total indirect flux used by the thermal solve. Their ratio
 is diagnostic: scattered sunlight matters near sunlit walls at noon, thermal
-IR dominates in deep shadow and at night. In the tutorial-04 run the shadowed
-faces peak at a median 2.8 W/m² indirect solar but 23.9 W/m² indirect IR —
-the warm rim's thermal emission, not scattered sunlight, is what heats this
-crater's floor. (Those two numbers were measured on 2026-07-29 and could **not**
-be re-measured on v1.0.3, because the coupled run aborts — see the status note
-at the top of [04_crater_radiosity.md](04_crater_radiosity.md).)
+IR dominates in deep shadow and at night. In the tutorial-04 coupled run the
+shadowed faces peak at a median **3.3 W/m² indirect solar** but **28.6 W/m²
+indirect IR** (measured 2026-08-05 over the 1,422-face shadowed set defined in
+[04_crater_radiosity.md](04_crater_radiosity.md), from
+`statistics/indirect_{solar,ir}_max.bin`) — the warm rim's thermal emission,
+not scattered sunlight, is what heats this crater's floor.
 
 ## Per-timestep series
 

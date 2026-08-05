@@ -71,16 +71,17 @@ the coupled run, then compare crater-floor temperatures:
 ./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
 ```
 
-Expected: the coupled run computes (and saves for reuse) the face-to-face view
-factors, the radiation–temperature iteration converges, and shadowed floor
-faces come out warmer than the control — walkthrough and numbers in
+Expected (measured 2026-08-05, CPU-only): 7.8 s for the control and 14.1 s for
+the coupled run including the view-factor build. The coupled run computes and
+saves the face-to-face view factors (36,278,242 bytes, reloaded by later runs),
+the radiation–temperature iteration converges — 4 iterations, on the
+max-temperature criterion at 0.20 K — and the 1,422 shadowed faces warm from a
+mean T_avg of 66.3 K to 108.3 K, while the median face on the mesh moves 0.00 K.
+Walkthrough, the full table and the shadowed-set definition:
 [docs/tutorials/04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md).
 
-> **On v1.0.3 the second command does not complete** (`FATAL: ... no
-> post-equilibration T(z) hand-off`, exit 1). The control run is unaffected, and
-> so is everything in steps 1 and 2. Read the status note in
-> [04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md) before you run
-> it, and use step 1 + step 2 to validate your install.
+> On the `v1.0.3` tag exactly, the coupled run aborts (`FATAL: ... no
+> post-equilibration T(z) hand-off`, exit 1); fixed after the tag (PTM-94).
 
 ## What you exercised
 
