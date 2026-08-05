@@ -497,6 +497,19 @@ private:
     double primary_radius_ = constants::JUPITER_RADIUS;  // Default, updated when body changes
     bool has_primary_body_ = true;  // True for satellites (Europa→Jupiter), false for heliocentric
 
+    // PTM-44 finite-disk visibility memo. Visibility depends only on the mesh
+    // and the primary's position (NOT on the Sun), and calculatePrimaryIRBatch
+    // and calculatePrimaryReflectedBatch are always called back to back with
+    // the same arguments, so one evaluation serves both. Both call sites are
+    // outside every OpenMP region -> no lock. Key: the two vector data()
+    // pointers, the face count and the primary position, all matched exactly.
+    std::vector<double> primary_vis_mean_cos_;   // <cos theta> over the disk
+    std::vector<double> primary_vis_dist_km_;    // face -> primary centre, km
+    const void* primary_vis_key_centers_ = nullptr;
+    const void* primary_vis_key_normals_ = nullptr;
+    std::array<double, 3> primary_vis_key_pos_ = {0.0, 0.0, 0.0};
+    size_t primary_vis_key_n_ = static_cast<size_t>(-1);
+
     // Generic body / Keplerian propagation support
     bool use_keplerian_ = false;
     std::unique_ptr<orbital::KeplerianPropagator> keplerian_propagator_;
@@ -535,16 +548,26 @@ private:
     
     // Illumination physics calculations
 
+    // PTM-44: <cos theta> over the primary's finite disk, horizon-clipped and
+    // terrain-weighted. Results in primary_vis_mean_cos_ / primary_vis_dist_km_.
+    void updatePrimaryDiskVisibility(
+        const std::vector<std::array<double, 3>>& face_centers,
+        const std::vector<std::array<double, 3>>& face_normals,
+        const std::array<double, 3>& primary_position);
+
+    // Both take mean_cos from updatePrimaryDiskVisibility in place of the old
+    // dot(face_normal, primary_direction); the two agree exactly for a fully
+    // visible disk.
     double calculatePrimaryHeating(
-        const std::array<double, 3>& face_normal,
-        const std::array<double, 3>& primary_direction,
+        double mean_cos,
         double primary_distance);
 
     double calculatePrimaryReflectedLight(
-        const std::array<double, 3>& face_normal,
+        double mean_cos,
         const std::array<double, 3>& primary_direction,
         const std::array<double, 3>& sun_position,
-        const std::array<double, 3>& primary_position);
+        const std::array<double, 3>& primary_position,
+        double primary_distance);
 
     double calculateSolarIlluminationWithFiniteDisk(
         const std::array<double, 3>& face_center,
