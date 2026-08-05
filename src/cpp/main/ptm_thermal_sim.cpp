@@ -11751,6 +11751,17 @@ int main(int argc, char** argv) {
     // empty for rad-off runs (never allocated).
     std::vector<float> rad_post_eq_T;
 
+    // TRUE only after the whole-mesh solve that produced `surface_temps` was
+    // runThermalModelsForAllFaces_GPU_Persistent WITH rad coupling on — i.e.
+    // the one and only code path that fills `rad_post_eq_T`. Set at the call
+    // sites below, next to the `&rad_post_eq_T` argument itself, so the flag
+    // cannot drift from the mechanism it records.
+    //
+    // The PTM-78 seed tripwire is gated on THIS, not on `radiation.enabled`
+    // (a user-set flag) and not on `want_post_coupling_state` (a GPU coupled
+    // run without a checkpoint still needs the guard). BUGS.md PTM-94.
+    bool rad_post_eq_T_expected = false;
+
 
     if (run_thermal_mesh) {
         // Configure OpenMP and setup thermal model
@@ -12378,6 +12389,9 @@ int main(int argc, char** argv) {
                     sim_config.thermal.gpu_inter_batch_pause_ms,
                     eq_indirect_vec
                 );
+                // This solver — and only this solver — fills the post-eq T(z)
+                // hand-off (argument above). Record it for the PTM-78 tripwire.
+                rad_post_eq_T_expected = enable_radiation_exchange;
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
@@ -12490,6 +12504,9 @@ int main(int argc, char** argv) {
                     sim_config.thermal.gpu_inter_batch_pause_ms,
                     eq_indirect_vec
                 );
+                // This solver — and only this solver — fills the post-eq T(z)
+                // hand-off (argument above). Record it for the PTM-78 tripwire.
+                rad_post_eq_T_expected = enable_radiation_exchange;
             } else if (use_simd_batch) {
                 const std::vector<double>* face_H_ptr_b =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
@@ -12817,20 +12834,33 @@ int main(int argc, char** argv) {
                 std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
 
                 // ---- Re-thermal SEED tripwire (BUGS.md PTM-78) --------------
-                // Every coupling iteration re-integrates the selected faces
+                // Every GPU coupling iteration re-integrates the selected faces
                 // from rad_post_eq_T. If that hand-off is empty or all-zero the
                 // whole coupled field is garbage, and it used to happen in
                 // SILENCE on every warm-start chunk. Refuse to produce results
                 // rather than write a plausible-looking wrong answer.
-                if (rad_post_eq_T.empty()) {
-                    std::cerr << "\nFATAL: radiation coupling is enabled but the thermal solver"
-                                 " returned no post-equilibration T(z) hand-off.\n"
-                              << "  Every coupling iteration would re-thermal from an undefined"
-                                 " state (BUGS.md PTM-78).\n"
-                              << "  Refusing to write results." << std::endl;
-                    return 1;
-                }
-                {
+                //
+                // GATED ON THE MECHANISM, not on radiation.enabled (BUGS.md
+                // PTM-94). The hand-off exists on exactly one path: it is
+                // written by runThermalModelsForAllFaces_GPU_Persistent and
+                // read by runThermalForSelectedFaces_GPU. The CPU whole-mesh
+                // solvers (runThermalModelsForAllFacesBatchSoA,
+                // runThermalModelsForAllFaces) never write it, and the CPU
+                // re-thermal (runThermalModelWithMatchedTimes) takes no seed
+                // argument at all — it re-equilibrates each selected face from
+                // scratch. Ungated, this guard therefore aborted EVERY CPU
+                // radiation-coupled run while protecting nothing on that path.
+                // It keeps its full force on the GPU path, which is where
+                // PTM-78 actually corrupted results.
+                if (rad_post_eq_T_expected) {
+                    if (rad_post_eq_T.empty()) {
+                        std::cerr << "\nFATAL: radiation coupling is enabled but the thermal solver"
+                                     " returned no post-equilibration T(z) hand-off.\n"
+                                  << "  Every coupling iteration would re-thermal from an undefined"
+                                     " state (BUGS.md PTM-78).\n"
+                                  << "  Refusing to write results." << std::endl;
+                        return 1;
+                    }
                     const size_t nl_seed = rad_post_eq_T.size() / std::max<size_t>(1, num_faces);
                     size_t n_cold_seed = 0;
                     for (size_t f = 0; f < num_faces; ++f) {
@@ -12847,6 +12877,14 @@ int main(int argc, char** argv) {
                     }
                     std::cout << "  Re-thermal seed: OK (" << num_faces
                               << " faces, no dead columns)" << std::endl;
+                } else {
+                    // Not an error — a different, self-contained integration.
+                    // Say it out loud so nobody compares a CPU coupled field to
+                    // a GPU one and calls the difference physics (BUGS.md PTM-94).
+                    std::cerr << "  [Re-thermal] WARNING: CPU thermal solver — each coupling"
+                                 " iteration re-equilibrates the selected faces from scratch"
+                                 " instead of resuming the GPU path's saved post-equilibration"
+                                 " temperatures, so CPU and GPU coupled results can differ.\n";
                 }
 
                 // Post-coupling end-of-window T(z), assembled across coupling
@@ -13403,6 +13441,20 @@ int main(int argc, char** argv) {
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
                     if (use_gpu_thermal_rerun && faces_to_rerun.size() >= 100) {
+                        // The seed guard, restated at the point of consumption:
+                        // the GPU re-thermal is the ONLY consumer of the
+                        // hand-off, so it must never be entered without one.
+                        // Unreachable today (the same use_gpu_thermal property
+                        // picks both solvers), but it is what keeps the gate
+                        // above honest if a future CPU->GPU re-thermal
+                        // escalation is added (BUGS.md PTM-78, PTM-94).
+                        if (!rad_post_eq_T_expected || rad_post_eq_T.empty()) {
+                            std::cerr << "\nFATAL: the GPU re-thermal was selected but no solver"
+                                         " produced the post-equilibration T(z) hand-off it seeds"
+                                         " from (BUGS.md PTM-78, PTM-94).\n"
+                                      << "  Refusing to write results." << std::endl;
+                            return 1;
+                        }
                         std::cout << "  Using GPU thermal solver..." << std::endl;
                         bool gpu_success = runThermalForSelectedFaces_GPU(
                             mesh,
