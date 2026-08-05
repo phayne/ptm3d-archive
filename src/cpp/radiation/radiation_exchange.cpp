@@ -1344,6 +1344,14 @@ void RadiositySolver::solveTwoBandJacobiFused(
     }
     bool conv_ir = false, conv_vis = false;
     int it_ir = 0, it_vis = 0;
+    // BUGS.md PTM-102: this path never wrote converged_ / last_residual_, so
+    // didConverge() and getLastResidual() reported whatever the previous solve (or
+    // the constructor) left behind. test_two_band_rownorm printed "JACOBI FAILED
+    // (unexpected)" on all 4 configs while the numbers were in fact correct to
+    // 1e-10, and production stats_.solver_residual was stale for the DEFAULT fused
+    // CPU two-band path. Track the per-band relative residual and publish both.
+    double rel_ir  = std::numeric_limits<double>::max();
+    double rel_vis = std::numeric_limits<double>::max();
     const double tol = config_.convergence_tolerance;
     for (int iter = 0; iter < config_.max_iterations && !(conv_ir && conv_vis); ++iter) {
         if (!conv_ir && !conv_vis) {
@@ -1364,6 +1372,7 @@ void RadiositySolver::solveTwoBandJacobiFused(
             std::swap(r_ir, rn_ir);
             it_ir = iter + 1;
             const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            rel_ir = rel;
             if (rel < tol) conv_ir = true;
         }
         if (!conv_vis) {
@@ -1377,6 +1386,7 @@ void RadiositySolver::solveTwoBandJacobiFused(
             std::swap(r_vis, rn_vis);
             it_vis = iter + 1;
             const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            rel_vis = rel;
             if (rel < tol) conv_vis = true;
         }
     }
@@ -1386,6 +1396,14 @@ void RadiositySolver::solveTwoBandJacobiFused(
     last_iterations_ir_  = it_ir;
     last_iterations_vis_ = it_vis;
     last_iterations_     = it_vis;  // aggregate getter: last band solved, as before
+    // PTM-102: a TWO-band solve has converged only when BOTH bands have, and its
+    // residual is the worse of the two. This is deliberately STRICTER than the
+    // "two separate solveJacobi calls" aggregate it otherwise mirrors -- that one
+    // would report only the visible band (the last call), hiding an unconverged IR
+    // band entirely. Diagnostic only: nothing branches on these (consumers are
+    // test_two_band_rownorm and stats_.solver_residual).
+    converged_     = conv_ir && conv_vis;
+    last_residual_ = std::max(rel_ir, rel_vis);
     B_ir  = std::move(r_ir);
     B_vis = std::move(r_vis);
 }
@@ -1993,7 +2011,9 @@ bool RadiationExchangeManager::prepare(
                   << " > 0: the Smith beamed-emission receiver and emitter sets are"
                      " selected from shadow fractions measured over THIS window, so a"
                      " beaming run is still chunk-decomposition dependent. The PTM-98"
-                     " fix covers the radiation-exchange set only." << std::endl;
+                     " fix covers the radiation-exchange set only. REMEDY: run beaming"
+                     " single-shot (one window, no chunking), or accept and state the"
+                     " chunk dependence of the result." << std::endl;
     }
 
     if (classification_.exchange_faces == 0) {
