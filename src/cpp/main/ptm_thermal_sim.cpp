@@ -1622,7 +1622,7 @@ std::vector<double> calculateAbsorbedFlux(
                       << "\") carries albedo " << planet->albedo
                       << ", which DISAGREES with the operative "
                       << default_visible_albedo
-                      << " used to build face_albedos. See BUGS.md PTM-55."
+                      << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md (PTM-55)."
                       << std::endl;
             std::cerr.flags(f);
             std::cerr.precision(pr);
@@ -2294,7 +2294,7 @@ bool runThermalModel(
         Eigen::MatrixXd flux_arr(flux_values.size(), 2);
         for (size_t i = 0; i < flux_values.size(); i++) {
             flux_arr(i, 0) = times[i];           // Time (seconds)
-            flux_arr(i, 1) = flux_values[i];      // Flux (W/mÂ²)
+            flux_arr(i, 1) = flux_values[i];      // Flux (W/m^2)
         }
         
         // Use vector of times instead of integer days parameter
@@ -4281,7 +4281,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << default_visible_albedo
                       << ". The operative value is what the flux uses; the "
                          "solver-scope Planet's albedo is used for nothing else. "
-                         "See BUGS.md PTM-55." << std::endl;
+                         "See docs/KNOWN_LIMITATIONS.md (PTM-55)." << std::endl;
             std::cerr.flags(f);
             std::cerr.precision(pr);
         }
@@ -7498,9 +7498,9 @@ void showUsage(const char* programName) {
     std::cout << "  --thermal-m N              Layers in upper skin depth (default: 10)\n";
     std::cout << "  --thermal-n N              Layer growth factor (default: 15)\n";
     std::cout << "  --thermal-b N              Skin depths to bottom layer (default: 8)\n";
-    std::cout << "  --geothermal-heat-flow Q   Geothermal heat flow [W/m²] (overrides planet default)\n";
+    std::cout << "  --geothermal-heat-flow Q   Geothermal heat flow [W/m^2] (overrides planet default)\n";
     std::cout << "  --heat-flow-mask FILE      Face index file for elevated Qb (one index per line)\n";
-    std::cout << "  --heat-flow-mask-value Q   Qb value [W/m²] for masked faces (default: 1.0)\n\n";
+    std::cout << "  --heat-flow-mask-value Q   Qb value [W/m^2] for masked faces (default: 1.0)\n\n";
 
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  Radiation Exchange Options\n";
@@ -7581,12 +7581,12 @@ std::string createDefaultLocationsFile(const std::string& output_dir) {
         
         // Format: latitude longitude location_name (space-separated)
         file << "# lat lon name\n";
-        file << "0.0 0.0 Sub_Jupiter\n";      // Equator at 0Â° longitude (sub-Jupiter point)
-        file << "0.0 90.0 Trailing\n";        // Equator at 90Â°E (trailing hemisphere)
-        file << "0.0 180.0 Anti_Jupiter\n";   // Equator at 180Â° (anti-Jupiter point)
-        file << "0.0 270.0 Leading\n";        // Equator at 270Â°E (leading hemisphere)
-        file << "45.0 0.0 North_45\n";        // 45Â°N at 0Â° longitude
-        file << "-45.0 0.0 South_45\n";       // 45Â°S at 0Â° longitude
+        file << "0.0 0.0 Sub_Jupiter\n";      // Equator at 0 deg longitude (sub-Jupiter point)
+        file << "0.0 90.0 Trailing\n";        // Equator at 90 deg E (trailing hemisphere)
+        file << "0.0 180.0 Anti_Jupiter\n";   // Equator at 180 deg (anti-Jupiter point)
+        file << "0.0 270.0 Leading\n";        // Equator at 270 deg E (leading hemisphere)
+        file << "45.0 0.0 North_45\n";        // 45 deg N at 0 deg longitude
+        file << "-45.0 0.0 South_45\n";       // 45 deg S at 0 deg longitude
         file << "85.0 0.0 North_Pole\n";      // Near North Pole
         file << "-85.0 0.0 South_Pole\n";     // Near South Pole
         
@@ -9438,7 +9438,7 @@ int main(int argc, char** argv) {
                       << "  Refusing to run. Continuing on built-in defaults would "
                          "silently replace the body, mesh, timesteps, thermophysical "
                          "properties and output directory you configured.\n"
-                      << "  See BUGS.md PTM-66." << std::endl;
+                      << "  See docs/KNOWN_LIMITATIONS.md (PTM-66)." << std::endl;
             return 1;
         }
     }
@@ -9875,13 +9875,13 @@ int main(int argc, char** argv) {
             eq_samples_per_diurnal_cli = std::stod(argv[++i]);
         } else if (arg == "--geothermal-heat-flow" && i + 1 < argc) {
             geothermal_heat_flow = std::stod(argv[++i]);
-            std::cout << "Setting geothermal heat flow to: " << geothermal_heat_flow << " W/m²" << std::endl;
+            std::cout << "Setting geothermal heat flow to: " << geothermal_heat_flow << " W/m^2" << std::endl;
         } else if (arg == "--heat-flow-mask" && i + 1 < argc) {
             sim_config.thermal.heat_flow_mask_file = argv[++i];
             std::cout << "Heat flow mask file: " << sim_config.thermal.heat_flow_mask_file << std::endl;
         } else if (arg == "--heat-flow-mask-value" && i + 1 < argc) {
             sim_config.thermal.heat_flow_mask_value = std::stod(argv[++i]);
-            std::cout << "Heat flow mask value: " << sim_config.thermal.heat_flow_mask_value << " W/m²" << std::endl;
+            std::cout << "Heat flow mask value: " << sim_config.thermal.heat_flow_mask_value << " W/m^2" << std::endl;
         } else if (arg == "--albedo-map" && i + 1 < argc) {
             albedo_map_file = argv[++i];
             config.setProperty("albedo_map", albedo_map_file);
@@ -10107,10 +10107,59 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // GPU-availability gate, AT CONFIG TIME.
+    //
+    // The compiled-in check already existed, but only inside the GPU thermal
+    // entry point -- i.e. AFTER the whole illumination pass. A CPU-only build
+    // handed a `use_gpu: true` config therefore ray-traced the entire run
+    // (minutes to hours on a production mesh) and only then printed
+    // "[GPU Thermal] Error: OpenCL support not compiled in" and gave up, having
+    // written nothing. Measured on the clean-room CPU-only build: full
+    // illumination for a 1280-face ico3, then the error. 47 of the 55 configs
+    // under configs/ set use_gpu: true, so this is the default way a new user
+    // meets a CPU-only build.
+    //
+    // The downstream check in the GPU entry point is deliberately LEFT IN PLACE
+    // (it guards paths that can enable the GPU after this point); this one only
+    // moves the common failure forward to where it costs nothing.
+    {
+        const bool want_gpu_thermal = config.getPropertyBool("use_gpu_thermal", false);
+        const bool want_gpu_illum   = sim_config.illumination.use_gpu;
+        const bool want_gpu_rad     = rad_use_gpu;
+#ifndef PTM_GPU_OPENCL
+        if (want_gpu_thermal) {
+            std::cerr << "FATAL [gpu]: this binary was built WITHOUT GPU support, but the run "
+                         "requests the GPU thermal solver.\n"
+                         "  Refusing to run: the illumination pass would complete and the "
+                         "thermal stage would then fail, wasting the whole run.\n"
+                         "  Either set `thermal.use_gpu: false` in the config (or drop "
+                         "--use-gpu-thermal) to use the CPU solver, which is correct and on "
+                         "many hosts faster,\n"
+                         "  or rebuild with -DPTM_ENABLE_GPU=ON -DGPU_BACKEND=OPENCL."
+                      << std::endl;
+            return 1;
+        }
+        if (want_gpu_illum || want_gpu_rad) {
+            // Not fatal: both of these already fall back to CPU. Say so instead
+            // of falling back in silence.
+            std::cerr << "[gpu] WARNING: this binary was built WITHOUT GPU support; "
+                      << (want_gpu_illum ? "illumination.use_gpu " : "")
+                      << (want_gpu_illum && want_gpu_rad ? "and " : "")
+                      << (want_gpu_rad ? "radiation.use_gpu " : "")
+                      << "will be IGNORED and the CPU path used. Set the flag(s) false to "
+                         "silence this, or rebuild with -DPTM_ENABLE_GPU=ON "
+                         "-DGPU_BACKEND=OPENCL." << std::endl;
+        }
+#else
+        (void)want_gpu_thermal; (void)want_gpu_illum; (void)want_gpu_rad;
+#endif
+    }
+
     // Override planet geothermal heat flow if specified in config or command line
     if (geothermal_heat_flow > 0) {
         planet.Qb = geothermal_heat_flow;
-        std::cout << "Overriding planet geothermal heat flow: " << planet.Qb << " W/m²" << std::endl;
+        std::cout << "Overriding planet geothermal heat flow: " << planet.Qb << " W/m^2" << std::endl;
     }
 
     // ========================================================================
@@ -10304,7 +10353,7 @@ int main(int argc, char** argv) {
         std::cout << "  Semi-major axis: " << generic_body.orbit.semi_major_axis_au << " AU" << std::endl;
         std::cout << "  Eccentricity: " << generic_body.orbit.eccentricity << std::endl;
         std::cout << "  Spin period: " << generic_body.spin.spin_period_s / 3600.0 << " hours" << std::endl;
-        std::cout << "  Solar constant: " << generic_body.thermo.S << " W/m²" << std::endl;
+        std::cout << "  Solar constant: " << generic_body.thermo.S << " W/m^2" << std::endl;
         std::cout << "  Synodic day: " << generic_body.thermo.day / 3600.0 << " hours" << std::endl;
         std::cout << "  Albedo: " << generic_body.thermo.albedo << std::endl;
         std::cout << "  Emissivity: " << generic_body.thermo.emissivity << std::endl;
@@ -10646,8 +10695,9 @@ int main(int argc, char** argv) {
                          "radius via the generic-body shape block.\n"
                       << "  mesh.scale_factor will NOT fix this: it scales the vertices "
                          "only and leaves face centers/areas/normals unscaled, which is "
-                         "itself a fatal inconsistency here (BUGS.md PTM-65).\n"
-                      << "  See BUGS.md PTM-37 and PTM-36." << std::endl;
+                         "itself a fatal inconsistency here (PTM-65).\n"
+                      << "  See docs/KNOWN_LIMITATIONS.md (PTM-37, PTM-36, PTM-65)."
+                      << std::endl;
             return 1;
         }
     }
@@ -11440,7 +11490,7 @@ int main(int argc, char** argv) {
     } else if (!illumination_values.empty()) {
         std::cout << "  Non-zero illumination values: " << non_zero_illumination << " out of " 
                 << illumination_values.size() << std::endl;
-        std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/mÂ²" << std::endl;
+        std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/m^2" << std::endl;
     }
 
     // DON'T filter illumination yet - run thermal model with full dataset first
@@ -12025,7 +12075,7 @@ int main(int argc, char** argv) {
         } else if (!illumination_values.empty()) {
             std::cout << "  Non-zero illumination values: " << non_zero_illumination << " out of " 
                     << illumination_values.size() << std::endl;
-            std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/mÂ²" << std::endl;
+            std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/m^2" << std::endl;
         }
         
         // Execute thermal path
@@ -14289,15 +14339,15 @@ int main(int argc, char** argv) {
 
     std::cout << "Results:" << std::endl;
     std::cout << "  Average total flux: " << std::fixed << std::setprecision(9) 
-            << avg_flux << " W/mÂ²" << std::endl;
-    std::cout << "    - Direct solar: " << avg_direct << " W/mÂ²" << std::endl;
-    std::cout << "    - Primary reflected: " << avg_reflected << " W/mÂ²" << std::endl;
-    std::cout << "    - Primary IR: " << avg_ir << " W/mÂ²" << std::endl;
-    std::cout << "  Maximum total flux: " << max_flux << " W/mÂ²" << std::endl;
-    std::cout << "    - Direct solar: " << max_direct << " W/mÂ²" << std::endl;
-    std::cout << "    - Primary reflected: " << max_reflected << " W/mÂ²" << std::endl;
-    std::cout << "    - Primary IR: " << max_ir << " W/mÂ²" << std::endl;
-    std::cout << "  Minimum flux (non-zero): " << min_flux << " W/mÂ²" << std::endl;
+            << avg_flux << " W/m^2" << std::endl;
+    std::cout << "    - Direct solar: " << avg_direct << " W/m^2" << std::endl;
+    std::cout << "    - Primary reflected: " << avg_reflected << " W/m^2" << std::endl;
+    std::cout << "    - Primary IR: " << avg_ir << " W/m^2" << std::endl;
+    std::cout << "  Maximum total flux: " << max_flux << " W/m^2" << std::endl;
+    std::cout << "    - Direct solar: " << max_direct << " W/m^2" << std::endl;
+    std::cout << "    - Primary reflected: " << max_reflected << " W/m^2" << std::endl;
+    std::cout << "    - Primary IR: " << max_ir << " W/m^2" << std::endl;
+    std::cout << "  Minimum flux (non-zero): " << min_flux << " W/m^2" << std::endl;
     std::cout << "  Output written to " << output_dir << std::endl;
 
 

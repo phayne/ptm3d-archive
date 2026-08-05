@@ -51,7 +51,33 @@ functionality are summarized in this file; no lookup elsewhere is required to us
   from the log line `[Thermo override] applied at solver: …`, which reports the value the **solver**
   used; the earlier `Property override (requested): …` line reports only what was asked for.
   Conductivity/emissivity/constant-TI results produced on built-in bodies before this fix are not
-  what their configs claim.
+  what their configs claim. (PTM-53)
+
+- **The albedo the log reports is the albedo the flux used — and a disagreement is now warned.**
+  The GPU thermal path used to rebuild its own `Planet` from the body name, which reinstated the
+  body default (Moon 0.1) while the main-scope banner still announced the configured value (e.g.
+  0.12). The *physics* always used the per-face albedo array, so the banner — not the result — was
+  wrong. If the two scopes ever disagree again, the run now prints
+  `[albedo] WARNING: … DISAGREES with the operative …` naming both numbers. Treat that line as a
+  configuration error to resolve, not as cosmetic. (PTM-55)
+
+## Mesh geometry and units
+
+- **PTM3D meshes are not all in the same length unit, and the mesh file carries no unit.**
+  Global icosphere meshes are generated in **kilometers**; DEM/site meshes are imported in
+  **meters**. The engine infers the unit from the face-center magnitudes, states its conclusion at
+  startup, and — as of v1.0.3 — **refuses to run** on the four cases where the inference is
+  ambiguous rather than guessing (a wrong guess is a 1000× error in every SPICE-derived length,
+  which is how a planetary-shadow radius once silently disabled every eclipse). If you hit that
+  FATAL, rescale the mesh *file* so its face centers are unambiguously meters or kilometers, or
+  supply the body radius through the generic-body shape block. (PTM-37, PTM-36)
+
+- **`mesh.scale_factor` is not fixed — it is only no longer silent.** It scales the vertices and
+  leaves `face_centers`, `face_areas` and `face_normals` at the loader's values, so the mesh ends
+  up internally inconsistent (face centers are no longer the averages of their own vertices) while
+  the log says "Applied scale factor". The mesh-units guard above refuses such a mesh and names it,
+  but the scaling itself is still wrong. No shipped config sets it; rescale the mesh file instead.
+  (PTM-65)
 
 ## Illumination
 
@@ -64,7 +90,22 @@ functionality are summarized in this file; no lookup elsewhere is required to us
   interior mesh holes and briefly light floor faces. The interior-hole seal
   (`PTM_ILLUM_SEAL_HOLES=1`) closes watertight interior hole loops, but **open and non-manifold
   hole components are left unsealed**. Ensure meshes are watertight for micro-relief floor studies;
-  the seal is a mitigation, not a guarantee.
+  the seal is a mitigation, not a guarantee. (PTM-18)
+
+- **The shadow ray starts a fixed ~1 cm off the surface, which can hop a millimeter-scale
+  occluder.** On meshes whose relief is finer than that offset — polar micro-relief, sub-meter
+  crater floors — the ray can step over a rim that genuinely blocks the Sun and light a face that
+  should be in permanent shadow. The default is unchanged (so results stay comparable), and the
+  mitigations are **opt-in** environment knobs: `PTM_ILLUM_RISE_EPS=1` with `PTM_ILLUM_RISE_HABS=0`
+  replaces the metric offset with an out-of-plane-rise self-relief test, and
+  `PTM_ILLUM_TRUE_NORMALS=1` stops the radial-up normal flip fabricating sunlit overhangs. See
+  `docs/ENVIRONMENT.md` for the full list and the recommended-ON tags. Relevant to cold-trap floor
+  temperatures on fine meshes; negligible on global icospheres. (PTM-13)
+
+- **An unrecognized primary body is refused, not defaulted.** The primary-body reflection/IR paths
+  only know EARTH, JUPITER, SATURN and MARS. A name outside that set used to take one of three
+  different silent fallbacks depending on which code path ran. The run now warns once, naming the
+  body and the consequence, instead of quietly emitting a made-up primary IR flux. (PTM-45)
 
 ## View factors / radiation
 
@@ -102,7 +143,26 @@ functionality are summarized in this file; no lookup elsewhere is required to us
 - **`statistics/*.bin` files begin with a 4-byte header.** The layout is
   `[int32 n_faces][float32 × n_faces]`. A custom reader must consume the leading `int32` (the
   shipped `scripts/ptm_qa.py` reader does); reading the file as raw `float32` shifts every face by
-  one index and mislabels the first value.
+  one index and mislabels the first value. (PTM-06)
+
+## Data files and maps
+
+- **The shipped lunar Bond-albedo FITS was registered 180° off in longitude, and older copies
+  still are.** `data/albedo_maps/Moon-BondAlbedo.fits` declared `CRVAL1=0` (column 0 = IAU_MOON
+  longitude 0) while its raster was actually laid out −180…180-centered, so the dark nearside maria
+  sampled onto the bright farside highlands. This is a **data** defect, not a reader defect — the
+  Europa FITS uses the same loader and the same convention and registers correctly, so patching the
+  loader would break Europa. The distributed archive now carries the corrected map; a copy fetched
+  before that revision must be re-fetched, or re-registered in place with
+  `scripts/fix_moon_albedo_lon_registration.py` (requires `astropy`; idempotent — it refuses to roll
+  a map that already passes the maria-dark test). Lunar topography was always correct. (PTM-34)
+
+- **Per-face albedo `.bin` maps must be regenerated from a corrected FITS.** The
+  `Moon_Albedo_res*.bin` files were sampled from the old FITS and additionally sampled −latitude in
+  the generator, so they carry both errors; the camera path reads them directly. Regenerate with
+  `build/bin/albedo_map_generator <fits> data/albedo_maps 3 9`. The *thermal* loader collapses the
+  `.bin` to a uniform mean, so thermal runs were not affected by the `.bin` error; camera renders
+  were. Europa's bins were already correct and are unchanged. (PTM-35)
 
 ## Physical constants
 
@@ -129,6 +189,13 @@ functionality are summarized in this file; no lookup elsewhere is required to us
 - **The A3GT batch tools depend on an external mesh helper.** `a3gt_v2_orchestrator.py` and
   `run_a3gt_batch.py` expect a `dtm_to_ply_delaunay` binary on a fixed path; provide it (or adjust
   the path) before running an A3GT batch.
+
+- **Occluder rings built from raw LOLA PDS `.IMG` need an explicit elevation scale.** Raw polar
+  `.IMG` products store scaled integers (`SCALING_FACTOR = 0.5 m/DN`) that GDAL returns *unscaled*,
+  so a ring built without `--elev-scale 0.5` comes out exactly 2× too tall and over-shadows grazing
+  sun. `scripts/build_lola_ring.py` now aborts rather than assuming 1.0 when the raster is an
+  integer type and carries no scale metadata; projected Float32 `.tif` sources are unaffected
+  (scale 1.0, byte-identical output). Background: `docs/ptm21-ring-scale-fix.md`. (PTM-21)
 
 ## GPU backends
 

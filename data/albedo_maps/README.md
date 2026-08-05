@@ -43,7 +43,9 @@ revision:
   Europa FITS is correct, so the roll is applied to the lunar file only — the
   shared FITS loader is **not** patched. Producer:
   `scripts/fix_moon_albedo_lon_registration.py`; verify with
-  `scripts/verify_moon_albedo_registration.py`.
+  `scripts/verify_moon_albedo_registration.py`. **Both scripts need `numpy` and
+  `astropy`** (`python3 -m pip install -r scripts/requirements.txt`); neither is
+  a build or runtime dependency of the engine.
 
 - **PTM-35 — per-face generator latitude.** `albedo_map_generator` previously
   sampled each face at −latitude, flipping the baked `Moon_Albedo_res*.bin`
@@ -66,7 +68,7 @@ fixed generator reproduces them); the Europa maps are unchanged.
 The distributed `albedo_maps.tar.gz` in this revision carries the corrected Moon
 FITS + regenerated Moon bins (Europa untouched); `data_manifest.json`'s sha256 and
 size are updated to match. If you have a local copy fetched before this revision,
-re-fetch. See `BUGS.md` PTM-34 / PTM-35.
+re-fetch. See `docs/KNOWN_LIMITATIONS.md` (PTM-34 / PTM-35).
 
 ## License
 

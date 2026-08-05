@@ -192,7 +192,7 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
         line << (i ? ", " : "") << dead[i];
     line << " -- editing them changes no result. Named properties are honored only under "
             "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
-            "See BUGS.md PTM-67.";
+            "See docs/KNOWN_LIMITATIONS.md (PTM-67).";
     std::cerr << line.str() << std::endl;
 }
 } // namespace

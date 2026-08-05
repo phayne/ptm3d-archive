@@ -92,7 +92,7 @@ void printViewshedSummary(const ViewshedResult& result,
                   << thermal.temperature_max << " K" << std::endl;
         std::cout << "  Mean temperature: " << thermal.temperature_mean << " K" << std::endl;
         std::cout << "  Mean solar flux: " << std::setprecision(2) 
-                  << thermal.solar_flux_mean << " W/m²" << std::endl;
+                  << thermal.solar_flux_mean << " W/m^2" << std::endl;
     }
     
     std::cout << "\nComputation time: " << std::setprecision(2) 

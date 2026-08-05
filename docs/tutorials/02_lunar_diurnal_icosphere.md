@@ -21,7 +21,8 @@ the entire Moon on a level-3 icosphere (1280 faces, ~480 km face pitch):
 ## Run it
 
 ```bash
-python3 scripts/fetch_kernels.py     # once (~45 MB from NAIF)
+python3 scripts/fetch_kernels.py --bodies moon   # once, ~44 MB from NAIF
+# (the bare command also pulls the 1.1 GB Galilean ephemeris for europa.tm)
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 

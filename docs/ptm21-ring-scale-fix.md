@@ -2,7 +2,7 @@
 
 2026-07-22 (Ada). Fix + rebuild for the PTM-21 defect: `build_lola_ring.py` silently
 produced the fig8_hybrid ring `sunlit_ring_50_200.ply` with elevations **exactly 2×**
-LOLA truth (over-tall horizon, over-shadows grazing sun). See `BUGS.md` PTM-21 and
+LOLA truth (over-tall horizon, over-shadows grazing sun). See `KNOWN_LIMITATIONS.md` and
 `scripts/audit_ring_horizon.py`.
 
 ## Root cause

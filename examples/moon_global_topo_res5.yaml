@@ -33,9 +33,6 @@ thermal:
   geothermal_heat_flow: -1.0
 thermophysical:
   use_default_albedo: true
-  albedo: 0.12
-  use_default_emissivity: true
-  emissivity: 0.95
   incidence_angle_albedo: true
 radiation:
   enabled: false

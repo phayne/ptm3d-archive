@@ -4,13 +4,19 @@ PTM3D loads SPICE data from this directory (compiled in as `SPICE_KERNELS_DIR`,
 a CMake cache variable defaulting to `<repo>/data/kernels`).
 
 The repo ships only the small **metakernel templates** (`moon.tm`, `europa.tm`,
-`mercury.tm`). The binary kernels they reference (~45 MB for the Moon set) are
+`mercury.tm`). The binary kernels they reference (~44 MB for the Moon set) are
 **not** in git — fetch them from NASA NAIF with:
 
 ```bash
-python3 scripts/fetch_kernels.py                  # Moon + Mercury set (~45 MB)
-python3 scripts/fetch_kernels.py --bodies europa  # also jup365.bsp for Europa
+python3 scripts/fetch_kernels.py                  # default (auto): ~1.15 GB
+python3 scripts/fetch_kernels.py --bodies moon    # Moon + Mercury core, ~44 MB
+python3 scripts/fetch_kernels.py --bodies europa  # core + jup365.bsp (1.1 GB)
 ```
+
+The bare command defaults to `--bodies auto`, which also fetches whatever the
+metakernels in this directory require. `europa.tm` ships here, so the default
+pulls `jup365.bsp` (1.1 GB) as well — ~1.15 GB total. Pass `--bodies moon` if
+you only need the lunar/Mercury set.
 
 Expected layout after fetching:
 

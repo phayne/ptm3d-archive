@@ -109,7 +109,7 @@ inline void warnUnknownPrimaryOnce(const std::string& body,
     std::cerr << "[illumination] WARNING: primary body '" << body
               << "' is not one of EARTH / JUPITER / SATURN / MARS. " << context
               << ": " << consequence
-              << " (warned once; see BUGS.md PTM-45)." << std::endl;
+              << " (warned once; see docs/KNOWN_LIMITATIONS.md, PTM-45)." << std::endl;
 }
 
 // PTM-38: does the primary body overlap ANY part of the finite solar disk seen
@@ -583,7 +583,8 @@ bool IlluminationModel::initializeScene(
                 std::cout << "[IlluminationModel] WARNING: topological self-skip applies on the CPU "
                              "illumination path only; GPU ray tracing is active, so it will NOT engage. "
                              "Set illumination.use_gpu:false to apply it (or add the GPU mirror). The "
-                             "GPU batch shadow origin additionally uses eps_d=8x (see BUGS.md PTM-13).\n";
+                             "GPU batch shadow origin additionally uses eps_d=8x "
+                             "(see docs/KNOWN_LIMITATIONS.md, PTM-13).\n";
         }
 
         // PTM-13 rise-epsilon: build the per-core-face facet scale for the out-of-plane-rise
@@ -1582,7 +1583,8 @@ std::vector<std::array<int, 3>> IlluminationModel::buildInteriorHoleFill(
               << " interior hole(s) -> " << fills.size() << " shadow-only fill triangle(s); excluded "
               << n_skip_outer << " outer/spanning boundary component(s); skipped " << n_skip_open
               << " open/non-manifold boundary component(s) (NOT sealed -- a residual grazing-sun flash "
-                 "may persist there; see BUGS.md PTM-18). Default OFF -> byte-identical.\n";
+                 "may persist there; see docs/KNOWN_LIMITATIONS.md, PTM-18). Default OFF -> "
+                 "byte-identical.\n";
     return fills;
 }
 
@@ -3648,17 +3650,17 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     if (show_progress_) {
         std::cout << "Results:" << std::endl;
         std::cout << "  Average total flux: " << std::fixed << std::setprecision(9) 
-                  << avg_flux << " W/m²" << std::endl;
-        std::cout << "    - Direct solar: " << avg_direct << " W/m²" << std::endl;
-        std::cout << "    - Primary reflected: " << avg_reflected << " W/m²" << std::endl;
-        std::cout << "    - Primary IR: " << avg_ir << " W/m²" << std::endl;
-        std::cout << "  Maximum total flux: " << max_flux << " W/m²" << std::endl;
-        std::cout << "    - Direct solar: " << max_direct << " W/m²" << std::endl;
-        std::cout << "    - Primary reflected: " << max_reflected << " W/m²" << std::endl;
-        std::cout << "    - Primary IR: " << max_ir << " W/m²" << std::endl;
+                  << avg_flux << " W/m^2" << std::endl;
+        std::cout << "    - Direct solar: " << avg_direct << " W/m^2" << std::endl;
+        std::cout << "    - Primary reflected: " << avg_reflected << " W/m^2" << std::endl;
+        std::cout << "    - Primary IR: " << avg_ir << " W/m^2" << std::endl;
+        std::cout << "  Maximum total flux: " << max_flux << " W/m^2" << std::endl;
+        std::cout << "    - Direct solar: " << max_direct << " W/m^2" << std::endl;
+        std::cout << "    - Primary reflected: " << max_reflected << " W/m^2" << std::endl;
+        std::cout << "    - Primary IR: " << max_ir << " W/m^2" << std::endl;
         std::cout << "  Minimum flux (non-zero): " 
                   << ((min_flux < std::numeric_limits<double>::max()) ? min_flux : 0.0) 
-                  << " W/m²" << std::endl;
+                  << " W/m^2" << std::endl;
     }
     
     return true;

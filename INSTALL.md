@@ -99,9 +99,19 @@ are not kept in the repository — fetch them from NASA NAIF with the bundled Py
 (no extra Python packages required):
 
 ```bash
-python3 scripts/fetch_kernels.py                  # Moon + Mercury set (~45 MB)
-python3 scripts/fetch_kernels.py --bodies europa  # also jup365.bsp for Europa (large)
+python3 scripts/fetch_kernels.py                  # default (auto): ~1.15 GB — see note
+python3 scripts/fetch_kernels.py --bodies moon    # Moon + Mercury core only, ~44 MB
+python3 scripts/fetch_kernels.py --bodies europa  # core + jup365.bsp (1.1 GB) for Europa
 ```
+
+**The bare command downloads ~1.15 GB, not ~44 MB.** In its default `--bodies auto` mode the
+script fetches the core set *and* whatever the metakernels present in `data/kernels/` require —
+and `europa.tm` ships with the repository, so it also pulls the Galilean ephemeris
+`jup365.bsp` (1.1 GB). That is deliberate (it is what the installed metakernels need, and it
+stops a Europa run failing twice on the same missing kernel), and the script announces the
+auto-add before downloading. If you only want the Moon/Mercury quickstart, pass
+`--bodies moon`: `naif0012.tls` (5 KB) + `pck00011.tpc` (128 KB) + `de440s.bsp` (31.2 MB) +
+`moon_pa_de440_200625.bpc` (12.3 MB) + `moon_de440_250416.tf` (19 KB) = ~44 MB.
 
 This populates `data/kernels/` with the layout the binary expects:
 
@@ -141,7 +151,8 @@ the data outside the repository. The quickstart example needs only the SPICE ker
 ```bash
 # Radiation gate (Ingersoll bowl crater — analytic):
 cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
-# Spectral equilibration:
+# Spectral equilibration (look for the '[test_equilibration_dt] PASS' verdict line;
+# it gates the worst-case error at the production cadence against the 1 K target):
 cmake --build build --target test_equilibration_dt -j && ./build/bin/test_equilibration_dt
 # Runtime-robustness unit tests (no external libraries needed):
 c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp_mp
@@ -155,6 +166,13 @@ after fetching kernels per §4):
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
+
+**Take your configurations from `examples/`, not `configs/`.** The 15 files at the top of
+`examples/` are the colleague-facing set and 12 of them are CPU-only. `configs/` (55 files)
+and `examples/campaigns/` (74 files) are internal production inputs kept for provenance:
+47 of the 55 `configs/` files set `thermal.use_gpu: true`, so on the CPU-only build of §3
+they stop immediately with `FATAL [gpu]` (set `thermal.use_gpu: false` to run them on the
+CPU), and several reference meshes, DEMs or view-factor files that are not distributed.
 
 ## 7. Known caveats (from the portability audit)
 

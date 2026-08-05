@@ -68,16 +68,22 @@ cmake --build build --target ptm_thermal_sim -j
 # 2. Verify with the analytic radiation gate:
 cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
 
-# 3. Fetch SPICE kernels from NASA NAIF (~45 MB, one time):
-python3 scripts/fetch_kernels.py
+# 3. Fetch SPICE kernels from NASA NAIF (~44 MB, one time):
+python3 scripts/fetch_kernels.py --bodies moon
+# (the bare `fetch_kernels.py` also pulls the 1.1 GB Galilean ephemeris that the
+#  shipped europa.tm needs — ~1.15 GB total. Use --bodies moon for this quickstart.)
 
 # 4. Run a global Moon diurnal simulation (1280 faces, seconds to minutes):
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-Expected: `output/quickstart_moon_diurnal/statistics/` with per-face
-temperature extremes — equatorial noon ~388 K, lunar night ~92 K. Walk through
-the outputs in [TUTORIAL.md](TUTORIAL.md) and [docs/tutorials/](docs/tutorials/).
+Expected: exit 0 in a few seconds, and
+`output/quickstart_moon_diurnal/statistics/` holding per-face temperature
+extremes — `temperature_max.bin` peaks at **385.0 K** (equatorial noon) and
+`temperature_min.bin` bottoms at **66.3 K** (a polar face), with the mean
+per-face minimum ~90.8 K. Note the 4-byte face-count header on every
+`statistics/*.bin`; `scripts/ptm_qa.py` reads it correctly. Walk through the
+outputs in [TUTORIAL.md](TUTORIAL.md) and [docs/tutorials/](docs/tutorials/).
 
 ## Documentation
 
@@ -91,6 +97,21 @@ the outputs in [TUTORIAL.md](TUTORIAL.md) and [docs/tutorials/](docs/tutorials/)
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
 | [docs/thermal-model.md](docs/thermal-model.md) · [docs/illumination-model.md](docs/illumination-model.md) · [docs/radiation-exchange.md](docs/radiation-exchange.md) | Physics and numerics of each stage |
 | [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [docs/PORTABILITY-AUDIT.md](docs/PORTABILITY-AUDIT.md) | What to watch out for |
+
+### Which configuration directory to start from
+
+**Start in [`examples/`](examples/), not `configs/`.** The 15 configurations at
+the top level of `examples/` are the ones written to be read and run by someone
+who did not build the repository; 12 of the 15 are CPU-only, and
+`quickstart_moon_diurnal.yaml` is the smallest.
+
+`configs/` (55 files) and `examples/campaigns/` (74 files) are the *internal*
+production inputs behind published runs. They are kept for provenance, not as
+onboarding material: 47 of the 55 `configs/` files set `thermal.use_gpu: true`,
+several point at meshes, DEMs or view-factor files that are not distributed, and
+many carry `thermophysical:` keys that PTM3D does not read (the run warns and
+names them — see [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md), PTM-67).
+Copy one only if you already know what it references.
 
 ## Hardware guidance
 
