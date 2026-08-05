@@ -129,6 +129,15 @@ set_target_properties(test_conductivity_model
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Primary-body finite-disk geometry gate (PTM-41 Lambert-sphere photometry,
+# PTM-44 fractional visibility). Header-only under test -- same reasoning as
+# test_conductivity_model above: no library to go stale underneath it.
+add_executable(test_primary_disk test_primary_disk.cpp)
+set_target_properties(test_primary_disk
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration large-dt accuracy test
 add_executable(test_equilibration_dt test_equilibration_dt.cpp)
 target_link_libraries(test_equilibration_dt
