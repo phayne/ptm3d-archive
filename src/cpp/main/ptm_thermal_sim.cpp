@@ -7683,6 +7683,19 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-coupling-temp-tol K  Temperature convergence threshold [K] (default: 0.5)\n";
     std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] for LEGACY mode (default: 0.1)\n";
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
+    std::cout << "                                   LEGACY coupling mode only (see --rad-coupling-mode).\n";
+    std::cout << "  --rad-coupling-mode MODE   PTM-89 chunk-decomposition independence:\n";
+    std::cout << "                                   bounded (default): absolute selection threshold, no\n";
+    std::cout << "                                     face-fraction exit -- a chunked run reproduces the\n";
+    std::cout << "                                     single-shot field.\n";
+    std::cout << "                                   fixed:   as bounded, and always runs coupling-iter\n";
+    std::cout << "                                     sweeps (iteration count cannot depend on the window).\n";
+    std::cout << "                                   legacy:  pre-2026-08-05 behavior, bit-for-bit. Use ONLY\n";
+    std::cout << "                                     to reproduce a published run; it re-introduces the\n";
+    std::cout << "                                     chunk dependence. Env: PTM_COUPLING_MODE.\n";
+    std::cout << "  --rad-coupling-select-dt K Absolute predicted-ΔT selection threshold for bounded/fixed\n";
+    std::cout << "                                   (default: 0 = every face carrying indirect flux). >0\n";
+    std::cout << "                                   trades accuracy for speed and warns.\n";
     std::cout << "  --rad-coupling-select-mode MODE  Face-selection mode: 'physics' (default) or 'legacy'.\n";
     std::cout << "                                   physics: ΔT predictor (1−α)·ΔF/(4εσT³) > temp_tol·safety.\n";
     std::cout << "                                   legacy:  absolute |max indirect flux| > flux_tol.\n";
@@ -9776,6 +9789,12 @@ int main(int argc, char** argv) {
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
     std::string rad_coupling_select_mode = "physics";  // "physics" (default) or "legacy"
     double rad_coupling_select_safety = 0.5;            // Safety factor on predicted-ΔT threshold
+    // PTM-89: "bounded" (default) | "fixed" | "legacy". See config_parser.h.
+    std::string rad_coupling_mode = "bounded";
+    double rad_coupling_select_dt = 0.0;    // Absolute predicted-ΔT selection threshold [K]
+    // PTM-98: "all" (default) | "shadow". Radiation-exchange face set. See config_parser.h.
+    std::string rad_exchange_selection = "all";
+    double rad_min_shadow_fraction = 0.3;   // "shadow" mode only (PTM-99: now plumbed)
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -9817,6 +9836,10 @@ int main(int argc, char** argv) {
     rad_coupling_face_frac = sim_config.radiation.coupling_face_fraction;
     rad_coupling_select_mode = sim_config.radiation.coupling_select_mode;
     rad_coupling_select_safety = sim_config.radiation.coupling_select_safety;
+    rad_coupling_mode = sim_config.radiation.coupling_mode;
+    rad_coupling_select_dt = sim_config.radiation.coupling_select_dt;
+    rad_exchange_selection = sim_config.radiation.exchange_selection;
+    rad_min_shadow_fraction = sim_config.radiation.min_shadow_fraction;
     rad_use_aca = sim_config.radiation.use_aca;
     rad_aca_tolerance = sim_config.radiation.aca_tolerance;
     rad_aca_max_rank = sim_config.radiation.aca_max_rank;
@@ -10200,6 +10223,31 @@ int main(int argc, char** argv) {
             rad_coupling_select_safety = std::stod(argv[++i]);
             std::cout << "Radiation coupling select safety factor: "
                       << rad_coupling_select_safety << std::endl;
+        } else if (arg == "--rad-coupling-mode" && i + 1 < argc) {
+            rad_coupling_mode = argv[++i];
+            if (rad_coupling_mode != "bounded" && rad_coupling_mode != "fixed"
+                    && rad_coupling_mode != "legacy") {
+                std::cerr << "Invalid --rad-coupling-mode '" << rad_coupling_mode
+                          << "': must be 'bounded', 'fixed' or 'legacy'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation coupling mode: " << rad_coupling_mode << std::endl;
+        } else if (arg == "--rad-coupling-select-dt" && i + 1 < argc) {
+            rad_coupling_select_dt = std::stod(argv[++i]);
+            std::cout << "Radiation coupling selection threshold: "
+                      << rad_coupling_select_dt << " K" << std::endl;
+        } else if (arg == "--rad-exchange-selection" && i + 1 < argc) {
+            rad_exchange_selection = argv[++i];
+            if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+                std::cerr << "Invalid --rad-exchange-selection '" << rad_exchange_selection
+                          << "': must be 'all' or 'shadow'." << std::endl;
+                return 1;
+            }
+            std::cout << "Radiation exchange selection: " << rad_exchange_selection << std::endl;
+        } else if (arg == "--rad-min-shadow-fraction" && i + 1 < argc) {
+            rad_min_shadow_fraction = std::stod(argv[++i]);
+            std::cout << "Radiation min shadow fraction: " << rad_min_shadow_fraction
+                      << " (exchange_selection: shadow only)" << std::endl;
         } else if (arg == "--rad-use-svd") {
             rad_use_aca = false;
             std::cout << "Using SVD compression for H-matrix (slower but more accurate)" << std::endl;
@@ -10273,6 +10321,88 @@ int main(int argc, char** argv) {
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // PTM-89 coupling-mode resolution, AT CONFIG TIME.
+    //
+    // Resolved and validated here — before the illumination pass — so a typo in
+    // the mode costs nothing instead of surfacing after minutes to hours of ray
+    // tracing (the failure shape of the *other* PTM-80). The env override lets a
+    // published run be reproduced without editing its config.
+    // ----------------------------------------------------------------------
+    {
+        if (const char* e = std::getenv("PTM_COUPLING_MODE")) {
+            const std::string v(e);
+            if (v != rad_coupling_mode) {
+                std::cout << "[coupling] PTM_COUPLING_MODE overrides coupling mode '"
+                          << rad_coupling_mode << "' -> '" << v << "'" << std::endl;
+            }
+            rad_coupling_mode = v;
+        }
+        if (rad_coupling_mode != "bounded" && rad_coupling_mode != "fixed"
+                && rad_coupling_mode != "legacy") {
+            std::cerr << "FATAL [coupling]: radiation.coupling_mode='" << rad_coupling_mode
+                      << "' is not one of bounded|fixed|legacy.\n"
+                         "  bounded (default) = PTM-89 fix: absolute selection threshold, no"
+                         " face-fraction exit.\n"
+                         "  fixed             = as bounded, plus a fixed iteration count.\n"
+                         "  legacy            = pre-PTM-89 behavior, for reproducing published"
+                         " runs." << std::endl;
+            return 1;
+        }
+        if (rad_coupling_select_dt < 0.0) {
+            std::cerr << "FATAL [coupling]: radiation.coupling_select_dt="
+                      << rad_coupling_select_dt << " K must be >= 0." << std::endl;
+            return 1;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // PTM-98 exchange-selection resolution, AT CONFIG TIME (same rationale as
+    // the coupling-mode block above: a typo must cost nothing).
+    // ----------------------------------------------------------------------
+    {
+        if (const char* e = std::getenv("PTM_EXCHANGE_SELECTION")) {
+            const std::string v(e);
+            if (v != rad_exchange_selection) {
+                std::cout << "[exchange] PTM_EXCHANGE_SELECTION overrides exchange selection '"
+                          << rad_exchange_selection << "' -> '" << v << "'" << std::endl;
+            }
+            rad_exchange_selection = v;
+        }
+        if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
+            std::cerr << "FATAL [exchange]: radiation.exchange_selection='"
+                      << rad_exchange_selection << "' is not one of all|shadow.\n"
+                         "  all (default) = PTM-98 fix: every face keeps the indirect flux the\n"
+                         "                  radiosity solve computed for it. Window-independent.\n"
+                         "  shadow        = pre-PTM-98 shadow-fraction gate, for reproducing\n"
+                         "                  published runs. Window-DEPENDENT." << std::endl;
+            return 1;
+        }
+        if (rad_exchange_selection == "shadow") {
+            std::cout << "[exchange] WARNING: radiation.exchange_selection='shadow' re-introduces"
+                         " PTM-98 — the set of faces that receive indirect flux is measured over"
+                         " THIS window (equilibration + output steps), so the result depends on"
+                         " how the run was chunked. Use it only to reproduce a pre-PTM-98 run,"
+                         " and pair it with coupling_mode: legacy." << std::endl;
+            if (rad_coupling_mode != "legacy") {
+                std::cout << "[exchange] NOTE: exchange_selection='shadow' with coupling_mode='"
+                          << rad_coupling_mode << "' reproduces NEITHER the pre-PTM-98 nor the"
+                             " current behavior exactly; pre-PTM-98 reproduction needs"
+                             " coupling_mode: legacy as well." << std::endl;
+            }
+            if (!(rad_min_shadow_fraction >= 0.0 && rad_min_shadow_fraction <= 1.0)) {
+                std::cerr << "FATAL [exchange]: radiation.min_shadow_fraction="
+                          << rad_min_shadow_fraction << " must be in [0, 1]." << std::endl;
+                return 1;
+            }
+        } else if (rad_min_shadow_fraction != 0.3) {
+            std::cout << "[exchange] WARNING: radiation.min_shadow_fraction="
+                      << rad_min_shadow_fraction << " is IGNORED under"
+                         " exchange_selection='all' (every face participates). Set"
+                         " exchange_selection: shadow to make it live." << std::endl;
         }
     }
 
@@ -12665,6 +12795,14 @@ int main(int argc, char** argv) {
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             rad_config.radiance_prune_eps = rad_radiance_prune_eps;
+            // PTM-98 / PTM-99: radiation-exchange face set. min_shadow_fraction
+            // parsed but was never bridged here before PTM-99, so the hard-coded
+            // 0.3 always won; it is now forwarded and only consulted in "shadow".
+            rad_config.exchange_selection =
+                (rad_exchange_selection == "shadow")
+                    ? radiation::RadiationConfig::ExchangeSelection::Shadow
+                    : radiation::RadiationConfig::ExchangeSelection::All;
+            rad_config.min_shadow_fraction = rad_min_shadow_fraction;
             // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
             // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
             // When ON, the per-face Bond albedo is sourced
@@ -12832,6 +12970,76 @@ int main(int argc, char** argv) {
                 std::cout << "\nStarting radiation-thermal coupling iterations..." << std::endl;
                 std::cout << "  Max iterations: " << rad_max_coupling_iter << std::endl;
                 std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
+
+                // ---- PTM-89: decomposition (chunking) independence ----------
+                // Mode was resolved and validated at config time (above).
+                const bool rad_coupling_legacy_mode = (rad_coupling_mode == "legacy");
+                const bool rad_coupling_fixed_iters = (rad_coupling_mode == "fixed");
+                // std::cout arrives here carrying a `fixed`/`setprecision(1)`
+                // left over from an earlier progress line (BUGS.md PTM-69), which
+                // would print a 0.05 threshold as "0.1". A diagnostic that lies
+                // about the number it is warning you about is worse than none, so
+                // pin the format for this block and restore it afterwards.
+                const std::ios_base::fmtflags rad_banner_flags = std::cout.flags();
+                const std::streamsize rad_banner_prec = std::cout.precision();
+                std::cout << std::defaultfloat << std::setprecision(6);
+                std::cout << "  Coupling mode: " << rad_coupling_mode
+                          << (rad_coupling_legacy_mode
+                                  ? "  (PRE-PTM-89: window-dependent selection + unbounded"
+                                    " face-fraction exit -- results depend on how the window"
+                                    " was chunked)"
+                                  : "  (PTM-89: absolute selection threshold, no face-fraction"
+                                    " exit)")
+                          << std::endl;
+                if (!rad_coupling_legacy_mode) {
+                    std::cout << "  Selection threshold: " << rad_coupling_select_dt
+                              << " K (absolute predicted ΔT; 0 = every face carrying"
+                                 " indirect flux)" << std::endl;
+                    if (rad_coupling_select_dt > 0.0) {
+                        std::cout << "  WARNING [PTM-89]: coupling_select_dt > 0 re-introduces"
+                                     " chunk-decomposition dependence at up to ~"
+                                  << rad_coupling_select_dt
+                                  << " K per face. Set 0 for decomposition independence."
+                                  << std::endl;
+                    }
+                    if (rad_coupling_fixed_iters) {
+                        std::cout << "  Early exit on coupling_temp_threshold DISABLED: every"
+                                     " window runs exactly " << rad_max_coupling_iter
+                                  << " sweeps." << std::endl;
+                    }
+                    // These two knobs are inert here; say so rather than letting a
+                    // config author believe they are doing something. Compared
+                    // against the struct defaults so the test cannot drift if a
+                    // default is ever retuned.
+                    const auto rad_defaults = decltype(sim_config.radiation){};
+                    if (std::abs(rad_coupling_face_frac
+                                 - rad_defaults.coupling_face_fraction) > 1e-12) {
+                        std::cout << "  WARNING [PTM-89]: radiation.coupling_face_fraction="
+                                  << rad_coupling_face_frac
+                                  << " is IGNORED in coupling_mode='" << rad_coupling_mode
+                                  << "' (the face-fraction exit has no error bound). Use"
+                                     " coupling_mode: legacy to restore it." << std::endl;
+                    }
+                    if (std::abs(rad_coupling_select_safety
+                                 - rad_defaults.coupling_select_safety) > 1e-12) {
+                        std::cout << "  WARNING [PTM-89]: radiation.coupling_select_safety="
+                                  << rad_coupling_select_safety
+                                  << " is IGNORED in coupling_mode='" << rad_coupling_mode
+                                  << "' (the selection threshold is the absolute"
+                                     " coupling_select_dt there, not a fraction of"
+                                     " coupling_temp_threshold)." << std::endl;
+                    }
+                    if (rad_coupling_select_mode != "physics") {
+                        std::cout << "  WARNING [PTM-89]: coupling_select_mode='"
+                                  << rad_coupling_select_mode
+                                  << "' selects on an absolute flux threshold taken over the"
+                                     " window, which remains chunk-dependent. Only"
+                                     " coupling_select_mode: physics is decomposition-"
+                                     "independent." << std::endl;
+                    }
+                }
+                std::cout.flags(rad_banner_flags);
+                std::cout.precision(rad_banner_prec);
 
                 // ---- Re-thermal SEED tripwire (BUGS.md PTM-78) --------------
                 // Every GPU coupling iteration re-integrates the selected faces
@@ -13362,8 +13570,18 @@ int main(int argc, char** argv) {
                         const double epsilon = planet.emissivity;
                         const double sigma = 5.67051196e-8;
                         const double T_floor = 40.0;
-                        const double pred_dT_threshold =
-                            rad_coupling_temp_tol * rad_coupling_select_safety;
+                        // PTM-89: in legacy mode the threshold is a fraction of
+                        // the convergence tolerance -- ~1 K -- and both of the
+                        // quantities compared against it are maxima OVER THE
+                        // WINDOW, so a half-length window scores every face
+                        // lower and freezes faces the full window re-thermals.
+                        // In bounded/fixed mode the threshold is absolute
+                        // (default 0), so the decision is "does this face carry
+                        // any indirect flux", which no longer depends on where
+                        // the window boundaries fell.
+                        const double pred_dT_threshold = rad_coupling_legacy_mode
+                            ? rad_coupling_temp_tol * rad_coupling_select_safety
+                            : rad_coupling_select_dt;
 
                         for (size_t f = 0; f < num_faces; f++) {
                             const double dF = (iter == 0)
@@ -13378,8 +13596,14 @@ int main(int argc, char** argv) {
                             // imply a future T change above the threshold?
                             // Phase B criterion: did the face's T already
                             // change meaningfully in the previous re-thermal?
-                            const bool select = (pred_dT >= pred_dT_threshold)
-                                             || (iter > 0 && observed_dT[f] >= pred_dT_threshold);
+                            // Comparison is strict in bounded/fixed mode so that
+                            // a zero threshold still freezes the faces that carry
+                            // no flux at all (>= 0 would select all of them).
+                            const bool select = rad_coupling_legacy_mode
+                                ? ((pred_dT >= pred_dT_threshold)
+                                   || (iter > 0 && observed_dT[f] >= pred_dT_threshold))
+                                : ((pred_dT > pred_dT_threshold)
+                                   || (iter > 0 && observed_dT[f] > pred_dT_threshold));
                             if (select) {
                                 faces_to_rerun.push_back(static_cast<int>(f));
                             } else {
@@ -13611,13 +13835,25 @@ int main(int argc, char** argv) {
                                        : "  Samples still changing: ")
                                   << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
-                        if (max_change_post < rad_coupling_temp_tol) {
+                        // PTM-89: the max-temperature exit bounds the residual on
+                        // EVERY face by rad_coupling_temp_tol. "fixed" mode drops
+                        // it as well, because any data-driven stopping rule is a
+                        // function of the window and so can stop a short window
+                        // an iteration earlier than a long one.
+                        if (max_change_post < rad_coupling_temp_tol
+                                && !rad_coupling_fixed_iters) {
                             std::cout << "  Converged on max-temperature criterion ("
                                       << max_change_post << " K < " << rad_coupling_temp_tol
                                       << " K)" << std::endl;
                             break;
                         }
-                        if (face_frac < rad_coupling_face_frac) {
+                        // PTM-89: the face-fraction exit has NO error bound -- it
+                        // stops while up to coupling_face_fraction of the mesh is
+                        // still moving by an arbitrary amount, and the count is a
+                        // max over the window, so a short window reaches it first.
+                        // Retained only under coupling_mode: legacy.
+                        if (rad_coupling_legacy_mode
+                                && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
                                       << (face_frac * 100) << "% < "

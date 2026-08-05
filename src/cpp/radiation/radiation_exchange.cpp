@@ -1449,14 +1449,40 @@ FaceClassification FaceSelector::classify(
         }
     }
 
-    // Classify faces based on shadow fraction
-    // Note: View factors are computed for ALL faces regardless of classification.
-    // The actual filtering for thermal re-runs happens based on computed indirect flux.
+    // PTM-98 — which faces keep the indirect flux the radiosity solve computes.
+    //
+    // View factors and the radiosity solve itself cover ALL faces regardless of
+    // this classification; the set below is applied afterwards as a copy mask
+    // (computeIndirectFlux / computeIndirectFluxBatch). Filtering for thermal
+    // re-runs is a SEPARATE, downstream decision made on the computed indirect
+    // flux (PTM-89 coupling_mode).
+    //
+    // The legacy Shadow gate is window-dependent: shadow_fractions comes from
+    // this run's own illumination series, whose length is
+    // n_equilibration_steps + n_output_steps, and a warm-started chunk has no
+    // equilibration samples. Splitting a window therefore reclassifies faces
+    // OUT of radiation exchange and zeroes their flux. Default is All.
+    const bool select_all =
+        (config_.exchange_selection == RadiationConfig::ExchangeSelection::All);
     for (size_t i = 0; i < n; ++i) {
-        result.needs_exchange[i] = (result.shadow_fractions[i] >= config_.min_shadow_fraction);
+        result.needs_exchange[i] =
+            select_all || (result.shadow_fractions[i] >= config_.min_shadow_fraction);
     }
 
     result.finalize();
+
+    // Never drop faces silently: say how many the legacy gate is zeroing.
+    if (!select_all && result.exchange_faces < result.total_faces) {
+        std::cout << "  WARNING [PTM-98] radiation.exchange_selection='shadow': "
+                  << (result.total_faces - result.exchange_faces) << " / "
+                  << result.total_faces << " faces are EXCLUDED from radiation"
+                     " exchange and will receive exactly 0 W/m^2 indirect flux."
+                     " This gate is measured over THIS window ("
+                  << (illumination_series.empty() ? 0 : illumination_series[0].size())
+                  << " illumination samples), so the result depends on how the run"
+                     " was chunked. Use exchange_selection: all (default) unless you"
+                     " are reproducing a pre-PTM-98 run." << std::endl;
+    }
 
     if (config_.verbose) {
         std::cout << "Face classification: " << result.exchange_faces << " / "
@@ -1823,6 +1849,17 @@ bool RadiationExchangeManager::prepare(
     FaceSelector selector(mesh_, config_);
     classification_ = selector.classify(illumination_series);
 
+    // PTM-101: the beamed-emission receiver/emitter sets are still shadow-fraction
+    // based and therefore window-dependent, even though the exchange set no longer
+    // is. Beaming is off by default (rms_slope_deg == 0); say so when it is on.
+    if (config_.rms_slope_deg > 0.0) {
+        std::cout << "  WARNING [PTM-101] rms_slope_deg=" << config_.rms_slope_deg
+                  << " > 0: the Smith beamed-emission receiver and emitter sets are"
+                     " selected from shadow fractions measured over THIS window, so a"
+                     " beaming run is still chunk-decomposition dependent. The PTM-98"
+                     " fix covers the radiation-exchange set only." << std::endl;
+    }
+
     if (classification_.exchange_faces == 0) {
         if (config_.verbose) {
             std::cout << "No faces require radiation exchange" << std::endl;
@@ -2099,15 +2136,11 @@ RadiationExchangeManager::computeIndirectFluxBatch(
     for (size_t k = 0; k < n_steps; ++k) {
         const auto& flux = raw_per_step[k];
         if (flux.empty()) continue;
-        for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
-            int face_idx = classification_.exchange_face_indices[i];
-            indirect_per_timestep[k][face_idx] = flux[face_idx];
-        }
+        // PTM-98: full write-back (see computeIndirectFlux).
+        writeBackFlux(flux, indirect_per_timestep[k]);
         if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
-            for (int face_idx : classification_.exchange_face_indices) {
-                indirect_ir_batch_[k][face_idx]  = ir_raw[k][face_idx];
-                indirect_vis_batch_[k][face_idx] = vis_raw[k][face_idx];
-            }
+            writeBackFlux(ir_raw[k],  indirect_ir_batch_[k]);
+            writeBackFlux(vis_raw[k], indirect_vis_batch_[k]);
         }
         // Smith beamed-emission correction (per timestep, Sun-dependent).
         if (do_beam) {
@@ -2155,11 +2188,11 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     // Solve radiosity equation (isotropic/Lambertian thermal emission)
     auto flux = solver_->solve(temperatures, solar_flux);
 
-    // Map back to all faces
-    for (size_t i = 0; i < classification_.exchange_face_indices.size(); ++i) {
-        int face_idx = classification_.exchange_face_indices[i];
-        indirect_flux_[face_idx] = flux[face_idx];
-    }
+    // PTM-98: write the solve's result back in FULL. `flux` is already indexed by
+    // global face id and covers every face; the legacy path copied only the
+    // classified subset and left the rest at 0, discarding computed flux.
+    // `flux` is ours, so the total path steals its buffer rather than copying.
+    writeBackFlux(std::move(flux), indirect_flux_);
 
     // C1: per-band absorbed indirect flux (reflected-solar vis / thermal-IR),
     // mapped to all faces. Only populated when the solver ran two-band.
@@ -2168,10 +2201,8 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
         const auto& qir  = solver_->lastIndirectIR();
         indirect_flux_vis_.assign(n, 0.0);
         indirect_flux_ir_.assign(n, 0.0);
-        for (int face_idx : classification_.exchange_face_indices) {
-            if (face_idx < static_cast<int>(qvis.size())) indirect_flux_vis_[face_idx] = qvis[face_idx];
-            if (face_idx < static_cast<int>(qir.size()))  indirect_flux_ir_[face_idx]  = qir[face_idx];
-        }
+        writeBackFlux(qvis, indirect_flux_vis_);
+        writeBackFlux(qir,  indirect_flux_ir_);
     } else {
         indirect_flux_vis_.clear();
         indirect_flux_ir_.clear();
@@ -2221,8 +2252,28 @@ void RadiationExchangeManager::buildBeamPairs() {
     beam_pairs_.clear();
     if (classification_.exchange_face_indices.empty()) return;
 
-    // Receivers = the radiation-exchange (shadowed-floor) faces.
-    const std::vector<int>& receivers = classification_.exchange_face_indices;
+    // Receivers = the shadowed-floor faces. PTM-98: this is deliberately NOT
+    // classification_.exchange_face_indices any more. That set is now every face
+    // by default, and the Smith beamed-emission correction is specifically a
+    // sunlit-wall -> shadowed-floor redistribution: widening the receiver set
+    // would both change the physics and make buildBeamPairs recompute view
+    // factors for the whole mesh. Identical to the old list when
+    // exchange_selection == Shadow.
+    //
+    // KNOWN RESIDUAL (PTM-101): this receiver set, and the shadow[j] >= 0.99
+    // emitter test below, are still measured over THIS window, so a beaming run
+    // (rms_slope_deg > 0) remains chunk-decomposition dependent. Beaming is off
+    // by default; the warning is emitted in prepare().
+    // No reserve hint: since PTM-98 the exchange list is the whole mesh, so it is
+    // no longer an estimate of the receiver count. Built once per run.
+    beam_receivers_.clear();
+    for (size_t i = 0; i < classification_.shadow_fractions.size(); ++i) {
+        if (classification_.shadow_fractions[i] >= config_.min_shadow_fraction) {
+            beam_receivers_.push_back(static_cast<int>(i));
+        }
+    }
+    if (beam_receivers_.empty()) return;
+    const std::vector<int>& receivers = beam_receivers_;
 
     // Geometric VF + Embree visibility for receiver rows. Backend-independent
     // (works for H-matrix runs where per-row matrix access is unavailable), and
@@ -2348,8 +2399,11 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
         flux[bp.i] += dq;
     }
 
-    // Keep absorbed indirect flux non-negative on the receiver set.
-    for (int i : classification_.exchange_face_indices) {
+    // Keep absorbed indirect flux non-negative on the receiver set. PTM-98: the
+    // beam receiver list, not the (now all-faces) exchange list — only receivers
+    // can be driven negative by the beamed correction, and clamping the rest
+    // would silently touch faces this pass never wrote.
+    for (int i : beam_receivers_) {
         if (flux[i] < 0.0) flux[i] = 0.0;
     }
 }

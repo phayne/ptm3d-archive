@@ -10,8 +10,35 @@ struct RadiationConfig {
     // Master enable/disable
     bool enabled = false;
 
-    // Face selection criteria
-    double min_shadow_fraction = 0.3;    // Min fraction of time in shadow to consider
+    // ---- Radiation-exchange face set (PTM-98) --------------------------------
+    // Which faces keep the indirect flux the radiosity solve already computed
+    // for them. RadiositySolver::solve() returns Q_indirect for ALL n faces
+    // (radiation_exchange.cpp, "Compute absorbed indirect flux at each face");
+    // this set is applied AFTER the solve as a copy mask, so it never changes
+    // the solve, only which computed values survive.
+    //
+    //   All (default) — every face keeps its flux. Window-INDEPENDENT by
+    //       construction, and the only setting with a physical justification:
+    //       the radiosity solution is a global self-consistent linear solve, so
+    //       zeroing part of its output is data loss, not an approximation.
+    //   Shadow — legacy gate: keep only faces in shadow at least
+    //       min_shadow_fraction of the time. WINDOW-DEPENDENT and therefore
+    //       chunk-decomposition dependent (PTM-98): the shadow fraction is
+    //       measured over the run's own illumination series, whose length is
+    //       n_equilibration_steps + n_output_steps. A warm-started chunk has no
+    //       equilibration samples, so a short chunk that happens to fall in
+    //       local daytime silently drops faces out of radiation exchange
+    //       entirely — measured 82.38 K / 6367 faces > 1 K on a 3-chunk
+    //       lunation, 361 faces receiving exactly 0 W/m^2. Provided ONLY to
+    //       reproduce published runs; it re-introduces the defect.
+    enum class ExchangeSelection { All, Shadow };
+    ExchangeSelection exchange_selection = ExchangeSelection::All;
+
+    // Min fraction of time in shadow for a face to keep its indirect flux.
+    // Consulted ONLY when exchange_selection == Shadow. Before PTM-99 this was
+    // hard-coded here at 0.3 because the config key was parsed and then never
+    // bridged into this struct; it is now plumbed through.
+    double min_shadow_fraction = 0.3;
 
     // View factor computation parameters
     double visibility_threshold = 1e-8;  // Min F_ij value to store (smaller = zero)
