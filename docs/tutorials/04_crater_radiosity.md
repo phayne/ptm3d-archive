@@ -6,9 +6,28 @@
 [`examples/tutorial04_crater80N_coupled.yaml`](../../examples/tutorial04_crater80N_coupled.yaml)
 **Mesh:** `data/meshes/lunar_crater_80N.ply` — a 12,800-face bowl crater at
 80°N, shipped with the repo.
-**Cost:** ~10 s (control) + ~13 s (coupled, incl. the view-factor build) on a
-many-core workstation; a few minutes on a laptop. <1 GB RAM; the saved
-view-factor file is ~35 MB.
+**Cost:** ~8.5 s (control, measured) + coupled (incl. the view-factor build) on
+a many-core workstation; a few minutes on a laptop. <1 GB RAM; the saved
+view-factor file is 36,278,242 bytes (~35 MB), measured.
+
+> **Status on v1.0.3 (checked 2026-08-05): the coupled run does not complete.**
+> The control run (`..._radoff.yaml`) is fine. The coupled run builds the view
+> factors, runs the thermal solve, enters the coupling stage and then stops
+> with:
+>
+> ```
+> FATAL: radiation coupling is enabled but the thermal solver returned no
+> post-equilibration T(z) hand-off. ... Refusing to write results.
+> ```
+>
+> exit 1, no output written. This is a guard added in v1.0.3 that fires on the
+> CPU solver, and it reproduces on an unrelated mesh as well, so it is not
+> specific to this crater. **Everything below the "Run both" section — the
+> comparison table and the indirect-flux numbers quoted in
+> [06_interpreting_outputs.md](06_interpreting_outputs.md) — was measured on
+> 2026-07-29 and could not be reproduced on v1.0.3.** Treat those numbers as
+> the physics you should expect, not as a check of your install; use the
+> quickstart (tutorial 02) and `test_bowl_crater` for that.
 
 ## The physics question
 
@@ -26,7 +45,9 @@ identical runs.
 ./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
 ```
 
-In the coupled run, watch for (elided):
+In the coupled run, watch for (elided). The first four lines are what v1.0.3
+prints today; the iteration lines are from the 2026-07-29 run and are **not**
+reached on v1.0.3 (see the status note above):
 
 ```
 Radiation exchange enabled from config file
@@ -67,8 +88,9 @@ for name in ('temperature_min', 'temperature_avg'):
 EOF
 ```
 
-Verified result (2026-07-29, CPU-only build; 1671/12800 faces with
-`direct_solar_max` < 50 W/m²):
+Result measured 2026-07-29 on a CPU-only build (1671/12800 faces with
+`direct_solar_max` < 50 W/m²). **Not reproducible on v1.0.3** — the coupled run
+needed for the right-hand column aborts, per the status note above:
 
 | Quantity (shadowed faces) | radiation OFF | radiation ON | effect |
 |---|---:|---:|---:|

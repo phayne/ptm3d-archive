@@ -9,8 +9,8 @@ All commands are run **from the repository root** after building
 | # | Tutorial | Status |
 |---|----------|--------|
 | 01 | Bowl-crater radiation gate (`test_bowl_crater`) — covered in [TUTORIAL.md](../../TUTORIAL.md) step 1 | in TUTORIAL.md |
-| 02 | [Lunar diurnal run on an icosphere](02_lunar_diurnal_icosphere.md) | verified |
+| 02 | [Lunar diurnal run on an icosphere](02_lunar_diurnal_icosphere.md) | verified on v1.0.3 (2026-08-05) |
 | 03 | Custom body via Keplerian elements / Horizons | planned |
-| 04 | [Crater radiosity: radiation on vs. off](04_crater_radiosity.md) | verified |
+| 04 | [Crater radiosity: radiation on vs. off](04_crater_radiosity.md) | **partial** — control verified on v1.0.3; the coupled run aborts, see its status note |
 | 05 | GPU acceleration and `--calibrate-gpu` | planned |
-| 06 | [Interpreting the outputs](06_interpreting_outputs.md) | verified |
+| 06 | [Interpreting the outputs](06_interpreting_outputs.md) | verified on v1.0.3 (2026-08-05), except the coupled-run numbers it quotes from 04 |

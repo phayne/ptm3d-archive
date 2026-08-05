@@ -73,8 +73,14 @@ the coupled run, then compare crater-floor temperatures:
 
 Expected: the coupled run computes (and saves for reuse) the face-to-face view
 factors, the radiation–temperature iteration converges, and shadowed floor
-faces come out warmer than the control — walkthrough and verified numbers in
+faces come out warmer than the control — walkthrough and numbers in
 [docs/tutorials/04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md).
+
+> **On v1.0.3 the second command does not complete** (`FATAL: ... no
+> post-equilibration T(z) hand-off`, exit 1). The control run is unaffected, and
+> so is everything in steps 1 and 2. Read the status note in
+> [04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md) before you run
+> it, and use step 1 + step 2 to validate your install.
 
 ## What you exercised
 

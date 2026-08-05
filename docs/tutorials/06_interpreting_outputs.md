@@ -12,11 +12,11 @@ From the tutorial-04 coupled run:
 output/tutorial04_crater80N_coupled/
 ├── mesh.ply                  # the simulated mesh (face order matches all .bin files)
 ├── metadata.txt              # faces, time_steps, exported components
-├── time_steps.txt            # per-step elapsed seconds (+ UTC label column)
+├── time_steps.txt            # per-step time stamp (+ UTC label column) — see below
 ├── body_positions.csv        # Sun / primary-body vectors per output step
-├── heartbeat.txt             # liveness file for long runs (monitoring)
+├── heartbeat.txt             # liveness file for monitoring — see note below
 ├── statistics/               # per-face min/avg/max over the output window
-├── temperature/              # per-timestep snapshots: temperature_00001.bin ...
+├── temperature/              # per-timestep snapshots: temperature_0000.bin ...
 ├── illumination/             #   total absorbed flux per step
 ├── direct_solar/             #   direct solar component
 ├── primary_reflected/        #   reflected light from the primary body
@@ -95,16 +95,33 @@ is diagnostic: scattered sunlight matters near sunlit walls at noon, thermal
 IR dominates in deep shadow and at night. In the tutorial-04 run the shadowed
 faces peak at a median 2.8 W/m² indirect solar but 23.9 W/m² indirect IR —
 the warm rim's thermal emission, not scattered sunlight, is what heats this
-crater's floor.
+crater's floor. (Those two numbers were measured on 2026-07-29 and could **not**
+be re-measured on v1.0.3, because the coupled run aborts — see the status note
+at the top of [04_crater_radiosity.md](04_crater_radiosity.md).)
 
 ## Per-timestep series
 
-`temperature/temperature_00001.bin` … `temperature_00118.bin` are snapshots at
-each output step (same header + float32 format). `time_steps.txt` column 1
-gives each step's elapsed seconds from simulation start; `metadata.txt` lists
-which components were exported. Note the UTC label column in
-`time_steps.txt`/`body_positions.csv` is measured from the J2000 epoch, not
-the configured start date — use the elapsed-seconds column for timing.
+`temperature/temperature_0000.bin` … `temperature_0117.bin` are snapshots at
+each output step (same header + float32 format). The index is **zero-based and
+zero-padded to four digits**, so a 118-step run ends at `_0117`, not `_00118`;
+`metadata.txt` lists the face count, the step count and which components were
+exported.
+
+**Timing columns — read this before you plot against time.** In
+`time_steps.txt`, column 1 is **seconds past the J2000 epoch** (SPICE ephemeris
+time), *not* elapsed time from the start of the run, despite the header comment
+the file writes for itself. Column 2 is a UTC label and *is* anchored to the
+configured `simulation.start_time`. Verified on the tutorial-04 control run
+(`start_time: 2026-04-05T00:00:00`): the first row reads
+`828630100.682384  2026-04-05T03:00:31.497`, and consecutive rows differ by
+21714.19 s = the configured ~6 h cadence. For elapsed time, subtract the first
+column-1 value; for a calendar axis, use column 2 (or `body_positions.csv`,
+whose `time` column carries the same UTC).
+
+**`heartbeat.txt`** is written by the radiation-coupling and re-thermal loops,
+plus once at startup — but the startup write happens before the output
+directory is created, so on a directory's *first* run the file only appears if
+the run reaches one of those loops. Do not treat its absence as a failure.
 
 ## Converting for visualization
 
@@ -116,5 +133,10 @@ python src/python/vtk_converter.py output/tutorial04_crater80N_coupled output/t0
 python src/python/netcdf_converter.py --input output/t04_paraview/statistics.pvd \
        --output output/t04.nc --format pvd
 ```
+
+Both converters need Python packages the model itself does not: `vtk` for the
+first, `vtk` + `netCDF4` for the second. Neither fails silently — each checks
+its imports up front and prints the `pip install` line (`vtk_converter.py` also
+names the interpreter it is running under).
 
 See [../USER_GUIDE.md](../USER_GUIDE.md) for the full tool list.
