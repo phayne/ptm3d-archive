@@ -591,6 +591,24 @@ def main():
                     except Exception as e:
                         print(f"[chunked] chunk {i:03d}: cleanup warning: {e}",
                               flush=True)
+                    # BUGS.md PTM-77: rmtree just deleted chunk_dir/config.yaml,
+                    # which is the very file the retry passes to --config. Every
+                    # retry after this branch was therefore guaranteed to fail —
+                    # and before the PTM-66 fix it failed INVISIBLY, because a
+                    # missing config was downgraded to a warning and the binary
+                    # ran a full simulation on built-in defaults into the default
+                    # output/ directory. Regenerate it, and prove it is there.
+                    cfg_path = make_chunk_yaml(base_cfg, cd,
+                                               info["start_time"],
+                                               info["duration_days"],
+                                               info["ts"],
+                                               initial_state, this_state)
+                    if not cfg_path.is_file():
+                        sys.exit(f"[chunked] chunk {i:03d}: could not regenerate "
+                                 f"{cfg_path} after the cleanup; aborting rather "
+                                 f"than retrying against a missing config.")
+                    print(f"[chunked] chunk {i:03d}: regenerated {cfg_path}",
+                          flush=True)
                     attempt += 1
                     continue
                 break
