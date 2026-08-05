@@ -442,6 +442,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_face_fraction = getWithDefault(rad, "coupling_face_fraction", config.radiation.coupling_face_fraction);
             config.radiation.coupling_select_mode = getWithDefault(rad, "coupling_select_mode", config.radiation.coupling_select_mode);
             config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
+            config.radiation.coupling_mode = getWithDefault(rad, "coupling_mode", config.radiation.coupling_mode);
+            config.radiation.coupling_select_dt = getWithDefault(rad, "coupling_select_dt", config.radiation.coupling_select_dt);
             config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
             config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
             config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);

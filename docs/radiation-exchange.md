@@ -272,9 +272,65 @@ Starting from the surface temperatures $T_i(t)$ computed by the initial thermal 
 | $\tau_Q$ | `--rad-coupling-flux-tol` | 0.1 W/m$^2$ | Indirect flux threshold (legacy mode only) |
 | $f_{\text{threshold}}$ | `--rad-coupling-face-frac` | 0.01 (1%) | Convergence threshold on faces (physics) or samples (legacy) still changing |
 | select mode | `--rad-coupling-select-mode` | `physics` | Face-selection criterion: `physics` (default) or `legacy` |
-| $s$ | `--rad-coupling-select-safety` | 0.5 | Safety factor on the predicted-ΔT threshold |
+| $s$ | `--rad-coupling-select-safety` | 0.5 | Safety factor on the predicted-ΔT threshold — **`coupling_mode: legacy` only** |
+| coupling mode | `--rad-coupling-mode` | `bounded` | `bounded` \| `fixed` \| `legacy` — see §7.2.1 |
+| $\tau_{\text{sel}}$ | `--rad-coupling-select-dt` | 0 K | Absolute predicted-ΔT selection threshold, `bounded`/`fixed` only |
 
-Convergence is satisfied when **either** the temperature or face-fraction criterion is met (changed from AND in May 2026).
+In `bounded` (default) the loop stops when the max per-face temperature change falls
+below $\tau_T$, or at $k_{\max}$. In `legacy` it also stops when the *fraction* of
+faces still changing falls below $f_{\text{threshold}}$ (either/or, changed from AND
+in May 2026). In `fixed` it always runs $k_{\max}$ iterations.
+
+### 7.2.1 Chunk-decomposition independence (PTM-89)
+
+Every input to the shipped (pre-2026-08-05) selection and exit decisions is a maximum
+**over the output window**: $\max_t Q_{\text{indirect},i}$, $\max_t T_i$,
+$\max_{i,t}|T^k - T^{k-1}|$, and the count of faces whose window-max change exceeds
+$\tau_T$. A half-length window therefore scores every face lower than the full window,
+selects fewer faces, and can stop an iteration earlier — so **the converged field
+depended on where the chunk boundaries fell**. Two mechanisms, both real:
+
+1. **Selection.** With $\tau_T\cdot s = 1$ K, a face whose window-max indirect flux
+   sits near the threshold is re-thermal'd in a 60-step window and frozen in the
+   30-step half. Measured on the 12 800-face `lunar_crater_80N` gate (60 frames,
+   29.53 d, seam at frame 30): the single-shot selected 2578/2578/2547 faces and the
+   first chunk 2559/2559/2380, for a peak single-shot-vs-2-chunk difference of
+   **41.4 K**, 28 faces above 1 K.
+2. **Exit.** The face-fraction criterion has **no error bound** — it stops while up to
+   $f_{\text{threshold}}$ of the mesh is still moving by an arbitrary amount — and its
+   count is also a window maximum, so a short window reaches it first.
+
+`bounded` removes both: the selection threshold becomes the absolute
+$\tau_{\text{sel}}$ (default 0, i.e. re-thermal every face carrying any indirect flux)
+and the face-fraction exit is disabled. On the same gate, the first chunk then becomes
+**bit-identical** to the single-shot over all 30 × 12 800 samples, and the whole-run
+residual falls to **0.014 K** — below the **0.029 K** radiation-free chunking floor set
+by the `float32` 30-layer checkpoint. Cost on that gate: +2.4 % face-re-thermals
+(7703 → 7889) and no wall-time change outside run-to-run noise.
+
+`fixed` additionally disables the early exit on $\tau_T$, because *any* data-driven
+stopping rule is a function of the window. It is the only mode whose iteration count
+cannot depend on the decomposition by construction; on the gate it costs +70 %
+face-re-thermals (7703 → 13 141, 3 iterations → 5) for the same 0.014 K residual, so
+`bounded` is the default and `fixed` is for when the iteration counts must be provably
+equal.
+
+`legacy` reproduces pre-PTM-89 behavior bit-for-bit (verified: byte-identical output
+trees against the `8fbedd4` build on the same gate, coupled and radoff, single-shot and
+2-chunk). Use it to reproduce a published run, and only for that: it re-introduces the
+defect. It can be selected without editing a config via `PTM_COUPLING_MODE=legacy`.
+
+Setting $\tau_{\text{sel}} > 0$ trades accuracy for speed on very large meshes and
+re-introduces the dependence at up to that magnitude per face; the run warns when it
+is set, and warns that `coupling_face_fraction` is inert, rather than ignoring either
+in silence.
+
+**Not covered by the measurement above:** the Moon `lunar_crater_80N` gate only. The
+ratio (faces carrying any indirect flux)/(faces above the 1 K predicted-ΔT threshold)
+is a property of the mesh — 1.02–1.05 here — and has **not** been measured on the
+140 k-face `fig8_hybrid` production mesh, where the shipped threshold selected 48 % of
+faces. The worst case is a full-mesh re-thermal per iteration, i.e. ≤ 2.1× the
+re-thermal component of the coupling stage on that mesh.
 
 ### 7.3 Optimizations
 

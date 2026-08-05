@@ -103,11 +103,16 @@ struct RadiationConfig {
     int max_coupling_iterations = 10;
     double coupling_temp_threshold = 0.5;
     double coupling_flux_threshold = 0.1;
-    double coupling_face_fraction = 0.01;
+    double coupling_face_fraction = 0.01;  // legacy coupling_mode only
+    std::string coupling_mode = "bounded"; // bounded | fixed | legacy (PTM-89)
+    double coupling_select_dt = 0.0;       // K, bounded/fixed only
     std::string view_factor_file;
     bool verbose = false;
 };
 ```
+
+`coupling_mode` controls whether the Picard coupling's face selection and exit
+criteria are decomposition-independent; see `docs/radiation-exchange.md` §7.2.1.
 
 ## Utility Functions
 
