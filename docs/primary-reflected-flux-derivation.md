@@ -127,8 +127,8 @@ E_true / E_code = (8/3) · Φ_L(a) / Φ_code(a)                               (6
 ```
 
 **8/3 = 2.667 at full phase** — the "2.7×" in the PTM-41 ledger row — but (6) is
-*not* a constant: it falls through 1.698 at quadrature, crosses 1 near
-`a ≈ 125°`, and → 0 as `a → π`. Near new phase the old code *over*-estimates.
+*not* a constant: it falls through 1.698 at quadrature, crosses 1 at
+`a = 128.7°`, and → 0 as `a → π`. Near new phase the old code *over*-estimates.
 
 ### 3.1 The conservation-law statement that settles the cancellation argument
 
@@ -290,16 +290,36 @@ On an icosphere the band `|h| < α` covers a fraction `≈ sin α` of the faces:
 
 * **Probe (5 rays):** disk center + 4 rim points, tracing only directions above
   the face's horizon. All clear → `vis ≡ 1`, use (9); all blocked → `E = 0`.
-  On a *convex* body (every icosphere) any above-horizon ray from an offset
-  origin escapes, so the probe is all-clear and costs 5 rays instead of 1.
+  The probe basis is oriented to the **horizon** — `u = normalize(n̂ − (n̂·d̂)d̂)`,
+  so probe `(+1,0)` is the disk's highest point (Fermi F1; an arbitrary azimuth
+  let all five probes miss a thin above-horizon crescent).
+  A *smooth* convex body would always let an above-horizon ray escape, so the
+  probe would be unanimously clear. **A faceted icosphere does not**: measured
+  on Europa ico5, 1178 of 5.9 M face-steps still reach the sampler and 697 are
+  ruled fully occluded by grazing hits on neighboring facets. Deciding those
+  with the 512-ray sampler instead finds *more* of them (3857), so they are real
+  ray hits, not a probe artifact — but they carry `⟨cos θ⟩ ≤ 2.3e-6`, i.e.
+  ≤ 3.5e-7 W/m². Global meshes therefore pay ~5 rays per face instead of 1.
 * **Escalate (N = 512 rays):** mixed probe → evaluate (8) directly. Sampling is
   Hammersley + concentric-disk (the same generator the solar-disk path uses).
-  The naive `1/N` quantization estimate is **wrong**: measured against a
-  half-plane occluder the worst-case error of this point set is ≈`3/N`, because
-  a straight edge crosses low-discrepancy points in clumps. Measured
-  (`test_primary_disk` §4): 0.0369 at N=64, 0.0161 at 128, 0.0123 at 256,
-  **0.0082 at 512**. Fibonacci-spiral and equal-area polar-grid point sets are
-  no better, so this is a property of counting rays. N = 512 is the smallest
+  The naive `1/N` quantization estimate is **wrong**: a straight edge crosses
+  low-discrepancy points in clumps, so the error falls much more slowly.
+  Measured (`./build/bin/test_primary_disk` §4, edge swept in steps of 1/500 of
+  the disk radius):
+
+  | N | worst \|sampled − analytic\| | 1/N |
+  | --- | --- | --- |
+  | 16 | 0.0837 | 0.0625 |
+  | 32 | 0.0484 | 0.0312 |
+  | 64 | 0.0381 | 0.0156 |
+  | 128 | 0.0175 | 0.0078 |
+  | 256 | 0.0159 | 0.0039 |
+  | **512** | **0.0082** | 0.0020 |
+
+  A power-law fit gives `worst ≈ 0.49·N^(−0.65)` — roughly inverse-square-root,
+  not `1/N`. (Fermi's independent fit on the same data: `N^(−0.68)`.) Two other
+  point sets at N = 512 are no better and are printed by the same binary:
+  Fibonacci spiral 0.0092, equal-area polar grid 0.0174. N = 512 is the smallest
   power of two meeting the `< 1 %` criterion.
 * The probe is an approximation: an occluder that hides part of the disk's
   interior while missing the center *and* all four rim points is not detected.
@@ -319,15 +339,26 @@ bit-identical. **Everything in between is where PTM-44 lived.**
 ## 8. What changes, and by how much
 
 At Europa's sub-Jovian point at full phase (local midnight), Jupiter-shine goes
-`0.0468 + 0.1498 = 0.197` → `0.1247 + 0.1498 = 0.275 W/m²`, `ΔF = +0.078 W/m²`.
-Radiative sensitivity `ΔT = T·ΔF/(4εσT⁴)` with `ε = 0.95`:
+`0.0468 + 0.1498 = 0.197` → `0.1247 + 0.1498 = 0.275 W/m²`, `ΔF_inc = +0.078 W/m²`
+*incident*. What the surface actually gains is the **absorbed** part: reflected
+light is solar-band and is absorbed with `(1 − A_vis)` (`ptm_thermal_sim.cpp:1720`),
+so with Europa's `A_vis = 0.55`,
 
-| background T | `ΔT` from PTM-41 |
+```
+ΔF_abs = (1 − 0.55) × 0.078 = 0.0351 W/m²
+ΔT     = T · ΔF_abs / (4 ε σ T⁴),   ε = 0.95
+```
+
+| background T | ΔT from PTM-41 (absorbed) |
 | --- | --- |
-| 130 K (Europa dusk) | +0.13 K |
-| 90 K (Europa deep night) | +0.55 K |
-| 70 K | +1.2 K |
-| 50 K (cold trap) | +3.1 K |
+| 130 K (Europa dusk) | +0.07 K |
+| 90 K (Europa deep night) | +0.22 K |
+| 70 K | +0.47 K |
+| 50 K (cold trap) | +1.30 K |
+
+(An earlier revision of this table applied the *incident* ΔF and so overstated
+these by 1/(1−A_vis) = 2.2×.) The primary-IR term is thermal-band and absorbed
+with `ε`, but PTM-40 already fixed it and this change does not move it.
 
 PTM-44's horizon ramp is signed: faces just below the old cutoff gain up to
 `α·g·J·Ω/π`, faces just above lose the difference between `cos θ₀` and (9).

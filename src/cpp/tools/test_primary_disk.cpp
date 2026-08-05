@@ -245,6 +245,38 @@ static double sampledVisibleFraction(uint32_t N, double edge, double alpha) {
     return w_total > 0.0 ? w_clear / w_total : 0.0;
 }
 
+// Alternative point sets, so the claim "other generators are no better" in
+// primary_disk.h is reproducible from this binary instead of from a scratch
+// script. Fibonacci (sunflower) spiral and an equal-area polar grid.
+static double sampledVisibleFractionAlt(uint32_t N, double edge, int which) {
+    double n_total = 0.0, n_clear = 0.0;
+    const double GA = M_PI * (3.0 - std::sqrt(5.0));
+    if (which == 0) {                                   // Fibonacci spiral
+        for (uint32_t k = 0; k < N; ++k) {
+            const double r = std::sqrt((k + 0.5) / double(N));
+            const double th = k * GA;
+            const double dx = r * std::cos(th);
+            n_total += 1.0;
+            if (dx >= edge) n_clear += 1.0;
+        }
+    } else {                                            // equal-area polar grid
+        const int nr = std::max(1, int(std::lround(std::sqrt(N / M_PI))));
+        for (int i = 0; i < nr; ++i) {
+            const double r0 = std::sqrt(double(i) / nr);
+            const double r1 = std::sqrt(double(i + 1) / nr);
+            const int ni = std::max(1, int(std::lround(N * (r1*r1 - r0*r0))));
+            const double r = 0.5 * (r0 + r1);
+            for (int j = 0; j < ni; ++j) {
+                const double th = 2.0 * M_PI * (j + 0.5) / ni + r * 2.399963;
+                const double dx = r * std::cos(th);
+                n_total += 1.0;
+                if (dx >= edge) n_clear += 1.0;
+            }
+        }
+    }
+    return n_total > 0.0 ? n_clear / n_total : 0.0;
+}
+
 static double segmentFraction(double e) {
     if (e <= -1.0) return 1.0;
     if (e >=  1.0) return 0.0;
@@ -282,6 +314,20 @@ static void testHalfPlaneOccluder() {
                   "PRIMARY_DISK_SAMPLES worst error < 1 % of full flux",
                   worst, 0.0, 0.01);
         }
+    }
+
+    // (b2) the same sweep for two other point sets, at the chosen N. If either
+    //      were materially better this would say so.
+    for (int which = 0; which < 2; ++which) {
+        double worst = 0.0;
+        for (int k = -600; k <= 600; ++k) {
+            const double e = k / 500.0;
+            worst = std::max(worst, std::fabs(
+                sampledVisibleFractionAlt(PRIMARY_DISK_SAMPLES, e, which)
+                - segmentFraction(e)));
+        }
+        std::printf("       N=%-4u worst = %.4f  (%s)\n", PRIMARY_DISK_SAMPLES, worst,
+                    which == 0 ? "Fibonacci spiral" : "equal-area polar grid");
     }
 
     // (c) monotone, no step, as the occluder sweeps off the disk.

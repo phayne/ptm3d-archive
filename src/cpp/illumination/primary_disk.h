@@ -120,24 +120,31 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 // Number of disk samples used when the cheap probe is ambiguous.
 //
 // The naive expectation is that N samples quantise the visible fraction at 1/N.
-// MEASURED against a half-plane occluder (test_primary_disk, section 4) the
-// worst-case error of this point set is about 3/N, not 1/N, because a straight
-// edge sweeping across a low-discrepancy point set crosses points in clumps:
+// MEASURED against a half-plane occluder (test_primary_disk section 4, edge
+// swept in steps of 1/500 of the disk radius) the worst-case error is much
+// SHALLOWER than 1/N -- a straight edge crosses low-discrepancy points in
+// clumps, so refining N buys less than counting suggests:
 //
-//     N     worst |sampled - analytic|      (Hammersley + concentric)
-//     64            0.0369
-//    128            0.0161
-//    256            0.0123
-//    512            0.0064
+//     N     worst |sampled - analytic|      1/N
+//     16           0.0837                 0.0625
+//     32           0.0484                 0.0312
+//     64           0.0381                 0.0156
+//    128           0.0175                 0.0078
+//    256           0.0159                 0.0039
+//    512           0.0082                 0.0020
 //
-// Fibonacci-spiral and equal-area polar-grid point sets were tried and are no
-// better (0.0067 and 0.0167 at N = 512), so this is a property of counting
-// rays, not of this particular sequence.  N = 512 is therefore the smallest
-// power of two that meets the specified criterion, < 1 % of full flux.
+// A power-law fit over that range gives worst ~ 0.49 * N^(-0.65), i.e. roughly
+// the inverse square root of the sample count, NOT 1/N. (Fermi's independent
+// fit on the same data: N^(-0.68).) Two other point sets were tried at N = 512
+// and are no better -- Fibonacci spiral 0.0092, equal-area polar grid 0.0174,
+// both printed by the same test -- so this is a property of counting rays, not
+// of this particular sequence.
+//
+// N = 512 is therefore the smallest power of two that meets the specified
+// criterion, < 1 % of full flux (0.0082).
 //
 // The cost lands ONLY on faces whose probe was split, i.e. the thin band whose
-// view of the primary is partly blocked by terrain; a convex global mesh has
-// none, and every other face is decided by the 5-ray probe.
+// view of the primary is partly blocked by terrain.
 constexpr uint32_t PRIMARY_DISK_SAMPLES = 512;
 
 // Cheap probe: disk centre + 4 rim points.  Unanimous probes decide the face
