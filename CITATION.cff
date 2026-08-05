@@ -11,8 +11,8 @@ authors:
 repository-code: "https://github.com/phayne/ptm3d"
 url: "https://github.com/phayne/ptm3d"
 license: MIT
-version: v1.0-rc1
-date-released: "2026-07-29"
+version: v1.0.3
+date-released: "2026-08-05"
 # doi: 10.5281/zenodo.XXXXXXX   # <- software-deposit DOI slot; fill when the CODE itself is deposited
 identifiers:
   - type: doi
