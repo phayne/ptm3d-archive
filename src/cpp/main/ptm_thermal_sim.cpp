@@ -795,6 +795,152 @@ static inline double solarConstForStep(int t, double fixed) {
     return fixed;
 }
 
+// ---- BUGS.md PTM-107(a): observable effective surface albedo -----------------
+// The BC's operative visible albedo A(theta) was computed per face per timestep and
+// then thrown away, so no external energy-closure audit could reconstruct it -- an
+// auditor had to treat it as a free parameter (that is what made the PTM-105
+// investigation and Fermi's 11.4% closure residual un-decidable). Accumulate the
+// flux-weighted mean per face here, at the ONE place the BC actually decides it,
+// and write it beside the other statistics.
+//   A_eff,f = sum_t A_f(t) Q_f(t) / sum_t Q_f(t)     (Q = direct solar, W/m^2)
+// Faces that never see the Sun have sum_t Q = 0 and are written as NaN (they have
+// no operative direct-beam albedo -- writing A0 there would invent a number).
+static std::vector<double> g_eff_albedo_num;   // sum_t A*Q per face
+static std::vector<double> g_eff_albedo_den;   // sum_t Q   per face
+static bool g_eff_albedo_valid = false;
+
+// PTM-106 self-check. The whole claim of the fix is one identity:
+//   the albedo the radiosity SCATTERS the direct beam with
+//     == the albedo the surface BC did NOT absorb with.
+// Both sides are now computed, so verify rather than assert by eye: the coupling
+// loop accumulates its installed source albedo with the SAME flux weighting the BC
+// uses above, and the two per-face vectors are differenced at the end of the run.
+// A wrong recipe (Hayne where the BC runs Hapke, planet.S where the BC uses the
+// per-step S_inst, a stale per-face A0) shows up here as a large residual instead
+// of as a plausible-looking temperature shift nobody can falsify.
+static std::vector<double> g_src_albedo_num;   // sum_t A_src*Q per face
+static std::vector<double> g_src_albedo_den;
+static bool g_src_albedo_valid = false;
+
+static void reportSourceAlbedoConsistency() {
+    if (!g_src_albedo_valid || !g_eff_albedo_valid) return;
+    const size_t n = std::min(g_src_albedo_den.size(), g_eff_albedo_den.size());
+    double max_abs = 0.0;
+    size_t worst = 0, n_cmp = 0;
+    for (size_t f = 0; f < n; ++f) {
+        if (g_src_albedo_den[f] <= 0.0 || g_eff_albedo_den[f] <= 0.0) continue;
+        const double a_src = g_src_albedo_num[f] / g_src_albedo_den[f];
+        const double a_bc  = g_eff_albedo_num[f] / g_eff_albedo_den[f];
+        const double d = std::abs(a_src - a_bc);
+        if (d > max_abs) { max_abs = d; worst = f; }
+        ++n_cmp;
+    }
+    if (n_cmp == 0) {
+        std::cerr << "  [radiation.PTM-106] WARNING: source-vs-BC albedo self-check had NO "
+                     "comparable faces (accumulators empty). The fix may be installed but "
+                     "UNVERIFIED for this run -- do not quote it as consistent." << std::endl;
+        return;
+    }
+    std::ios_base::fmtflags fl(std::cout.flags());
+    std::streamsize pr = std::cout.precision();
+    std::cout << "[albedo] PTM-106 source-vs-BC albedo self-check over " << n_cmp
+              << " ever-lit faces: max |A_radiosity - A_BC| = "
+              << std::scientific << std::setprecision(3) << max_abs
+              << " (face " << worst << ")";
+    if (max_abs > 1e-9) {
+        std::cout << "  <-- NOT CONSISTENT; the visible source is NOT the BC albedo."
+                  << std::endl;
+        std::cerr << "  [radiation.PTM-106] WARNING: radiosity source albedo disagrees with the "
+                     "surface-BC albedo by up to " << max_abs
+                  << "; reflected-solar energy does not close per face." << std::endl;
+    } else {
+        std::cout << "  -> consistent." << std::endl;
+    }
+    std::cout.flags(fl);
+    std::cout.precision(pr);
+}
+
+// Write statistics/effective_albedo.bin (float64[num_faces]) and report the
+// global flux-weighted scalar. Returns false if there is nothing to write.
+static bool writeEffectiveAlbedo(const std::string& output_dir) {
+    if (!g_eff_albedo_valid || g_eff_albedo_den.empty()) return false;
+    const size_t n = g_eff_albedo_den.size();
+    std::vector<double> a_eff(n);
+    double num_tot = 0.0, den_tot = 0.0;
+    size_t n_lit = 0;
+    for (size_t f = 0; f < n; ++f) {
+        if (g_eff_albedo_den[f] > 0.0) {
+            a_eff[f] = g_eff_albedo_num[f] / g_eff_albedo_den[f];
+            num_tot += g_eff_albedo_num[f];
+            den_tot += g_eff_albedo_den[f];
+            ++n_lit;
+        } else {
+            a_eff[f] = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+    try {
+        std::filesystem::create_directories(output_dir + "/statistics");
+        const std::string fn = output_dir + "/statistics/effective_albedo.bin";
+        std::ofstream out(fn, std::ios::binary);
+        if (!out) {
+            std::cerr << "WARNING: could not open " << fn
+                      << " for the PTM-107(a) effective-albedo output." << std::endl;
+            return false;
+        }
+        // SAME on-disk convention as every other statistics/*.bin: uint32 face
+        // count, then float32[n]. Writing float64 here would silently mis-parse in
+        // every existing reader (scripts/ptm_analyze, the GUI) at exactly half the
+        // face count -- the PTM-67 class.
+        const uint32_t n32 = static_cast<uint32_t>(n);
+        out.write(reinterpret_cast<const char*>(&n32), sizeof(n32));
+        std::vector<float> a_eff_f(n);
+        for (size_t f = 0; f < n; ++f) a_eff_f[f] = static_cast<float>(a_eff[f]);
+        out.write(reinterpret_cast<const char*>(a_eff_f.data()),
+                  static_cast<std::streamsize>(n * sizeof(float)));
+        out.close();
+        std::ios_base::fmtflags fl(std::cout.flags());
+        std::streamsize pr = std::cout.precision();
+        std::cout << "[albedo] PTM-107(a) effective surface albedo (flux-weighted over the "
+                     "DIRECT beam, the value the BC absorbed with): global A_eff = "
+                  << std::defaultfloat << std::setprecision(6)
+                  << (den_tot > 0.0 ? num_tot / den_tot
+                                    : std::numeric_limits<double>::quiet_NaN())
+                  << " over " << n_lit << "/" << n << " ever-lit faces; per-face -> "
+                  << fn << " (uint32 n + float32[" << n
+                  << "], NaN where never lit)." << std::endl;
+        std::cout.flags(fl);
+        std::cout.precision(pr);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "WARNING: PTM-107(a) effective-albedo output failed: "
+                  << e.what() << std::endl;
+        return false;
+    }
+}
+
+// ---- BUGS.md PTM-106: radiosity visible-band SOURCE albedo -------------------
+// The surface BC absorbs (1 - A(theta)) Q with the incidence-dependent Hayne/Hapke
+// albedo, so the enclosure must receive A(theta) Q. Before this fix the two-band
+// radiosity built its visible source from the STATIC base albedo A0 instead (0.12
+// on the Moon vs ~0.6 at 80N grazing incidence), so (A(theta) - A0) Q of reflected
+// sunlight left the budget entirely rather than reaching the shadowed floors.
+// DEFAULT = FIXED. PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1 restores the pre-fix source
+// for A/B work; it is announced loudly because it reinstates a known energy leak.
+static inline bool legacyRadiosityStaticAlbedo() {
+    static bool legacy = []() {
+        const char* e = std::getenv("PTM_LEGACY_RADIOSITY_STATIC_ALBEDO");
+        bool on = (e && std::string(e) != "0" && e[0] != '\0');
+        if (on) {
+            std::cerr << "[radiation.PTM-106] PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1: the two-band "
+                         "visible SOURCE reverts to the STATIC base albedo. This REINSTATES the "
+                         "PTM-106 energy leak at grazing incidence (reflected sunlight is lost "
+                         "from the budget). Use for A/B comparison only.\n";
+        }
+        return on;
+    }();
+    return legacy;
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -1656,6 +1802,13 @@ std::vector<double> calculateAbsorbedFlux(
         }
     }
 
+    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized here
+    // (not in the parallel region) and published to the file-scope globals after the
+    // loop, so a run that calls calculateAbsorbedFlux more than once reports the
+    // LAST (operative) composition rather than a silent mixture.
+    std::vector<double> eff_alb_num(num_faces, 0.0);
+    std::vector<double> eff_alb_den(num_faces, 0.0);
+
     // Apply albedo to calculate absorbed flux for each face at each time step
     #pragma omp parallel for schedule(dynamic, 1000)
     for (size_t f = 0; f < num_faces; f++) {
@@ -1715,6 +1868,14 @@ std::vector<double> calculateAbsorbedFlux(
                 }
             }
 
+            // PTM-107(a): record the OPERATIVE albedo the BC just decided on, flux-
+            // weighted by the direct beam. Per-face accumulators under an omp loop
+            // that is parallel over FACES, so face f is touched by one thread only.
+            if (direct_flux > 0.0) {
+                eff_alb_num[f] += visible_albedo * direct_flux;
+                eff_alb_den[f] += direct_flux;
+            }
+
             // Apply appropriate albedo to each component
             double absorbed_direct = direct_flux * (1.0 - visible_albedo);
             double absorbed_reflected = primary_reflected_values[idx] * (1.0 - visible_albedo);
@@ -1724,6 +1885,11 @@ std::vector<double> calculateAbsorbedFlux(
             absorbed_flux[idx] = absorbed_direct + absorbed_reflected + absorbed_ir;
         }
     }
+
+    // PTM-107(a): publish the operative effective albedo for the statistics writer.
+    g_eff_albedo_num = std::move(eff_alb_num);
+    g_eff_albedo_den = std::move(eff_alb_den);
+    g_eff_albedo_valid = true;
 
     return absorbed_flux;
 }
@@ -12917,21 +13083,35 @@ int main(int argc, char** argv) {
                 std::cout << "  [radiation.band_separated] two-band radiosity ON: visible band "
                              "uses per-face Bond albedo (scatter A_i / absorb 1-A_i), IR band 1-eps/eps."
                           << std::endl;
-                // The per-face albedo sourced here is the STATIC base Bond albedo. When
-                // the BC uses an incidence-dependent albedo (Hayne angular / Hapke), the
-                // absorbed A_BC(θ) varies per timestep while the radiosity A is static —
-                // a residual per-face energy leak at grazing incidence. Wiring the
-                // per-timestep incidence-albedo update into the coupling loop
-                // (RadiationExchangeManager::setSolarAlbedo per timestep) is the remaining
-                // A2/D1 production step; warn rather than close energy silently-wrong.
+                // BUGS.md PTM-106. The albedo above is the STATIC base Bond albedo A0. It
+                // remains the correct reflectance for the DIFFUSE inter-face exchange
+                // (the operator and the absorptivity), but NOT for the first bounce of
+                // the collimated direct beam, which the surface BC reflects with the
+                // incidence-dependent A(theta). The coupling loop below now installs
+                // A(theta) per timestep as the visible-band SOURCE albedo. Say which
+                // albedo feeds the radiosity, every run -- never leave it inferable only
+                // from source.
                 const bool incidence_on =
                     (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
                 if (incidence_on) {
-                    std::cout << "  [radiation.band_separated] WARNING: incidence-dependent albedo is "
-                                 "active; the two-band reflected-solar albedo is the STATIC base value, "
-                                 "so energy does not fully close at grazing incidence. Per-timestep "
-                                 "incidence-albedo update in the coupling loop is not yet wired."
-                              << std::endl;
+                    if (legacyRadiosityStaticAlbedo()) {
+                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: LEGACY "
+                                     "(static base A0) -- incidence-dependent albedo is active, so "
+                                     "reflected sunlight (A(theta)-A0)*Q is LOST from the budget at "
+                                     "grazing incidence. Diffuse operator/absorptivity = A0."
+                                  << std::endl;
+                    } else {
+                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: FIXED -- "
+                                     "the visible-band SOURCE uses the same per-face, per-timestep "
+                                     "A(theta) the surface BC absorbs with ("
+                                  << (planet.use_hapke_albedo ? "Hapke" : "Hayne 2017")
+                                  << "); the diffuse operator/absorptivity keep the Bond value A0."
+                                  << std::endl;
+                    }
+                } else {
+                    std::cout << "  [radiation.band_separated] PTM-106 source albedo: base A0 "
+                                 "(no incidence-dependent albedo on this body -- source == "
+                                 "operator == A0 by construction)." << std::endl;
                 }
             }
 
@@ -13326,6 +13506,62 @@ int main(int argc, char** argv) {
                     // overwritten each step below, so reuse is behavior-identical.
                     std::vector<double> temps_t(num_faces);
                     std::vector<double> solar_t(num_faces);
+
+                    // --- PTM-106: per-timestep visible-band SOURCE albedo ------------
+                    // A(theta) is the albedo the surface BC reflects the DIRECT beam
+                    // with, so it is exactly what the enclosure must receive. Recipe is
+                    // character-for-character the one the coupled CPU re-thermal uses to
+                    // rebuild combined_flux below, so source == 1 - BC absorptivity by
+                    // construction on every face and every timestep.
+                    const double ptm106_a_coef = (planet.albedoCoef.size() >= 2)
+                                               ? planet.albedoCoef[0] : 0.0;
+                    const double ptm106_b_coef = (planet.albedoCoef.size() >= 2)
+                                               ? planet.albedoCoef[1] : 0.0;
+                    const double ptm106_S      = planet.S;
+                    const bool   ptm106_hapke  = planet.use_hapke_albedo
+                                               && planet.hapke_albedo_w >= 0.0;
+                    const bool   ptm106_incidence =
+                        (planet.albedoCoef.size() >= 2 && ptm106_S > 0.0)
+                        || (ptm106_hapke && ptm106_S > 0.0);
+                    // Active only where it can mean anything: two-band radiosity ON and
+                    // an incidence-dependent BC. Otherwise source == operator == A0 and
+                    // installing it would be a no-op that only risks drift.
+                    const bool ptm106_active = rad_config.band_separated
+                                             && ptm106_incidence
+                                             && !legacyRadiosityStaticAlbedo();
+                    std::vector<double> srcalb_t;
+                    if (ptm106_active) srcalb_t.resize(num_faces);
+                    // Self-check accumulators (see reportSourceAlbedoConsistency).
+                    // Filled on coupling iteration 0 only -- every iteration sweeps the
+                    // same timesteps, so accumulating them all would just re-weight the
+                    // identical sum and hide nothing.
+                    // NOTE: this block runs once per COUPLING ITERATION, not once per
+                    // run -- clearing unconditionally here would wipe iteration 0's
+                    // accumulation on iteration 1 and leave the self-check with nothing
+                    // to compare (it silently reported nothing until this was caught).
+                    if (ptm106_active && iter == 0) {
+                        g_src_albedo_num.assign(num_faces, 0.0);
+                        g_src_albedo_den.assign(num_faces, 0.0);
+                    }
+                    auto ptm106_fill = [&](std::vector<double>& out, int t,
+                                           const std::vector<double>& q,
+                                           bool accumulate) {
+                        const double S_t = solarConstForStep(t, ptm106_S);
+                        #pragma omp parallel for schedule(static)
+                        for (size_t f = 0; f < num_faces; f++) {
+                            const double base_A = (f < face_albedos_rad.size())
+                                                ? face_albedos_rad[f] : planet.albedo;
+                            out[f] = applyIncidenceAlbedo(base_A, q[f], S_t,
+                                                          ptm106_a_coef, ptm106_b_coef,
+                                                          ptm106_hapke,
+                                                          hapkeWFromA0(base_A));
+                            if (accumulate && q[f] > 0.0) {
+                                g_src_albedo_num[f] += out[f] * q[f];
+                                g_src_albedo_den[f] += q[f];
+                            }
+                        }
+                        if (accumulate) g_src_albedo_valid = true;
+                    };
                     for (int t_start = 0; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -13349,6 +13585,11 @@ int main(int argc, char** argv) {
                                 const auto& sp = sun_positions[t];
                                 double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
                                 if (sl > 0.0) s_hat = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
+                            }
+                            // PTM-106: install A(theta) for THIS timestep before solving.
+                            if (ptm106_active) {
+                                ptm106_fill(srcalb_t, t, solar_t, iter == 0);
+                                rad_manager.setSolarSourceAlbedo(srcalb_t);
                             }
                             std::vector<double> indirect_t =
                                 rad_manager.computeIndirectFlux(temps_t, solar_t, s_hat);
@@ -13409,6 +13650,18 @@ int main(int argc, char** argv) {
                                     double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
                                     if (sl > 0.0) sun_dirs_batch[j] = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
                                 }
+                            }
+                            // PTM-106: per-timestep A(theta) for the batched (pool) path.
+                            // Built here so timestep j pairs with solar_batch[j]; the
+                            // solver refuses the pool rather than mis-pair on a mismatch.
+                            if (ptm106_active) {
+                                std::vector<std::vector<double>> srcalb_batch(n_batch);
+                                for (int j = 0; j < n_batch; j++) {
+                                    srcalb_batch[j].resize(num_faces);
+                                    ptm106_fill(srcalb_batch[j], t_start + j,
+                                                solar_batch[j], iter == 0);
+                                }
+                                rad_manager.setSolarSourceAlbedoBatch(srcalb_batch);
                             }
                             std::vector<std::vector<double>> indirect_batch =
                                 rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
@@ -14781,6 +15034,11 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             std::cerr << "WARNING: Exception during statistics export: " << e.what() << std::endl;
         }
+
+        // PTM-107(a): the operative per-face effective albedo, so an external energy-
+        // closure audit no longer has to treat the BC albedo as a free parameter.
+        writeEffectiveAlbedo(output_dir);
+        reportSourceAlbedoConsistency();
 
         // Schorghofer & Taylor (2007) ice-stability output. Computed only
         // when the user asked for it (zero overhead otherwise) and only

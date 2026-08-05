@@ -369,6 +369,72 @@ void RadiositySolver::setSolarAlbedo(const std::vector<double>& solar_albedo) {
     // are recomputed on the next solve().
 }
 
+// --- PTM-106: direct-beam (source) albedo, distinct from the diffuse operator ---
+
+void RadiositySolver::setSolarSourceAlbedo(const std::vector<double>& source_albedo) {
+    if (source_albedo.size() != emissivity_.size()) {
+        std::cerr << "  [RadiositySolver::setSolarSourceAlbedo] WARNING: source-albedo size "
+                  << source_albedo.size() << " != face count " << emissivity_.size()
+                  << "; IGNORED (the visible-band source keeps the STATIC base albedo "
+                     "-- BUGS.md PTM-106 remains in force for this run)." << std::endl;
+        return;
+    }
+    solar_albedo_source_ = source_albedo;
+    solar_albedo_source_batch_.clear();
+    checkSourceAlbedoGPURepresentable();
+}
+
+void RadiositySolver::setSolarSourceAlbedoBatch(
+    const std::vector<std::vector<double>>& source_albedo) {
+    for (const auto& v : source_albedo) {
+        if (v.size() != emissivity_.size()) {
+            std::cerr << "  [RadiositySolver::setSolarSourceAlbedoBatch] WARNING: a per-timestep "
+                         "source-albedo vector has size " << v.size() << " != face count "
+                      << emissivity_.size() << "; the WHOLE batch override is IGNORED (the "
+                         "visible-band source keeps the STATIC base albedo -- PTM-106)."
+                      << std::endl;
+            return;
+        }
+    }
+    solar_albedo_source_batch_ = source_albedo;
+    solar_albedo_source_.clear();
+    checkSourceAlbedoGPURepresentable();
+}
+
+void RadiositySolver::clearSolarSourceAlbedo() {
+    solar_albedo_source_.clear();
+    solar_albedo_source_batch_.clear();
+    src_albedo_gpu_ok_ = true;
+}
+
+// The GPU kernel computes solar_source[i] = reflectivity[i] * solar_flux[i] with
+// reflectivity = the OPERATOR albedo A_op. A source albedo A_src != A_op is therefore
+// expressed by pre-scaling the uploaded flux by A_src/A_op, which is undefined where
+// A_op -> 0. Rather than silently dropping those faces' reflected sunlight (the exact
+// archetype PTM-106 is an instance of), refuse the GPU two-band path and let the CPU
+// two-band solve -- which multiplies A_src in directly and needs no ratio -- run.
+void RadiositySolver::checkSourceAlbedoGPURepresentable() {
+    src_albedo_gpu_ok_ = true;
+    if (solar_albedo_source_.empty() && solar_albedo_source_batch_.empty()) return;
+    constexpr double A_OP_MIN = 1e-6;
+    size_t n_bad = 0;
+    for (size_t i = 0; i < solar_reflectivity_.size(); ++i) {
+        if (solar_reflectivity_[i] < A_OP_MIN) ++n_bad;
+    }
+    if (n_bad == 0) return;
+    src_albedo_gpu_ok_ = false;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::cerr << "  [radiation.PTM-106] WARNING: " << n_bad
+                  << " face(s) carry an operator Bond albedo < " << A_OP_MIN
+                  << ", so the incidence-dependent visible SOURCE albedo cannot be "
+                     "represented on the GPU (which hard-wires source = A_op * Q). "
+                     "Falling back to the exact CPU two-band radiosity for this run "
+                     "(correct results, slower)." << std::endl;
+    }
+}
+
 void RadiositySolver::enableTwoBand() {
     // D1: config-driven activation (no env). Never invents an albedo — the archetype.
     if (solar_reflectivity_.empty()) {
@@ -708,6 +774,11 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
     const size_t n = temperatures.size();
     std::vector<float> emiss_f(n), refl_f(n), visE_f(n), visR_f(n);
     std::vector<float> temps_f(n), flux_f(n), zeros_f(n, 0.0f);
+    // PTM-106: the kernel forms solar_source = visR * flux, so a direct-beam source
+    // albedo A_src != the operator A is applied by uploading the EFFECTIVE flux
+    // Q_i * A_src_i / A_i. Reduces to Q_i exactly when no source albedo is installed
+    // (visSourceAlbedo returns solar_reflectivity_ -> ratio == 1 bitwise).
+    const std::vector<double>& src_alb = visSourceAlbedoSingle();
     for (size_t i = 0; i < n; ++i) {
         emiss_f[i] = static_cast<float>(emissivity_[i]);
         refl_f[i]  = static_cast<float>(reflectivity_[i]);
@@ -715,7 +786,9 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
         visR_f[i]  = static_cast<float>(A);
         visE_f[i]  = static_cast<float>(1.0 - A);
         temps_f[i] = static_cast<float>(temperatures[i]);
-        flux_f[i]  = static_cast<float>(solar_flux[i]);
+        const double As = (i < src_alb.size()) ? src_alb[i] : A;
+        flux_f[i]  = static_cast<float>((As == A) ? solar_flux[i]
+                                                  : solar_flux[i] * (As / A));
     }
 
     // IR band (normal properties already uploaded), no solar source.
@@ -750,7 +823,8 @@ std::vector<double> RadiositySolver::solveGPU(
     const std::vector<double>& solar_flux)
 {
     // Band-separated GPU solve when enabled (B1); otherwise the gray GPU path below.
-    if (two_band_gpu_ok_) {
+    // src_albedo_gpu_ok_ (PTM-106) can veto it when A_src/A_op is not representable.
+    if (two_band_gpu_ok_ && src_albedo_gpu_ok_) {
         return solveGPUTwoBand(temperatures, solar_flux);
     }
 
@@ -792,15 +866,55 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     const size_t n_steps = temperatures_per_timestep.size();
     std::vector<std::vector<double>> indirect_per_timestep(n_steps);
 
+    // PTM-106: a per-timestep source albedo must be paired with the RIGHT timestep.
+    // If the batch override is present but mis-sized, refuse the pool (the serial
+    // fallback below re-installs the correct per-step vector on each solve()).
+    const bool src_batch_ok =
+        solar_albedo_source_batch_.empty()
+        || solar_albedo_source_batch_.size() == n_steps;
+    if (!src_batch_ok) {
+        std::cerr << "  [radiation.PTM-106] WARNING: per-timestep source-albedo batch has "
+                  << solar_albedo_source_batch_.size() << " step(s) but the radiosity batch has "
+                  << n_steps << "; running the serial per-timestep path instead of the pool "
+                     "(correct results, slower) rather than pairing the wrong albedo."
+                  << std::endl;
+    }
+
     // Single-device or CPU fallback: serial loop over solve(). Semantically
     // identical to the caller running its own per-timestep loop.
 #ifdef PTM_GPU_OPENCL
-    if (!gpu_pool_) {
+    // A PTM-106 veto sends a POOL run down the serial path; that run still expects
+    // per-band batch output, so populate it here (legacy no-pool callers keep the
+    // exact old behavior -- band batches untouched).
+    const bool ptm106_serial_veto =
+        (gpu_pool_ != nullptr) && (!src_albedo_gpu_ok_ || !src_batch_ok);
+    if (!gpu_pool_ || ptm106_serial_veto) {
+#else
+    const bool ptm106_serial_veto = false;
 #endif
+        // Per-timestep source albedo (if any) must follow the timestep into solve(),
+        // which reads the single-vector slot. Save/restore so the caller's batch
+        // override survives the loop.
+        std::vector<std::vector<double>> saved_batch;
+        saved_batch.swap(solar_albedo_source_batch_);
+        const std::vector<double> saved_single = solar_albedo_source_;
+        if (ptm106_serial_veto && two_band_) {
+            last_indirect_ir_batch_.assign(n_steps, {});
+            last_indirect_vis_batch_.assign(n_steps, {});
+        }
         for (size_t k = 0; k < n_steps; ++k) {
+            if (!saved_batch.empty() && k < saved_batch.size()) {
+                solar_albedo_source_ = saved_batch[k];
+            }
             indirect_per_timestep[k] =
                 solve(temperatures_per_timestep[k], solar_flux_per_timestep[k]);
+            if (ptm106_serial_veto && two_band_) {
+                last_indirect_ir_batch_[k]  = last_indirect_ir_;
+                last_indirect_vis_batch_[k] = last_indirect_vis_;
+            }
         }
+        solar_albedo_source_ = saved_single;
+        solar_albedo_source_batch_.swap(saved_batch);
         return indirect_per_timestep;
 #ifdef PTM_GPU_OPENCL
     }
@@ -854,6 +968,9 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                 [&temperatures_per_timestep, &solar_flux_per_timestep,
                  &indirect_per_timestep, device_steps, n, &row_norm = vf_row_norm_,
                  &emiss_f, &refl_f, &visE_f, &visR_f,
+                 &op_alb = solar_reflectivity_,
+                 &src_single = solar_albedo_source_,
+                 &src_batch = solar_albedo_source_batch_,
                  &ir_batch = last_indirect_ir_batch_,
                  &vis_batch = last_indirect_vis_batch_](
                     gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
@@ -861,9 +978,21 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                     for (size_t k : device_steps) {
                         const auto& temps_d = temperatures_per_timestep[k];
                         const auto& solar_d = solar_flux_per_timestep[k];
+                        // PTM-106: per-timestep direct-beam source albedo, applied by
+                        // pre-scaling the uploaded flux (the kernel forms
+                        // source = A_op * flux). No override -> ratio 1, bitwise legacy.
+                        const std::vector<double>* src_alb =
+                            !src_batch.empty() ? &src_batch[k]
+                                               : (!src_single.empty() ? &src_single : nullptr);
                         for (size_t i = 0; i < n; ++i) {
                             temps_f[i] = static_cast<float>(temps_d[i]);
-                            solar_f[i] = static_cast<float>(solar_d[i]);
+                            double q = solar_d[i];
+                            if (src_alb) {
+                                const double A  = (i < op_alb.size()) ? op_alb[i] : 0.0;
+                                const double As = (i < src_alb->size()) ? (*src_alb)[i] : A;
+                                if (As != A) q *= As / A;
+                            }
+                            solar_f[i] = static_cast<float>(q);
                         }
                         // IR band (device holds IR props), then visible, then
                         // restore IR -- identical sequence to solveGPUTwoBand.
@@ -938,7 +1067,8 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     // two-band path is NOT engaged (e.g. band separation enabled AFTER initGPU, or
     // a Σ>1 mesh), fall through to the CPU two-band solve rather than silently
     // running the gray GPU kernel for a two-band request.
-    if (use_gpu_ && gpu_solver_ && (two_band_gpu_ok_ || !two_band_)) {
+    if (use_gpu_ && gpu_solver_
+        && ((two_band_gpu_ok_ && src_albedo_gpu_ok_) || !two_band_)) {
         return solveGPU(temperatures, solar_flux);
     }
 #endif
@@ -1013,9 +1143,15 @@ std::vector<double> RadiositySolver::solveTwoBand(
     //   Visible: (I - A F) B_vis = A Q_solar  (A = solar_reflectivity_, no emission)
     // vis_source (A_i Q_solar) is needed by both the solve and the identity below.
     auto emission = computeThermalEmission(temperatures);
+    // PTM-106: the FIRST bounce scatters the collimated direct beam, so it uses the
+    // direct-beam albedo A_src (== the BC's A(theta) when the caller installs it);
+    // the operator/absorptivity below keep the diffuse Bond value. Falls back to
+    // solar_reflectivity_ when no source albedo was installed -> legacy path,
+    // byte-identical.
+    const std::vector<double>& src_alb = visSourceAlbedoSingle();
     std::vector<double> vis_source(n);
     for (size_t i = 0; i < n; ++i) {
-        vis_source[i] = solar_reflectivity_[i] * solar_flux[i];
+        vis_source[i] = src_alb[i] * solar_flux[i];
     }
     std::vector<double> B_ir, B_vis;
     // Gauss-Seidel is the effective solver ONLY when it can actually access rows
@@ -2075,6 +2211,39 @@ void RadiationExchangeManager::setSolarAlbedo(const std::vector<double>& solar_a
     if (solver_ && !solar_albedo_.empty()) {
         solver_->setSolarAlbedo(solar_albedo_);
     }
+}
+
+// PTM-106 forwarders. Unlike setSolarAlbedo these are NOT cached across prepare():
+// the source albedo is a per-timestep quantity that only means anything once the
+// solver exists and the caller is inside the coupling loop. Silently dropping it
+// would reinstate the bug, so a missing solver WARNS.
+void RadiationExchangeManager::setSolarSourceAlbedo(const std::vector<double>& source_albedo) {
+    if (!solver_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "  [radiation.PTM-106] WARNING: setSolarSourceAlbedo() called before the "
+                         "radiosity solver exists; the incidence-dependent visible SOURCE albedo "
+                         "was DROPPED for this call (static base albedo in force)." << std::endl;
+        }
+        return;
+    }
+    solver_->setSolarSourceAlbedo(source_albedo);
+}
+
+void RadiationExchangeManager::setSolarSourceAlbedoBatch(
+    const std::vector<std::vector<double>>& source_albedo) {
+    if (!solver_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "  [radiation.PTM-106] WARNING: setSolarSourceAlbedoBatch() called before "
+                         "the radiosity solver exists; DROPPED (static base albedo in force)."
+                      << std::endl;
+        }
+        return;
+    }
+    solver_->setSolarSourceAlbedoBatch(source_albedo);
 }
 
 void RadiationExchangeManager::enableTwoBand() {
