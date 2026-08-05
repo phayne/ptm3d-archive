@@ -566,17 +566,29 @@ __kernel void persistentThermalKernel(
                 float k0 = k_local[0];
                 float T1 = T_local[1];
 
-                // Initial guess - MUST match CPU surfTemp() exactly!
-                // CPU uses: sqrt(sqrt(Qs / (eps * sigma))) when Qs > 0, else T1
-                float T_surf;
+                // Initial guess: the UPPER end of the root bracket.
+                //
+                // f(T) = Qs + k0*(T1 - T)/dz - eps*sigma*T^4 is strictly
+                // decreasing, and f(T_eq)*f(T1) <= 0 for T_eq = (Qs/(eps*sigma))^0.25
+                // (f(T_eq) = k0*(T1-T_eq)/dz, f(T1) = eps*sigma*(T_eq^4 - T1^4)),
+                // so the unique root is ALWAYS bracketed by [min(T_eq,T1), max(T_eq,T1)].
+                // Starting at the upper end also puts Newton on the side where the
+                // concave f (f'' = -12*eps*sigma*T^2 < 0) converges monotonically.
+                //
+                // PTM-115: starting at T_eq unconditionally when Qs > 0 is the
+                // defect. As Qs -> 0+, T_eq -> 0, while the step limiter below
+                // caps growth at 1.5x per iteration over max_iter=10 -> the
+                // iterate can travel at most 1.5^10 = 57.665x from the guess.
+                // Any face with 0 < Qs < eps*sigma*(T_root/57.665)^4 (~5e-7 W/m^2
+                // for a 100 K root) therefore returned an under-converged,
+                // spuriously COLD surface temperature, exactly 1.5^10 * T_eq.
+                // Sunlit faces have T_eq >= T1 and are bit-unchanged.
+                float T_surf = T1;
                 if (Q_surf > 0.0f) {
-                    // Equilibrium temperature as initial guess (matching CPU)
-                    // sqrt(sqrt(x)) = x^0.25 but more accurate
+                    // Equilibrium temperature (sqrt(sqrt(x)) = x^0.25, more accurate)
                     float x = Q_surf / (eps * sigma);
-                    T_surf = native_sqrt(native_sqrt(x));
-                } else {
-                    // Night side: use subsurface temperature as initial guess (matching CPU)
-                    T_surf = T1;
+                    float T_eq = native_sqrt(native_sqrt(x));
+                    if (T_eq > T_surf) T_surf = T_eq;
                 }
 
                 // Newton-Raphson iterations with early termination
