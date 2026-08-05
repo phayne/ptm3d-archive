@@ -1,4 +1,5 @@
 #include "illumination_model.h"
+#include "primary_disk.h"
 #include "../constants/physics_constants.h"
 #include "../constants/numeric_constants.h"
 #include "../constants/constants.h"  // For ptm_thermal::constants
@@ -194,31 +195,13 @@ inline uint32_t hashFaceSeed(const std::array<double,3>& c, const std::array<dou
     h = mix32(h ^ q(sun_pos[0])); h = mix32(h ^ q(sun_pos[1])); h = mix32(h ^ q(sun_pos[2]));
     return h;
 }
-// Radical inverse base 2
-inline double vanDerCorput(uint32_t n) {
-    n = (n << 16) | (n >> 16);
-    n = ((n & 0x55555555u) << 1) | ((n & 0xAAAAAAAAu) >> 1);
-    n = ((n & 0x33333333u) << 2) | ((n & 0xCCCCCCCCu) >> 2);
-    n = ((n & 0x0F0F0F0Fu) << 4) | ((n & 0xF0F0F0F0u) >> 4);
-    n = ((n & 0x00FF00FFu) << 8) | ((n & 0xFF00FF00u) >> 8);
-    return double(n) * 2.3283064365386963e-10; // /2^32
-}
-// Hammersley point in [0,1)^2 with Cranley–Patterson rotation
-inline void hammersley(uint32_t i, uint32_t N, double uoff, double voff, double& u, double& v) {
-    u = std::fmod((double(i) / double(std::max(1u,N))) + uoff, 1.0);
-    v = std::fmod(vanDerCorput(i) + voff, 1.0);
-}
-// Concentric disk mapping (Shirley–Chiu)
-inline void squareToConcentricDisk(double u, double v, double& dx, double& dy) {
-    double sx = 2.0*u - 1.0;
-    double sy = 2.0*v - 1.0;
-    if (sx == 0.0 && sy == 0.0) { dx = dy = 0.0; return; }
-    double r, phi;
-    if (std::abs(sx) > std::abs(sy)) { r = sx; phi = (M_PI/4.0) * (sy/sx); }
-    else                             { r = sy; phi = (M_PI/2.0) - (M_PI/4.0) * (sx/sy); }
-    dx = r * std::cos(phi);
-    dy = r * std::sin(phi);
-}
+// The QMC disk sampler now lives in primary_disk.h so the solar-disk path and
+// the PTM-44 primary-disk path share ONE definition (and so the standalone
+// test_primary_disk gate can exercise the same arithmetic). Definitions moved
+// verbatim; every call site below is unchanged.
+using ptm::disk::vanDerCorput;
+using ptm::disk::hammersley;
+using ptm::disk::squareToConcentricDisk;
 inline void rotateBasis(const std::array<double,3>& u, const std::array<double,3>& v,
                         double ang, std::array<double,3>& ur, std::array<double,3>& vr) {
     double c = std::cos(ang), s = std::sin(ang);
@@ -4087,6 +4070,234 @@ void IlluminationModel::createCoordinateSystem(
     v[2] = direction[0] * u[1] - direction[1] * u[0];
 }
 
+// ===========================================================================
+// PTM-44: fractional visibility of the PRIMARY's finite disk.
+//
+// Both primary-flux paths used to decide visibility with ONE ray to the disk
+// centre and to zero the flux the instant cos(theta) <= 0. The primary is not a
+// point -- Jupiter's angular RADIUS from Europa is 5.98 deg, Earth's from the
+// Moon 0.95 deg -- so a crater rim sweeping across it switched a face between
+// 100 % and 0 % with a hard step, and a face whose normal fell 0.1 deg past the
+// primary's horizon lost all of it. The finite SOLAR disk already gets this
+// treatment (:3727 uses the identical `cos_inc0 <= -sin(disk_ang)` criterion);
+// this brings the primary paths level.
+//
+// The result is <cos theta> over the disk, eq. (8) of
+// docs/primary-reflected-flux-derivation.md, factored as
+//
+//     <cos theta> = A(h, alpha) * V_terrain
+//
+//   A         analytic horizon clip, ptm::disk::diskMeanCosAboveHorizon.
+//             EXACTLY cos(theta_0) when the whole disk is above the horizon, so
+//             the arithmetic for those faces is bit-identical to the old code.
+//   V_terrain cosine-weighted unoccluded fraction of the disk, from rays.
+//
+// Cost control (fast-path criterion, documented in the derivation note 7.3):
+//   * whole disk below the horizon        -> 0, NO rays;
+//   * 5-ray probe (centre + 4 rim points, above-horizon directions only)
+//     unanimous                           -> V_terrain = 1 or 0, no more rays;
+//   * probe split                         -> PRIMARY_DISK_SAMPLES rays; see
+//                                            primary_disk.h for the MEASURED
+//                                            quantisation that fixes the count.
+// On a convex body (every icosphere) an above-horizon ray from an offset origin
+// always escapes, so global meshes pay 5 rays per face instead of 1 and get the
+// analytic horizon ramp for free. PTM_PRIMARY_DISK_ALWAYS_SAMPLE=1 disables the
+// probe short-circuit for validation.
+//
+// Results land in the memo members and are consumed by BOTH batch functions:
+// visibility depends only on (mesh, primary position) -- not on the Sun -- and
+// the two batches are always called back to back with the same arguments
+// (:2223/:2251 and :3530/:3539), so one evaluation serves both. Both call sites
+// are outside every OpenMP region, so the memo needs no lock.
+// ===========================================================================
+void IlluminationModel::updatePrimaryDiskVisibility(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& primary_position) {
+
+    const size_t num_faces = face_centers.size();
+
+    if (primary_vis_key_n_ == num_faces &&
+        primary_vis_key_centers_ == static_cast<const void*>(face_centers.data()) &&
+        primary_vis_key_normals_ == static_cast<const void*>(face_normals.data()) &&
+        primary_vis_key_pos_[0] == primary_position[0] &&
+        primary_vis_key_pos_[1] == primary_position[1] &&
+        primary_vis_key_pos_[2] == primary_position[2] &&
+        primary_vis_mean_cos_.size() == num_faces) {
+        return;                                   // memo hit
+    }
+
+    // The memo key is published only AFTER the loop completes: if the loop
+    // throws, the next call must recompute rather than serve a half-filled
+    // array (the two batch callers catch and zero-fill, which would otherwise
+    // hide it).
+    primary_vis_key_centers_ = nullptr;
+    primary_vis_key_normals_ = nullptr;
+    primary_vis_key_n_       = static_cast<size_t>(-1);
+    primary_vis_mean_cos_.assign(num_faces, 0.0);
+    primary_vis_dist_km_.assign(num_faces, 0.0);
+    if (num_faces == 0) return;
+
+    // Same |face_center| > 10000 unit discriminator the rest of this file uses
+    // (PTM-37 makes it visible and refuses the ambiguous cases at startup).
+    const bool centers_in_meters = (vectorLength(face_centers[0]) > 10000.0);
+    const double km_to_native = centers_in_meters ? 1000.0 : 1.0;
+
+    static const bool always_sample = [](){
+        const char* e = std::getenv("PTM_PRIMARY_DISK_ALWAYS_SAMPLE");
+        return e && std::atoi(e) != 0;
+    }();
+    // Opt-in branch census. Without it there is no way to tell from a run's
+    // outputs whether the escalation path ever fired, and "it must have" is not
+    // evidence.
+    static const bool report_stats = [](){
+        const char* e = std::getenv("PTM_PRIMARY_DISK_STATS");
+        return e && std::atoi(e) != 0;
+    }();
+    size_t n_below = 0, n_full = 0, n_dark = 0, n_sampled = 0;
+
+    const uint32_t N_SAMP = ptm::disk::PRIMARY_DISK_SAMPLES;
+
+    #pragma omp parallel for schedule(dynamic) \
+        reduction(+:n_below, n_full, n_dark, n_sampled)
+    for (size_t i = 0; i < num_faces; ++i) {
+        const auto& fn = face_normals[i];
+
+        std::array<double, 3> fc_km = centers_in_meters
+            ? metersToKm(face_centers[i]) : face_centers[i];
+
+        const std::array<double, 3> rel = {
+            primary_position[0] - fc_km[0],
+            primary_position[1] - fc_km[1],
+            primary_position[2] - fc_km[2]
+        };
+        const double dist = vectorLength(rel);
+        if (dist <= constants::EPSILON) continue;
+        primary_vis_dist_km_[i] = dist;
+
+        const std::array<double, 3> dir = { rel[0]/dist, rel[1]/dist, rel[2]/dist };
+        const double c0 = dotProduct(fn, dir);
+
+        double sin_alpha = primary_radius_ / dist;
+        if (sin_alpha > 1.0) sin_alpha = 1.0;          // degenerate: inside the primary
+        const double alpha = std::asin(sin_alpha);
+
+        // Whole disk below the face's own horizon plane -> no flux, no rays.
+        if (c0 <= -sin_alpha) { ++n_below; continue; }
+
+        const double A = ptm::disk::diskMeanCosAboveHorizon(c0, alpha);
+        if (A <= 0.0) { ++n_below; continue; }
+
+        if (!embree_scene_) {                          // no BVH -> nothing occludes
+            primary_vis_mean_cos_[i] = A;
+            ++n_full;
+            continue;
+        }
+
+        const double safe_offset = calculateSafeRayOffset(face_centers[i], fn);
+        const std::array<double, 3> ray_origin_local = {
+            face_centers[i][0] + fn[0]*safe_offset - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+            face_centers[i][1] + fn[1]*safe_offset - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+            face_centers[i][2] + fn[2]*safe_offset - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+        };
+        // Stop the ray at the primary's near surface, exactly as the single
+        // centre ray did. Mesh-native units.
+        const float tfar_dist = static_cast<float>((dist - primary_radius_) * km_to_native);
+
+        std::array<double, 3> u, v;
+        createCoordinateSystem(dir, u, v);
+
+        // Direction toward the disk point offset by (dx, dy) in units of the
+        // disk's angular radius. Same construction (and same sin(alpha) scale)
+        // as the solar-disk sampler at :3868.
+        auto disk_dir = [&](double dx, double dy) {
+            std::array<double, 3> sd = {
+                dir[0] + sin_alpha*(dx*u[0] + dy*v[0]),
+                dir[1] + sin_alpha*(dx*u[1] + dy*v[1]),
+                dir[2] + sin_alpha*(dx*u[2] + dy*v[2])
+            };
+            const double l = vectorLength(sd);
+            if (l > constants::EPSILON) { sd[0]/=l; sd[1]/=l; sd[2]/=l; }
+            return sd;
+        };
+
+        auto occluded = [&](const std::array<double, 3>& sd) {
+            RTCRayHit rayhit;
+            rayhit.ray.org_x = ray_origin_local[0];
+            rayhit.ray.org_y = ray_origin_local[1];
+            rayhit.ray.org_z = ray_origin_local[2];
+            rayhit.ray.dir_x = sd[0];
+            rayhit.ray.dir_y = sd[1];
+            rayhit.ray.dir_z = sd[2];
+            rayhit.ray.tnear = 1.0e-4f;
+            rayhit.ray.tfar  = tfar_dist;
+            rayhit.ray.mask  = 0xFFFFFFFF;
+            rayhit.ray.flags = 0;
+            rayhit.ray.time  = 0.0f;
+            rayhit.hit.geomID    = RTC_INVALID_GEOMETRY_ID;
+            rayhit.hit.primID    = RTC_INVALID_GEOMETRY_ID;
+            rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
+            RTCIntersectArguments args;
+            rtcInitIntersectArguments(&args);
+            rtcIntersect1(embree_scene_, &rayhit, &args);
+            return rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID;
+        };
+
+        // ---- cheap probe: centre + 4 rim points, above-horizon only ---------
+        uint32_t probes_up = 0, probes_clear = 0;
+        for (uint32_t k = 0; k < ptm::disk::PRIMARY_DISK_PROBES; ++k) {
+            double dx, dy;
+            ptm::disk::probeOffset(k, dx, dy);
+            const std::array<double, 3> sd = disk_dir(dx, dy);
+            if (dotProduct(fn, sd) <= 0.0) continue;   // carries no flux anyway
+            ++probes_up;
+            if (!occluded(sd)) ++probes_clear;
+        }
+
+        if (probes_up == 0) { ++n_below; continue; }   // nothing above the horizon
+        if (!always_sample && probes_clear == probes_up) {
+            primary_vis_mean_cos_[i] = A;              // fully visible
+            ++n_full;
+            continue;
+        }
+        if (!always_sample && probes_clear == 0) {
+            ++n_dark;
+            continue;                                  // fully occluded -> 0
+        }
+        ++n_sampled;
+
+        // ---- escalate: cosine-weighted unoccluded fraction of the disk ------
+        // V is a RATIO over the same sample set, so the O(alpha^2) bias of
+        // sampling a projected disk cancels and V == 1 reproduces A exactly.
+        double w_total = 0.0, w_clear = 0.0;
+        for (uint32_t k = 0; k < N_SAMP; ++k) {
+            double su, sv;
+            ptm::disk::hammersley(k, N_SAMP, 0.0, 0.0, su, sv);
+            double dx, dy;
+            ptm::disk::squareToConcentricDisk(su, sv, dx, dy);
+            const std::array<double, 3> sd = disk_dir(dx, dy);
+            const double w = dotProduct(fn, sd);
+            if (w <= 0.0) continue;                    // below the horizon: no flux
+            w_total += w;
+            if (!occluded(sd)) w_clear += w;
+        }
+        if (w_total <= 0.0) continue;
+        primary_vis_mean_cos_[i] = A * (w_clear / w_total);
+    }
+
+    primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
+    primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
+    primary_vis_key_pos_     = primary_position;
+    primary_vis_key_n_       = num_faces;
+
+    if (report_stats) {
+        std::cerr << "[illumination] primary disk: " << num_faces << " faces -- "
+                  << n_below << " below horizon, " << n_full << " fully visible, "
+                  << n_dark << " fully occluded, " << n_sampled << " sampled ("
+                  << N_SAMP << " rays each)" << std::endl;
+    }
+}
+
 void IlluminationModel::calculatePrimaryIRBatch(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
@@ -4095,21 +4306,12 @@ void IlluminationModel::calculatePrimaryIRBatch(
     
     size_t num_faces = face_centers.size();
     ir_values.assign(num_faces, 0.0);
-    
+
     // Skip if primary is the sun
     if (primary_is_sun_) {
         return;
     }
-    
-    // Detect if face centers are in meters or kilometers
-    bool centers_in_meters = false;
-    if (!face_centers.empty()) {
-        double mag = vectorLength(face_centers[0]);
-        if (mag > 10000.0) {
-            centers_in_meters = true;
-        }
-    }
-    
+
     // Get primary IR flux based on body
     double primary_ir_flux = 0.0;
     if (primary_body_name_ == "EARTH") {
@@ -4128,111 +4330,19 @@ void IlluminationModel::calculatePrimaryIRBatch(
         return;
     }
     
+    // PTM-44: one evaluation of the finite disk's visibility, shared with
+    // calculatePrimaryReflectedBatch. Replaces the per-face centre ray AND the
+    // hard cos_angle <= 0 cut that used to live in this loop.
+    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
+
     // Process each face in parallel
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_normal = face_normals[i];
-        
-        // Convert face center to kilometers if needed for consistent calculations
-        std::array<double, 3> face_center_km;
-        if (centers_in_meters) {
-            face_center_km = {
-                face_centers[i][0] / 1000.0,
-                face_centers[i][1] / 1000.0,
-                face_centers[i][2] / 1000.0
-            };
-        } else {
-            face_center_km = face_centers[i];
+        const double mean_cos = primary_vis_mean_cos_[i];
+        if (mean_cos <= 0.0) {
+            continue;    // below the horizon, fully occluded, or degenerate
         }
-        
-        // Calculate primary direction relative to face (both now in km)
-        std::array<double, 3> primary_rel = {
-            primary_position[0] - face_center_km[0],
-            primary_position[1] - face_center_km[1],
-            primary_position[2] - face_center_km[2]
-        };
-        
-        double primary_dist = vectorLength(primary_rel);
-        
-        // Skip if too close (shouldn't happen but safety check)
-        if (primary_dist <= constants::EPSILON) {
-            continue;
-        }
-        
-        // Normalize to get direction vector
-        std::array<double, 3> primary_dir = {
-            primary_rel[0] / primary_dist,
-            primary_rel[1] / primary_dist,
-            primary_rel[2] / primary_dist
-        };
-        
-        // Check if face is oriented toward primary
-        double cos_angle = dotProduct(face_normal, primary_dir);
-        
-        // Skip faces not facing the primary
-        if (cos_angle <= 0.0) {
-            continue;
-        }
-        
-        // Calculate IR heating value
-        double ir_flux = calculatePrimaryHeating(
-            face_normal, primary_dir, primary_dist);
-        
-        // Ray tracing visibility check
-        // Use original mesh units for ray origin, but apply scene origin offset for Embree
-        double safe_offset = calculateSafeRayOffset(face_centers[i], face_normal);
-        std::array<double, 3> ray_origin = {
-            face_centers[i][0] + face_normal[0] * safe_offset,
-            face_centers[i][1] + face_normal[1] * safe_offset,
-            face_centers[i][2] + face_normal[2] * safe_offset
-        };
-
-        // Apply scene origin offset for Embree local coordinate system
-        std::array<double, 3> ray_origin_local = {
-            ray_origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
-            ray_origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
-            ray_origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
-        };
-
-        // Create ray for Embree
-        RTCRayHit rayhit;
-        rayhit.ray.org_x = ray_origin_local[0];
-        rayhit.ray.org_y = ray_origin_local[1];
-        rayhit.ray.org_z = ray_origin_local[2];
-        rayhit.ray.dir_x = primary_dir[0];
-        rayhit.ray.dir_y = primary_dir[1];
-        rayhit.ray.dir_z = primary_dir[2];
-        rayhit.ray.tnear = 1.0e-4f;  // Small offset to avoid self-intersection
-        
-        // CRITICAL: Set tfar to stop at primary body edge
-        // Distance from face to primary edge = distance to center - primary radius
-        // Must be in same units as mesh
-        float tfar_dist;
-        if (centers_in_meters) {
-            // Convert km distance back to meters for ray tracing
-            tfar_dist = static_cast<float>((primary_dist - primary_radius_) * 1000.0);
-        } else {
-            // Already in km
-            tfar_dist = static_cast<float>(primary_dist - primary_radius_);
-        }
-        rayhit.ray.tfar = tfar_dist;
-        
-        rayhit.ray.mask = 0xFFFFFFFF;
-        rayhit.ray.flags = 0;
-        rayhit.ray.time = 0.0f;
-        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-        rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
-        rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-        
-        // Trace the ray
-        RTCIntersectArguments args;
-        rtcInitIntersectArguments(&args);
-        rtcIntersect1(embree_scene_, &rayhit, &args);
-        
-        // If no hit, primary is visible from this face
-        if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-            ir_values[i] = ir_flux;
-        }
+        ir_values[i] = calculatePrimaryHeating(mean_cos, primary_vis_dist_km_[i]);
     }
 }
 
@@ -4252,15 +4362,6 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
         return;
     }
     
-    // Detect if face centers are in meters or kilometers
-    bool centers_in_meters = false;
-    if (!face_centers.empty()) {
-        double mag = vectorLength(face_centers[0]);
-        if (mag > 10000.0) {
-            centers_in_meters = true;
-        }
-    }
-    
     // Get primary bond albedo based on body
     double primary_albedo = 0.3;  // Default
     if (primary_body_name_ == "EARTH") {
@@ -4278,112 +4379,43 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
         warnUnknownPrimaryOnce(primary_body_name_, "primary reflected light (batch)",
                                "substituting a Bond albedo of 0.3");
     }
-    
+
+    // PTM-44: shared finite-disk visibility (memoized -- the IR batch that runs
+    // beside this one gets the same evaluation, not a second set of rays).
+    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
+
+    // Detect if face centers are in meters or kilometers (needed only to put
+    // the face centre in km for the phase-angle geometry).
+    const bool centers_in_meters =
+        (!face_centers.empty() && vectorLength(face_centers[0]) > 10000.0);
+
     // Process each face in parallel
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < num_faces; ++i) {
-        const auto& face_normal = face_normals[i];
-        
-        // Convert face center to kilometers if needed
-        std::array<double, 3> face_center_km;
-        if (centers_in_meters) {
-            face_center_km = {
-                face_centers[i][0] / 1000.0,
-                face_centers[i][1] / 1000.0,
-                face_centers[i][2] / 1000.0
-            };
-        } else {
-            face_center_km = face_centers[i];
+        const double mean_cos = primary_vis_mean_cos_[i];
+        if (mean_cos <= 0.0) {
+            continue;    // below the horizon, fully occluded, or degenerate
         }
-        
-        // Calculate primary direction relative to face
-        std::array<double, 3> primary_rel = {
+        const double primary_dist = primary_vis_dist_km_[i];
+        if (primary_dist <= constants::EPSILON) {
+            continue;
+        }
+
+        const std::array<double, 3> face_center_km = centers_in_meters
+            ? metersToKm(face_centers[i]) : face_centers[i];
+        const std::array<double, 3> primary_rel = {
             primary_position[0] - face_center_km[0],
             primary_position[1] - face_center_km[1],
             primary_position[2] - face_center_km[2]
         };
-        
-        double primary_dist = vectorLength(primary_rel);
-        
-        // Skip if too close
-        if (primary_dist <= constants::EPSILON) {
-            continue;
-        }
-        
-        // Normalize to get direction vector
-        std::array<double, 3> primary_dir = {
+        const std::array<double, 3> primary_dir = {
             primary_rel[0] / primary_dist,
             primary_rel[1] / primary_dist,
             primary_rel[2] / primary_dist
         };
-        
-        // Check if face is oriented toward primary
-        double cos_angle = dotProduct(face_normal, primary_dir);
-        
-        // Skip faces not facing the primary
-        if (cos_angle <= 0.0) {
-            continue;
-        }
-        
-        // Calculate reflected light value using existing physics function
-        // This function handles the phase angle and illumination calculations
-        double reflection_value = calculatePrimaryReflectedLight(
-            face_normal, primary_dir, sun_position, primary_position);
-        
-        // Ray tracing visibility check
-        // Use original mesh units for ray origin, but apply scene origin offset for Embree
-        double safe_offset = calculateSafeRayOffset(face_centers[i], face_normal);
-        std::array<double, 3> ray_origin = {
-            face_centers[i][0] + face_normal[0] * safe_offset,
-            face_centers[i][1] + face_normal[1] * safe_offset,
-            face_centers[i][2] + face_normal[2] * safe_offset
-        };
 
-        // Apply scene origin offset for Embree local coordinate system
-        std::array<double, 3> ray_origin_local = {
-            ray_origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
-            ray_origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
-            ray_origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
-        };
-
-        // Create ray for Embree
-        RTCRayHit rayhit;
-        rayhit.ray.org_x = ray_origin_local[0];
-        rayhit.ray.org_y = ray_origin_local[1];
-        rayhit.ray.org_z = ray_origin_local[2];
-        rayhit.ray.dir_x = primary_dir[0];
-        rayhit.ray.dir_y = primary_dir[1];
-        rayhit.ray.dir_z = primary_dir[2];
-        rayhit.ray.tnear = 1.0e-4f;
-        rayhit.ray.tfar  = 1.0e30f; // Will be set properly below
-        
-        // Set tfar with proper unit conversion
-        float tfar_dist;
-        if (centers_in_meters) {
-            // Convert km distance back to meters for ray tracing
-            tfar_dist = static_cast<float>((primary_dist - primary_radius_) * 1000.0);
-        } else {
-            // Already in km
-            tfar_dist = static_cast<float>(primary_dist - primary_radius_);
-        }
-        rayhit.ray.tfar = tfar_dist;
-        
-        rayhit.ray.mask = 0xFFFFFFFF;
-        rayhit.ray.flags = 0;
-        rayhit.ray.time = 0.0f;
-        rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-        rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
-        rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-        
-        // Trace the ray
-        RTCIntersectArguments args;
-        rtcInitIntersectArguments(&args);
-        rtcIntersect1(embree_scene_, &rayhit, &args);
-        
-        // If no hit, primary is visible from this face
-        if (rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-            reflected_values[i] = reflection_value;
-        }
+        reflected_values[i] = calculatePrimaryReflectedLight(
+            mean_cos, primary_dir, sun_position, primary_position, primary_dist);
     }
 }
 
@@ -4399,16 +4431,16 @@ bool IlluminationModel::traceRaySingle(const Ray& ray) {
     return !result.empty() && result[0] >= 0;
 }
 
+// `mean_cos` is <cos theta> over the primary's disk (PTM-44): the horizon clip
+// and the terrain-visible fraction are already folded in by
+// updatePrimaryDiskVisibility, and it equals the old dot(normal, primary_dir)
+// exactly whenever the whole disk is above the horizon and unoccluded.
 double IlluminationModel::calculatePrimaryHeating(
-    const std::array<double, 3>& face_normal,
-    const std::array<double, 3>& primary_direction,
+    double mean_cos,
     double primary_distance) {
 
-    // Calculate cosine of angle between normal and primary direction
-    double cos_angle = dotProduct(face_normal, primary_direction);
-
-    // If Primary is below horizon, no heating
-    if (cos_angle <= 0.0) {
+    // If Primary is below the horizon or fully hidden, no heating
+    if (mean_cos <= 0.0) {
         return 0.0;
     }
 
@@ -4437,7 +4469,7 @@ double IlluminationModel::calculatePrimaryHeating(
     // temperature, not any at-target irradiance. (SATURN_IR_FLUX and
     // MARS_IR_FLUX do NOT match their own stated temperatures -- see BUGS PTM-43;
     // Titan/Enceladus/Phobos-class runs are affected by that, not by this fix.)
-    double view_factor = solid_angle / M_PI * cos_angle;
+    double view_factor = solid_angle / M_PI * mean_cos;
     
     // Use appropriate IR flux based on the primary body
     double primary_ir_flux = 0.0;
@@ -4482,17 +4514,54 @@ double IlluminationModel::calculatePrimaryHeating(
     return primary_ir_flux * view_factor;
 }
 
+// PTM-41: disk-integrated reflected irradiance from a LAMBERT SPHERE primary.
+//
+//     E = p * F * sin^2(alpha) * Phi_L(a) * <cos theta>
+//     p       = (2/3) * A_bond          (Lambert sphere: phase integral q = 3/2)
+//     Phi_L(a)= [sin a + (pi - a) cos a] / pi
+//
+// Full derivation, limits and the numerical check:
+// docs/primary-reflected-flux-derivation.md.
+//
+// What this replaces, and why the previous "the two errors cancel" note was
+// only half right. The old expression was
+//
+//     E_old = F * A_bond * [(1+cos a)/2] * (Omega/(4 pi)) * cos theta
+//           = F * (A_bond/4) * sin^2(alpha) * Phi_old(a) * cos theta
+//
+// The 1/4 in Omega/(4 pi) does belong to an ISOTROPIC re-radiator -- an
+// isotropic sphere has Phi == 1 and phase integral q = 4, so p_iso = A_bond/4.
+// But the code then multiplied that isotropic normalisation by a NON-isotropic
+// phase function whose own phase integral is
+//
+//     q_old = 2 * Int_0^pi [(1+cos a)/2] sin a da = 2
+//
+// so the implied total reflected power was F*pi*R^2 * A_bond * (2/4), i.e.
+// EXACTLY HALF the sunlight the primary reflects. The pre-fix term was not just
+// mis-shaped in phase, it broke energy conservation by a factor 2, and at full
+// phase it was 8/3 = 2.667x low (ratio truth/old = (8/3) Phi_L/Phi_old, which
+// falls to 1.70 at quadrature and crosses 1 near a = 125 deg -- near NEW phase
+// the old code over-estimated). The declined blanket x4 of PTM-40 would have
+// given 2x the correct total power; the radiosity and the phase function had to
+// be repaired together, which is what this does. With p = (2/3) A_bond and
+// Phi_L, q = 3/2 and the energy budget closes exactly.
+//
+// Model choice: a Lambert sphere, energy-consistent with the *_BOND_ALBEDO
+// constants. Jupiter's measured V-band geometric albedo (~0.52) would be 2.3x
+// brighter at full phase, but pairing it with A_bond = 0.343 implies q = 0.66,
+// which is not Jupiter's phase integral, and it is a V-band number applied to a
+// bolometric flux. A body-specific measured (p, Phi) pair is a separate ticket.
 double IlluminationModel::calculatePrimaryReflectedLight(
-    const std::array<double, 3>& face_normal,
+    double mean_cos,
     const std::array<double, 3>& primary_direction,
     const std::array<double, 3>& sun_position,
-    const std::array<double, 3>& primary_position) {
+    const std::array<double, 3>& primary_position,
+    double primary_distance) {
 
-    // Calculate cosine of angle between normal and primary direction
-    double cos_angle = dotProduct(face_normal, primary_direction);
-
-    // If Primary is below horizon, no reflection
-    if (cos_angle <= 0.0) {
+    // If Primary is below the horizon or fully hidden, no reflection.
+    // mean_cos is <cos theta> over the disk (PTM-44); it equals the old
+    // dot(normal, primary_dir) for a fully visible disk.
+    if (mean_cos <= 0.0) {
         return 0.0;
     }
 
@@ -4503,6 +4572,9 @@ double IlluminationModel::calculatePrimaryReflectedLight(
         sun_position[2] - primary_position[2]
     };
     double sun_dist = vectorLength(primary_to_sun);
+    if (sun_dist <= constants::EPSILON || primary_distance <= constants::EPSILON) {
+        return 0.0;
+    }
 
     // Normalize
     std::array<double, 3> sun_direction = {
@@ -4511,19 +4583,17 @@ double IlluminationModel::calculatePrimaryReflectedLight(
         primary_to_sun[2] / sun_dist
     };
 
-    // Calculate Primary distance
-    double primary_distance = vectorLength(primary_position);
-
-    // Phase angle between sun and Body as seen from Primary
-    // Note the negative sign because primary_direction points *toward* Primary
-    double phase_angle = std::acos(-dotProduct(sun_direction, primary_direction));
-
-    // Phase function for Primary's reflectance (Lambert sphere approximation)
-    double phase_function = (1.0 + std::cos(phase_angle)) / 2.0;
+    // Phase angle: Sun-primary-face angle. primary_direction points *toward*
+    // the primary, so -primary_direction is the primary->face direction.
+    // a = 0 is "full" primary (and, on the sub-primary hemisphere, local
+    // midnight); a = pi is "new".
+    double cos_phase = -dotProduct(sun_direction, primary_direction);
+    cos_phase = std::max(-1.0, std::min(1.0, cos_phase));
+    const double phase_angle = std::acos(cos_phase);
 
     // Get Primary's albedo based on the current primary body
     double primary_albedo = 0.0;
-    
+
     if (primary_body_name_ == "JUPITER") {
         primary_albedo = constants::JUPITER_BOND_ALBEDO;
     }
@@ -4544,34 +4614,22 @@ double IlluminationModel::calculatePrimaryReflectedLight(
         primary_albedo = 0.3; // Default albedo for other bodies
     }
 
-    // Calculate angular size of Primary as seen from Body
-    // Use the member variable for radius instead of constant
-    double primary_angular_radius = std::asin(primary_radius_ / primary_distance);
-    double solid_angle = 2 * M_PI * (1.0 - std::cos(primary_angular_radius));
+    // Angular radius of the primary seen from THIS FACE. The pre-fix code used
+    // vectorLength(primary_position), i.e. the BODY-CENTRE distance, while the
+    // IR path next door used the face-relative one; that inconsistency was
+    // worth 0.5 % at Europa and 0.9 % on a lunar DEM patch.
+    double sin_angular_radius = primary_radius_ / primary_distance;
+    if (sin_angular_radius > 1.0) sin_angular_radius = 1.0;
 
-    // Calculate solar flux at Primary
+    // Solar flux at the primary
     double sun_dist_au = sun_dist / constants::KM_PER_AU;
     double solar_flux_at_primary = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
-    // Calculate reflected flux
-    //
-    // PTM-40 note -- deliberately NOT given the x4 that calculatePrimaryHeating
-    // just got, because here the 4*pi is not (only) a view-factor error and the
-    // two errors currently cancel. The emitter radiosity of a sphere reflecting
-    // a beam is J = A*F*pi*R^2 / (4*pi*R^2) = A*F/4, not A*F; this expression
-    // uses A*F, so the spurious 1/4 in Omega/(4*pi) is exactly the 1/4 that
-    // belongs in J. At full phase it already returns the correct
-    // isotropic-equivalent value (0.0469 W/m^2 at the sub-Jovian Europa face).
-    // Multiplying by 4 would give 0.1875 W/m^2 = 1.50x the Lambert-sphere truth
-    // of 0.1247, so a blanket x4 here would replace an underestimate with an
-    // overestimate. The term IS low -- 2.7x vs a Lambert sphere, ~6x vs
-    // Jupiter's real geometric albedo of 0.52 -- but fixing it means replacing
-    // the radiosity AND the ad-hoc (1+cos)/2 phase function together, which
-    // changes the phase dependence and needs its own gate. Tracked as PTM-41.
-    double reflected_flux = solar_flux_at_primary * primary_albedo * phase_function *
-                           (solid_angle / (4.0 * M_PI)) * cos_angle;
-    
-    return reflected_flux;
+    return ptm::disk::lambertSphereIrradiance(solar_flux_at_primary,
+                                              primary_albedo,
+                                              sin_angular_radius,
+                                              phase_angle,
+                                              mean_cos);
 }
 
 // Helper function to map body names to SPICE IDs
