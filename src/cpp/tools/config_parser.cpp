@@ -327,6 +327,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.equilibration_orbits = getWithDefault(thermal, "equilibration_orbits", config.thermal.equilibration_orbits);
             config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
+            config.thermal.equilibration_cycles = getWithDefault(thermal, "equilibration_cycles", config.thermal.equilibration_cycles);
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
             config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
             config.thermal.gpu_devices = getWithDefault(thermal, "gpu_devices", config.thermal.gpu_devices);
@@ -741,6 +742,11 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "equilibration_orbits" << YAML::Value << config.thermal.equilibration_orbits;
         out << YAML::Key << "equilibration_steps_per_day" << YAML::Value << config.thermal.equilibration_steps_per_day;
         out << YAML::Key << "equilibration_samples_per_diurnal_cycle" << YAML::Value << config.thermal.equilibration_samples_per_diurnal_cycle;
+        // Only emit when explicitly set — an unset value means "solver legacy
+        // default", and writing -1 into every template would invite confusion
+        // with the real pass count (which is 2, not 1).
+        if (config.thermal.equilibration_cycles > 0)
+            out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
         out << YAML::Key << "compute_statistics" << YAML::Value << config.thermal.compute_statistics;
         // Multi-GPU knobs (only emit when not at defaults — keep templates clean).
         if (config.thermal.gpu_devices != 1)
@@ -930,6 +936,8 @@ void ConfigParser::overrideFromCommandLine(SimulationConfig& config, int argc, c
             config.thermal.equilibration_steps_per_day = std::stod(argv[++i]);
         } else if (arg == "--equilibration-samples-per-diurnal" && i + 1 < argc) {
             config.thermal.equilibration_samples_per_diurnal_cycle = std::stod(argv[++i]);
+        } else if (arg == "--equilibration-cycles" && i + 1 < argc) {
+            config.thermal.equilibration_cycles = std::stoi(argv[++i]);
         } else if (arg == "--no-statistics") {
             config.thermal.compute_statistics = false;
         } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
@@ -1065,6 +1073,10 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      #   240 -> ~3 K max err (High accuracy)\n";
     out << "                                      #    30 -> ~7 K max err (Fast)\n";
     out << "                                      #   <=0 -> legacy (match output cadence)\n";
+    out << "  # equilibration_cycles: 2           # PASSES over the eq forcing array (GPU solver only).\n";
+    out << "                                      # Effective eq = cycles x equilibration_orbits diurnal\n";
+    out << "                                      # cycles, at 1x illumination cost and 1x flux RAM.\n";
+    out << "                                      # Unset = the solver legacy value, which is 2 (not 1).\n";
     out << "  compute_statistics: true            # Compute temperature statistics\n";
     out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
     out << "  ice_stability:\n";
@@ -1149,6 +1161,14 @@ bool ConfigParser::validate(const SimulationConfig& config) {
     }
     if (config.thermal.equilibration_orbits < 0.0) {
         std::cerr << "Error: equilibration_orbits cannot be negative" << std::endl;
+        valid = false;
+    }
+    // equilibration_cycles: -1 = unset (solver legacy default), otherwise >= 1.
+    if (config.thermal.equilibration_cycles != -1 &&
+        config.thermal.equilibration_cycles < 1) {
+        std::cerr << "Error: equilibration_cycles must be >= 1 "
+                     "(or -1 for the solver default); got "
+                  << config.thermal.equilibration_cycles << std::endl;
         valid = false;
     }
     // equilibration_steps_per_day: allow -1 (sentinel = match output cadence) or strictly positive.

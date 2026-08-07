@@ -4574,6 +4574,94 @@ static void ensureGpuCalibrated(const thermal::Config& config,
               << (saved_default ? "" : " [profile write skipped]") << "\n";
 }
 
+// ---- Equilibration cycling (thermal.equilibration_cycles) ------------------
+//
+// The unit here is PASSES over the equilibration forcing array, not "extra"
+// cycles. The GPU persistent solver already implements the loop
+// (thermal_opencl.cpp: `const int total_cycles = n_equil_cycles + 1;`): each
+// pass replays the SAME uploaded flux array while buf_T_ persists across
+// passes, so P passes over an N-orbit equilibration window integrate P*N
+// diurnal cycles at 1x illumination cost and 1x flux RAM. That is the only
+// affordable route past the RAM wall — a 25-orbit eq array is ~6.1 GB on the
+// 509k-face lunar mesh, so 100+ orbits in ONE array is hard-blocked.
+//
+// Granularity: we cycle the EQUILIBRATION forcing array as assembled
+// (`prepare_flux(0, equilibration_steps)`), i.e. equilibration_orbits worth of
+// real ephemeris-driven flux. On the shipped lunar year-long config that array
+// is 25 lunations = 738.3 d = 2.02 Earth-years, so the seasonal (declination)
+// content is inside the cycled array and is preserved by construction; cycling
+// a single lunation would discard it. Cycling a *separately assembled* annual
+// array is not done here: it would need a second illumination pass on a second
+// time grid and a second flux buffer, and would not reduce to the current path
+// exactly.
+//
+// ⚠️ THE LEGACY VALUE IS 2, NOT 1. The two-phase branch has always passed
+// n_equil_cycles = 1, i.e. total_cycles = 2: the equilibration window is
+// integrated TWICE (the second pass's per-step output is simply discarded).
+// The banner printed "1 eq cycles" while the kernel logged "2 cycles x 3000
+// timesteps" for the same phase — see the shipped moon3d year-long
+// chunk_000.log lines 144 and 195. `equilibration_orbits: 25` therefore buys
+// 50 integrated lunations on this path. The default below reproduces that
+// bit-for-bit; the banner now states the true pass count and the equivalent
+// diurnal cycles so the 2x cannot stay silent (BUGS.md PTM-145).
+static constexpr int kLegacyEquilibrationPasses = 2;
+
+// Resolve the requested number of equilibration passes.
+// Precedence: PTM_EQUILIBRATION_CYCLES env > config `equilibration_cycles` >
+// legacy default. Returns 0 on a malformed request — callers MUST treat that
+// as fatal rather than silently continuing with the default (a silent
+// substitution here would misreport the equilibration length of every run).
+static int resolveEquilibrationPasses(const thermal::Config& config,
+                                      bool* explicitly_set = nullptr,
+                                      std::string* source = nullptr) {
+    int passes = kLegacyEquilibrationPasses;
+    bool explicit_set = false;
+    std::string src = "legacy default";
+
+    const int cfg = config.getPropertyInt("equilibration_cycles", -1);
+    if (cfg > 0) {
+        passes = cfg;
+        explicit_set = true;
+        src = "config thermal.equilibration_cycles";
+    } else if (cfg != -1) {
+        std::cerr << "[Thermal] ERROR: equilibration_cycles must be >= 1 "
+                     "(or -1 for the legacy default); got " << cfg << "\n";
+        if (explicitly_set) *explicitly_set = true;
+        if (source) *source = "invalid";
+        return 0;
+    }
+
+    if (const char* e = std::getenv("PTM_EQUILIBRATION_CYCLES")) {
+        int v = 0;
+        try {
+            size_t consumed = 0;
+            v = std::stoi(std::string(e), &consumed);
+            if (consumed != std::string(e).size()) v = 0;
+        } catch (const std::exception&) {
+            v = 0;
+        }
+        if (v < 1) {
+            std::cerr << "[Thermal] ERROR: PTM_EQUILIBRATION_CYCLES='" << e
+                      << "' is not an integer >= 1\n";
+            if (explicitly_set) *explicitly_set = true;
+            if (source) *source = "invalid";
+            return 0;
+        }
+        if (explicit_set && v != passes) {
+            std::cout << "[Thermal] PTM_EQUILIBRATION_CYCLES=" << v
+                      << " overrides config equilibration_cycles=" << passes
+                      << "\n";
+        }
+        passes = v;
+        explicit_set = true;
+        src = "env PTM_EQUILIBRATION_CYCLES";
+    }
+
+    if (explicitly_set) *explicitly_set = explicit_set;
+    if (source) *source = src;
+    return passes;
+}
+
 /**
  * @brief GPU-accelerated thermal solver using persistent kernel
  *
@@ -4780,6 +4868,62 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << std::fixed << std::setprecision(1) << eq_dt << "s ("
                   << equilibration_steps << " steps), out_dt="
                   << out_dt << "s (" << output_steps << " steps)" << std::endl;
+    }
+
+    // ---- Equilibration cycling knob ------------------------------------
+    // eq_passes = number of passes over the equilibration forcing array.
+    // solvePersistentMultipleCycles runs (n_equil_cycles + 1) passes, so the
+    // value handed to it is eq_passes - 1. See kLegacyEquilibrationPasses.
+    bool   eq_cycles_explicit = false;
+    std::string eq_cycles_source;
+    const int eq_passes = resolveEquilibrationPasses(config, &eq_cycles_explicit,
+                                                     &eq_cycles_source);
+    if (eq_passes <= 0) {
+        std::cerr << "[GPU Thermal] FATAL: invalid equilibration_cycles request; "
+                     "refusing to run rather than silently using the default.\n";
+        return false;
+    }
+    {
+        const int    cycled_steps = two_phase ? equilibration_steps : total_time_steps;
+        const double cycled_dt    = two_phase ? eq_dt : dt;
+        const double synodic_s    = getSynodicDayFromPlanet(planet) * 86400.0;
+        const double eq_seconds   = static_cast<double>(eq_passes)
+                                  * static_cast<double>(cycled_steps) * cycled_dt;
+        std::ios_base::fmtflags bf(std::cout.flags());
+        std::streamsize bp = std::cout.precision();
+        std::cout << "[GPU Thermal] Equilibration cycling: " << eq_passes
+                  << " passes x " << cycled_steps << " steps x "
+                  << std::fixed << std::setprecision(1) << cycled_dt << " s = "
+                  << (static_cast<long long>(eq_passes) * cycled_steps)
+                  << " integrated steps";
+        if (synodic_s > 0.0) {
+            std::cout << " = " << std::setprecision(2) << (eq_seconds / synodic_s)
+                      << " equivalent diurnal cycles";
+        }
+        std::cout << "  [" << eq_cycles_source << "; legacy = "
+                  << kLegacyEquilibrationPasses << " passes]" << std::endl;
+        std::cout.flags(bf);
+        std::cout.precision(bp);
+    }
+    // Paths that do NOT honor the knob must say so — a silently ignored
+    // equilibration request is exactly the class of failure that makes a run
+    // unreproducible.
+    if (eq_cycles_explicit && warm_start_run) {
+        std::cerr << "[GPU Thermal] WARNING: equilibration_cycles=" << eq_passes
+                  << " requested, but this is a WARM-START chunk "
+                     "(initial_state_file set). The loaded T(z) is already "
+                     "equilibrated and the window is integrated EXACTLY ONCE "
+                     "(PTM-54/57/78); the knob is IGNORED here.\n";
+    } else if (eq_cycles_explicit && !two_phase) {
+        std::cerr << "[GPU Thermal] WARNING: equilibration_cycles=" << eq_passes
+                  << " on a SINGLE-PHASE run: the cycled array is the FULL "
+                     "window (equilibration + output, " << total_time_steps
+                  << " steps), not an equilibration-only prefix.\n";
+    }
+    if (eq_cycles_explicit && equilibration_steps <= 0 && !warm_start_run) {
+        std::cerr << "[GPU Thermal] WARNING: equilibration_cycles=" << eq_passes
+                  << " requested with equilibration_steps=0; there is no "
+                     "equilibration phase to cycle.\n";
     }
 
     // GPU memory constraint: estimate ~50 bytes per face per layer for arrays
@@ -5272,7 +5416,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             return flux;
         };
 
-        int equil_cycles = 1;
+        // Passes over the eq forcing array, minus the +1 that
+        // solvePersistentMultipleCycles adds internally (total_cycles =
+        // n_equil_cycles + 1). eq_passes defaults to the legacy 2.
+        int equil_cycles = eq_passes - 1;
         std::vector<float> output_temps;
 
         std::vector<float> batch_avg_E;
@@ -5284,8 +5431,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
         if (two_phase) {
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Phase 1: " << equil_cycles
-                          << " eq cycles × " << equilibration_steps
+                // Report PASSES (equil_cycles + 1) — the number the kernel
+                // actually runs and logs. The old banner printed equil_cycles
+                // and so understated the eq phase by one full pass.
+                std::cout << "[GPU Thermal] Phase 1: " << (equil_cycles + 1)
+                          << " eq passes × " << equilibration_steps
                           << " steps (dt=" << std::fixed << std::setprecision(1)
                           << eq_dt << "s)" << std::endl;
             }
@@ -5887,7 +6037,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         };
 
         // Number of equilibration cycles (each replays the flux sequence).
-        int equil_cycles = 1;
+        // eq_passes = passes over the array; solvePersistentMultipleCycles
+        // runs n_equil_cycles + 1, so hand it eq_passes - 1. Legacy = 2 passes.
+        int equil_cycles = eq_passes - 1;
         std::vector<float> output_temps;
 
         // Per-batch Schorghofer accumulator buffer. Sized n_layers × batch_n.
@@ -5903,8 +6055,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // ---- Two-phase GPU execution ----
             // Phase 1: equilibration with coarse dt (temperatures persist on GPU)
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
-                std::cout << "[GPU Thermal] Phase 1: " << equil_cycles
-                          << " eq cycles × " << equilibration_steps
+                // Report PASSES (equil_cycles + 1) — the number the kernel
+                // actually runs and logs. The old banner printed equil_cycles
+                // and so understated the eq phase by one full pass.
+                std::cout << "[GPU Thermal] Phase 1: " << (equil_cycles + 1)
+                          << " eq passes × " << equilibration_steps
                           << " steps (dt=" << std::fixed << std::setprecision(1)
                           << eq_dt << "s)" << std::endl;
             }
@@ -8048,6 +8203,11 @@ void showUsage(const char* programName) {
     std::cout << "  --illum-gpu-inter-batch-pause-ms N  Per-device sleep between illumination batches\n";
     std::cout << "  --bvh-cache-file FILE      Disk cache for the BVH (default: <output>/bvh_cache.bvh1)\n";
     std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
+    std::cout << "  --equilibration-cycles N   PASSES over the equilibration forcing array\n";
+    std::cout << "                             (GPU persistent solver only; default: 2 = legacy).\n";
+    std::cout << "                             Effective equilibration = N x equilibration-orbits\n";
+    std::cout << "                             diurnal cycles, at 1x illumination cost and 1x RAM.\n";
+    std::cout << "                             Env override: PTM_EQUILIBRATION_CYCLES.\n";
     std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
     std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
     std::cout << "                             > 0 = explicit override for the equilibration segment.\n";
@@ -10460,6 +10620,11 @@ int main(int argc, char** argv) {
                       << sim_config.illumination.bvh_cache_file << std::endl;
         } else if (arg == "--equilibration-orbits" && i + 1 < argc) {
             equilibration_orbits = std::stoi(argv[++i]);
+        } else if (arg == "--equilibration-cycles" && i + 1 < argc) {
+            sim_config.thermal.equilibration_cycles = std::stoi(argv[++i]);
+            std::cout << "Equilibration passes over the eq forcing array: "
+                      << sim_config.thermal.equilibration_cycles
+                      << " (legacy = 2)" << std::endl;
         } else if (arg == "--equilibration-steps-per-day" && i + 1 < argc) {
             eq_steps_per_day_cli = std::stod(argv[++i]);
         } else if (arg == "--equilibration-samples-per-diurnal" && i + 1 < argc) {
@@ -12620,6 +12785,51 @@ int main(int argc, char** argv) {
         if (config.getPropertyBool("use_gpu_thermal", false)) {
             thermal_config.setProperty("use_gpu_thermal", true);
             std::cout << "[GPU Thermal] Flag detected - GPU thermal solver enabled" << std::endl;
+        }
+
+        // Equilibration cycling (thermal.equilibration_cycles). Only set the
+        // property when the user asked for it → thermal_config is unchanged for
+        // every legacy run, and the solver falls through to
+        // kLegacyEquilibrationPasses.
+        //
+        // ConfigParser::validate() is NOT called on this executable's path, so
+        // the range check has to live here: a `> 0` guard alone would DROP an
+        // out-of-range request (0, -5) without a word and run the legacy length
+        // while the config claimed otherwise.
+        if (sim_config.thermal.equilibration_cycles != -1) {
+            if (sim_config.thermal.equilibration_cycles < 1) {
+                std::cerr << "Error: thermal.equilibration_cycles must be >= 1 "
+                             "(or -1 for the solver default); got "
+                          << sim_config.thermal.equilibration_cycles
+                          << ". Aborting rather than silently equilibrating for "
+                             "a different length than the config states.\n";
+                return 1;
+            }
+            thermal_config.setProperty("equilibration_cycles",
+                                       sim_config.thermal.equilibration_cycles);
+        }
+        {
+            // The knob drives solvePersistentMultipleCycles' cycling loop, which
+            // exists ONLY in the GPU persistent solver. The CPU/SIMD
+            // equilibrators run their own fixed step schedules and would ignore
+            // it without a word. Refuse instead of pretending.
+            bool eq_cycles_explicit = false;
+            const int eq_passes_req = resolveEquilibrationPasses(thermal_config,
+                                                                 &eq_cycles_explicit);
+            if (eq_passes_req <= 0) {
+                std::cerr << "Error: invalid equilibration_cycles request; aborting.\n";
+                return 1;
+            }
+            if (eq_cycles_explicit &&
+                !config.getPropertyBool("use_gpu_thermal", false)) {
+                std::cerr << "Error: equilibration_cycles=" << eq_passes_req
+                          << " is implemented only for the GPU persistent thermal "
+                             "solver (thermal.use_gpu: true / --use-gpu-thermal). "
+                             "The CPU and SIMD equilibrators would ignore it "
+                             "silently. Aborting rather than misreporting the "
+                             "equilibration length.\n";
+                return 1;
+            }
         }
 
         // Copy SIMD batch flag from CLI parsing config to thermal_config.
