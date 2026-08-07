@@ -1,0 +1,131 @@
+# PTM3D quickstart: asteroid (101955) Bennu on its real SPICE ephemeris, with
+# its real DAMIT-class radar shape model, near the 2019-01-10 perihelion of
+# its orbit during the OSIRIS-REx proximity-operations era.
+#
+# Notebook counterpart of examples/quickstart_asteroid_diurnal.yaml (tutorial
+# 03, Keplerian orbit, fictional body). This config is that notebook's SPICE
+# counterpart: same generic-body thermal path, but the Sun-body vector comes
+# from a real ephemeris file instead of an analytic two-body propagation, and
+# the shape is Bennu's actual radar-derived facet model instead of a sphere.
+# See docs/tutorials/notebooks/04_asteroid_spice.ipynb for the full walkthrough.
+#
+# CPU-only, laptop-friendly (2692-facet mesh, well under a minute measured on
+# an 8-thread run -- see the notebook's Provenance cell for the exact number).
+#
+# Run FROM THE REPOSITORY ROOT:
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_asteroid_bennu.yaml
+#
+# ---------------------------------------------------------------------------
+# Shape: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/bennu_radar_shape.obj
+# -- Nolan et al. (2013) radar+lightcurve shape model, archived at the PDS
+# Small Bodies Node (urn:nasa:pds:ast-bennu.radar.shape-model::1.1). 1348
+# vertices, 2692 facets, already in km, no decimation needed (see the file's
+# own header and the notebook's shape-sourcing section for the full citation
+# and the DAMIT-vs-PDS decision).
+#
+# Ephemeris: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/ephemeris.spk
+# -- the OSIRIS-REx navigation team's own archived Bennu SPK (NAIF/PDS mission
+# archive), not a Horizons-generated file -- Horizons' small-body SPK service
+# declines ad hoc SPK generation for Bennu (see the notebook and the
+# metakernel's own header comment for the exact server message and the
+# fallback path). Coverage 2014-12-31 to 2023-05-30; 2019-01-10 is real
+# perihelion (r=0.897 AU) within that window, found by scanning the SPK, not
+# assumed from a catalog.
+#
+# Spin: period 4.29746 h (Hergenrother et al. 2013, same PDS archive as the
+# shape); pole (ecliptic lambda=45 deg, beta=-88 deg -> equatorial
+# pole_ra_deg=86.64, pole_dec_deg=-65.11 via the standard J2000-obliquity
+# rotation) -- an obliquity of ~178 deg, i.e. Bennu is a slow, RETROGRADE
+# rotator (spin axis nearly anti-parallel to its orbit normal). prime_meridian
+# is a documented simplification (W0=0 at the SPICE epoch below, not Bennu's
+# true rotational phase at that instant) -- immaterial for the diurnal-cycle
+# physics this tutorial studies.
+#
+# Thermal inertia: TI = sqrt(ks*rhos*cp0) = sqrt(0.075*1500*800) = 300.0 SI,
+# matching Rozitis et al. (2020, Sci. Adv. 6, eaay4835) OTES-derived global
+# thermal inertia (~300 SI, locally 200-700 over boulders/fines). rhos/cp0
+# reuse tutorial 03's Keplerian-config regolith values (not a bulk-density
+# measurement -- Bennu's real bulk density is ~1190 kg/m^3, a whole-body
+# rubble-pile macroporosity number, not this surface layer's grain density).
+# albedo=0.017 (bolometric Bond albedo, Golish et al. 2021 OCAMS phase curve;
+# Bennu's geometric albedo is 0.044 -- very dark, B-type/CI-CM-analog surface).
+# ---------------------------------------------------------------------------
+
+simulation:
+  start_time: '2019-01-10T00:00:00'
+  duration_days: 0.3581216666666667   # 2 rotations (2 * 4.29746h / 24h)
+  timesteps: 192                       # 96 samples/rotation
+  body: 101955 Bennu (1999 RQ36)
+mesh:
+  resolution: 3                        # unused for custom_mesh; harmless placeholder
+  import_file: ''                      # left empty -- generic_body.shape.mesh_file below supplies it
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 4                           # modest -- shared hardware, GPU campaigns may be running
+  equilibration_orbits: 40.0            # 40 rotations (~7.2 days); "orbits" here means diurnal cycles
+  equilibration_steps_per_day: 268.03   # pinned: 48 steps/rotation (48 * 24/4.29746)
+  use_gpu: false                       # CPU-only by design for this tutorial
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  # PTM-67 (docs/KNOWN_LIMITATIONS.md): for a generic body, only
+  # generic_body.surface: below is read; the plain-named keys in this block
+  # are inert except use_default_albedo, which IS read on every body type.
+  use_default_albedo: false
+radiation:
+  enabled: false                       # negligible self-heating on a convex-dominated shape at this scale
+illumination:
+  include_primary_reflection: false    # heliocentric orbit, no primary body
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: ''
+output:
+  directory: output/quickstart_asteroid_bennu
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
+generic_body:
+  name: 101955 Bennu (1999 RQ36)
+  config_file: ''                      # single-file config, like tutorial 03
+  ephemeris_source: spice              # <-- the tutorial-03 contrast: spice, not keplerian
+  spice_metakernel: bennu.tm           # bare filename: resolved under data/kernels/ (see the
+                                        # file's own header for why it can't be a data/horizons_cache path)
+  naif_id: '2101955'                   # read back from the SPK itself, not computed from 101955
+  shape:
+    type: custom_mesh
+    radius_km: 0.2447                  # mean radius of the shape model's own vertices
+    mesh_file: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/bennu_radar_shape.obj
+    mesh_scale: 1.0                    # already in km at the correct physical scale
+  orbit:
+    # Keplerian FALLBACK ONLY: the engine uses these elements if a requested
+    # epoch falls outside ephemeris.spk's coverage (illumination_model.cpp,
+    # getSunPosition) -- not used for any epoch inside this tutorial's window,
+    # included so the fallback is well-defined rather than a zero orbit.
+    semi_major_axis_au: 1.128922045323413
+    eccentricity: 0.2046513239154546
+    inclination_deg: 6.025539444076259
+    lon_ascending_node_deg: 2.178489605966394
+    arg_perihelion_deg: 65.67184368910024
+    mean_anomaly_deg: 36.23987193922569
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 4.29746
+    pole_ra_deg: 86.639
+    pole_dec_deg: -65.109
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.017
+    emissivity: 0.95
+    ks: 0.075                          # W/m/K -> TI=300 SI with rhos, cp0 below
+    kd: 0.075                          # == ks: homogeneous column (see header)
+    rhos: 1500.0                       # kg/m^3
+    rhod: 1500.0                       # == rhos: homogeneous column
+    H: 0.02                            # m; moot here since ks==kd, rhos==rhod
+    cp0: 800.0                         # J/kg/K
+    Qb: 0.0                            # negligible internal heat flux for a body this size
+    chi: 0.0                           # no T-dependent radiative conductivity term
