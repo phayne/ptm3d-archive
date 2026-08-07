@@ -24,6 +24,7 @@ output reader, plots, interpretation, exercises) and is committed **with its
 executed outputs** so the plots render directly on GitHub — re-run it
 yourself (`Kernel > Restart & Run All`) rather than trusting a stale render.
 
-| Notebook | Body / example | Status |
-|---|---|---|
-| [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, CPU-only, ~6-8 s) | verified 2026-08-07 — notebook counterpart of tutorial 02 above |
+| # | Notebook | Body / example | Status |
+|---|---|---|---|
+| 01 | [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, CPU-only, ~6-8 s) — notebook counterpart of tutorial 02 above | verified 2026-08-07 |
+| 02 | [`02_europa_thermal.ipynb`](notebooks/02_europa_thermal.ipynb) | Europa diurnal run, `examples/quickstart_europa_diurnal.yaml` (ico4, 5120 faces, CPU-only, ~6.6 s) — includes a Jupiter eclipse captured in the diurnal window and its thermal-cooling signature; day/night contrast vs. latitude cross-referenced against tutorial 02's Moon numbers | executed end-to-end 2026-08-07; see the notebook's Provenance cell for the exact binary/commit |
