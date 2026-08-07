@@ -1,0 +1,86 @@
+# PTM3D quickstart asteroid, TI-doubled SENSITIVITY CHECK — identical to
+# examples/quickstart_asteroid_diurnal.yaml except ks/kd are 4x larger
+# (TI: 100 -> 200 SI) and the output directory differs.
+#
+# Purpose: `generic_body.surface.*` is the ONLY place a generic body's
+# thermophysical properties are actually read (PTM-67); crucially, the run
+# log's "Using generic body:" banner does NOT echo ks/kd/rhos/rhod/cp0/Qb/chi
+# back to you the way it echoes albedo/emissivity/spin/orbit — so there is no
+# banner line to grep to confirm a thermal-inertia edit took effect. This
+# config exists to demonstrate the honest alternative: run the SAME setup at
+# two thermal inertias and confirm the *physics* moved (smaller diurnal
+# amplitude, later peak, at the higher TI) — see
+# docs/tutorials/notebooks/03_asteroid_thermal.ipynb, section 3.
+#
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_asteroid_diurnal.yaml
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_asteroid_diurnal_ti200_check.yaml
+#
+# TI = sqrt(0.033333333 * 1500 * 800) = 200.0 SI exactly (4x ks/kd -> 2x TI).
+
+simulation:
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 0.4166666666666667
+  timesteps: 192
+  body: Quickstart Asteroid
+mesh:
+  resolution: 3
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 4
+  equilibration_orbits: 50.0
+  equilibration_steps_per_day: 230.4
+  use_gpu: false
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: false
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: ''
+output:
+  directory: output/quickstart_asteroid_diurnal_ti200_check
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
+generic_body:
+  name: Quickstart Asteroid
+  config_file: ''
+  ephemeris_source: keplerian
+  shape:
+    type: spherical
+    radius_km: 5.0
+    mesh_scale: 1.0
+  orbit:
+    semi_major_axis_au: 2.7
+    eccentricity: 0.0
+    inclination_deg: 8.0
+    lon_ascending_node_deg: 80.0
+    arg_perihelion_deg: 50.0
+    mean_anomaly_deg: 0.0
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 5.0
+    pole_ra_deg: 0.0
+    pole_dec_deg: 90.0
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.05
+    emissivity: 0.95
+    ks: 0.033333333                    # 4x base -> TI=200 SI
+    kd: 0.033333333
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.02
+    cp0: 800.0
+    Qb: 0.018
+    chi: 0.0

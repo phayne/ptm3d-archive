@@ -77,6 +77,11 @@ data/jwst/
 camera_output/
 plots/
 notebooks/
+# ...except the tracked, executed tutorial notebooks (docs/tutorials/notebooks/
+# is a deliberate onboarding path, not a scratch dir the "notebooks/" rule above
+# was written for -- unanchored pattern, so it silently matched this path too).
+!docs/tutorials/notebooks/
+!docs/tutorials/notebooks/**
 examples/data/
 docs/figures/jwst/
 
