@@ -52,7 +52,7 @@ print(len(t), 'faces; global max', max(t), 'K')
 ```
 
 Skipping the 4-byte header (e.g. a bare `np.fromfile(..., dtype='f4')`) shifts
-every face by one and injects a bogus first value — the classic mistake.
+every face by one and injects a bogus first value — a common mistake.
 
 Units: temperatures in **K**; all flux files in **W/m²** (absorbed, i.e. after
 albedo).
@@ -107,21 +107,20 @@ zero-padded to four digits**, so a 118-step run ends at `_0117`, not `_00118`;
 `metadata.txt` lists the face count, the step count and which components were
 exported.
 
-**Timing columns — read this before you plot against time.** In
-`time_steps.txt`, column 1 is **seconds past the J2000 epoch** (SPICE ephemeris
-time), *not* elapsed time from the start of the run, despite the header comment
-the file writes for itself. Column 2 is a UTC label and *is* anchored to the
-configured `simulation.start_time`. Verified on the tutorial-04 control run
-(`start_time: 2026-04-05T00:00:00`): the first row reads
+**Timing columns.** In `time_steps.txt`, column 1 is **seconds past the J2000
+epoch** (SPICE ephemeris time), *not* elapsed time from the start of the run —
+note that the file's own header comment mislabels it. Column 2 is a UTC label
+anchored to the configured `simulation.start_time`. In the tutorial-04 control
+run (`start_time: 2026-04-05T00:00:00`) the first row reads
 `828630100.682384  2026-04-05T03:00:31.497`, and consecutive rows differ by
 21714.19 s = the configured ~6 h cadence. For elapsed time, subtract the first
 column-1 value; for a calendar axis, use column 2 (or `body_positions.csv`,
 whose `time` column carries the same UTC).
 
 **`heartbeat.txt`** is written by the radiation-coupling and re-thermal loops,
-plus once at startup — but the startup write happens before the output
-directory is created, so on a directory's *first* run the file only appears if
-the run reaches one of those loops. Do not treat its absence as a failure.
+plus once at startup. The startup write happens before the output directory is
+created, so on a directory's *first* run the file only appears if the run
+reaches one of those loops. Its absence is not a failure.
 
 ## Converting for visualization
 

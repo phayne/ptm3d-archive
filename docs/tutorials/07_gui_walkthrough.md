@@ -7,15 +7,13 @@ app, `gui/ptm3d_gui.py`)
 workstation; expect a minute or two on a laptop.
 **Verified:** 2026-08-07 against `origin/main` (7fd214f), PyQt6 6.7.1 / Qt 6.7.1.
 
-Everything in the other tutorials can be done from the command line. This one
-covers the same ground through the graphical front end, which is what most
-colleagues will actually use. If you have not built PTM3D yet, start with
-[INSTALL.md](../../INSTALL.md) — the GUI is a front end, not a substitute for
-the engine binary.
+This tutorial covers the same ground as the command-line tutorials, through
+the graphical front end. The GUI drives the engine binary, so build PTM3D
+first ([INSTALL.md](../../INSTALL.md)).
 
-All figures below were rendered from the real panels. The five marked
-**[SCREENSHOT-PAUL #n]** still need to be shot on a live display; they are
-tabulated again at the end.
+The figures below were rendered from the live panels. The five marked
+**[SCREENSHOT-PAUL #n]** remain to be captured on a live display; they are
+tabulated at the end.
 
 ---
 
@@ -30,8 +28,7 @@ pip install -r requirements.txt
 
 Required: `PyQt6`, `numpy`, `PyYAML`. Optional but strongly recommended:
 `pyvista` + `pyvistaqt` (the 3D view) and `matplotlib` (the 2D plots). The
-launcher checks these for you and says which are missing rather than dying with
-an import traceback (`gui/run_gui.py:42-90`):
+launcher checks these and reports which are missing (`gui/run_gui.py:42-90`):
 
 ```
 ERROR: Missing required dependencies:
@@ -44,7 +41,7 @@ Install with:
 A missing *optional* package is a warning, not a failure — the app starts with
 that feature disabled.
 
-### The one supported entry point
+### Entry point
 
 ```bash
 cd gui/
@@ -59,13 +56,13 @@ python run_gui.py --project /path/to/config.yaml     # open a saved project
 python run_gui.py --results /path/to/output_dir/     # open a finished run
 ```
 
-`gui/run_dashboard.py` is a separate multi-module launcher that bundles the
-DEM/mesh tools. It gets less testing; `run_gui.py` is the supported door.
+`run_gui.py` is the supported entry point. `gui/run_dashboard.py` is a
+separate multi-module launcher that bundles the DEM/mesh tools and receives
+less testing.
 
-On the **first launch only**, the app asks which body you want, so the default
-(Moon) is an explicit choice rather than a silent one
-(`gui/ptm3d_gui.py:163-191`). You can change it any time on the Simulation tab,
-and the prompt never appears again.
+On the **first launch only**, the app asks which target body you want
+(`gui/ptm3d_gui.py:163-191`). You can change it any time on the Simulation
+tab; the prompt does not appear again.
 
 > **[SCREENSHOT-PAUL #1]** — the first-launch "Select target body" dialog. To
 > make it appear again, quit the GUI and run
@@ -92,7 +89,7 @@ console, and **View > Reset Layout** puts everything back.
 > Frame the full window so the toolbar, status bar, and all three regions are
 > visible.
 
-Keyboard shortcuts worth memorizing: `F5` run, `Shift+F5` stop, `Ctrl+T`
+Keyboard shortcuts: `F5` run, `Shift+F5` stop, `Ctrl+T`
 validate configuration, `Ctrl+S` save project, `Ctrl+L` load a results
 directory, `F6` refresh the 3D view, `Home` reset the camera.
 
@@ -123,8 +120,8 @@ rail reveals the rest (section 7).
   maps, equilibration units).
 
 The **YAML preview** at the bottom is live: it is the file that will be handed
-to the engine. Read it. It is the fastest way to confirm that a control you just
-touched changed the thing you meant.
+to the engine, and the quickest way to confirm a control changed the key you
+intended.
 
 ### Mesh
 
@@ -150,16 +147,13 @@ touched changed the thing you meant.
 Thermophysical properties, seeded from the selected body. Each row has a
 **Use Default** checkbox; uncheck it to type your own value.
 
-The important behavior here is the one that is *not* obvious:
-
 > For a **built-in** body the engine accepts custom values only for **Bond
-> albedo, emissivity, ks and kd** (it writes them as `*_override` keys). It has
-> no path for `H`, `rhos`, `rhod`, `cp0`, `Qb`, or `chi` on a built-in body.
-> The GUI therefore **disables** those six rows rather than letting you type a
-> number the engine will silently ignore
+> albedo, emissivity, ks and kd** (written as `*_override` keys). It has no
+> path for `H`, `rhos`, `rhod`, `cp0`, `Qb`, or `chi` on a built-in body, so
+> the GUI **disables** those six rows
 > (`gui/gui_panels/config_panel.py:1828-1845` and `:2201-2238`).
-> To customize them, use a Custom or HORIZONS body, where they are
-> written to `generic_body.surface:` and are read.
+> To customize them, use a Custom or HORIZONS body, where they are written to
+> `generic_body.surface:` and are read.
 
 **Incidence-Angle Albedo** is a model selector, not an on/off switch:
 *Hayne (2017)* (the default for global bodies) or *Hapke*. It maps to the single
@@ -168,8 +162,7 @@ no "off" — `false` already selects the Hayne angular model.
 
 The **Thermal Inertia** row is derived: it shows TI = sqrt(k rho cp) and the
 implied `cp(T_eq)`. Typing a value there activates constant-TI mode, which
-**forces chi to 0** and makes `cp` constant — by design, and worth knowing
-before you wonder where your radiative conductivity went.
+**forces chi to 0** (no radiative conductivity) and makes `cp` constant.
 
 ### Thermal
 
@@ -204,7 +197,7 @@ Under **Advanced thermal** (collapsed by default, expanded in the figure):
   which the GUI derives from the location of the engine binary (the directory
   containing `build/bin/ptm_thermal_sim`), *not* from wherever you launched the
   GUI. The console prints the pinned working directory (`[run] cwd: ...`) at
-  launch, so you always know where results will land.
+  launch.
 - **Format** (`binary` or `vtk`) and **VTK Mode** (`thermal` / `complete` /
   `both`).
 - **Location Exports** — a `lat,lon` file and a depths file give you
@@ -227,10 +220,10 @@ through the GUI.
    sanity check on ranges and required fields.
 7. Press **Run** (or `F5`).
 
-You do **not** have to save first. If a project file is open, the GUI saves it
-and runs it; if not, it writes an engine-facing `config.yaml` into the output
-directory with every path absolutized, and runs that
-(`gui/ptm3d_gui.py:679-709`). Either way the console tells you which file it ran.
+Saving first is not required: if a project file is open the GUI saves and runs
+it; otherwise it writes an engine-facing `config.yaml` (all paths absolutized)
+into the output directory and runs that (`gui/ptm3d_gui.py:679-709`). The
+console reports which file it ran.
 
 ### The pre-flight check
 
@@ -239,33 +232,32 @@ Before the engine starts, the GUI runs a pre-flight
 
 ![Console at launch](images/gui/11_console_preflight.png)
 
-Read those four lines every time. In order they tell you:
+The lines report:
 
-- **which binary** you are about to run, by absolute path, **md5, and build
-  time**. If you are ever unsure whether you rebuilt, this line settles it.
-- **where the output goes**, and how much disk is free there.
+- **which binary** will run, by absolute path, **md5, and build time** — a
+  quick check that a rebuild took effect;
+- **where the output goes**, and how much disk is free there;
 - **which engine environment flags** are being applied — by default the
   recommended physics-fix set (`PTM_EQ_PERFACE_FLUX=1`, `PTM_ILLUM_RISE_HABS=0`,
   `PTM_ILLUM_SEAL_HOLES=1`, `PTM_ILLUM_TRUE_NORMALS=1`).
 
 Pre-flight *blocks* the launch on missing/unreadable files and on "dataless"
-cloud placeholders (files evicted to the cloud: reading one hangs the engine
-indefinitely, so the GUI refuses rather than letting you hang). It asks for an
-explicit override on cloud-synced paths and on a view-factor rebuild. Keep
-simulation input data on a local disk.
+cloud placeholders (files evicted to the cloud; reading one hangs the engine
+indefinitely). It asks for an explicit override on cloud-synced paths and on a
+view-factor rebuild. Keep simulation input data on a local disk.
 
 ### The view-factor cost estimate
 
-If radiation exchange is on and no view-factor file is set, the engine has to
-build the view-factor matrix first — which can dominate the run. The GUI warns
-before you commit, with an estimate:
+If radiation exchange is on and no view-factor file is set, the engine builds
+the view-factor matrix first — which can dominate the run. The GUI warns
+before launch, with an estimate:
 
 ![View-factor rebuild dialog](images/gui/10_preflight_view_factor_dialog.png)
 
-The estimate is explicitly labeled approximate (disk from 8 bytes per nonzero;
-solve time from measured throughput; the *build* time is separate and highly
-variable). It warns; it never blocks. The same estimate updates live on the
-Radiation page as you change the mesh (section 7).
+The estimate is labeled approximate (disk from 8 bytes per nonzero; solve time
+from measured throughput; the *build* time is separate and highly variable)
+and advisory — it warns but never blocks. The same estimate updates live on
+the Radiation page (section 7).
 
 For this walkthrough radiation is off, so no dialog appears.
 
@@ -280,18 +272,17 @@ console streams the engine's output.
 > shows the progress bar partly filled and the yellow "Running" badge, with the
 > console streaming "Progress N/144" lines above it.
 
-Two things worth knowing about the console:
+Two notes on the console:
 
-- Lines are colored by **content**, not by which stream they came from. The
-  engine writes plenty of informational banners to stderr; coloring by stream
-  made good runs look failed. Red is reserved for genuine failure signatures
-  (`ERROR:`, `FATAL:`, tracebacks, crash signatures, "simulation failed"), yellow
-  for warnings (`gui/gui_core/simulation_runner.py:33-57`).
+- Lines are colored by **content**, not by which stream they came from (the
+  engine writes informational banners to stderr). Red is reserved for genuine
+  failure signatures (`ERROR:`, `FATAL:`, tracebacks, crash signatures,
+  "simulation failed"), yellow for warnings
+  (`gui/gui_core/simulation_runner.py:33-57`).
 - A **watchdog** samples the child process's CPU clock every 30 s. If the
   process stops accumulating CPU time it posts a `[watchdog]` warning and the
-  status bar reads `STALLED`. That distinguishes "still computing" from "hung on
-  a file read or a wedged GPU" — a distinction you cannot make from a silent
-  progress bar.
+  status bar reads `STALLED`, distinguishing a long computation from a hang
+  (a blocked file read, a wedged GPU).
 
 ### Completion
 
@@ -302,7 +293,7 @@ On exit code 0 you get a green `Simulation completed successfully`, and the GUI
 Browser. On a nonzero exit code you get a red failure line with the code, and no
 auto-load.
 
-`rc=0` is necessary, not sufficient. Confirm the numbers in the tail of the log:
+Exit code 0 alone does not confirm a healthy run. Check the tail of the log:
 face count, time steps, `Statistics export completed successfully`, and a flux
 summary that is not all zeros. The run above reported 1,280 faces, 144 time
 steps, and a maximum total flux of 1,413.9 W/m^2 — about right for the Moon at
@@ -316,8 +307,8 @@ steps, and a maximum total flux of 1,413.9 W/m^2 — about right for the Moon at
 
 ![Results browser](images/gui/13_results_browser.png)
 
-The tree shows what the run actually produced — per-timestep series
-(temperature, illumination, direct solar, primary reflected, primary IR), the
+The tree shows what the run produced — per-timestep series (temperature,
+illumination, direct solar, primary reflected, primary IR), the
 `Statistics (annual)` aggregate set, `mesh.ply`, `time_steps.txt`, and
 `body_positions.csv` — with file counts and sizes. The **Details** pane
 summarizes the directory; the **Timesteps** table lists every output step with
@@ -334,11 +325,10 @@ its values), timestep animation, and image export (`Ctrl+E`). **2D Plots** gives
 temperature histograms, temperature-vs-latitude scatter, and time series,
 including the series for a picked face.
 
-The toolbar's **Timestep** and **Field** selectors populate themselves from
-what is actually present in the loaded directory — statistics fields come from
-`statistics/*.bin`, per-step fields from the per-field subdirectories — so you
-can only select a field the run really wrote
-(`gui/ptm3d_gui.py:947-997`).
+The toolbar's **Timestep** and **Field** selectors populate from what is
+present in the loaded directory — statistics fields from `statistics/*.bin`,
+per-step fields from the per-field subdirectories — so only fields the run
+wrote are selectable (`gui/ptm3d_gui.py:947-997`).
 
 > **[SCREENSHOT-PAUL #4]** — the 3D Visualization tab after loading
 > `output/gui_tutorial_moon_quickstart`, with Field = "Annual Max Temperature
@@ -352,9 +342,8 @@ can only select a field the run really wrote
 For exporting to other tools, the **Export Data** button on the visualization
 panel writes **GeoTIFF**, **HDF5**, both, or **VTU/PVD** (`ExportDataDialog`,
 `gui/gui_panels/visualization_panel.py:2125`); the 2D Plots tab has its own
-**Export Data (ASCII)** button for the plotted series. (`gui/README.md` lists a
-wider set of formats under the Results Browser — the code above is what actually
-ships.) For reading the raw binaries yourself, see
+**Export Data (ASCII)** button for the plotted series. For reading the raw
+binaries yourself, see
 [06_interpreting_outputs.md](06_interpreting_outputs.md).
 
 ---
@@ -384,13 +373,13 @@ it changes nothing in your YAML.
 
 ### Illumination
 
-**Include Reflected Sunlight from Primary Body** does exactly what it says and
-no more: it gates the **reflected-sunlight** term from the primary (Jupiter for
-Europa, Earth for the Moon) in the total incident flux
+**Include Reflected Sunlight from Primary Body** gates only the
+**reflected-sunlight** term from the primary (Jupiter for Europa, Earth for
+the Moon) in the total incident flux
 (`src/cpp/illumination/illumination_model.cpp:2279`). It does **not** gate the
-primary's **thermal IR**, which is computed and stored independently and is
-zeroed only when the primary is the Sun (`:2263-2271`). Turning this off is not
-"no primary body."
+primary's **thermal IR**, which is computed independently and zeroed only when
+the primary is the Sun (`:2263-2271`). Turning this off is not "no primary
+body."
 
 The page also carries the **albedo source** selector: *Built-in* resolves
 the shipped Bond-albedo map for the body and resolution and shows the resolved
@@ -410,20 +399,16 @@ alongside it, and the collapsed sections hold the coupling controls, the
 view-factor file/H-matrix/ACA options, and the sparse-view-factor settings for
 meshes above ~1M faces.
 
-**Read this before touching the coupling controls.** The engine's default
-coupling mode is `bounded` (`src/cpp/tools/config_parser.h:315`), and in that
-mode the **Face Fraction** control does nothing:
-
-- The control is labeled **"Face Fraction (legacy mode only)"** for exactly that
-  reason (`gui/gui_panels/config_panel.py:1664-1671`). The face-fraction exit
-  criterion has no error bound and made a coupled run's answer depend on how the
-  window was chunked (PTM-89), so `bounded` and `fixed` mode ignore it.
-- **The GUI has no control for `coupling_mode` at all** — it predates the
-  setting. To run `legacy` (or `fixed`), you must add
-  `radiation.coupling_mode: legacy` to the YAML by hand, or pass
-  `--rad-coupling-mode` on the command line. This gap is tracked as **PTM-102**.
-- If you change Face Fraction without also setting `coupling_mode: legacy`, the
-  engine says so, in the console:
+**Coupling controls.** The engine's default coupling mode is `bounded`
+(`src/cpp/tools/config_parser.h:315`). In that mode the **Face Fraction**
+control has no effect — it applies only in `legacy` mode, hence its label
+**"Face Fraction (legacy mode only)"** (`gui/gui_panels/config_panel.py:1664-1671`);
+the face-fraction exit criterion has no error bound, so `bounded` and `fixed`
+modes ignore it. The GUI has no control for `coupling_mode` itself: to run
+`legacy` (or `fixed`), add `radiation.coupling_mode: legacy` to the YAML by
+hand, or pass `--rad-coupling-mode` on the command line. If Face Fraction is
+changed without setting `coupling_mode: legacy`, the engine prints a console
+warning:
 
   ```
   WARNING [PTM-89]: radiation.coupling_face_fraction=0.02 is IGNORED in
@@ -431,24 +416,22 @@ mode the **Face Fraction** control does nothing:
   Use coupling_mode: legacy to restore it.
   ```
 
-  Which is the point: **an inert knob that warns is fine; an inert knob that is
-  silent is a bug.** Watch the console.
-
 **Max Coupling Iterations**, **Temperature Tolerance**, and **Flux Tolerance**
-are live in the default mode and are the knobs you actually want.
+are live in the default mode.
 
 The blue box at the bottom of the page is the live **view-factor cost
 estimate**, recomputed whenever the mesh or the radiation settings change. It
 reports estimated nonzeros, disk, and radiosity solve time per window, with an
 explicit band (partners-per-face is a heuristic, 5-20 for smooth convex, ~105
-default). It also has a hard warning worth respecting:
+default). At high resolution it adds a warning:
 
 ![View-factor estimator warning](images/gui/08_vf_cost_estimator_warning.png)
 
-At level 9 (5,242,880 faces) the estimate crosses the single-GPU radiosity wall
-at 536,870,912 nonzeros (a 2^31-byte SpMV offset). Past that point single-GPU
-radiosity cannot allocate; you need the chunked/int64 path or multiple GPUs.
-The estimator warns and lets you proceed — it is advisory, not a gate.
+At level 9 (5,242,880 faces) the estimate crosses the single-GPU radiosity
+limit of 536,870,912 nonzeros (a 2^31-byte SpMV offset), beyond which
+single-GPU radiosity cannot allocate; the chunked/int64 path or multiple GPUs
+are required. The estimator warns and lets you proceed — it is advisory, not a
+gate.
 
 If radiation is off, the box reads
 `Enable radiation exchange to see a view-factor cost estimate.`
@@ -460,14 +443,12 @@ If radiation is off, the box reads
 The engine gates several physics fixes behind `PTM_*` environment variables so
 that old runs stay byte-identical. The GUI applies the recommended-ON set by
 default; this table lets you override a value, add a flag, or blank one out
-(blank = not set). **Restore Recommended** puts the default set back. The set is
-stored in the project YAML under `engine_env:`, so a saved project documents
-exactly what its run had set, and the engine itself reads the same block at
-startup — which is why a GUI launch logs them as already set and identical
-rather than fighting over them.
+(blank = not set). **Restore Recommended** puts the default set back. The set
+is stored in the project YAML under `engine_env:`, so a saved project records
+exactly what its run had set, and the engine reads the same block at startup.
 
-Do not change these casually. Do change them deliberately when you are
-reproducing an old run that predates a fix.
+Change these only deliberately — for example, to reproduce an old run that
+predates a fix.
 
 ### Body / HORIZONS
 
@@ -483,29 +464,25 @@ by default, which drives `ptm_camera_sim` for synthetic imaging.
 
 ---
 
-## 8. Make the GUI prove your setting took effect
+## 8. Confirming a setting took effect
 
-PTM3D has a documented history of controls that quietly stopped reaching the
-physics — the `coupling_face_fraction` case above, thermophysical scalars that
-the engine ignores on built-in bodies, and others. The GUI now closes the
-obvious ones (disabled rows, "legacy mode only" labels, engine warnings), but
-the habit still matters, and it costs about ten seconds:
+Some engine settings apply only in certain modes or on certain body types —
+the `coupling_face_fraction` case above, or thermophysical scalars on built-in
+bodies. The GUI disables or labels the known cases; to confirm any setting
+reached the run:
 
-1. **Read the YAML preview.** Change the control, look at the pane at the bottom
-   of the configuration panel. If the key did not change there, it will not
-   change in the run.
-2. **Read the pre-flight lines.** Binary md5, output path, engine env. That is
-   your provenance for the run you are about to launch.
-3. **Read the engine's own banners in the console.** The engine announces what
-   it actually did: `Radiation exchange enabled from config file`,
-   `Coupling mode: bounded (PTM-89: absolute selection threshold, no face-fraction exit)`,
-   `Loaded view factors from: ...`,
-   `WARNING [PTM-89]: ... is IGNORED ...`, `Face count: ...`. If you set
-   something and the console never mentions it, that is your cue to check the
-   YAML rather than to assume.
+1. **Read the YAML preview.** Change the control and check that the key
+   changed in the pane at the bottom of the configuration panel — the run uses
+   exactly that file.
+2. **Read the pre-flight lines.** Binary md5, output path, engine environment:
+   a record of exactly what is about to run.
+3. **Read the engine's banners in the console.** The engine announces what it
+   did (`Radiation exchange enabled from config file`,
+   `Loaded view factors from: ...`, `Face count: ...`) and warns when a set
+   value is ignored. If a setting is never mentioned, check the YAML.
 4. **Compare the outputs.** For anything that should change temperatures, run
-   both arms and difference them, as [tutorial 04](04_crater_radiosity.md) does.
-   A setting that changes nothing measurable did nothing measurable.
+   both arms and difference them, as [tutorial 04](04_crater_radiosity.md)
+   does.
 
 ---
 
@@ -532,23 +509,22 @@ python3 scripts/fetch_kernels.py --bodies moon    # Moon/Mercury core, ~44 MB
 python3 scripts/fetch_kernels.py --bodies europa  # adds the Galilean ephemeris (~1.1 GB)
 ```
 
-Note that `data/kernels/*.tm` metakernels use paths **relative to the repository
-root**. The GUI pins the working directory to the project root for you, so this
-works from the GUI; it is a common failure when running the engine by hand from
-elsewhere.
+`data/kernels/*.tm` metakernels use paths **relative to the repository root**.
+The GUI pins the working directory to the project root, so this works from the
+GUI; it is a common failure when running the engine by hand from elsewhere.
 
 **"Use GPU" is checked and the run fails or ignores it.**
 CPU and GPU are a **build-time** choice. `PTM_ENABLE_GPU=OFF` is the default on
 a fresh checkout, and PTM3D is designed to run well on ordinary CPUs using all
-cores. If you want the GPU path you must configure with
-`-DPTM_ENABLE_GPU=ON` and run the one-time per-host calibration
-(`ptm_thermal_sim --calibrate-gpu`). Never let the GUI auto-run that calibration
-on a machine whose GPU you care about — on some AMD hardware a wedge takes the
-whole box down. Apple Silicon has no OpenCL future; use the CPU path there.
+cores. For the GPU path, configure with `-DPTM_ENABLE_GPU=ON` and run the
+one-time per-host calibration (`ptm_thermal_sim --calibrate-gpu`). Run the
+calibration deliberately, not automatically: on some AMD hardware a wedged GPU
+can take down the whole machine. On Apple Silicon (no OpenCL support), use the
+CPU path.
 
 **Everything in the console is red and the run "failed" but the outputs look
-fine.** You are on an old build. Severity is classified by content on current
-`main`; if you see engine banners colored red, update.
+fine.** You are on an old build; severity is classified by content on current
+`main`. Update.
 
 **The launch is blocked with "Cloud placeholder (dataless) files".** Those files
 have been evicted to the cloud; reading one hangs the engine indefinitely.
@@ -556,12 +532,11 @@ Hydrate them (Finder: right-click > "Always Keep on This Device", wait for the
 download) or point the config at a local copy. Better: keep simulation input
 data off cloud-synced folders entirely.
 
-**No 3D view.** `pip install --upgrade pyvista pyvistaqt vtk`. The rest of the
-app works without it; only the 3D tab is affected.
+**No 3D view.** `pip install --upgrade pyvista pyvistaqt vtk`. Only the 3D tab
+is affected; the rest of the app works without it.
 
-**A control seems to do nothing.** See section 8 — and check the console for an
-engine warning saying the value is ignored. That is usually the answer, and it
-is printed on purpose.
+**A control seems to do nothing.** See section 8, and check the console for an
+engine warning saying the value is ignored.
 
 ---
 
@@ -575,11 +550,11 @@ python scripts/make_gui_tutorial_screenshots.py          # panels only
 python scripts/make_gui_tutorial_screenshots.py --run    # + one tiny CPU run
 ```
 
-It never opens a window on your display. Note that the **whole window** and the
+It never opens a window on your display. The **whole window** and the
 **3D/2D result views** cannot be captured this way: constructing
 `VisualizationPanel` under the offscreen platform crashes inside headless
-PyVista/VTK (SIGSEGV), and the main window constructs one (reproduce with
-`--probe-mainwindow`). Those figures are the `[SCREENSHOT-PAUL]` items above.
+PyVista/VTK (SIGSEGV), and the main window constructs one. Those figures are
+the `[SCREENSHOT-PAUL]` items above.
 
 ## Screenshots still to be taken on a live display
 

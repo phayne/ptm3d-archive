@@ -63,9 +63,9 @@ Physical sanity checks:
   inertia of the upper regolith). ✓
 - **Polar Tmax ~182 K**: grazing incidence at the poles. ✓
 
-These values are build-dependent and are re-verified per release: the same table
-on a pre-v1.0.3 binary read `min=149.8 median=372.5 max=388.5 K` for
-`temperature_max`. Check your version before treating a difference as a problem.
+These values are build-dependent: the same table on a pre-v1.0.3 binary read
+`min=149.8 median=372.5 max=388.5 K` for `temperature_max`. Check your version
+before comparing against the numbers above.
 
 ## Things to try
 
