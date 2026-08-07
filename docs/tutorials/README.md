@@ -14,6 +14,7 @@ All commands are run **from the repository root** after building
 | 04 | [Crater radiosity: radiation on vs. off](04_crater_radiosity.md) | verified 2026-08-05 (both arms; needs the post-v1.0.3 PTM-94 fix) |
 | 05 | GPU acceleration and `--calibrate-gpu` | planned |
 | 06 | [Interpreting the outputs](06_interpreting_outputs.md) | verified 2026-08-05 |
+| 07 | [The PTM3D GUI, end to end](07_gui_walkthrough.md) | verified 2026-08-07 (panels rendered offscreen from `origin/main`; 5 live-display screenshots pending) |
 
 ## Jupyter notebooks
 
