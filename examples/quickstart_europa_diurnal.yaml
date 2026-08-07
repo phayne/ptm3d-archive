@@ -1,0 +1,69 @@
+# PTM3D quickstart: Europa diurnal (one orbit) run on a small icosphere (ico4, 5120 faces).
+#
+# Laptop-friendly (CPU-only, radiation off, < 1 GB RAM, seconds of wall time). All
+# paths are relative — run FROM THE REPOSITORY ROOT after fetching SPICE kernels:
+#
+#     python3 scripts/fetch_kernels.py --bodies europa   # once, ~1.1 GB from NAIF
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_diurnal.yaml
+#
+# Europa is tidally locked, so one "diurnal cycle" IS one orbit around Jupiter
+# (3.55 Earth days) — unlike the Moon, whose 29.53-day synodic day is much
+# longer than its (irrelevant, for surface heating) sidereal rotation.
+#
+# start_time is pinned to 2025-01-01T00:00:00 deliberately: at this epoch a
+# full Jupiter eclipse (Europa passing through Jupiter's shadow) falls at
+# ~18:06-20:33 UTC on day 1, i.e. inside this run's single-orbit output
+# window. Direct solar flux drops to exactly zero, body-wide, for ~2.7 h
+# (6 of 192 output steps) — Europa's signature physics event that a
+# heliocentric-only quickstart (like the Moon's) cannot show. See
+# docs/tutorials/notebooks/02_europa_thermal.ipynb.
+#
+# Outputs land in output/quickstart_europa_diurnal/ (per-face statistics +
+# per-timestep binaries). See docs/tutorials/ for a walkthrough of the outputs.
+
+simulation:
+  start_time: '2025-01-01T00:00:00'
+  duration_days: 3.55           # one Europa orbit = one Europa "day" (synchronous rotation)
+  timesteps: 192                # ~26.6 min output cadence (resolves the ~2.7 h eclipse in ~6 steps)
+  body: Europa
+mesh:
+  resolution: 4                 # icosphere subdivision level (5120 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0                    # 0 = auto-detect
+  equilibration_orbits: 5.0     # ice skin depth here is ~5 cm; a few orbits is enough to
+                                 # reach cyclic steady state (production Europa runs use ~20
+                                 # for publication-grade convergence — see configs/europa_*.yaml)
+  use_gpu: false
+  compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+thermophysical:
+  # Built-in Europa defaults (thermal/planetary_properties.h): Bond albedo 0.5,
+  # emissivity 0.9, porous-ice thermal inertia Gamma ~ 60 SI (ks=0.0096 W/m/K,
+  # rhos=500 kg/m^3), internal heat flux Qb=0.03 W/m^2. use_default_albedo:true
+  # selects these; no albedo map is used (uniform ice, not the spatial map).
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false                # no inter-face radiation on a convex sphere
+illumination:
+  # Jupiter is the primary body for Europa (set automatically from `body: Europa`,
+  # via europa.tm's Galilean-satellite ephemeris jup365.bsp). This flag controls
+  # only REFLECTED sunlight off Jupiter ("Jupiter-shine") — Jupiter's own thermal
+  # IR is a physically separate term (calculatePrimaryIRBatch) that is always
+  # included whenever the body has a primary; setting this false does NOT turn
+  # off Jupiter's IR heating (see exercise 3 and PTM-117 in BUGS.md).
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false         # uniform ice albedo (Europa default = 0.5), not the spatial map
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/quickstart_europa_diurnal
+  format: binary
+  vtk_mode: none
+advanced:
+  verbose: false
