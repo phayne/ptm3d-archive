@@ -140,8 +140,47 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
 // unconditionally -- so a regression that doubled the error would still have
 // exited 0 and been read as a pass by INSTALL.md's battery and by CI. The
 // remaining cadences (768/384/96/48/24) are reported for the convergence trend
-// and are NOT gated: they exist to show the dt^2 scaling, and 24 steps/day is
+// and are NOT gated: they exist to show the dt scaling, and 24 steps/day is
 // knowingly far outside the target.
+//
+// RE-BLESS, 2026-08-06 (PTM-116 scalar surface-Newton seed fix). The gate value
+// MOVED relative to the pre-fix binary -- 0.677 K at latitude 0 -> 0.987 K at
+// latitude 85 -- but it moved BACK ONTO the recorded documentation, which was
+// never updated: docs/thermal-model.md L204, docs/equilibration-paper.md L193
+// and docs/ptm3d-thermal-radiation-methods-paper.md L957 all state 0.99 K at
+// N=192 "at the 85 deg polar slope", 2.2 K at N=96, 11.9 K at N=24 and 0.21 K
+// at N=768. Post-fix this program prints 0.987 / 2.168 / 11.931 / 0.207 at
+// latitude 85 -- all four match. Pre-fix it printed 0.442 / 1.111 / 13.097 /
+// 0.125 and put the worst latitude at 0 deg, matching none of them. So no
+// expected value here or in docs/ needed updating: PTM-116 was a regression
+// away from the documented behavior, and the fix restores it.
+//
+// Root cause of the movement, measured (probe in
+// ~/projects/ptm116_2026-08-06/probe_eqdt_arms.cpp): exactly ONE step per
+// simulated day. At every candidate cadence N (all divisible by 4) the step at
+// day_fraction 0.75 has hour_angle = 2.5*pi, where cos() returns ~3e-16 instead
+// of 0, i.e. a "sunlit" step with Qs ~ 1e-13 W/m^2 -- squarely inside PTM-116's
+// collapse band. Pre-fix that single step returned a surface T up to 140 K
+// below the true root, cold-biasing the coarse-dt arms and partly cancelling
+// their large-dt warm bias. The Fourier reference arm (4979 steps/day, NOT
+// divisible by 4) never lands on that step, which is why it barely moved.
+// Zeroing fluxes below 1e-6 W/m^2 makes pre-fix and post-fix agree to <=1e-4 K
+// at every cadence -- the whole delta is that one step. Do NOT "fix" the
+// forcing: tiny-but-positive surface fluxes are real (Jupiter-shine on Europa,
+// PTM-44 fractional-disk visibility), and this step is the canary.
+//
+// ATTENTION, not resolved here: the docs quoted above also claim the error
+// scales as dt^2 (second-order Crank-Nicolson). The recorded numbers themselves
+// contradict that -- 0.21 K at N=768 to 0.99 K at N=192 is a factor 4.7 for a
+// factor 4 in dt, i.e. order ~1.1, and the post-fix series measured here
+// (0.207 / 0.456 / 0.987 / 2.168 / 4.961 / 11.931 at latitude 85) is a clean
+// first-order power law. That discrepancy pre-dates PTM-116 and is a claim in
+// two manuscripts; it is flagged, not edited.
+//
+// The 1 K tolerance below is deliberately NOT widened. At latitude 85 the
+// production cadence now sits at 0.987 K against it -- a 1.3% margin, where the
+// pre-fix binary appeared to have 56%. That margin is real and is a decision
+// for the author, not a tolerance to relax.
 constexpr int    kGateStepsPerDay = 192;
 constexpr double kGateMaxAbsDT_K  = 1.0;
 
