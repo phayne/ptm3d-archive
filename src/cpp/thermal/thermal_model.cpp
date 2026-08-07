@@ -1359,15 +1359,31 @@ void surfTemp(Profile& p, double Qs) {
     // iteration below converges to. Temperatures are therefore set by physics,
     // not bounded to an arbitrary [3, 500] K range.
 
-    // Better initial guess
-    double Tnew;
+    // Initial guess: the UPPER end of the root bracket.
+    //
+    // f(T) = Qs + k0*(T1 - T)/dz0 - eps*sigma*T^4 is strictly decreasing, and
+    // f(T_eq)*f(T1) <= 0 for T_eq = (Qs/(eps*sigma))^0.25 (f(T_eq) =
+    // k0*(T1-T_eq)/dz0, f(T1) = eps*sigma*(T_eq^4 - T1^4)), so the unique root
+    // is ALWAYS bracketed by [min(T_eq,T1), max(T_eq,T1)]. Starting at the
+    // upper end also puts Newton on the side where the concave f
+    // (f'' = -12*eps*sigma*T^2 < 0) converges monotonically.
+    //
+    // PTM-116 (the scalar twin of PTM-115's GPU kernel defect): starting at
+    // T_eq unconditionally when Qs > 0 is the defect. As Qs -> 0+, T_eq -> 0,
+    // while the step limiter below caps growth at 1.5x per iteration over
+    // max_iter = 10 -> the iterate can travel at most 1.5^10 = 57.665x from
+    // the guess. Any face with 0 < Qs < eps*sigma*(T_root/57.665)^4
+    // (~5e-7 W/m^2 for a 100 K root) therefore returned an under-converged,
+    // spuriously COLD surface temperature, exactly 1.5^10 * T_eq. Sunlit faces
+    // have T_eq >= T1 and are bit-unchanged. Gated by
+    // src/cpp/tools/test_surface_newton.cpp.
+    double Tnew = T1;
     if (Qs > 0) {
         // sqrt(sqrt(x)) is faster than pow(x, 0.25)
-        Tnew = std::sqrt(std::sqrt(Qs / (epsilon * sigma)));
-    } else {
-        Tnew = T1;
+        const double T_eq = std::sqrt(std::sqrt(Qs / (epsilon * sigma)));
+        if (T_eq > Tnew) Tnew = T_eq;
     }
-    
+
     // Optimized Newton-Raphson with early termination
     double dT = 1.0;
     int max_iter = 10; 
