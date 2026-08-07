@@ -10,11 +10,10 @@
 (control) + 14.1 s (coupled, including the view-factor build); a few minutes on
 a laptop. <1 GB RAM; the saved view-factor file is 36,278,242 bytes (~35 MB).
 
-> **If you are on the `v1.0.3` tag exactly, the coupled run aborts** with
-> `FATAL: ... no post-equilibration T(z) hand-off` and exit 1 — a guard that
-> fired on the CPU solver, which it was never meant to cover. Fixed after the
-> tag (PTM-94); on current `main` the coupled run completes. Everything below
-> was measured on the fixed build.
+> **On the `v1.0.3` tag exactly, the coupled run aborts** with
+> `FATAL: ... no post-equilibration T(z) hand-off` and exit 1. This is fixed
+> on current `main`, where the coupled run completes; the numbers below are
+> from the fixed build.
 
 ## The physics question
 
@@ -22,8 +21,7 @@ A polar crater floor that never sees the Sun directly is not at 0 flux: it is
 heated by sunlight **scattered** off the sunlit walls and by **thermal IR
 emitted** by the warm rim. PTM3D models this with a radiosity solve over
 face-to-face view factors, coupled to the thermal model. This tutorial
-measures exactly how much that matters, by differencing two otherwise
-identical runs.
+quantifies the effect by differencing two otherwise identical runs.
 
 ## Run both
 
@@ -48,10 +46,10 @@ Faces requiring radiation exchange: 12800 / 12800
 Simulation completed in 14.061 seconds
 ```
 
-On the CPU solver the run also prints a `[Re-thermal] WARNING:` saying each
-coupling iteration re-equilibrates the selected faces from scratch rather than
-resuming a saved post-equilibration column, so CPU and GPU coupled fields can
-differ. That is expected on this path, not a fault.
+On the CPU solver the run also prints a `[Re-thermal] WARNING:` noting that
+each coupling iteration re-equilibrates the selected faces from scratch rather
+than resuming a saved post-equilibration column, so CPU and GPU coupled fields
+can differ. This is expected on the CPU path.
 
 (The "H-matrix" in the log is a hierarchically compressed storage scheme that
 keeps the face-to-face view-factor matrix affordable; see
@@ -75,9 +73,8 @@ def load(p):
     b = open(p, 'rb').read(); n = struct.unpack('<i', b[:4])[0]
     a = array.array('f'); a.frombytes(b[4:4+4*n]); return list(a)
 base = 'output/tutorial04_crater80N_%s/statistics/%s.bin'
-# The "shadowed set" is DEFINED HERE: faces whose peak direct solar flux in the
-# CONTROL run is < 50 W/m2. Print the population — it is part of the result, and
-# it moves when the illumination model changes.
+# "Shadowed set" = faces whose peak direct solar flux in the CONTROL run is
+# < 50 W/m2. The population is printed because it is part of the result.
 dsm  = load(base % ('radoff', 'direct_solar_max'))
 shad = [i for i, v in enumerate(dsm) if v < 50.0]
 print(f"shadowed set: {len(shad)}/{len(dsm)} faces (direct_solar_max < 50 W/m2, control run)")
@@ -104,15 +101,14 @@ the control run):
 | largest single-face ΔT_max | | | +88.0 K |
 
 The **median face on the mesh changes by 0.00 K** — flat sunlit terrain
-outside the crater doesn't care — while the shadowed floor and walls warm by
-tens of kelvin. That asymmetry is the signature of correctly-scoped radiation
-exchange (and why cold-trap studies cannot skip it).
+outside the crater is unaffected — while the shadowed floor and walls warm by
+tens of kelvin. That asymmetry is the expected signature of radiation
+exchange, and why cold-trap studies cannot skip it.
 
-Quote the **population and the criterion** whenever you quote these numbers.
-Both moved between builds: the same criterion selected 1,671 faces on
-2026-07-29 and selects 1,422 today, because the illumination model changed
-underneath it, so a bare "+34.5 K vs +42.0 K" comparison across dates would be
-comparing two different sets of faces as well as two different builds.
+Quote the **population and the criterion** together with these numbers: both
+are build-dependent, because the shadowed set is selected by the illumination
+model. The same criterion selected 1,671 faces on 2026-07-29 and 1,422 on
+2026-08-05.
 
 ## Things to try
 
