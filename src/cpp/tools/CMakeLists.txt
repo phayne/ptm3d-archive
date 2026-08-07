@@ -150,6 +150,20 @@ set_target_properties(test_equilibration_dt
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Scalar surface-Newton convergence gate (PTM-116). Links `thermal` so it
+# measures the SHIPPING surfTemp against a float64 bisection root -- a stale
+# libthermal would be caught by the emulation-fidelity self-check inside.
+add_executable(test_surface_newton test_surface_newton.cpp)
+target_link_libraries(test_surface_newton
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_surface_newton
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Chunked-run statistics merge tool. Combines per-chunk raw statistics
 # (statistics/_raw/) from N chunks into a single set of merged stats
 # (max/avg/min) plus the Schorghofer ice-stability depth recomputed
