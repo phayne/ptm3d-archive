@@ -1,0 +1,140 @@
+# PTM3D quickstart: a generic-body (Keplerian) asteroid diurnal run on a small
+# icosphere (ico3, 1280 faces).
+#
+# Laptop-friendly (CPU-only, <1 GB RAM; ~23 s measured on an 8-core machine
+# with thermal.threads=4, well under a minute of wall time).
+# SELF-CONTAINED: unlike the Moon/Horizons quickstarts, this run needs NO
+# external data at all — no SPICE kernels, no DEM, no albedo/property maps.
+# The body is fictional (there is no real "Quickstart Asteroid"); its orbit is
+# propagated analytically (Keplerian two-body) and its shape is a synthetic
+# icosphere, so nothing outside this file is fetched or required.
+#
+# All paths are relative — run FROM THE REPOSITORY ROOT:
+#
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_asteroid_diurnal.yaml
+#
+# Outputs land in output/quickstart_asteroid_diurnal/ (per-face statistics +
+# per-timestep binaries). See docs/tutorials/notebooks/03_asteroid_thermal.ipynb
+# for a full walkthrough of the outputs.
+#
+# ---------------------------------------------------------------------------
+# Orbit choice (documented, not physically tuned to a real object): a=2.7 AU,
+# e=0 (circular — an eccentric variant is Exercise 3 in the notebook),
+# i=8 deg. This sits in the mid-main-belt (S/C-type transition zone, between
+# Vesta at 2.36 AU and the Themis family near 3.1 AU) with a modest, generic
+# inclination. Solar constant at 2.7 AU is 1361/2.7^2 = 187 W/m^2 (vs. 1361 at
+# Earth) — asteroids are cold and (for dark, low-albedo surfaces) thermal-
+# infrared-bright, which is why radiometry works on them at all.
+#
+# Spin choice: period_hours=5.0 ("a few hours", typical for a small,
+# fast-rotating NEA/main-belt fragment) with pole_dec_deg=90 (spin axis normal
+# to the reference frame => zero obliquity). Zero obliquity means the
+# sub-solar latitude is pinned at the equator regardless of orbital phase, so
+# the ONLY time-dependence at this orbit-frozen timescale is the diurnal
+# (rotational) cycle — the point of this tutorial is to isolate that signal
+# cleanly. A nonzero-obliquity, non-circular-orbit variant is Exercise 3/4.
+#
+# Thermophysical choice: this is the tutorial's main teaching point. Thermal
+# inertia TI = sqrt(k * rho * cp) [SI: J m^-2 K^-1 s^-1/2] controls how much a
+# surface's temperature LAGS the (fast-varying, here 5 h) insolation cycle —
+# it is *the* asteroid-surface observable radiometry actually measures
+# (regolith/rock/bare-rock discrimination, e.g. Delbo et al. 2007, 2015). We
+# pick ks=kd=0.008333 W/m/K, rhos=rhod=1500 kg/m^3, cp0=800 J/kg/K, chi=0 (no
+# T^3 radiative-conductivity enhancement) so that:
+#     TI = sqrt(0.008333 * 1500 * 800) = 100.0 SI  exactly,
+# constant with depth AND temperature (ks=kd, rhos=rhod collapse the
+# two-layer regolith profile to a single homogeneous slab — deliberately, so
+# there is exactly one TI number to reason about). TI=100 sits in the
+# textbook regolith range (~50-200 SI; loose lunar-like regolith is ~50,
+# bare rock/boulders are 400-2500) and matches the *lower* end of the
+# "extreme-TI numerical limit" tests done during EMA campaign validation
+# (working range ~32-316 SI on this solver) — comfortably inside it.
+# ---------------------------------------------------------------------------
+
+simulation:
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 0.4166666666666667   # 2 rotations (2 * 5h / 24h) — one to
+                                        # look at, one to CONFIRM periodicity
+  timesteps: 192                       # 96 samples/rotation -> 0.25 h local-time resolution
+  body: Quickstart Asteroid
+mesh:
+  resolution: 3                        # icosphere subdivision level (1280 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 4                           # modest — leave headroom on shared hardware
+  equilibration_orbits: 50.0            # 50 rotations (~10.4 days) pre-spin-up;
+                                        # "orbits" here means diurnal (day/night)
+                                        # cycles, NOT heliocentric orbits — see
+                                        # thermal.equilibration_orbits in
+                                        # config_parser.h
+  equilibration_steps_per_day: 230.4   # pinned: 48 steps/rotation, decoupled from
+                                        # the output cadence above (legacy behavior
+                                        # would otherwise double equilibration cost
+                                        # every time the output is resolved finer)
+  use_gpu: false                       # CPU-only by design for this tutorial
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0           # -1 = leave the generic-body Qb (below) alone
+thermophysical:
+  # PTM-67: for a GENERIC body (this config), the plain-named keys in THIS
+  # top-level block (ks, kd, H, rhos, rhod, cp0, Qb, chi, albedo, emissivity)
+  # are NOT read at all — only `generic_body.surface:` below is. We therefore
+  # deliberately omit them here rather than ship a block that looks load-
+  # bearing and silently isn't (see docs/KNOWN_LIMITATIONS.md). The one key
+  # that IS read regardless of body type is use_default_albedo, which we set
+  # to false so the engine doesn't waste a lookup searching for a per-body
+  # FITS/binary albedo map that cannot exist for a fictional body.
+  use_default_albedo: false
+radiation:
+  enabled: false                       # negligible self-heating on a convex sphere
+illumination:
+  include_primary_reflection: false    # no primary body (heliocentric orbit)
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: ''
+output:
+  directory: output/quickstart_asteroid_diurnal
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
+generic_body:
+  name: Quickstart Asteroid
+  config_file: ''                      # deliberately empty: no external body_config.yaml
+  ephemeris_source: keplerian          # analytic two-body propagation — no SPICE
+  shape:
+    type: spherical
+    radius_km: 5.0
+    mesh_scale: 1.0
+  orbit:
+    semi_major_axis_au: 2.7
+    eccentricity: 0.0
+    inclination_deg: 8.0
+    lon_ascending_node_deg: 80.0
+    arg_perihelion_deg: 50.0
+    mean_anomaly_deg: 0.0
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 5.0
+    pole_ra_deg: 0.0
+    pole_dec_deg: 90.0                 # zero obliquity (see header note)
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.05                       # dark, C-type-like
+    emissivity: 0.95
+    ks: 0.008333333                    # W/m/K -> TI=100 SI with rhos, cp0 below
+    kd: 0.008333333                    # == ks: homogeneous column (see header)
+    rhos: 1500.0                       # kg/m^3
+    rhod: 1500.0                       # == rhos: homogeneous column
+    H: 0.02                            # m; regolith/deep transition depth (moot
+                                        # here since ks==kd, rhos==rhod)
+    cp0: 800.0                         # J/kg/K
+    Qb: 0.018                          # W/m^2; typical small-body value, negligible
+                                        # on a diurnal-only run — included for
+                                        # completeness/realism
+    chi: 0.0                           # no T-dependent radiative conductivity term
+                                        # (keeps TI exactly constant, see header)

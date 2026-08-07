@@ -14,3 +14,13 @@ All commands are run **from the repository root** after building
 | 04 | [Crater radiosity: radiation on vs. off](04_crater_radiosity.md) | verified 2026-08-05 (both arms; needs the post-v1.0.3 PTM-94 fix) |
 | 05 | GPU acceleration and `--calibrate-gpu` | planned |
 | 06 | [Interpreting the outputs](06_interpreting_outputs.md) | verified 2026-08-05 |
+
+## Jupyter notebooks
+
+Runnable, colleague-facing notebook tutorials (executed with outputs committed) —
+a different medium from the numbered `.md` walkthroughs above, covering the same
+ground interactively.
+
+| # | Notebook | Status |
+|---|----------|--------|
+| 03 | [Asteroid thermal model: a generic body on a Keplerian orbit](notebooks/03_asteroid_thermal.ipynb) | verified on v1.0.3 (2026-08-07) |
