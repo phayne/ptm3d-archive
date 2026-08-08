@@ -102,6 +102,55 @@ struct Options {
     int    coupling_iteration = 0;
 };
 
+// ---------------------------------------------------------------------------
+// ADDENDUM NOTE 6 guard constants.
+//
+// The defect the first validation caught is an ILL-POSEDNESS, not a bug: RRE
+// fits one gamma per column by minimising a COLUMN-WIDE 2-norm, so a deep layer
+// whose window differences sit at the float32 noise floor contributes nothing
+// to the fit and yet receives the full weight vector. In exact arithmetic
+// sum(gamma)=1 protects it; in float32 the residual is
+// ||gamma||_1 * eps32 * |S(z)| -- amplified roundoff, with the amplification
+// set by layers that carry signal and applied to layers that do not.
+//
+// MEASURED separation (N6.2): worst ACTIVE column ||gamma||_1 = 5.3; the faces
+// that failed need ||gamma||_1 ~ 2.6e5. Five orders. `cond` is a POOR
+// discriminator (an active column measured cond 3.2e5 and was fine) --
+// ||gamma||_1 is the right diagnostic.
+//
+// Rejected by Fermi, do not reintroduce: per-layer gamma (the scalar-Aitken
+// family, measured diverging to 1e14 K), per-depth-block gamma (more
+// parameters, arbitrary boundaries, deep block still fitted to noise), and
+// "extrapolate only above the last active layer" (assumes activity is monotone
+// in depth -- it is NOT: the PSR/polar-night population has a LOCKED surface
+// over a still-relaxing deep column, exactly inverted).
+constexpr double kEpsState    = 1.1920928955078125e-07;  // float32 epsilon
+constexpr double kLevel1Frac  = 0.2;    // Level-1 bound = kLevel1Frac * tol_K
+constexpr double kLevel2Slack = 10.0;   // Level-2 noise-floor multiplier
+constexpr double kLevel2Floor = 1e-5;   // K, absolute floor for the hold test
+constexpr double kHeldDispTol = 1e-4;   // K, displacement tripwire on held layers
+constexpr int    kNBlocks     = 3;      // certificate blocks [0,15) [15,30) [30,n)
+inline int blockOf(int layer) {
+    return (layer < 15) ? 0 : (layer < 30 ? 1 : 2);
+}
+
+// LEVEL 1 — refuse the whole column when amplified float32 state roundoff could
+// reach a fifth of the reporting tolerance. Self-calibrating: no magic constant,
+// the bound moves with tol_K and with the column's own temperature scale.
+inline bool level1Refuse(double gamma_l1, double max_abs_S, double tol_K) {
+    return gamma_l1 * kEpsState * max_abs_S > kLevel1Frac * tol_K;
+}
+
+// LEVEL 2 — hold one layer when its window signal is at or below the local
+// noise floor. A no-op wherever the layer carries signal: on the active
+// populations the deep layers move ~0.12 K per pass, five orders above this.
+inline bool level2Hold(double s_layer, double gamma_l1, double S_last_layer) {
+    const double floor_l = std::max(kLevel2Slack * gamma_l1 * kEpsState
+                                        * std::fabs(S_last_layer),
+                                    kLevel2Floor);
+    return s_layer <= floor_l;
+}
+
 struct Stats {
     long long certified        = 0;  // ehat <= tol_K
     long long cert_refused     = 0;  // ehat >  tol_K  (state still shipped)
@@ -110,7 +159,14 @@ struct Stats {
     long long faces_seen       = 0;
     int       passes_spent     = 0;
     long long solve_failed     = 0;  // non-finite lstsq -> fell back to S_{N-1}
-    std::vector<float> ehat;         // one entry per extrapolated face
+    // ---- NOTE 6 additions ----
+    long long gamma_refused     = 0; // Level 1: amplification bound exceeded
+    long long converged_window  = 0; // whole column below the noise floor (vacuous)
+    long long layers_held       = 0; // Level 2: individual layers held
+    long long faces_partly_held = 0; // faces with >=1 held layer but not all
+    double    d_held_max        = 0.0;  // displacement tripwire, must stay <= 1e-4 K
+    std::vector<float> ehat;         // one entry per extrapolated face (max over blocks)
+    std::vector<float> gamma_l1;     // ||gamma||_1 per solved face
 
     void merge(const Stats& o) {
         certified        += o.certified;
@@ -119,8 +175,14 @@ struct Stats {
         budget_exhausted += o.budget_exhausted;
         faces_seen       += o.faces_seen;
         solve_failed     += o.solve_failed;
+        gamma_refused    += o.gamma_refused;
+        converged_window += o.converged_window;
+        layers_held      += o.layers_held;
+        faces_partly_held += o.faces_partly_held;
+        d_held_max        = std::max(d_held_max, o.d_held_max);
         passes_spent      = std::max(passes_spent, o.passes_spent);
         ehat.insert(ehat.end(), o.ehat.begin(), o.ehat.end());
+        gamma_l1.insert(gamma_l1.end(), o.gamma_l1.begin(), o.gamma_l1.end());
     }
 };
 
@@ -237,12 +299,30 @@ inline int minNormLstsq(double* A, int m, int n, const double* b, double* x,
 // Returns false (and leaves `out` = X[p], the newest state) if the solve is
 // not usable. `out` is therefore ALWAYS a valid state -- never garbage.
 // ---------------------------------------------------------------------------
+// `gamma_l1_out` receives sum|gamma_j| -- the amplification factor that turns
+// float32 state roundoff into extrapolant error, and the single most diagnostic
+// number in the feature (N6.2c). `s_layer_out`, if non-null, receives
+// max_j |u_j(z)| per layer: that layer's window SIGNAL, which Level 2 compares
+// against the local noise floor.
 inline bool rreColumn(const double* X, int p, int n_layers, double* out,
-                      double* cond_out, double rcond = kRcond) {
+                      double* cond_out, double rcond = kRcond,
+                      double* gamma_l1_out = nullptr,
+                      double* s_layer_out = nullptr) {
     const double* newest = X + static_cast<size_t>(p) * n_layers;
+    if (s_layer_out) {
+        for (int l = 0; l < n_layers; ++l) {
+            double s = 0.0;
+            for (int j = 0; j < p; ++j) {
+                s = std::max(s, std::fabs(X[static_cast<size_t>(j + 1) * n_layers + l]
+                                        - X[static_cast<size_t>(j) * n_layers + l]));
+            }
+            s_layer_out[l] = s;
+        }
+    }
     auto fallback = [&]() {
         for (int l = 0; l < n_layers; ++l) out[l] = newest[l];
         if (cond_out) *cond_out = HUGE_VAL;
+        if (gamma_l1_out) *gamma_l1_out = HUGE_VAL;
         return false;
     };
     if (p < 2 || n_layers <= 0 || p - 1 > kMaxCols) return fallback();
@@ -272,6 +352,10 @@ inline bool rreColumn(const double* X, int p, int n_layers, double* out,
     }
     gam[0] = 1.0 - bsum;
     if (!std::isfinite(gam[0])) return fallback();
+
+    double g1 = 0.0;
+    for (int j = 0; j < p; ++j) g1 += std::fabs(gam[j]);
+    if (gamma_l1_out) *gamma_l1_out = g1;
 
     // T* = sum_{j=0}^{p-1} gamma_j X_j  (note: X_p is used only via u_{p-1}).
     for (int l = 0; l < n_layers; ++l) {

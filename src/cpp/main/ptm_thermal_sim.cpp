@@ -6434,12 +6434,38 @@ post_batch_loop:
         const double p95 = ptm::eqextrap::percentile(eq_extrap_stats.ehat, 0.95);
         std::cout << "[eq-extrap] certified " << eq_extrap_stats.certified
                   << " | cert_refused "       << eq_extrap_stats.cert_refused
+                  << " | converged_window "   << eq_extrap_stats.converged_window
+                  << " | gamma_refused "      << eq_extrap_stats.gamma_refused
                   << " | box_refused "        << eq_extrap_stats.box_refused
                   << " | budget_exhausted "   << eq_extrap_stats.budget_exhausted
                   << " | median e " << std::fixed << std::setprecision(4) << med
                   << " K | p95 e "  << p95
                   << " K | passes spent " << eq_extrap_stats.passes_spent
                   << std::endl;
+        // ||gamma||_1 is the amplification factor that turns float32 state
+        // roundoff into extrapolant error -- the single most diagnostic number
+        // in the feature (N6.2c), and the one that would have caught the
+        // near-degenerate failure before a gate did.
+        {
+            const double g50 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.50);
+            const double g95 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.95);
+            const double g99 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.99);
+            const double gmx = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 1.00);
+            std::cout << "[eq-extrap] ||gamma||_1  p50 " << std::setprecision(3) << g50
+                      << " | p95 " << g95 << " | p99 " << g99 << " | max " << gmx
+                      << "   (Level-1 bound = " << ptm::eqextrap::kLevel1Frac
+                      << " * tol_K / (eps32 * max|S|))" << std::endl;
+            std::cout << "[eq-extrap] layers_held " << eq_extrap_stats.layers_held
+                      << " | faces_partly_held " << eq_extrap_stats.faces_partly_held
+                      << " | held-layer displacement max "
+                      << std::scientific << std::setprecision(3)
+                      << eq_extrap_stats.d_held_max << " K (tripwire bar "
+                      << ptm::eqextrap::kHeldDispTol << " K)" << std::endl;
+            if (eq_extrap_stats.d_held_max > ptm::eqextrap::kHeldDispTol) {
+                std::cerr << "[eq-extrap] ERROR: held-layer displacement exceeded the "
+                             "tripwire -- the Level-2 guard is not doing what it claims.\n";
+            }
+        }
         if (eq_extrap_stats.solve_failed > 0) {
             std::cout << "[eq-extrap] non-finite solves (fell back to the plain "
                          "state, counted in box_refused's sibling bucket): "

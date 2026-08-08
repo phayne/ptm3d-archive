@@ -280,9 +280,102 @@ static void testRingAddressing() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 8. REGRESSION on the MEASURED gate-3a failure (ADDENDUM NOTE 6).
+//
+// The 2026-08-08 validation failed gate 3a: 73 zero-forcing faces moved >1e-4 K
+// at layers >=30, worst 0.465260 K on face 277511. Its measured signature: the
+// UPPER column still moving (4->8 pass change 9.47e-3 K over layers 0..15)
+// while the DEEP column was bit-locked (4->8 change EXACTLY 0 over layers
+// 30..49), and RRE displaced the deep column by a nearly uniform -0.465 K
+// (30.0829 -> 29.6180, 30.7314 -> 30.2662).
+//
+// SCOPE, stated honestly: the 50 column values below are REAL engine data from
+// the banked 8-pass reference. The five-snapshot window that produced the
+// failure is NOT recoverable -- the per-pass snapshots never reach disk (that
+// is its own ledger row). An attempt to reconstruct one gave ||gamma||_1 = 1.29
+// and no displacement, i.e. it did NOT reproduce the mechanism, so it is not
+// used. What IS asserted here is the guard itself, against the MEASURED
+// ||gamma||_1 values from N6.2: the worst healthy active column (5.3) must
+// survive, and the amplification implied by the observed 0.465 K displacement
+// (2.6e5) must be refused.
+static void testMeasuredNearDegenerateRegression() {
+    std::printf("\n[8] guard vs the MEASURED gate-3a failure (face 277511 column)\n");
+    static const double S_last[50] = {
+        53.5418396, 54.1749001, 54.665905, 55.0112038, 55.2049446,
+        55.2383347, 55.1001358, 54.7769241, 54.2532043, 53.5117302,
+        52.5338936, 51.3004646, 49.7927208, 47.9939308, 45.8917999,
+        43.4815178, 40.771347, 37.7923088, 34.7830391, 32.4550056,
+        30.7293568, 29.5028744, 28.6723919, 28.1446915, 27.840704,
+        27.6963482, 27.6619644, 27.7005253, 27.7856255, 27.8994808,
+        28.0300159, 28.1699219, 28.3147583, 28.4618893, 28.609848,
+        28.7584991, 28.9070053, 29.0555553, 29.2038116, 29.3519058,
+        29.4992275, 29.6461201, 29.7923889, 29.9379635, 30.0828915,
+        30.2276859, 30.3721333, 30.516325, 30.6601276, 30.7314262,
+    };
+    const int L = 50;
+    double smax = 0.0;
+    for (int l = 0; l < L; ++l) smax = std::max(smax, std::fabs(S_last[l]));
+
+    // LEVEL 1, against the two measured ends of N6.2's separation table.
+    // Implied amplification of the observed failure: 0.465 K / (eps32 * 30 K).
+    const double g_fail = 0.465260 / (ex::kEpsState * 30.7314262);
+    const double g_ok   = 5.3;      // worst ACTIVE column measured by Fermi
+    std::printf("       implied failing ||gamma||_1 = %.3g ; worst active = %.1f\n",
+                g_fail, g_ok);
+    check(ex::level1Refuse(g_fail, smax, /*tol_K=*/0.5),
+          "Level 1 REFUSES the measured failure amplification", 1, 1);
+    check(!ex::level1Refuse(g_ok, smax, /*tol_K=*/0.5),
+          "Level 1 PERMITS the worst healthy active column", 1, 1);
+    // Margin either side of the bound, so a future tol_K change is visible.
+    const double bound = ex::kLevel1Frac * 0.5 / (ex::kEpsState * smax);
+    std::printf("       Level-1 bound at tol_K=0.5, max|S|=%.1f K : ||gamma||_1 <= %.3g\n",
+                smax, bound);
+    check(bound > 10.0 * g_ok, "bound sits >10x above the worst active column",
+          bound / g_ok, 10);
+    check(bound < 0.5 * g_fail, "bound sits >2x below the failing amplification",
+          g_fail / bound, 2);
+
+    // LEVEL 2, on this column's real temperatures: a deep layer carrying only
+    // 1 float32 ULP of window signal must be held; an active layer carrying the
+    // 3b population's measured ~0.12 K per pass must NOT be.
+    const double ulp_deep = 1.907e-6;            // ULP at 30.73 K
+    check(ex::level2Hold(ulp_deep, 2.0, S_last[49]),
+          "Level 2 HOLDS a deep layer at 1 ULP of signal", 1, 1);
+    check(!ex::level2Hold(0.12, 2.0, S_last[49]),
+          "Level 2 does NOT hold an active layer (0.12 K/pass)", 1, 1);
+    check(!ex::level2Hold(0.12, 5.3, S_last[0]),
+          "Level 2 does NOT hold an active SURFACE layer at worst active gamma", 1, 1);
+    // The operationally relevant case: at the WORST ACTIVE amplification the
+    // Level-2 floor must sit far below the active signal, so the 55-64x result
+    // on LIT/(b2) is untouched.
+    const double floor_active = std::max(
+        ex::kLevel2Slack * g_ok * ex::kEpsState * std::fabs(S_last[49]),
+        ex::kLevel2Floor);
+    std::printf("       Level-2 floor at the worst ACTIVE gamma (%.1f): %.3g K "
+                "(active signal 0.12 K)\n", g_ok, floor_active);
+    check(floor_active < 0.012, "Level-2 floor >=10x below active signal at worst active gamma",
+          floor_active, 0.012);
+
+    // DOCUMENTED INTERACTION, reported not asserted: a column sitting AT the
+    // Level-1 bound has a Level-2 floor of ~0.56 K, above the 0.12 K active
+    // signal, so every layer is held and the extrapolation becomes a complete
+    // no-op (T* = S_last = plain cycling). That is graceful degradation, not
+    // damage -- but it means the two levels overlap, and columns in the top
+    // decade below the Level-1 bound buy nothing. Worth knowing before tuning
+    // either constant.
+    const double floor_at_bound = std::max(
+        ex::kLevel2Slack * bound * ex::kEpsState * std::fabs(S_last[49]),
+        ex::kLevel2Floor);
+    std::printf("       [reported] Level-2 floor AT the Level-1 bound: %.3g K "
+                "=> such columns become full no-ops (graceful, not harmful)\n",
+                floor_at_bound);
+}
+
 int main() {
     std::printf("=== test_eq_extrapolation — pass-stride RRE correctness gate ===\n");
     testRingAddressing();
+    testMeasuredNearDegenerateRegression();
     testGoldenVsReference();
     testExactOnGeometricModes();
     testRankDeficient();

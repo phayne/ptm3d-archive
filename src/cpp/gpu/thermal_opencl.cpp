@@ -1596,11 +1596,18 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
     }
 
     T_star.assign(n_faces * n_layers, 0.0f);
-    rhat_out.assign(n_faces, std::numeric_limits<float>::quiet_NaN());
+    // rhat is now per face PER BLOCK (N6.2b): a slow deep ACTIVE block must not
+    // be masked by a fast surface block in a column-wide norm.
+    rhat_out.assign(n_faces * ptm::eqextrap::kNBlocks,
+                    std::numeric_limits<float>::quiet_NaN());
 
     std::vector<double> X(depth * n_layers);
     std::vector<double> cand(n_layers);
-    long long box_refused = 0, solve_failed = 0;
+    std::vector<double> s_layer(n_layers);
+    std::vector<unsigned char> held(n_layers);
+    long long box_refused = 0, solve_failed = 0, gamma_refused = 0;
+    long long converged_window = 0, layers_held = 0, faces_partly_held = 0;
+    double d_held_max = 0.0;
 
     for (size_t f = 0; f < n_faces; ++f) {
         for (size_t s = 0; s < depth; ++s) {
@@ -1611,34 +1618,69 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
         }
         const double* newest = X.data() + static_cast<size_t>(p) * n_layers;
 
-        double cond = 0.0;
+        double cond = 0.0, gamma_l1 = 0.0;
         const bool ok = ptm::eqextrap::rreColumn(X.data(), p,
                                                  static_cast<int>(n_layers),
-                                                 cand.data(), &cond);
+                                                 cand.data(), &cond,
+                                                 ptm::eqextrap::kRcond,
+                                                 &gamma_l1, s_layer.data());
         bool use_extrap = ok;
         if (!ok) {
             ++solve_failed;
-        } else if (!ptm::eqextrap::insideAutoBox(X.data(), p,
-                                                 static_cast<int>(n_layers),
-                                                 cand.data())) {
-            use_extrap = false;
-            ++box_refused;
+        } else {
+            // ---- LEVEL 1 (N6.2): column refusal on the amplification bound.
+            // Self-calibrating, no magic constant: refuse when amplified state
+            // roundoff could reach a fifth of the reporting tolerance.
+            double smax = 0.0;
+            for (size_t l = 0; l < n_layers; ++l) smax = std::max(smax, std::fabs(newest[l]));
+            if (ptm::eqextrap::level1Refuse(gamma_l1, smax, opt.tol_K)) {
+                use_extrap = false;
+                ++gamma_refused;
+            } else if (!ptm::eqextrap::insideAutoBox(X.data(), p,
+                                                     static_cast<int>(n_layers),
+                                                     cand.data())) {
+                use_extrap = false;
+                ++box_refused;
+            }
         }
 
         if (use_extrap) {
-            // rhat = ||S_{N-1}-S_{N-2}|| / ||S_{N-2}-S_{N-3}||, this face only.
-            double d2 = 0.0, d1 = 0.0;
+            if (stats) stats->gamma_l1.push_back(static_cast<float>(gamma_l1));
+            // ---- LEVEL 2 (N6.2): per-layer hold on a signal-vs-noise test.
+            // A no-op wherever the layer carries signal, so the 55-64x result on
+            // the active populations is untouched by construction.
+            size_t n_held = 0;
+            for (size_t l = 0; l < n_layers; ++l) {
+                held[l] = ptm::eqextrap::level2Hold(s_layer[l], gamma_l1, newest[l]) ? 1 : 0;
+                if (held[l]) { cand[l] = newest[l]; ++n_held; }
+            }
+            layers_held += static_cast<long long>(n_held);
+            if (n_held == n_layers)      ++converged_window;
+            else if (n_held > 0)         ++faces_partly_held;
+            // ---- Displacement tripwire on held layers (N6.2a). Identically 0
+            // once Level 2 is in place; it exists to VERIFY the guard, because
+            // the residual certificate is irreducibly blind on frozen layers
+            // (vanishing one-pass residual AND rhat = 0/0 -> clamp floor).
+            for (size_t l = 0; l < n_layers; ++l) {
+                if (held[l]) d_held_max = std::max(d_held_max,
+                                                   std::fabs(cand[l] - newest[l]));
+            }
+            // ---- Block-local rhat (N6.2b).
             const double* s1 = X.data() + static_cast<size_t>(p)     * n_layers;
             const double* s2 = X.data() + static_cast<size_t>(p - 1) * n_layers;
             const double* s3 = X.data() + static_cast<size_t>(p - 2) * n_layers;
+            double d2[ptm::eqextrap::kNBlocks] = {0, 0, 0};
+            double d1[ptm::eqextrap::kNBlocks] = {0, 0, 0};
             for (size_t l = 0; l < n_layers; ++l) {
-                const double a = s1[l] - s2[l];
-                const double b = s2[l] - s3[l];
-                d2 += a * a;
-                d1 += b * b;
+                const int B = ptm::eqextrap::blockOf(static_cast<int>(l));
+                const double a = s1[l] - s2[l], b = s2[l] - s3[l];
+                d2[B] += a * a;
+                d1[B] += b * b;
             }
-            rhat_out[f] = static_cast<float>(
-                ptm::eqextrap::clampRhat(std::sqrt(d2), std::sqrt(d1), opt.r_cap));
+            for (int B = 0; B < ptm::eqextrap::kNBlocks; ++B) {
+                rhat_out[f * ptm::eqextrap::kNBlocks + B] = static_cast<float>(
+                    ptm::eqextrap::clampRhat(std::sqrt(d2[B]), std::sqrt(d1[B]), opt.r_cap));
+            }
             for (size_t l = 0; l < n_layers; ++l) {
                 T_star[l * n_faces + f] = static_cast<float>(cand[l]);
             }
@@ -1652,8 +1694,13 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
         }
     }
     if (stats) {
-        stats->box_refused  += box_refused;
-        stats->solve_failed += solve_failed;
+        stats->box_refused       += box_refused;
+        stats->solve_failed      += solve_failed;
+        stats->gamma_refused     += gamma_refused;
+        stats->converged_window  += converged_window;
+        stats->layers_held       += layers_held;
+        stats->faces_partly_held += faces_partly_held;
+        stats->d_held_max         = std::max(stats->d_held_max, d_held_max);
     }
     return true;
 }
@@ -1665,20 +1712,28 @@ void eqScoreCertificate(const std::vector<float>& T_out,
                         size_t n_faces, size_t n_layers,
                         const ptm::eqextrap::Options& opt,
                         ptm::eqextrap::Stats* stats) {
+    // BLOCK-LOCAL (N6.2b): d_post and rhat are evaluated per depth block
+    // [0,15) [15,30) [30,n) and ehat = max_B ehat_B. A column-wide norm lets a
+    // fast surface block mask a slow deep ACTIVE block; this stops that.
     if (!stats) return;
     long long certified = 0, refused = 0;
+    const int NB = ptm::eqextrap::kNBlocks;
     stats->ehat.reserve(stats->ehat.size() + n_faces);
     for (size_t f = 0; f < n_faces; ++f) {
-        const float r = rhat[f];
-        if (!std::isfinite(r)) continue;    // not extrapolated -> already counted
-        double dmax = 0.0;
+        if (!std::isfinite(rhat[f * NB])) continue;  // not extrapolated
+        double dmax[ptm::eqextrap::kNBlocks] = {0, 0, 0};
         for (size_t l = 0; l < n_layers; ++l) {
             const size_t i = l * n_faces + f;
-            dmax = std::max(dmax, std::fabs(static_cast<double>(T_out[i])
-                                          - static_cast<double>(T_star[i])));
+            const int B = ptm::eqextrap::blockOf(static_cast<int>(l));
+            dmax[B] = std::max(dmax[B], std::fabs(static_cast<double>(T_out[i])
+                                                - static_cast<double>(T_star[i])));
         }
-        const double amp  = static_cast<double>(r) / (1.0 - static_cast<double>(r));
-        const double ehat = opt.safety * dmax * amp;
+        double ehat = 0.0;
+        for (int B = 0; B < NB; ++B) {
+            const double r = static_cast<double>(rhat[f * NB + B]);
+            if (!std::isfinite(r)) continue;
+            ehat = std::max(ehat, opt.safety * dmax[B] * r / (1.0 - r));
+        }
         stats->ehat.push_back(static_cast<float>(ehat));
         if (ehat <= opt.tol_K) ++certified; else ++refused;
     }
