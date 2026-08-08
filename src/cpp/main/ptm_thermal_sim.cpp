@@ -4115,6 +4115,104 @@ bool addThermalDataToVTK(
     return true;
 }
 
+// ---- Equilibration cycling (thermal.equilibration_cycles) ------------------
+//
+// PLACEMENT: this block must stay OUTSIDE the `#ifdef PTM_GPU_OPENCL` that
+// opens just below it. resolveEquilibrationPasses() is called from main() to
+// REFUSE the knob on every non-GPU path, and that refusal has to compile in
+// CPU-only builds — which are precisely the builds where the knob can never be
+// honored. It first shipped inside the guard, which built fine with GPU=ON here
+// and broke the CPU-only CI build outright ("use of undeclared identifier
+// resolveEquilibrationPasses" at the main() call site). Guarding the call site
+// instead would compile, but would silently delete the refusal from the only
+// configuration that needs it.
+//
+// The unit here is PASSES over the equilibration forcing array, not "extra"
+// cycles. The GPU persistent solver already implements the loop
+// (thermal_opencl.cpp: `const int total_cycles = n_equil_cycles + 1;`): each
+// pass replays the SAME uploaded flux array while buf_T_ persists across
+// passes, so P passes over an N-orbit equilibration window integrate P*N
+// diurnal cycles at 1x illumination cost and 1x flux RAM. That is the only
+// affordable route past the RAM wall — a 25-orbit eq array is ~6.1 GB on the
+// 509k-face lunar mesh, so 100+ orbits in ONE array is hard-blocked.
+//
+// Granularity: we cycle the EQUILIBRATION forcing array as assembled
+// (`prepare_flux(0, equilibration_steps)`), i.e. equilibration_orbits worth of
+// real ephemeris-driven flux. On the shipped lunar year-long config that array
+// is 25 lunations = 738.3 d = 2.02 Earth-years, so the seasonal (declination)
+// content is inside the cycled array and is preserved by construction; cycling
+// a single lunation would discard it. Cycling a *separately assembled* annual
+// array is not done here: it would need a second illumination pass on a second
+// time grid and a second flux buffer, and would not reduce to the current path
+// exactly.
+//
+// ⚠️ THE LEGACY VALUE IS 2, NOT 1. The two-phase branch has always passed
+// n_equil_cycles = 1, i.e. total_cycles = 2: the equilibration window is
+// integrated TWICE (the second pass's per-step output is simply discarded).
+// The banner printed "1 eq cycles" while the kernel logged "2 cycles x 3000
+// timesteps" for the same phase — see the shipped moon3d year-long
+// chunk_000.log lines 144 and 195. `equilibration_orbits: 25` therefore buys
+// 50 integrated lunations on this path. The default below reproduces that
+// bit-for-bit; the banner now states the true pass count and the equivalent
+// diurnal cycles so the 2x cannot stay silent (BUGS.md PTM-145).
+static constexpr int kLegacyEquilibrationPasses = 2;
+
+// Resolve the requested number of equilibration passes.
+// Precedence: PTM_EQUILIBRATION_CYCLES env > config `equilibration_cycles` >
+// legacy default. Returns 0 on a malformed request — callers MUST treat that
+// as fatal rather than silently continuing with the default (a silent
+// substitution here would misreport the equilibration length of every run).
+static int resolveEquilibrationPasses(const thermal::Config& config,
+                                      bool* explicitly_set = nullptr,
+                                      std::string* source = nullptr) {
+    int passes = kLegacyEquilibrationPasses;
+    bool explicit_set = false;
+    std::string src = "legacy default";
+
+    const int cfg = config.getPropertyInt("equilibration_cycles", -1);
+    if (cfg > 0) {
+        passes = cfg;
+        explicit_set = true;
+        src = "config thermal.equilibration_cycles";
+    } else if (cfg != -1) {
+        std::cerr << "[Thermal] ERROR: equilibration_cycles must be >= 1 "
+                     "(or -1 for the legacy default); got " << cfg << "\n";
+        if (explicitly_set) *explicitly_set = true;
+        if (source) *source = "invalid";
+        return 0;
+    }
+
+    if (const char* e = std::getenv("PTM_EQUILIBRATION_CYCLES")) {
+        int v = 0;
+        try {
+            size_t consumed = 0;
+            v = std::stoi(std::string(e), &consumed);
+            if (consumed != std::string(e).size()) v = 0;
+        } catch (const std::exception&) {
+            v = 0;
+        }
+        if (v < 1) {
+            std::cerr << "[Thermal] ERROR: PTM_EQUILIBRATION_CYCLES='" << e
+                      << "' is not an integer >= 1\n";
+            if (explicitly_set) *explicitly_set = true;
+            if (source) *source = "invalid";
+            return 0;
+        }
+        if (explicit_set && v != passes) {
+            std::cout << "[Thermal] PTM_EQUILIBRATION_CYCLES=" << v
+                      << " overrides config equilibration_cycles=" << passes
+                      << "\n";
+        }
+        passes = v;
+        explicit_set = true;
+        src = "env PTM_EQUILIBRATION_CYCLES";
+    }
+
+    if (explicitly_set) *explicitly_set = explicit_set;
+    if (source) *source = src;
+    return passes;
+}
+
 // ========== GPU PERSISTENT THERMAL SOLVER ==========
 #ifdef PTM_GPU_OPENCL
 
@@ -4572,94 +4670,6 @@ static void ensureGpuCalibrated(const thermal::Config& config,
               << out.safe_dispatch_ceiling_s << " s)"
               << (saved_cache ? "" : " [cache write skipped]")
               << (saved_default ? "" : " [profile write skipped]") << "\n";
-}
-
-// ---- Equilibration cycling (thermal.equilibration_cycles) ------------------
-//
-// The unit here is PASSES over the equilibration forcing array, not "extra"
-// cycles. The GPU persistent solver already implements the loop
-// (thermal_opencl.cpp: `const int total_cycles = n_equil_cycles + 1;`): each
-// pass replays the SAME uploaded flux array while buf_T_ persists across
-// passes, so P passes over an N-orbit equilibration window integrate P*N
-// diurnal cycles at 1x illumination cost and 1x flux RAM. That is the only
-// affordable route past the RAM wall — a 25-orbit eq array is ~6.1 GB on the
-// 509k-face lunar mesh, so 100+ orbits in ONE array is hard-blocked.
-//
-// Granularity: we cycle the EQUILIBRATION forcing array as assembled
-// (`prepare_flux(0, equilibration_steps)`), i.e. equilibration_orbits worth of
-// real ephemeris-driven flux. On the shipped lunar year-long config that array
-// is 25 lunations = 738.3 d = 2.02 Earth-years, so the seasonal (declination)
-// content is inside the cycled array and is preserved by construction; cycling
-// a single lunation would discard it. Cycling a *separately assembled* annual
-// array is not done here: it would need a second illumination pass on a second
-// time grid and a second flux buffer, and would not reduce to the current path
-// exactly.
-//
-// ⚠️ THE LEGACY VALUE IS 2, NOT 1. The two-phase branch has always passed
-// n_equil_cycles = 1, i.e. total_cycles = 2: the equilibration window is
-// integrated TWICE (the second pass's per-step output is simply discarded).
-// The banner printed "1 eq cycles" while the kernel logged "2 cycles x 3000
-// timesteps" for the same phase — see the shipped moon3d year-long
-// chunk_000.log lines 144 and 195. `equilibration_orbits: 25` therefore buys
-// 50 integrated lunations on this path. The default below reproduces that
-// bit-for-bit; the banner now states the true pass count and the equivalent
-// diurnal cycles so the 2x cannot stay silent (BUGS.md PTM-145).
-static constexpr int kLegacyEquilibrationPasses = 2;
-
-// Resolve the requested number of equilibration passes.
-// Precedence: PTM_EQUILIBRATION_CYCLES env > config `equilibration_cycles` >
-// legacy default. Returns 0 on a malformed request — callers MUST treat that
-// as fatal rather than silently continuing with the default (a silent
-// substitution here would misreport the equilibration length of every run).
-static int resolveEquilibrationPasses(const thermal::Config& config,
-                                      bool* explicitly_set = nullptr,
-                                      std::string* source = nullptr) {
-    int passes = kLegacyEquilibrationPasses;
-    bool explicit_set = false;
-    std::string src = "legacy default";
-
-    const int cfg = config.getPropertyInt("equilibration_cycles", -1);
-    if (cfg > 0) {
-        passes = cfg;
-        explicit_set = true;
-        src = "config thermal.equilibration_cycles";
-    } else if (cfg != -1) {
-        std::cerr << "[Thermal] ERROR: equilibration_cycles must be >= 1 "
-                     "(or -1 for the legacy default); got " << cfg << "\n";
-        if (explicitly_set) *explicitly_set = true;
-        if (source) *source = "invalid";
-        return 0;
-    }
-
-    if (const char* e = std::getenv("PTM_EQUILIBRATION_CYCLES")) {
-        int v = 0;
-        try {
-            size_t consumed = 0;
-            v = std::stoi(std::string(e), &consumed);
-            if (consumed != std::string(e).size()) v = 0;
-        } catch (const std::exception&) {
-            v = 0;
-        }
-        if (v < 1) {
-            std::cerr << "[Thermal] ERROR: PTM_EQUILIBRATION_CYCLES='" << e
-                      << "' is not an integer >= 1\n";
-            if (explicitly_set) *explicitly_set = true;
-            if (source) *source = "invalid";
-            return 0;
-        }
-        if (explicit_set && v != passes) {
-            std::cout << "[Thermal] PTM_EQUILIBRATION_CYCLES=" << v
-                      << " overrides config equilibration_cycles=" << passes
-                      << "\n";
-        }
-        passes = v;
-        explicit_set = true;
-        src = "env PTM_EQUILIBRATION_CYCLES";
-    }
-
-    if (explicitly_set) *explicitly_set = explicit_set;
-    if (source) *source = src;
-    return passes;
 }
 
 /**
