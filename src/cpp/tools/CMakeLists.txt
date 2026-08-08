@@ -150,6 +150,19 @@ set_target_properties(test_eq_extrapolation
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Depth-grid / layer-property dump. Prints the arrays the solver ACTUALLY
+# builds (thermal::Profile z/dz/kc/rho), so an offline flux audit does not have
+# to reconstruct them -- a reconstruction wrong by a few percent is
+# indistinguishable from an energy-conservation defect, which is exactly what
+# blocked the 2026-08-08 offset investigation. No GPU, no mesh, no simulation:
+# safe to run while a production job owns the GPUs.
+add_executable(dump_thermal_grid dump_thermal_grid.cpp)
+target_link_libraries(dump_thermal_grid PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(dump_thermal_grid
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration large-dt accuracy test
 add_executable(test_equilibration_dt test_equilibration_dt.cpp)
 target_link_libraries(test_equilibration_dt
