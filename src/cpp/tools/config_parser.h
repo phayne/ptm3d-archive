@@ -60,6 +60,18 @@ struct SimulationConfig {
         //  <= 0 = fall back to legacy behavior (match output cadence)
         // Only consulted when equilibration_steps_per_day <= 0.
         double equilibration_samples_per_diurnal_cycle = -1.0;
+
+        // Number of PASSES over the equilibration forcing array (GPU persistent
+        // solver only). Each pass replays the same uploaded flux array with the
+        // temperature state persisting, so the effective equilibration is
+        // equilibration_cycles x equilibration_orbits diurnal cycles at 1x
+        // illumination cost and 1x flux RAM.
+        //   -1 (default) = unset → the solver's legacy value (2 passes).
+        //   >= 1         = explicit pass count.
+        // ⚠️ The legacy value is 2, not 1: the two-phase GPU path has always
+        // run total_cycles = n_equil_cycles + 1 = 2 over the eq window.
+        int equilibration_cycles = -1;
+
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
 
