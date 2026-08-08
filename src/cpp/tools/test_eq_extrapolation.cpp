@@ -1,0 +1,296 @@
+// test_eq_extrapolation — correctness gate for pass-stride RRE extrapolation.
+//
+// WHY THIS TEST EXISTS
+// --------------------
+// The acceptance thresholds in Fermi's ADDENDUM (A1: 0.267 K certified at 5
+// passes; A3a: 0 missed detections over 72 cases) were measured with ONE
+// specific reference implementation, `eq_compare_2026-08-08/code/modeext.py`
+// `_rre`. If the C++ disagrees with that function, every published number
+// becomes a statement about a different algorithm and the GO decision does not
+// transfer. So the gate is: reproduce it, on well-conditioned AND rank-deficient
+// inputs, to machine precision.
+//
+// This is not hypothetical. The first draft of minNormLstsq() had an inverted
+// sign in the Jacobi rotation, which made the sweep ANTI-diagonalize. It
+// returned finite, plausible-looking temperatures and disagreed with numpy by
+// 17-21 % on a FULL-RANK system. No physics gate would have caught it; only a
+// direct comparison against the reference did.
+//
+// Header-only under test, so nothing links here and no stale library can
+// silently satisfy it (same reasoning as test_conductivity_model).
+//
+// Run:  ./build/bin/test_eq_extrapolation      (exit 0 = pass)
+#include "../thermal/eq_extrapolation.h"
+
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+namespace ex = ptm::eqextrap;
+
+static int g_failures = 0;
+
+static void check(bool ok, const char* what, double got, double want) {
+    if (!ok) ++g_failures;
+    std::printf("  %-58s got %-18.10g want %-18.10g  %s\n",
+                what, got, want, ok ? "PASS" : "*** FAIL ***");
+}
+
+static void checkNear(const char* what, double got, double want, double tol) {
+    check(std::fabs(got - want) <= tol, what, got, want);
+}
+
+// ---------------------------------------------------------------------------
+// 1. GOLDEN VECTORS from modeext.py `_rre`. Four layers, five snapshots.
+//    Produced by: me._rre(list(S), p) on the S below, numpy 1.x, rcond 1e-12.
+// ---------------------------------------------------------------------------
+static void testGoldenVsReference() {
+    std::printf("\n[1] golden vectors vs eq_compare/code/modeext.py::_rre\n");
+    const int L = 4;
+    // S[snapshot][layer], oldest first.
+    const double S[5][4] = {
+        {300.0,   250.0,   200.0,   150.0   },
+        {280.0,   238.0,   193.0,   147.5   },
+        {268.0,   230.8,   188.8,   146.05  },
+        {260.8,   226.48,  186.28,  145.18  },
+        {256.48,  223.888, 184.768, 144.658 },
+    };
+    const double want_p4[4] = {250.00000000000003, 219.99999999999997,
+                               182.5,              143.87499999999997};
+    const double want_p3[4] = {249.99999999999994, 219.99999999999997,
+                               182.5,              143.875};
+
+    {
+        std::vector<double> X(5 * L);
+        for (int s = 0; s < 5; ++s)
+            for (int l = 0; l < L; ++l) X[s * L + l] = S[s][l];
+        std::vector<double> out(L);
+        double cond = 0.0;
+        const bool ok = ex::rreColumn(X.data(), 4, L, out.data(), &cond);
+        check(ok, "p=4 solve reports success", ok ? 1 : 0, 1);
+        for (int l = 0; l < L; ++l) {
+            char lab[80];
+            std::snprintf(lab, sizeof lab, "p=4 layer %d matches numpy", l);
+            checkNear(lab, out[l], want_p4[l], 1e-9);
+        }
+    }
+    {
+        std::vector<double> X(4 * L);
+        for (int s = 0; s < 4; ++s)
+            for (int l = 0; l < L; ++l) X[s * L + l] = S[s][l];
+        std::vector<double> out(L);
+        double cond = 0.0;
+        ex::rreColumn(X.data(), 3, L, out.data(), &cond);
+        for (int l = 0; l < L; ++l) {
+            char lab[80];
+            std::snprintf(lab, sizeof lab, "p=3 layer %d matches numpy", l);
+            checkNear(lab, out[l], want_p3[l], 1e-9);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. EXACTNESS. RRE of order p annihilates up to p-1 geometric modes exactly,
+//    so on a sequence T_k = T_inf + sum_{m<p} a_m r_m^k it must return T_inf to
+//    machine precision -- with NO reference data needed. This is the property
+//    that makes the whole scheme work: the eq pass map is linear-ish near its
+//    fixed point and its transient is a sum of decaying modes.
+// ---------------------------------------------------------------------------
+static void testExactOnGeometricModes() {
+    std::printf("\n[2] exactness on <= p-1 geometric modes (analytic, no reference)\n");
+    const int L = 50;
+    for (int p = 3; p <= 4; ++p) {
+        const int n_modes = p - 1;
+        const double rates[3] = {0.61, 0.27, 0.08};
+        std::vector<double> Tinf(L), X(static_cast<size_t>(p + 1) * L);
+        std::vector<std::vector<double>> amp(n_modes, std::vector<double>(L));
+        for (int l = 0; l < L; ++l) {
+            Tinf[l] = 30.0 + 6.0 * l;
+            for (int m = 0; m < n_modes; ++m)
+                amp[m][l] = 40.0 * std::sin(0.7 * l + 1.3 * m) + 5.0 * (m + 1);
+        }
+        for (int s = 0; s <= p; ++s) {
+            for (int l = 0; l < L; ++l) {
+                double v = Tinf[l];
+                for (int m = 0; m < n_modes; ++m)
+                    v += amp[m][l] * std::pow(rates[m], s);
+                X[static_cast<size_t>(s) * L + l] = v;
+            }
+        }
+        std::vector<double> out(L);
+        double cond = 0.0;
+        ex::rreColumn(X.data(), p, L, out.data(), &cond);
+        double worst = 0.0;
+        for (int l = 0; l < L; ++l) worst = std::max(worst, std::fabs(out[l] - Tinf[l]));
+        char lab[80];
+        std::snprintf(lab, sizeof lab, "p=%d recovers T_inf for %d modes (max err)",
+                      p, n_modes);
+        checkNear(lab, worst, 0.0, 1e-8);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. RANK DEFICIENCY. Fewer live modes than p is the COMMON case on a real
+//    mesh (a face deep in shadow relaxes on one time constant). The minimum-norm
+//    solve must still land on the exact limit and must not blow up.
+// ---------------------------------------------------------------------------
+static void testRankDeficient() {
+    std::printf("\n[3] rank-deficient column (1 live mode, p=4)\n");
+    const int L = 50, p = 4;
+    std::vector<double> Tinf(L), X(static_cast<size_t>(p + 1) * L), out(L);
+    for (int l = 0; l < L; ++l) Tinf[l] = 25.0 + 0.5 * l;
+    for (int s = 0; s <= p; ++s)
+        for (int l = 0; l < L; ++l)
+            X[static_cast<size_t>(s) * L + l] = Tinf[l] + 33.0 * std::pow(0.42, s);
+    double cond = 0.0;
+    ex::rreColumn(X.data(), p, L, out.data(), &cond);
+    double worst = 0.0;
+    for (int l = 0; l < L; ++l) worst = std::max(worst, std::fabs(out[l] - Tinf[l]));
+    checkNear("p=4 on a 1-mode column recovers T_inf (max err)", worst, 0.0, 1e-8);
+
+    // Already converged: every snapshot identical. 0/0 everywhere. Must return
+    // that state, finite, and must not produce NaN.
+    std::vector<double> Xc(static_cast<size_t>(p + 1) * L), oc(L);
+    for (int s = 0; s <= p; ++s)
+        for (int l = 0; l < L; ++l) Xc[static_cast<size_t>(s) * L + l] = 100.0 + l;
+    ex::rreColumn(Xc.data(), p, L, oc.data(), &cond);
+    double wc = 0.0;
+    bool finite = true;
+    for (int l = 0; l < L; ++l) {
+        wc = std::max(wc, std::fabs(oc[l] - (100.0 + l)));
+        finite = finite && std::isfinite(oc[l]);
+    }
+    check(finite, "fully converged column stays finite", finite ? 1 : 0, 1);
+    checkNear("fully converged column is a fixed point (max err)", wc, 0.0, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// 4. REFUSALS. p < 3 must never be executed by rreColumn, and a bad column must
+//    degrade to the newest state rather than to garbage.
+// ---------------------------------------------------------------------------
+static void testRefusals() {
+    std::printf("\n[4] refusals and safe degradation\n");
+    const int L = 6;
+    std::vector<double> X(3 * L), out(L);
+    for (int s = 0; s < 3; ++s)
+        for (int l = 0; l < L; ++l) X[static_cast<size_t>(s) * L + l] = 200.0 - 10.0 * s + l;
+    const bool ok2 = ex::rreColumn(X.data(), 2, L, out.data(), nullptr);
+    // p=2 is inside rreColumn's algebraic domain, but the CONFIG layer refuses
+    // it; assert only that it is well-formed here.
+    check(std::isfinite(out[0]), "p=2 result finite (config layer is what refuses it)",
+          out[0], out[0]);
+    (void)ok2;
+
+    // A NaN anywhere must trigger the fallback to the newest snapshot.
+    std::vector<double> Xn(5 * L), on(L);
+    for (int s = 0; s < 5; ++s)
+        for (int l = 0; l < L; ++l) Xn[static_cast<size_t>(s) * L + l] = 150.0 + l - 2.0 * s;
+    Xn[0] = std::nan("");
+    const bool okn = ex::rreColumn(Xn.data(), 4, L, on.data(), nullptr);
+    check(!okn, "NaN input reports failure", okn ? 1 : 0, 0);
+    checkNear("NaN input falls back to the newest snapshot",
+              on[1], Xn[4 * L + 1], 0.0);
+
+    // Box guard: an absurd extrapolant is rejected, a sane one is not.
+    std::vector<double> Xb(5 * L), sane(L), wild(L);
+    for (int s = 0; s < 5; ++s)
+        for (int l = 0; l < L; ++l) Xb[static_cast<size_t>(s) * L + l] = 100.0 + l - 3.0 * s;
+    for (int l = 0; l < L; ++l) { sane[l] = 88.0 + l; wild[l] = 1.0e6; }
+    check(ex::insideAutoBox(Xb.data(), 4, L, sane.data()),
+          "auto box accepts a nearby extrapolant", 1, 1);
+    check(!ex::insideAutoBox(Xb.data(), 4, L, wild.data()),
+          "auto box rejects a 1e6 K extrapolant", 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5. CERTIFICATE ALGEBRA. rhat clamping is what keeps ehat finite when the
+//    sequence stalls (r -> 1 makes r/(1-r) diverge).
+// ---------------------------------------------------------------------------
+static void testCertificateAlgebra() {
+    std::printf("\n[5] certificate algebra\n");
+    checkNear("rhat = d2/d1 in the normal regime",
+              ex::clampRhat(2.0, 4.0, 0.9995), 0.5, 1e-15);
+    checkNear("rhat clamped at r_cap when the sequence stalls",
+              ex::clampRhat(4.0, 4.0, 0.9995), 0.9995, 1e-15);
+    checkNear("rhat clamped at r_cap on a zero denominator",
+              ex::clampRhat(1.0, 0.0, 0.9995), 0.9995, 1e-15);
+    checkNear("rhat floored at 1e-6 on a zero numerator",
+              ex::clampRhat(0.0, 4.0, 0.9995), 1e-6, 1e-15);
+    // ehat = safety * dinf * r/(1-r): the amplification at pass stride is O(1),
+    // which is the whole reason the certificate is usable here (at lunation
+    // stride r ~ 0.97 gives ~40x).
+    const double r = 0.4;
+    checkNear("amplification r/(1-r) at a measured pass-stride r=0.4",
+              r / (1.0 - r), 0.6666666666666666, 1e-15);
+}
+
+// ---------------------------------------------------------------------------
+// 6. LEAST SQUARES. Direct check of the min-norm solver against a hand-solvable
+//    overdetermined system, plus an exactly singular one.
+// ---------------------------------------------------------------------------
+static void testLeastSquares() {
+    std::printf("\n[6] minimum-norm least squares\n");
+    // A = [[1,0],[0,1],[1,1]], b = [1,2,3]. Normal equations:
+    // [[2,1],[1,2]] x = [4,5]  ->  x = [1, 2].
+    double A[6] = {1, 0, 1,   0, 1, 1};      // column-major 3x2
+    const double b[3] = {1, 2, 3};
+    double x[2] = {0, 0}, cond = 0;
+    ex::minNormLstsq(A, 3, 2, b, x, ex::kRcond, &cond);
+    checkNear("lstsq x0", x[0], 1.0, 1e-12);
+    checkNear("lstsq x1", x[1], 2.0, 1e-12);
+
+    // Exactly singular: two identical columns. Minimum-norm splits the
+    // coefficient evenly instead of returning an arbitrary large pair.
+    double As[6] = {1, 1, 1,   1, 1, 1};
+    const double bs[3] = {2, 2, 2};
+    double xs[2] = {0, 0};
+    const int rank = ex::minNormLstsq(As, 3, 2, bs, xs, ex::kRcond, &cond);
+    check(rank == 1, "singular system detected as rank 1", rank, 1);
+    checkNear("min-norm splits evenly (x0)", xs[0], 1.0, 1e-12);
+    checkNear("min-norm splits evenly (x1)", xs[1], 1.0, 1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// 7. RING ADDRESSING. Snapshots are written to slot k % (p+1) as the passes run,
+//    so recovering them oldest-first at the top of the last pass is a modular
+//    index. Get it wrong and RRE is handed a ROTATED sequence: finite, plausible
+//    temperatures, silently wrong. Simulate the writes and assert the reads.
+// ---------------------------------------------------------------------------
+static void testRingAddressing() {
+    std::printf("\n[7] ring-buffer addressing (rotation would be silent)\n");
+    for (int p = 3; p <= 4; ++p) {
+        const int depth = p + 1;
+        for (int N = p + 1; N <= p + 6; ++N) {   // N = total passes
+            // Simulate: pass k writes snapshot id k into slot k % depth.
+            std::vector<int> slot(depth, -1);
+            for (int k = 0; k < N; ++k) slot[k % depth] = k;
+            // Read back oldest-first at newest_cycle = N-1.
+            bool ok = true;
+            for (int s = 0; s <= p; ++s) {
+                const int got = slot[ex::ringSlot(N - 1, p, s, depth)];
+                const int want = (N - 1) - p + s;
+                if (got != want) ok = false;
+            }
+            char lab[96];
+            std::snprintf(lab, sizeof lab,
+                          "p=%d N=%d recovers S_%d..S_%d in order", p, N,
+                          N - 1 - p, N - 1);
+            check(ok, lab, ok ? 1 : 0, 1);
+        }
+    }
+}
+
+int main() {
+    std::printf("=== test_eq_extrapolation — pass-stride RRE correctness gate ===\n");
+    testRingAddressing();
+    testGoldenVsReference();
+    testExactOnGeometricModes();
+    testRankDeficient();
+    testRefusals();
+    testCertificateAlgebra();
+    testLeastSquares();
+    std::printf("\n%s (%d failure%s)\n",
+                g_failures == 0 ? "ALL PASS" : "*** FAILURES ***",
+                g_failures, g_failures == 1 ? "" : "s");
+    return g_failures == 0 ? 0 : 1;
+}

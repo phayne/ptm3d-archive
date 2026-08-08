@@ -328,6 +328,19 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
             config.thermal.equilibration_cycles = getWithDefault(thermal, "equilibration_cycles", config.thermal.equilibration_cycles);
+            if (thermal["eq_extrapolation"]) {
+                const auto& ex = thermal["eq_extrapolation"];
+                config.thermal.eq_extrapolation.method =
+                    getWithDefault(ex, "method",  config.thermal.eq_extrapolation.method);
+                config.thermal.eq_extrapolation.order_p =
+                    getWithDefault(ex, "order_p", config.thermal.eq_extrapolation.order_p);
+                config.thermal.eq_extrapolation.tol_K =
+                    getWithDefault(ex, "tol_K",   config.thermal.eq_extrapolation.tol_K);
+                config.thermal.eq_extrapolation.safety =
+                    getWithDefault(ex, "safety",  config.thermal.eq_extrapolation.safety);
+                config.thermal.eq_extrapolation.r_cap =
+                    getWithDefault(ex, "r_cap",   config.thermal.eq_extrapolation.r_cap);
+            }
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
             config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
             config.thermal.gpu_devices = getWithDefault(thermal, "gpu_devices", config.thermal.gpu_devices);
@@ -747,6 +760,17 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // with the real pass count (which is 2, not 1).
         if (config.thermal.equilibration_cycles > 0)
             out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
+        // Same rule: only round-trip the extrapolation block when it is armed,
+        // so an OFF run's re-serialized config stays free of the knob entirely.
+        if (config.thermal.eq_extrapolation.method != "off") {
+            out << YAML::Key << "eq_extrapolation" << YAML::Value << YAML::BeginMap;
+            out << YAML::Key << "method"  << YAML::Value << config.thermal.eq_extrapolation.method;
+            out << YAML::Key << "order_p" << YAML::Value << config.thermal.eq_extrapolation.order_p;
+            out << YAML::Key << "tol_K"   << YAML::Value << config.thermal.eq_extrapolation.tol_K;
+            out << YAML::Key << "safety"  << YAML::Value << config.thermal.eq_extrapolation.safety;
+            out << YAML::Key << "r_cap"   << YAML::Value << config.thermal.eq_extrapolation.r_cap;
+            out << YAML::EndMap;
+        }
         out << YAML::Key << "compute_statistics" << YAML::Value << config.thermal.compute_statistics;
         // Multi-GPU knobs (only emit when not at defaults — keep templates clean).
         if (config.thermal.gpu_devices != 1)
@@ -1077,6 +1101,12 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      # Effective eq = cycles x equilibration_orbits diurnal\n";
     out << "                                      # cycles, at 1x illumination cost and 1x flux RAM.\n";
     out << "                                      # Unset = the solver legacy value, which is 2 (not 1).\n";
+    out << "  # eq_extrapolation:                  # Pass-stride RRE on the equilibration state. DEFAULT OFF.\n";
+    out << "  #   method: off                      #   off | rre\n";
+    out << "  #   order_p: 4                       #   3 or 4; needs equilibration_cycles >= order_p + 1\n";
+    out << "  #   tol_K: 0.5                       #   certificate reporting threshold (state ships regardless)\n";
+    out << "  #   safety: 3.0                      #   certificate safety factor\n";
+    out << "  #   r_cap: 0.9995                    #   cap on the measured contraction ratio\n";
     out << "  compute_statistics: true            # Compute temperature statistics\n";
     out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
     out << "  ice_stability:\n";
@@ -1170,6 +1200,43 @@ bool ConfigParser::validate(const SimulationConfig& config) {
                      "(or -1 for the solver default); got "
                   << config.thermal.equilibration_cycles << std::endl;
         valid = false;
+    }
+    // eq_extrapolation. Every rejection here is FATAL rather than a silent
+    // downgrade: an unrecognised method or an order the study showed to be
+    // HARMFUL must not be quietly replaced with something that runs.
+    {
+        const auto& ex = config.thermal.eq_extrapolation;
+        if (ex.method != "off" && ex.method != "rre") {
+            std::cerr << "Error: thermal.eq_extrapolation.method must be 'off' or 'rre'; got '"
+                      << ex.method << "'" << std::endl;
+            valid = false;
+        }
+        if (ex.method == "rre") {
+            if (ex.order_p < 3) {
+                std::cerr << "Error: thermal.eq_extrapolation.order_p must be >= 3; got "
+                          << ex.order_p << ". order_p=2 is not merely weak, it is HARMFUL "
+                             "(measured 54.82 K worst-column error vs 31.88 K for plain "
+                             "2-pass cycling): the seed sits outside the linear regime and a "
+                             "degree-1 annihilator cannot remove it. Refusing rather than "
+                             "silently raising it." << std::endl;
+                valid = false;
+            }
+            if (ex.tol_K <= 0.0) {
+                std::cerr << "Error: thermal.eq_extrapolation.tol_K must be > 0; got "
+                          << ex.tol_K << std::endl;
+                valid = false;
+            }
+            if (ex.safety <= 0.0) {
+                std::cerr << "Error: thermal.eq_extrapolation.safety must be > 0; got "
+                          << ex.safety << std::endl;
+                valid = false;
+            }
+            if (!(ex.r_cap > 0.0) || ex.r_cap >= 1.0) {
+                std::cerr << "Error: thermal.eq_extrapolation.r_cap must be in (0,1); got "
+                          << ex.r_cap << std::endl;
+                valid = false;
+            }
+        }
     }
     // equilibration_steps_per_day: allow -1 (sentinel = match output cadence) or strictly positive.
     // Reject 0 and negative-but-not-minus-one values.

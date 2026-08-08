@@ -138,6 +138,18 @@ set_target_properties(test_primary_disk
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Pass-stride RRE extrapolation gate. Must reproduce the reference
+# implementation the GO decision was measured against
+# (eq_compare_2026-08-08/code/modeext.py::_rre) to machine precision, on
+# rank-deficient inputs as well as well-conditioned ones. Header-only under
+# test -- same reasoning as test_conductivity_model: no library can go stale
+# underneath it.
+add_executable(test_eq_extrapolation test_eq_extrapolation.cpp)
+set_target_properties(test_eq_extrapolation
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration large-dt accuracy test
 add_executable(test_equilibration_dt test_equilibration_dt.cpp)
 target_link_libraries(test_equilibration_dt

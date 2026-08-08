@@ -13,6 +13,7 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "opencl_config.h"
+#include "thermal/eq_extrapolation.h"
 #include <vector>
 #include <memory>
 #include <string>
@@ -189,7 +190,19 @@ public:
         // cycles (cycles 0..n_equil_cycles-1) skip accumulation.
         std::vector<float>* avg_E_inout = nullptr,
         int accum_start = 0,
-        int accum_end   = -1 /* -1 = n_timesteps */);
+        int accum_end   = -1 /* -1 = n_timesteps */,
+        // Pass-stride RRE extrapolation of the equilibration state. Pass
+        // nullptr (the default) or an Options with enabled == false and this
+        // function takes LITERALLY the pre-existing code path: no readback, no
+        // upload, no branch inside the cycle loop beyond one bool test.
+        //
+        // Only ever supplied at the two EQUILIBRATION call sites. The output
+        // cycle and the coupling re-thermal must never receive it: the output
+        // window is not a fixed-point iteration at all, and the re-thermal
+        // dispatches one pass per call (n_equil_cycles = 0), so a ring buffer
+        // could never fill there anyway.
+        const ptm::eqextrap::Options* extrap = nullptr,
+        ptm::eqextrap::Stats* extrap_stats   = nullptr);
 
     /**
      * @brief Set the active face count for the next call.

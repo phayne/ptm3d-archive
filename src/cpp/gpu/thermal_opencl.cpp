@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <limits>   // eq-extrap: quiet_NaN sentinel for "face not extrapolated"
 
 namespace gpu {
 namespace opencl {
@@ -1560,6 +1561,133 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
               << n_faces_active_ << " faces in " << last_kernel_time_ms_ << " ms\n";
 }
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Pass-stride RRE helpers. Both operate on the SoA device layout
+// [layer * n_faces + face] and are pure host arithmetic -- no OpenCL, no
+// kernel, nothing that can change when the extrapolation is off.
+// ---------------------------------------------------------------------------
+
+// Build T* for every face from the p+1 most recent pass snapshots.
+// `ring` is indexed cycle % (p+1); `newest_cycle` says which slot is newest.
+// rhat_out[f] = the measured per-face contraction ratio, or NaN for a face
+// that was NOT extrapolated (box guard or a failed solve) -- the certificate
+// scorer skips those so they cannot pollute the ehat distribution.
+bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
+                       int newest_cycle, size_t n_faces, size_t n_layers,
+                       const ptm::eqextrap::Options& opt,
+                       std::vector<float>& T_star,
+                       std::vector<float>& rhat_out,
+                       ptm::eqextrap::Stats* stats) {
+    const int p = opt.order_p;
+    const size_t depth = ring.size();
+    if (depth != static_cast<size_t>(p) + 1 || n_faces == 0 || n_layers < 2) return false;
+    for (const auto& s : ring) {
+        if (s.size() != n_faces * n_layers) return false;
+    }
+    // ordered[s] = S_{newest_cycle - p + s}: oldest first, newest last.
+    std::vector<const float*> ordered(depth);
+    for (size_t s = 0; s < depth; ++s) {
+        const int slot = ptm::eqextrap::ringSlot(newest_cycle, p,
+                                                 static_cast<int>(s),
+                                                 static_cast<int>(depth));
+        ordered[s] = ring[static_cast<size_t>(slot)].data();
+    }
+
+    T_star.assign(n_faces * n_layers, 0.0f);
+    rhat_out.assign(n_faces, std::numeric_limits<float>::quiet_NaN());
+
+    std::vector<double> X(depth * n_layers);
+    std::vector<double> cand(n_layers);
+    long long box_refused = 0, solve_failed = 0;
+
+    for (size_t f = 0; f < n_faces; ++f) {
+        for (size_t s = 0; s < depth; ++s) {
+            const float* src = ordered[s];
+            for (size_t l = 0; l < n_layers; ++l) {
+                X[s * n_layers + l] = static_cast<double>(src[l * n_faces + f]);
+            }
+        }
+        const double* newest = X.data() + static_cast<size_t>(p) * n_layers;
+
+        double cond = 0.0;
+        const bool ok = ptm::eqextrap::rreColumn(X.data(), p,
+                                                 static_cast<int>(n_layers),
+                                                 cand.data(), &cond);
+        bool use_extrap = ok;
+        if (!ok) {
+            ++solve_failed;
+        } else if (!ptm::eqextrap::insideAutoBox(X.data(), p,
+                                                 static_cast<int>(n_layers),
+                                                 cand.data())) {
+            use_extrap = false;
+            ++box_refused;
+        }
+
+        if (use_extrap) {
+            // rhat = ||S_{N-1}-S_{N-2}|| / ||S_{N-2}-S_{N-3}||, this face only.
+            double d2 = 0.0, d1 = 0.0;
+            const double* s1 = X.data() + static_cast<size_t>(p)     * n_layers;
+            const double* s2 = X.data() + static_cast<size_t>(p - 1) * n_layers;
+            const double* s3 = X.data() + static_cast<size_t>(p - 2) * n_layers;
+            for (size_t l = 0; l < n_layers; ++l) {
+                const double a = s1[l] - s2[l];
+                const double b = s2[l] - s3[l];
+                d2 += a * a;
+                d1 += b * b;
+            }
+            rhat_out[f] = static_cast<float>(
+                ptm::eqextrap::clampRhat(std::sqrt(d2), std::sqrt(d1), opt.r_cap));
+            for (size_t l = 0; l < n_layers; ++l) {
+                T_star[l * n_faces + f] = static_cast<float>(cand[l]);
+            }
+        } else {
+            // Fall back to the plain state for this face. Uploading S_{N-1}
+            // unchanged is exactly what plain cycling would have left on the
+            // device, so a refused face is bit-for-bit the plain result.
+            for (size_t l = 0; l < n_layers; ++l) {
+                T_star[l * n_faces + f] = static_cast<float>(newest[l]);
+            }
+        }
+    }
+    if (stats) {
+        stats->box_refused  += box_refused;
+        stats->solve_failed += solve_failed;
+    }
+    return true;
+}
+
+// ehat = safety * ||Phi(T*) - T*||_inf * rhat/(1-rhat), per face.
+void eqScoreCertificate(const std::vector<float>& T_out,
+                        const std::vector<float>& T_star,
+                        const std::vector<float>& rhat,
+                        size_t n_faces, size_t n_layers,
+                        const ptm::eqextrap::Options& opt,
+                        ptm::eqextrap::Stats* stats) {
+    if (!stats) return;
+    long long certified = 0, refused = 0;
+    stats->ehat.reserve(stats->ehat.size() + n_faces);
+    for (size_t f = 0; f < n_faces; ++f) {
+        const float r = rhat[f];
+        if (!std::isfinite(r)) continue;    // not extrapolated -> already counted
+        double dmax = 0.0;
+        for (size_t l = 0; l < n_layers; ++l) {
+            const size_t i = l * n_faces + f;
+            dmax = std::max(dmax, std::fabs(static_cast<double>(T_out[i])
+                                          - static_cast<double>(T_star[i])));
+        }
+        const double amp  = static_cast<double>(r) / (1.0 - static_cast<double>(r));
+        const double ehat = opt.safety * dmax * amp;
+        stats->ehat.push_back(static_cast<float>(ehat));
+        if (ehat <= opt.tol_K) ++certified; else ++refused;
+    }
+    stats->certified    += certified;
+    stats->cert_refused += refused;
+}
+
+}  // namespace
+
 void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     const std::vector<float>& all_flux,
     std::vector<float>& output_temps,
@@ -1568,7 +1696,9 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     int n_equil_cycles,
     std::vector<float>* avg_E_inout,
     int accum_start,
-    int accum_end)
+    int accum_end,
+    const ptm::eqextrap::Options* extrap,
+    ptm::eqextrap::Stats* extrap_stats)
 {
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
@@ -1684,7 +1814,94 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     const int max_ts = gpuMaxTimestepsPerDispatch();
 
     const int total_cycles = n_equil_cycles + 1;
+
+    // ---- Pass-stride RRE extrapolation (thermal.eq_extrapolation) ----------
+    // Snapshots are taken at the TOP of each pass, so at the top of the last
+    // pass we hold S_0..S_{N-1}. We extrapolate there and run pass N from T*:
+    // that pass is simultaneously the polish, the a-posteriori verification,
+    // and the delivered state, which is why the certificate costs zero
+    // wall-clock (we were running pass N regardless).
+    //
+    // COUPLING CONDITION (mandatory). On radiation-coupling iterations >= 2 the
+    // eq forcing gains eq_indirect_flux[f], so the fixed point MOVES and
+    // snapshots from the previous iteration's map must never be reused. The
+    // ring buffer below is a function LOCAL: it is constructed empty on every
+    // call and destroyed on return, so it is structurally impossible for a
+    // snapshot to survive into another coupling iteration. `ring.assign` below
+    // makes that explicit rather than merely true.
+    const bool extrap_on = (extrap != nullptr) && extrap->enabled;
+    const int  ext_p     = extrap_on ? extrap->order_p : 0;
+    const bool ext_ok    = extrap_on && ext_p >= ptm::eqextrap::kMinOrderP
+                        && total_cycles >= ext_p + 1 && n_layers_ >= 2;
+    const size_t ext_ncol = static_cast<size_t>(n_faces_active_) * n_layers_;
+    std::vector<std::vector<float>> ring;        // depth ext_p+1, newest last
+    std::vector<float> T_star_host;              // the uploaded extrapolant
+    std::vector<float> rhat_host;                // per-face contraction ratio
+    bool extrapolated = false;
+    if (extrap_on && extrap_stats) {
+        extrap_stats->passes_spent = total_cycles;
+        extrap_stats->faces_seen  += static_cast<long long>(n_faces_active_);
+        if (!ext_ok) {
+            // Not a silent downgrade: the caller has already warned once, and
+            // the banner reports the count so the run cannot look extrapolated
+            // when it was not.
+            extrap_stats->budget_exhausted += static_cast<long long>(n_faces_active_);
+        }
+    }
+    bool ext_live = ext_ok;   // cleared if a readback ever fails, with a warning
+    if (ext_live) {
+        ring.assign(static_cast<size_t>(ext_p) + 1, std::vector<float>());
+    }
+
     for (int cycle = 0; cycle < total_cycles; ++cycle) {
+        if (ext_live) {
+            // Snapshot S_cycle from the persistent device state, then -- on the
+            // last pass only -- extrapolate and upload T*.
+            std::vector<float>& slot = ring[static_cast<size_t>(cycle) % ring.size()];
+            bool slot_ok = true;
+            try {
+                downloadAllTemps(slot);
+            } catch (const std::exception& e) {
+                std::cerr << "[eq-extrap] WARNING: snapshot readback failed at pass "
+                          << cycle << " (" << e.what() << "); running plain cycling\n";
+                slot_ok = false;
+            }
+            if (slot_ok && slot.size() != ext_ncol) {
+                std::cerr << "[eq-extrap] WARNING: snapshot size " << slot.size()
+                          << " != " << ext_ncol << " at pass " << cycle
+                          << "; running plain cycling\n";
+                slot_ok = false;
+            }
+            if (!slot_ok) {
+                ext_live = false;
+                ring.clear();
+                if (extrap_stats) {
+                    extrap_stats->budget_exhausted +=
+                        static_cast<long long>(n_faces_active_);
+                }
+            } else if (cycle == total_cycles - 1) {
+                // We hold S_0..S_{N-1}. Extrapolate, then upload T* so that the
+                // pass about to run starts from it.
+                extrapolated = eqExtrapolateRing(ring, cycle, n_faces_active_,
+                                                 n_layers_, *extrap,
+                                                 T_star_host, rhat_host,
+                                                 extrap_stats);
+                if (extrapolated) {
+                    try {
+                        uploadAllTemps(T_star_host);
+                    } catch (const std::exception& e) {
+                        std::cerr << "[eq-extrap] WARNING: T* upload failed ("
+                                  << e.what() << "); the final pass runs from the"
+                                     " plain state instead\n";
+                        extrapolated = false;
+                        if (extrap_stats) {
+                            extrap_stats->budget_exhausted +=
+                                static_cast<long long>(n_faces_active_);
+                        }
+                    }
+                }
+            }
+        }
         // Only accumulate on the FINAL cycle (the "output" cycle). The kernel
         // gates accumulation on the GLOBAL timestep vs [accum_start, accum_end),
         // so a self-chunked final cycle still accumulates each output step
@@ -1698,6 +1915,30 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
             std::cerr << "[GPU Thermal] Kernel launch/exec failed (cycle " << cycle
                       << "): " << clErrorString(err) << "\n";
             break;
+        }
+    }
+
+    // Certificate. The final pass has just run FROM T*, so buf_T_ now holds
+    // Phi(T*) -- the state we are shipping. ehat is evaluated per face against
+    // the T* we uploaded, using the contraction ratio measured over the last
+    // three snapshots. Nothing here is re-integrated: the "verification pass"
+    // is the pass we were going to run anyway.
+    if (extrapolated && extrap_stats) {
+        std::vector<float> T_out;
+        try {
+            downloadAllTemps(T_out);
+        } catch (const std::exception& e) {
+            std::cerr << "[eq-extrap] WARNING: post-polish readback failed ("
+                      << e.what() << "); certificate NOT evaluated for this batch\n";
+            T_out.clear();
+        }
+        if (T_out.size() == T_star_host.size()) {
+            eqScoreCertificate(T_out, T_star_host, rhat_host, n_faces_active_,
+                               n_layers_, *extrap, extrap_stats);
+        } else if (!T_out.empty()) {
+            std::cerr << "[eq-extrap] WARNING: post-polish size mismatch ("
+                      << T_out.size() << " vs " << T_star_host.size()
+                      << "); certificate NOT evaluated for this batch\n";
         }
     }
 
