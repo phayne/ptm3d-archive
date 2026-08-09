@@ -20,7 +20,7 @@ _SRC_PYTHON = Path(__file__).resolve().parents[2] / "src" / "python"
 def ensure_ptm_importable():
     """Return the path added to ``sys.path``, or ``None`` if nothing was needed."""
     try:
-        import ptm  # noqa: F401
+        import ptm  # noqa: F401  (availability probe, not a use)
         return None
     except ImportError:
         pass
