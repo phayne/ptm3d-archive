@@ -9,8 +9,7 @@ and `scripts/` for `getenv("PTM_` and compare the result against the names below
 Status tags:
 
 - **[recommended-ON]** — validated fixes that default OFF only so historical
-  baseline runs can still be reproduced digit-for-digit. **Production-validated
-  runs (the Moon3D campaigns) used:**
+  baseline runs can still be reproduced digit-for-digit. **The validated set is:**
   `PTM_ILLUM_TRUE_NORMALS=1 PTM_ILLUM_RISE_EPS=1 PTM_ILLUM_RISE_KEPS=0.2
   PTM_ILLUM_RISE_HABS=0 PTM_ILLUM_SEAL_HOLES=1 PTM_EQ_PERFACE_FLUX=1`.
   New science runs should set these.
@@ -24,8 +23,7 @@ Status tags:
 
 A config may declare the variables its run needs, and **the engine applies them
 itself** at startup (since 2026-08-04; before that the block was documentation
-only, and a regression pair could silently run under two different environments
-— internal bug PTM-42):
+only, and a regression pair could silently run under two different environments):
 
 ```yaml
 engine_env:
@@ -62,13 +60,13 @@ Rules:
 | Variable | Default | Effect | Status |
 |---|---|---|---|
 | `PTM_ILLUM_TRUE_NORMALS` | off | Use the mesh's true triangle-winding normals for illumination instead of the radial-up flip. The flip inverted ~97% of steep-wall faces on polar terrain, fabricating sunlit overhangs. Validated: removes the false >380 K overhang tail without darkening any genuinely sunlit face. | **[recommended-ON]** `=1` |
-| `PTM_ILLUM_RISE_EPS` | off | Enables the out-of-plane-rise self-relief discriminator for shadow rays (PTM-13): separates a face's own mm-scale relief from a real occluding rim by rise height rather than the legacy 1 cm ray offset (which hopped real rims and leaked direct sun into PSRs). | **[recommended-ON]** `=1` |
+| `PTM_ILLUM_RISE_EPS` | off | Enables the out-of-plane-rise self-relief discriminator for shadow rays: separates a face's own mm-scale relief from a real occluding rim by rise height rather than the legacy 1 cm ray offset (which hopped real rims and leaked direct sun into PSRs). | **[recommended-ON]** `=1` |
 | `PTM_ILLUM_RISE_KEPS` | 0.2 | Facet-edge fraction defining the edge-proportional self-relief floor for RISE_EPS. | **[recommended]** leave at `0.2` |
 | `PTM_ILLUM_RISE_HABS` | unset (edge-proportional) | Absolute self-relief floor override in meters; `0` = exact source-triangle-only exclusion. Validated: `=0` eliminates 100% of the grazing-incidence light leaks without introducing spurious self-shadowing speckle. | **[recommended-ON]** `=0` |
-| `PTM_ILLUM_SEAL_HOLES` | off | Fills interior mesh holes with shadow-only faces (never solved/output) so finite-disk penumbra rays cannot thread through mesh gaps (PTM-18 "crater-center flash"). Validated on the Moon3D mesh: 49 shadow-only fills, flash → 0, collateral 1/778. | **[recommended-ON]** `=1` |
-| `PTM_ILLUM_RISE_EPS2` | off | PTM-13 "option 3" multi-hit refinement sub-mode (implies RISE_EPS). Superseded by the RISE_EPS + RISE_HABS=0 recipe; did not fix the spurious-illumination classes on its own. | [experimental] |
+| `PTM_ILLUM_SEAL_HOLES` | off | Fills interior mesh holes with shadow-only faces (never solved/output) so finite-disk penumbra rays cannot thread through mesh gaps (the "crater-center flash"). Validated on a 509k-face lunar polar mesh: 49 shadow-only fills, flash eliminated, one collateral face in 778. | **[recommended-ON]** `=1` |
+| `PTM_ILLUM_RISE_EPS2` | off | "option 3" multi-hit refinement sub-mode (implies RISE_EPS). Superseded by the RISE_EPS + RISE_HABS=0 recipe; did not fix the spurious-illumination classes on its own. | [experimental] |
 | `PTM_ILLUM_RISE_BARY_EPS` | internal default | Barycentric tolerance for the RISE_EPS source-triangle exclusion. | [tuning] |
-| `PTM_ILLUM_TOPO_SELFSKIP` | off | Alternative PTM-13 mitigation: topological self-skip of the source face's neighborhood (CPU illumination path only; does not engage on the GPU tracer). | [experimental] |
+| `PTM_ILLUM_TOPO_SELFSKIP` | off | Alternative mitigation: topological self-skip of the source face's neighborhood (CPU illumination path only; does not engage on the GPU tracer). | [experimental] |
 | `PTM_ILLUM_SELFSKIP_RINGS` | 1 | Neighborhood ring count for TOPO_SELFSKIP. | [experimental] |
 | `PTM_ILLUM_HORIZON_CULL` | off | Heightfield-horizon pre-cull of shadow rays. | [experimental] |
 | `PTM_ILLUM_HORIZON_SLACK_DEG` | internal default | Slack angle for HORIZON_CULL. | [experimental] |
@@ -102,10 +100,10 @@ Rules:
 | `PTM_RAD_EMISSIVITY` | unset | Forces a uniform radiosity emissivity (consistency studies). | [internal] |
 | `PTM_BEAM_SOLAR` | 0 | Smith-style beamed reflected-solar emission on wall→floor pairs. | [experimental] |
 | `PTM_RAD_COUPLING_RELAX` | 1.0 | Picard under-relaxation ω for the thermal-radiation coupling loop; safety knob for pathological meshes. | [tuning] |
-| `PTM_COUPLING_MODE` | unset (config wins; config default `bounded`) | PTM-89 escape hatch. Overrides `radiation.coupling_mode` = `bounded` \| `fixed` \| `legacy` without editing the config, so a run published before the fix can be reproduced exactly. Validated at config time — an unrecognized value is FATAL before the illumination pass, never silently ignored. See `docs/radiation-exchange.md` § "Chunk-decomposition independence (PTM-89)". | [standard] |
-| `PTM_EXCHANGE_SELECTION` | unset (config wins; config default `all`) | PTM-98 escape hatch. Overrides `radiation.exchange_selection` = `all` \| `shadow` without editing the config, so a run published before the fix can be reproduced exactly. `shadow` restores the window-scoped shadow-fraction gate that silently zeroes the indirect flux on faces a chunk happens to find sunlit — the run warns and names the count. Validated at config time — an unrecognized value is FATAL before the illumination pass, never silently ignored. See `docs/radiation-exchange.md` § "The radiation-exchange face set (PTM-98)". | [standard] |
+| `PTM_COUPLING_MODE` | unset (config wins; config default `bounded`) | Escape hatch. Overrides `radiation.coupling_mode` = `bounded` \| `fixed` \| `legacy` without editing the config, so a run published before the fix can be reproduced exactly. Validated at config time — an unrecognized value is FATAL before the illumination pass, never silently ignored. See `docs/radiation-exchange.md` § "Chunk-decomposition independence". | [standard] |
+| `PTM_EXCHANGE_SELECTION` | unset (config wins; config default `all`) | Escape hatch. Overrides `radiation.exchange_selection` = `all` \| `shadow` without editing the config, so a run published before the fix can be reproduced exactly. `shadow` restores the window-scoped shadow-fraction gate that silently zeroes the indirect flux on faces a chunk happens to find sunlit — the run warns and names the count. Validated at config time — an unrecognized value is FATAL before the illumination pass, never silently ignored. See `docs/radiation-exchange.md` § "The radiation-exchange face set". | [standard] |
 | `PTM_RAD_RERUN_MAX_GPUS` | 1 | Cap on GPUs used for the selective-face re-run stage. | [tuning] |
-| `PTM_HMATRIX_VF_REPLACE` | unset | Replace the stored view-factor matrix with an independently computed reference (a sparse-matrix file whose every entry passed an explicit shadowing test; row sums ≤ 1, reciprocity preserved). The program stops with a clear error rather than run with a mismatched or invalid correction. Campaign-specific corrected view factors were used in Moon3D/Haworth production. | [experimental] |
+| `PTM_HMATRIX_VF_REPLACE` | unset | Replace the stored view-factor matrix with an independently computed reference (a sparse-matrix file whose every entry passed an explicit shadowing test; row sums ≤ 1, reciprocity preserved). The program stops with a clear error rather than run with a mismatched or invalid correction. | [experimental] |
 | `PTM_HMATRIX_ROWFIX` | unset | Row-sum correction for over-counted view factors: a symmetric rescaling of the matrix (D·F·D), iterated (Sinkhorn algorithm) until each face's total view factor matches a reference value supplied as a file of n double-precision numbers. If the iteration fails to converge the program stops rather than run with an invalid matrix. | [experimental] |
 | `PTM_HMATRIX_ROWFIX_MODE` | `damp` | `damp` = reductions only (stable, validated); `full` = also restores under-coupling but **diverges on this problem class** — the convergence check stops the run. Use `damp`. | [experimental] |
 | `PTM_HMATRIX_ROWFIX_RCAP` | 4.0 | FULL-mode cap: restoration ≤ RCAP×stored per row. | [experimental] |
@@ -140,7 +138,7 @@ Rules:
 
 | Variable | Default | Effect | Status |
 |---|---|---|---|
-| `PTM_DUMP_EQ_SEED` | unset | Write a per-face CSV of the CPU batch path's equilibration seed (`avg_flux`, `T_surf_est`, `T_deep - T_surf_est`) and of the analytic clear-sky forcing that drove the equilibration (`eq_forcing_mean/max`), plus each face's final surface temperature. Written once at the end of the batch solve; unset = no cost and byte-identical output. Added to settle PTM-51's disputed mechanism by measurement. | [internal] |
+| `PTM_DUMP_EQ_SEED` | unset | Write a per-face CSV of the CPU batch path's equilibration seed (`avg_flux`, `T_surf_est`, `T_deep - T_surf_est`) and of the analytic clear-sky forcing that drove the equilibration (`eq_forcing_mean/max`), plus each face's final surface temperature. Written once at the end of the batch solve; unset = no cost and byte-identical output. | [internal] |
 | `PTM_DUMP_VF_ROWSUMS` | unset | Write each face's total view factor ΣF to the given path (binary: a 4-byte count, then n double-precision values). | [internal] |
 | `PTM_DUMP_QIND_SERIES` | unset | Write the per-face indirect-flux time series (binary, 'QIDT' marker; single-precision values, all timesteps of face 0, then face 1, ...). | [internal] |
 | `PTM_DUMP_REFLIR` | unset | Write each face's peak temperature and the indirect flux at that moment (binary, 'RFIR' marker). | [internal] |
@@ -148,9 +146,9 @@ Rules:
 | `PTM_PRIMARY_DISK_ALWAYS_SAMPLE` | 0 | `=1` disables the convex-body short-circuit in the finite primary-disk visibility probe, so every face pays the full sample count. Validation use. | [internal] |
 | `PTM_PRIMARY_DISK_STATS` | 0 | `=1` prints a census of which primary-disk branch each face took (below horizon, fully lit, dark, sampled). | [internal] |
 | `PTM_ESC_BENCH`, `PTM_ESC_DUMP` | unset | Benchmark timing and matrix dump for the GPU sparse product escalation path. | [internal] |
-| `PTM_PP_RING_PLY` | unset | PTM-12 diagnostic pipeline (`scripts/ptm12_diag/`). | [internal] |
+| `PTM_PP_RING_PLY` | unset | View-factor diagnostic pipeline (`scripts/ptm12_diag/`). | [internal] |
 | `PTM_RADIANCE_PRUNE_EPS` | unset (off) | Radiance-weighted view-factor pruning threshold (W/m²) applied at VF **assembly** (`scripts/ptm12_diag/assemble_vf_haworth.py`): keep partner j for face i only if F_ij·R_j ≥ ε. Also exposed as the config key `radiation.radiance_prune_eps` (see [configuration.md](configuration.md)); when both are set the **env var takes precedence** and the runners propagate the config value into it only when it is unset. The sim does **not** prune — it logs the effective ε at radiation init. `0`/unset = off (numerically identical to the last digit). See [radiation-exchange.md §10.9](radiation-exchange.md). | [experimental] |
-| `PTM_A3GT_REPO`, `PTM_A3GT_MESH_DIR`, `PTM_A3GT_TEMPLATE_RAD` | unset | A3GT campaign-runner plumbing (`scripts/a3gt_*`). | [internal] |
+| `PTM_A3GT_REPO`, `PTM_A3GT_MESH_DIR`, `PTM_A3GT_TEMPLATE_RAD` | unset | Path plumbing for the multi-site batch orchestration scripts (`scripts/a3gt_*`). | [internal] |
 
 ## See also
 
@@ -158,5 +156,4 @@ Rules:
 - [configuration.md](configuration.md) — the YAML configuration reference
   (config keys, not env vars)
 - [USER_GUIDE.md](USER_GUIDE.md) — CLI reference and output formats
-- [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — known caveats (the PTM-nn bug
-  ids above refer to the project's internal bug ledger)
+- [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — known caveats

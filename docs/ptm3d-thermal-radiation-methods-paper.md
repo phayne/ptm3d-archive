@@ -756,7 +756,7 @@ chase a small set of outliers.
 
 Table 2 shows the iteration-by-iteration behavior of the selector
 and convergence criteria on a representative production window
-(A03MM022 Mons Mouton site, 1.80-million-face core+ring mesh, 30
+(Mons Mouton site, 1.80-million-face core+ring mesh, 30
 day output window at hourly cadence, full radiation coupling).
 The first selection (row $k=1$, driven by the iteration-0 indirect
 flux) flags 27% of faces — the cold, shadowed portion of the mesh
@@ -769,7 +769,7 @@ $5.1\thinspace\mathrm{K}$ and drops the fraction of faces still moving above
 $\tau_T$ below the $f_{\min}$ floor (row $k=3$), terminating the
 loop.
 
-**Table 2.** Picard-iteration convergence on the A03MM022 production
+**Table 2.** Picard-iteration convergence on the production
 window. Selected fraction is the share of mesh faces above
 $s\tau_T = 0.25\thinspace\mathrm{K}$ in either the predicted or observed
 $\Delta T$. $f_{\mathrm{moving}}$ is the share of faces whose
@@ -791,7 +791,7 @@ signature of the physics-based selector on lunar polar terrain.
 ![Picard convergence](figures/v2/picard_convergence.png)
 
 **Figure 5.** Thermal–radiation Picard convergence on the
-A03MM022 production window. Panel (a) gives the per-iteration
+production window. Panel (a) gives the per-iteration
 selected-face fraction (blue, the union of predicted-$\widehat
 {\Delta T}$ and observed-$\Delta T$ above $s\tau_T$) and observed
 $f_\mathrm{moving}$ (gray); the dashed red line is the
@@ -836,7 +836,7 @@ and reused across windows on the same site.
 
 **Table 3.** Time decomposition of a single 30-day production
 window at hourly cadence on a 1.8-million-face lunar polar mesh
-(A03MM022 Mons Mouton site, two equilibration orbits, full
+(Mons Mouton site, two equilibration orbits, full
 radiation coupling). View-factor construction is amortized across
 the eight windows of a site.
 
@@ -867,15 +867,14 @@ benefit from the GPU pool — come to dominate the wall-clock budget.
 
 Figure 6 reports the computational cost of a complete 1-lunation
 PTM3D run on lunar polar terrain, broken down by component, as a
-function of mesh face count. The model is anchored on the A03MM022
-production run of 2026-05.
+function of mesh face count. The model is anchored on the production run of 2026-05.
 
 ![Computational performance scaling](figures/v2/performance_lunation.png)
 
 **Figure 6.** Wall-clock time (a) and total compute cost
 (b) per 1-lunation PTM3D run with full inter-face radiation coupling,
 broken down by component, as a function of mesh face count. Curves
-are power-law fits anchored on the measured A03MM022 production
+are power-law fits anchored on the measured production
 batch (star, $N=1.80\times 10^{6}$); the diagonal dashed line is
 the sum of all components. Dotted reference curves show the
 asymptotic scalings $\mathcal{O}(N \log N)$ (gray, naive
