@@ -46,9 +46,8 @@
 # two-layer regolith profile to a single homogeneous slab — deliberately, so
 # there is exactly one TI number to reason about). TI=100 sits in the
 # textbook regolith range (~50-200 SI; loose lunar-like regolith is ~50,
-# bare rock/boulders are 400-2500) and matches the *lower* end of the
-# "extreme-TI numerical limit" tests done during EMA campaign validation
-# (working range ~32-316 SI on this solver) — comfortably inside it.
+# bare rock/boulders are 400-2500) and sits comfortably inside the range this
+# solver has been exercised over on asteroid-scale bodies, roughly 32-316 SI.
 # ---------------------------------------------------------------------------
 
 simulation:
