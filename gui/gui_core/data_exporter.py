@@ -5,19 +5,45 @@ Includes regridding from unstructured triangular mesh to regular grid.
 Automatically selects equirectangular or polar stereographic projection.
 """
 
-import struct
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-# Optional dependency guards
-try:
-    from scipy.spatial import cKDTree
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+from ._ptm_bootstrap import ensure_ptm_importable
+
+ensure_ptm_importable()
+
+# The mesh/statistics readers, the projection helpers and the regridder used to
+# be duplicated here, with a comment on the other copy asking that the two be
+# kept byte-for-byte identical by hand. They had already drifted: the shared
+# copy gained a `center_lon` argument and a barycentric `regrid_linear` path
+# that never reached this file. There is one implementation now.
+#
+# Several of these names are unused *in this module* and imported to preserve
+# its public surface: gui_panels/visualization_panel.py imports BODY_RADII,
+# GridResolutionEstimator, detect_body_from_mesh, choose_projection,
+# POLAR_LAT_THRESHOLD and _forward_polar_stereo from here.
+from ptm.results import (                                          # noqa: E402,F401
+    BODY_RADII,
+    NICE_RESOLUTIONS,
+    POLAR_LAT_THRESHOLD,
+    SCIPY_AVAILABLE,
+    STAT_LABELS,
+    STAT_TYPES,
+    GridResolutionEstimator,
+    MeshRegridder,
+    _forward_polar_stereo,
+    _inverse_polar_stereo,
+    choose_projection,
+    detect_body_from_mesh,
+    field_catalog,
+    read_binary_data,
+)
+from ptm.results import FIELD_INFO as _FIELD_INFO_ASCII            # noqa: E402
+from ptm.results import STATISTICS_FIELDS as _STATS_FIELDS_ASCII   # noqa: E402
+from ptm.results import detect_available_statistics as _detect_stats_in_dir  # noqa: E402
 
 try:
     import rasterio
@@ -41,398 +67,30 @@ except ImportError:
     VTK_AVAILABLE = False
 
 
-# Field metadata
-FIELD_INFO = {
-    'temperature': {'label': 'Temperature', 'units': 'K'},
-    'illumination': {'label': 'Total Illumination', 'units': 'W/m²'},
-    'direct_solar': {'label': 'Direct Solar', 'units': 'W/m²'},
-    'primary_reflected': {'label': 'Primary Reflected', 'units': 'W/m²'},
-    'primary_ir': {'label': 'Primary IR', 'units': 'W/m²'},
-}
+# Field metadata. Same catalog as ptm.results, with the flux units spelled
+# 'W/m²' rather than 'W/m^2': these strings are written into GeoTIFF and HDF5
+# tags and shown in the UI, so the spelling is part of this module's output and
+# is requested explicitly instead of being carried by a second copy of the dict.
+FIELD_INFO = field_catalog(_FIELD_INFO_ASCII, units_style='unicode')
+STATISTICS_FIELDS = field_catalog(_STATS_FIELDS_ASCII, units_style='unicode')
 
-# Planetary body radii in meters
-BODY_RADII = {
-    'Europa': 1560800.0,
-    'Moon': 1737400.0,
-    'Mercury': 2439700.0,
-    'Mars': 3389500.0,
-    'Enceladus': 252100.0,
-    'Titan': 2574730.0,
-    'Ceres': 473000.0,
-}
+# BODY_RADII, STAT_TYPES, STAT_LABELS, NICE_RESOLUTIONS, POLAR_LAT_THRESHOLD,
+# detect_body_from_mesh, choose_projection, _forward_polar_stereo,
+# _inverse_polar_stereo, GridResolutionEstimator, MeshRegridder and
+# read_binary_data are imported above from ptm.results and re-exported here,
+# because gui_panels/visualization_panel.py imports them from this module.
 
-# Statistics metadata
-STAT_TYPES = ['avg', 'max', 'min']
-STAT_LABELS = {'avg': 'Average', 'max': 'Maximum', 'min': 'Minimum'}
 
-STATISTICS_FIELDS = {
-    'temperature': {'label': 'Temperature', 'units': 'K'},
-    'illumination': {'label': 'Total Illumination', 'units': 'W/m²'},
-    'direct_solar': {'label': 'Direct Solar', 'units': 'W/m²'},
-    'primary_reflected': {'label': 'Primary Reflected', 'units': 'W/m²'},
-    'primary_ir': {'label': 'Primary IR', 'units': 'W/m²'},
-    # scalar=True: single per-face value (no avg/max/min split). On disk as
-    # ice_depth.bin (Schorghofer J(z)=J0 stability depth, not a time-average).
-    'ice_depth': {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
-}
 
-# Nice resolution values for rounding
-NICE_RESOLUTIONS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.025, 0.05,
-                    0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0]
 
-# Latitude threshold for switching to polar stereographic projection.
-# Data where ALL faces are within this many degrees of a pole uses stere.
-POLAR_LAT_THRESHOLD = 70.0
 
 
-def detect_body_from_mesh(mesh_data):
-    """Detect planetary body from mesh vertex distances from origin.
 
-    The PTM3D simulation stores mesh vertices at the body radius (in km).
-    By computing the median vertex distance, we can match to a known body.
 
-    Returns:
-        str or None: Body name if confidently detected, else None
-    """
-    vertices = mesh_data.get('vertices')
-    if vertices is None or len(vertices) == 0:
-        return None
 
-    vertices = np.asarray(vertices)
-    radii = np.sqrt(np.sum(vertices**2, axis=1))
-    mesh_radius = float(np.median(radii))
 
-    # Try matching as km (PTM3D convention)
-    best_body = None
-    best_diff = float('inf')
-    for name, radius_m in BODY_RADII.items():
-        diff = abs(radius_m / 1000.0 - mesh_radius)
-        if diff < best_diff:
-            best_diff = diff
-            best_body = name
 
-    # Accept if within 5% of known body radius
-    expected_km = BODY_RADII[best_body] / 1000.0
-    if best_diff / expected_km < 0.05:
-        return best_body
 
-    return None
-
-
-def _forward_polar_stereo(lat, lon, pole_lat, center_lon, body_radius):
-    """Forward polar stereographic projection for a sphere.
-
-    Args:
-        lat, lon: Arrays of geographic coordinates (degrees)
-        pole_lat: +90 for north pole, -90 for south pole
-        center_lon: Central meridian (degrees)
-        body_radius: Sphere radius (meters)
-
-    Returns:
-        (x, y) projected coordinates in meters
-    """
-    lat_r = np.radians(np.asarray(lat, dtype=np.float64))
-    dlon_r = np.radians(np.asarray(lon, dtype=np.float64) - center_lon)
-
-    if pole_lat > 0:
-        rho = 2.0 * body_radius * np.tan(np.pi / 4.0 - lat_r / 2.0)
-        x = rho * np.sin(dlon_r)
-        y = -rho * np.cos(dlon_r)
-    else:
-        rho = 2.0 * body_radius * np.tan(np.pi / 4.0 + lat_r / 2.0)
-        x = rho * np.sin(dlon_r)
-        y = rho * np.cos(dlon_r)
-
-    return x, y
-
-
-def _inverse_polar_stereo(x, y, pole_lat, center_lon, body_radius):
-    """Inverse polar stereographic projection for a sphere.
-
-    Args:
-        x, y: Projected coordinates (meters)
-        pole_lat: +90 for north pole, -90 for south pole
-        center_lon: Central meridian (degrees)
-        body_radius: Sphere radius (meters)
-
-    Returns:
-        (lat, lon) in degrees
-    """
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    rho = np.sqrt(x**2 + y**2)
-
-    if pole_lat > 0:
-        lat = np.degrees(np.pi / 2.0 - 2.0 * np.arctan(rho / (2.0 * body_radius)))
-        lon = center_lon + np.degrees(np.arctan2(x, -y))
-    else:
-        lat = np.degrees(-np.pi / 2.0 + 2.0 * np.arctan(rho / (2.0 * body_radius)))
-        lon = center_lon + np.degrees(np.arctan2(x, y))
-
-    return lat, lon
-
-
-def choose_projection(latitudes):
-    """Choose projection based on latitude range of the data.
-
-    Returns 'stere' if all data is within ~20 degrees of a pole,
-    otherwise 'eqc'.
-    """
-    min_lat = float(np.nanmin(latitudes))
-    max_lat = float(np.nanmax(latitudes))
-
-    if min_lat > POLAR_LAT_THRESHOLD:
-        return 'stere'
-    elif max_lat < -POLAR_LAT_THRESHOLD:
-        return 'stere'
-    return 'eqc'
-
-
-class GridResolutionEstimator:
-    """Estimates optimal grid resolution from unstructured mesh face spacing."""
-
-    @staticmethod
-    def estimate_resolution(latitudes, longitudes):
-        """Compute optimal grid resolution from face center spacing.
-
-        Args:
-            latitudes: Array of face center latitudes (degrees)
-            longitudes: Array of face center longitudes (degrees)
-
-        Returns:
-            float: Estimated resolution in degrees, rounded to a nice value
-        """
-        if not SCIPY_AVAILABLE:
-            # Fallback: rough estimate from coordinate range
-            lat_range = np.ptp(latitudes)
-            lon_range = np.ptp(longitudes)
-            n_faces = len(latitudes)
-            area = lat_range * lon_range
-            raw = np.sqrt(area / n_faces)
-            return GridResolutionEstimator._round_to_nice(raw)
-
-        points = np.column_stack([longitudes, latitudes])
-        tree = cKDTree(points)
-
-        # Query k=2: self + nearest neighbor
-        distances, _ = tree.query(points, k=2, workers=-1)
-        # Column 1 is the nearest neighbor distance (column 0 is self = 0)
-        nearest_distances = distances[:, 1]
-
-        raw_resolution = float(np.median(nearest_distances))
-        return GridResolutionEstimator._round_to_nice(raw_resolution)
-
-    @staticmethod
-    def _round_to_nice(value):
-        """Round a value to the nearest 'nice' resolution."""
-        if value <= 0:
-            return 0.01
-        best = NICE_RESOLUTIONS[0]
-        best_ratio = abs(np.log(value / best))
-        for nice in NICE_RESOLUTIONS[1:]:
-            ratio = abs(np.log(value / nice))
-            if ratio < best_ratio:
-                best = nice
-                best_ratio = ratio
-        return best
-
-
-class MeshRegridder:
-    """Regrids unstructured face data to a regular projected grid.
-
-    Automatically selects equirectangular projection for mid-latitude data
-    and polar stereographic for data within ~20 deg of either pole.
-    Uses KDTree-based k=3 inverse-distance weighting.
-    """
-
-    def __init__(self, latitudes, longitudes, resolution, body_radius=1737400.0):
-        """Build the regridding index.
-
-        Args:
-            latitudes: Face center latitudes (N_faces,)
-            longitudes: Face center longitudes (N_faces,)
-            resolution: Grid resolution in degrees
-            body_radius: Planetary body radius in meters
-        """
-        if not SCIPY_AVAILABLE:
-            raise RuntimeError("scipy is required for regridding")
-
-        self.resolution = resolution
-        self.body_radius = body_radius
-
-        lon = np.array(longitudes, dtype=np.float64)
-        lat = np.array(latitudes, dtype=np.float64)
-        if np.ptp(lon) > 300:
-            lon = lon % 360.0
-
-        # Determine projection from latitude range
-        min_lat = float(np.nanmin(lat))
-        max_lat = float(np.nanmax(lat))
-
-        if min_lat > POLAR_LAT_THRESHOLD:
-            self.projection = 'stere'
-            self.pole_lat = 90.0
-        elif max_lat < -POLAR_LAT_THRESHOLD:
-            self.projection = 'stere'
-            self.pole_lat = -90.0
-        else:
-            self.projection = 'eqc'
-            self.pole_lat = None
-
-        if self.projection == 'stere':
-            self._init_stereo(lat, lon)
-        else:
-            self._init_eqc(lat, lon)
-
-    def _init_eqc(self, lat, lon):
-        """Initialize equirectangular grid."""
-        resolution = self.resolution
-        self.center_lon = float((np.nanmin(lon) + np.nanmax(lon)) / 2)
-
-        lat_min = np.floor(np.nanmin(lat) / resolution) * resolution
-        lat_max = np.ceil(np.nanmax(lat) / resolution) * resolution
-        lon_min = np.floor(np.nanmin(lon) / resolution) * resolution
-        lon_max = np.ceil(np.nanmax(lon) / resolution) * resolution
-
-        self.lat_grid = np.arange(lat_min, lat_max + resolution * 0.5, resolution)
-        self.lon_grid = np.arange(lon_min, lon_max + resolution * 0.5, resolution)
-        self.n_lat = len(self.lat_grid)
-        self.n_lon = len(self.lon_grid)
-
-        # KDTree in degree space
-        valid_mask = np.isfinite(lon) & np.isfinite(lat)
-        source_points = np.column_stack([lon[valid_mask], lat[valid_mask]])
-        tree = cKDTree(source_points)
-
-        LON, LAT = np.meshgrid(self.lon_grid, self.lat_grid)
-        grid_points = np.column_stack([LON.ravel(), LAT.ravel()])
-
-        self.distances, indices = tree.query(grid_points, k=3, workers=-1)
-        valid_indices = np.where(valid_mask)[0]
-        self.neighbor_faces = valid_indices[indices]
-
-        self.zero_mask = (self.distances == 0.0)
-        self.has_any_zeros = np.any(self.zero_mask)
-
-        # Mask grid points outside the mesh boundary:
-        # if nearest face center is > 1.5x the cell spacing, it's outside
-        self._outside_mask = (
-            self.distances[:, 0] > 1.5 * resolution
-        ).reshape(self.n_lat, self.n_lon)
-
-        # Stereographic attributes unused
-        self.x_grid = None
-        self.y_grid = None
-
-    def _init_stereo(self, lat, lon):
-        """Initialize polar stereographic grid."""
-        center_lon = float((np.nanmin(lon) + np.nanmax(lon)) / 2)
-        self.center_lon = center_lon
-
-        # Metric resolution from degree resolution
-        metric_res = self.body_radius * np.radians(self.resolution)
-
-        # Convert face centers to stereographic
-        valid_mask = np.isfinite(lon) & np.isfinite(lat)
-        fx, fy = _forward_polar_stereo(
-            lat[valid_mask], lon[valid_mask],
-            self.pole_lat, center_lon, self.body_radius
-        )
-
-        # Grid bounds in projected space (snapped to resolution)
-        x_min = np.floor(np.nanmin(fx) / metric_res) * metric_res
-        x_max = np.ceil(np.nanmax(fx) / metric_res) * metric_res
-        y_min = np.floor(np.nanmin(fy) / metric_res) * metric_res
-        y_max = np.ceil(np.nanmax(fy) / metric_res) * metric_res
-
-        self.x_grid = np.arange(x_min, x_max + metric_res * 0.5, metric_res)
-        self.y_grid = np.arange(y_min, y_max + metric_res * 0.5, metric_res)
-        self.n_lon = len(self.x_grid)   # width (columns)
-        self.n_lat = len(self.y_grid)   # height (rows)
-
-        # KDTree in projected space for correct nearest-neighbors at poles
-        source_points = np.column_stack([fx, fy])
-        tree = cKDTree(source_points)
-
-        X, Y = np.meshgrid(self.x_grid, self.y_grid)
-        grid_points = np.column_stack([X.ravel(), Y.ravel()])
-
-        self.distances, indices = tree.query(grid_points, k=3, workers=-1)
-        valid_indices = np.where(valid_mask)[0]
-        self.neighbor_faces = valid_indices[indices]
-
-        self.zero_mask = (self.distances == 0.0)
-        self.has_any_zeros = np.any(self.zero_mask)
-
-        # Mask grid points outside the mesh boundary:
-        # if nearest face center is > 1.5x the cell spacing, it's outside
-        self._outside_mask = (
-            self.distances[:, 0] > 1.5 * metric_res
-        ).reshape(self.n_lat, self.n_lon)
-
-        # 2D lat/lon grids for HDF5 coordinate storage
-        grid_lats, grid_lons = _inverse_polar_stereo(
-            X.ravel(), Y.ravel(),
-            self.pole_lat, center_lon, self.body_radius
-        )
-        self.lat_grid = grid_lats.reshape((self.n_lat, self.n_lon))
-        self.lon_grid = grid_lons.reshape((self.n_lat, self.n_lon))
-
-    def regrid(self, face_values):
-        """Interpolate face values to the regular grid.
-
-        Args:
-            face_values: 1D array of per-face values (N_faces,)
-
-        Returns:
-            2D array of shape (n_lat, n_lon) with NaN for missing data
-        """
-        vals = face_values[self.neighbor_faces]
-        valid_vals = np.isfinite(vals)
-
-        if self.has_any_zeros:
-            choose = self.zero_mask.argmax(axis=1)
-            has_zero = self.zero_mask.any(axis=1)
-            out = np.full(self.distances.shape[0], np.nan, dtype=np.float32)
-            out[has_zero] = vals[
-                np.arange(vals.shape[0])[has_zero], choose[has_zero]
-            ].astype(np.float32)
-
-            rem = ~has_zero
-            if np.any(rem):
-                d = self.distances[rem]
-                v = vals[rem]
-                vv = valid_vals[rem]
-                w = 1.0 / (d**2 + 1e-12)
-                w[~vv] = 0.0
-                ws = w.sum(axis=1)
-                good = ws > 0
-                out_rem = np.full(rem.sum(), np.nan, dtype=np.float32)
-                if np.any(good):
-                    wn = w[good] / ws[good][:, None]
-                    out_rem[good] = np.nansum(
-                        wn * v[good], axis=1
-                    ).astype(np.float32)
-                out[rem] = out_rem
-        else:
-            w = 1.0 / (self.distances**2 + 1e-12)
-            w[~valid_vals] = 0.0
-            ws = w.sum(axis=1)
-            out = np.full(self.distances.shape[0], np.nan, dtype=np.float32)
-            good = ws > 0
-            if np.any(good):
-                wn = w[good] / ws[good][:, None]
-                out[good] = np.nansum(
-                    wn * vals[good], axis=1
-                ).astype(np.float32)
-
-        result = out.reshape((self.n_lat, self.n_lon))
-        result[self._outside_mask] = np.nan
-        return result
-
-    def get_grid_shape(self):
-        """Return (n_lat, n_lon) tuple."""
-        return (self.n_lat, self.n_lon)
 
 
 class GeoTIFFExporter:
@@ -1033,78 +691,19 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
     return readme_path
 
 
-def read_binary_data(file_path, expected_count):
-    """Read a PTM3D binary data file.
-
-    Args:
-        file_path: Path to .bin file
-        expected_count: Expected number of face values
-
-    Returns:
-        numpy float32 array or None if file can't be read
-    """
-    try:
-        with open(file_path, 'rb') as f:
-            header = f.read(4)
-            if len(header) == 4:
-                count = struct.unpack('<I', header)[0]
-                f.seek(0, 2)
-                file_size = f.tell()
-
-                if file_size == 4 + count * 4 and count == expected_count:
-                    f.seek(4)
-                    return np.frombuffer(f.read(), dtype='<f4').copy()
-                else:
-                    f.seek(0)
-                    data = np.frombuffer(f.read(), dtype='<f4').copy()
-                    if len(data) == expected_count:
-                        return data
-
-        return None
-    except Exception:
-        return None
-
-
 def detect_available_statistics(results_dir):
-    """Detect which statistics files are available and contain valid data.
+    """Which statistics files a RUN directory has, and which hold real data.
 
-    Args:
-        results_dir: Path to the results directory
-
-    Returns:
-        List of (base_field, stat_type) tuples for files with non-NaN data.
+    Deliberately not the same signature as
+    ``ptm.results.detect_available_statistics``, which takes the
+    ``statistics/`` directory itself. This one takes the run directory, because
+    that is what ``gui_panels/visualization_panel.py`` passes. Returns the same
+    list of ``(base_field, stat_type)`` pairs, with ``stat_type`` None for
+    scalar fields such as ``ice_depth``.
     """
-    stats_dir = Path(results_dir) / 'statistics'
-    if not stats_dir.is_dir():
-        return []
+    return _detect_stats_in_dir(Path(results_dir) / 'statistics')
 
-    def _file_has_data(filepath):
-        """True iff the binary stats file is well-formed and not all-NaN."""
-        if not filepath.is_file() or filepath.stat().st_size <= 4:
-            return False
-        try:
-            with open(filepath, 'rb') as f:
-                header = f.read(4)
-                if len(header) != 4:
-                    return False
-                count = struct.unpack('<I', header)[0]
-                data = np.frombuffer(f.read(), dtype='<f4')
-                return len(data) == count and not np.all(np.isnan(data))
-        except Exception:
-            return False
 
-    available = []
-    for base_field, info in STATISTICS_FIELDS.items():
-        if info.get('scalar'):
-            # Single per-face value, file is <base>.bin (no _avg/_max/_min).
-            # Selection key uses stat_type=None to flag the scalar path.
-            if _file_has_data(stats_dir / f"{base_field}.bin"):
-                available.append((base_field, None))
-            continue
-        for stat_type in STAT_TYPES:
-            if _file_has_data(stats_dir / f"{base_field}_{stat_type}.bin"):
-                available.append((base_field, stat_type))
-    return available
 
 
 class DataExportWorker(QThread):
