@@ -19,13 +19,19 @@ Two output binary formats exist in the tree and they are NOT the same:
   (4 bytes) followed by ``n`` little-endian ``float32``. :func:`read_binary_data`
   reads these, including the header-less legacy variant.
 * per-face albedo maps under ``data/albedo_maps/``: ``size_t`` count (8 bytes)
-  followed by ``n`` ``float64``. Not read by this module.
+  followed by ``n`` ``float64``. Read by :func:`ptm.readers.read_albedo_map`.
+
+:class:`Results`, at the bottom of this module, is the object over a whole run
+directory that composes these functions with the readers in ``ptm.readers``.
 """
 
+import hashlib
 import struct
 from pathlib import Path
 
 import numpy as np
+
+from . import readers
 
 try:
     from scipy.spatial import cKDTree, Delaunay
@@ -613,3 +619,570 @@ def detect_available_statistics(stats_dir):
             if _file_has_data(stats_dir / f"{base_field}_{stat_type}.bin"):
                 available.append((base_field, stat_type))
     return available
+
+
+# --- A run directory as an object ------------------------------------------
+#
+# Everything above is a function over a path. Results is the object over a run
+# directory that composes them, so that "open this run and show me a picture"
+# is a line of code rather than the 250 lines of readers the four tutorial
+# notebooks each re-derive. It adds no reader that is not already above or in
+# ptm.readers, and it computes no physics.
+
+class Results:
+    """A finished PTM3D run directory.
+
+    ::
+
+        from ptm import Results
+        run = Results("output/quickstart_moon_diurnal")
+        run.stat("temperature", "max")          # per-face array
+        t, T = run.series("temperature", lat=0, lon=0)
+        run.plot_diurnal(lat=0, lon=0, save="diurnal.png")
+
+    The constructor reads only ``metadata.txt``; the mesh, the time axis and
+    the body positions load on first use and are then cached.
+
+    Two things a run directory does not record are settled here rather than
+    guessed at every call site:
+
+    ``mesh_units``
+        ``mesh.ply`` carries no length unit and is metres for a topographic
+        run, kilometres for a plain icosphere. :attr:`mesh_units` states which,
+        by the engine's own rule (:func:`ptm.readers.infer_mesh_length_unit`),
+        and :attr:`face_centers_m` / :attr:`face_areas_m2` are normalized. Pass
+        ``mesh_units=`` or ``body_radius_km=`` for a mesh the rule refuses.
+    ``units_style``
+        Flux units are spelled ``W/m^2`` by the catalogs in this module and
+        ``W/m²`` by the GUI, and the GUI's spelling is written into exported
+        GeoTIFF and HDF5 tags. Results carries the choice
+        (``units_style='ascii'`` or ``'unicode'``) instead of picking one, and
+        :meth:`units_of` and every axis label follow it.
+    """
+
+    #: The per-step field directories the engine writes on a default run, in
+    #: the order ``metadata.txt`` lists them. This is a preferred *ordering*,
+    #: not the set: :attr:`step_fields` discovers what is actually on disk,
+    #: because a two-band radiosity run also writes ``indirect_solar`` and
+    #: ``indirect_ir``, and a hard-coded list drops them silently.
+    STEP_FIELD_ORDER = ('illumination', 'direct_solar', 'primary_reflected',
+                        'primary_ir', 'indirect_solar', 'indirect_ir',
+                        'temperature')
+
+    #: Labels and units for products ``STATISTICS_FIELDS`` does not carry.
+    #: ``effective_albedo.bin`` is written by every run and the two ``indirect``
+    #: bands by every two-band radiosity run, yet none of the three appears in
+    #: that catalog, so ``detect_available_statistics`` does not report them.
+    #: Kept separate rather than added to the catalog, because the GUI builds
+    #: its field menu from the catalog and gaining three entries there is a
+    #: change to the GUI, not to this class.
+    EXTRA_FIELD_INFO = {
+        'indirect_solar': {'label': 'Indirect Solar', 'units': 'W/m^2'},
+        'indirect_ir': {'label': 'Indirect IR', 'units': 'W/m^2'},
+        'effective_albedo': {'label': 'Effective Albedo', 'units': '',
+                             'scalar': True},
+    }
+
+    def __init__(self, run_dir, units_style='ascii', mesh_units=None,
+                 body_radius_km=None):
+        self.path = Path(run_dir).expanduser().resolve()
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"{self.path} is not a directory")
+        if units_style not in ('ascii', 'unicode'):
+            raise ValueError(
+                f"units_style must be 'ascii' or 'unicode', got {units_style!r}")
+        self.units_style = units_style
+        self._forced_mesh_units = mesh_units
+        self._body_radius_km = body_radius_km
+
+        self.metadata = self._read_metadata()
+        if not self.metadata and not (self.path / "mesh.ply").is_file():
+            raise FileNotFoundError(
+                f"{self.path} has neither metadata.txt nor mesh.ply; it does not "
+                f"look like a PTM3D run directory")
+
+        self._mesh = None
+        self._mesh_unit_report = None
+        self._times = None
+        self._positions = None
+        self._regridders = {}
+
+    def __repr__(self):
+        return (f"<Results {self.path.name}: {self.n_faces} faces, "
+                f"{len(self.step_fields)} per-step field(s), "
+                f"{self.metadata.get('time_steps', '?')} steps>")
+
+    # -- metadata.txt --------------------------------------------------------
+
+    def _read_metadata(self):
+        path = self.path / "metadata.txt"
+        if not path.is_file():
+            return {}
+        out = {}
+        for line in path.read_text().splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if value in ("true", "false"):
+                out[key] = (value == "true")
+            elif key == "components":
+                out[key] = tuple(v for v in value.split(",") if v)
+            else:
+                try:
+                    out[key] = int(value)
+                except ValueError:
+                    out[key] = value
+        return out
+
+    # -- mesh ----------------------------------------------------------------
+
+    @property
+    def mesh(self):
+        """``read_ply_mesh_minimal`` output for this run's ``mesh.ply``.
+
+        The per-face ``latitude``/``longitude`` properties stored in the file
+        are not re-read: this dict's computed values reproduce them to float32
+        rounding (measured max difference 3.6e-06 deg in latitude, 7.6e-06 deg
+        in longitude on ``quickstart_moon_diurnal``).
+        """
+        if self._mesh is None:
+            path = self.path / "mesh.ply"
+            if not path.is_file():
+                raise FileNotFoundError(f"{path} not found")
+            self._mesh = read_ply_mesh_minimal(path)
+            declared = self.metadata.get("faces")
+            if declared is not None and declared != self._mesh["n_faces"]:
+                raise ValueError(
+                    f"{self.path}: metadata.txt says faces={declared} but "
+                    f"mesh.ply has {self._mesh['n_faces']}; the run directory "
+                    f"is inconsistent")
+        return self._mesh
+
+    @property
+    def n_faces(self):
+        faces = self.metadata.get("faces")
+        return int(faces) if faces is not None else int(self.mesh["n_faces"])
+
+    @property
+    def lat(self):
+        """Per-face latitude, degrees."""
+        return self.mesh["face_latitudes"]
+
+    @property
+    def lon(self):
+        """Per-face longitude, degrees on [-180, 180]."""
+        return self.mesh["face_longitudes"]
+
+    @property
+    def mesh_unit_report(self):
+        """The full :class:`ptm.readers.MeshUnitReport` for this mesh."""
+        if self._mesh_unit_report is None:
+            mesh = self.mesh
+            if self._forced_mesh_units is not None:
+                if self._forced_mesh_units not in ("m", "km"):
+                    raise ValueError("mesh_units must be 'm' or 'km', got "
+                                     f"{self._forced_mesh_units!r}")
+                mag = np.linalg.norm(mesh["face_centers"], axis=1)
+                self._mesh_unit_report = readers.MeshUnitReport(
+                    unit=self._forced_mesh_units, median=float(np.median(mag)),
+                    lo=float(mag.min()), hi=float(mag.max()),
+                    corroborated=False, body=None)
+            else:
+                self._mesh_unit_report = readers.infer_mesh_length_unit(
+                    mesh["face_centers"], vertices=mesh["vertices"],
+                    body_radius_km=self._body_radius_km)
+        return self._mesh_unit_report
+
+    @property
+    def mesh_units(self):
+        """``'m'`` or ``'km'`` -- the unit ``mesh.ply``'s coordinates are in."""
+        return self.mesh_unit_report.unit
+
+    @property
+    def _to_m(self):
+        return 1000.0 if self.mesh_units == "km" else 1.0
+
+    @property
+    def face_centers_m(self):
+        """Face centers in metres, whatever the mesh file's unit is."""
+        return self.mesh["face_centers"] * self._to_m
+
+    @property
+    def face_areas_m2(self):
+        """Face areas in square metres, whatever the mesh file's unit is."""
+        return self.mesh["face_areas"] * (self._to_m ** 2)
+
+    @property
+    def face_unit_vectors(self):
+        """Unit vectors of the face centers -- unit-independent by definition."""
+        centers = self.mesh["face_centers"]
+        return centers / np.linalg.norm(centers, axis=1, keepdims=True)
+
+    # -- fields and statistics ------------------------------------------------
+
+    @property
+    def step_fields(self):
+        """Per-step field names this run wrote, discovered from the directory.
+
+        A directory counts when it holds at least one ``<name>/<name>_NNNN.bin``.
+        Known names come first in :data:`STEP_FIELD_ORDER`; anything else the
+        engine grows follows, sorted, rather than being dropped.
+        """
+        found = set()
+        for entry in self.path.iterdir():
+            if not entry.is_dir():
+                continue
+            if next(entry.glob(f"{entry.name}_[0-9]*.bin"), None) is not None:
+                found.add(entry.name)
+        ordered = [n for n in self.STEP_FIELD_ORDER if n in found]
+        return tuple(ordered + sorted(found.difference(ordered)))
+
+    @property
+    def stats(self):
+        """``[(field, moment), ...]`` present under ``statistics/``.
+
+        ``moment`` is ``'avg'``/``'max'``/``'min'``, or ``None`` for a scalar
+        product such as ``ice_depth`` or ``effective_albedo``.
+
+        ``detect_available_statistics`` is asked first, then the directory is
+        scanned for anything it does not know about -- it iterates a fixed
+        catalog, so on a two-band radiosity run it silently omits
+        ``indirect_solar_*``, ``indirect_ir_*`` and ``effective_albedo``, all
+        of which are on disk.
+        """
+        stats_dir = self.path / "statistics"
+        known = detect_available_statistics(stats_dir)
+        if not stats_dir.is_dir():
+            return known
+        seen = set(known)
+        extra = []
+        for path in stats_dir.glob("*.bin"):
+            if path.stat().st_size <= 4:
+                continue
+            stem = path.stem
+            base, _, suffix = stem.rpartition("_")
+            entry = ((base, suffix) if base and suffix in STAT_TYPES
+                     else (stem, None))
+            if entry not in seen:
+                seen.add(entry)
+                extra.append(entry)
+        return known + sorted(extra)
+
+    def steps(self, field='temperature'):
+        """Sorted step indices for which ``field`` has a per-step file."""
+        directory = self.path / field
+        if not directory.is_dir():
+            raise FileNotFoundError(
+                f"{directory} not found; this run wrote {self.step_fields}")
+        out = []
+        for path in directory.glob(f"{field}_*.bin"):
+            token = path.stem[len(field) + 1:]
+            if token.isdigit():
+                out.append(int(token))
+        return sorted(out)
+
+    def _read(self, path):
+        values = read_binary_data(path, self.n_faces)
+        if values is None:
+            raise ValueError(
+                f"{path}: not a readable per-face binary of {self.n_faces} "
+                f"values (expected a 4-byte int32 count then that many "
+                f"float32, or a headerless array of the same length)")
+        return values
+
+    def stat(self, field='temperature', moment='max'):
+        """A per-face statistic, e.g. ``stat('temperature', 'max')``.
+
+        ``moment=None`` reads the scalar form ``statistics/<field>.bin``.
+        """
+        name = field if moment is None else f"{field}_{moment}"
+        return self._read(self.path / "statistics" / f"{name}.bin")
+
+    def field(self, field='temperature', step=0):
+        """One per-step per-face field, e.g. ``field('temperature', 120)``."""
+        return self._read(self.path / field / f"{field}_{int(step):04d}.bin")
+
+    def albedo_map(self, path):
+        """Read a per-face albedo map and check it against this run's mesh.
+
+        Separate from :meth:`field` because it is a different binary layout --
+        ``size_t`` count and float64 -- and lives outside the run directory,
+        under ``data/albedo_maps/``.
+        """
+        return readers.read_albedo_map(path, expected_count=self.n_faces)
+
+    # -- time ----------------------------------------------------------------
+
+    def times(self):
+        """The output time axis as a :class:`ptm.readers.TimeAxis`.
+
+        ``.et`` is SPICE ET (seconds past J2000), which is what column 1 of
+        ``time_steps.txt`` actually holds; ``.elapsed_s`` is that column rebased
+        to the first output step, which is what its header claims it is.
+        """
+        if self._times is None:
+            self._times = readers.read_time_steps(self.path / "time_steps.txt")
+        return self._times
+
+    @property
+    def elapsed_hours(self):
+        return self.times().elapsed_s / 3600.0
+
+    def body_positions(self):
+        """``body_positions.csv`` as a structured array (see readers)."""
+        if self._positions is None:
+            self._positions = readers.read_body_positions(
+                self.path / "body_positions.csv")
+        return self._positions
+
+    def subsolar_latlon(self, step=0):
+        """Body-fixed sub-solar (lat, lon) in degrees at ``step``."""
+        return readers.subsolar_latlon(self.body_positions(), step)
+
+    # -- selection -------------------------------------------------------------
+
+    def face_at(self, lat, lon):
+        """Index of the face nearest ``(lat, lon)``.
+
+        Returns just the index; :meth:`face_at_verbose` also returns the
+        angular separation, which is worth printing when the mesh is coarse.
+        """
+        return self.face_at_verbose(lat, lon)[0]
+
+    def face_at_verbose(self, lat, lon):
+        """``(index, separation_degrees)`` for the face nearest ``(lat, lon)``."""
+        return readers.find_nearest_face(lat, lon, self.lat, self.lon)
+
+    def faces_in_band(self, lat_min, lat_max):
+        """Indices of faces whose center latitude is within ``[lat_min, lat_max]``."""
+        lat = self.lat
+        return np.where((lat >= lat_min) & (lat <= lat_max))[0]
+
+    def resolve_face(self, face=None, lat=None, lon=None):
+        """A face index from either spec: ``face=`` or ``lat=``/``lon=``.
+
+        The one place that decides what "which face?" means, so every entry
+        point that accepts both spellings agrees on it.
+        """
+        if face is not None:
+            if lat is not None or lon is not None:
+                raise ValueError("give either face= or lat=/lon=, not both")
+            return int(face)
+        if lat is None or lon is None:
+            raise ValueError("give face=, or both lat= and lon=")
+        return self.face_at(lat, lon)
+
+    # -- series ----------------------------------------------------------------
+
+    def series(self, field='temperature', face=None, lat=None, lon=None,
+               steps=None):
+        """One face's time series: ``(elapsed_hours, values)``.
+
+        The single most repeated pattern in the notebooks and the survey
+        scripts. ``face=`` takes an index, ``lat=``/``lon=`` take degrees and go
+        through :meth:`face_at`.
+        """
+        index = self.resolve_face(face, lat, lon)
+        if steps is None:
+            steps = self.steps(field)
+        values = np.array([self.field(field, s)[index] for s in steps])
+        hours = self.elapsed_hours
+        if len(hours) >= len(steps):
+            hours = hours[list(steps)]
+        else:
+            raise ValueError(
+                f"time_steps.txt has {len(hours)} rows but {len(steps)} "
+                f"{field} files exist; the run directory is inconsistent")
+        return hours, values
+
+    def stack(self, field='temperature', steps=None, faces=None):
+        """``(n_steps, n_faces)`` for a per-step field. Reads every step.
+
+        ``faces`` restricts the columns as each step is read, so a band of a
+        large mesh costs the band rather than the mesh: the fig-8 core is
+        140,091 faces, and 240 steps of it is 134 MB before the selection.
+        """
+        if steps is None:
+            steps = self.steps(field)
+        if faces is None:
+            return np.stack([self.field(field, s) for s in steps])
+        faces = np.asarray(faces)
+        return np.stack([self.field(field, s)[faces] for s in steps])
+
+    def local_solar_time_curve(self, field='temperature', lat_max=10.0,
+                               n_bins=48, steps=None,
+                               noon_field='direct_solar'):
+        """Noon-referenced diurnal curve over a latitude band.
+
+        Returns ``(local_solar_time_hours, mean, p25, p75, n_faces_used)``.
+        ``steps=None`` uses every output step; the asteroid notebooks pass the
+        second of two rotations, and that choice stays with the caller.
+        """
+        if steps is None:
+            steps = self.steps(field)
+        band = self.faces_in_band(-abs(lat_max), abs(lat_max))
+        if band.size == 0:
+            raise ValueError(f"no faces within +/-{lat_max} deg of the equator")
+        values = self.stack(field, steps, faces=band)
+        reference = self.stack(noon_field, steps, faces=band)
+        centers, mean, p25, p75 = readers.local_solar_time_bins(
+            values, reference, n_bins=n_bins)
+        return centers, mean, p25, p75, int(band.size)
+
+    # -- regridding ------------------------------------------------------------
+
+    def to_grid(self, values, resolution=None, linear=False):
+        """Regrid a per-face field to a raster: ``(grid, regridder)``.
+
+        Uses :class:`MeshRegridder`, which picks equirectangular or polar
+        stereographic from the latitude range. ``resolution=None`` asks
+        :class:`GridResolutionEstimator` for one. Needs scipy
+        (``pip install 'ptm[regrid]'``); nothing here silently falls back to a
+        coarser method.
+        """
+        if not SCIPY_AVAILABLE:
+            raise RuntimeError(
+                "regridding needs scipy: pip install 'ptm[regrid]'")
+        values = np.asarray(values)
+        if values.shape[0] != self.n_faces:
+            raise ValueError(f"expected {self.n_faces} face values, got "
+                             f"{values.shape[0]}")
+        if resolution is None:
+            resolution = GridResolutionEstimator.estimate_resolution(
+                self.lat, self.lon)
+        key = float(resolution)
+        if key not in self._regridders:
+            self._regridders[key] = MeshRegridder(
+                self.lat, self.lon, key,
+                body_radius=float(np.median(np.linalg.norm(
+                    self.face_centers_m, axis=1))))
+        regridder = self._regridders[key]
+        grid = (regridder.regrid_linear(values) if linear
+                else regridder.regrid(values))
+        return grid, regridder
+
+    # -- units -----------------------------------------------------------------
+
+    def field_catalog(self):
+        """The field catalog in this run's :attr:`units_style`.
+
+        ``STATISTICS_FIELDS`` plus :data:`EXTRA_FIELD_INFO`, so a field that
+        exists on disk always has a label and a unit.
+        """
+        merged = dict(STATISTICS_FIELDS)
+        merged.update(self.EXTRA_FIELD_INFO)
+        return field_catalog(merged, units_style=self.units_style)
+
+    def units_of(self, field):
+        """The unit string for ``field``, spelled in this run's units style."""
+        info = self.field_catalog().get(field)
+        return info["units"] if info else ""
+
+    def label_of(self, field):
+        """A human label for ``field`` (``'Temperature'``, ...)."""
+        info = self.field_catalog().get(field)
+        return info["label"] if info else field.replace("_", " ").title()
+
+    def axis_label(self, field, moment=None):
+        """``'Maximum Temperature (K)'`` -- an axis label for a field/moment."""
+        label = self.label_of(field)
+        if moment:
+            label = f"{STAT_LABELS.get(moment, moment.title())} {label}"
+        units = self.units_of(field)
+        return f"{label} ({units})" if units else label
+
+    # -- provenance --------------------------------------------------------------
+
+    def provenance(self):
+        """What this run records about itself, and what it does not.
+
+        The engine writes ``metadata.txt`` (face count, step counts, which
+        components were exported) and nothing else about its own identity: no
+        config copy, no config hash, no binary md5, no engine version, no body
+        name. Those appear under ``not_recorded`` rather than being inferred,
+        because a plausible-looking guess about which binary produced a run is
+        worse than an admission that the run does not say.
+
+        A config **hash** is reported only when a YAML sits in the run
+        directory -- some drivers copy one in; the engine does not.
+        """
+        meta = dict(self.metadata)
+        not_recorded = []
+
+        config_path, config_sha256 = None, None
+        yamls = sorted(p for p in self.path.glob("*.yaml"))
+        if len(yamls) == 1:
+            config_path = yamls[0]
+            config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        elif len(yamls) > 1:
+            not_recorded.append(
+                f"config (the run directory holds {len(yamls)} YAML files; "
+                f"none is marked as the one used)")
+        else:
+            not_recorded.append(
+                "config (the engine writes no copy of the YAML it ran)")
+        not_recorded.append("engine binary md5 / version (never written)")
+        not_recorded.append("body name (infer it from the mesh radius if needed)")
+        not_recorded.append("field units (this package's catalog supplies them)")
+
+        started = None
+        heartbeat = self.path / "heartbeat.txt"
+        if heartbeat.is_file():
+            text = heartbeat.read_text().strip()
+            if text:
+                started = text.split()[0]
+
+        try:
+            times = self.times()
+            span = {"n_steps": len(times.et),
+                    "first_utc": times.utc[0] if times.utc else None,
+                    "last_utc": times.utc[-1] if times.utc else None,
+                    "elapsed_hours": float(times.elapsed_s[-1] / 3600.0),
+                    "cadence_hours": (float(np.median(np.diff(times.elapsed_s))
+                                            / 3600.0)
+                                      if len(times.et) > 1 else None)}
+        except (FileNotFoundError, ValueError) as exc:
+            span = None
+            not_recorded.append(f"time axis ({exc})")
+
+        report = self.mesh_unit_report
+        return {
+            "run_dir": str(self.path),
+            "n_faces": self.n_faces,
+            "metadata": meta,
+            "mesh_units": report.unit,
+            "mesh_units_corroborated_by": report.body,
+            "mesh_median_radius_m": report.median * self._to_m,
+            "step_fields": self.step_fields,
+            "statistics": self.stats,
+            "time": span,
+            "started_utc": started,
+            "config_file": str(config_path) if config_path else None,
+            "config_sha256": config_sha256,
+            "units_style": self.units_style,
+            "not_recorded": tuple(not_recorded),
+        }
+
+    # -- canned plots ----------------------------------------------------------
+    # Thin delegations, so that importing ptm.results never imports matplotlib.
+
+    def plot_diurnal(self, **kwargs):
+        """Time series at one face. See :func:`ptm.plots.plot_diurnal`."""
+        from . import plots
+        return plots.plot_diurnal(self, **kwargs)
+
+    def plot_map(self, *args, **kwargs):
+        """Regridded lat/lon map. See :func:`ptm.plots.plot_map`."""
+        from . import plots
+        return plots.plot_map(self, *args, **kwargs)
+
+    def plot_globes(self, *args, **kwargs):
+        """Orthographic globe set. See :func:`ptm.plots.plot_globes`."""
+        from . import plots
+        return plots.plot_globes(self, *args, **kwargs)
+
+    def plot_histogram(self, *args, **kwargs):
+        """Distribution of a per-face field. See :func:`ptm.plots.plot_histogram`."""
+        from . import plots
+        return plots.plot_histogram(self, *args, **kwargs)
