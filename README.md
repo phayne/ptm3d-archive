@@ -266,10 +266,10 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 
 ### Which configuration directory to start from
 
-**Start in [`examples/`](examples/), not `configs/`.** The 19 configurations at
+**Start in [`examples/`](examples/), not `configs/`.** The 21 configurations at
 the top level of `examples/` are the ones written to be read and run by someone
-who did not build the repository; most are CPU-only, and
-`quickstart_moon_diurnal.yaml` is the smallest.
+who did not build the repository; 20 of the 21 are CPU-only, and
+`quickstart_moon_diurnal.yaml` is the one to start from.
 
 `configs/` (55 YAML files at its top level) holds study inputs kept for
 provenance, not as onboarding material: 47 of the 55 set `thermal.use_gpu: true`,

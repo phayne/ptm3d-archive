@@ -217,8 +217,8 @@ after fetching kernels per §4):
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-**Take your configurations from `examples/`, not `configs/`.** The 19 files at the top of
-`examples/` are the colleague-facing set and most of them are CPU-only. `configs/` (55 files)
+**Take your configurations from `examples/`, not `configs/`.** The 21 files at the top of
+`examples/` are the colleague-facing set and 20 of them are CPU-only. `configs/` (55 files)
 holds study inputs kept for provenance: 47 of the 55 set `thermal.use_gpu: true`, so on the
 CPU-only build of §3 they stop immediately with `FATAL [gpu]` (set `thermal.use_gpu: false`
 to run them on the CPU), and several reference meshes, DEMs or view-factor files that are
