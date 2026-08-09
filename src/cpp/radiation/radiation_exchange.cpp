@@ -1075,8 +1075,10 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
 
     size_t n = temperatures.size();
 
-    // Band-separated (visible + thermal-IR) radiosity when requested. OFF by
-    // default => the gray path below runs, byte-identical to committed behavior.
+    // Band-separated (visible + thermal-IR) radiosity when requested. ON by
+    // default since the D2 flip (radiation_config.h: band_separated = true);
+    // set `radiation.band_separated: false` to recover the gray path below,
+    // which is byte-identical to pre-two-band behavior at A = 1 - eps.
     if (two_band_) {
         return solveTwoBand(temperatures, solar_flux);
     }
