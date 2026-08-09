@@ -180,7 +180,23 @@ fetched the same way with `python3 scripts/fetch_data.py --core` (~1.7 GB) — s
 `data/README.md` for the catalog, and `$PTM_DATA_ROOT` in `docs/ENVIRONMENT.md` to keep
 the data outside the repository. The quickstart example needs only the SPICE kernels.
 
-## 5. Verify the build (correctness gates)
+## 5. Python environment (QA, notebooks, plots)
+
+The engine and the correctness gates need no Python packages. The QA checker
+(`scripts/ptm_qa.py`), the tutorial notebooks and every plotting route do:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+The root `requirements.txt` is the environment for the documented path — numpy,
+matplotlib, PyYAML, JupyterLab, and SpiceyPy (needed by notebook 04 only). Two
+narrower files exist for the parts of the repository beyond it:
+`scripts/requirements.txt` (scipy, astropy and the rest of the analysis and
+figure tooling) and `gui/requirements.txt` (PyQt6, PyVista and the desktop GUI).
+
+## 6. Verify the build (correctness gates)
 
 ```bash
 # Radiation gate (Ingersoll bowl crater — analytic):
@@ -193,7 +209,7 @@ c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp
 python3 scripts/test_ptm_run_guard.py
 ```
 
-## 6. Run something
+## 7. Run something
 
 See `TUTORIAL.md` for a 10-minute laptop walkthrough. The quickstart (from the repo root,
 after fetching kernels per §4):
@@ -208,12 +224,12 @@ CPU-only build of §3 they stop immediately with `FATAL [gpu]` (set `thermal.use
 to run them on the CPU), and several reference meshes, DEMs or view-factor files that are
 not distributed.
 
-## 7. Known caveats (from the portability audit)
+## 8. Known caveats (from the portability audit)
 
 - Files directly under `examples/` use relative paths and run from a clone. Files under
   `configs/` may reference datasets and machine-specific paths that are not distributed.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
-  individual test programs directly (as in §5).
+  individual test programs directly (as in §6).
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver

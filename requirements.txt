@@ -1,0 +1,23 @@
+# PTM3D — Python environment for the documented user path.
+#
+# The ENGINE needs none of this. `ptm_thermal_sim`, the correctness tests and
+# `scripts/fetch_kernels.py` / `fetch_data.py` / `ptm_mem_estimate.py` are C++
+# or Python-standard-library only. Install this file to run the QA check, open
+# the tutorial notebooks, and make plots:
+#
+#     python3 -m venv .venv && source .venv/bin/activate
+#     python3 -m pip install -r requirements.txt
+#
+# Versions are lower bounds only; these are analysis helpers, not part of the
+# validated numerical path.
+
+numpy>=1.20          # scripts/ptm_qa.py; every notebook; all statistics/*.bin readers
+matplotlib>=3.4      # every notebook; all figure scripts
+pyyaml>=5.4          # every notebook (reads and writes PTM3D YAML configs)
+jupyterlab>=3.0      # to open docs/tutorials/notebooks/ at all
+spiceypy>=5.0        # notebook 04 only (reads the Bennu SPK coverage window)
+
+# Deliberately NOT here, because the four tutorial notebooks do not need them:
+#   scripts/requirements.txt   scipy, astropy — the wider analysis/figure tooling
+#   gui/requirements.txt       PyQt6, pyvista, ... — the desktop GUI
+# Install those additionally if you use those parts of the repository.

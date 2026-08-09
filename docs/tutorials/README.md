@@ -28,6 +28,17 @@ outputs** so the plots render directly on GitHub; re-run with
 Every notebook is CPU-only: nothing here needs a GPU, and nothing here competes
 for one.
 
+They need a Python environment, which the repository root supplies in one step:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install -r requirements.txt   # numpy, matplotlib, pyyaml, jupyterlab, spiceypy
+jupyter lab docs/tutorials/notebooks/
+```
+
+Of those, SpiceyPy is used by notebook 04 alone; the other three are used by all
+four.
+
 | # | Notebook | What it covers | Runtime | Beyond a built binary, needs | Status |
 |---|---|---|---|---|---|
 | 01 | [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, 1,280 faces). Config anatomy, the binary output format, temperature map, diurnal curve, day/night contrast against latitude, orthographic globes, and — section 6 — the same run on real LOLA global topography (res-5) against a smooth-sphere control. The notebook counterpart of tutorial 02 above | 36 s end to end (three engine runs: 2.3 s + 12.7 s + 12.4 s) | Moon SPICE kernels, ~44 MB (`fetch_kernels.py --bodies moon`); for section 6, `fetch_data.py --core` (topography, property maps, albedo maps) | verified 2026-08-09 |

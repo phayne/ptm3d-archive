@@ -177,7 +177,22 @@ For a 3D view of the same output, point the [GUI](#gui) at the run directory, or
 open `mesh.ply` in ParaView. Field-by-field walkthrough:
 [docs/tutorials/06_interpreting_outputs.md](docs/tutorials/06_interpreting_outputs.md).
 
-### 5. Confirm the install is sound
+### 5. Set up the Python environment (for QA, notebooks and plots)
+
+Everything up to here is C++ and the Python standard library. The QA check
+below, the tutorial notebooks and every plotting route need a few packages:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install -r requirements.txt   # numpy, matplotlib, pyyaml, jupyterlab, spiceypy
+```
+
+That is the whole environment for the documented path.
+[`scripts/requirements.txt`](scripts/requirements.txt) adds the wider analysis
+tooling (scipy, astropy) and [`gui/requirements.txt`](gui/requirements.txt) the
+desktop GUI; neither is needed for the walkthrough.
+
+### 6. Confirm the install is sound
 
 ```bash
 python3 scripts/ptm_qa.py thermal output/quickstart_moon_diurnal  # -> verdict: PASS
@@ -190,7 +205,7 @@ and range violations. `test_bowl_crater` is the analytic radiation gate (look
 for `Error: 0.49...%` and `Result: PASSED`); `test_equilibration_dt` gates the
 spectral spin-up and prints `[test_equilibration_dt] PASS`. All three are
 CPU-only and take seconds. There is no `ctest`/`pytest` — the tests are
-standalone executables, listed in [INSTALL.md §5](INSTALL.md).
+standalone executables, listed in [INSTALL.md §6](INSTALL.md).
 
 ### Science data (not needed for the quickstart)
 
