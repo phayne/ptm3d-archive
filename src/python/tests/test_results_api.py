@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""The Results/readers/plots layer, against a run directory built in a tempdir.
+
+No engine, no SPICE, no GPU, no network: every check below writes the exact
+byte layouts the engine writes and then reads them back. That is the point --
+the formats are the contract, and three of them are documented nowhere in
+``docs/``, which is why the tree carries 44 independent ``mesh.ply`` parsers
+and 40 per-face ``.bin`` readers.
+
+What is asserted, in the order it would break:
+
+1. the readers round-trip the byte layouts, including the albedo map's
+   *different* one (``size_t`` + float64, not ``int32`` + float32);
+2. the mesh length unit is decided the way the engine decides it -- the same
+   run written in metres and in kilometres reads back the same geometry, and
+   the cases the engine calls fatal raise here too;
+3. ``Results`` discovers fields and statistics from the directory rather than
+   from a hard-coded list;
+4. the two flux-unit spellings stay distinct all the way to an axis label;
+5. every canned plot draws on the Agg backend.
+
+Run directly (no pytest needed)::
+
+    python3 src/python/tests/test_results_api.py
+"""
+
+from __future__ import annotations
+
+import shutil
+import struct
+import sys
+import tempfile
+import warnings
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
+
+import numpy as np                                              # noqa: E402
+
+from ptm import readers                                         # noqa: E402
+from ptm.readers import MeshUnitError                           # noqa: E402
+from ptm.results import Results                                 # noqa: E402
+
+MOON_RADIUS_KM = 1737.4
+
+
+# --- a synthetic run directory ----------------------------------------------
+
+def _icosphere(subdivisions=2):
+    """A unit icosphere: ``(vertices, faces)``. Closed, pure triangles."""
+    phi = (1.0 + 5.0 ** 0.5) / 2.0
+    verts = [(-1, phi, 0), (1, phi, 0), (-1, -phi, 0), (1, -phi, 0),
+             (0, -1, phi), (0, 1, phi), (0, -1, -phi), (0, 1, -phi),
+             (phi, 0, -1), (phi, 0, 1), (-phi, 0, -1), (-phi, 0, 1)]
+    faces = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+             (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+             (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+             (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
+    verts = [tuple(np.array(v) / np.linalg.norm(v)) for v in verts]
+    for _ in range(subdivisions):
+        midpoint, new_faces = {}, []
+
+        def _mid(a, b):
+            key = (min(a, b), max(a, b))
+            if key not in midpoint:
+                m = np.array(verts[a]) + np.array(verts[b])
+                verts.append(tuple(m / np.linalg.norm(m)))
+                midpoint[key] = len(verts) - 1
+            return midpoint[key]
+
+        for a, b, c in faces:
+            ab, bc, ca = _mid(a, b), _mid(b, c), _mid(c, a)
+            new_faces += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        faces = new_faces
+    return np.array(verts, dtype=np.float64), np.array(faces, dtype=np.int32)
+
+
+def _write_ply(path, vertices, faces):
+    """``mesh.ply`` exactly as the engine writes it.
+
+    Vertex ``6 x float64`` (xyz then three zero normals); face ``uchar(3)`` +
+    ``3 x int32`` + ``float32`` latitude + ``float32`` longitude in degrees.
+    """
+    centers = vertices[faces].mean(axis=1)
+    radius = np.linalg.norm(centers, axis=1)
+    lat = np.degrees(np.arcsin(centers[:, 2] / radius))
+    lon = np.degrees(np.arctan2(centers[:, 1], centers[:, 0]))
+    with open(path, "wb") as handle:
+        handle.write(
+            b"ply\nformat binary_little_endian 1.0\n"
+            b"element vertex %d\n"
+            b"property double x\nproperty double y\nproperty double z\n"
+            b"property double nx\nproperty double ny\nproperty double nz\n"
+            b"element face %d\n"
+            b"property list uchar int vertex_indices\n"
+            b"property float latitude\nproperty float longitude\n"
+            b"end_header\n" % (len(vertices), len(faces)))
+        block = np.zeros((len(vertices), 6), dtype="<f8")
+        block[:, :3] = vertices
+        handle.write(block.tobytes())
+        for i, (a, b, c) in enumerate(faces):
+            handle.write(struct.pack("<B3iff", 3, a, b, c, lat[i], lon[i]))
+    return lat, lon
+
+
+def _write_bin(path, values):
+    """A per-face ``.bin``: ``int32`` count then that many little-endian float32."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(values, dtype="<f4")
+    with open(path, "wb") as handle:
+        handle.write(struct.pack("<I", values.size))
+        handle.write(values.tobytes())
+
+
+def make_run(root, unit="km", n_steps=8, extra_fields=()):
+    """Build a complete run directory and return its path."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    vertices, faces = _icosphere(2)
+    scale = MOON_RADIUS_KM * (1000.0 if unit == "m" else 1.0)
+    lat, lon = _write_ply(root / "mesh.ply", vertices * scale, faces)
+    n_faces = len(faces)
+
+    # A field with real latitude structure, so a map or a globe of it is
+    # recognizable rather than noise. No physics: this is a cosine, not a model.
+    base = 100.0 + 250.0 * np.clip(np.cos(np.radians(lat)), 0.0, None)
+    for step in range(n_steps):
+        phase = 2 * np.pi * step / n_steps
+        lit = np.clip(np.cos(np.radians(lon) - phase), 0.0, None)
+        _write_bin(root / "temperature" / f"temperature_{step:04d}.bin",
+                   base * (0.4 + 0.6 * lit))
+        _write_bin(root / "direct_solar" / f"direct_solar_{step:04d}.bin",
+                   1361.0 * lit * np.clip(np.cos(np.radians(lat)), 0.0, None))
+        for name in extra_fields:
+            _write_bin(root / name / f"{name}_{step:04d}.bin",
+                       np.full(n_faces, 1.0 + step, dtype=np.float32))
+
+    stats = root / "statistics"
+    stack = np.stack([
+        np.frombuffer((root / "temperature" /
+                       f"temperature_{s:04d}.bin").read_bytes(),
+                      dtype="<f4", offset=4)
+        for s in range(n_steps)])
+    for moment, func in (("avg", np.mean), ("max", np.max), ("min", np.min)):
+        _write_bin(stats / f"temperature_{moment}.bin", func(stack, axis=0))
+    # Written by every run, and absent from STATISTICS_FIELDS.
+    _write_bin(stats / "effective_albedo.bin", np.full(n_faces, 0.12))
+    for name in extra_fields:
+        _write_bin(stats / f"{name}_avg.bin", np.full(n_faces, 2.0))
+
+    et0 = 8.28e8
+    lines = ["# Time steps metadata",
+             "# Column 1: Time elapsed from start (seconds)",
+             "# Column 2: UTC time"]
+    for step in range(n_steps):
+        lines.append(f"{et0 + step * 3600.0:.6f}\t2026-04-{step + 1:02d}T00:00:00.000")
+    (root / "time_steps.txt").write_text("\n".join(lines) + "\n")
+
+    rows = ["time,sun_x,sun_y,sun_z,primary_x,primary_y,primary_z"]
+    for step in range(n_steps):
+        phase = 2 * np.pi * step / n_steps
+        rows.append(f"2026-04-{step + 1:02d}T00:00:00.000,"
+                    f"{1.5e8 * np.cos(phase)},{1.5e8 * np.sin(phase)},0.0,"
+                    f"{4.0e5 * np.cos(phase)},{4.0e5 * np.sin(phase)},0.0")
+    (root / "body_positions.csv").write_text("\n".join(rows) + "\n")
+
+    components = ",".join(("temperature", "direct_solar") + tuple(extra_fields))
+    (root / "metadata.txt").write_text(
+        f"faces={n_faces}\ntime_steps={n_steps}\n"
+        f"successful_timesteps={n_steps}\nfailed_timesteps=0\n"
+        f"is_custom_mesh=false\ncomponents={components}\n")
+    return root
+
+
+# --- 1. byte layouts ---------------------------------------------------------
+
+def test_time_steps_column_one_is_et_and_is_rebased(tmp):
+    run = Results(make_run(tmp / "km_run"))
+    times = run.times()
+    assert times.et[0] > 8.0e8, (
+        "column 1 of time_steps.txt is SPICE ET (seconds past J2000); a reader "
+        "that treats it as elapsed time gets an axis starting at 8.3e8")
+    assert times.elapsed_s[0] == 0.0
+    assert np.allclose(np.diff(times.elapsed_s), 3600.0)
+    assert len(times.utc) == len(times.et)
+
+
+def test_albedo_map_is_a_different_binary_format(tmp):
+    values = np.linspace(0.05, 0.4, 320)
+    path = tmp / "albedo.bin"
+    with open(path, "wb") as handle:
+        handle.write(struct.pack("<Q", values.size))
+        handle.write(values.astype("<f8").tobytes())
+    back = readers.read_albedo_map(path, expected_count=320)
+    assert np.allclose(back, values)
+
+    # The statistics layout must not be readable as an albedo map: silently
+    # returning garbage is the failure this reader exists to prevent.
+    stats_like = tmp / "stats_like.bin"
+    _write_bin(stats_like, values.astype(np.float32))
+    try:
+        readers.read_albedo_map(stats_like)
+    except ValueError as exc:
+        assert "statistics" in str(exc)
+    else:
+        raise AssertionError("an int32+float32 file was accepted as an albedo map")
+
+
+def test_body_positions_and_subsolar_point(tmp):
+    run = Results(make_run(tmp / "km_run"))
+    positions = run.body_positions()
+    assert positions.shape[0] == 8
+    assert "sun_x" in positions.dtype.names
+    lat, lon = run.subsolar_latlon(0)
+    assert abs(lat) < 1e-9 and abs(lon) < 1e-9
+    lat, lon = run.subsolar_latlon(2)          # a quarter turn
+    assert abs(lat) < 1e-9 and abs(lon - 90.0) < 1e-9
+
+
+def test_find_nearest_face_is_longitude_convention_safe(tmp):
+    run = Results(make_run(tmp / "km_run"))
+    index_a, sep_a = run.face_at_verbose(30.0, -170.0)
+    index_b, sep_b = run.face_at_verbose(30.0, 190.0)   # the same meridian
+    assert index_a == index_b, (
+        "a target on [0, 360) and one on [-180, 180] naming the same point "
+        "must select the same face")
+    assert abs(sep_a - sep_b) < 1e-9
+
+
+# --- 2. the mesh length unit -------------------------------------------------
+
+def test_same_geometry_in_metres_and_kilometres(tmp):
+    """The trap, stated as a test: one body, two units, no unit in the file."""
+    km = Results(make_run(tmp / "u_km", unit="km"))
+    m = Results(make_run(tmp / "u_m", unit="m"))
+    assert km.mesh_units == "km" and m.mesh_units == "m"
+    assert np.allclose(km.face_centers_m, m.face_centers_m, rtol=1e-9)
+    assert np.allclose(km.face_areas_m2, m.face_areas_m2, rtol=1e-9)
+    assert np.allclose(km.lat, m.lat) and np.allclose(km.lon, m.lon)
+    # Both must corroborate against a real radius rather than guess.
+    assert km.mesh_unit_report.corroborated
+    assert m.mesh_unit_report.corroborated
+
+
+def test_unit_inference_refuses_what_the_engine_refuses():
+    rng = np.random.default_rng(0)
+    directions = rng.normal(size=(200, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    # Straddling the 10,000 discriminator: consumers classify from one face.
+    straddle = directions * np.linspace(5e3, 5e4, 200)[:, None]
+    _expect_refusal(straddle, "straddle")
+
+    # Inside the ambiguous band with no known radius to confirm it.
+    ambiguous = directions * 9.0e3
+    _expect_refusal(ambiguous, "ambiguous band")
+
+    # Face centers rescaled away from the vertices (the mesh.scale_factor bug).
+    centers = directions * MOON_RADIUS_KM
+    _expect_refusal(centers, "internally inconsistent",
+                    vertices=directions * MOON_RADIUS_KM * 1000.0)
+
+
+def _expect_refusal(centers, fragment, vertices=None):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            readers.infer_mesh_length_unit(centers, vertices=vertices)
+    except MeshUnitError as exc:
+        assert fragment in str(exc), f"expected {fragment!r} in: {exc}"
+    else:
+        raise AssertionError(f"no refusal for the {fragment!r} case")
+
+
+def test_magnitude_only_verdict_warns():
+    directions = np.array([[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        report = readers.infer_mesh_length_unit(directions * 3.0)
+    assert report.unit == "km" and not report.corroborated
+    assert any("magnitude alone" in str(w.message) for w in caught), (
+        "a unit decided on magnitude alone must say so")
+
+
+def test_forced_mesh_units_are_honoured(tmp):
+    run = Results(make_run(tmp / "u_km"), mesh_units="m")
+    assert run.mesh_units == "m"
+    assert not run.mesh_unit_report.corroborated
+
+
+# --- 3. discovery ------------------------------------------------------------
+
+def test_fields_and_statistics_are_discovered_not_listed(tmp):
+    run = Results(make_run(tmp / "two_band", extra_fields=("indirect_solar",
+                                                           "indirect_ir")))
+    assert set(run.step_fields) == {"temperature", "direct_solar",
+                                    "indirect_solar", "indirect_ir"}, (
+        "per-step fields must come from the directory: a two-band radiosity "
+        "run writes indirect_solar and indirect_ir, and a hard-coded list "
+        "drops them")
+    stats = dict(run.stats)
+    assert ("effective_albedo", None) in run.stats, (
+        "effective_albedo.bin is written by every run and is not in "
+        "STATISTICS_FIELDS, so it must be discovered")
+    assert stats.get("indirect_solar") is not None
+
+
+def test_metadata_face_count_mismatch_is_fatal(tmp):
+    root = make_run(tmp / "bad_meta")
+    text = (root / "metadata.txt").read_text().replace("faces=320", "faces=321")
+    (root / "metadata.txt").write_text(text)
+    try:
+        Results(root).mesh
+    except ValueError as exc:
+        assert "inconsistent" in str(exc)
+    else:
+        raise AssertionError("a metadata/mesh face-count mismatch was accepted")
+
+
+def test_truncated_field_file_raises(tmp):
+    root = make_run(tmp / "truncated")
+    target = root / "temperature" / "temperature_0000.bin"
+    target.write_bytes(target.read_bytes()[:-40])
+    try:
+        Results(root).field("temperature", 0)
+    except ValueError as exc:
+        assert "readable per-face binary" in str(exc)
+    else:
+        raise AssertionError("a truncated per-face binary was accepted")
+
+
+def test_series_and_local_solar_time(tmp):
+    run = Results(make_run(tmp / "km_run"))
+    hours, values = run.series("temperature", lat=0.0, lon=0.0)
+    assert hours.shape == values.shape == (8,)
+    assert hours[0] == 0.0 and np.isclose(hours[-1], 7.0)
+    lst, mean, p25, p75, n = run.local_solar_time_curve(n_bins=8, lat_max=30.0)
+    assert lst.shape == (8,) and n > 0
+    assert np.nanmax(mean) > np.nanmin(mean)
+
+
+def test_provenance_says_what_is_missing(tmp):
+    prov = Results(make_run(tmp / "km_run")).provenance()
+    assert prov["n_faces"] == 320
+    assert prov["config_sha256"] is None
+    joined = " ".join(prov["not_recorded"])
+    assert "engine binary md5" in joined and "config" in joined, (
+        "provenance must name what the run does not record rather than "
+        "inferring it")
+
+
+# --- 4. the two unit spellings ------------------------------------------------
+
+def test_units_style_survives_to_the_axis_label(tmp):
+    root = make_run(tmp / "km_run")
+    ascii_run = Results(root, units_style="ascii")
+    unicode_run = Results(root, units_style="unicode")
+    assert ascii_run.units_of("illumination") == "W/m^2"
+    assert unicode_run.units_of("illumination") == "W/m²"
+    assert ascii_run.axis_label("illumination", "avg").endswith("(W/m^2)")
+    assert unicode_run.axis_label("illumination", "avg").endswith("(W/m²)")
+    assert ascii_run.units_of("temperature") == unicode_run.units_of("temperature")
+    try:
+        Results(root, units_style="latex")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown units_style was accepted")
+
+
+# --- 5. the plots draw --------------------------------------------------------
+
+def test_every_canned_plot_draws(tmp):
+    import matplotlib
+    matplotlib.use("Agg")
+    from ptm import plots
+
+    run = Results(make_run(tmp / "km_run"))
+    out = tmp / "figs"
+    out.mkdir(exist_ok=True)
+    run.plot_diurnal(lat=0, lon=0, save=out / "diurnal.png")
+    run.plot_globes("temperature", "max", save=out / "globes.png")
+    run.plot_histogram("temperature", "max", save=out / "hist.png")
+    try:
+        run.plot_map("temperature", "max", save=out / "map.png")
+    except RuntimeError as exc:
+        assert "scipy" in str(exc)          # optional dependency, named clearly
+    for name in ("diurnal", "globes", "hist"):
+        assert (out / f"{name}.png").stat().st_size > 5000, f"{name} is blank"
+
+    norm = plots.flux_norm(np.array([100.0, 200.0, 390.0]))
+    assert plots.clip_extend(np.array([50.0, 400.0]), norm) == "both"
+
+
+def test_globes_refuse_a_site_patch(tmp):
+    import matplotlib
+    matplotlib.use("Agg")
+    from ptm import plots
+
+    root = make_run(tmp / "patch_run")
+    run = Results(root)
+    full = plots.mesh_angular_radius(run.face_unit_vectors)
+    assert full > 170.0, "a closed icosphere covers the whole sphere"
+
+    # Keep only the faces near one pole, in place, so the same Results object
+    # now describes a site patch of the body it described a moment ago.
+    keep = np.where(run.lat > 80.0)[0]
+    mesh = run.mesh
+    mesh["face_centers"] = mesh["face_centers"][keep]
+    mesh["face_latitudes"] = mesh["face_latitudes"][keep]
+    mesh["face_longitudes"] = mesh["face_longitudes"][keep]
+    assert plots.mesh_angular_radius(run.face_unit_vectors) < 30.0
+    try:
+        plots.plot_globes(run, "temperature", "max")
+    except ValueError as exc:
+        assert "site patch" in str(exc)
+    else:
+        raise AssertionError("a globe of a site patch was drawn")
+
+
+TESTS = [
+    test_time_steps_column_one_is_et_and_is_rebased,
+    test_albedo_map_is_a_different_binary_format,
+    test_body_positions_and_subsolar_point,
+    test_find_nearest_face_is_longitude_convention_safe,
+    test_same_geometry_in_metres_and_kilometres,
+    test_unit_inference_refuses_what_the_engine_refuses,
+    test_magnitude_only_verdict_warns,
+    test_forced_mesh_units_are_honoured,
+    test_fields_and_statistics_are_discovered_not_listed,
+    test_metadata_face_count_mismatch_is_fatal,
+    test_truncated_field_file_raises,
+    test_series_and_local_solar_time,
+    test_provenance_says_what_is_missing,
+    test_units_style_survives_to_the_axis_label,
+    test_every_canned_plot_draws,
+    test_globes_refuse_a_site_patch,
+]
+
+
+def main():
+    tmp = Path(tempfile.mkdtemp(prefix="ptm_results_api_"))
+    failures = 0
+    try:
+        for test in TESTS:
+            needs_tmp = test.__code__.co_argcount == 1
+            try:
+                test(tmp) if needs_tmp else test()
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {test.__name__}\n     {exc}")
+            except Exception as exc:                   # noqa: BLE001
+                failures += 1
+                print(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+            else:
+                print(f"PASS {test.__name__}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    total = len(TESTS)
+    print(f"\n[test_results_api] {total - failures}/{total} passed")
+    if failures:
+        print("[test_results_api] FAIL")
+        return 1
+    print("[test_results_api] PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

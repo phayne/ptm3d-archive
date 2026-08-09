@@ -3,6 +3,9 @@
 This document lists the YAML configuration keys PTM3D reads, with the defaults the
 parser applies when a key is absent (`src/cpp/tools/config_parser.cpp`).
 
+> Changing a key or a default in the parser? Regenerate the Python layer's copy of
+> this table as well — see [CONTRIBUTING.md](../CONTRIBUTING.md#changing-an-engine-configuration-key).
+
 > Runtime behavior is also influenced by `PTM_*` **environment variables** — see
 > [ENVIRONMENT.md](ENVIRONMENT.md) for the complete table, including the
 > `engine_env:` block that lets a configuration declare its own environment.
