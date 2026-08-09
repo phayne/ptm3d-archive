@@ -336,10 +336,15 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                     getWithDefault(ex, "order_p", config.thermal.eq_extrapolation.order_p);
                 config.thermal.eq_extrapolation.tol_K =
                     getWithDefault(ex, "tol_K",   config.thermal.eq_extrapolation.tol_K);
-                config.thermal.eq_extrapolation.safety =
-                    getWithDefault(ex, "safety",  config.thermal.eq_extrapolation.safety);
-                config.thermal.eq_extrapolation.r_cap =
-                    getWithDefault(ex, "r_cap",   config.thermal.eq_extrapolation.r_cap);
+                // safety and r_cap were retired as user knobs; their values are
+                // now internal constants. Warn rather than ignore silently.
+                for (const char* k : {"safety", "r_cap"}) {
+                    if (ex[k]) {
+                        std::cerr << "Warning: thermal.eq_extrapolation." << k
+                                  << " is no longer a knob and is IGNORED; the value is now "
+                                     "an internal constant (safety 3.0, r_cap 0.9995).\n";
+                    }
+                }
                 config.thermal.eq_extrapolation.hold_K =
                     getWithDefault(ex, "hold_K",  config.thermal.eq_extrapolation.hold_K);
             }
@@ -769,8 +774,6 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "method"  << YAML::Value << config.thermal.eq_extrapolation.method;
             out << YAML::Key << "order_p" << YAML::Value << config.thermal.eq_extrapolation.order_p;
             out << YAML::Key << "tol_K"   << YAML::Value << config.thermal.eq_extrapolation.tol_K;
-            out << YAML::Key << "safety"  << YAML::Value << config.thermal.eq_extrapolation.safety;
-            out << YAML::Key << "r_cap"   << YAML::Value << config.thermal.eq_extrapolation.r_cap;
             out << YAML::Key << "hold_K"  << YAML::Value << config.thermal.eq_extrapolation.hold_K;
             out << YAML::EndMap;
         }
@@ -1108,8 +1111,6 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  #   method: off                      #   off | rre\n";
     out << "  #   order_p: 4                       #   3 or 4; needs equilibration_cycles >= order_p + 1\n";
     out << "  #   tol_K: 0.5                       #   certificate reporting threshold (state ships regardless)\n";
-    out << "  #   safety: 3.0                      #   certificate safety factor\n";
-    out << "  #   r_cap: 0.9995                    #   cap on the measured contraction ratio\n";
     out << "  #   hold_K: 1.0e-3                   #   hold a layer whose last-pass increment is below this (K)\n";
     out << "  compute_statistics: true            # Compute temperature statistics\n";
     out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
@@ -1230,19 +1231,9 @@ bool ConfigParser::validate(const SimulationConfig& config) {
                           << ex.tol_K << std::endl;
                 valid = false;
             }
-            if (ex.safety <= 0.0) {
-                std::cerr << "Error: thermal.eq_extrapolation.safety must be > 0; got "
-                          << ex.safety << std::endl;
-                valid = false;
-            }
             if (!(ex.hold_K > 0.0)) {
                 std::cerr << "Error: thermal.eq_extrapolation.hold_K must be > 0; got "
                           << ex.hold_K << std::endl;
-                valid = false;
-            }
-            if (!(ex.r_cap > 0.0) || ex.r_cap >= 1.0) {
-                std::cerr << "Error: thermal.eq_extrapolation.r_cap must be in (0,1); got "
-                          << ex.r_cap << std::endl;
                 valid = false;
             }
         }

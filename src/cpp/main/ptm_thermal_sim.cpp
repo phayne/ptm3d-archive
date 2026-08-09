@@ -4249,8 +4249,6 @@ static bool resolveEqExtrapolation(const thermal::Config& config,
     }
     o.order_p = config.getPropertyInt("eq_extrap_order_p", 4);
     o.tol_K   = config.getPropertyDouble("eq_extrap_tol_K", 0.5);
-    o.safety  = config.getPropertyDouble("eq_extrap_safety", 3.0);
-    o.r_cap   = config.getPropertyDouble("eq_extrap_r_cap", 0.9995);
     o.hold_K  = config.getPropertyDouble("eq_extrap_hold_K", ptm::eqextrap::kHoldKDefault);
 
     if (o.order_p < ptm::eqextrap::kMinOrderP) {
@@ -4273,10 +4271,9 @@ static bool resolveEqExtrapolation(const thermal::Config& config,
                   << o.hold_K << "\n";
         return false;
     }
-    if (!(o.tol_K > 0.0) || !(o.safety > 0.0) || !(o.r_cap > 0.0) || o.r_cap >= 1.0) {
-        std::cerr << "[Thermal] ERROR: eq_extrapolation requires tol_K > 0, "
-                     "safety > 0 and 0 < r_cap < 1; got tol_K=" << o.tol_K
-                  << " safety=" << o.safety << " r_cap=" << o.r_cap << "\n";
+    if (!(o.tol_K > 0.0)) {
+        std::cerr << "[Thermal] ERROR: eq_extrapolation.tol_K must be > 0; got "
+                  << o.tol_K << "\n";
         return false;
     }
 
@@ -5054,9 +5051,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << " over " << eq_passes << " passes (extrapolate after "
                   << (eq_passes - 1) << ", pass " << eq_passes
                   << " = polish + certificate + delivered state), tol_K="
-                  << eq_extrap.tol_K << " safety=" << eq_extrap.safety
-                  << " r_cap=" << eq_extrap.r_cap
-                  << " hold_K=" << eq_extrap.hold_K << " K/pass" << std::endl;
+                  << eq_extrap.tol_K << " hold_K=" << eq_extrap.hold_K
+                  << " K/pass" << std::endl;
     }
     ptm::eqextrap::Stats eq_extrap_stats;
     std::mutex eq_extrap_mutex;
@@ -6439,60 +6435,51 @@ post_batch_loop:
         std::streamsize bp = std::cout.precision();
         const double med = ptm::eqextrap::percentile(eq_extrap_stats.ehat, 0.50);
         const double p95 = ptm::eqextrap::percentile(eq_extrap_stats.ehat, 0.95);
-        std::cout << "[eq-extrap] certified " << eq_extrap_stats.certified
-                  << " | cert_refused "       << eq_extrap_stats.cert_refused
-                  << " | converged_window "   << eq_extrap_stats.converged_window
-                  << " | gamma_refused "      << eq_extrap_stats.gamma_refused
-                  << " | box_refused "        << eq_extrap_stats.box_refused
-                  << " | budget_exhausted "   << eq_extrap_stats.budget_exhausted
-                  << " | median e " << std::fixed << std::setprecision(4) << med
-                  << " K | p95 e "  << p95
-                  << " K | passes spent " << eq_extrap_stats.passes_spent
+        // Five numbers. Trimmed deliberately: the earlier banner reported
+        // counters for guards that never fired and a diagnostic from a theory
+        // the measurements refuted.
+        //   extrapolated  = faces where the extrapolation actually did work
+        //                   (certified count minus the vacuous converged windows)
+        //   declined      = faces the certificate could not certify at tol_K;
+        //                   their state still ships, it is a contraction step
+        //   near-degenerate = REPORTED ONLY, never acted on: windows where the
+        //                   seed weight could displace a converged layer by more
+        //                   than tol_K (|gamma_0| * max|S_0 - S_last| > tol_K)
+        const long long extrapolated =
+            eq_extrap_stats.certified - eq_extrap_stats.converged_window;
+        const double held_frac = eq_extrap_stats.layers_total > 0
+            ? static_cast<double>(eq_extrap_stats.layers_held)
+                  / static_cast<double>(eq_extrap_stats.layers_total)
+            : 0.0;
+        std::cout << "[eq-extrap] extrapolated " << extrapolated
+                  << " | declined "        << eq_extrap_stats.cert_refused
+                  << " | p95 e " << std::fixed << std::setprecision(4) << p95
+                  << " K | held_fraction " << std::setprecision(6) << held_frac
+                  << " | near_degenerate " << eq_extrap_stats.near_degenerate
                   << std::endl;
-        // ||gamma||_1 is the amplification factor that turns float32 state
-        // roundoff into extrapolant error -- the single most diagnostic number
-        // in the feature (N6.2c), and the one that would have caught the
-        // near-degenerate failure before a gate did.
-        {
-            const double g50 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.50);
-            const double g95 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.95);
-            const double g99 = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 0.99);
-            const double gmx = ptm::eqextrap::percentile(eq_extrap_stats.gamma_l1, 1.00);
-            std::cout << "[eq-extrap] ||gamma||_1  p50 " << std::setprecision(3) << g50
-                      << " | p95 " << g95 << " | p99 " << g99 << " | max " << gmx
-                      << "   (Level-1 bound = " << ptm::eqextrap::kLevel1Frac
-                      << " * tol_K / (eps32 * max|S|))" << std::endl;
-            const double held_frac = eq_extrap_stats.layers_total > 0
-                ? static_cast<double>(eq_extrap_stats.layers_held)
-                      / static_cast<double>(eq_extrap_stats.layers_total)
-                : 0.0;
-            std::cout << "[eq-extrap] layers_held " << eq_extrap_stats.layers_held
-                      << " | held_fraction " << std::fixed << std::setprecision(6) << held_frac
-                      << " | faces_partly_held " << eq_extrap_stats.faces_partly_held
-                      << " | T*-assertion max " << std::scientific << std::setprecision(3)
-                      << eq_extrap_stats.d_held_max << " K (must be 0)" << std::endl;
-            // POST-POLISH tripwire on HELD layers -- the one with detection power.
-            const double q50 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.50);
-            const double q95 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.95);
-            const double qmx = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 1.00);
-            std::cout << "[eq-extrap] post-polish |Phi(T*)-S_last| on HELD layers: p50 "
-                      << q50 << " | p95 " << q95 << " | max " << qmx
-                      << " K (bar " << ptm::eqextrap::kHeldPostTol << " K)" << std::endl;
-            if (eq_extrap_stats.d_held_max > ptm::eqextrap::kHeldDispTol) {
-                std::cerr << "[eq-extrap] ERROR: T*-based assertion non-zero -- the Level-2 "
-                             "guard did not execute as claimed.\n";
-            }
-            if (qmx > ptm::eqextrap::kHeldPostTol) {
-                std::cerr << "[eq-extrap] ERROR: post-polish held-layer deviation " << qmx
-                          << " K exceeds the " << ptm::eqextrap::kHeldPostTol
-                          << " K tripwire -- the delivered state moved a layer the guard "
-                             "declared converged.\n";
-            }
+        const double q50 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.50);
+        const double q95 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.95);
+        const double qmx = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 1.00);
+        std::cout << "[eq-extrap] post-polish |Phi(T*)-S_last| on HELD layers: p50 "
+                  << std::scientific << std::setprecision(3) << q50
+                  << " | p95 " << q95 << " | max " << qmx
+                  << " K (bar " << ptm::eqextrap::kHeldPostTol << " K)" << std::endl;
+        if (eq_extrap_stats.d_held_max > 0.0) {
+            std::cerr << "[eq-extrap] ERROR: held layers were modified -- the Level-2 guard "
+                         "did not execute as claimed.\n";
+        }
+        if (qmx > ptm::eqextrap::kHeldPostTol) {
+            std::cerr << "[eq-extrap] WARNING: post-polish deviation on a held layer exceeds "
+                      << ptm::eqextrap::kHeldPostTol << " K; the delivered state moved a layer "
+                         "the guard declared converged.\n";
+        }
+        if (eq_extrap_stats.budget_exhausted > 0) {
+            std::cout << "[eq-extrap] budget_exhausted " << eq_extrap_stats.budget_exhausted
+                      << " (too few passes for order_p; ran plain)" << std::endl;
         }
         if (eq_extrap_stats.solve_failed > 0) {
-            std::cout << "[eq-extrap] non-finite solves (fell back to the plain "
-                         "state, counted in box_refused's sibling bucket): "
-                      << eq_extrap_stats.solve_failed << std::endl;
+            std::cout << "[eq-extrap] solve_failed " << eq_extrap_stats.solve_failed
+                      << " (non-finite lstsq; fell back to the plain state)" << std::endl;
         }
         std::cout.flags(bf);
         std::cout.precision(bp);
@@ -13044,10 +13031,6 @@ int main(int argc, char** argv) {
                                        sim_config.thermal.eq_extrapolation.order_p);
             thermal_config.setProperty("eq_extrap_tol_K",
                                        sim_config.thermal.eq_extrapolation.tol_K);
-            thermal_config.setProperty("eq_extrap_safety",
-                                       sim_config.thermal.eq_extrapolation.safety);
-            thermal_config.setProperty("eq_extrap_r_cap",
-                                       sim_config.thermal.eq_extrapolation.r_cap);
             thermal_config.setProperty("eq_extrap_hold_K",
                                        sim_config.thermal.eq_extrapolation.hold_K);
         }

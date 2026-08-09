@@ -191,15 +191,6 @@ static void testRefusals() {
     checkNear("NaN input falls back to the newest snapshot",
               on[1], Xn[4 * L + 1], 0.0);
 
-    // Box guard: an absurd extrapolant is rejected, a sane one is not.
-    std::vector<double> Xb(5 * L), sane(L), wild(L);
-    for (int s = 0; s < 5; ++s)
-        for (int l = 0; l < L; ++l) Xb[static_cast<size_t>(s) * L + l] = 100.0 + l - 3.0 * s;
-    for (int l = 0; l < L; ++l) { sane[l] = 88.0 + l; wild[l] = 1.0e6; }
-    check(ex::insideAutoBox(Xb.data(), 4, L, sane.data()),
-          "auto box accepts a nearby extrapolant", 1, 1);
-    check(!ex::insideAutoBox(Xb.data(), 4, L, wild.data()),
-          "auto box rejects a 1e6 K extrapolant", 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,25 +308,12 @@ static void testMeasuredNearDegenerateRegression() {
     double smax = 0.0;
     for (int l = 0; l < L; ++l) smax = std::max(smax, std::fabs(S_last[l]));
 
-    // LEVEL 1, against the two measured ends of N6.2's separation table.
-    // Implied amplification of the observed failure: 0.465 K / (eps32 * 30 K).
-    const double g_fail = 0.465260 / (ex::kEpsState * 30.7314262);
-    const double g_ok   = 5.3;      // worst ACTIVE column measured by Fermi
-    std::printf("       implied failing ||gamma||_1 = %.3g ; worst active = %.1f\n",
-                g_fail, g_ok);
-    check(ex::level1Refuse(g_fail, smax, /*tol_K=*/0.5),
-          "Level 1 REFUSES the measured failure amplification", 1, 1);
-    check(!ex::level1Refuse(g_ok, smax, /*tol_K=*/0.5),
-          "Level 1 PERMITS the worst healthy active column", 1, 1);
-    // Margin either side of the bound, so a future tol_K change is visible.
-    const double bound = ex::kLevel1Frac * 0.5 / (ex::kEpsState * smax);
-    std::printf("       Level-1 bound at tol_K=0.5, max|S|=%.1f K : ||gamma||_1 <= %.3g\n",
-                smax, bound);
-    check(bound > 10.0 * g_ok, "bound sits >10x above the worst active column",
-          bound / g_ok, 10);
-    check(bound < 0.5 * g_fail, "bound sits >2x below the failing amplification",
-          g_fail / bound, 2);
+    // Level 1 and the box guard are GONE (2026-08-09 trim): gamma_refused and
+    // box_refused were 0 in every validated run, and Level 1's stated rationale
+    // was refuted -- its roundoff bound is 2.6e-5 K against a 0.465 K observed
+    // displacement, 17,800x too small. What remains is tested below.
 
+    // gamma_0 is the quantity that actually bounds the failure mode.
     // LEVEL 2 (ADDENDUM NOTE 8): absolute HOLD_K on the LAST-pass increment.
     const double HOLD_K = ex::kHoldKDefault;   // 1e-3 K/pass
     check(ex::level2Hold(0.0, HOLD_K),
@@ -395,6 +373,17 @@ static void testMeasuredNearDegenerateRegression() {
         checkNear("with the hold, T* == S_last EXACTLY (the named prediction)",
                   disp_held, 0.0, 0.0);
     }
+
+    // NEAR-DEGENERATE WINDOW diagnostic (reported, never acted on).
+    // Measured on the affected faces: gamma_0 ~ 0.09, seed distance ~5 K,
+    // so the predicted displacement is ~0.45 K -- above a 0.5 K tol_K? no:
+    // just under it, which is why the count is a diagnostic and not a guard.
+    check(ex::nearDegenerateWindow(0.093, 5.0, 0.4),
+          "near-degenerate fires when |g0|*seed_dist exceeds tol_K", 1, 1);
+    check(!ex::nearDegenerateWindow(0.093, 5.0, 0.6),
+          "near-degenerate silent when the bound is below tol_K", 1, 1);
+    check(!ex::nearDegenerateWindow(0.0, 100.0, 0.5),
+          "near-degenerate silent when the seed carries no weight", 1, 1);
 }
 
 int main() {

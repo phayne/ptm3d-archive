@@ -91,13 +91,25 @@ constexpr int kMaxCols = 8;
 // uses it as a default. Full rationale at level2Hold() below.
 constexpr double kHoldKDefault = 1e-3;  // K per pass
 
+// Certificate constants, folded in from what were user knobs. Neither was ever
+// set to anything but these values in any validated run, and neither has a
+// defensible reason to vary per config:
+//   kSafety -- the conservatism factor in ehat. Measured recall over 72 cases
+//     (4 columns x 3 profiles x 6 variants): 0 missed detections at both the
+//     0.1 K and 0.5 K thresholds, median conservatism 3.42x. 3.0 is the value
+//     that recall was established at; changing it invalidates that evidence.
+//   kRCap -- clamp on the measured contraction ratio, so that ehat stays finite
+//     when a sequence stalls and rhat -> 1. At pass stride the measured rhat is
+//     0.26-0.59, four orders below the cap, so it is a guard rail rather than a
+//     tuning parameter.
+constexpr double kSafety = 3.0;
+constexpr double kRCap   = 0.9995;
+
 struct Options {
     bool   enabled  = false;   // method: rre
     int    order_p  = 4;
     double tol_K    = 0.5;
-    double safety   = 3.0;
-    double r_cap    = 0.9995;
-    double hold_K   = kHoldKDefault;  // Level-2 hold threshold, K per pass
+    double hold_K   = kHoldKDefault;  // Level-2 hold threshold, K per pass  // Level-2 hold threshold, K per pass
     // Radiation-coupling iteration that owns this eq phase. Reported in the
     // banner. The ring buffer is function-local and therefore structurally
     // cleared at every call, which is what satisfies ADDENDUM A5's mandatory
@@ -129,8 +141,6 @@ struct Options {
 // "extrapolate only above the last active layer" (assumes activity is monotone
 // in depth -- it is NOT: the PSR/polar-night population has a LOCKED surface
 // over a still-relaxing deep column, exactly inverted).
-constexpr double kEpsState    = 1.1920928955078125e-07;  // float32 epsilon
-constexpr double kLevel1Frac  = 0.2;    // Level-1 bound = kLevel1Frac * tol_K
 // LEVEL 2 threshold (ADDENDUM NOTE 8). ABSOLUTE, in Kelvin, and deliberately
 // NOT coupled to ||gamma||_1: that coupling was justified by a roundoff premise
 // that the measurement refuted (N8.0), and keeping it would carry a refuted
@@ -145,22 +155,6 @@ constexpr double kHeldPostTol  = 1e-2;  // K, POST-POLISH tripwire on held layer
 constexpr int    kNBlocks     = 3;      // certificate blocks [0,15) [15,30) [30,n)
 inline int blockOf(int layer) {
     return (layer < 15) ? 0 : (layer < 30 ? 1 : 2);
-}
-
-// LEVEL 1 — refuse the whole column when amplified float32 state roundoff could
-// reach a fifth of the reporting tolerance. Self-calibrating: no magic constant,
-// the bound moves with tol_K and with the column's own temperature scale.
-//
-// HONEST SCOPE (ADDENDUM NOTE 8, N8.0): this is NOT the fix for the deep-layer
-// displacement defect, and must not be recorded as such. That defect is exact
-// algebra, not roundoff: for a layer bit-locked from pass 1 (S_0 = a, S_1..S_4 = b)
-// sum(gamma)=1 gives T* = b + gamma_0*(a-b), i.e. displacement LINEAR in the
-// seed-to-converged distance -- 0.465 K observed implies an entirely ordinary
-// gamma_0 ~ 0.093. Measured ||gamma||_1 max was 14.5, whose roundoff bound is
-// 2.6e-5 K, 17,800x too small, and Level 1 never fired (gamma_refused = 0).
-// It is kept because it bounds a real if non-dominant failure mode at 6 LOC.
-inline bool level1Refuse(double gamma_l1, double max_abs_S, double tol_K) {
-    return gamma_l1 * kEpsState * max_abs_S > kLevel1Frac * tol_K;
 }
 
 // LEVEL 2 — hold one layer whose LAST-PASS increment is below HOLD_K.
@@ -185,34 +179,50 @@ inline bool level2Hold(double s_layer, double hold_K) {
     return s_layer <= hold_K;
 }
 
+// NEAR-DEGENERATE WINDOW — a REPORTED diagnostic, not a guard. Nothing acts on
+// it, deliberately.
+//
+// A window is near-degenerate when the fit's weight on the seed snapshot could
+// move a converged layer by more than the reporting tolerance:
+//
+//     |gamma_0| * max_z |S_0(z) - S_last(z)|  >  tol_K
+//
+// This is Fermi's bound (N8.0) evaluated at extrapolation time from quantities
+// already in hand. It identifies the population that produced the 73 faces in
+// the 2026-08-09 validation: columns whose upper layers are still active (so
+// the fit assigns a non-zero seed weight) while deeper layers have converged to
+// within hold_K of a value the seed is far from. Counting it makes that
+// population visible on any body without re-deriving the analysis; acting on it
+// would need evidence this round did not produce.
+inline bool nearDegenerateWindow(double gamma0, double seed_distance, double tol_K) {
+    return std::fabs(gamma0) * seed_distance > tol_K;
+}
+
 struct Stats {
     long long certified        = 0;  // ehat <= tol_K
     long long cert_refused     = 0;  // ehat >  tol_K  (state still shipped)
-    long long box_refused      = 0;  // extrapolant outside the auto box -> plain
     long long budget_exhausted = 0;  // faces that never got p+1 passes
     long long faces_seen       = 0;
     int       passes_spent     = 0;
     long long solve_failed     = 0;  // non-finite lstsq -> fell back to S_{N-1}
     // ---- NOTE 6 additions ----
-    long long gamma_refused     = 0; // Level 1: amplification bound exceeded
     long long converged_window  = 0; // whole column below the noise floor (vacuous)
+    long long near_degenerate   = 0; // window where the seed weight could displace > tol_K
     long long layers_held       = 0; // Level 2: individual layers held
     long long faces_partly_held = 0; // faces with >=1 held layer but not all
     double    d_held_max        = 0.0;  // T*-based ASSERTION that the guard ran (structurally 0)
     long long layers_total      = 0;    // for the held-layer fraction
     std::vector<float> d_held_post;     // POST-POLISH |Phi(T*)-S_last| on HELD layers, per face
     std::vector<float> ehat;         // one entry per extrapolated face (max over blocks)
-    std::vector<float> gamma_l1;     // ||gamma||_1 per solved face
 
     void merge(const Stats& o) {
         certified        += o.certified;
         cert_refused     += o.cert_refused;
-        box_refused      += o.box_refused;
         budget_exhausted += o.budget_exhausted;
         faces_seen       += o.faces_seen;
         solve_failed     += o.solve_failed;
-        gamma_refused    += o.gamma_refused;
         converged_window += o.converged_window;
+        near_degenerate  += o.near_degenerate;
         layers_held      += o.layers_held;
         faces_partly_held += o.faces_partly_held;
         d_held_max        = std::max(d_held_max, o.d_held_max);
@@ -220,7 +230,6 @@ struct Stats {
         d_held_post.insert(d_held_post.end(), o.d_held_post.begin(), o.d_held_post.end());
         passes_spent      = std::max(passes_spent, o.passes_spent);
         ehat.insert(ehat.end(), o.ehat.begin(), o.ehat.end());
-        gamma_l1.insert(gamma_l1.end(), o.gamma_l1.begin(), o.gamma_l1.end());
     }
 };
 
@@ -337,14 +346,18 @@ inline int minNormLstsq(double* A, int m, int n, const double* b, double* x,
 // Returns false (and leaves `out` = X[p], the newest state) if the solve is
 // not usable. `out` is therefore ALWAYS a valid state -- never garbage.
 // ---------------------------------------------------------------------------
-// `gamma_l1_out` receives sum|gamma_j| -- the amplification factor that turns
-// float32 state roundoff into extrapolant error, and the single most diagnostic
-// number in the feature (N6.2c). `s_layer_out`, if non-null, receives
+// `gamma0_out` receives gamma_0, the weight the fit assigns to the OLDEST
+// snapshot (the seed). It is the quantity that bounds the known failure mode:
+// for a layer converged since pass 1 (S_0 = a, S_1.. = b), sum(gamma) = 1 gives
+//     T*(z) = b + gamma_0 * (a - b),
+// so the displacement is gamma_0 times that layer's seed error -- LINEAR, not
+// amplified. Measured gamma_0 ~ 0.09 on the affected faces.
+// `s_layer_out`, if non-null, receives
 // max_j |u_j(z)| per layer: that layer's window SIGNAL, which Level 2 compares
 // against the local noise floor.
 inline bool rreColumn(const double* X, int p, int n_layers, double* out,
                       double* cond_out, double rcond = kRcond,
-                      double* gamma_l1_out = nullptr,
+                      double* gamma0_out = nullptr,
                       double* s_layer_out = nullptr) {
     const double* newest = X + static_cast<size_t>(p) * n_layers;
     if (s_layer_out) {
@@ -356,7 +369,7 @@ inline bool rreColumn(const double* X, int p, int n_layers, double* out,
     auto fallback = [&]() {
         for (int l = 0; l < n_layers; ++l) out[l] = newest[l];
         if (cond_out) *cond_out = HUGE_VAL;
-        if (gamma_l1_out) *gamma_l1_out = HUGE_VAL;
+        if (gamma0_out) *gamma0_out = HUGE_VAL;
         return false;
     };
     if (p < 2 || n_layers <= 0 || p - 1 > kMaxCols) return fallback();
@@ -387,9 +400,7 @@ inline bool rreColumn(const double* X, int p, int n_layers, double* out,
     gam[0] = 1.0 - bsum;
     if (!std::isfinite(gam[0])) return fallback();
 
-    double g1 = 0.0;
-    for (int j = 0; j < p; ++j) g1 += std::fabs(gam[j]);
-    if (gamma_l1_out) *gamma_l1_out = g1;
+    if (gamma0_out) *gamma0_out = gam[0];
 
     // T* = sum_{j=0}^{p-1} gamma_j X_j  (note: X_p is used only via u_{p-1}).
     for (int l = 0; l < n_layers; ++l) {
@@ -399,36 +410,6 @@ inline bool rreColumn(const double* X, int p, int n_layers, double* out,
     }
     for (int l = 0; l < n_layers; ++l) {
         if (!std::isfinite(out[l])) return fallback();
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Secondary box guard (the certificate is primary). The extrapolant must stay
-// inside the hull the snapshots actually visited, widened by half that hull's
-// own span, plus an absolute physical sanity box. On a monotonically
-// converging column the limit sits just past the newest snapshot by
-// ~|S_N-S_{N-1}| * r/(1-r), which is tiny next to the hull span, so this can
-// only fire on a genuinely broken extrapolant.
-// ---------------------------------------------------------------------------
-constexpr double kHardFloorK   = 1.0;
-constexpr double kHardCeilingK = 1000.0;
-
-inline bool insideAutoBox(const double* X, int p, int n_layers, const double* cand) {
-    double lo = HUGE_VAL, hi = -HUGE_VAL;
-    for (int s = 0; s <= p; ++s) {
-        for (int l = 0; l < n_layers; ++l) {
-            const double v = X[static_cast<size_t>(s) * n_layers + l];
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
-        }
-    }
-    if (!std::isfinite(lo) || !std::isfinite(hi)) return false;
-    const double margin = std::max(0.5 * (hi - lo), 5.0);
-    const double flo = std::max(lo - margin, kHardFloorK);
-    const double fhi = std::min(hi + margin, kHardCeilingK);
-    for (int l = 0; l < n_layers; ++l) {
-        if (!std::isfinite(cand[l]) || cand[l] < flo || cand[l] > fhi) return false;
     }
     return true;
 }

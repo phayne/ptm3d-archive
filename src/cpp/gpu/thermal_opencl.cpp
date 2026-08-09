@@ -1607,7 +1607,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
     std::vector<double> cand(n_layers);
     std::vector<double> s_layer(n_layers);
     std::vector<unsigned char> held(n_layers);
-    long long box_refused = 0, solve_failed = 0, gamma_refused = 0;
+    long long solve_failed = 0, near_degenerate = 0;
     long long converged_window = 0, layers_held = 0, faces_partly_held = 0;
     double d_held_max = 0.0;
 
@@ -1620,34 +1620,25 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
         }
         const double* newest = X.data() + static_cast<size_t>(p) * n_layers;
 
-        double cond = 0.0, gamma_l1 = 0.0;
+        double cond = 0.0, gamma0 = 0.0;
         const bool ok = ptm::eqextrap::rreColumn(X.data(), p,
                                                  static_cast<int>(n_layers),
                                                  cand.data(), &cond,
                                                  ptm::eqextrap::kRcond,
-                                                 &gamma_l1, s_layer.data());
+                                                 &gamma0, s_layer.data());
         bool use_extrap = ok;
-        if (!ok) {
-            ++solve_failed;
-        } else {
-            // ---- LEVEL 1 (N6.2): column refusal on the amplification bound.
-            // Self-calibrating, no magic constant: refuse when amplified state
-            // roundoff could reach a fifth of the reporting tolerance.
-            double smax = 0.0;
-            for (size_t l = 0; l < n_layers; ++l) smax = std::max(smax, std::fabs(newest[l]));
-            if (ptm::eqextrap::level1Refuse(gamma_l1, smax, opt.tol_K)) {
-                use_extrap = false;
-                ++gamma_refused;
-            } else if (!ptm::eqextrap::insideAutoBox(X.data(), p,
-                                                     static_cast<int>(n_layers),
-                                                     cand.data())) {
-                use_extrap = false;
-                ++box_refused;
-            }
-        }
+        if (!ok) ++solve_failed;
 
         if (use_extrap) {
-            if (stats) stats->gamma_l1.push_back(static_cast<float>(gamma_l1));
+            // NEAR-DEGENERATE WINDOW: reported, never acted on.
+            {
+                double seed_dist = 0.0;
+                const double* seed = X.data();      // X[0] = oldest = the seed
+                for (size_t l = 0; l < n_layers; ++l)
+                    seed_dist = std::max(seed_dist, std::fabs(seed[l] - newest[l]));
+                if (ptm::eqextrap::nearDegenerateWindow(gamma0, seed_dist, opt.tol_K))
+                    ++near_degenerate;
+            }
             // ---- LEVEL 2 (N6.2): per-layer hold on a signal-vs-noise test.
             // A no-op wherever the layer carries signal, so the 55-64x result on
             // the active populations is untouched by construction.
@@ -1685,7 +1676,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
             }
             for (int B = 0; B < ptm::eqextrap::kNBlocks; ++B) {
                 rhat_out[f * ptm::eqextrap::kNBlocks + B] = static_cast<float>(
-                    ptm::eqextrap::clampRhat(std::sqrt(d2[B]), std::sqrt(d1[B]), opt.r_cap));
+                    ptm::eqextrap::clampRhat(std::sqrt(d2[B]), std::sqrt(d1[B]), ptm::eqextrap::kRCap));
             }
             for (size_t l = 0; l < n_layers; ++l) {
                 T_star[l * n_faces + f] = static_cast<float>(cand[l]);
@@ -1701,9 +1692,8 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
     }
     if (stats) {
         stats->layers_total      += static_cast<long long>(n_faces) * n_layers;
-        stats->box_refused       += box_refused;
         stats->solve_failed      += solve_failed;
-        stats->gamma_refused     += gamma_refused;
+        stats->near_degenerate   += near_degenerate;
         stats->converged_window  += converged_window;
         stats->layers_held       += layers_held;
         stats->faces_partly_held += faces_partly_held;
@@ -1762,7 +1752,7 @@ void eqScoreCertificate(const std::vector<float>& T_out,
         for (int B = 0; B < NB; ++B) {
             const double r = static_cast<double>(rhat[f * NB + B]);
             if (!std::isfinite(r)) continue;
-            ehat = std::max(ehat, opt.safety * dmax[B] * r / (1.0 - r));
+            ehat = std::max(ehat, ptm::eqextrap::kSafety * dmax[B] * r / (1.0 - r));
         }
         stats->ehat.push_back(static_cast<float>(ehat));
         if (ehat <= opt.tol_K) ++certified; else ++refused;
