@@ -26,23 +26,23 @@ The coupling is currently one-directional: the thermal model provides surface te
 
 The equilibrium vapor pressure of hexagonal water ice follows the Marti & Mauersberger (1993) formulation:
 
-$$\log_{10}\!\bigl(P_{\mathrm{sat}}\bigr) = \frac{-2663.5}{T} + 12.537 \tag{D1}$$
+$$\log_{10}\negthinspace\bigl(P_{\mathrm{sat}}\bigr) = \frac{-2663.5}{T} + 12.537 \tag{D1}$$
 
 where $P_{\mathrm{sat}}$ is the saturation vapor pressure in Pa and $T$ is the surface temperature in K. This parameterization was established from laboratory measurements over the range $T = 170$--$250$ K. We extrapolate it to the $80$--$150$ K range relevant to Europa's surface; at these temperatures, no direct measurements exist, though Murphy & Koop (2005) obtain consistent values from thermodynamic integration of heat capacity data. The extrapolation uncertainty is unlikely to exceed a factor of a few in vapor pressure, which is negligible compared to the 12 orders of magnitude variation over the relevant temperature range.
 
 The number density of vapor molecules in local thermodynamic equilibrium is given by the ideal gas law:
 
-$$\rho_v = \frac{P_{\mathrm{sat}} \, M}{R \, T} \tag{D2}$$
+$$\rho_v = \frac{P_{\mathrm{sat}} \thinspace M}{R \thinspace T} \tag{D2}$$
 
 where $M = 0.01802$ kg/mol is the molar mass of water and $R = 8.314$ J/(mol$\cdot$K) is the universal gas constant. The mean thermal speed of molecules in a Maxwell-Boltzmann distribution is:
 
-$$\bar{v} = \sqrt{\frac{8 \, k_B \, T}{\pi \, m}} \tag{D3}$$
+$$\bar{v} = \sqrt{\frac{8 \thinspace k_B \thinspace T}{\pi \thinspace m}} \tag{D3}$$
 
 where $k_B = 1.381 \times 10^{-23}$ J/K and $m = 2.992 \times 10^{-26}$ kg is the molecular mass of H$_2$O.
 
 The sublimation mass flux follows the Hertz-Knudsen equation, assuming a sticking coefficient of unity:
 
-$$\Phi_{\mathrm{sub}} = \frac{\rho_v \, \bar{v}}{4} \tag{D4}$$
+$$\Phi_{\mathrm{sub}} = \frac{\rho_v \thinspace \bar{v}}{4} \tag{D4}$$
 
 Table D1 shows the strong temperature sensitivity of the sublimation flux, which varies by more than 12 orders of magnitude across Europa's surface temperature range. This extreme sensitivity means that the spatial distribution of surface temperature is the dominant control on volatile redistribution.
 
@@ -67,7 +67,7 @@ Key assumptions: (1) The sticking coefficient $\alpha = 1$, meaning all impingin
 
 Europa's exosphere is collisionless. The mean free path for H$_2$O molecules at the expected surface number densities ($\sim 10^4$ cm$^{-3}$) is approximately $10^6$ km, vastly exceeding the barometric scale height:
 
-$$H = \frac{k_B \, T}{m \, g} \approx 35 \text{ km} \quad (T = 100 \text{ K}) \tag{D5}$$
+$$H = \frac{k_B \thinspace T}{m \thinspace g} \approx 35 \text{ km} \quad (T = 100 \text{ K}) \tag{D5}$$
 
 where $g = 1.314$ m/s$^2$ is Europa's surface gravity. The Knudsen number $\text{Kn} = \ell / H \gg 1$ throughout, so molecular trajectories are purely ballistic between surface contacts.
 
@@ -81,27 +81,27 @@ $$d = \frac{v^2 \sin 2\theta}{g} \tag{D6}$$
 
 Molecules are emitted from the surface with a Lambertian angular distribution (cosine law) and a Maxwellian speed distribution at the local surface temperature $T$. The joint probability of emission at speed $v$ and zenith angle $\theta$ is:
 
-$$f(v, \theta) \, dv \, d\theta = \frac{m}{k_B T} \, v^3 \exp\!\left(-\frac{m v^2}{2 k_B T}\right) \cos\theta \, \sin\theta \; dv \, d\theta \tag{D7}$$
+$$f(v, \theta) \thinspace dv \thinspace d\theta = \frac{m}{k_B T} \thinspace v^3 \exp\negthinspace\left(-\frac{m v^2}{2 k_B T}\right) \cos\theta \thinspace \sin\theta \thickspace dv \thinspace d\theta \tag{D7}$$
 
 where the $v^3$ factor arises from the product of the Maxwell-Boltzmann speed distribution ($\propto v^2 e^{-mv^2/2k_BT}$) and the flux-weighting factor ($v \cos\theta$), and the $\sin\theta$ term is the solid angle element. The $\cos\theta$ factor enforces the Lambertian emission law.
 
 The probability density for a molecule to land at great-circle distance $d$ is obtained by integrating $f(v, \theta)$ over all $(v, \theta)$ pairs that produce range $d$, subject to the constraint of Equation D6. We derive this result below; to our knowledge, this closed-form kernel has not previously appeared in the literature. Prior Monte Carlo models of volatile migration (e.g., Butler 1997; Schorghofer 2015) simulate individual molecular trajectories numerically rather than evaluating the landing probability analytically.
 
-From Equation D6, a molecule landing at distance $d$ must satisfy $v^2 = gd / \sin 2\theta$. For a given $d$, the zenith angle $\theta$ can range from $0$ to $\pi/4$ (since $\sin 2\theta$ must be positive and achieves its maximum at $\theta = \pi/4$, corresponding to the minimum launch speed). We change variables from $(v, \theta)$ to $(d, \theta)$ using $v^2 = gd/\sin 2\theta$, which gives $v \, dv = gd \cos 2\theta \, d\theta / \sin^2 2\theta$. Substituting into Equation D7 and integrating over all zenith angles that produce range $d$:
+From Equation D6, a molecule landing at distance $d$ must satisfy $v^2 = gd / \sin 2\theta$. For a given $d$, the zenith angle $\theta$ can range from $0$ to $\pi/4$ (since $\sin 2\theta$ must be positive and achieves its maximum at $\theta = \pi/4$, corresponding to the minimum launch speed). We change variables from $(v, \theta)$ to $(d, \theta)$ using $v^2 = gd/\sin 2\theta$, which gives $v \thinspace dv = gd \cos 2\theta \thinspace d\theta / \sin^2 2\theta$. Substituting into Equation D7 and integrating over all zenith angles that produce range $d$:
 
-$$\mathcal{P}(d, T) = \int_0^{\pi/4} f\bigl(v(d,\theta),\, \theta\bigr) \left|\frac{\partial v}{\partial d}\right| d\theta \tag{D8}$$
+$$\mathcal{P}(d, T) = \int_0^{\pi/4} f\bigl(v(d,\theta),\thinspace \theta\bigr) \left|\frac{\partial v}{\partial d}\right| d\theta \tag{D8}$$
 
 Introducing the velocity variance $\sigma^2 = k_B T / m$ and the dimensionless distance parameter $\xi = gd/(2\sigma^2)$, the integrand contains the factor $\exp(-\xi/\sin 2\theta)$. After carrying out the algebra, the integral takes the form:
 
-$$\mathcal{P}(d, T) = \frac{g^2 \, d}{4 \, \sigma^4} \int_0^{\pi/4} \frac{\cos\theta \, \cos 2\theta}{\sin^3 2\theta} \exp\!\left(\frac{-\xi}{\sin 2\theta}\right) d\theta \tag{D9}$$
+$$\mathcal{P}(d, T) = \frac{g^2 \thinspace d}{4 \thinspace \sigma^4} \int_0^{\pi/4} \frac{\cos\theta \thinspace \cos 2\theta}{\sin^3 2\theta} \exp\negthinspace\left(\frac{-\xi}{\sin 2\theta}\right) d\theta \tag{D9}$$
 
 With the substitution $u = 1/\sin 2\theta$ (so $u$ ranges from $1$ to $\infty$), this integral reduces to the standard integral representation of the modified Bessel function of the second kind:
 
-$$K_0(\xi) = \int_1^{\infty} \frac{e^{-\xi u}}{\sqrt{u^2 - 1}} \, du \tag{D10}$$
+$$K_0(\xi) = \int_1^{\infty} \frac{e^{-\xi u}}{\sqrt{u^2 - 1}} \thinspace du \tag{D10}$$
 
 yielding the closed-form transport kernel:
 
-$$\mathcal{P}(d, T) = \frac{\xi^2}{d} \, K_0(\xi) \tag{D11}$$
+$$\mathcal{P}(d, T) = \frac{\xi^2}{d} \thinspace K_0(\xi) \tag{D11}$$
 
 where $\xi = gd/(2\sigma^2)$. The $K_0$ function has a logarithmic singularity at $\xi = 0$ (molecules landing very close to the source) and decays exponentially as $K_0(\xi) \sim e^{-\xi}/\sqrt{\xi}$ for $\xi \gg 1$, providing a natural cutoff at large distances. We truncate the kernel at $\xi = 10$, beyond which $K_0 < 2 \times 10^{-5}$ and the contribution is negligible.
 
@@ -110,17 +110,17 @@ This analytical kernel enables direct construction of the transport matrix witho
 The $K_0$ function is evaluated using polynomial approximations from Abramowitz & Stegun (1964):
 
 - For $x \le 2$: a series expansion with a logarithmic term
-- For $x > 2$: the asymptotic expansion $K_0(x) \approx e^{-x} / \sqrt{x} \; \times \; \text{polynomial}(2/x)$
+- For $x > 2$: the asymptotic expansion $K_0(x) \approx e^{-x} / \sqrt{x} \thickspace \times \thickspace \text{polynomial}(2/x)$
 
 ### D.3.3 Transport Matrix
 
 The transport kernel is discretized on the triangular mesh. The transport matrix element $M_{ji}$ gives the fraction of mass emitted from face $i$ that is deposited on face $j$:
 
-$$M_{ji} = \mathcal{P}(d_{ij}, T_i) \; A_j \; \mathcal{C}_{ij} \tag{D12}$$
+$$M_{ji} = \mathcal{P}(d_{ij}, T_i) \thickspace A_j \thickspace \mathcal{C}_{ij} \tag{D12}$$
 
 where $d_{ij}$ is the great-circle distance between face centers, $A_j$ is the area of the target face, and $\mathcal{C}_{ij}$ is a ring-density correction factor (see below). The deposition flux at face $j$ from all emitting faces is then:
 
-$$\Phi_{\mathrm{dep},j} = \sum_{i} M_{ji} \; \Phi_{\mathrm{sub},i} \; A_i \; / \; A_j \tag{D13}$$
+$$\Phi_{\mathrm{dep},j} = \sum_{i} M_{ji} \thickspace \Phi_{\mathrm{sub},i} \thickspace A_i \thickspace / \thickspace A_j \tag{D13}$$
 
 The matrix satisfies the mass conservation constraint:
 
@@ -128,9 +128,9 @@ $$\sum_{j} M_{ji} = 1 - f_{\mathrm{esc}}(T_i) \tag{D14}$$
 
 where $f_{\mathrm{esc}}$ is the Jeans escape fraction (Section D.4). This ensures that all emitted mass is either redeposited on the surface or escapes to space.
 
-**Ring-density correction.** Icosahedral mesh subdivision produces a quasi-uniform triangulation, but residual packing variations create small systematic biases in the transport matrix. We correct for this by computing the ratio of the continuous ring area $2\pi R_E \sin\theta \; \Delta\theta$ to the total discrete face area within each angular shell around the source face, and scaling the matrix entries accordingly. This correction removes mesh-topology artifacts from the mass redistribution pattern.
+**Ring-density correction.** Icosahedral mesh subdivision produces a quasi-uniform triangulation, but residual packing variations create small systematic biases in the transport matrix. We correct for this by computing the ratio of the continuous ring area $2\pi R_E \sin\theta \thickspace \Delta\theta$ to the total discrete face area within each angular shell around the source face, and scaling the matrix entries accordingly. This correction removes mesh-topology artifacts from the mass redistribution pattern.
 
-The transport matrix is stored in compressed sparse column format (Eigen library), exploiting the exponential decay of $K_0$ at large distances. For meshes with $> 10^5$ faces, the matrix is $> 99\%$ sparse.
+The transport matrix is stored in compressed sparse column format (Eigen library), exploiting the exponential decay of $K_0$ at large distances. For meshes with $> 10^5$ faces, the matrix is $> 99$% sparse.
 
 **Table D2.** Characteristic hop distances for H$_2$O molecules on Europa.
 
@@ -151,11 +151,17 @@ Key assumptions: (1) Collisionless exosphere (Knudsen number $\gg 1$). (2) Unifo
 
 Molecules in the high-energy tail of the Maxwell-Boltzmann distribution can exceed Europa's escape velocity ($v_{\mathrm{esc}} = 2025$ m/s) and be lost to space. The escape fraction is computed using the Chamberlain (1963) approximation. The Jeans parameter quantifies the ratio of gravitational binding energy to thermal energy:
 
-$$\lambda_J = \frac{v_{\mathrm{esc}}^2 \, m}{2 \, k_B \, T} \tag{D15}$$
+$$\lambda_J = \frac{v_{\mathrm{esc}}^2 \thinspace m}{2 \thinspace k_B \thinspace T} \tag{D15}$$
 
 The escape fraction is:
 
-$$f_{\mathrm{esc}} = \begin{cases} 0 & \lambda_J > 50 \\[4pt] \dfrac{e^{-\lambda_J}(1 + \lambda_J)}{2\sqrt{\pi\,\lambda_J}} & 2 \le \lambda_J \le 50 \\[4pt] 0.5 & \lambda_J < 2 \end{cases} \tag{D16}$$
+$$
+f_{\mathrm{esc}} = \begin{cases}
+0 & \lambda_J > 50 \\
+\dfrac{e^{-\lambda_J}(1 + \lambda_J)}{2\sqrt{\pi\thinspace\lambda_J}} & 2 \le \lambda_J \le 50 \\
+0.5 & \lambda_J < 2
+\end{cases} \tag{D16}
+$$
 
 **Table D3.** Jeans escape parameter and escape fraction for H$_2$O on Europa.
 
@@ -191,7 +197,7 @@ We adopt the global sputtering rates from Cassidy et al. (2013), summarized in T
 
 The mean H$_2$O sputtering flux averaged over Europa's surface ($A_E = 3.09 \times 10^{13}$ m$^2$) is:
 
-$$\bar{\Phi}_{\mathrm{sput}} = \frac{\dot{N}_{\mathrm{H_2O}} \, m}{A_E} = \frac{2.0 \times 10^{27} \times 2.99 \times 10^{-26}}{3.09 \times 10^{13}} = 1.94 \times 10^{-12} \text{ kg/m}^2\text{/s} \tag{D17}$$
+$$\bar{\Phi}_{\mathrm{sput}} = \frac{\dot{N}_{\mathrm{H_2O}} \thinspace m}{A_E} = \frac{2.0 \times 10^{27} \times 2.99 \times 10^{-26}}{3.09 \times 10^{13}} = 1.94 \times 10^{-12} \text{ kg/m}^2\text{/s} \tag{D17}$$
 
 ### D.5.2 Spatial Distribution
 
@@ -213,11 +219,11 @@ where $E_{\mathrm{pol}} = 1.2$ is the polar enhancement factor. This linear para
 
 The sputtering yield increases with temperature due to thermally-enhanced diffusion of radiolytic products to the surface (Teolis et al. 2017):
 
-$$Y(T) = Y_0 \left[1 + q_0 \, \exp\!\left(\frac{-Q}{k_B \, T}\right)\right] \tag{D20}$$
+$$Y(T) = Y_0 \left[1 + q_0 \thinspace \exp\negthinspace\left(\frac{-Q}{k_B \thinspace T}\right)\right] \tag{D20}$$
 
 where $q_0 = 1000$ is a dimensionless prefactor and $Q = 0.06$ eV is the activation energy for thermally-enhanced sputtering. We normalize the yield relative to a reference temperature $T_{\mathrm{ref}} = 100$ K:
 
-$$\hat{Y}(T) = \frac{1 + q_0 \, e^{-Q/(k_B T)}}{1 + q_0 \, e^{-Q/(k_B T_{\mathrm{ref}})}} \tag{D21}$$
+$$\hat{Y}(T) = \frac{1 + q_0 \thinspace e^{-Q/(k_B T)}}{1 + q_0 \thinspace e^{-Q/(k_B T_{\mathrm{ref}})}} \tag{D21}$$
 
 **Table D5.** Temperature-dependent sputtering yield enhancement.
 
@@ -234,7 +240,7 @@ $$\hat{Y}(T) = \frac{1 + q_0 \, e^{-Q/(k_B T)}}{1 + q_0 \, e^{-Q/(k_B T_{\mathrm
 
 The sputtering mass flux at mesh face $i$ is:
 
-$$\Phi_{\mathrm{sput},i} = \bar{\Phi}_{\mathrm{sput}} \; f_{\mathrm{lon},i} \; f_{\mathrm{lat},i} \; \hat{Y}(T_i) \; S \tag{D22}$$
+$$\Phi_{\mathrm{sput},i} = \bar{\Phi}_{\mathrm{sput}} \thickspace f_{\mathrm{lon},i} \thickspace f_{\mathrm{lat},i} \thickspace \hat{Y}(T_i) \thickspace S \tag{D22}$$
 
 where $S$ is a user-configurable rate scale factor (default $S = 1$).
 
@@ -242,7 +248,7 @@ where $S$ is a user-configurable rate scale factor (default $S = 1$).
 
 Sublimation exceeds the mean sputtering flux at $T \gtrsim 125$ K. At Europa's subsolar point ($\sim 130$ K), sublimation dominates by approximately an order of magnitude. At nightside and polar temperatures ($80$--$100$ K), sputtering dominates by many orders of magnitude. The sputtering-sublimation crossover temperature is a critical boundary: above it, ice loss is controlled by thermodynamics and is highly sensitive to surface temperature; below it, ice loss is controlled by magnetospheric conditions and is relatively temperature-insensitive.
 
-Sputtered H$_2$O molecules are assumed to follow the same ballistic transport as sublimated molecules. Of the sputtered products, H$_2$O constitutes approximately 85% of the mass flux; the remainder is O$_2$ ($\sim 10\%$) and H$_2$ ($\sim 5\%$), with escape fractions of approximately 90% and 95%, respectively (these lighter species have much lower Jeans parameters and escape efficiently).
+Sputtered H$_2$O molecules are assumed to follow the same ballistic transport as sublimated molecules. Of the sputtered products, H$_2$O constitutes approximately 85% of the mass flux; the remainder is O$_2$ ($\sim 10$%) and H$_2$ ($\sim 5$%), with escape fractions of approximately 90% and 95%, respectively (these lighter species have much lower Jeans parameters and escape efficiently).
 
 Key assumptions: (1) Steady-state magnetospheric conditions (no time variation from Jovian magnetotail passages). (2) Smooth cosine variation of the ion flux, simplified from full particle-tracing simulations. (3) Sputtered H$_2$O molecules have the same velocity distribution as sublimated molecules.
 
@@ -258,7 +264,7 @@ The primary state variable is the non-ice concentration $c$ (dimensionless, $0 \
 
 The ice mass per unit area in the layer is:
 
-$$m_{\mathrm{ice}} = (1 - c) \; \delta_{\mathrm{th}} \; \rho_{\mathrm{ice}} \tag{D23}$$
+$$m_{\mathrm{ice}} = (1 - c) \thickspace \delta_{\mathrm{th}} \thickspace \rho_{\mathrm{ice}} \tag{D23}$$
 
 where $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth (default value, appropriate for Europa's ice regolith with thermal inertia $\sim 60$ SI units) and $\rho_{\mathrm{ice}} = 917$ kg/m$^3$ is the water ice density.
 
@@ -266,13 +272,13 @@ where $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth (default value, 
 
 **Sublimation and sputtering** remove ice from the layer, increasing $c$:
 
-$$\Delta c = \frac{\Delta m_{\mathrm{loss}}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}} \tag{D24}$$
+$$\Delta c = \frac{\Delta m_{\mathrm{loss}}}{\delta_{\mathrm{th}} \thickspace \rho_{\mathrm{ice}}} \tag{D24}$$
 
 where $\Delta m_{\mathrm{loss}}$ is the ice mass removed per unit area over a timestep (from either sublimation or sputtering). Sublimation and sputtering are only active when $c < 1$ (ice is present).
 
 **Deposition** fills void space with fresh ice, decreasing $c$:
 
-$$\Delta c = -\frac{\min\!\bigl(\Delta m_{\mathrm{dep}},\; c \, \delta_{\mathrm{th}} \, \rho_{\mathrm{ice}}\bigr)}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}} \tag{D25}$$
+$$\Delta c = -\frac{\min\negthinspace\bigl(\Delta m_{\mathrm{dep}},\thickspace c \thinspace \delta_{\mathrm{th}} \thinspace \rho_{\mathrm{ice}}\bigr)}{\delta_{\mathrm{th}} \thickspace \rho_{\mathrm{ice}}} \tag{D25}$$
 
 Deposition cannot reduce $c$ below zero (the layer cannot hold more ice than its volume allows).
 
@@ -294,15 +300,15 @@ Water ice on Europa exists in a competition between thermally driven crystalliza
 
 The crystallization rate follows Avrami kinetics as parameterized by Mitchell et al. (2017) for water ice:
 
-$$k_{\mathrm{cryst}}^{1/n} = A_0^{1/n} \, \exp\!\left(\frac{-\Delta H_a}{R \, T}\right) \tag{D26}$$
+$$k_{\mathrm{cryst}}^{1/n} = A_0^{1/n} \thinspace \exp\negthinspace\left(\frac{-\Delta H_a}{R \thinspace T}\right) \tag{D26}$$
 
-$$k_{\mathrm{eff}} = n \; k_{\mathrm{cryst}}^{1/n} \tag{D27}$$
+$$k_{\mathrm{eff}} = n \thickspace k_{\mathrm{cryst}}^{1/n} \tag{D27}$$
 
 where $A_0^{1/n} = 3.9 \times 10^{19}$ s$^{-1}$ is the pre-exponential factor (Mitchell et al. 2017, Table 2, Stage 2), $\Delta H_a = 62$ kJ/mol is the activation energy, $R = 8.314$ J/(mol$\cdot$K) is the gas constant, and $n$ is the Avrami exponent.
 
 The Avrami exponent depends on ice porosity, reflecting the dimensionality of crystal growth (Mitchell et al. 2017):
 
-$$n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}}) \, \frac{\varphi}{\varphi_{\max}} \tag{D28}$$
+$$n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}}) \thinspace \frac{\varphi}{\varphi_{\max}} \tag{D28}$$
 
 where $n_{\mathrm{low}} = 4.0$ (compact ice: bulk nucleation with 3D growth), $n_{\mathrm{high}} = 1.5$ (porous ice: predominantly 1D growth along pore walls), and $\varphi_{\max} = 0.7$. We adopt latitude-dependent porosities of $\varphi_{\mathrm{eq}} = 0.50$ at the equator and $\varphi_{\mathrm{pol}} = 0.20$ at the poles, with linear interpolation, broadly consistent with ALMA-derived porosity estimates (Thelen et al. 2024).
 
@@ -329,11 +335,11 @@ where $\dot{D}$ is the local radiation energy deposition rate [eV/(molecule$\cdo
 
 The radiation dose rate varies spatially following the energetic ion flux patterns from Nordheim et al. (2022):
 
-$$\dot{D}(\phi_{\mathrm{lat}}, \phi_{\mathrm{lon}}) = \dot{D}_0 \; f_{\mathrm{lon}}^{(\mathrm{dose})} \; f_{\mathrm{lat}}^{(\mathrm{dose})} \tag{D30}$$
+$$\dot{D}(\phi_{\mathrm{lat}}, \phi_{\mathrm{lon}}) = \dot{D}_0 \thickspace f_{\mathrm{lon}}^{(\mathrm{dose})} \thickspace f_{\mathrm{lat}}^{(\mathrm{dose})} \tag{D30}$$
 
 **Longitude factor** (S$^+$ ion flux):
 
-$$f_{\mathrm{lon}}^{(\mathrm{dose})} = \frac{1}{C_D} + \left(1 - \frac{1}{C_D}\right) \max\!\left(0,\; \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}\right) \tag{D31}$$
+$$f_{\mathrm{lon}}^{(\mathrm{dose})} = \frac{1}{C_D} + \left(1 - \frac{1}{C_D}\right) \max\negthinspace\left(0,\thickspace \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}\right) \tag{D31}$$
 
 **Latitude factor** (O$^+$ and S$^+$ at $\sim 1$ keV):
 
@@ -347,11 +353,11 @@ We note that the radiation dose distribution uses different spatial parameters t
 
 The crystalline fraction evolves according to the competition ODE:
 
-$$\frac{d\phi_C}{dt} = k_{\mathrm{cryst}}(T) \, (1 - \phi_C) - k_{\mathrm{amorph}} \, \phi_C \tag{D33}$$
+$$\frac{d\phi_C}{dt} = k_{\mathrm{cryst}}(T) \thinspace (1 - \phi_C) - k_{\mathrm{amorph}} \thinspace \phi_C \tag{D33}$$
 
 This linear ODE has the analytical solution:
 
-$$\phi_C(t) = \phi_{\mathrm{eq}} + \bigl[\phi_C(0) - \phi_{\mathrm{eq}}\bigr] \, \exp\!\bigl[-(k_{\mathrm{cryst}} + k_{\mathrm{amorph}}) \, t\bigr] \tag{D34}$$
+$$\phi_C(t) = \phi_{\mathrm{eq}} + \bigl[\phi_C(0) - \phi_{\mathrm{eq}}\bigr] \thinspace \exp\negthinspace\bigl[-(k_{\mathrm{cryst}} + k_{\mathrm{amorph}}) \thinspace t\bigr] \tag{D34}$$
 
 where the equilibrium crystalline fraction is:
 
@@ -359,15 +365,15 @@ $$\phi_{\mathrm{eq}} = \frac{k_{\mathrm{cryst}}}{k_{\mathrm{cryst}} + k_{\mathrm
 
 The temperature dependence of the equilibrium crystallinity has a characteristic sigmoid shape, arising from the balance between the Arrhenius-activated crystallization rate (exponential in $1/T$) and the temperature-independent radiation amorphization rate. We can derive the transition temperature $T^*$ where $\phi_{\mathrm{eq}} = 0.5$, which requires $k_{\mathrm{cryst}}(T^*) = k_{\mathrm{amorph}}$. From Equations D27 and D29:
 
-$$n \, A_0^{1/n} \, \exp\!\left(\frac{-\Delta H_a}{R \, T^*}\right) = \frac{\dot{D}}{E_{\mathrm{amorph}}} \tag{D36}$$
+$$n \thinspace A_0^{1/n} \thinspace \exp\negthinspace\left(\frac{-\Delta H_a}{R \thinspace T^*}\right) = \frac{\dot{D}}{E_{\mathrm{amorph}}} \tag{D36}$$
 
 Solving for $T^*$:
 
-$$T^* = \frac{\Delta H_a}{R \, \ln\!\left(\frac{n \, A_0^{1/n} \, E_{\mathrm{amorph}}}{\dot{D}}\right)} \tag{D37}$$
+$$T^* = \frac{\Delta H_a}{R \thinspace \ln\negthinspace\left(\frac{n \thinspace A_0^{1/n} \thinspace E_{\mathrm{amorph}}}{\dot{D}}\right)} \tag{D37}$$
 
 For compact ice ($n = 4$) at the trailing equator ($\dot{D} = \dot{D}_0 = 2.3 \times 10^{-6}$ eV/(molecule$\cdot$s)):
 
-$$T^* = \frac{62{,}000}{8.314 \times \ln\!\left(\frac{4 \times 3.9 \times 10^{19} \times 3.0}{2.3 \times 10^{-6}}\right)} = \frac{62{,}000}{8.314 \times 59.6} \approx 125 \text{ K} \tag{D38}$$
+$$T^* = \frac{62{,}000}{8.314 \times \ln\negthinspace\left(\frac{4 \times 3.9 \times 10^{19} \times 3.0}{2.3 \times 10^{-6}}\right)} = \frac{62{,}000}{8.314 \times 59.6} \approx 125 \text{ K} \tag{D38}$$
 
 This transition temperature falls squarely within the range of Europa's diurnal surface temperature variations ($86$--$132$ K), explaining why both crystalline and amorphous ice are observed on the surface. The transition is sharp because the crystallization rate changes by orders of magnitude over a few kelvin (Table D6), while the amorphization rate is essentially constant. At the leading hemisphere, the dose rate is $\sim 5\times$ lower, shifting $T^*$ down by $\sim 5$ K, which is consistent with JWST observations showing crystalline ice at warm, leading-hemisphere locations (Cartwright et al. 2025).
 
@@ -385,7 +391,7 @@ This transition temperature falls squarely within the range of Europa's diurnal 
 
 Freshly deposited ice at Europa's surface temperatures ($< 150$ K) is amorphous. When new ice of mass $\Delta m_{\mathrm{dep}}$ is deposited on a face with existing ice mass $m_{\mathrm{old}}$, the crystalline fraction is diluted by mass-weighted mixing:
 
-$$\phi_{C,\mathrm{new}} = \phi_{C,\mathrm{old}} \; \frac{m_{\mathrm{old}}}{m_{\mathrm{old}} + \Delta m_{\mathrm{dep}}} \tag{D39}$$
+$$\phi_{C,\mathrm{new}} = \phi_{C,\mathrm{old}} \thickspace \frac{m_{\mathrm{old}}}{m_{\mathrm{old}} + \Delta m_{\mathrm{dep}}} \tag{D39}$$
 
 This provides a third amorphization pathway beyond radiation, particularly important in polar regions where deposition rates are high.
 
@@ -409,9 +415,9 @@ $$\bar{\Phi}_{\mathrm{sub},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{sub
 
 **Step 2: Epoch extrapolation.** Apply the time-averaged fluxes over one epoch of $N_c$ diurnal cycles:
 
-$$\Delta t_{\mathrm{epoch}} = N_c \; P_{\mathrm{diurnal}} \tag{D41}$$
+$$\Delta t_{\mathrm{epoch}} = N_c \thickspace P_{\mathrm{diurnal}} \tag{D41}$$
 
-$$\Delta c_i = \frac{\bar{\Phi}_{\mathrm{sub},i} + \bar{\Phi}_{\mathrm{sput},i} - \bar{\Phi}_{\mathrm{dep},i}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}} \; \Delta t_{\mathrm{epoch}} \tag{D42}$$
+$$\Delta c_i = \frac{\bar{\Phi}_{\mathrm{sub},i} + \bar{\Phi}_{\mathrm{sput},i} - \bar{\Phi}_{\mathrm{dep},i}}{\delta_{\mathrm{th}} \thickspace \rho_{\mathrm{ice}}} \thickspace \Delta t_{\mathrm{epoch}} \tag{D42}$$
 
 The crystalline fraction is also evolved analytically over the epoch using Equation D34.
 
@@ -421,7 +427,7 @@ The crystalline fraction is also evolved analytically over the epoch using Equat
 
 As ice is progressively removed from warm faces ($c \to 1$), the sublimation flux from those faces decreases. To maintain global mass conservation, the deposition flux is rescaled:
 
-$$\bar{\Phi}_{\mathrm{dep}}^{(\mathrm{scaled})} = \bar{\Phi}_{\mathrm{dep}}^{(\mathrm{base})} \; \frac{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{current})}}{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{base})}} \tag{D43}$$
+$$\bar{\Phi}_{\mathrm{dep}}^{(\mathrm{scaled})} = \bar{\Phi}_{\mathrm{dep}}^{(\mathrm{base})} \thickspace \frac{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{current})}}{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{base})}} \tag{D43}$$
 
 where $\Phi_{\mathrm{em},i}^{(\mathrm{base})}$ is the emission flux computed with the initial (undepleted) state and $\Phi_{\mathrm{em},i}^{(\mathrm{current})}$ reflects the current ice availability (zero emission from ice-depleted faces).
 
