@@ -34,6 +34,18 @@ CLASSIFICATION_CASES = [
     ("Calculating illumination: 42.5%", "info"),
     ("Simulation completed in 5.030 seconds (5030 ms)", "info"),
     ("FATAL: Failed to load mesh from crater.ply", "error"),
+    # The startup guards tag their fatals. Verbatim from the engine:
+    ("FATAL [gpu]: this binary was built WITHOUT GPU support, but the run "
+     "requests the GPU thermal solver.", "error"),
+    ("FATAL [mesh-units]: mesh units are ambiguous", "error"),
+    ("FATAL [coupling]: radiation.coupling_mode unknown", "error"),
+    ("FATAL [exchange]: unknown exchange_selection", "error"),
+    ("[FATAL] Caught signal 11", "error"),
+    ("[FATAL] Backtrace:", "error"),
+    # ...and the word inside another word must not fire.
+    ("fatality rate of the cold trap", "info"),
+    ("0 errors", "info"),
+    ("[Statistics] Exported to output/quickstart_moon_diurnal/statistics", "info"),
     ("ERROR: mesh file not found", "error"),
     ("terminate called after throwing an instance of 'std::runtime_error'", "error"),
     ("Segmentation fault: 11", "error"),

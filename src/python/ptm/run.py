@@ -55,8 +55,17 @@ find_engine_executable = paths.find_engine_executable
 # Genuine-failure signatures (error) are kept narrow so ordinary banners are
 # never reported as errors; a real failure also carries a non-zero exit code,
 # which the caller sees independently.
+#
+# The engine spells a fatal in three ways, and all three must match:
+#     FATAL: Failed to load mesh from ...
+#     FATAL [gpu]: GPU requested but this binary is CPU-only
+#     [FATAL] Caught signal 11
+# The bracketed tag forms are the ones the startup guards use -- [gpu],
+# [mesh-units], [coupling], [exchange] -- so the optional tag and the closing
+# bracket below are not decoration.
 _ERROR_RE = re.compile(
-    r'(?<![A-Za-z])(?:FATAL|ERROR)\s*:'          # "ERROR:" / "FATAL:"
+    r'(?<![A-Za-z])(?:FATAL|ERROR)'
+    r'\s*(?:\[[^\]\n]{0,40}\])?\s*[:\]]'         # FATAL: / FATAL [gpu]: / [FATAL]
     r'|traceback \(most recent call last\)'
     r'|segmentation fault|abort trap|bus error|core dumped'
     r'|terminate called|what\(\):|std::bad_alloc|std::runtime_error'
