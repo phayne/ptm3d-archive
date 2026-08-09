@@ -195,7 +195,7 @@ functionality are summarized in this file; no lookup elsewhere is required to us
   so a ring built without `--elev-scale 0.5` comes out exactly 2× too tall and over-shadows grazing
   sun. `scripts/build_lola_ring.py` now aborts rather than assuming 1.0 when the raster is an
   integer type and carries no scale metadata; projected Float32 `.tif` sources are unaffected
-  (scale 1.0, byte-identical output). Background: `docs/ptm21-ring-scale-fix.md`. (PTM-21)
+  (scale 1.0, byte-identical output).
 
 ## GPU backends
 

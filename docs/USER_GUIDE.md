@@ -305,9 +305,9 @@ generic_body:                # For arbitrary bodies
 ```
 
 See [`../examples/`](../examples/) for runnable configurations (relative paths
-only; start with `quickstart_moon_diurnal.yaml`). The configs under
-`examples/campaigns/` are internal production-campaign artifacts with
-machine-specific paths and are **not** runnable from a clone.
+only; start with `quickstart_moon_diurnal.yaml`). The study configurations under
+`../configs/` are kept for provenance and may reference datasets and paths that
+are not distributed.
 
 ---
 

@@ -1,6 +1,6 @@
 # External-data placeholders (`external/`)
 
-Some **internal study configs** (in `configs/` and `examples/campaigns/`)
+Some **study configurations** (in `configs/`)
 reference datasets that PTM3D does not distribute — collaborator DEMs (e.g. the
 Europa SOCET stereo DEMs under `sutton_DEMs/`), large intermediate terrain
 products (`dtm/`, `moon3d/`), and private analysis inputs (`research/`).

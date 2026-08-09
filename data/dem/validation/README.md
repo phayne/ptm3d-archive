@@ -2,8 +2,7 @@
 
 Terrain meshes, occluder rings, and precomputed view-factor files for the
 Diviner cross-validation sites (Haworth, Faustini, Shackleton, and a sunlit
-control site), plus the LOLA 20 m polar-stereographic source rasters. These are
-referenced by the `divval_*` configs in `examples/campaigns/`.
+control site), plus the LOLA 20 m polar-stereographic source rasters.
 
 **Not in git.** Fetch with:
 
