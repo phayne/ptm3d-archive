@@ -230,6 +230,12 @@ not distributed.
   `configs/` may reference datasets and machine-specific paths that are not distributed.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
   individual test programs directly (as in §6).
+- `rebuild.sh` in the repository root is a **macOS developer convenience script, not the
+  supported build path**. It deletes the contents of `build/`, passes none of
+  `-DPTM_ENABLE_GPU` / `-DPTM_ARCH_NATIVE` / `-DCSPICE_ROOT`, and so produces a **CPU-only**
+  binary tuned to the build host's own CPU (`-march=native`), covering every default target
+  rather than `ptm_thermal_sim` alone. It states all of that when it starts. Use §3 unless you
+  specifically want those defaults.
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver
