@@ -207,6 +207,28 @@ spectral spin-up and prints `[test_equilibration_dt] PASS`. All three are
 CPU-only and take seconds. There is no `ctest`/`pytest` — the tests are
 standalone executables, listed in [INSTALL.md §6](INSTALL.md).
 
+### 7. Get to a picture: the tutorial notebooks
+
+Four executed Jupyter notebooks take a config to a figure and explain what the
+figure shows. They are committed **with their outputs**, so the plots render on
+GitHub before you run anything, and each is CPU-only:
+
+| Notebook | Body | Covers | Engine runtime |
+|---|---|---|---|
+| [01 `moon_diurnal`](docs/tutorials/notebooks/01_moon_diurnal.ipynb) | Moon | Config anatomy, the binary output format, temperature maps, the diurnal curve, day/night contrast with latitude, and the same run on real LOLA topography | 36 s (3 runs) |
+| [02 `europa_thermal`](docs/tutorials/notebooks/02_europa_thermal.ipynb) | Europa | A Jupiter eclipse inside the output window and its cooling signature, a spin-up-length check, and the observed Bond-albedo map against uniform ice | 34 s (3 runs) |
+| [03 `asteroid_thermal`](docs/tutorials/notebooks/03_asteroid_thermal.ipynb) | Synthetic asteroid | The generic-body path from orbital elements alone — no ephemeris file — at two thermal inertias, showing amplitude damping and phase lag | 21 s (2 runs) |
+| [04 `asteroid_spice`](docs/tutorials/notebooks/04_asteroid_spice.ipynb) | (101955) Bennu | The generic-body path on a real SPICE ephemeris and a real facet shape, at perihelion and aphelion | 53 s (3 runs) |
+
+```bash
+source .venv/bin/activate                    # the environment from step 5
+jupyter lab docs/tutorials/notebooks/
+```
+
+Data requirements per notebook, and the rest of the tutorial track, are in
+[docs/tutorials/README.md](docs/tutorials/README.md). Notebooks 03 and 04 need
+no science datasets and only a few hundred kB of SPICE.
+
 ### Science data (not needed for the quickstart)
 
 Topography, property and albedo maps, and the validation crater meshes are too
@@ -232,6 +254,7 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 | [INSTALL.md](INSTALL.md) | Dependencies, build options, SPICE kernel data, verification |
 | [TUTORIAL.md](TUTORIAL.md) | 10-minute laptop walkthrough |
 | [docs/tutorials/](docs/tutorials/) | Numbered tutorials: diurnal runs, crater radiosity, interpreting outputs |
+| [docs/tutorials/notebooks/](docs/tutorials/notebooks/) | Four executed Jupyter notebooks — Moon, Europa, a Keplerian asteroid, and Bennu — config to figure, with outputs committed |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | CLI reference, YAML schema, output formats, architecture, Python tools |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Every `PTM_*` environment variable, with status tags |
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
