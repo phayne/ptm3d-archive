@@ -84,6 +84,7 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
 | `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle; consulted only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
 | `equilibration_cycles` | int | -1 | Passes over the equilibration forcing array, GPU persistent solver only (-1 = the solver's value of 2) |
+| `eq_extrapolation` | map | off | Pass-stride extrapolation of the equilibration state; see below |
 | `compute_statistics` | bool | true | Compute and write per-face statistics |
 | `use_gpu` | bool | false | OpenCL thermal solver (a CPU-only build refuses at startup) |
 | `gpu_devices` | int | 1 | Devices in the thermal pool (0 = all enumerated) |
@@ -113,6 +114,60 @@ Runnable examples are in [`../examples/`](../examples/); start with
 The checkpoint files are used by the chunked-run workflow
 (`scripts/run_chunked_simulation.py` and `ptm_merge_chunks`).
 
+
+### Equilibration extrapolation (`thermal.eq_extrapolation`)
+
+The GPU equilibration phase replays one forcing block several times
+(`equilibration_cycles`). Because the same block is replayed unchanged, the
+temperature field after each pass is a fixed-point iteration, and its limit can
+be estimated from a few passes instead of reached by brute force. Enabling this
+option applies reduced-rank extrapolation to that sequence and then runs the
+final pass from the extrapolated state, so the last pass serves as polish,
+verification and delivered state at once.
+
+Default is `off`, and with it off the solver takes the pre-existing code path
+and produces byte-identical output.
+
+```yaml
+thermal:
+  equilibration_cycles: 5
+  eq_extrapolation:
+    method: rre        # off | rre          (default off)
+    order_p: 4         # 3 or 4; needs equilibration_cycles >= order_p + 1
+    tol_K: 0.5         # certificate reporting threshold, K
+    hold_K: 1.0e-3     # per-pass increment below which a layer is held, K
+```
+
+`order_p` below 3 is refused rather than adjusted: a second-order fit is less
+accurate than not extrapolating at all. If `equilibration_cycles` is smaller
+than `order_p + 1` the run warns and uses plain cycling.
+
+Every run reports a one-line summary of how many faces were extrapolated, how
+many the certificate declined, the 95th-percentile error estimate, the fraction
+of layers held, and the number of near-degenerate windows.
+
+**Accuracy and where it applies.** On a 509,337-face lunar polar mesh at
+`order_p: 4` with five passes, the extrapolated state was 55x closer (sunlit
+faces) and 64x closer (seasonal-terminator faces) to a 200-lunation reference
+than four passes of plain cycling, for 1.18x the wall-clock of four passes. The
+benefit accrues to faces that carry energy; about 70 percent of that mesh is
+already converged at depth after four passes and gains nothing.
+
+**A known limitation.** The fit assigns a weight to the first snapshot in its
+window, which is the initial guess. For a depth layer that converged early while
+shallower layers were still evolving, that weight can pull the layer back toward
+the initial guess. The displacement is bounded by
+
+    displacement  <=  |gamma_0| * (initial-guess error at that depth)
+
+with `gamma_0` the weight on the first snapshot, measured at about 0.09 - so
+roughly ten percent of the initial-guess error, not an amplification of it. The
+`hold_K` test suppresses this by holding any layer whose last-pass increment is
+below the threshold, and the run reports how many windows remain susceptible.
+On the mesh above, 73 of 509,337 faces retained a displacement, the largest
+0.47 K at 1 m depth, all on faces receiving no flux during equilibration.
+Raising `hold_K` holds more layers and trades extrapolation speed-up for
+robustness; the layers it holds simply converge at the ordinary rate.
 ## illumination
 
 | Key | Type | Default | Description |
