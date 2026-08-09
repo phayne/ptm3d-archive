@@ -54,15 +54,49 @@ brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
 ```
 
 ### CSPICE (both platforms — manual)
-CSPICE is distributed by NASA NAIF, not a package manager:
+
+CSPICE is distributed by NASA NAIF, not a package manager. It is shipped as a **prebuilt static
+library, one package per CPU architecture** — so pick the package that matches the machine you
+are building on:
+
+| Build host | NAIF package directory | Download |
+|---|---|---|
+| Linux, x86_64 | `PC_Linux_GCC_64bit` | ~41 MB compressed |
+| macOS, **Apple Silicon** (`uname -m` → `arm64`) | `MacM1_OSX_clang_64bit` | ~40 MB compressed |
+| macOS, Intel (`uname -m` → `x86_64`) | `MacIntel_OSX_AppleC_64bit` | ~40 MB compressed |
+
+The snippet below selects the right one for you:
+
 ```bash
-# Linux:  PC_Linux_GCC_64bit ; macOS: MacIntel_OSX_AppleC_64bit
-URL=https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z
+case "$(uname -s)/$(uname -m)" in
+  Linux/*)       NAIF_PKG=PC_Linux_GCC_64bit        ;;
+  Darwin/arm64)  NAIF_PKG=MacM1_OSX_clang_64bit     ;;   # Apple Silicon (M1/M2/M3/M4)
+  Darwin/x86_64) NAIF_PKG=MacIntel_OSX_AppleC_64bit ;;   # Intel Mac
+  *) echo "No NAIF package mapping for $(uname -s)/$(uname -m)"; exit 1 ;;
+esac
+URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/${NAIF_PKG}/packages/cspice.tar.Z"
 curl -sSL "$URL" -o cspice.tar.Z && gzip -d cspice.tar.Z && tar xf cspice.tar
-# CMake's find_library wants libcspice.a:
+# CMake's find_library wants libcspice.a; NAIF ships lib/cspice.a:
 cp cspice/lib/cspice.a cspice/lib/libcspice.a
 export CSPICE_ROOT="$PWD/cspice"
 ```
+
+**On Apple Silicon, verify the architecture before you build.** CMake's `find_library` only checks
+that `libcspice.a` *exists*; it does not check what it was compiled for. Handing an arm64 build the
+Intel (`MacIntel_OSX_AppleC_64bit`) package therefore **configures cleanly and then fails at the
+link step**, because the linker silently ignores an archive built for another architecture and
+every SPICE symbol (`_furnsh_c`, `_spkezr_c`, …) comes out undefined for `arm64`. One command
+settles it:
+
+```bash
+lipo -info "$CSPICE_ROOT/lib/libcspice.a"
+# -> ... is architecture: arm64     correct on an Apple Silicon Mac
+# -> ... is architecture: x86_64    wrong package — re-download MacM1_OSX_clang_64bit
+```
+
+(An Intel Mac wants the opposite answer, `x86_64`. Running an arm64 build under Rosetta is not
+supported here; build natively.)
+
 PTM3D resolves CSPICE from `-DCSPICE_ROOT=`, then `$CSPICE_ROOT`/`$CSPICE_DIR`, then common
 prefixes. If it cannot find `libcspice.a`, the configure step stops with a clear error message
 saying what to set.
@@ -146,7 +180,23 @@ fetched the same way with `python3 scripts/fetch_data.py --core` (~1.7 GB) — s
 `data/README.md` for the catalog, and `$PTM_DATA_ROOT` in `docs/ENVIRONMENT.md` to keep
 the data outside the repository. The quickstart example needs only the SPICE kernels.
 
-## 5. Verify the build (correctness gates)
+## 5. Python environment (QA, notebooks, plots)
+
+The engine and the correctness gates need no Python packages. The QA checker
+(`scripts/ptm_qa.py`), the tutorial notebooks and every plotting route do:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+The root `requirements.txt` is the environment for the documented path — numpy,
+matplotlib, PyYAML, JupyterLab, and SpiceyPy (needed by notebook 04 only). Two
+narrower files exist for the parts of the repository beyond it:
+`scripts/requirements.txt` (scipy, astropy and the rest of the analysis and
+figure tooling) and `gui/requirements.txt` (PyQt6, PyVista and the desktop GUI).
+
+## 6. Verify the build (correctness gates)
 
 ```bash
 # Radiation gate (Ingersoll bowl crater — analytic):
@@ -159,7 +209,7 @@ c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp
 python3 scripts/test_ptm_run_guard.py
 ```
 
-## 6. Run something
+## 7. Run something
 
 See `TUTORIAL.md` for a 10-minute laptop walkthrough. The quickstart (from the repo root,
 after fetching kernels per §4):
@@ -167,19 +217,25 @@ after fetching kernels per §4):
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-**Take your configurations from `examples/`, not `configs/`.** The 19 files at the top of
-`examples/` are the colleague-facing set and most of them are CPU-only. `configs/` (55 files)
+**Take your configurations from `examples/`, not `configs/`.** The 21 files at the top of
+`examples/` are the colleague-facing set and 20 of them are CPU-only. `configs/` (55 files)
 holds study inputs kept for provenance: 47 of the 55 set `thermal.use_gpu: true`, so on the
 CPU-only build of §3 they stop immediately with `FATAL [gpu]` (set `thermal.use_gpu: false`
 to run them on the CPU), and several reference meshes, DEMs or view-factor files that are
 not distributed.
 
-## 7. Known caveats (from the portability audit)
+## 8. Known caveats (from the portability audit)
 
 - Files directly under `examples/` use relative paths and run from a clone. Files under
   `configs/` may reference datasets and machine-specific paths that are not distributed.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
-  individual test programs directly (as in §5).
+  individual test programs directly (as in §6).
+- `rebuild.sh` in the repository root is a **macOS developer convenience script, not the
+  supported build path**. It deletes the contents of `build/`, passes none of
+  `-DPTM_ENABLE_GPU` / `-DPTM_ARCH_NATIVE` / `-DCSPICE_ROOT`, and so produces a **CPU-only**
+  binary tuned to the build host's own CPU (`-march=native`), covering every default target
+  rather than `ptm_thermal_sim` alone. It states all of that when it starts. Use §3 unless you
+  specifically want those defaults.
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver

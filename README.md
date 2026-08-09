@@ -81,8 +81,8 @@ cannot see the repository — ask Paul to add your GitHub username, then retry.
 | C++ compiler | C++17 — GCC 10+, Clang 12+, AppleClang | `build-essential` · Xcode Command Line Tools |
 | Embree | **4.x** (not 3.x) | `apt install libembree-dev` · `brew install embree` |
 | Eigen3, CFITSIO, yaml-cpp, OpenMP | any recent | `apt install libeigen3-dev libcfitsio-dev libyaml-cpp-dev libomp-dev pkg-config` · `brew install eigen cfitsio yaml-cpp libomp pkg-config` |
-| CSPICE | N0067+ | **not in apt/brew** — download from NASA NAIF, [INSTALL.md §2](INSTALL.md) |
-| Python | 3.8+, standard library only | `scripts/fetch_kernels.py`, `fetch_data.py`, `ptm_qa.py`, `ptm_mem_estimate.py` |
+| CSPICE | N0067+ | **not in apt/brew** — download from NASA NAIF, matching your CPU architecture (Apple Silicon needs the `MacM1_OSX_clang_64bit` package, not the Intel one): [INSTALL.md §2](INSTALL.md) |
+| Python | 3.8+ | Standard library only for `scripts/fetch_kernels.py`, `fetch_data.py`, `ptm_mem_estimate.py`. `ptm_qa.py`, the notebooks and every plotting route need [`requirements.txt`](requirements.txt) — see step 5 |
 | OpenCL | optional | only for the GPU build |
 
 Per-platform commands, including the CSPICE download: [INSTALL.md](INSTALL.md).
@@ -101,6 +101,12 @@ cmake --build build --target ptm_thermal_sim -j
 ~12 s and ends with a summary block naming every library it resolved — read it
 before building; a missing CSPICE stops there with a message saying what to
 set. The build itself is ~50 s at `-j8` on a workstation.
+
+If configure succeeds but the **link** step ends in undefined SPICE symbols
+(`_furnsh_c`, `_spkezr_c`, …), the CSPICE package is built for the wrong CPU
+architecture — the usual case on Apple Silicon. Check it with
+`lipo -info "$CSPICE_ROOT/lib/libcspice.a"`; see
+[INSTALL.md §2](INSTALL.md#cspice-both-platforms--manual).
 
 **Which build did you get?** GPU support is opt-in: a `cmake` line without
 `-DPTM_ENABLE_GPU=ON` produces a CPU-only binary *even on a machine with a
@@ -171,7 +177,22 @@ For a 3D view of the same output, point the [GUI](#gui) at the run directory, or
 open `mesh.ply` in ParaView. Field-by-field walkthrough:
 [docs/tutorials/06_interpreting_outputs.md](docs/tutorials/06_interpreting_outputs.md).
 
-### 5. Confirm the install is sound
+### 5. Set up the Python environment (for QA, notebooks and plots)
+
+Everything up to here is C++ and the Python standard library. The QA check
+below, the tutorial notebooks and every plotting route need a few packages:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install -r requirements.txt   # numpy, matplotlib, pyyaml, jupyterlab, spiceypy
+```
+
+That is the whole environment for the documented path.
+[`scripts/requirements.txt`](scripts/requirements.txt) adds the wider analysis
+tooling (scipy, astropy) and [`gui/requirements.txt`](gui/requirements.txt) the
+desktop GUI; neither is needed for the walkthrough.
+
+### 6. Confirm the install is sound
 
 ```bash
 python3 scripts/ptm_qa.py thermal output/quickstart_moon_diurnal  # -> verdict: PASS
@@ -184,7 +205,29 @@ and range violations. `test_bowl_crater` is the analytic radiation gate (look
 for `Error: 0.49...%` and `Result: PASSED`); `test_equilibration_dt` gates the
 spectral spin-up and prints `[test_equilibration_dt] PASS`. All three are
 CPU-only and take seconds. There is no `ctest`/`pytest` — the tests are
-standalone executables, listed in [INSTALL.md §5](INSTALL.md).
+standalone executables, listed in [INSTALL.md §6](INSTALL.md).
+
+### 7. Get to a picture: the tutorial notebooks
+
+Four executed Jupyter notebooks take a config to a figure and explain what the
+figure shows. They are committed **with their outputs**, so the plots render on
+GitHub before you run anything, and each is CPU-only:
+
+| Notebook | Body | Covers | Engine runtime |
+|---|---|---|---|
+| [01 `moon_diurnal`](docs/tutorials/notebooks/01_moon_diurnal.ipynb) | Moon | Config anatomy, the binary output format, temperature maps, the diurnal curve, day/night contrast with latitude, and the same run on real LOLA topography | 36 s (3 runs) |
+| [02 `europa_thermal`](docs/tutorials/notebooks/02_europa_thermal.ipynb) | Europa | A Jupiter eclipse inside the output window and its cooling signature, a spin-up-length check, and the observed Bond-albedo map against uniform ice | 34 s (3 runs) |
+| [03 `asteroid_thermal`](docs/tutorials/notebooks/03_asteroid_thermal.ipynb) | Synthetic asteroid | The generic-body path from orbital elements alone — no ephemeris file — at two thermal inertias, showing amplitude damping and phase lag | 21 s (2 runs) |
+| [04 `asteroid_spice`](docs/tutorials/notebooks/04_asteroid_spice.ipynb) | (101955) Bennu | The generic-body path on a real SPICE ephemeris and a real facet shape, at perihelion and aphelion | 53 s (3 runs) |
+
+```bash
+source .venv/bin/activate                    # the environment from step 5
+jupyter lab docs/tutorials/notebooks/
+```
+
+Data requirements per notebook, and the rest of the tutorial track, are in
+[docs/tutorials/README.md](docs/tutorials/README.md). Notebooks 03 and 04 need
+no science datasets and only a few hundred kB of SPICE.
 
 ### Science data (not needed for the quickstart)
 
@@ -211,6 +254,7 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 | [INSTALL.md](INSTALL.md) | Dependencies, build options, SPICE kernel data, verification |
 | [TUTORIAL.md](TUTORIAL.md) | 10-minute laptop walkthrough |
 | [docs/tutorials/](docs/tutorials/) | Numbered tutorials: diurnal runs, crater radiosity, interpreting outputs |
+| [docs/tutorials/notebooks/](docs/tutorials/notebooks/) | Four executed Jupyter notebooks — Moon, Europa, a Keplerian asteroid, and Bennu — config to figure, with outputs committed |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | CLI reference, YAML schema, output formats, architecture, Python tools |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Every `PTM_*` environment variable, with status tags |
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
@@ -222,10 +266,10 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 
 ### Which configuration directory to start from
 
-**Start in [`examples/`](examples/), not `configs/`.** The 19 configurations at
+**Start in [`examples/`](examples/), not `configs/`.** The 21 configurations at
 the top level of `examples/` are the ones written to be read and run by someone
-who did not build the repository; most are CPU-only, and
-`quickstart_moon_diurnal.yaml` is the smallest.
+who did not build the repository; 20 of the 21 are CPU-only, and
+`quickstart_moon_diurnal.yaml` is the one to start from.
 
 `configs/` (55 YAML files at its top level) holds study inputs kept for
 provenance, not as onboarding material: 47 of the 55 set `thermal.use_gpu: true`,

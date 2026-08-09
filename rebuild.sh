@@ -1,9 +1,41 @@
 #!/bin/bash
-# Clean rebuild script for PTM with yaml-cpp support
+# Clean rebuild script for PTM with yaml-cpp support.
+#
+# THIS IS NOT THE SUPPORTED BUILD. The supported build is INSTALL.md section 3.
+# This script is a macOS developer convenience that predates the CMake options
+# INSTALL.md documents, and it differs from them in four ways that matter:
+#
+#   1. It produces a CPU-ONLY binary. It never passes -DPTM_ENABLE_GPU, so the
+#      CMake default (OFF, CMakeLists.txt:600) applies. A run whose config sets
+#      thermal.use_gpu: true will refuse to start with FATAL [gpu].
+#   2. It produces a NON-PORTABLE binary. It never passes -DPTM_ARCH_NATIVE, so
+#      the CMake default (ON, CMakeLists.txt:137) applies and the binary is
+#      compiled with -march=native for this exact CPU.
+#   3. It DELETES the build directory contents (rm -rf build/*, below) before
+#      configuring, discarding any existing build and its CMake cache.
+#   4. It never passes -DCSPICE_ROOT, so CSPICE is resolved from $CSPICE_ROOT /
+#      $CSPICE_DIR or a common prefix (CMakeLists.txt:364-380).
+#
+# It also builds the DEFAULT target set (every target), not just
+# ptm_thermal_sim, and it uses macOS-only tooling (sysctl, otool).
+#
+# The documented equivalent, which states each of these choices explicitly:
+#
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+#         -DPTM_ENABLE_GPU=OFF -DPTM_ARCH_NATIVE=OFF -DCSPICE_ROOT="$CSPICE_ROOT"
+#   cmake --build build --target ptm_thermal_sim -j
 
 set -e  # Exit on error
 
 echo "=== PTM3D Clean Rebuild with YAML Config Support ==="
+echo ""
+echo "  NOTE: this is the developer convenience script, not the supported build"
+echo "        path (INSTALL.md section 3). It will:"
+echo "          * delete the contents of ./build"
+echo "          * build a CPU-ONLY binary   (-DPTM_ENABLE_GPU not passed; default OFF)"
+echo "          * build a NON-PORTABLE binary (-DPTM_ARCH_NATIVE not passed; default ON,"
+echo "            i.e. -march=native for this machine)"
+echo "          * build every default target, not just ptm_thermal_sim"
 echo ""
 
 # Check if we're in project root
@@ -126,11 +158,16 @@ echo "5. Testing executable..."
 if [ -f "bin/ptm_thermal_sim" ]; then
     echo "   ✓ Executable found: bin/ptm_thermal_sim"
     
-    # Check if yaml-cpp is linked
-    if otool -L bin/ptm_thermal_sim | grep -q yaml-cpp; then
-        echo "   ✓ yaml-cpp is linked"
+    # Check if yaml-cpp is linked (otool is macOS-only; do not report a missing
+    # tool as a missing library)
+    if command -v otool &> /dev/null; then
+        if otool -L bin/ptm_thermal_sim | grep -q yaml-cpp; then
+            echo "   ✓ yaml-cpp is linked"
+        else
+            echo "   ℹ yaml-cpp not linked (config support disabled)"
+        fi
     else
-        echo "   ℹ yaml-cpp not linked (config support disabled)"
+        echo "   ℹ link check skipped (otool not available on this platform)"
     fi
     
     # Test help
@@ -158,6 +195,9 @@ echo ""
 echo "=== Build Complete ==="
 echo ""
 echo "Executable: $(pwd)/bin/ptm_thermal_sim"
+echo "GPU acceleration: OFF (CPU-only build -- this script never enables it)"
+echo "Portability: tuned to this CPU (-march=native); rebuild per INSTALL.md"
+echo "             section 3 with -DPTM_ARCH_NATIVE=OFF for a portable binary."
 if [ "$YAML_FOUND" = true ]; then
     echo "YAML config support: ENABLED"
     echo ""
