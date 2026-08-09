@@ -27,6 +27,61 @@ on:
   workflow_dispatch:
 
 jobs:
+  # The Python layer: no compiler, no CSPICE, no GPU. Fast enough to be the
+  # first signal on a push, and it is where config-key drift shows up -- the
+  # parity test re-derives the engine's 154 config keys and their defaults from
+  # src/cpp/tools/config_parser.{h,cpp} and fails if the committed table in
+  # ptm/engine_defaults.py no longer matches.
+  python-layer:
+    name: ${{ matrix.os }} Python layer
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # PyQt6 imports QtCore from a shared library that wants these on the
+      # bare runner image. The GUI is never displayed here -- the parity test
+      # imports gui_core to read the config writer, nothing more.
+      - name: Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+
+      - name: Install the package and the GUI's Qt dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install "PyQt6>=6.4"
+
+      - name: Config parity (Python layer vs config_parser.cpp)
+        run: python3 src/python/tests/test_config_parity.py
+
+      - name: Engine run driver (ptm.run, no engine needed)
+        run: python3 src/python/tests/test_engine_process.py
+
+      - name: The GUI still imports
+        env:
+          QT_QPA_PLATFORM: offscreen
+        working-directory: gui
+        run: |
+          python3 - <<'EOF'
+          import importlib, sys
+          sys.path.insert(0, ".")
+          # gui_core only: the panels pull in PyVista, which is not installed here.
+          for m in ("gui_core", "gui_core.config_manager", "gui_core.preflight",
+                    "gui_core.simulation_runner", "gui_core.data_exporter",
+                    "gui_core.datasets"):
+              importlib.import_module(m)
+              print("imported", m)
+          EOF
+
   build-and-test:
     name: ${{ matrix.os }} CPU
     runs-on: ${{ matrix.os }}

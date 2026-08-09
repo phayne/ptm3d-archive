@@ -27,8 +27,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 import pyvista as pv
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, DOUBLE_W, panel_label
+from ptm.pubstyle import apply_style, DOUBLE_W, panel_label
 
 REGOLITH = np.array([0.80, 0.76, 0.70])     # warm gray lunar tone
 LIGHT = np.array([0.9, 0.45, 0.55])          # oblique sun (mesh frame), normalized below

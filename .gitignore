@@ -32,6 +32,11 @@ __pycache__/
 venv/
 env/
 
+# Python packaging artifacts (pip install -e . writes the egg-info tree)
+*.egg-info/
+build/lib/
+dist/
+
 # Claude Code
 .claude/
 CLAUDE.md

@@ -40,7 +40,7 @@ try:
 except ImportError:
     GDAL_AVAILABLE = False
 
-from ptm_regridder import FIELD_INFO, STATISTICS_FIELDS, STAT_LABELS
+from ptm.results import FIELD_INFO, STATISTICS_FIELDS, STAT_LABELS
 
 
 def _find_gdal_tool(name):

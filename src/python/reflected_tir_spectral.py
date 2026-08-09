@@ -92,9 +92,8 @@ def main():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    sys.path.insert(0, str(Path(__file__).parent))
     try:
-        from ptm_pubstyle import apply_style
+        from ptm.pubstyle import apply_style
         apply_style()
     except Exception:
         pass

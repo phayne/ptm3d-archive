@@ -29,8 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, COLORS, DOUBLE_W, panel_label, load_face_mask
+from ptm.pubstyle import apply_style, COLORS, DOUBLE_W, panel_label, load_face_mask
 
 
 def load_stat(stat_dir: Path, field: str, name: str) -> np.ndarray:

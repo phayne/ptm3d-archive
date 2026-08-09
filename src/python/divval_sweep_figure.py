@@ -24,8 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style
+from ptm.pubstyle import apply_style
 
 # Baseline (committed run + rebuilt-binary no-op): albedo 0.12, depth-dependent
 # Hayne TI (k-scale factor 1.0).

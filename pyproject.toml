@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ptm"
+version = "0.1.0"
+description = "Python layer for PTM3D: read a run directory, launch the engine"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Paul O. Hayne", email = "paul.hayne@colorado.edu" }]
+keywords = ["planetary", "thermal", "thermophysical", "PTM3D"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+# The C++ engine is the model; this package reads what it writes and starts it.
+# There is no compiled extension here and no build-time dependency on the
+# engine -- `pip install -e .` works in a checkout that has never been built.
+dependencies = [
+    "numpy>=1.20",       # imported by ptm.results
+    "pyyaml>=5.4",       # imported by ptm.engine_config (config inspection)
+    "matplotlib>=3.4",   # not imported yet; the plotting entry point lands next
+]
+
+[project.optional-dependencies]
+# Regridding a mesh to a raster (ptm.results.MeshRegridder) needs a KD-tree and
+# a Delaunay triangulation. Everything else in ptm.results works without it.
+regrid = ["scipy>=1.7"]
+
+[project.urls]
+Homepage = "https://github.com/phayne/ptm3d"
+Issues = "https://github.com/phayne/ptm3d/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src/python" }
+# Listed explicitly: src/python also holds ~110 loose modules and four
+# unrelated packages (damit, horizons, ptm_ice, ojakangas_stevenson) that are
+# not part of this distribution.
+packages = ["ptm"]
