@@ -1,6 +1,9 @@
 #include "../mesh/mesh_utils.h"
 #include "../illumination/illumination_model.h"
 #include "../constants/constants.h"
+// Header-only, and deliberately NOT behind the GPU guard: the eq_extrapolation
+// knob has to be parsed and refused in CPU-only builds too.
+#include "../thermal/eq_extrapolation.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -4213,6 +4216,87 @@ static int resolveEquilibrationPasses(const thermal::Config& config,
     return passes;
 }
 
+// ---- Pass-stride RRE extrapolation (thermal.eq_extrapolation) --------------
+//
+// PLACEMENT: this stays OUTSIDE the `#ifdef PTM_GPU_OPENCL` below, for exactly
+// the reason spelled out above resolveEquilibrationPasses. The 2026-08-07
+// CPU-only CI break was a helper defined inside the guard and called outside
+// it; the refusal path here is needed most in the build that cannot honour the
+// knob at all.
+//
+// Returns false only on a request we refuse to run. A request we cannot honour
+// (too few passes) is NOT a refusal: it warns and falls back to plain cycling,
+// which is what Fermi's ADDENDUM A3(b) specifies.
+//
+// `eq_passes` <= 0 means "the pass budget is not known at this call site" and
+// skips ONLY the budget check, so main() can validate the knob itself long
+// before the solver has resolved a pass count.
+static bool resolveEqExtrapolation(const thermal::Config& config,
+                                   int eq_passes,
+                                   ptm::eqextrap::Options* out,
+                                   bool* requested = nullptr) {
+    ptm::eqextrap::Options o;
+    const std::string method = config.getProperty("eq_extrap_method", "off");
+    if (requested) *requested = (method != "off");
+    if (method == "off") {
+        if (out) *out = o;                       // enabled = false
+        return true;
+    }
+    if (method != "rre") {
+        std::cerr << "[Thermal] ERROR: thermal.eq_extrapolation.method must be "
+                     "'off' or 'rre'; got '" << method << "'\n";
+        return false;
+    }
+    o.order_p = config.getPropertyInt("eq_extrap_order_p", 4);
+    o.tol_K   = config.getPropertyDouble("eq_extrap_tol_K", 0.5);
+    o.hold_K  = config.getPropertyDouble("eq_extrap_hold_K", ptm::eqextrap::kHoldKDefault);
+
+    if (o.order_p < ptm::eqextrap::kMinOrderP) {
+        std::cerr << "[Thermal] ERROR: eq_extrapolation.order_p=" << o.order_p
+                  << " is refused. order_p=2 is not merely weak, it is HARMFUL "
+                     "(54.82 K worst-column error vs 31.88 K for plain 2-pass "
+                     "cycling): the DC seed sits outside the linear regime and a "
+                     "degree-1 annihilator cannot remove it. Minimum is "
+                  << ptm::eqextrap::kMinOrderP
+                  << ". Refusing rather than silently raising it.\n";
+        return false;
+    }
+    if (o.order_p > ptm::eqextrap::kMaxValidatedOrderP) {
+        std::cout << "[Thermal] WARNING: eq_extrapolation.order_p=" << o.order_p
+                  << " is above the validated range (3-4). It will run, but no "
+                     "acceptance threshold has been measured for it.\n";
+    }
+    if (!(o.hold_K > 0.0)) {
+        std::cerr << "[Thermal] ERROR: eq_extrapolation.hold_K must be > 0; got "
+                  << o.hold_K << "\n";
+        return false;
+    }
+    if (!(o.tol_K > 0.0)) {
+        std::cerr << "[Thermal] ERROR: eq_extrapolation.tol_K must be > 0; got "
+                  << o.tol_K << "\n";
+        return false;
+    }
+
+    // Budget. Extrapolating at the top of the last pass needs order_p+1
+    // snapshots, i.e. order_p+1 passes. Warn and run plain; never silently
+    // reduce the order (a reduction to p=2 would be worse than not
+    // extrapolating at all).
+    if (eq_passes > 0 && eq_passes < o.order_p + 1) {
+        std::cout << "[Thermal] WARNING: eq_extrapolation is ON with order_p="
+                  << o.order_p << ", which needs equilibration_cycles >= "
+                  << (o.order_p + 1) << ", but only " << eq_passes
+                  << " pass(es) are budgeted. Running PLAIN cycling for this run "
+                     "(the order is NOT reduced: order_p=2 is harmful).\n";
+        o.enabled = false;
+        if (out) *out = o;
+        return true;
+    }
+
+    o.enabled = true;
+    if (out) *out = o;
+    return true;
+}
+
 // ========== GPU PERSISTENT THERMAL SOLVER ==========
 #ifdef PTM_GPU_OPENCL
 
@@ -4936,6 +5020,52 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                      "equilibration phase to cycle.\n";
     }
 
+    // ---- Pass-stride RRE extrapolation ---------------------------------
+    // Default OFF. When off, `eq_extrap.enabled == false`, the eq call sites
+    // below hand the solver a disabled Options and it takes the pre-existing
+    // path with no readback, no upload and no extra allocation.
+    ptm::eqextrap::Options eq_extrap;
+    bool eq_extrap_requested = false;
+    if (!resolveEqExtrapolation(config, eq_passes, &eq_extrap, &eq_extrap_requested)) {
+        std::cerr << "[GPU Thermal] FATAL: invalid eq_extrapolation request; "
+                     "refusing to run.\n";
+        return false;
+    }
+    // The extrapolation is defined on the EQUILIBRATION pass map. Anything that
+    // is not a two-phase, cold-start equilibration must say out loud that the
+    // knob is inert rather than let the config imply it was applied.
+    if (eq_extrap.enabled && warm_start_run) {
+        std::cerr << "[GPU Thermal] WARNING: eq_extrapolation is ON but this is a "
+                     "WARM-START chunk; there is no equilibration pass map to "
+                     "extrapolate. The knob is IGNORED here.\n";
+        eq_extrap.enabled = false;
+    }
+    if (eq_extrap.enabled && !two_phase) {
+        std::cerr << "[GPU Thermal] WARNING: eq_extrapolation is ON but this is a "
+                     "SINGLE-PHASE run: the cycled array is the full window, not "
+                     "an equilibration prefix. The knob is IGNORED here.\n";
+        eq_extrap.enabled = false;
+    }
+    if (eq_extrap.enabled) {
+        std::cout << "[eq-extrap] pass-stride RRE ARMED: order_p=" << eq_extrap.order_p
+                  << " over " << eq_passes << " passes (extrapolate after "
+                  << (eq_passes - 1) << ", pass " << eq_passes
+                  << " = polish + certificate + delivered state), tol_K="
+                  << eq_extrap.tol_K << " hold_K=" << eq_extrap.hold_K
+                  << " K/pass" << std::endl;
+    }
+    ptm::eqextrap::Stats eq_extrap_stats;
+    std::mutex eq_extrap_mutex;
+    // ONE place that knows the locking rule. The multi-GPU pool runs eq batches
+    // concurrently, so every merge into eq_extrap_stats must hold the mutex;
+    // keeping that discipline at the call sites would mean a future third eq
+    // call site could copy the solver call and quietly omit the lock.
+    auto merge_extrap_stats = [&](const ptm::eqextrap::Stats& s) {
+        if (!eq_extrap.enabled) return;
+        std::lock_guard<std::mutex> lk(eq_extrap_mutex);
+        eq_extrap_stats.merge(s);
+    };
+
     // GPU memory constraint: estimate ~50 bytes per face per layer for arrays
     // Plus flux and output: ~8 bytes per face per timestep * 2
     // Conservative batch size based on 6 GB GPU memory budget.
@@ -5451,8 +5581,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
             auto flux_eq = prepare_flux(0, equilibration_steps);
             std::vector<float> eq_output_discard;
+            // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
+            // a data race on every counter under the multi-GPU pool.
+            ptm::eqextrap::Stats batch_extrap_stats;
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
-                                                 equilibration_steps, eq_dt, equil_cycles);
+                                                 equilibration_steps, eq_dt, equil_cycles,
+                                                 nullptr, 0, -1,
+                                                 &eq_extrap, &batch_extrap_stats);
+            merge_extrap_stats(batch_extrap_stats);
 
             // Snapshot the post-eq T(z) profile here — this is exactly
             // the initial state the output cycle is about to run from.
@@ -6075,8 +6211,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
             auto flux_eq = prepare_flux(0, equilibration_steps);
             std::vector<float> eq_output_discard;
+            // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
+            // a data race on every counter under the multi-GPU pool.
+            ptm::eqextrap::Stats batch_extrap_stats;
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
-                                                 equilibration_steps, eq_dt, equil_cycles);
+                                                 equilibration_steps, eq_dt, equil_cycles,
+                                                 nullptr, 0, -1,
+                                                 &eq_extrap, &batch_extrap_stats);
+            merge_extrap_stats(batch_extrap_stats);
 
             // Snapshot the post-eq T(z) for the rad-coupling re-thermal hand-off
             // (same purpose as the multi-GPU run_batch_on_solver path). This
@@ -6282,6 +6424,66 @@ post_batch_loop:
     auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(end_total - start_total);
     std::cout << "[GPU Thermal] Completed " << n_faces << " faces x " << total_time_steps
               << " timesteps in " << total_duration.count() << " seconds" << std::endl;
+
+    // ---- eq-extrapolation banner --------------------------------------
+    // Printed unconditionally whenever the knob was REQUESTED, including when
+    // it could not be honoured. This line IS the guard-rate measurement: it is
+    // the first time a PTM3D run has reported how converged its own deep
+    // column is, per face, without running a second simulation to find out.
+    if (eq_extrap_requested) {
+        std::ios_base::fmtflags bf(std::cout.flags());
+        std::streamsize bp = std::cout.precision();
+        const double med = ptm::eqextrap::percentile(eq_extrap_stats.ehat, 0.50);
+        const double p95 = ptm::eqextrap::percentile(eq_extrap_stats.ehat, 0.95);
+        // Five numbers. Trimmed deliberately: the earlier banner reported
+        // counters for guards that never fired and a diagnostic from a theory
+        // the measurements refuted.
+        //   extrapolated  = faces where the extrapolation actually did work
+        //                   (certified count minus the vacuous converged windows)
+        //   declined      = faces the certificate could not certify at tol_K;
+        //                   their state still ships, it is a contraction step
+        //   near-degenerate = REPORTED ONLY, never acted on: windows where the
+        //                   seed weight could displace a converged layer by more
+        //                   than tol_K (|gamma_0| * max|S_0 - S_last| > tol_K)
+        const long long extrapolated =
+            eq_extrap_stats.certified - eq_extrap_stats.converged_window;
+        const double held_frac = eq_extrap_stats.layers_total > 0
+            ? static_cast<double>(eq_extrap_stats.layers_held)
+                  / static_cast<double>(eq_extrap_stats.layers_total)
+            : 0.0;
+        std::cout << "[eq-extrap] extrapolated " << extrapolated
+                  << " | declined "        << eq_extrap_stats.cert_refused
+                  << " | p95 e " << std::fixed << std::setprecision(4) << p95
+                  << " K | held_fraction " << std::setprecision(6) << held_frac
+                  << " | near_degenerate " << eq_extrap_stats.near_degenerate
+                  << std::endl;
+        const double q50 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.50);
+        const double q95 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.95);
+        const double qmx = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 1.00);
+        std::cout << "[eq-extrap] post-polish |Phi(T*)-S_last| on HELD layers: p50 "
+                  << std::scientific << std::setprecision(3) << q50
+                  << " | p95 " << q95 << " | max " << qmx
+                  << " K (bar " << ptm::eqextrap::kHeldPostTol << " K)" << std::endl;
+        if (eq_extrap_stats.d_held_max > 0.0) {
+            std::cerr << "[eq-extrap] ERROR: held layers were modified -- the Level-2 guard "
+                         "did not execute as claimed.\n";
+        }
+        if (qmx > ptm::eqextrap::kHeldPostTol) {
+            std::cerr << "[eq-extrap] WARNING: post-polish deviation on a held layer exceeds "
+                      << ptm::eqextrap::kHeldPostTol << " K; the delivered state moved a layer "
+                         "the guard declared converged.\n";
+        }
+        if (eq_extrap_stats.budget_exhausted > 0) {
+            std::cout << "[eq-extrap] budget_exhausted " << eq_extrap_stats.budget_exhausted
+                      << " (too few passes for order_p; ran plain)" << std::endl;
+        }
+        if (eq_extrap_stats.solve_failed > 0) {
+            std::cout << "[eq-extrap] solve_failed " << eq_extrap_stats.solve_failed
+                      << " (non-finite lstsq; fell back to the plain state)" << std::endl;
+        }
+        std::cout.flags(bf);
+        std::cout.precision(bp);
+    }
 
     // Finalize Schorghofer accumulator. n_samples is the number of output
     // timesteps over which the GPU kernel summed E(T(z,t)). For both two-phase
@@ -12817,6 +13019,45 @@ int main(int argc, char** argv) {
             }
             thermal_config.setProperty("equilibration_cycles",
                                        sim_config.thermal.equilibration_cycles);
+        }
+        // Pass-stride RRE extrapolation. Same "only when armed" rule as the
+        // pass knob above: with method == "off" no property is set at all, so
+        // thermal_config is byte-identical for every legacy run and the
+        // resolver's default (disabled) applies.
+        if (sim_config.thermal.eq_extrapolation.method != "off") {
+            thermal_config.setProperty("eq_extrap_method",
+                                       sim_config.thermal.eq_extrapolation.method);
+            thermal_config.setProperty("eq_extrap_order_p",
+                                       sim_config.thermal.eq_extrapolation.order_p);
+            thermal_config.setProperty("eq_extrap_tol_K",
+                                       sim_config.thermal.eq_extrapolation.tol_K);
+            thermal_config.setProperty("eq_extrap_hold_K",
+                                       sim_config.thermal.eq_extrapolation.hold_K);
+        }
+        {
+            // The extrapolation lives in the GPU persistent solver's pass loop.
+            // The CPU/SIMD equilibrators have no pass loop at all and would
+            // ignore the request without a word. Refuse instead of pretending.
+            bool extrap_requested = false;
+            ptm::eqextrap::Options probe;
+            // -1 = pass budget not known here, so this validates the KNOB only;
+            // the solver re-resolves with the real budget and owns the
+            // "too few passes" warning.
+            if (!resolveEqExtrapolation(thermal_config, /*eq_passes=*/-1, &probe,
+                                        &extrap_requested)) {
+                std::cerr << "Error: invalid thermal.eq_extrapolation; aborting.\n";
+                return 1;
+            }
+            if (extrap_requested &&
+                !config.getPropertyBool("use_gpu_thermal", false)) {
+                std::cerr << "Error: thermal.eq_extrapolation is implemented only "
+                             "for the GPU persistent thermal solver "
+                             "(thermal.use_gpu: true / --use-gpu-thermal). The CPU "
+                             "and SIMD equilibrators have no pass loop and would "
+                             "ignore it silently. Aborting rather than reporting an "
+                             "equilibration that did not happen.\n";
+                return 1;
+            }
         }
         {
             // The knob drives solvePersistentMultipleCycles' cycling loop, which

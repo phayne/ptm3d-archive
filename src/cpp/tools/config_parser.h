@@ -72,6 +72,32 @@ struct SimulationConfig {
         // run total_cycles = n_equil_cycles + 1 = 2 over the eq window.
         int equilibration_cycles = -1;
 
+        // ---- thermal.eq_extrapolation -------------------------------------
+        // Pass-stride RRE extrapolation of the equilibration state. DEFAULT
+        // OFF: with method == "off" the solver runs the pre-existing pass loop
+        // with no added work and byte-identical output.
+        //
+        // There is deliberately no `stride` knob. The pass map is autonomous by
+        // construction (the same forcing block is replayed byte-identically),
+        // so pass stride is correct for every body and every config without a
+        // predicate. A one-cycle stride is available by setting
+        // equilibration_orbits: 1 -- no new knob needed.
+        struct EqExtrapolation {
+            // "off" | "rre"
+            std::string method = "off";
+            // Polynomial order. Needs equilibration_cycles >= order_p + 1.
+            // 3 and 4 are the validated values; < 3 is REFUSED (p=2 is worse
+            // than no extrapolation at all: 54.82 K vs plain-2's 31.88 K).
+            int    order_p = 4;
+            // Certificate reporting threshold. Faces with ehat > tol_K are
+            // counted `cert_refused`; the extrapolated state still ships.
+            double tol_K   = 0.5;
+            // Level-2 hold threshold, K per pass: a layer whose LAST-pass
+            // increment |S_{N-1}-S_{N-2}| is below this is treated as converged
+            // and held at S_last instead of extrapolated.
+            double hold_K  = 1e-3;
+        } eq_extrapolation;
+
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
 

@@ -138,6 +138,31 @@ set_target_properties(test_primary_disk
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Pass-stride RRE extrapolation gate. Must reproduce the reference
+# implementation the GO decision was measured against
+# (eq_compare_2026-08-08/code/modeext.py::_rre) to machine precision, on
+# rank-deficient inputs as well as well-conditioned ones. Header-only under
+# test -- same reasoning as test_conductivity_model: no library can go stale
+# underneath it.
+add_executable(test_eq_extrapolation test_eq_extrapolation.cpp)
+set_target_properties(test_eq_extrapolation
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Depth-grid / layer-property dump. Prints the arrays the solver ACTUALLY
+# builds (thermal::Profile z/dz/kc/rho), so an offline flux audit does not have
+# to reconstruct them -- a reconstruction wrong by a few percent is
+# indistinguishable from an energy-conservation defect, which is exactly what
+# blocked the 2026-08-08 offset investigation. No GPU, no mesh, no simulation:
+# safe to run while a production job owns the GPUs.
+add_executable(dump_thermal_grid dump_thermal_grid.cpp)
+target_link_libraries(dump_thermal_grid PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(dump_thermal_grid
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration large-dt accuracy test
 add_executable(test_equilibration_dt test_equilibration_dt.cpp)
 target_link_libraries(test_equilibration_dt
