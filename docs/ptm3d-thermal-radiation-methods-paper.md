@@ -505,7 +505,7 @@ simpler and is the default; the H-matrix path is retained for
 future workloads where $N \gg 10^{7}$ exceeds the per-face
 ray-budget memory pressure.
 
-![H-matrix vs sparse top-K view factors](figures/v2/hmatrix_vs_mc.png)
+*Figure 3 (`figures/v2/hmatrix_vs_mc.png`) is not included in this distribution.*
 
 **Figure 3.** H-matrix vs sparse top-$K$ view-factor compression on
 a sequence of spherical-cap bowl-crater meshes (ACA tolerance
@@ -714,7 +714,7 @@ workload by a factor of $\sim 5$ relative to legacy ($1.31 +
 $10 \times 2.45 = 24.5\thinspace\mathrm{M}$ legacy alternative at the
 default $k_{\max}$).
 
-![Face-selection physics vs legacy on Amundsen PSR](figures/v2/face_selection_comparison.png)
+*Figure 4 (`figures/v2/face_selection_comparison.png`) is not included in this distribution.*
 
 **Figure 4.** Physics-based vs legacy face selection on the
 Amundsen-crater PSR validation run (4.0 M faces, full radiation
@@ -788,7 +788,7 @@ iteration 2 and iteration 3 — the bulk of the cold-floor population
 crossing $s\tau_T$ in a single Picard sweep — is the characteristic
 signature of the physics-based selector on lunar polar terrain.
 
-![Picard convergence](figures/v2/picard_convergence.png)
+*Figure 5 (`figures/v2/picard_convergence.png`) is not included in this distribution.*
 
 **Figure 5.** Thermal–radiation Picard convergence on the
 production window. Panel (a) gives the per-iteration
