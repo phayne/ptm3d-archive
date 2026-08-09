@@ -21,10 +21,15 @@ classifiers = [
 # There is no compiled extension here and no build-time dependency on the
 # engine -- `pip install -e .` works in a checkout that has never been built.
 dependencies = [
-    "numpy>=1.20",       # imported by ptm.results
+    "numpy>=1.20",       # imported by ptm.results and ptm.readers
     "pyyaml>=5.4",       # imported by ptm.engine_config (config inspection)
-    "matplotlib>=3.4",   # not imported yet; the plotting entry point lands next
+    "matplotlib>=3.4",   # imported by ptm.plots; 3.4 is where FuncNorm arrived
 ]
+
+[project.scripts]
+# `ptm info <run>` and `ptm plot <run> map --save f.png` are the shell route
+# from a finished run to a picture. Nothing else in the tree provides one.
+ptm = "ptm.cli:main"
 
 [project.optional-dependencies]
 # Regridding a mesh to a raster (ptm.results.MeshRegridder) needs a KD-tree and
