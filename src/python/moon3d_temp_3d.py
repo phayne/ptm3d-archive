@@ -31,8 +31,7 @@ import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, DOUBLE_W, panel_label, savefig_pinned
+from ptm.pubstyle import apply_style, DOUBLE_W, panel_label, savefig_pinned
 
 
 def load_stat(stat_dir: Path, name: str) -> np.ndarray:

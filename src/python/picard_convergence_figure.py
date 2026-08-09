@@ -27,8 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, COLORS, COLUMN_W, DOUBLE_W, panel_label
+from ptm.pubstyle import apply_style, COLORS, COLUMN_W, DOUBLE_W, panel_label
 
 
 # ---------------------------------------------------------------------------

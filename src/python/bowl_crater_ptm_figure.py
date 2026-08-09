@@ -31,8 +31,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-sys.path.insert(0, str(Path(__file__).parent))
-from ptm_pubstyle import apply_style, DOUBLE_W, panel_label
+from ptm.pubstyle import apply_style, DOUBLE_W, panel_label
 
 CMAP = plt.cm.RdBu_r
 SIGMA = 5.670374e-8

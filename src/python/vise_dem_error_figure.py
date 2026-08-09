@@ -22,8 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.dirname(__file__))
-from ptm_pubstyle import apply_style, DOUBLE_W  # noqa: E402
+from ptm.pubstyle import apply_style, DOUBLE_W  # noqa: E402
 
 CH = {
     "radiance": dict(

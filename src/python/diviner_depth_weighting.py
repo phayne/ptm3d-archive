@@ -174,9 +174,8 @@ def main():
     import matplotlib.pyplot as plt
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
     try:
-        from ptm_pubstyle import apply_style
+        from ptm.pubstyle import apply_style
         apply_style()
     except Exception:
         pass
