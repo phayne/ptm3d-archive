@@ -57,14 +57,25 @@ jobs:
       - name: Install the package and the GUI's Qt dependency
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e '.[regrid]'
           python -m pip install "PyQt6>=6.4"
 
       - name: Config parity (Python layer vs config_parser.cpp)
         run: python3 src/python/tests/test_config_parity.py
 
+      - name: Run-directory API (ptm.results / ptm.readers / ptm.plots)
+        run: python3 src/python/tests/test_results_api.py
+
       - name: Engine run driver (ptm.run, no engine needed)
         run: python3 src/python/tests/test_engine_process.py
+
+      # The console script is the shell route from a finished run to a picture,
+      # so its argument parsing is worth a smoke test even with no run to read.
+      - name: The ptm command is installed and self-describing
+        run: |
+          ptm --version
+          ptm --help
+          ptm plot --help
 
       - name: The GUI still imports
         env:
