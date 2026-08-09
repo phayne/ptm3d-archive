@@ -610,6 +610,50 @@ static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalP
         || (tp.constant_thermal_inertia > 0.0);
 }
 
+// Parse a numeric CLI argument, or refuse the run naming the flag.
+//
+// The rest of this parser calls std::stod(argv[++i]) bare, so `--duration abc`
+// leaves main() through an uncaught std::invalid_argument and the operator sees
+// only `libc++abi: terminating`. New flags do not inherit that: a value that is
+// not a finite number, or that has trailing junk ("0.12kg"), stops the run with
+// a line that says which flag and what it received.
+static bool parseCliDouble(const std::string& flag, const char* text, double& out) {
+    try {
+        std::size_t consumed = 0;
+        out = std::stod(text, &consumed);
+        if (text[consumed] != '\0') throw std::invalid_argument("trailing characters");
+    } catch (const std::exception&) {
+        std::cerr << "FATAL: " << flag << " expects a number, got '" << text << "'."
+                  << std::endl;
+        return false;
+    }
+    if (!std::isfinite(out)) {
+        std::cerr << "FATAL: " << flag << " expects a finite number, got '" << text
+                  << "'." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Heat capacity at temperature T for a body whose cp(T) is the
+// planetary_properties polynomial cp = cp0 + sum_j cpCoeff[j] * T^(j+1).
+//
+// This is the same evaluation, at the same 273 K reference, that the engine's
+// only other body-level thermal-inertia definition already uses
+// (thermal_property_map.cpp: cpAtT / depthWeightedTI, i.e. the TI(273 K) maps
+// of Hayne et al. 2017). It is duplicated rather than exported because that
+// one is file-local in an anonymous namespace; if either moves, they must move
+// together, and this comment is the contract.
+//
+// For every body with a constant heat capacity -- which is every generic body,
+// cpCoeff empty -- this returns cp0 exactly.
+static double heatCapacityAtT(const thermal::Planet& planet, double T) {
+    double cp = planet.cp0;
+    double T_pow = T;
+    for (double c : planet.cpCoeff) { cp += c * T_pow; T_pow *= T; }
+    return cp;
+}
+
 // Parse a comma-separated list of doubles ("" => empty). Shared by the
 // generic-body cpCoeff forwarding and the override cpCoeff forwarding.
 static std::vector<double> parseCsvDoubles(const std::string& csv) {
@@ -8428,6 +8472,30 @@ void showUsage(const char* programName) {
     std::cout << "                             target body (24=<2 K accuracy, 48=<1 K, 12=marginal,\n";
     std::cout << "                             <=0=legacy/match output cadence).\n";
     std::cout << "  --thermal-inertia-map FILE Path to thermal inertia map file\n";
+    std::cout << "  --thermal-inertia TI       Set the nominal SURFACE thermal inertia [SI:\n";
+    std::cout << "                             J m^-2 K^-1 s^-1/2] on any body, built-in or generic.\n";
+    std::cout << "                             TI = sqrt(ks * rhos * cp(273 K)): the densities and the\n";
+    std::cout << "                             heat capacity are held at the body's values and the\n";
+    std::cout << "                             conductivity carries the change, ks = TI^2/(rhos*cp);\n";
+    std::cout << "                             kd is scaled by the SAME factor, so the kd/ks depth\n";
+    std::cout << "                             contrast is preserved. This is the convention already\n";
+    std::cout << "                             used by scripts/ema_campaign_driver.py, divval_sweep.py\n";
+    std::cout << "                             and examples/quickstart_asteroid_diurnal_ti200_check.yaml.\n";
+    std::cout << "                             cp(T) and chi are NOT altered, so on a body that has them\n";
+    std::cout << "                             the delivered TI varies with temperature about TI; the\n";
+    std::cout << "                             number is nominal, at the Hayne et al. (2017) 273 K\n";
+    std::cout << "                             reference. Equivalent to setting ks_override/kd_override.\n";
+    std::cout << "  --constant-thermal-inertia TI  The OTHER reading: TI exactly constant in temperature\n";
+    std::cout << "                             AND depth. Derives cp = TI^2/(ks*rhos) and forces chi=0,\n";
+    std::cout << "                             kd=ks, rhod=rhos. Same as thermophysical.\n";
+    std::cout << "                             constant_thermal_inertia. Mutually exclusive with\n";
+    std::cout << "                             --thermal-inertia.\n";
+    std::cout << "  --albedo A0                Bond albedo A0 in [0,1), on any body. Same as\n";
+    std::cout << "                             thermophysical.albedo_override. A per-face albedo MAP\n";
+    std::cout << "                             out-ranks it for absorbed solar flux -- the run warns if\n";
+    std::cout << "                             one is configured; set illumination.use_albedo_map: false\n";
+    std::cout << "                             to sweep albedo directly. With incidence_angle_albedo the\n";
+    std::cout << "                             angular model is re-anchored on the new A0.\n";
     std::cout << "  --no-statistics            Disable computation of statistics\n";
     std::cout << "  --integration-days DAYS    Integration window in days\n";
     std::cout << "  --integration-steps N      Integration steps override\n";
@@ -10541,6 +10609,13 @@ int main(int argc, char** argv) {
     std::string albedo_maps_directory = sim_config.illumination.albedo_maps_directory;
     bool use_albedo_map = sim_config.illumination.use_albedo_map;
 
+    // Scalar physical-property overrides taken straight from argv. `--albedo`
+    // and `--constant-thermal-inertia` land directly on their config keys in
+    // the argv loop; `--thermal-inertia` cannot, because resolving it needs the
+    // finished Planet's rhos / cp / ks / kd. It is parked here and resolved in
+    // PHASE 4b' below, before anything reads the override keys.
+    double cli_thermal_inertia = -1.0;
+
     // VTK files
     std::string thermal_vtk_file = sim_config.output.thermal_vtk_file;
     std::string complete_vtk_file = sim_config.output.complete_vtk_file;
@@ -10872,6 +10947,48 @@ int main(int argc, char** argv) {
         } else if (arg == "--thermal-inertia-map" && i + 1 < argc) {
             thermal_inertia_map_file = argv[++i];
             continue;
+        } else if (arg == "--thermal-inertia" && i + 1 < argc) {
+            // Resolved in PHASE 4b' -- it needs the finished Planet.
+            if (!parseCliDouble(arg, argv[++i], cli_thermal_inertia)) return 1;
+            if (!(cli_thermal_inertia > 0.0)) {
+                std::cerr << "FATAL: --thermal-inertia must be > 0 (got "
+                          << cli_thermal_inertia
+                          << "). Thermal inertia is sqrt(k*rho*cp); zero or negative "
+                             "has no property assignment." << std::endl;
+                return 1;
+            }
+        } else if (arg == "--constant-thermal-inertia" && i + 1 < argc) {
+            double v = -1.0;
+            if (!parseCliDouble(arg, argv[++i], v)) return 1;
+            if (!(v > 0.0)) {
+                std::cerr << "FATAL: --constant-thermal-inertia must be > 0 (got " << v
+                          << "). Use --thermal-inertia, or omit both, for the body default."
+                          << std::endl;
+                return 1;
+            }
+            sim_config.thermophysical.constant_thermal_inertia = v;
+            std::cout << "[cli] constant_thermal_inertia = " << v << " SI" << std::endl;
+        } else if (arg == "--albedo" && i + 1 < argc) {
+            double v = -1.0;
+            if (!parseCliDouble(arg, argv[++i], v)) return 1;
+            if (!(v >= 0.0 && v < 1.0)) {
+                std::cerr << "FATAL: --albedo must be in [0, 1) (got " << v
+                          << "). This is the Bond albedo A0, a reflected fraction."
+                          << std::endl;
+                return 1;
+            }
+            // Same key the YAML `thermophysical.albedo_override` sets, so the
+            // flag inherits the PTM-53 solver forwarding, the albedo-map
+            // out-ranking warning and the rule-7 tripwire unchanged. CLI beats
+            // config, per the documented precedence -- say so when it does.
+            double prior = sim_config.thermophysical.albedo_override;
+            if (prior >= 0.0 && prior != v) {
+                std::cout << "[cli] --albedo " << v
+                          << " overrides thermophysical.albedo_override " << prior
+                          << " from the config file" << std::endl;
+            }
+            sim_config.thermophysical.albedo_override = v;
+            std::cout << "[cli] albedo_override = " << v << std::endl;
         } else if (arg == "--mesh-file" && i + 1 < argc) {
             mesh_file = argv[++i];
         } else if (arg == "--mesh-scale" && i + 1 < argc) {
@@ -11448,6 +11565,154 @@ int main(int argc, char** argv) {
                                           ? "Keplerian" : "SPICE") << std::endl;
         if (generic_body.ephemeris_source == orbital::GenericBody::SPICE && !generic_body.spice_metakernel.empty()) {
             std::cout << "  Metakernel: " << generic_body.spice_metakernel << std::endl;
+        }
+    }
+
+    // ========================================================================
+    // PHASE 4b': --thermal-inertia  ->  ks / kd on the RESOLVED body
+    // ========================================================================
+    // Thermal inertia is not a stored property of this engine. The primaries
+    // are ks / kd / rhos / rhod / cp0 / chi, which is very likely why 126 CLI
+    // flags existed and none of them set TI. Rather than define a new
+    // inversion, this resolves the flag onto the SAME two knobs every existing
+    // thermal-inertia sweep in the tree already turns -- ks_override and
+    // kd_override -- so the request inherits, unchanged, the PTM-53 forwarding
+    // to every solver, the martinez2021 composition guard, and the rule-7
+    // tripwire that fails a run whose override no solver applied.
+    //
+    // THE CONVENTION, and where it comes from. Three places in this repository
+    // already map a thermal-inertia NUMBER onto properties this way:
+    //   scripts/ema_campaign_driver.py   ti_to_ks(ti) = ti^2 / (rhos * cp0),
+    //                                    "TI is set PHYSICALLY via ks"
+    //   scripts/divval_sweep.py          ks_override and kd_override scaled by
+    //                                    the same factor, "TI ~ sqrt(k)"
+    //   examples/quickstart_asteroid_diurnal{,_ti200_check}.yaml
+    //                                    ks,kd x4 shipped as "TI: 100 -> 200"
+    // So: TI = sqrt(ks * rhos * cp) at the SURFACE, with the densities and the
+    // heat capacity held fixed and the conductivity carrying the whole change;
+    // kd moves by the same FACTOR as ks, so the kd/ks depth contrast the body
+    // was configured with survives instead of being flattened. That factor rule
+    // is divval's ("depth-profile-preserving"), and it is a no-op on the
+    // asteroid quickstarts, where ks == kd already.
+    //
+    // Varying k rather than cp is not a free choice: cp of a silicate regolith
+    // is known to within a factor well under two, while k spans four orders of
+    // magnitude with porosity and contact area. It is also the only reading
+    // under which the flag reproduces the two-point sweep the repository ships
+    // as a tutorial.
+    //
+    // cp IS EVALUATED AT 273 K, by the same polynomial and at the same
+    // reference temperature as the engine's only other body-level thermal-
+    // inertia definition (thermal_property_map.cpp: cpAtT / depthWeightedTI --
+    // the TI(273 K) maps of Hayne et al. 2017). On a body whose cp is constant,
+    // i.e. every generic body, cp(273) == cp0 exactly and this reduces to the
+    // EMA/quickstart formula with no residual. On the Moon it is the only
+    // workable choice: `cp0` there is the CONSTANT TERM of the cp polynomial
+    // and equals -3.6125 J/kg/K, so sqrt(ks*rhos*cp0) is not a real number.
+    //
+    // WHAT THIS FLAG DOES NOT DO. It does not make thermal inertia constant in
+    // temperature or in depth. chi (k's T^3 term) and the cp(T) polynomial are
+    // left alone, so on a body that has them the delivered TI moves with
+    // temperature about the requested value, and the requested number is a
+    // nominal surface TI at 273 K. `--constant-thermal-inertia` is the knob for
+    // the other reading -- exactly constant, at the cost of collapsing cp(T),
+    // chi and the two-layer profile -- and the banner below names it.
+    // ========================================================================
+    if (cli_thermal_inertia > 0.0) {
+        auto& tpw = sim_config.thermophysical;
+
+        // Rule 7: two knobs that both claim to set thermal inertia cannot both
+        // be honoured, and picking one silently is how a sweep measures the
+        // wrong axis for a week. Refuse, and name the choice.
+        if (tpw.constant_thermal_inertia > 0.0) {
+            std::cerr << "\nFATAL: --thermal-inertia " << cli_thermal_inertia
+                      << " and constant_thermal_inertia "
+                      << tpw.constant_thermal_inertia
+                      << " both set the thermal inertia, by different conventions.\n"
+                      << "  --thermal-inertia          scales k, keeps cp(T), chi and the "
+                         "kd/ks depth contrast;\n"
+                         "                             the delivered TI varies with "
+                         "temperature about the request.\n"
+                      << "  --constant-thermal-inertia derives cp instead, and forces "
+                         "chi=0, kd=ks, rhod=rhos so\n"
+                         "                             that TI is exactly constant in "
+                         "temperature AND depth.\n"
+                      << "  Pick one." << std::endl;
+            return 1;
+        }
+        if (tpw.ks_override > 0.0 || tpw.kd_override > 0.0) {
+            std::cerr << "\nFATAL: --thermal-inertia " << cli_thermal_inertia
+                      << " resolves to ks_override and kd_override, but the config "
+                         "already sets"
+                      << (tpw.ks_override > 0.0 ? " ks_override" : "")
+                      << (tpw.kd_override > 0.0 ? " kd_override" : "")
+                      << ".\n  Refusing to overwrite an explicit conductivity with a "
+                         "derived one. Remove one of them." << std::endl;
+            return 1;
+        }
+        if (!thermal_inertia_map_file.empty()) {
+            std::cerr << "\nFATAL: --thermal-inertia " << cli_thermal_inertia
+                      << " is a single body-wide value, but a per-face thermal-inertia "
+                         "map is also configured\n  ("
+                      << thermal_inertia_map_file
+                      << "). The map's TI values are inverted to per-face H against the "
+                         "body's ks/kd;\n  rescaling ks/kd underneath it would silently "
+                         "move every face off the TI the map asked for.\n"
+                         "  Use one or the other." << std::endl;
+            return 1;
+        }
+
+        const double rhos_b = planet.rhos;
+        const double ks_b   = planet.ks;
+        const double kd_b   = planet.kd;
+        const double cp_ref = heatCapacityAtT(planet, 273.0);
+        if (!(rhos_b > 0.0) || !(ks_b > 0.0) || !(cp_ref > 0.0)) {
+            std::cerr << "\nFATAL: --thermal-inertia " << cli_thermal_inertia
+                      << " needs rhos > 0, ks > 0 and cp(273 K) > 0 to solve "
+                         "ks = TI^2 / (rhos * cp),\n  but the resolved body '"
+                      << planet.name << "' has rhos = " << rhos_b
+                      << ", ks = " << ks_b << ", cp(273 K) = " << cp_ref << ".\n"
+                      << "  Refusing to run with the body defaults under a "
+                         "thermal-inertia banner." << std::endl;
+            return 1;
+        }
+
+        const double ks_new = (cli_thermal_inertia * cli_thermal_inertia)
+                              / (rhos_b * cp_ref);
+        const double factor = ks_new / ks_b;
+        const double kd_new = kd_b * factor;
+        const double ti_before = std::sqrt(ks_b * rhos_b * cp_ref);
+
+        tpw.ks_override = ks_new;
+        if (kd_new > 0.0) tpw.kd_override = kd_new;
+
+        std::cout << "Thermal inertia (requested): " << cli_thermal_inertia
+                  << " SI = sqrt(ks * rhos * cp(273 K)), surface, nominal\n"
+                  << "  body '" << planet.name << "': rhos = " << rhos_b
+                  << " kg/m^3, cp(273 K) = " << cp_ref << " J/kg/K"
+                  << (planet.cpCoeff.empty() ? " (constant)"
+                                             : " (cp is T-dependent)") << "\n"
+                  << "  ks " << ks_b << " -> " << ks_new << " W/m/K  (x" << factor
+                  << ", from TI " << ti_before << " SI)\n"
+                  << "  kd " << kd_b << " -> " << kd_new
+                  << " W/m/K  (same factor: kd/ks depth contrast preserved)"
+                  << std::endl;
+        // chi does not live on Planet: it is thermal::Config::chi, resolved at
+        // the forwarding site as (chi_override >= 0 ? chi_override : 2.7).
+        const double chi_eff = (chi_override >= 0.0) ? chi_override : 2.7;
+        const bool cp_varies  = !planet.cpCoeff.empty();
+        const bool chi_active = (chi_eff > 0.0);
+        if (cp_varies || chi_active) {
+            std::cout << "  NOTE: this body has "
+                      << (cp_varies ? "a temperature-dependent cp" : "")
+                      << ((cp_varies && chi_active) ? " and " : "")
+                      << (chi_active ? "a radiative conductivity term chi = " : "");
+            if (chi_active) std::cout << chi_eff;
+            std::cout << ", so the delivered thermal inertia varies with\n"
+                         "        temperature about the requested value. Use "
+                         "--constant-thermal-inertia for a TI that is exactly\n"
+                         "        constant in temperature and depth."
+                      << std::endl;
         }
     }
 
