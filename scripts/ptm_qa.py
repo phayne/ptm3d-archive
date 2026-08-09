@@ -38,7 +38,16 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError:  # actionable instead of a bare traceback
+    sys.stderr.write(
+        "ptm_qa.py needs NumPy, which is not installed in this interpreter\n"
+        f"  ({sys.executable}).\n"
+        "Install the repository's Python environment:\n"
+        "    python3 -m pip install -r requirements.txt\n"
+    )
+    raise SystemExit(2)
 
 # --- thresholds, each traceable to a measurement on an archived fixture -------------
 # never-lit faces receive zero direct solar; their Tmin must be nearly uniform.

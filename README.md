@@ -82,7 +82,7 @@ cannot see the repository — ask Paul to add your GitHub username, then retry.
 | Embree | **4.x** (not 3.x) | `apt install libembree-dev` · `brew install embree` |
 | Eigen3, CFITSIO, yaml-cpp, OpenMP | any recent | `apt install libeigen3-dev libcfitsio-dev libyaml-cpp-dev libomp-dev pkg-config` · `brew install eigen cfitsio yaml-cpp libomp pkg-config` |
 | CSPICE | N0067+ | **not in apt/brew** — download from NASA NAIF, matching your CPU architecture (Apple Silicon needs the `MacM1_OSX_clang_64bit` package, not the Intel one): [INSTALL.md §2](INSTALL.md) |
-| Python | 3.8+, standard library only | `scripts/fetch_kernels.py`, `fetch_data.py`, `ptm_qa.py`, `ptm_mem_estimate.py` |
+| Python | 3.8+ | Standard library only for `scripts/fetch_kernels.py`, `fetch_data.py`, `ptm_mem_estimate.py`. `ptm_qa.py`, the notebooks and every plotting route need [`requirements.txt`](requirements.txt) — see step 5 |
 | OpenCL | optional | only for the GPU build |
 
 Per-platform commands, including the CSPICE download: [INSTALL.md](INSTALL.md).
