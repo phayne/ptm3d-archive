@@ -38,7 +38,7 @@ def main():
                     help="Meters per stored DEM unit. Default: read band.GetScale(). "
                          "Raw LOLA polar .IMG store scaled integers (SCALING_FACTOR=0.5) that "
                          "GDAL returns UNSCALED -- pass 0.5 for those. "
-                         "See docs/ptm21-ring-scale-fix.md (PTM-21).")
+                         "See docs/KNOWN_LIMITATIONS.md, 'Workflow / tooling'.")
     ap.add_argument("--elev-offset", type=float, default=None,
                     help="Additive meters. Default: read band.GetOffset() (or 0).")
     a = ap.parse_args()

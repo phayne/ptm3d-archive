@@ -1,25 +1,25 @@
 # PTM3D PSR Floor Temperature: H-matrix Fix and Ingersoll/Diviner Validation
 
-**Status:** investigation complete (2026-06-08). Test case: Haworth crater central
-permanently-shadowed region (PSR), lunar south pole (−87.45°, −2.1°).
+Validation case: the central permanently shadowed region (PSR) of Haworth crater,
+lunar south pole (−87.45°, −2.1°).
 
 ## Summary
 
-Two distinct issues were diagnosed for the cold Haworth PSR floor:
+Two effects govern the modeled floor temperature there:
 
-1. **H-matrix view-factor collapse at fine resolution (FIXED).** Above ~100k faces the
+1. **H-matrix view-factor collapse at fine resolution (corrected).** Above ~100k faces the
    H-matrix builder zeroed large floor↔wall blocks to avoid an OOM balloon, collapsing
    the floor's terrain coupling (F_terrain 0.013 → 0.0003) and dropping the 400k floor to
    an unphysical 25 K. A bounded **subdivide-to-sparse** path replaces the three zeroing
    branches, restoring the fine-core coupling to the geometric value. The fine core now
    reproduces the ~100k-face result (~45 K) instead of collapsing.
 
-2. **The residual ~20 K floor cold bias vs Diviner is a resolved-intermittency effect,
-   not a model error in any single subsystem.** PTM3D gives a central-floor summer
-   maximum of ~45 K; Diviner observes ~65 K. Every candidate cause was ruled out (below),
-   and the gap is precisely the difference between the **instantaneous sunlit half-ring**
-   that PTM3D resolves and the **whole-ring-warm steady state** that the Ingersoll closed
-   form (and, evidently, the real Moon) assume.
+2. **The residual ~20 K floor cold bias against Diviner is a resolved-intermittency
+   effect, not an error in any single subsystem.** PTM3D gives a central-floor summer
+   maximum of ~45 K; Diviner observes ~65 K. The gap is the difference between the
+   **instantaneous sunlit half-ring** that PTM3D resolves and the **whole-ring-warm
+   steady state** that the Ingersoll closed form, and evidently the real Moon, assume.
+   The candidates ruled out, and the diagnostic that excluded each, are tabulated below.
 
 ## Diviner / Ingersoll benchmark
 
@@ -59,7 +59,7 @@ PTM3D's uniform low-thermal-inertia regolith cools each rim sector between Sun p
 the floor only ever sees the instantaneous half-ring. Ingersoll's steady whole-ring value
 is an upper bound that the real Moon reaches because its rim retains heat.
 
-## Levers ruled out (with the diagnostic that excluded each)
+## Candidates ruled out, with the diagnostic that excluded each
 
 | Candidate | Verdict | Evidence |
 |---|---|---|
@@ -71,7 +71,7 @@ is an upper bound that the real Moon reaches because its rim retains heat.
 | Output cadence (temporal aliasing) | 0 effect | 35-day summer window, 1/day vs hourly: 41 vs 37 K |
 | Scattered-solar albedo (ρ = 1−ε vs 0.12) | ~+1 K | `radiation_exchange.cpp:452`; thermal IR dominates at warm rim |
 
-## Features added
+## Related features
 
 ### Bounded subdivide-to-sparse H-matrix (default ON)
 `radiation_config.hmatrix_subdivide_admissible` (env `PTM_HMATRIX_SUBDIVIDE`). Replaces the

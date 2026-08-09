@@ -1,11 +1,11 @@
 # Primary-body reflected flux ("Jupiter-shine", "Earthshine") — derivation
 
-Ada, 2026-08-05. Support for the PTM-41 fix in
+Derivation supporting the primary-reflected-flux implementation in
 `src/cpp/illumination/illumination_model.cpp`.
 
 This note derives the irradiance a PTM3D surface face receives from sunlight
 reflected off its primary body, states the assumptions and the limits, and shows
-exactly which factors the pre-fix expression dropped.
+which factors an earlier form of the expression dropped.
 
 ---
 
@@ -50,7 +50,7 @@ projected onto the face by `cos θ`.
 ### 2.2 Why the `sin²α` and not `Ω/4π`
 
 `sin²α·cos θ` **is** the view factor from a differential area to a sphere — the
-same factor PTM-40 installed on the primary-IR path (`Ω/π = 2(1−cos α)`, which
+the same factor used on the primary-IR path (`Ω/π = 2(1−cos α)`, which
 equals `sin²α` to 0.3 % at `α = 6°`). `Ω/(4π)` is the fraction of the *full
 sphere of directions* the primary occupies, which is not an irradiance view
 factor at all.
@@ -126,14 +126,14 @@ so
 E_true / E_code = (8/3) · Φ_L(a) / Φ_code(a)                               (6)
 ```
 
-**8/3 = 2.667 at full phase** — the "2.7×" in the PTM-41 ledger row — but (6) is
+**8/3 = 2.667 at full phase** — but (6) is
 *not* a constant: it falls through 1.698 at quadrature, crosses 1 at
 `a = 128.7°`, and → 0 as `a → π`. Near new phase the old code *over*-estimates.
 
 ### 3.1 The conservation-law statement that settles the cancellation argument
 
-The PTM-40 pass declined to apply a blanket ×4 here, on the argument that the
-spurious `1/4` in `Ω/(4π)` "is exactly the 1/4 that belongs in the radiosity"
+An earlier revision declined to apply a blanket ×4 here, on the argument that
+the spurious `1/4` in `Ω/(4π)` "is exactly the 1/4 that belongs in the radiosity"
 `J = A_B F/4` of a sphere re-radiating isotropically. **That argument is half
 right, and the half that is wrong is decisive.**
 
@@ -153,8 +153,8 @@ The implied total reflected power is therefore `F πR² · p_iso · q_code
 > reflects.** It is not merely mis-shaped in phase; it violates energy
 > conservation by a factor of 2.
 
-So the honest reading of the old decision is: **yes, it was masking part of the
-error.** A blanket ×4 with `Φ_code` retained would have given `4 × ½ = 2×` the
+So the earlier decision was masking part of the error. A blanket ×4 with
+`Φ_code` retained would have given `4 × ½ = 2×` the
 correct *total* power and 1.50× the truth at full phase (the note's number is
 right). Declining the ×4 avoided that overestimate but preserved a *larger*
 underestimate — 2.667× low at full phase, 2× low in total energy. The two
@@ -173,16 +173,16 @@ F              = 1361/5.2038²      = 50.26  W/m²
 p (Lambert)    = (2/3)(0.343)      = 0.2287
 E_refl(full)   = 50.26·0.2287·sin²α = 0.1247 W/m²      <-- fixed code
 E_refl(pre-fix)= 50.26·0.0858·sin²α = 0.0468 W/m²      <-- old code
-E_IR           = 13.8·sin²α         = 0.1498 W/m²      (PTM-40, unchanged)
+E_IR           = 13.8·sin²α         = 0.1498 W/m²      (primary IR, unchanged)
 ```
 
 Cross-check by total power, independent of any view factor:
 Jupiter emits `4πR²·13.8 = 8.48e17 W`; spread over `4πd²` at Europa gives
 `0.1498 W/m²`. ✔
 
-**Order-of-magnitude claim, checked honestly.** The mandate cited a literature
-expectation of "order 1 W/m²". My numbers do not reach it, and geometry forbids
-it: the *hard upper bound* on reflected flux at Europa, obtained by setting
+**Order-of-magnitude check.** A literature expectation of "order 1 W/m²" is
+sometimes quoted. The numbers above do not reach it, and geometry forbids it:
+the hard upper bound on reflected flux at Europa, obtained by setting
 `p = 1` (a perfectly white Jupiter), is
 
 ```
@@ -238,14 +238,14 @@ phase integral q (isotropic)        = 4.0000
    step from `Ω/π` to `sin²α` is a 0.3 % effect at Europa, 0.008 % at the Moon.
 4. **Grey.** Reflected light is absorbed by the target with `(1 − A_vis)` (see
    `ptm_thermal_sim.cpp:1720`), which is the right spectral bin; no color term.
-5. **Occlusion weighting.** When the primary's disk is partly hidden (PTM-44,
-   §7), the visible *fraction* is computed treating the disk as uniformly bright.
+5. **Occlusion weighting.** When the primary's disk is partly hidden (§7),
+   the visible *fraction* is computed treating the disk as uniformly bright.
    At intermediate phase the lit part of the disk is off-center, so a partial
    occultation is weighted slightly wrong. The error is bounded by the disk's
    brightness contrast and applies only to the thin band of faces that are
    partly occulted.
 
-## 7. PTM-44 — fractional visibility of a finite disk
+## 7. Fractional visibility of a finite disk
 
 The same code paths treated the primary as a *point*: one ray to the disk center
 decided all-or-nothing, and a face whose normal fell 0.1° below the primary's
@@ -267,7 +267,7 @@ old expression exactly.
 ### 7.1 The horizon term is analytic — no rays needed
 
 For a smooth global mesh (an icosphere: Europa, and every global Moon run) there
-is **no terrain at all**, so the *entire* PTM-44 defect is the `cos θ ≤ 0` step.
+is **no terrain at all**, so the entire error is in the `cos θ ≤ 0` step.
 That part has a closed form. Writing the disk-center altitude above the face's
 horizon plane as `h = asin(cos θ₀)` and linearizing `cos θ ≈ h + x` across the
 disk (`|x| ≤ α`):
@@ -291,7 +291,7 @@ On an icosphere the band `|h| < α` covers a fraction `≈ sin α` of the faces:
 * **Probe (5 rays):** disk center + 4 rim points, tracing only directions above
   the face's horizon. All clear → `vis ≡ 1`, use (9); all blocked → `E = 0`.
   The probe basis is oriented to the **horizon** — `u = normalize(n̂ − (n̂·d̂)d̂)`,
-  so probe `(+1,0)` is the disk's highest point (Fermi F1; an arbitrary azimuth
+  so probe `(+1,0)` is the disk's highest point (an arbitrary azimuth
   let all five probes miss a thin above-horizon crescent).
   A *smooth* convex body would always let an above-horizon ray escape, so the
   probe would be unanimously clear. **A faceted icosphere does not**: measured
@@ -317,7 +317,7 @@ On an icosphere the band `|h| < α` covers a fraction `≈ sin α` of the faces:
   | **512** | **0.0082** | 0.0020 |
 
   A power-law fit gives `worst ≈ 0.49·N^(−0.65)` — roughly inverse-square-root,
-  not `1/N`. (Fermi's independent fit on the same data: `N^(−0.68)`.) Two other
+  not `1/N`. (An independent fit on the same data gives `N^(−0.68)`.) Two other
   point sets at N = 512 are no better and are printed by the same binary:
   Fibonacci spiral 0.0092, equal-area polar grid 0.0174. N = 512 is the smallest
   power of two meeting the `< 1 %` criterion.
@@ -334,7 +334,8 @@ Sampling is skipped entirely when **both**
 
 Then `⟨cos θ⟩ = cos θ₀` exactly and the arithmetic is bit-identical to the
 pre-fix expression. Faces with `h ≤ −α` return 0 with no rays at all, also
-bit-identical. **Everything in between is where PTM-44 lived.**
+bit-identical. **Everything in between is where the finite-disk treatment
+matters.**
 
 ## 8. What changes, and by how much
 
@@ -349,7 +350,7 @@ so with Europa's `A_vis = 0.55`,
 ΔT     = T · ΔF_abs / (4 ε σ T⁴),   ε = 0.95
 ```
 
-| background T | ΔT from PTM-41 (absorbed) |
+| background T | ΔT from the corrected reflected term (absorbed) |
 | --- | --- |
 | 130 K (Europa dusk) | +0.07 K |
 | 90 K (Europa deep night) | +0.22 K |
@@ -358,8 +359,7 @@ so with Europa's `A_vis = 0.55`,
 
 (An earlier revision of this table applied the *incident* ΔF and so overstated
 these by 1/(1−A_vis) = 2.2×.) The primary-IR term is thermal-band and absorbed
-with `ε`, but PTM-40 already fixed it and this change does not move it.
+with `ε`, and is unaffected by this term.
 
-PTM-44's horizon ramp is signed: faces just below the old cutoff gain up to
-`α·g·J·Ω/π`, faces just above lose the difference between `cos θ₀` and (9).
-Measured deltas are in the session report, not asserted here.
+The horizon ramp of §7 is signed: faces just below the old cutoff gain up to
+`α·g·J·Ω/π`, and faces just above lose the difference between `cos θ₀` and (9).

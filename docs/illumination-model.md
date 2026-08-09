@@ -8,9 +8,10 @@ The PTM3D illumination model computes the radiative energy flux incident on each
 
 All celestial body positions are computed in the IAU body-fixed reference frame of the target. The Sun and primary body positions at ephemeris time $t$ are obtained via the SPICE routine `spkpos_c` with light-time and stellar aberration correction (`LT+S`):
 
-$$\mathbf{r}_\odot(t) = \texttt{spkpos}(\text{SUN},\; t,\; \text{IAU\_BODY},\; \text{LT+S},\; \text{BODY})$$
-
-$$\mathbf{r}_\mathrm{p}(t) = \texttt{spkpos}(\text{PRIMARY},\; t,\; \text{IAU\_BODY},\; \text{LT+S},\; \text{BODY})$$
+```
+r_sun(t)     = spkpos_c("SUN",     t, "IAU_<BODY>", "LT+S", "<BODY>")
+r_primary(t) = spkpos_c("PRIMARY", t, "IAU_<BODY>", "LT+S", "<BODY>")
+```
 
 where both vectors are expressed in kilometers in the target body-fixed frame. For bodies with a user-specified spin state (e.g., DAMIT shape models or Horizons-derived ephemerides for asteroids), positions are rotated from the ecliptic J2000 inertial frame to the body-fixed frame using the pole orientation and prime meridian angle.
 
@@ -20,9 +21,9 @@ where both vectors are expressed in kilometers in the target body-fixed frame. F
 
 The solar irradiance at heliocentric distance $d_\odot$ is
 
-$$E_\odot = \frac{S_0}{(d_\odot / 1\;\text{AU})^2}$$
+$$E_\odot = \frac{S_0}{(d_\odot / 1\thickspace\text{AU})^2}$$
 
-where $S_0 = 1361\;\text{W m}^{-2}$ is the total solar irradiance at 1 AU.
+where $S_0 = 1361\thickspace\text{W m}^{-2}$ is the total solar irradiance at 1 AU.
 
 ### Point-Source Approximation
 
@@ -36,9 +37,9 @@ where $\theta_i$ is the solar incidence angle, i.e., $\cos\theta_i = \hat{\mathb
 
 When the fast-path conditions are not met --- for instance near topographic shadow boundaries, during partial eclipses, or at high solar incidence --- the Sun is modeled as a finite-extent disk. The apparent angular radius of the solar disk as seen from face $i$ is
 
-$$\alpha_\odot = \arcsin\!\left(\frac{R_\odot}{d_\odot}\right)$$
+$$\alpha_\odot = \arcsin\negthinspace\left(\frac{R_\odot}{d_\odot}\right)$$
 
-where $R_\odot = 695{,}700\;\text{km}$.
+where $R_\odot = 695{,}700\thickspace\text{km}$.
 
 #### Disk Sampling
 
@@ -46,7 +47,7 @@ The solar disk is sampled by $N$ points distributed uniformly over the disk area
 
 An orthonormal basis $(\hat{\mathbf{u}}, \hat{\mathbf{v}})$ is constructed perpendicular to the Sun direction $\hat{\mathbf{s}}$. Each disk sample $k$ with coordinates $(d_{x,k}, d_{y,k})$ satisfying $d_{x,k}^2 + d_{y,k}^2 \leq 1$ generates a ray direction
 
-$$\hat{\mathbf{d}}_k = \frac{\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\,\hat{\mathbf{u}} + d_{y,k}\,\hat{\mathbf{v}}\right)}{\left\|\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\,\hat{\mathbf{u}} + d_{y,k}\,\hat{\mathbf{v}}\right)\right\|}$$
+$$\hat{\mathbf{d}}_k = \frac{\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)}{\left\lVert\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)\right\rVert}$$
 
 which samples directions uniformly across the solid angle subtended by the solar disk. The Sun is treated as a uniform-brightness disk (no limb darkening is applied).
 
@@ -70,7 +71,12 @@ Each sample direction $\hat{\mathbf{d}}_k$ undergoes two sequential occlusion te
 
 The direct solar flux on face $i$ is computed as a cosine-weighted average over all $N$ valid disk samples:
 
-$$F_{\mathrm{direct},i} = E_\odot \cdot \frac{1}{N_\mathrm{total}} \sum_{k=1}^{N_\mathrm{total}} \begin{cases} \max\!\left(0,\; \hat{\mathbf{n}}_i \cdot \hat{\mathbf{d}}_k\right) & \text{if sample } k \text{ is unoccluded} \\ 0 & \text{otherwise} \end{cases}$$
+$$
+F_{\mathrm{direct},i} = E_\odot \cdot \frac{1}{N_\mathrm{total}} \sum_{k=1}^{N_\mathrm{total}} \begin{cases}
+\max\negthinspace\left(0,\thickspace \hat{\mathbf{n}}_i \cdot \hat{\mathbf{d}}_k\right) & \text{if sample } k \text{ is unoccluded} \\
+0 & \text{otherwise}
+\end{cases}
+$$
 
 where $N_\mathrm{total}$ is the number of samples that survived the unit-disk rejection test (i.e., $d_x^2 + d_y^2 \leq 1$). This formulation naturally reproduces full illumination, penumbra, and umbra as the fraction of unblocked samples varies continuously.
 
@@ -95,7 +101,7 @@ $$F_\mathrm{shadow} = E_\odot \sin(e_0) \cdot \frac{(1 - A) f}{1 - Af} \cdot \le
 
 For satellites orbiting a giant planet or other body with significant thermal emission, the absorbed thermal infrared flux from the primary is computed. The solid angle subtended by the primary at distance $d_\mathrm{p}$ is
 
-$$\Omega_\mathrm{p} = 2\pi\left(1 - \cos\alpha_\mathrm{p}\right), \qquad \alpha_\mathrm{p} = \arcsin\!\left(\frac{R_\mathrm{p}}{d_\mathrm{p}}\right)$$
+$$\Omega_\mathrm{p} = 2\pi\left(1 - \cos\alpha_\mathrm{p}\right), \qquad \alpha_\mathrm{p} = \arcsin\negthinspace\left(\frac{R_\mathrm{p}}{d_\mathrm{p}}\right)$$
 
 The view factor from a planar face to a spherical primary, assuming Lambertian emission, is
 
@@ -105,13 +111,13 @@ where $\hat{\mathbf{p}}_i$ is the unit vector from face $i$ toward the primary c
 
 $$F_{\mathrm{IR},i} = F_\mathrm{IR,p} \cdot \mathcal{F}_i$$
 
-where $F_\mathrm{IR,p}$ is the total thermal infrared flux emitted by the primary (e.g., $F_\mathrm{IR,Jupiter} = 13.8\;\text{W m}^{-2}$ at Europa's orbit). Terrain visibility is verified via ray tracing before assigning the flux.
+where $F_\mathrm{IR,p}$ is the total thermal infrared flux emitted by the primary (e.g., $F_\mathrm{IR,Jupiter} = 13.8\thickspace\text{W m}^{-2}$ at Europa's orbit). Terrain visibility is verified via ray tracing before assigning the flux.
 
 ## Primary Body Reflected Sunlight
 
 Sunlight reflected by the primary body toward the satellite surface is modeled assuming Lambertian scattering with a phase-dependent correction. The phase angle $\varphi$ between the Sun and the target body as seen from the primary is
 
-$$\varphi = \arccos\!\left(-\hat{\mathbf{s}}_\mathrm{p} \cdot \hat{\mathbf{p}}_i\right)$$
+$$\varphi = \arccos\negthinspace\left(-\hat{\mathbf{s}}_\mathrm{p} \cdot \hat{\mathbf{p}}_i\right)$$
 
 where $\hat{\mathbf{s}}_\mathrm{p}$ is the unit vector from the primary to the Sun, and $\hat{\mathbf{p}}_i$ points from the face toward the primary. A Lambert-sphere phase function modulates the reflected intensity:
 
@@ -121,13 +127,13 @@ The reflected solar flux incident on face $i$ is
 
 $$F_{\mathrm{refl},i} = \frac{E_{\odot,\mathrm{p}} \cdot A_\mathrm{p} \cdot \Phi(\varphi) \cdot \Omega_\mathrm{p}}{4\pi} \left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right)$$
 
-where $E_{\odot,\mathrm{p}} = S_0 / (d_{\odot,\mathrm{p}} / 1\;\text{AU})^2$ is the solar irradiance at the primary's heliocentric distance and $A_\mathrm{p}$ is the primary's Bond albedo (e.g., $A_\mathrm{Jupiter} = 0.343$). Terrain visibility is again verified by ray tracing.
+where $E_{\odot,\mathrm{p}} = S_0 / (d_{\odot,\mathrm{p}} / 1\thickspace\text{AU})^2$ is the solar irradiance at the primary's heliocentric distance and $A_\mathrm{p}$ is the primary's Bond albedo (e.g., $A_\mathrm{Jupiter} = 0.343$). Terrain visibility is again verified by ray tracing.
 
 ## Total Absorbed Flux
 
 The total radiative flux absorbed by face $i$ at time $t$ is the sum of the three components:
 
-$$F_{\mathrm{abs},i}(t) = (1 - A)\,F_{\mathrm{direct},i}(t) + F_{\mathrm{IR},i}(t) + (1 - A)\,F_{\mathrm{refl},i}(t)$$
+$$F_{\mathrm{abs},i}(t) = (1 - A)\thinspaceF_{\mathrm{direct},i}(t) + F_{\mathrm{IR},i}(t) + (1 - A)\thinspaceF_{\mathrm{refl},i}(t)$$
 
 where $A$ is the surface Bond albedo. For heliocentric bodies without a parent planet (e.g., asteroids), the primary IR and reflected terms vanish and only the direct solar term contributes.
 
@@ -135,11 +141,11 @@ where $A$ is the surface Bond albedo. For heliocentric bodies without a parent p
 
 To prevent self-intersection artifacts in ray tracing, each ray origin is offset from the face center along both the face normal and the ray direction. The offset magnitude is scale-aware:
 
-$$\epsilon = \max\!\left(16\,\epsilon_\mathrm{mach}\,r,\; \max\!\left(10^{-6}\,r,\; 0.01\;\text{m}\right)\right)$$
+$$\epsilon = \max\negthinspace\left(16\thinspace\epsilon_\mathrm{mach}\thinspacer,\thickspace \max\negthinspace\left(10^{-6}\thinspacer,\thickspace 0.01\thickspace\text{m}\right)\right)$$
 
-where $r = \|\mathbf{r}_i\|$ is the radial distance of the face center from the body origin and $\epsilon_\mathrm{mach}$ is the machine epsilon for double-precision arithmetic. The ray origin for face $i$ with sun direction $\hat{\mathbf{s}}$ is then
+where $r = \lVert\mathbf{r}_i\rVert$ is the radial distance of the face center from the body origin and $\epsilon_\mathrm{mach}$ is the machine epsilon for double-precision arithmetic. The ray origin for face $i$ with sun direction $\hat{\mathbf{s}}$ is then
 
-$$\mathbf{o}_i = \mathbf{r}_i + 2\epsilon\,\hat{\mathbf{n}}_i + 12\epsilon\,\hat{\mathbf{s}}$$
+$$\mathbf{o}_i = \mathbf{r}_i + 2\epsilon\thinspace\hat{\mathbf{n}}_i + 12\epsilon\thinspace\hat{\mathbf{s}}$$
 
 This ensures robust behavior across scales ranging from meter-scale DEM patches to planetary-radius global meshes.
 

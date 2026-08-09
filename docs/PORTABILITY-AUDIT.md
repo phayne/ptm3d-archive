@@ -1,10 +1,10 @@
 # PTM3D Portability Audit (Phase 0)
 
-**Author:** Ada · **Date:** 2026-07-21 · **Tree:** `~/projects/ptm` (main @ `3e3baae`),
+**Date:** 2026-07-21 · **Tree:** repository root at `3e3baae`,
 branch `feat/portability-phaseR`.
-**Scope:** read-only inventory per the plan (`~/projects/ptm-portability-plan.md` §Phase 0)
-against the fresh release tree. Findings are `file:line` with a severity and a Phase-1 disposition.
-This is the audit input to Phase 1 (Linux CPU build + CI + path portability), not the fix itself.
+**Scope:** read-only inventory of the release tree. Findings are `file:line` with a severity and
+a disposition. This is the audit input to the portability work (Linux CPU build, CI, path
+portability), not the fix itself.
 
 Severity: **P0** blocks a non-Mac / non-this-host build or run · **P1** wrong/silent on another host ·
 **P2** hygiene / reproducibility.
@@ -76,7 +76,7 @@ the CPU-only TU compiles with the GPU blocks elided)** — this is a Phase-1 bui
 
 The full absorbed-illumination series is held resident: `n_faces × n_steps × components` float64
 (direct + primary-reflected + primary-IR ⇒ ~3 components) before the thermal solve. The knob
-`PTM_RAM_ILLUM_MAX_GB` (read in the illumination path; e.g. Ousha needs `=40`) triggers a streaming
+`PTM_RAM_ILLUM_MAX_GB` (read in the illumination path; a large shape model may need `=40`) triggers a streaming
 path above the cap. This was sized on the 384 GB workstation. Scaling law and 16 GB-laptop guidance:
 
 | faces | steps | components | resident (float64) | laptop verdict |
@@ -156,10 +156,10 @@ state, then moves to the next batch (`ptm_thermal_sim.cpp:4478-4562`, assembled 
 `assembled_final_T`, written once at `:4584`). Consequence: **there is no wall-clock moment at which
 all faces share the same output step**, so true "checkpoint every N output steps" (R4) of a full-mesh
 state is architecturally impossible here — a partial dump carries un-solved faces at 0 K and is a
-resume footgun (the zero-column runaway guarded at `:4609-4614`). Blast-radius bounding today is the
+resume hazard (the zero-column runaway guarded at `:4609-4614`). Loss is bounded today by the
 runner's process-level chunk split (`run_yearlong_wedge_safe.py --stage-b-nchunks`). Per-output-step
-checkpointing belongs to the **CPU-first solver** (time-outer, Phase 1) or a solver restructure.
-The R4 config key `thermal.checkpoint_every_output_steps` is plumbed and **warns loudly** if set on
+checkpointing belongs to a time-outer CPU-first solver, or to a solver restructure.
+The config key `thermal.checkpoint_every_output_steps` is plumbed and **warns loudly** if set on
 the GPU path rather than silently no-op'ing (`ptm_thermal_sim.cpp` PHASE-3 mapping).
 
 ## 9. Phase-1 priority ordering (from this audit)

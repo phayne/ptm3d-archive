@@ -81,7 +81,7 @@ Walkthrough, the full table and the shadowed-set definition:
 [docs/tutorials/04_crater_radiosity.md](docs/tutorials/04_crater_radiosity.md).
 
 > On the `v1.0.3` tag exactly, the coupled run aborts (`FATAL: ... no
-> post-equilibration T(z) hand-off`, exit 1); fixed after the tag (PTM-94).
+> post-equilibration T(z) hand-off`, exit 1); fixed after the tag.
 
 ## What you exercised
 

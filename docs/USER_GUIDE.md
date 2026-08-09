@@ -151,10 +151,10 @@ src/cpp/
 - Validated against Lunar Diviner data (RMS error <4 K)
 
 **Radiation Exchange**:
-- Radiosity equation: $B_i = \varepsilon_i \sigma T_i^4 + \rho_i \sum_j F_{ij} B_j + \rho_i Q_{\text{solar},i}$
+- Band-separated radiosity, on by default: a visible band $(I - AF)B_{\text{vis}} = AQ_{\text{solar}}$ scattering with the Bond albedo, and a thermal-IR band $(I - \rho F)B_{\text{ir}} = \varepsilon\sigma T^4$ scattering with $\rho = 1-\varepsilon$; the two absorbed fluxes are summed. `radiation.band_separated: false` recovers the single gray band
 - View factor methods: centroid (far field) and subdivision (near field), selected adaptively by dimensionless separation $N_s = r/\sqrt{A}$
 - Hierarchical-matrix ("H-matrix") compression with octree spatial partitioning, low-rank block compression by adaptive cross approximation (ACA), and $O(N \log N)$ matrix–vector multiplication cost
-- Adaptive thermal-radiation coupling: selective face re-run, warm-start solver, convergence on temperature and flux criteria
+- Adaptive thermal-radiation coupling: selective face re-run, warm-started solver, convergence on the maximum per-face temperature change
 
 **Exosphere Model**:
 - Sublimation-driven water vapor loss with Hertz-Knudsen kinetics
@@ -174,7 +174,8 @@ src/cpp/
 
 ```
 --config <file>               Load YAML configuration file
---body, -b <name>             Body name (Moon, Mercury, Europa, Mars, Ceres, ...)
+--body, -b <name>             Body name. Moon, Mercury and Europa have built-in
+                              properties; any other name needs a generic_body: block
 --start <time>                Start time (ISO 8601, default: 2025-01-01T00:00:00)
 --resolution <n>              Global icosphere resolution (default: 5)
 --duration <days>             Simulation duration in days
@@ -201,7 +202,7 @@ src/cpp/
 --geothermal-heat-flow <Q>    Bottom boundary heat flow (W/m^2)
 --thermal-m <n>               Layers in upper skin depth (default: 10)
 --thermal-n <n>               Layer growth factor (default: 15)
---thermal-b <n>               Skin depths to bottom (default: 8)
+--thermal-b <n>               Skin depths to bottom (default: 15)
 ```
 
 ### Radiation Exchange
@@ -212,8 +213,8 @@ src/cpp/
 --rad-use-gpu                 Use GPU radiosity solver (OpenCL)
 --rad-view-factor-file <f>    Save/load pre-computed view factors
 --rad-coupling-iter <n>       Max coupling iterations (default: 10)
---rad-coupling-temp-tol <K>   Temperature convergence threshold (default: 2.0 K)
---rad-coupling-flux-tol <W>   Flux change threshold (default: 0.1 W/m^2)
+--rad-coupling-temp-tol <K>   Temperature convergence threshold (default: 0.5 K)
+--rad-coupling-flux-tol <W>   Flux threshold, legacy selection only (default: 0.1 W/m^2)
 --rad-coupling-face-frac <f>  Face fraction still changing (default: 0.01)
 --rad-aca-tolerance <t>       ACA compression tolerance (default: 1e-3)
 --rad-hmatrix-threads <n>     H-matrix build threads (0 = auto)
@@ -262,7 +263,7 @@ mesh:
 thermal:
   run_thermal_mesh: true
   threads: 0                # 0 = auto-detect
-  equilibration_orbits: 10
+  equilibration_orbits: 4   # default: 1
   geothermal_heat_flow: -1  # -1 = planet default
 
 illumination:
@@ -274,15 +275,15 @@ radiation:
   enabled: false
   use_hmatrix: false
   max_coupling_iterations: 10
-  coupling_temp_threshold: 2.0   # K
+  coupling_temp_threshold: 0.5   # K
   coupling_flux_threshold: 0.1   # W/m^2
-  coupling_mode: bounded         # bounded | fixed | legacy (PTM-89; see
+  coupling_mode: bounded         # bounded | fixed | legacy (see
                                  # docs/radiation-exchange.md 7.2.1).
                                  # `legacy` reproduces pre-2026-08-05 runs and
                                  # makes the answer depend on the chunk plan.
   coupling_select_dt: 0.0        # K; 0 = re-thermal every face carrying
                                  # indirect flux (decomposition-independent)
-  exchange_selection: all        # all | shadow (PTM-98; see
+  exchange_selection: all        # all | shadow (see
                                  # docs/radiation-exchange.md 7.2.2).
                                  # `shadow` reproduces pre-2026-08-05 runs: it
                                  # drops faces that are lit for most of THIS
@@ -305,9 +306,9 @@ generic_body:                # For arbitrary bodies
 ```
 
 See [`../examples/`](../examples/) for runnable configurations (relative paths
-only; start with `quickstart_moon_diurnal.yaml`). The configs under
-`examples/campaigns/` are internal production-campaign artifacts with
-machine-specific paths and are **not** runnable from a clone.
+only; start with `quickstart_moon_diurnal.yaml`). The study configurations under
+`../configs/` are kept for provenance and may reference datasets and paths that
+are not distributed.
 
 ---
 

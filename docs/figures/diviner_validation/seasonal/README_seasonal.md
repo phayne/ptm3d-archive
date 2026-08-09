@@ -66,8 +66,9 @@ Values below are taken verbatim from `summary.json` / `seasonal_summary.png`:
    **winter-mean from +29.2 to +0.6 K (RMSE 1.6), winter-max from +22.0 to −6.6,
    summer-mean from +11.5 to −9.7**. Both the walls' off-peak temperatures (Tmin
    59→41 K) and the floor's own reservoir cool; the walls' *peak* (237 K) is
-   unchanged, being set by direct sun. Recipe locked: **≥25 equilibration orbits +
-   ⟨indirect⟩-in-equilibration + coarse eq cadence** (`divval_haworth_eq49.yaml`).
+   unchanged, being set by direct sun. The recommended configuration is **≥25
+   equilibration orbits, ⟨indirect⟩-in-equilibration, and a coarse equilibration
+   cadence**.
 2. **The production summer-max match was coincidental, and the residual summer-max
    cold bias is now understood.** The 2-orbit run's good summer-max (+1.6) was
    propped up by the same warm reservoir; with a correctly cold deep column the

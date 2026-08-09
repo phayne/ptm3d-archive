@@ -8,7 +8,7 @@ This document develops an analytical diffusive framework for this transport, cal
 
 The equilibrium H$_2$O vapor pressure over ice (Marti & Mauersberger 1993),
 
-$$\log_{10} P_v\;[\mathrm{Pa}] = -2663.5/T + 12.537$$
+$$\log_{10} P_v\thickspace[\mathrm{Pa}] = -2663.5/T + 12.537$$
 
 amplifies temperature contrasts exponentially.  From the PTM3D orbit-averaged temperatures, the equatorial vapor pressure profile as a function of longitude is:
 
@@ -39,15 +39,15 @@ Both profiles serve as inputs to the diffusive transport model developed below.
 
 Jeans escape is negligible at Europa ($\lambda_J \approx 42$; $f_\mathrm{esc} \sim 10^{-18}$), so all sublimated H$_2$O returns to the surface.  Let $K(\Delta\lambda)$ be the ballistic transport kernel—the probability that a molecule sublimated at $\lambda'$ lands at $\lambda = \lambda' + \Delta\lambda$.  The deposition flux is the convolution
 
-$$\Phi_\mathrm{dep}(\lambda) = \int K(\lambda - \lambda')\, \Phi_\mathrm{sub}(\lambda')\, d\lambda'$$
+$$\Phi_\mathrm{dep}(\lambda) = \int K(\lambda - \lambda')\thinspace \Phi_\mathrm{sub}(\lambda')\thinspace d\lambda'$$
 
 Taylor-expanding $\Phi_\mathrm{sub}(\lambda')$ about $\lambda$, the zeroth-order term recovers $\Phi_\mathrm{sub}$ by normalization of $K$, the first-order term vanishes by symmetry, and the leading correction is
 
-$$\Phi_\mathrm{net} = \Phi_\mathrm{sub} - \Phi_\mathrm{dep} \approx -\frac{\ell^2}{2}\,\frac{d^2\Phi_\mathrm{sub}}{d\lambda^2}$$
+$$\Phi_\mathrm{net} = \Phi_\mathrm{sub} - \Phi_\mathrm{dep} \approx -\frac{\ell^2}{2}\thinspace\frac{d^2\Phi_\mathrm{sub}}{d\lambda^2}$$
 
-where $\ell^2 \equiv \int (\Delta\lambda)^2\, K(\Delta\lambda)\, d(\Delta\lambda)$ is the mean-square angular hop distance.  Since the fractional temperature variation is small ($\Delta T / \bar{T} \approx 2\%$), the mass sublimation flux $\Phi_\mathrm{sub} = P_v \sqrt{m/(2\pi k_B T)}$ is proportional to $P_v$ to excellent approximation, giving
+where $\ell^2 \equiv \int (\Delta\lambda)^2\thinspace K(\Delta\lambda)\thinspace d(\Delta\lambda)$ is the mean-square angular hop distance.  Since the fractional temperature variation is small ($\Delta T / \bar{T} \approx 2$%), the mass sublimation flux $\Phi_\mathrm{sub} = P_v \sqrt{m/(2\pi k_B T)}$ is proportional to $P_v$ to excellent approximation, giving
 
-$$\boxed{\Phi_\mathrm{net}(\lambda) \;\approx\; -D_b\,\frac{d^2 P_v}{d\lambda^2} \;\times\; \sqrt{\frac{m}{2\pi k_B \bar{T}}}}$$
+$$\boxed{\Phi_\mathrm{net}(\lambda) \thickspace\approx\thickspace -D_b\thinspace\frac{d^2 P_v}{d\lambda^2} \thickspace\times\thickspace \sqrt{\frac{m}{2\pi k_B \bar{T}}}}$$
 
 where $D_b = \ell^2/2$ is the effective ballistic diffusivity.  For the $K_0$ transport kernel, the analytical second moment is $\langle\xi^2\rangle = 4$ (with $\xi = g d / 2\sigma^2$ the dimensionless hop parameter, $g = 1.314$ m s$^{-2}$, $\sigma^2 = k_BT/m$), giving a characteristic hop distance $\ell \approx 5.5°$ at 107 K and $D_b \approx 4.6 \times 10^{-3}$ rad$^2$.  Since $\ell$ is much shorter than the $\sim 60°$ longitudinal transition zone, the diffusive approximation is well justified for equatorial transport ($\ell/H_\lambda \approx 0.08$).
 
@@ -66,10 +66,10 @@ The $n^2$ weighting amplifies the higher harmonics encoding the steep transition
 
 | $\lambda$ | $\Phi_\mathrm{net} / \bar{\Phi}$ | Ice rate ($\mu$m Myr$^{-1}$) | Interpretation |
 |-----------|-------------------------------|-------------------------------|----------------|
-| $0°$ (sub-jovian) | $-0.5\%$ | $-0.13$ (accretion) | Cold trap |
-| $\pm 90°$ (flanks) | $\mathbf{+1.3\%}$ | $\mathbf{+0.32}$ (removal) | **Net ice loss** |
-| $135°$ | $-0.3\%$ | $-0.07$ (accretion) | Slight deposition |
-| $180°$ (anti-jovian) | $-0.2\%$ | $-0.05$ (accretion) | Near equilibrium |
+| $0°$ (sub-jovian) | $-0.5$% | $-0.13$ (accretion) | Cold trap |
+| $\pm 90°$ (flanks) | $\mathbf{+1.3}$**%** | $\mathbf{+0.32}$ (removal) | **Net ice loss** |
+| $135°$ | $-0.3$% | $-0.07$ (accretion) | Slight deposition |
+| $180°$ (anti-jovian) | $-0.2$% | $-0.05$ (accretion) | Near equilibrium |
 
 The flanks at $\pm 90°$ are the only equatorial longitudes with net ice removal.  Despite having nearly the same $P_v$ as the anti-jovian hemisphere, the flanks sit at the inflection point of the vapor pressure profile: molecules hopping anti-jovianward are replaced by equivalent return flux, while those hopping sub-jovianward land on colder terrain that returns far less.
 
@@ -86,17 +86,17 @@ These rates describe transport along a **single axis only**: the latitudinal rat
 
 The two directions play complementary roles.  Latitudinal transport is **zonally symmetric**—it depletes equatorial ice at all longitudes equally, driving poleward migration.  Longitudinal transport **breaks this symmetry**, preferentially removing ice from the $\pm 90°$ flanks.  Both operate simultaneously, but the latitudinal component dominates by a factor $\sim 5$.
 
-The diffusion approximation is less well justified in the latitudinal direction: the vapor pressure scale height $H_\varphi \approx 16°$ at $\varphi = 15°$ gives $\ell/H_\varphi \approx 0.34$, versus $\ell/H_\lambda \approx 0.08$ longitudinally.  Higher-order Taylor corrections contribute $\sim 10\%$.  The spherical harmonic treatment below provides the proper two-dimensional generalization.
+The diffusion approximation is less well justified in the latitudinal direction: the vapor pressure scale height $H_\varphi \approx 16°$ at $\varphi = 15°$ gives $\ell/H_\varphi \approx 0.34$, versus $\ell/H_\lambda \approx 0.08$ longitudinally.  Higher-order Taylor corrections contribute $\sim 10$%.  The spherical harmonic treatment below provides the proper two-dimensional generalization.
 
 ## Spherical Harmonic Generalization
 
 On the full sphere, the transport kernel becomes a convolution over solid angle, and the same Taylor expansion yields the angular Laplacian $\nabla^2_\Omega$ in place of the 1D second derivative:
 
-$$\boxed{\Phi_\mathrm{net}(\theta,\phi) \;=\; -D_b\,\nabla^2_\Omega P_v \;\times\; \sqrt{\frac{m}{2\pi k_B \bar{T}}}}$$
+$$\boxed{\Phi_\mathrm{net}(\theta,\phi)  =  -D_b\thinspace\nabla^2_\Omega P_v \thickspace\times\thickspace \sqrt{\frac{m}{2\pi k_B \bar{T}}}}$$
 
-Expanding $P_v$ in spherical harmonics, $P_v = \sum c_{\ell m}\, Y_\ell^m$, the eigenvalue relation $\nabla^2_\Omega Y_\ell^m = -\ell(\ell+1)\,Y_\ell^m$ gives
+Expanding $P_v$ in spherical harmonics, $P_v = \sum c_{\ell m}\thinspace Y_\ell^m$, the eigenvalue relation $\nabla^2_\Omega Y_\ell^m = -\ell(\ell+1)\thinspaceY_\ell^m$ gives
 
-$$\Phi_\mathrm{net} = D_b \sum_{\ell,m} \ell(\ell+1)\, c_{\ell m}\, Y_\ell^m \;\times\; \sqrt{\frac{m}{2\pi k_B \bar{T}}}$$
+$$\Phi_\mathrm{net} = D_b \sum_{\ell,m} \ell(\ell+1)\thinspace c_{\ell m}\thinspace Y_\ell^m \thickspace\times\thickspace \sqrt{\frac{m}{2\pi k_B \bar{T}}}$$
 
 This is the natural generalization: the 1D Fourier weighting $n^2$ becomes the spherical harmonic eigenvalue $\ell(\ell+1)$.  The equatorial Fourier modes $a_n$ correspond to sectoral harmonics ($\ell = n$, $m = n$), while the latitudinal structure maps onto zonal harmonics ($m = 0$).
 
@@ -128,7 +128,7 @@ The transport power per degree, $S_\ell = \ell(\ell+1)\sum_m |c_{\ell m}|^2$, me
 | 3 | 6% | 84% |
 | 5 | 5% | 89% |
 
-The $\ell = 4$ mode dominates because the $\ell(\ell+1)$ weighting amplifies intermediate-scale structure—the steep equator-to-midlatitude $P_v$ transition projects most strongly onto this degree.  Zonal ($m = 0$) modes account for $\sim 85\%$ of total transport power, confirming that poleward transport dominates.
+The $\ell = 4$ mode dominates because the $\ell(\ell+1)$ weighting amplifies intermediate-scale structure—the steep equator-to-midlatitude $P_v$ transition projects most strongly onto this degree.  Zonal ($m = 0$) modes account for $\sim 85$% of total transport power, confirming that poleward transport dominates.
 
 ### Combined 2D ice rates
 
@@ -144,19 +144,19 @@ In contrast to the 1D longitudinal analysis, the 2D model predicts net ice remov
 
 ## Ice Evolution and Steady State
 
-Since $\Phi_\mathrm{net}$ depends on temperature alone (not on the ice column), ice thickness at any location evolves linearly: $\sigma(t) = \sigma_0 - \Phi_\mathrm{net}\, t$.  Ice is depleted first at the equatorial flanks, with a depletion timescale
+Since $\Phi_\mathrm{net}$ depends on temperature alone (not on the ice column), ice thickness at any location evolves linearly: $\sigma(t) = \sigma_0 - \Phi_\mathrm{net}\thinspace t$.  Ice is depleted first at the equatorial flanks, with a depletion timescale
 
-$$t^*(\pm 90°) = \frac{\rho_\mathrm{ice}\, h_0}{\Phi_\mathrm{net}(\pm 90°)} \approx 3.1\;\mathrm{Myr} \times \left(\frac{h_0}{1\;\mu\mathrm{m}}\right)$$
+$$t^*(\pm 90°) = \frac{\rho_\mathrm{ice}\thinspace h_0}{\Phi_\mathrm{net}(\pm 90°)} \approx 3.1\thickspace\mathrm{Myr} \times \left(\frac{h_0}{1\thickspace\mu\mathrm{m}}\right)$$
 
 However, as ice sublimes, refractory material (silicates, salts) accumulates as a lag deposit.  The growing non-ice concentration $c$ reduces the exposed ice fraction to $(1-c)$, throttling further sublimation.  For a well-mixed surface layer of gardening depth $\delta$, the concentration evolves as
 
-$$\rho_\mathrm{ice}\,\delta\,\frac{dc}{dt} = (1-c)\,\Phi_\mathrm{sub}(\lambda) - \Phi_\mathrm{dep}(\lambda)$$
+$$\rho_\mathrm{ice}\thinspace\delta\thinspace\frac{dc}{dt} = (1-c)\thinspace\Phi_\mathrm{sub}(\lambda) - \Phi_\mathrm{dep}(\lambda)$$
 
 In the diffusive model $\Phi_\mathrm{dep} \approx \Phi_\mathrm{sub} - \Phi_\mathrm{net}$, yielding the analytical solution
 
 $$\boxed{c(\lambda, t) = c_\mathrm{eq}(\lambda)\left(1 - e^{-t/\tau(\lambda)}\right)}$$
 
-where $c_\mathrm{eq} = \Phi_\mathrm{net}/\Phi_\mathrm{sub}$ is the equilibrium concentration at which the lag deposit balances net transport, and $\tau = \rho_\mathrm{ice}\,\delta/\Phi_\mathrm{sub}$ is the sublimation turnover time.  Evaluating at $\pm 90°$ ($\Phi_\mathrm{sub} \approx 9.0 \times 10^{-16}$ kg m$^{-2}$ s$^{-1}$):
+where $c_\mathrm{eq} = \Phi_\mathrm{net}/\Phi_\mathrm{sub}$ is the equilibrium concentration at which the lag deposit balances net transport, and $\tau = \rho_\mathrm{ice}\thinspace\delta/\Phi_\mathrm{sub}$ is the sublimation turnover time.  Evaluating at $\pm 90°$ ($\Phi_\mathrm{sub} \approx 9.0 \times 10^{-16}$ kg m$^{-2}$ s$^{-1}$):
 
 | Gardening depth $\delta$ | Turnover time $\tau$ | $c_\mathrm{eq}$ |
 |--------------------------|---------------------|------------------|
@@ -164,6 +164,6 @@ where $c_\mathrm{eq} = \Phi_\mathrm{net}/\Phi_\mathrm{sub}$ is the equilibrium c
 | 100 $\mu$m (thermal skin) | 3.2 Myr | 1.0% |
 | 1 cm | 320 Myr | 1.0% |
 
-The equilibrium concentration $c_\mathrm{eq} \approx 1\%$ is independent of gardening depth—set purely by the ratio of net transport to local sublimation.  The gardening depth controls only how quickly equilibrium is reached: $\tau \propto \delta$.
+The equilibrium concentration $c_\mathrm{eq} \approx 1$% is independent of gardening depth—set purely by the ratio of net transport to local sublimation.  The gardening depth controls only how quickly equilibrium is reached: $\tau \propto \delta$.
 
-This $\sim 1\%$ enrichment results from lateral diffusive transport alone, without albedo feedback.  In the full numerical model, the positive feedback loop (higher $c$ → lower albedo → higher $T$ → exponentially faster sublimation) amplifies $c_\mathrm{eq}$ well beyond the diffusive prediction, with the amplification depending sensitively on the albedo endmembers and gardening depth.
+This $\sim 1$% enrichment results from lateral diffusive transport alone, without albedo feedback.  In the full numerical model, the positive feedback loop (higher $c$ → lower albedo → higher $T$ → exponentially faster sublimation) amplifies $c_\mathrm{eq}$ well beyond the diffusive prediction, with the amplification depending sensitively on the albedo endmembers and gardening depth.

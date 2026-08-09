@@ -167,18 +167,17 @@ after fetching kernels per §4):
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 ```
 
-**Take your configurations from `examples/`, not `configs/`.** The 15 files at the top of
-`examples/` are the colleague-facing set and 12 of them are CPU-only. `configs/` (55 files)
-and `examples/campaigns/` (74 files) are internal production inputs kept for provenance:
-47 of the 55 `configs/` files set `thermal.use_gpu: true`, so on the CPU-only build of §3
-they stop immediately with `FATAL [gpu]` (set `thermal.use_gpu: false` to run them on the
-CPU), and several reference meshes, DEMs or view-factor files that are not distributed.
+**Take your configurations from `examples/`, not `configs/`.** The 19 files at the top of
+`examples/` are the colleague-facing set and most of them are CPU-only. `configs/` (55 files)
+holds study inputs kept for provenance: 47 of the 55 set `thermal.use_gpu: true`, so on the
+CPU-only build of §3 they stop immediately with `FATAL [gpu]` (set `thermal.use_gpu: false`
+to run them on the CPU), and several reference meshes, DEMs or view-factor files that are
+not distributed.
 
 ## 7. Known caveats (from the portability audit)
 
-- Configs under `examples/campaigns/` are internal production-campaign artifacts with
-  machine-specific absolute paths and are **not runnable from a clone** (see the README
-  there). Everything directly in `examples/` uses relative paths.
+- Files directly under `examples/` use relative paths and run from a clone. Files under
+  `configs/` may reference datasets and machine-specific paths that are not distributed.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
   individual test programs directly (as in §5).
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine

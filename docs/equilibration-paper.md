@@ -8,8 +8,8 @@ The thermal evolution of a planetary surface is governed by the
 one-dimensional heat-conduction equation
 
 $$
-\rho(z)\, c_p(T)\, \frac{\partial T}{\partial t}
-   \;=\; \frac{\partial}{\partial z}\!\left[k(T)\,\frac{\partial T}{\partial z}\right],
+\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t}
+    =  \frac{\partial}{\partial z}\negthinspace\left[k(T)\thinspace\frac{\partial T}{\partial z}\right],
 \qquad 0 \leq z \leq z_b,
 \tag{1}
 $$
@@ -43,26 +43,26 @@ solution.  The characteristic penetration depth is the *thermal skin
 depth*
 
 $$
-\delta(P) \;=\; \sqrt{\frac{k\,P}{\pi\,\rho\,c_p}},
+\delta(P)  =  \sqrt{\frac{k\thinspaceP}{\pi\thinspace\rho\thinspacec_p}},
 \tag{2}
 $$
 
 so that the diurnal skin depth on the Moon (regolith $k_s \approx
 7.4\times 10^{-4}\,\mathrm{W\,m^{-1}\,K^{-1}}$, $\rho_s = 1100\,
 \mathrm{kg\,m^{-3}}$, $c_p \sim 800\,\mathrm{J\,kg^{-1}\,K^{-1}}$,
-$P_{\mathrm{lun}} = 29.5\,\mathrm{d}$) is $\delta_1 \approx 3$ cm.
+$P_{\mathrm{lun}} = 29.5\thinspace\mathrm{d}$) is $\delta_1 \approx 3$ cm.
 The seasonal skin depth at terrestrial-planet rotational obliquity
 is larger by $\sqrt{P_{\mathrm{seas}}/P_{\mathrm{diur}}}$; for the
 $\sim$18-yr lunar nodal cycle this is $\sim 23\times$ deeper.
 
-PTM3D places the lower boundary at $z_b = b\,\delta_1$, where $b$ is
+PTM3D places the lower boundary at $z_b = b\thinspace\delta_1$, where $b$ is
 a depth scaling factor configurable per run.  The radiative
 enhancement of solid conductivity ($\chi(T/350)^{3}$ in the
 Vasavada–Hayne parameterization) deepens the effective skin depth
 at high $T$, and we adopt $b=15$ as a production default, placing
 the bottom Neumann condition at $\sim 9$ effective $e$-folds of
 damping in the high-temperature limit and fully attenuating the
-diurnal amplitude at $z_b$ to $<0.1\,\mathrm{K}$ for any planetary
+diurnal amplitude at $z_b$ to $<0.1\thinspace\mathrm{K}$ for any planetary
 application of interest.
 
 The vertical grid uses $m$ logarithmically spaced surface layers
@@ -70,7 +70,7 @@ filling the first skin depth (default $m=10$) and a geometric
 expansion ratio $\eta = 1 + 1/n$ (default $n=15$) beyond, terminating
 at $z_b$.  At the production parameters this gives 30 layers spanning
 the full $b$-skin-depth domain, with the surface layer thickness
-$\Delta z_0 \approx 0.03\,\delta_1$ resolving the steep gradient
+$\Delta z_0 \approx 0.03\thinspace\delta_1$ resolving the steep gradient
 near the radiative boundary.
 
 ## 3. Time integration
@@ -83,9 +83,9 @@ includes the $T^3$ radiative term and $c_p(T)$ is a low-order
 polynomial fitted to laboratory regolith data), so the resulting
 tridiagonal system is mildly nonlinear; we solve it with a Picard
 loop that typically converges in two passes against a
-fixed-point tolerance of $10^{-3}\,\mathrm{K}$.  The radiative
+fixed-point tolerance of $10^{-3}\thinspace\mathrm{K}$.  The radiative
 surface boundary condition is closed by Newton–Raphson on $T_0$
-at each timestep (typically 3-5 iterations to $10^{-4}\,\mathrm{K}$
+at each timestep (typically 3-5 iterations to $10^{-4}\thinspace\mathrm{K}$
 on the equilibrium residual).
 
 The Crank–Nicolson scheme has truncation error $\mathcal{O}(\Delta
@@ -116,7 +116,7 @@ target $N_{\mathrm{s}}$ samples per diurnal cycle on the body under
 study:
 
 $$
-\Delta t_{\mathrm{eq}} \;=\; P_{\mathrm{diur}}\big/\,N_{\mathrm{s}}.
+\Delta t_{\mathrm{eq}}  =  P_{\mathrm{diur}}\big/\thinspaceN_{\mathrm{s}}.
 \tag{3}
 $$
 
@@ -128,7 +128,7 @@ cadence.
 
 We integrate for $N_{\mathrm{orb}}$ full diurnal cycles in the
 equilibration phase (production default: 2 lunar synodic months), then
-hand the post-equilibration profile $T(z, t = N_{\mathrm{orb}}\, P_{\mathrm{diur}})$
+hand the post-equilibration profile $T(z, t = N_{\mathrm{orb}}\thinspace P_{\mathrm{diur}})$
 to the output phase, which then runs at the science cadence
 $\Delta t_{\mathrm{out}}$ over one further full diurnal cycle.  Only
 the output phase is saved to disk.
@@ -137,9 +137,9 @@ On a representative large-mesh production case (4.8 M-face lunar
 polar mesh, one-minute output cadence over a 30-day window) the
 decoupled cadence reduces the equilibration phase from
 $8.5\times 10^{4}$ to $1.4\times 10^{3}$ timesteps and the peak
-in-RAM thermal-state footprint from $227\,\mathrm{GB}$ to $13\,\mathrm{GB}$,
+in-RAM thermal-state footprint from $227\thinspace\mathrm{GB}$ to $13\thinspace\mathrm{GB}$,
 while keeping the surface temperature error at the first output
-timestep below $2\,\mathrm{K}$.
+timestep below $2\thinspace\mathrm{K}$.
 
 ## 5. Initial profile
 
@@ -148,18 +148,18 @@ profile.  We use an exponential blend between a near-surface
 target and a deep-soil target,
 
 $$
-T(z, t=0) \;=\; T_{\mathrm{deep}}
-   \;+\;\bigl(T_{\mathrm{avg}} - T_{\mathrm{deep}}\bigr)\,\exp(-z/\delta_1),
+T(z, t=0)  =  T_{\mathrm{deep}}
+    + \bigl(T_{\mathrm{avg}} - T_{\mathrm{deep}}\bigr)\thinspace\exp(-z/\delta_1),
 \tag{4}
 $$
 
 with
 
 $$
-T_{\mathrm{avg}} \;=\; \frac{T_{\mathrm{ss}}}{\sqrt{2}}, \qquad
-T_{\mathrm{ss}} \;=\; \biggl[\frac{(1-\alpha_i)\,S}{\varepsilon_i\,\sigma}\biggr]^{1/4},
+T_{\mathrm{avg}}  =  \frac{T_{\mathrm{ss}}}{\sqrt{2}}, \qquad
+T_{\mathrm{ss}}  =  \biggl[\frac{(1-\alpha_i)\thinspaceS}{\varepsilon_i\thinspace\sigma}\biggr]^{1/4},
 \qquad
-T_{\mathrm{deep}} \;=\; T_{\mathrm{avg}} \;+\; \min\!\bigl(Q_b\,z_b/k,\,50\,\mathrm{K}\bigr),
+T_{\mathrm{deep}}  =  T_{\mathrm{avg}}  +  \min\negthinspace\bigl(Q_b\thinspacez_b/k,\thinspace50\thinspace\mathrm{K}\bigr),
 \tag{5}
 $$
 
@@ -186,15 +186,15 @@ where the radiative damping is weakest.
 We characterize the equilibration accuracy with a controlled
 sensitivity study.  At each of four latitudes ($0°, 30°, 60°, 85°$)
 on the Moon we run the thermal solver for 24 diurnal cycles at
-$N_{\mathrm{s}} \in \{24, 48, 96, 192, 384, 768\}$ samples per
+$N_{\mathrm{s}} \in \lbrace24, 48, 96, 192, 384, 768\rbrace$ samples per
 diurnal cycle, comparing per-layer temperatures against a
 Fourier-stable reference solution at $\sim 5000$ samples per cycle.
 At the production cadence $N_{\mathrm{s}}=192$ the worst-case
-per-layer error across latitudes is $0.99\,\mathrm{K}$, occurring
+per-layer error across latitudes is $0.99\thinspace\mathrm{K}$, occurring
 at the $85°$ polar slope where the radiative forcing is most
 strongly modulated by the diurnal cycle.  At $N_{\mathrm{s}}=24$ the
-worst-case error grows to $11.9\,\mathrm{K}$; at $N_{\mathrm{s}}=768$
-it drops to $0.21\,\mathrm{K}$.  The error scales as $\mathcal{O}
+worst-case error grows to $11.9\thinspace\mathrm{K}$; at $N_{\mathrm{s}}=768$
+it drops to $0.21\thinspace\mathrm{K}$.  The error scales as $\mathcal{O}
 (\Delta t^{2})$, consistent with the second-order temporal accuracy
 of Crank–Nicolson.
 
@@ -203,12 +203,12 @@ against the Diviner-derived lunar regolith model of Hayne et al.\
 (2017) on a global ico7 icosphere mesh, using six equilibration
 orbits and the Hayne et al.\ (2017) Table A1 thermophysical
 defaults.  PTM3D matches the Hayne et al.\ (2017) surface
-temperatures to within $1.4\,\mathrm{K}$ at peak (local noon),
-$1.7\,\mathrm{K}$ at midnight, and $1.1\,\mathrm{K}$ at the
-post-dawn minimum, with $1.27\,\mathrm{K}$ RMS across fifteen
+temperatures to within $1.4\thinspace\mathrm{K}$ at peak (local noon),
+$1.7\thinspace\mathrm{K}$ at midnight, and $1.1\thinspace\mathrm{K}$ at the
+post-dawn minimum, with $1.27\thinspace\mathrm{K}$ RMS across fifteen
 nighttime reference points spanning three latitudes.  Per-face
 energy balance, integrated over a full synodic month after spin-up,
-closes to $2.0\%$ of absorbed solar flux; the residual reflects the
+closes to $2.0$% of absorbed solar flux; the residual reflects the
 combination of finite-time-of-flight thermal lag between absorbed
 solar input and re-radiated thermal emission, and Jensen's
 inequality applied to the nonlinear $\sigma T^{4}$ emission when
@@ -254,7 +254,7 @@ the radiation coupling is a small physical perturbation.
 Figure B.6 reports the computational cost of a complete 1-lunation
 PTM3D run on lunar polar terrain, broken down by component, as a
 function of mesh face count.  The model is anchored on the
-A03MM022 (Mons Mouton) production run of 2026-05: a
+a Mons Mouton production run: a
 $1.8\times 10^{6}$-face linear-density mesh with 2 equilibration
 orbits at the body-independent cadence of §4 and a 30-day output
 window at 1-hour cadence, with full inter-face radiation coupling
@@ -284,14 +284,14 @@ output I/O and equilibration thermal account for a substantial
 fraction of the cost; at production polar-terrain scale
 ($N \sim 10^{6}$) the radiosity solver, illumination ray tracing,
 and equilibration are co-dominant and together account for
-$\sim 90\%$ of the wall time.
+$\sim 90$% of the wall time.
 
 ![Figure B.6: Computational performance scaling](figures/v2/performance_lunation.png)
 
 **Figure B.6.** Wall-clock time (a) and total compute cost (b)
 per 1-lunation PTM3D run with full inter-face radiation coupling,
 broken down by component, as a function of mesh face count.
-Curves are power-law fits anchored on the measured A03MM022
+Curves are power-law fits anchored on the measured
 production batch (star, $N=1.80\times 10^{6}$); the diagonal
 dashed line is the sum of all components.  Dotted reference
 curves show the asymptotic scalings $\mathcal{O}(N \log N)$ (grey,

@@ -78,7 +78,7 @@ confound the conductivity comparison:
 
 | Paper element | Status here |
 |---|---|
-| Retuned density scale height `H = 5.6 cm` | NOT applied. PTM3D keeps the body's `H` (lunar default 6.0 cm) and prints a note whenever `H != 0.056` under this model. **There is currently no config route to set it on a named body:** `thermophysical.H` is never read (`KNOWN_LIMITATIONS.md`, PTM-67); the only routes are a per-face `thermal.h_parameter_map` or the generic-body path. So a faithful reproduction of the paper's Figures 4-11 is NOT reachable from a lunar YAML today. |
+| Retuned density scale height `H = 5.6 cm` | NOT applied. PTM3D keeps the body's `H` (lunar default 6.0 cm) and prints a note whenever `H != 0.056` under this model. **There is currently no config route to set it on a named body:** `thermophysical.H` is never read (`KNOWN_LIMITATIONS.md`); the only routes are a per-face `thermal.h_parameter_map` or the generic-body path. So a faithful reproduction of the paper's Figures 4-11 is NOT reachable from a lunar YAML today. |
 | Feng et al. (2020) bolometric Bond albedo (their Eq. 4) | NOT applied. PTM3D offers Hayne-angular or Hapke. |
 | Feng's `ks = 8.0e-4`, `kd = 3.8e-3` | Moot — `ks`/`kd` do not enter Eq. 10 at all. |
 | `cp(T)` | Already identical: the paper uses Hayne et al. (2017) cp unchanged. |
@@ -166,8 +166,7 @@ Two design points worth keeping:
 * **The selector rides `thermal::Config`, never `thermal::Planet`.** `Config` is
   built once in `main` and *passed* to every solver entry point; `Planet` is
   *rebuilt* from the body name at every entry point, which is exactly why
-  `ks_override`/`kd_override` are silent no-ops on the Moon/Europa mesh+GPU path
-  (`KNOWN_LIMITATIONS.md`, PTM-53). Placing it on `Config` sidesteps that class of bug by
+  `ks_override`/`kd_override` are silent no-ops on the Moon/Europa mesh+GPU path (`KNOWN_LIMITATIONS.md`). Placing it on `Config` sidesteps that class of bug by
   construction — but engagement is still proven by byte-difference in a real
   run, never assumed.
 * **`setMaterialParams` takes `cond_model` with no default argument.** A

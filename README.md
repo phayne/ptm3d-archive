@@ -215,23 +215,23 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Every `PTM_*` environment variable, with status tags |
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
 | [docs/thermal-model.md](docs/thermal-model.md) · [docs/illumination-model.md](docs/illumination-model.md) · [docs/radiation-exchange.md](docs/radiation-exchange.md) | Physics and numerics of each stage |
+| [docs/api-reference.md](docs/api-reference.md) | C++ types for callers linking against the libraries |
 | [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [docs/PORTABILITY-AUDIT.md](docs/PORTABILITY-AUDIT.md) | What to watch out for — **read this before your first production run** |
 | [data/README.md](data/README.md) | Science-data catalog, provenance, licenses, `PTM_DATA_ROOT` |
 | [gui/README.md](gui/README.md) | The desktop GUI |
 
 ### Which configuration directory to start from
 
-**Start in [`examples/`](examples/), not `configs/`.** The 15 configurations at
+**Start in [`examples/`](examples/), not `configs/`.** The 19 configurations at
 the top level of `examples/` are the ones written to be read and run by someone
-who did not build the repository; 12 of the 15 are CPU-only, and
+who did not build the repository; most are CPU-only, and
 `quickstart_moon_diurnal.yaml` is the smallest.
 
-`configs/` (55 YAML files at its top level) and `examples/campaigns/` (74) are
-the *internal* production inputs behind published runs. They are kept for
+`configs/` (55 YAML files at its top level) holds study inputs kept for
 provenance, not as onboarding material: 47 of the 55 set `thermal.use_gpu: true`,
 several point at meshes, DEMs or view-factor files that are not distributed, and
 many carry `thermophysical:` keys that PTM3D does not read (the run warns and
-names them — see [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md), PTM-67).
+names them — see [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)).
 Copy one only if you already know what it references.
 
 ## Hardware guidance

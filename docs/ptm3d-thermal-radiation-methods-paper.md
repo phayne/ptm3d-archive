@@ -27,7 +27,7 @@ convergence accuracy. We validate the model against the analytic
 two-zone bowl-crater solution of Ingersoll et al.\ (1992) and against
 the Diviner-derived lunar regolith model of Hayne et al.\ (2017),
 matching the Hayne et al.\ (2017) surface temperatures to within
-$1.27\,\mathrm{K}$ RMS across fifteen nighttime reference points
+$1.27\thinspace\mathrm{K}$ RMS across fifteen nighttime reference points
 spanning three latitudes. On a representative production workload
 (1.8-million-face lunar polar mesh, 30-day output window at hourly
 cadence, full radiation coupling), a coupled solve completes in
@@ -79,8 +79,8 @@ At the surface ($z = 0$) of each mesh face $i$ the thermal model
 enforces
 
 $$
-Q_{s,i}(t) \;+\; k_0 \frac{T_1 - T_0}{\Delta z_0}
-   \;=\; \varepsilon_i \sigma T_0^4,
+Q_{s,i}(t)  +  k_0 \frac{T_1 - T_0}{\Delta z_0}
+    =  \varepsilon_i \sigma T_0^4,
 \tag{1}
 $$
 
@@ -88,15 +88,15 @@ where $T_0(t)$ is the surface temperature at face $i$ and time $t$
 (the unknown), $T_1(t)$ is the temperature at the first subsurface
 node a distance $\Delta z_0$ below the surface, $k_0$ is the thermal
 conductivity at the surface, $\varepsilon_i$ the broadband IR
-emissivity, and $\sigma=5.6705\times10^{-8}\,\mathrm{W\,m^{-2}\,K^{-4}}$
+emissivity, and $\sigma=5.6705\times10^{-8}\thinspace\mathrm{W\thinspacem^{-2}\thinspaceK^{-4}}$
 the Stefan–Boltzmann constant. The absorbed surface flux $Q_{s,i}(t)$
 combines four contributions,
 
 $$
-Q_{s,i}(t) \;=\;
-   \bigl[Q_{\odot,i}(t) + Q_{\mathrm{refl},i}(t)\bigr]\,\bigl[1 - \alpha_i(\theta_i)\bigr]
-   \;+\; \varepsilon_i\, Q_{\mathrm{IR},i}(t)
-   \;+\; Q_{\mathrm{ind},i}(t),
+Q_{s,i}(t)  = 
+   \bigl[Q_{\odot,i}(t) + Q_{\mathrm{refl},i}(t)\bigr]\thinspace\bigl[1 - \alpha_i(\theta_i)\bigr]
+    +  \varepsilon_i\thinspace Q_{\mathrm{IR},i}(t)
+    +  Q_{\mathrm{ind},i}(t),
 \tag{2}
 $$
 
@@ -107,7 +107,7 @@ primary-body thermal IR $Q_{\mathrm{IR},i}$; and the inter-face
 indirect flux $Q_{\mathrm{ind},i}(t)$ computed by the
 radiation-exchange module (§6). The first three contributions come
 from the ephemeris-driven illumination model and are independent of
-the surface temperature state; the fourth depends on $\{T_i(t)\}$
+the surface temperature state; the fourth depends on $\lbraceT_i(t)\rbrace$
 across all radiatively coupled faces and motivates the iterative
 coupling scheme in §6.3.
 
@@ -115,9 +115,9 @@ The visible-wavelength albedo $\alpha_i(\theta_i)$ optionally carries
 an incidence-angle dependence after Hayne et al.\ (2017),
 
 $$
-\alpha(\theta) \;=\; \alpha_0
-   \;+\; a\,\Bigl(\tfrac{\theta}{\pi/4}\Bigr)^{3}
-   \;+\; b\,\Bigl(\tfrac{\theta}{\pi/2}\Bigr)^{8},
+\alpha(\theta)  =  \alpha_0
+    +  a\thinspace\Bigl(\tfrac{\theta}{\pi/4}\Bigr)^{3}
+    +  b\thinspace\Bigl(\tfrac{\theta}{\pi/2}\Bigr)^{8},
 \tag{3}
 $$
 
@@ -148,20 +148,20 @@ The thermal evolution of the regolith subsurface is governed by the
 1-D heat-conduction equation
 
 $$
-\rho(z)\, c_p(T)\, \frac{\partial T}{\partial t}
-   \;=\; \frac{\partial}{\partial z}\!\left[k(T)\,\frac{\partial T}{\partial z}\right],
+\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t}
+    =  \frac{\partial}{\partial z}\negthinspace\left[k(T)\thinspace\frac{\partial T}{\partial z}\right],
 \qquad 0 \leq z \leq z_b,
 \tag{4}
 $$
 
 solved at each mesh face $i$ with the radiative surface condition
 (1) at $z=0$ and a fixed-flux geothermal lower boundary
-$-k\,\partial T/\partial z = Q_b$ at $z_b$. The thermal conductivity
-$k(T) = k_c\,[\,1 + \chi\,(T/350\,\mathrm{K})^{3}\,]$ supplements the
+$-k\thinspace\partial T/\partial z = Q_b$ at $z_b$. The thermal conductivity
+$k(T) = k_c\thinspace[\thinspace1 + \chi\thinspace(T/350\thinspace\mathrm{K})^{3}\thinspace]$ supplements the
 solid-contact conductivity $k_c$ with a radiative pore-transfer term
 that grows as $T^{3}$ (Mitchell and de Pater 1994); with the
 production value $\chi \approx 2.7$ the radiative term equals the
-contact term near $250\,\mathrm{K}$ and dominates transport at
+contact term near $250\thinspace\mathrm{K}$ and dominates transport at
 daytime surface temperatures. The heat capacity $c_p(T)$ is a
 low-order polynomial fitted to laboratory regolith data.
 
@@ -173,33 +173,33 @@ solution. The characteristic penetration depth is the *thermal skin
 depth*
 
 $$
-\delta(P) \;=\; \sqrt{\frac{k\,P}{\pi\,\rho\,c_p}},
+\delta(P)  =  \sqrt{\frac{k\thinspaceP}{\pi\thinspace\rho\thinspacec_p}},
 \tag{5}
 $$
 
 so the diurnal skin depth on the Moon (regolith $k_s \approx
 7.4\times 10^{-4}\,\mathrm{W\,m^{-1}\,K^{-1}}$, $\rho_s = 1100\,
 \mathrm{kg\,m^{-3}}$, $c_p \sim 800\,\mathrm{J\,kg^{-1}\,K^{-1}}$,
-$P_{\mathrm{lun}} = 29.5\,\mathrm{d}$) is $\delta_1 \approx 3\,
+$P_{\mathrm{lun}} = 29.5\thinspace\mathrm{d}$) is $\delta_1 \approx 3\,
 \mathrm{cm}$. Longer-period insolation
 modulation penetrates deeper by $\sqrt{P_{\mathrm{long}}/
 P_{\mathrm{diur}}}$; for the 18.6-yr lunar nodal cycle this is
 $\sim 15\times$ the diurnal skin depth, and for the 1-yr annual
 cycle $\sim 3.5\times$.
 
-PTM3D places the lower boundary at $z_b = b\,\delta_1$, where $b$ is
+PTM3D places the lower boundary at $z_b = b\thinspace\delta_1$, where $b$ is
 a depth scaling factor configurable per run. The radiative
 enhancement of solid conductivity deepens the effective skin depth
 at high $T$, and we adopt $b=15$ as a production default, placing
 the bottom Neumann condition at $\sim 9$ effective $e$-folds of
 damping in the high-temperature limit and fully attenuating the
-diurnal amplitude at $z_b$ to $<0.1\,\mathrm{K}$ for any planetary
+diurnal amplitude at $z_b$ to $<0.1\thinspace\mathrm{K}$ for any planetary
 application of interest. The vertical grid uses $m$ logarithmically
 spaced surface layers filling the first skin depth (default $m=10$)
 and, in the legacy non-adaptive path, a geometric expansion ratio
 $\eta = 1 + 1/n$ (default $n=15$) beyond, terminating at $z_b$. At
 the production defaults the legacy grid spans 30 layers with surface
-layer thickness $\Delta z_0 \approx 0.03\,\delta_1$. The
+layer thickness $\Delta z_0 \approx 0.03\thinspace\delta_1$. The
 production path is an adaptive grid that places at least one layer
 per skin depth in the deep regolith and resolves the surface to the
 same $\Delta z_0$. Figure 2 illustrates the resulting diurnal
@@ -211,7 +211,7 @@ representative lunar latitudes.
 **Figure 2.** Diurnal thermal-wave profiles $T(z, t)$ at four lunar
 latitudes ($0°, 30°, 60°, 85°$), showing the exponential attenuation
 of diurnal amplitude with depth and the production grid layout
-(black markers). The bottom boundary at $z_b = 15\,\delta_1$ sits
+(black markers). The bottom boundary at $z_b = 15\thinspace\delta_1$ sits
 well below the diurnal wave and isolates the lower Neumann
 condition from the surface forcing.
 
@@ -224,10 +224,10 @@ re-evaluated at the layer temperatures every time step ($k(T)$
 includes the $T^3$ radiative term and $c_p(T)$ the regolith
 polynomial), so the resulting tridiagonal system is mildly nonlinear;
 we solve it with a Picard loop that typically converges in two
-passes against a fixed-point tolerance of $10^{-3}\,\mathrm{K}$. The
+passes against a fixed-point tolerance of $10^{-3}\thinspace\mathrm{K}$. The
 radiative surface boundary condition (1) is closed by
 Newton–Raphson on $T_0$ at each time step (typically 3–5 iterations
-to $10^{-4}\,\mathrm{K}$ on the equilibrium residual).
+to $10^{-4}\thinspace\mathrm{K}$ on the equilibrium residual).
 
 The Crank–Nicolson scheme has truncation error $\mathcal{O}(\Delta
 t^{2})$. Stability does not constrain $\Delta t$ but accuracy does:
@@ -275,7 +275,7 @@ target $N_{\mathrm{s}}$ samples per diurnal cycle on the body under
 study:
 
 $$
-\Delta t_{\mathrm{eq}} \;=\; P_{\mathrm{diur}}\big/\,N_{\mathrm{s}}.
+\Delta t_{\mathrm{eq}}  =  P_{\mathrm{diur}}\big/\thinspaceN_{\mathrm{s}}.
 \tag{6}
 $$
 
@@ -296,9 +296,9 @@ On a representative large-mesh production case (4.8-million-face
 lunar polar mesh, one-minute output cadence over a 30-day window)
 the decoupled cadence reduces the equilibration phase from
 $8.5\times 10^{4}$ to $1.4\times 10^{3}$ time steps and the peak
-in-RAM thermal-state footprint from $227\,\mathrm{GB}$ to
-$13\,\mathrm{GB}$, while keeping the surface temperature error at
-the first output time step below $2\,\mathrm{K}$.
+in-RAM thermal-state footprint from $227\thinspace\mathrm{GB}$ to
+$13\thinspace\mathrm{GB}$, while keeping the surface temperature error at
+the first output time step below $2\thinspace\mathrm{K}$.
 
 ### 5.3 Initial profile
 
@@ -307,18 +307,18 @@ profile. We use an exponential blend between a near-surface target
 and a deep-soil target,
 
 $$
-T(z, t=0) \;=\; T_{\mathrm{deep}}
-   \;+\;\bigl(T_{\mathrm{avg}} - T_{\mathrm{deep}}\bigr)\,\exp(-z/\delta_1),
+T(z, t=0)  =  T_{\mathrm{deep}}
+    + \bigl(T_{\mathrm{avg}} - T_{\mathrm{deep}}\bigr)\thinspace\exp(-z/\delta_1),
 \tag{7}
 $$
 
 with
 
 $$
-T_{\mathrm{avg}} \;=\; \frac{T_{\mathrm{ss}}}{\sqrt{2}}, \qquad
-T_{\mathrm{ss}} \;=\; \biggl[\frac{(1-\alpha_i)\,S}{\varepsilon_i\,\sigma}\biggr]^{1/4},
+T_{\mathrm{avg}}  =  \frac{T_{\mathrm{ss}}}{\sqrt{2}}, \qquad
+T_{\mathrm{ss}}  =  \biggl[\frac{(1-\alpha_i)\thinspaceS}{\varepsilon_i\thinspace\sigma}\biggr]^{1/4},
 \qquad
-T_{\mathrm{deep}} \;=\; T_{\mathrm{avg}} \;+\; \min\!\bigl(Q_b\,z_b/k,\,50\,\mathrm{K}\bigr),
+T_{\mathrm{deep}}  =  T_{\mathrm{avg}}  +  \min\negthinspace\bigl(Q_b\thinspacez_b/k,\thinspace50\thinspace\mathrm{K}\bigr),
 \tag{8}
 $$
 
@@ -338,7 +338,7 @@ $z$ relaxes on $\tau(z)\sim z^{2}/\kappa$, where $\kappa = k/\rho
 c_p$ is the thermal diffusivity. The uppermost skin depths — which
 set the surface diurnal temperature extremes — equilibrate within a
 few diurnal cycles, but the deepest layers of a domain extending to
-$z_b = b\,\delta_1$ carry a time constant of order $\tau_b \sim
+$z_b = b\thinspace\delta_1$ carry a time constant of order $\tau_b \sim
 (b^{2}/\pi)\,P_{\mathrm{diur}}$ ($\approx 70$ diurnal periods at the
 production depth $b=15$). Quantities controlled by the deep column
 therefore require substantially longer equilibration than the
@@ -364,9 +364,9 @@ $B_i(t)$, defined as the total outgoing radiant flux per unit area
 (emission plus reflection), satisfies
 
 $$
-B_i \;=\; \varepsilon_i\, \sigma\, T_i^4
-       \;+\; \rho_i \sum_{j=1}^{N} F_{ij}\, B_j
-       \;+\; \rho_i\, Q_{\odot,i},
+B_i  =  \varepsilon_i\thinspace \sigma\thinspace T_i^4
+        +  \rho_i \sum_{j=1}^{N} F_{ij}\thinspace B_j
+        +  \rho_i\thinspace Q_{\odot,i},
 \tag{9}
 $$
 
@@ -376,8 +376,8 @@ terms represent thermal self-emission, reflected incoming radiation
 from other faces, and reflected direct solar flux. In matrix form,
 
 $$
-(\mathbf{I} - \boldsymbol{\rho} \mathbf{F})\,\mathbf{B}
-   \;=\; \mathbf{E} \;+\; \boldsymbol{\rho}\,\mathbf{Q}_{\odot},
+(\mathbf{I} - \boldsymbol{\rho} \mathbf{F})\thinspace\mathbf{B}
+    =  \mathbf{E}  +  \boldsymbol{\rho}\thinspace\mathbf{Q}_{\odot},
 \tag{10}
 $$
 
@@ -386,13 +386,13 @@ $\boldsymbol{\rho}=\mathrm{diag}(\rho_i)$. After solving for
 $\mathbf{B}$, the absorbed indirect flux at each face is
 
 $$
-Q_{\mathrm{ind},i} \;=\; \varepsilon_i \sum_{j=1}^{N} F_{ij}\, B_j
-   \;=\; \varepsilon_i\,(\mathbf{F}\mathbf{B})_i.
+Q_{\mathrm{ind},i}  =  \varepsilon_i \sum_{j=1}^{N} F_{ij}\thinspace B_j
+    =  \varepsilon_i\thinspace(\mathbf{F}\mathbf{B})_i.
 \tag{11}
 $$
 
-We solve (10) at each output time step $t \in \{1,\dots,N_t\}$ in
-the science window using current surface temperatures $\{T_i(t)\}$.
+We solve (10) at each output time step $t \in \lbrace1,\dots,N_t\rbrace$ in
+the science window using current surface temperatures $\lbraceT_i(t)\rbrace$.
 Solar fluxes $\mathbf{Q}_{\odot}(t)$ vary on the diurnal timescale
 and are sampled at the same cadence as the temperature trajectory.
 
@@ -403,16 +403,16 @@ $j$ in vacuum is
 
 $$
 F_{ij}
-   \;=\; \frac{1}{A_i} \int_{A_i} \int_{A_j}
-   \frac{\cos\theta_i\,\cos\theta_j}{\pi\, r^{2}}\;
-   V_{ij}(\mathbf{x},\mathbf{y})\;
-   dA_j\, dA_i,
+    =  \frac{1}{A_i} \int_{A_i} \int_{A_j}
+   \frac{\cos\theta_i\thinspace\cos\theta_j}{\pi\thinspace r^{2}}\thickspace
+   V_{ij}(\mathbf{x},\mathbf{y})\thickspace
+   dA_j\thinspace dA_i,
 \tag{12}
 $$
 
 where $\theta_i,\theta_j$ are the angles between the inter-element
-ray $\mathbf{x}\!\to\!\mathbf{y}$ and the local outward normals, $r$
-is the inter-element distance, and $V_{ij}\in\{0,1\}$ is a
+ray $\mathbf{x}\negthinspace\to\negthinspace\mathbf{y}$ and the local outward normals, $r$
+is the inter-element distance, and $V_{ij}\in\lbrace0,1\rbrace$ is a
 visibility indicator (1 if the segment is not occluded by
 intervening terrain, 0 otherwise). By construction the matrix
 $\mathbf{F}$ is row-stochastic modulo the sky aperture: $\sum_j
@@ -445,7 +445,7 @@ non-sky energy is absorbed into $F_{i,\mathrm{sky}}$, slightly
 inflating the apparent sky aperture relative to the unsparsified
 estimator. In our lunar polar test cases we have not found a face
 class where $\eta = 0.95$ leads to a visible artifact in the
-converged $\{T_i(t)\}$.
+converged $\lbraceT_i(t)\rbrace$.
 
 The sensitivity of $K$ to $\eta$ is geometry-dependent. Table 1
 gives the trade-off on a 6320-face spherical-cap bowl crater (§8.1
@@ -468,7 +468,7 @@ $\langle \mathrm{leaked} \rangle$ is the mean fraction of the
 non-sky energy budget absorbed into $F_{i,\mathrm{sky}}$ by the
 compaction.
 
-| $\eta$  | $\langle K \rangle$ | $K_{99\%}$ | $K_{\max}$ | total non-zeros | $\langle \mathrm{leaked} \rangle$ |
+| $\eta$  | $\langle K \rangle$ | $K_{99}$ (99th pct) | $K_{\max}$ | total non-zeros | $\langle \mathrm{leaked} \rangle$ |
 |---------|--------------------:|-----------:|-----------:|----------------:|----------------------------------:|
 | 0.50    | 1885 |  1896 |  1896 | 11.9 M |  1.93 % |
 | 0.80    | 3549 |  3565 |  3565 | 22.4 M |  0.77 % |
@@ -499,18 +499,18 @@ matrix-vector product is within a factor of 2 of the sparse path
 in either direction at this scale. The MVP relative error against
 the sparse reference holds at $\sim$5–6% across the sequence,
 dominated by the per-block ACA truncation. Practically, on the
-$1.8\,\mathrm{M}$-face polar meshes used in this paper, the
+$1.8\thinspace\mathrm{M}$-face polar meshes used in this paper, the
 Monte-Carlo path with adaptive top-$K$ compaction is faster and
 simpler and is the default; the H-matrix path is retained for
 future workloads where $N \gg 10^{7}$ exceeds the per-face
 ray-budget memory pressure.
 
-![H-matrix vs sparse top-K view factors](figures/v2/hmatrix_vs_mc.png)
+*Figure 3 (`figures/v2/hmatrix_vs_mc.png`) is not included in this distribution.*
 
 **Figure 3.** H-matrix vs sparse top-$K$ view-factor compression on
 a sequence of spherical-cap bowl-crater meshes (ACA tolerance
 $10^{-2}$, $\eta = 0.95$). Panel (a) gives per-storage cost in
-megabytes; the dotted curve is the dense $N^{2}\!\cdot\!8\,$byte
+megabytes; the dotted curve is the dense $N^{2}\negthinspace\cdot\negthinspace8\thinspace$byte
 extrapolation, included for reference. Panel (b) gives the
 matrix-vector-product wall-clock per call. Panel (c) gives the
 maximum relative MVP error of the H-matrix solution against the
@@ -530,7 +530,7 @@ check. Two regimes are useful to characterise. On the analytic
 constructed by direct quadrature of the differential-area integral
 (12) rather than by Monte-Carlo sampling, the maximum relative
 residual over the 1.97 million significant face-pairs is
-$7\times 10^{-14}\%$ (mean $1\times 10^{-14}\%$), i.e.\ at the
+$7\times 10^{-14}$% (mean $1\times 10^{-14}$%), i.e.\ at the
 double-precision round-off floor — the analytic formula is
 constructed to satisfy reciprocity exactly by symmetric integration
 of the differential-area form. With the Monte-Carlo estimator the
@@ -545,21 +545,21 @@ reference CPU solver to $10^{-6}$ relative error.
 
 ### 6.3 Coupled thermal–radiation Picard iteration
 
-Because $\{T_i(t)\}$ and $\{Q_{\mathrm{ind},i}(t)\}$ depend on each
+Because $\lbraceT_i(t)\rbrace$ and $\lbraceQ_{\mathrm{ind},i}(t)\rbrace$ depend on each
 other through equations (1), (2), and (9)–(11), the coupled system
 is solved by a Picard iteration that wraps the thermal model and
 the radiosity solver in an outer loop.
 
-We denote by $\mathcal{T}\!\bigl[\,\cdot\,\bigr]$ the thermal-model
+We denote by $\mathcal{T}\negthinspace\bigl[\thinspace\cdot\thinspace\bigr]$ the thermal-model
 operator that, given a time series of total absorbed flux
-$\{Q_{s,i}(t)\}$ at each face, returns the surface temperature
-trajectory $\{T_i(t)\}$ over one full output cycle of the diurnal
+$\lbraceQ_{s,i}(t)\rbrace$ at each face, returns the surface temperature
+trajectory $\lbraceT_i(t)\rbrace$ over one full output cycle of the diurnal
 window. Internally $\mathcal{T}$ also takes the initial subsurface
 temperature profile $\mathbf{T}_i(z, t=0)$ as input — a critical
 detail revisited in §6.3.2. We denote by $\mathcal{R}\!\bigl[\,\cdot\,
 \bigr]$ the radiosity operator (10)–(11) that maps a temperature
-trajectory $\{T_i(t)\}$ to the indirect-flux trajectory
-$\{Q_{\mathrm{ind},i}(t)\}$.
+trajectory $\lbraceT_i(t)\rbrace$ to the indirect-flux trajectory
+$\lbraceQ_{\mathrm{ind},i}(t)\rbrace$.
 
 #### 6.3.1 Outer fixed-point iteration
 
@@ -568,17 +568,17 @@ The fixed-point iteration is
 $$
 \begin{aligned}
 T^{(0)}_i(t) &= \mathcal{T}\bigl[Q^{(0)}_{s,i}(t)\bigr],
-   \qquad Q^{(0)}_{s,i}(t) = (1-\alpha_i)\bigl(Q_{\odot,i}+Q_{\mathrm{refl},i}\bigr) + \varepsilon_i Q_{\mathrm{IR},i}, \\[2pt]
+   \qquad Q^{(0)}_{s,i}(t) = (1-\alpha_i)\bigl(Q_{\odot,i}+Q_{\mathrm{refl},i}\bigr) + \varepsilon_i Q_{\mathrm{IR},i}, \\
 Q^{(k)}_{\mathrm{ind},i}(t) &= \mathcal{R}\bigl[T^{(k-1)}_i(t)\bigr],
-   \qquad k \geq 1, \\[2pt]
-Q^{(k)}_{s,i}(t) &= Q^{(0)}_{s,i}(t) + Q^{(k)}_{\mathrm{ind},i}(t), \\[2pt]
+   \qquad k \geq 1, \\
+Q^{(k)}_{s,i}(t) &= Q^{(0)}_{s,i}(t) + Q^{(k)}_{\mathrm{ind},i}(t), \\
 T^{(k)}_i(t) &= \mathcal{T}\bigl[Q^{(k)}_{s,i}(t)\bigr].
 \end{aligned}
 \tag{13}
 $$
 
 Iteration 0 is the radiation-off solution; each subsequent iteration
-refines $\{T_i\}$ using the indirect flux computed from the prior
+refines $\lbraceT_i\rbrace$ using the indirect flux computed from the prior
 iteration's temperatures. The iteration is terminated by the
 convergence criterion described in §6.4 or when a maximum count is
 reached (default 10).
@@ -604,11 +604,11 @@ sanity floor in the cold-start formula (8)), the equilibration phase
 converges to a different fixed point than iteration 0 reached, and
 the subsequent output cycle inherits the offset. In our tests on
 the lunar polar Mons Mouton site this produced a systematic surface
-temperature offset of order $30\,\mathrm{K}$ relative to iteration 0
+temperature offset of order $30\thinspace\mathrm{K}$ relative to iteration 0
 on the majority of re-equilibrated faces.
 
 Option (ii) eliminates the dependence on the cold-start guess by
-construction: iteration $k\!\geq\!1$ uses the subsurface profile
+construction: iteration $k\negthinspace\geq\negthinspace1$ uses the subsurface profile
 that iteration 0 actually reached at the end of its equilibration
 phase (saved off the GPU once at iteration 0 and held in memory).
 The only difference between iteration 0 and iteration $k$ at the
@@ -619,7 +619,7 @@ $Q^{(k)}_{\mathrm{ind},i}(t) \geq 0$ (true for radiosity solutions
 with positive emissivities and non-negative view factors). We adopt
 option (ii) as the default coupling scheme.
 
-In practice we observe that on a $1.8\,\mathrm{M}$-face lunar polar
+In practice we observe that on a $1.8\thinspace\mathrm{M}$-face lunar polar
 mesh the coupling iteration converges in 2–3 Picard sweeps (see
 §6.4); the first sweep absorbs the dominant indirect-flux signal
 (typically warming PSR floors by tens of K) and the subsequent
@@ -637,12 +637,12 @@ whose temperature is *expected* to change on the next iteration.
 The selection criterion uses a linearized radiative response:
 
 $$
-\widehat{\Delta T}_i^{\,(k)}
-   \;=\; \frac{(1-\alpha_i)\,\Delta F_i^{\,(k)}}
-                {4\,\varepsilon_i\,\sigma\,T_{\mathrm{eff},i}^{3}},
+\widehat{\Delta T}_i^{\thinspace(k)}
+    =  \frac{(1-\alpha_i)\thinspace\Delta F_i^{\thinspace(k)}}
+                {4\thinspace\varepsilon_i\thinspace\sigma\thinspaceT_{\mathrm{eff},i}^{3}},
    \qquad
-   \Delta F_i^{\,(k)} \;=\;
-   \max_t Q_{\mathrm{ind},i}^{\,(k)}(t) - \max_t Q_{\mathrm{ind},i}^{\,(k-1)}(t),
+   \Delta F_i^{\thinspace(k)}  = 
+   \max_t Q_{\mathrm{ind},i}^{\thinspace(k)}(t) - \max_t Q_{\mathrm{ind},i}^{\thinspace(k-1)}(t),
 \tag{14}
 $$
 
@@ -676,11 +676,11 @@ iterations.
 The linearization naturally gives cold PSR floors a larger predicted
 response per unit flux than warm crater walls — the desired
 asymmetry, since cold faces are the ones sensitive to inter-face
-IR. On a $300\,\mathrm{K}$ rim face an indirect flux of
-$1\,\mathrm{W\,m^{-2}}$ corresponds to a predicted response of
-$\sim 0.2\,\mathrm{K}$; on an $80\,\mathrm{K}$ floor face the same
-flux predicts $\sim 13\,\mathrm{K}$. A constant-flux selector with a
-fixed threshold ($0.1\,\mathrm{W\,m^{-2}}$, retained as a legacy
+IR. On a $300\thinspace\mathrm{K}$ rim face an indirect flux of
+$1\thinspace\mathrm{W\thinspacem^{-2}}$ corresponds to a predicted response of
+$\sim 0.2\thinspace\mathrm{K}$; on an $80\thinspace\mathrm{K}$ floor face the same
+flux predicts $\sim 13\thinspace\mathrm{K}$. A constant-flux selector with a
+fixed threshold ($0.1\thinspace\mathrm{W\thinspacem^{-2}}$, retained as a legacy
 mode) instead selects warm faces it does not need to re-solve and
 may miss cold faces it does. Figure 4 shows the
 head-to-head iteration-by-iteration comparison on the Amundsen
@@ -692,44 +692,44 @@ selector mode flag.
 
 The two selectors produce qualitatively different convergence
 behavior. The legacy flux-threshold selector picks
-$2.45\times10^{6}/4.00\times10^{6}$ faces ($61.3\%$) on iteration 1
-and $61.2\%$ on iteration 2; the selection set is essentially
+$2.45\times10^{6}/4.00\times10^{6}$ faces ($61.3$%) on iteration 1
+and $61.2$% on iteration 2; the selection set is essentially
 unchanged from iteration to iteration because $\max_t Q_{\mathrm
 {ind},i}(t)$ above the constant $0.1\,\mathrm{W\,m^{-2}}$ threshold
 is dominated by the same crater-wall population on every sweep,
 regardless of whether those faces are still moving. The physics
-selector picks $1.31\times10^{6}$ ($32.8\%$) on iteration 1 — the
+selector picks $1.31\times10^{6}$ ($32.8$%) on iteration 1 — the
 cold PSR-floor population where the predicted $\widehat{\Delta T}$
-is large — drops to $7.33\times10^{5}$ ($18.3\%$) on iteration 3
+is large — drops to $7.33\times10^{5}$ ($18.3$%) on iteration 3
 as those floors warm and stop moving, and collapses to
-$9.7\times10^{3}$ ($0.24\%$) on iteration 4 once the per-face
+$9.7\times10^{3}$ ($0.24$%) on iteration 4 once the per-face
 freeze (Phase B) removes everything below $s\tau_T$. Convergence
-on the $f_{\min} = 1\%$ floor follows immediately, terminating the
+on the $f_{\min} = 1$% floor follows immediately, terminating the
 loop in four iterations instead of the ten that legacy would have
-required at unchanging $\sim 61\%$ selection. Because the cost of
+required at unchanging $\sim 61$% selection. Because the cost of
 each re-thermal pass scales linearly in the selection-set size,
 the physics selector reduces the total re-thermal compute on this
 workload by a factor of $\sim 5$ relative to legacy ($1.31 +
 1.31 + 0.73 + 0.01 \approx 3.4\,\mathrm{M}$ face-iterations vs the
-$10 \times 2.45 = 24.5\,\mathrm{M}$ legacy alternative at the
+$10 \times 2.45 = 24.5\thinspace\mathrm{M}$ legacy alternative at the
 default $k_{\max}$).
 
-![Face-selection physics vs legacy on Amundsen PSR](figures/v2/face_selection_comparison.png)
+*Figure 4 (`figures/v2/face_selection_comparison.png`) is not included in this distribution.*
 
 **Figure 4.** Physics-based vs legacy face selection on the
 Amundsen-crater PSR validation run (4.0 M faces, full radiation
 coupling, identical inputs and view-factor cache). Panel (a) gives
 the per-iteration selected-face fraction on a log axis: the legacy
-flux-threshold selector (gray) holds steady at $61\%$ of the mesh
+flux-threshold selector (gray) holds steady at $61$% of the mesh
 every iteration regardless of how much has converged, while the
 physics selector (blue) drops by more than two decades — from
-$32.8\%$ at iteration 1 to $0.24\%$ at iteration 4 — once the
+$32.8$% at iteration 1 to $0.24$% at iteration 4 — once the
 cold-floor population stops moving and the Phase B per-face freeze
 removes them. Panel (b) gives the observed maximum face-wise
 temperature change per iteration; both selectors share the same
 radiosity solve so the iter-2 $\Delta T_{\max}$ matches (the iter-1
 re-thermal selection set is a superset of the physics one), but
-the physics selector reaches the $\tau_T = 0.5\,\mathrm{K}$ floor
+the physics selector reaches the $\tau_T = 0.5\thinspace\mathrm{K}$ floor
 at iteration 4 while legacy would continue grinding to $k_{\max}$.
 Legacy was stopped at iteration 3 after producing two complete
 iterations of selection data, since the trend is by then clear.
@@ -740,13 +740,13 @@ of faces still moving falls below the configured floor
 $f_{\min}$:
 
 $$
-\Delta T^{\,(k)}_{\max} < \tau_T
-   \;\;\mathrm{or}\;\;
+\Delta T^{\thinspace(k)}_{\max} < \tau_T
+   \thickspace\thickspace\mathrm{or}\thickspace\thickspace
    f^{(k)}_{\mathrm{moving}} < f_{\min}.
 \tag{15}
 $$
 
-Default values are $\tau_T = 0.5\,\mathrm{K}$, $f_{\min} = 0.01$,
+Default values are $\tau_T = 0.5\thinspace\mathrm{K}$, $f_{\min} = 0.01$,
 $s = 0.5$, $k_{\max} = 10$. The disjunction is necessary because a
 handful of pathological faces — typically PSR-floor edges with
 extreme radiative feedback — can oscillate above $\tau_T$ for many
@@ -756,26 +756,26 @@ chase a small set of outliers.
 
 Table 2 shows the iteration-by-iteration behavior of the selector
 and convergence criteria on a representative production window
-(A03MM022 Mons Mouton site, 1.80-million-face core+ring mesh, 30
+(Mons Mouton site, 1.80-million-face core+ring mesh, 30
 day output window at hourly cadence, full radiation coupling).
 The first selection (row $k=1$, driven by the iteration-0 indirect
 flux) flags 27% of faces — the cold, shadowed portion of the mesh
 where the linearized predictor sees the largest response per unit
 flux. The re-thermal of that set produces a maximum surface
-temperature change of $114.6\,\mathrm{K}$ (row $k=2$; a deep PSR
+temperature change of $114.6\thinspace\mathrm{K}$ (row $k=2$; a deep PSR
 floor warming in response to newly accounted-for crater-wall IR).
 The next pass reduces the maximum change by $\sim 20\times$ to
-$5.1\,\mathrm{K}$ and drops the fraction of faces still moving above
+$5.1\thinspace\mathrm{K}$ and drops the fraction of faces still moving above
 $\tau_T$ below the $f_{\min}$ floor (row $k=3$), terminating the
 loop.
 
-**Table 2.** Picard-iteration convergence on the A03MM022 production
+**Table 2.** Picard-iteration convergence on the production
 window. Selected fraction is the share of mesh faces above
-$s\tau_T = 0.25\,\mathrm{K}$ in either the predicted or observed
+$s\tau_T = 0.25\thinspace\mathrm{K}$ in either the predicted or observed
 $\Delta T$. $f_{\mathrm{moving}}$ is the share of faces whose
-observed peak-of-cycle change exceeds $\tau_T = 0.5\,\mathrm{K}$.
+observed peak-of-cycle change exceeds $\tau_T = 0.5\thinspace\mathrm{K}$.
 
-| $k$ | Selected faces  | Selected % | $\Delta T^{\,(k)}_{\max}$ (K) | $f^{(k)}_{\mathrm{moving}}$ | Status |
+| $k$ | Selected faces  | Selected % | $\Delta T^{\thinspace(k)}_{\max}$ (K) | $f^{(k)}_{\mathrm{moving}}$ | Status |
 |-----|-----------------|-----------:|------------------------------:|----------------------------:|---------------------------|
 | 1   | 490 091/1 797 769 | 27.26 %  | —                             | —                           | predict-only (iter-0 ΔF)  |
 | 2   | 490 090/1 797 769 | 27.26 %  | 114.6                         | 23.7 %                     | still moving               |
@@ -788,16 +788,16 @@ iteration 2 and iteration 3 — the bulk of the cold-floor population
 crossing $s\tau_T$ in a single Picard sweep — is the characteristic
 signature of the physics-based selector on lunar polar terrain.
 
-![Picard convergence](figures/v2/picard_convergence.png)
+*Figure 5 (`figures/v2/picard_convergence.png`) is not included in this distribution.*
 
 **Figure 5.** Thermal–radiation Picard convergence on the
-A03MM022 production window. Panel (a) gives the per-iteration
+production window. Panel (a) gives the per-iteration
 selected-face fraction (blue, the union of predicted-$\widehat
 {\Delta T}$ and observed-$\Delta T$ above $s\tau_T$) and observed
 $f_\mathrm{moving}$ (gray); the dashed red line is the
-$f_{\min}=1\%$ termination floor. Panel (b) gives the observed
+$f_{\min}=1$% termination floor. Panel (b) gives the observed
 maximum face-wise temperature change per iteration on a log axis;
-the dashed red line is the $\tau_T=0.5\,\mathrm{K}$ temperature
+the dashed red line is the $\tau_T=0.5\thinspace\mathrm{K}$ temperature
 tolerance. The green dotted line marks the converged iteration
 ($k=3$, terminated on the $f_{\min}$ criterion).
 
@@ -827,7 +827,7 @@ when no device is available.
 ### 7.1 Cost decomposition on a production workload
 
 On a representative production workload (eleven lunar polar sites,
-each at $\sim\!1.8\,\mathrm{M}$ faces, eight 30-day windows at
+each at $\sim\negthinspace1.8\thinspace\mathrm{M}$ faces, eight 30-day windows at
 hourly cadence) a coupled solve takes roughly two wall-clock hours
 per site on a workstation with two AMD W6800X Duo cards (four GPU
 dies total) and 48 CPU threads. Table 3 lists the dominant cost
@@ -836,7 +836,7 @@ and reused across windows on the same site.
 
 **Table 3.** Time decomposition of a single 30-day production
 window at hourly cadence on a 1.8-million-face lunar polar mesh
-(A03MM022 Mons Mouton site, two equilibration orbits, full
+(Mons Mouton site, two equilibration orbits, full
 radiation coupling). View-factor construction is amortized across
 the eight windows of a site.
 
@@ -867,15 +867,14 @@ benefit from the GPU pool — come to dominate the wall-clock budget.
 
 Figure 6 reports the computational cost of a complete 1-lunation
 PTM3D run on lunar polar terrain, broken down by component, as a
-function of mesh face count. The model is anchored on the A03MM022
-production run of 2026-05.
+function of mesh face count. The model is anchored on the production run of 2026-05.
 
 ![Computational performance scaling](figures/v2/performance_lunation.png)
 
 **Figure 6.** Wall-clock time (a) and total compute cost
 (b) per 1-lunation PTM3D run with full inter-face radiation coupling,
 broken down by component, as a function of mesh face count. Curves
-are power-law fits anchored on the measured A03MM022 production
+are power-law fits anchored on the measured production
 batch (star, $N=1.80\times 10^{6}$); the diagonal dashed line is
 the sum of all components. Dotted reference curves show the
 asymptotic scalings $\mathcal{O}(N \log N)$ (gray, naive
@@ -904,7 +903,7 @@ $1\times 10^{6}$-face run with full radiation coupling completes in
 for a substantial fraction of the cost; at production polar-terrain
 scale ($N \sim 10^{6}$) the radiosity solver, illumination ray
 tracing, and equilibration are co-dominant and together account for
-$\sim 90\%$ of the wall time.
+$\sim 90$% of the wall time.
 
 ## 8. Validation
 
@@ -919,8 +918,8 @@ compute the PTM3D radiosity solution at four solar elevations
 ($0°, 70°, 80°, 85°$) and compare against the analytic
 equilibrium-floor temperature $T_f(\beta)$ at each elevation $\beta$.
 The per-mesh-face sky view factor $F_{\mathrm{sky}}$ agrees with
-the analytic spherical-cap value $\sin^{2}\alpha$ to within $0.5\%$,
-with a per-face dispersion of $\pm 0.4\%$. Figure 7 plots the
+the analytic spherical-cap value $\sin^{2}\alpha$ to within $0.5$%,
+with a per-face dispersion of $\pm 0.4$%. Figure 7 plots the
 PTM3D-modeled equilibrium-floor temperature against the analytic
 prediction across the latitude grid; Figure 8 shows the 3-D
 visualization of the meshed crater colored by indirect flux at the
@@ -940,7 +939,7 @@ depth-to-diameter ratios. Solid lines: analytic Ingersoll et al.\
 spherical-cap bowl crater colored by absorbed indirect flux
 $Q_{\mathrm{ind},i}$, at the worst-case configuration
 ($d/D = 0.3$, $\beta = 85°$). Rim faces emit IR that bathes the
-shadowed floor at a maximum of ${\sim}5\,\mathrm{W\,m^{-2}}$.
+shadowed floor at a maximum of ${\sim}5\thinspace\mathrm{W\thinspacem^{-2}}$.
 
 ### 8.2 Equilibration-cadence sensitivity
 
@@ -956,8 +955,8 @@ $\mathcal{O}(\Delta t^{2})$, consistent with the second-order
 temporal accuracy of Crank–Nicolson (Figure 9): the worst-case
 per-layer error across latitudes — always at the $85°$ polar slope,
 where the radiative forcing is most strongly modulated by the
-diurnal cycle — falls from $11.9\,\mathrm{K}$ at $N_{\mathrm{s}}=24$
-to $0.99\,\mathrm{K}$ at $N_{\mathrm{s}}=192$ and $0.21\,\mathrm{K}$
+diurnal cycle — falls from $11.9\thinspace\mathrm{K}$ at $N_{\mathrm{s}}=24$
+to $0.99\thinspace\mathrm{K}$ at $N_{\mathrm{s}}=192$ and $0.21\thinspace\mathrm{K}$
 at $N_{\mathrm{s}}=768$. The production default of $N_{\mathrm{s}}=
 120$ samples per cycle lies on this curve at a worst-case polar
 error of $\sim$2–3 K, a deliberate accuracy/cost compromise for the
@@ -977,12 +976,12 @@ against the Diviner-derived lunar regolith model of Hayne et al.\
 (2017) on a global ico7 icosphere mesh, using six equilibration
 orbits and the Hayne et al.\ (2017) Table A1 thermophysical
 defaults. PTM3D matches the Hayne et al.\ (2017) surface
-temperatures to within $1.4\,\mathrm{K}$ at peak (local noon),
-$1.7\,\mathrm{K}$ at midnight, and $1.1\,\mathrm{K}$ at the
-post-dawn minimum, with $1.27\,\mathrm{K}$ RMS across fifteen
+temperatures to within $1.4\thinspace\mathrm{K}$ at peak (local noon),
+$1.7\thinspace\mathrm{K}$ at midnight, and $1.1\thinspace\mathrm{K}$ at the
+post-dawn minimum, with $1.27\thinspace\mathrm{K}$ RMS across fifteen
 nighttime reference points spanning three latitudes (Table 4,
 Figure 10). Per-face energy balance, integrated over a full synodic
-month after spin-up, closes to $2.0\%$ of absorbed solar flux; the
+month after spin-up, closes to $2.0$% of absorbed solar flux; the
 residual reflects the combination of finite-time-of-flight thermal
 lag between absorbed solar input and re-radiated thermal emission,
 and Jensen's inequality applied to the nonlinear $\sigma T^{4}$
@@ -1003,7 +1002,7 @@ over the indicated nighttime reference points.
 **Figure 10.** PTM3D vs.\ Hayne et al.\ (2017) Diviner-derived lunar
 regolith model on a global ico7 mesh at three latitudes. PTM3D
 matches the published reference surface temperatures to
-$1.27\,\mathrm{K}$ RMS across fifteen nighttime reference points.
+$1.27\thinspace\mathrm{K}$ RMS across fifteen nighttime reference points.
 
 ![Energy balance closure](figures/v2/energy_conservation.png)
 
@@ -1039,17 +1038,17 @@ planetary applications.
 
 **Topological closure.** The view-factor matrix is row-stochastic
 modulo the sky aperture (§6.2) but the sparse storage truncates rows
-to the top-$K$ neighbors capturing $\eta = 95\%$ of energy by
-default. The remaining $5\%$ is absorbed into the sky-aperture term,
+to the top-$K$ neighbors capturing $\eta = 95$% of energy by
+default. The remaining $5$% is absorbed into the sky-aperture term,
 slightly inflating $F_{i,\mathrm{sky}}$ relative to the
 unsparsified estimator. We have not found any face class in our
-lunar polar test cases where $\eta = 95\%$ leads to a visible
-artifact in the converged $\{T_i(t)\}$.
+lunar polar test cases where $\eta = 95$% leads to a visible
+artifact in the converged $\lbraceT_i(t)\rbrace$.
 
 **Equilibration duration.** The surface diurnal temperature extremes
 equilibrate within a few diurnal cycles, but quantities set by the
 deep regolith column relax only on the deepest-layer time constant
-$\tau_b \sim (b^{2}/\pi)\,P_{\mathrm{diur}}$, of order 70 diurnal
+$\tau_b \sim (b^{2}/\pi)\thinspaceP_{\mathrm{diur}}$, of order 70 diurnal
 periods at the production domain depth $b=15$. The time-mean and
 off-peak temperatures of permanently shadowed floors, ice-stability
 depths whose thermal wave penetrates below the diurnal skin depth,
@@ -1124,7 +1123,7 @@ cost.
 | $b$ | Domain depth in diurnal skin depths | — |
 | $c_p(T)$ | Specific heat capacity | J kg⁻¹ K⁻¹ |
 | $\Delta F_i$ | Iter-to-iter change in indirect flux | W m⁻² |
-| $\Delta T^{(k)}_{\max}$ | Maximum face-wise $\|T^{(k)} - T^{(k-1)}\|_\infty$ | K |
+| $\Delta T^{(k)}_{\max}$ | Maximum face-wise $\lVert T^{(k)} - T^{(k-1)}\rVert_\infty$ | K |
 | $\widehat{\Delta T}_i$ | Linearized predicted temperature change | K |
 | $\Delta t_{\mathrm{eq}}$ | Equilibration time step | s |
 | $\Delta t_{\mathrm{out}}$ | Output time step | s |
@@ -1159,7 +1158,7 @@ cost.
 | $T_{\mathrm{eff},i}$ | Effective temperature for predictor: $\max(\max_t T^{(k-1)}_i, T_{\mathrm{floor}})$ | K |
 | $T_{\mathrm{floor}}$ | Lower bound on $T_{\mathrm{eff}}$ | K |
 | $\tau_T$ | Convergence threshold on $\Delta T$ | K |
-| $V_{ij}$ | Mutual-visibility indicator | $\{0,1\}$ |
+| $V_{ij}$ | Mutual-visibility indicator | $\lbrace0,1\rbrace$ |
 | $z_b$ | Domain lower boundary | m |
 
 ## Appendix B. Production-default parameters
