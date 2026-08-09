@@ -54,15 +54,49 @@ brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
 ```
 
 ### CSPICE (both platforms — manual)
-CSPICE is distributed by NASA NAIF, not a package manager:
+
+CSPICE is distributed by NASA NAIF, not a package manager. It is shipped as a **prebuilt static
+library, one package per CPU architecture** — so pick the package that matches the machine you
+are building on:
+
+| Build host | NAIF package directory | Download |
+|---|---|---|
+| Linux, x86_64 | `PC_Linux_GCC_64bit` | ~41 MB compressed |
+| macOS, **Apple Silicon** (`uname -m` → `arm64`) | `MacM1_OSX_clang_64bit` | ~40 MB compressed |
+| macOS, Intel (`uname -m` → `x86_64`) | `MacIntel_OSX_AppleC_64bit` | ~40 MB compressed |
+
+The snippet below selects the right one for you:
+
 ```bash
-# Linux:  PC_Linux_GCC_64bit ; macOS: MacIntel_OSX_AppleC_64bit
-URL=https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z
+case "$(uname -s)/$(uname -m)" in
+  Linux/*)       NAIF_PKG=PC_Linux_GCC_64bit        ;;
+  Darwin/arm64)  NAIF_PKG=MacM1_OSX_clang_64bit     ;;   # Apple Silicon (M1/M2/M3/M4)
+  Darwin/x86_64) NAIF_PKG=MacIntel_OSX_AppleC_64bit ;;   # Intel Mac
+  *) echo "No NAIF package mapping for $(uname -s)/$(uname -m)"; exit 1 ;;
+esac
+URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/${NAIF_PKG}/packages/cspice.tar.Z"
 curl -sSL "$URL" -o cspice.tar.Z && gzip -d cspice.tar.Z && tar xf cspice.tar
-# CMake's find_library wants libcspice.a:
+# CMake's find_library wants libcspice.a; NAIF ships lib/cspice.a:
 cp cspice/lib/cspice.a cspice/lib/libcspice.a
 export CSPICE_ROOT="$PWD/cspice"
 ```
+
+**On Apple Silicon, verify the architecture before you build.** CMake's `find_library` only checks
+that `libcspice.a` *exists*; it does not check what it was compiled for. Handing an arm64 build the
+Intel (`MacIntel_OSX_AppleC_64bit`) package therefore **configures cleanly and then fails at the
+link step**, because the linker silently ignores an archive built for another architecture and
+every SPICE symbol (`_furnsh_c`, `_spkezr_c`, …) comes out undefined for `arm64`. One command
+settles it:
+
+```bash
+lipo -info "$CSPICE_ROOT/lib/libcspice.a"
+# -> ... is architecture: arm64     correct on an Apple Silicon Mac
+# -> ... is architecture: x86_64    wrong package — re-download MacM1_OSX_clang_64bit
+```
+
+(An Intel Mac wants the opposite answer, `x86_64`. Running an arm64 build under Rosetta is not
+supported here; build natively.)
+
 PTM3D resolves CSPICE from `-DCSPICE_ROOT=`, then `$CSPICE_ROOT`/`$CSPICE_DIR`, then common
 prefixes. If it cannot find `libcspice.a`, the configure step stops with a clear error message
 saying what to set.

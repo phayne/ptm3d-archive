@@ -81,7 +81,7 @@ cannot see the repository — ask Paul to add your GitHub username, then retry.
 | C++ compiler | C++17 — GCC 10+, Clang 12+, AppleClang | `build-essential` · Xcode Command Line Tools |
 | Embree | **4.x** (not 3.x) | `apt install libembree-dev` · `brew install embree` |
 | Eigen3, CFITSIO, yaml-cpp, OpenMP | any recent | `apt install libeigen3-dev libcfitsio-dev libyaml-cpp-dev libomp-dev pkg-config` · `brew install eigen cfitsio yaml-cpp libomp pkg-config` |
-| CSPICE | N0067+ | **not in apt/brew** — download from NASA NAIF, [INSTALL.md §2](INSTALL.md) |
+| CSPICE | N0067+ | **not in apt/brew** — download from NASA NAIF, matching your CPU architecture (Apple Silicon needs the `MacM1_OSX_clang_64bit` package, not the Intel one): [INSTALL.md §2](INSTALL.md) |
 | Python | 3.8+, standard library only | `scripts/fetch_kernels.py`, `fetch_data.py`, `ptm_qa.py`, `ptm_mem_estimate.py` |
 | OpenCL | optional | only for the GPU build |
 
@@ -101,6 +101,12 @@ cmake --build build --target ptm_thermal_sim -j
 ~12 s and ends with a summary block naming every library it resolved — read it
 before building; a missing CSPICE stops there with a message saying what to
 set. The build itself is ~50 s at `-j8` on a workstation.
+
+If configure succeeds but the **link** step ends in undefined SPICE symbols
+(`_furnsh_c`, `_spkezr_c`, …), the CSPICE package is built for the wrong CPU
+architecture — the usual case on Apple Silicon. Check it with
+`lipo -info "$CSPICE_ROOT/lib/libcspice.a"`; see
+[INSTALL.md §2](INSTALL.md#cspice-both-platforms--manual).
 
 **Which build did you get?** GPU support is opt-in: a `cmake` line without
 `-DPTM_ENABLE_GPU=ON` produces a CPU-only binary *even on a machine with a
