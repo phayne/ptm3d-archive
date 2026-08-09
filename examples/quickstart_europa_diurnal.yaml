@@ -34,9 +34,14 @@ mesh:
 thermal:
   run_thermal_mesh: true
   threads: 0                    # 0 = auto-detect
-  equilibration_orbits: 5.0     # ice skin depth here is ~5 cm; a few orbits is enough to
-                                 # reach cyclic steady state (production Europa runs use ~20
-                                 # for publication-grade convergence — see configs/europa_*.yaml)
+  equilibration_orbits: 20.0    # The ~5 cm diurnal skin depth settles within an orbit or two,
+                                 # but the layers below it do not: with 5 orbits of spin-up the
+                                 # deep column still relaxes during the output window, which the
+                                 # rotating sub-solar point smears into a spurious ~9 K
+                                 # longitudinal ramp in temperature_max. 20 orbits removes it
+                                 # (residual ~0.6 K RMS against a 40-orbit run) and matches the
+                                 # production Europa configs. See section 4.6 of
+                                 # docs/tutorials/notebooks/02_europa_thermal.ipynb.
   use_gpu: false
   compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
   enable_shadow_flux: false
@@ -56,7 +61,7 @@ illumination:
   # only REFLECTED sunlight off Jupiter ("Jupiter-shine") — Jupiter's own thermal
   # IR is a physically separate term (calculatePrimaryIRBatch) that is always
   # included whenever the body has a primary; setting this false does NOT turn
-  # off Jupiter's IR heating (see exercise 3 and PTM-117 in BUGS.md).
+  # off Jupiter's IR heating (see exercise 3 in the notebook tutorial).
   include_primary_reflection: true
   use_batch_processing: true
   use_albedo_map: false         # uniform ice albedo (Europa default = 0.5), not the spatial map
