@@ -1,9 +1,10 @@
 # PTM3D environment variables
 
 Every `PTM_*` environment variable read by the C++ binaries and the shipped
-scripts (exhaustive search of `src/` + `scripts/`, 2026-07-29). All are **unset
-by default**, and unset always reproduces the established baseline behavior
-(numerically identical to the last digit wherever a reference baseline exists).
+scripts. All are **unset by default**, and unset always reproduces the
+established baseline behavior (numerically identical to the last digit wherever a
+reference baseline exists). To re-audit this table against the tree, grep `src/`
+and `scripts/` for `getenv("PTM_` and compare the result against the names below.
 
 Status tags:
 
@@ -82,12 +83,21 @@ Rules:
 | `PTM_EQ_WITH_INDIRECT` | off | Folds the (phase-mapped) indirect radiation flux into re-equilibration for coupled seasonal runs. | [experimental] |
 | `PTM_EQ_INDIRECT_CYCLES` | 2 | Number of prior seasonal cycles assumed stationary for the EQ_WITH_INDIRECT phase mapping. | [experimental] |
 | `PTM_EQ_RETHERMAL_BATCH` | 4000 | GPU batch cap during EQ_WITH_INDIRECT re-equilibration (the 50k default overruns the macOS/AMD GPU command-buffer watchdog). | [tuning] |
+| `PTM_EQUILIBRATION_CYCLES` | unset (config wins) | Number of passes over the equilibration forcing array, GPU persistent solver only. Overrides `thermal.equilibration_cycles`; the solver's own value is 2. Must be an integer ≥ 1 — anything else is reported as an error rather than silently ignored. | [standard] |
+| `PTM_EQ_LEGACY_SEED` | unset | Read by nothing in this tree. Setting it changes no result; the CPU batch path prints a warning naming it so a caller is not left assuming it took effect. | [internal] |
+| `PTM_RETHERMAL_WARMUP_SKIP` | 0 | Number of leading output steps of a coupling re-run that keep the un-coupled iteration-0 temperature. `=2` restores the pre-v1.0.3 mask, which existed to hide a checkpoint-seed transient that no longer occurs. | [internal] |
 
 ## Radiation exchange / radiosity
 
 | Variable | Default | Effect | Status |
 |---|---|---|---|
-| `PTM_RAD_TWO_BAND` | off (gray) | Band-separated radiosity: the visible channel scatters with the Bond albedo, the IR channel with 1−ε; absorbed indirect flux = visible + IR. **Requires `PTM_SOLAR_ALBEDO`** (warns loudly and falls back to gray if unset). Used by the two-band production campaigns. | [standard] |
+| `PTM_RAD_TWO_BAND` | unset | Alternative activation path for band-separated radiosity, which is **already the default** through `radiation.band_separated: true`. The visible channel scatters with the Bond albedo, the IR channel with 1−ε, and the absorbed indirect flux is their sum. **Requires `PTM_SOLAR_ALBEDO`**: without a per-face Bond albedo the request warns and stays gray. Set `radiation.band_separated: false` to get the single gray band. | [standard] |
+| `PTM_LEGACY_RADIOSITY_STATIC_ALBEDO` | 0 | `=1` builds the two-band visible source from the static base albedo instead of the incidence-angle albedo the boundary condition applied. This reinstates a known energy leak at grazing incidence and announces itself loudly; for A/B comparison only. | [internal] |
+| `PTM_LEGACY_ALBEDO_NORMAL_A0` | 0 | Vestigial. With the per-face single-scattering albedo now in use, the Hapke normal-incidence short-circuit returns the same value as the continuous branch, so this changes nothing. Kept as a labeled no-op; it announces itself when set. | [internal] |
+| `PTM_LEGACY_FIXED_SOLARCONST` | 0 | `=1` restores the fixed 1 AU solar constant in place of the per-timestep instantaneous value. Byte-identical to the pre-v1.0.3 path. | [internal] |
+| `PTM_HMATRIX_VF_REPLACE_GPU` | unset | Used with `PTM_HMATRIX_VF_REPLACE`: routes the replacement matrix through the GPU sparse path instead of the CPU operator. | [experimental] |
+| `PTM_RADIOSITY_CHUNK_NNZ` | auto (2.0 GB per buffer) | Lower the per-chunk stored-entry cap for the chunked GPU sparse product. The automatic budget leaves margin under the 2 GB single-allocation wall; lower it only to reproduce a chunk split. | [internal] |
+| `PTM_RAD_FORCE_SINGLE_FAIL`, `PTM_RAD_FORCE_POOL_FAIL` | unset | Fault injection: force the single-GPU or multi-GPU radiosity initialization to fail so the fallback path can be exercised. Testing only. | [internal] |
 | `PTM_SOLAR_ALBEDO` | unset | Bond albedo for the reflected-solar radiosity source (e.g. `0.12` for the Moon); without it the solar source scatters with the thermal reflectivity 1−ε (~0.05), under-scattering sunlight. Also feeds `PTM_BEAM_SOLAR`. | [standard] (set with TWO_BAND) |
 | `PTM_RAD_EMISSIVITY` | unset | Forces a uniform radiosity emissivity (consistency studies). | [internal] |
 | `PTM_BEAM_SOLAR` | 0 | Smith-style beamed reflected-solar emission on wall→floor pairs. | [experimental] |
@@ -109,7 +119,7 @@ Rules:
 |---|---|---|---|
 | `PTM_HMATRIX_THREADS` | auto | Thread count for the view-factor (H-matrix) computation. Cap it on large meshes to avoid running out of memory during the build (some blocks fall back to dense storage and are memory-hungry). | [tuning] |
 | `PTM_HMATRIX_ACA_CAP` | 12000 | Max faces/side for ACA low-rank blocks (0 = off); larger admissible blocks are zeroed or subdivided. | [tuning] |
-| `PTM_HMATRIX_SUBDIVIDE` | config | 1/0 override of `subdivide_large_admissible`: bisect + re-ACA oversized admissible blocks instead of zeroing them. | [tuning] |
+| `PTM_HMATRIX_SUBDIVIDE` | config (default on) | 1/0 override of `radiation.hmatrix_subdivide_admissible`: bisect and re-run ACA on oversized admissible blocks instead of zeroing them. Zeroing them removes crater floor-to-wall coupling above roughly 100k faces. | [tuning] |
 | `PTM_HMATRIX_HIER_LEVELS` | mesh-size clamp | Override the number of octree subdivision levels (a memory lever: more levels = smaller per-block working memory). | [tuning] |
 | `PTM_HMATRIX_SPARSE_CAP` | 5000 (out-of-core) / 300 | Cap on per-block sparse-fallback size. | [tuning] |
 | `PTM_HMATRIX_RAY_LIFT` | 0.0 | Lift visibility-ray origins along the face normal by this fraction of the local edge (clears sub-mesh roughness on grazing sightlines). | [experimental] |
@@ -122,7 +132,8 @@ Rules:
 | Variable | Default | Effect | Status |
 |---|---|---|---|
 | `PTM_RAM_ILLUM_MAX_GB` | 10 | Threshold (GB) above which the illumination time series is read from disk in pieces rather than held entirely in memory. Raise on high-memory machines to keep everything in RAM (faster); lower on laptops. | [tuning] |
-| `PTM_MAX_TIMESTEPS_PER_DISPATCH` | machine profile, else 300 | Ceiling on how many thermal timesteps one GPU work submission may contain (protection against GPU driver timeouts); normally supplied by `--calibrate-gpu`. | [tuning] |
+| `PTM_MAX_TIMESTEPS_PER_DISPATCH` | machine profile, else 300 | Ceiling on how many thermal timesteps one GPU work submission may contain (protection against GPU driver timeouts); normally supplied by `--calibrate-gpu`. Setting it explicitly also disables the inline auto-calibration probe. | [tuning] |
+| `PTM_NO_AUTO_CALIBRATE` | unset | Disables the inline GPU auto-calibration probe (`thermal.auto_calibrate_gpu`, default on), restoring the machine-profile or conservative dispatch ceiling. Affects dispatch batching only, never the physics. | [tuning] |
 | `PTM_LOG_SUBDISPATCH` | off | Log the timing of each GPU work submission (diagnostics for GPU driver hangs). | [internal] |
 
 ## Diagnostics and internal tooling
@@ -134,6 +145,9 @@ Rules:
 | `PTM_DUMP_QIND_SERIES` | unset | Write the per-face indirect-flux time series (binary, 'QIDT' marker; single-precision values, all timesteps of face 0, then face 1, ...). | [internal] |
 | `PTM_DUMP_REFLIR` | unset | Write each face's peak temperature and the indirect flux at that moment (binary, 'RFIR' marker). | [internal] |
 | `PTM_VF_ROBUST`, `PTM_VF_NLIFT`, `PTM_VF_MSAMPLE`, `PTM_VF_IGNORE_NEAR`, `PTM_VF_MC_LIFT` | unset | Settings for the standalone view-factor checking tools (`vf_face_probe`, `vf_hemisphere_mc`), which recompute individual view factors by independent Monte Carlo ray tracing for comparison. | [internal] |
+| `PTM_PRIMARY_DISK_ALWAYS_SAMPLE` | 0 | `=1` disables the convex-body short-circuit in the finite primary-disk visibility probe, so every face pays the full sample count. Validation use. | [internal] |
+| `PTM_PRIMARY_DISK_STATS` | 0 | `=1` prints a census of which primary-disk branch each face took (below horizon, fully lit, dark, sampled). | [internal] |
+| `PTM_ESC_BENCH`, `PTM_ESC_DUMP` | unset | Benchmark timing and matrix dump for the GPU sparse product escalation path. | [internal] |
 | `PTM_PP_RING_PLY` | unset | PTM-12 diagnostic pipeline (`scripts/ptm12_diag/`). | [internal] |
 | `PTM_RADIANCE_PRUNE_EPS` | unset (off) | Radiance-weighted view-factor pruning threshold (W/m²) applied at VF **assembly** (`scripts/ptm12_diag/assemble_vf_haworth.py`): keep partner j for face i only if F_ij·R_j ≥ ε. Also exposed as the config key `radiation.radiance_prune_eps` (see [configuration.md](configuration.md)); when both are set the **env var takes precedence** and the runners propagate the config value into it only when it is unset. The sim does **not** prune — it logs the effective ε at radiation init. `0`/unset = off (numerically identical to the last digit). See [radiation-exchange.md §10.9](radiation-exchange.md). | [experimental] |
 | `PTM_A3GT_REPO`, `PTM_A3GT_MESH_DIR`, `PTM_A3GT_TEMPLATE_RAD` | unset | A3GT campaign-runner plumbing (`scripts/a3gt_*`). | [internal] |
