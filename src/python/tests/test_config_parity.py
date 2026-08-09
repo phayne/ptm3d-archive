@@ -21,6 +21,11 @@ Four things are asserted, in the order they would break:
 4. the dead keys in the shipped ``examples/`` configs are exactly the ones
    already known, so a new one cannot be added unnoticed.
 
+Check 3 needs PyQt6, because it reads the GUI's own config writer. Without it
+that check is **skipped**, and the summary distinguishes skipped from failed --
+a missing GUI dependency is not a config-parity failure. CI installs PyQt6 and
+sees all five run.
+
 Run directly (no pytest needed)::
 
     python3 src/python/tests/test_config_parity.py
@@ -36,6 +41,28 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
+
+
+class Skipped(Exception):
+    """A check that could not run here, as distinct from one that failed.
+
+    Only ``test_gui_written_yaml_uses_only_engine_keys`` raises this, and only
+    for a missing PyQt6: the GUI's ConfigManager imports Qt, so without it the
+    check is unrunnable, not failing. It used to surface as
+    ``ERROR ... ModuleNotFoundError`` and a ``4/5 ... FAIL`` summary on any
+    machine without the GUI's dependencies installed -- a red result that said
+    nothing about the config surface. CI installs PyQt6, so CI still runs all
+    five and a genuine failure is still a failure.
+    """
+
+
+def _skip(reason):
+    """Skip the current check. Uses pytest's own mechanism when under pytest."""
+    try:
+        import pytest
+    except ImportError:
+        raise Skipped(reason) from None
+    pytest.skip(reason)
 
 from ptm import engine_config                                    # noqa: E402
 from ptm.engine_config import (ENGINE_DEFAULTS, ENGINE_SECTIONS,  # noqa: E402
@@ -171,8 +198,15 @@ def test_gui_written_yaml_uses_only_engine_keys():
     switches, the three scalar ``semi_axis_?_km`` fields). ``_config_for_yaml``
     is what removes or translates them, so that is what is checked -- checking
     DEFAULT_CONFIG instead would report 26 false positives.
+
+    Skipped, not failed, where PyQt6 is not installed: the check needs the
+    GUI's own writer and there is no substitute for it.
     """
-    from gui_core.config_manager import ConfigManager
+    try:
+        from gui_core.config_manager import ConfigManager
+    except ImportError as exc:
+        _skip(f"the GUI's config writer is unavailable here ({exc}); "
+              f"install PyQt6 to run this check")
 
     manager = ConfigManager()
     written = manager._config_for_yaml()
@@ -234,24 +268,41 @@ TESTS = [
 
 def main():
     failures = 0
+    skipped = 0
     for test in TESTS:
         try:
             test()
         except AssertionError as exc:
             failures += 1
             print(f"FAIL {test.__name__}\n     {exc}")
-        except Exception as exc:                       # noqa: BLE001
-            failures += 1
-            print(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+        except BaseException as exc:                   # noqa: BLE001
+            # pytest.skip raises its own Skipped, which derives from
+            # BaseException, so match on the name and let anything else through
+            # as the error it is.
+            if type(exc).__name__ != "Skipped":
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failures += 1
+                print(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+            else:
+                skipped += 1
+                print(f"SKIP {test.__name__}\n     {exc}")
         else:
             print(f"PASS {test.__name__}")
     total = len(TESTS)
-    print(f"\n[test_config_parity] {total - failures}/{total} passed, "
+    passed = total - failures - skipped
+    tally = f"{passed}/{total} passed"
+    if skipped:
+        tally += f", {skipped} skipped"
+    if failures:
+        tally += f", {failures} failed"
+    print(f"\n[test_config_parity] {tally}, "
           f"{len(ENGINE_DEFAULTS)} engine config keys checked")
     if failures:
         print("[test_config_parity] FAIL")
         return 1
-    print("[test_config_parity] PASS")
+    print("[test_config_parity] PASS"
+          + (f" ({skipped} skipped)" if skipped else ""))
     return 0
 
 
