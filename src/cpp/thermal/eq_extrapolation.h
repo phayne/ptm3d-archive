@@ -87,12 +87,17 @@ constexpr int kMaxValidatedOrderP = 4;
 // Column limit for the tiny stack-allocated solver below (p-1 columns).
 constexpr int kMaxCols = 8;
 
+// Level-2 hold threshold (ADDENDUM NOTE 8) -- declared here because Options
+// uses it as a default. Full rationale at level2Hold() below.
+constexpr double kHoldKDefault = 1e-3;  // K per pass
+
 struct Options {
     bool   enabled  = false;   // method: rre
     int    order_p  = 4;
     double tol_K    = 0.5;
     double safety   = 3.0;
     double r_cap    = 0.9995;
+    double hold_K   = kHoldKDefault;  // Level-2 hold threshold, K per pass
     // Radiation-coupling iteration that owns this eq phase. Reported in the
     // banner. The ring buffer is function-local and therefore structurally
     // cleared at every call, which is what satisfies ADDENDUM A5's mandatory
@@ -126,9 +131,17 @@ struct Options {
 // over a still-relaxing deep column, exactly inverted).
 constexpr double kEpsState    = 1.1920928955078125e-07;  // float32 epsilon
 constexpr double kLevel1Frac  = 0.2;    // Level-1 bound = kLevel1Frac * tol_K
-constexpr double kLevel2Slack = 10.0;   // Level-2 noise-floor multiplier
-constexpr double kLevel2Floor = 1e-5;   // K, absolute floor for the hold test
-constexpr double kHeldDispTol = 1e-4;   // K, displacement tripwire on held layers
+// LEVEL 2 threshold (ADDENDUM NOTE 8). ABSOLUTE, in Kelvin, and deliberately
+// NOT coupled to ||gamma||_1: that coupling was justified by a roundoff premise
+// that the measurement refuted (N8.0), and keeping it would carry a refuted
+// rationale into shipped code. Physically interpretable instead: a layer moving
+// less than a millikelvin per pass is converged. Sized on the contraction bound,
+// not on noise -- s_z = 1e-3 K/pass at r_pass = 0.348 implies a remaining error
+// of 5.3e-4 K, an order of magnitude below any threshold in the gate table.
+// No ULP floor arm: 1e-3 K is 556 ULP at 30 K and 43 ULP at 390 K, so such an
+// arm would be dead code.
+constexpr double kHeldDispTol  = 1e-4;  // K, T*-based assertion (structurally 0)
+constexpr double kHeldPostTol  = 1e-2;  // K, POST-POLISH tripwire on held layers
 constexpr int    kNBlocks     = 3;      // certificate blocks [0,15) [15,30) [30,n)
 inline int blockOf(int layer) {
     return (layer < 15) ? 0 : (layer < 30 ? 1 : 2);
@@ -137,18 +150,39 @@ inline int blockOf(int layer) {
 // LEVEL 1 — refuse the whole column when amplified float32 state roundoff could
 // reach a fifth of the reporting tolerance. Self-calibrating: no magic constant,
 // the bound moves with tol_K and with the column's own temperature scale.
+//
+// HONEST SCOPE (ADDENDUM NOTE 8, N8.0): this is NOT the fix for the deep-layer
+// displacement defect, and must not be recorded as such. That defect is exact
+// algebra, not roundoff: for a layer bit-locked from pass 1 (S_0 = a, S_1..S_4 = b)
+// sum(gamma)=1 gives T* = b + gamma_0*(a-b), i.e. displacement LINEAR in the
+// seed-to-converged distance -- 0.465 K observed implies an entirely ordinary
+// gamma_0 ~ 0.093. Measured ||gamma||_1 max was 14.5, whose roundoff bound is
+// 2.6e-5 K, 17,800x too small, and Level 1 never fired (gamma_refused = 0).
+// It is kept because it bounds a real if non-dominant failure mode at 6 LOC.
 inline bool level1Refuse(double gamma_l1, double max_abs_S, double tol_K) {
     return gamma_l1 * kEpsState * max_abs_S > kLevel1Frac * tol_K;
 }
 
-// LEVEL 2 — hold one layer when its window signal is at or below the local
-// noise floor. A no-op wherever the layer carries signal: on the active
-// populations the deep layers move ~0.12 K per pass, five orders above this.
-inline bool level2Hold(double s_layer, double gamma_l1, double S_last_layer) {
-    const double floor_l = std::max(kLevel2Slack * gamma_l1 * kEpsState
-                                        * std::fabs(S_last_layer),
-                                    kLevel2Floor);
-    return s_layer <= floor_l;
+// LEVEL 2 — hold one layer whose LAST-PASS increment is below HOLD_K.
+//
+// s_z = |S_{N-1}(z) - S_{N-2}(z)|, the LAST difference only. The seed transition
+// is excluded by construction, which is the whole point: including it (the
+// N6.2 wording said max_j|u_j|) makes a layer bit-locked since pass 1 still look
+// active, because the seed sits ~5.85 K away at depth. That is what made the
+// first guard inert.
+//
+// LAST difference, not max of the last two, because the two error directions are
+// NOT symmetric:
+//   * a MISSED hold (converged layer judged active) -> displacement
+//     gamma_0*(seed - converged), up to 0.5 K -- a WRONG ANSWER;
+//   * a SPURIOUS hold (active layer judged quiet)  -> that layer converges at the
+//     plain rate instead of the accelerated one -- graceful, never wrong.
+// The predicate must therefore be biased toward holding, and the last difference
+// is the smallest candidate statistic, so it holds most. The usual objection to a
+// single difference -- an increment passing through zero on an active layer --
+// lands entirely in the benign direction under that asymmetry.
+inline bool level2Hold(double s_layer, double hold_K) {
+    return s_layer <= hold_K;
 }
 
 struct Stats {
@@ -164,7 +198,9 @@ struct Stats {
     long long converged_window  = 0; // whole column below the noise floor (vacuous)
     long long layers_held       = 0; // Level 2: individual layers held
     long long faces_partly_held = 0; // faces with >=1 held layer but not all
-    double    d_held_max        = 0.0;  // displacement tripwire, must stay <= 1e-4 K
+    double    d_held_max        = 0.0;  // T*-based ASSERTION that the guard ran (structurally 0)
+    long long layers_total      = 0;    // for the held-layer fraction
+    std::vector<float> d_held_post;     // POST-POLISH |Phi(T*)-S_last| on HELD layers, per face
     std::vector<float> ehat;         // one entry per extrapolated face (max over blocks)
     std::vector<float> gamma_l1;     // ||gamma||_1 per solved face
 
@@ -180,6 +216,8 @@ struct Stats {
         layers_held      += o.layers_held;
         faces_partly_held += o.faces_partly_held;
         d_held_max        = std::max(d_held_max, o.d_held_max);
+        layers_total     += o.layers_total;
+        d_held_post.insert(d_held_post.end(), o.d_held_post.begin(), o.d_held_post.end());
         passes_spent      = std::max(passes_spent, o.passes_spent);
         ehat.insert(ehat.end(), o.ehat.begin(), o.ehat.end());
         gamma_l1.insert(gamma_l1.end(), o.gamma_l1.begin(), o.gamma_l1.end());
@@ -310,14 +348,10 @@ inline bool rreColumn(const double* X, int p, int n_layers, double* out,
                       double* s_layer_out = nullptr) {
     const double* newest = X + static_cast<size_t>(p) * n_layers;
     if (s_layer_out) {
-        for (int l = 0; l < n_layers; ++l) {
-            double s = 0.0;
-            for (int j = 0; j < p; ++j) {
-                s = std::max(s, std::fabs(X[static_cast<size_t>(j + 1) * n_layers + l]
-                                        - X[static_cast<size_t>(j) * n_layers + l]));
-            }
-            s_layer_out[l] = s;
-        }
+        // LAST difference only: |S_{N-1} - S_{N-2}| = |X[p] - X[p-1]|.
+        const double* sl  = X + static_cast<size_t>(p)     * n_layers;
+        const double* sl1 = X + static_cast<size_t>(p - 1) * n_layers;
+        for (int l = 0; l < n_layers; ++l) s_layer_out[l] = std::fabs(sl[l] - sl1[l]);
     }
     auto fallback = [&]() {
         for (int l = 0; l < n_layers; ++l) out[l] = newest[l];

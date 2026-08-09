@@ -94,6 +94,10 @@ struct SimulationConfig {
             double tol_K   = 0.5;
             double safety  = 3.0;
             double r_cap   = 0.9995;
+            // Level-2 hold threshold, K per pass: a layer whose LAST-pass
+            // increment |S_{N-1}-S_{N-2}| is below this is treated as converged
+            // and held at S_last instead of extrapolated.
+            double hold_K  = 1e-3;
         } eq_extrapolation;
 
         bool compute_statistics = true;

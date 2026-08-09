@@ -1579,6 +1579,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
                        const ptm::eqextrap::Options& opt,
                        std::vector<float>& T_star,
                        std::vector<float>& rhat_out,
+                       std::vector<unsigned char>& held_out,
                        ptm::eqextrap::Stats* stats) {
     const int p = opt.order_p;
     const size_t depth = ring.size();
@@ -1601,6 +1602,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
     rhat_out.assign(n_faces * ptm::eqextrap::kNBlocks,
                     std::numeric_limits<float>::quiet_NaN());
 
+    held_out.assign(n_faces * n_layers, 0);
     std::vector<double> X(depth * n_layers);
     std::vector<double> cand(n_layers);
     std::vector<double> s_layer(n_layers);
@@ -1651,8 +1653,12 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
             // the active populations is untouched by construction.
             size_t n_held = 0;
             for (size_t l = 0; l < n_layers; ++l) {
-                held[l] = ptm::eqextrap::level2Hold(s_layer[l], gamma_l1, newest[l]) ? 1 : 0;
-                if (held[l]) { cand[l] = newest[l]; ++n_held; }
+                held[l] = ptm::eqextrap::level2Hold(s_layer[l], opt.hold_K) ? 1 : 0;
+                if (held[l]) {
+                    cand[l] = newest[l];
+                    held_out[l * n_faces + f] = 1;
+                    ++n_held;
+                }
             }
             layers_held += static_cast<long long>(n_held);
             if (n_held == n_layers)      ++converged_window;
@@ -1694,6 +1700,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
         }
     }
     if (stats) {
+        stats->layers_total      += static_cast<long long>(n_faces) * n_layers;
         stats->box_refused       += box_refused;
         stats->solve_failed      += solve_failed;
         stats->gamma_refused     += gamma_refused;
@@ -1709,6 +1716,7 @@ bool eqExtrapolateRing(const std::vector<std::vector<float>>& ring,
 void eqScoreCertificate(const std::vector<float>& T_out,
                         const std::vector<float>& T_star,
                         const std::vector<float>& rhat,
+                        const std::vector<unsigned char>& held,
                         size_t n_faces, size_t n_layers,
                         const ptm::eqextrap::Options& opt,
                         ptm::eqextrap::Stats* stats) {
@@ -1727,6 +1735,28 @@ void eqScoreCertificate(const std::vector<float>& T_out,
             const int B = ptm::eqextrap::blockOf(static_cast<int>(l));
             dmax[B] = std::max(dmax[B], std::fabs(static_cast<double>(T_out[i])
                                                 - static_cast<double>(T_star[i])));
+        }
+        // POST-POLISH TRIPWIRE (N8.2), restricted to HELD layers. This is the
+        // one with detection power: the T*-based tripwire is structurally zero
+        // once the hold fires, so it can only assert that the guard EXECUTED.
+        // Restricted to held layers because the 3b population's deep layers move
+        // ~0.9 K per pass legitimately -- an all-layers-below-30 version would
+        // false-positive on exactly the faces that passed. On a HELD layer the
+        // pre-extrapolation state was quiet (<= hold_K), so one more pass may
+        // move it by that much plus the deep response to the correctly
+        // extrapolated upper column; 0.01 K is 10x that allowance and still
+        // catches the observed 0.465 K by 46x.
+        {
+            double dpost = 0.0;
+            bool any_held = false;
+            for (size_t l = 0; l < n_layers; ++l) {
+                const size_t i = l * n_faces + f;
+                if (!held[i]) continue;
+                any_held = true;
+                dpost = std::max(dpost, std::fabs(static_cast<double>(T_out[i])
+                                                - static_cast<double>(T_star[i])));
+            }
+            if (any_held) stats->d_held_post.push_back(static_cast<float>(dpost));
         }
         double ehat = 0.0;
         for (int B = 0; B < NB; ++B) {
@@ -1892,6 +1922,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     std::vector<std::vector<float>> ring;        // depth ext_p+1, newest last
     std::vector<float> T_star_host;              // the uploaded extrapolant
     std::vector<float> rhat_host;                // per-face contraction ratio
+    std::vector<unsigned char> held_host;        // per face x layer: Level-2 hold mask
     bool extrapolated = false;
     if (extrap_on && extrap_stats) {
         extrap_stats->passes_spent = total_cycles;
@@ -1939,7 +1970,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                 // pass about to run starts from it.
                 extrapolated = eqExtrapolateRing(ring, cycle, n_faces_active_,
                                                  n_layers_, *extrap,
-                                                 T_star_host, rhat_host,
+                                                 T_star_host, rhat_host, held_host,
                                                  extrap_stats);
                 if (extrapolated) {
                     try {
@@ -1988,8 +2019,8 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
             T_out.clear();
         }
         if (T_out.size() == T_star_host.size()) {
-            eqScoreCertificate(T_out, T_star_host, rhat_host, n_faces_active_,
-                               n_layers_, *extrap, extrap_stats);
+            eqScoreCertificate(T_out, T_star_host, rhat_host, held_host,
+                               n_faces_active_, n_layers_, *extrap, extrap_stats);
         } else if (!T_out.empty()) {
             std::cerr << "[eq-extrap] WARNING: post-polish size mismatch ("
                       << T_out.size() << " vs " << T_star_host.size()

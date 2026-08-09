@@ -336,40 +336,65 @@ static void testMeasuredNearDegenerateRegression() {
     check(bound < 0.5 * g_fail, "bound sits >2x below the failing amplification",
           g_fail / bound, 2);
 
-    // LEVEL 2, on this column's real temperatures: a deep layer carrying only
-    // 1 float32 ULP of window signal must be held; an active layer carrying the
-    // 3b population's measured ~0.12 K per pass must NOT be.
-    const double ulp_deep = 1.907e-6;            // ULP at 30.73 K
-    check(ex::level2Hold(ulp_deep, 2.0, S_last[49]),
-          "Level 2 HOLDS a deep layer at 1 ULP of signal", 1, 1);
-    check(!ex::level2Hold(0.12, 2.0, S_last[49]),
-          "Level 2 does NOT hold an active layer (0.12 K/pass)", 1, 1);
-    check(!ex::level2Hold(0.12, 5.3, S_last[0]),
-          "Level 2 does NOT hold an active SURFACE layer at worst active gamma", 1, 1);
-    // The operationally relevant case: at the WORST ACTIVE amplification the
-    // Level-2 floor must sit far below the active signal, so the 55-64x result
-    // on LIT/(b2) is untouched.
-    const double floor_active = std::max(
-        ex::kLevel2Slack * g_ok * ex::kEpsState * std::fabs(S_last[49]),
-        ex::kLevel2Floor);
-    std::printf("       Level-2 floor at the worst ACTIVE gamma (%.1f): %.3g K "
-                "(active signal 0.12 K)\n", g_ok, floor_active);
-    check(floor_active < 0.012, "Level-2 floor >=10x below active signal at worst active gamma",
-          floor_active, 0.012);
+    // LEVEL 2 (ADDENDUM NOTE 8): absolute HOLD_K on the LAST-pass increment.
+    const double HOLD_K = ex::kHoldKDefault;   // 1e-3 K/pass
+    check(ex::level2Hold(0.0, HOLD_K),
+          "Level 2 HOLDS a bit-locked layer (s_z = 0)", 1, 1);
+    check(ex::level2Hold(9.9e-4, HOLD_K),
+          "Level 2 HOLDS a layer just under HOLD_K", 1, 1);
+    check(!ex::level2Hold(1.1e-3, HOLD_K),
+          "Level 2 does NOT hold a layer just over HOLD_K", 1, 1);
+    // The 3b population's deep layers carry a pass-4 increment of
+    // gap*(1-r)/r = 0.4796 * 1.874 = 0.90 K, i.e. 899x above HOLD_K.
+    check(!ex::level2Hold(0.90, HOLD_K),
+          "Level 2 does NOT hold the 3b population's deep layers (0.90 K/pass)", 1, 1);
+    std::printf("       3b deep increment 0.90 K is %.0fx above HOLD_K = %.0e K\n",
+                0.90 / HOLD_K, HOLD_K);
+    // HOLD_K must sit well above the float32 noise floor at both ends of the range.
+    std::printf("       HOLD_K = %.0f ULP at 30 K, %.0f ULP at 390 K\n",
+                HOLD_K / 1.9073486e-06, HOLD_K / 3.0517578e-05);
+    check(HOLD_K > 100.0 * 1.9073486e-06,
+          "HOLD_K is >100 ULP at 30 K (no ULP floor arm needed)", 1, 1);
 
-    // DOCUMENTED INTERACTION, reported not asserted: a column sitting AT the
-    // Level-1 bound has a Level-2 floor of ~0.56 K, above the 0.12 K active
-    // signal, so every layer is held and the extrapolation becomes a complete
-    // no-op (T* = S_last = plain cycling). That is graceful degradation, not
-    // damage -- but it means the two levels overlap, and columns in the top
-    // decade below the Level-1 bound buy nothing. Worth knowing before tuning
-    // either constant.
-    const double floor_at_bound = std::max(
-        ex::kLevel2Slack * bound * ex::kEpsState * std::fabs(S_last[49]),
-        ex::kLevel2Floor);
-    std::printf("       [reported] Level-2 floor AT the Level-1 bound: %.3g K "
-                "=> such columns become full no-ops (graceful, not harmful)\n",
-                floor_at_bound);
+    // ---- THE NAMED PREDICTION (N8.1): the 73-face case must now hold at depth.
+    // A layer bit-locked from pass 1: S_0 = a (the seed), S_1..S_4 = b.
+    // Without the hold, sum(gamma)=1 gives T* = b + gamma_0*(a-b) -- displacement
+    // LINEAR in the seed-to-converged distance, which is the measured defect
+    // (0.465 K observed => gamma_0 ~ 0.093, an ordinary weight, NOT roundoff).
+    // With the hold, s_z = |S_4 - S_3| = 0 <= HOLD_K, so T*(z) = b EXACTLY.
+    {
+        const int L = 4, p = 4;
+        const double a[4] = {29.0, 29.5, 30.0, 30.5};      // seed, ~5 K away
+        const double b[4] = {24.0426, 24.1230, 24.1975, 24.2670};  // converged
+        std::vector<double> X(static_cast<size_t>(p + 1) * L);
+        for (int l = 0; l < L; ++l) {
+            X[l] = a[l];                                    // S_0 = seed
+            for (int j = 1; j <= p; ++j) X[static_cast<size_t>(j) * L + l] = b[l];
+        }
+        std::vector<double> out(L), sz(L);
+        double cond = 0.0, g1 = 0.0;
+        ex::rreColumn(X.data(), p, L, out.data(), &cond, ex::kRcond, &g1, sz.data());
+        double s_max = 0.0, disp = 0.0;
+        for (int l = 0; l < L; ++l) {
+            s_max = std::max(s_max, sz[l]);
+            disp  = std::max(disp, std::fabs(out[l] - b[l]));
+        }
+        std::printf("       bit-locked-from-pass-1 column: s_z max = %.3g K, "
+                    "unheld displacement = %.6g K, ||gamma||_1 = %.3g\n",
+                    s_max, disp, g1);
+        checkNear("s_z excludes the seed transition (== 0 on a pass-1-locked layer)",
+                  s_max, 0.0, 0.0);
+        int held = 0;
+        for (int l = 0; l < L; ++l) if (ex::level2Hold(sz[l], HOLD_K)) ++held;
+        check(held == L, "ALL layers of the pass-1-locked column are HELD", held, L);
+        double disp_held = 0.0;
+        for (int l = 0; l < L; ++l) {
+            const double v = ex::level2Hold(sz[l], HOLD_K) ? b[l] : out[l];
+            disp_held = std::max(disp_held, std::fabs(v - b[l]));
+        }
+        checkNear("with the hold, T* == S_last EXACTLY (the named prediction)",
+                  disp_held, 0.0, 0.0);
+    }
 }
 
 int main() {

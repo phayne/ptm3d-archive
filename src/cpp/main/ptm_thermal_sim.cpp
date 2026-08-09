@@ -4251,6 +4251,7 @@ static bool resolveEqExtrapolation(const thermal::Config& config,
     o.tol_K   = config.getPropertyDouble("eq_extrap_tol_K", 0.5);
     o.safety  = config.getPropertyDouble("eq_extrap_safety", 3.0);
     o.r_cap   = config.getPropertyDouble("eq_extrap_r_cap", 0.9995);
+    o.hold_K  = config.getPropertyDouble("eq_extrap_hold_K", ptm::eqextrap::kHoldKDefault);
 
     if (o.order_p < ptm::eqextrap::kMinOrderP) {
         std::cerr << "[Thermal] ERROR: eq_extrapolation.order_p=" << o.order_p
@@ -4266,6 +4267,11 @@ static bool resolveEqExtrapolation(const thermal::Config& config,
         std::cout << "[Thermal] WARNING: eq_extrapolation.order_p=" << o.order_p
                   << " is above the validated range (3-4). It will run, but no "
                      "acceptance threshold has been measured for it.\n";
+    }
+    if (!(o.hold_K > 0.0)) {
+        std::cerr << "[Thermal] ERROR: eq_extrapolation.hold_K must be > 0; got "
+                  << o.hold_K << "\n";
+        return false;
     }
     if (!(o.tol_K > 0.0) || !(o.safety > 0.0) || !(o.r_cap > 0.0) || o.r_cap >= 1.0) {
         std::cerr << "[Thermal] ERROR: eq_extrapolation requires tol_K > 0, "
@@ -5049,7 +5055,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << (eq_passes - 1) << ", pass " << eq_passes
                   << " = polish + certificate + delivered state), tol_K="
                   << eq_extrap.tol_K << " safety=" << eq_extrap.safety
-                  << " r_cap=" << eq_extrap.r_cap << std::endl;
+                  << " r_cap=" << eq_extrap.r_cap
+                  << " hold_K=" << eq_extrap.hold_K << " K/pass" << std::endl;
     }
     ptm::eqextrap::Stats eq_extrap_stats;
     std::mutex eq_extrap_mutex;
@@ -6455,15 +6462,31 @@ post_batch_loop:
                       << " | p95 " << g95 << " | p99 " << g99 << " | max " << gmx
                       << "   (Level-1 bound = " << ptm::eqextrap::kLevel1Frac
                       << " * tol_K / (eps32 * max|S|))" << std::endl;
+            const double held_frac = eq_extrap_stats.layers_total > 0
+                ? static_cast<double>(eq_extrap_stats.layers_held)
+                      / static_cast<double>(eq_extrap_stats.layers_total)
+                : 0.0;
             std::cout << "[eq-extrap] layers_held " << eq_extrap_stats.layers_held
+                      << " | held_fraction " << std::fixed << std::setprecision(6) << held_frac
                       << " | faces_partly_held " << eq_extrap_stats.faces_partly_held
-                      << " | held-layer displacement max "
-                      << std::scientific << std::setprecision(3)
-                      << eq_extrap_stats.d_held_max << " K (tripwire bar "
-                      << ptm::eqextrap::kHeldDispTol << " K)" << std::endl;
+                      << " | T*-assertion max " << std::scientific << std::setprecision(3)
+                      << eq_extrap_stats.d_held_max << " K (must be 0)" << std::endl;
+            // POST-POLISH tripwire on HELD layers -- the one with detection power.
+            const double q50 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.50);
+            const double q95 = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 0.95);
+            const double qmx = ptm::eqextrap::percentile(eq_extrap_stats.d_held_post, 1.00);
+            std::cout << "[eq-extrap] post-polish |Phi(T*)-S_last| on HELD layers: p50 "
+                      << q50 << " | p95 " << q95 << " | max " << qmx
+                      << " K (bar " << ptm::eqextrap::kHeldPostTol << " K)" << std::endl;
             if (eq_extrap_stats.d_held_max > ptm::eqextrap::kHeldDispTol) {
-                std::cerr << "[eq-extrap] ERROR: held-layer displacement exceeded the "
-                             "tripwire -- the Level-2 guard is not doing what it claims.\n";
+                std::cerr << "[eq-extrap] ERROR: T*-based assertion non-zero -- the Level-2 "
+                             "guard did not execute as claimed.\n";
+            }
+            if (qmx > ptm::eqextrap::kHeldPostTol) {
+                std::cerr << "[eq-extrap] ERROR: post-polish held-layer deviation " << qmx
+                          << " K exceeds the " << ptm::eqextrap::kHeldPostTol
+                          << " K tripwire -- the delivered state moved a layer the guard "
+                             "declared converged.\n";
             }
         }
         if (eq_extrap_stats.solve_failed > 0) {
@@ -13025,6 +13048,8 @@ int main(int argc, char** argv) {
                                        sim_config.thermal.eq_extrapolation.safety);
             thermal_config.setProperty("eq_extrap_r_cap",
                                        sim_config.thermal.eq_extrapolation.r_cap);
+            thermal_config.setProperty("eq_extrap_hold_K",
+                                       sim_config.thermal.eq_extrapolation.hold_K);
         }
         {
             // The extrapolation lives in the GPU persistent solver's pass loop.
