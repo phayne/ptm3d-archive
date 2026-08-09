@@ -1,0 +1,64 @@
+# PTM3D quickstart companion: Europa diurnal run with the GLOBAL BOND-ALBEDO MAP.
+#
+# This file is the spatial-albedo arm of a two-run comparison. It is a copy of
+# examples/quickstart_europa_diurnal.yaml with exactly TWO keys changed:
+#
+#     illumination.use_albedo_map : false -> true
+#     output.directory            : .../quickstart_europa_diurnal
+#                                -> .../quickstart_europa_albedo_map
+#
+# Everything else (epoch, duration, mesh, equilibration, thermophysics) is
+# byte-for-byte the same, so a face-by-face difference between the two output
+# directories is attributable to the albedo map alone.
+#
+# Requires the albedo-map dataset (Europa_Albedo_res4.bin, per-face Bond albedo
+# on the ico4 icosphere) plus the Europa SPICE kernels:
+#
+#     python3 scripts/fetch_kernels.py --bodies europa   # once, ~1.1 GB from NAIF
+#     python3 scripts/fetch_data.py --dataset albedo-maps
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_albedo_map.yaml
+#
+# The engine picks the per-face binary that matches the mesh resolution:
+# mesh.resolution 4 -> <albedo_maps_directory>/Europa_Albedo_res4.bin. A
+# resolution with no matching file falls back to the uniform default albedo and
+# says so in the run log ("Failed to load binary albedo file ...").
+#
+# See docs/tutorials/notebooks/02_europa_thermal.ipynb, section 7.
+
+simulation:
+  start_time: '2025-01-01T00:00:00'
+  duration_days: 3.55           # one Europa orbit = one Europa "day" (synchronous rotation)
+  timesteps: 192                # ~26.6 min output cadence (resolves the ~2.7 h eclipse in ~6 steps)
+  body: Europa
+mesh:
+  resolution: 4                 # icosphere subdivision level (5120 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0                    # 0 = auto-detect
+  equilibration_orbits: 20.0    # matches the uniform-ice arm exactly
+  use_gpu: false
+  compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+thermophysical:
+  # use_default_albedo still selects the built-in Europa thermophysics (emissivity
+  # 0.9, porous-ice thermal inertia ~60 SI, Qb = 0.03 W/m^2). Its uniform Bond
+  # albedo 0.5 is what the per-face map replaces below.
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false                # no inter-face radiation on a convex sphere
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: true          # <-- the one physics change: per-face Bond albedo
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/quickstart_europa_albedo_map
+  format: binary
+  vtk_mode: none
+advanced:
+  verbose: false
