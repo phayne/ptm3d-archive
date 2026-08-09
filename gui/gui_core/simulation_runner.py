@@ -1,19 +1,29 @@
 """
 Simulation Runner for PTM3D GUI
 Handles simulation execution in background thread
+
+The process driving -- executable discovery, the output severity classifier,
+the CPU-clock stall watchdog and process-group teardown -- lives in ``ptm.run``
+and is shared with the command-line and notebook paths. What remains here is
+the Qt layer: a QThread that forwards ``ptm.run``'s callbacks to signals.
 """
 
 import subprocess
-import signal
 import sys
 import os
 import re
 import select
-import time
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from gui_core.preflight import build_engine_env, find_project_root
+from ._ptm_bootstrap import ensure_ptm_importable
+
+ensure_ptm_importable()
+
+from ptm import run as ptm_run                        # noqa: E402
+from ptm.run import EngineProcess, build_command      # noqa: E402
+
+from gui_core.preflight import build_engine_env, find_project_root  # noqa: E402
 
 
 class SimulationThread(QThread):
@@ -30,76 +40,18 @@ class SimulationThread(QThread):
     heartbeat = pyqtSignal(str, bool)
     finished = pyqtSignal(int)  # Exit code
 
-    # --- Severity classification -------------------------------------------
-    # The engine writes many INFORMATIONAL and WARNING banners to stderr
-    # ([eq-seed] equilibration seed..., [machine-profile] ...CONSERVATIVE
-    # defaults, [GPU Thermal] dispatch self-chunk ceiling..., progress). A
-    # successful run therefore emits stderr lines that are NOT errors, so
-    # routing purely by "came from stderr" mislabels a good run as failed.
-    # Classify by CONTENT/severity instead, on both streams.
-    #
-    # Genuine-failure signatures (red) are kept narrow so normal banners are
-    # never shown as errors; a real failure also carries a non-zero exit
-    # code, which the GUI surfaces red independently.
-    _ERROR_RE = re.compile(
-        r'(?<![A-Za-z])(?:FATAL|ERROR)\s*:'          # "ERROR:" / "FATAL:"
-        r'|traceback \(most recent call last\)'
-        r'|segmentation fault|abort trap|bus error|core dumped'
-        r'|terminate called|what\(\):|std::bad_alloc|std::runtime_error'
-        r'|uncaught exception|assertion failed'
-        r'|simulation failed',
-        re.IGNORECASE)
-    _WARN_RE = re.compile(
-        r'(?<![A-Za-z])warn(?:ing)?\b'               # "WARNING" / "warn:"
-        r'|conservative defaults|no usable gpu profile'
-        r'|falling back|fall back to|fallback|deprecat'
-        r'|spice error|spice\(',                     # engine SPICE diagnostics
-        re.IGNORECASE)
-
-    WATCHDOG_INTERVAL_S = 30.0   # child cputime sampling cadence
-    STALL_CPU_DELTA_S = 0.5      # < this much CPU advance per interval = stalled
+    # Watchdog cadence and the stall threshold live with the driver.
+    WATCHDOG_INTERVAL_S = EngineProcess.WATCHDOG_INTERVAL_S
+    STALL_CPU_DELTA_S = EngineProcess.STALL_CPU_DELTA_S
 
     def __init__(self, config_file, working_dir=None, config_dict=None):
         super().__init__()
         self.config_file = config_file
         self.working_dir = working_dir
         self.config_dict = config_dict  # Full config for engine env + CLI options
-        self.process = None
+        self.process = None             # the child Popen, once started
+        self._engine = None             # ptm.run.EngineProcess
         self._stop_requested = False
-
-    # NOTE: radiation options are deliberately NOT duplicated as command-line
-    # flags. config_parser.cpp reads the complete radiation section from the
-    # YAML itself (enabled, use_hmatrix, use_gpu, view_factor_file, coupling
-    # and ACA parameters, band_separated, gpu_devices, ...). The old
-    # _build_radiation_args copied a subset onto the CLI "because they were
-    # not in the YAML parser" -- that has been false for a long time, and the
-    # CLI copy risked silently overriding the YAML whenever GUI and engine
-    # defaults diverged. YAML is the single source of truth now.
-
-    def _build_gpu_thermal_args(self):
-        """Build command-line arguments for GPU thermal options (not in YAML parser)"""
-        args = []
-        if not self.config_dict:
-            return args
-
-        thermal = self.config_dict.get("thermal", {})
-        if thermal.get("use_gpu", False):
-            args.append("--use-gpu-thermal")
-
-        return args
-
-    def _build_generic_body_args(self):
-        """Build command-line arguments for generic body configuration."""
-        args = []
-        if not self.config_dict:
-            return args
-
-        generic = self.config_dict.get("generic_body", {})
-        config_file = generic.get("config_file", "")
-        if config_file:
-            args.extend(["--generic-body-config", str(config_file)])
-
-        return args
 
     def run(self):
         """Execute the simulation and emit output"""
@@ -110,12 +62,10 @@ class SimulationThread(QThread):
                 self.finished.emit(-1)
                 return
 
-            # Build command with config file and additional CLI args for GPU/
-            # generic-body options (radiation comes from the YAML -- see note
-            # above _build_gpu_thermal_args).
-            command = [str(executable), "--config", str(self.config_file)]
-            command.extend(self._build_gpu_thermal_args())
-            command.extend(self._build_generic_body_args())
+            # Radiation options are deliberately NOT duplicated onto the CLI:
+            # config_parser.cpp reads the whole radiation section from the YAML
+            # (see ptm.run.build_command).
+            command = build_command(executable, self.config_file, self.config_dict)
 
             # Pin the subprocess cwd to the project root (derived from the
             # executable location) so relative config paths (data/...,
@@ -133,112 +83,23 @@ class SimulationThread(QThread):
             if applied:
                 self.output_ready.emit("[run] engine env: " + " ".join(applied))
 
-            self.process = subprocess.Popen(
+            self._engine = EngineProcess(
                 command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=False,
-                bufsize=0,
-                cwd=self.working_dir,
+                working_dir=self.working_dir,
                 env=env,
-                start_new_session=True  # own process group: clean group kill
+                on_output=self.output_ready.emit,
+                on_warning=self.warning_ready.emit,
+                on_error=self.error_ready.emit,
+                on_progress=self.progress_update.emit,
+                on_heartbeat=lambda msg, stalled: self.heartbeat.emit(msg, stalled),
             )
+            if self._stop_requested:      # stop() arrived before the child started
+                self.finished.emit(-1)
+                return
 
-            stdout_buffer = bytearray()
-            stderr_buffer = bytearray()
-
-            def drain_buffer(buf, is_stderr):
-                parts = re.split(b'[\r\n]', buf)
-                complete = parts[:-1]
-                remainder = parts[-1] if parts else b""
-
-                for seg in complete:
-                    if not seg:
-                        continue
-                    decoded = seg.decode('utf-8', errors='replace').strip()
-                    if not decoded:
-                        continue
-
-                    # Extract progress if available
-                    progress = self._extract_progress(decoded)
-                    if progress is not None:
-                        self.progress_update.emit(progress)
-
-                    # Route by severity/content, NOT by stream (see class
-                    # docstring): the engine emits info/warning banners on
-                    # stderr during successful runs.
-                    self._emit_classified(decoded)
-
-                buf.clear()
-                buf.extend(remainder)
-
-            # Stall watchdog state: sample the child's CPU clock every
-            # WATCHDOG_INTERVAL_S. A process blocked in a file read (e.g. a
-            # dehydrated cloud-synced file) accumulates no CPU time, which is
-            # otherwise indistinguishable from long computation.
-            next_watchdog = time.monotonic() + self.WATCHDOG_INTERVAL_S
-            last_cputime = None
-            stall_since = None
-
-            # Pump both pipes
-            while not self._stop_requested:
-                if self.process.poll() is not None:
-                    tail_out = self.process.stdout.read() or b""
-                    tail_err = self.process.stderr.read() or b""
-                    if tail_out:
-                        stdout_buffer.extend(tail_out)
-                    if tail_err:
-                        stderr_buffer.extend(tail_err)
-                    break
-
-                now = time.monotonic()
-                if now >= next_watchdog:
-                    next_watchdog = now + self.WATCHDOG_INTERVAL_S
-                    cpu = self._sample_cputime(self.process.pid)
-                    if cpu is not None:
-                        if (last_cputime is not None
-                                and (cpu - last_cputime) < self.STALL_CPU_DELTA_S):
-                            if stall_since is None:
-                                stall_since = now - self.WATCHDOG_INTERVAL_S
-                            mins = (now - stall_since) / 60.0
-                            self.heartbeat.emit(
-                                f"No progress for {mins:.1f} min (CPU idle) -- "
-                                "likely blocked on file I/O (cloud-synced or "
-                                "dataless file?)", True)
-                        else:
-                            if stall_since is not None:
-                                self.heartbeat.emit(
-                                    "Progress resumed (CPU active)", False)
-                            stall_since = None
-                        last_cputime = cpu
-
-                readable, _, _ = select.select(
-                    [self.process.stdout, self.process.stderr], [], [], 0.1
-                )
-                for stream in readable:
-                    data = stream.read(4096)
-                    if not data:
-                        continue
-                    if stream is self.process.stdout:
-                        stdout_buffer.extend(data)
-                        drain_buffer(stdout_buffer, is_stderr=False)
-                    else:
-                        stderr_buffer.extend(data)
-                        drain_buffer(stderr_buffer, is_stderr=True)
-
-            # Emit remaining content (classified, so a genuine error in the
-            # final chunk still surfaces red).
-            for buf, is_stderr in [(stdout_buffer, False), (stderr_buffer, True)]:
-                if buf:
-                    try:
-                        tail = buf.decode('utf-8', errors='replace').strip()
-                        if tail:
-                            self._emit_classified(tail)
-                    except Exception:
-                        pass
-
-            self.process.wait()
-            self.finished.emit(self.process.returncode)
+            returncode = self._engine.run()
+            self.process = self._engine.process
+            self.finished.emit(returncode)
 
         except Exception as e:
             self.error_ready.emit(f"Execution error: {str(e)}")
@@ -247,87 +108,36 @@ class SimulationThread(QThread):
     def stop(self):
         """Stop the running simulation.
 
-        The child is launched with start_new_session=True, so signal the
-        whole process group: TERM first, KILL after 5 s. A process stuck in
-        an uninterruptible cloud-file read may not die instantly even on
-        KILL; the final wait is bounded so this never hangs the caller.
+        The child runs in its own session, so this signals the whole process
+        group: TERM first, KILL after 5 s, both waits bounded so a process
+        stuck in an uninterruptible cloud-file read never hangs the GUI.
         """
         self._stop_requested = True
-        if self.process and self.process.poll() is None:
-            self._signal_group(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._signal_group(signal.SIGKILL)
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass  # bounded: do not hang the GUI on a stuck process
+        if self._engine is not None:
+            self._engine.stop()
+            self.process = self._engine.process
 
-    def _signal_group(self, sig):
-        """Send `sig` to the child's process group (fallback: child only)."""
-        try:
-            os.killpg(os.getpgid(self.process.pid), sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                if sig == signal.SIGKILL:
-                    self.process.kill()
-                else:
-                    self.process.terminate()
-            except Exception:
-                pass
-
-    @staticmethod
-    def _sample_cputime(pid):
-        """Child CPU time in seconds via ps (portable on macOS/Linux).
-        Returns None if unavailable."""
-        try:
-            out = subprocess.run(
-                ["ps", "-o", "cputime=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-        except Exception:
-            return None
-        if not out:
-            return None
-        # Format: [[dd-]hh:]mm:ss[.ff]
-        try:
-            days = 0
-            if "-" in out:
-                d, out = out.split("-", 1)
-                days = int(d)
-            parts = [float(p) for p in out.split(":")]
-            while len(parts) < 3:
-                parts.insert(0, 0.0)
-            h, m, s = parts[-3], parts[-2], parts[-1]
-            return days * 86400.0 + h * 3600.0 + m * 60.0 + s
-        except (ValueError, IndexError):
-            return None
-
+    # --- Severity classification -------------------------------------------
+    # The engine writes informational and warning banners to stderr during
+    # successful runs, so routing by stream mislabels a good run as failed;
+    # ptm.run.classify_severity decides on content instead. Kept as methods
+    # because the GUI and the tutorial screenshot script call them on an
+    # instance.
     def classify_severity(self, text):
-        """Classify a single output line as 'error' | 'warning' | 'info'
-        by its CONTENT (works for stdout and stderr alike). Genuine failure
-        signatures -> error (red); explicit warnings and known
-        conservative-fallback banners -> warning (yellow); everything else,
-        including the engine's [eq-seed]/[machine-profile]/[GPU Thermal]
-        banners and progress lines -> info (white)."""
-        if self._ERROR_RE.search(text):
-            return "error"
-        if self._WARN_RE.search(text):
-            return "warning"
-        return "info"
+        """Classify one output line as 'error' | 'warning' | 'info'."""
+        return ptm_run.classify_severity(text)
 
     # Back-compat alias (kept private-style for internal callers/tests).
     _classify_severity = classify_severity
 
-    def _emit_classified(self, text):
-        sev = self.classify_severity(text)
-        if sev == "error":
-            self.error_ready.emit(text)
-        elif sev == "warning":
-            self.warning_ready.emit(text)
-        else:
-            self.output_ready.emit(text)
+    @staticmethod
+    def _sample_cputime(pid):
+        """Child CPU time in seconds via ps, or None."""
+        return ptm_run.sample_cputime(pid)
+
+    def _extract_progress(self, text):
+        """Extract a progress percentage from text, or None."""
+        return ptm_run.extract_progress(text)
 
     def _is_progress_line(self, text):
         """Check if line is a progress/info update (not an error).
@@ -375,12 +185,22 @@ class SimulationThread(QThread):
 
         return False
 
-    def _extract_progress(self, text):
-        """Extract progress percentage from text"""
-        match = re.search(r'(\d+(?:\.\d+)?)\s*%', text)
-        if match:
-            return float(match.group(1))
-        return None
+
+#: The checkout this GUI lives in: gui/gui_core/simulation_runner.py -> <root>.
+_GUI_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+#: Probed after <root>/build/bin, relative to the current directory. Kept for
+#: launches from inside build/ or from a directory beside it.
+_RELATIVE_BIN_CANDIDATES = ("../build/bin", "../../build/bin", "./build/bin",
+                            "../bin", "./bin")
+
+
+def _find_binary(name):
+    return ptm_run.find_engine_executable(
+        name,
+        search_roots=(_GUI_REPO_ROOT,),
+        extra_candidates=[f"{d}/{name}" for d in _RELATIVE_BIN_CANDIDATES],
+    )
 
 
 class SimulationRunner:
@@ -389,37 +209,27 @@ class SimulationRunner:
     @staticmethod
     def find_ptm_executable():
         """Locate the ptm_thermal_sim executable"""
-        possible_paths = [
-            Path(__file__).parent.parent.parent / "build" / "bin" / "ptm_thermal_sim",
-            Path("../build/bin/ptm_thermal_sim"),
-            Path("../../build/bin/ptm_thermal_sim"),
-            Path("./build/bin/ptm_thermal_sim"),
-            Path("../bin/ptm_thermal_sim"),
-            Path("./bin/ptm_thermal_sim"),
-        ]
-
-        for path in possible_paths:
-            resolved = path.resolve()
-            if resolved.exists():
-                return resolved
-
-        return None
+        return _find_binary("ptm_thermal_sim")
 
     @staticmethod
     def find_converter_script():
-        """Locate the VTK converter script"""
-        possible_paths = [
-            Path(__file__).parent.parent.parent / "src" / "python" / "vtk_converter_optimized.py",
-            Path("../src/python/vtk_converter_optimized.py"),
-            Path("../../src/python/vtk_converter_optimized.py"),
-            Path("./src/python/vtk_converter_optimized.py"),
-        ]
+        """Locate the VTK converter script.
 
-        for path in possible_paths:
-            resolved = path.resolve()
-            if resolved.exists():
-                return resolved
-
+        ``vtk_converter_optimized.py`` is probed first and is not in the
+        repository -- the name is left in place for trees that carry it. The
+        shipped converter is ``src/python/vtk_converter.py``, whose CLI takes
+        exactly the four flags ConverterThread passes (--input-dir,
+        --output-dir, --format, --no-statistics). Before this fallback existed,
+        this returned None in every clean checkout and the GUI's post-run
+        conversion could not run at all.
+        """
+        names = ("vtk_converter_optimized.py", "vtk_converter.py")
+        roots = (_GUI_REPO_ROOT, Path(".."), Path("../.."), Path("."))
+        for name in names:
+            for root in roots:
+                candidate = (root / "src" / "python" / name).resolve()
+                if candidate.exists():
+                    return candidate
         return None
 
 
@@ -530,17 +340,7 @@ class CameraSimThread(QThread):
     @staticmethod
     def find_camera_executable():
         """Locate ptm_camera_sim executable."""
-        candidates = [
-            Path(__file__).parent.parent.parent / "build" / "bin" / "ptm_camera_sim",
-            Path("../build/bin/ptm_camera_sim"),
-            Path("../../build/bin/ptm_camera_sim"),
-            Path("./build/bin/ptm_camera_sim"),
-        ]
-        for p in candidates:
-            resolved = p.resolve()
-            if resolved.exists():
-                return resolved
-        return None
+        return _find_binary("ptm_camera_sim")
 
 
 class ConverterThread(QThread):
