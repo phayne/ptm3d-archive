@@ -47,6 +47,19 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Docs/prose checks. Standard-library only, so they run before the pip
+      # install and give the fastest possible signal on a text-only PR.
+      #   * American English: PTM3D uses it everywhere a reader can see --
+      #     docs, comments, docstrings, GUI labels. Legitimate exceptions
+      #     (quoted paper titles, OGC WKT unit names, code identifiers that
+      #     cannot be renamed) live in the checker's own ALLOW table.
+      #   * GitHub math: `$...$` spans that CommonMark escaping would mangle.
+      - name: Docs check -- American English
+        run: python3 scripts/check_american_english.py
+
+      - name: Docs check -- GitHub-renderable math
+        run: python3 scripts/check_github_math.py
+
       # PyQt6 imports QtCore from a shared library that wants these on the
       # bare runner image. The GUI is never displayed here -- the parity test
       # imports gui_core to read the config writer, nothing more.
