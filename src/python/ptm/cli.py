@@ -1,10 +1,11 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Three subcommands::
+Four subcommands::
 
-    ptm info <run_dir>                  what the run is, and what it does not record
-    ptm plot <run_dir> <what> [--save]  diurnal | map | globes | hist
-    ptm run  <config.yaml>              start the engine on a config
+    ptm info  <run_dir>                  what the run is, and what it does not record
+    ptm plot  <run_dir> <what> [--save]  diurnal | map | globes | hist
+    ptm run   <config.yaml>              start the engine on a config
+    ptm sweep <config.yaml> --vary K=V,V run a grid of them
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
 documented quickstart ends at a stdlib snippet printing three floats, and every
@@ -12,9 +13,9 @@ route from there to a picture needed a second environment (the GUI's twelve
 unpinned dependencies, Jupyter -- which is named in no requirements file -- or
 ParaView).
 
-``ptm run`` is here because :class:`ptm.run.EngineProcess` already does the
-work; it is a single serial run and nothing more. Parameter sweeps are
-deliberately not in this command.
+``ptm run`` is a single serial run and nothing more. ``ptm sweep`` is the same
+engine driver over a grid, with the resume, provenance and collection that the
+nineteen bespoke sweep scripts in this tree each re-implemented.
 """
 
 from __future__ import annotations
@@ -88,6 +89,60 @@ def _build_parser():
     run.add_argument("--workdir", default=None,
                      help="working directory (default: the repository root, "
                           "which is where the shipped metakernels resolve)")
+
+    sweep = sub.add_parser(
+        "sweep", help="run a grid of simulations from one base config",
+        description="Run a parameter grid. Serial by default: there is one "
+                    "GPU. Resumable: re-running skips points that finished.",
+        epilog="examples:\n"
+               "  ptm sweep examples/quickstart_asteroid_diurnal.yaml \\\n"
+               "      --vary thermal_inertia=50,100,200,400\n"
+               "  ptm sweep output/asteroid_sweep --table sweep.csv "
+               "--plot curves --save family.png\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sweep.add_argument(
+        "target",
+        help="a base YAML config, or an existing sweep directory to reopen")
+    sweep.add_argument(
+        "--vary", action="append", default=[], metavar="NAME=V1,V2,...",
+        help="one grid axis. NAME is 'thermal_inertia', 'albedo', or any "
+             "dotted config key (thermal.equilibration_orbits). Repeat for a "
+             "cartesian product.")
+    sweep.add_argument("--outdir", default=None,
+                       help="where the points go (default: the base config's "
+                            "output.directory with _sweep appended)")
+    sweep.add_argument("--exe", default=None, help="engine binary")
+    sweep.add_argument("--workdir", default=None,
+                       help="working directory for the engine (default: the "
+                            "repository root)")
+    sweep.add_argument("--jobs", type=int, default=1,
+                       help="concurrent engine processes (default 1). CPU-only: "
+                            "refuses to start if any point asks for the GPU.")
+    sweep.add_argument("--timeout", type=float, default=None,
+                       help="wall-clock ceiling per point, in seconds")
+    sweep.add_argument("--no-resume", action="store_true",
+                       help="re-run every point, including finished ones")
+    sweep.add_argument("--no-run", action="store_true",
+                       help="do not launch anything; only --table / --plot the "
+                            "points already on disk")
+    sweep.add_argument("--dry-run", action="store_true",
+                       help="print the engine command for each point, run none")
+    sweep.add_argument("--list", action="store_true",
+                       help="print the grid and each point's status, run none")
+    sweep.add_argument("--use-flags", default="auto",
+                       choices=("auto", "yes", "no"),
+                       help="deliver thermal_inertia/albedo through the engine "
+                            "CLI flags (auto: use them if this binary has "
+                            "them)")
+    sweep.add_argument("--table", default=None, metavar="FILE.csv",
+                       help="write a tidy table of the finished points")
+    sweep.add_argument("--plot", default=None, choices=("curves",),
+                       help="draw the family-of-curves figure")
+    sweep.add_argument("--field", default="temperature",
+                       help="field for --table and --plot (default temperature)")
+    sweep.add_argument("--save", default=None, metavar="FILE",
+                       help="write the figure here")
+    sweep.add_argument("--dpi", type=int, default=200, help="raster DPI (200)")
     return parser
 
 
@@ -226,6 +281,109 @@ def _do_run(args):
     return status
 
 
+# --- sweep --------------------------------------------------------------------
+
+def _parse_scalar(text):
+    """``'50'`` -> 50, ``'0.05'`` -> 0.05, ``'true'`` -> True, else the string."""
+    lowered = text.strip().lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return text
+
+
+def _parse_vary(specs):
+    """``['ti=1,2', ...]`` -> an ordered ``{name: [values]}``."""
+    grid = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise SystemExit(
+                f"--vary needs NAME=V1,V2,...; got {spec!r}")
+        name, _, values = spec.partition("=")
+        name = name.strip()
+        items = [v for v in values.split(",") if v.strip() != ""]
+        if not items:
+            raise SystemExit(f"--vary {name}: no values given")
+        if name in grid:
+            raise SystemExit(f"--vary {name} given twice")
+        grid[name] = [_parse_scalar(v) for v in items]
+    return grid
+
+
+def _print_sweep_list(sweep):
+    print(f"base   {sweep.base_config_path}")
+    print(f"outdir {sweep.outdir}")
+    print(f"engine {sweep.exe} (md5 {sweep.exe_md5})")
+    for name, values in sweep.axes.items():
+        route = sweep.route.get(name, "config")
+        print(f"axis   {name} = {values}  [{route}]")
+    print(f"points {len(sweep)} ({'x'.join(str(n) for n in sweep.shape)})")
+    for point in sweep:
+        complete, why = point.completeness()
+        mark = "done" if complete else "todo"
+        print(f"  {mark}  {point.name:<40s} {why}")
+
+
+def _do_sweep(args):
+    from . import sweep as sweep_mod
+
+    target = Path(args.target).expanduser()
+    if target.is_dir():
+        if args.vary:
+            raise SystemExit(
+                f"{target} is an existing sweep directory; its grid comes from "
+                f"sweep.json, so --vary cannot be combined with it")
+        sweep = sweep_mod.load_sweep(target, exe=args.exe) if args.exe \
+            else sweep_mod.load_sweep(target)
+    else:
+        if not target.is_file():
+            raise SystemExit(f"not a config file or sweep directory: {target}")
+        if not args.vary:
+            raise SystemExit("ptm sweep needs at least one --vary NAME=V1,V2")
+        use_flags = {"auto": "auto", "yes": True, "no": False}[args.use_flags]
+        sweep = sweep_mod.Sweep(
+            target, grid=_parse_vary(args.vary), outdir=args.outdir,
+            exe=args.exe, workdir=args.workdir, use_flags=use_flags,
+            timeout=args.timeout)
+
+    if args.list:
+        _print_sweep_list(sweep)
+        return 0
+
+    status = 0
+    if not args.no_run:
+        summary = sweep.run(resume=not args.no_resume, jobs=args.jobs,
+                            dry_run=args.dry_run)
+        if summary["failed"]:
+            status = 1
+        if args.dry_run:
+            return status
+
+    if args.table:
+        import numpy as np
+        field = args.field
+        rows = sweep.write_table(
+            args.table,
+            **{f"{field}_max": lambda r: float(np.max(r.stat(field, "max"))),
+               f"{field}_min": lambda r: float(np.min(r.stat(field, "min"))),
+               f"{field}_mean": lambda r: float(np.mean(r.stat(field, "avg")))})
+        print(f"wrote {args.table} ({len(rows)} rows)")
+
+    if args.plot:
+        import matplotlib
+        matplotlib.use("Agg")
+        fig = sweep.plot_curves(field=args.field)
+        if not args.save:
+            raise SystemExit("--plot needs --save FILE")
+        fig.savefig(args.save, dpi=args.dpi)
+        print(f"wrote {args.save}")
+    return status
+
+
 # --- entry point ------------------------------------------------------------
 
 def main(argv=None):
@@ -242,6 +400,8 @@ def main(argv=None):
 
     if args.command == "run":
         return _do_run(args)
+    if args.command == "sweep":
+        return _do_sweep(args)
 
     from .results import Results
     units = getattr(args, "units", "ascii")
