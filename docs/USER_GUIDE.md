@@ -205,6 +205,55 @@ src/cpp/
 --thermal-b <n>               Skin depths to bottom (default: 15)
 ```
 
+### Physical properties
+
+Two scalar properties can be set from the command line on any body, built-in or
+generic, without editing the YAML. Both go through the same override channel the
+solvers already honor (`thermophysical.albedo_override`, `ks_override`,
+`kd_override`), so the run prints `[Thermo override] applied at solver: ...`
+confirming the value reached the solver and not merely `main()`.
+
+```
+--albedo <A0>                 Bond albedo A0, in [0, 1)
+--thermal-inertia <TI>        Nominal surface thermal inertia [J m^-2 K^-1 s^-1/2]
+--constant-thermal-inertia <TI>   Thermal inertia held exactly constant
+```
+
+`--thermal-inertia TI` means
+
+```
+TI = sqrt(ks * rhos * cp(273 K))        ->   ks = TI^2 / (rhos * cp(273 K))
+```
+
+with the densities and the heat capacity left at the body's values, the
+conductivity carrying the whole change, and `kd` scaled by the same factor so
+the `kd/ks` depth contrast survives. This is the convention already used by
+`scripts/ema_campaign_driver.py`, `scripts/divval_sweep.py` and the shipped pair
+`examples/quickstart_asteroid_diurnal.yaml` /
+`examples/quickstart_asteroid_diurnal_ti200_check.yaml` — and running the first
+of those with `--thermal-inertia 200` reproduces the second to 1e-4 K.
+
+`cp` is evaluated at 273 K by the body's own `cp(T)` polynomial, the same
+reference the engine's TI(273 K) property maps use (Hayne et al. 2017). On a
+body with a constant `cp` — every generic body — that is `cp0` exactly. On the
+Moon it is the only workable choice: `cp0` there is the *constant term* of the
+polynomial and is negative (−3.6125 J/kg/K).
+
+The flag does **not** make thermal inertia constant. `cp(T)` and `chi` are left
+alone, so on a body that has them the delivered TI moves with temperature about
+the requested value and the run says so. `--constant-thermal-inertia` is the
+other reading: it derives `cp = TI^2/(ks*rhos)` and forces `chi = 0`, `kd = ks`,
+`rhod = rhos`, making TI exactly constant in temperature and depth at the cost
+of the two-layer profile. The two are mutually exclusive and the run refuses if
+both are given.
+
+`--albedo` is out-ranked by a per-face albedo map for the absorbed-solar flux;
+the run warns when one is configured. Set `illumination.use_albedo_map: false`
+to sweep albedo directly. With `incidence_angle_albedo: true` the Hapke angular
+model is re-anchored on the new A0 (the single-scattering albedo `w` is
+re-derived), so the flag stays consistent with that gate rather than bypassing
+it.
+
 ### Radiation Exchange
 
 ```

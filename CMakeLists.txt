@@ -108,6 +108,25 @@ endif()
 
 project(planetary_thermophysical_model VERSION 1.1)
 
+# ---------------------------------------------------------------------------
+# Link the project's own libraries statically, and pin the decision HERE.
+#
+# This is not a preference, it is a correction. `find_package(VTK)` in
+# src/cpp/main/CMakeLists.txt writes BUILD_SHARED_LIBS=ON into this project's
+# cache ("Build VTK with shared libraries"), which silently turns every
+# add_library() that does not say STATIC into a shared object. Measured on this
+# tree: src/cpp/ice/CMakeLists.txt says `add_library(ice_table ice_table.cpp)`,
+# and the resulting ptm_thermal_sim carries `@rpath/libice_table.dylib` -- so
+# an edit confined to ice_table.cpp moves a .dylib and leaves the EXECUTABLE's
+# md5 unchanged. This project identifies binaries by that md5.
+#
+# Declaring the option before any find_package fixes the cache entry to OFF, so
+# VTK's later non-FORCE cache set is a no-op and the executable is a complete
+# identity for the engine. -DBUILD_SHARED_LIBS=ON still works if anyone wants
+# the old behavior; the run's provenance.txt then reports it.
+# ---------------------------------------------------------------------------
+option(BUILD_SHARED_LIBS "Build the project's own libraries as shared objects" OFF)
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -416,6 +435,30 @@ configure_file(
     ${CMAKE_CURRENT_BINARY_DIR}/include/config.h
 )
 
+# ---------------------------------------------------------------------------
+# Engine build identity (ptm_build_info.h) -- see cmake/GenerateBuildInfo.cmake
+#
+# Two invocations on purpose. The configure-time one guarantees the header
+# exists before the first dependency scan; the build-time target re-resolves
+# the git SHA on every build so a commit made between builds is reported
+# correctly. The generator writes the file only when its content changes, so
+# a no-op rebuild neither recompiles nor perturbs the executable's md5.
+#
+# ENABLE_GPU is read here rather than earlier because the GPU block below sets
+# it from PTM_ENABLE_GPU; this configure_file call is re-run by the build-time
+# target anyway, so the recorded value tracks the option.
+# ---------------------------------------------------------------------------
+set(PTM_BUILD_INFO_IN  "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/ptm_build_info.h.in")
+set(PTM_BUILD_INFO_OUT "${CMAKE_CURRENT_BINARY_DIR}/include/ptm_build_info.h")
+set(PTM_BUILD_INFO_ARGS
+    "-DPTM_BUILD_INFO_IN=${PTM_BUILD_INFO_IN}"
+    "-DPTM_BUILD_INFO_OUT=${PTM_BUILD_INFO_OUT}"
+    "-DPTM_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DPTM_VERSION=${PROJECT_VERSION}"
+    "-DPTM_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+    "-DPTM_COMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+
+
 # ============================================================================
 # Include Directories
 # ============================================================================
@@ -608,6 +651,30 @@ if(ENABLE_GPU)
 else()
     message(STATUS "GPU acceleration OFF - building the portable CPU-first core")
 endif()
+
+# ---------------------------------------------------------------------------
+# Engine build identity, part 2 -- deferred to here because it records whether
+# the GPU core was compiled in, and ENABLE_GPU is only final after the block
+# above.
+# ---------------------------------------------------------------------------
+if(ENABLE_GPU)
+    list(APPEND PTM_BUILD_INFO_ARGS "-DPTM_GPU_LABEL=ON")
+else()
+    list(APPEND PTM_BUILD_INFO_ARGS "-DPTM_GPU_LABEL=OFF")
+endif()
+if(BUILD_SHARED_LIBS)
+    list(APPEND PTM_BUILD_INFO_ARGS "-DPTM_SHARED_LABEL=true")
+else()
+    list(APPEND PTM_BUILD_INFO_ARGS "-DPTM_SHARED_LABEL=false")
+endif()
+execute_process(COMMAND ${CMAKE_COMMAND} ${PTM_BUILD_INFO_ARGS}
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateBuildInfo.cmake")
+add_custom_target(ptm_build_info ALL
+    COMMAND ${CMAKE_COMMAND} ${PTM_BUILD_INFO_ARGS}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateBuildInfo.cmake"
+    BYPRODUCTS "${PTM_BUILD_INFO_OUT}"
+    COMMENT "Resolving engine build identity (git SHA)"
+    VERBATIM)
 
 # ============================================================================
 # Subdirectories

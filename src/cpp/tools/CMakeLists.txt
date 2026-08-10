@@ -226,10 +226,15 @@ cmake_minimum_required(VERSION 3.10)
 # Collect tool sources
 set(TOOL_SOURCES
     config_parser.cpp
+    run_provenance.cpp
 )
 
 # Create tools library
 add_library(ptm_tools STATIC ${TOOL_SOURCES})
+
+# run_provenance.cpp includes the generated ptm_build_info.h.
+add_dependencies(ptm_tools ptm_build_info)
+target_include_directories(ptm_tools PRIVATE ${CMAKE_BINARY_DIR}/include)
 
 # Include directories
 target_include_directories(ptm_tools

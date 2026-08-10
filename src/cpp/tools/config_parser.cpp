@@ -486,8 +486,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // Distinct from visibility_threshold. The runners propagate it to the
             // assembler via PTM_RADIANCE_PRUNE_EPS; the sim only logs it.
             config.radiation.radiance_prune_eps = getWithDefault(rad, "radiance_prune_eps", config.radiation.radiance_prune_eps);
-            // Band-separated (visible + thermal-IR) radiosity (D1). Default OFF;
-            // Paul's default-flip (D2) is separate. See two-band-radiosity-derivation.tex.
+            // Band-separated (visible + thermal-IR) radiosity (D1). Default ON
+            // since the D2 flip (config_parser.h: band_separated = true); set
+            // false to recover the gray solve. See two-band-radiosity-derivation.tex.
             config.radiation.band_separated = getWithDefault(rad, "band_separated", config.radiation.band_separated);
 
             // Multi-GPU radiosity dispatch (mirrors thermal pool YAML keys).

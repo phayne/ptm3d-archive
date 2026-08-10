@@ -344,10 +344,73 @@ def test_provenance_says_what_is_missing(tmp):
     prov = Results(make_run(tmp / "km_run")).provenance()
     assert prov["n_faces"] == 320
     assert prov["config_sha256"] is None
+    assert prov["engine"] == {}, "a run with no provenance.txt reports no engine"
     joined = " ".join(prov["not_recorded"])
     assert "engine binary md5" in joined and "config" in joined, (
         "provenance must name what the run does not record rather than "
         "inferring it")
+
+
+def test_provenance_reads_the_engine_record(tmp):
+    """A run WITH provenance.txt stops reporting the fields as missing.
+
+    The engine has written ``provenance.txt`` since schema
+    ``ptm3d-provenance-1``. This is the reader's half of that contract: the
+    field names below are the ones ``run_provenance.cpp`` writes, and if either
+    side renames one, provenance silently goes back to ``not_recorded`` --
+    which looks like an old run rather than like a bug. Hence an explicit test
+    rather than trust.
+    """
+    root = make_run(tmp / "km_run_prov")
+    (root / "config_used.yaml").write_text("simulation:\n  body: Moon\n")
+    (root / "provenance.txt").write_text(
+        "schema=ptm3d-provenance-1\n"
+        "run_started_utc=2026-08-09T12:00:00Z\n"
+        "engine_version=1.1\n"
+        "engine_git_sha=abcdef0123\n"
+        "engine_build_type=Release\n"
+        "engine_gpu_enabled=false\n"
+        "engine_binary=/somewhere/ptm_thermal_sim\n"
+        "engine_binary_md5=0123456789abcdef0123456789abcdef\n"
+        "engine_shared_libraries=false\n"
+        "command_line=ptm_thermal_sim --config x.yaml --albedo 0.2\n"
+        "body=Moon\n"
+        "generic_body=false\n"
+        "mesh_source=icosphere, resolution 2\n"
+        "mesh_faces=320\n"
+        "mesh_length_unit=kilometers\n"
+        "config_copy=config_used.yaml\n"
+        "config_md5=00112233445566778899aabbccddeeff\n")
+
+    prov = Results(root).provenance()
+    assert prov["engine_version"] == "1.1"
+    assert prov["engine_git_sha"] == "abcdef0123"
+    assert prov["engine_binary_md5"] == "0123456789abcdef0123456789abcdef"
+    assert prov["body"] == "Moon"
+    assert "--albedo 0.2" in prov["command_line"]
+    # Compare by identity, not by string: Results resolves its path, and on
+    # macOS the temp directory is reached through the /var -> /private/var
+    # symlink, so the two spellings differ while naming one file.
+    assert Path(prov["config_file"]).samefile(root / "config_used.yaml")
+    assert prov["config_sha256"] is not None
+    assert prov["config_md5_recorded"] == "00112233445566778899aabbccddeeff"
+    assert prov["started_utc"] == "2026-08-09T12:00:00Z"
+
+    joined = " ".join(prov["not_recorded"])
+    assert "engine binary md5" not in joined
+    assert "predates provenance.txt" not in joined
+    # 'kilometers' and 'km' are the same unit spelled two ways; a vocabulary
+    # difference must not be reported as a disagreement.
+    assert "agreed mesh length unit" not in joined
+    assert prov["mesh_units_recorded_by_engine"] == "kilometers"
+
+    # A build with shared project libraries must say the executable md5 is not
+    # the whole engine -- silence there is how a dylib-only change gets missed.
+    (root / "provenance.txt").write_text(
+        (root / "provenance.txt").read_text().replace(
+            "engine_shared_libraries=false", "engine_shared_libraries=true"))
+    shared = " ".join(Results(root).provenance()["not_recorded"])
+    assert "shared project libraries" in shared
 
 
 # --- 4. the two unit spellings ------------------------------------------------
@@ -433,6 +496,7 @@ TESTS = [
     test_truncated_field_file_raises,
     test_series_and_local_solar_time,
     test_provenance_says_what_is_missing,
+    test_provenance_reads_the_engine_record,
     test_units_style_survives_to_the_axis_label,
     test_every_canned_plot_draws,
     test_globes_refuse_a_site_patch,

@@ -136,8 +136,21 @@ def _print_info(run):
     if prov["config_file"]:
         print(f"config       {prov['config_file']}")
         print(f"  sha256     {prov['config_sha256']}")
+    engine = prov["engine"]
+    if engine:
+        # The point of provenance.txt is that these are answerable at all; a
+        # run that has them should not make the reader open the file.
+        print(f"engine       {prov['engine_version']} @ "
+              f"{prov['engine_git_sha']} "
+              f"({engine.get('engine_build_type', '?')}, GPU "
+              f"{'on' if engine.get('engine_gpu_enabled') == 'true' else 'off'})")
+        print(f"  binary     {engine.get('engine_binary', '?')}")
+        print(f"  md5        {prov['engine_binary_md5']}")
+        if prov["command_line"]:
+            print(f"  invoked    {prov['command_line']}")
     if prov["started_utc"]:
-        print(f"started      {prov['started_utc']} (heartbeat.txt)")
+        source = "provenance.txt" if engine.get("run_started_utc") else "heartbeat.txt"
+        print(f"started      {prov['started_utc']} ({source})")
 
     print("\nnot recorded by the run:")
     for item in prov["not_recorded"]:
