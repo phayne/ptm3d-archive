@@ -22,9 +22,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 
-from ptm.run import (CompletedRun, EngineProcess, build_command,   # noqa: E402
-                     classify_severity, extract_progress, resolve_engine,
-                     run_engine)
+from ptm.run import (CompletedRun, EngineProcess, binary_provenance,  # noqa: E402
+                     build_command, classify_severity, extract_progress,
+                     resolve_engine, run_engine)
 
 # Lines the engine really emits, and the severity each must be given. The
 # stderr banners are the point: a successful PTM3D run prints all of these.
@@ -293,6 +293,43 @@ def test_run_engine_raises_on_failure_and_check_false_does_not():
         assert done.returncode == 4 and not done.ok
 
 
+def test_binary_provenance_identifies_a_binary_with_no_run():
+    """The build-side question the run directory cannot answer.
+
+    Results.provenance() reads what the engine wrote about itself, which is
+    complete -- but only after a run exists. This is the one asked first.
+    """
+    import hashlib
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        exe = _stub_engine(tmp)
+        prov = binary_provenance(exe=exe, repo_root=tmp)
+        assert prov.md5 == hashlib.md5(exe.read_bytes()).hexdigest()
+        assert prov.size_bytes == exe.stat().st_size
+        assert prov.mtime_utc.endswith("Z") and prov.mtime_utc[4] == "-"
+        assert prov.help_ok is True and prov.n_flags == 2, prov.as_dict()
+        text = str(prov)
+        assert "md5" in text and prov.md5 in text
+        # Not a git checkout: reported, not silently dropped.
+        assert prov.git_sha is None
+        assert any("git commit" in item for item in prov.unavailable), \
+            prov.unavailable
+
+
+def test_binary_provenance_flags_a_binary_that_cannot_answer_help():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        broken = tmp / "ptm_thermal_sim"
+        broken.write_text("#!/bin/sh\nexit 0\n")     # exits 0, prints nothing
+        broken.chmod(0o755)
+        prov = binary_provenance(exe=broken, repo_root=tmp)
+        assert prov.help_ok is False
+        assert any("build is broken" in item for item in prov.unavailable), \
+            prov.unavailable
+
+
 def test_resolve_engine_names_the_build_command_when_absent():
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -316,6 +353,8 @@ TESTS = [
     test_run_engine_show_prints_only_the_asked_for_lines,
     test_run_engine_output_override_and_results_handoff,
     test_run_engine_raises_on_failure_and_check_false_does_not,
+    test_binary_provenance_identifies_a_binary_with_no_run,
+    test_binary_provenance_flags_a_binary_that_cannot_answer_help,
     test_resolve_engine_names_the_build_command_when_absent,
 ]
 

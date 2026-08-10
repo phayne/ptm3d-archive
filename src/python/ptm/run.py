@@ -49,8 +49,10 @@ from pathlib import Path
 from . import paths
 
 __all__ = [
+    "BinaryProvenance",
     "CompletedRun",
     "EngineProcess",
+    "binary_provenance",
     "build_command",
     "classify_severity",
     "engine_flags",
@@ -608,6 +610,135 @@ def resolve_engine(exe=None, cwd=None, config=None, name="ptm_thermal_sim"):
     if not exe.exists():
         raise FileNotFoundError(f"{exe} does not exist. {_BUILD_HINT}")
     return exe, cwd
+
+
+# --- which binary am I about to run? ------------------------------------------
+# The engine now records its own identity into every run directory, and
+# Results.provenance() reads it back -- md5, git SHA, version, build type, the
+# command line. That answers "what produced this run" completely.
+#
+# It cannot answer "what am I about to run", which is the question a notebook
+# asks in its first cell and a script asks before a twenty-minute launch. There
+# is no run directory yet.
+
+
+class BinaryProvenance:
+    """The identity of an engine binary, before it has produced anything.
+
+    The run-directory counterpart is
+    :meth:`ptm.results.Results.provenance`, which reads what the engine wrote
+    about itself; use that one to describe a finished run. This one describes a
+    binary on disk.
+
+    ``print(...)`` gives the four lines a caller wants in a log header. Fields
+    that could not be determined are ``None`` and are listed in
+    :attr:`unavailable` rather than left to look like absences.
+    """
+
+    __slots__ = ("path", "md5", "size_bytes", "mtime_utc", "repo_root",
+                 "git_sha", "git_branch", "git_dirty", "help_ok", "n_flags",
+                 "unavailable")
+
+    def __init__(self, **fields):
+        for name in self.__slots__:
+            setattr(self, name, fields.get(name))
+        self.unavailable = tuple(fields.get("unavailable", ()))
+
+    def __repr__(self):
+        return f"<BinaryProvenance {self.path} md5={self.md5}>"
+
+    def __str__(self):
+        lines = [f"Binary : {self.path}",
+                 f"  md5  : {self.md5}",
+                 f"  built: {self.mtime_utc}  ({self.size_bytes} bytes)"]
+        if self.git_sha:
+            dirty = " +uncommitted changes" if self.git_dirty else ""
+            lines.append(f"  commit: {self.git_sha} ({self.git_branch}){dirty}")
+        if self.help_ok is not None:
+            lines.append(f"  --help: {'ok' if self.help_ok else 'FAILED'}"
+                         f"  ({self.n_flags} flags advertised)")
+        for item in self.unavailable:
+            lines.append(f"  (not determined: {item})")
+        return "\n".join(lines)
+
+    def as_dict(self):
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+def _git(repo_root, *args):
+    """Run git in ``repo_root``; return stdout, or ``None``."""
+    import shutil
+    git = shutil.which("git")
+    if git is None or repo_root is None:
+        return None
+    try:
+        proc = subprocess.run([git, *args], cwd=str(repo_root),
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def binary_provenance(exe=None, repo_root=None, check_help=True):
+    """Identify the engine binary a run would use.
+
+    ::
+
+        from ptm import run as engine
+        print(engine.binary_provenance())
+
+        Binary : /path/to/build/bin/ptm_thermal_sim
+          md5  : e19adfdabfac617d187833414acc7931
+          built: 2026-08-10T02:36:11Z  (3287688 bytes)
+          commit: 3f06348 (feat/ptm-api-gaps)
+          --help: ok  (126 flags advertised)
+
+    ``exe`` defaults to the engine :func:`resolve_engine` would pick.
+    ``check_help`` runs ``--help`` once, which is the cheapest check that a
+    build is not broken; the flag count comes from the same call, cached.
+
+    Git is located with ``shutil.which``, not hard-coded, and a checkout with no
+    git available reports that in :attr:`BinaryProvenance.unavailable` instead
+    of silently omitting the commit.
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    exe, cwd = resolve_engine(exe=exe, cwd=repo_root)
+    if repo_root is None:
+        repo_root = paths.find_repo_root(exe.parent) or cwd
+
+    unavailable = []
+    stat = exe.stat()
+    md5 = hashlib.md5(exe.read_bytes()).hexdigest()
+    mtime = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+
+    sha = _git(repo_root, "rev-parse", "--short", "HEAD")
+    branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    dirty = None
+    if sha is None:
+        unavailable.append(
+            f"git commit ({repo_root} is not a git checkout, or git is not "
+            f"on PATH)")
+    else:
+        status = _git(repo_root, "status", "--porcelain")
+        dirty = bool(status)
+
+    help_ok, n_flags = None, None
+    if check_help:
+        flags = engine_flags(exe)
+        n_flags = len(flags)
+        help_ok = n_flags > 0
+        if not help_ok:
+            unavailable.append(
+                f"the flag list: {exe} --help advertised none, which usually "
+                f"means the build is broken")
+
+    return BinaryProvenance(
+        path=exe, md5=md5, size_bytes=stat.st_size,
+        mtime_utc=mtime.strftime("%Y-%m-%dT%H:%M:%SZ"), repo_root=repo_root,
+        git_sha=sha, git_branch=branch, git_dirty=dirty,
+        help_ok=help_ok, n_flags=n_flags, unavailable=tuple(unavailable))
 
 
 def run_engine(config, exe=None, cwd=None, echo=False, progress_every=25.0,
