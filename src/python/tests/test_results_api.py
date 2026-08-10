@@ -544,7 +544,7 @@ def test_globe_grid_rows_views_and_per_view_fields(tmp):
 
 
 def test_flux_scale_default_is_peak_temperature_only(tmp):
-    """A day/night snapshot must not default to the T**4 colour scale.
+    """A day/night snapshot must not default to the T**4 color scale.
 
     On the Moon quickstart it puts 51% of the body -- everything below 150 K --
     into the bottom 2.1% of the bar, one flat black. The rule is the same one

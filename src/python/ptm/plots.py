@@ -113,7 +113,7 @@ def flux_norm(values, lo_pct=1.0, hi_pct=100.0):
 
 
 def _flux_by_default(what, moment='max', step=None):
-    """Whether to colour this request linear in ``T**4`` unless told otherwise.
+    """Whether to color this request linear in ``T**4`` unless told otherwise.
 
     Only a *peak* temperature statistic. The point of :func:`flux_norm` is to
     undo the fourth-root compression of a field that is everywhere near its own
@@ -121,8 +121,8 @@ def _flux_by_default(what, moment='max', step=None):
     shown at its own local noon.
 
     A single output step is not, and neither is ``min`` or ``avg``. On a Moon
-    snapshot spanning 67 to 385 K, colouring linear in ``T**4`` gives the whole
-    night hemisphere -- most of the visible disk -- 2.1% of the colour range,
+    snapshot spanning 67 to 385 K, coloring linear in ``T**4`` gives the whole
+    night hemisphere -- most of the visible disk -- 2.1% of the color range,
     so it renders as one flat black. Measured on
     ``quickstart_moon_diurnal`` step 120; the same field on a linear scale
     separates the night side over a third of the bar.
@@ -136,10 +136,10 @@ def _flux_by_default(what, moment='max', step=None):
 
 def default_norm(values, what, moment='max', step=None, flux_scaled=None,
                  norm=None):
-    """The colour scale for a request, unless the caller already chose one.
+    """The color scale for a request, unless the caller already chose one.
 
     ``norm`` wins if given; then an explicit ``flux_scaled``; then
-    :func:`_flux_by_default`. Every canned plot that colours a per-face field
+    :func:`_flux_by_default`. Every canned plot that colors a per-face field
     resolves its scale here, so ``plot_map``, ``plot_globes``,
     :func:`globe_grid` and ``plot_shape`` cannot drift apart about what a
     temperature snapshot should look like.
@@ -296,7 +296,7 @@ def _face_normals(vertices, tris):
     Oriented by the face centroid rather than by the winding order: shape files
     in this tree come from several archives (DAMIT, the PDS radar models,
     the icosphere generator) and their winding is not uniformly outward. Every
-    body drawn this way is star-shaped about its centre of figure, so the
+    body drawn this way is star-shaped about its center of figure, so the
     centroid direction settles the sign.
     """
     corners = vertices[tris]
@@ -342,7 +342,7 @@ def shape(ax, vertices, faces, face_values, cmap=CMAP_FIELD, norm=None,
     in the data. Pass ``edgecolor='k'`` with a ``linewidth`` to draw the facets
     deliberately.
 
-    Returns the ``Poly3DCollection``, which carries the colour mapping, so
+    Returns the ``Poly3DCollection``, which carries the color mapping, so
     :func:`colorbar` works on it directly.
     """
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -485,7 +485,7 @@ def colorbar(fig, artist, ax, label="", values=None, norm=None, **kwargs):
     arrays) to get that. And on a non-linear norm it places the ticks evenly
     along the *bar* instead of at round numbers in data space: with
     :func:`flux_norm` on a field spanning day and night, matplotlib's default
-    locator stacks three labels on top of each other in the bottom millimetre.
+    locator stacks three labels on top of each other in the bottom millimeter.
 
     ``**kwargs`` go straight to ``fig.colorbar`` (``fraction``, ``pad``,
     ``orientation``, ``shrink``).
@@ -536,7 +536,7 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
                 title="", xlabel=True, ylabel=True, grid=True, **kwargs):
     """Draw a per-face field at its own face centers on ``ax``.
 
-    One dot per face at its centre, no regridding and no scipy: what is drawn
+    One dot per face at its center, no regridding and no scipy: what is drawn
     is the mesh's own values. ``lat``/``lon`` are per-face degrees --
     :attr:`ptm.results.Results.lat` and :attr:`~ptm.results.Results.lon`, in
     that order -- and ``lon`` is on ``[-180, 180]``, which is what the axis is
@@ -586,7 +586,7 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
 # the tutorials needs the other axis too: two fields down the rows (temperature
 # and what topography changed; albedo and the temperature it produces), or two
 # output steps across one row (before ingress and mid-eclipse). Rows share a
-# colour scale and a colorbar; columns share a viewpoint.
+# color scale and a colorbar; columns share a viewpoint.
 
 #: The four views the tutorials use when none are named.
 DEFAULT_VIEWS = ((0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
@@ -623,7 +623,7 @@ def _row_values(run, row, n_views):
 
 
 def _row_norm(row, stacked):
-    """One norm per row, so every panel in it is on the same colour scale."""
+    """One norm per row, so every panel in it is on the same color scale."""
     return default_norm(stacked, row.get("what"), row.get("moment", "max"),
                         row.get("step"), row.get("flux_scaled"),
                         row.get("norm"))
@@ -836,7 +836,7 @@ def plot_globes(run, what='temperature', moment='max', step=None, views=None,
     ``mark_subsolar=True`` and a ``step``, the sub-solar point is read from
     ``body_positions.csv`` and marked.
 
-    ``flux_scaled`` colours by :func:`flux_norm`; the default follows
+    ``flux_scaled`` colors by :func:`flux_norm`; the default follows
     :func:`_flux_by_default` -- peak temperature yes, a single step no, because
     a snapshot spanning day and night has almost all of its faces in the bottom
     two percent of a ``T**4`` bar. Passing ``step`` draws that output step and
@@ -855,14 +855,14 @@ def plot_shape(run, what='temperature', moment='max', step=None, views=None,
                cmap=CMAP_FIELD, norm=None, flux_scaled=None, ax=None,
                axes_off=None, save=None, show=False, label=None, figsize=None,
                suptitle=None):
-    """The run's own facets, coloured by a per-face field.
+    """The run's own facets, colored by a per-face field.
 
     For a body whose shape matters -- a DAMIT model, a radar shape, a contact
     binary. :func:`plot_globes` normalizes the vertices onto a sphere, which is
     correct for an icosphere and wrong for anything else.
 
     ``views`` is a sequence of ``(elev, azim)`` or ``(elev, azim, title)`` in
-    degrees; the default is one view. All views share one colour scale and one
+    degrees; the default is one view. All views share one color scale and one
     colorbar. Passing ``ax`` draws a single view on an existing 3-D axes and
     ``views`` is then a single view.
 
