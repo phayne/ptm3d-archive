@@ -48,7 +48,7 @@ _CORRECT_CP_COEFF = [7.49, 90.0]
 _CORRECT_CP0 = 839.0  # at ~100 K, for grid/timestep consistency
 
 # Standard uniform-property Europa regolith for all plots.
-# Use uniform k, rho with depth (H very large) so that the labelled
+# Use uniform k, rho with depth (H very large) so that the labeled
 # thermal inertia matches the effective thermal inertia.
 # Target Gamma = 60 tiu (matching PTM3D Europa default).
 # Gamma = sqrt(ks * rhos * cp) => ks = Gamma^2 / (rhos * cp)
@@ -68,7 +68,7 @@ _SKIN_DEPTH_M = 0.045  # ~4.5 cm
 # Eclipse parameters (from PTM3D body_positions.csv analysis).
 # Eclipse occurs once per orbit when Europa passes behind Jupiter.
 # Duration: ~9 timesteps out of 288 ≈ 9600 s ≈ 2.67 hours.
-# For the sub-Jovian point (lon=0°), the eclipse is centred on local noon.
+# For the sub-Jovian point (lon=0°), the eclipse is centered on local noon.
 # For the anti-Jovian point (lon=180°), the eclipse is at local midnight.
 # In heat1d coordinates, t=0 is local noon (hour angle h=0).
 # Eclipse half-width in hour angle:
@@ -157,7 +157,7 @@ def _extract_last_day(model, NPERDAY=480):
     """Extract the last diurnal cycle from a multi-day run.
 
     Returns (lst, T) arrays for one cycle, sorted by local solar time.
-    Using the last day minimises residual equilibration drift.
+    Using the last day minimizes residual equilibration drift.
     """
     N = NPERDAY
     lst_day = model.lst[-N:]
@@ -177,7 +177,7 @@ def run_europa_model_eclipse(eclipse_center_h=0.0, **kwargs):
     Parameters
     ----------
     eclipse_center_h : float
-        Hour angle of eclipse centre in heat1d coordinates (radians).
+        Hour angle of eclipse center in heat1d coordinates (radians).
         0 = local noon (sub-Jovian), π = local midnight (anti-Jovian).
     **kwargs :
         Passed to ``run_europa_model``.
@@ -208,7 +208,7 @@ def run_europa_model_eclipse(eclipse_center_h=0.0, **kwargs):
         original_surfFlux(self)
         # Hour angle of current timestep
         h = orbits.hourAngle(self.t, self.planet.day)
-        # Angular distance from eclipse centre (wrapping around 2π)
+        # Angular distance from eclipse center (wrapping around 2π)
         dh = abs(((h - eclipse_center_h + np.pi) % (2 * np.pi)) - np.pi)
         if dh < _ECLIPSE_HALF_ANGLE:
             self.Qs = 0.0
@@ -283,7 +283,7 @@ def fig_diurnal_depths(save_dir):
     model_anti = run_europa_model(**run_kw)
     lst_anti, T_anti = _extract_last_day(model_anti, NPERDAY)
 
-    # Sub-Jovian: eclipse centred at noon (hour angle 0)
+    # Sub-Jovian: eclipse centered at noon (hour angle 0)
     print("  Running sub-Jovian (eclipse at noon)...")
     model_sub = run_europa_model_eclipse(eclipse_center_h=0.0, **run_kw)
     lst_sub, T_sub = _extract_last_day(model_sub, NPERDAY)

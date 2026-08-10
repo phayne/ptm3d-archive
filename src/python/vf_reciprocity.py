@@ -87,7 +87,7 @@ def reciprocity_stats(row_ptr: np.ndarray, col_idx: np.ndarray,
     Computes ``|A_i F_ij − A_j F_ji| / mean(A_i F_ij, A_j F_ji)`` for every
     (i,j) pair (i<j) where ``max(F_ij, F_ji) >= min_significant``.
 
-    Uses scipy.sparse to vectorise: build CSR F and CSC F (= CSR F^T's
+    Uses scipy.sparse to vectorize: build CSR F and CSC F (= CSR F^T's
     row-format), so for every nnz of (F + F^T) we get both values in one
     pass.
     """

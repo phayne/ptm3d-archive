@@ -22,7 +22,7 @@ Pass criteria:
   4. cross.max       < 5 K   (worst-face cross-discrepancy bounded by the
                               pre-existing CPU/GPU radiative-BC baseline gap)
 
-The 50 K pre-existing CPU/GPU disagreement on cold polar faces (linearised
+The 50 K pre-existing CPU/GPU disagreement on cold polar faces (linearized
 radiative BC vs Newton iteration) is a separate issue and is excluded from
 the per-face H validation.
 """

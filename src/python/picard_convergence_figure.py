@@ -5,7 +5,7 @@ F9 — Picard-iteration convergence diagram for the thermal/radiation coupling.
 Reads the per-iter trace from a production ``ptm_thermal_sim`` log
 (e.g. ``tmp/corering_val_noring.log``) and plots:
 
-  (a) selected-face %% per Picard iter k (linearised-predictor +
+  (a) selected-face %% per Picard iter k (linearized-predictor +
       observed-ΔT union), with the f_min termination floor drawn as a
       horizontal reference;
   (b) max face-wise ΔT per iter on a log-y axis, with the τ_T temperature

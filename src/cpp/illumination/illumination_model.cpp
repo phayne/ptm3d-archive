@@ -4089,7 +4089,7 @@ void IlluminationModel::createCoordinateSystem(
 // PTM-44: fractional visibility of the PRIMARY's finite disk.
 //
 // Both primary-flux paths used to decide visibility with ONE ray to the disk
-// centre and to zero the flux the instant cos(theta) <= 0. The primary is not a
+// center and to zero the flux the instant cos(theta) <= 0. The primary is not a
 // point -- Jupiter's angular RADIUS from Europa is 5.98 deg, Earth's from the
 // Moon 0.95 deg -- so a crater rim sweeping across it switched a face between
 // 100 % and 0 % with a hard step, and a face whose normal fell 0.1 deg past the
@@ -4109,11 +4109,11 @@ void IlluminationModel::createCoordinateSystem(
 //
 // Cost control (fast-path criterion, documented in the derivation note 7.3):
 //   * whole disk below the horizon        -> 0, NO rays;
-//   * 5-ray probe (centre + 4 rim points, above-horizon directions only)
+//   * 5-ray probe (center + 4 rim points, above-horizon directions only)
 //     unanimous                           -> V_terrain = 1 or 0, no more rays;
 //   * probe split                         -> PRIMARY_DISK_SAMPLES rays; see
 //                                            primary_disk.h for the MEASURED
-//                                            quantisation that fixes the count.
+//                                            quantization that fixes the count.
 // On a convex body (every icosphere) an above-horizon ray from an offset origin
 // always escapes, so global meshes pay 5 rays per face instead of 1 and get the
 // analytic horizon ramp for free. PTM_PRIMARY_DISK_ALWAYS_SAMPLE=1 disables the
@@ -4222,7 +4222,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             face_centers[i][2] + fn[2]*safe_offset - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
         };
         // Stop the ray at the primary's near surface, exactly as the single
-        // centre ray did. Mesh-native units.
+        // center ray did. Mesh-native units.
         const float tfar_dist = static_cast<float>((dist - primary_radius_) * km_to_native);
 
         // Fermi F1: the probe basis is oriented to the HORIZON, not arbitrarily.
@@ -4285,7 +4285,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             return rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID;
         };
 
-        // ---- cheap probe: centre + 4 rim points, above-horizon only ---------
+        // ---- cheap probe: center + 4 rim points, above-horizon only ---------
         uint32_t probes_up = 0, probes_clear = 0;
         for (uint32_t k = 0; k < ptm::disk::PRIMARY_DISK_PROBES; ++k) {
             double dx, dy;
@@ -4398,7 +4398,7 @@ void IlluminationModel::calculatePrimaryIRBatch(
     }
     
     // PTM-44: one evaluation of the finite disk's visibility, shared with
-    // calculatePrimaryReflectedBatch. Replaces the per-face centre ray AND the
+    // calculatePrimaryReflectedBatch. Replaces the per-face center ray AND the
     // hard cos_angle <= 0 cut that used to live in this loop.
     updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
 
@@ -4452,7 +4452,7 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
     updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
 
     // Detect if face centers are in meters or kilometers (needed only to put
-    // the face centre in km for the phase-angle geometry).
+    // the face center in km for the phase-angle geometry).
     const bool centers_in_meters =
         (!face_centers.empty() && vectorLength(face_centers[0]) > 10000.0);
 
@@ -4598,7 +4598,7 @@ double IlluminationModel::calculatePrimaryHeating(
 //
 // The 1/4 in Omega/(4 pi) does belong to an ISOTROPIC re-radiator -- an
 // isotropic sphere has Phi == 1 and phase integral q = 4, so p_iso = A_bond/4.
-// But the code then multiplied that isotropic normalisation by a NON-isotropic
+// But the code then multiplied that isotropic normalization by a NON-isotropic
 // phase function whose own phase integral is
 //
 //     q_old = 2 * Int_0^pi [(1+cos a)/2] sin a da = 2
@@ -4682,7 +4682,7 @@ double IlluminationModel::calculatePrimaryReflectedLight(
     }
 
     // Angular radius of the primary seen from THIS FACE. The pre-fix code used
-    // vectorLength(primary_position), i.e. the BODY-CENTRE distance, while the
+    // vectorLength(primary_position), i.e. the BODY-CENTER distance, while the
     // IR path next door used the face-relative one; that inconsistency was
     // worth 0.5 % at Europa and 0.9 % on a lunar DEM patch.
     double sin_angular_radius = primary_radius_ / primary_distance;

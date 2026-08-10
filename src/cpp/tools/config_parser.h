@@ -101,7 +101,7 @@ struct SimulationConfig {
         bool compute_statistics = true;
         bool use_gpu = false;  // Use GPU thermal solver (OpenCL)
 
-        // Multi-GPU controls (OpenCL only). Defaults preserve legacy behaviour:
+        // Multi-GPU controls (OpenCL only). Defaults preserve legacy behavior:
         //   gpu_devices == 1 (and gpu_device_ids empty) → first available GPU,
         //   gpu_batch_size == 0 → existing 6 GB / 500 K-face cap,
         //   gpu_inter_batch_pause_ms == 0 → no pause.
@@ -238,7 +238,7 @@ struct SimulationConfig {
         bool use_gpu = false;
 
         // Multi-GPU dispatch knobs for the BVH ray tracer. Defaults preserve
-        // single-GPU behaviour (gpu_devices == 1, gpu_device_ids empty).
+        // single-GPU behavior (gpu_devices == 1, gpu_device_ids empty).
         // gpu_devices == 0 / "auto" → use every enumerated GPU.
         // gpu_device_ids overrides gpu_devices when non-empty.
         int gpu_devices = 1;
@@ -388,7 +388,7 @@ struct SimulationConfig {
         // Multi-GPU radiosity dispatch (mirrors thermal pool config).
         // Per-timestep solves are independent so the timestep-batch can be
         // split across N GPUs. Default == 1 preserves legacy single-GPU
-        // behaviour byte-identically. Only consulted when use_gpu = true.
+        // behavior byte-identically. Only consulted when use_gpu = true.
         int gpu_devices = 1;
         std::vector<int> gpu_device_ids;
         int gpu_batch_size = 0;              // 0 = auto = 4 * gpu_devices
@@ -485,7 +485,7 @@ struct SimulationConfig {
         //                            conduction; intended for ultracold regolith
         //                            (PSRs) where the Hayne form is extrapolated
         //                            below its ~150 K laboratory floor.
-        // Stored as the RAW string. The parser reports an unrecognised value on
+        // Stored as the RAW string. The parser reports an unrecognized value on
         // stderr but does not throw; ptm_thermal_sim.cpp validates this string
         // right after config load and exits 1, so an unknown law can never be
         // silently replaced by Hayne. (The original reason for not throwing was

@@ -210,7 +210,7 @@ def annual_map_figure_v2(ve, f, coupled, field: str, label: str, out_stub: str):
           manuscript's own \\includegraphics[width=0.95\\linewidth] call
           (Moon3D_Paper_v4_revised.tex) means EFFECTIVE on-page font size is
           proportional to (native pt size / native PDF page width) -- so a
-          fontsize bump can be entirely cancelled out (or worse) by growing
+          fontsize bump can be entirely canceled out (or worse) by growing
           the saved canvas, which two earlier iterations did (wspace=0.95 +
           generous pad_inches ballooned the native PDF width from the
           original's 7.73in to over 9in). The two-line titles below +

@@ -178,7 +178,7 @@ public:
      * Returns a stable, deterministic list (platform-major, device-minor)
      * suitable for indexing via `--gpu-device-ids`. The single-device
      * `initialize(bool)` path below is left unchanged for byte-identical
-     * behaviour at N=1.
+     * behavior at N=1.
      *
      * @param only_available If true, drop devices whose CL_DEVICE_AVAILABLE
      *        is false (busy, faulted, disabled).
@@ -241,7 +241,7 @@ public:
      * @brief Initialize OpenCL context pinned to a specific enumerated device.
      *
      * Used by the multi-GPU device pool. The single-device default path
-     * (`initialize(bool)` below) is byte-identical to legacy behaviour.
+     * (`initialize(bool)` below) is byte-identical to legacy behavior.
      *
      * @return true if initialization succeeded.
      */

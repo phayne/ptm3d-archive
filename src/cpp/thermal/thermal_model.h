@@ -736,7 +736,7 @@ struct ThermalBatchSoA {
     double cp0;              // Base heat capacity
     double R350_val;         // Radiative conductivity coefficient (Hayne 2017)
     // Conductivity law for this batch. Default Hayne2017 so a batch that is
-    // zero-initialised or built by older code keeps the historical behaviour.
+    // zero-initialized or built by older code keeps the historical behavior.
     ConductivityModel cond_model = ConductivityModel::Hayne2017;
     double rho_s;            // Surface density
     double rho_d;            // Deep density
@@ -762,7 +762,7 @@ struct ThermalBatchSoA {
 
     // Copy grid from existing Profile.
     // If H_per_face is non-null, it must point to `n_faces` doubles; rho/kc
-    // are then initialised per-face with each face's own H. Otherwise the
+    // are then initialized per-face with each face's own H. Otherwise the
     // batch's shared H_val is used (legacy behavior).
     void copyGridFromProfile(const Profile& ref_profile,
                              const double* H_per_face = nullptr);

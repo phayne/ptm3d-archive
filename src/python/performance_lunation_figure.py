@@ -126,7 +126,7 @@ COMPONENT_COLORS = {
     "out_thermal":   "#9467bd",   # purple
     "radiation":     "#d62728",   # red
     "re_thermal":    "#e377c2",   # pink
-    "io_stats":      "#7f7f7f",   # grey
+    "io_stats":      "#7f7f7f",   # gray
 }
 
 ORDER = [

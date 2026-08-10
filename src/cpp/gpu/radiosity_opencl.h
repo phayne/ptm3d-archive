@@ -71,7 +71,7 @@ public:
      *
      * Used by RadiosityGPUDevicePool to spin up one solver per device. The
      * default-device path (`initialize()` above) is byte-identical to legacy
-     * behaviour so single-device callers are unaffected.
+     * behavior so single-device callers are unaffected.
      *
      * @param device_handle Device handle from OpenCLContext::enumerateGPUs().
      * @return true if initialization succeeded.

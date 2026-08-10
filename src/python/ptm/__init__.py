@@ -40,7 +40,7 @@ Modules
 ``ptm.sweep``          a base config plus a grid: :class:`~ptm.sweep.Sweep`,
                        resumable, provenance-recording, serial by default
 ``ptm.plots``          the orthographic globe renderer and the shape-model
-                       renderer, the flux-linear colour scale, the comparison
+                       renderer, the flux-linear color scale, the comparison
                        grid, five canned figures and two sweep figures
 ``ptm.cli``            the ``ptm`` command
 ``ptm.run``            launching the engine: :func:`~ptm.run.run_engine` and

@@ -5,9 +5,9 @@ radiation exchange in PTM3D.
 
 Renders an oblique 3D view of a ~500 m × 500 m region of the A03MM022
 (Mons Mouton) crater interior + rim, with triangle edges shown and
-faces coloured by peak direct solar flux.  Two example triangles are
+faces colored by peak direct solar flux.  Two example triangles are
 highlighted: one in deep shadow (PSR floor) and one on a sunlit wall.
-Three labelled arrows show:
+Three labeled arrows show:
 
   1. Direct solar flux from above the mesh impinging on the sunlit
      face (with explicit incidence-angle treatment).
@@ -100,7 +100,7 @@ def main():
     areas = 0.5 * np.linalg.norm(cross, axis=1)
     normals = cross / (2.0 * areas[:, None] + 1e-30)
     # On a sphere-fitted mesh the cross product may point either way; align
-    # to the outward radial direction (away from the body centre).
+    # to the outward radial direction (away from the body center).
     radial = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-30)
     flip = (np.einsum("ij,ij->i", normals, radial) < 0)
     normals[flip] *= -1.0
@@ -111,7 +111,7 @@ def main():
     # discussion.  Search by gridding the centroid xy plane.
     print("Searching for a crater bowl with mutually visible floor/wall…")
     cx, cy, cz = centroids[:, 0], centroids[:, 1], centroids[:, 2]
-    half_size = 200.0  # metres — bigger window so a crater fits
+    half_size = 200.0  # meters — bigger window so a crater fits
 
     # ---- Direct floor-face search: find faces that are local low spots
     # AND in shadow (low direct_solar_max), then for each one search the
@@ -176,7 +176,7 @@ def main():
                         d_elev_pair, cos_i_v, cos_j_v)
     assert best is not None, "no mutually visible floor/wall pair found"
     _, face_i, face_j, horiz, dz, cos_i, cos_j = best
-    # Centre the window on the midpoint of the two faces
+    # Center the window on the midpoint of the two faces
     xc = 0.5 * (cx[face_i] + cx[face_j])
     yc = 0.5 * (cy[face_i] + cy[face_j])
     # Compute window membership for rendering
@@ -185,17 +185,17 @@ def main():
     print(f"  example pair: face_i (floor) {face_i}, face_j (wall) {face_j}")
     print(f"    horiz {horiz:.1f} m, vert {dz:.1f} m, "
           f"cos_i {cos_i:.3f}, cos_j {cos_j:.3f}")
-    print(f"  window centred at ({xc:.0f}, {yc:.0f}) m, {len(idx)} faces")
+    print(f"  window centered at ({xc:.0f}, {yc:.0f}) m, {len(idx)} faces")
 
     win_size = half_size
 
-    # ---- Convert to a LOCAL East/North/Up frame centred on the window.
+    # ---- Convert to a LOCAL East/North/Up frame centered on the window.
     # The mesh sits near the lunar south pole, where global +z is roughly
-    # "down" (toward the body centre), so rendering with the raw
-    # lunar-centred Cartesian frame makes terrain appear inverted and
+    # "down" (toward the body center), so rendering with the raw
+    # lunar-centered Cartesian frame makes terrain appear inverted and
     # squashed in the matplotlib 3D view. Build an ENU rotation matrix
     # such that:
-    #   - the local +Z axis is the outward radial at the window centre
+    #   - the local +Z axis is the outward radial at the window center
     #   - the local +X axis is the in-tangent direction obtained by
     #     projecting global +x onto the tangent plane
     #   - the local +Y axis completes a right-handed frame
@@ -211,7 +211,7 @@ def main():
     north = np.cross(up, east)
     north /= np.linalg.norm(north)
     R = np.column_stack([east, north, up])   # columns are basis vectors
-    # Rotate vertices and centroids into the local ENU frame, centred
+    # Rotate vertices and centroids into the local ENU frame, centered
     # on the window centroid so the local origin sits at the window
     # mid-elevation.
     def to_local(P):
@@ -252,7 +252,7 @@ def main():
 
     # ---- Highlight the two example triangles. The native faces are
     # small (~m²) at the 400-m window zoom, so we mark each face with a
-    # bright screen-space scatter dot floated a few metres above the
+    # bright screen-space scatter dot floated a few meters above the
     # terrain so matplotlib's 3D depth-sort cannot bury it.
     for face_idx_global, color in [
         (face_i, "#00ddff"),   # cyan against dark PSR floor
@@ -281,7 +281,7 @@ def main():
     # ---- Camera & axes ----
     ax.view_init(elev=22, azim=-55)
 
-    # Zoom in around the window (now in local coords centred on 0,0).
+    # Zoom in around the window (now in local coords centered on 0,0).
     # Pad in z to keep some sky above and enforce equal x/y/z spatial
     # aspect so topography doesn't look squished.
     z_floor_mesh = tris[..., 2].min()
@@ -311,8 +311,8 @@ def main():
     ax.zaxis.set_pane_color((0.99, 0.99, 0.995, 1.0))
     ax.grid(False)
 
-    # Subdued axis labels (LOCAL Cartesian metres around the window
-    # centroid; the absolute coordinates are 1.737e6 m in lunar-centred
+    # Subdued axis labels (LOCAL Cartesian meters around the window
+    # centroid; the absolute coordinates are 1.737e6 m in lunar-centered
     # frame).
     ax.set_xlabel("x (m, local)", fontsize=9)
     ax.set_ylabel("y (m, local)", fontsize=9)

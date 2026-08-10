@@ -54,7 +54,7 @@ def context_grids():
     from scipy.ndimage import map_coordinates
     EL = map_coordinates(elev, [row, col], order=1, mode="constant",
                          cval=np.nan).reshape(GX.shape) * 0.5  # DN->m
-    # Diviner summer-max sampled at each grid point via nearest neighbour
+    # Diviner summer-max sampled at each grid point via nearest neighbor
     # (the level-4 product is a sparse point cloud; binning it onto a fine grid
     # leaves white gaps wherever a cell catches no point, so query the nearest
     # Diviner observation at every grid pixel instead).

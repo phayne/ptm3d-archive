@@ -7,7 +7,7 @@ This is the same set of pictures tutorial notebook 01 draws, written against
 ``ptm.Results``. The notebook spends 246 non-blank lines of code getting from
 the run directory to its orthographic globe figure -- 60 for a ``mesh.ply``
 parser and a per-face ``.bin`` reader, 69 for a matplotlib style block and the
-``T**4`` colour scale, 84 for the globe renderer, 33 for the figure itself.
+``T**4`` color scale, 84 for the globe renderer, 33 for the figure itself.
 The equivalent below is the three lines under "the whole thing".
 
 Everything else here is choosing which pictures to draw.

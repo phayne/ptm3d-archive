@@ -176,7 +176,7 @@ def build_figure():
                           solid_capstyle="round")
             lines[(model, sp)] = ln
 
-    # Static linestyle key (upper centre)
+    # Static linestyle key (upper center)
     style_handles = [
         Line2D([], [], color="0.2", lw=2.0, ls=LINESTYLE["topo_albedo"],
                label="topography + albedo"),

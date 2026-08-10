@@ -62,7 +62,7 @@ struct CameraConfig {
     int ny = 1024;
     double fov_x_deg = -1.0;  // If > 0, overrides focal_length
 
-    // Realistic-camera extensions. All default to pinhole behaviour (zero
+    // Realistic-camera extensions. All default to pinhole behavior (zero
     // distortion, principal point at image center, square pixels) so existing
     // configurations are bit-identical.
     //

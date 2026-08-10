@@ -119,7 +119,7 @@ def available_ram_gb() -> float:
 
 def read_n_faces(mesh_file: Path) -> int:
     """Read 'element face N' from a PLY header to size the chunk
-    estimator. Falls back to 0 if the file isn't a recognised PLY."""
+    estimator. Falls back to 0 if the file isn't a recognized PLY."""
     try:
         with open(mesh_file, "rb") as f:
             for _ in range(200):  # PLY headers are short

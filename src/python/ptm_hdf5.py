@@ -96,14 +96,14 @@ def read_hdf5_field(path, field):
             latitudes:   ndarray, 1D (eqc) or 2D (stere) for regridded;
                          1D (n_faces,) for unstructured
             longitudes:  ndarray, same as latitudes
-            x:           ndarray, 1D projected x (metres), or empty array
-            y:           ndarray, 1D projected y (metres), or empty array
+            x:           ndarray, 1D projected x (meters), or empty array
+            y:           ndarray, 1D projected y (meters), or empty array
             time_labels: list of str (UTC time labels)
             elapsed_seconds: ndarray (n_timesteps,) of float64
             field:       str (field name)
             units:       str (e.g. 'K', 'W/m2')
             projection:  str ('eqc', 'stere', or '')
-            body_radius: float (metres)
+            body_radius: float (meters)
             source:      str ('regridded' or 'unstructured')
     """
     _require_h5py()
@@ -195,10 +195,10 @@ def read_hdf5(path):
             }
             latitudes:   ndarray (regridded grid coords, or empty)
             longitudes:  ndarray (regridded grid coords, or empty)
-            x:           ndarray (projected x, metres, or empty)
-            y:           ndarray (projected y, metres, or empty)
+            x:           ndarray (projected x, meters, or empty)
+            y:           ndarray (projected y, meters, or empty)
             projection:  str ('eqc', 'stere', or '')
-            body_radius: float (metres)
+            body_radius: float (meters)
             resolution:  float (grid resolution in degrees, or 0)
             proj4:       str (PROJ4 string, or '')
             format_version: str

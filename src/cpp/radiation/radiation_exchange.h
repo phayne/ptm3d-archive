@@ -416,7 +416,7 @@ private:
     bool two_band_ = false;
     // True iff the GPU is running the two-band solve (B1). Only enabled when every
     // vf_row_norm_[i] == 1 (no Σ_j F_ij > 1 row), because the GPU Jacobi kernel does
-    // NOT apply the row-norm inside its iteration (the GPU analogue of PTM-08). On a
+    // NOT apply the row-norm inside its iteration (the GPU analog of PTM-08). On a
     // mesh with an overshoot row the GPU visible band would diverge, so two-band with
     // any Σ>1 row falls back to the row-norm-protected CPU solve (warned in initGPU).
     bool two_band_gpu_ok_ = false;

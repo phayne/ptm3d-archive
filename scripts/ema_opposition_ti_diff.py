@@ -6,7 +6,7 @@ only move the reflected-light normalization?
 Method: hold the sweep grid FIXED (its albedo axis comes from sweep_point.json on disk and does
 not depend on the formula). Vary only `p_nom`, which is the single place `disk_p_from_w` enters
 the real fit (ema_ti_fit.py:379). It sets BOTH the injected truth albedo and the Gaussian prior
-centre. Run the identical injection-recovery for three conventions:
+center. Run the identical injection-recovery for three conventions:
 
   verbatim   p = w/8 + 0.49 r0 + 0.196 r0^2          bracket (1+B0)P(0) = 2   [what shipped]
   excluded   p = (r0/2)(1 + r0/3)                    bracket = 1              [true opposition-excluded]

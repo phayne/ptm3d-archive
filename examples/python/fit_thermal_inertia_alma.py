@@ -72,7 +72,7 @@ try:
 except ImportError as exc:                                     # pragma: no cover
     raise SystemExit(f"could not import scripts/alma/forward_model.py: {exc}")
 
-FREQ_GHZ = 233.0     # ALMA Band 6 centre, forward_model.ALMA_BANDS[6]
+FREQ_GHZ = 233.0     # ALMA Band 6 center, forward_model.ALMA_BANDS[6]
 POROSITY = 0.5       # regolith porosity fed to the Maxwell-Garnett mixing rule
 EMISSIVITY = "fresnel"
 SIGMA_TB = 1.5       # K, the assumed observational uncertainty per sample
@@ -164,8 +164,8 @@ def build_inputs(outdir):
     locations = outdir / "location.csv"
     locations.write_text("name,lat,lon\nequator,0.0,0.0\n")
     # 0 to 2 m, log-spaced: the Band-6 penetration depth in porous ice is
-    # decimetres, so the grid has to resolve the top few centimetres and still
-    # reach optical depth. Rounded to millimetres and de-duplicated because the
+    # decimeters, so the grid has to resolve the top few centimeters and still
+    # reach optical depth. Rounded to millimeters and de-duplicated because the
     # engine prints depth column headings to three decimals, and two entries
     # closer than that come back as one ambiguous column.
     depths = np.unique(np.round(

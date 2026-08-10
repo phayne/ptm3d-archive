@@ -7,7 +7,7 @@
 //                       density/conductivity profile (Hayne et al. 2017 Diviner fits).
 //   * THERMAL_INERTIA — values are TI(273K) in J m^-2 K^-1 s^-1/2; the loader
 //                       inverts to an effective H per face via bisection so that
-//                       the rest of the thermal model (which is parameterised by H)
+//                       the rest of the thermal model (which is parameterized by H)
 //                       can consume the result directly.
 //
 // File layout (binary, little-endian, host-order; matches the offline tool

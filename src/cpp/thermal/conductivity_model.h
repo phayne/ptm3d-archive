@@ -49,7 +49,7 @@
  * the LOCAL DENSITY rho(z) only. `ks` and `kd` no longer enter k at all. At the
  * lunar surface node (rho = 1100 kg m^-3) Martinez gives 0.63-0.69x the Hayne
  * conductivity at ALL temperatures 150-400 K, not merely at low T (the two laws
- * cross near rho ~ 1300-1400). This is the paper's own behaviour - see its
+ * cross near rho ~ 1300-1400). This is the paper's own behavior - see its
  * Figure 3, where the "New 1100" curve sits below "Hayne 1100" across 0-400 K -
  * and it means selecting this model changes DAYTIME thermal inertia too.
  *

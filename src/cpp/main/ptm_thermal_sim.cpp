@@ -1252,7 +1252,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     std::vector<float>* post_eq_T_out = nullptr,
     // Multi-GPU controls (see config_parser.h thermal.gpu_*).
     //   gpu_devices == 1 (default) AND gpu_device_ids empty → legacy
-    //     single-device path, byte-identical to pre-multi-GPU behaviour.
+    //     single-device path, byte-identical to pre-multi-GPU behavior.
     //   gpu_devices == 0 / "auto" → use every enumerated GPU.
     //   gpu_device_ids non-empty → use exactly those device indices.
     //   gpu_batch_size = 0 keeps the legacy 6 GB / 500 K-face cap.
@@ -1275,7 +1275,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 // Hoisting the pool above the radiation-coupling iter loop eliminates the
 // per-iter OpenCL context create/destroy churn that wedged the macOS+AMD
 // driver during long re-thermal runs (kernel hang → SMC -108 forced reset).
-// Pass nullptr to keep the legacy build-pool-per-call behaviour.
+// Pass nullptr to keep the legacy build-pool-per-call behavior.
 bool runThermalForSelectedFaces_GPU(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<int>& face_indices,
@@ -1306,7 +1306,7 @@ bool runThermalForSelectedFaces_GPU(
     // build instead of the body-average albedo. Indexed by global face id.
     const std::vector<double>& face_albedos,
     // Multi-GPU dispatch knobs (mirrors the all-faces path). Defaults preserve
-    // legacy single-GPU serial-batches behaviour.
+    // legacy single-GPU serial-batches behavior.
     int gpu_devices = 1,
     const std::vector<int>& gpu_device_ids = {},
     int gpu_inter_batch_pause_ms = 0,
@@ -4266,10 +4266,10 @@ static int resolveEquilibrationPasses(const thermal::Config& config,
 // PLACEMENT: this stays OUTSIDE the `#ifdef PTM_GPU_OPENCL` below, for exactly
 // the reason spelled out above resolveEquilibrationPasses. The 2026-08-07
 // CPU-only CI break was a helper defined inside the guard and called outside
-// it; the refusal path here is needed most in the build that cannot honour the
+// it; the refusal path here is needed most in the build that cannot honor the
 // knob at all.
 //
-// Returns false only on a request we refuse to run. A request we cannot honour
+// Returns false only on a request we refuse to run. A request we cannot honor
 // (too few passes) is NOT a refusal: it warns and falls back to plain cycling,
 // which is what Fermi's ADDENDUM A3(b) specifies.
 //
@@ -5363,7 +5363,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const size_t gpu_memory_limit = 6ULL * 1024 * 1024 * 1024;  // 6 GB conservative
     const size_t max_batch_size_legacy = std::min(n_faces, gpu_memory_limit / bytes_per_face);
     // gpu_batch_size_override > 0 lets the user shrink batches (watchdog mitigation
-    // on macOS+AMD; see memory/gpu_hang_amd_macos.md). 0 keeps legacy behaviour.
+    // on macOS+AMD; see memory/gpu_hang_amd_macos.md). 0 keeps legacy behavior.
     const size_t BATCH_SIZE = (gpu_batch_size_override > 0)
         ? std::min(n_faces, std::min(max_batch_size_legacy, gpu_batch_size_override))
         : std::min(max_batch_size_legacy, static_cast<size_t>(500000));
@@ -5989,7 +5989,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                      sp_equil_cycles - 1);
             }
             // Snapshot the state the OUTPUT cycle is about to start from — the
-            // single-phase analogue of the two-phase post-eq snapshot above.
+            // single-phase analog of the two-phase post-eq snapshot above.
             if (post_eq_T_out) {
                 std::vector<float> batch_T_pre_out;
                 try {
@@ -6755,7 +6755,7 @@ post_batch_loop:
 
     // ---- eq-extrapolation banner --------------------------------------
     // Printed unconditionally whenever the knob was REQUESTED, including when
-    // it could not be honoured. This line IS the guard-rate measurement: it is
+    // it could not be honored. This line IS the guard-rate measurement: it is
     // the first time a PTM3D run has reported how converged its own deep
     // column is, per face, without running a second simulation to find out.
     if (eq_extrap_requested) {
@@ -7338,7 +7338,7 @@ bool runThermalForSelectedFaces_GPU(
             std::cout << "  [Re-thermal] PTM_RETHERMAL_WARMUP_SKIP="
                       << kReThermalWarmupSkip << ": the first "
                       << kReThermalWarmupSkip << " output step(s) keep iter-0's"
-                         " UN-COUPLED temperature (legacy PTM-54 behaviour)"
+                         " UN-COUPLED temperature (legacy PTM-54 behavior)"
                       << std::endl;
         }
         for (size_t f = 0; f < batch_n; ++f) {
@@ -7462,7 +7462,7 @@ bool runThermalForSelectedFaces_GPU(
     }
 
     // Legacy single-GPU serial-batches path (byte-identical to pre-multi-GPU
-    // behaviour when gpu_devices == 1).
+    // behavior when gpu_devices == 1).
     for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
         size_t batch_start = batch_idx * BATCH_SIZE;
         size_t batch_end = std::min(batch_start + BATCH_SIZE, n_selected);
@@ -10249,7 +10249,7 @@ bool exportStatisticsBinary(
         // Note: ice-depth statistics are computed separately by the main
         // driver from the Schorghofer & Taylor (2007) IceStabilityAccumulator
         // (only when thermal.compute_ice_stability is enabled). The legacy
-        // surface-T-only Newton solver was removed in favour of the
+        // surface-T-only Newton solver was removed in favor of the
         // depth-resolved time-averaged formulation.
     }
 
@@ -10760,7 +10760,7 @@ int main(int argc, char** argv) {
     }
 
     // Validate the conductivity-law selector HERE, before anything else runs.
-    // An unrecognised law must never be silently substituted with Hayne -- that
+    // An unrecognized law must never be silently substituted with Hayne -- that
     // would attribute an entire campaign to the wrong physics.
     //
     // Historically this could not be done by throwing from the parser: the catch
@@ -11906,7 +11906,7 @@ int main(int argc, char** argv) {
         auto& tpw = sim_config.thermophysical;
 
         // Rule 7: two knobs that both claim to set thermal inertia cannot both
-        // be honoured, and picking one silently is how a sweep measures the
+        // be honored, and picking one silently is how a sweep measures the
         // wrong axis for a week. Refuse, and name the choice.
         if (tpw.constant_thermal_inertia > 0.0) {
             std::cerr << "\nFATAL: --thermal-inertia " << cli_thermal_inertia
@@ -12588,7 +12588,7 @@ int main(int argc, char** argv) {
                 std::filesystem::create_directories(
                     std::filesystem::path(rad_view_factor_file).parent_path(), mkdir_ec);
 
-                // Save view factors to disk immediately and honour the return value.
+                // Save view factors to disk immediately and honor the return value.
                 // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
                 // auto-enabled by the manager for large meshes, even if --rad-hmatrix wasn't passed
                 bool wrote = false;
@@ -14839,7 +14839,7 @@ int main(int argc, char** argv) {
                     // Multi-GPU radiosity dispatch: when the pool is active,
                     // process timesteps in batches sized to amortize per-batch
                     // overhead across N GPUs concurrently. Single-GPU and CPU
-                    // paths use batch_size = 1 for byte-identical legacy behaviour.
+                    // paths use batch_size = 1 for byte-identical legacy behavior.
                     const bool use_pool_dispatch = rad_manager.hasGPUPool();
                     int batch_size = 1;
                     if (use_pool_dispatch) {
@@ -14930,7 +14930,7 @@ int main(int argc, char** argv) {
 
                         if (n_batch == 1 && !use_pool_dispatch) {
                             // Legacy fast path: single timestep, no batch
-                            // wrapping. Preserves byte-identical behaviour
+                            // wrapping. Preserves byte-identical behavior
                             // for CPU and single-GPU radiation paths.
                             const int t = t_start;
                             #pragma omp parallel for schedule(static)
@@ -15714,7 +15714,7 @@ int main(int argc, char** argv) {
 
         // The accumulators were told this window before the solve. If anything
         // upstream changed the step counts in between, the file would silently
-        // describe a different window from its neighbours -- fail loudly instead.
+        // describe a different window from its neighbors -- fail loudly instead.
         if (g_aeff_win_set &&
             (g_aeff_win_start != stats_start_step || g_aeff_win_steps != stats_steps)) {
             std::cerr << "WARNING: the effective-albedo accumulation window ["

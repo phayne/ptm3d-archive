@@ -31,7 +31,7 @@
 // HOW THE "BEFORE" COLUMN IS PRODUCED
 // -----------------------------------
 // A single binary cannot call two versions of the shipping function, so this
-// program carries a local, clearly-labelled re-implementation of the Newton
+// program carries a local, clearly-labeled re-implementation of the Newton
 // loop with a selectable seed (`newton_emulated`). Its fidelity is not assumed:
 // every case also runs the REAL shipping `surfTemp`, and the run FAILS if the
 // emulation with the new seed disagrees with it by more than 1e-9 K. The

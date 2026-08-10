@@ -179,7 +179,7 @@ void Profile::update_k() {
 
     // Martinez & Siegler (2021) Eq. 10: k = (A1*rho-A2)*k_am(T) + (B1*rho-B2)*T^3.
     // Scalar-only on purpose. k_am(T) is a 9-term Laurent polynomial; hand-
-    // vectorising it would buy little here (this loop is ~10-64 layers) and
+    // vectorizing it would buy little here (this loop is ~10-64 layers) and
     // would add a second numerical expression to keep in step with the OpenCL
     // mirror. Taking the branch OUTSIDE the SIMD blocks also guarantees the
     // Hayne path below is textually and bit-for-bit unchanged.
@@ -2007,7 +2007,7 @@ void Model::run() {
         // profile.update_T calls per face with max |dT| < 10 K on the
         // Moon-benchmark test config. Falls back to the adaptive/Fourier-stable
         // driver when the flag is 0 so existing users who tuned dt_scale or
-        // MULTIRATE_ADAPTIVE_STEP get identical behaviour.
+        // MULTIRATE_ADAPTIVE_STEP get identical behavior.
         const bool use_cn_substep = config && config->MAIN_LOOP_STEPS_PER_DAY > 0;
         const double cn_target_dt = use_cn_substep
             ? (planet.day / static_cast<double>(config->MAIN_LOOP_STEPS_PER_DAY))

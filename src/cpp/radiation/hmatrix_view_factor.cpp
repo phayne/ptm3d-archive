@@ -1829,7 +1829,7 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                 }
                 block->data = disk;
-                // Keep parent indices populated. writeBlock() serialises them; if
+                // Keep parent indices populated. writeBlock() serializes them; if
                 // cleared, loaded H-matrix matvec silently skips every disk-backed
                 // block (empty-indices guard in HMatrixBlock::matvec) -> zero flux.
                 block->row_indices = row_faces;
@@ -2425,7 +2425,7 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
                     disk = writeBlockToDisk(sparse, row_faces_copy, col_faces_copy);
                 }
                 block->data = disk;
-                // Keep parent indices populated. writeBlock() serialises them; if
+                // Keep parent indices populated. writeBlock() serializes them; if
                 // cleared, loaded H-matrix matvec silently skips every disk-backed
                 // block (empty-indices guard in HMatrixBlock::matvec) -> zero flux.
                 block->row_indices = row_faces;

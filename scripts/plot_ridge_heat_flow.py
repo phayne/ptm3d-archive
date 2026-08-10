@@ -164,7 +164,7 @@ def plot_3d_pyvista(pv_mesh, scalars, trough_mask, title, vmin, vmax,
     """Render a 3D mesh with PyVista (off-screen) for publication.
 
     Camera is placed at 45° emission angle from the surface normal at
-    the mesh centre.  Transparent background, black text, compact layout.
+    the mesh center.  Transparent background, black text, compact layout.
     Auto-crops whitespace after rendering.
     """
     plotter = pv.Plotter(off_screen=True, window_size=[2400, 1600])
@@ -186,7 +186,7 @@ def plot_3d_pyvista(pv_mesh, scalars, trough_mask, title, vmin, vmax,
         },
     )
 
-    # --- Camera at 45° emission angle from surface normal at mesh centre ---
+    # --- Camera at 45° emission angle from surface normal at mesh center ---
     pts = np.array(pv_mesh.points)
     center = pts.mean(axis=0)
     normal = center / np.linalg.norm(center)
@@ -242,7 +242,7 @@ def plot_difference_map(face_lat, face_lon, delta_T, trough_mask,
                         title, save_path):
     """2D lat/lon map of temperature difference (relative to flat surface).
 
-    Uses a diverging colormap centred on zero so positive (warmer than flat)
+    Uses a diverging colormap centered on zero so positive (warmer than flat)
     and negative (cooler than flat) deviations are both visible.
     """
     fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -510,7 +510,7 @@ def main():
                      f"Heated Trough - Nighttime (Qb={qb_label} W/m^2)",
                      T_night_min, T_night_max, "inferno",
                      os.path.join(plot_dir, "3d_night_heated.png"))
-    # Symmetric range centred on zero (same convention as 2D diff maps)
+    # Symmetric range centered on zero (same convention as 2D diff maps)
     diff_vlim = max(abs(np.percentile(dT_flat_night, 0.5)),
                     abs(np.percentile(dT_flat_night, 99.5)), 1.0)
     plot_3d_pyvista(pv_mesh, dT_flat_night, trough_mask,

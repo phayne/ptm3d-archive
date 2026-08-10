@@ -9,7 +9,7 @@ Three pathways for amorphous-ice production (per Eq. D29 + Eq. D39 + frost):
 
 We plot the LOG ratio  log10(k_dep_dilution / k_rad)  per face, so that
 positive values flag faces where deposition (cold/bright) dominates the
-amorphization budget — as the abstract hypothesises — and negative values
+amorphization budget — as the abstract hypothesizes — and negative values
 flag radiation-dominated (warmer / dose-controlled) faces.
 
 We also plot the recrystallization-vs-amorphization competition map.

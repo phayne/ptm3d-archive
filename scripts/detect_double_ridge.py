@@ -464,7 +464,7 @@ def compute_ridge_coordinates(centroids, ridge_strike_deg):
     is perpendicular to the ridge strike; positive = to the right when
     looking along the strike direction.
 
-    Returns along_ridge (n,), cross_ridge (n,) in metres.
+    Returns along_ridge (n,), cross_ridge (n,) in meters.
     """
     # Convert centroids to local lat/lon
     r = np.linalg.norm(centroids, axis=1)
@@ -477,8 +477,8 @@ def compute_ridge_coordinates(centroids, ridge_strike_deg):
     r0 = np.mean(r)
 
     # Local tangent plane: approximate x ~ r * cos(lat) * dlon, y ~ r * dlat
-    x_local = r0 * np.cos(lat0) * (lon - lon0)  # metres, east
-    y_local = r0 * (lat - lat0)                   # metres, north
+    x_local = r0 * np.cos(lat0) * (lon - lon0)  # meters, east
+    y_local = r0 * (lat - lat0)                   # meters, north
 
     # Rotate into ridge coordinate system
     strike_rad = np.radians(ridge_strike_deg)

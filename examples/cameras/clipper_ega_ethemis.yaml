@@ -11,11 +11,11 @@
 #
 # Per the user's request, we model E-THEMIS as scanned in azimuth to form a
 # SQUARE image of 5.85° × 5.85° at native pixel scale (896 × 896 pixels at
-# 12-um pitch). The native focal length and detector pitch are honoured so
+# 12-um pitch). The native focal length and detector pitch are honored so
 # the derived FOV exactly reproduces the spec values.
 #
 # Thermal band: set on the CLI via --thermal-wavelength. Defaults to 10 um
-# (Band 1 centre). For other bands use:
+# (Band 1 center). For other bands use:
 #   Band 1 (7-14 um)  → ~10 um
 #   Band 2 (14-28 um) → ~20 um
 #   Band 3 (28-80 um) → ~50 um
@@ -40,7 +40,7 @@ camera:
 
   pointing:
     mode: look_at
-    look_at: [0.0, 0.0, 0.0]       # Moon body-fixed centre (IAU_MOON)
+    look_at: [0.0, 0.0, 0.0]       # Moon body-fixed center (IAU_MOON)
     up:      [0.0, 0.0, 1.0]
 
   photometry:

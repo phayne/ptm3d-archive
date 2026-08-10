@@ -1,4 +1,4 @@
-"""Figures from a run directory: the renderers, the colour scales, four plots.
+"""Figures from a run directory: the renderers, the color scales, four plots.
 
 The tutorial notebooks carry two byte-identical copies of an 84-line
 orthographic globe renderer and two copies of a 69-line style-and-normalization
@@ -19,7 +19,7 @@ figure. They are the one-liners, and each is also reachable as a method on
 
 Matplotlib only -- no cartopy, no PyVista. Axis labels come from the run's own
 :attr:`~ptm.results.Results.units_style`, so a figure made from a Results
-configured for the GUI's ``W/m²`` spelling is labelled that way.
+configured for the GUI's ``W/m²`` spelling is labeled that way.
 
 Figure convention, project-wide: no data tables, no annotation boxes and no
 notes drawn on a figure. Numbers belong in the caller's own output.
@@ -55,7 +55,7 @@ __all__ = [
     "view_basis",
 ]
 
-#: Sequential, perceptually uniform, monotone in lightness, survives greyscale.
+#: Sequential, perceptually uniform, monotone in lightness, survives grayscale.
 #: Never a rainbow: its uneven lightness invents structure that is not there.
 CMAP_FIELD = "inferno"
 #: Diverging, for a signed difference drawn about zero.
@@ -78,14 +78,14 @@ def styled(variant=None):
     return plt
 
 
-# --- colour scales ----------------------------------------------------------
+# --- color scales -----------------------------------------------------------
 
 def flux_norm(values, lo_pct=1.0, hi_pct=100.0):
-    """A colour scale linear in ``T**4`` between two percentiles of ``values``.
+    """A color scale linear in ``T**4`` between two percentiles of ``values``.
 
     Radiative equilibrium makes surface temperature the fourth root of absorbed
     flux, so a temperature field is a compressed picture of the flux field.
-    Colouring by ``T**4`` undoes exactly that compression; the colorbar still
+    Coloring by ``T**4`` undoes exactly that compression; the colorbar still
     reads in kelvin, its ticks are simply not evenly spaced.
 
     Uses ``FuncNorm``. On matplotlib older than 3.4, which has no ``FuncNorm``,
@@ -448,7 +448,7 @@ def _nonlinear_ticks(norm, n=6):
     A ``FuncNorm`` linear in ``T**4`` maps equal temperature steps to very
     unequal bar positions, so matplotlib's default locator -- which chooses
     round numbers in data space -- crowds several labels into the bottom
-    millimetre of the colorbar and prints them on top of each other. Placing
+    millimeter of the colorbar and prints them on top of each other. Placing
     the ticks uniformly in normalized space and rounding the *labels* instead
     puts one legible tick per interval.
 
@@ -776,11 +776,11 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
 
     ``linear=True`` (the default) uses the regridder's barycentric path, which
     fills every pixel inside the convex hull of the face centers. The
-    nearest-neighbour path (``linear=False``) masks any pixel more than 1.5
+    nearest-neighbor path (``linear=False``) masks any pixel more than 1.5
     grid cells from a face center, which on a coarse global mesh leaves a
     notched, broken-looking polar edge -- correct, but it reads as a bug.
 
-    ``flux_scaled`` colours by :func:`flux_norm` instead of linearly. The
+    ``flux_scaled`` colors by :func:`flux_norm` instead of linearly. The
     default follows :func:`_flux_by_default`: peak temperature yes, a single
     step or ``min``/``avg`` no. Passing ``step`` draws that output step and
     ``moment`` is not used.
@@ -958,15 +958,15 @@ def plot_histogram(run, what='temperature', moment='max', step=None, bins=60,
 
 # --- sweeps -------------------------------------------------------------------
 # A sweep axis is an *ordered magnitude*, not a set of unrelated categories, so
-# the curves are coloured from a sequential ramp in grid order rather than from
-# a categorical cycle: neighbouring parameter values then look neighbouring, the
-# ordering survives greyscale, and no curve's colour depends on how many other
+# the curves are colored from a sequential ramp in grid order rather than from
+# a categorical cycle: neighboring parameter values then look neighboring, the
+# ordering survives grayscale, and no curve's color depends on how many other
 # curves are drawn.
 #
 # The span stops short of viridis' pale end because that end vanishes on a white
 # page: measured against the #fcfcfb surface, six curves over [0.15, 0.90] put
 # three of them under a 3:1 contrast ratio and the lightest at 1.49:1, whereas
-# [0.02, 0.72] leaves one at 2.19:1 and keeps the worst adjacent-pair colour
+# [0.02, 0.72] leaves one at 2.19:1 and keeps the worst adjacent-pair color
 # separation above the CVD target (deutan OKLab dE 9.1, protan/tritan >= 8.0).
 # The legend is always drawn, which is the relief a sub-3:1 mark requires.
 
@@ -977,7 +977,7 @@ SWEEP_LEGEND_MAX = 8
 
 
 def sweep_colors(n, cmap=CMAP_SWEEP, span=_SWEEP_RAMP_SPAN):
-    """``n`` colours from a sequential ramp, in grid order."""
+    """``n`` colors from a sequential ramp, in grid order."""
     import matplotlib.pyplot as plt
     ramp = plt.get_cmap(cmap)
     if n == 1:
@@ -1101,7 +1101,7 @@ def _sweep_colorbar(fig, ax, curves, cmap, label):
 
     Only meaningful when the grid has one numeric axis; with more than one the
     curves are ordered but not on a single scale, so the ramp is left
-    unlabelled rather than given a misleading axis.
+    unlabeled rather than given a misleading axis.
     """
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
@@ -1119,7 +1119,7 @@ def _sweep_colorbar(fig, ax, curves, cmap, label):
     lo, hi = _SWEEP_RAMP_SPAN
     norm = Normalize(vmin=values.min(), vmax=values.max())
     # The ramp is sampled over a sub-span, so the bar must be too, or the bar
-    # shows colours no curve was drawn in.
+    # shows colors no curve was drawn in.
     sub = plt.get_cmap(cmap)(np.linspace(lo, hi, 256))
     mappable = ScalarMappable(norm=norm, cmap=ListedColormap(sub))
     bar = fig.colorbar(mappable, ax=ax, fraction=0.04, pad=0.02)

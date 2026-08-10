@@ -291,7 +291,7 @@ def make_temp_norm(vmin, vmax):
 
     Uses linear scaling so that the full colormap dynamic range is allocated
     evenly.  Pair with a judiciously chosen vmin (see _stat_norm) to focus the
-    colour stretch on the temperature range of interest.
+    color stretch on the temperature range of interest.
     """
     return colors.Normalize(vmin=vmin, vmax=vmax)
 
@@ -573,7 +573,7 @@ def fig_profiles_vs_latitude(cases, save_path):
     ax.set_xlim(-90, 90)
     ax.tick_params(direction='in', top=True, right=True)
 
-    # Build legend: stat colours + case linestyles
+    # Build legend: stat colors + case linestyles
     from matplotlib.lines import Line2D
     handles = []
     for stat_key, _, _ in STATS:

@@ -112,7 +112,7 @@ struct RadiationConfig {
     bool use_hmatrix = false;            // Use hierarchical matrix compression
     // Bypass the n_faces > 1M auto-disable so H-matrix + OOC is attempted regardless.
     // Intended for the probe run that determines whether the >1M disable is still
-    // warranted; left off by default so existing behaviour is unchanged.
+    // warranted; left off by default so existing behavior is unchanged.
     bool force_hmatrix = false;
     double hmatrix_tolerance = 1e-2;     // SVD truncation tolerance for low-rank blocks
     int hmatrix_max_depth = 10;          // Maximum quadtree depth

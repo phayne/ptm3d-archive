@@ -84,7 +84,7 @@ def coverage_status(x: float, y: float, extent: dict[str, float],
     DEM), ``in`` (ROI of radius ``roi_m`` fits entirely inside), or
     ``partial`` (center inside but the ROI clips one or more DEM edges).
     ``clip_m`` maps the clipped axes (west/east/south/north) to the overshoot
-    in metres (empty unless status == ``partial``).
+    in meters (empty unless status == ``partial``).
 
     This is the geometry primitive shared by ``classify_site`` (single-DEM
     legacy mode) and the catalog/association mode. Behavior is identical to
@@ -121,7 +121,7 @@ def coverage_status(x: float, y: float, extent: dict[str, float],
 
 def classify_site(site: dict[str, str], extent: dict[str, float],
                   roi_m: float) -> dict[str, Any]:
-    """Tag a site as in / partial / out and report per-axis clip in metres."""
+    """Tag a site as in / partial / out and report per-axis clip in meters."""
     x = float(site["x_m"])
     y = float(site["y_m"])
     out = {
