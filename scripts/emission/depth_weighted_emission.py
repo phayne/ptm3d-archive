@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-Forward model: PTM3D subsurface temperature → predicted ALMA brightness temperature.
+Depth-weighted emission: a subsurface temperature profile → brightness temperature.
 
-Computes the disk-resolved brightness temperature that ALMA would observe given
-PTM3D T(z) profiles, ice dielectric properties, and observation geometry.
+Turns a PTM3D subsurface temperature profile T(z) into the brightness
+temperature a radiometer would measure, by integrating the plane-parallel
+radiative transfer equation through the profile. Because the absorption
+coefficient of the regolith is finite, the measurement is a weighted average
+over depth rather than a reading of the surface temperature — which is what
+makes it sensitive to subsurface structure, and therefore to thermal inertia.
 
 The radiative transfer integral:
     Tb(ν) = ε(ν) ∫₀^∞ T(z) κ_a(ν, T(z)) exp(-∫₀^z κ_a(ν, T(z')) dz') dz
 
 where κ_a is the power absorption coefficient of the porous ice regolith and
-ε is the surface emissivity.
+ε is the surface emissivity. Both come from ``dielectric_mixing.py``.
+
+This module is instrument-independent: the observing frequency is an argument
+in GHz, and no observatory, receiver band, or observing program is assumed.
 
 Usage:
-  python forward_model.py ptm3d_output.npz --freq 233 --porosity 0.5
-  python forward_model.py ptm3d_output.npz --band 6 --emissivity 0.75
+  python depth_weighted_emission.py profiles.npz --freq 233 --porosity 0.5
+  python depth_weighted_emission.py --demo
 """
 
 import argparse
@@ -23,18 +30,10 @@ from pathlib import Path
 # Import local modules
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from ice_dielectric import (
+from dielectric_mixing import (
     absorption_coefficient, penetration_depth, porous_ice_permittivity,
-    fresnel_emissivity
+    fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ
 )
-
-
-# ALMA band center frequencies [GHz]
-ALMA_BANDS = {
-    3: 97.5,
-    6: 233.0,
-    7: 343.5,
-}
 
 
 def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
@@ -162,7 +161,8 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
         Surface emissivity.  "fresnel" (default) computes the
         angle-dependent Fresnel emissivity from the dielectric model,
         which is the physically correct choice for a full RT integral.
-        A scalar value overrides (e.g. 0.75 for Trumbo-style comparison).
+        A scalar value overrides it (e.g. 0.75, to reproduce a published
+        surface-only fit).
 
     Returns
     -------
@@ -215,10 +215,12 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
 
 def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
                   ang_diam_arcsec, sub_obs_lon, sub_obs_lat):
-    """Convolve a model Tb map with a 2D Gaussian ALMA beam.
+    """Convolve a model Tb map with a 2D Gaussian instrument beam.
 
     Projects the model map to the observer's plane-of-sky, convolves
-    with the beam, then maps back to lat/lon.
+    with the beam, then maps back to lat/lon. Use this when comparing a
+    model against a spatially resolved observation whose angular
+    resolution is coarser than the model grid.
 
     Parameters
     ----------
@@ -229,7 +231,7 @@ def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
     beam_fwhm_arcsec : float or tuple
         Beam FWHM in arcseconds (scalar for circular, tuple (major, minor)).
     ang_diam_arcsec : float
-        Europa angular diameter in arcseconds.
+        Angular diameter of the body in arcseconds.
     sub_obs_lon, sub_obs_lat : float
         Sub-observer point in degrees.
 
@@ -279,7 +281,7 @@ def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
 def project_model_to_image(face_tb, face_lat, face_lon,
                            nx, ny, pixel_scale_arcsec, ang_diam_arcsec,
                            sub_obs_lon, sub_obs_lat):
-    """Project face-resolved Tb onto an image plane matching ALMA observation.
+    """Project face-resolved Tb onto an image plane matching an observation.
 
     Parameters
     ----------
@@ -292,7 +294,7 @@ def project_model_to_image(face_tb, face_lat, face_lon,
     pixel_scale_arcsec : float
         Image pixel scale (arcsec/pixel).
     ang_diam_arcsec : float
-        Europa angular diameter (arcsec).
+        Angular diameter of the body (arcsec).
     sub_obs_lon, sub_obs_lat : float
         Sub-observer point (degrees).
 
@@ -358,7 +360,7 @@ def process_ptm3d_output(npz_path, freq_ghz=233.0, porosity=0.5,
     npz_path : str or Path
         Path to PTM3D output .npz file containing T(z) profiles.
     freq_ghz : float
-        ALMA frequency in GHz.
+        Observing frequency in GHz.
     porosity : float or ndarray
         Porosity (uniform or depth-varying).
     emissivity : float
@@ -444,7 +446,7 @@ def compute_disk_averaged_tb(z, T_profiles, face_lat, freq_ghz, porosity,
         <Tb> = Σ Tb_i × cos(emission_i) / Σ cos(emission_i)
 
     This is useful for comparison with spatially-unresolved or
-    disk-integrated ALMA measurements.
+    disk-integrated measurements.
 
     Parameters
     ----------
@@ -478,14 +480,12 @@ def compute_disk_averaged_tb(z, T_profiles, face_lat, freq_ghz, porosity,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PTM3D → predicted ALMA brightness temperature"
+        description="Subsurface T(z) → depth-weighted brightness temperature"
     )
     parser.add_argument("input", nargs="?",
                         help="PTM3D output .npz file")
     parser.add_argument("--freq", type=float, default=233.0,
-                        help="Frequency in GHz (default: 233)")
-    parser.add_argument("--band", type=int, choices=[3, 6, 7],
-                        help="ALMA band (overrides --freq)")
+                        help="Observing frequency in GHz (default: 233)")
     parser.add_argument("--porosity", type=float, default=0.5,
                         help="Porosity (default: 0.5)")
     parser.add_argument("--emissivity", type=float, default=0.75,
@@ -498,17 +498,14 @@ def main():
                         help="Run with synthetic T(z) profile for testing")
     args = parser.parse_args()
 
-    if args.band:
-        freq_ghz = ALMA_BANDS[args.band]
-    else:
-        freq_ghz = args.freq
+    freq_ghz = args.freq
 
     if args.demo:
         # Generate a synthetic T(z) profile for testing
-        print("\n  Running demo with synthetic Europa T(z) profile...")
+        print("\n  Running demo with a synthetic icy-surface T(z) profile...")
         z = np.linspace(0, 0.5, 100)  # 0 to 50 cm
 
-        # Typical Europa diurnal profile: warm surface, cold subsurface
+        # Typical icy-surface diurnal profile: warm surface, cold subsurface
         T_surface = 110.0  # K (subsolar point)
         T_deep = 95.0      # K (diurnal mean)
         skin_depth = 0.02   # 2 cm thermal skin depth
@@ -518,15 +515,15 @@ def main():
         print(f"  T(0) = {T_z[0]:.1f} K, T(50cm) = {T_z[-1]:.1f} K")
         print(f"  Thermal skin depth: {skin_depth*100:.1f} cm")
 
-        for band, freq in ALMA_BANDS.items():
+        for freq in REFERENCE_FREQUENCIES_GHZ:
             Tb = radiative_transfer_1d(z, T_z, freq, args.porosity,
                                        args.emissivity, args.mixing)
             L = penetration_depth(freq, T_surface, args.porosity, args.mixing)
-            print(f"  Band {band} ({freq:.1f} GHz): Tb = {Tb:.2f} K, "
+            print(f"  {freq:6.1f} GHz: Tb = {Tb:.2f} K, "
                   f"L_e = {L*100:.2f} cm")
 
         # Test emission angle dependence
-        print(f"\n  Emission angle dependence (Band 6):")
+        print(f"\n  Emission angle dependence (233 GHz):")
         for angle in [0, 20, 40, 60, 75]:
             Tb = radiative_transfer_emission_angle(
                 z, T_z, 233.0, args.porosity, angle,

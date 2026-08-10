@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Sweep -> lookup table -> fit: thermal inertia from an ALMA diurnal curve.
+"""Sweep -> lookup table -> fit: thermal inertia from a brightness-temperature curve.
 
-    python3 examples/python/fit_thermal_inertia_alma.py
+    python3 examples/python/fit_thermal_inertia.py
 
 Six small CPU-only Europa runs (about 18 s each on a 48-core box), one
 brightness-temperature curve per run, and one number with an error bar at the
@@ -18,26 +18,32 @@ The three parts, in the order they matter
 
 2. **The observable conversion is yours, not the library's.** ``observable``
    below is an ordinary function of a :class:`ptm.Results`; nothing in ``ptm``
-   knows what an ALMA brightness temperature is. Here it is the repository's
-   own 1-D microwave radiative-transfer model,
-   ``scripts/alma/forward_model.radiative_transfer_1d`` (549 lines) over
-   ``scripts/alma/ice_dielectric.py`` (563 lines) -- Maxwell-Garnett mixing for
+   knows what a brightness temperature is. Here it is the repository's
+   depth-weighted emission model,
+   ``scripts/emission/depth_weighted_emission.radiative_transfer_1d`` over
+   ``scripts/emission/dielectric_mixing.py`` -- Maxwell-Garnett mixing for
    porous ice, Fresnel surface emissivity, and the emission integral
    ``Tb = eps * INT T(z) kappa(z) exp(-tau(z)) dz``. Swap it for an infrared
    band, a bolometer, or anything else and nothing else in this script changes.
+
+   Why a millimeter observable is worth the trouble: at these frequencies the
+   regolith is semi-transparent, so ``Tb`` is a weighted average over the top
+   few decimeters rather than a reading of the skin. That depth weighting is
+   what makes the curve sensitive to thermal inertia in the first place.
 
 3. **The fit** is a lookup table plus interpolation, not an engine in a loop.
 
 What is real and what is synthetic
 ----------------------------------
 
-The five model runs are real PTM3D output. The "observations" are **not** ALMA
-data: they are a sixth engine run at a thermal inertia deliberately placed
-*between* two grid points, pushed through the same observable and given
+The five model runs are real PTM3D output. The "observations" are **not**
+measured data: they are a sixth engine run at a thermal inertia deliberately
+placed *between* two grid points, pushed through the same observable and given
 Gaussian noise, so that the answer is known and the recovery is checkable. A
 fit against real data replaces ``observed()`` and nothing else.
 
-Needs scipy (``pip install 'ptm[regrid]'`` brings it in).
+Needs scipy (``pip install 'ptm[regrid]'`` brings it in) and numpy >= 2.0
+(the emission integral uses ``numpy.trapezoid``).
 """
 
 from __future__ import annotations
@@ -61,29 +67,30 @@ except ImportError:                                            # pragma: no cove
 from ptm import Results, Sweep
 from ptm.paths import find_repo_root
 
-# --- the observable: the repository's own ALMA forward model -----------------
+# --- the observable: the repository's depth-weighted emission model ----------
 
 REPO = find_repo_root(Path(__file__).parent)
 if REPO is None:
     raise SystemExit("run this from inside a PTM3D checkout")
-sys.path.insert(0, str(REPO / "scripts" / "alma"))
+sys.path.insert(0, str(REPO / "scripts" / "emission"))
 try:
-    from forward_model import radiative_transfer_1d
+    from depth_weighted_emission import radiative_transfer_1d
 except ImportError as exc:                                     # pragma: no cover
-    raise SystemExit(f"could not import scripts/alma/forward_model.py: {exc}")
+    raise SystemExit(
+        f"could not import scripts/emission/depth_weighted_emission.py: {exc}")
 
-FREQ_GHZ = 233.0     # ALMA Band 6 center, forward_model.ALMA_BANDS[6]
+FREQ_GHZ = 233.0     # observing frequency, 1.3 mm
 POROSITY = 0.5       # regolith porosity fed to the Maxwell-Garnett mixing rule
 EMISSIVITY = "fresnel"
 SIGMA_TB = 1.5       # K, the assumed observational uncertainty per sample
 
 
 def observable(results):
-    """A PTM3D run -> the curve an ALMA observation would produce.
+    """A PTM3D run -> the curve a millimeter radiometer would produce.
 
     ``(elapsed_hours, brightness_temperature_K)``. This is the user-supplied
     conversion: it reads the subsurface profile the run wrote and integrates
-    the repository's microwave radiative-transfer model over it at each output
+    the repository's depth-weighted emission model over it at each output
     time.
     """
     profile = results.depth_series()
@@ -163,7 +170,7 @@ def build_inputs(outdir):
     outdir.mkdir(parents=True, exist_ok=True)
     locations = outdir / "location.csv"
     locations.write_text("name,lat,lon\nequator,0.0,0.0\n")
-    # 0 to 2 m, log-spaced: the Band-6 penetration depth in porous ice is
+    # 0 to 2 m, log-spaced: the 233 GHz penetration depth in porous ice is
     # decimeters, so the grid has to resolve the top few centimeters and still
     # reach optical depth. Rounded to millimeters and de-duplicated because the
     # engine prints depth column headings to three decimals, and two entries
@@ -177,7 +184,7 @@ def build_inputs(outdir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--outdir", default="output/europa_alma_sweep")
+    parser.add_argument("--outdir", default="output/europa_ti_fit_sweep")
     parser.add_argument("--truth", type=float, default=65.0,
                         help="the thermal inertia the synthetic observations "
                              "are drawn from; deliberately off-grid")
@@ -231,7 +238,7 @@ def main():
     best, low, high, chi2, dof = fit.fit(observed)
 
     print()
-    print(f"ALMA Band {FREQ_GHZ:g} GHz, porosity {POROSITY}, "
+    print(f"{FREQ_GHZ:g} GHz, porosity {POROSITY}, "
           f"emissivity model {EMISSIVITY!r}, sigma {SIGMA_TB} K")
     print(f"grid              {thermal_inertia.tolist()} SI "
           f"({len(x)} samples per curve)")

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Ice dielectric properties at millimeter wavelengths for Europa.
+Dielectric properties of porous water ice at millimeter wavelengths.
 
 Computes the complex permittivity, absorption coefficient, and penetration
-depth for porous water ice regolith at temperatures and frequencies relevant
-to ALMA observations of Europa (80–130 K, 90–350 GHz).
+depth of a porous water-ice regolith. The parameterizations are validated
+over roughly 80–270 K and 30–400 GHz, which covers the icy-satellite surface
+regime (80–130 K) at millimeter wavelengths.
+
+This module is instrument-independent: it takes a frequency in GHz and a
+temperature in K and returns bulk electromagnetic properties. Pair it with
+``depth_weighted_emission.py`` to turn a subsurface temperature profile into
+a brightness temperature.
 
 Models:
   - Ice permittivity: Mätzler (2006), based on Hufford (1991)
@@ -16,12 +22,10 @@ References:
   Mätzler (2006) — Thermal Microwave Radiation, IET, Ch. 5.3
   Mishima et al. (1983) — J. Chem. Phys., 78, 6399
   Warren & Brandt (2008) — J. Geophys. Res., 113, D14220
-  Thelen et al. (2024) — Planet. Sci. J., 5, 42
-  Trumbo et al. (2018) — AJ, 156, 161
 
 Usage:
-  python ice_dielectric.py --freq 233 --temp 100 --porosity 0.5
-  python ice_dielectric.py --plot   # Generate diagnostic plots
+  python dielectric_mixing.py --freq 233 --temp 100 --porosity 0.5
+  python dielectric_mixing.py --plot   # Generate diagnostic plots
 """
 
 import argparse
@@ -31,6 +35,12 @@ import numpy as np
 C_LIGHT = 2.99792458e8       # Speed of light [m/s]
 K_BOLTZ = 1.380649e-23       # Boltzmann constant [J/K]
 H_PLANCK = 6.62607015e-34    # Planck constant [J·s]
+
+# Frequencies used by the diagnostics and the command-line summary. They are
+# spread across the millimeter window (about 3 mm, 1.3 mm and 0.9 mm) purely so
+# the printed tables and plots span the useful range; nothing in the physics
+# below is tied to these values, and any frequency in GHz may be passed instead.
+REFERENCE_FREQUENCIES_GHZ = (97.5, 233.0, 343.5)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -62,8 +72,8 @@ def epsilon_imag_ice(freq_ghz, T):
     Implements the Hufford (1991) / Mätzler (2006) parameterization
     combining Debye relaxation tail and infrared resonance wing.
 
-    At Europa temperatures (80–130 K), the Debye relaxation frequency
-    is extremely low (< 1 Hz), so the Debye tail contribution at
+    At icy-satellite surface temperatures (80–130 K), the Debye relaxation
+    frequency is extremely low (< 1 Hz), so the Debye tail contribution at
     mm-wave frequencies is negligible. The dominant contribution comes
     from the infrared lattice absorption wing.
 
@@ -288,10 +298,11 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
 
     For a full radiative transfer integral through T(z), the correct
     emissivity is (1 - R) where R is the Fresnel power reflectivity at
-    the vacuum–regolith interface.  This replaces the Trumbo et al. (2018)
-    effective emissivity of 0.75, which was fit to a surface-only model
-    (Tb = ε T_surf) and would double-count the subsurface probing effect
-    when used with an RT integral.
+    the vacuum–regolith interface.  This is the physically consistent
+    alternative to a fitted effective emissivity (values near 0.75 are
+    common in the literature): those are calibrated against a surface-only
+    model (Tb = ε T_surf) and would double-count the subsurface probing
+    effect if reused inside an RT integral.
 
     Parameters
     ----------
@@ -394,7 +405,7 @@ def make_diagnostic_plots(output_dir=None):
     """Generate diagnostic plots of ice dielectric properties.
 
     Creates:
-    1. Loss tangent vs. temperature at three ALMA frequencies
+    1. Loss tangent vs. temperature at three representative frequencies
     2. Penetration depth vs. porosity at 100 K
     3. Absorption coefficient vs. frequency for several temperatures
     """
@@ -402,18 +413,14 @@ def make_diagnostic_plots(output_dir=None):
 
     if output_dir is None:
         from pathlib import Path
-        output_dir = Path(__file__).parent.parent.parent / "data" / "alma" / "diagnostics"
+        output_dir = Path(__file__).parent.parent.parent / "data" / "emission" / "diagnostics"
     else:
         from pathlib import Path
         output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ALMA band frequencies
-    bands = {
-        "Band 3 (97.5 GHz)": 97.5,
-        "Band 6 (233 GHz)": 233.0,
-        "Band 7 (343.5 GHz)": 343.5,
-    }
+    # Representative millimeter frequencies spanning the useful range.
+    bands = {f"{f:g} GHz": f for f in REFERENCE_FREQUENCIES_GHZ}
 
     # ── Plot 1: Loss tangent vs temperature ──
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -448,9 +455,9 @@ def make_diagnostic_plots(output_dir=None):
     ax.set_title("Penetration Depth vs. Porosity at T = 100 K", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    # Mark Thelen et al. porosity ranges
-    ax.axvspan(40, 50, alpha=0.15, color="red", label="Trailing (40-50%)")
-    ax.axvspan(50, 75, alpha=0.15, color="green", label="Leading (50-75%)")
+    # Porosity ranges typically inferred for icy-satellite regolith.
+    ax.axvspan(40, 50, alpha=0.15, color="red", label="40-50%")
+    ax.axvspan(50, 75, alpha=0.15, color="green", label="50-75%")
     fig.tight_layout()
     fig.savefig(str(output_dir / "penetration_depth_vs_porosity.png"), dpi=150)
     print(f"  Saved: {output_dir / 'penetration_depth_vs_porosity.png'}")
@@ -470,7 +477,7 @@ def make_diagnostic_plots(output_dir=None):
     ax.set_title("Absorption Coefficient (50% porosity, Maxwell-Garnett)", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
-    # Mark ALMA bands
+    # Mark the reference frequencies
     for label, freq in bands.items():
         ax.axvline(freq, color="gray", linestyle="--", alpha=0.5)
     fig.tight_layout()
@@ -482,7 +489,7 @@ def make_diagnostic_plots(output_dir=None):
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     porosity_arr = np.linspace(0.01, 0.95, 100)
-    freq = 233.0  # Band 6
+    freq = 233.0
     T = 100.0
 
     for model, ls in [("maxwell_garnett", "-"), ("bruggeman", "--")]:
@@ -550,12 +557,12 @@ def main():
 
     print_dielectric_summary(args.freq, args.temp, args.porosity, args.mixing)
 
-    # Also show all three ALMA bands
-    print("\n  All ALMA bands at current settings:")
-    for band, freq in [("Band 3", 97.5), ("Band 6", 233.0), ("Band 7", 343.5)]:
+    # Also show the three reference frequencies
+    print("\n  Reference frequencies at current settings:")
+    for freq in REFERENCE_FREQUENCIES_GHZ:
         kappa = absorption_coefficient(freq, args.temp, args.porosity, args.mixing)
         L = penetration_depth(freq, args.temp, args.porosity, args.mixing)
-        print(f"    {band} ({freq:>5.1f} GHz): κ = {kappa:.4f} m⁻¹, "
+        print(f"    {freq:>5.1f} GHz: κ = {kappa:.4f} m⁻¹, "
               f"L = {L*100:.2f} cm")
 
 
