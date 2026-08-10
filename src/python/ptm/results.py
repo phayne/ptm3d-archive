@@ -1408,6 +1408,16 @@ class Results:
         from . import plots
         return plots.plot_globes(self, *args, **kwargs)
 
+    def globe_grid(self, *args, **kwargs):
+        """Fields x views comparison grid. See :func:`ptm.plots.globe_grid`."""
+        from . import plots
+        return plots.globe_grid(self, *args, **kwargs)
+
+    def plot_shape(self, *args, **kwargs):
+        """The real facets of a shape model. See :func:`ptm.plots.plot_shape`."""
+        from . import plots
+        return plots.plot_shape(self, *args, **kwargs)
+
     def plot_histogram(self, *args, **kwargs):
         """Distribution of a per-face field. See :func:`ptm.plots.plot_histogram`."""
         from . import plots
