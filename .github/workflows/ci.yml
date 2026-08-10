@@ -54,6 +54,13 @@ jobs:
       #     (quoted paper titles, OGC WKT unit names, code identifiers that
       #     cannot be renamed) live in the checker's own ALLOW table.
       #   * GitHub math: `$...$` spans that CommonMark escaping would mangle.
+      # Self-test first: it pins the notebook parser (a .ipynb is JSON with
+      # megabytes of base64 image data, and scanning it raw reports PNG bytes
+      # as British spellings) and pins the exit code, so a checker that prints
+      # hits and returns 0 cannot ship.
+      - name: Docs check -- American English checker self-test
+        run: python3 scripts/test_check_american_english.py
+
       - name: Docs check -- American English
         run: python3 scripts/check_american_english.py
 

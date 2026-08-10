@@ -17,7 +17,16 @@ for the cases where the British form is the correct text:
    them with ``american-english: allow-begin`` and ``american-english:
    allow-end`` (in a comment, so an HTML comment in Markdown).
 
-This file exempts itself: its rule table *is* a list of British spellings.
+This file and its self-test exempt themselves: the rule table and the test
+fixtures *are* lists of British spellings.
+
+Jupyter notebooks are parsed as JSON, not scanned as text: only cell sources
+and *textual* outputs are read. A prose spelling a notebook prints is a real
+hit and is reported; base64 image data is never scanned, because random bytes
+match these patterns and the hits move every time a figure is redrawn.
+
+`scripts/test_check_american_english.py` pins all of that, including the exit
+code. Run it after touching this file.
 
 A word that is correct in American English must never enter ``RULES``. Two that
 bite people: ``cancellation`` keeps its double L in American usage (only
@@ -33,6 +42,7 @@ Usage::
 Exits 1 if any un-allowed British spelling is found.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -150,8 +160,14 @@ INLINE_ALLOW = "american-english: allow"
 BLOCK_BEGIN = "american-english: allow-begin"
 BLOCK_END = "american-english: allow-end"
 
-# This checker's own rule table is, unavoidably, a list of British spellings.
-SELF_PATH = os.path.abspath(__file__)
+# Two files are, by construction, corpora of British spellings: this one (its
+# rule table) and its self-test (its fixtures). Scanning either is meaningless,
+# and allow-listing line by line would rot on the next edit.
+SELF_EXEMPT = {
+    os.path.abspath(__file__),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "test_check_american_english.py"),
+}
 
 SKIP_EXTENSIONS = {
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".ttf", ".zip",
@@ -193,8 +209,98 @@ def allowed(path, line):
     return INLINE_ALLOW in line
 
 
+# --- notebooks --------------------------------------------------------------
+# A .ipynb is JSON, and a re-executed one carries megabytes of base64 image
+# data on single lines. Scanning it raw finds "British spellings" in PNG bytes
+# -- `...SfACrGReYZMCj...` matches `grey` -- and those hits move every time the
+# figure is redrawn, so they can never be allow-listed away. Parse the JSON and
+# read only the parts a human wrote or the kernel printed.
+#
+# Output MIME types are ALLOW-listed, not block-listed: a new binary bundle
+# (image/webp, application/vnd.plotly.v1+json) must default to "not scanned".
+TEXTUAL_MIME = ("text/plain", "text/html", "text/markdown", "text/latex")
+
+# text/html legitimately carries <img src="data:image/png;base64,...">, so
+# strip embedded data URIs even from the textual bundles.
+_DATA_URI = re.compile(r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=\s]*")
+
+
+def _as_lines(value):
+    """nbformat stores multi-line text as a list of strings, or as one string."""
+    if isinstance(value, str):
+        return value.split("\n")
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.extend(item.split("\n"))
+        return out
+    return []
+
+
+def notebook_lines(text):
+    """Prose-bearing lines of a notebook, in file order.
+
+    Yields the cell sources and the *textual* outputs -- a printed British
+    spelling is a real hit and must still be caught. Image, PDF and any other
+    non-textual output bundle is skipped entirely.
+
+    Raises ValueError if the file is not a notebook we understand, so the
+    caller can fall back rather than silently scanning nothing.
+    """
+    nb = json.loads(text)
+    if not isinstance(nb, dict) or "cells" not in nb:
+        raise ValueError("not an nbformat notebook")
+    for cell in nb.get("cells", []):
+        if not isinstance(cell, dict):
+            continue
+        for line in _as_lines(cell.get("source")):
+            yield line
+        for out in cell.get("outputs", []) or []:
+            if not isinstance(out, dict):
+                continue
+            kind = out.get("output_type")
+            if kind == "stream":
+                for line in _as_lines(out.get("text")):
+                    yield line
+            elif kind in ("execute_result", "display_data"):
+                data = out.get("data") or {}
+                for mime in TEXTUAL_MIME:
+                    if mime in data:
+                        for line in _as_lines(data[mime]):
+                            yield _DATA_URI.sub("", line)
+            elif kind == "error":
+                yield str(out.get("ename", ""))
+                yield str(out.get("evalue", ""))
+                for line in _as_lines(out.get("traceback")):
+                    yield line
+
+
+def _number_against_source(lines, raw):
+    """Best-effort raw-file line numbers for text pulled out of a notebook.
+
+    nbformat writes each source line as its own JSON string on its own file
+    line, so the escaped text can be found in the raw file. The pointer only
+    advances, because notebook order is file order. Falls back to 0 -- shown as
+    a bare path -- when a line cannot be located, which is honest about the
+    fact that the number is a convenience, not a parse position.
+    """
+    raw_lines = raw.split("\n")
+    out, ptr = [], 0
+    for line in lines:
+        lineno = 0
+        if line.strip():
+            needle = json.dumps(line)[1:-1]
+            for i in range(ptr, len(raw_lines)):
+                if needle in raw_lines[i]:
+                    lineno, ptr = i + 1, i
+                    break
+        out.append((lineno, line))
+    return out
+
+
 def check(path):
-    if os.path.abspath(path) == SELF_PATH:
+    if os.path.abspath(path) in SELF_EXEMPT:
         return []
     if os.path.splitext(path)[1].lower() in SKIP_EXTENSIONS:
         return []
@@ -208,9 +314,23 @@ def check(path):
         return []
     if "\x00" in text[:4096]:          # binary payload with a text extension
         return []
+
+    if norm.endswith(".ipynb"):
+        try:
+            lines = list(notebook_lines(text))
+        except (ValueError, json.JSONDecodeError) as exc:
+            # Never fall through to a raw scan of a notebook we could not
+            # parse -- that is the base64 false-positive path. Fail loudly.
+            print(f"{norm}: cannot parse as a notebook ({exc}); NOT scanned",
+                  file=sys.stderr)
+            return []
+        numbered = _number_against_source(lines, text)
+    else:
+        numbered = list(enumerate(text.split("\n"), 1))
+
     found = []
     in_block = False
-    for lineno, line in enumerate(text.split("\n"), 1):
+    for lineno, line in numbered:
         if BLOCK_BEGIN in line:
             in_block = True
             continue

@@ -14,9 +14,13 @@ help.
 
 ```bash
 python3 scripts/check_american_english.py
+python3 scripts/test_check_american_english.py   # after editing the checker
 ```
 
-CI runs this on every push. Three kinds of hit are legitimate and stay British:
+CI runs both on every push. Notebooks are parsed as JSON, so a spelling in a
+cell or in printed output is caught while base64 image data is never scanned.
+
+Three kinds of hit are legitimate and stay British:
 
 - **Quoted text you do not own** — a paper title in a citation, third-party
   license text, vendored code.
