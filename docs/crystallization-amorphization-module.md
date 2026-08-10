@@ -26,7 +26,7 @@ The Avrami exponent $n$ is a function of porosity $\varphi$ — compact ice nucl
 
 $$n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}})\thinspace\frac{\varphi}{\varphi_{\max}}, \qquad \varphi_{\max}=0.7 \tag{3}$$
 
-We adopt $\varphi_{\mathrm{eq}}=0.50$ at the equator and $\varphi_{\mathrm{pol}}=0.20$ at the poles, with linear interpolation in $|\phi_{\mathrm{lat}}|$ — consistent with the porosity range derived from ALMA disk-resolved millimeter brightness temperatures (Thelen et al. 2024).
+We adopt $\varphi_{\mathrm{eq}}=0.50$ at the equator and $\varphi_{\mathrm{pol}}=0.20$ at the poles, with linear interpolation in $|\phi_{\mathrm{lat}}|$ — consistent with the porosity range derived from disk-resolved millimeter brightness temperatures (Thelen et al. 2024).
 
 **Order-of-magnitude calibration** (compact ice, $n=4$):
 
@@ -148,4 +148,4 @@ The analytical form keeps the per-face update O(1) regardless of $\Delta t_{\mat
 - Leto, G., Baratta, G. A. (2003). "Ly-α photon induced amorphization of Ic water ice at 16 K." *A&A* **397**, 7–13.
 - Mitchell, E. H., Raut, U., Teolis, B. D., Baragiola, R. A. (2017). "Porosity effects on crystallization kinetics of amorphous solid water: implications for cold icy bodies." *Icarus* **285**, 291–299.
 - Nordheim, T. A. et al. (2022). "Magnetospheric ion bombardment of Europa's surface." *Planet. Sci. J.* **3**, 5. doi:10.3847/PSJ/ac382a
-- Thelen, A. E., Cordiner, M. A., Sykes, M. V., Rivkin, A. S. (2024). ALMA-derived disk-resolved porosity / thermal-inertia maps of Europa.
+- Thelen, A. E., Cordiner, M. A., Sykes, M. V., Rivkin, A. S. (2024). Disk-resolved millimeter-wavelength porosity / thermal-inertia maps of Europa. *Planet. Sci. J.* **5**, 42. doi:10.3847/PSJ/ad251c

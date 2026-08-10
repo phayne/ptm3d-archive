@@ -221,7 +221,7 @@ The post-illumination phase (thermal solver plus statistics export and binary ou
 
 ### 8.6 Europa Validation
 
-Validation of PTM3D against Europa-specific observations (Galileo PPR diurnal curves and ALMA depth-resolved brightness temperatures) is presented in the main text Section 3 and is not repeated here. The 1D thermal solver is identical for the Moon and Europa runs; only the input parameters of §3.5 and the orbital/illumination geometry change.
+Validation of PTM3D against Europa-specific observations (Galileo PPR diurnal curves and depth-resolved millimeter brightness temperatures) is presented in the main text Section 3 and is not repeated here. The 1D thermal solver is identical for the Moon and Europa runs; only the input parameters of §3.5 and the orbital/illumination geometry change.
 
 ## 9. Configuration Reference
 
