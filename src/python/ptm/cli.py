@@ -93,11 +93,23 @@ def _build_parser():
     sweep = sub.add_parser(
         "sweep", help="run a grid of simulations from one base config",
         description="Run a parameter grid. Serial by default: there is one "
-                    "GPU. Resumable: re-running skips points that finished.",
-        epilog="examples:\n"
+                    "GPU. Resumable: re-running skips points that finished. "
+                    "Reading a finished sweep needs no engine.",
+        epilog="thermal inertia is TWO parameters, and they are different physics:\n"
+               "  thermal_inertia            ks = TI^2/(rhos*cp(273 K)), kd scaled\n"
+               "                             with it; depth contrast preserved.\n"
+               "                             Needs an engine with --thermal-inertia.\n"
+               "  constant_thermal_inertia   cp = TI^2/(ks*rhos), chi=0, kd=ks,\n"
+               "                             rhod=rhos; TI exactly constant in\n"
+               "                             temperature AND depth. Any engine.\n"
+               "  At TI=200 on quickstart_asteroid_diurnal they give 39.27 K and\n"
+               "  42.19 K diurnal amplitude. Pick one deliberately; you cannot\n"
+               "  sweep both at once, and neither is a default.\n"
+               "\n"
+               "examples:\n"
                "  ptm sweep examples/quickstart_asteroid_diurnal.yaml \\\n"
                "      --vary thermal_inertia=50,100,200,400\n"
-               "  ptm sweep output/asteroid_sweep --table sweep.csv "
+               "  ptm sweep output/asteroid_sweep --no-run --table sweep.csv "
                "--plot curves --save family.png\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sweep.add_argument(
@@ -105,9 +117,10 @@ def _build_parser():
         help="a base YAML config, or an existing sweep directory to reopen")
     sweep.add_argument(
         "--vary", action="append", default=[], metavar="NAME=V1,V2,...",
-        help="one grid axis. NAME is 'thermal_inertia', 'albedo', or any "
-             "dotted config key (thermal.equilibration_orbits). Repeat for a "
-             "cartesian product.")
+        help="one grid axis. NAME is 'thermal_inertia', "
+             "'constant_thermal_inertia', 'albedo', or any dotted config key "
+             "(thermal.equilibration_orbits). Repeat for a cartesian product. "
+             "See the note below on the two thermal-inertia conventions.")
     sweep.add_argument("--outdir", default=None,
                        help="where the points go (default: the base config's "
                             "output.directory with _sweep appended)")
@@ -131,9 +144,10 @@ def _build_parser():
                        help="print the grid and each point's status, run none")
     sweep.add_argument("--use-flags", default="auto",
                        choices=("auto", "yes", "no"),
-                       help="deliver thermal_inertia/albedo through the engine "
+                       help="deliver the named parameters through the engine "
                             "CLI flags (auto: use them if this binary has "
-                            "them)")
+                            "them). 'no' cannot serve thermal_inertia, which "
+                            "has no config-file equivalent.")
     sweep.add_argument("--table", default=None, metavar="FILE.csv",
                        help="write a tidy table of the finished points")
     sweep.add_argument("--plot", default=None, choices=("curves",),
@@ -345,19 +359,31 @@ def _do_sweep(args):
         if not args.vary:
             raise SystemExit("ptm sweep needs at least one --vary NAME=V1,V2")
         use_flags = {"auto": "auto", "yes": True, "no": False}[args.use_flags]
-        sweep = sweep_mod.Sweep(
-            target, grid=_parse_vary(args.vary), outdir=args.outdir,
-            exe=args.exe, workdir=args.workdir, use_flags=use_flags,
-            timeout=args.timeout)
+        try:
+            sweep = sweep_mod.Sweep(
+                target, grid=_parse_vary(args.vary), outdir=args.outdir,
+                exe=args.exe, workdir=args.workdir, use_flags=use_flags,
+                timeout=args.timeout)
+        except ValueError as exc:
+            raise SystemExit(f"ptm sweep: {exc}")
 
     if args.list:
-        _print_sweep_list(sweep)
+        try:
+            _print_sweep_list(sweep)
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise SystemExit(f"ptm sweep: {exc}")
         return 0
 
     status = 0
     if not args.no_run:
-        summary = sweep.run(resume=not args.no_resume, jobs=args.jobs,
-                            dry_run=args.dry_run)
+        # A missing engine and an axis this engine cannot deliver are both
+        # ordinary operator errors with a paragraph of explanation attached;
+        # they belong on stderr as a message, not as a traceback.
+        try:
+            summary = sweep.run(resume=not args.no_resume, jobs=args.jobs,
+                                dry_run=args.dry_run)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            raise SystemExit(f"ptm sweep: {exc}")
         if summary["failed"]:
             status = 1
         if args.dry_run:

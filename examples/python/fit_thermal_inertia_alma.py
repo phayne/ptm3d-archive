@@ -193,8 +193,17 @@ def main():
              "output.depths_file": str(depths_file)}
     base = REPO / "examples" / "quickstart_europa_diurnal.yaml"
 
-    # 1. the sweep -- the lookup table
-    sweep = Sweep(base, grid={"thermal_inertia": [30, 50, 80, 120, 200]},
+    # 1. the sweep -- the lookup table.
+    #
+    # constant_thermal_inertia, not thermal_inertia, and the choice is not
+    # incidental: they are different physics. This one solves for cp and
+    # collapses the column so TI is exactly constant in temperature and depth,
+    # and it reaches any engine (--constant-thermal-inertia, or the config key
+    # of the same name). The other scales ks/kd and preserves the depth
+    # contrast, and needs an engine with --thermal-inertia. At TI=200 on the
+    # asteroid quickstart they differ by 2.9 K in diurnal amplitude. Swap the
+    # key below to fit the other convention; nothing else changes.
+    sweep = Sweep(base, grid={"constant_thermal_inertia": [30, 50, 80, 120, 200]},
                   outdir=outdir, overrides=fixed, exe=args.exe)
     sweep.run()
 
@@ -206,11 +215,11 @@ def main():
                 "the grid points do not share a time axis; every point must "
                 "run the same schedule for a lookup table to mean anything")
     table = np.array([c.y for c in curves])
-    thermal_inertia = sweep.values("thermal_inertia")
+    thermal_inertia = sweep.values("constant_thermal_inertia")
 
     # 2. the "observations" -- a sixth run, off-grid, plus noise
     truth_dir = outdir / f"truth_ti-{args.truth:g}"
-    truth = Sweep(base, grid={"thermal_inertia": [args.truth]},
+    truth = Sweep(base, grid={"constant_thermal_inertia": [args.truth]},
                   outdir=truth_dir, overrides=fixed, exe=args.exe, quiet=True)
     truth.run()
     _, clean = observable(truth.points[0].results)

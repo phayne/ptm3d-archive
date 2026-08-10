@@ -409,7 +409,30 @@ sweep.plot_curves(save="family.png")
 | Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, **and** the outputs are on disk; every skip and every re-run prints its reason. |
 | Provenance | The swept values, the generated overrides, the argv, the engine path and md5, and the config hash are recorded next to the outputs. `ptm.sweep.load_sweep(dir)` reopens a finished sweep without retyping the grid. |
 | Generated configs | Written to each point's own output directory, never into `examples/` or `configs/`. `radiation.view_factor_file` is made absolute, because it is the one key the engine resolves against the YAML's own directory (`config_parser.cpp:507-517`). |
-| Axis names | `thermal_inertia` and `albedo` are delivered through the engine CLI flags `--thermal-inertia` / `--albedo` when the binary advertises them (detected from `--help`, never assumed) and otherwise through `thermophysical.constant_thermal_inertia` / `thermophysical.albedo_override`, which the engine interprets identically. Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
+| Axis names | `albedo` and `constant_thermal_inertia` go through the engine CLI flags `--albedo` / `--constant-thermal-inertia` when the binary advertises them (detected from `--help`, never assumed) and otherwise through the config keys `thermophysical.albedo_override` / `thermophysical.constant_thermal_inertia`, which the engine interprets identically (measured: byte-identical output either way). `thermal_inertia` is **flag-only** — see below. Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
+| No engine needed to read one | Constructing a sweep, `--list`, `--dry-run`, `table()`, `write_table()`, `grid_of()`, the plots and `load_sweep()` all work with no compiled binary present. The engine is resolved only when something launches. |
+
+#### Thermal inertia is two parameters — say which one
+
+TI is derived here (the primaries are `ks`/`kd`/`rhos`/`rhod`/`cp0`/`chi`), so
+"set TI to 200" has two answers and the engine implements both. They are
+**different physics**, not two spellings.
+
+| Grid key | What the engine does | Route |
+|---|---|---|
+| `thermal_inertia` | `ks = TI²/(rhos·cp(273 K))`, `kd` scaled by the same factor. Densities, `cp(T)` and `chi` untouched, so the depth contrast is preserved. Resolves onto `thermophysical.{ks,kd}_override`. This is the convention already used by `ema_campaign_driver.py`, `divval_sweep.py` and the shipped `quickstart_asteroid_diurnal_ti200_check.yaml`. | `--thermal-inertia` **only** |
+| `constant_thermal_inertia` | `cp = TI²/(ks·rhos)` instead, plus `chi=0`, `kd=ks`, `rhod=rhos`, so TI is exactly constant in temperature **and** depth — and the thermal diffusivity moves along the axis where the other holds it. | `--constant-thermal-inertia`, or the config key of the same name |
+
+Measured at TI=200 on `quickstart_asteroid_diurnal`: **39.27 K** diurnal
+amplitude for the first, **42.19 K** for the second — 6.0 K per-face at the
+extreme. The engine refuses a run given both, and so does `Sweep`.
+
+`thermal_inertia` has no config-file route on purpose. Building one would mean
+this Python layer evaluating the body's `cp` polynomial at 273 K, which is
+physics the wrapper does not do — and on the Moon `cp0` is that polynomial's
+*constant term*, −3.6125 J/kg/K, so the naive `sqrt(ks·rhos·cp0)` is not a real
+number. On an engine without the flag you get an error naming
+`constant_thermal_inertia`, never a silent switch to different physics.
 | Collection | `values()`, `collect()`, `stat()`, `grid_of()`, `table()`, `write_table()`, `curves()`. `table()` returns a list of dicts — `pandas.DataFrame(sweep.table(...))` works, and nothing here requires pandas. |
 
 Worked examples: [`examples/python/fit_thermal_inertia_alma.py`](../examples/python/fit_thermal_inertia_alma.py)

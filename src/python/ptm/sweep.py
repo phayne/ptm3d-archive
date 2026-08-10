@@ -36,19 +36,40 @@ hard-codes ``{"alb008": 0.08, ...}`` because the run directories do not record
 what was swept. Here the parameters are in ``sweep_point.json`` next to the
 outputs, and :meth:`Sweep.values` reads them back.
 
-**Two ways to reach the engine, one meaning.** ``thermal_inertia`` and
-``albedo`` are engine CLI flags on newer binaries (``--thermal-inertia``,
-``--albedo``). On a binary that does not have them the same parameter is
-delivered through the config keys the engine already interprets the same way --
-``thermophysical.constant_thermal_inertia`` and
-``thermophysical.albedo_override``. Which route was taken is detected from
-``--help`` (never assumed), announced, and recorded per point. Any other
-parameter is a dotted config key and always goes through the config.
+**Two ways to reach the engine, one meaning.** ``albedo`` and
+``constant_thermal_inertia`` are engine CLI flags on newer binaries and config
+keys the engine interprets identically on older ones; which route was taken is
+detected from ``--help`` (never assumed), announced, and recorded per point.
+Any name containing a dot is a config key set verbatim.
 
-No physics is computed here. The two named parameters map onto knobs the
-*engine* interprets -- the engine derives ``cp = TI^2/(ks*rhos)`` for a
-constant thermal inertia, not this module -- and anything else is a config key
-set verbatim.
+**Thermal inertia is two parameters, and you have to say which.** TI is derived
+from ks/rhos/cp here, so "TI = 200" has two answers and the engine implements
+both:
+
+``thermal_inertia``
+    ``--thermal-inertia``: ``ks = TI^2/(rhos*cp(273 K))`` with ``kd`` scaled by
+    the same factor, so the depth contrast is preserved. **Flag only.** There
+    is no config route, because building one would mean this module evaluating
+    the body's cp polynomial -- and on the Moon ``cp0`` is that polynomial's
+    constant term, ``-3.6125 J/kg/K``. An engine without the flag gets an error
+    naming the alternative, never a quiet switch to different physics.
+``constant_thermal_inertia``
+    ``--constant-thermal-inertia`` or
+    ``thermophysical.constant_thermal_inertia``: ``cp = TI^2/(ks*rhos)`` with
+    ``chi=0``, ``kd=ks``, ``rhod=rhos``, so TI is exactly constant in
+    temperature and depth. Works on any engine.
+
+Measured difference at TI=200 on ``quickstart_asteroid_diurnal``: **39.27 K vs
+42.19 K** diurnal amplitude. The engine refuses a run given both, and so does
+this module.
+
+No physics is computed here. Every named parameter maps onto a knob the
+*engine* interprets, and anything else is a config key set verbatim.
+
+**No engine needed to read one.** Constructing a sweep, listing its points,
+dry-running it, tabulating it, plotting it and reopening a finished one with
+:func:`load_sweep` all work with no compiled binary present; the engine is
+resolved when something actually launches.
 """
 
 from __future__ import annotations
@@ -104,11 +125,42 @@ def _md5(path):
 # there. Re-exported above so `from ptm.sweep import set_dotted` also works.
 
 
-# --- the two named parameters ------------------------------------------------
-# Both config keys below were checked against the engine on a GENERIC body as
-# well as a built-in one, because `generic_body.surface.*` is the only place a
-# generic body's properties are normally read (PTM-67) and a body-class-
-# dependent mapping would have been the obvious guess. Measured on
+# --- the named parameters -----------------------------------------------------
+#
+# THERMAL INERTIA IS TWO PARAMETERS, NOT ONE. TI is derived here -- the
+# primaries are ks/kd/rhos/rhod/cp0/chi -- so "set TI to 200" has more than one
+# answer, and the engine implements both:
+#
+#   thermal_inertia            --thermal-inertia
+#                              ks = TI^2/(rhos*cp(273 K)), kd scaled by the same
+#                              factor. Densities, cp(T) and chi untouched, so
+#                              the depth contrast is preserved. Resolves onto
+#                              thermophysical.{ks,kd}_override. This is the
+#                              convention already used by ema_campaign_driver,
+#                              divval_sweep and the shipped ti200_check config.
+#
+#   constant_thermal_inertia   --constant-thermal-inertia,
+#                              thermophysical.constant_thermal_inertia
+#                              cp = TI^2/(ks*rhos) instead, plus chi=0, kd=ks,
+#                              rhod=rhos, so TI is exactly constant in
+#                              temperature AND depth -- and the diffusivity
+#                              moves along the axis where the other holds it.
+#
+# They are not interchangeable: 39.27 K vs 42.19 K diurnal amplitude at TI=200
+# on quickstart_asteroid_diurnal (measured by the engine change that added the
+# flags). The engine refuses if both are given, and so does this module.
+#
+# The first has NO config-file route here, deliberately. Reproducing it in YAML
+# would mean this wrapper evaluating the body's cp polynomial at 273 K, which is
+# physics it does not do -- and on the Moon cp0 is the CONSTANT TERM of that
+# polynomial, -3.6125 J/kg/K, so the naive sqrt(k*rho*cp0) is not even a real
+# number. An engine without the flag therefore gets an error naming the other
+# convention, never a quiet substitution of different physics.
+#
+# The two config-key parameters below were checked against the engine on a
+# GENERIC body as well as a built-in one, because generic_body.surface.* is
+# normally the only place a generic body's properties are read (PTM-67) and a
+# body-class-dependent mapping would have been the obvious guess. Measured on
 # quickstart_asteroid_diurnal, binary f0f66a09:
 #   * thermophysical.albedo_override 0.30 and generic_body.surface.albedo 0.30
 #     produce byte-identical temperature statistics (max|diff| = 0.0 K);
@@ -119,25 +171,37 @@ def _md5(path):
 # body-class branch.
 
 class _NamedParameter:
-    """One physical parameter, and the two interchangeable ways to set it.
+    """One physical parameter, and how it reaches the engine.
 
-    ``flag`` is what a newer engine accepts on the command line. ``config_key``
-    is the YAML key an older one reads for the *same* quantity with the *same*
-    meaning -- not an approximation of it. ``check`` reports config states in
-    which the setting would be silently weakened, because a sweep whose axis
+    ``flag`` is what a new enough engine accepts on the command line.
+    ``config_key`` is the YAML key an older one reads for the *same* quantity
+    with the *same* meaning -- not an approximation of it -- or ``None`` when
+    no such key exists, in which case the flag is the only route and its
+    absence is an error rather than a fallback. ``check`` reports config states
+    in which the setting would be silently weakened, because a sweep whose axis
     quietly does nothing is the failure this module exists to prevent.
     """
 
-    def __init__(self, name, flag, config_key, units, note, check):
+    def __init__(self, name, flag, config_key, units, note, check,
+                 no_config_route=None):
         self.name = name
         self.flag = flag
         self.config_key = config_key
         self.units = units
         self.note = note
         self._check = check
+        #: Why there is no config key, for the error message. Set iff
+        #: ``config_key`` is None.
+        self.no_config_route = no_config_route
+
+    @property
+    def flag_only(self):
+        return self.config_key is None
 
     def overrides(self, value):
         """``{dotted_key: value}`` for the config route."""
+        if self.flag_only:
+            raise RuntimeError(f"{self.name} has no config route")
         return {self.config_key: float(value)}
 
     def warnings(self, config):
@@ -149,16 +213,34 @@ def _check_thermal_inertia(config):
     thermo = config.get("thermophysical") or {}
     if str(thermo.get("conductivity_model", "")).strip() == "martinez2021":
         out.append(
+            "thermophysical.conductivity_model is martinez2021, which reads "
+            "neither ks nor kd (k is Eq. 10 of T and rho). The engine warns "
+            "that the overrides are inert; the sweep would run N identical "
+            "simulations and report them as a sweep.")
+    out.append(
+        "this is ks = TI^2/(rhos*cp(273 K)) with kd scaled by the same factor: "
+        "the depth contrast is preserved and the diffusivity moves with TI. "
+        "The other convention, constant_thermal_inertia, derives cp instead "
+        "and collapses the column -- 39.27 K vs 42.19 K diurnal amplitude at "
+        "TI=200 on quickstart_asteroid_diurnal. Choose deliberately.")
+    return out
+
+
+def _check_constant_thermal_inertia(config):
+    out = []
+    thermo = config.get("thermophysical") or {}
+    if str(thermo.get("conductivity_model", "")).strip() == "martinez2021":
+        out.append(
             "thermophysical.conductivity_model is martinez2021, which ignores "
             "ks entirely; the engine calls this combination FATAL "
             "(ptm_thermal_sim.cpp composition guard 1). Every point will fail.")
     out.append(
-        "the engine delivers a constant thermal inertia by solving for heat "
-        "capacity, cp = TI^2/(ks*rhos), and zeroing chi: k and rho are left "
-        "alone, so the thermal diffusivity varies along this axis. Setting the "
-        "same TI by scaling ks instead is a different column "
-        "(measured 2.9 K in equatorial diurnal amplitude on "
-        "quickstart_asteroid_diurnal at TI=200).")
+        "this is cp = TI^2/(ks*rhos) with chi=0, kd=ks and rhod=rhos: TI is "
+        "exactly constant in temperature AND depth, and the thermal "
+        "diffusivity therefore varies along the axis. The other convention, "
+        "thermal_inertia, scales ks/kd instead -- 42.19 K vs 39.27 K diurnal "
+        "amplitude at TI=200 on quickstart_asteroid_diurnal. Choose "
+        "deliberately.")
     return out
 
 
@@ -181,16 +263,31 @@ def _check_albedo(config):
 #: key, applied verbatim.
 NAMED_PARAMETERS = {
     "thermal_inertia": _NamedParameter(
-        "thermal_inertia", "--thermal-inertia",
+        "thermal_inertia", "--thermal-inertia", None,
+        "SI (J m^-2 K^-1 s^-1/2)",
+        "ks = TI^2/(rhos*cp(273 K)), kd scaled with it; depth contrast kept",
+        _check_thermal_inertia,
+        no_config_route=(
+            "TI is a derived quantity, and this convention needs the body's cp "
+            "polynomial evaluated at 273 K. Doing that here would put physics "
+            "in the wrapper -- and on the Moon cp0 is the constant term of "
+            "that polynomial, -3.6125 J/kg/K, so the naive sqrt(ks*rhos*cp0) "
+            "is not a real number")),
+    "constant_thermal_inertia": _NamedParameter(
+        "constant_thermal_inertia", "--constant-thermal-inertia",
         "thermophysical.constant_thermal_inertia",
         "SI (J m^-2 K^-1 s^-1/2)",
-        "constant in temperature and depth",
-        _check_thermal_inertia),
+        "cp = TI^2/(ks*rhos), chi=0, kd=ks, rhod=rhos; constant in T and depth",
+        _check_constant_thermal_inertia),
     "albedo": _NamedParameter(
         "albedo", "--albedo", "thermophysical.albedo_override",
         "", "bolometric Bond albedo, uniform over the body",
         _check_albedo),
 }
+
+#: Axis names the engine itself refuses to accept together, because they are
+#: two conventions for one quantity.
+MUTUALLY_EXCLUSIVE = (("thermal_inertia", "constant_thermal_inertia"),)
 
 
 # --- one point ----------------------------------------------------------------
@@ -283,8 +380,15 @@ class SweepPoint:
         return self._config_sha
 
     def command(self):
-        """The engine argv for this point."""
-        cmd = [str(self.sweep.exe), "--config", str(self.config_path)]
+        """The engine argv for this point.
+
+        With no engine resolved the argv names ``ptm_thermal_sim`` rather than
+        a path, so ``--dry-run`` still shows what would be run; ``run()`` and
+        :meth:`execute` resolve for real first, and fail if they cannot.
+        """
+        engine = self.sweep.exe_or_none
+        cmd = [str(engine) if engine else "ptm_thermal_sim",
+               "--config", str(self.config_path)]
         cmd.extend(self.sweep._flag_args(self.params))
         cmd.extend(str(a) for a in self.sweep.engine_args)
         return cmd
@@ -348,6 +452,7 @@ class SweepPoint:
 
     def execute(self, echo=True):
         """Write the config, run the engine, record the outcome. Returns status."""
+        _ = self.sweep.exe        # resolve, and fail here rather than mid-write
         self.dir.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(self.config_text())
         command = self.command()
@@ -359,7 +464,7 @@ class SweepPoint:
             engine_flags=self.sweep._flag_args(self.params),
             parameter_route=self.sweep.route,
             command=command,
-            engine=str(self.sweep.exe), engine_md5=self.sweep.exe_md5,
+            engine=str(self.sweep.exe_or_none), engine_md5=self.sweep.exe_md5,
             base_config=str(self.sweep.base_config_path),
             base_config_sha256=self.sweep.base_sha256,
             config_sha256=self.config_sha256(),
@@ -420,9 +525,12 @@ class Sweep:
         Path to the YAML the sweep varies. It is never modified.
     grid
         ``{name: [values...]}``. Iterated as a cartesian product in the order
-        given, first axis slowest. A name in :data:`NAMED_PARAMETERS` reaches
+        given, first axis slowest. A name in :data:`NAMED_PARAMETERS`
+        (``thermal_inertia``, ``constant_thermal_inertia``, ``albedo``) reaches
         the engine by flag or by its config key; any other name is treated as a
-        dotted config key (``'thermal.equilibration_orbits'``).
+        dotted config key (``'thermal.equilibration_orbits'``). See the module
+        docstring on the two thermal-inertia conventions -- they are different
+        physics and this class will not choose between them for you.
     outdir
         Where the points go, one directory each. Defaults to the base config's
         ``output.directory`` with ``_sweep`` appended.
@@ -445,9 +553,12 @@ class Sweep:
         is where the shipped metakernels resolve), its environment, and extra
         argv appended to every point.
     use_flags
-        ``'auto'`` (default) detects ``--thermal-inertia`` / ``--albedo`` from
+        ``'auto'`` (default) detects each named parameter's flag from
         ``exe --help``; ``True`` requires them; ``False`` always writes config
-        keys instead.
+        keys instead -- which ``thermal_inertia`` refuses, having none.
+    route
+        ``{axis: 'flag'|'config'}`` decided already, as :func:`load_sweep`
+        passes from the manifest. Supplying it means no engine is consulted.
     timeout
         Wall-clock ceiling per point, in seconds.
     results_kwargs
@@ -458,7 +569,7 @@ class Sweep:
     def __init__(self, base_config, grid, outdir=None, overrides=None,
                  derived=None, label_axes=(), exe=None, workdir=None, env=None,
                  engine_args=(), use_flags="auto", timeout=None,
-                 name_from=None, results_kwargs=None, quiet=False):
+                 name_from=None, results_kwargs=None, quiet=False, route=None):
         import yaml
 
         self.base_config_path = Path(base_config).expanduser().resolve()
@@ -495,6 +606,20 @@ class Sweep:
                 f"that only feeds derived=, pass label_axes=({name!r},); "
                 f"writing it into the YAML would add a key the engine reads "
                 f"and ignores without complaint.")
+        for pair in MUTUALLY_EXCLUSIVE:
+            named = [n for n in pair
+                     if n in self.axes
+                     or NAMED_PARAMETERS[n].config_key in self.overrides]
+            if len(named) > 1:
+                first, second = NAMED_PARAMETERS[pair[0]], NAMED_PARAMETERS[pair[1]]
+                raise ValueError(
+                    f"{' and '.join(named)} are two conventions for one "
+                    f"quantity and cannot both be set. The engine refuses a run "
+                    f"that is given both.\n"
+                    f"  {first.name}: {first.note}\n"
+                    f"  {second.name}: {second.note}\n"
+                    f"  They differ by 39.27 K vs 42.19 K in diurnal amplitude "
+                    f"at TI=200 on quickstart_asteroid_diurnal.")
         self._name_from = name_from
         self.results_kwargs = dict(results_kwargs or {})
         self.timeout = None if timeout is None else float(timeout)
@@ -507,23 +632,23 @@ class Sweep:
         self.workdir = Path(workdir).expanduser().resolve() if workdir else (
             self.root if self.root else None)
 
-        resolved = (Path(exe).expanduser().resolve() if exe
-                    else paths.find_engine_executable(
-                        search_roots=[self.root] if self.root else []))
-        if resolved is None or not Path(resolved).exists():
-            raise FileNotFoundError(
-                "ptm_thermal_sim not found. Build it, set PTM_BUILD_DIR, or "
-                "pass exe=. See INSTALL.md.")
-        self.exe = Path(resolved)
-        self.exe_md5 = _md5(self.exe)
+        # The engine is resolved lazily, and so is the route that depends on
+        # it. Constructing a sweep, listing its points, writing its table,
+        # plotting it and reopening a finished one are all analysis, and
+        # analysis of results that already exist must not require a compiled
+        # binary to be sitting in build/bin.
+        self._exe_arg = exe
+        self._exe = None
+        self._exe_md5 = None
+        self._use_flags = use_flags
+        self._route = dict(route) if route else None
+        self._reported = False
 
         base_out = get_dotted(self.base_config, "output.directory") or "output"
         self.outdir = Path(outdir).expanduser().resolve() if outdir else (
             (self.workdir or Path.cwd()) / f"{base_out}_sweep").resolve()
 
         self._said_vf = False
-        self.route = self._decide_route(use_flags)
-        self._report_axes()
         self.points = self._build_points()
         self._check_names_unique()
 
@@ -531,6 +656,41 @@ class Sweep:
         shape = "x".join(str(n) for n in self.shape)
         return (f"<Sweep {self.base_config_path.name} {shape} = "
                 f"{len(self.points)} points -> {self.outdir}>")
+
+    # -- the engine, resolved when it is actually needed -----------------------
+
+    @property
+    def exe_or_none(self):
+        """The engine binary, or ``None`` if it cannot be found."""
+        if self._exe is None:
+            candidate = (Path(self._exe_arg).expanduser() if self._exe_arg
+                         else paths.find_engine_executable(
+                             search_roots=[self.root] if self.root else []))
+            if candidate is not None and Path(candidate).exists():
+                self._exe = Path(candidate).resolve()
+        return self._exe
+
+    @property
+    def exe(self):
+        """The engine binary. Raises if it cannot be found."""
+        found = self.exe_or_none
+        if found is None:
+            named = f" at {self._exe_arg!r}" if self._exe_arg else ""
+            raise FileNotFoundError(
+                f"ptm_thermal_sim not found{named}. Build it, set "
+                f"PTM_BUILD_DIR, or pass exe=. See INSTALL.md.\n"
+                f"  (Reading a sweep does not need one -- Sweep(), .table(), "
+                f".values(), .curves(), the plots and load_sweep() all work "
+                f"without an engine. This message means something asked to "
+                f"launch one.)")
+        return found
+
+    @property
+    def exe_md5(self):
+        """md5 of the engine binary, or ``None`` if it is not resolved."""
+        if self._exe_md5 is None and self.exe_or_none is not None:
+            self._exe_md5 = _md5(self.exe_or_none)
+        return self._exe_md5
 
     def __len__(self):
         return len(self.points)
@@ -552,8 +712,40 @@ class Sweep:
 
     # -- how each parameter reaches the engine ---------------------------------
 
+    @property
+    def route(self):
+        """``{axis: 'flag'|'config'}``, decided once and announced.
+
+        Decided on first use rather than at construction, because deciding it
+        may mean asking the engine what flags it has, and a sweep must be
+        constructible without one. :func:`load_sweep` supplies the recorded
+        route, so reading a finished sweep never asks.
+        """
+        if self._route is None:
+            self._route = self._decide_route(self._use_flags)
+        if not self._reported:
+            self._reported = True
+            self._report_axes()
+        return self._route
+
+    def _no_flag_message(self, param, where):
+        return (
+            f"grid axis {param.name!r} is delivered only by the engine flag "
+            f"{param.flag}, and {where}.\n"
+            f"  There is no config-file equivalent: {param.no_config_route}.\n"
+            f"  Either use an engine that has {param.flag}, or sweep the other "
+            f"convention explicitly:\n"
+            f"      grid={{'constant_thermal_inertia': [...]}}\n"
+            f"  which is thermophysical.constant_thermal_inertia and works on "
+            f"any engine. THE TWO ARE NOT THE SAME PHYSICS -- "
+            f"{param.name} is {param.note}, constant_thermal_inertia is "
+            f"{NAMED_PARAMETERS['constant_thermal_inertia'].note}, and they "
+            f"give 39.27 K vs 42.19 K diurnal amplitude at TI=200 on "
+            f"quickstart_asteroid_diurnal. This module will not pick one for "
+            f"you.")
+
     def _decide_route(self, use_flags):
-        """``{parameter: 'flag'|'config'}``, decided once and announced."""
+        """``{parameter: 'flag'|'config'}``. May need the engine; see :attr:`route`."""
         route = {}
         available = None
         for name in self.axes:
@@ -562,15 +754,36 @@ class Sweep:
                 route[name] = "config"
                 continue
             if use_flags is False:
+                if param.flag_only:
+                    raise RuntimeError(self._no_flag_message(
+                        param, "use_flags=False forbids using it"))
                 route[name] = "config"
                 continue
             if available is None:
-                available = run_mod.engine_flags(self.exe)
+                engine = self.exe_or_none
+                if engine is None:
+                    if param.flag_only:
+                        raise FileNotFoundError(self._no_flag_message(
+                            param, "no engine could be found to ask whether "
+                                   "this one has it"))
+                    # A parameter with a config key means the same thing either
+                    # way, so an unfindable engine is not fatal -- but it is
+                    # said out loud, because the route was decided by absence.
+                    if not self.quiet:
+                        print(f"[sweep] no engine found, so no flags can be "
+                              f"detected; {name} goes through "
+                              f"{param.config_key}", file=sys.stderr)
+                    available = frozenset()
+                else:
+                    available = run_mod.engine_flags(engine)
             if param.flag in available:
                 route[name] = "flag"
+            elif param.flag_only:
+                raise RuntimeError(self._no_flag_message(
+                    param, f"{self.exe_or_none} does not advertise it"))
             elif use_flags is True:
                 raise RuntimeError(
-                    f"use_flags=True but {self.exe} does not advertise "
+                    f"use_flags=True but {self.exe_or_none} does not advertise "
                     f"{param.flag}. Build a newer engine, or pass "
                     f"use_flags='auto' to fall back to "
                     f"{param.config_key}.")
@@ -586,7 +799,9 @@ class Sweep:
         def say(text):
             print(f"[sweep] {text}", file=sys.stderr)
 
-        say(f"engine {self.exe} (md5 {self.exe_md5})")
+        engine = self.exe_or_none
+        say(f"engine {engine} (md5 {self.exe_md5})" if engine
+            else "engine not resolved (nothing has been launched)")
         for name, values in self.axes.items():
             param = NAMED_PARAMETERS.get(name)
             if param is None:
@@ -736,6 +951,12 @@ class Sweep:
         are on disk; anything else is re-run, and the reason is printed.
         """
         jobs = max(1, int(jobs))
+        # Resolve the engine and the route before anything is written, so a
+        # missing binary is one clear error rather than a half-built sweep
+        # directory. A dry run is analysis and needs neither.
+        if not dry_run:
+            _ = self.exe
+        _ = self.route
         self.outdir.mkdir(parents=True, exist_ok=True)
         self._write_manifest()
 
@@ -753,6 +974,10 @@ class Sweep:
                     print(f"[sweep] rerun {point.name}: {why}", file=sys.stderr)
 
         if dry_run:
+            if self.exe_or_none is None and not self.quiet:
+                print("[sweep] no engine resolved: the commands below name "
+                      "'ptm_thermal_sim' where the resolved path would go",
+                      file=sys.stderr)
             for point in todo:
                 print(" ".join(point.command()))
             return {"planned": len(todo), "skipped": len(skipped),
@@ -807,7 +1032,7 @@ class Sweep:
             "label_axes": sorted(self.label_axes),
             "derived_keys": sorted(self.derived),
             "route": dict(self.route),
-            "engine": str(self.exe),
+            "engine": str(self.exe_or_none) if self.exe_or_none else None,
             "engine_md5": self.exe_md5,
             "engine_args": list(self.engine_args),
             "working_dir": str(self.workdir) if self.workdir else None,
@@ -999,10 +1224,12 @@ class Sweep:
 def load_sweep(outdir, **overrides):
     """Rebuild a :class:`Sweep` from the ``sweep.json`` in ``outdir``.
 
-    Reading a finished sweep should not require retyping the grid. The engine
-    is still resolved (a sweep is a runnable object), and every field in the
-    manifest can be overridden by keyword -- ``exe=`` in particular, when the
-    binary that produced the sweep has since been rebuilt or moved.
+    Reading a finished sweep should not require retyping the grid, and it does
+    not require an engine either: the manifest records the route each axis
+    took, so nothing here has to ask a binary what flags it has. Every field
+    can be overridden by keyword -- ``exe=`` in particular, when the binary
+    that produced the sweep has been rebuilt or moved, and ``route=None`` to
+    force re-detection against whatever engine resolves now.
     """
     outdir = Path(outdir).expanduser().resolve()
     manifest_path = outdir / _MANIFEST
@@ -1020,18 +1247,17 @@ def load_sweep(outdir, **overrides):
         workdir=manifest.get("working_dir"),
         engine_args=manifest.get("engine_args", ()),
         timeout=manifest.get("timeout_seconds"),
-        # The route is a property of the engine, and the manifest records what
-        # it was. Re-detecting is right when the engine is the same binary and
-        # wrong when it is not, so the recorded route is the default and a
-        # caller who rebuilt passes use_flags='auto' explicitly.
-        use_flags=any(v == "flag" for v in manifest.get("route", {}).values()),
+        route=manifest.get("route") or None,
         quiet=True,
     )
     kwargs.update(overrides)
     sweep = Sweep(**kwargs)
     recorded_md5 = manifest.get("engine_md5")
-    if recorded_md5 and recorded_md5 != sweep.exe_md5:
-        print(f"[sweep] the engine at {sweep.exe} (md5 {sweep.exe_md5}) is not "
-              f"the one that produced this sweep (md5 {recorded_md5})",
-              file=sys.stderr)
+    # Only when an engine is actually there: reading a finished sweep on a
+    # machine with no build is normal, and is not a provenance mismatch.
+    if recorded_md5 and sweep.exe_or_none is not None \
+            and recorded_md5 != sweep.exe_md5:
+        print(f"[sweep] the engine at {sweep.exe_or_none} (md5 "
+              f"{sweep.exe_md5}) is not the one that produced this sweep "
+              f"(md5 {recorded_md5})", file=sys.stderr)
     return sweep

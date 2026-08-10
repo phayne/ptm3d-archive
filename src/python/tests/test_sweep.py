@@ -146,47 +146,52 @@ def _one_point_config_and_argv(sweep):
     return point.config(), point.command()
 
 
+NEW_FLAGS = ("--thermal-inertia", "--constant-thermal-inertia", "--albedo")
+
+
 def test_config_route_when_the_flag_is_absent(tmp):
     base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
-    sweep = Sweep(base, grid={"thermal_inertia": [50.0, 200.0]},
+    sweep = Sweep(base, grid={"constant_thermal_inertia": [50.0, 200.0]},
                   outdir=tmp / "sweep_cfg", exe=write_stub(tmp / "old.py"),
                   workdir=tmp, quiet=True)
-    assert sweep.route["thermal_inertia"] == "config"
+    assert sweep.route["constant_thermal_inertia"] == "config"
     config, argv = _one_point_config_and_argv(sweep)
-    key = NAMED_PARAMETERS["thermal_inertia"].config_key
+    key = NAMED_PARAMETERS["constant_thermal_inertia"].config_key
     assert get_dotted(config, key) == 50.0, (
         f"the config route must set {key}")
-    assert "--thermal-inertia" not in argv
+    assert "--constant-thermal-inertia" not in argv
 
 
 def test_flag_route_when_the_engine_has_it(tmp):
     base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
-    sweep = Sweep(base, grid={"thermal_inertia": [50.0, 200.0]},
+    sweep = Sweep(base, grid={"constant_thermal_inertia": [50.0, 200.0]},
                   outdir=tmp / "sweep_flag",
-                  exe=write_stub(tmp / "new.py",
-                                 extra_flags=("--thermal-inertia", "--albedo")),
+                  exe=write_stub(tmp / "new.py", extra_flags=NEW_FLAGS),
                   workdir=tmp, quiet=True)
-    assert sweep.route["thermal_inertia"] == "flag"
+    assert sweep.route["constant_thermal_inertia"] == "flag"
     config, argv = _one_point_config_and_argv(sweep)
-    key = NAMED_PARAMETERS["thermal_inertia"].config_key
+    key = NAMED_PARAMETERS["constant_thermal_inertia"].config_key
     assert get_dotted(config, key) is None, (
         "with the flag in use the config key must NOT also be written: two "
         "sources for one quantity is how they drift apart")
-    assert "--thermal-inertia" in argv
-    assert argv[argv.index("--thermal-inertia") + 1].startswith("50")
+    assert "--constant-thermal-inertia" in argv
+    assert argv[argv.index("--constant-thermal-inertia") + 1].startswith("50")
 
 
 def test_the_parameter_is_delivered_exactly_once(tmp):
     """Whichever route is taken, the value appears once. Never both, never none."""
     base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
-    for name, extra in (("old", ()), ("new", ("--thermal-inertia", "--albedo"))):
-        sweep = Sweep(base, grid={"thermal_inertia": [123.0], "albedo": [0.2]},
+    for name, extra in (("old", ()), ("new", NEW_FLAGS)):
+        sweep = Sweep(base,
+                      grid={"constant_thermal_inertia": [123.0],
+                            "albedo": [0.2]},
                       outdir=tmp / f"sweep_once_{name}",
                       exe=write_stub(tmp / f"engine_{name}.py",
                                      extra_flags=extra),
                       workdir=tmp, quiet=True)
         config, argv = _one_point_config_and_argv(sweep)
-        for param, value in (("thermal_inertia", 123.0), ("albedo", 0.2)):
+        for param, value in (("constant_thermal_inertia", 123.0),
+                             ("albedo", 0.2)):
             spec = NAMED_PARAMETERS[param]
             in_config = get_dotted(config, spec.config_key) is not None
             in_argv = spec.flag in argv
@@ -194,13 +199,66 @@ def test_the_parameter_is_delivered_exactly_once(tmp):
                 f"{param} on the {name} engine: in_config={in_config}, "
                 f"in_argv={in_argv} -- it must be exactly one")
 
+    # thermal_inertia has no config key at all, so on the new engine it is the
+    # flag and nothing else.
+    sweep = Sweep(base, grid={"thermal_inertia": [123.0]},
+                  outdir=tmp / "sweep_once_ti",
+                  exe=write_stub(tmp / "engine_ti.py", extra_flags=NEW_FLAGS),
+                  workdir=tmp, quiet=True)
+    config, argv = _one_point_config_and_argv(sweep)
+    assert "--thermal-inertia" in argv
+    assert get_dotted(config, "thermophysical.constant_thermal_inertia") is None
+    assert get_dotted(config, "thermophysical.ks_override") is None, (
+        "the wrapper must not compute ks itself -- the engine does that")
+
+
+def test_thermal_inertia_refuses_rather_than_switching_convention(tmp):
+    """The 3a contract: --thermal-inertia is ks-scaling, constant_thermal_inertia
+    is cp-solving, and they differ by ~3 K. An engine without the flag must get
+    an error, never the other convention wearing the same name."""
+    base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
+    old = write_stub(tmp / "old_ti.py")
+    for kwargs, why in (({}, "an engine without the flag"),
+                        ({"use_flags": False}, "use_flags=False")):
+        sweep = Sweep(base, grid={"thermal_inertia": [50.0]},
+                      outdir=tmp / "sweep_ti_refuse", exe=old, workdir=tmp,
+                      quiet=True, **kwargs)
+        try:
+            sweep.route
+        except (RuntimeError, FileNotFoundError) as exc:
+            text = str(exc)
+            assert "constant_thermal_inertia" in text, (
+                f"{why}: the error must name the alternative")
+            assert "NOT THE SAME PHYSICS" in text, (
+                f"{why}: the error must say the two conventions differ")
+        else:
+            raise AssertionError(
+                f"{why}: thermal_inertia must not silently fall back to "
+                f"thermophysical.constant_thermal_inertia -- that is a "
+                f"different column (39.27 K vs 42.19 K at TI=200)")
+
+
+def test_the_two_thermal_inertia_conventions_cannot_both_be_swept(tmp):
+    base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
+    try:
+        Sweep(base, grid={"thermal_inertia": [50.0],
+                          "constant_thermal_inertia": [50.0]},
+              outdir=tmp / "sweep_both",
+              exe=write_stub(tmp / "both.py", extra_flags=NEW_FLAGS),
+              workdir=tmp, quiet=True)
+    except ValueError as exc:
+        assert "two conventions" in str(exc)
+    else:
+        raise AssertionError("the engine refuses both; so must this")
+
 
 def test_requiring_an_absent_flag_is_an_error(tmp):
     base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
+    sweep = Sweep(base, grid={"albedo": [0.1]}, outdir=tmp / "sweep_req",
+                  exe=write_stub(tmp / "old2.py"), workdir=tmp,
+                  use_flags=True, quiet=True)
     try:
-        Sweep(base, grid={"albedo": [0.1]}, outdir=tmp / "sweep_req",
-              exe=write_stub(tmp / "old2.py"), workdir=tmp,
-              use_flags=True, quiet=True)
+        sweep.route
     except RuntimeError as exc:
         assert "--albedo" in str(exc)
     else:
@@ -430,6 +488,100 @@ def test_provenance_is_recorded_with_the_point(tmp):
     assert marker["params"] == {"albedo": 0.1}
 
 
+# --- 5b. no engine present ------------------------------------------------------------
+# The python-layer CI job never builds the engine, and neither does a colleague
+# who was handed a results directory. Everything that is analysis must work
+# without one; only launching may demand it.
+
+class _NoEngine:
+    """Make ptm.paths.find_engine_executable find nothing, as on a fresh clone."""
+
+    def __enter__(self):
+        from ptm import paths
+        self._paths, self._real = paths, paths.find_engine_executable
+        paths.find_engine_executable = lambda *a, **k: None
+        return self
+
+    def __exit__(self, *exc):
+        self._paths.find_engine_executable = self._real
+        return False
+
+
+def test_a_sweep_is_usable_with_no_engine_at_all(tmp):
+    base = write_base_config(tmp / "cfg" / "base.yaml", tmp / "out")
+    with _NoEngine():
+        sweep = Sweep(base,
+                      grid={"thermal.equilibration_orbits": [1.0, 5.0, 9.0]},
+                      outdir=tmp / "sweep_noengine", workdir=tmp, quiet=True)
+        assert sweep.exe_or_none is None
+        assert len(sweep) == 3
+
+        # --list: the status of every point, with its reason.
+        assert [p.completeness()[0] for p in sweep] == [False] * 3
+
+        # the generated configs, and the route
+        assert sweep.route == {"thermal.equilibration_orbits": "config"}
+        assert get_dotted(sweep.points[1].config(),
+                          "thermal.equilibration_orbits") == 5.0
+
+        # --dry-run
+        summary = sweep.run(dry_run=True)
+        assert summary["planned"] == 3 and summary["dry_run"]
+        assert sweep.points[0].command()[0] == "ptm_thermal_sim"
+
+        # and launching is the one thing that fails, with a message that says
+        # reading does not need one.
+        try:
+            sweep.run()
+        except FileNotFoundError as exc:
+            assert "PTM_BUILD_DIR" in str(exc) and "load_sweep" in str(exc)
+        else:
+            raise AssertionError("run() must demand an engine")
+
+
+def test_a_finished_sweep_is_readable_with_no_engine(tmp):
+    """Analysis of results that already exist must never need a binary."""
+    sweep, _ = _run_sweep(tmp, "sweep_read")
+    (tmp / "sweep_read_engine.py").unlink()      # the binary is gone
+    with _NoEngine():
+        reopened = load_sweep(sweep.outdir)
+        assert reopened.exe_or_none is None
+        assert len(reopened.completed()) == 3
+        assert np.allclose(reopened.values("albedo"), [0.1, 0.2, 0.3])
+        rows = reopened.table(
+            tmax=lambda r: float(r.stat("temperature", "max").max()))
+        assert len(rows) == 3
+        assert reopened.grid_of(
+            lambda r: float(r.stat("temperature", "max").max())).shape == (3,)
+        reopened.write_table(tmp / "read.csv")
+        assert (tmp / "read.csv").exists()
+
+        import matplotlib
+        matplotlib.use("Agg")
+        reopened.plot_curves(
+            of=lambda r: r.series("temperature", lat=0.0, lon=0.0),
+            save=tmp / "read.png")
+        assert (tmp / "read.png").exists()
+
+
+def test_a_finished_flag_route_sweep_reopens_without_asking_the_engine(tmp):
+    """The manifest records the route, so reopening never re-detects."""
+    base = write_base_config(tmp / "cfg" / "flagged.yaml", tmp / "out")
+    sweep = Sweep(base, grid={"thermal_inertia": [50.0, 200.0]},
+                  outdir=tmp / "sweep_flagged",
+                  exe=write_stub(tmp / "flagged_engine.py",
+                                 extra_flags=NEW_FLAGS),
+                  workdir=tmp, quiet=True)
+    sweep.run()
+    (tmp / "flagged_engine.py").unlink()
+    with _NoEngine():
+        reopened = load_sweep(sweep.outdir)
+        # thermal_inertia is flag-only: without the recorded route this would
+        # raise, because there is no engine to ask and no config fallback.
+        assert reopened.route == {"thermal_inertia": "flag"}
+        assert len(reopened.completed()) == 2
+
+
 # --- 6. parallelism is opt-in and CPU-only ------------------------------------------
 
 def test_parallel_refuses_a_gpu_config(tmp):
@@ -589,6 +741,8 @@ TESTS = [
     test_config_route_when_the_flag_is_absent,
     test_flag_route_when_the_engine_has_it,
     test_the_parameter_is_delivered_exactly_once,
+    test_thermal_inertia_refuses_rather_than_switching_convention,
+    test_the_two_thermal_inertia_conventions_cannot_both_be_swept,
     test_requiring_an_absent_flag_is_an_error,
     test_generated_config_lands_beside_its_outputs,
     test_view_factor_path_is_anchored_to_the_base_config,
@@ -607,6 +761,9 @@ TESTS = [
     test_dry_run_launches_nothing,
     test_the_manifest_round_trips,
     test_provenance_is_recorded_with_the_point,
+    test_a_sweep_is_usable_with_no_engine_at_all,
+    test_a_finished_sweep_is_readable_with_no_engine,
+    test_a_finished_flag_route_sweep_reopens_without_asking_the_engine,
     test_parallel_refuses_a_gpu_config,
     test_parallel_runs_a_cpu_sweep,
     test_depth_series_round_trips,
