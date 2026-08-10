@@ -451,7 +451,7 @@ class PyVistaWidget(QWidget):
         """Load a specific data field for a timestep, or a per-face annual
         statistic (in which case timestep_index is ignored).
 
-        Statistics are recognised by trailing _max/_avg/_min and live in
+        Statistics are recognized by trailing _max/_avg/_min and live in
         <results>/statistics/<field_name>.bin (single file, no timestep).
         """
         # Statistics path: single file, no timestep index
@@ -1017,14 +1017,14 @@ class PyVistaWidget(QWidget):
             return
 
         # Local tangent frame at the mesh centroid (which sits roughly
-        # on the body sphere, so centroid normalised = local up).
+        # on the body sphere, so centroid normalized = local up).
         try:
             centroid = np.asarray(self.mesh.center, dtype=float)
         except Exception:
             return
         r = np.linalg.norm(centroid)
         if r < 1.0:
-            # Mesh centred at body origin — fall back to global +z up.
+            # Mesh centered at body origin — fall back to global +z up.
             up = np.array([0.0, 0.0, 1.0])
             centroid = up * 1.0
         else:
@@ -2462,11 +2462,11 @@ class ExportDataDialog(QDialog):
         return self.body_radius
 
     def _meters_per_degree(self):
-        """Great-circle metres per degree at the body's surface."""
+        """Great-circle meters per degree at the body's surface."""
         return self._get_body_radius() * np.radians(1.0)
 
     def _spin_value_to_degrees(self, value):
-        """Convert the current spinbox value to degrees, honouring the unit
+        """Convert the current spinbox value to degrees, honoring the unit
         combo. The regridder always works in degrees."""
         unit = self.resolution_unit_combo.currentText()
         if unit == "m/px":
@@ -2765,7 +2765,7 @@ class VisualizationPanel(QWidget):
     # Known field directories and their display labels.
     # Per-timestep series (loaded from <results>/<key>/<key>_NNNN.bin)
     # plus statistics rasters (loaded from <results>/statistics/<key>.bin
-    # — single file each, no timestep index). Statistics keys are recognised
+    # — single file each, no timestep index). Statistics keys are recognized
     # by the trailing _max / _avg / _min / a leading 'ice_depth_' suffix.
     # Curated set of matplotlib colormaps for the toolbar Colormap dropdown.
     # Order: perceptually-uniform sequential first, then classic sequentials,
@@ -2784,7 +2784,7 @@ class VisualizationPanel(QWidget):
         'coolwarm', 'bwr', 'seismic', 'RdBu_r', 'RdYlBu_r', 'PiYG',
         # cyclic
         'twilight', 'twilight_shifted', 'hsv',
-        # terrain-flavoured
+        # terrain-flavored
         'terrain', 'gist_earth', 'ocean', 'cubehelix',
     ]
 
@@ -3389,7 +3389,7 @@ class VisualizationPanel(QWidget):
         progress.close()
 
         if was_cancelled:
-            QMessageBox.information(self, "Cancelled", "Animation export was cancelled.")
+            QMessageBox.information(self, "Canceled", "Animation export was canceled.")
             # Try to delete partial file
             try:
                 Path(filename).unlink(missing_ok=True)

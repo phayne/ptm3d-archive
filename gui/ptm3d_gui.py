@@ -992,7 +992,7 @@ class PTM3DMainWindow(QMainWindow):
             self.field_combo.setCurrentIndex(default_idx)
 
         self.field_combo.blockSignals(False)
-        # Trigger one synthesise change so the viz panel applies the default
+        # Trigger one synthesize change so the viz panel applies the default
         if self.field_combo.isEnabled():
             self.on_field_changed(self.field_combo.currentIndex())
 

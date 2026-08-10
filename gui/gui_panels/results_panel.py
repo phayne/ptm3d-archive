@@ -388,7 +388,7 @@ class ResultsPanel(QWidget):
         lines.append(f"Modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # If this is a per-face binary (PTM3D writeStatisticsBinary or
-        # writeBinaryData), read it and summarise. Format: uint32 N + N×float32.
+        # writeBinaryData), read it and summarize. Format: uint32 N + N×float32.
         if file_path.suffix == ".bin" and file_path.stat().st_size > 4:
             try:
                 import struct
