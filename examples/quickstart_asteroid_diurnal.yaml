@@ -27,12 +27,19 @@
 # infrared-bright, which is why radiometry works on them at all.
 #
 # Spin choice: period_hours=5.0 ("a few hours", typical for a small,
-# fast-rotating NEA/main-belt fragment) with pole_dec_deg=90 (spin axis normal
-# to the reference frame => zero obliquity). Zero obliquity means the
-# sub-solar latitude is pinned at the equator regardless of orbital phase, so
-# the ONLY time-dependence at this orbit-frozen timescale is the diurnal
-# (rotational) cycle — the point of this tutorial is to isolate that signal
-# cleanly. A nonzero-obliquity, non-circular-orbit variant is Exercise 3/4.
+# fast-rotating NEA/main-belt fragment) with pole_dec_deg=90, which puts the
+# spin axis along the equatorial-frame +Z. That is NOT zero obliquity: the
+# orbit is given by elements referred to a frame tilted from the equatorial
+# one, leaving an effective obliquity near 23 deg. Measured over this run, the
+# sub-solar latitude is a constant -23.0 deg — so the north pole is in
+# permanent darkness and the south pole in permanent daylight, the asymmetry
+# visible in the notebook's first globes. What the geometry does deliver is a
+# CONSTANT sub-solar latitude, so the only time dependence at this
+# orbit-frozen timescale is still the diurnal (rotational) cycle, which is the
+# signal this tutorial isolates. Because the poles are a permanent-shadow /
+# permanent-daylight edge case, the notebook compares an equatorial band
+# rather than whole-body extrema. A sub-solar latitude that MOVES needs an
+# eccentric orbit and a long window; that is Exercise 3.
 #
 # Thermophysical choice: this is the tutorial's main teaching point. Thermal
 # inertia TI = sqrt(k * rho * cp) [SI: J m^-2 K^-1 s^-1/2] controls how much a
@@ -120,7 +127,8 @@ generic_body:
   spin:
     period_hours: 5.0
     pole_ra_deg: 0.0
-    pole_dec_deg: 90.0                 # zero obliquity (see header note)
+    pole_dec_deg: 90.0                 # spin axis along equatorial +Z; the effective
+                                        # obliquity is ~23 deg, NOT zero (see header)
     prime_meridian_deg: 0.0
   surface:
     albedo: 0.05                       # dark, C-type-like
