@@ -27,6 +27,7 @@ directory that composes these functions with the readers in ``ptm.readers``.
 
 import hashlib
 import struct
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -929,6 +930,68 @@ class Results:
     def elapsed_hours(self):
         return self.times().elapsed_s / 3600.0
 
+    def depth_locations(self):
+        """The named locations for which a depth profile was written."""
+        directory = self.path / "locations"
+        if not directory.is_dir():
+            return ()
+        return tuple(sorted(p.stem[:-len("_depths")]
+                            for p in directory.glob("*_depths.csv")))
+
+    def depth_series(self, location=None, window='output'):
+        """A subsurface temperature profile as a
+        :class:`ptm.readers.DepthSeries`.
+
+        Written only when the config sets ``output.locations_file`` and
+        ``output.depths_file``. ``location=None`` is allowed when the run wrote
+        exactly one; otherwise the name is required, rather than picking one.
+
+        ``window='output'`` (the default) returns the rows that correspond to
+        this run's own ``time_steps.txt``, which is what every other product
+        this class exposes covers. The file itself also contains the
+        **equilibration** period -- on ``quickstart_europa_diurnal`` with
+        ``equilibration_orbits: 20`` that is 3,840 of its 4,032 rows -- and
+        pairing the raw file against the 192-row time axis silently misaligns
+        by twenty orbits. The trim is done by matching the UTC labels, and it
+        raises rather than guesses if they do not line up.
+        ``window='all'`` returns the file as written, equilibration included.
+        """
+        if window not in ('output', 'all'):
+            raise ValueError("window must be 'output' or 'all', got "
+                             f"{window!r}")
+        available = self.depth_locations()
+        if not available:
+            raise FileNotFoundError(
+                f"{self.path} has no locations/*_depths.csv; the run needs "
+                f"output.locations_file and output.depths_file set")
+        if location is None:
+            if len(available) > 1:
+                raise ValueError(
+                    f"this run wrote {len(available)} depth profiles "
+                    f"({', '.join(available)}); name one")
+            location = available[0]
+        path = self.path / "locations" / f"{location}_depths.csv"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{path} not found; this run wrote {available}")
+        series = readers.read_depth_series(path)
+        if window == 'all':
+            return series
+
+        wanted = list(self.times().utc)
+        n = len(wanted)
+        if len(series.utc) == n and list(series.utc) == wanted:
+            return series
+        if len(series.utc) < n or list(series.utc[-n:]) != wanted:
+            raise ValueError(
+                f"{path}: its {len(series.utc)} rows do not end with the "
+                f"{n} UTC labels in time_steps.txt, so the output window "
+                f"cannot be identified. Pass window='all' to take the file as "
+                f"written.")
+        return series._replace(utc=series.utc[-n:],
+                               temperature=series.temperature[-n:],
+                               n_equilibration=len(series.utc) - n)
+
     def body_positions(self):
         """``body_positions.csv`` as a structured array (see readers)."""
         if self._positions is None:
@@ -1010,22 +1073,96 @@ class Results:
         faces = np.asarray(faces)
         return np.stack([self.field(field, s)[faces] for s in steps])
 
+    @staticmethod
+    def _rotations_in(stack):
+        """Rotations spanned by an ``(n_steps, n_faces)`` insolation block.
+
+        Counted per face and then taken as a median, NOT from the band mean:
+        the band holds every longitude, so at any instant about half of it is
+        lit and its mean is nearly flat -- on the asteroid quickstart that flat
+        series' numerical wobble counted as 4 rotations in a window holding 2.
+        A maximum counts only if it clears a tenth of that face's own range, so
+        numerical wobble on a flat night side is not a sunrise.
+        """
+        if stack.shape[0] < 3:
+            return 1
+        lo = stack.min(axis=0)
+        span = stack.max(axis=0) - lo
+        usable = span > 0
+        if not np.any(usable):
+            return 1
+        values = stack[:, usable]
+        floor = (lo[usable] + 0.1 * span[usable])[None, :]
+        interior = values[1:-1]
+        peaks = ((interior > values[:-2]) & (interior >= values[2:])
+                 & (interior > floor)).sum(axis=0)
+        return max(1, int(round(float(np.median(peaks)))))
+
+    def _band(self, lat_max):
+        band = self.faces_in_band(-abs(lat_max), abs(lat_max))
+        if band.size == 0:
+            raise ValueError(f"no faces within +/-{lat_max} deg of the equator")
+        return band
+
+    def n_rotations(self, noon_field='direct_solar', steps=None, lat_max=10.0):
+        """How many rotations the given output steps span, from the flux.
+
+        One maximum of the insolation per solar day. Geometry, not physics: it
+        is here because :meth:`local_solar_time_curve` folds onto a 24-hour
+        axis and needs to know whether it is being handed one rotation or
+        several.
+        """
+        if steps is None:
+            steps = self.steps(noon_field)
+        return self._rotations_in(
+            self.stack(noon_field, steps, faces=self._band(lat_max)))
+
+    def rotation_steps(self, which=-1, field='temperature',
+                       noon_field='direct_solar'):
+        """The output steps belonging to one rotation. ``which=-1`` is the last.
+
+        The asteroid quickstart writes two rotations -- one to look at, one to
+        confirm periodicity -- and the settled one is the second.
+        """
+        steps = list(self.steps(field))
+        count = self.n_rotations(noon_field=noon_field)
+        if count <= 1:
+            return steps
+        per = len(steps) // count
+        index = which % count
+        return steps[index * per:(index + 1) * per]
+
     def local_solar_time_curve(self, field='temperature', lat_max=10.0,
                                n_bins=48, steps=None,
                                noon_field='direct_solar'):
         """Noon-referenced diurnal curve over a latitude band.
 
         Returns ``(local_solar_time_hours, mean, p25, p75, n_faces_used)``.
-        ``steps=None`` uses every output step; the asteroid notebooks pass the
-        second of two rotations, and that choice stays with the caller.
+
+        The binning maps the steps it is given onto a single 24-hour axis, so
+        handing it *two* rotations draws two cycles on that axis -- a plausible
+        figure of a quantity nobody asked for. ``steps=None`` still means every
+        output step, but the rotation count is now measured
+        (:meth:`n_rotations`) and a multi-rotation window says so instead of
+        folding quietly. Pass ``steps=run.rotation_steps()`` for the last one.
         """
+        check_rotations = steps is None
         if steps is None:
             steps = self.steps(field)
-        band = self.faces_in_band(-abs(lat_max), abs(lat_max))
-        if band.size == 0:
-            raise ValueError(f"no faces within +/-{lat_max} deg of the equator")
+        band = self._band(lat_max)
         values = self.stack(field, steps, faces=band)
+        # One read of the reference block, used for both the rotation check and
+        # the binning: on a 140k-face core these are the expensive lines.
         reference = self.stack(noon_field, steps, faces=band)
+        if check_rotations:
+            count = self._rotations_in(reference)
+            if count > 1:
+                warnings.warn(
+                    f"this window spans about {count} rotations and every step "
+                    f"is being folded onto one 24-hour axis, which draws "
+                    f"{count} cycles. Pass steps=run.rotation_steps() for the "
+                    f"last rotation, or steps=... for the ones you want.",
+                    stacklevel=2)
         centers, mean, p25, p75 = readers.local_solar_time_bins(
             values, reference, n_bins=n_bins)
         return centers, mean, p25, p75, int(band.size)
