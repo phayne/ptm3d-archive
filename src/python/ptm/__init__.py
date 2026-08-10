@@ -8,8 +8,13 @@ launches it.
 
 The short version::
 
-    from ptm import Results
-    run = Results("output/quickstart_moon_diurnal")
+    from ptm import paths, Results
+    from ptm import run as engine
+
+    paths.preflight(["examples/quickstart_moon_diurnal.yaml"],
+                    engine="ptm_thermal_sim").raise_if_missing()
+    done = engine.run_engine("examples/quickstart_moon_diurnal.yaml", echo=True)
+    run = done.results()
     run.plot_globes("temperature", "max", save="globes.png")
 
 or, for a grid of runs::
@@ -34,20 +39,30 @@ Modules
                        binary, nearest-face selection, the mesh length unit
 ``ptm.sweep``          a base config plus a grid: :class:`~ptm.sweep.Sweep`,
                        resumable, provenance-recording, serial by default
-``ptm.plots``          the orthographic globe renderer, the flux-linear colour
-                       scale, four canned figures and two sweep figures
+``ptm.plots``          the orthographic globe renderer and the shape-model
+                       renderer, the flux-linear colour scale, the comparison
+                       grid, five canned figures and two sweep figures
 ``ptm.cli``            the ``ptm`` command
-``ptm.run``            launching the engine: executable discovery, engine-flag
-                       detection, the output severity classifier, the CPU-clock
-                       stall watchdog, process-group teardown
-``ptm.paths``          repository and executable location
+``ptm.run``            launching the engine: :func:`~ptm.run.run_engine` and
+                       the callback-shaped ``EngineProcess`` under it, plus
+                       executable discovery, engine-flag detection, the output
+                       severity classifier, the CPU-clock stall watchdog,
+                       process-group teardown, and
+                       :func:`~ptm.run.binary_provenance`
+``ptm.paths``          repository and executable location, and
+                       :func:`~ptm.paths.preflight`
 ``ptm.engine_config``  the config keys and defaults the engine actually reads,
                        derived from ``src/cpp/tools/config_parser.{h,cpp}``
+
+Two further packages ship with this distribution and are importable the same
+way: ``damit`` (DAMIT shape search and conversion) and ``horizons`` (the JPL
+HORIZONS client, SPK generator and body-config writer). They are the small-body
+preset half of the workflow.
 
 Install with ``pip install -e .`` from the repository root.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = ["Results", "Sweep", "__version__", "cli", "engine_config", "paths",
            "plots", "readers", "results", "run", "sweep"]

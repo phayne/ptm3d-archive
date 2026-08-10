@@ -32,6 +32,7 @@ import numpy as np
 __all__ = [
     "clip_extend",
     "colorbar",
+    "default_norm",
     "face_unit_vectors",
     "flux_norm",
     "globe",
@@ -131,6 +132,30 @@ def _flux_by_default(what, moment='max', step=None):
     if not isinstance(what, str) or not what.startswith("temperature"):
         return False
     return step is None and moment == 'max'
+
+
+def default_norm(values, what, moment='max', step=None, flux_scaled=None,
+                 norm=None):
+    """The colour scale for a request, unless the caller already chose one.
+
+    ``norm`` wins if given; then an explicit ``flux_scaled``; then
+    :func:`_flux_by_default`. Every canned plot that colours a per-face field
+    resolves its scale here, so ``plot_map``, ``plot_globes``,
+    :func:`globe_grid` and ``plot_shape`` cannot drift apart about what a
+    temperature snapshot should look like.
+    """
+    if norm is not None:
+        return norm
+    if flux_scaled is None:
+        flux_scaled = _flux_by_default(what, moment, step)
+    values = np.asarray(values)
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return None
+    if flux_scaled:
+        return flux_norm(finite)
+    from matplotlib.colors import Normalize
+    return Normalize(float(finite.min()), float(finite.max()))
 
 
 def sym_norm(values, pct=99.0):
@@ -477,8 +502,8 @@ def colorbar(fig, artist, ax, label="", values=None, norm=None, **kwargs):
     return bar
 
 
-#: The project's panel label, re-exported so a figure composed from this module
-#: does not need a second import to letter its panels.
+# Forwarded rather than imported at module level: ptm.pubstyle imports
+# matplotlib on import, and this module deliberately does not.
 def panel_label(ax, label, x=0.02, y=0.97, **kwargs):
     """Place a panel label like ``'(a)'`` in the top-left corner of ``ax``.
 
@@ -599,16 +624,9 @@ def _row_values(run, row, n_views):
 
 def _row_norm(row, stacked):
     """One norm per row, so every panel in it is on the same colour scale."""
-    if row.get("norm") is not None:
-        return row["norm"]
-    flux_scaled = row.get("flux_scaled")
-    if flux_scaled is None:
-        flux_scaled = _flux_by_default(row.get("what"), row.get("moment", "max"),
-                                       row.get("step"))
-    if flux_scaled:
-        return flux_norm(stacked)
-    from matplotlib.colors import Normalize
-    return Normalize(float(np.min(stacked)), float(np.max(stacked)))
+    return default_norm(stacked, row.get("what"), row.get("moment", "max"),
+                        row.get("step"), row.get("flux_scaled"),
+                        row.get("norm"))
 
 
 def globe_grid(run, rows, views=None, save=None, show=False, figsize=None,
@@ -774,12 +792,9 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
     axis_label = label or axis_label
     grid, regridder = run.to_grid(values, resolution=resolution, linear=linear)
 
-    if norm is None:
-        if flux_scaled is None:
-            flux_scaled = _flux_by_default(what, moment, step)
-        finite = grid[np.isfinite(grid)]
-        norm = (flux_norm(finite) if flux_scaled and finite.size
-                else None)
+    # A regridded map is masked outside the mesh's hull, so the scale comes
+    # from the finite pixels -- which is what default_norm() looks at.
+    norm = default_norm(grid, what, moment, step, flux_scaled, norm)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W,
@@ -876,12 +891,7 @@ def plot_shape(run, what='temperature', moment='max', step=None, views=None,
     if axes_off is None:
         axes_off = len(views) > 1
 
-    if norm is None:
-        if flux_scaled is None:
-            flux_scaled = _flux_by_default(what, moment, step)
-        from matplotlib.colors import Normalize
-        norm = (flux_norm(values) if flux_scaled
-                else Normalize(float(values.min()), float(values.max())))
+    norm = default_norm(values, what, moment, step, flux_scaled, norm)
 
     if ax is None:
         if figsize is None:

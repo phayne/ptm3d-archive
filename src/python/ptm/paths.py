@@ -137,26 +137,40 @@ _BUILD_REMEDY = (
 _EUROPA_KERNELS = ("spk/jup365.bsp", "europa.tm")
 
 
+_MANIFEST_CACHE = {}
+
+
 def _dataset_remedies(root):
     """``{repo-relative directory: dataset name}`` from ``data_manifest.json``.
 
     Read from the manifest rather than hard-coded, so a new dataset gets a
-    correct remedy without anyone remembering to update a table here.
+    correct remedy without anyone remembering to update a table here. Cached on
+    the manifest's identity, because a preflight of a dozen paths would
+    otherwise re-read and re-parse the same file a dozen times.
     """
-    out = {}
     manifest = Path(root) / "data" / "data_manifest.json" if root else None
     if manifest is None or not manifest.is_file():
-        return out
+        return {}
+    try:
+        stat = manifest.stat()
+        key = (str(manifest), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return {}
+    if key in _MANIFEST_CACHE:
+        return _MANIFEST_CACHE[key]
+
+    out = {}
     try:
         import json
         datasets = json.loads(manifest.read_text()).get("datasets", {})
     except (OSError, ValueError):
-        return out
+        return {}
     for name, spec in datasets.items():
         for entry in spec.get("files", []):
             target = (entry.get("unpack_to") or "").strip("/")
             if target:
                 out[target] = name
+    _MANIFEST_CACHE[key] = out
     return out
 
 

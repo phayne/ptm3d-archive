@@ -58,6 +58,7 @@ __all__ = [
     "engine_flags",
     "engine_supports_flag",
     "extract_progress",
+    "file_md5",
     "find_engine_executable",
     "resolve_engine",
     "run_engine",
@@ -537,6 +538,7 @@ class _Throttle:
 
 def _resolve_output_dir(config_dict, cwd, extra_args):
     """Where the engine will write, or ``None`` if nothing says."""
+    from .engine_config import get_dotted
     directory = None
     args = [str(a) for a in extra_args]
     for i, arg in enumerate(args):
@@ -545,7 +547,7 @@ def _resolve_output_dir(config_dict, cwd, extra_args):
         elif arg.startswith("--output="):
             directory = arg.split("=", 1)[1]
     if directory is None:
-        directory = (config_dict or {}).get("output", {}).get("directory")
+        directory = get_dotted(config_dict or {}, "output.directory")
     if not directory:
         return None
     path = Path(directory).expanduser()
@@ -567,7 +569,7 @@ def _load_config(config):
         return {}
     try:
         loaded = yaml.safe_load(Path(config).read_text())
-    except (OSError, Exception) as exc:                        # noqa: BLE001
+    except Exception as exc:                                   # noqa: BLE001
         sys.stderr.write(
             f"[ptm] could not read {config} as YAML ({exc}); launching anyway "
             f"and letting the engine judge it. output_dir will be unknown.\n")
@@ -640,6 +642,11 @@ class BinaryProvenance:
                  "unavailable")
 
     def __init__(self, **fields):
+        unknown = set(fields) - set(self.__slots__)
+        if unknown:
+            # A typo'd keyword would otherwise land nowhere and leave the field
+            # it was meant for reading None, i.e. "not determined".
+            raise TypeError(f"unknown BinaryProvenance field(s): {sorted(unknown)}")
         for name in self.__slots__:
             setattr(self, name, fields.get(name))
         self.unavailable = tuple(fields.get("unavailable", ()))
@@ -663,6 +670,21 @@ class BinaryProvenance:
 
     def as_dict(self):
         return {name: getattr(self, name) for name in self.__slots__}
+
+
+def file_md5(path, block=1 << 20):
+    """md5 of a file, read in blocks.
+
+    Block-wise rather than ``read_bytes()``: the engine binary is a few
+    megabytes and a view-factor matrix can be gigabytes, and nothing here needs
+    the contents afterwards. ``ptm.sweep`` uses this for the same purpose.
+    """
+    import hashlib
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _git(repo_root, *args):
@@ -701,7 +723,6 @@ def binary_provenance(exe=None, repo_root=None, check_help=True):
     git available reports that in :attr:`BinaryProvenance.unavailable` instead
     of silently omitting the commit.
     """
-    import hashlib
     from datetime import datetime, timezone
 
     exe, cwd = resolve_engine(exe=exe, cwd=repo_root)
@@ -710,7 +731,7 @@ def binary_provenance(exe=None, repo_root=None, check_help=True):
 
     unavailable = []
     stat = exe.stat()
-    md5 = hashlib.md5(exe.read_bytes()).hexdigest()
+    md5 = file_md5(exe)
     mtime = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
 
     sha = _git(repo_root, "rev-parse", "--short", "HEAD")

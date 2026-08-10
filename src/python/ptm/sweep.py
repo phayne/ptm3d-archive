@@ -111,12 +111,10 @@ def _utc_now():
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _md5(path):
-    digest = hashlib.md5()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+#: Block-wise md5 of a file. Lives in ``ptm.run`` beside the other
+#: engine-identity helpers, since both modules ask it the same question about
+#: the same binary.
+_md5 = run_mod.file_md5
 
 
 # --- config plumbing ---------------------------------------------------------
