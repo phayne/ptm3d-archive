@@ -75,6 +75,11 @@ jobs:
       - name: Paths and preflight (ptm.paths)
         run: python3 src/python/tests/test_paths.py
 
+      # One declared version, and damit/horizons importable with no sys.path
+      # surgery -- the last path insert in the tutorial notebooks.
+      - name: Distribution contents and version parity
+        run: python3 src/python/tests/test_packaging.py
+
       # Drives whole sweeps against a stub engine, so resume, provenance and
       # the flag-vs-config routing are covered without a compiler. The routing
       # matters most: the engine advertises --albedo-map and no --albedo, so a
