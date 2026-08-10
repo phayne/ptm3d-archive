@@ -310,7 +310,7 @@ The Avrami exponent depends on ice porosity, reflecting the dimensionality of cr
 
 $$n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}}) \thinspace \frac{\varphi}{\varphi_{\max}} \tag{D28}$$
 
-where $n_{\mathrm{low}} = 4.0$ (compact ice: bulk nucleation with 3D growth), $n_{\mathrm{high}} = 1.5$ (porous ice: predominantly 1D growth along pore walls), and $\varphi_{\max} = 0.7$. We adopt latitude-dependent porosities of $\varphi_{\mathrm{eq}} = 0.50$ at the equator and $\varphi_{\mathrm{pol}} = 0.20$ at the poles, with linear interpolation, broadly consistent with ALMA-derived porosity estimates (Thelen et al. 2024).
+where $n_{\mathrm{low}} = 4.0$ (compact ice: bulk nucleation with 3D growth), $n_{\mathrm{high}} = 1.5$ (porous ice: predominantly 1D growth along pore walls), and $\varphi_{\max} = 0.7$. We adopt latitude-dependent porosities of $\varphi_{\mathrm{eq}} = 0.50$ at the equator and $\varphi_{\mathrm{pol}} = 0.20$ at the poles, with linear interpolation, broadly consistent with porosity estimates derived from millimeter-wavelength observations (Thelen et al. 2024).
 
 The Arrhenius temperature dependence produces an extremely steep variation in crystallization rate (Table D6).
 

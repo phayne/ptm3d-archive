@@ -12,13 +12,12 @@
 numpy>=1.20          # every analysis script; statistics/*.bin readers
 matplotlib>=3.4      # all figure scripts
 scipy>=1.7           # fitting, interpolation, filtering
-astropy>=5.0         # FITS maps: albedo map verification/re-registration, ALMA tools
+astropy>=5.0         # FITS maps: albedo map verification/re-registration
 pyyaml>=5.4          # scripts that read/write PTM3D YAML configs
 spiceypy>=5.0        # scripts that need SPICE geometry outside the engine
 
 # Not required by the core tooling; install as needed for specific scripts:
 #   pillow, imageio      image/animation output (camera + movie scripts)
 #   pyvista              3D mesh visualization (the GUI ships its own gui/requirements.txt)
-#   astroquery           JPL Horizons queries (small-body ephemerides)
 #   gdal / rasterio      DEM ingestion (build_lola_ring.py, ptm_cog.py) -- system GDAL
 #   psutil, requests     run guards and downloads

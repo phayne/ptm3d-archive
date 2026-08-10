@@ -96,8 +96,9 @@ def read_depth_series(path):
     writes ``locations/<name>_depths.csv``: a ``# Location: <name>`` comment,
     then a header ``time,T(z=0.000 m),T(z=0.025 m),...``, then one row per
     step. The depths are recoverable only by parsing the *column headings*,
-    which is why the ALMA workflow -- the one consumer of this product in the
-    tree -- carries its own copy of that parse.
+    which is why the thermal-inertia fitting example -- the one consumer of
+    this product in the tree -- reads it through here rather than parsing the
+    file for itself.
 
     Two properties of this file are not shared by any other output product,
     and both are silent:

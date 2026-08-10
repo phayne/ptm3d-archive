@@ -59,7 +59,7 @@ results/
 # (1.6 MB mission SPKs) is tracked.
 data/maps/*.fits
 data/meshes/moon3d_cartesian_double.ply
-data/alma/
+data/emission/
 data/dem/**
 !data/dem/**/
 !data/dem/**/README.md

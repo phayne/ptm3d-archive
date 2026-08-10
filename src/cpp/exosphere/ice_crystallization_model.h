@@ -66,7 +66,7 @@ namespace crystallization_constants {
     constexpr double DEFAULT_POLAR_DOSE_ENHANCEMENT = 2.5;
 
     // Default porosity values
-    // Cartwright et al. (2025): ALMA Band 3 observations, 40-70% at low latitudes
+    // Cartwright et al. (2025): millimeter observations, 40-70% at low latitudes
     constexpr double DEFAULT_EQUATORIAL_POROSITY = 0.50;
     constexpr double DEFAULT_POLAR_POROSITY = 0.20;
 
@@ -114,7 +114,7 @@ struct CrystallizationConfig {
 
     // --- Porosity parameters ---
 
-    // Equatorial porosity (from ALMA observations, Cartwright et al. 2025)
+    // Equatorial porosity (from millimeter observations, Cartwright et al. 2025)
     double equatorial_porosity = crystallization_constants::DEFAULT_EQUATORIAL_POROSITY;
 
     // Polar porosity
@@ -163,7 +163,7 @@ public:
 
     /**
      * Initialize porosity distribution from face coordinates
-     * Uses latitude-dependent model calibrated to Cartwright et al. (2025) ALMA observations
+     * Uses latitude-dependent model calibrated to Cartwright et al. (2025) observations
      *
      * @param latitudes Face center latitudes [degrees]
      */

@@ -484,8 +484,8 @@ number. On an engine without the flag you get an error naming
 `constant_thermal_inertia`, never a silent switch to different physics.
 | Collection | `values()`, `collect()`, `stat()`, `grid_of()`, `table()`, `write_table()`, `curves()`. `table()` returns a list of dicts — `pandas.DataFrame(sweep.table(...))` works, and nothing here requires pandas. |
 
-Worked examples: [`examples/python/fit_thermal_inertia_alma.py`](../examples/python/fit_thermal_inertia_alma.py)
-(sweep → lookup table → fit thermal inertia to an ALMA Band 6 brightness-temperature
+Worked examples: [`examples/python/fit_thermal_inertia.py`](../examples/python/fit_thermal_inertia.py)
+(sweep → lookup table → fit thermal inertia to a 233 GHz brightness-temperature
 curve, with the observable conversion supplied as a callable) and
 [`examples/python/sweep_replaces_45_configs.py`](../examples/python/sweep_replaces_45_configs.py)
 (the 40-file `configs/europa_lat*` product as one sweep, checked key-by-key
@@ -511,7 +511,7 @@ against the shipped files).
 
 ### Analysis Scripts (`scripts/`)
 
-Research analysis scripts for ice shell modeling, polar wander, ALMA data comparison, and seasonal thermal surveys.
+Research analysis scripts for ice shell modeling, polar wander, millimeter-wavelength emission modeling, and seasonal thermal surveys.
 
 ### Python Packages (`src/python/`)
 

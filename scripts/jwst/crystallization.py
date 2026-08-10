@@ -37,7 +37,7 @@ E_D = 2.5                     # polar dose enhancement
 # convention to match the run's mesh.ply lat/lon and the albedo map data.
 TRAILING_APEX_LON_E = 90.0
 
-# Porosity (Cartwright 2025 / Thelen 2024 ALMA)
+# Porosity (Cartwright 2025 / Thelen 2024, millimeter-wavelength)
 POR_EQ = 0.50
 POR_POL = 0.20
 
