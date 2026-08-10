@@ -4342,6 +4342,248 @@ static bool resolveEqExtrapolation(const thermal::Config& config,
     return true;
 }
 
+// ---- Equilibration forcing dump (PTM_DUMP_EQ_LUNATION_MEAN) ----------------
+//
+// DIAGNOSTIC, DEFAULT OFF. When PTM_DUMP_EQ_LUNATION_MEAN names a directory the
+// run assembles the equilibration absorbed-flux block exactly as the thermal
+// solver does (the reduction consumes the solver's OWN prepare_flux output, it
+// does not re-derive illumination), reduces it to a per-face, per-diurnal-cycle
+// mean, writes it, and EXITS before any thermal solve. With the variable unset
+// every function below is unreachable and no state is allocated, so the default
+// path is byte-identical.
+//
+// WHY: the engine's equilibration forcing is `equilibration_orbits` diurnal
+// cycles of REAL ephemeris illumination (25 cycles = 738.26 d on the shipped
+// moon3d config) replayed as one block, so the solver's Poincare period is one
+// PASS over that block, not one diurnal cycle. Any equilibration accelerator
+// that samples the state at a ONE-CYCLE stride assumes the block is one-cycle
+// periodic. The seasonal modulation index
+//     a_f = (max_j Qbar_j - min_j Qbar_j) / (2 * mean_j Qbar_j),  j = 1..n_lun
+// measures how false that assumption is, per face. See the 2026-08-08 audit of
+// the restarted-RRE equilibration accelerator, section "DECISIVE NEXT
+// MEASUREMENT".
+//
+// PLACEMENT is deliberately OUTSIDE `#ifdef PTM_GPU_OPENCL`. The reduction
+// hangs off the GPU persistent solver, so a CPU-only build can never produce
+// the dump — which is exactly why its REFUSAL (in main()) must compile there.
+// A GPU-gated definition with a CPU-visible call site is the CPU-only CI break
+// of 2026-08-07, verbatim; do not move this inside the guard.
+namespace eqlundump {
+
+// Empty string = not requested. Any other value is the output DIRECTORY.
+inline std::string requestedDir() {
+    const char* e = std::getenv("PTM_DUMP_EQ_LUNATION_MEAN");
+    if (!e) return std::string();
+    std::string v(e);
+    if (v.empty() || v == "0" || v == "false" || v == "off") return std::string();
+    return v;
+}
+
+struct Buffers {
+    bool        enabled   = false;
+    std::string dir;
+    size_t      n_faces   = 0;
+    size_t      n_lun     = 0;   // diurnal cycles inside the eq forcing block
+    size_t      spl       = 0;   // samples per diurnal cycle
+    int         eq_steps  = 0;
+    double      eq_dt_s   = 0.0;
+    double      synodic_d = 0.0;
+
+    std::vector<double>   sum_abs;  // n_faces * n_lun  (sum of absorbed W/m^2)
+    std::vector<double>   sum_dir;  // n_faces * n_lun  (sum of direct  W/m^2)
+    std::vector<uint32_t> lit_cnt;  // n_faces * n_lun  (samples with direct > 0)
+    std::vector<float>    max_dir;  // n_faces          (max direct over block)
+};
+
+// Configure, or REFUSE. Every condition that would silently make the dump mean
+// something other than "per-diurnal-cycle mean of the equilibration forcing
+// block" is fatal: a wrong-but-plausible dump is worse than no dump.
+inline void configure(Buffers& b, const std::string& dir, size_t n_faces,
+                      int equilibration_steps, bool two_phase,
+                      double eq_dt_s, double synodic_day_days) {
+    if (dir.empty()) return;
+
+    if (!two_phase || equilibration_steps <= 0) {
+        std::cerr << "[eq-lun-dump] FATAL: PTM_DUMP_EQ_LUNATION_MEAN is set but this "
+                     "run has no separate equilibration phase (two_phase="
+                  << (two_phase ? 1 : 0) << ", equilibration_steps="
+                  << equilibration_steps << "). There is no equilibration forcing "
+                     "block to reduce. Refusing rather than dumping the wrong array.\n";
+        std::exit(1);
+    }
+    const double synodic_s = synodic_day_days * 86400.0;
+    if (!(synodic_s > 0.0) || !(eq_dt_s > 0.0)) {
+        std::cerr << "[eq-lun-dump] FATAL: cannot resolve the diurnal period "
+                     "(synodic_day=" << synodic_day_days << " d, eq_dt="
+                  << eq_dt_s << " s).\n";
+        std::exit(1);
+    }
+
+    // n_lun from the physics (block length / synodic day), then cross-checked
+    // against exact divisibility of the sample count. Env override exists for
+    // configs whose cadence is not an integer number of samples per cycle.
+    const double eq_seconds = static_cast<double>(equilibration_steps) * eq_dt_s;
+    long long n_lun = static_cast<long long>(eq_seconds / synodic_s + 0.5);
+    if (const char* e = std::getenv("PTM_DUMP_EQ_LUNATIONS")) {
+        long long v = std::atoll(e);
+        if (v < 2) {
+            std::cerr << "[eq-lun-dump] FATAL: PTM_DUMP_EQ_LUNATIONS='" << e
+                      << "' is not an integer >= 2.\n";
+            std::exit(1);
+        }
+        if (v != n_lun) {
+            std::cout << "[eq-lun-dump] PTM_DUMP_EQ_LUNATIONS=" << v
+                      << " overrides the derived " << n_lun << "\n";
+        }
+        n_lun = v;
+    }
+    if (n_lun < 2) {
+        std::cerr << "[eq-lun-dump] FATAL: the equilibration block spans only "
+                  << (eq_seconds / synodic_s) << " diurnal cycles; a "
+                     "cycle-to-cycle modulation index is undefined.\n";
+        std::exit(1);
+    }
+    if (equilibration_steps % static_cast<int>(n_lun) != 0) {
+        std::cerr << "[eq-lun-dump] FATAL: equilibration_steps="
+                  << equilibration_steps << " is not divisible by n_lunations="
+                  << n_lun << "; the per-cycle bins would be ragged and the "
+                     "modulation index would pick up a binning artifact. Set "
+                     "PTM_DUMP_EQ_LUNATIONS to a divisor, or use a cadence that "
+                     "divides evenly.\n";
+        std::exit(1);
+    }
+
+    b.enabled   = true;
+    b.dir       = dir;
+    b.n_faces   = n_faces;
+    b.n_lun     = static_cast<size_t>(n_lun);
+    b.spl       = static_cast<size_t>(equilibration_steps) / b.n_lun;
+    b.eq_steps  = equilibration_steps;
+    b.eq_dt_s   = eq_dt_s;
+    b.synodic_d = synodic_day_days;
+    b.sum_abs.assign(b.n_faces * b.n_lun, 0.0);
+    b.sum_dir.assign(b.n_faces * b.n_lun, 0.0);
+    b.lit_cnt.assign(b.n_faces * b.n_lun, 0u);
+    b.max_dir.assign(b.n_faces, 0.0f);
+
+    std::cout << "[eq-lun-dump] ENABLED -> " << dir << "\n"
+              << "[eq-lun-dump]   " << n_faces << " faces x " << b.n_lun
+              << " diurnal cycles x " << b.spl << " samples/cycle = "
+              << equilibration_steps << " eq steps (dt=" << eq_dt_s
+              << " s, synodic=" << synodic_day_days << " d)\n"
+              << "[eq-lun-dump]   the run will EXIT after the dump; NO thermal "
+                 "solve is performed.\n";
+}
+
+// Reduce one batch of the solver's OWN eq forcing array. flux_eq is laid out
+// [t * batch_n + f] exactly as prepare_flux returns it; direct_solar_values is
+// the whole-mesh illumination table laid out [global_f * total_time_steps + t].
+// Batches cover disjoint face ranges, so concurrent pool workers need no lock.
+inline void accumulateBatch(Buffers& b, const std::vector<float>& flux_eq,
+                            const std::vector<double>& direct_solar_values,
+                            size_t batch_start, size_t batch_n,
+                            int equilibration_steps, int total_time_steps) {
+    if (!b.enabled) return;
+    const size_t n_lun = b.n_lun, spl = b.spl;
+
+    for (int t = 0; t < equilibration_steps; ++t) {
+        const size_t j = static_cast<size_t>(t) / spl;
+        if (j >= n_lun) break;
+        const float* row = flux_eq.data() + static_cast<size_t>(t) * batch_n;
+        for (size_t f = 0; f < batch_n; ++f) {
+            b.sum_abs[(batch_start + f) * n_lun + j] += static_cast<double>(row[f]);
+        }
+    }
+    for (size_t f = 0; f < batch_n; ++f) {
+        const size_t gf   = batch_start + f;
+        const size_t base = gf * static_cast<size_t>(total_time_steps);
+        double  mx = 0.0;
+        for (int t = 0; t < equilibration_steps; ++t) {
+            const size_t idx = base + static_cast<size_t>(t);
+            const double d = (idx < direct_solar_values.size())
+                           ? direct_solar_values[idx] : 0.0;
+            const size_t j = static_cast<size_t>(t) / spl;
+            if (j >= n_lun) break;
+            b.sum_dir[gf * n_lun + j] += d;
+            if (d > 0.0) { b.lit_cnt[gf * n_lun + j] += 1u; mx = std::max(mx, d); }
+        }
+        b.max_dir[gf] = static_cast<float>(mx);
+    }
+}
+
+// Write the products. Returns false on ANY write failure -- the caller must
+// treat that as fatal; a partially written dump that later gets analyzed is a
+// silent-wrong-answer generator.
+inline bool write(const Buffers& b,
+                  const std::vector<double>& latitudes,
+                  const std::vector<double>& longitudes,
+                  const std::string& planet_name) {
+    if (!b.enabled) return true;
+    std::error_code ec;
+    std::filesystem::create_directories(b.dir, ec);
+
+    auto path = [&](const char* leaf) { return b.dir + "/" + leaf; };
+    auto put  = [&](const std::string& p, const void* data, size_t bytes) {
+        std::ofstream os(p, std::ios::binary);
+        if (!os) { std::cerr << "[eq-lun-dump] ERROR: cannot open " << p << "\n"; return false; }
+        os.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        if (!os) { std::cerr << "[eq-lun-dump] ERROR: short write on " << p << "\n"; return false; }
+        return true;
+    };
+
+    const size_t nf = b.n_faces, nl = b.n_lun;
+    const double inv = 1.0 / static_cast<double>(b.spl);
+
+    std::vector<float> mean_abs(nf * nl), mean_dir(nf * nl);
+    for (size_t i = 0; i < nf * nl; ++i) {
+        mean_abs[i] = static_cast<float>(b.sum_abs[i] * inv);
+        mean_dir[i] = static_cast<float>(b.sum_dir[i] * inv);
+    }
+    std::vector<float> geom(nf * 3);
+    for (size_t f = 0; f < nf; ++f) {
+        geom[f * 3 + 0] = static_cast<float>(f < latitudes.size()  ? latitudes[f]  : 0.0);
+        geom[f * 3 + 1] = static_cast<float>(f < longitudes.size() ? longitudes[f] : 0.0);
+        geom[f * 3 + 2] = b.max_dir[f];
+    }
+
+    bool ok = true;
+    ok = put(path("eq_lunation_mean_absorbed.f32"), mean_abs.data(), mean_abs.size() * sizeof(float)) && ok;
+    ok = put(path("eq_lunation_mean_direct.f32"),   mean_dir.data(), mean_dir.size() * sizeof(float)) && ok;
+    ok = put(path("eq_lunation_lit_count.u32"),     b.lit_cnt.data(), b.lit_cnt.size() * sizeof(uint32_t)) && ok;
+    ok = put(path("eq_face_geom.f32"),              geom.data(),      geom.size() * sizeof(float)) && ok;
+
+    std::ofstream js(path("eq_lunation_dump.json"));
+    if (!js) { std::cerr << "[eq-lun-dump] ERROR: cannot open the JSON sidecar\n"; ok = false; }
+    else {
+        js << "{\n"
+           << "  \"n_faces\": " << nf << ",\n"
+           << "  \"n_lunations\": " << nl << ",\n"
+           << "  \"samples_per_lunation\": " << b.spl << ",\n"
+           << "  \"equilibration_steps\": " << b.eq_steps << ",\n"
+           << "  \"eq_dt_s\": " << std::setprecision(12) << b.eq_dt_s << ",\n"
+           << "  \"synodic_day_days\": " << b.synodic_d << ",\n"
+           << "  \"planet\": \"" << planet_name << "\",\n"
+           << "  \"dtype_mean\": \"float32\",\n"
+           << "  \"dtype_lit_count\": \"uint32\",\n"
+           << "  \"layout\": \"face-major: value[f, j] at offset f*n_lunations + j\",\n"
+           << "  \"eq_face_geom\": \"n_faces x 3 float32 (lat_deg, lon_deg, max_direct_W_m2)\",\n"
+           << "  \"units\": \"W/m^2\",\n"
+           << "  \"source\": \"prepare_flux(0, equilibration_steps) of the GPU persistent solver\",\n"
+           << "  \"env\": \"PTM_DUMP_EQ_LUNATION_MEAN\"\n"
+           << "}\n";
+        js.close();
+        if (!js) { std::cerr << "[eq-lun-dump] ERROR: short write on the JSON sidecar\n"; ok = false; }
+    }
+
+    std::cout << "[eq-lun-dump] wrote " << nf << " x " << nl
+              << " float32 (" << (nf * nl * sizeof(float)) << " bytes) to "
+              << path("eq_lunation_mean_absorbed.f32") << (ok ? "" : "  [WITH ERRORS]")
+              << std::endl;
+    return ok;
+}
+
+}  // namespace eqlundump
+
 // ========== GPU PERSISTENT THERMAL SOLVER ==========
 #ifdef PTM_GPU_OPENCL
 
@@ -5344,6 +5586,16 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     size_t n_batches = (n_faces + BATCH_SIZE - 1) / BATCH_SIZE;
     std::cout << "[GPU Thermal] Processing " << n_faces << " faces in " << n_batches << " batch(es)..." << std::endl;
 
+    // Equilibration forcing dump (diagnostic, default OFF). Declared here so it
+    // is in scope on BOTH the multi-GPU pool path and the serial loop, and ahead
+    // of the `goto post_batch_loop` below. configure() is a no-op when the env
+    // var is unset and fatal when the request cannot be honored exactly.
+    eqlundump::Buffers eq_lun_dump;
+    eqlundump::configure(eq_lun_dump, eqlundump::requestedDir(), n_faces,
+                         equilibration_steps, two_phase,
+                         static_cast<double>(eq_dt),
+                         getSynodicDayFromPlanet(planet));
+
     // ----- Schorghofer & Taylor (2007) ice-stability accumulator setup -----
     // Pre-size the global accumulator and copy the depth grid. Each batch
     // contributes its slice of faces to ice_acc->sum_E[layer * n_faces + face].
@@ -5625,6 +5877,15 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                           << eq_dt << "s)" << std::endl;
             }
             auto flux_eq = prepare_flux(0, equilibration_steps);
+            // Diagnostic dump of the equilibration forcing (default OFF).
+            // Reduces the solver's OWN flux array, then abandons the batch
+            // before any kernel dispatch — the dump path must never run a solve.
+            if (eq_lun_dump.enabled) {
+                eqlundump::accumulateBatch(eq_lun_dump, flux_eq, direct_solar_values,
+                                           batch_start, batch_n,
+                                           equilibration_steps, total_time_steps);
+                return true;
+            }
             std::vector<float> eq_output_discard;
             // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
             // a data race on every counter under the multi-GPU pool.
@@ -6255,6 +6516,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                           << eq_dt << "s)" << std::endl;
             }
             auto flux_eq = prepare_flux(0, equilibration_steps);
+            // Diagnostic dump of the equilibration forcing (default OFF); see
+            // the multi-GPU copy above. Abandons the batch before any dispatch.
+            if (eq_lun_dump.enabled) {
+                eqlundump::accumulateBatch(eq_lun_dump, flux_eq, direct_solar_values,
+                                           batch_start, batch_n,
+                                           equilibration_steps, total_time_steps);
+                continue;
+            }
             std::vector<float> eq_output_discard;
             // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
             // a data race on every counter under the multi-GPU pool.
@@ -6464,6 +6733,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 post_batch_loop:
     // Complete the progress bar
     std::cout << "\r[GPU Thermal] Progress: 100.0% (complete)                    " << std::endl;
+
+    // Equilibration forcing dump: every batch reduced its own eq flux array and
+    // returned before dispatching a kernel, so nothing downstream of here has
+    // valid state. Write and stop -- continuing would emit statistics from
+    // uninitialized temperatures.
+    if (eq_lun_dump.enabled) {
+        const bool ok = eqlundump::write(eq_lun_dump, mesh->latitudes,
+                                         mesh->longitudes,
+                                         config.getProperty("planet", "Moon"));
+        std::cout << "[eq-lun-dump] NO THERMAL SOLVE WAS RUN; exiting with "
+                  << (ok ? 0 : 1) << std::endl;
+        std::cout.flush();
+        std::exit(ok ? 0 : 1);
+    }
 
     auto end_total = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(end_total - start_total);
@@ -13399,6 +13682,20 @@ int main(int argc, char** argv) {
                              "equilibration length.\n";
                 return 1;
             }
+        }
+
+        // The equilibration forcing dump reduces the GPU persistent solver's own
+        // prepare_flux output. The CPU/SIMD equilibrators build their forcing
+        // elsewhere and would produce no file at all, so refuse instead of
+        // letting the run proceed to a full thermal solve the caller did not
+        // want and then exit 0 with nothing written.
+        if (!eqlundump::requestedDir().empty() &&
+            !config.getPropertyBool("use_gpu_thermal", false)) {
+            std::cerr << "Error: PTM_DUMP_EQ_LUNATION_MEAN is implemented only for "
+                         "the GPU persistent thermal solver (thermal.use_gpu: true / "
+                         "--use-gpu-thermal). The CPU and SIMD paths would ignore it "
+                         "silently and run a full simulation instead. Aborting.\n";
+            return 1;
         }
 
         // Copy SIMD batch flag from CLI parsing config to thermal_config.
