@@ -46,8 +46,10 @@ __all__ = [
     "KEYS_WITHOUT_DEFAULT",
     "default_for",
     "flatten_config",
+    "get_dotted",
     "known_keys",
     "parse_engine_config",
+    "set_dotted",
     "unknown_keys",
 ]
 
@@ -75,6 +77,34 @@ def default_for(key):
     listed in :data:`KEYS_WITHOUT_DEFAULT`.
     """
     return ENGINE_DEFAULTS[key]
+
+
+def get_dotted(config, dotted):
+    """``get_dotted(cfg, 'thermal.use_gpu')``, or ``None`` if absent.
+
+    Here rather than in the caller because the friction audit counted **seven
+    dialects** of "set a nested config key by path" across nineteen sweep
+    scripts, and this is the config module.
+    """
+    node = config
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def set_dotted(config, dotted, value):
+    """Set ``cfg['a']['b'] = value`` from ``'a.b'``, creating dicts as needed."""
+    parts = dotted.split(".")
+    node = config
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
 
 
 def flatten_config(config, prefix=""):
