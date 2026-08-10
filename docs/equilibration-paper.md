@@ -294,7 +294,7 @@ broken down by component, as a function of mesh face count.
 Curves are power-law fits anchored on the measured
 production batch (star, $N=1.80\times 10^{6}$); the diagonal
 dashed line is the sum of all components.  Dotted reference
-curves show the asymptotic scalings $\mathcal{O}(N \log N)$ (grey,
+curves show the asymptotic scalings $\mathcal{O}(N \log N)$ (gray,
 naive view-factor enumeration with BVH ray casting) and
 $\mathcal{O}(N^{2})$ (orange, dense radiosity without sparse top-K
 compaction), each anchored at the same point as the measured

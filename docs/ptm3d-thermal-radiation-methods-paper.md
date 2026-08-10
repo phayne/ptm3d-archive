@@ -525,7 +525,7 @@ terrain is much sparser and the sparse path scales linearly there.
 
 The view factor matrix satisfies a strict reciprocity relation,
 $A_i F_{ij} = A_j F_{ji}$, which we use as an internal consistency
-check. Two regimes are useful to characterise. On the analytic
+check. Two regimes are useful to characterize. On the analytic
 1404-face bowl-crater test of §8.1, where view factors are
 constructed by direct quadrature of the differential-area integral
 (12) rather than by Monte-Carlo sampling, the maximum relative
