@@ -12,6 +12,8 @@ From the tutorial-04 coupled run:
 output/tutorial04_crater80N_coupled/
 ├── mesh.ply                  # the simulated mesh (face order matches all .bin files)
 ├── metadata.txt              # faces, time_steps, exported components
+├── provenance.txt            # which engine produced this, and how — see below
+├── config_used.yaml          # verbatim copy of the configuration that was loaded
 ├── time_steps.txt            # per-step time stamp (+ UTC label column) — see below
 ├── body_positions.csv        # Sun / primary-body vectors per output step
 ├── heartbeat.txt             # liveness file for monitoring — see note below
@@ -106,6 +108,41 @@ each output step (same header + float32 format). The index is **zero-based and
 zero-padded to four digits**, so a 118-step run ends at `_0117`, not `_00118`;
 `metadata.txt` lists the face count, the step count and which components were
 exported.
+
+**`provenance.txt` and `config_used.yaml`.** `provenance.txt` is `key=value`,
+one per line, like `metadata.txt`, and it answers "which binary produced this
+directory, running what?" — engine version, git SHA, build type, whether the
+GPU core was compiled in, the compiler, the **md5 of the executable itself**,
+the full command line, the body, the mesh source, and the mesh length unit the
+engine actually inferred and used. `config_used.yaml` beside it is a byte copy
+of the configuration file that was loaded.
+
+The pair is deliberately redundant: the YAML alone would misreport a run
+launched with a CLI override such as `--thermal-inertia`, so `command_line`
+carries the rest. `config_used.yaml` is the file **as read**, not a dump of the
+resolved configuration.
+
+```
+schema=ptm3d-provenance-1
+engine_version=1.1
+engine_git_sha=2436cad9f5
+engine_binary_md5=2884834efa55f531771f80b9d354ade6
+engine_shared_libraries=false
+command_line=./build/bin/ptm_thermal_sim --config moon.yaml --albedo 0.24
+body=Moon
+mesh_faces=20480
+mesh_length_unit=kilometers
+```
+
+`engine_shared_libraries` is the honest caveat on the checksum: when it is
+`false` — the default build — the executable is the whole engine and its md5
+is a complete identity. Under `-DBUILD_SHARED_LIBS=ON` a change confined to one
+project library would move that library and leave the executable's md5
+unchanged, and the field says so.
+
+`ptm info <run>` prints all of this, and `ptm.Results.provenance()` returns it;
+on a run made before the engine wrote the file, the same fields appear under
+`not_recorded` rather than being guessed at.
 
 **Timing columns.** In `time_steps.txt`, column 1 is **seconds past the J2000
 epoch** (SPICE ephemeris time), *not* elapsed time from the start of the run —

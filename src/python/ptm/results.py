@@ -696,6 +696,9 @@ class Results:
         self._body_radius_km = body_radius_km
 
         self.metadata = self._read_metadata()
+        #: What ``provenance.txt`` says, or ``{}`` on a run written before the
+        #: engine recorded any (see :meth:`provenance`).
+        self.engine_provenance = self._read_engine_provenance()
         if not self.metadata and not (self.path / "mesh.ply").is_file():
             raise FileNotFoundError(
                 f"{self.path} has neither metadata.txt nor mesh.ply; it does not "
@@ -713,6 +716,31 @@ class Results:
                 f"{self.metadata.get('time_steps', '?')} steps>")
 
     # -- metadata.txt --------------------------------------------------------
+
+    def _read_engine_provenance(self):
+        """``provenance.txt``, written by the engine since schema
+        ``ptm3d-provenance-1``.
+
+        Absent on every run produced before the engine recorded its own
+        identity, which is why nothing here raises: an old run directory is a
+        run directory with less to say about itself, not a broken one.
+
+        Values stay strings. ``engine_binary_md5`` is a hex digest and
+        ``mesh_faces`` is a count, but mixing types in one flat mapping is how
+        a caller ends up comparing an int to the string the engine wrote; the
+        two fields that are genuinely typed are surfaced by
+        :meth:`provenance` instead.
+        """
+        path = self.path / "provenance.txt"
+        if not path.is_file():
+            return {}
+        out = {}
+        for line in path.read_text().splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+        return out
 
     def _read_metadata(self):
         path = self.path / "metadata.txt"
@@ -1097,38 +1125,75 @@ class Results:
     def provenance(self):
         """What this run records about itself, and what it does not.
 
-        The engine writes ``metadata.txt`` (face count, step counts, which
-        components were exported) and nothing else about its own identity: no
-        config copy, no config hash, no binary md5, no engine version, no body
-        name. Those appear under ``not_recorded`` rather than being inferred,
+        Since engine schema ``ptm3d-provenance-1`` the engine writes
+        ``provenance.txt`` (version, git SHA, build type, GPU flag, compiler,
+        the executable's own md5, the full command line, the body, the mesh
+        source and the mesh length unit it actually used) and a verbatim
+        ``config_used.yaml``. Those fields are reported here under ``engine``,
+        and the corresponding ``not_recorded`` entries disappear.
+
+        On a run made before that -- every run in the archive -- there is only
+        ``metadata.txt``: face count, step counts, exported components. The
+        missing identity is listed in ``not_recorded`` rather than inferred,
         because a plausible-looking guess about which binary produced a run is
         worse than an admission that the run does not say.
 
-        A config **hash** is reported only when a YAML sits in the run
-        directory -- some drivers copy one in; the engine does not.
+        Two things stay honest even when the record exists. ``config_used.yaml``
+        is the configuration file as read, not a dump of the resolved
+        configuration -- ``engine['command_line']`` carries any CLI override on
+        top of it. And ``engine_binary_md5`` is the md5 of the *executable*: if
+        ``engine['engine_shared_libraries']`` is ``"true"``, a change confined
+        to one shared project library would not move it, and that appears in
+        ``not_recorded`` too.
         """
         meta = dict(self.metadata)
+        engine = dict(self.engine_provenance)
         not_recorded = []
 
         config_path, config_sha256 = None, None
-        yamls = sorted(p for p in self.path.glob("*.yaml"))
-        if len(yamls) == 1:
-            config_path = yamls[0]
+        recorded_copy = engine.get("config_copy")
+        if recorded_copy and recorded_copy != "none":
+            # The engine named the file, so a driver that copied a second YAML
+            # in cannot make this ambiguous.
+            candidate = self.path / recorded_copy
+            if candidate.is_file():
+                config_path = candidate
+            else:
+                not_recorded.append(
+                    f"config (provenance.txt names {recorded_copy}, which is "
+                    f"not in the run directory)")
+        if config_path is None and not recorded_copy:
+            yamls = sorted(p for p in self.path.glob("*.yaml"))
+            if len(yamls) == 1:
+                config_path = yamls[0]
+            elif len(yamls) > 1:
+                not_recorded.append(
+                    f"config (the run directory holds {len(yamls)} YAML files; "
+                    f"none is marked as the one used)")
+            else:
+                not_recorded.append(
+                    "config (this run predates provenance.txt; the engine wrote "
+                    "no copy of the YAML it ran)")
+        if config_path is not None:
             config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-        elif len(yamls) > 1:
+
+        if not engine:
             not_recorded.append(
-                f"config (the run directory holds {len(yamls)} YAML files; "
-                f"none is marked as the one used)")
-        else:
+                "engine binary md5 / version / git SHA (this run predates "
+                "provenance.txt)")
+            not_recorded.append("command line (this run predates provenance.txt)")
+            not_recorded.append("body name (infer it from the mesh radius if needed)")
+        elif engine.get("engine_shared_libraries") == "true":
             not_recorded.append(
-                "config (the engine writes no copy of the YAML it ran)")
-        not_recorded.append("engine binary md5 / version (never written)")
-        not_recorded.append("body name (infer it from the mesh radius if needed)")
+                "complete engine identity: engine_binary_md5 covers the "
+                "executable only, and this build links shared project "
+                "libraries, so a change confined to one of them would not "
+                "move it")
         not_recorded.append("field units (this package's catalog supplies them)")
 
-        started = None
+        started = engine.get("run_started_utc")
         heartbeat = self.path / "heartbeat.txt"
-        if heartbeat.is_file():
+        if started is None and heartbeat.is_file():
             text = heartbeat.read_text().strip()
             if text:
                 started = text.split()[0]
@@ -1147,11 +1212,32 @@ class Results:
             not_recorded.append(f"time axis ({exc})")
 
         report = self.mesh_unit_report
+        # The engine states the unit it actually used; this reader infers one
+        # from the mesh. Disagreement means one of the two is wrong about the
+        # geometry, which is worth saying out loud rather than quietly
+        # preferring either.
+        engine_unit = engine.get("mesh_length_unit")
+        # The engine spells the unit out; this package uses 'm'/'km'. Compare
+        # the normalized forms, or every run reports a disagreement that is
+        # only a difference of vocabulary.
+        engine_unit_short = {"meters": "m", "kilometers": "km"}.get(engine_unit)
+        if engine_unit_short and engine_unit_short != report.unit:
+            not_recorded.append(
+                f"an agreed mesh length unit: the engine recorded "
+                f"{engine_unit!r}, this reader infers {report.unit!r}")
+
         return {
             "run_dir": str(self.path),
             "n_faces": self.n_faces,
             "metadata": meta,
+            "engine": engine,
+            "body": engine.get("body"),
+            "engine_version": engine.get("engine_version"),
+            "engine_git_sha": engine.get("engine_git_sha"),
+            "engine_binary_md5": engine.get("engine_binary_md5"),
+            "command_line": engine.get("command_line"),
             "mesh_units": report.unit,
+            "mesh_units_recorded_by_engine": engine_unit,
             "mesh_units_corroborated_by": report.body,
             "mesh_median_radius_m": report.median * self._to_m,
             "step_fields": self.step_fields,
@@ -1160,6 +1246,9 @@ class Results:
             "started_utc": started,
             "config_file": str(config_path) if config_path else None,
             "config_sha256": config_sha256,
+            "config_md5_recorded": (engine.get("config_md5")
+                                    if engine.get("config_md5") not in (None, "none")
+                                    else None),
             "units_style": self.units_style,
             "not_recorded": tuple(not_recorded),
         }

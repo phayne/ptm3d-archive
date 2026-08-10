@@ -34,6 +34,7 @@
 #include <ctime>      // for gmtime_r / strftime (heartbeat)
 
 #include "../tools/config_parser.h"
+#include "../tools/run_provenance.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
@@ -11860,6 +11861,10 @@ int main(int argc, char** argv) {
     ptm::MeshUtils meshUtils;
     std::shared_ptr<Mesh> fallback_mesh;
     bool using_fallback_mesh = false;
+    // Hoisted out of the procedural branch below so the provenance record can
+    // say whether the topographic mesh was actually LOADED, not merely asked
+    // for -- `use_topographic: true` silently falls back to a plain icosphere.
+    bool topo_loaded = false;
 
     // Set body radius for procedural mesh generation
     if (using_generic_body && generic_body.shape.meanRadiusKm() > 0.0) {
@@ -11952,7 +11957,6 @@ int main(int argc, char** argv) {
         meshUtils.setMeshResolution(mesh_resolution);
 
         // Try loading a pre-computed topographic mesh if enabled
-        bool topo_loaded = false;
         if (sim_config.mesh.use_topographic) {
             std::string topo_dir = sim_config.mesh.topo_directory;
             if (topo_dir.empty()) {
@@ -12028,11 +12032,15 @@ int main(int argc, char** argv) {
     // PTM-37: state the inferred mesh length unit (and the body radius that
     // does or does not corroborate it), and refuse to run when the inference
     // is a coin flip. See inspectMeshLengthUnit for the three fatal cases.
+    std::string mesh_length_unit = "unknown";
+    double mesh_median_radius = 0.0;
     {
         const double R_for_units = using_generic_body
             ? generic_body.shape.meanRadiusKm()
             : planet.body_radius_km;
         MeshUnitReport units = inspectMeshLengthUnit(mesh, R_for_units);
+        mesh_length_unit = units.meters ? "meters" : "kilometers";
+        mesh_median_radius = units.median;
         if (units.fatal) {
             // Do NOT recommend mesh.scale_factor here. It scales the vertices
             // and leaves face_centers/face_areas/face_normals at the loader's
@@ -12051,6 +12059,40 @@ int main(int argc, char** argv) {
                       << std::endl;
             return 1;
         }
+    }
+
+    // ========================================================================
+    // Run provenance
+    // ========================================================================
+    // Until this existed, metadata.txt was the ONLY thing the engine wrote
+    // about a run, and it named no version, no commit, no checksum, no body,
+    // no mesh unit and no configuration -- so which binary produced a given
+    // output directory was not answerable from the directory. Written HERE, at
+    // the first point where every recorded field is known and before any of
+    // the expensive work, so that a run which dies in the solver still leaves
+    // a record of what it was.
+    //
+    // Two new files, no existing format touched. See tools/run_provenance.h.
+    {
+        ptm::RunProvenance prov;
+        prov.output_dir  = output_dir;
+        prov.config_file = has_config_file ? config_file : std::string();
+        prov.argv.assign(argv, argv + argc);
+        prov.body = using_generic_body ? generic_body.name : sim_config.time.body;
+        prov.generic_body = using_generic_body;
+        if (!mesh_file.empty()) {
+            prov.mesh_source = mesh_file;
+        } else if (topo_loaded) {
+            prov.mesh_source = "topographic sphere, resolution "
+                             + std::to_string(mesh_resolution);
+        } else {
+            prov.mesh_source = "icosphere, resolution "
+                             + std::to_string(mesh_resolution);
+        }
+        prov.mesh_faces        = mesh->faces.size();
+        prov.mesh_length_unit  = mesh_length_unit;
+        prov.mesh_median_radius = mesh_median_radius;
+        ptm::writeRunProvenance(prov);
     }
 
     // ----------------------------------------------------------------------
