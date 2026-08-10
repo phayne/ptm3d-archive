@@ -4,7 +4,7 @@
 Question: with ``ptm.Sweep``, which ways of naming a thermophysical property
 reach the solver, and which ones fail quietly? Runs the engine for the routes
 that are supposed to work, and only constructs (never runs) the ones being
-checked for validation behaviour.
+checked for validation behavior.
 
     python3 scripts/thermophys_python_probe.py --exe build-cpu/bin/ptm_thermal_sim
 """
