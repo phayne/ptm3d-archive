@@ -69,6 +69,12 @@ jobs:
       - name: Engine run driver (ptm.run, no engine needed)
         run: python3 src/python/tests/test_engine_process.py
 
+      # Discovery and the run preflight. What is checked is which REMEDY the
+      # report names: the Galilean kernel set and the Moon core set both live
+      # under data/kernels and need different fetch commands.
+      - name: Paths and preflight (ptm.paths)
+        run: python3 src/python/tests/test_paths.py
+
       # Drives whole sweeps against a stub engine, so resume, provenance and
       # the flag-vs-config routing are covered without a compiler. The routing
       # matters most: the engine advertises --albedo-map and no --albedo, so a
