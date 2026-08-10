@@ -472,9 +472,16 @@ TI is derived here (the primaries are `ks`/`kd`/`rhos`/`rhod`/`cp0`/`chi`), so
 | `thermal_inertia` | `ks = TI²/(rhos·cp(273 K))`, `kd` scaled by the same factor. Densities, `cp(T)` and `chi` untouched, so the depth contrast is preserved. Resolves onto `thermophysical.{ks,kd}_override`. This is the convention already used by `ema_campaign_driver.py`, `divval_sweep.py` and the shipped `quickstart_asteroid_diurnal_ti200_check.yaml`. | `--thermal-inertia` **only** |
 | `constant_thermal_inertia` | `cp = TI²/(ks·rhos)` instead, plus `chi=0`, `kd=ks`, `rhod=rhos`, so TI is exactly constant in temperature **and** depth — and the thermal diffusivity moves along the axis where the other holds it. | `--constant-thermal-inertia`, or the config key of the same name |
 
-Measured at TI=200 on `quickstart_asteroid_diurnal`: **39.27 K** diurnal
-amplitude for the first, **42.19 K** for the second — 6.0 K per-face at the
-extreme. The engine refuses a run given both, and so does `Sweep`.
+The two are far enough apart to change a thermal inertia you fit, so the choice
+is not a formality. How far apart is a property of the body, the mesh and the
+window, not a constant worth carrying between runs: measure it on the case you
+care about by running the same config twice, once per key, and comparing a
+statistic you state in full — the metric, the faces it covers and the window it
+covers. "Diurnal amplitude" on its own does not pin those down, and different
+choices of them disagree. A fully specified example: the median, over all
+faces, of `temperature_max - temperature_min` from `statistics/`, accumulated
+over the run's final diurnal cycle. The engine refuses a run given both, and so
+does `Sweep`.
 
 `thermal_inertia` has no config-file route on purpose. Building one would mean
 this Python layer evaluating the body's `cp` polynomial at 273 K, which is

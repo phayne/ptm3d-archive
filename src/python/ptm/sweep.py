@@ -59,9 +59,10 @@ both:
     ``chi=0``, ``kd=ks``, ``rhod=rhos``, so TI is exactly constant in
     temperature and depth. Works on any engine.
 
-Measured difference at TI=200 on ``quickstart_asteroid_diurnal``: **39.27 K vs
-42.19 K** diurnal amplitude. The engine refuses a run given both, and so does
-this module.
+The two give measurably different diurnal amplitudes on the same config; how
+different depends on the body, the mesh and the window, so measure it on your
+own case and state the aggregation you used. The engine refuses a run given
+both, and so does this module.
 
 No physics is computed here. Every named parameter maps onto a knob the
 *engine* interprets, and anything else is a config key set verbatim.
@@ -144,9 +145,9 @@ _md5 = run_mod.file_md5
 #                              temperature AND depth -- and the diffusivity
 #                              moves along the axis where the other holds it.
 #
-# They are not interchangeable: 39.27 K vs 42.19 K diurnal amplitude at TI=200
-# on quickstart_asteroid_diurnal (measured by the engine change that added the
-# flags). The engine refuses if both are given, and so does this module.
+# They are not interchangeable: they produce measurably different diurnal
+# amplitudes on the same config. The engine refuses if both are given, and so
+# does this module.
 #
 # The first has NO config-file route here, deliberately. Reproducing it in YAML
 # would mean this wrapper evaluating the body's cp polynomial at 273 K, which is
@@ -219,8 +220,8 @@ def _check_thermal_inertia(config):
         "this is ks = TI^2/(rhos*cp(273 K)) with kd scaled by the same factor: "
         "the depth contrast is preserved and the diffusivity moves with TI. "
         "The other convention, constant_thermal_inertia, derives cp instead "
-        "and collapses the column -- 39.27 K vs 42.19 K diurnal amplitude at "
-        "TI=200 on quickstart_asteroid_diurnal. Choose deliberately.")
+        "and collapses the column, giving a measurably different diurnal "
+        "amplitude on the same config. Choose deliberately.")
     return out
 
 
@@ -236,9 +237,8 @@ def _check_constant_thermal_inertia(config):
         "this is cp = TI^2/(ks*rhos) with chi=0, kd=ks and rhod=rhos: TI is "
         "exactly constant in temperature AND depth, and the thermal "
         "diffusivity therefore varies along the axis. The other convention, "
-        "thermal_inertia, scales ks/kd instead -- 42.19 K vs 39.27 K diurnal "
-        "amplitude at TI=200 on quickstart_asteroid_diurnal. Choose "
-        "deliberately.")
+        "thermal_inertia, scales ks/kd instead, giving a measurably different "
+        "diurnal amplitude on the same config. Choose deliberately.")
     return out
 
 
@@ -616,8 +616,8 @@ class Sweep:
                     f"that is given both.\n"
                     f"  {first.name}: {first.note}\n"
                     f"  {second.name}: {second.note}\n"
-                    f"  They differ by 39.27 K vs 42.19 K in diurnal amplitude "
-                    f"at TI=200 on quickstart_asteroid_diurnal.")
+                    f"  They give measurably different diurnal amplitudes on "
+                    f"the same config.")
         self._name_from = name_from
         self.results_kwargs = dict(results_kwargs or {})
         self.timeout = None if timeout is None else float(timeout)
@@ -738,9 +738,8 @@ class Sweep:
             f"any engine. THE TWO ARE NOT THE SAME PHYSICS -- "
             f"{param.name} is {param.note}, constant_thermal_inertia is "
             f"{NAMED_PARAMETERS['constant_thermal_inertia'].note}, and they "
-            f"give 39.27 K vs 42.19 K diurnal amplitude at TI=200 on "
-            f"quickstart_asteroid_diurnal. This module will not pick one for "
-            f"you.")
+            f"give measurably different diurnal amplitudes on the same "
+            f"config. This module will not pick one for you.")
 
     def _decide_route(self, use_flags):
         """``{parameter: 'flag'|'config'}``. May need the engine; see :attr:`route`."""
