@@ -373,6 +373,52 @@ See [../gui/README.md](../gui/README.md) for detailed GUI documentation.
 
 ## Python Tools
 
+### The `ptm` package and the `ptm` command
+
+`pip install -e .` from the repository root installs one importable package and
+one console script. Everything below is plumbing and presentation — the C++
+engine is still the model.
+
+```bash
+ptm info  output/quickstart_moon_diurnal            # what the run records
+ptm plot  output/quickstart_moon_diurnal map --save map.png
+ptm run   examples/quickstart_moon_diurnal.yaml     # one simulation
+ptm sweep examples/quickstart_asteroid_diurnal.yaml \
+          --vary thermal_inertia=50,100,200,400     # a grid of them
+```
+
+```python
+from ptm import Results, Sweep
+
+run = Results("output/quickstart_moon_diurnal")
+run.plot_globes("temperature", "max", save="globes.png")
+
+sweep = Sweep("examples/quickstart_asteroid_diurnal.yaml",
+              grid={"thermal_inertia": [50, 100, 200, 400]})
+sweep.run()                                          # serial; resumes
+ti   = sweep.values("thermal_inertia")               # the axis
+tmax = sweep.collect(lambda r: r.stat("temperature", "max").max())
+sweep.plot_curves(save="family.png")
+```
+
+#### Sweeps
+
+| Behaviour | Detail |
+|---|---|
+| Execution | Serial by default. `jobs=N` runs `N` engine processes at once and **refuses to start** if any point asks for the GPU — there is one GPU, and concurrent use of it wedges the device. |
+| Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, **and** the outputs are on disk; every skip and every re-run prints its reason. |
+| Provenance | The swept values, the generated overrides, the argv, the engine path and md5, and the config hash are recorded next to the outputs. `ptm.sweep.load_sweep(dir)` reopens a finished sweep without retyping the grid. |
+| Generated configs | Written to each point's own output directory, never into `examples/` or `configs/`. `radiation.view_factor_file` is made absolute, because it is the one key the engine resolves against the YAML's own directory (`config_parser.cpp:507-517`). |
+| Axis names | `thermal_inertia` and `albedo` are delivered through the engine CLI flags `--thermal-inertia` / `--albedo` when the binary advertises them (detected from `--help`, never assumed) and otherwise through `thermophysical.constant_thermal_inertia` / `thermophysical.albedo_override`, which the engine interprets identically. Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
+| Collection | `values()`, `collect()`, `stat()`, `grid_of()`, `table()`, `write_table()`, `curves()`. `table()` returns a list of dicts — `pandas.DataFrame(sweep.table(...))` works, and nothing here requires pandas. |
+
+Worked examples: [`examples/python/fit_thermal_inertia_alma.py`](../examples/python/fit_thermal_inertia_alma.py)
+(sweep → lookup table → fit thermal inertia to an ALMA Band 6 brightness-temperature
+curve, with the observable conversion supplied as a callable) and
+[`examples/python/sweep_replaces_45_configs.py`](../examples/python/sweep_replaces_45_configs.py)
+(the 40-file `configs/europa_lat*` product as one sweep, checked key-by-key
+against the shipped files).
+
 ### Post-Processing Scripts (`src/python/`)
 
 | Script | Purpose |
