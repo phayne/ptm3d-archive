@@ -1,5 +1,13 @@
 """Launching ``ptm_thermal_sim`` and reading what it says while it runs.
 
+Two entry points, for the two ways people use this:
+
+* :func:`run_engine` -- one blocking call, returns a :class:`CompletedRun`.
+  This is what a script or a notebook wants, and what everything in the tree
+  was hand-rolling on top of ``EngineProcess``.
+* :class:`EngineProcess` -- the callback-shaped driver underneath, for a caller
+  with its own event loop (the GUI wraps it in a ``QThread``).
+
 This is the process-driving half of ``gui/gui_core/simulation_runner.py``,
 extracted with no Qt so that a script, a notebook or the GUI can all use the
 same driver. The GUI's ``SimulationThread`` is now a ``QThread`` wrapper that
@@ -34,18 +42,26 @@ import re
 import select
 import signal
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 from . import paths
 
 __all__ = [
+    "BinaryProvenance",
+    "CompletedRun",
     "EngineProcess",
+    "binary_provenance",
     "build_command",
     "classify_severity",
     "engine_flags",
     "engine_supports_flag",
     "extract_progress",
+    "file_md5",
     "find_engine_executable",
+    "resolve_engine",
+    "run_engine",
     "sample_cputime",
 ]
 
@@ -396,3 +412,437 @@ class EngineProcess:
                     self.process.terminate()
             except Exception:
                 pass
+
+
+# --- run it to completion -----------------------------------------------------
+# EngineProcess is callback-shaped because the GUI needs it to be: a QThread
+# forwards each callback to a signal while the event loop keeps running. A
+# script or a notebook wants the opposite -- one blocking call that returns what
+# happened -- and every consumer in the tree was writing the same 15-to-48-line
+# adapter to get there. run_engine() is that adapter, once.
+#
+# It serves the two consumers that actually exist: one wants a throttled live
+# log (echo=True), one wants only the text afterwards (echo=False, .text).
+
+#: The engine's second progress form. It writes two carriage-return readouts:
+#: a ``[====>] 47%`` bar (matched by :func:`extract_progress`) and this one,
+#: which carries no percent sign and so needs its own pattern.
+_STEP_RE = re.compile(r'Progress (\d+)/(\d+)')
+
+_BUILD_HINT = (
+    "Build it from the repository root (INSTALL.md, 'TL;DR'):\n"
+    "    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPTM_ENABLE_GPU=OFF \\\n"
+    "          -DPTM_ARCH_NATIVE=OFF -DCSPICE_ROOT=/path/to/cspice\n"
+    "    cmake --build build --target ptm_thermal_sim -j\n"
+    "or point $PTM_BUILD_DIR at an existing build/bin."
+)
+
+
+class CompletedRun:
+    """What one engine run did. Returned by :func:`run_engine`.
+
+    ``lines`` are the engine's output lines in the order they were read, both
+    streams interleaved and carriage-return segments split apart, which is how
+    the engine's progress bars arrive. ``text`` joins them.
+
+    ``output_dir`` is where the run wrote, taken from the config's
+    ``output.directory`` (resolved against ``cwd``) or from an ``--output``
+    override in ``extra_args``. It is ``None`` when neither says, and
+    :meth:`results` then raises rather than guessing.
+    """
+
+    __slots__ = ("command", "returncode", "lines", "seconds", "timed_out",
+                 "config", "output_dir", "executable")
+
+    def __init__(self, command, returncode, lines, seconds, timed_out=False,
+                 config=None, output_dir=None, executable=None):
+        self.command = list(command)
+        self.returncode = returncode
+        self.lines = list(lines)
+        self.seconds = float(seconds)
+        self.timed_out = bool(timed_out)
+        self.config = config
+        self.output_dir = output_dir
+        self.executable = executable
+
+    def __repr__(self):
+        return (f"<CompletedRun rc={self.returncode} "
+                f"{len(self.lines)} lines {self.seconds:.1f}s "
+                f"-> {self.output_dir}>")
+
+    @property
+    def ok(self):
+        """True when the engine exited 0 and was not stopped at a timeout."""
+        return self.returncode == 0 and not self.timed_out
+
+    @property
+    def text(self):
+        """The whole output as one string."""
+        return "\n".join(self.lines)
+
+    def matching(self, *needles):
+        """Output lines containing any of ``needles`` -- the log-grep every
+        caller writes after a quiet run."""
+        return [ln for ln in self.lines
+                if any(n in ln for n in needles)]
+
+    def results(self, **kwargs):
+        """A :class:`ptm.results.Results` for :attr:`output_dir`.
+
+        ``**kwargs`` go to the constructor (``body_radius_km=``,
+        ``units_style=``). Raises if the run did not say where it wrote, or
+        wrote nothing there.
+        """
+        if self.output_dir is None:
+            raise ValueError(
+                "this run's output directory is unknown: the config set no "
+                "output.directory and no --output was passed. Construct "
+                "Results(<path>) yourself.")
+        if not Path(self.output_dir).is_dir():
+            raise FileNotFoundError(
+                f"the engine exited {self.returncode} but {self.output_dir} "
+                f"does not exist; the run wrote nothing there")
+        from .results import Results
+        return Results(self.output_dir, **kwargs)
+
+
+class _Throttle:
+    """Decide which of the engine's progress readouts to echo.
+
+    The engine emits a percent roughly 100 times per phase and a step counter
+    once per output step. Echoing all of them turns an executed notebook into
+    several hundred lines of bar art. This keeps the first, the last, and one
+    per ``every`` percent of advance, per readout kind.
+
+    A percentage that goes *backwards* means a new phase started -- the engine
+    runs an illumination bar and then a thermal bar, both 0 to 100 -- so the
+    counter resets. Without that the second bar is silent until it finishes,
+    which is exactly the phase a reader is waiting on.
+    """
+
+    def __init__(self, every):
+        self.every = float(every)
+        self.last = {}
+
+    def keep(self, kind, pct):
+        if self.every <= 0:
+            return True
+        previous = self.last.get(kind)
+        if previous is not None and pct < previous:
+            previous = None                      # new phase
+        if pct >= 100.0 or previous is None or pct - previous >= self.every:
+            self.last[kind] = pct
+            return True
+        return False
+
+
+def _resolve_output_dir(config_dict, cwd, extra_args):
+    """Where the engine will write, or ``None`` if nothing says."""
+    from .engine_config import get_dotted
+    directory = None
+    args = [str(a) for a in extra_args]
+    for i, arg in enumerate(args):
+        if arg == "--output" and i + 1 < len(args):
+            directory = args[i + 1]
+        elif arg.startswith("--output="):
+            directory = arg.split("=", 1)[1]
+    if directory is None:
+        directory = get_dotted(config_dict or {}, "output.directory")
+    if not directory:
+        return None
+    path = Path(directory).expanduser()
+    return path if path.is_absolute() else (Path(cwd) / path).resolve()
+
+
+def _load_config(config):
+    """The config as a dict, or ``{}`` with a warning if it cannot be read.
+
+    Warned rather than raised: the engine is the authority on whether a config
+    is usable, and refusing to launch because *this* parser choked would make
+    the wrapper stricter than the thing it wraps.
+    """
+    try:
+        import yaml
+    except ImportError:                                        # pragma: no cover
+        sys.stderr.write("[ptm] PyYAML is not installed; run_engine cannot read "
+                         "the config for --use-gpu-thermal / output.directory\n")
+        return {}
+    try:
+        loaded = yaml.safe_load(Path(config).read_text())
+    except Exception as exc:                                   # noqa: BLE001
+        sys.stderr.write(
+            f"[ptm] could not read {config} as YAML ({exc}); launching anyway "
+            f"and letting the engine judge it. output_dir will be unknown.\n")
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def resolve_engine(exe=None, cwd=None, config=None, name="ptm_thermal_sim"):
+    """The engine executable to run, and the working directory to run it in.
+
+    Returns ``(executable, cwd)`` as absolute :class:`~pathlib.Path` objects.
+    ``cwd`` defaults to the checkout containing ``config`` (falling back to the
+    one containing the current directory), because the engine resolves
+    ``output.directory`` and the other relative paths in a config against the
+    process working directory, and every shipped config is written to be run
+    from the repository root.
+
+    Raises :class:`FileNotFoundError` naming the build command when no engine
+    is found, which is the failure every notebook hand-writes a message for.
+    """
+    root = None
+    if cwd is None:
+        if config is not None:
+            root = paths.find_repo_root(Path(config).expanduser().parent)
+        if root is None:
+            root = paths.find_repo_root()
+        cwd = root if root is not None else Path.cwd()
+    cwd = Path(cwd).expanduser().resolve()
+
+    if exe is None:
+        search = [cwd]
+        if root is not None and root != cwd:
+            search.append(root)
+        exe = paths.find_engine_executable(name, search_roots=search)
+        if exe is None:
+            raise FileNotFoundError(
+                f"{name} not found in {cwd}/build/bin (nor in $PTM_BUILD_DIR). "
+                f"{_BUILD_HINT}")
+    exe = Path(exe).expanduser().resolve()
+    if not exe.exists():
+        raise FileNotFoundError(f"{exe} does not exist. {_BUILD_HINT}")
+    return exe, cwd
+
+
+# --- which binary am I about to run? ------------------------------------------
+# The engine now records its own identity into every run directory, and
+# Results.provenance() reads it back -- md5, git SHA, version, build type, the
+# command line. That answers "what produced this run" completely.
+#
+# It cannot answer "what am I about to run", which is the question a notebook
+# asks in its first cell and a script asks before a twenty-minute launch. There
+# is no run directory yet.
+
+
+class BinaryProvenance:
+    """The identity of an engine binary, before it has produced anything.
+
+    The run-directory counterpart is
+    :meth:`ptm.results.Results.provenance`, which reads what the engine wrote
+    about itself; use that one to describe a finished run. This one describes a
+    binary on disk.
+
+    ``print(...)`` gives the four lines a caller wants in a log header. Fields
+    that could not be determined are ``None`` and are listed in
+    :attr:`unavailable` rather than left to look like absences.
+    """
+
+    __slots__ = ("path", "md5", "size_bytes", "mtime_utc", "repo_root",
+                 "git_sha", "git_branch", "git_dirty", "help_ok", "n_flags",
+                 "unavailable")
+
+    def __init__(self, **fields):
+        unknown = set(fields) - set(self.__slots__)
+        if unknown:
+            # A typo'd keyword would otherwise land nowhere and leave the field
+            # it was meant for reading None, i.e. "not determined".
+            raise TypeError(f"unknown BinaryProvenance field(s): {sorted(unknown)}")
+        for name in self.__slots__:
+            setattr(self, name, fields.get(name))
+        self.unavailable = tuple(fields.get("unavailable", ()))
+
+    def __repr__(self):
+        return f"<BinaryProvenance {self.path} md5={self.md5}>"
+
+    def __str__(self):
+        lines = [f"Binary : {self.path}",
+                 f"  md5  : {self.md5}",
+                 f"  built: {self.mtime_utc}  ({self.size_bytes} bytes)"]
+        if self.git_sha:
+            dirty = " +uncommitted changes" if self.git_dirty else ""
+            lines.append(f"  commit: {self.git_sha} ({self.git_branch}){dirty}")
+        if self.help_ok is not None:
+            lines.append(f"  --help: {'ok' if self.help_ok else 'FAILED'}"
+                         f"  ({self.n_flags} flags advertised)")
+        for item in self.unavailable:
+            lines.append(f"  (not determined: {item})")
+        return "\n".join(lines)
+
+    def as_dict(self):
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+def file_md5(path, block=1 << 20):
+    """md5 of a file, read in blocks.
+
+    Block-wise rather than ``read_bytes()``: the engine binary is a few
+    megabytes and a view-factor matrix can be gigabytes, and nothing here needs
+    the contents afterwards. ``ptm.sweep`` uses this for the same purpose.
+    """
+    import hashlib
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git(repo_root, *args):
+    """Run git in ``repo_root``; return stdout, or ``None``."""
+    import shutil
+    git = shutil.which("git")
+    if git is None or repo_root is None:
+        return None
+    try:
+        proc = subprocess.run([git, *args], cwd=str(repo_root),
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def binary_provenance(exe=None, repo_root=None, check_help=True):
+    """Identify the engine binary a run would use.
+
+    ::
+
+        from ptm import run as engine
+        print(engine.binary_provenance())
+
+        Binary : /path/to/build/bin/ptm_thermal_sim
+          md5  : e19adfdabfac617d187833414acc7931
+          built: 2026-08-10T02:36:11Z  (3287688 bytes)
+          commit: 3f06348 (feat/ptm-api-gaps)
+          --help: ok  (126 flags advertised)
+
+    ``exe`` defaults to the engine :func:`resolve_engine` would pick.
+    ``check_help`` runs ``--help`` once, which is the cheapest check that a
+    build is not broken; the flag count comes from the same call, cached.
+
+    Git is located with ``shutil.which``, not hard-coded, and a checkout with no
+    git available reports that in :attr:`BinaryProvenance.unavailable` instead
+    of silently omitting the commit.
+    """
+    from datetime import datetime, timezone
+
+    exe, cwd = resolve_engine(exe=exe, cwd=repo_root)
+    if repo_root is None:
+        repo_root = paths.find_repo_root(exe.parent) or cwd
+
+    unavailable = []
+    stat = exe.stat()
+    md5 = file_md5(exe)
+    mtime = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+
+    sha = _git(repo_root, "rev-parse", "--short", "HEAD")
+    branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    dirty = None
+    if sha is None:
+        unavailable.append(
+            f"git commit ({repo_root} is not a git checkout, or git is not "
+            f"on PATH)")
+    else:
+        status = _git(repo_root, "status", "--porcelain")
+        dirty = bool(status)
+
+    help_ok, n_flags = None, None
+    if check_help:
+        flags = engine_flags(exe)
+        n_flags = len(flags)
+        help_ok = n_flags > 0
+        if not help_ok:
+            unavailable.append(
+                f"the flag list: {exe} --help advertised none, which usually "
+                f"means the build is broken")
+
+    return BinaryProvenance(
+        path=exe, md5=md5, size_bytes=stat.st_size,
+        mtime_utc=mtime.strftime("%Y-%m-%dT%H:%M:%SZ"), repo_root=repo_root,
+        git_sha=sha, git_branch=branch, git_dirty=dirty,
+        help_ok=help_ok, n_flags=n_flags, unavailable=tuple(unavailable))
+
+
+def run_engine(config, exe=None, cwd=None, echo=False, progress_every=25.0,
+               extra_args=(), env=None, timeout=None, show=(), check=True):
+    """Run ``ptm_thermal_sim`` on ``config`` to completion.
+
+    ::
+
+        from ptm import run as engine
+        done = engine.run_engine("examples/quickstart_moon_diurnal.yaml",
+                                 echo=True)
+        result = done.results()                 # a ptm.results.Results
+
+    ``exe`` and ``cwd`` default through :func:`resolve_engine`. ``extra_args``
+    are appended to the command line, so ``--equilibration-orbits 5`` and
+    ``--output some/dir`` work and the second one is reflected in
+    :attr:`CompletedRun.output_dir`.
+
+    ``echo=False`` (the default) runs silently and keeps everything in
+    :attr:`CompletedRun.lines`; ``show=('Simulation completed in',)`` prints
+    just the lines you care about once it is over. ``echo=True`` streams the
+    output live, keeping one progress readout per ``progress_every`` percent so
+    an executed notebook stays readable; ``progress_every=0`` echoes every
+    line, bar art included.
+
+    ``check=True`` raises :class:`RuntimeError` on a non-zero exit, quoting the
+    last 30 lines -- the engine's own FATAL message is in there. Pass
+    ``check=False`` to inspect :attr:`CompletedRun.returncode` yourself.
+
+    No physics: this starts a process, reads what it printed, and reports it.
+    """
+    config = Path(config).expanduser()
+    exe, cwd = resolve_engine(exe=exe, cwd=cwd, config=config)
+    config_dict = _load_config(config)
+    command = build_command(exe, config, config_dict) + [str(a) for a in extra_args]
+    output_dir = _resolve_output_dir(config_dict, cwd, extra_args)
+
+    lines = []
+    throttle = _Throttle(progress_every)
+
+    def take(line):
+        lines.append(line)
+        if not echo:
+            return
+        pct = extract_progress(line)
+        step = _STEP_RE.search(line)
+        if pct is not None:
+            if throttle.keep("percent", pct):
+                print(line)
+        elif step is not None:
+            done, total = int(step.group(1)), int(step.group(2))
+            if throttle.keep("step", 100.0 * done / max(total, 1)):
+                print(line)
+        else:
+            print(line)
+
+    if echo:
+        print("Running:", " ".join(str(c) for c in command))
+        print(f"(cwd={cwd})\n")
+
+    started = time.time()
+    process = EngineProcess(command, working_dir=cwd, env=env, on_output=take,
+                            on_warning=take, on_error=take, timeout=timeout)
+    returncode = process.run()
+    seconds = time.time() - started
+
+    completed = CompletedRun(command, returncode, lines, seconds,
+                             timed_out=process.timed_out, config=config,
+                             output_dir=output_dir, executable=exe)
+
+    for line in completed.matching(*show):
+        print("   ", line.strip())
+    if echo:
+        print(f"\n--- {len(lines)} output lines; {seconds:.1f} s wall; "
+              f"exit code {returncode} ---")
+
+    if output_dir is not None and returncode == 0 and not Path(output_dir).is_dir():
+        sys.stderr.write(
+            f"[ptm] the engine exited 0 but {output_dir} was not created; the "
+            f"config's output.directory may not be what this run used\n")
+    if check and returncode != 0:
+        raise RuntimeError(
+            f"{config} exited with code {returncode}"
+            f"{' (stopped at the timeout)' if process.timed_out else ''}:\n"
+            + "\n".join(lines[-30:]))
+    return completed

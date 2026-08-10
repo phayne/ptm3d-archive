@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptm"
-version = "0.1.0"
+# Single-sourced from ptm/__init__.py. A literal here goes stale the moment
+# anyone bumps __version__ and nothing complains: this file said 0.1.0 while
+# the package reported 0.3.0, so `pip show ptm` and `ptm --version` disagreed.
+dynamic = ["version"]
 description = "Python layer for PTM3D: read a run directory, launch the engine"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -42,7 +45,17 @@ Issues = "https://github.com/phayne/ptm3d/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src/python" }
-# Listed explicitly: src/python also holds ~110 loose modules and four
-# unrelated packages (damit, horizons, ptm_ice, ojakangas_stevenson) that are
-# not part of this distribution.
-packages = ["ptm"]
+# Listed explicitly: src/python also holds ~110 loose modules and two further
+# packages (ptm_ice, ojakangas_stevenson) that are not part of this
+# distribution.
+#
+# damit and horizons ARE, as of the tutorial-04 work: they are the small-body
+# preset half of the workflow (DAMIT shape search and conversion; the HORIZONS
+# client, SPK generator and body-config writer), and tutorial 04 was doing
+# sys.path surgery for the single line `from damit import DAMITClient`. Both
+# import nothing outside the standard library except a guarded `yaml`, which is
+# already a dependency, so packaging them adds no requirement.
+packages = ["ptm", "damit", "horizons"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ptm.__version__" }

@@ -31,16 +31,23 @@ import numpy as np
 
 __all__ = [
     "clip_extend",
+    "colorbar",
+    "default_norm",
     "face_unit_vectors",
     "flux_norm",
     "globe",
+    "globe_grid",
     "mesh_angular_radius",
+    "panel_label",
     "plot_diurnal",
     "plot_globes",
     "plot_histogram",
     "plot_map",
+    "plot_shape",
     "plot_sweep_curves",
     "plot_sweep_residuals",
+    "scatter_map",
+    "shape",
     "styled",
     "sweep_colors",
     "sym_norm",
@@ -103,6 +110,52 @@ def flux_norm(values, lo_pct=1.0, hi_pct=100.0):
     return FuncNorm((lambda t: np.clip(t, 0.0, None) ** 4,
                      lambda y: np.clip(y, 0.0, None) ** 0.25),
                     vmin=vmin, vmax=vmax)
+
+
+def _flux_by_default(what, moment='max', step=None):
+    """Whether to colour this request linear in ``T**4`` unless told otherwise.
+
+    Only a *peak* temperature statistic. The point of :func:`flux_norm` is to
+    undo the fourth-root compression of a field that is everywhere near its own
+    radiative equilibrium, and ``temperature_max`` is that field: every face is
+    shown at its own local noon.
+
+    A single output step is not, and neither is ``min`` or ``avg``. On a Moon
+    snapshot spanning 67 to 385 K, colouring linear in ``T**4`` gives the whole
+    night hemisphere -- most of the visible disk -- 2.1% of the colour range,
+    so it renders as one flat black. Measured on
+    ``quickstart_moon_diurnal`` step 120; the same field on a linear scale
+    separates the night side over a third of the bar.
+
+    An explicit ``flux_scaled=`` always wins; this only chooses the default.
+    """
+    if not isinstance(what, str) or not what.startswith("temperature"):
+        return False
+    return step is None and moment == 'max'
+
+
+def default_norm(values, what, moment='max', step=None, flux_scaled=None,
+                 norm=None):
+    """The colour scale for a request, unless the caller already chose one.
+
+    ``norm`` wins if given; then an explicit ``flux_scaled``; then
+    :func:`_flux_by_default`. Every canned plot that colours a per-face field
+    resolves its scale here, so ``plot_map``, ``plot_globes``,
+    :func:`globe_grid` and ``plot_shape`` cannot drift apart about what a
+    temperature snapshot should look like.
+    """
+    if norm is not None:
+        return norm
+    if flux_scaled is None:
+        flux_scaled = _flux_by_default(what, moment, step)
+    values = np.asarray(values)
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return None
+    if flux_scaled:
+        return flux_norm(finite)
+    from matplotlib.colors import Normalize
+    return Normalize(float(finite.min()), float(finite.max()))
 
 
 def sym_norm(values, pct=99.0):
@@ -231,6 +284,106 @@ def globe(ax, xyz, tris, vertex_values, view_lat, view_lon, cmap=CMAP_FIELD,
     return art
 
 
+# --- a real shape model -------------------------------------------------------
+# globe() normalizes the vertices onto a unit sphere, which is the right thing
+# for an icosphere of a round body and destroys a spinning top, a contact binary
+# or any DAMIT/radar shape. This draws the facets where they actually are.
+
+
+def _face_normals(vertices, tris):
+    """Outward unit normals, one per triangle.
+
+    Oriented by the face centroid rather than by the winding order: shape files
+    in this tree come from several archives (DAMIT, the PDS radar models,
+    the icosphere generator) and their winding is not uniformly outward. Every
+    body drawn this way is star-shaped about its centre of figure, so the
+    centroid direction settles the sign.
+    """
+    corners = vertices[tris]
+    normals = np.cross(corners[:, 1] - corners[:, 0],
+                       corners[:, 2] - corners[:, 0])
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = normals / np.where(lengths > 0, lengths, 1.0)
+    outward = corners.mean(axis=1) - vertices.mean(axis=0)
+    flip = np.sum(normals * outward, axis=1) < 0
+    normals[flip] *= -1.0
+    return normals
+
+
+def _view_direction(elev, azim):
+    """The unit vector from the body toward the camera, for matplotlib's
+    ``view_init(elev, azim)`` convention."""
+    e, a = np.radians(elev), np.radians(azim)
+    return np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
+
+
+def shape(ax, vertices, faces, face_values, cmap=CMAP_FIELD, norm=None,
+          elev=20.0, azim=35.0, title="", edgecolor="none", linewidth=0.0,
+          cull_backfaces=True, axis_labels=("x", "y", "z (spin axis)"),
+          unit=""):
+    """Draw a per-face field on the actual facets of a shape model.
+
+    ``ax`` must be a 3-D axes (``fig.add_subplot(projection='3d')``).
+    ``vertices`` are in the mesh's own length unit and are *not* rescaled --
+    that is the whole difference from :func:`globe`, which normalizes them onto
+    a unit sphere and turns Bennu into a ball. The three axes are given equal
+    limits and an equal box aspect, so the body's real proportions survive.
+
+    ``cull_backfaces`` drops the facets pointing away from the camera before
+    drawing. Matplotlib's 3-D renderer is a painter's algorithm, not a z-buffer,
+    so without culling the far side is painted first and every so often shows
+    through a near facet. Culling removes that for a star-shaped body; a genuine
+    concavity can still mis-sort, and there is no fix for that inside
+    matplotlib.
+
+    Drawn with ``antialiased=False``, which is not cosmetic: antialiasing
+    blends each facet's edge with the white canvas behind it, and on Bennu's
+    2,692 facets that pale hairline covers the body in a wireframe that is not
+    in the data. Pass ``edgecolor='k'`` with a ``linewidth`` to draw the facets
+    deliberately.
+
+    Returns the ``Poly3DCollection``, which carries the colour mapping, so
+    :func:`colorbar` works on it directly.
+    """
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces)
+    values = np.asarray(face_values, dtype=np.float64)
+    if faces.shape[0] != values.shape[0]:
+        raise ValueError(
+            f"the mesh has {faces.shape[0]} faces but {values.shape[0]} values "
+            f"were given")
+
+    keep = np.ones(faces.shape[0], dtype=bool)
+    if cull_backfaces:
+        keep = _face_normals(vertices, faces) @ _view_direction(elev, azim) > 0
+        if not keep.any():
+            raise ValueError(
+                f"no facet faces the camera at elev={elev}, azim={azim}")
+
+    collection = Poly3DCollection(vertices[faces[keep]], cmap=cmap, norm=norm,
+                                  edgecolors=edgecolor, linewidths=linewidth,
+                                  antialiased=False)
+    collection.set_array(values[keep])
+    ax.add_collection3d(collection)
+
+    span = float(np.abs(vertices).max())
+    ax.set_xlim(-span, span)
+    ax.set_ylim(-span, span)
+    ax.set_zlim(-span, span)
+    ax.set_box_aspect((1, 1, 1))
+    ax.view_init(elev=elev, azim=azim)
+    if axis_labels is not None:
+        suffix = f" ({unit})" if unit else ""
+        for setter, name in zip((ax.set_xlabel, ax.set_ylabel, ax.set_zlabel),
+                                axis_labels):
+            setter(f"{name}{suffix}")
+    if title:
+        ax.set_title(title, fontsize=11)
+    return collection
+
+
 # --- resolving what to plot -------------------------------------------------
 
 def mesh_angular_radius(directions):
@@ -319,16 +472,258 @@ def _nonlinear_ticks(norm, n=6):
     return rounded if rounded.size >= 2 else None
 
 
-def _colorbar(fig, artist, ax, label, values, norm, **kwargs):
-    """A colorbar with legible ticks and the correct clipping arrows."""
-    extend = clip_extend(values, norm) if norm is not None else "neither"
+def colorbar(fig, artist, ax, label="", values=None, norm=None, **kwargs):
+    """A colorbar with legible ticks and the correct clipping arrows.
+
+    ``ax`` may be one axes or a sequence of them, and a sequence is how a
+    shared colorbar is made: one bar beside the whole row or column, sized by
+    the group rather than by one panel.
+
+    Two things this does that ``fig.colorbar`` does not. It sets ``extend``
+    from the data, so the arrows appear exactly when values fall outside the
+    norm -- pass ``values`` (any array, or the concatenation of several panels'
+    arrays) to get that. And on a non-linear norm it places the ticks evenly
+    along the *bar* instead of at round numbers in data space: with
+    :func:`flux_norm` on a field spanning day and night, matplotlib's default
+    locator stacks three labels on top of each other in the bottom millimetre.
+
+    ``**kwargs`` go straight to ``fig.colorbar`` (``fraction``, ``pad``,
+    ``orientation``, ``shrink``).
+    """
+    extend = (clip_extend(values, norm)
+              if (norm is not None and values is not None) else "neither")
     bar = fig.colorbar(artist, ax=ax, extend=extend, **kwargs)
     if norm is not None:
         ticks = _nonlinear_ticks(norm)
         if ticks is not None:
             bar.set_ticks(ticks)
-    bar.set_label(label)
+    if label:
+        bar.set_label(label)
     return bar
+
+
+# Forwarded rather than imported at module level: ptm.pubstyle imports
+# matplotlib on import, and this module deliberately does not.
+def panel_label(ax, label, x=0.02, y=0.97, **kwargs):
+    """Place a panel label like ``'(a)'`` in the top-left corner of ``ax``.
+
+    See :func:`ptm.pubstyle.panel_label`; this is the same function, reachable
+    from the module a figure is already importing.
+    """
+    from . import pubstyle
+    return pubstyle.panel_label(ax, label, x=x, y=y, **kwargs)
+
+
+# --- unprojected per-face map -------------------------------------------------
+# plot_map() regrids onto a raster and needs scipy. Every tutorial figure that
+# shows a field over the whole body instead scatters the face centers directly:
+# no interpolation, no extra dependency, and each dot is one solved face. That
+# is twelve lines of axis setup repeated six times across the notebooks, and it
+# is the single most-copied plotting block in them.
+
+
+def _face_marker_size(n_faces):
+    """A dot size that tiles the map without merging into a slab.
+
+    Scaled so the dots cover a roughly constant fraction of a 7-inch-wide
+    equirectangular axes: 16 pt^2 at ico3 (1,280 faces), 7 at ico4, 5 at ico5,
+    floored at 1 so a 500k-face mesh still draws something.
+    """
+    return float(np.clip(16.0 * (1280.0 / max(n_faces, 1)) ** 0.5, 1.0, 24.0))
+
+
+def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
+                title="", xlabel=True, ylabel=True, grid=True, **kwargs):
+    """Draw a per-face field at its own face centers on ``ax``.
+
+    One dot per face at its centre, no regridding and no scipy: what is drawn
+    is the mesh's own values. ``lat``/``lon`` are per-face degrees --
+    :attr:`ptm.results.Results.lat` and :attr:`~ptm.results.Results.lon`, in
+    that order -- and ``lon`` is on ``[-180, 180]``, which is what the axis is
+    set to.
+
+    ``xlabel``/``ylabel`` may be ``False`` to leave the axis bare, which is
+    what the inner panels of a shared-axis grid want. Returns the ``scatter``
+    artist, for :func:`colorbar`.
+    """
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    values = np.asarray(values)
+    if lat.shape != lon.shape or lat.shape[0] != values.shape[0]:
+        raise ValueError(
+            f"lat, lon and values must have one entry per face; got "
+            f"{lat.shape}, {lon.shape}, {values.shape}")
+    # Argument order is (lat, lon) to match Results.lat / Results.lon and the
+    # rest of this package, while scatter's own order is (x=lon, y=lat).
+    # Swapping them draws a plausible-looking wrong figure, so it is caught.
+    if np.nanmax(np.abs(lat)) > 90.0 + 1e-6:
+        raise ValueError(
+            f"latitude out of range (max |lat| = {np.nanmax(np.abs(lat)):.1f} "
+            f"deg): the arguments are (ax, lat, lon, values), and these look "
+            f"transposed")
+
+    if size is None:
+        size = _face_marker_size(values.shape[0])
+    artist = ax.scatter(lon, lat, c=values, cmap=cmap, norm=norm, s=size,
+                        linewidths=0, **kwargs)
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-90, 90)
+    ax.set_xticks(range(-180, 181, 60))
+    ax.set_yticks(range(-90, 91, 30))
+    if xlabel:
+        ax.set_xlabel("Longitude (deg)")
+    if ylabel:
+        ax.set_ylabel("Latitude (deg)")
+    if grid:
+        ax.grid(True, linewidth=0.4)
+    if title:
+        ax.set_title(title, fontsize=11)
+    return artist
+
+
+# --- a grid of globes ---------------------------------------------------------
+# plot_globes() draws one field from several views. Every comparison figure in
+# the tutorials needs the other axis too: two fields down the rows (temperature
+# and what topography changed; albedo and the temperature it produces), or two
+# output steps across one row (before ingress and mid-eclipse). Rows share a
+# colour scale and a colorbar; columns share a viewpoint.
+
+#: The four views the tutorials use when none are named.
+DEFAULT_VIEWS = ((0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
+                 (90.0, 0.0, "north pole"), (-90.0, 0.0, "south pole"))
+
+
+def _normalize_views(views):
+    views = DEFAULT_VIEWS if views is None else views
+    return [(float(v[0]), float(v[1]), (v[2] if len(v) > 2 else ""))
+            for v in views]
+
+
+def _row_values(run, row, n_views):
+    """The value array for each view in one row of :func:`globe_grid`.
+
+    ``what`` may be a single field name or array (the same field seen from
+    every view), or a sequence of one per view -- which is how a row compares
+    two output steps side by side.
+    """
+    what = row.get("what", "temperature")
+    moment, step = row.get("moment", "max"), row.get("step")
+    is_sequence = (isinstance(what, (list, tuple))
+                   or (isinstance(what, np.ndarray) and what.ndim == 2))
+    if not is_sequence:
+        values, label = _values_and_label(run, what, moment, step)
+        return [values] * n_views, label
+    if len(what) != n_views:
+        raise ValueError(
+            f"this row lists {len(what)} fields but the grid has {n_views} "
+            f"views; a per-view list must have exactly one entry per view")
+    resolved = [_values_and_label(run, w, moment, step) for w in what]
+    labels = [lab for _, lab in resolved if lab]
+    return [v for v, _ in resolved], (labels[0] if labels else "")
+
+
+def _row_norm(row, stacked):
+    """One norm per row, so every panel in it is on the same colour scale."""
+    return default_norm(stacked, row.get("what"), row.get("moment", "max"),
+                        row.get("step"), row.get("flux_scaled"),
+                        row.get("norm"))
+
+
+def globe_grid(run, rows, views=None, save=None, show=False, figsize=None,
+               suptitle=None, panel_labels=False, graticule_step=30.0):
+    """A grid of orthographic globes: one row per field, one column per view.
+
+    ::
+
+        plots.globe_grid(run,
+            rows=[{"what": "temperature", "moment": "max"},
+                  {"what": delta, "label": r"$\\Delta T$ (K)",
+                   "cmap": plots.CMAP_DIFF, "norm": plots.sym_norm(delta)}],
+            views=[(90, 0, "north pole"), (-90, 0, "south pole")])
+
+    Each entry of ``rows`` is a mapping. ``what`` is a field name, an array, or
+    a list of either with one entry per view (that is how one row compares two
+    output steps). The optional keys are ``moment``, ``step``, ``label``,
+    ``cmap``, ``norm``, ``flux_scaled``, ``mark`` (a ``(lat, lon)`` cross) and
+    ``titles``.
+
+    Every panel in a row shares one norm and one colorbar, because that is what
+    makes a row comparable; different rows are independent. Column titles are
+    drawn on the top row only. Returns the figure.
+    """
+    plt = styled()
+
+    views = _normalize_views(views)
+    rows = [dict(r) for r in rows]
+    if not rows:
+        raise ValueError("globe_grid needs at least one row")
+
+    mesh = run.mesh
+    _require_global_mesh(run)
+
+    n_rows, n_cols = len(rows), len(views)
+    if figsize is None:
+        figsize = _globe_grid_figsize(n_rows, n_cols, bool(suptitle))
+    # Constrained layout, not the default: a globe's axes has aspect='equal',
+    # so its box shrinks inside whatever cell it is given and the leftover
+    # becomes a band of white between the rows -- measured at 0.8 in on a
+    # 2x2 grid, which reads as a missing panel. Constrained layout also keeps
+    # each row's colorbar the height of that row, and places the suptitle, so
+    # the suptitle below must not be given an explicit y.
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False,
+                             constrained_layout=True)
+
+    letters = iter("abcdefghijklmnopqrstuvwxyz")
+    for i, row in enumerate(rows):
+        per_view, default_label = _row_values(run, row, n_cols)
+        vertex_fields = [vertex_values_from_faces(mesh["faces"], v,
+                                                  mesh["n_vertices"])
+                         for v in per_view]
+        stacked = np.concatenate(vertex_fields)
+        norm = _row_norm(row, stacked)
+        cmap = row.get("cmap", CMAP_FIELD)
+        titles = row.get("titles")
+        artist = None
+        for j, (view_lat, view_lon, view_title) in enumerate(views):
+            title = (titles[j] if titles is not None
+                     else (view_title if i == 0 else ""))
+            artist = globe(axes[i][j], mesh["vertices"], mesh["faces"],
+                           vertex_fields[j], view_lat, view_lon, cmap=cmap,
+                           norm=norm, title=title,
+                           graticule_step=graticule_step, mark=row.get("mark"))
+            if panel_labels:
+                panel_label(axes[i][j], f"({next(letters)})")
+        colorbar(fig, artist, list(axes[i]), row.get("label", default_label),
+                 stacked, norm, fraction=0.02, pad=0.02)
+
+    if suptitle:
+        fig.suptitle(suptitle)
+    return _finish(fig, save, show)
+
+
+#: Inches a globe grid loses off its width to the colorbar, its label and the
+#: figure margins. Measured on the 2x2 and 1x4 grids the tutorials draw.
+_GLOBE_CBAR_IN = 0.9
+#: Inches reserved for the column titles, and for a suptitle when there is one.
+_GLOBE_TITLE_IN = 0.35
+_GLOBE_SUPTITLE_IN = 0.45
+
+
+def _globe_grid_figsize(n_rows, n_cols, has_suptitle, column_in=3.4):
+    """A canvas on which the square globes fill their cells.
+
+    The width is the free parameter and the height follows from it: an
+    aspect='equal' axes shrinks its box to a square inside whatever cell it is
+    given, so a cell taller than it is wide turns the surplus into white space
+    between the rows -- 0.8 in of it on a 2x2 grid, which reads as a missing
+    panel rather than as margin.
+    """
+    width = column_in * n_cols
+    cell = (width - _GLOBE_CBAR_IN) / n_cols
+    height = n_rows * cell + _GLOBE_TITLE_IN
+    if has_suptitle:
+        height += _GLOBE_SUPTITLE_IN
+    return (width, height)
 
 
 def _finish(fig, save=None, show=False, dpi=200):
@@ -385,9 +780,10 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
     grid cells from a face center, which on a coarse global mesh leaves a
     notched, broken-looking polar edge -- correct, but it reads as a bug.
 
-    ``flux_scaled`` colours by :func:`flux_norm` instead of linearly; the
-    default is to do that for temperature and not for anything else. Passing
-    ``step`` draws that output step and ``moment`` is not used.
+    ``flux_scaled`` colours by :func:`flux_norm` instead of linearly. The
+    default follows :func:`_flux_by_default`: peak temperature yes, a single
+    step or ``min``/``avg`` no. Passing ``step`` draws that output step and
+    ``moment`` is not used.
     """
     plt = styled()
     from . import pubstyle
@@ -396,13 +792,9 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
     axis_label = label or axis_label
     grid, regridder = run.to_grid(values, resolution=resolution, linear=linear)
 
-    if norm is None:
-        if flux_scaled is None:
-            flux_scaled = (isinstance(what, str)
-                           and what.startswith("temperature"))
-        finite = grid[np.isfinite(grid)]
-        norm = (flux_norm(finite) if flux_scaled and finite.size
-                else None)
+    # A regridded map is masked outside the mesh's hull, so the scale comes
+    # from the finite pixels -- which is what default_norm() looks at.
+    norm = default_norm(grid, what, moment, step, flux_scaled, norm)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W,
@@ -426,7 +818,7 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
         ax.set_ylabel("Polar stereographic y (km)")
 
     finite = grid[np.isfinite(grid)]
-    _colorbar(fig, image, ax, axis_label, finite, norm, pad=0.02, fraction=0.046)
+    colorbar(fig, image, ax, axis_label, finite, norm, pad=0.02, fraction=0.046)
     fig.tight_layout()
     return _finish(fig, save, show)
 
@@ -436,47 +828,98 @@ def plot_globes(run, what='temperature', moment='max', step=None, views=None,
                 save=None, show=False, label=None):
     """A row of orthographic globes of a per-face field.
 
+    One row of :func:`globe_grid`, which is where the drawing lives; use that
+    directly for more than one field or more than one output step.
+
     ``views`` is a sequence of ``(lat, lon)`` or ``(lat, lon, title)``. The
     default is the four the tutorials use: 0 deg, 180 deg, and both poles. With
     ``mark_subsolar=True`` and a ``step``, the sub-solar point is read from
     ``body_positions.csv`` and marked.
 
-    Passing ``step`` draws that output step and ``moment`` is not used.
+    ``flux_scaled`` colours by :func:`flux_norm`; the default follows
+    :func:`_flux_by_default` -- peak temperature yes, a single step no, because
+    a snapshot spanning day and night has almost all of its faces in the bottom
+    two percent of a ``T**4`` bar. Passing ``step`` draws that output step and
+    ``moment`` is not used.
+    """
+    mark = (run.subsolar_latlon(step)
+            if (mark_subsolar and step is not None) else None)
+    row = {"what": what, "moment": moment, "step": step, "cmap": cmap,
+           "norm": norm, "flux_scaled": flux_scaled, "mark": mark}
+    if label:
+        row["label"] = label
+    return globe_grid(run, [row], views=views, save=save, show=show)
+
+
+def plot_shape(run, what='temperature', moment='max', step=None, views=None,
+               cmap=CMAP_FIELD, norm=None, flux_scaled=None, ax=None,
+               axes_off=None, save=None, show=False, label=None, figsize=None,
+               suptitle=None):
+    """The run's own facets, coloured by a per-face field.
+
+    For a body whose shape matters -- a DAMIT model, a radar shape, a contact
+    binary. :func:`plot_globes` normalizes the vertices onto a sphere, which is
+    correct for an icosphere and wrong for anything else.
+
+    ``views`` is a sequence of ``(elev, azim)`` or ``(elev, azim, title)`` in
+    degrees; the default is one view. All views share one colour scale and one
+    colorbar. Passing ``ax`` draws a single view on an existing 3-D axes and
+    ``views`` is then a single view.
+
+    ``axes_off`` hides the 3-D box, ticks and axis labels. The default is to
+    keep them for a single view -- where the km scale is worth having -- and
+    drop them for several, because a 3-D axes draws its tick labels outside its
+    own bounding box and three of them side by side overprint each other. Set
+    it explicitly either way.
+
+    Axis labels carry the mesh's length unit from
+    :attr:`ptm.results.Results.mesh_units`, which is settled by the engine's
+    own rule rather than assumed.
     """
     plt = styled()
 
     values, axis_label = _values_and_label(run, what, moment, step)
     axis_label = label or axis_label
+    mesh = run.mesh
 
     if views is None:
-        views = [(0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
-                 (90.0, 0.0, "north pole"), (-90.0, 0.0, "south pole")]
-    views = [(v[0], v[1], v[2] if len(v) > 2 else "") for v in views]
+        views = [(20.0, 35.0, "")]
+    views = [(float(v[0]), float(v[1]), (v[2] if len(v) > 2 else ""))
+             for v in views]
+    if ax is not None and len(views) != 1:
+        raise ValueError("ax= draws one view; pass a single view or drop ax=")
+    if axes_off is None:
+        axes_off = len(views) > 1
 
-    mesh = run.mesh
-    _require_global_mesh(run)
-    vertex_values = vertex_values_from_faces(mesh["faces"], values,
-                                             mesh["n_vertices"])
-    if norm is None:
-        if flux_scaled is None:
-            flux_scaled = (isinstance(what, str)
-                           and what.startswith("temperature"))
-        from matplotlib.colors import Normalize
-        norm = (flux_norm(vertex_values) if flux_scaled
-                else Normalize(float(vertex_values.min()),
-                               float(vertex_values.max())))
+    norm = default_norm(values, what, moment, step, flux_scaled, norm)
 
-    mark = run.subsolar_latlon(step) if (mark_subsolar and step is not None) else None
+    if ax is None:
+        if figsize is None:
+            figsize = ((4.2 if axes_off else 5.0) * len(views), 4.4)
+        fig = plt.figure(figsize=figsize)
+        axes = [fig.add_subplot(1, len(views), i + 1, projection="3d")
+                for i in range(len(views))]
+        # Explicit margins, not tight/constrained layout: neither reserves room
+        # for a 3-D axes' tick labels, which are drawn outside its bounding
+        # box, and the left panel's z label is clipped against the canvas.
+        fig.subplots_adjust(left=(0.02 if axes_off else 0.09),
+                            right=0.88, bottom=0.04, top=0.90,
+                            wspace=(0.02 if axes_off else 0.24))
+    else:
+        fig, axes = ax.figure, [ax]
 
-    fig, axes = plt.subplots(1, len(views), figsize=(3.4 * len(views), 3.8))
-    axes = np.atleast_1d(axes)
-    art = None
-    for ax, (view_lat, view_lon, title) in zip(axes, views):
-        art = globe(ax, mesh["vertices"], mesh["faces"], vertex_values,
-                    view_lat, view_lon, cmap=cmap, norm=norm, title=title,
-                    mark=mark)
-    _colorbar(fig, art, axes, axis_label, vertex_values, norm,
-              fraction=0.02, pad=0.02)
+    artist = None
+    for panel, (elev, azim, title) in zip(axes, views):
+        artist = shape(panel, mesh["vertices"], mesh["faces"], values,
+                       cmap=cmap, norm=norm, elev=elev, azim=azim, title=title,
+                       unit=run.mesh_units,
+                       axis_labels=None if axes_off else ("x", "y",
+                                                          "z (spin axis)"))
+        if axes_off:
+            panel.set_axis_off()
+    colorbar(fig, artist, axes, axis_label, values, norm, shrink=0.6, pad=0.02)
+    if suptitle:
+        fig.suptitle(suptitle)
     return _finish(fig, save, show)
 
 

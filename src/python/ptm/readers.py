@@ -420,10 +420,17 @@ def infer_mesh_length_unit(face_centers, vertices=None, body_radius_km=None):
 
     unit = "m" if meters else "km"
     if not (says_km or says_m):
+        # This fires on every small body -- no asteroid is in the known-radii
+        # table, and cannot be -- so the message has to say what silences it,
+        # or a Bennu or Chimaera user sees a warning with no stated action on
+        # every single call.
         warnings.warn(
             f"mesh length unit inferred as {unit.upper()} from magnitude alone "
-            f"(median |face_center| = {median:g}); no body radius corroborates "
-            f"it. If this mesh is not body-centered, check it.",
+            f"(median |face_center| = {median:g}); no known body radius "
+            f"corroborates it. Expected for a small body: pass "
+            f"body_radius_km=<the body's radius> (e.g. Results(run_dir, "
+            f"body_radius_km=0.2447) for Bennu) to corroborate it and silence "
+            f"this, or mesh_units={unit!r} to state it outright.",
             stacklevel=2)
     return MeshUnitReport(unit=unit, median=median, lo=lo, hi=hi,
                           corroborated=bool(says_km or says_m),

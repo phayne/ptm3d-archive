@@ -482,6 +482,126 @@ def test_globes_refuse_a_site_patch(tmp):
         raise AssertionError("a globe of a site patch was drawn")
 
 
+def test_scatter_map_catches_transposed_lat_lon(tmp):
+    """(ax, lat, lon, values) drawn as (lon, lat) is a plausible wrong figure."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from ptm import plots
+
+    run = Results(make_run(tmp / "sm_run"))
+    values = run.stat("temperature", "max")
+    fig, ax = plt.subplots()
+    plots.scatter_map(ax, run.lat, run.lon, values)          # correct order
+    try:
+        plots.scatter_map(ax, run.lon, run.lat, values)      # transposed
+    except ValueError as exc:
+        assert "transposed" in str(exc), exc
+    else:
+        raise AssertionError("a transposed lat/lon was drawn without complaint")
+    plt.close(fig)
+
+
+def test_globe_grid_rows_views_and_per_view_fields(tmp):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from ptm import plots
+
+    run = Results(make_run(tmp / "gg_run"))
+    out = tmp / "figs2"
+    out.mkdir(exist_ok=True)
+    tmax = run.stat("temperature", "max")
+    delta = tmax - run.stat("temperature", "min")
+
+    fig = run.globe_grid(
+        rows=[{"what": "temperature", "moment": "max"},
+              {"what": delta, "label": "range (K)", "cmap": plots.CMAP_DIFF,
+               "norm": plots.sym_norm(delta)}],
+        views=[(90, 0, "north"), (-90, 0, "south")],
+        panel_labels=True, suptitle="grid", save=out / "grid.png")
+    assert len(fig.axes) == 4 + 2, "expected 4 panels and 2 colorbars"
+    assert (out / "grid.png").stat().st_size > 5000
+    plt.close(fig)
+
+    # One row, a different field per view -- the two-output-steps comparison.
+    fig = run.globe_grid(
+        rows=[{"what": [run.field("temperature", 0), run.field("temperature", 4)],
+               "label": "T (K)"}],
+        views=[(0, 0, "step 0"), (0, 0, "step 4")], save=out / "steps.png")
+    assert len(fig.axes) == 2 + 1
+    plt.close(fig)
+
+    # A per-view list of the wrong length is a mistake, not a broadcast.
+    try:
+        run.globe_grid(rows=[{"what": [tmax, tmax, tmax]}],
+                       views=[(0, 0), (0, 180)])
+    except ValueError as exc:
+        assert "one entry per view" in str(exc), exc
+    else:
+        raise AssertionError("a mismatched per-view list was accepted")
+    plt.close("all")
+
+
+def test_flux_scale_default_is_peak_temperature_only(tmp):
+    """A day/night snapshot must not default to the T**4 colour scale.
+
+    On the Moon quickstart it puts 51% of the body -- everything below 150 K --
+    into the bottom 2.1% of the bar, one flat black. The rule is the same one
+    plot_map, plot_globes and globe_grid all read.
+    """
+    from ptm import plots
+    assert plots._flux_by_default("temperature", "max", None) is True
+    assert plots._flux_by_default("temperature", "max", 5) is False
+    assert plots._flux_by_default("temperature", "min", None) is False
+    assert plots._flux_by_default("temperature", "avg", None) is False
+    assert plots._flux_by_default("direct_solar", "max", None) is False
+    assert plots._flux_by_default(np.zeros(3), "max", None) is False
+
+
+def test_shape_draws_real_facets_and_culls(tmp):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from ptm import plots
+
+    run = Results(make_run(tmp / "shape_run"))
+    out = tmp / "figs3"
+    out.mkdir(exist_ok=True)
+
+    # Culling keeps about half a closed body, and never all of it.
+    mesh = run.mesh
+    normals = plots._face_normals(mesh["vertices"], mesh["faces"])
+    visible = normals @ plots._view_direction(20.0, 35.0) > 0
+    assert 0.3 < visible.mean() < 0.7, visible.mean()
+
+    fig = run.plot_shape(what="temperature", moment="max",
+                         save=out / "shape.png")
+    assert (out / "shape.png").stat().st_size > 5000, "shape figure is blank"
+    plt.close(fig)
+
+    # Several views drop the 3-D boxes, one view keeps them.
+    fig = run.plot_shape(what="temperature", moment="max",
+                         views=[(20, 35), (20, 215)])
+    assert fig.axes[0].get_zlabel() == "", \
+        "a multi-view shape kept its overprinting axis labels"
+    plt.close(fig)
+    fig = run.plot_shape(what="temperature", moment="max")
+    assert "km" in fig.axes[0].get_zlabel(), \
+        f"a single view lost its length scale: {fig.axes[0].get_zlabel()!r}"
+    plt.close(fig)
+
+    # The vertices are drawn where they are: the drawn extent must match the
+    # mesh's own, not a unit sphere.
+    fig = plt.figure()
+    ax = fig.add_subplot(projection="3d")
+    plots.shape(ax, mesh["vertices"], mesh["faces"],
+                run.stat("temperature", "max"))
+    span = float(np.abs(mesh["vertices"]).max())
+    assert abs(ax.get_zlim()[1] - span) < 1e-6, (ax.get_zlim(), span)
+    plt.close(fig)
+
+
 TESTS = [
     test_time_steps_column_one_is_et_and_is_rebased,
     test_albedo_map_is_a_different_binary_format,
@@ -500,6 +620,10 @@ TESTS = [
     test_units_style_survives_to_the_axis_label,
     test_every_canned_plot_draws,
     test_globes_refuse_a_site_patch,
+    test_scatter_map_catches_transposed_lat_lon,
+    test_globe_grid_rows_views_and_per_view_fields,
+    test_flux_scale_default_is_peak_temperature_only,
+    test_shape_draws_real_facets_and_culls,
 ]
 
 
