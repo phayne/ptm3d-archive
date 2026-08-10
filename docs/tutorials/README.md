@@ -28,23 +28,33 @@ outputs** so the plots render directly on GitHub; re-run with
 Every notebook is CPU-only: nothing here needs a GPU, and nothing here competes
 for one.
 
-They need a Python environment, which the repository root supplies in one step:
+They need a Python environment and the repository's own `ptm` package, which
+carries the run reader (`ptm.Results`), the engine launcher (`ptm.run`) and the
+plotting (`ptm.plots`) the notebooks use throughout:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -r requirements.txt   # numpy, matplotlib, pyyaml, jupyterlab, spiceypy
+python3 -m pip install -e .                  # the ptm package
 jupyter lab docs/tutorials/notebooks/
 ```
 
-Of those, SpiceyPy is used by notebook 04 alone; the other three are used by all
-four.
+`pip install -e .` brings numpy, matplotlib and PyYAML with it, so on a bare
+environment it is the only line that is strictly required; `requirements.txt`
+adds JupyterLab and SpiceyPy. Of those, SpiceyPy is used by notebook 04 alone.
+
+Each notebook's first cell checks for the package, the binary and the data it
+needs, and names the command that fixes whatever is missing.
 
 | # | Notebook | What it covers | Runtime | Beyond a built binary, needs | Status |
 |---|---|---|---|---|---|
-| 01 | [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, 1,280 faces). Config anatomy, the binary output format, temperature map, diurnal curve, day/night contrast against latitude, orthographic globes, and — section 6 — the same run on real LOLA global topography (res-5) against a smooth-sphere control. The notebook counterpart of tutorial 02 above | 36 s end to end (three engine runs: 2.3 s + 12.7 s + 12.4 s) | Moon SPICE kernels, ~44 MB (`fetch_kernels.py --bodies moon`); for section 6, `fetch_data.py --core` (topography, property maps, albedo maps) | verified 2026-08-09 |
-| 02 | [`02_europa_thermal.ipynb`](notebooks/02_europa_thermal.ipynb) | Europa, `examples/quickstart_europa_diurnal.yaml` (ico4, 5,120 faces). A Jupiter eclipse inside the output window and its cooling signature, day/night contrast against the Moon, orthographic globes, a spin-up-length check that separates a numerical artifact from the real sub-Jupiter eclipse notch, and — section 6 — the observed global Bond-albedo map against uniform ice | 34 s end to end (three engine runs: 10.0 s + 3.5 s + 9.7 s) | Europa SPICE kernels, ~1.1 GB including `jup365.bsp` (`fetch_kernels.py --bodies europa`); for section 6, `fetch_data.py --dataset albedo-maps` | verified 2026-08-09 |
-| 03 | [`03_asteroid_thermal.ipynb`](notebooks/03_asteroid_thermal.ipynb) | The generic-body path with no ephemeris file: a synthetic asteroid on a Keplerian orbit, `examples/quickstart_asteroid_diurnal.yaml`, run at two thermal inertias to show amplitude damping and phase lag | 21 s end to end (two engine runs, 6.9 s + 7.3 s) | only the SPICE leapseconds kernel (`fetch_kernels.py`, a few hundred kB) — no body ephemeris, no DEM, no maps | verified 2026-08-09 |
-| 04 | [`04_asteroid_spice.ipynb`](notebooks/04_asteroid_spice.ipynb) | The generic-body path on a real SPICE ephemeris and a real facet shape: (101955) Bennu at perihelion and aphelion, `examples/quickstart_asteroid_bennu.yaml`, with the Keplerian approximation of tutorial 03 as a third arm | 53 s end to end (three engine runs, ~9.5 s each) | the radar shape model and archived SPK ship in the repository under `data/horizons_cache/`; generic SPICE kernels via `fetch_kernels.py` | verified 2026-08-09 |
+| 01 | [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, 1,280 faces). Config anatomy, the binary output format, temperature map, diurnal curve, day/night contrast against latitude, orthographic globes, and — section 6 — the same run on real LOLA global topography (res-5) against a smooth-sphere control. The notebook counterpart of tutorial 02 above | 38 s end to end (three engine runs: 6.8 s + 9.8 s + 9.6 s) | the `ptm` package (`pip install -e .`); Moon SPICE kernels, ~44 MB (`fetch_kernels.py --bodies moon`); for section 6, `fetch_data.py --core` (topography, property maps, albedo maps) | verified 2026-08-09 |
+| 02 | [`02_europa_thermal.ipynb`](notebooks/02_europa_thermal.ipynb) | Europa, `examples/quickstart_europa_diurnal.yaml` (ico4, 5,120 faces). A Jupiter eclipse inside the output window and its cooling signature, day/night contrast against the Moon, orthographic globes, a spin-up-length check that separates a numerical artifact from the real sub-Jupiter eclipse notch, and — section 6 — the observed global Bond-albedo map against uniform ice | 46 s end to end (three engine runs: 12.9 s + 6.0 s + 13.7 s) | the `ptm` package (`pip install -e .`); Europa SPICE kernels, ~1.1 GB including `jup365.bsp` (`fetch_kernels.py --bodies europa`); for section 6, `fetch_data.py --dataset albedo-maps` | verified 2026-08-09 |
+| 03 | [`03_asteroid_thermal.ipynb`](notebooks/03_asteroid_thermal.ipynb) | The generic-body path with no ephemeris file: a synthetic asteroid on a Keplerian orbit, `examples/quickstart_asteroid_diurnal.yaml`, run at two thermal inertias to show amplitude damping and phase lag | 24 s end to end (two engine runs, 8.1 s + 8.8 s) | the `ptm` package (`pip install -e .`) and only the SPICE leapseconds kernel (`fetch_kernels.py`, a few hundred kB) — no body ephemeris, no DEM, no maps | verified 2026-08-09 |
+| 04 | [`04_asteroid_spice.ipynb`](notebooks/04_asteroid_spice.ipynb) | The generic-body path on a real SPICE ephemeris and a real facet shape: (101955) Bennu at perihelion and aphelion, `examples/quickstart_asteroid_bennu.yaml`, with the Keplerian approximation of tutorial 03 as a third arm | 68 s end to end (three engine runs, 10.3 s + 20.6 s + 9.9 s) | the `ptm` package (`pip install -e .`); the radar shape model and archived SPK ship in the repository under `data/horizons_cache/`; generic SPICE kernels via `fetch_kernels.py` | verified 2026-08-09 |
 
 Each notebook records the binary md5 and commit that produced its numbers in
-its own Version / Provenance cell.
+its own Version / Provenance cell. The runtimes above were measured on a
+48-core workstation against a default CPU-only build; the portable
+`-DPTM_ARCH_NATIVE=OFF` build in INSTALL.md's TL;DR has AVX disabled and runs
+the engine roughly 2-3x slower.
