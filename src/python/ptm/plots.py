@@ -39,7 +39,10 @@ __all__ = [
     "plot_globes",
     "plot_histogram",
     "plot_map",
+    "plot_sweep_curves",
+    "plot_sweep_residuals",
     "styled",
+    "sweep_colors",
     "sym_norm",
     "vertex_values_from_faces",
     "view_basis",
@@ -506,5 +509,268 @@ def plot_histogram(run, what='temperature', moment='max', step=None, bins=60,
             color=color or pubstyle.COLORS["ptm"], edgecolor="none")
     ax.set_xlabel(axis_label)
     ax.set_ylabel("Surface area (m$^2$)" if area_weighted else "Faces")
+    fig.tight_layout()
+    return _finish(fig, save, show)
+
+
+# --- sweeps -------------------------------------------------------------------
+# A sweep axis is an *ordered magnitude*, not a set of unrelated categories, so
+# the curves are coloured from a sequential ramp in grid order rather than from
+# a categorical cycle: neighbouring parameter values then look neighbouring, the
+# ordering survives greyscale, and no curve's colour depends on how many other
+# curves are drawn.
+#
+# The span stops short of viridis' pale end because that end vanishes on a white
+# page: measured against the #fcfcfb surface, six curves over [0.15, 0.90] put
+# three of them under a 3:1 contrast ratio and the lightest at 1.49:1, whereas
+# [0.02, 0.72] leaves one at 2.19:1 and keeps the worst adjacent-pair colour
+# separation above the CVD target (deutan OKLab dE 9.1, protan/tritan >= 8.0).
+# The legend is always drawn, which is the relief a sub-3:1 mark requires.
+
+CMAP_SWEEP = "viridis"
+_SWEEP_RAMP_SPAN = (0.02, 0.72)
+#: Above this many curves a legend stops being readable and becomes a colorbar.
+SWEEP_LEGEND_MAX = 8
+
+
+def sweep_colors(n, cmap=CMAP_SWEEP, span=_SWEEP_RAMP_SPAN):
+    """``n`` colours from a sequential ramp, in grid order."""
+    import matplotlib.pyplot as plt
+    ramp = plt.get_cmap(cmap)
+    if n == 1:
+        return [ramp(0.5)]
+    lo, hi = span
+    return [ramp(lo + (hi - lo) * i / (n - 1)) for i in range(n)]
+
+
+def _curve_list(sweep, curves, kwargs):
+    """Accept either a Sweep or an explicit list of :class:`ptm.sweep.Curve`."""
+    if curves is not None:
+        return list(curves)
+    if not hasattr(sweep, "curves"):
+        raise TypeError(
+            "pass a Sweep, or curves=[Curve(...), ...]; got "
+            f"{type(sweep).__name__}")
+    return sweep.curves(**kwargs)
+
+
+def _sweep_axis_labels(sweep, xlabel, ylabel, field):
+    """Default the axis labels, taking the y label from the run's own catalog.
+
+    ``Results.axis_label`` knows the units and the run's unit spelling, so
+    ``temperature`` becomes ``Temperature (K)`` rather than ``Temperature``.
+    """
+    if xlabel is None:
+        xlabel = "Local solar time (h)"
+    if ylabel is None:
+        ylabel = field.replace("_", " ").title()
+        try:
+            done = sweep.completed()
+            if done:
+                ylabel = done[0].results.axis_label(field)
+        except Exception:                                       # noqa: BLE001
+            pass
+    return xlabel, ylabel
+
+
+def _bare_value_labels(curves, legend_title):
+    """With a legend *title* naming the axis, the entries need only the value.
+
+    ``thermal inertia = 50`` six times under a heading that already says
+    "Thermal inertia (SI)" is the same word printed seven times.
+    """
+    if not legend_title:
+        return curves
+    keys = {k for c in curves for k in c.params}
+    if len(keys) != 1:
+        return curves
+    key = next(iter(keys))
+    out = []
+    for curve in curves:
+        value = curve.params[key]
+        text = f"{value:g}" if isinstance(value, float) else str(value)
+        out.append(curve._replace(label=text))
+    return out
+
+
+def _sweep_legend(ax, title):
+    """A legend beside the axes, never on top of the curves.
+
+    Inside the axes, a six-entry legend lands on the family it describes --
+    measured, on the first draw of this figure. Outside costs width and
+    collides with nothing.
+    """
+    return ax.legend(title=title, frameon=False, fontsize="small",
+                     loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                     borderaxespad=0.0, handlelength=1.6)
+
+
+def plot_sweep_curves(sweep=None, curves=None, field='temperature',
+                      xlabel=None, ylabel=None, title=None, cmap=CMAP_SWEEP,
+                      ax=None, save=None, show=False, legend_title=None,
+                      **kwargs):
+    """One curve per grid point.
+
+    ``sweep`` is a :class:`ptm.sweep.Sweep`; anything in ``**kwargs`` goes to
+    :meth:`~ptm.sweep.Sweep.curves`, so ``of=``, ``lat=``/``lon=`` and
+    ``field=`` all work here. Alternatively pass ``curves=`` directly.
+
+    Up to :data:`SWEEP_LEGEND_MAX` curves get a legend; beyond that the ramp
+    becomes a colorbar, because a fifteen-entry legend is a data table and this
+    project does not put data tables on figures.
+    """
+    plt = styled()
+    from . import pubstyle
+
+    kwargs.setdefault("field", field)
+    curves = _curve_list(sweep, curves, kwargs)
+    if not curves:
+        raise RuntimeError("no completed points to plot")
+    curves = _bare_value_labels(curves, legend_title)
+    colors = sweep_colors(len(curves), cmap=cmap)
+    xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W,
+                                        0.45 * pubstyle.DOUBLE_W))
+    else:
+        fig = ax.figure
+
+    for curve, color in zip(curves, colors):
+        ax.plot(curve.x, curve.y, color=color, label=curve.label)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.set_xlim(min(float(np.min(c.x)) for c in curves),
+                max(float(np.max(c.x)) for c in curves))
+
+    if len(curves) <= SWEEP_LEGEND_MAX:
+        _sweep_legend(ax, legend_title)
+    else:
+        _sweep_colorbar(fig, ax, curves, cmap, legend_title)
+    fig.tight_layout()
+    return _finish(fig, save, show)
+
+
+def _sweep_colorbar(fig, ax, curves, cmap, label):
+    """A colorbar standing in for an unreadably long legend.
+
+    Only meaningful when the grid has one numeric axis; with more than one the
+    curves are ordered but not on a single scale, so the ramp is left
+    unlabelled rather than given a misleading axis.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import ListedColormap, Normalize
+
+    keys = {k for c in curves for k in c.params}
+    numeric = [k for k in sorted(keys)
+               if all(isinstance(c.params.get(k), (int, float))
+                      and not isinstance(c.params.get(k), bool)
+                      for c in curves)]
+    if len(numeric) != 1:
+        return None
+    key = numeric[0]
+    values = np.array([float(c.params[key]) for c in curves])
+    lo, hi = _SWEEP_RAMP_SPAN
+    norm = Normalize(vmin=values.min(), vmax=values.max())
+    # The ramp is sampled over a sub-span, so the bar must be too, or the bar
+    # shows colours no curve was drawn in.
+    sub = plt.get_cmap(cmap)(np.linspace(lo, hi, 256))
+    mappable = ScalarMappable(norm=norm, cmap=ListedColormap(sub))
+    bar = fig.colorbar(mappable, ax=ax, fraction=0.04, pad=0.02)
+    bar.set_label(label or key.split(".")[-1].replace("_", " "))
+    return bar
+
+
+def plot_sweep_residuals(sweep=None, obs_x=None, obs_y=None, obs_sigma=None,
+                         curves=None, field='temperature', xlabel=None,
+                         ylabel=None, obs_label="observed", cmap=CMAP_SWEEP,
+                         title=None, save=None, show=False, legend_title=None,
+                         **kwargs):
+    """Model curves against observations, with model-minus-observation below.
+
+    ``obs_x``/``obs_y`` are the observations, ``obs_sigma`` their uncertainty
+    (a scalar or per-point). Each model curve is interpolated onto ``obs_x``
+    for the residual panel; a model whose x-range does not cover an
+    observation contributes nothing there rather than an extrapolation, and
+    says so.
+
+    Two stacked panels sharing one x-axis -- never two y-scales on one axes.
+    """
+    plt = styled()
+    from . import pubstyle
+
+    if obs_x is None or obs_y is None:
+        raise ValueError("plot_sweep_residuals needs obs_x and obs_y")
+    obs_x = np.asarray(obs_x, dtype=float)
+    obs_y = np.asarray(obs_y, dtype=float)
+
+    kwargs.setdefault("field", field)
+    curves = _curve_list(sweep, curves, kwargs)
+    if not curves:
+        raise RuntimeError("no completed points to plot")
+    curves = _bare_value_labels(curves, legend_title)
+    colors = sweep_colors(len(curves), cmap=cmap)
+    xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
+
+    fig, (top, bottom) = plt.subplots(
+        2, 1, sharex=True, figsize=(pubstyle.DOUBLE_W, 0.75 * pubstyle.DOUBLE_W),
+        gridspec_kw={"height_ratios": [2.2, 1.0]})
+
+    # A marker per residual is right for a handful of observations and is
+    # clutter for hundreds: at 192 samples x 5 curves the markers merge into a
+    # band and hide the trend they were meant to show.
+    marker = "o" if obs_x.size <= 40 else None
+
+    for curve, color in zip(curves, colors):
+        top.plot(curve.x, curve.y, color=color, label=curve.label)
+        x = np.asarray(curve.x, dtype=float)
+        order = np.argsort(x)
+        inside = (obs_x >= x[order][0]) & (obs_x <= x[order][-1])
+        if not inside.all():
+            import warnings
+            warnings.warn(
+                f"{(~inside).sum()} observation(s) lie outside the x-range of "
+                f"curve {curve.label!r}; they are left out of its residual "
+                f"rather than extrapolated", stacklevel=2)
+        model = np.interp(obs_x[inside], x[order],
+                          np.asarray(curve.y, dtype=float)[order])
+        bottom.plot(obs_x[inside], model - obs_y[inside], color=color,
+                    marker=marker, markersize=3.5, linewidth=1.2)
+
+    ink = pubstyle.COLORS["neutral"]
+    if obs_sigma is None:
+        top.plot(obs_x, obs_y, linestyle="none", marker="o", markersize=4.5,
+                 color=ink, label=obs_label, zorder=5)
+    else:
+        top.errorbar(obs_x, obs_y, yerr=obs_sigma, linestyle="none", marker="o",
+                     markersize=4.5, color=ink, ecolor=ink, elinewidth=1.0,
+                     capsize=2.5, label=obs_label, zorder=5)
+        bottom.fill_between(obs_x, -np.asarray(obs_sigma) * np.ones_like(obs_x),
+                            np.asarray(obs_sigma) * np.ones_like(obs_x),
+                            color=pubstyle.COLORS["envelope"], zorder=0)
+    bottom.axhline(0.0, color=ink, linewidth=1.0, zorder=1)
+
+    top.set_ylabel(ylabel)
+    if title:
+        top.set_title(title)
+    bottom.set_xlabel(xlabel)
+    # The residual carries the observable's own units, so the label borrows
+    # whatever is in parentheses on the top panel rather than inventing one.
+    units = ylabel[ylabel.rfind("(") + 1:ylabel.rfind(")")] \
+        if "(" in ylabel and ylabel.rfind(")") > ylabel.rfind("(") else ""
+    bottom.set_ylabel(f"Model $-$ obs ({units})" if units else "Model $-$ obs")
+    bottom.set_xlim(float(obs_x.min()), float(obs_x.max()))
+
+    if len(curves) < SWEEP_LEGEND_MAX:
+        _sweep_legend(top, legend_title)
+    else:
+        _sweep_colorbar(fig, [top, bottom], curves, cmap, legend_title)
+        handles, labels = top.get_legend_handles_labels()
+        top.legend(handles=handles[-1:], labels=labels[-1:], frameon=False,
+                   fontsize="small", loc="upper left",
+                   bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     fig.tight_layout()
     return _finish(fig, save, show)
