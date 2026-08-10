@@ -11,7 +11,7 @@ contains, each of which was being re-derived at every call site:
 :func:`subsolar_latlon`       body-fixed sub-solar point from the sun vector
 :func:`read_albedo_map`       the *other* binary format (size_t + float64)
 :func:`find_nearest_face`     nearest face to a lat/lon
-:func:`infer_mesh_length_unit`  metres or kilometres, by the engine's own rule
+:func:`infer_mesh_length_unit`  meters or kilometers, by the engine's own rule
 :func:`local_solar_time_bins`   noon-referenced binning of a per-step field
 ============================  =========================================
 
@@ -81,7 +81,7 @@ def read_time_steps(path):
 # --- locations/<name>_depths.csv ---------------------------------------------
 
 #: ``location`` the name in the file's header comment; ``utc`` the time labels;
-#: ``depths_m`` the depth of each column in metres; ``temperature`` the
+#: ``depths_m`` the depth of each column in meters; ``temperature`` the
 #: ``(n_times, n_depths)`` block in kelvin; ``n_equilibration`` how many leading
 #: rows were dropped as equilibration (0 from the raw reader --
 #: :meth:`ptm.results.Results.depth_series` is what fills it in).
@@ -110,7 +110,7 @@ def read_depth_series(path):
       :meth:`ptm.results.Results.depth_series` trims to the output window by
       matching those labels; this function returns the file as written.
     * **The depths are printed to three decimals**, so two requested depths
-      closer than a millimetre become the same heading. That is data loss in
+      closer than a millimeter become the same heading. That is data loss in
       the file, not in the parse, and it is reported here rather than passed
       on quietly.
     """
@@ -172,7 +172,7 @@ def read_body_positions(path):
     """Read ``body_positions.csv`` into a structured array.
 
     The engine writes one row per output step: a UTC ``time`` label, then the
-    Sun and primary position vectors in kilometres, **in the body-fixed frame**
+    Sun and primary position vectors in kilometers, **in the body-fixed frame**
     -- which is why :func:`subsolar_latlon` is a coordinate conversion rather
     than an inference. Columns are taken from the header, so a run that gains a
     column keeps working.
@@ -298,7 +298,7 @@ class MeshUnitError(ValueError):
 #: corroborates the UNIT and is not an identification of the body.
 MeshUnitReport = namedtuple("MeshUnitReport", "unit median lo hi corroborated body")
 
-#: Equatorial radii in kilometres, used only to corroborate the unit.
+#: Equatorial radii in kilometers, used only to corroborate the unit.
 _BODY_RADII_KM = {
     "Europa": 1560.8, "Moon": 1737.4, "Mercury": 2439.7, "Mars": 3389.5,
     "Enceladus": 252.1, "Titan": 2574.73, "Ceres": 473.0,
@@ -315,10 +315,10 @@ _RADIUS_TOL_LO, _RADIUS_TOL_HI = 0.5, 2.0
 
 
 def infer_mesh_length_unit(face_centers, vertices=None, body_radius_km=None):
-    """Decide whether a mesh is in metres or kilometres, as the engine does.
+    """Decide whether a mesh is in meters or kilometers, as the engine does.
 
-    ``mesh.ply`` records no length unit. The same file is metres for a
-    topographic run and kilometres for a plain icosphere -- on the same body,
+    ``mesh.ply`` records no length unit. The same file is meters for a
+    topographic run and kilometers for a plain icosphere -- on the same body,
     with the same header. Every consumer in the tree re-derives the unit from
     ``|face_center| > 10000``, and getting it backwards is a 1000x error in
     every length (that was PTM-36: Jupiter's shadow shrank 1000x and every

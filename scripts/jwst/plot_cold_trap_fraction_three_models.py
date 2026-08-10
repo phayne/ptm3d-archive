@@ -66,7 +66,7 @@ TERRAINS = cts.TERRAIN_KEYS
 # Two species. Colors: cool steel-blue for water (ice association),
 # warm terracotta for CO2 (dry-ice / desert association). Mid-saturation
 # so they read well on white backgrounds and remain distinguishable
-# in greyscale (luminances differ by ~15%).
+# in grayscale (luminances differ by ~15%).
 SPECIES_TO_PLOT = ["H2O", "CO2"]
 SPECIES_COLOR = {"H2O": "#2C7DA0", "CO2": "#BC5A3C"}
 

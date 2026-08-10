@@ -496,7 +496,7 @@ def resolve_site_dem(site: dict, manifest: dict, catalog: dict | None,
     # DTM tool to read a 1 m grid over the whole R_ext extent — ~10 GB at
     # R_ext=20 km but ~100+ GB at R_ext=82 km (it materialized that and filled
     # the disk). `sfs=False` builds a LOLA-only (~80 m) ring VRT; the ring is
-    # sampled at hundreds of metres regardless, so the occluder is unaffected.
+    # sampled at hundreds of meters regardless, so the occluder is unaffected.
     ranked = ([by_id[d["id"]] for d in site.get("dems", [])
                if d.get("role") != "base" and d["id"] in by_id]
               if sfs else [])

@@ -789,7 +789,7 @@ class DataExportWorker(QThread):
 
         if self._cancelled:
             self._cleanup(output_dir)
-            self.export_finished.emit(False, "Export cancelled")
+            self.export_finished.emit(False, "Export canceled")
             return
 
         # Read and regrid all data, one field at a time
@@ -800,7 +800,7 @@ class DataExportWorker(QThread):
         for field_name in fields:
             if self._cancelled:
                 self._cleanup(output_dir)
-                self.export_finished.emit(False, "Export cancelled")
+                self.export_finished.emit(False, "Export canceled")
                 return
 
             self.status_updated.emit(f"Processing {field_name}...")
@@ -822,7 +822,7 @@ class DataExportWorker(QThread):
             for t in range(n_timesteps):
                 if self._cancelled:
                     self._cleanup(output_dir)
-                    self.export_finished.emit(False, "Export cancelled")
+                    self.export_finished.emit(False, "Export canceled")
                     return
 
                 file_path = field_dir / f"{field_name}_{t:04d}.bin"
@@ -882,7 +882,7 @@ class DataExportWorker(QThread):
 
         if self._cancelled:
             self._cleanup(output_dir)
-            self.export_finished.emit(False, "Export cancelled")
+            self.export_finished.emit(False, "Export canceled")
             return
 
         # Export statistics (single-band per-face data)
@@ -895,7 +895,7 @@ class DataExportWorker(QThread):
             for base_field, stat_type in statistics:
                 if self._cancelled:
                     self._cleanup(output_dir)
-                    self.export_finished.emit(False, "Export cancelled")
+                    self.export_finished.emit(False, "Export canceled")
                     return
 
                 # Scalar fields (e.g. ice_depth) carry stat_type=None and
@@ -1006,7 +1006,7 @@ class DataExportWorker(QThread):
             for t in range(n_timesteps):
                 if self._cancelled:
                     self._cleanup(output_dir)
-                    self.export_finished.emit(False, "Export cancelled")
+                    self.export_finished.emit(False, "Export canceled")
                     return
 
                 grid = vtk.vtkUnstructuredGrid()

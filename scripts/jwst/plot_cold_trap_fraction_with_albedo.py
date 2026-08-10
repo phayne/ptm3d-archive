@@ -2,7 +2,7 @@
 """Cold-trap fraction vs latitude — combining topographic shadowing
 (per-face PTM3D output) and the Bond-albedo distribution at each latitude.
 
-This is the broadened analogue of `plots/polar_cold_traps/composition_combined.pdf`,
+This is the broadened analog of `plots/polar_cold_traps/composition_combined.pdf`,
 which used the per-face T_max distribution under a uniform Bond albedo
 A = 0.5. Here, each face's T_max is rescaled by N independent draws from
 the Bond-albedo distribution within ±5° of the same latitude:

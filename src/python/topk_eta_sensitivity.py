@@ -13,7 +13,7 @@ This validates the manuscript's qualitative claim (§6.2.1):
     and the storage and matrix-vector cost in proportion."
 
 Output: a small table (printed to stdout, optionally written to
-``tmp/topk_eta_table.txt``) summarising:
+``tmp/topk_eta_table.txt``) summarizing:
 
   η  |  ⟨K⟩  |  Kmax  |  total nnz (K-pairs)  |  ⟨1 − Σ F_ij^kept⟩
 

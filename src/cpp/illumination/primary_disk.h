@@ -4,9 +4,9 @@
 //
 // PTM-44: the primary is not a point.  Jupiter subtends 5.98 deg of angular
 // RADIUS from Europa and Earth 0.95 deg from the Moon, yet both primary-flux
-// paths decided visibility with a single ray to the disk CENTRE and zeroed the
+// paths decided visibility with a single ray to the disk CENTER and zeroed the
 // whole flux the instant `cos(theta) <= 0`.  Both are all-or-nothing
-// quantisations of a finite source; this header supplies the two pieces that
+// quantizations of a finite source; this header supplies the two pieces that
 // replace them.
 //
 // Full derivation, with the numerical verification: docs/primary-reflected-flux-derivation.md
@@ -85,11 +85,11 @@ inline double horizonMeanG(double t) {
 }
 
 // <cos theta> over the primary's disk with the part below the face's horizon
-// plane removed.  `cos_theta0` is the cosine at the disk CENTRE, `alpha` the
+// plane removed.  `cos_theta0` is the cosine at the disk CENTER, `alpha` the
 // disk's angular radius in radians.
 //
 // Branches, and why they join exactly:
-//   h = asin(cos_theta0) is the disk centre's altitude above the horizon plane.
+//   h = asin(cos_theta0) is the disk center's altitude above the horizon plane.
 //   h >= alpha : the whole disk is up -> the exact answer is cos_theta0, and
 //                the arithmetic downstream is BIT-IDENTICAL to the pre-PTM-44
 //                code.  This is the overwhelming majority of faces.
@@ -98,7 +98,7 @@ inline double horizonMeanG(double t) {
 //   otherwise  : sin(alpha * g(h/alpha)).  At h = +alpha this is sin(alpha),
 //                which is exactly cos_theta0 there; at h = -alpha it is 0.
 //                The sin() wrapper is what makes both seams exact -- g is
-//                derived from a linearisation of cos(theta) across the disk,
+//                derived from a linearization of cos(theta) across the disk,
 //                and mapping back through sin recovers the leading curvature.
 //
 // Truncation is O(alpha^2) INSIDE the band only: <= ~1 % of an already small
@@ -119,7 +119,7 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 
 // Number of disk samples used when the cheap probe is ambiguous.
 //
-// The naive expectation is that N samples quantise the visible fraction at 1/N.
+// The naive expectation is that N samples quantize the visible fraction at 1/N.
 // MEASURED against a half-plane occluder (test_primary_disk section 4, edge
 // swept in steps of 1/500 of the disk radius) the worst-case error is much
 // SHALLOWER than 1/N -- a straight edge crosses low-discrepancy points in
@@ -147,12 +147,12 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 // view of the primary is partly blocked by terrain.
 constexpr uint32_t PRIMARY_DISK_SAMPLES = 512;
 
-// Cheap probe: disk centre + 4 rim points.  Unanimous probes decide the face
+// Cheap probe: disk center + 4 rim points.  Unanimous probes decide the face
 // without sampling (see illumination_model.cpp computePrimaryDiskVisibility).
 constexpr uint32_t PRIMARY_DISK_PROBES = 5;
 
 // Offsets, in units of the disk's angular radius, of the probe directions.
-// Index 0 is the centre so callers can reuse it as the old centre ray.
+// Index 0 is the center so callers can reuse it as the old center ray.
 inline void probeOffset(uint32_t k, double& dx, double& dy) {
     switch (k) {
         case 0:  dx =  0.0; dy =  0.0; break;
@@ -167,7 +167,7 @@ inline void probeOffset(uint32_t k, double& dx, double& dy) {
 // Lambert-sphere photometry (PTM-41)
 // ---------------------------------------------------------------------------
 
-// Phase function of a Lambert sphere, normalised to Phi(0) = 1:
+// Phase function of a Lambert sphere, normalized to Phi(0) = 1:
 //     Phi(a) = [ sin a + (pi - a) cos a ] / pi
 // Phase integral q = 2 * Int_0^pi Phi sin a da = 3/2, hence the geometric
 // albedo of a Lambert sphere is p = A_bond / q = (2/3) A_bond.

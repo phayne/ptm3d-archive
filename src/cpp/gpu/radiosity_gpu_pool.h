@@ -16,7 +16,7 @@
  * uploaded once per device at init. Each batch's input (T, Q_solar) and
  * output (Q_indirect) is per-timestep state, transferred at solve time.
  *
- * Single-device behaviour is the legacy single-GPU path used directly
+ * Single-device behavior is the legacy single-GPU path used directly
  * (no pool); the pool is only instantiated when n_devices > 1.
  */
 
@@ -111,7 +111,7 @@ public:
      *     already pre-loaded with static data.
      *   - No two batches run on the *same* device concurrently.
      *   - Batches on *different* devices run in parallel.
-     *   - Optional inter_batch_pause_ms sleep is honoured between
+     *   - Optional inter_batch_pause_ms sleep is honored between
      *     consecutive batches on the same device.
      *
      * @return future<bool> — true if the batch ran cleanly.

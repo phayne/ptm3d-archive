@@ -236,7 +236,7 @@ phase integral q (isotropic)        = 4.0000
 2. **Uniform primary.** No zonal albedo structure, no Io/Ganymede shadows.
 3. **Far field.** `sin²α` is the exact `dA→sphere` view factor; the small-`α`
    step from `Ω/π` to `sin²α` is a 0.3 % effect at Europa, 0.008 % at the Moon.
-4. **Grey.** Reflected light is absorbed by the target with `(1 − A_vis)` (see
+4. **Gray.** Reflected light is absorbed by the target with `(1 − A_vis)` (see
    `ptm_thermal_sim.cpp:1720`), which is the right spectral bin; no color term.
 5. **Occlusion weighting.** When the primary's disk is partly hidden (§7),
    the visible *fraction* is computed treating the disk as uniformly bright.

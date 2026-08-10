@@ -89,7 +89,7 @@ void CameraModel::configure(const CameraConfig& config, double body_radius_km) {
     }
 
     // ------------------------------------------------------------------
-    // Intrinsics. Supports three parameterisations:
+    // Intrinsics. Supports three parameterizations:
     //   (a) explicit FOV (fov_x_deg > 0) — sensor dimensions are reconstructed
     //       from FOV + focal length for pixel-pitch computation.
     //   (b) anisotropic pixel pitch (pixel_pitch_x_mm and _y_mm both > 0).
@@ -180,7 +180,7 @@ void CameraModel::setAxesFromRotationMatrix(
 }
 
 void CameraModel::setAxesFromQuaternion(const std::array<double, 4>& q) {
-    // q = (w, x, y, z). Normalise and build the 3x3 rotation matrix, then
+    // q = (w, x, y, z). Normalize and build the 3x3 rotation matrix, then
     // delegate.
     double w = q[0], x = q[1], y = q[2], z = q[3];
     double n = std::sqrt(w*w + x*x + y*y + z*z);

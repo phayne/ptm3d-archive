@@ -263,7 +263,7 @@ For this walkthrough radiation is off, so no dialog appears.
 
 ### Watching it run
 
-The **Run** button greys out, **Stop** becomes available, a progress bar appears
+The **Run** button grays out, **Stop** becomes available, a progress bar appears
 in the status bar, and the indicator on the right turns yellow **Running**. The
 console streams the engine's output.
 

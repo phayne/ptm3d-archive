@@ -161,7 +161,7 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
 // day_fraction 0.75 has hour_angle = 2.5*pi, where cos() returns ~3e-16 instead
 // of 0, i.e. a "sunlit" step with Qs ~ 1e-13 W/m^2 -- squarely inside PTM-116's
 // collapse band. Pre-fix that single step returned a surface T up to 140 K
-// below the true root, cold-biasing the coarse-dt arms and partly cancelling
+// below the true root, cold-biasing the coarse-dt arms and partly canceling
 // their large-dt warm bias. The Fourier reference arm (4979 steps/day, NOT
 // divisible by 4) never lands on that step, which is why it barely moved.
 // Zeroing fluxes below 1e-6 W/m^2 makes pre-fix and post-fix agree to <=1e-4 K

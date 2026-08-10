@@ -452,7 +452,7 @@ sweep.plot_curves(save="family.png")
 
 #### Sweeps
 
-| Behaviour | Detail |
+| Behavior | Detail |
 |---|---|
 | Execution | Serial by default. `jobs=N` runs `N` engine processes at once and **refuses to start** if any point asks for the GPU — there is one GPU, and concurrent use of it wedges the device. |
 | Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, **and** the outputs are on disk; every skip and every re-run prints its reason. |

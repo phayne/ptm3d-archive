@@ -1,4 +1,4 @@
-"""Figures from a run directory: the renderers, the colour scales, four plots.
+"""Figures from a run directory: the renderers, the color scales, four plots.
 
 The tutorial notebooks carry two byte-identical copies of an 84-line
 orthographic globe renderer and two copies of a 69-line style-and-normalization
@@ -19,7 +19,7 @@ figure. They are the one-liners, and each is also reachable as a method on
 
 Matplotlib only -- no cartopy, no PyVista. Axis labels come from the run's own
 :attr:`~ptm.results.Results.units_style`, so a figure made from a Results
-configured for the GUI's ``W/m²`` spelling is labelled that way.
+configured for the GUI's ``W/m²`` spelling is labeled that way.
 
 Figure convention, project-wide: no data tables, no annotation boxes and no
 notes drawn on a figure. Numbers belong in the caller's own output.
@@ -55,7 +55,7 @@ __all__ = [
     "view_basis",
 ]
 
-#: Sequential, perceptually uniform, monotone in lightness, survives greyscale.
+#: Sequential, perceptually uniform, monotone in lightness, survives grayscale.
 #: Never a rainbow: its uneven lightness invents structure that is not there.
 CMAP_FIELD = "inferno"
 #: Diverging, for a signed difference drawn about zero.
@@ -78,14 +78,14 @@ def styled(variant=None):
     return plt
 
 
-# --- colour scales ----------------------------------------------------------
+# --- color scales -----------------------------------------------------------
 
 def flux_norm(values, lo_pct=1.0, hi_pct=100.0):
-    """A colour scale linear in ``T**4`` between two percentiles of ``values``.
+    """A color scale linear in ``T**4`` between two percentiles of ``values``.
 
     Radiative equilibrium makes surface temperature the fourth root of absorbed
     flux, so a temperature field is a compressed picture of the flux field.
-    Colouring by ``T**4`` undoes exactly that compression; the colorbar still
+    Coloring by ``T**4`` undoes exactly that compression; the colorbar still
     reads in kelvin, its ticks are simply not evenly spaced.
 
     Uses ``FuncNorm``. On matplotlib older than 3.4, which has no ``FuncNorm``,
@@ -113,7 +113,7 @@ def flux_norm(values, lo_pct=1.0, hi_pct=100.0):
 
 
 def _flux_by_default(what, moment='max', step=None):
-    """Whether to colour this request linear in ``T**4`` unless told otherwise.
+    """Whether to color this request linear in ``T**4`` unless told otherwise.
 
     Only a *peak* temperature statistic. The point of :func:`flux_norm` is to
     undo the fourth-root compression of a field that is everywhere near its own
@@ -121,8 +121,8 @@ def _flux_by_default(what, moment='max', step=None):
     shown at its own local noon.
 
     A single output step is not, and neither is ``min`` or ``avg``. On a Moon
-    snapshot spanning 67 to 385 K, colouring linear in ``T**4`` gives the whole
-    night hemisphere -- most of the visible disk -- 2.1% of the colour range,
+    snapshot spanning 67 to 385 K, coloring linear in ``T**4`` gives the whole
+    night hemisphere -- most of the visible disk -- 2.1% of the color range,
     so it renders as one flat black. Measured on
     ``quickstart_moon_diurnal`` step 120; the same field on a linear scale
     separates the night side over a third of the bar.
@@ -136,10 +136,10 @@ def _flux_by_default(what, moment='max', step=None):
 
 def default_norm(values, what, moment='max', step=None, flux_scaled=None,
                  norm=None):
-    """The colour scale for a request, unless the caller already chose one.
+    """The color scale for a request, unless the caller already chose one.
 
     ``norm`` wins if given; then an explicit ``flux_scaled``; then
-    :func:`_flux_by_default`. Every canned plot that colours a per-face field
+    :func:`_flux_by_default`. Every canned plot that colors a per-face field
     resolves its scale here, so ``plot_map``, ``plot_globes``,
     :func:`globe_grid` and ``plot_shape`` cannot drift apart about what a
     temperature snapshot should look like.
@@ -296,7 +296,7 @@ def _face_normals(vertices, tris):
     Oriented by the face centroid rather than by the winding order: shape files
     in this tree come from several archives (DAMIT, the PDS radar models,
     the icosphere generator) and their winding is not uniformly outward. Every
-    body drawn this way is star-shaped about its centre of figure, so the
+    body drawn this way is star-shaped about its center of figure, so the
     centroid direction settles the sign.
     """
     corners = vertices[tris]
@@ -342,7 +342,7 @@ def shape(ax, vertices, faces, face_values, cmap=CMAP_FIELD, norm=None,
     in the data. Pass ``edgecolor='k'`` with a ``linewidth`` to draw the facets
     deliberately.
 
-    Returns the ``Poly3DCollection``, which carries the colour mapping, so
+    Returns the ``Poly3DCollection``, which carries the color mapping, so
     :func:`colorbar` works on it directly.
     """
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -448,7 +448,7 @@ def _nonlinear_ticks(norm, n=6):
     A ``FuncNorm`` linear in ``T**4`` maps equal temperature steps to very
     unequal bar positions, so matplotlib's default locator -- which chooses
     round numbers in data space -- crowds several labels into the bottom
-    millimetre of the colorbar and prints them on top of each other. Placing
+    millimeter of the colorbar and prints them on top of each other. Placing
     the ticks uniformly in normalized space and rounding the *labels* instead
     puts one legible tick per interval.
 
@@ -485,7 +485,7 @@ def colorbar(fig, artist, ax, label="", values=None, norm=None, **kwargs):
     arrays) to get that. And on a non-linear norm it places the ticks evenly
     along the *bar* instead of at round numbers in data space: with
     :func:`flux_norm` on a field spanning day and night, matplotlib's default
-    locator stacks three labels on top of each other in the bottom millimetre.
+    locator stacks three labels on top of each other in the bottom millimeter.
 
     ``**kwargs`` go straight to ``fig.colorbar`` (``fraction``, ``pad``,
     ``orientation``, ``shrink``).
@@ -536,7 +536,7 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
                 title="", xlabel=True, ylabel=True, grid=True, **kwargs):
     """Draw a per-face field at its own face centers on ``ax``.
 
-    One dot per face at its centre, no regridding and no scipy: what is drawn
+    One dot per face at its center, no regridding and no scipy: what is drawn
     is the mesh's own values. ``lat``/``lon`` are per-face degrees --
     :attr:`ptm.results.Results.lat` and :attr:`~ptm.results.Results.lon`, in
     that order -- and ``lon`` is on ``[-180, 180]``, which is what the axis is
@@ -586,7 +586,7 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
 # the tutorials needs the other axis too: two fields down the rows (temperature
 # and what topography changed; albedo and the temperature it produces), or two
 # output steps across one row (before ingress and mid-eclipse). Rows share a
-# colour scale and a colorbar; columns share a viewpoint.
+# color scale and a colorbar; columns share a viewpoint.
 
 #: The four views the tutorials use when none are named.
 DEFAULT_VIEWS = ((0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
@@ -623,7 +623,7 @@ def _row_values(run, row, n_views):
 
 
 def _row_norm(row, stacked):
-    """One norm per row, so every panel in it is on the same colour scale."""
+    """One norm per row, so every panel in it is on the same color scale."""
     return default_norm(stacked, row.get("what"), row.get("moment", "max"),
                         row.get("step"), row.get("flux_scaled"),
                         row.get("norm"))
@@ -776,11 +776,11 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
 
     ``linear=True`` (the default) uses the regridder's barycentric path, which
     fills every pixel inside the convex hull of the face centers. The
-    nearest-neighbour path (``linear=False``) masks any pixel more than 1.5
+    nearest-neighbor path (``linear=False``) masks any pixel more than 1.5
     grid cells from a face center, which on a coarse global mesh leaves a
     notched, broken-looking polar edge -- correct, but it reads as a bug.
 
-    ``flux_scaled`` colours by :func:`flux_norm` instead of linearly. The
+    ``flux_scaled`` colors by :func:`flux_norm` instead of linearly. The
     default follows :func:`_flux_by_default`: peak temperature yes, a single
     step or ``min``/``avg`` no. Passing ``step`` draws that output step and
     ``moment`` is not used.
@@ -836,7 +836,7 @@ def plot_globes(run, what='temperature', moment='max', step=None, views=None,
     ``mark_subsolar=True`` and a ``step``, the sub-solar point is read from
     ``body_positions.csv`` and marked.
 
-    ``flux_scaled`` colours by :func:`flux_norm`; the default follows
+    ``flux_scaled`` colors by :func:`flux_norm`; the default follows
     :func:`_flux_by_default` -- peak temperature yes, a single step no, because
     a snapshot spanning day and night has almost all of its faces in the bottom
     two percent of a ``T**4`` bar. Passing ``step`` draws that output step and
@@ -855,14 +855,14 @@ def plot_shape(run, what='temperature', moment='max', step=None, views=None,
                cmap=CMAP_FIELD, norm=None, flux_scaled=None, ax=None,
                axes_off=None, save=None, show=False, label=None, figsize=None,
                suptitle=None):
-    """The run's own facets, coloured by a per-face field.
+    """The run's own facets, colored by a per-face field.
 
     For a body whose shape matters -- a DAMIT model, a radar shape, a contact
     binary. :func:`plot_globes` normalizes the vertices onto a sphere, which is
     correct for an icosphere and wrong for anything else.
 
     ``views`` is a sequence of ``(elev, azim)`` or ``(elev, azim, title)`` in
-    degrees; the default is one view. All views share one colour scale and one
+    degrees; the default is one view. All views share one color scale and one
     colorbar. Passing ``ax`` draws a single view on an existing 3-D axes and
     ``views`` is then a single view.
 
@@ -958,15 +958,15 @@ def plot_histogram(run, what='temperature', moment='max', step=None, bins=60,
 
 # --- sweeps -------------------------------------------------------------------
 # A sweep axis is an *ordered magnitude*, not a set of unrelated categories, so
-# the curves are coloured from a sequential ramp in grid order rather than from
-# a categorical cycle: neighbouring parameter values then look neighbouring, the
-# ordering survives greyscale, and no curve's colour depends on how many other
+# the curves are colored from a sequential ramp in grid order rather than from
+# a categorical cycle: neighboring parameter values then look neighboring, the
+# ordering survives grayscale, and no curve's color depends on how many other
 # curves are drawn.
 #
 # The span stops short of viridis' pale end because that end vanishes on a white
 # page: measured against the #fcfcfb surface, six curves over [0.15, 0.90] put
 # three of them under a 3:1 contrast ratio and the lightest at 1.49:1, whereas
-# [0.02, 0.72] leaves one at 2.19:1 and keeps the worst adjacent-pair colour
+# [0.02, 0.72] leaves one at 2.19:1 and keeps the worst adjacent-pair color
 # separation above the CVD target (deutan OKLab dE 9.1, protan/tritan >= 8.0).
 # The legend is always drawn, which is the relief a sub-3:1 mark requires.
 
@@ -977,7 +977,7 @@ SWEEP_LEGEND_MAX = 8
 
 
 def sweep_colors(n, cmap=CMAP_SWEEP, span=_SWEEP_RAMP_SPAN):
-    """``n`` colours from a sequential ramp, in grid order."""
+    """``n`` colors from a sequential ramp, in grid order."""
     import matplotlib.pyplot as plt
     ramp = plt.get_cmap(cmap)
     if n == 1:
@@ -1101,7 +1101,7 @@ def _sweep_colorbar(fig, ax, curves, cmap, label):
 
     Only meaningful when the grid has one numeric axis; with more than one the
     curves are ordered but not on a single scale, so the ramp is left
-    unlabelled rather than given a misleading axis.
+    unlabeled rather than given a misleading axis.
     """
     import matplotlib.pyplot as plt
     from matplotlib.cm import ScalarMappable
@@ -1119,7 +1119,7 @@ def _sweep_colorbar(fig, ax, curves, cmap, label):
     lo, hi = _SWEEP_RAMP_SPAN
     norm = Normalize(vmin=values.min(), vmax=values.max())
     # The ramp is sampled over a sub-span, so the bar must be too, or the bar
-    # shows colours no curve was drawn in.
+    # shows colors no curve was drawn in.
     sub = plt.get_cmap(cmap)(np.linspace(lo, hi, 256))
     mappable = ScalarMappable(norm=norm, cmap=ListedColormap(sub))
     bar = fig.colorbar(mappable, ax=ax, fraction=0.04, pad=0.02)

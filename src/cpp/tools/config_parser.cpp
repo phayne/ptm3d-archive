@@ -616,7 +616,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 thermo, "albedo_hapke_w", config.thermophysical.albedo_hapke_w);
 
             // Regolith conductivity law. Default "hayne2017" = the historical
-            // path (byte-identical). An unrecognised value must be FATAL.
+            // path (byte-identical). An unrecognized value must be FATAL.
             //
             // Deliberately NOT a `throw`, and the reason CHANGED during this
             // release -- read both halves before touching it.
@@ -1208,7 +1208,7 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         valid = false;
     }
     // eq_extrapolation. Every rejection here is FATAL rather than a silent
-    // downgrade: an unrecognised method or an order the study showed to be
+    // downgrade: an unrecognized method or an order the study showed to be
     // HARMFUL must not be quietly replaced with something that runs.
     {
         const auto& ex = config.thermal.eq_extrapolation;
@@ -1250,7 +1250,7 @@ bool ConfigParser::validate(const SimulationConfig& config) {
     }
 
     // Per-face thermal property maps: H and TI are mutually exclusive (the
-    // model is parameterised on H, and we only want one input source of truth).
+    // model is parameterized on H, and we only want one input source of truth).
     if (!config.thermal.h_parameter_map.empty() &&
         !config.thermal.thermal_inertia_map.empty()) {
         std::cerr << "Error: cannot set both h_parameter_map and "

@@ -95,7 +95,7 @@ def _pixel_coords(transform, width, height):
 
 
 def _xy_to_latlon_eqc(x, y, body_radius, central_meridian, standard_parallel):
-    """Convert equirectangular projected metres to lat/lon degrees."""
+    """Convert equirectangular projected meters to lat/lon degrees."""
     cos_ts = np.cos(np.radians(standard_parallel))
     lat = np.degrees(np.asarray(y, dtype=np.float64) / body_radius)
     lon = central_meridian + np.degrees(
@@ -105,7 +105,7 @@ def _xy_to_latlon_eqc(x, y, body_radius, central_meridian, standard_parallel):
 
 
 def _xy_to_latlon_stere(x, y, body_radius, latitude_of_origin, central_meridian):
-    """Convert polar stereographic projected metres to lat/lon degrees."""
+    """Convert polar stereographic projected meters to lat/lon degrees."""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     rho = np.sqrt(x**2 + y**2)
@@ -121,7 +121,7 @@ def _xy_to_latlon_stere(x, y, body_radius, latitude_of_origin, central_meridian)
 
 
 def _latlon_to_xy_eqc(lat, lon, body_radius, central_meridian, standard_parallel):
-    """Convert lat/lon degrees to equirectangular projected metres."""
+    """Convert lat/lon degrees to equirectangular projected meters."""
     cos_ts = np.cos(np.radians(standard_parallel))
     x = body_radius * cos_ts * np.radians(np.asarray(lon) - central_meridian)
     y = body_radius * np.radians(np.asarray(lat))
@@ -129,7 +129,7 @@ def _latlon_to_xy_eqc(lat, lon, body_radius, central_meridian, standard_parallel
 
 
 def _latlon_to_xy_stere(lat, lon, body_radius, latitude_of_origin, central_meridian):
-    """Convert lat/lon degrees to polar stereographic projected metres."""
+    """Convert lat/lon degrees to polar stereographic projected meters."""
     lat_r = np.radians(np.asarray(lat, dtype=np.float64))
     dlon_r = np.radians(np.asarray(lon, dtype=np.float64) - central_meridian)
 
@@ -151,7 +151,7 @@ def _compute_coordinates(transform, width, height, crs_params):
     Returns:
         (lat, lon, x_proj, y_proj) where:
         - lat, lon: geographic coordinates (1D for eqc, 2D for stere)
-        - x_proj, y_proj: 1D arrays of projected CRS coordinates (metres),
+        - x_proj, y_proj: 1D arrays of projected CRS coordinates (meters),
           in ascending order (matching the flipped data arrays)
     """
     x, y = _pixel_coords(transform, width, height)
@@ -195,13 +195,13 @@ def read_geotiff(path):
             values:      ndarray, shape (n_bands, n_lat, n_lon) or (n_lat, n_lon)
             latitudes:   ndarray, 1D (eqc) or 2D (stere)
             longitudes:  ndarray, 1D (eqc) or 2D (stere)
-            x:           ndarray, 1D projected x coordinates (metres, ascending)
-            y:           ndarray, 1D projected y coordinates (metres, ascending)
+            x:           ndarray, 1D projected x coordinates (meters, ascending)
+            y:           ndarray, 1D projected y coordinates (meters, ascending)
             time_labels: list of str (band descriptions, typically UTC times)
             field:       str (field name from tags, e.g. 'temperature')
             units:       str (e.g. 'K', 'W/m²')
             projection:  str ('eqc' or 'stere')
-            body_radius: float (metres)
+            body_radius: float (meters)
             crs_wkt:     str (full WKT string)
     """
     if not RASTERIO_AVAILABLE:

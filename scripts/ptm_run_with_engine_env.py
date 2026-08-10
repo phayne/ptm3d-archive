@@ -65,7 +65,7 @@ def main(argv=None):
     ap.add_argument("--bin", default=os.path.join(REPO, "build", "bin", "ptm_thermal_sim"))
     ap.add_argument("--log", default=None, help="write stdout+stderr here")
     # parse_known_args (not REMAINDER): the runner's own flags must work on
-    # either side of the config path, and anything it does not recognise is
+    # either side of the config path, and anything it does not recognize is
     # forwarded verbatim to ptm_thermal_sim.
     args, extra = ap.parse_known_args(argv)
     args.extra = extra

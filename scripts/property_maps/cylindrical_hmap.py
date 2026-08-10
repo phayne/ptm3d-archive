@@ -2,7 +2,7 @@
 comparison with Hayne et al. (2017), Figure 7 (global H-parameter map).
 
 For each ico level we have, render the per-face H to a 720x360 (0.5 deg/px)
-lat/lon grid using nearest-neighbour assignment from face centres reconstructed
+lat/lon grid using nearest-neighbor assignment from face centers reconstructed
 exactly as MeshUtils::createIcosphereMesh produces them.
 
 The Hayne paper's color scale is H ∈ [0.02, 0.09] m. We match that here so
@@ -72,7 +72,7 @@ def build_icosphere(level):
 
 def render_cylindrical(level, h_face, out_path: Path,
                        grid_dpd: int = 4, vmin=0.02, vmax=0.09):
-    """Nearest-neighbour rasterisation of per-face H onto an equirectangular
+    """Nearest-neighbor rasterization of per-face H onto an equirectangular
     grid at `grid_dpd` pixels per degree."""
     lat, lon, centers = build_icosphere(level)
 
@@ -128,7 +128,7 @@ def render_cylindrical(level, h_face, out_path: Path,
     ax.set_xlabel('East Longitude (deg)')
     ax.set_ylabel('Latitude (deg)')
     ax.set_title(f'Bundled per-face H map  (ico{level}, {h_face.size:,} faces) '
-                 f'— nearest-neighbour to {grid_dpd}°⁻¹ grid')
+                 f'— nearest-neighbor to {grid_dpd}°⁻¹ grid')
     ax.grid(True, color='white', alpha=0.15, linewidth=0.4)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')

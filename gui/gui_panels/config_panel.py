@@ -475,7 +475,7 @@ class SimulationTab(BaseConfigTab):
             self.step_size_spin.setValue(self._seconds_to_step_display(step_sec))
             self.step_size_spin.blockSignals(False)
 
-    # ── Duration / End-Time synchronisation ──────────────────────────
+    # ── Duration / End-Time synchronization ──────────────────────────
 
     def on_widget_changed(self, key, value):
         """Override to sync end time when start time changes."""
@@ -616,7 +616,7 @@ class SimulationTab(BaseConfigTab):
         finally:
             self._syncing = False
 
-    # ── Time Steps ↔ Step Size synchronisation ─────────────────────
+    # ── Time Steps ↔ Step Size synchronization ─────────────────────
 
     def _step_size_to_seconds(self, value=None):
         """Convert the step size spinbox value to seconds using current unit."""
@@ -1736,7 +1736,7 @@ class RadiationTab(BaseConfigTab):
         # build threads) only take effect when H-matrix compression is enabled:
         # in the engine ACA is simply the compression method *inside* the
         # H-matrix path (radiation_exchange.cpp: compression_method = use_aca ?
-        # ACA : SVD). Grey them out when H-matrix is off so the panel reflects
+        # ACA : SVD). Gray them out when H-matrix is off so the panel reflects
         # that dependency. This never changes the saved YAML — disabled widgets
         # keep their stored values.
         self.widgets["radiation.use_hmatrix"].toggled.connect(

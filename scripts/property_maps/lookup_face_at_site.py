@@ -136,7 +136,7 @@ def main() -> int:
     elev = float(cr[fi]) - args.body_radius
     print(f"\nNearest face to ({args.lat:.5f}°, {args.lon:.5f}°):")
     print(f"  face index : {fi}")
-    print(f"  face centre: lat={face_lat:.5f}°  lon={face_lon:.5f}°  elev={elev:.1f} m")
+    print(f"  face center: lat={face_lat:.5f}°  lon={face_lon:.5f}°  elev={elev:.1f} m")
     print(f"  great-circle distance: {ang_m:.2f} m")
 
     # Read each statistic

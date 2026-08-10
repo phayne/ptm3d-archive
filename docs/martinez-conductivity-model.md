@@ -91,7 +91,7 @@ confound the conductivity comparison:
 2. **This is not a low-temperature-only change on PTM3D's Moon.** At the surface
    node (`rho = 1100 kg m^-3`) Martinez gives 0.63-0.69x the Hayne conductivity
    across the whole range 150-400 K, not just in the cold. The two laws only
-   cross near `rho ~ 1300-1400 kg m^-3`. This is the paper's own behaviour — see
+   cross near `rho ~ 1300-1400 kg m^-3`. This is the paper's own behavior — see
    its Figure 3, where "New 1100" lies below "Hayne 1100" over 0-400 K — and it
    means selecting this model also changes **daytime** thermal inertia.
 
@@ -187,7 +187,7 @@ HIP/CUDA backend). Neither carries the Martinez law; both are annotated to say s
   computed from the published coefficients, at `rtol 1e-12`, over 10-400 K and
   rho = 1100 / 1300 / 1800 kg m^-3.
 * **A3.** Domain guards: sign-flip density, `k > 0` over T in [2.7, 500] K and
-  rho in [1100, 1800], the T-floor behaviour, the density validity gate.
+  rho in [1100, 1800], the T-floor behavior, the density validity gate.
 * **B.** The float32 OpenCL device mirror agrees with the double-precision host
   implementation (worst relative difference 1.03e-6). The test carries its own
   copy of the device expression, so drift between the two files fails here

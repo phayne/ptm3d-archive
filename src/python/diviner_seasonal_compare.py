@@ -249,7 +249,7 @@ def _context_grids(lat0, lon0):
     grid — the wider-region site-overview context for the manuscript Fig. 8 top
     row. Reuses the diviner_se_rim_paper.py recipe: LOLA is nearest-sampled from
     the south-polar-stereo DEM (DN->m via x0.5), Diviner summer-max is queried by
-    nearest neighbour (the level-4 product is a sparse point cloud; binning leaves
+    nearest neighbor (the level-4 product is a sparse point cloud; binning leaves
     white gaps), masked where the nearest observation is > 1.5 km away."""
     import rasterio
     from scipy.ndimage import map_coordinates

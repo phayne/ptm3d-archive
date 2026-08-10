@@ -216,7 +216,7 @@ class MeshRegridder:
         Args:
             latitudes, longitudes: per-face center coords (degrees).
             resolution: grid resolution. Degrees for eqc; converted to
-                ``body_radius * radians(resolution)`` metres for stereo.
+                ``body_radius * radians(resolution)`` meters for stereo.
             body_radius: planetary body radius (m).
             center_lon: central meridian to use for the projection.
                 ``None`` (default) auto-picks the mesh midpoint (a
@@ -648,8 +648,8 @@ class Results:
     guessed at every call site:
 
     ``mesh_units``
-        ``mesh.ply`` carries no length unit and is metres for a topographic
-        run, kilometres for a plain icosphere. :attr:`mesh_units` states which,
+        ``mesh.ply`` carries no length unit and is meters for a topographic
+        run, kilometers for a plain icosphere. :attr:`mesh_units` states which,
         by the engine's own rule (:func:`ptm.readers.infer_mesh_length_unit`),
         and :attr:`face_centers_m` / :attr:`face_areas_m2` are normalized. Pass
         ``mesh_units=`` or ``body_radius_km=`` for a mesh the rule refuses.
@@ -834,12 +834,12 @@ class Results:
 
     @property
     def face_centers_m(self):
-        """Face centers in metres, whatever the mesh file's unit is."""
+        """Face centers in meters, whatever the mesh file's unit is."""
         return self.mesh["face_centers"] * self._to_m
 
     @property
     def face_areas_m2(self):
-        """Face areas in square metres, whatever the mesh file's unit is."""
+        """Face areas in square meters, whatever the mesh file's unit is."""
         return self.mesh["face_areas"] * (self._to_m ** 2)
 
     @property

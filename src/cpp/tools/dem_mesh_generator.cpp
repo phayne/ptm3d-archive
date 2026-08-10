@@ -130,14 +130,14 @@ bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename,
 
     // Auto-detect projected (metric) Equidistant / SimpleCylindrical
     // coordinates and convert to degrees. The LOLA SLDEM2015 / LDEM_118m
-    // products from PDS ship with projected metres at 0° standard parallel:
-    //   x_metres = R * lon_radians ;  y_metres = R * lat_radians.
+    // products from PDS ship with projected meters at 0° standard parallel:
+    //   x_meters = R * lon_radians ;  y_meters = R * lat_radians.
     // Triggered when the raw bounds are obviously not lat/lon (any |coord|
     // exceeding 720°), which is a safe heuristic since a global lat/lon
     // raster fits within ±180° lon / ±90° lat.
     if (std::abs(lon_min) > 720.0 || std::abs(lon_max) > 720.0 ||
         std::abs(lat_min) > 720.0 || std::abs(lat_max) > 720.0) {
-        const double R = mean_radius;     // metres; passed via argv[5]
+        const double R = mean_radius;     // meters; passed via argv[5]
         const double rad_to_deg = 180.0 / M_PI;
         std::cout << "Detected projected (metric) coordinates; converting to "
                   << "degrees using R = " << R << " m\n";
@@ -418,8 +418,8 @@ int main(int argc, char** argv) {
         std::cout << "  max_res: Maximum resolution level (default: 7)" << std::endl;
         std::cout << "  body_radius: Mean radius of body in meters (default: 1737400 for Moon)" << std::endl;
         std::cout << "  elevation_scale: Scaling factor for elevation values (default: 0.5)" << std::endl;
-        std::cout << "                   0.5 is the LOLA SLDEM2015 / LDEM_118m DN-to-metre factor." << std::endl;
-        std::cout << "                   Override only if your input DEM is already pre-scaled to metres." << std::endl;
+        std::cout << "                   0.5 is the LOLA SLDEM2015 / LDEM_118m DN-to-meter factor." << std::endl;
+        std::cout << "                   Override only if your input DEM is already pre-scaled to meters." << std::endl;
         return 1;
     }
 
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
     int min_resolution = (argc > 3) ? std::stoi(argv[3]) : 3;
     int max_resolution = (argc > 4) ? std::stoi(argv[4]) : 7;
     double mean_radius = (argc > 5) ? std::stod(argv[5]) : MEAN_LUNAR_RADIUS;
-    // Default 0.5 reflects the LOLA SLDEM2015 / LDEM_118m DN-to-metre factor
+    // Default 0.5 reflects the LOLA SLDEM2015 / LDEM_118m DN-to-meter factor
     // (16-bit signed integers store elevation in 0.5 m increments).
     double elevation_scale = (argc > 6) ? std::stod(argv[6]) : 0.5;
 
@@ -657,7 +657,7 @@ int main(int argc, char** argv) {
                                 + "_ico" + std::to_string(resolution) + ".bin";
 
         // Apply elevation_scale to the elevations array as well, so the file
-        // stores elevations in metres (matching the geometry of the vertex
+        // stores elevations in meters (matching the geometry of the vertex
         // positions written above). Canonical Moon_Topo_res9.bin (the
         // Artemis-validated reference) follows this convention.
         std::vector<double> scaled_elevations(vertex_elevations.size());

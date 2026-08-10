@@ -12,7 +12,7 @@ What is asserted, in the order it would break:
 1. the readers round-trip the byte layouts, including the albedo map's
    *different* one (``size_t`` + float64, not ``int32`` + float32);
 2. the mesh length unit is decided the way the engine decides it -- the same
-   run written in metres and in kilometres reads back the same geometry, and
+   run written in meters and in kilometers reads back the same geometry, and
    the cases the engine calls fatal raise here too;
 3. ``Results`` discovers fields and statistics from the directory rather than
    from a hard-coded list;
@@ -544,7 +544,7 @@ def test_globe_grid_rows_views_and_per_view_fields(tmp):
 
 
 def test_flux_scale_default_is_peak_temperature_only(tmp):
-    """A day/night snapshot must not default to the T**4 colour scale.
+    """A day/night snapshot must not default to the T**4 color scale.
 
     On the Moon quickstart it puts 51% of the body -- everything below 150 K --
     into the bottom 2.1% of the bar, one flat black. The rule is the same one

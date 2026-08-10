@@ -7,7 +7,7 @@
  * normal, tmax = |dir| - eps), and times both engines on the same ray set.
  *
  * This is a prototype for Tier 3 (GPU-dispatched visibility) of the view-factor
- * optimisation effort. It does NOT modify the production VF build path; it only
+ * optimization effort. It does NOT modify the production VF build path; it only
  * measures whether GPU dispatch of shadow rays is worth pursuing on this system.
  *
  * Usage: benchmark_gpu_visibility <mesh.ply> [num_rays=1000000] [runs=3]
@@ -520,7 +520,7 @@ int main(int argc, char** argv) {
     std::cout << "GPU BVH built in " << gpu_bvh_ms << " ms ("
               << bvh_builder.numNodes() << " nodes)." << std::endl;
 
-    std::cout << "Initialising GPU ray tracer..." << std::endl;
+    std::cout << "Initializing GPU ray tracer..." << std::endl;
     gpu::opencl::BVHRayTracer gpu_rt;
     if (!gpu_rt.initialize()) {
         std::cerr << "[error] GPU ray tracer init failed." << std::endl;

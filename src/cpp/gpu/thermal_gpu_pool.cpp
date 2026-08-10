@@ -91,7 +91,7 @@ std::future<bool> ThermalGPUDevicePool::submit(
          pause_ms, verbose]() -> bool {
             std::lock_guard<std::mutex> lk(slot->mtx);
 
-            // Honour inter-batch pause on the *same* device.
+            // Honor inter-batch pause on the *same* device.
             if (pause_ms > 0
                 && slot->last_finish_.time_since_epoch().count() != 0) {
                 auto now = std::chrono::steady_clock::now();

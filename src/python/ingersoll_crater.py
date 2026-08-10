@@ -11,7 +11,7 @@ The sphere radius is
 
     R  =  (r² + d²) / (2 d),     r = D/2
 
-The half-opening angle from the floor centre to the rim is
+The half-opening angle from the floor center to the rim is
 
     α  =  arctan(r / d),
 
@@ -55,12 +55,12 @@ SOLAR_CONSTANT = 1361.0
 
 
 def crater_alpha(depth_to_diameter: float) -> float:
-    """Half-opening angle (rad) from the floor centre to the rim."""
+    """Half-opening angle (rad) from the floor center to the rim."""
     return float(np.arctan(0.5 / depth_to_diameter))
 
 
 def critical_elevation(depth_to_diameter: float) -> float:
-    """Solar elevation above which the floor centre sees direct sun (rad)."""
+    """Solar elevation above which the floor center sees direct sun (rad)."""
     return float(np.arctan(2.0 * depth_to_diameter))
 
 

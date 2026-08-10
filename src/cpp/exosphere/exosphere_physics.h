@@ -340,7 +340,7 @@ public:
         double threshold = 1e-10) const;
 
     // Area-weighted smoothing of a per-face scalar over the spatial-index
-    // neighbourhood within `smooth_radius_rad` (or, if <=0, a default of
+    // neighborhood within `smooth_radius_rad` (or, if <=0, a default of
     // ~20× the mean face angular width). Used to match the per-face
     // sublimation field to the transport's effective spatial resolution
     // so that sharp albedo-map pixel boundaries do not create artifacts in

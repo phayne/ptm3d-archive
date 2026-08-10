@@ -1271,7 +1271,7 @@ def make_ousha_noisy_snapshots():
 # under a constant vantage direction, while each facet's color is the most
 # recent thermal-IR brightness-T from whichever rendered camera frame last
 # had that facet in view (most-recent-wins accumulation over time), with
-# never-yet-imaged facets left neutral grey.
+# never-yet-imaged facets left neutral gray.
 #
 # Implementation notes:
 #  * Per-facet "was this facet imaged, and at what brightness-T" for each

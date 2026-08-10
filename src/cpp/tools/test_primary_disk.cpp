@@ -3,7 +3,7 @@
 //
 // Everything here runs on the CPU in well under a second and needs no SPICE,
 // no mesh and no Embree: it exercises the closed forms directly against
-// numerical truth, so a failure localises to the physics and not to the
+// numerical truth, so a failure localizes to the physics and not to the
 // plumbing. The engine-level arms live in the session report.
 //
 // Build:  cmake --build build --target test_primary_disk
@@ -36,7 +36,7 @@ static void checkClose(const std::string& what, double got, double want,
 }
 
 // ---------------------------------------------------------------------------
-// 1. Lambert-sphere phase function vs the lune integral it summarises.
+// 1. Lambert-sphere phase function vs the lune integral it summarizes.
 //
 //    E*d^2/(A F) = Int_{lit and visible} (cos i / pi) cos e dA  over the unit
 //    sphere.  The closed form says this equals (2/3) Phi_L(a).
@@ -138,7 +138,7 @@ static void testEnergyClosure() {
 // ---------------------------------------------------------------------------
 static double meanCosNumeric(double h, double alpha, int n) {
     // average of max(cos theta, 0) over the disk of angular radius alpha whose
-    // centre sits at altitude h; theta measured from the face normal, so
+    // center sits at altitude h; theta measured from the face normal, so
     // cos theta = sin(altitude) and the altitude of a disk point offset by
     // (x, y) is h + x to first order in the (small) disk radius.
     double acc = 0.0;
@@ -187,7 +187,7 @@ static void testHorizonMeanCos() {
         std::snprintf(buf, sizeof buf,
                       "alpha=%.3f deg: max |closed - numeric| / alpha",
                       alpha * 180.0 / M_PI);
-        // O(alpha^2) truncation of the linearisation, expressed as a fraction
+        // O(alpha^2) truncation of the linearization, expressed as a fraction
         // of alpha (the scale of <cos> inside the band).
         check(worst / alpha <= 2.0e-2, buf, worst / alpha, 0.0, 2.0e-2);
     }
@@ -216,7 +216,7 @@ static void testHorizonMeanCos() {
         check(ramp_mono, buf, ramp_mono ? 1 : 0, 1, 0);
     }
 
-    // The pre-fix behaviour, for contrast: a step of sin(alpha) at h = 0.
+    // The pre-fix behavior, for contrast: a step of sin(alpha) at h = 0.
     std::printf("     (pre-fix step at the horizon was %.4g in <cos theta>, "
                 "i.e. the FULL flux)\n", std::sin(alphas[0]));
 }
@@ -227,7 +227,7 @@ static void testHorizonMeanCos() {
 //    same cosine weighting) and compares to the analytic circular-segment area.
 // ---------------------------------------------------------------------------
 static double sampledVisibleFraction(uint32_t N, double edge, double alpha) {
-    // Face normal == disk centre direction (+z); disk offsets in x, y.
+    // Face normal == disk center direction (+z); disk offsets in x, y.
     double w_total = 0.0, w_clear = 0.0;
     const double s = std::sin(alpha);
     for (uint32_t k = 0; k < N; ++k) {
@@ -342,11 +342,11 @@ static void testHalfPlaneOccluder() {
         prev = v;
     }
     check(mono, "visible fraction monotone as the occluder retreats", mono ? 1 : 0, 1, 0);
-    // Same criterion as the quantisation: no residual discontinuity worth more
-    // than 1 % of full flux. The pre-fix centre ray stepped the FULL 1.0000.
+    // Same criterion as the quantization: no residual discontinuity worth more
+    // than 1 % of full flux. The pre-fix center ray stepped the FULL 1.0000.
     check(maxstep <= 0.01, "largest single step in the sweep < 1 % of full flux",
           maxstep, 0.0, 0.01);
-    std::printf("     (the pre-fix centre ray stepped 1.0000 at edge = 0)\n");
+    std::printf("     (the pre-fix center ray stepped 1.0000 at edge = 0)\n");
 }
 
 // ---------------------------------------------------------------------------

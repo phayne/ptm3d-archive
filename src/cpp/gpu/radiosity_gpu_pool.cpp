@@ -136,7 +136,7 @@ std::future<bool> RadiosityGPUDevicePool::submit(BatchCallback work) {
                 return false;
             }
 
-            // Honour inter-batch pause on the *same* device.
+            // Honor inter-batch pause on the *same* device.
             if (pause_ms > 0) {
                 auto now = std::chrono::steady_clock::now();
                 auto since = std::chrono::duration_cast<std::chrono::milliseconds>(

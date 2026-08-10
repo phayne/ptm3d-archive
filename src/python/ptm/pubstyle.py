@@ -3,7 +3,7 @@ Shared matplotlib style for PTM3D publication figures (docs/figures/v2/).
 
 Built on top of `pretty_plots` (https://github.com/phayne/pretty-plots) to get
 IDL-style defaults — bold axis lines, full box-frame, inward ticks, IDL Hershey
-serif, IDL colour tables — with a few PTM3D-specific colour constants and
+serif, IDL color tables — with a few PTM3D-specific color constants and
 helpers on top.
 
 Use:
@@ -33,7 +33,7 @@ except Exception:
 COLUMN_W = 3.5
 DOUBLE_W = 7.2
 
-# PTM3D colour palette — kept compatible with the IDL `colortables` so curves
+# PTM3D color palette — kept compatible with the IDL `colortables` so curves
 # read well against IDL's white background and full-box frame
 COLORS = {
     "ptm":      "#1f77b4",   # IDL default blue

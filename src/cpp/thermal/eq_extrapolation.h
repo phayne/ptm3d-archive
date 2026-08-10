@@ -123,7 +123,7 @@ struct Options {
 // ADDENDUM NOTE 6 guard constants.
 //
 // The defect the first validation caught is an ILL-POSEDNESS, not a bug: RRE
-// fits one gamma per column by minimising a COLUMN-WIDE 2-norm, so a deep layer
+// fits one gamma per column by minimizing a COLUMN-WIDE 2-norm, so a deep layer
 // whose window differences sit at the float32 noise floor contributes nothing
 // to the fit and yet receives the full weight vector. In exact arithmetic
 // sum(gamma)=1 protects it; in float32 the residual is
@@ -237,7 +237,7 @@ struct Stats {
 // Minimum-norm least squares for a tall, very thin system, via one-sided Jacobi
 // SVD. Chosen over normal equations because rank deficiency is EXPECTED here
 // (a face whose column has fewer than p live modes) and the minimum-norm
-// behaviour on the deficient subspace is the property that keeps the
+// behavior on the deficient subspace is the property that keeps the
 // extrapolant sane. numpy.linalg.lstsq has the same semantics.
 //
 //   A : m x n, COLUMN-MAJOR, DESTROYED (overwritten with U*Sigma).

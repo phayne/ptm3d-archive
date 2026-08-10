@@ -309,7 +309,7 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
     Returns
     -------
     float
-        Surface emissivity ε = 1 − R(θ), averaged over polarisations.
+        Surface emissivity ε = 1 − R(θ), averaged over polarizations.
     """
     eps_eff = porous_ice_permittivity(freq_ghz, T, porosity, mixing)
     n_complex = np.sqrt(eps_eff)

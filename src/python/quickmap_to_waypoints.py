@@ -11,9 +11,9 @@ def main():
     parser.add_argument("-o", "--output", default="-",
                         help="Output file (default: stdout)")
     parser.add_argument("--height-lander", type=float, default=2.0,
-                        help="Lander height in metres (default: 2.0)")
+                        help="Lander height in meters (default: 2.0)")
     parser.add_argument("--height-rover", type=float, default=1.0,
-                        help="Rover height in metres (default: 1.0)")
+                        help="Rover height in meters (default: 1.0)")
     args = parser.parse_args()
 
     # Read input

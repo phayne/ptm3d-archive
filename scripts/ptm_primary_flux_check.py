@@ -27,12 +27,12 @@ to assume it would be testing the mesh instead of the physics.
 A body orbiting its primary sweeps the full phase range every orbit (Europa:
 0 to 180 deg in 1.77 d), so ONE diurnal run exercises the whole phase curve.
 
-QUANTISATION GATE (PTM-44)
+QUANTIZATION GATE (PTM-44)
 --------------------------
 Given two runs of the same config, one from a build BEFORE the fix and one
 after, reports the distribution of ``primary_ir_after / primary_ir_before``.
 The pre-fix code decided the primary's visibility with a single ray to the disk
-centre and zeroed the flux at ``cos theta <= 0``, so that ratio can only be 0,
+center and zeroed the flux at ``cos theta <= 0``, so that ratio can only be 0,
 1, or +inf (0 -> nonzero) before the fix and takes intermediate values after it.
 The count of intermediate values IS the defect's footprint.
 
@@ -87,7 +87,7 @@ def read_mesh(path):
     """Face centroids and OUTWARD geometric face normals, mesh's own units.
 
     The normal is the vertex cross product, flipped to point away from the body
-    centre.  On a convex global icosphere that is exactly the normal the engine
+    center.  On a convex global icosphere that is exactly the normal the engine
     uses; on a DEM patch it is not necessarily so, which is why the horizon
     census below is only offered for global meshes.
     """
@@ -187,7 +187,7 @@ def cmd_phase(args):
 
     utc, sun, pri = read_body_positions(os.path.join(run, "body_positions.csv"))
     cent = read_centroids(os.path.join(run, "mesh.ply"))
-    # Mesh unit: km icosphere or metre DEM patch (the engine's own |c| > 10000
+    # Mesh unit: km icosphere or meter DEM patch (the engine's own |c| > 10000
     # discriminator, illumination_model.cpp kmToNativeScale).
     if np.linalg.norm(cent[0]) > 10000.0:
         cent = cent / 1000.0
@@ -284,7 +284,7 @@ def cmd_compare(args):
     print("  max |delta| primary_ir   : %.6g W/m^2" % max_abs_dw)
     print("  max after/before ratio   : %.4f" % max_gain)
     print("\n  Interpretation: the pre-fix path could only ever emit 0 or the full")
-    print("  centre-ray flux, so every count in the middle two rows is a face-step")
+    print("  center-ray flux, so every count in the middle two rows is a face-step")
     print("  the all-or-nothing treatment was getting wrong.")
     return 0
 
@@ -351,7 +351,7 @@ def main(argv=None):
     p.add_argument("--min-steps", type=int, default=10)
     p.set_defaults(func=cmd_phase)
 
-    c = sub.add_parser("compare", help="PTM-44 quantisation footprint, two runs")
+    c = sub.add_parser("compare", help="PTM-44 quantization footprint, two runs")
     c.add_argument("before_dir")
     c.add_argument("after_dir")
     c.set_defaults(func=cmd_compare)

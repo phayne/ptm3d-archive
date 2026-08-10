@@ -145,7 +145,7 @@ def capture_panels(app):
     save(panel, "02_basic_mesh_tab.png", app, 640, 760)
 
     # 03 — Properties page on a BUILT-IN body: the six rows the engine cannot
-    #      receive are greyed out (config_panel.py:_update_builtin_support).
+    #      receive are grayed out (config_panel.py:_update_builtin_support).
     show_page(panel, "properties" if "properties" in panel._nav_keys
               else "thermophysical")
     save(panel, "03_basic_properties_tab.png", app, 640, 900)

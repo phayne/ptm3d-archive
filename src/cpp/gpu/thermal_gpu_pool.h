@@ -16,7 +16,7 @@
  * memory/multi_gpu_thermal.md). The pool now creates each device's context
  * once and reuses it for every batch on that device.
  *
- * Single-device behaviour (N=1) is unchanged: callers continue to bypass the
+ * Single-device behavior (N=1) is unchanged: callers continue to bypass the
  * pool entirely on the legacy single-GPU path, so byte-identical results are
  * preserved when the user does not opt in.
  */
@@ -109,7 +109,7 @@ public:
      *   - No two batches run on the *same* device concurrently
      *     (per-device mutex).
      *   - Batches on *different* devices run in parallel.
-     *   - Optional inter_batch_pause_ms sleep is honoured between
+     *   - Optional inter_batch_pause_ms sleep is honored between
      *     consecutive batches on the same device.
      *
      * @param n_faces_in_batch Number of faces in this batch (<= max_n_faces).

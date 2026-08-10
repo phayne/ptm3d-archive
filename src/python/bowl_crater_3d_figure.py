@@ -70,7 +70,7 @@ def build_crater_mesh(depth_to_diameter: float = 0.1,
     z_c = R - d
     theta_max = float(np.arcsin(r_rim / R))
 
-    verts = [[0.0, 0.0, -d]]                    # apex (floor centre)
+    verts = [[0.0, 0.0, -d]]                    # apex (floor center)
     thetas = np.linspace(0.0, theta_max, n_rings + 1)
     for k in range(1, n_rings + 1):
         th = thetas[k]

@@ -481,7 +481,7 @@ class ConfigManager:
 
         Preserves generic_body when it has meaningful data (config_file,
         name, or orbital elements set) so that project files survive
-        save/load cycles.  Also sanitises the body name so the separator
+        save/load cycles.  Also sanitizes the body name so the separator
         or ``[H] `` display prefix never leak into the YAML.
 
         For generic_body output:
@@ -647,7 +647,7 @@ class ConfigManager:
                     therm["thermal_inertia_map"] = custom_path
             out["thermal"] = therm
 
-        # Sanitise simulation.body
+        # Sanitize simulation.body
         body = out.get("simulation", {}).get("body", "")
         if body.startswith("[H] "):
             out["simulation"] = _dc(out["simulation"])

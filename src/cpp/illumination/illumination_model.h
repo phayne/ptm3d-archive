@@ -293,7 +293,7 @@ public:
      *
      * Must be called BEFORE initializeScene() so the device list is set
      * when the BVH/mesh upload happens. Defaults preserve single-GPU
-     * behaviour.
+     * behavior.
      *
      * @param gpu_devices N (>=1) or 0 for "all available GPUs".
      * @param gpu_device_ids If non-empty, exactly those device indices
@@ -504,7 +504,7 @@ private:
     // outside every OpenMP region -> no lock. Key: the two vector data()
     // pointers, the face count and the primary position, all matched exactly.
     std::vector<double> primary_vis_mean_cos_;   // <cos theta> over the disk
-    std::vector<double> primary_vis_dist_km_;    // face -> primary centre, km
+    std::vector<double> primary_vis_dist_km_;    // face -> primary center, km
     const void* primary_vis_key_centers_ = nullptr;
     const void* primary_vis_key_normals_ = nullptr;
     std::array<double, 3> primary_vis_key_pos_ = {0.0, 0.0, 0.0};
@@ -830,7 +830,7 @@ private:
     std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;
     bool gpu_mesh_uploaded_ = false;
 
-    // Multi-GPU dispatch config (defaults preserve single-GPU behaviour).
+    // Multi-GPU dispatch config (defaults preserve single-GPU behavior).
     int                gpu_devices_count_         = 1;
     std::vector<int>   gpu_device_ids_;
     int                gpu_inter_batch_pause_ms_  = 0;

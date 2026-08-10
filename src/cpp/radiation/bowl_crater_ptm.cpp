@@ -157,7 +157,7 @@ Built build_mesh(double dd, double diameter, int n_rings, int n_az,
             if (nrm[2] < 0) for (int k = 0; k < 3; ++k) nrm[k] = -nrm[k];   // +z up
             mask[i] = 2;
         } else {
-            // inward (toward open bowl == toward sphere centre above)
+            // inward (toward open bowl == toward sphere center above)
             std::array<double, 3> tc = {{ctr_sphere[0] - c[0], ctr_sphere[1] - c[1], ctr_sphere[2] - c[2]}};
             if (nrm[0] * tc[0] + nrm[1] * tc[1] + nrm[2] * tc[2] < 0)
                 for (int k = 0; k < 3; ++k) nrm[k] = -nrm[k];

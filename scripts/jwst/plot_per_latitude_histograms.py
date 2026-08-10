@@ -208,7 +208,7 @@ def plot_NS_overlay(lat_temps_by_lat, stability_table, T_edges,
                     title_suffix, out_path):
     """One panel per |latitude|; overlays Northern (solid blue fill) and
     Southern (orange hatch, no fill) peak-temperature histograms.
-    Distinguishable in colour and in greyscale: only the southern
+    Distinguishable in color and in grayscale: only the southern
     distribution is hatched, the northern is a translucent solid fill.
     """
     with plt.rc_context({
