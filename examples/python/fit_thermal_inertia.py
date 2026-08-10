@@ -42,8 +42,9 @@ placed *between* two grid points, pushed through the same observable and given
 Gaussian noise, so that the answer is known and the recovery is checkable. A
 fit against real data replaces ``observed()`` and nothing else.
 
-Needs scipy (``pip install 'ptm[regrid]'`` brings it in) and numpy >= 2.0
-(the emission integral uses ``numpy.trapezoid``).
+Needs scipy (``pip install 'ptm[regrid]'`` brings it in). numpy at the
+repository floor (>=1.20) is enough: the emission integral binds
+``numpy.trapezoid`` or, before numpy 2.0 renamed it, ``numpy.trapz``.
 """
 
 from __future__ import annotations

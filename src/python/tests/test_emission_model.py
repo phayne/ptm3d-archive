@@ -15,8 +15,17 @@ so these are the original doubles, not a rounded copy of them.
 
     python3 src/python/tests/test_emission_model.py
 
-Needs numpy >= 2.0: the emission integral calls ``numpy.trapezoid``, which
-replaced ``numpy.trapz`` in numpy 2.0 and does not exist before it.
+Runs on the repository's declared numpy floor (>=1.20) and upward: the emission
+integral binds ``numpy.trapezoid`` or, before numpy 2.0 renamed it,
+``numpy.trapz``. They are the same routine and integrate bit-identically.
+
+The ``==`` above is exact, and exactness is not portable across math-library
+backends. Measured: 306/306 reproduce on an MKL-backed numpy 1.26.4 and on
+numpy 2.2.6/2.4.3, while an OpenBLAS-backed numpy 1.26.4 and 1.24.4 move 27 of
+them by 1-3 ULP. The movement is in the ``dielectric_mixing`` permittivity,
+upstream of the emission integral, so a handful of last-bit deltas here is a
+backend difference; anything larger, or anything confined to the ``Tb`` rows,
+is this module changing.
 """
 
 import sys

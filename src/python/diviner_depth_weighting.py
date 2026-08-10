@@ -24,6 +24,14 @@ small thermal-rectification (time-mean subsurface warming) seen at mm depth.
 from __future__ import annotations
 import numpy as np
 
+# numpy 2.0 renamed ``trapz`` to ``trapezoid`` and REMOVED the old name, so the
+# bare ``np.trapz`` below stopped existing on numpy>=2. Bind whichever spelling
+# this numpy has; the repository's declared floor is numpy>=1.20 and both ends
+# of that range have to work.
+_trapezoid = getattr(np, "trapezoid", None)
+if _trapezoid is None:                  # numpy < 2.0
+    _trapezoid = np.trapz
+
 SIGMA = 5.670374419e-8
 # --- PTM3D Moon-default regolith (config_parser.h / planetary_properties.h) ---
 KS, KD = 7.4e-4, 3.4e-3      # surface/deep conductivity W/m/K
@@ -136,9 +144,9 @@ def brightness_max(z, Tsave, depths_mm):
     for dmm in depths_mm:
         d = dmm * 1e-3
         w = np.exp(-z / d)
-        w = w / np.trapz(w, z)
+        w = w / _trapezoid(w, z)
         T4 = Tsave ** 4
-        Tb = (np.trapz(T4 * w, z, axis=1)) ** 0.25      # brightness T(t)
+        Tb = (_trapezoid(T4 * w, z, axis=1)) ** 0.25    # brightness T(t)
         out[f"{dmm:g}mm"] = (Tb.max(), Tb.max() - surf_max)
     return out
 

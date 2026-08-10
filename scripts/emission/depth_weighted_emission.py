@@ -35,6 +35,16 @@ from dielectric_mixing import (
     fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ
 )
 
+# numpy renamed ``trapz`` to ``trapezoid`` in 2.0 and REMOVED the old name, so
+# neither spelling works on both sides of that release. Bind whichever this
+# numpy has, and the module runs on everything from the declared floor
+# (numpy>=1.20) upward. The two are the same routine: on identical inputs they
+# return the same bits on numpy 1.24.4, 1.26.4, 2.2.6 and 2.4.3, for both the
+# 1-D and the ``axis=`` call below.
+_trapezoid = getattr(np, "trapezoid", None)
+if _trapezoid is None:                  # numpy < 2.0
+    _trapezoid = np.trapz
+
 
 def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
                           mixing="maxwell_garnett"):
@@ -97,7 +107,7 @@ def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
 
     # Radiative transfer integral: Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz
     integrand = T_z * kappa * np.exp(-tau)
-    Tb = eps * np.trapezoid(integrand, z)
+    Tb = eps * _trapezoid(integrand, z)
 
     # Add contribution from the bottom boundary if τ_max < ~5
     # (profile doesn't extend deep enough to be optically thick)
@@ -205,7 +215,7 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
         tau[i] = tau[i - 1] + 0.5 * (kappa_eff[i - 1] + kappa_eff[i]) * dz
 
     integrand = T_z * kappa_eff * np.exp(-tau)
-    Tb = eps * np.trapezoid(integrand, z)
+    Tb = eps * _trapezoid(integrand, z)
 
     if tau[-1] < 5.0:
         Tb += eps * T_z[-1] * np.exp(-tau[-1])
