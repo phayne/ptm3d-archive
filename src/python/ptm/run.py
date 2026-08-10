@@ -42,6 +42,8 @@ __all__ = [
     "EngineProcess",
     "build_command",
     "classify_severity",
+    "engine_flags",
+    "engine_supports_flag",
     "extract_progress",
     "find_engine_executable",
     "sample_cputime",
@@ -126,6 +128,65 @@ def sample_cputime(pid):
         return None
 
 
+# --- what this engine binary can be told on the command line ------------------
+# The engine's flag set grows: `--thermal-inertia` and `--albedo` are being
+# added, and a caller that wants to use them must find out whether the binary in
+# front of it has them rather than assume. `--help` is the only interface that
+# answers, so it is parsed -- once per binary, keyed on the binary's identity so
+# a rebuild invalidates the answer.
+
+_FLAG_CACHE = {}
+_FLAG_TOKEN = re.compile(r"--[A-Za-z0-9][-A-Za-z0-9_]*")
+
+
+def engine_flags(executable, timeout=20.0):
+    """The set of ``--flags`` ``executable --help`` advertises.
+
+    Returns an empty set if the binary cannot be run or prints no flags; that
+    is reported on stderr rather than passed off as "supports nothing", because
+    the two are different and only one of them is a caller's fault.
+    """
+    path = str(executable)
+    try:
+        stat = os.stat(path)
+        key = (path, stat.st_mtime_ns, stat.st_size)
+    except OSError as exc:
+        import sys
+        sys.stderr.write(f"[ptm] cannot stat engine {path!r}: {exc}\n")
+        return frozenset()
+    if key in _FLAG_CACHE:
+        return _FLAG_CACHE[key]
+
+    try:
+        proc = subprocess.run([path, "--help"], capture_output=True, text=True,
+                              timeout=timeout)
+        text = (proc.stdout or "") + (proc.stderr or "")
+    except (OSError, subprocess.SubprocessError) as exc:
+        import sys
+        sys.stderr.write(
+            f"[ptm] could not ask {path!r} for its flags ({exc}); assuming it "
+            f"advertises none\n")
+        text = ""
+    flags = frozenset(_FLAG_TOKEN.findall(text))
+    if not flags and text:
+        import sys
+        sys.stderr.write(
+            f"[ptm] {path} --help printed no --flags; assuming it advertises "
+            f"none\n")
+    _FLAG_CACHE[key] = flags
+    return flags
+
+
+def engine_supports_flag(executable, flag):
+    """Whether ``executable`` advertises ``flag`` (e.g. ``'--albedo'``).
+
+    Matched as a whole token, which is the entire point: today's engine
+    advertises ``--albedo-map`` and ``--albedo-maps-directory`` but no
+    ``--albedo``, and a substring test says yes to all three.
+    """
+    return flag in engine_flags(executable)
+
+
 def build_command(executable, config_file, config_dict=None):
     """Build the engine argv for ``config_file``.
 
@@ -154,6 +215,12 @@ class EngineProcess:
     child's CPU clock is not advancing, and once when it resumes. Any of them
     may be ``None``.
 
+    ``timeout`` is a wall-clock ceiling in seconds. On expiry the child is
+    stopped through :meth:`stop` and :attr:`timed_out` is set, so a caller can
+    tell "killed at the ceiling" from "exited non-zero on its own" -- an
+    unattended sweep needs that distinction and an exit status alone does not
+    carry it.
+
     :meth:`run` blocks and returns the child's exit status.
     """
 
@@ -162,7 +229,7 @@ class EngineProcess:
 
     def __init__(self, command, working_dir=None, env=None,
                  on_output=None, on_warning=None, on_error=None,
-                 on_progress=None, on_heartbeat=None):
+                 on_progress=None, on_heartbeat=None, timeout=None):
         self.command = [str(c) for c in command]
         self.working_dir = str(working_dir) if working_dir else None
         self.env = env
@@ -171,6 +238,8 @@ class EngineProcess:
         self.on_error = on_error
         self.on_progress = on_progress
         self.on_heartbeat = on_heartbeat
+        self.timeout = None if timeout is None else float(timeout)
+        self.timed_out = False
         self.process = None
         self.returncode = None
         self._stop_requested = False
@@ -222,11 +291,21 @@ class EngineProcess:
         stdout_buffer = bytearray()
         stderr_buffer = bytearray()
 
-        next_watchdog = time.monotonic() + self.WATCHDOG_INTERVAL_S
+        started = time.monotonic()
+        next_watchdog = started + self.WATCHDOG_INTERVAL_S
         last_cputime = None
         stall_since = None
 
         while not self._stop_requested:
+            if (self.timeout is not None
+                    and (time.monotonic() - started) > self.timeout
+                    and self.process.poll() is None):
+                self.timed_out = True
+                self._emit_classified(
+                    f"ERROR: engine exceeded the {self.timeout:g} s wall-clock "
+                    f"timeout; stopping it")
+                self.stop()
+                break
             if self.process.poll() is not None:
                 tail_out = self.process.stdout.read() or b""
                 tail_err = self.process.stderr.read() or b""

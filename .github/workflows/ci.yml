@@ -69,6 +69,13 @@ jobs:
       - name: Engine run driver (ptm.run, no engine needed)
         run: python3 src/python/tests/test_engine_process.py
 
+      # Drives whole sweeps against a stub engine, so resume, provenance and
+      # the flag-vs-config routing are covered without a compiler. The routing
+      # matters most: the engine advertises --albedo-map and no --albedo, so a
+      # substring test for a flag says yes to a flag that does not exist.
+      - name: Parameter sweeps (ptm.sweep, stub engine)
+        run: python3 src/python/tests/test_sweep.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing
@@ -76,6 +83,13 @@ jobs:
           ptm --version
           ptm --help
           ptm plot --help
+          ptm sweep --help
+
+      # The 40-file europa_lat cluster against the Sweep that reproduces it:
+      # 2,480 config keys compared, no engine and no DEM data needed. Fails if
+      # the generated configs stop matching the shipped ones.
+      - name: A sweep reproduces the 40 shipped europa_lat configs
+        run: python3 examples/python/sweep_replaces_45_configs.py
 
       - name: The GUI still imports
         env:

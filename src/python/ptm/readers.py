@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 __all__ = [
+    "DepthSeries",
     "MeshUnitError",
     "MeshUnitReport",
     "TimeAxis",
@@ -38,6 +39,7 @@ __all__ = [
     "local_solar_time_bins",
     "read_albedo_map",
     "read_body_positions",
+    "read_depth_series",
     "read_time_steps",
     "subsolar_latlon",
 ]
@@ -74,6 +76,94 @@ def read_time_steps(path):
         raise ValueError(f"{path}: no time-step rows (only comments?)")
     et = np.asarray(et, dtype=np.float64)
     return TimeAxis(et=et, elapsed_s=et - et[0], utc=utc)
+
+
+# --- locations/<name>_depths.csv ---------------------------------------------
+
+#: ``location`` the name in the file's header comment; ``utc`` the time labels;
+#: ``depths_m`` the depth of each column in metres; ``temperature`` the
+#: ``(n_times, n_depths)`` block in kelvin; ``n_equilibration`` how many leading
+#: rows were dropped as equilibration (0 from the raw reader --
+#: :meth:`ptm.results.Results.depth_series` is what fills it in).
+DepthSeries = namedtuple(
+    "DepthSeries", "location utc depths_m temperature n_equilibration")
+
+
+def read_depth_series(path):
+    """Read a subsurface temperature profile written by ``output.depths_file``.
+
+    A run configured with ``output.locations_file`` and ``output.depths_file``
+    writes ``locations/<name>_depths.csv``: a ``# Location: <name>`` comment,
+    then a header ``time,T(z=0.000 m),T(z=0.025 m),...``, then one row per
+    step. The depths are recoverable only by parsing the *column headings*,
+    which is why the ALMA workflow -- the one consumer of this product in the
+    tree -- carries its own copy of that parse.
+
+    Two properties of this file are not shared by any other output product,
+    and both are silent:
+
+    * **It covers the equilibration period as well as the output window**,
+      where ``statistics/`` and the per-step binaries cover the output window
+      only. Measured on ``quickstart_europa_diurnal`` with
+      ``equilibration_orbits: 20``: 4,032 rows against 192 in
+      ``time_steps.txt``, the last 192 of which match it exactly.
+      :meth:`ptm.results.Results.depth_series` trims to the output window by
+      matching those labels; this function returns the file as written.
+    * **The depths are printed to three decimals**, so two requested depths
+      closer than a millimetre become the same heading. That is data loss in
+      the file, not in the parse, and it is reported here rather than passed
+      on quietly.
+    """
+    path = Path(path)
+    location = path.stem
+    header = None
+    rows, utc = [], []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            _, _, tail = line.partition("Location:")
+            if tail.strip():
+                location = tail.strip()
+            continue
+        if header is None:
+            header = [c.strip() for c in line.split(",")]
+            continue
+        parts = line.split(",")
+        utc.append(parts[0])
+        rows.append([float(v) for v in parts[1:]])
+    if header is None or not rows:
+        raise ValueError(f"{path}: no depth-series rows found")
+
+    depths = []
+    for column in header[1:]:
+        # 'T(z=0.025 m)' -> 0.025
+        _, _, tail = column.partition("z=")
+        token = tail.replace("m)", "").replace(")", "").strip()
+        try:
+            depths.append(float(token))
+        except ValueError:
+            raise ValueError(
+                f"{path}: cannot read a depth out of the column heading "
+                f"{column!r}; expected the form 'T(z=0.025 m)'")
+    temperature = np.asarray(rows, dtype=np.float64)
+    if temperature.shape[1] != len(depths):
+        raise ValueError(
+            f"{path}: {temperature.shape[1]} data columns but {len(depths)} "
+            f"depth headings")
+    depths = np.asarray(depths, dtype=np.float64)
+    repeated = int(np.sum(np.diff(depths) <= 0.0))
+    if repeated:
+        import warnings
+        warnings.warn(
+            f"{path}: {repeated} of {depths.size} depth headings do not "
+            f"increase -- the file prints depths to three decimals, so "
+            f"requested depths closer than 1 mm collapse onto one label. "
+            f"Space the entries in output.depths_file further apart.",
+            stacklevel=2)
+    return DepthSeries(location=location, utc=utc, depths_m=depths,
+                       temperature=temperature, n_equilibration=0)
 
 
 # --- body_positions.csv -----------------------------------------------------
