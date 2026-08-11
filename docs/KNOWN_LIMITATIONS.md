@@ -481,7 +481,19 @@ that the value you set is the value that was echoed.
   replaces the metric offset with an out-of-plane-rise self-relief test, and
   `PTM_ILLUM_TRUE_NORMALS=1` stops the radial-up normal flip fabricating sunlit overhangs. See
   `docs/ENVIRONMENT.md` for the full list and the recommended-ON tags. Relevant to cold-trap floor
-  temperatures on fine meshes; negligible on global icospheres.
+  temperatures on fine meshes.
+
+  On a smooth global icosphere `PTM_ILLUM_TRUE_NORMALS` now has no effect at all, and the engine
+  says so. Such a mesh carries analytic radial normals, deliberately substituted for the geometric
+  winding normals to remove a ~0.5 K pentagon-vertex bias, and it has no overhang faces for the
+  knob to correct. Recomputing winding normals there used to undo the pentagon fix silently: on a
+  1,280-face ico3 run it changed the average direct solar flux on 1,208 faces (94.4%, up to
+  0.58 W/m²) and the peak temperature on 1,216 faces (95.0%, up to 1.86 K), while reporting "0
+  overhang faces". The illumination path now declines the override on any mesh whose normals were
+  analytically substituted, prints that it declined, and leaves imported and topographic meshes —
+  where the winding normal *is* the surface normal — bit-for-bit unchanged. Earlier releases did
+  not: a global-icosphere run made with `PTM_ILLUM_TRUE_NORMALS=1` before this change carries the
+  pentagon bias and should be repeated.
 
 - **An unrecognized primary body is refused, not defaulted.** The primary-body reflection/IR paths
   only know EARTH, JUPITER, SATURN and MARS. A name outside that set used to take one of three

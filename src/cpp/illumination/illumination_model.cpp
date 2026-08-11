@@ -3283,6 +3283,29 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     if (const char* tn = std::getenv("PTM_ILLUM_TRUE_NORMALS"))
         if (tn[0]=='1'||tn[0]=='t'||tn[0]=='T'||tn[0]=='y'||tn[0]=='Y') use_true_normals = true;
 
+    // PTM-221: DECLINE on a mesh whose normals were ANALYTICALLY substituted.
+    // MeshUtils::setupMesh() deliberately replaces the winding normal with the
+    // radial normal on a smooth icosphere to remove a ~0.5 K pentagon-vertex bias
+    // (test_pentagon_bias). Recomputing the winding normal here would silently undo
+    // that fix -- measured on ico3: 1,208 / 1,280 faces (94.4%) of direct_solar_avg
+    // changed, up to 1.86 K in temperature_max, while the banner reported "0
+    // overhang faces". The discriminator is the mesh's own record of the
+    // substitution, NOT a guess at mesh type, so imported/DEM meshes (which never
+    // carry it) are untouched bit-for-bit. There is nothing to gain here either
+    // way: on an analytic sphere every radial normal already points outward, so the
+    // overhang population this override exists to rescue is empty by construction.
+    if (use_true_normals && mesh->analytic_radial_normals) {
+        std::cout << "[IlluminationModel] PTM-Class1 TRUE normals DECLINED (env "
+                     "PTM_ILLUM_TRUE_NORMALS is set): this mesh carries ANALYTIC RADIAL "
+                     "normals that MeshUtils::setupMesh deliberately substituted for the "
+                     "geometric winding normals (the smooth-icosphere pentagon-vertex bias "
+                     "fix). Recomputing winding normals would undo that fix. Keeping the "
+                     "radial normals; 0 of " << mesh->faces.size()
+                  << " illumination normals overridden. A smooth icosphere has no overhang "
+                     "faces by construction, so this override has nothing to correct here.\n";
+        use_true_normals = false;
+    }
+
     if (use_true_normals) {
         const size_t nfc = mesh->faces.size();
         // 1. raw winding normals from the mesh's own vertex order (BEFORE any flip)
@@ -3342,20 +3365,56 @@ bool IlluminationModel::calculateIlluminationFromMesh(
                       << " faces); falling back to the radial-flip orientation.\n";
             use_true_normals = false;
         } else {
+            // Report what the override ACTUALLY did, not just the overhang subset:
+            // count every face whose illumination normal ends up different from the
+            // default radial-flip normal, and the largest angular change. An earlier
+            // banner reported only the overhang count, which read "0 overhang faces
+            // (0.00 %)" on a run that in fact replaced all 1,280 normals (PTM-221).
             int overhang = 0;
+            size_t differ = 0;    // differ from the default normal at all (incl. round-off)
+            size_t reversed = 0;  // differ by more than 90 deg, i.e. orientation reversed
+            double max_dot = 1.0; // smallest cos(angle) seen => largest rotation
             for (size_t i = 0; i < nfc; ++i) {
+                const auto& c = face_centers[i];
+                // What the default (radial-flip) path would have used for this face.
+                std::array<double,3> n0 = mesh->face_normals[i];
+                if (c[0]*n0[0] + c[1]*n0[1] + c[2]*n0[2] < 0.0) {
+                    n0[0] = -n0[0]; n0[1] = -n0[1]; n0[2] = -n0[2];
+                }
                 double S = (vote[uf_find(static_cast<int>(i))] >= 0) ? 1.0 : -1.0;
                 corrected_normals[i] = {{ S*nwv[i][0], S*nwv[i][1], S*nwv[i][2] }};
-                const auto& c = face_centers[i];
+                if (corrected_normals[i] != n0) {
+                    ++differ;
+                    double d = corrected_normals[i][0]*n0[0] + corrected_normals[i][1]*n0[1]
+                             + corrected_normals[i][2]*n0[2];
+                    if (d < max_dot) max_dot = d;
+                    if (d < 0.0) ++reversed;
+                }
                 if (c[0]*corrected_normals[i][0] + c[1]*corrected_normals[i][1]
                         + c[2]*corrected_normals[i][2] < 0.0)
                     ++overhang;
             }
+            const double max_rot_deg =
+                (differ == 0) ? 0.0
+                              : std::acos(std::max(-1.0, std::min(1.0, max_dot))) * 180.0 / M_PI;
+            std::ostringstream rot;
+            rot << std::scientific << std::setprecision(3) << max_rot_deg;
+            // Report the whole picture. "differ" counts every face whose illumination
+            // normal is not bit-identical to the default one, which on a well-wound mesh
+            // is dominated by last-ulp round-off between two algebraically equal ways of
+            // normalizing the same cross product -- read it together with the max
+            // rotation. "reversed" is the physically meaningful subset: the faces whose
+            // orientation the radial flip actually had backwards.
             std::cout << "[IlluminationModel] PTM-Class1 TRUE (winding-consistent) normals ENABLED "
                          "(env PTM_ILLUM_TRUE_NORMALS): winding "
                       << (inconsistent==0 ? "GLOBALLY CONSISTENT" : "near-consistent") << " ("
-                      << inconsistent << " inconsistent half-edges); " << overhang << " overhang faces ("
-                      << std::fixed << std::setprecision(2)
+                      << inconsistent << " inconsistent half-edges); illumination normal differs "
+                         "from the default radial-flip normal on " << differ << " of " << nfc
+                      << " faces (" << std::fixed << std::setprecision(2)
+                      << (100.0*differ/std::max<size_t>(nfc,1)) << "%, max rotation "
+                      << rot.str() << " deg), of which " << reversed << " ("
+                      << (100.0*reversed/std::max<size_t>(nfc,1))
+                      << "%) are orientation REVERSALS; " << overhang << " overhang faces ("
                       << (100.0*overhang/std::max<size_t>(nfc,1)) << "%) keep their true radial-INWARD "
                          "normal instead of being flipped outward -> darkens spurious direct sun on "
                          "ledge undersides / rock-base slope breaks (Class 1). Illumination normal only; "
