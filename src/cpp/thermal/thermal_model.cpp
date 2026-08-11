@@ -1536,20 +1536,29 @@ void reportSurfaceNewtonStats() {
     const long long ni = g_surf_bc_iters.load(std::memory_order_relaxed);
     const long long nu = g_surf_bc_ulp_limited.load(std::memory_order_relaxed);
     const double    rm = g_surf_bc_max_resid.load(std::memory_order_relaxed);
+    // Printed through a LOCAL stream. std::cout arrives here carrying
+    // `std::fixed << std::setprecision(1)` from an earlier banner, which
+    // renders a 3e-13 K residual as "0.0" -- a run reporting a number that is
+    // not the number it measured, i.e. the PTM-05/PTM-55 archetype.
     if (ns > 0) {
-        std::cout << "[Thermal] surface-BC certificate: max achieved "
-                     "|f|/(4 eps sigma T^3) = " << rm << " K over " << ns
-                  << " solves (tol_K = " << surfaceBCTolK() << " K), mean "
-                  << (static_cast<double>(ni) / static_cast<double>(ns))
-                  << " Newton iterations/solve." << std::endl;
+        std::ostringstream o;
+        o << "[Thermal] surface-BC certificate: max achieved "
+             "|f|/(4 eps sigma T^3) = " << std::scientific << std::setprecision(3)
+          << rm << " K over " << std::defaultfloat << ns
+          << " solves (tol_K = " << std::scientific << std::setprecision(1)
+          << surfaceBCTolK() << " K), mean " << std::fixed << std::setprecision(2)
+          << (static_cast<double>(ni) / static_cast<double>(ns))
+          << " Newton iterations/solve.";
+        std::cout << o.str() << std::endl;
     }
     if (nu > 0) {
-        std::cout << "[Thermal] surface-BC round-off floor bound on " << nu
-                  << " / " << ns << " solves ("
-                  << (100.0 * static_cast<double>(nu) / static_cast<double>(ns))
-                  << "%): those iterates are at the precision limit of the "
-                     "residual test, not at tol_K. Reported, not hidden."
-                  << std::endl;
+        std::ostringstream o;
+        o << "[Thermal] surface-BC round-off floor bound on " << nu << " / " << ns
+          << " solves (" << std::fixed << std::setprecision(3)
+          << (100.0 * static_cast<double>(nu) / static_cast<double>(ns))
+          << "%): those iterates are at the precision limit of the residual "
+             "test, not at tol_K. Reported, not hidden.";
+        std::cout << o.str() << std::endl;
     }
     if (n > 0) {
         std::cout << "[Thermal] PTM_SOLVER_EQFIX T_geo-floor release: " << w

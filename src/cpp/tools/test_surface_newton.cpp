@@ -398,7 +398,7 @@ int main(int argc, char** argv)
                         // fix/surface-bc-unification, so the emulation that the
                         // tripwire below compares against is always the
                         // eqfix/solveSurfaceBC loop. newton_emulated() is kept
-                        // only to reproduce the PRE-fix behaviour for the
+                        // only to reproduce the PRE-fix behavior for the
                         // 'pre-fix' column and the defect-still-demonstrated
                         // gate; it is no longer a model of shipping code.
                         const double T_new =
