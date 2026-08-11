@@ -347,6 +347,31 @@ public:
 // (3) total depth ≈ b·δ_surface, (4) smooth geometric stretching limited by R_MAX.
 std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& config, bool verbose = false);
 
+// Top-cell Crank-Nicolson Fourier number, Fo0 = kappa[0]*dt/dz[0]^2.
+//
+// This is the quantity that actually limits how fine the depth grid may be,
+// and it is why Profile's constructor carries no minimum layer thickness (see
+// the derivation there). CN is A-stable, so Fo0 never causes divergence, but
+// the per-step amplification of the stiffest mode is ~(1-Fo0)/(1+Fo0): it goes
+// negative above Fo0 = 1 and approaches -1 as Fo0 grows, i.e. a sharp forcing
+// transition rings for ~1/|ln|g|| steps instead of decaying monotonically.
+// Substituting the adaptive grid's own dz0 = delta/m gives the closed form
+// Fo0 = pi*m^2/(steps per rotation), independent of kappa and of the body.
+double topCellFourierNumber(const Profile& profile, double dt);
+
+// Warn ONCE per process if `dt` leaves the top cell above `fo_warn`.
+//
+// The CPU mesh path sizes its substep from a fixed steps-per-day
+// (Config::MAIN_LOOP_STEPS_PER_DAY, and the equilibration target), so refining
+// the depth grid raises Fo0 as m^2 with NO automatic response. The GPU
+// persistent kernel does respond -- it derives its own substep count from
+// Fo<0.49 (gpu/thermal_kernels.cl:352-368) -- so this check is specifically
+// the CPU path's missing half. Diagnostic only: it never alters the grid or
+// the step, because clamping either one silently is what the old 1 mm
+// thickness floor did.
+void warnIfTopCellFourierHigh(const Profile& profile, double dt,
+                              const char* context, double fo_warn = 1.0);
+
 // Auto-tune adaptive stepping and event-aware dt using physics + flux series
 // Optional configuration via custom properties:
 //   "AUTO_TUNE_STEPPING" (bool, default true)

@@ -3913,6 +3913,13 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const int total_substeps = static_cast<int>(std::llround(
                     equil_duration_s / dt_sub));
 
+                // This dt is fixed by steps-per-day and knows nothing about the
+                // depth grid, so a finer --thermal-m raises the top-cell
+                // Fourier number as m^2 with no automatic response. Warn rather
+                // than clamp (the removed 1 mm thickness floor was the clamp).
+                thermal::warnIfTopCellFourierHigh(ref_profile, dt_sub,
+                                                  "CPU equilibration");
+
                 alignas(64) double flux_vec[thermal::THERMAL_BATCH_SIZE];
                 for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_vec[f] = 0.0;
 
@@ -4021,6 +4028,10 @@ bool runThermalModelsForAllFacesBatchSoA(
             // substepping gave only ~7% speedup at ~3x worse max error, so we
             // use a uniform target dt here.
             const double main_target_dt = planet.day / 768.0;
+            // Same caveat as the equilibration loop above: dt here is set by a
+            // fixed steps-per-day, not by the grid.
+            thermal::warnIfTopCellFourierHigh(ref_profile, main_target_dt,
+                                              "CPU main loop");
             alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
             for (int t = 0; t < total_time_steps - 1; ++t) {

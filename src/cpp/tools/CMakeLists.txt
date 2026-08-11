@@ -320,3 +320,17 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
 endif()
 
 message(STATUS "Configured ptm_tools library")
+# Depth-grid convergence gate. Refines m and requires the solution to converge
+# with dz == the grid's own spacing, and to FAIL to converge with the removed
+# 1 mm dz clamp re-created — the falsifier for that clamp. Links `thermal` so
+# it exercises the shipping Profile constructor.
+add_executable(test_grid_convergence test_grid_convergence.cpp)
+target_link_libraries(test_grid_convergence
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_grid_convergence
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
