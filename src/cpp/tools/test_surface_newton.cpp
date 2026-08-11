@@ -228,8 +228,16 @@ struct Case {
 //   grid. If this ever stops holding, the grid no longer covers the defect and
 //   the "post-fix residual is small" result is vacuous.
 // ---------------------------------------------------------------------------
-constexpr double kGateMaxResidual_K      = 0.150;
-constexpr double kGatePhysicalResidual_K = 0.001;
+// RE-GATED 2026-08-11 (fix/surface-bc-unification). The two thresholds above
+// described the PRE-unification loop: 10 iterations, omega = 0.8, exit on the
+// step. The shipping loop is now omega = 1.0 with the radiatively normalized
+// residual test, whose position error is bounded by tol_K/A <= tol_K = 1e-4 K
+// analytically. Both are therefore re-gated at 2e-4 K, twice the guaranteed
+// bound -- the same bar Fermi's 252-case derivation sweep passes at 1.790e-4 K
+// worst. The old 0.15 K corner (T1 = 400 K under 5 cm of k = 7.4e-4) is no
+// longer a corner: undamped Newton reaches it in 3 steps.
+constexpr double kGateMaxResidual_K      = 2e-4;
+constexpr double kGatePhysicalResidual_K = 2e-4;
 constexpr double kGateMinDefectDemo_K    = 10.0;
 constexpr double kEmulationTol_K         = 1e-9;
 
@@ -346,13 +354,15 @@ int main(int argc, char** argv)
                                                             config.sigma);
                         const double T_old = newton_emulated(Qs, k0, dz0, T1, eps,
                                                              config.sigma, /*new_seed=*/false);
-                        // The emulation must track WHICH loop surfTemp is
-                        // running, or this tripwire fires on the eqfix branch
-                        // and masks every result below it.
-                        const double T_new = eqfix_on
-                            ? newton_eqfix<double>(Qs, k0, dz0, T1, eps, config.sigma)
-                            : newton_emulated(Qs, k0, dz0, T1, eps,
-                                              config.sigma, /*new_seed=*/true);
+                        // The unified criterion is UNCONDITIONAL as of
+                        // fix/surface-bc-unification, so the emulation that the
+                        // tripwire below compares against is always the
+                        // eqfix/solveSurfaceBC loop. newton_emulated() is kept
+                        // only to reproduce the PRE-fix behaviour for the
+                        // 'pre-fix' column and the defect-still-demonstrated
+                        // gate; it is no longer a model of shipping code.
+                        const double T_new =
+                            newton_eqfix<double>(Qs, k0, dz0, T1, eps, config.sigma);
 
                         const double d_ship = std::abs(T_ship - T_ref);
                         const double d_old  = std::abs(T_old  - T_ref);
@@ -755,20 +765,13 @@ int main(int argc, char** argv)
                     worst_old, kGateMinDefectDemo_K);
         return 1;
     }
-    if (eqfix_on) {
-        std::printf("  NOTE: kGateMaxResidual_K / kGatePhysicalResidual_K describe the\n"
-                    "        PRE-eqfix loop's 10-iteration, 0.8-relaxed truncation. With\n"
-                    "        the gate on they are not the operative bar; the eqfix gate\n"
-                    "        below is. Measured anyway: %.6f K full grid, %.6f K T1<=150 K.\n",
-                    worst_ship, worst_ship_phys);
-    }
-    if (!eqfix_on && !(worst_ship <= kGateMaxResidual_K)) {
+    if (!(worst_ship <= kGateMaxResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K over the full grid, tolerance %.3f K "
                     "(PTM-116).\n", worst_ship, kGateMaxResidual_K);
         return 1;
     }
-    if (!eqfix_on && !(worst_ship_phys <= kGatePhysicalResidual_K)) {
+    if (!(worst_ship_phys <= kGatePhysicalResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K on the science-relevant T1 <= 150 K "
                     "subset, tolerance %.3f K (the Newton loop's own declared "
@@ -776,9 +779,17 @@ int main(int argc, char** argv)
                     worst_ship_phys, kGatePhysicalResidual_K);
         return 1;
     }
-    // Correction 1: the GATED eqfix quantity is the Newton's own converged
-    // position error, not the column offset. Scored only when the gate is on;
-    // with the gate off the pre-eqfix loop is expected to sit near 1e-04 K.
+    // The GATED quantity is the Newton's own converged position error, not the
+    // column offset.
+    //
+    // Still scored only under PTM_SOLVER_EQFIX, and NOT because the criterion
+    // is gated any more (it is unconditional as of fix/surface-bc-unification)
+    // -- because the T_geo FLOOR is. With the floor on, update_T() overwrites
+    // layer 0 with the analytic (Qb/(eps*sigma))^0.25 after the Newton runs, so
+    // |f|/|df| measured on the relaxed column is the FLOOR's residual and is
+    // blind to the Newton entirely (measured: bit-identical 1.418e-04 K before
+    // and after the criterion changed). Gating it with the floor on would score
+    // a quantity this change does not touch.
     if (thermal::solverEqFixEnabled()) {
         if (!(newton_worst <= kGateNewtonResidual_K)) {
             std::printf("[test_surface_newton] FAIL: with PTM_SOLVER_EQFIX on, the "
@@ -787,7 +798,7 @@ int main(int argc, char** argv)
                         newton_worst, kGateNewtonResidual_K);
             return 1;
         }
-        std::printf("[test_surface_newton] eqfix PASS: worst converged Newton "
+        std::printf("[test_surface_newton] criterion PASS: worst converged Newton "
                     "position error |f|/|df| = %.3e K over %d columns "
                     "(tol %.1e K = tol_K, the criterion's guaranteed bound).\n",
                     newton_worst, 3, kGateNewtonResidual_K);

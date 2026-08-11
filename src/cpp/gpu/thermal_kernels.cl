@@ -297,7 +297,11 @@ __kernel void persistentThermalKernel(
     // Regolith conductivity law: 0 = Hayne 2017 (default), 1 = Martinez &
     // Siegler 2021. Appended LAST on purpose so the hard-coded arg indices
     // kArgNTimesteps(20) / kArgTOffset(25) above stay valid.
-    int cond_model)
+    int cond_model,
+    // Per-face surface-BC certificate: max over this session's substeps of the
+    // achieved |f| / (4 eps sigma T^3) [K] from the surface Newton. Appended
+    // after cond_model for the same reason cond_model was appended last.
+    __global float* surf_resid_K)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -412,7 +416,13 @@ __kernel void persistentThermalKernel(
                 kappa_local[i] = k_local[i] / (rho_local[i] * cp_local[i]);
             }
 
-            // Step 1: Newton-Raphson for surface temperature (matches CPU surfTemp)
+            // Step 1: the surface energy balance.
+            //
+            // THIS IS THE SAME SPECIFICATION AS THE CPU solveSurfaceBC()
+            // (src/cpp/thermal/thermal_model.h), evaluated in float32. Seed,
+            // relaxation, exit criterion, ulp floor, step limiter and
+            // max_iter are identical; the derivation lives in that header and
+            // is not repeated here. A change to one MUST be made to the other.
             // Energy balance at surface: Qs + k*(T1-T0)/dz = eps*sigma*T0^4
             {
                 float dz = z[1] - z[0];
@@ -444,40 +454,73 @@ __kernel void persistentThermalKernel(
                     if (T_eq > T_surf) T_surf = T_eq;
                 }
 
-                // Newton-Raphson iterations with early termination
-                // Matches CPU: max_iter=10, tolerance=0.001, relaxation=0.8
-                float dT_nr = 1.0f;
-                for (int iter = 0; iter < 10 && fabs(dT_nr) > 0.001f; ++iter) {
+                // Exit when the RADIATIVELY NORMALIZED residual is small:
+                //   |f| <= max(tol_K*4*eps*sigma*T0^3, 2*|df|*FLT_EPSILON*T0)
+                // with omega = 1.0 and max_iter = 10.
+                //
+                // THE SECOND TERM IS LOAD-BEARING ON THIS PATH. In float32 the
+                // residual test's own round-off noise is 1.08e-4 K at 24 K on
+                // the moon3d grid -- i.e. AT tol_K -- so without the floor a
+                // fully converged iterate cannot certify convergence and spins
+                // to the iteration cap on essentially every cold face. The
+                // achieved residual is written out per face below so a run that
+                // is limited by that floor rather than by tol_K says so.
+                float f = 0.0f;
+                float h_rad = 0.0f;
+                for (int iter = 0; iter < 10; ++iter) {
                     float T0 = T_surf;
                     float T3 = T0 * T0 * T0;
-                    float T4 = T0 * T3;
 
                     // f = Qs + k*(T1 - T0)/dz - eps*sigma*T0^4
-                    float f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T4;
+                    f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T3 * T0;
 
                     // df/dT0 = -k/dz - 4*eps*sigma*T0^3
                     float df = -k0 / dz - 4.0f * eps * sigma * T3;
 
                     if (fabs(df) < 1e-10f) df = -1e-10f;
 
-                    // dT = relaxation * f / df
-                    dT_nr = 0.8f * f / df;
+                    h_rad = 4.0f * eps * sigma * T3;
+
+                    // MIN_ITER = 1: testing before the first step turns a
+                    // Qb = 0 column into a continuum of accepted states of
+                    // width tol_K, so it stops wherever it happens to be.
+                    if (iter > 0) {
+                        float tol_res = 1.0e-4f * h_rad;
+                        float tol_ulp = 2.0f * fabs(df) * FLT_EPSILON * T0;
+                        if (fabs(f) <= tol_res || fabs(f) <= tol_ulp) break;
+                    }
+
+                    float dT_nr = f / df;   // relaxation omega = 1.0
 
                     // Robust-Newton step limiter (globalization, NOT an output
                     // clamp). For very cold, low-conductivity faces (PSR floors)
-                    // df = -k/dz - 4εσT^3 -> 0 as both terms vanish, so an
-                    // unguarded Newton step overshoots past the unique positive
-                    // root of the monotonic f(T) into NEGATIVE T, collapsing the
-                    // column. Capping the step to a fraction of the current T
-                    // keeps every iterate strictly positive and converges to the
-                    // true physical root (e.g. ~25 K from geothermal balance).
-                    // Warm, well-conditioned faces take sub-cap steps, so their
-                    // result is bit-unchanged. The final temperature is still set
-                    // by physics (the root of f), not bounded to a fixed range.
-                    float max_step = 0.5f * T0;
-                    if (dT_nr >  max_step) dT_nr =  max_step;
-                    if (dT_nr < -max_step) dT_nr = -max_step;
+                    // df = -k/dz - 4 eps sigma T^3 -> 0 as both terms vanish, so
+                    // an unguarded Newton step overshoots past the unique
+                    // positive root of the monotonic f(T) into NEGATIVE T,
+                    // collapsing the column. Capping the COOLING step at 0.5*T0
+                    // keeps every iterate strictly positive. The GROWTH side is
+                    // 4*T0 rather than 0.5*T0, which at 1.5x/iteration imposed a
+                    // factor-57.7 ceiling over 10 iterations; that ceiling is
+                    // unreachable from the max(T_eq, T1) seed, and widening it
+                    // means the code does not silently depend on that premise.
+                    // The final temperature is still set by physics (the root of
+                    // f), not bounded to a fixed range.
+                    float cool_cap   = 0.5f * T0;
+                    float growth_cap = 4.0f * T0;
+                    if (dT_nr >  cool_cap)   dT_nr =  cool_cap;
+                    if (dT_nr < -growth_cap) dT_nr = -growth_cap;
                     T_surf = T0 - dT_nr;
+                }
+
+                // Per-face surface-BC certificate: the worst achieved
+                // |f| / (4 eps sigma T^3) [K] over every substep this face
+                // takes. Each work-item owns its own element, so there is no
+                // race. The host reduces it to a per-run maximum and prints it;
+                // that is what keeps the float32 round-off floor from binding
+                // silently.
+                {
+                    float resid = (h_rad > 0.0f) ? fabs(f) / h_rad : fabs(f);
+                    if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
                 }
 
                 T_local[0] = T_surf;

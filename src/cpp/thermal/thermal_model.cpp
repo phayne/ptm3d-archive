@@ -1473,12 +1473,82 @@ bool solverEqFixEnabled() {
 // Counted, not assumed -- reported by reportSurfaceNewtonStats().
 static std::atomic<long long> g_surf_newton_growth_cap{0};
 static std::atomic<long long> g_surf_newton_iter_cap{0};
+// Surface-BC certificate: the per-run maximum of the achieved
+// |f| / (4*eps*sigma*T^3), plus the number of solves that could only be
+// terminated by the round-off floor rather than by tol_K.
+static std::atomic<long long> g_surf_bc_ulp_limited{0};
+static std::atomic<long long> g_surf_bc_solves{0};
+static std::atomic<long long> g_surf_bc_iters{0};
+static std::atomic<double>    g_surf_bc_max_resid{0.0};
+
+double surfaceBCTolK() {
+    static const double tol = [] {
+        // Legacy name honored, with a warning, so an existing diagnostic script
+        // does not silently lose its override.
+        const char* legacy = std::getenv("PTM_SOLVER_EQFIX_TOLK");
+        const char* e      = std::getenv("PTM_SURFACE_BC_TOLK");
+        if ((!e || !*e) && legacy && *legacy) {
+            std::cout << "[Thermal] PTM_SOLVER_EQFIX_TOLK is deprecated (the "
+                         "criterion is no longer gated); use "
+                         "PTM_SURFACE_BC_TOLK. Honoring it for this run."
+                      << std::endl;
+            e = legacy;
+        }
+        if (!e || !*e) return kSurfaceBCTolK;
+        const double v = std::atof(e);
+        if (!(v > 0.0)) {
+            std::cerr << "[Thermal] WARNING: PTM_SURFACE_BC_TOLK='" << e
+                      << "' is not a positive number; keeping the derived "
+                      << kSurfaceBCTolK << " K." << std::endl;
+            return kSurfaceBCTolK;
+        }
+        std::cout << "[Thermal] PTM_SURFACE_BC_TOLK=" << v
+                  << " K overrides the derived surface-BC tolerance ("
+                  << kSurfaceBCTolK << " K). Diagnostic use only." << std::endl;
+        return v;
+    }();
+    return tol;
+}
+
+void noteSurfaceBCSolution(const SurfaceBCSolution& s) {
+    g_surf_bc_solves.fetch_add(1, std::memory_order_relaxed);
+    g_surf_bc_iters.fetch_add(s.iterations, std::memory_order_relaxed);
+    if (s.growth_capped) g_surf_newton_growth_cap.fetch_add(1, std::memory_order_relaxed);
+    if (s.hit_iter_cap)  g_surf_newton_iter_cap.fetch_add(1, std::memory_order_relaxed);
+    if (s.ulp_limited)   g_surf_bc_ulp_limited.fetch_add(1, std::memory_order_relaxed);
+    // Monotone max. The relaxed load is the common case; the CAS runs only when
+    // this solve is the new worst, which happens a handful of times per run.
+    double prev = g_surf_bc_max_resid.load(std::memory_order_relaxed);
+    while (s.residual_K > prev &&
+           !g_surf_bc_max_resid.compare_exchange_weak(prev, s.residual_K,
+                                                      std::memory_order_relaxed)) {
+    }
+}
 
 void reportSurfaceNewtonStats() {
     const long long g = g_surf_newton_growth_cap.load(std::memory_order_relaxed);
     const long long c = g_surf_newton_iter_cap.load(std::memory_order_relaxed);
     const long long w = g_tgeo_would_clamp.load(std::memory_order_relaxed);
     const long long n = g_tgeo_tested.load(std::memory_order_relaxed);
+    const long long ns = g_surf_bc_solves.load(std::memory_order_relaxed);
+    const long long ni = g_surf_bc_iters.load(std::memory_order_relaxed);
+    const long long nu = g_surf_bc_ulp_limited.load(std::memory_order_relaxed);
+    const double    rm = g_surf_bc_max_resid.load(std::memory_order_relaxed);
+    if (ns > 0) {
+        std::cout << "[Thermal] surface-BC certificate: max achieved "
+                     "|f|/(4 eps sigma T^3) = " << rm << " K over " << ns
+                  << " solves (tol_K = " << surfaceBCTolK() << " K), mean "
+                  << (static_cast<double>(ni) / static_cast<double>(ns))
+                  << " Newton iterations/solve." << std::endl;
+    }
+    if (nu > 0) {
+        std::cout << "[Thermal] surface-BC round-off floor bound on " << nu
+                  << " / " << ns << " solves ("
+                  << (100.0 * static_cast<double>(nu) / static_cast<double>(ns))
+                  << "%): those iterates are at the precision limit of the "
+                     "residual test, not at tol_K. Reported, not hidden."
+                  << std::endl;
+    }
     if (n > 0) {
         std::cout << "[Thermal] PTM_SOLVER_EQFIX T_geo-floor release: " << w
                   << " / " << n << " node-updates ("
@@ -1503,176 +1573,20 @@ void reportSurfaceNewtonStats() {
 }
 
 void surfTemp(Profile& p, double Qs) {
-    double epsilon = p.emissivity;
-    double sigma = p.config->sigma;
-    double k0 = p.k()[0];
-    double dz0 = p.dz()[0];
-    double T1 = p.T()[1];
+    const double epsilon = p.emissivity;
+    const double sigma   = p.config->sigma;
+    const double k0      = p.k()[0];
+    const double dz0     = p.dz()[0];
+    const double T1      = p.T()[1];
 
-    // No artificial temperature clamps: the surface energy balance
-    // f(T) = Qs + k*(T1-T)/dz - eps*sigma*T^4 is monotonically decreasing in T
-    // (df/dT < 0), so it has a unique physical root that the damped Newton
-    // iteration below converges to. Temperatures are therefore set by physics,
-    // not bounded to an arbitrary [3, 500] K range.
-
-    // Initial guess: the UPPER end of the root bracket.
-    //
-    // f(T) = Qs + k0*(T1 - T)/dz0 - eps*sigma*T^4 is strictly decreasing, and
-    // f(T_eq)*f(T1) <= 0 for T_eq = (Qs/(eps*sigma))^0.25 (f(T_eq) =
-    // k0*(T1-T_eq)/dz0, f(T1) = eps*sigma*(T_eq^4 - T1^4)), so the unique root
-    // is ALWAYS bracketed by [min(T_eq,T1), max(T_eq,T1)]. Starting at the
-    // upper end also puts Newton on the side where the concave f
-    // (f'' = -12*eps*sigma*T^2 < 0) converges monotonically.
-    //
-    // PTM-116 (the scalar twin of PTM-115's GPU kernel defect): starting at
-    // T_eq unconditionally when Qs > 0 is the defect. As Qs -> 0+, T_eq -> 0,
-    // while the step limiter below caps growth at 1.5x per iteration over
-    // max_iter = 10 -> the iterate can travel at most 1.5^10 = 57.665x from
-    // the guess. Any face with 0 < Qs < eps*sigma*(T_root/57.665)^4
-    // (~5e-7 W/m^2 for a 100 K root) therefore returned an under-converged,
-    // spuriously COLD surface temperature, exactly 1.5^10 * T_eq. Sunlit faces
-    // have T_eq >= T1 and are bit-unchanged. Gated by
-    // src/cpp/tools/test_surface_newton.cpp.
-    double Tnew = T1;
-    if (Qs > 0) {
-        // sqrt(sqrt(x)) is faster than pow(x, 0.25)
-        const double T_eq = std::sqrt(std::sqrt(Qs / (epsilon * sigma)));
-        if (T_eq > Tnew) Tnew = T_eq;
-    }
-
-    // ---- PTM_SOLVER_EQFIX: residual-based exit criterion -------------------
-    // Three changes, in decreasing order of leverage:
-    //
-    //  1. relaxation 0.8 -> 1.0. This is the larger lever, not the tolerance:
-    //     f is concave and decreasing and the seed is >= the root, so the
-    //     undamped Newton converges monotonically from above with no risk of
-    //     overshoot, and 0.8 merely truncates a converging sequence.
-    //
-    //  2. Exit on the RADIATIVELY NORMALIZED residual |f| <= tol_K*4*eps*sigma
-    //     *T0^3, not on |dT| and not on a raw W/m^2 residual. |df| = k0/dz0 +
-    //     4*eps*sigma*T0^3 >= 4*eps*sigma*T0^3, so this bounds the POSITION
-    //     error by tol_K uniformly in T. A single raw f_tol would span 4300x
-    //     between a 24 K and a 390 K surface, which is worse than the 74x it
-    //     would replace.
-    //
-    //  3. The test runs only AFTER at least one step (MIN_ITER = 1). Testing
-    //     before the first step turns any Q_b = 0 column into a CONTINUUM of
-    //     fixed points of width tol_K: every T whose residual is already
-    //     inside the band is accepted, so the column stops wherever it
-    //     happens to be. Measured on the Qb=0 / Qs=1e-3 drift column: the
-    //     zero-step variant lands +9.99953e-05 K off (exactly the band edge),
-    //     the guarded one +7.1937e-10 K.
-    //
-    // ulp floor. Below ~22 K in float32, |df|*ulp(T0) exceeds tol_K*4*eps*
-    // sigma*T0^3, so a converged iterate cannot CERTIFY convergence and spins
-    // to the iteration cap (measured cap fraction 0.9895 at 1-3 K) while its
-    // true position error is ~4e-8 K. The tolerance is therefore floored at
-    // the residual change one representable step of T0 produces. c = 2 because
-    // eps_mach*T0 is between 1x and 2x the true ulp(T0), and the float32
-    // evaluation of f can itself round by a step; 2 covers both. In float64
-    // the floor is ~1e-16 relative and never binds, so the CPU path keeps its
-    // full accuracy and this is purely the GPU twin's safety net.
-    if (solverEqFixEnabled()) {
-        const int    kMaxIter = 10;
-        // Diagnostic override. The shipping value is 1e-4 K; PTM_SOLVER_EQFIX_TOLK
-        // exists so a test can SWEEP it and thereby attribute a converged-column
-        // bias to the Newton's exit criterion (bias shrinks with tol_K) versus
-        // the interior stencil (bias does not). Both are dt-independent at the
-        // fixed point, so dt cannot separate them and tol_K is the discriminator.
-        static const double kTolK = [] {
-            const char* e = std::getenv("PTM_SOLVER_EQFIX_TOLK");
-            if (!e || !*e) return 1e-4;
-            const double v = std::atof(e);
-            std::cout << "[Thermal] PTM_SOLVER_EQFIX_TOLK=" << v
-                      << " overrides the surface-Newton tolerance (diagnostic)."
-                      << std::endl;
-            return (v > 0.0) ? v : 1e-4;
-        }();
-        const double kUlpC    = 2.0;
-        const double eps_mach = std::numeric_limits<double>::epsilon();
-        int iter = 0;
-        for (; iter < kMaxIter; ++iter) {
-            const double T0 = Tnew;
-            const double T0_cubed  = pow3(T0);
-            const double T0_fourth = T0 * T0_cubed;
-
-            const double f  = Qs + k0 * (T1 - T0) / dz0 - epsilon * sigma * T0_fourth;
-            double df = -k0 / dz0 - 4.0 * epsilon * sigma * T0_cubed;
-            if (std::abs(df) < 1e-10) df = -1e-10;
-
-            // MIN_ITER = 1: skipped on iter 0 so at least one step is taken.
-            if (iter > 0) {
-                const double h_rad   = 4.0 * epsilon * sigma * T0_cubed;
-                const double tol_res = kTolK * h_rad;
-                const double tol_ulp = kUlpC * std::abs(df) * eps_mach * T0;
-                if (std::abs(f) <= std::max(tol_res, tol_ulp)) break;
-            }
-
-            double dTi = f / df;   // relaxation 1.0
-
-            // Step limiter. The COOLING side (dT > 0 lowers T) is what keeps
-            // every iterate strictly positive when df -> 0 on a cold,
-            // low-conductivity face, so it stays at 0.5*T0. The GROWTH side is
-            // widened from 0.5*T0 to 4*T0: at 0.5*T0 it caps growth at
-            // 1.5x/iteration, a factor-57.7 ceiling over 10 iterations that
-            // produced measured errors of -68.5 / -130.5 / -392.3 K from a
-            // below-root start. That start is unreachable from the
-            // max(T_eq, T1) seed, but the code must not silently depend on
-            // that: widening makes the ceiling unreachable too, and the
-            // counter below records any firing.
-            const double cool_cap  = 0.5 * T0;
-            const double growth_cap = 4.0 * T0;
-            if (dTi >  cool_cap)   dTi =  cool_cap;
-            if (dTi < -growth_cap) {
-                dTi = -growth_cap;
-                g_surf_newton_growth_cap.fetch_add(1, std::memory_order_relaxed);
-            }
-            Tnew = T0 - dTi;
-        }
-        if (iter >= kMaxIter) {
-            g_surf_newton_iter_cap.fetch_add(1, std::memory_order_relaxed);
-        }
-        p.T()[0] = Tnew;
-        return;
-    }
-
-    // Optimized Newton-Raphson with early termination
-    double dT = 1.0;
-    int max_iter = 10;
-    double tolerance = 0.001;
-    double relaxation = 0.8;
-
-    for (int iter = 0; iter < max_iter && std::abs(dT) > tolerance; iter++) {
-        double T0 = Tnew;
-        
-        // Compute T^3 once and reuse
-        double T0_cubed = pow3(T0);
-        double T0_fourth = T0 * T0_cubed;
-        
-        double f = Qs + k0 * (T1 - T0) / dz0 - epsilon * sigma * T0_fourth;
-        double df = -k0 / dz0 - 4.0 * epsilon * sigma * T0_cubed;
-        
-        if (std::abs(df) < 1e-10) {
-            df = -1e-10;
-        }
-        
-        dT = relaxation * f / df;
-
-        // Robust-Newton step limiter (globalization, NOT an output clamp).
-        // For very cold, low-conductivity faces (PSR floors) df = -k/dz -
-        // 4εσT^3 -> 0 as both terms vanish, so an unguarded step overshoots
-        // past the unique positive root of the monotonic f(T) into NEGATIVE
-        // T. Capping the step to a fraction of the current T keeps every
-        // iterate strictly positive and converges to the true physical root
-        // (e.g. ~25 K geothermal balance). Warm faces take sub-cap steps, so
-        // their result is unchanged; the temperature is still set by physics.
-        const double max_step = 0.5 * T0;
-        if (dT >  max_step) dT =  max_step;
-        if (dT < -max_step) dT = -max_step;
-        Tnew = T0 - dT;
-    }
-
-    p.T()[0] = Tnew;
+    // The whole algorithm -- seed, relaxation, exit criterion, ulp floor and
+    // step limiter -- lives in solveSurfaceBC() (thermal_model.h) so that the
+    // CPU scalar path, the CPU SIMD batch path and the OpenCL kernel cannot
+    // drift apart again. See that header block for the derivation.
+    const SurfaceBCSolution s =
+        solveSurfaceBC(Qs, T1, k0, dz0, epsilon, sigma, surfaceBCTolK());
+    noteSurfaceBCSolution(s);
+    p.T()[0] = s.T;
 }
 
 void botTemp(Profile& p, double Qb) {
@@ -3011,116 +2925,43 @@ void updateMaterialPropertiesBatchSIMD(ThermalBatchSoA& batch) {
 }
 
 // Apply surface boundary condition using Newton-Raphson iteration
+// Surface boundary condition for the SoA batch path.
+//
+// This used to be a fourth, private implementation of the surface energy
+// balance, and it was the worst one in the codebase as well as the default
+// mesh solver (thermal.use_gpu defaults false). It seeded from the PREVIOUS
+// T[0] -- off-bracket at any transition -- ran exactly 5 iterations with no
+// convergence test, had no step limiter, and applied a hard [2.7, 500] K clamp
+// INSIDE the Newton loop, which can terminate iteration on a legitimately hot
+// face and is exactly the arbitrary cutoff this project has ruled against.
+// Measured single-call errors against a float64 Brent root, all one-signed
+// warm: +22.958 K (0 -> 127 W/m^2), +13.416 K (0 -> 255), +28.686 K
+// (1197 -> 0 at T1 = 100 K) -- i.e. a warm bias at every terminator crossing,
+// shadow exit and eclipse transition.
+//
+// It is deleted. The batch keeps its SoA layout; the per-face solve is the
+// shared solveSurfaceBC(). The AVX-512/AVX2 kernels are NOT reinstated in
+// vector form: the exit criterion is per-lane data-dependent, so a vector
+// version would either run every lane to the worst lane's iteration count or
+// need mask bookkeeping -- a fifth implementation to keep in step with the
+// other three, which is precisely how this divergence was created. The surface
+// solve is one scalar root find per face against a 50-layer Thomas sweep, so
+// it is not where this path's time goes.
 void applySurfaceBCBatch(ThermalBatchSoA& batch, double dt) {
-    const double sigma = batch.sigma_sb;
-    const double dz0 = batch.dz[0];
+    (void)dt;   // the surface balance is quasi-static; dt enters the interior solve
+    const double sigma  = batch.sigma_sb;
+    const double dz0    = batch.dz[0];
+    const double tol_K  = surfaceBCTolK();
+    const double* k0p   = batch.layer_ptr(batch.k, 0);
+    const double* T1p   = batch.layer_ptr(batch.T, 1);
+    double*       T0p   = batch.layer_ptr(batch.T, 0);
 
-#if defined(AVX512_ENABLED)
-    __m512d sigma_vec = _mm512_set1_pd(sigma);
-    __m512d dz0_vec = _mm512_set1_pd(dz0);
-    __m512d four = _mm512_set1_pd(4.0);
-    __m512d relax = _mm512_set1_pd(0.8);
-    __m512d neg_one = _mm512_set1_pd(-1.0);
-
-    // Load surface data
-    __m512d T_surf = _mm512_load_pd(batch.layer_ptr(batch.T, 0));
-    __m512d T_sub = _mm512_load_pd(batch.layer_ptr(batch.T, 1));
-    __m512d eps_vec = _mm512_load_pd(batch.emissivity);
-    __m512d flux_vec = _mm512_load_pd(batch.flux);
-    __m512d k0_vec = _mm512_load_pd(batch.layer_ptr(batch.k, 0));
-
-    // Newton-Raphson iterations for surface temperature
-    // Equation: Qs + k*(T1-T0)/dz - eps*sigma*T0^4 = 0
-    for (int iter = 0; iter < 5; ++iter) {
-        __m512d T2 = _mm512_mul_pd(T_surf, T_surf);
-        __m512d T3 = _mm512_mul_pd(T2, T_surf);
-        __m512d T4 = _mm512_mul_pd(T3, T_surf);
-
-        // f = flux + k*(T_sub - T_surf)/dz - eps*sigma*T4
-        __m512d dT_dz = _mm512_div_pd(_mm512_sub_pd(T_sub, T_surf), dz0_vec);
-        __m512d cond_flux = _mm512_mul_pd(k0_vec, dT_dz);
-        __m512d rad_flux = _mm512_mul_pd(eps_vec, _mm512_mul_pd(sigma_vec, T4));
-        __m512d f = _mm512_sub_pd(_mm512_add_pd(flux_vec, cond_flux), rad_flux);
-
-        // df = -k/dz - 4*eps*sigma*T3
-        __m512d df_cond = _mm512_mul_pd(neg_one, _mm512_div_pd(k0_vec, dz0_vec));
-        __m512d df_rad = _mm512_mul_pd(four, _mm512_mul_pd(eps_vec, _mm512_mul_pd(sigma_vec, T3)));
-        __m512d df = _mm512_sub_pd(df_cond, df_rad);
-
-        // T_new = T_old - relax * f/df
-        __m512d delta = _mm512_mul_pd(relax, _mm512_div_pd(f, df));
-        T_surf = _mm512_sub_pd(T_surf, delta);
-
-        // Clamp to physical range
-        T_surf = _mm512_max_pd(T_surf, _mm512_set1_pd(ABSOLUTE_ZERO_K));
-        T_surf = _mm512_min_pd(T_surf, _mm512_set1_pd(MAX_PHYSICAL_TEMP_K));
-    }
-
-    _mm512_store_pd(batch.layer_ptr(batch.T, 0), T_surf);
-
-#elif defined(AVX2_ENABLED)
-    __m256d sigma_vec = _mm256_set1_pd(sigma);
-    __m256d dz0_vec = _mm256_set1_pd(dz0);
-    __m256d four = _mm256_set1_pd(4.0);
-    __m256d relax = _mm256_set1_pd(0.8);
-    __m256d neg_one = _mm256_set1_pd(-1.0);
-
-    for (int base = 0; base < THERMAL_BATCH_SIZE; base += 4) {
-        __m256d T_surf = _mm256_load_pd(batch.layer_ptr(batch.T, 0) + base);
-        __m256d T_sub = _mm256_load_pd(batch.layer_ptr(batch.T, 1) + base);
-        __m256d eps_vec = _mm256_load_pd(batch.emissivity + base);
-        __m256d flux_vec = _mm256_load_pd(batch.flux + base);
-        __m256d k0_vec = _mm256_load_pd(batch.layer_ptr(batch.k, 0) + base);
-
-        for (int iter = 0; iter < 5; ++iter) {
-            __m256d T2 = _mm256_mul_pd(T_surf, T_surf);
-            __m256d T3 = _mm256_mul_pd(T2, T_surf);
-            __m256d T4 = _mm256_mul_pd(T3, T_surf);
-
-            __m256d dT_dz = _mm256_div_pd(_mm256_sub_pd(T_sub, T_surf), dz0_vec);
-            __m256d cond_flux = _mm256_mul_pd(k0_vec, dT_dz);
-            __m256d rad_flux = _mm256_mul_pd(eps_vec, _mm256_mul_pd(sigma_vec, T4));
-            __m256d f = _mm256_sub_pd(_mm256_add_pd(flux_vec, cond_flux), rad_flux);
-
-            __m256d df_cond = _mm256_mul_pd(neg_one, _mm256_div_pd(k0_vec, dz0_vec));
-            __m256d df_rad = _mm256_mul_pd(four, _mm256_mul_pd(eps_vec, _mm256_mul_pd(sigma_vec, T3)));
-            __m256d df = _mm256_sub_pd(df_cond, df_rad);
-
-            __m256d delta = _mm256_mul_pd(relax, _mm256_div_pd(f, df));
-            T_surf = _mm256_sub_pd(T_surf, delta);
-
-            T_surf = _mm256_max_pd(T_surf, _mm256_set1_pd(ABSOLUTE_ZERO_K));
-            T_surf = _mm256_min_pd(T_surf, _mm256_set1_pd(MAX_PHYSICAL_TEMP_K));
-        }
-
-        _mm256_store_pd(batch.layer_ptr(batch.T, 0) + base, T_surf);
-    }
-
-#else
-    // Scalar fallback
     for (int f = 0; f < batch.n_faces; ++f) {
-        double T_surf = batch.T[f];
-        double T_sub = batch.T[THERMAL_BATCH_SIZE + f];
-        double eps = batch.emissivity[f];
-        double Q = batch.flux[f];
-        double k0 = batch.k[f];
-
-        for (int iter = 0; iter < 5; ++iter) {
-            double T3 = T_surf * T_surf * T_surf;
-            double T4 = T3 * T_surf;
-
-            double f_val = Q + k0 * (T_sub - T_surf) / dz0 - eps * sigma * T4;
-            double df_val = -k0 / dz0 - 4.0 * eps * sigma * T3;
-
-            double delta = 0.8 * f_val / df_val;
-            T_surf -= delta;
-
-            T_surf = std::max(ABSOLUTE_ZERO_K, std::min(MAX_PHYSICAL_TEMP_K, T_surf));
-        }
-
-        batch.T[f] = T_surf;
+        const SurfaceBCSolution s = solveSurfaceBC(
+            batch.flux[f], T1p[f], k0p[f], dz0, batch.emissivity[f], sigma, tol_K);
+        noteSurfaceBCSolution(s);
+        T0p[f] = s.T;
     }
-#endif
 }
 
 // Apply bottom boundary condition (geothermal heat flux)
