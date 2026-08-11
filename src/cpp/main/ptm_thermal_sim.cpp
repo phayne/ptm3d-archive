@@ -14215,6 +14215,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Surface-Newton globalization counters and, under PTM_SOLVER_EQFIX,
+        // the T_geo-floor release census. Both are no-ops unless something
+        // fired; a counter nobody prints is the same as no counter.
+        thermal::reportSurfaceNewtonStats();
+
         // ====================================================================
         // PTM-53 rule-7 tripwire: an override that was requested but never
         // applied must FAIL, not sail through with a reassuring banner.

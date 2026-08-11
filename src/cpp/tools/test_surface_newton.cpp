@@ -49,6 +49,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <limits>
 
 namespace {
 
@@ -124,6 +125,68 @@ double newton_emulated(double Qs, double k0, double dz0, double T1,
         Tnew = T0 - dT;
     }
     return Tnew;
+}
+
+// ---------------------------------------------------------------------------
+// PTM_SOLVER_EQFIX variant of the same loop, in a SELECTABLE precision, so the
+// float32 numbers the GPU twin will actually see can be measured on the host.
+// Keep textually in step with thermal_model.cpp::surfTemp's eqfix branch.
+//
+// `iters_out` receives the number of f-evaluations (the quantity the
+// acceptance table calls "iterations"); `capped_out` is set when the loop
+// exhausted max_iter without meeting the criterion.
+// ---------------------------------------------------------------------------
+template <typename R>
+double newton_eqfix(double Qs_d, double k0_d, double dz0_d, double T1_d,
+                    double eps_d, double sigma_d,
+                    int* iters_out = nullptr, bool* capped_out = nullptr,
+                    bool ulp_floor = true, bool min_iter_guard = true,
+                    double omega = 1.0)
+{
+    const R Qs = static_cast<R>(Qs_d), k0 = static_cast<R>(k0_d);
+    const R dz0 = static_cast<R>(dz0_d), T1 = static_cast<R>(T1_d);
+    const R eps = static_cast<R>(eps_d), sigma = static_cast<R>(sigma_d);
+    const R om  = static_cast<R>(omega);
+
+    R Tnew = T1;
+    if (Qs > R(0)) {
+        const R T_eq = std::sqrt(std::sqrt(Qs / (eps * sigma)));
+        if (T_eq > Tnew) Tnew = T_eq;
+    }
+
+    const int kMaxIter = 10;
+    const R   kTolK    = static_cast<R>(1e-4);
+    const R   kUlpC    = static_cast<R>(2.0);
+    const R   eps_mach = std::numeric_limits<R>::epsilon();
+
+    int iter = 0;
+    for (; iter < kMaxIter; ++iter) {
+        const R T0 = Tnew;
+        const R T3 = T0 * T0 * T0;
+        const R T4 = T0 * T3;
+
+        const R f = Qs + k0 * (T1 - T0) / dz0 - eps * sigma * T4;
+        R df = -k0 / dz0 - R(4) * eps * sigma * T3;
+        if (std::abs(df) < static_cast<R>(1e-10)) df = static_cast<R>(-1e-10);
+
+        if (iter > 0 || !min_iter_guard) {
+            const R h_rad   = R(4) * eps * sigma * T3;
+            const R tol_res = kTolK * h_rad;
+            const R tol_ulp = ulp_floor ? (kUlpC * std::abs(df) * eps_mach * T0)
+                                        : R(0);
+            if (std::abs(f) <= std::max(tol_res, tol_ulp)) break;
+        }
+
+        R dTi = om * f / df;
+        const R cool_cap   = static_cast<R>(0.5) * T0;
+        const R growth_cap = static_cast<R>(4.0) * T0;
+        if (dTi >  cool_cap)   dTi =  cool_cap;
+        if (dTi < -growth_cap) dTi = -growth_cap;
+        Tnew = T0 - dTi;
+    }
+    if (iters_out)  *iters_out  = iter + 1;   // f-evaluations actually performed
+    if (capped_out) *capped_out = (iter >= kMaxIter);
+    return static_cast<double>(Tnew);
 }
 
 struct Case {
@@ -342,6 +405,194 @@ int main(int argc, char** argv)
                                              config.sigma, /*new_seed=*/true,
                                              v.iters, v.omega);
             std::printf("    %s -> |dT| = %.3e K\n", v.label, std::abs(T - c.T_ref));
+        }
+        std::printf("\n");
+    }
+
+    // ---- The falsifier column ----------------------------------------------
+    // The headline acceptance number is a property of a whole relaxed COLUMN,
+    // not of one surfTemp call: with Qs = 0 and Qb = 0.018 W/m^2 the exact
+    // steady surface temperature is (Qb/(eps*sigma))^0.25, so
+    // T_inf[0] - (Qb/(eps*sigma))^0.25 isolates the solver's own bias with no
+    // reference model in the loop.
+    //
+    // It also demonstrates WHY the T_geo floor and the Newton fix share one
+    // gate: the floor pins layer 0 at exactly that analytic value, so with the
+    // floor on the measured bias is identically zero whatever the Newton does.
+    // Run this with and without PTM_SOLVER_EQFIX to see both halves.
+    {
+        const double Qb  = 0.018;
+        const double eps = 0.95;
+        const double sig = thermal::SIGMA_SB;   // the engine own constant
+        const double T_exact = std::sqrt(std::sqrt(Qb / (eps * sig)));
+
+        std::printf("=== Falsifier column (Qs = 0, Qb = %.3f W/m^2, eps = %.2f) ===\n",
+                    Qb, eps);
+        std::printf("  exact  (Qb/(eps*sigma))^0.25 : %.12f K\n", T_exact);
+        std::printf("  eqfix gate                   : %s\n",
+                    thermal::solverEqFixEnabled() ? "ON" : "OFF");
+        std::printf("  The fixed point of the DISCRETE map depends on dt, so the bias\n"
+                    "  is swept in dt to separate the surface Newton (dt-independent)\n"
+                    "  from the interior CN stencil (vanishes with dt).\n");
+        std::printf("    %10s  %12s  %14s  %10s\n", "dt [s]", "steps", "bias [K]", "bias*dt^-1");
+        for (double dt : {3600.0, 1800.0, 900.0, 450.0, 193.2909090909}) {
+            Planet moon("Moon");
+            moon.Qb = Qb;
+            moon.emissivity = eps;
+            Config cfg2;
+            cfg2.sigma = sig;
+            Profile col(moon, 0.0, cfg2, /*verbose=*/false);
+            col.emissivity = eps;
+            for (size_t i = 0; i < col.T().size(); ++i) col.T()[i] = 30.0;
+
+            double prev = col.T()[0];
+            long steps = 0;
+            const long kMaxSteps = 8000000;
+            for (; steps < kMaxSteps; ++steps) {
+                col.update_T(dt, 0.0, Qb);
+                if (steps % 512 == 511) {
+                    if (std::abs(col.T()[0] - prev) < 1e-13) break;
+                    prev = col.T()[0];
+                }
+            }
+            const double bias = col.T()[0] - T_exact;
+            // The Newton's OWN position error at the converged column: the
+            // surface residual divided by |df|. If this is ~1e-12 K while the
+            // column bias is ~1e-3 K, the bias cannot be the Newton.
+            const double T0s = col.T()[0], T1s = col.T()[1];
+            const double k0s = col.k()[0], dz0s = col.dz()[0];
+            const double fs  = 0.0 + k0s * (T1s - T0s) / dz0s
+                             - eps * sig * T0s * T0s * T0s * T0s;
+            const double dfs = -k0s / dz0s - 4.0 * eps * sig * T0s * T0s * T0s;
+            std::printf("    %10.2f  %12ld  %+14.6e  %10.3e   |f|/|df| = %.3e K\n",
+                        dt, steps, bias, bias / dt, std::abs(fs / dfs));
+        }
+        std::printf("  NOTE: the column relaxes ABOVE T_geo here, so the removed floor\n"
+                    "        never binds on this case and the gate-OFF number is the\n"
+                    "        Newton's own bias, not the clamp.\n\n");
+    }
+
+    // ---- PTM_SOLVER_EQFIX acceptance table ----------------------------------
+    // Report-only: this block does not gate. It measures, over the SAME grid,
+    // what the eqfix Newton does relative to the float64 bisection root, in
+    // float64 and in the float32 the GPU twin runs.
+    {
+        std::printf("=== PTM_SOLVER_EQFIX surface-Newton acceptance (report-only) ===\n");
+
+        std::vector<double> err64, err32, err32_noulp;
+        std::vector<int> it_cold, it_warm, it_ship_cold, it_ship_warm;
+        long n_cap32 = 0, n_cap32_noulp = 0, n_div = 0, n_grid = 0;
+        // Cap fraction versus surface-temperature band, float32, WITHOUT the
+        // ulp floor -- the population the T_geo-floor removal creates.
+        struct Band { double lo, hi; long n, cap, cap_floor; };
+        Band bands[] = {{1,3,0,0,0}, {3,6,0,0,0}, {6,10,0,0,0}, {10,14,0,0,0},
+                        {14,18,0,0,0}, {18,22,0,0,0}, {22,30,0,0,0}, {30,1e9,0,0,0}};
+
+        for (double eps : eps_list) {
+            for (double k0 : k0_list) {
+                for (double dz0 : dz0_list) {
+                    for (double T1 : T1_list) {
+                        for (double Qs : Qs_list) {
+                            const double T_ref = reference_root(Qs, k0, dz0, T1, eps,
+                                                                config.sigma);
+                            int i64 = 0, i32 = 0, i32n = 0;
+                            bool c32 = false, c32n = false;
+                            const double T64 = newton_eqfix<double>(
+                                Qs, k0, dz0, T1, eps, config.sigma, &i64);
+                            const double T32 = newton_eqfix<float>(
+                                Qs, k0, dz0, T1, eps, config.sigma, &i32, &c32);
+                            const double T32n = newton_eqfix<float>(
+                                Qs, k0, dz0, T1, eps, config.sigma, &i32n, &c32n,
+                                /*ulp_floor=*/false);
+
+                            // Shipping loop's iteration count, same grid.
+                            int i_ship = 0;
+                            {
+                                double Tn = T1;
+                                if (Qs > 0.0) {
+                                    const double Te = std::sqrt(std::sqrt(Qs / (eps * config.sigma)));
+                                    if (Te > Tn) Tn = Te;
+                                }
+                                double dT = 1.0;
+                                for (; i_ship < 10 && std::abs(dT) > 1e-3; ++i_ship) {
+                                    const double T0 = Tn, T3 = T0*T0*T0;
+                                    double f = Qs + k0*(T1-T0)/dz0 - eps*config.sigma*T0*T3;
+                                    double df = -k0/dz0 - 4.0*eps*config.sigma*T3;
+                                    if (std::abs(df) < 1e-10) df = -1e-10;
+                                    dT = 0.8 * f / df;
+                                    const double ms = 0.5 * T0;
+                                    if (dT >  ms) dT =  ms;
+                                    if (dT < -ms) dT = -ms;
+                                    Tn = T0 - dT;
+                                }
+                            }
+
+                            ++n_grid;
+                            err64.push_back(std::abs(T64 - T_ref));
+                            err32.push_back(std::abs(T32 - T_ref));
+                            err32_noulp.push_back(std::abs(T32n - T_ref));
+                            if (!std::isfinite(T64) || T64 <= 0.0) ++n_div;
+                            if (c32)  ++n_cap32;
+                            if (c32n) ++n_cap32_noulp;
+                            if (T_ref <= 60.0) { it_cold.push_back(i64); it_ship_cold.push_back(i_ship); }
+                            else               { it_warm.push_back(i64); it_ship_warm.push_back(i_ship); }
+                            for (auto& b : bands) {
+                                if (T_ref >= b.lo && T_ref < b.hi) {
+                                    ++b.n;
+                                    if (c32n) ++b.cap;
+                                    if (c32)  ++b.cap_floor;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        auto med = [](std::vector<double> v) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+        auto medi = [](std::vector<int> v) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return static_cast<double>(v[v.size() / 2]);
+        };
+        auto mx = [](const std::vector<double>& v) {
+            return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end());
+        };
+
+        std::printf("  cases: %ld\n", n_grid);
+        std::printf("  |T_eqfix - root|  float64 : median %.4e K   max %.4e K\n",
+                    med(err64), mx(err64));
+        std::printf("  |T_eqfix - root|  float32 : median %.4e K   max %.4e K\n",
+                    med(err32), mx(err32));
+        std::printf("  iterations (f-evals): cold root<=60 K  eqfix %.1f  shipping %.1f\n",
+                    medi(it_cold), medi(it_ship_cold));
+        std::printf("                        warm root >60 K  eqfix %.1f  shipping %.1f\n",
+                    medi(it_warm), medi(it_ship_warm));
+        std::printf("  globalization: %ld non-finite / non-positive results\n", n_div);
+        std::printf("  float32 iteration-cap hits: %ld with ulp floor, %ld without\n",
+                    n_cap32, n_cap32_noulp);
+        std::printf("  cap fraction by root temperature, float32 (the population the\n"
+                    "  T_geo-floor removal creates); 'no floor' is the defect:\n");
+        for (const auto& b : bands) {
+            if (b.n == 0) continue;
+            std::printf("    %6.0f-%-6.0f K  n=%-6ld  no floor %.4f   with floor %.4f\n",
+                        b.lo, (b.hi > 1e8 ? 999.0 : b.hi), b.n,
+                        static_cast<double>(b.cap) / static_cast<double>(b.n),
+                        static_cast<double>(b.cap_floor) / static_cast<double>(b.n));
+        }
+        // The amplification law A = |df| / (4 eps sigma T0^3) at the lunar
+        // geothermal floor, quoted in the design note. Printed so the value in
+        // the ledger can never drift from the code's own constants.
+        {
+            const double Qb = 0.018, e = 0.95, s = 5.67051196e-8;
+            const double T_geo = std::sqrt(std::sqrt(Qb / (e * s)));
+            const double h_rad = 4.0 * e * s * T_geo * T_geo * T_geo;
+            std::printf("  A(T_geo=%.4f K): 4*eps*sigma*T^3 = %.6e W/m^2/K\n",
+                        T_geo, h_rad);
         }
         std::printf("\n");
     }

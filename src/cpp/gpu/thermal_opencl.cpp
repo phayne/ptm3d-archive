@@ -972,6 +972,27 @@ bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
 }
 
 void ThermalOpenCLSolver::buildKernels() {
+    // PTM_SOLVER_EQFIX is implemented on the CPU solver paths ONLY at this
+    // commit; the device twin of the surface-Newton exit criterion and of the
+    // T_geo-floor removal is NOT in this kernel. Running the GPU solver with
+    // the gate set would silently produce a CPU/GPU mismatch -- exactly the
+    // class of quiet substitution that PTM-115/116 were. Refuse instead.
+    {
+        const char* e = std::getenv("PTM_SOLVER_EQFIX");
+        if (e && *e && std::strcmp(e, "0") != 0) {
+            std::cerr << "\n[GPU Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the "
+                         "eqfix solver changes (surface-Newton exit criterion, "
+                         "T_geo-floor removal, R1 deviation form) are implemented "
+                         "on the CPU paths only at this commit.\n"
+                         "  Running the GPU persistent kernel now would use the "
+                         "OLD physics while the CPU paths use the new physics, "
+                         "and nothing would say so.\n"
+                         "  Use a CPU run (thermal.use_gpu: false) or unset "
+                         "PTM_SOLVER_EQFIX." << std::endl;
+            std::exit(1);
+        }
+    }
+
     std::string source;
     const std::string embedded = getEmbeddedKernelSource();
 
