@@ -138,14 +138,31 @@ void discloseThermalSolverPath(ThermalSolverPath path,
               << "[thermal-solver] REASON: " << detail << "\n";
 
     if (path == ThermalSolverPath::CpuStreamed) {
-        // The substitution, stated. This is the line whose absence made every
+        // The substitution, stated. This is the text whose absence made every
         // production-mesh CPU comparison unattributable.
+        //
+        // Be precise about WHAT it substitutes. The streamed path reuses the
+        // scalar TIME INTEGRATOR (runThermalModelWithMatchedTimes), but it
+        // builds its own forcing inline instead of routing through
+        // calculateAbsorbedFlux(..., planet, ...), and it hard-codes the
+        // equilibration length to zero. Calling it "the scalar solver" without
+        // saying that would invite the reader to equate this run with a
+        // --no-simd-batch run, which it is NOT: measured 4.82 K max / 3.97 K
+        // mean apart on 11,664 of 12,800 faces of the 80N tutorial crater.
         std::cout
-            << "[thermal-solver] NOTE:   the streamed path runs the CPU SCALAR solver\n"
-            << "[thermal-solver]         core (runThermalModelWithMatchedTimes), NOT the\n"
-            << "[thermal-solver]         CPU SIMD batch solver. The two differ in surface\n"
-            << "[thermal-solver]         boundary condition, spin-up, bottom boundary\n"
-            << "[thermal-solver]         condition and clamp set.\n";
+            << "[thermal-solver] NOTE:   the streamed path reuses the CPU SCALAR time\n"
+            << "[thermal-solver]         integrator (runThermalModelWithMatchedTimes), but it\n"
+            << "[thermal-solver]         is NOT equivalent to a --no-simd-batch run. Three\n"
+            << "[thermal-solver]         differences, all of them silent until now:\n"
+            << "[thermal-solver]           1. equilibration_steps is hard-coded to 0, so this\n"
+            << "[thermal-solver]              run has NO equilibration phase at all.\n"
+            << "[thermal-solver]           2. the absorbed flux is built inline from a per-face\n"
+            << "[thermal-solver]              CONSTANT albedo. The configured angular-albedo\n"
+            << "[thermal-solver]              model (Hayne or Hapke, via incidence_angle_albedo)\n"
+            << "[thermal-solver]              is NOT applied -- the other CPU paths route\n"
+            << "[thermal-solver]              through calculateAbsorbedFlux(..., planet, ...).\n"
+            << "[thermal-solver]           3. the equilibration indirect-flux term is not\n"
+            << "[thermal-solver]              carried; this path takes no eq_indirect argument.\n";
         if (simd_batch_requested) {
             std::cout
                 << "[thermal-solver] WARNING: use_simd_batch is true for this run, but the\n"
@@ -218,6 +235,16 @@ bool appendThermalSolverProvenance(const std::string& output_dir) {
        r.mixed ? "mixed" : thermalSolverReasonId(r.reason));
     kv("thermal_solver_reason", r.detail.empty() ? "none" : r.detail);
     kv("thermal_solver_simd_batch_requested", r.simd_batch_requested ? "true" : "false");
+    // `thermal_solver_core` names the time integrator, which for the streamed
+    // path is the scalar one. That alone would read as "same as a
+    // --no-simd-batch run", and it is not: the streamed path also drops the
+    // equilibration phase, the angular-albedo model and the eq-indirect term.
+    // A reader who has only the provenance file must be told.
+    kv("thermal_solver_caveats",
+       (!r.mixed && r.path == ThermalSolverPath::CpuStreamed)
+           ? "no_equilibration_phase;constant_albedo_angular_model_ignored;"
+             "no_eq_indirect_flux"
+           : "none");
     kv("thermal_rethermal_path",
        r.rethermal_mixed ? "mixed" : rethermalPathId(r.rethermal));
     kv("thermal_rethermal_reason",

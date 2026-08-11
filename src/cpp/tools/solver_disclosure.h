@@ -95,9 +95,15 @@ void discloseRethermalPath(RethermalPath path, const std::string& detail);
 // Stable machine-readable ids, for provenance.txt and for tests.
 const char* thermalSolverPathId(ThermalSolverPath p);   // "cpu_simd_batch", ...
 const char* thermalSolverEntryPoint(ThermalSolverPath p);
-// The numerical core a path actually runs. This is the field that answers
-// "did my physics change?": CpuStreamed reports "cpu_scalar", because that is
-// what it is.
+// The time integrator a path actually runs. CpuStreamed reports "cpu_scalar"
+// because that is the integrator it loops.
+//
+// This is NOT on its own an answer to "is this the same as a --no-simd-batch
+// run?" -- for the streamed path it is not. That path also hard-codes the
+// equilibration length to zero, builds its absorbed flux inline from a
+// per-face CONSTANT albedo (so the configured Hayne/Hapke angular model is
+// dropped), and carries no eq-indirect term. Those are reported separately in
+// the `thermal_solver_caveats` provenance key and in the banner.
 const char* thermalSolverCoreId(ThermalSolverPath p);
 const char* thermalSolverReasonId(ThermalSolverReason r);
 const char* rethermalPathId(RethermalPath p);
