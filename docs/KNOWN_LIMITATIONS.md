@@ -31,16 +31,18 @@ not put you off; it should tell you which of the two columns below your question
 
 | Use | Why |
 |---|---|
-| Absolute subsurface temperatures at depth on faces that receive no sunlight | Spin-up in every shipped configuration is far shorter than the deep column's relaxation time (section 1), and on the GPU path the dark-face deep column stops relaxing altogether about 0.36 K short (section 3) |
+| Absolute subsurface temperatures at depth on faces that receive no sunlight | Spin-up in every shipped configuration is far shorter than the deep column's relaxation time (section 1), and neither backend reaches the converged dark column: the GPU stops relaxing early, and the CPU starts from an analytic seed it does not have time to shed, leaving a warm residual of several kelvin (section 3) |
 | Any statistic below about 24 K on the Moon or 28 K on Europa | The solver enforces a hard lower bound at the geothermal equilibrium temperature (section 2) |
 | Sensitivity of results to the basal heat flow on a built-in body | `thermal.geothermal_heat_flow` is announced and then discarded on Moon, Europa and Mercury (section 4) |
 | Very low conductivity generic bodies (porous or cometary regolith, insulating lags) | A `generic_body.surface` value below 5e-7 is silently replaced by Europa's ice properties (section 5) |
-| Ice-table depth and cold-trap volatile budgets on lunar polar meshes | Affected by sections 1, 2 and 3 together; the 0.36 K deep offset alone is about 6 cm of table depth at the measured gradient |
+| Ice-table depth and cold-trap volatile budgets on lunar polar meshes | Affected by sections 1, 2 and 3 together; at the measured gradient a 0.36 K deep offset is about 6 cm of table depth, and the several-kelvin CPU residual of section 3 is correspondingly larger |
 
-Nothing in sections 1–6 has been shown to affect surface temperature, peak temperature,
-illumination or the radiation-exchange gates. Section 7 is the exception to that reassurance, and
-applies to every kind of run: a silently ignored key or flag means the model you ran is not the
-model you wrote.
+Sections 1–5 have not been shown to affect surface temperature, peak temperature, illumination or
+the radiation-exchange gates. There are two exceptions to that reassurance. The surface boundary
+condition on the default CPU path (section 6) does move surface temperature, by up to tens of
+kelvin on a face whose illumination changes sharply inside one substep. And section 7 applies to
+every kind of run: a silently ignored key or flag means the model you ran is not the model you
+wrote.
 
 ---
 
@@ -58,7 +60,7 @@ to be judged against.
 | Population | Share of a lunar polar mesh | Deep-column error at the shipped 50 lunations | More cycles fix it? |
 |---|---|---|---|
 | Faces that receive flux during spin-up | 29.7% | **7.2 K median**, tens of kelvin on the worst faces | **Yes** |
-| Faces that receive none | 70.3% | 0.36 K, frozen | No — see section 3 |
+| Faces that receive none | 70.3% | Backend-dependent: a few tenths of a kelvin on the GPU, several kelvin on the CPU | No — see section 3 |
 
 **Measured.** On a 509,337-face lunar polar terrain mesh, three states of the same run differing
 only in `thermal.equilibration_cycles` (50, 100 and 200 integrated lunations — on the pre-2026-08-11
@@ -185,25 +187,67 @@ unresolved rather than empty.
 
 ---
 
-## 3. On the GPU path the deep column of an unforced face stops relaxing early
+## 3. The deep column of an unforced face does not reach steady state, on either backend
 
-**What it is.** The GPU persistent kernel carries its temperature state in **single precision**
-(`float`). At the production substep the per-step change at depth on an unforced column falls
-below one unit in the last place of float32 and rounds to zero, so the column stops relaxing while
-it is still short of steady state — and then stays there for any number of further cycles.
+**What it is.** On a face that receives no sunlight the deep column should relax to the conductive
+steady profile set by the basal heat flow. Neither shipped backend gets it there. The two fall
+short for different reasons and by very different amounts: the GPU column stops moving before it
+arrives, while the CPU column starts from an analytic seed that is far too warm and does not have
+time to shed it. Where the mechanism has been isolated, both leave the column warm. **Neither
+backend is a workaround for the other**, and on this population the CPU residual is the larger of
+the two — an earlier revision of this section recommended `use_gpu: false` as a way around the
+problem, and that advice was wrong.
 
-**This is a GPU-path defect, and the CPU is immune.** The CPU solvers hold the profile in double
-precision (`aligned_vector<double>`), where the same per-step change is many orders of magnitude
-above the rounding limit. A double-precision transcription of the same kernel, same substep, from
-the same banked state keeps converging where the single-precision arm freezes. For a mesh small
-enough to run on CPU, `use_gpu: false` avoids this entirely.
+**Provenance of the decomposition below.** The per-mechanism numbers come from a
+double-precision transcription of the engine's own column — the engine's stencil, substep and
+boundary condition, on its 50-layer lunar polar production grid at 88° latitude with
+`T_geo = 24.0426 K`. It is a controlled reproduction of the solver's arithmetic, not an engine run.
+The banked-state numbers further down are from engine output.
 
-**Who is affected.** GPU runs, on the unforced 70.3% population of section 1 — which is where PSR
-floors, cold traps and ice-table depths live. Forced faces are dominated by section 1 instead,
-which is 20 times larger and *is* curable.
+**On the GPU: single-precision arithmetic, not single-precision storage.** The persistent GPU
+kernel both stores *and evaluates* the column in single precision. Earlier revisions of this
+document attributed the arrest to the stored state — the per-step change at depth falling below one
+unit in the last place and rounding to zero. That mechanism is real, but it is by far the smaller
+of the two. Separating them over 3000 lunations on the column above:
 
-**Measured.** On the banked 200-lunation lunar state, comparing the unforced columns against the
-closed-form converged profile for the same grid and basal flux:
+| Configuration | Excess over the converged profile |
+|---|---|
+| float32 storage, float64 arithmetic | 6.7e-6 K |
+| float32 arithmetic, as the shipped kernel does | 3.87e-3 K at the surface, 6.31e-3 K at depth |
+
+The arithmetic term is about **580 times** the storage term. What drives it is cancellation in the
+Crank-Nicolson interior stencil: at depth the profile is very nearly linear, so neighboring nodes
+agree through their leading digits and the difference the stencil needs is left to the digits at
+the rounding limit.
+
+That distinction sets the remedy, which is why it is worth stating precisely. If the stored state
+were the problem, the fix would be to carry the column in double precision — twice the GPU memory
+for the temperature arrays, a real cost. Because cancellation is the problem, the fix is instead to
+solve for the **deviation** from the closed-form conductive profile rather than for the temperature
+itself: algebraically identical in exact arithmetic, no extra memory, and measured in the same
+transcription to recover about **74%** of the excess. Neither change is in the shipped engine.
+
+**On the CPU: an unconfigurable analytic seed the run does not have time to shed.** Before the
+configured equilibration begins, the CPU paths run a fixed 24-lunation analytic clear-sky
+pre-conditioner (section 1, item 1) with no topography, no shadowing, no infrared and no indirect
+flux, so a permanently shadowed face is seeded as though it stood on an unobstructed plain. On the
+column above, that hands the solver a permanently shadowed profile at **64.375 K**, against a
+geothermal floor of 24.0426 K. Sixty further lunations of the true forcing remove only **88%** of
+that excess. What is left is **+5.06 K at the surface** and **+9.14 K at 1.004 m**, still moving
+**0.37 K per lunation** at depth — relaxing, but a long way from converged. The GPU has no
+equivalent pre-conditioner and does not inherit this.
+
+The two are therefore not comparable in size on this population: the GPU excess from arithmetic is
+measured in thousandths of a kelvin, the CPU seed residual in kelvin. Moving a dark-column study
+from GPU to CPU also moves it onto the CPU SIMD surface boundary condition of section 6, which
+carries its own error on any face whose illumination changes quickly.
+
+**Who is affected.** Both backends, on the unforced 70.3% population of section 1 — which is where
+PSR floors, cold traps and ice-table depths live. Forced faces are dominated by section 1 instead,
+which *is* curable by integrating longer.
+
+**Measured on the banked state.** On the banked 200-lunation lunar GPU state, comparing the
+unforced columns against the closed-form converged profile for the same grid and basal flux:
 
 - Analytic surface-to-bottom rise **5.8483 K**; measured **5.4896 K** on the 147,873 faces pinned
   at the floor — a **0.359 K** deficit. Across all 358,294 unforced faces the median deficit is
@@ -211,21 +255,42 @@ closed-form converged profile for the same grid and basal flux:
 - It is frozen, not slow: over the 100-lunation gap from 100 to 200 integrated lunations the mean
   deep change on unforced faces is **0.0000 K** and **100.00%** of them are bit-identical over the
   bottom five nodes.
-- About a fifth of the deficit is the floor of section 2 erasing the surface-to-first-node step; the
-  remainder is the rounding arrest.
 
-**What this is worth in practice.** At the measured gradient of 5.85 K/m, 0.36 K is about **6 cm**
-of ice-table depth. It is not a large absolute temperature error. Note also that on this mesh
-*every* unforced face has a deep node below 40 K, where absolute water sublimation rates are
-negligible, so the large *fractional* sensitivity of sublimation to temperature at these
-temperatures multiplies a vanishing flux; do not translate 0.36 K into a large volatile-loss error
-without checking the absolute temperature of the faces concerned.
+**Read that 0.359 K for what it is.** It is a shortfall of the measured surface-to-bottom gradient
+against the closed-form conductive one, *with the geothermal floor of section 2 active*, and it has
+not been decomposed. The floor, the cancellation described above and residual under-spin-up from
+section 1 all feed into it, in shares nobody has separated — and they do not even act in the same
+direction: holding the surface node up at the floor compresses the gradient, while the
+single-precision arithmetic leaves the column warm. The controlled transcription recovers only
+about **3e-2 K** of arrest when scaled to the production substep, roughly ten times less than
+0.359 K, so the two measurements have not been reconciled. Read 0.359 K as a bound on the combined
+effect rather than as the size of any one mechanism, and do not quote it as the magnitude of the
+single-precision arrest.
 
-**What to do instead.** Run on the CPU where the mesh size allows. Where it does not, treat
-absolute deep temperatures on unforced GPU faces as carrying a floor-side bias of a few tenths of
-a kelvin, and prefer differences between runs on the same backend to absolute values.
+**What this is worth in practice.** At the measured gradient of 5.85 K/m, a 0.36 K offset is about
+**6 cm** of ice-table depth; the CPU residual above is more than ten times larger in magnitude and
+would dominate any table-depth estimate made from a CPU run. Note also that on this mesh *every*
+unforced face has a deep node below 40 K, where absolute water sublimation rates are negligible, so
+the
+large *fractional* sensitivity of sublimation to temperature at these temperatures multiplies a
+vanishing flux; do not translate a few tenths of a kelvin into a large volatile-loss error without
+checking the absolute temperature of the faces concerned.
 
-**Status.** Open, root cause established.
+**What to do instead.** The choice of backend is not the lever — no arm of the model today delivers
+a converged dark column. Three things do help:
+
+1. Report absolute deep temperatures on unforced faces as carrying a warm bias, and prefer
+   differences between runs on the *same* backend at the *same* spin-up length to absolute values.
+2. Score the state against the physics rather than against a previous cycle. At a converged steady
+   state on an unforced face, `k_j (T_j − T_{j+1}) / dz_j = Q_b` at every interface (section 1,
+   item 4). An arrested column and a converged one both stop changing; only the residual against
+   that identity separates them.
+3. Where the mesh is small enough for both backends, run both and read the spread as a lower bound
+   on the uncertainty. On the population measured here that spread is kelvin-scale, not a rounding
+   difference.
+
+**Status.** Open on both backends. A root cause is identified on each; neither remedy is
+implemented, and the two measurements of the GPU-side magnitude have not been reconciled.
 
 ---
 
@@ -234,8 +299,8 @@ a kelvin, and prefer differences between runs on the same backend to absolute va
 **What it is.** On a built-in body (Moon, Europa, Mercury) the value is parsed, applied to the
 main-scope planet object, and announced —
 `Overriding planet geothermal heat flow: …` — and then thrown away, because every mesh solver
-rebuilds its own planet from the body name. This is true on **both** backends and at all four
-solver entry points, not only on the GPU. The Moon therefore always integrates its compiled
+rebuilds its own planet from the body name. This is true on **both** backends and at every solver
+entry point, not only on the GPU. The Moon therefore always integrates its compiled
 default `Q_b = 0.018 W/m²` (Langseth et al. 1976) whatever the config asks for and whatever the
 banner says.
 
@@ -301,16 +366,20 @@ precision and is not affected.
 
 ---
 
-## 6. CPU and GPU are not interchangeable at the level of a few tenths of a kelvin
+## 6. CPU and GPU are not interchangeable, and the gap is not always small
 
 Beyond section 3, two differences between the backends are worth knowing before a CPU/GPU
 comparison is read as physics. Both are open.
 
-- **The CPU SIMD batch solves the surface boundary condition with a weaker Newton iteration.**
-  The batched CPU path runs a fixed five iterations with a relaxation factor and **no convergence
-  test**; the CPU scalar path and the GPU kernel use ten iterations with a bracketed seed and a
-  step limiter. All three converge to the same root on well-behaved faces; they need not agree to
-  the last tenth of a kelvin on cold or sharply forced ones.
+- **The CPU SIMD batch — the default CPU path — solves the surface boundary condition with a
+  weaker Newton iteration.** The batched CPU path runs a fixed five iterations with a relaxation
+  factor and **no convergence test**; the CPU scalar path and the GPU kernel use ten iterations
+  with a bracketed seed and a step limiter. On well-behaved faces all three converge to the same
+  root. On a face whose absorbed flux changes sharply within a single substep — a shadow edge, a
+  rim crossing, sunset — the batched path can leave the surface node **up to 28.7 K** warm against
+  a converged reference solution of the same boundary condition. That is a surface-temperature
+  error on the default CPU path, not a deep-column one, and it is reachable at ordinary production
+  cadences, where a terminator crossing can fall entirely inside one substep.
 
 - **The CPU floors every layer thickness at 1 mm; the GPU does not.** The CPU profile builder
   applies `dz = max(0.001, z[i+1] − z[i])` and derives its whole conduction stencil from the
@@ -526,10 +595,15 @@ that the value you set is the value that was echoed.
   pairs can still exchange radiation. Affects fine (sub-meter) meshes; the corrected-VF operator
   mitigates the net magnitude.
 
-- **GPU two-band radiosity is limited to meshes with Σ_j F_ij ≤ 1.** The GPU Jacobi kernel does not
-  apply the row-sum renormalization, so on meshes whose centroid view-factor row sums exceed 1 the
-  solver warns and falls back to the (always-protected) CPU two-band solver. The CPU path is
-  unrestricted.
+- **GPU radiosity is limited to meshes with Σ_j F_ij ≤ 1, and only the two-band path checks.** The
+  GPU Jacobi kernel does not apply the row-sum renormalization inside its iteration, while the CPU
+  solver does. Below the threshold this makes no difference — the normalization factor is
+  identically 1 unless a row overshoots — so the two backends solve the same operator on a mesh
+  with no overshooting row. On a mesh that does overshoot, the **two-band** GPU path detects it,
+  warns and falls back to the row-norm-protected CPU two-band solver. The **gray** (single-band)
+  GPU path has no such check: the guard sits inside the two-band branch, so a gray GPU radiosity
+  solve on the same mesh runs without the renormalization and without a warning. Row sums above 1
+  arise on fine and concave near-field geometry. The CPU path is protected in both cases.
 
 ## Output format
 
