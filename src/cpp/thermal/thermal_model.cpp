@@ -11,6 +11,7 @@
 #include <limits>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 
 // CPU feature detection - protect against redefinition
 #if defined(__AVX512F__) && !defined(AVX512_ENABLED)
@@ -734,10 +735,55 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     z().assign(z_tmp.begin(), z_tmp.end());
     nlayers = z().size();
 
-    // Derive layer thicknesses
+    // Derive layer thicknesses. dz is EXACTLY the depth grid's own spacing --
+    // there is deliberately no minimum-thickness clamp. That clamp was derived
+    // away rather than dropped; the reasoning is recorded here because the
+    // constant it replaced looked protective.
+    //
+    // WHAT THE OLD CLAMP DID. `dz()[i] = max(1e-3, z[i+1]-z[i])` floored dz
+    // WITHOUT touching z, so the two described different columns: the
+    // conduction stencil (d3z/g1/g2 below, surfTemp, botTemp) integrates dz,
+    // while the material model (kc/rho below) and every GPU path index z. The
+    // grid then stopped telescoping -- sum(dz) != z_max -- and the CPU stopped
+    // matching the GPU, which differences z directly and applies no floor
+    // (gpu/thermal_gpu.cpp:319, gpu/thermal_kernels.cl:361). Measured on the
+    // shipped asteroid quickstart: dz0 1.559x too thick, 11 layers affected,
+    // sum(dz) 2.50% deeper than z_max.
+    //
+    // WHY NO FLOOR IS NEEDED. The surface node is MASSLESS -- surfTemp solves
+    // the algebraic balance Qs + k0(T1-T0)/dz0 = eps*sigma*T0^4 with no
+    // rho*c*dz0 capacity -- so the radiative response time
+    // rho*c*dz0/(4*eps*sigma*T^3) does not bound the step at all. Of the
+    // constraints that remain:
+    //   * Surface Newton: its nonlinearity is the top-cell radiative Biot
+    //     number Bi = 4*eps*sigma*T^3*dz0/k0, the ratio of the radiative slope
+    //     to the conductive slope k0/dz0. Bi -> 0 as dz0 -> 0, so a THINNER
+    //     cell makes f more linear and the Newton converges in fewer
+    //     iterations. The old floor raised Bi by 1.56x on the asteroid
+    //     quickstart -- it made this strictly worse. tools/test_surface_newton
+    //     already sweeps dz0 down to 1e-4 m and passes.
+    //   * Tridiagonal conditioning: the CN matrix is a strictly diagonally
+    //     dominant M-matrix for every dz > 0 and cond ~ 1 + 4*kappa*dt/dz^2.
+    //     In float64 that needs dz ~ 1e-10 m to lose 1% -- seven orders below
+    //     the old floor. On the GPU the persistent kernel substeps to Fo<0.49,
+    //     which bounds its conditioning at ~2 independently of dz.
+    //   * float32 depth grid on the GPU: dz must stay above ~10 ulp of z_max,
+    //     i.e. ~1.2e-6 * z_max (about 0.11 um for this asteroid grid) -- four
+    //     orders below the old floor.
+    // What DOES bind is Crank-Nicolson's oscillatory error at the first
+    // interior node, governed by the top-cell Fourier number Fo0 =
+    // kappa*dt/dz0^2 (amplification (1-Fo0)/(1+Fo0), sign-alternating above
+    // 1). Substituting this file's own adaptive grid, dz0 = delta/m with
+    // delta = sqrt(2*kappa/omega), gives
+    //        Fo0 = pi * m^2 / (steps per rotation),
+    // in which kappa CANCELS IDENTICALLY. The binding constraint is therefore
+    // dimensionless and couples dt to m; no constant expressed in meters can
+    // control it, which is why the floor is gone rather than retuned. The
+    // resolution/substep pair is checked explicitly by
+    // warnIfTopCellFourierHigh() instead of being silently clamped here.
     dz().resize(z().size() - 1);
     for (int i = 0; i < static_cast<int>(z().size()) - 1; i++) {
-        dz()[i] = std::max(0.001, z()[i+1] - z()[i]); // enforce minimum thickness
+        dz()[i] = z()[i+1] - z()[i];
     }
 
     // Grid coefficients for variable spacing
@@ -1942,6 +1988,50 @@ double Model::estimateFluxDerivative(double time) {
     return (flux_values[hi] - flux_values[lo]) / dt;
 }
 
+double topCellFourierNumber(const Profile& profile, double dt) {
+    if (profile.dz().empty() || profile.kappa().empty()) return 0.0;
+    const double dz0 = profile.dz()[0];
+    if (!(dz0 > 0.0) || !(dt > 0.0)) return 0.0;
+    return profile.kappa()[0] * dt / (dz0 * dz0);
+}
+
+void warnIfTopCellFourierHigh(const Profile& profile, double dt,
+                              const char* context, double fo_warn) {
+    const double Fo = topCellFourierNumber(profile, dt);
+    if (!(Fo > fo_warn)) return;
+
+    // Once per process. An over-refined run substeps tens of thousands of
+    // times; a per-step warning would bury the run's real output.
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (!warned.compare_exchange_strong(expected, true)) return;
+
+    // Amplification of the stiffest mode under CN, for scale. |g| < 1 always
+    // (A-stable), so this is an accuracy statement, not a stability one.
+    const double g = (1.0 - Fo) / (1.0 + Fo);
+
+    // Formatted into a local stream, NOT straight to cerr. Callers upstream
+    // leave std::fixed/setprecision(1) sticky on cerr, under which a
+    // sub-millimeter dz0 prints as "0.0" -- the one number this message exists
+    // to report. (Observed on the m=20 positive control.)
+    std::ostringstream msg;
+    msg << std::scientific << std::setprecision(4);
+    msg << "[Thermal WARNING] Top-cell Fourier number Fo0 = " << Fo
+        << " > " << fo_warn << " (" << (context ? context : "?")
+        << "): dz0 = " << profile.dz()[0] << " m, dt = " << dt
+        << " s. Crank-Nicolson stays stable, but the stiffest mode's "
+           "per-step amplification is " << g
+        << " (negative = sign-alternating ringing after a sharp "
+           "sunrise/shadow transition, damped by |g| per step).\n"
+        << "                  Fo0 = pi*m^2/(steps per rotation), so this "
+           "grows as the SQUARE of --thermal-m. To refine the grid further, "
+           "raise the substep count in proportion to m^2 "
+           "(thermal.equilibration_steps_per_day and the main-loop target), "
+           "or accept the ringing. The CPU path does NOT substep on Fo "
+           "automatically; the GPU persistent kernel does.\n";
+    std::cerr << msg.str();
+}
+
 std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& config, bool verbose) {
     // Angular frequency of diurnal forcing
     const double omega = (planet.day > 0.0) ? (2.0 * M_PI / planet.day) : 0.0;
@@ -2737,9 +2827,13 @@ void initializeBatchGrid(ThermalBatchSoA& batch, const std::vector<double>& z_gr
         batch.z[i] = z_grid[i];
     }
 
-    // Compute dz
+    // Compute dz. No minimum-thickness clamp, for the reasons derived at the
+    // matching site in Profile's constructor: a floor applied to dz alone
+    // desynchronizes the stencil's column from the z-indexed material model
+    // and from the GPU, and the constraint that actually binds (CN's
+    // oscillatory error) is the dimensionless kappa*dt/dz0^2, not a length.
     for (int i = 0; i < batch.n_layers - 1; ++i) {
-        batch.dz[i] = std::max(0.001, z_grid[i+1] - z_grid[i]);
+        batch.dz[i] = z_grid[i+1] - z_grid[i];
     }
 
     // Compute grid coefficients g1, g2
