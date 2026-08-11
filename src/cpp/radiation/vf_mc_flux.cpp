@@ -27,6 +27,7 @@
 #include <random>
 #include <algorithm>
 #include <embree4/rtcore.h>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 using V3 = std::array<double, 3>;
 static double dot(const V3&a,const V3&b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
@@ -65,7 +66,7 @@ int main(int argc,char**argv){
     int NR = (argc>3)?std::atoi(argv[3]):8000;
     double EPS = (argc>4)?std::atof(argv[4]):0.95;
     std::string outp = (argc>5)?argv[5]:"";
-    const double SIG = 5.670374e-8;
+    const double SIG = ptm::kStefanBoltzmann;
     std::vector<V3> V,VN; std::vector<std::array<int,3>> Fc;
     if(!readPLY(argv[1],V,Fc,VN)){ std::cerr<<"load failed\n"; return 1; }
     size_t nf=Fc.size();

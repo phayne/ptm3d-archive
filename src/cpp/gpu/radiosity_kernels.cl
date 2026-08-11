@@ -10,7 +10,9 @@
 
 // Stefan-Boltzmann constant (can be overridden at compile time)
 #ifndef SIGMA
-#define SIGMA 5.67051196e-8f
+// Stefan-Boltzmann, SI-2019 (exact). Canonical definition:
+// src/cpp/constants/stefan_boltzmann.h (ptm::kStefanBoltzmann).
+#define SIGMA 5.670374419e-8f
 #endif
 
 /**

@@ -17,6 +17,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace gpu {
 namespace opencl {
@@ -299,7 +300,7 @@ private:
     float R350_ = 0.0f;
     // Conductivity law passed to every kernel (0 = Hayne 2017, 1 = Martinez 2021).
     int   cond_model_ = 0;
-    float sigma_ = 5.67051196e-8f;
+    float sigma_ = static_cast<float>(ptm::kStefanBoltzmann);
     int n_cp_coeffs_ = 0;
 
     bool initialized_ = false;

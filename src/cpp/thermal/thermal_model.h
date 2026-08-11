@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>    // std::numeric_limits, for the surface-BC ulp floor
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #include <string>
 #include <memory>
 #include <iostream>  // Add this for std::cout
@@ -158,7 +159,9 @@ public:
 };
 
 // Constants
-const double SIGMA_SB = 5.67051196e-8; // Stefan-Boltzmann Constant
+// Stefan-Boltzmann constant. Single definition in constants/stefan_boltzmann.h;
+// this alias exists only because SIGMA_SB is used unqualified in ~40 places.
+const double SIGMA_SB = ptm::kStefanBoltzmann;
 const double ABSOLUTE_ZERO_K = 2.7;      // Cosmic microwave background temperature (K) - physical minimum
 const double MAX_PHYSICAL_TEMP_K = 500.0; // Maximum physically reasonable temperature for icy bodies (K)
 

@@ -293,7 +293,7 @@ int main(int argc, char** argv)
     // config->sigma are read by surfTemp.
     Planet planet("Moon");
     Config config;
-    config.sigma = 5.670374419e-8;
+    config.sigma = ptm::kStefanBoltzmann;
     Profile prof(planet, 0.0, config, /*verbose=*/false);
 
     // --- Parameter space -----------------------------------------------------
@@ -730,7 +730,7 @@ int main(int argc, char** argv)
         // geothermal floor, quoted in the design note. Printed so the value in
         // the ledger can never drift from the code's own constants.
         {
-            const double Qb = 0.018, e = 0.95, s = 5.67051196e-8;
+            const double Qb = 0.018, e = 0.95, s = ptm::kStefanBoltzmann;
             const double T_geo = std::sqrt(std::sqrt(Qb / (e * s)));
             const double h_rad = 4.0 * e * s * T_geo * T_geo * T_geo;
             std::printf("  A(T_geo=%.4f K): 4*eps*sigma*T^3 = %.6e W/m^2/K\n",

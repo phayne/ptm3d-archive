@@ -690,7 +690,7 @@ def compute_pole_for_obliquity(obliquity_deg, current_pole_ra_deg, current_pole_
 
 
 # ── Thermal Inertia utilities ────────────────────────────────────────
-_SIGMA_SB = 5.67051196e-8  # Stefan-Boltzmann constant (W/m²/K⁴)
+_SIGMA_SB = 5.670374419e-8  # Stefan-Boltzmann (W/m²/K⁴), SI-2019 exact; canonical: src/cpp/constants/stefan_boltzmann.h
 
 
 def compute_equilibrium_temperature(albedo, emissivity, rAU):

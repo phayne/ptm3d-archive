@@ -150,8 +150,11 @@ std::string getEmbeddedKernelSource() {
 // Embedded OpenCL kernel source for PTM thermal solver
 #define MAX_LAYERS 64
 
+// Stefan-Boltzmann. OpenCL cannot include constants/stefan_boltzmann.h, so this
+// literal is checked against ptm::kStefanBoltzmann by the static_assert below
+// getEmbeddedKernelSource(); the two cannot drift.
 #ifndef SIGMA
-#define SIGMA 5.67051196e-8f
+#define SIGMA 5.670374419e-8f
 #endif
 
 // --------------------------------------------------------------------------
@@ -853,6 +856,22 @@ __kernel void persistentThermalKernel(
 )CL_SOURCE";
 }
 
+// The kernel text above carries its own `#define SIGMA` because OpenCL C cannot
+// include a C++ header. These two lines are the tripwire that keeps it honest:
+// change ptm::kStefanBoltzmann and the build stops here, change the kernel
+// literal and the runtime check below fires. Neither can drift silently.
+static_assert(ptm::kStefanBoltzmann == 5.670374419e-8,
+              "ptm::kStefanBoltzmann changed. Update the `#define SIGMA` in "
+              "getEmbeddedKernelSource() (and re-run "
+              "scripts/sync_cl_from_embedded.py), then update this assert.");
+
+namespace {
+// Verified once, at kernel build time, against the same literal.
+bool kernelSigmaMatchesHost(const std::string& src) {
+    return src.find("#define SIGMA 5.670374419e-8f") != std::string::npos;
+}
+}  // namespace
+
 bool isOpenCLAvailable() {
     cl_uint num_platforms = 0;
     cl_int err = clGetPlatformIDs(0, nullptr, &num_platforms);
@@ -1038,6 +1057,13 @@ void ThermalOpenCLSolver::buildKernels() {
 
     std::string source;
     const std::string embedded = getEmbeddedKernelSource();
+    if (!kernelSigmaMatchesHost(embedded)) {
+        std::cerr << "\n[GPU Thermal] FATAL: the embedded kernel's Stefan-Boltzmann "
+                     "constant does not match ptm::kStefanBoltzmann. The GPU surface "
+                     "energy balance and the CPU one would disagree by construction. "
+                     "Fix the `#define SIGMA` in getEmbeddedKernelSource().\n";
+        std::exit(1);
+    }
 
     // Phase R / Fermi F5: the kernel source is single-sourced from the embedded
     // string (see scripts/sync_cl_from_embedded.py). buildKernels() must NEVER

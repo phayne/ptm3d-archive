@@ -942,7 +942,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     // j=1 with the floor on, none with it off). Only the absolute physical
     // floor (the CMB) survives. Nodes that WOULD have been clamped are counted
     // and reported rather than silently released.
-    const double sigma_sb = config ? config->sigma : 5.670374419e-8;
+    const double sigma_sb = config ? config->sigma : ptm::kStefanBoltzmann;
     const double T_geo = (Qb > 0.0)
         ? std::sqrt(std::sqrt(Qb / (emissivity * sigma_sb))) : 0.0;
     //

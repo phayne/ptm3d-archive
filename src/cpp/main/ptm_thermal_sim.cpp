@@ -65,6 +65,7 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #endif
 
 using namespace ptm;
@@ -4930,7 +4931,7 @@ static int calibrateGpuCore(const CalibrationProbe& pr, gpu::MachineProfile& out
     // polynomial + R350, so the probe's per-step substep count is representative.
     solver.setMaterialParams(static_cast<float>(pr.cp0), pr.cp_coeffs,
                              static_cast<float>(pr.R350),
-                             5.67051196e-8f, pr.cond_model);
+                             static_cast<float>(ptm::kStefanBoltzmann), pr.cond_model);
 
     // Two-point regression: wall(P) ~= overhead + P * per_step. Two point counts
     // separate the fixed per-dispatch overhead (INTERCEPT) from the per-timestep
@@ -5932,7 +5933,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8),
+            static_cast<float>(ptm::kStefanBoltzmann),
             static_cast<int>(config.conductivity_model)
         );
 
@@ -5984,11 +5985,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     // geothermal steady state ~24.7 K; sunlit ~unchanged after eq.
                     // Isothermal at the diurnal-mean equilibrium (no warm floor).
                     double T_eq = std::sqrt(std::sqrt(
-                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                        (avg_flux + planet.Qb) / (planet.emissivity * ptm::kStefanBoltzmann)));
                     for (size_t layer = 0; layer < n_layers; ++layer)
                         T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
                 } else {
-                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * ptm::kStefanBoltzmann)));
                     if (T_eq < 40.0) T_eq = 100.0;
                     if (T_eq > 400.0) T_eq = 400.0;
                     for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -6579,7 +6580,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8),
+            static_cast<float>(ptm::kStefanBoltzmann),
             static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
@@ -6621,12 +6622,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     // absorbed flux + Qb (PSR floors cold-start at the geothermal
                     // steady state ~24.7 K; sunlit ~unchanged after equilibration).
                     double T_eq = std::sqrt(std::sqrt(
-                        (avg_flux + planet.Qb) / (planet.emissivity * 5.67051196e-8)));
+                        (avg_flux + planet.Qb) / (planet.emissivity * ptm::kStefanBoltzmann)));
                     for (size_t layer = 0; layer < n_layers; ++layer)
                         T_initial[layer * batch_n + f] = static_cast<float>(T_eq);
                 } else {
                     // Equilibrium temperature from Stefan-Boltzmann
-                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * 5.67051196e-8)));
+                    double T_eq = std::sqrt(std::sqrt(avg_flux / (planet.emissivity * ptm::kStefanBoltzmann)));
                     if (T_eq < 40.0) T_eq = 100.0;  // Minimum reasonable temperature
                     if (T_eq > 400.0) T_eq = 400.0;
 
@@ -7331,7 +7332,7 @@ bool runThermalForSelectedFaces_GPU(
             static_cast<float>(planet.cp0),
             cp_coeffs_f,
             static_cast<float>(R350_val),
-            static_cast<float>(5.67051196e-8),
+            static_cast<float>(ptm::kStefanBoltzmann),
             static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
@@ -13730,7 +13731,10 @@ int main(int argc, char** argv) {
         // NOT counted by thermal.equilibration_orbits and the GPU path has no
         // equivalent; the pre-flight banner prints it for that reason.
         thermal_config.NYEARSEQ = kCpuAnalyticSeedYears;
-        thermal_config.sigma = 5.67e-8;
+        // Stefan-Boltzmann for every mesh run. This used to be 5.67e-8, a value
+        // no other subsystem used, so the surface energy balance and the
+        // radiosity that feeds it did not conserve energy with each other.
+        thermal_config.sigma = ptm::kStefanBoltzmann;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 
         // ---- Regolith conductivity law (thermophysical.conductivity_model) ----
@@ -15678,7 +15682,7 @@ int main(int argc, char** argv) {
 
                     if (rad_coupling_physics_mode) {
                         const double epsilon = planet.emissivity;
-                        const double sigma = 5.67051196e-8;
+                        const double sigma = ptm::kStefanBoltzmann;
                         const double T_floor = 40.0;
                         // PTM-89: in legacy mode the threshold is a fraction of
                         // the convergence tolerance -- ~1 K -- and both of the

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 
 namespace gpu {
 namespace opencl {
@@ -23,7 +24,9 @@ std::string getRadiosityKernelSource() {
 // OpenCL kernels for PTM radiosity solver
 // Implements Jacobi iteration for radiosity equation: B = E + rho * F * B
 
-#define SIGMA_SB 5.67051196e-8f
+// Stefan-Boltzmann. Checked against ptm::kStefanBoltzmann by the static_assert
+// after this function; OpenCL C cannot include the C++ header.
+#define SIGMA_SB 5.670374419e-8f
 
 // Sparse matrix-vector multiply (CSR format) - Scalar version
 // Each work item handles one row of the matrix
@@ -254,6 +257,10 @@ __kernel void indirect_flux_kernel(
 }
 )CL_SOURCE";
 }
+
+static_assert(ptm::kStefanBoltzmann == 5.670374419e-8,
+              "ptm::kStefanBoltzmann changed. Update the `#define SIGMA_SB` in "
+              "getRadiosityKernelSource(), then update this assert.");
 
 // RadiosityOpenCLSolver implementation
 

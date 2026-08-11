@@ -576,11 +576,19 @@ that the value you set is the value that was echoed.
   124.4 → 124.90 K purely to make its pair self-consistent, and is read by nothing. A load-time
   check now warns if any pair drifts more than 5% apart.
 
-- **Three values of the Stefan-Boltzmann constant coexist in the code.** The thermal and radiation
-  paths use `5.67051196e-8`, a few utilities use the CODATA `5.670374419e-8`, and one test uses
-  `5.67e-8`. The spread is 2.4e-5 relative, which is far below any physical uncertainty here, but
-  it means an analytic cross-check reproduces the engine to about five significant figures rather
-  than exactly.
+- **The Stefan-Boltzmann constant is now a single value (resolved 2026-08-11).** Five values used
+  to coexist: `5.67051196e-8` (thermal solver, radiosity, every GPU kernel), `5.670374419e-8`
+  (`constants.cpp`, camera, beaming), `5.670374e-8` (the Ingersoll bowl-crater validation gate and
+  `vf_mc_flux` — a value no solver used), `5.67e-8` (`thermal_config.sigma`, i.e. what every mesh
+  run's surface energy balance actually used) and `5.6704e-8` (the Ojakangas-Stevenson module).
+  The spread was 2.4e-5 relative, far below any physical uncertainty, but it meant the surface
+  energy balance and the radiosity that feeds it did not conserve energy with each other by
+  construction, and an analytic cross-check reproduced the engine to about five significant figures
+  rather than exactly. Everything now uses the SI-2019 value `5.670374419e-8`, defined once in
+  `src/cpp/constants/stefan_boltzmann.h`; the two OpenCL kernel texts carry their own `#define`
+  (OpenCL cannot include a C++ header) and are held to it by a `static_assert` plus a runtime
+  check at kernel build. The change shifts temperatures by `dT/T = -6.06e-6`: 0.15 mK at 24 K,
+  0.61 mK at 100 K, 2.37 mK at 390 K.
 
 ## Workflow / tooling
 

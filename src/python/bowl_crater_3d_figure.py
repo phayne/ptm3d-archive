@@ -42,7 +42,7 @@ from ingersoll_crater import critical_elevation, sky_view_factor
 from ptm_pubstyle import apply_style, COLORS, DOUBLE_W, panel_label
 
 
-SIGMA = 5.670374e-8
+SIGMA = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 SOLAR_CONSTANT = 1361.0
 ALBEDO = 0.12
 EMISSIVITY = 0.95

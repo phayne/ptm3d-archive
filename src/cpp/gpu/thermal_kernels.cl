@@ -2,8 +2,11 @@
 // Embedded OpenCL kernel source for PTM thermal solver
 #define MAX_LAYERS 64
 
+// Stefan-Boltzmann. OpenCL cannot include constants/stefan_boltzmann.h, so this
+// literal is checked against ptm::kStefanBoltzmann by the static_assert below
+// getEmbeddedKernelSource(); the two cannot drift.
 #ifndef SIGMA
-#define SIGMA 5.67051196e-8f
+#define SIGMA 5.670374419e-8f
 #endif
 
 // --------------------------------------------------------------------------

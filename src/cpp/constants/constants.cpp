@@ -1,4 +1,5 @@
 #include "constants.h"
+#include "stefan_boltzmann.h"
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -8,7 +9,7 @@ namespace constants {
 
 // ---- Physical Constants ----
 const double SPEED_OF_LIGHT = 299792458.0;        // m/s
-const double STEFAN_BOLTZMANN = 5.670374419e-8;   // W/m^2/K^4
+const double STEFAN_BOLTZMANN = ptm::kStefanBoltzmann;   // W/m^2/K^4
 const double BOLTZMANN_CONSTANT = 1.380649e-23;   // J/K
 const double PLANCK_CONSTANT = 6.62607015e-34;    // J·s
 

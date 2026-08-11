@@ -1,11 +1,12 @@
 #include "photometric_model.h"
 #include <algorithm>
 #include <cmath>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace ptm {
 
 // Physical constants
-static constexpr double STEFAN_BOLTZMANN = 5.670374419e-8;  // W/m^2/K^4
+static constexpr double STEFAN_BOLTZMANN = ptm::kStefanBoltzmann;  // W/m^2/K^4
 static constexpr double PLANCK_H = 6.62607015e-34;          // J·s
 static constexpr double SPEED_C = 2.99792458e8;             // m/s
 static constexpr double BOLTZMANN_K = 1.380649e-23;         // J/K
