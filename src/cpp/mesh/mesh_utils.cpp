@@ -410,6 +410,12 @@ void MeshUtils::setupMesh() {
             mesh_->face_normals[i] = {{c[0]/r, c[1]/r, c[2]/r}};
         }
     }
+    // Record that the winding normals were deliberately discarded here, so that
+    // downstream consumers (notably the PTM_ILLUM_TRUE_NORMALS illumination
+    // override) do not silently recompute and reinstate them -- which would undo
+    // this pentagon-bias fix. This is an exact record of the substitution, not a
+    // mesh-type heuristic.
+    mesh_->analytic_radial_normals = true;
 
     // Map faces to lat/lon coordinates
     mapFacesToLatLon();
@@ -484,6 +490,13 @@ void MeshUtils::createIcosphereMesh(int resolution, Mesh& mesh) {
     // Store the results in the mesh
     mesh.vertices = std::move(vertices);
     mesh.faces = std::move(faces);
+    // The geometry has just been replaced, so any earlier analytic-radial-normal
+    // substitution no longer describes it. Clearing here keeps the flag meaning
+    // exactly "the CURRENT face_normals were analytically substituted for the
+    // CURRENT vertices". Without this, createEllipsoidMesh -- which builds a unit
+    // icosphere here and then moves every vertex onto the ellipsoid -- would
+    // inherit a stale `true` from a preceding setupMesh() call.
+    mesh.analytic_radial_normals = false;
 }
 
 void MeshUtils::setBodyRadius(double radius_km) {
@@ -888,6 +901,11 @@ void ptm::MeshUtils::calculateFaceProperties(bool auto_orient_normals) {
         std::cout << "Face properties already calculated, skipping recalculation" << std::endl;
         return;
     }
+
+    // From here on the normals are recomputed from the vertex winding, so any
+    // earlier analytic radial substitution no longer describes them. (The two
+    // early returns above deliberately leave the flag alone: they change nothing.)
+    mesh_->analytic_radial_normals = false;
 
     mesh_->face_normals.resize(mesh_->faces.size());
     mesh_->face_centers.resize(mesh_->faces.size());

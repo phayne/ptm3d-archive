@@ -20,6 +20,15 @@ struct Mesh {
     std::vector<double> longitudes;
     std::vector<double> elevations; // Added to store elevation data
 
+    // True when face_normals hold ANALYTIC radial normals that were deliberately
+    // substituted for the geometric winding normals (MeshUtils::setupMesh, the
+    // smooth-icosphere pentagon-bias fix). This is a record of what was actually
+    // done to this mesh's normals -- not a guess about mesh type -- so consumers
+    // can tell "the winding normal is the best available surface normal" (false)
+    // from "the winding normal was deliberately discarded" (true). Set only where
+    // the substitution happens; cleared wherever face_normals are recomputed.
+    bool analytic_radial_normals = false;
+
     // Add these new methods:
     void setProperty(const std::string& key, const std::string& value) {
         properties[key] = value;
