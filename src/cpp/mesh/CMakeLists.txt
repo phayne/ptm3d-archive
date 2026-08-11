@@ -20,6 +20,19 @@ target_link_libraries(mesh_utils
     OpenMP::OpenMP_CXX
 )
 
+# Ellipsoid mesh geometry gate (see test_ellipsoid_mesh.cpp for what it proves)
+add_executable(test_ellipsoid_mesh
+    test_ellipsoid_mesh.cpp
+)
+target_link_libraries(test_ellipsoid_mesh
+    PRIVATE
+    mesh_utils
+)
+set_target_properties(test_ellipsoid_mesh
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Enable VTK reader in this library too
 if(PTM_USE_VTK_READER)
   find_package(VTK COMPONENTS

@@ -530,7 +530,20 @@ void MeshUtils::createEllipsoidMesh(int resolution, double a_km, double b_km, do
         }
     }
 
-    // Recompute face properties for the ellipsoidal geometry
+    // Recompute face properties for the ellipsoidal geometry.
+    // The vertices have just moved, but the face COUNT has not -- and
+    // calculateFaceProperties' skip-cache keys only on array size, so without
+    // clearing it short-circuits ("already calculated, skipping recalculation")
+    // and every face_center / face_normal is retained from the UNDISPLACED
+    // sphere that the caller's earlier setupMesh() left behind. Measured on a
+    // 7/5/3 km ellipsoid at resolution 4: all 5120 face centers off by up to
+    // 2.279 km (mean 1.592 km), normals off by up to 23.88 deg, and the derived
+    // face latitudes off by up to 23.57 deg (mean 11.91 deg). Same trap, same
+    // remedy as tools/dem_mesh_generator.cpp. Face AREAS are unaffected:
+    // getFaceArea() derives them from the vertices on demand and never reads
+    // these arrays.
+    mesh.face_normals.clear();
+    mesh.face_centers.clear();
     calculateFaceProperties(false);
     mapFacesToLatLon();
 
