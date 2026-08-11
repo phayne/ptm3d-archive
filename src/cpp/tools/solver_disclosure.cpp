@@ -144,23 +144,23 @@ void discloseThermalSolverPath(ThermalSolverPath path,
         // Be precise about WHAT it substitutes. The streamed path reuses the
         // scalar TIME INTEGRATOR (runThermalModelWithMatchedTimes), but it
         // builds its own forcing inline instead of routing through
-        // calculateAbsorbedFlux(..., planet, ...), and it hard-codes the
-        // equilibration length to zero. Calling it "the scalar solver" without
-        // saying that would invite the reader to equate this run with a
-        // --no-simd-batch run, which it is NOT: measured 4.82 K max / 3.97 K
-        // mean apart on 11,664 of 12,800 faces of the 80N tutorial crater.
+        // calculateAbsorbedFlux(..., planet, ...). Calling it "the scalar
+        // solver" without saying that would invite the reader to equate this
+        // run with a --no-simd-batch run, which it is NOT: measured 4.82 K max
+        // / 3.97 K mean apart on 11,664 of 12,800 faces of the 80N tutorial
+        // crater, same config, same illumination, 4,200 output steps.
         std::cout
             << "[thermal-solver] NOTE:   the streamed path reuses the CPU SCALAR time\n"
             << "[thermal-solver]         integrator (runThermalModelWithMatchedTimes), but it\n"
-            << "[thermal-solver]         is NOT equivalent to a --no-simd-batch run. Three\n"
-            << "[thermal-solver]         differences, all of them silent until now:\n"
-            << "[thermal-solver]           1. equilibration_steps is hard-coded to 0, so this\n"
-            << "[thermal-solver]              run has NO equilibration phase at all.\n"
-            << "[thermal-solver]           2. the absorbed flux is built inline from a per-face\n"
-            << "[thermal-solver]              CONSTANT albedo. The configured angular-albedo\n"
-            << "[thermal-solver]              model (Hayne or Hapke, via incidence_angle_albedo)\n"
-            << "[thermal-solver]              is NOT applied -- the other CPU paths route\n"
-            << "[thermal-solver]              through calculateAbsorbedFlux(..., planet, ...).\n"
+            << "[thermal-solver]         is NOT equivalent to a --no-simd-batch run. It builds\n"
+            << "[thermal-solver]         its absorbed flux INLINE, so:\n"
+            << "[thermal-solver]           1. the albedo is a per-face CONSTANT. The configured\n"
+            << "[thermal-solver]              angular-albedo model (Hayne, or Hapke via\n"
+            << "[thermal-solver]              incidence_angle_albedo) is NOT applied -- the\n"
+            << "[thermal-solver]              other CPU paths route through\n"
+            << "[thermal-solver]              calculateAbsorbedFlux(..., planet, ...).\n"
+            << "[thermal-solver]           2. no effective_albedo statistic is produced, because\n"
+            << "[thermal-solver]              A_eff accumulates inside that same function.\n"
             << "[thermal-solver]           3. the equilibration indirect-flux term is not\n"
             << "[thermal-solver]              carried; this path takes no eq_indirect argument.\n";
         if (simd_batch_requested) {
@@ -242,7 +242,7 @@ bool appendThermalSolverProvenance(const std::string& output_dir) {
     // A reader who has only the provenance file must be told.
     kv("thermal_solver_caveats",
        (!r.mixed && r.path == ThermalSolverPath::CpuStreamed)
-           ? "no_equilibration_phase;constant_albedo_angular_model_ignored;"
+           ? "constant_albedo_angular_model_ignored;no_effective_albedo_statistic;"
              "no_eq_indirect_flux"
            : "none");
     kv("thermal_rethermal_path",
