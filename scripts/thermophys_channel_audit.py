@@ -201,7 +201,12 @@ CASES = [
 
     # ---- thermal: material keys --------------------------------------------
     C("geothermal_heat_flow", MOON_BASE, {"thermal.geothermal_heat_flow": 5.0},
-      note="Qb 0.018 -> 5.0 W/m2 (floor 24 K -> 172 K if live)", expect="?"),
+      note="Qb 0.018 -> 5.0 W/m2 (floor 24.04 K -> 98.15 K if live)", expect="?"),
+    C("geothermal_normalization", MOON_BASE,
+      {"thermal.geothermal_heat_flow": 0.022},
+      note="the lunar campaign value 0.022 vs the 0.018 default: the delta a "
+           "config normalization would introduce IF the knob were live "
+           "(floor 24.04 K -> 25.28 K)", expect="?"),
     C("geothermal_cli", MOON_BASE, args=["--geothermal-heat-flow", "5.0"],
       note="same via CLI", expect="?"),
     C("heat_flow_mask", MOON_BASE,

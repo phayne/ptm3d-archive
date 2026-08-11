@@ -51,6 +51,20 @@ that affects released functionality is described here; no external lookup is nee
   Conductivity/emissivity/constant-TI results produced on built-in bodies before this fix are not
   what their configs claim.
 
+- **`thermal.geothermal_heat_flow` was left out of that fix, and still announces a change it does
+  not make.** On a built-in body the value is parsed, applied to the main-scope planet, printed as
+  `Overriding planet geothermal heat flow: …` — and then discarded, because every mesh solver
+  rebuilds its own planet from the body name. This is true on **both** backends, not only the GPU.
+  The Moon therefore always integrates its compiled default `Qb = 0.018 W/m²` (Langseth et al.
+  1976), whatever the config asks for and whatever the banner says. Measured on a global ico3
+  diurnal run and on the 12,800-face 80°N crater with radiation coupling: `geothermal_heat_flow`
+  raised from the default to **5.0 W/m²** — 278× — leaves every `statistics/*.bin` **byte-identical**.
+  The one channel that does reach the solver is `thermal.heat_flow_mask_file`, which seeds the
+  per-face `Qb` array; the same 5.0 W/m² applied that way moves the coldest face by 34 K. If you
+  need a non-default basal flux today, use the mask file. `examples/moon_ico3_qb_falsifier.yaml`
+  is the standing fixture for this: it documents the number to expect now and the number that must
+  appear once the override is forwarded.
+
 - **The albedo the log reports is the albedo the flux used — and a disagreement is now warned.**
   The GPU thermal path used to rebuild its own `Planet` from the body name, which reinstated the
   body default (Moon 0.1) while the main-scope banner still announced the configured value (e.g.

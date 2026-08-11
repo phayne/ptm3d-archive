@@ -1,0 +1,97 @@
+# PTM3D falsifier fixture: does `thermal.geothermal_heat_flow` reach the solver?
+#
+# WHAT THIS IS. A deliberately-wrong configuration, kept as a standing test. It
+# asks for a basal heat flow 278x the Moon's compiled default and, at the time
+# of writing, GETS THE DEFAULT ANYWAY while the log announces success. This file
+# exists so that the day the defect is fixed, the fix is visible in one number
+# instead of being taken on trust. It is not an example of good configuration
+# and it is not a science case.
+#
+# THE DEFECT (BUGS.md PTM-161, root cause of PTM-123). `thermal.
+# geothermal_heat_flow` is parsed, applied to the main-scope `Planet`, and
+# announced --
+#
+#     Overriding planet geothermal heat flow: 5 W/m^2
+#
+# -- and then every mesh solver rebuilds its own `Planet` from the body name and
+# throws the override away (ptm_thermal_sim.cpp: 2157 CPU scalar, 3440 CPU SIMD
+# batch, 4729 GPU persistent, 6399 GPU re-thermal). On a built-in body the knob
+# does nothing on either backend. The only channel that does reach the solver is
+# `thermal.heat_flow_mask_file`, which seeds the per-face Qb array.
+#
+# HOW TO RUN IT (from the repository root, CPU only, ~5 s on 1280 faces):
+#
+#     ./build/bin/ptm_thermal_sim --config examples/moon_ico3_qb_falsifier.yaml
+#     python3 -c "import struct,numpy as np; \
+#       d=open('output/moon_ico3_qb_falsifier/statistics/temperature_min.bin','rb').read(); \
+#       print(np.frombuffer(d[4:],dtype='<f4').min())"
+#
+# WHAT TO EXPECT, in numbers. The radiative floor a basal flux can hold a face
+# at is T_geo = (Qb / (eps * sigma))^(1/4), with the engine's own constants
+# eps = 0.95 (Moon) and SIGMA_SB = 5.67051196e-8 (thermal_model.h:160):
+#
+#     Qb = 0.018 W/m^2 (Moon default, Langseth et al. 1976)  ->  T_geo =  24.0426 K
+#     Qb = 5.0   W/m^2 (what this file asks for)             ->  T_geo =  98.1536 K
+#
+#   * TODAY, DEFECT PRESENT -- min(temperature_min.bin) = 66.3465 K, and every
+#     statistics binary is BYTE-IDENTICAL to the same run with
+#     `geothermal_heat_flow: -1.0`. Note carefully that 66.35 K is NOT the
+#     24.04 K floor: this is an unshadowed diurnal run, so the coldest face is
+#     set by nighttime cooling, and the 24 K floor sits below it and never
+#     binds. That is exactly why this fixture asks for 5.0 rather than a
+#     plausible value -- only a floor ABOVE the diurnal minimum is observable
+#     without a reference run.
+#
+#   * ONCE FORWARDING IS FIXED -- min(temperature_min.bin) must rise to at
+#     least T_geo = 98.1536 K. The expected value is not a derivation: the same
+#     Qb = 5.0 pushed through the one channel that IS live today
+#     (`heat_flow_mask_file` over all 1280 faces, same mesh, same binary) gives
+#     min(temperature_min.bin) = 100.3590 K. Treat 100.36 K as the target and
+#     98.15 K as the hard floor it may not fall below.
+#
+#   * A FIX THAT LEAVES THIS FILE AT 66.35 K IS NOT A FIX. Nor is one that fixes
+#     only the YAML route: `--geothermal-heat-flow 5.0` on the command line is
+#     dead in exactly the same way today (measured, byte-identical), because it
+#     writes the same field. Check both routes.
+#
+# Measured 2026-08-10 on cb1ec3b, CPU-only build (-DPTM_ENABLE_GPU=OFF),
+# ptm_thermal_sim md5 6768e5ddc7f9e3c30022e32524756ab2. Re-measure the two
+# numbers above if the mesh, the equilibration settings or the body defaults
+# below ever change -- they are properties of this configuration, not constants.
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53          # one synodic lunar day
+  timesteps: 240                # ~3 h output cadence
+  body: Moon
+mesh:
+  resolution: 3                 # icosphere subdivision level (1280 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0                    # 0 = auto-detect
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false                # CPU only: the defect is not backend-specific
+  compute_statistics: true      # writes the statistics/*.bin this fixture reads
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: 5.0     # THE POINT OF THIS FILE. 278x the Moon default.
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false                # no inter-face radiation on a convex sphere
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/moon_ico3_qb_falsifier
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false
