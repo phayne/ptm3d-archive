@@ -899,6 +899,27 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     const double sigma_sb = config ? config->sigma : 5.670374419e-8;
     const double T_geo = (Qb > 0.0)
         ? std::sqrt(std::sqrt(Qb / (emissivity * sigma_sb))) : 0.0;
+    //
+    // Correction-3 rule: under the gate, a path carrying the floor removal
+    // WITHOUT the deviation form must refuse, because the two are one physical
+    // change. This path does NOT refuse, and the exemption is measured rather
+    // than argued: the deviation form's entire benefit is float32 quantization.
+    // In the reference measurement (r1_deviation_2026-08-10/arrest_arms2.json)
+    // the absolute and deviation forms agree to 6.2e-14 K in float64 -- the
+    // algebraic-identity noise floor -- while in float32 the deviation form
+    // recovers 0.0649 K of deficit and removes the arrest at j=1. This path
+    // stores T in double, so there is no arrest here for the deviation form to
+    // remove. The static_assert makes that precondition fail the BUILD rather
+    // than the physics if the state type is ever narrowed.
+    static_assert(std::is_same<
+                      std::remove_reference<decltype(grid.T[0])>::type,
+                      double>::value,
+                  "Profile state is no longer float64. The PTM_SOLVER_EQFIX "
+                  "T_geo-floor removal is exempt from the deviation-form "
+                  "requirement ONLY because this path is float64 and cannot "
+                  "arrest. Narrowing it re-arms the arrest: implement the R1 "
+                  "deviation form here, or make this path refuse under the "
+                  "gate like the CPU SIMD and GPU paths do.");
     const bool   eqfix = solverEqFixEnabled();
     const double T_lo  = eqfix ? ABSOLUTE_ZERO_K
                                : std::max(ABSOLUTE_ZERO_K, T_geo);
@@ -2652,6 +2673,28 @@ void ThermalBatchSoA::setFluxContiguous(const double* flux_values, int num_faces
 }
 
 void ThermalBatchSoA::advanceTimestep(double dt) {
+    // PTM_SOLVER_EQFIX refusal (the general rule, not a special case): under
+    // the gate, any solver path that would run the T_geo-floor removal WITHOUT
+    // the deviation form -- or, here, without even the new surface-Newton
+    // criterion -- is a knowingly-wrong configuration and must be impossible to
+    // execute, not merely discouraged. This path has neither: its surface
+    // Newton (applySurfaceBCBatch) is a separate, weaker solver -- 5 fixed
+    // iterations, no convergence test, a hard [CMB, 500 K] clamp -- and the
+    // deviation form is not implemented here. BUGS.md PTM-216.
+    static const bool refuse = solverEqFixEnabled();
+    if (refuse) {
+        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the CPU SIMD "
+                     "batch path (ThermalBatchSoA::advanceTimestep) implements "
+                     "neither the new surface-Newton exit criterion nor the R1 "
+                     "deviation form.\n"
+                     "  Running it under the gate would release the T_geo floor "
+                     "under an unimproved 5-iteration Newton and leave the "
+                     "interior arrest in place, and nothing would say so.\n"
+                     "  Only the CPU scalar path (Profile::update_T) is covered "
+                     "at this commit. Unset PTM_SOLVER_EQFIX, or use a solver "
+                     "configuration that takes the scalar path." << std::endl;
+        std::exit(1);
+    }
     updateMaterialPropertiesBatchSIMD(*this);
     applySurfaceBCBatch(*this, dt);
     buildTridiagonalSystemBatch(*this, dt);
@@ -2667,22 +2710,16 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     // at T_geo corrects only that sub-floor drift (real PSR floors converge to
     // T_geo from above -> no-op). Per-face, physics-set, NOT a fixed clamp.
     //
-    // PTM_SOLVER_EQFIX removes it here too -- a CPU-scalar-only or GPU-only
-    // removal would break CPU/GPU equivalence. Counted, not silently released.
-    const bool eqfix = solverEqFixEnabled();
+    // NOT touched by PTM_SOLVER_EQFIX. This path REFUSES to run under the gate
+    // (see advanceTimestep), because removing the floor here without also
+    // giving this path the new surface-Newton criterion and the deviation form
+    // would leave a weak 5-iteration Newton with its safety net gone -- worse
+    // than either change alone. BUGS.md PTM-216.
     for (int f = 0; f < n_faces; ++f) {
         const double qb = Qb[f];
         if (qb <= 0.0) continue;
         const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
         if (T_geo <= ABSOLUTE_ZERO_K) continue;
-        if (eqfix) {
-            long long below = 0;
-            for (int layer = 0; layer < n_layers; ++layer) {
-                if (T[layer * THERMAL_BATCH_SIZE + f] < T_geo) ++below;
-            }
-            noteTgeoRelease(below, n_layers);
-            continue;
-        }
         for (int layer = 0; layer < n_layers; ++layer) {
             double& Tlf = T[layer * THERMAL_BATCH_SIZE + f];
             if (Tlf < T_geo) Tlf = T_geo;
