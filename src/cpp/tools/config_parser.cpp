@@ -328,6 +328,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.equilibration_steps_per_day = getWithDefault(thermal, "equilibration_steps_per_day", config.thermal.equilibration_steps_per_day);
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
             config.thermal.equilibration_cycles = getWithDefault(thermal, "equilibration_cycles", config.thermal.equilibration_cycles);
+            config.thermal.equilibration_target_K = getWithDefault(thermal, "equilibration_target_K", config.thermal.equilibration_target_K);
             if (thermal["eq_extrapolation"]) {
                 const auto& ex = thermal["eq_extrapolation"];
                 config.thermal.eq_extrapolation.method =
@@ -768,6 +769,7 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // with the real pass count (which is 2, not 1).
         if (config.thermal.equilibration_cycles > 0)
             out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
+        out << YAML::Key << "equilibration_target_K" << YAML::Value << config.thermal.equilibration_target_K;
         // Same rule: only round-trip the extrapolation block when it is armed,
         // so an OFF run's re-serialized config stays free of the knob entirely.
         if (config.thermal.eq_extrapolation.method != "off") {
@@ -1105,6 +1107,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      #    30 -> ~7 K max err (Fast)\n";
     out << "                                      #   <=0 -> legacy (match output cadence)\n";
     out << "  # equilibration_cycles: 2           # PASSES over the eq forcing array (GPU solver only).\n";
+    out << "  # equilibration_target_K: 0.1        # accuracy the spin-up ESTIMATE targets (report-only).\n";
     out << "                                      # Effective eq = cycles x equilibration_orbits diurnal\n";
     out << "                                      # cycles, at 1x illumination cost and 1x flux RAM.\n";
     out << "                                      # Unset = the solver legacy value, which is 2 (not 1).\n";

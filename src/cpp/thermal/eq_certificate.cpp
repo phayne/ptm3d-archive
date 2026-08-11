@@ -11,15 +11,18 @@
 namespace thermal {
 
 bool eqCertificateEnabled() {
+    // DEFAULT ON. This is report-only -- it changes no solver state and the
+    // statistics files are byte-identical either way -- so the default is that
+    // every run tells the user what its spin-up bought. PTM_EQ_CERTIFICATE=0
+    // is the opt-out (for a byte-identical LOG, e.g. a log-diffing harness).
     static const bool on = [] {
         const char* e = std::getenv("PTM_EQ_CERTIFICATE");
-        const bool v = (e && *e && std::strcmp(e, "0") != 0);
-        if (v) {
-            std::cout << "[Thermal] PTM_EQ_CERTIFICATE=1: equilibration spin-up "
-                         "estimate and convergence certificate ENABLED "
-                         "(report-only; changes no solver state)." << std::endl;
+        const bool off = (e && *e && std::strcmp(e, "0") == 0);
+        if (off) {
+            std::cout << "[Thermal] PTM_EQ_CERTIFICATE=0: equilibration spin-up "
+                         "estimate suppressed." << std::endl;
         }
-        return v;
+        return !off;
     }();
     return on;
 }
@@ -159,6 +162,7 @@ EqSpinupCensus::EqSpinupCensus(double P, double target_K, double precision_floor
       sec_per_cycle_(seconds_per_cycle_estimate) {}
 
 void EqSpinupCensus::add(const EqSpinupResult& r, bool zero_forcing) {
+    std::lock_guard<std::mutex> lk(m_);
     Bin& b = zero_forcing ? zero_ : forced_;
     ++b.n;
     // A column the estimator could not score must be COUNTED, not dropped. A
@@ -213,6 +217,7 @@ void EqSpinupCensus::line(std::ostream& os, const char* label, const Bin& b,
 }
 
 bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
+    std::lock_guard<std::mutex> lk(m_);
     if (zero_.n == 0 && forced_.n == 0) return false;
     const long long unreachable = zero_.unreachable + forced_.unreachable;
 
@@ -248,6 +253,10 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
         os << "  NOTE: the configured " << n_configured << " cycles is BELOW the "
               "p95 requirement (" << std::fixed << std::setprecision(1) << worst
            << ").\n        Report-only at this stage -- the run proceeds.\n";
+    }
+    if (!(sec_per_cycle_ > 0.0)) {
+        os << "  Wall-clock is not shown: nothing measured a seconds-per-cycle for\n"
+              "  this run, and a made-up timing constant would be worse than none.\n";
     }
     os << "=======================================================================\n";
     return true;

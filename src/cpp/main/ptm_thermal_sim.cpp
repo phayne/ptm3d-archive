@@ -36,6 +36,8 @@
 #include "../tools/config_parser.h"
 #include "../tools/run_provenance.h"
 #include "../thermal/thermal_model.h"
+#include "../thermal/eq_certificate.h"
+#include <memory>
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
 #include "../maps/spatial_map.h"
@@ -3673,6 +3675,40 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     bool success = true;
 
+    // Equilibration duration. Hoisted out of the batch loop (it depends only
+    // on config/planet/times, never on the batch) so it is computed once and
+    // the spin-up banner can quote the configured cycle count.
+    double equil_duration_s_shared;
+    if (config.getProperty("using_generic_body") == "true") {
+        // Generic (fast-rotating) body: equilibrate for the CONFIGURED number of
+        // DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps was
+        // sized in main as (output cadence)x(equilibration_orbits)x(diurnal
+        // period), so equilibration_steps x output-cadence dt = the intended
+        // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day) here
+        // would be ~10^4 four-hour cycles (an asteroid's year is that many diurnal
+        // periods) and never finish. Gated -> Moon/Europa untouched.
+        const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
+        const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
+        equil_duration_s_shared = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
+    } else {
+        const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
+                                         std::round(planet.year / planet.day);
+        equil_duration_s_shared = equil_days_needed * planet.day;
+    }
+
+    // ---- Equilibration spin-up estimate (FIX 0) ----------------------------
+    // Report-only and DEFAULT ON: it changes no solver state and the
+    // statistics are byte-identical either way, so gating it off would only
+    // hide the one number a user benefits from. PTM_EQ_CERTIFICATE=0 opts out.
+    const double eq_target_K = config.getPropertyDouble("eq_target_K", 0.1);
+    std::unique_ptr<thermal::EqSpinupCensus> g_spinup_census;
+    if (thermal::eqCertificateEnabled()) {
+        g_spinup_census.reset(new thermal::EqSpinupCensus(
+            planet.day, eq_target_K,
+            /*precision_floor_K=*/0.0,
+            /*seconds_per_cycle=*/0.0));   // nothing measures it; banner says so
+    }
+
     #pragma omp parallel num_threads(thermal_threads)
     {
         // Thread-local batch buffer
@@ -3851,23 +3887,9 @@ bool runThermalModelsForAllFacesBatchSoA(
             // flux trajectory as a quasi-periodic signal and substep it down to
             // dt <= planet.day / 192 so CN accuracy stays within ~1 K worst case
             // (see src/cpp/tools/test_equilibration_dt.cpp for the accuracy study).
-            double equil_duration_s;
-            if (config.getProperty("using_generic_body") == "true") {
-                // Generic (fast-rotating) body: equilibrate for the CONFIGURED number
-                // of DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps
-                // was sized in main as (output cadence)x(equilibration_orbits)x(diurnal
-                // period), so equilibration_steps x output-cadence dt = the intended
-                // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day)
-                // here would be ~10^4 four-hour cycles (an asteroid's year is that many
-                // diurnal periods) and never finish. Gated -> Moon/Europa untouched.
-                const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
-                const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
-                equil_duration_s = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
-            } else {
-                const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
-                                                 std::round(planet.year / planet.day);
-                equil_duration_s = equil_days_needed * planet.day;
-            }
+            // Computed once above the parallel region (it depends only on
+            // config/planet/times, never on the batch); see equil_duration_s_shared.
+            const double& equil_duration_s = equil_duration_s_shared;
 
             if (equil_duration_s > 0.0 && total_time_steps >= 2) {
                 // Match Model::fastEquilibrate (thermal_model.cpp:2024) exactly:
@@ -3926,6 +3948,55 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
+
+                    // Spin-up estimate (FIX 0, report-only). Scored after the
+                    // FIRST substep of ~30,000, so it still lands before any
+                    // real time is spent, but after advanceTimestep has filled
+                    // batch.k / batch.cp -- initialize() memsets them to zero
+                    // and scoring a zero-conductivity column would report
+                    // nonsense. Reading only; writes no solver state.
+                    if (step == 0 && g_spinup_census) {
+                        const int BS2 = thermal::THERMAL_BATCH_SIZE;
+                        std::vector<double> cz(n_layers), cT(n_layers),
+                                            ck(n_layers), cr(n_layers), cc(n_layers);
+                        for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            for (int i = 0; i < n_layers; ++i) {
+                                cT[i] = batch.T  [i * BS2 + f];
+                                ck[i] = batch.k  [i * BS2 + f];
+                                cr[i] = batch.rho[i * BS2 + f];
+                                cc[i] = batch.cp [i * BS2 + f];
+                            }
+                            thermal::EqSpinupInput ein;
+                            ein.z = cz.data(); ein.T = cT.data(); ein.k = ck.data();
+                            ein.rho = cr.data(); ein.cp = cc.data();
+                            ein.n = n_layers;
+                            ein.Qb  = batch.Qb[f];
+                            ein.eps = batch.emissivity[f];
+                            ein.sigma = thermal::SIGMA_SB;
+                            ein.P = planet.day;
+                            ein.target_K = eq_target_K;
+                            // This path is float64 and carries no arithmetic
+                            // floor; the float32 arrest is a GPU-path property.
+                            ein.precision_floor_K = 0.0;
+                            // Dark iff the face never sees sun in the REAL
+                            // illumination. Using the analytic equilibration
+                            // forcing instead (cos_lat*cos_hour) would call
+                            // every face lit -- it has no topography and no
+                            // shadowing, so cos_lat > 0 everywhere off the
+                            // poles -- and the split that exists to expose the
+                            // frozen dark population would report no dark
+                            // population at all.
+                            double fmax = 0.0;
+                            for (int t = 0; t < total_time_steps; ++t) {
+                                const double v = flux_column_major[
+                                    static_cast<size_t>(t) * n_faces + start_face + f];
+                                if (v > fmax) fmax = v;
+                            }
+                            const bool dark = !(fmax > 0.0);
+                            g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
+                        }
+                    }
                 }
             }
 
@@ -3987,6 +4058,16 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // Equilibration spin-up estimate (FIX 0). Emitted once, after every batch
+    // has contributed. The numbers are a prediction made one substep into a
+    // ~30,000-substep equilibration, not a measurement of what it achieved --
+    // the retrospective certificate is a separate, not-yet-implemented piece.
+    if (g_spinup_census) {
+        const double n_configured = (planet.day > 0.0)
+                                  ? (equil_duration_s_shared / planet.day) : 0.0;
+        g_spinup_census->report(std::cout, n_configured);
+    }
 
     // PTM-51 diagnostic: write the per-face seed terms and the analytic
     // equilibration forcing that actually drove the column.
@@ -13485,6 +13566,12 @@ int main(int argc, char** argv) {
         // it via getPropertyBool. Default true (on); PTM_NO_AUTO_CALIBRATE also opts
         // out at the solver.
         thermal_config.setProperty("auto_calibrate_gpu", sim_config.thermal.auto_calibrate_gpu);
+
+        // Accuracy the spin-up ESTIMATE targets (report-only; the solvers
+        // rebuild a local Config, so like every other engine knob it has to be
+        // forwarded or it silently reverts to the built-in default).
+        thermal_config.setProperty("eq_target_K",
+                                   fullPrecision(sim_config.thermal.equilibration_target_K));
 
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {

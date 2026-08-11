@@ -23,11 +23,13 @@
 
 #include <cstddef>
 #include <iosfwd>
+#include <mutex>
 #include <vector>
 
 namespace thermal {
 
-// PTM_EQ_CERTIFICATE=1. Default off. Announced once.
+// DEFAULT ON; PTM_EQ_CERTIFICATE=0 opts out. Report-only, so the default
+// is that every run reports what its spin-up bought.
 bool eqCertificateEnabled();
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,7 @@ private:
         std::vector<double> n_req, tau1_cycles, E0;
     };
     Bin zero_, forced_;
+    mutable std::mutex m_;   // scored once per face, from an OpenMP batch loop
     double P_, target_K_, floor_K_, sec_per_cycle_;
     static void line(std::ostream& os, const char* label, const Bin& b,
                      double sec_per_cycle);
