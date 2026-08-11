@@ -42,7 +42,6 @@ thermophysical:
   use_default_cp0: true
   cp0: 800.0
   use_default_Qb: true
-  Qb: 0.018
   use_default_chi: true
   chi: 2.7
 radiation:

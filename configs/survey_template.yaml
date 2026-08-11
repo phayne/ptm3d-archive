@@ -66,8 +66,12 @@ thermophysical:
   rhos: 1100.0                  # Surface density (kg/m³)
   rhod: 1800.0                  # Deep density (kg/m³)
   cp0: 800.0                    # Heat capacity at 200K (J/kg/K)
-  Qb: 0.018                     # Geothermal heat flow (W/m²)
   chi: 2.7                      # Conductivity temperature exponent
+  # Basal (geothermal) heat flow is deliberately absent: this survey config has
+  # no channel for it. The engine's key is thermal.geothermal_heat_flow, where
+  # -1.0 means "use the body's compiled default" (0.018 W/m² for the Moon), and
+  # the survey pipeline neither reads nor forwards it. See
+  # docs/KNOWN_LIMITATIONS.md for the current state of that key.
 
 # --- Site selection criteria ---
 selection_criteria:
