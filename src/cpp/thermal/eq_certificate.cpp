@@ -233,7 +233,16 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
        << "  reaching an unknown final surface temperature.\n"
        << "  Reported per population -- the all-face median hides the lit\n"
        << "  faces behind a frozen dark majority (measured: median drift over\n"
-       << "  50->100 lunations is 0.0 K all-face but -6.12 K on lit faces).\n";
+       << "  50->100 lunations is 0.0 K all-face but -6.12 K on lit faces).\n"
+       << "  CALIBRATION, so you know what n_req is worth: this is a SINGLE-MODE\n"
+          "  model -- the seed's error is assumed to decay as exp(-t/tau1).\n"
+          "  Checked once against a measured spin-up, on the production 50-layer\n"
+          "  lunar grid: a lit column needs 339 cycles to reach 0.002 K by this\n"
+          "  estimate against 150-200 integrated lunations measured, i.e. 1.9x\n"
+          "  CONSERVATIVE -- it over-warns rather than leaving you short. Pinned\n"
+          "  by build/bin/test_eq_spinup gate 4. tau1 is a property of THIS grid\n"
+          "  and state: never compare a number from one grid against a\n"
+          "  measurement from another (that error is what BUGS.md PTM-219 was).\n";
     line(os, "dark  (Qs=0)", zero_,  sec_per_cycle_);
     line(os, "lit   (Qs>0)", forced_, sec_per_cycle_);
 
