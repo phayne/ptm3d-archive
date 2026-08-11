@@ -189,6 +189,20 @@ set_target_properties(test_surface_newton
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Equilibration spin-up estimator gate. Checks tau1 against the analytic
+# quarter-wave slab, the ln(1/target) scaling of n_req, and that an
+# unreachable target returns NO cycle count.
+add_executable(test_eq_spinup test_eq_spinup.cpp)
+target_link_libraries(test_eq_spinup
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_eq_spinup
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Chunked-run statistics merge tool. Combines per-chunk raw statistics
 # (statistics/_raw/) from N chunks into a single set of merged stats
 # (max/avg/min) plus the Schorghofer ice-stability depth recomputed
