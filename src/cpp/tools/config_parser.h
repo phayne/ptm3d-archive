@@ -237,6 +237,23 @@ struct SimulationConfig {
         std::string indirect_mean_out_file = "";
         std::string eq_indirect_flux_file  = "";
 
+        // Where the equilibration-phase indirect flux comes from when
+        // radiation coupling is enabled (docs/radiation-exchange.md 7.7):
+        //   "auto" (default) -- the engine estimates it internally. One extra
+        //     radiosity sweep over the window plus one extra whole-mesh thermal
+        //     solve: the first solve gives surface temperatures, the sweep gives
+        //     Q_indirect(i,t), its output-window time mean becomes <q_ind>[i],
+        //     and the whole-mesh solve is repeated with <q_ind> in the
+        //     equilibration forcing. This is the two-pass file workflow below,
+        //     internalized; no user action.
+        //   "off" -- legacy: the equilibration phase sees no indirect term, so
+        //     a face whose only heat source is neighboring-face infrared
+        //     equilibrates to the bare geothermal floor.
+        // A non-empty eq_indirect_flux_file overrides both (explicit wins).
+        // Overridable without editing a configuration through
+        // PTM_EQ_INDIRECT_SOURCE, for reproducing a run published under "off".
+        std::string eq_indirect_source = "auto";
+
         // Schorghofer & Taylor (2007) ice-stability output. When enabled,
         // the thermal solver accumulates time-averaged sublimation rate
         // ⟨E(T(z,t))⟩ at each native depth node during the integration
