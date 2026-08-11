@@ -241,6 +241,7 @@ cmake_minimum_required(VERSION 3.10)
 set(TOOL_SOURCES
     config_parser.cpp
     run_provenance.cpp
+    solver_disclosure.cpp
 )
 
 # Create tools library
