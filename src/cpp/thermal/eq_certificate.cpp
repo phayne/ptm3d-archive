@@ -224,7 +224,8 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
     os << "\n=== Equilibration spin-up estimate (report-only; nothing is changed) ===\n"
        << "  Target accuracy      : " << target_K_ << " K"
        << "   (thermal.equilibration_target_K)\n"
-       << "  Config requests      : " << n_configured << " cycles\n"
+       << "  Spin-up this run does: " << n_configured << " cycles"
+          "   (analytic seed + thermal.equilibration_orbits)\n"
        << "  Model: n_req = (tau1/P) * ln(E0/target), with tau1 the slowest\n"
        << "  eigenvalue of the ACTUAL discrete column (Robin top, Neumann\n"
        << "  bottom, 3 inverse iterations) and E0 the seed's departure from the\n"
@@ -259,9 +260,9 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
     }
     const double worst = std::max(pct(zero_.n_req, 0.95), pct(forced_.n_req, 0.95));
     if (n_configured > 0.0 && worst > n_configured) {
-        os << "  NOTE: the configured " << n_configured << " cycles is BELOW the "
-              "p95 requirement (" << std::fixed << std::setprecision(1) << worst
-           << ").\n        Report-only at this stage -- the run proceeds.\n";
+        os << "  NOTE: the " << n_configured << " cycles this run integrates is "
+              "BELOW the p95 requirement (" << std::fixed << std::setprecision(1)
+           << worst << ").\n        Report-only at this stage -- the run proceeds.\n";
     }
     if (!(sec_per_cycle_ > 0.0)) {
         os << "  Wall-clock is not shown: nothing measured a seconds-per-cycle for\n"

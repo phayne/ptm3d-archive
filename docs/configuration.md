@@ -83,10 +83,10 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `thermal_m` | int | 10 | Layers within the upper skin depth |
 | `thermal_n` | int | 15 | Inert. The legacy non-adaptive grid it feeds cannot be selected from any config key, flag or environment variable, so this value and the `--thermal-n` flag have no effect |
 | `thermal_b` | int | 15 | Skin depths to the bottom layer |
-| `equilibration_orbits` | float | 1.0 | Diurnal cycles of spin-up before the output window. On the GPU persistent solver the integrated total is this value times `equilibration_cycles` (default 2). Choose it with [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 1 |
+| `equilibration_orbits` | float | 1.0 | **Integrated** diurnal cycles of real, ephemeris-driven spin-up before the output window. The same number on the CPU scalar, CPU SIMD and GPU persistent paths; `equilibration_cycles` changes how it is reached, never the total. The CPU paths additionally run a fixed analytic pre-conditioner that this key does not count — see [Equilibration length](#equilibration-length-what-the-number-means). Choose it with [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 1 |
 | `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
 | `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle; consulted only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
-| `equilibration_cycles` | int | -1 | Passes over the equilibration forcing array, GPU persistent solver only (-1 = the solver's value of 2) |
+| `equilibration_cycles` | int | -1 | Replays of the equilibration forcing block used to reach `equilibration_orbits`, GPU persistent solver only (-1 = 1 replay). The block is `equilibration_orbits / equilibration_cycles` cycles long, so the integrated total does not change and only the flux RAM and illumination cost fall |
 | `eq_extrapolation` | map | off | Pass-stride extrapolation of the equilibration state; see below |
 | `compute_statistics` | bool | true | Compute and write per-face statistics |
 | `use_gpu` | bool | false | OpenCL thermal solver (a CPU-only build refuses at startup) |
@@ -118,6 +118,58 @@ The checkpoint files are used by the chunked-run workflow
 (`scripts/run_chunked_simulation.py` and `ptm_merge_chunks`).
 
 
+### Equilibration length: what the number means
+
+`thermal.equilibration_orbits` is the **integrated** number of diurnal cycles of
+real, ephemeris-driven forcing the solver runs before the output window opens.
+That is true on all three solver paths and at any `equilibration_cycles`:
+
+```
+block_cycles = equilibration_orbits / equilibration_cycles
+integrated   = equilibration_cycles * block_cycles = equilibration_orbits
+```
+
+`equilibration_cycles` is a memory and cost dial, not a length. Raising it
+shortens the assembled forcing block and replays it more times, which cuts the
+equilibration flux array and the illumination trace by that factor while
+integrating the same number of cycles. That is the only affordable route past
+the flux-array size limit: a 25-cycle equilibration block is about 6.1 GB on a
+509,337-face lunar mesh. It is a trade, not a free lunch — *N* replays of a
+short block are not the same forcing as one long block of real ephemeris, and
+the block should be a whole number of diurnal cycles so each replay restarts at
+the same point in the cycle it ended on. The engine warns when it is not.
+
+Only the GPU persistent solver has a replay loop. On a CPU run the engine prints
+a notice and delivers the same integrated length as one block of the full size,
+which costs more memory and traces more illumination but is the same spin-up.
+
+Every run prints all of this before it starts, so the configured number and the
+integrated number can be compared directly:
+
+```
+Equilibration (configured): 20.00 day/night cycles  (thermal.equilibration_orbits)
+Equilibration (integrated): 20.00 day/night cycles = 2 pass(es) x 10.00-cycle forcing block
+```
+
+**What `equilibration_orbits` does not count.** The CPU scalar and CPU SIMD
+paths run a fixed analytic clear-sky pre-conditioner before the real forcing —
+`NYEARSEQ * round(year/day)` diurnal cycles, which is 24 on the Moon, 2 on
+Europa and 4 on Mercury. It uses a flat, unshadowed diurnal insolation with the
+body-average albedo, it is not configurable from any key, and the GPU path has
+no equivalent. The pre-flight banner prints its length on the CPU paths. So on
+the GPU the integrated spin-up is exactly `equilibration_orbits`, and on the CPU
+it is `equilibration_orbits` of real forcing on top of that fixed analytic seed.
+
+**Before 2026-08-11** `equilibration_orbits` was the *block* length and the GPU
+pass count defaulted to 2, so a GPU run integrated twice what its config said
+while a CPU run integrated once. `equilibration_orbits: 25` bought 50 lunations
+on the GPU. The shipped GPU configurations in `configs/` and `examples/` were
+rewritten at the same time as this change to state the integrated number they
+had always been running (10 became 20, and so on) with `equilibration_cycles: 2`
+alongside, so their results are unchanged. A configuration written before that
+date and not rewritten will now integrate half of what it used to on the GPU;
+double its `equilibration_orbits` to restore the old behavior.
+
 ### Equilibration extrapolation (`thermal.eq_extrapolation`)
 
 The GPU equilibration phase replays one forcing block several times
@@ -133,7 +185,8 @@ and produces byte-identical output.
 
 ```yaml
 thermal:
-  equilibration_cycles: 5
+  equilibration_orbits: 50   # integrated diurnal cycles
+  equilibration_cycles: 5    # ...as 5 replays of a 10-cycle block
   eq_extrapolation:
     method: rre        # off | rre          (default off)
     order_p: 4         # 3 or 4; needs equilibration_cycles >= order_p + 1

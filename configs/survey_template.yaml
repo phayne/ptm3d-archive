@@ -49,7 +49,8 @@ illumination:
 thermal:
   enabled: true
   lunations: [7, 13]             # Which lunation indices to simulate (e.g., summer + winter)
-  equilibration_orbits: 1.0      # Thermal equilibration cycles
+  equilibration_orbits: 2.0      # Integrated day/night cycles of spin-up
+  equilibration_cycles: 2        # ...reached as 2 replays of a 1.0-cycle block
   radiation_exchange: true       # Enable radiation exchange (view factors + radiosity)
   max_coupling_iterations: 1     # Radiation-thermal coupling iterations
   use_gpu: true                  # Use GPU for thermal solver (if compiled with OpenCL)

@@ -43,7 +43,8 @@ simulation:
 thermal:
   compute_statistics: true
   enable_shadow_flux: false
-  equilibration_orbits: 10.0
+  equilibration_cycles: 2
+  equilibration_orbits: 20.0
   geothermal_heat_flow: -1.0
   run_thermal_mesh: true
   threads: 0

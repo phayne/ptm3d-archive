@@ -45,6 +45,17 @@ struct SimulationConfig {
     struct ThermalParams {
         bool run_thermal_mesh = false;
         int threads = 0;  // 0 = auto
+        // INTEGRATED number of diurnal cycles of real, ephemeris-driven
+        // spin-up before the output window opens. Identical on the CPU
+        // scalar, CPU SIMD and GPU persistent paths. equilibration_cycles
+        // below changes only HOW the total is reached, never the total.
+        // ⚠️ Before 2026-08-11 this was the BLOCK length and the GPU
+        // integrated 2x it (BUGS.md PTM-146); shipped GPU configs were
+        // rewritten to state the integrated number they always ran.
+        // ⚠️ The CPU paths additionally run a fixed analytic clear-sky
+        // pre-conditioner of NYEARSEQ * round(year/day) cycles (Moon 24,
+        // Europa 2) that this key does not count and the GPU lacks; the
+        // pre-flight banner prints it.
         double equilibration_orbits = 1.0;
         // Separate (coarser) cadence for the equilibration period.
         // Highest-priority explicit override: if > 0, used directly (in steps per Earth-day).
@@ -61,15 +72,21 @@ struct SimulationConfig {
         // Only consulted when equilibration_steps_per_day <= 0.
         double equilibration_samples_per_diurnal_cycle = -1.0;
 
-        // Number of PASSES over the equilibration forcing array (GPU persistent
-        // solver only). Each pass replays the same uploaded flux array with the
-        // temperature state persisting, so the effective equilibration is
-        // equilibration_cycles x equilibration_orbits diurnal cycles at 1x
-        // illumination cost and 1x flux RAM.
-        //   -1 (default) = unset → the solver's legacy value (2 passes).
-        //   >= 1         = explicit pass count.
-        // ⚠️ The legacy value is 2, not 1: the two-phase GPU path has always
-        // run total_cycles = n_equil_cycles + 1 = 2 over the eq window.
+        // Number of REPLAYS of the equilibration forcing block (GPU persistent
+        // solver only). A pure memory/cost dial: the assembled block is
+        // equilibration_orbits / equilibration_cycles diurnal cycles long and
+        // each pass replays the same uploaded flux array with the temperature
+        // state persisting, so the INTEGRATED spin-up is equilibration_orbits
+        // at every pass count while the flux RAM and the illumination trace
+        // shrink by this factor. That is the only affordable route past the RAM
+        // wall: a 25-cycle eq array is ~6.1 GB on the 509k-face lunar mesh.
+        //   -1 (default) = unset → 1 pass (block == equilibration_orbits).
+        //   >= 1         = explicit replay count.
+        // Trade-off, not a free lunch: N replays of a short block are not the
+        // same forcing as one long block of real ephemeris, so prefer a block
+        // that is a whole number of diurnal cycles (the engine warns otherwise).
+        // On CPU runs the pass count is downgraded to 1 with a printed notice —
+        // the integrated length is preserved by assembling the full block.
         int equilibration_cycles = -1;
 
         // Accuracy the spin-up estimator is asked to reach, in kelvin. The

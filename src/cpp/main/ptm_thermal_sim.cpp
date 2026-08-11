@@ -1580,6 +1580,23 @@ public:
     }
 }; 
 
+// thermal::Config::NYEARSEQ as main() sets it. Named because the CPU analytic
+// pre-conditioner length is reported in the pre-flight banner and computed by
+// the SIMD equilibrator, and the two must not drift apart.
+static constexpr int kCpuAnalyticSeedYears = 2;
+
+// Length of the CPU paths' analytic clear-sky pre-conditioner, in diurnal
+// cycles, for a body with a real seasonal year (Moon 24, Europa 2, Mercury 4).
+// SINGLE SOURCE: the SIMD equilibrator sizes its seed with this and the
+// pre-flight banner reports it with this, so the reported length cannot drift
+// away from the integrated one. Generic bodies do NOT use it on the SIMD path
+// (an asteroid's year is ~10^4 rotations); see the "using_generic_body" branch
+// in runThermalModelsForAllFacesBatchSoA.
+static double cpuAnalyticSeedCycles(const thermal::Planet& planet, int nyearseq) {
+    if (!(planet.day > 0.0)) return 0.0;
+    return static_cast<double>(nyearseq) * std::round(planet.year / planet.day);
+}
+
 double getSynodicDayFromPlanet(const thermal::Planet& planet) {
     // The planet object stores the rotational period in seconds in the 'day' field
     double rotation_period_seconds = planet.day;
@@ -3691,9 +3708,8 @@ bool runThermalModelsForAllFacesBatchSoA(
         const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
         equil_duration_s_shared = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
     } else {
-        const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
-                                         std::round(planet.year / planet.day);
-        equil_duration_s_shared = equil_days_needed * planet.day;
+        equil_duration_s_shared =
+            cpuAnalyticSeedCycles(planet, config.NYEARSEQ) * planet.day;
     }
 
     // ---- Equilibration spin-up estimate (FIX 0) ----------------------------
@@ -4064,9 +4080,20 @@ bool runThermalModelsForAllFacesBatchSoA(
     // ~30,000-substep equilibration, not a measurement of what it achieved --
     // the retrospective certificate is a separate, not-yet-implemented piece.
     if (g_spinup_census) {
-        const double n_configured = (planet.day > 0.0)
-                                  ? (equil_duration_s_shared / planet.day) : 0.0;
-        g_spinup_census->report(std::cout, n_configured);
+        // Report the spin-up this run ACTUALLY integrates, which is the analytic
+        // clear-sky seed PLUS the real-ephemeris equilibration prefix. Passing
+        // the seed alone (as this did) printed "Config requests: 24 cycles" for
+        // a config that says equilibration_orbits: 3 — a number that is neither
+        // the configured value nor the integrated one.
+        const double seed_cycles = (planet.day > 0.0)
+                                 ? (equil_duration_s_shared / planet.day) : 0.0;
+        double real_eq_cycles = 0.0;
+        if (planet.day > 0.0 && equilibration_steps > 0 &&
+            equilibration_steps < total_time_steps &&
+            static_cast<size_t>(equilibration_steps) < times.size()) {
+            real_eq_cycles = (times[equilibration_steps] - times[0]) / planet.day;
+        }
+        g_spinup_census->report(std::cout, seed_cycles + real_eq_cycles);
     }
 
     // PTM-51 diagnostic: write the per-face seed terms and the analytic
@@ -4274,52 +4301,81 @@ bool addThermalDataToVTK(
 // cycles. The GPU persistent solver already implements the loop
 // (thermal_opencl.cpp: `const int total_cycles = n_equil_cycles + 1;`): each
 // pass replays the SAME uploaded flux array while buf_T_ persists across
-// passes, so P passes over an N-orbit equilibration window integrate P*N
-// diurnal cycles at 1x illumination cost and 1x flux RAM. That is the only
-// affordable route past the RAM wall — a 25-orbit eq array is ~6.1 GB on the
-// 509k-face lunar mesh, so 100+ orbits in ONE array is hard-blocked.
+// passes, so P passes over a B-cycle forcing block integrate P*B diurnal
+// cycles at 1x illumination cost and 1x flux RAM. That is the only affordable
+// route past the RAM wall — a 25-cycle eq array is ~6.1 GB on the 509k-face
+// lunar mesh, so 100+ cycles in ONE array is hard-blocked.
+//
+// ---- SEMANTICS (changed 2026-08-11; BUGS.md PTM-146) ----------------------
+// `thermal.equilibration_orbits` is the INTEGRATED number of diurnal cycles of
+// real, ephemeris-driven spin-up. `thermal.equilibration_cycles` (passes) is a
+// pure MEMORY/COST dial that says how many replays are used to reach it, so
+// the assembled forcing block is
+//
+//     block_cycles = equilibration_orbits / equilibration_cycles
+//     integrated   = equilibration_cycles * block_cycles = equilibration_orbits
+//
+// and the configured number is the integrated number on every path and at
+// every pass count. Before this change `equilibration_orbits` was the BLOCK
+// length and the integrated total was orbits x passes, with the pass count
+// defaulting to 2 — so `equilibration_orbits: 25` silently integrated 50
+// lunations on the GPU and 25 on the CPU (measured, see below). The default
+// pass count is now 1, which is what makes "configured == integrated" true for
+// a config that does not mention passes at all.
+//
+// MEASURED, `equilibration_orbits: 3.0`, Moon, res-2 icosphere, before/after
+// the change (integrated diurnal cycles of real forcing before the output
+// window opens):
+//     CPU scalar   27.00 -> 27.00   (3.00 configured + 24.00 analytic seed)
+//     CPU SIMD     27.00 -> 27.00   (3.00 configured + 24.00 analytic seed)
+//     GPU 2-phase   6.00 ->  3.00
+//     GPU 1-phase   7.07 ->  3.04
+//
+// ⚠️ WHAT THIS DOES NOT FIX. Both CPU paths ALSO run a fixed analytic
+// clear-sky pre-conditioner before the real forcing — Model::fastEquilibrate
+// (scalar) and its mirror in the SIMD batch path — of
+// `NYEARSEQ * round(planet.year / planet.day)` diurnal cycles: 24 on the Moon,
+// 2 on Europa, 4 on Mercury, with NYEARSEQ hard-wired to 2 in main(). It is
+// not user-configurable, it is not counted by equilibration_orbits, and the
+// GPU path has no equivalent. So "configured == integrated" is exact on the
+// GPU and is "configured == integrated real-forcing spin-up, plus a fixed
+// analytic seed" on the CPU. The banner below prints the seed length rather
+// than letting it stay invisible. Removing or exposing it is a separate change
+// (it would move every CPU baseline) — BUGS.md row proposed.
 //
 // Granularity: we cycle the EQUILIBRATION forcing array as assembled
-// (`prepare_flux(0, equilibration_steps)`), i.e. equilibration_orbits worth of
-// real ephemeris-driven flux. On the shipped lunar year-long config that array
-// is 25 lunations = 738.3 d = 2.02 Earth-years, so the seasonal (declination)
-// content is inside the cycled array and is preserved by construction; cycling
-// a single lunation would discard it. Cycling a *separately assembled* annual
-// array is not done here: it would need a second illumination pass on a second
-// time grid and a second flux buffer, and would not reduce to the current path
-// exactly.
-//
-// ⚠️ THE LEGACY VALUE IS 2, NOT 1. The two-phase branch has always passed
-// n_equil_cycles = 1, i.e. total_cycles = 2: the equilibration window is
-// integrated TWICE (the second pass's per-step output is simply discarded).
-// The banner printed "1 eq cycles" while the kernel logged "2 cycles x 3000
-// timesteps" for the same phase — see the shipped moon3d year-long
-// chunk_000.log lines 144 and 195. `equilibration_orbits: 25` therefore buys
-// 50 integrated lunations on this path. The default below reproduces that
-// bit-for-bit; the banner now states the true pass count and the equivalent
-// diurnal cycles so the 2x cannot stay silent (BUGS.md PTM-145).
-static constexpr int kLegacyEquilibrationPasses = 2;
+// (`prepare_flux(0, equilibration_steps)`). On the shipped lunar year-long
+// config the block is 25 lunations = 738.3 d = 2.02 Earth-years, so the
+// seasonal (declination) content is inside the cycled block and is preserved
+// by construction; cycling a single lunation would discard it. Cycling a
+// *separately assembled* annual array is not done here: it would need a second
+// illumination pass on a second time grid and a second flux buffer, and would
+// not reduce to the current path exactly.
+static constexpr int kDefaultEquilibrationPasses = 1;
+// The pre-2026-08-11 default, kept only so messages can name it: every run
+// before that date integrated TWICE what its config said on the GPU.
+static constexpr int kHistoricalEquilibrationPasses = 2;
 
-// Resolve the requested number of equilibration passes.
-// Precedence: PTM_EQUILIBRATION_CYCLES env > config `equilibration_cycles` >
-// legacy default. Returns 0 on a malformed request — callers MUST treat that
-// as fatal rather than silently continuing with the default (a silent
-// substitution here would misreport the equilibration length of every run).
-static int resolveEquilibrationPasses(const thermal::Config& config,
-                                      bool* explicitly_set = nullptr,
-                                      std::string* source = nullptr) {
-    int passes = kLegacyEquilibrationPasses;
+// Resolve the requested number of equilibration passes from the raw config
+// value (-1 = unset). Precedence: PTM_EQUILIBRATION_CYCLES env > config
+// `equilibration_cycles` > default. Returns 0 on a malformed request —
+// callers MUST treat that as fatal rather than silently continuing with the
+// default (a silent substitution here would misreport the equilibration
+// length of every run).
+static int resolveEquilibrationPassesValue(int cfg,
+                                           bool* explicitly_set = nullptr,
+                                           std::string* source = nullptr) {
+    int passes = kDefaultEquilibrationPasses;
     bool explicit_set = false;
-    std::string src = "legacy default";
+    std::string src = "default";
 
-    const int cfg = config.getPropertyInt("equilibration_cycles", -1);
     if (cfg > 0) {
         passes = cfg;
         explicit_set = true;
         src = "config thermal.equilibration_cycles";
     } else if (cfg != -1) {
         std::cerr << "[Thermal] ERROR: equilibration_cycles must be >= 1 "
-                     "(or -1 for the legacy default); got " << cfg << "\n";
+                     "(or -1 for the default); got " << cfg << "\n";
         if (explicitly_set) *explicitly_set = true;
         if (source) *source = "invalid";
         return 0;
@@ -4354,6 +4410,16 @@ static int resolveEquilibrationPasses(const thermal::Config& config,
     if (explicitly_set) *explicitly_set = explicit_set;
     if (source) *source = src;
     return passes;
+}
+
+// Config-object overload. main() resolves the pass count long before
+// thermal_config exists (it needs it to size the equilibration window), so the
+// raw-value function above is the primitive and this is the thin wrapper.
+static int resolveEquilibrationPasses(const thermal::Config& config,
+                                      bool* explicitly_set = nullptr,
+                                      std::string* source = nullptr) {
+    return resolveEquilibrationPassesValue(
+        config.getPropertyInt("equilibration_cycles", -1), explicitly_set, source);
 }
 
 // ---- Pass-stride RRE extrapolation (thermal.eq_extrapolation) --------------
@@ -5349,7 +5415,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // ---- Equilibration cycling knob ------------------------------------
     // eq_passes = number of passes over the equilibration forcing array.
     // solvePersistentMultipleCycles runs (n_equil_cycles + 1) passes, so the
-    // value handed to it is eq_passes - 1. See kLegacyEquilibrationPasses.
+    // value handed to it is eq_passes - 1. main() has ALREADY divided
+    // thermal.equilibration_orbits by this pass count when it sized the
+    // equilibration window, so eq_passes x (this block) == the configured
+    // number of integrated diurnal cycles. See kDefaultEquilibrationPasses.
     bool   eq_cycles_explicit = false;
     std::string eq_cycles_source;
     const int eq_passes = resolveEquilibrationPasses(config, &eq_cycles_explicit,
@@ -5376,8 +5445,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::cout << " = " << std::setprecision(2) << (eq_seconds / synodic_s)
                       << " equivalent diurnal cycles";
         }
-        std::cout << "  [" << eq_cycles_source << "; legacy = "
-                  << kLegacyEquilibrationPasses << " passes]" << std::endl;
+        std::cout << "  [" << eq_cycles_source << "; default = "
+                  << kDefaultEquilibrationPasses << " pass, pre-2026-08-11 = "
+                  << kHistoricalEquilibrationPasses << "]" << std::endl;
         std::cout.flags(bf);
         std::cout.precision(bp);
     }
@@ -5950,7 +6020,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
         // Passes over the eq forcing array, minus the +1 that
         // solvePersistentMultipleCycles adds internally (total_cycles =
-        // n_equil_cycles + 1). eq_passes defaults to the legacy 2.
+        // n_equil_cycles + 1). eq_passes defaults to 1 (pre-2026-08-11: 2).
         int equil_cycles = eq_passes - 1;
         std::vector<float> output_temps;
 
@@ -6585,7 +6655,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
         // Number of equilibration cycles (each replays the flux sequence).
         // eq_passes = passes over the array; solvePersistentMultipleCycles
-        // runs n_equil_cycles + 1, so hand it eq_passes - 1. Legacy = 2 passes.
+        // runs n_equil_cycles + 1, so hand it eq_passes - 1. Default = 1 pass
+        // (pre-2026-08-11 it was 2, which doubled every GPU run's spin-up).
         int equil_cycles = eq_passes - 1;
         std::vector<float> output_temps;
 
@@ -8837,11 +8908,15 @@ void showUsage(const char* programName) {
     std::cout << "  --illum-gpu-device-ids 0,1,...  Explicit illumination GPU indices\n";
     std::cout << "  --illum-gpu-inter-batch-pause-ms N  Per-device sleep between illumination batches\n";
     std::cout << "  --bvh-cache-file FILE      Disk cache for the BVH (default: <output>/bvh_cache.bvh1)\n";
-    std::cout << "  --equilibration-orbits N   Day/night cycles for equilibration (default: 1)\n";
-    std::cout << "  --equilibration-cycles N   PASSES over the equilibration forcing array\n";
-    std::cout << "                             (GPU persistent solver only; default: 2 = legacy).\n";
-    std::cout << "                             Effective equilibration = N x equilibration-orbits\n";
-    std::cout << "                             diurnal cycles, at 1x illumination cost and 1x RAM.\n";
+    std::cout << "  --equilibration-orbits N   INTEGRATED day/night cycles of spin-up (default: 1).\n";
+    std::cout << "                             This is what the solver integrates, on every path.\n";
+    std::cout << "  --equilibration-cycles N   Replays of the equilibration forcing block used to\n";
+    std::cout << "                             reach it (GPU persistent solver only; default: 1).\n";
+    std::cout << "                             The block is equilibration-orbits / N cycles long,\n";
+    std::cout << "                             so the integrated total is unchanged and only the\n";
+    std::cout << "                             flux RAM and illumination cost fall (by N).\n";
+    std::cout << "                             Before 2026-08-11 the default was 2 and the total\n";
+    std::cout << "                             was N x equilibration-orbits (BUGS.md PTM-146).\n";
     std::cout << "                             Env override: PTM_EQUILIBRATION_CYCLES.\n";
     std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
     std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
@@ -12830,9 +12905,65 @@ int main(int argc, char** argv) {
         equilibration_orbits = 0.0;
     }
 
-    // Calculate equilibration period using the correct synodic day
-    // Note: equilibration_orbits represents number of day/night cycles for equilibration
-    double equilibration_days = std::max(0.0, equilibration_orbits) * synodic_day;
+    // ---- Equilibration length: configured == integrated ---------------------
+    // thermal.equilibration_orbits is the INTEGRATED number of diurnal cycles
+    // of real, ephemeris-driven spin-up. thermal.equilibration_cycles is the
+    // number of replays used to reach it (GPU persistent solver only), so the
+    // assembled forcing block is orbits/passes and passes*block == orbits at
+    // every pass count. See kDefaultEquilibrationPasses for the full note and
+    // the before/after measurements.
+    std::string eq_passes_source;
+    const int   eq_passes_requested = resolveEquilibrationPassesValue(
+        sim_config.thermal.equilibration_cycles, nullptr, &eq_passes_source);
+    if (eq_passes_requested <= 0) {
+        std::cerr << "Error: invalid thermal.equilibration_cycles; aborting rather "
+                     "than silently equilibrating for a different length than the "
+                     "config states.\n";
+        return 1;
+    }
+    const bool eq_gpu_thermal = config.getPropertyBool("use_gpu_thermal", false);
+    // Clamped once, then used for every derived quantity and every message, so
+    // the block length, the notices and the banner cannot disagree about what
+    // the configured length was.
+    const double eq_orbits_configured = std::max(0.0, equilibration_orbits);
+    // Only the GPU persistent solver has a pass loop. The CPU scalar and SIMD
+    // equilibrators integrate their forcing block exactly once, so on those
+    // paths the SAME integrated length is delivered by one block of the full
+    // configured size. That is a larger flux array, not a different spin-up —
+    // warn (it costs RAM and illumination time) but never change the length.
+    int eq_passes_effective = eq_passes_requested;
+    if (!eq_gpu_thermal && eq_passes_requested > 1) {
+        std::cout << "[Equilibration] NOTE: equilibration_cycles="
+                  << eq_passes_requested << " is a GPU-persistent-solver memory "
+                     "optimization (replay a short forcing block). This run uses a "
+                     "CPU solver, which has no pass loop, so the same "
+                  << eq_orbits_configured << " integrated diurnal cycles are "
+                     "delivered as ONE block of that length instead of "
+                  << eq_passes_requested << " replays of "
+                  << (eq_orbits_configured / eq_passes_requested)
+                  << ". The spin-up LENGTH is unchanged; the equilibration flux "
+                     "array is " << eq_passes_requested << "x larger and the "
+                     "forcing is continuous rather than replayed, so results will "
+                     "differ from the GPU run of this config.\n";
+        eq_passes_effective = 1;
+    }
+    const double eq_block_cycles = eq_orbits_configured
+                                 / static_cast<double>(eq_passes_effective);
+    const double eq_block_frac =
+        std::fabs(eq_block_cycles - std::round(eq_block_cycles));
+    if (eq_passes_effective > 1 && eq_block_frac > 1e-9) {
+        std::cerr << "[Equilibration] WARNING: equilibration_orbits="
+                  << eq_orbits_configured << " / equilibration_cycles="
+                  << eq_passes_effective << " gives a forcing block of "
+                  << eq_block_cycles << " diurnal cycles, which is not a whole "
+                     "number. Each replay then restarts at a different point in "
+                     "the diurnal cycle than the one it ended on, which is a "
+                     "discontinuity in the forcing the solver sees. Prefer an "
+                     "equilibration_orbits that is a multiple of "
+                     "equilibration_cycles.\n";
+    }
+    // Calculate equilibration period using the correct synodic day.
+    double equilibration_days = eq_block_cycles * synodic_day;
 
     // The output (export) window is the user-requested duration
     const double output_days = duration_days;
@@ -12868,7 +12999,48 @@ int main(int argc, char** argv) {
     std::cout << "\n========== Thermal Equilibration Configuration ==========" << std::endl;
     std::cout << "Body: " << planet.name << std::endl;
     std::cout << "Synodic day (solar day): " << synodic_day << " Earth days" << std::endl;
-    std::cout << "Equilibration cycles: " << std::fixed << std::setprecision(2) << equilibration_orbits << " day/night cycles" << std::endl;
+    // Equilibration length, stated so the configured number, the integrated
+    // number and the forcing block can be read off one banner on EVERY solver
+    // path. Before 2026-08-11 this printed only equilibration_orbits, which on
+    // the GPU was half of what the run actually integrated (BUGS.md PTM-146).
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Equilibration (configured): " << eq_orbits_configured
+              << " day/night cycles  (thermal.equilibration_orbits)" << std::endl;
+    std::cout << "Equilibration (integrated): "
+              << (eq_block_cycles * eq_passes_effective)
+              << " day/night cycles = " << eq_passes_effective << " pass(es) x "
+              << eq_block_cycles << "-cycle forcing block  ["
+              << eq_passes_source
+              << (eq_passes_effective != eq_passes_requested
+                      ? ", downgraded to 1 pass on this CPU path" : "")
+              << "]" << std::endl;
+    if (!eq_gpu_thermal) {
+        // The CPU scalar and SIMD equilibrators additionally run a fixed
+        // analytic clear-sky pre-conditioner that equilibration_orbits does not
+        // count and the GPU path does not have. Print it rather than let it
+        // stay invisible; it dominates the real prefix on short lunar configs.
+        // The two CPU paths do NOT agree on its length for a generic body: the
+        // SIMD batch path uses the equilibration window (ptm_thermal_sim.cpp,
+        // "using_generic_body" branch) while the scalar Model::run always uses
+        // NYEARSEQ * round(year/day), which for an asteroid is thousands of
+        // rotations. Report whichever this run will take.
+        const bool simd_path = config.getPropertyBool("use_simd_batch", true);
+        const double seed_cycles =
+            (simd_path && using_generic_body)
+                ? eq_block_cycles   // generic + SIMD: the equilibration window
+                : cpuAnalyticSeedCycles(planet, kCpuAnalyticSeedYears);
+        std::cout << "Equilibration (analytic seed, CPU paths only): "
+                  << seed_cycles << " day/night cycles  (not configurable; "
+                     "clear-sky forcing, no topography or shadowing)" << std::endl;
+        if (!simd_path && using_generic_body && seed_cycles > 1000.0) {
+            std::cerr << "[Equilibration] WARNING: the CPU scalar path's analytic "
+                         "seed for this generic body is " << seed_cycles
+                      << " rotations (NYEARSEQ x round(year/day)), which is a "
+                         "body-year of spin-up, not a spin-up length anyone asked "
+                         "for. The SIMD batch path uses the equilibration window "
+                         "instead. Prefer the SIMD path for generic bodies.\n";
+        }
+    }
     std::cout << "Total equilibration period: " << equilibration_days << " Earth days" << std::endl;
     std::cout << "Output window (for export): " << output_days << " Earth days" << std::endl;
     std::cout << "Requested integration (stats): " << requested_integ_days << " days"
@@ -13399,7 +13571,11 @@ int main(int argc, char** argv) {
         thermal_config.b = thermal_b;   // Skin depths to bottom (CLI: --thermal-b)
         thermal_config.F = 0.5;
         thermal_config.NPERDAY = 24;
-        thermal_config.NYEARSEQ = 2;
+        // Length of the CPU analytic clear-sky pre-conditioner, in body years:
+        // NYEARSEQ * round(year/day) diurnal cycles (Moon 24, Europa 2). It is
+        // NOT counted by thermal.equilibration_orbits and the GPU path has no
+        // equivalent; the pre-flight banner prints it for that reason.
+        thermal_config.NYEARSEQ = kCpuAnalyticSeedYears;
         thermal_config.sigma = 5.67e-8;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 
@@ -13710,13 +13886,20 @@ int main(int argc, char** argv) {
         }
 
         // Equilibration cycling (thermal.equilibration_cycles). Only set the
-        // property when the user asked for it → thermal_config is unchanged for
-        // every legacy run, and the solver falls through to
-        // kLegacyEquilibrationPasses.
+        // property when the pass count will actually be used, i.e. on the GPU
+        // persistent solver → thermal_config is unchanged for every run that
+        // does not mention the knob, and the solver falls through to
+        // kDefaultEquilibrationPasses.
+        //
+        // On a CPU run main() has already downgraded the pass count to 1 and
+        // said so out loud when it sized the equilibration window (the block is
+        // then the full configured length, so the INTEGRATED spin-up is the
+        // same). Setting the property here as well would leave a value in
+        // thermal_config that nothing honors.
         //
         // ConfigParser::validate() is NOT called on this executable's path, so
         // the range check has to live here: a `> 0` guard alone would DROP an
-        // out-of-range request (0, -5) without a word and run the legacy length
+        // out-of-range request (0, -5) without a word and run the default length
         // while the config claimed otherwise.
         if (sim_config.thermal.equilibration_cycles != -1) {
             if (sim_config.thermal.equilibration_cycles < 1) {
@@ -13727,8 +13910,10 @@ int main(int argc, char** argv) {
                              "a different length than the config states.\n";
                 return 1;
             }
-            thermal_config.setProperty("equilibration_cycles",
-                                       sim_config.thermal.equilibration_cycles);
+            if (config.getPropertyBool("use_gpu_thermal", false)) {
+                thermal_config.setProperty("equilibration_cycles",
+                                           sim_config.thermal.equilibration_cycles);
+            }
         }
         // Pass-stride RRE extrapolation. Same "only when armed" rule as the
         // pass knob above: with method == "off" no property is set at all, so
@@ -13769,29 +13954,14 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        {
-            // The knob drives solvePersistentMultipleCycles' cycling loop, which
-            // exists ONLY in the GPU persistent solver. The CPU/SIMD
-            // equilibrators run their own fixed step schedules and would ignore
-            // it without a word. Refuse instead of pretending.
-            bool eq_cycles_explicit = false;
-            const int eq_passes_req = resolveEquilibrationPasses(thermal_config,
-                                                                 &eq_cycles_explicit);
-            if (eq_passes_req <= 0) {
-                std::cerr << "Error: invalid equilibration_cycles request; aborting.\n";
-                return 1;
-            }
-            if (eq_cycles_explicit &&
-                !config.getPropertyBool("use_gpu_thermal", false)) {
-                std::cerr << "Error: equilibration_cycles=" << eq_passes_req
-                          << " is implemented only for the GPU persistent thermal "
-                             "solver (thermal.use_gpu: true / --use-gpu-thermal). "
-                             "The CPU and SIMD equilibrators would ignore it "
-                             "silently. Aborting rather than misreporting the "
-                             "equilibration length.\n";
-                return 1;
-            }
-        }
+        // NOTE: equilibration_cycles needs no check here. main() resolved and
+        // validated it far above (where it sized the equilibration window) and
+        // aborted on a malformed value, and on a CPU run it already downgraded
+        // the pass count to 1 and said so — under the old semantics that was a
+        // hard refusal, which was right when equilibration_orbits was the BLOCK
+        // length, but the knob can no longer change the integrated length.
+        // Re-resolving here would also re-print the PTM_EQUILIBRATION_CYCLES
+        // override notice a second time.
 
         // The equilibration forcing dump reduces the GPU persistent solver's own
         // prepare_flux output. The CPU/SIMD equilibrators build their forcing
