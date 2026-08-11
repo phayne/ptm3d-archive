@@ -469,6 +469,69 @@ illumination pass.
   every face the re-run touched, so a resumed chunk does not cold-start the faces where indirect
   radiation sets the temperature.
 
+### 7.7 Indirect flux during equilibration
+
+The coupling loop of §7.1 supplies indirect flux over the **output window**. The equilibration
+phase that precedes it runs before any radiosity solution exists, so by construction its surface
+forcing omits the indirect term. On a face whose only heat source is infrared from neighboring
+faces, that means the deep column equilibrates against the geothermal flux alone, reaches
+$T_{\text{geo}} = (Q_b/\varepsilon\sigma)^{1/4}$, and then warms through the output window. Every
+statistic taken over that window is biased cold.
+
+PTM3D therefore estimates the equilibration-phase indirect flux and applies it, by default.
+
+**How it is estimated.** With `thermal.eq_indirect_source: auto` (the default), the run performs
+one radiosity sweep over the window using the temperatures of the first thermal solve, reduces it
+to the per-face output-window time mean
+
+$$\langle q_{\text{ind}}\rangle_i = \frac{1}{N_{\text{out}}} \sum_{t \in \text{window}} Q_{\text{indirect},i}(t),$$
+
+repeats the whole-mesh thermal solve with $\langle q_{\text{ind}}\rangle_i$ added to the absorbed
+flux at every equilibration step, and then restarts the coupling loop. The output window is
+untouched — it already carries the time-varying indirect from the coupling — so there is no double
+counting. Equilibration sets the deep column, whose response time is many diurnal cycles, so the
+cycle-mean forcing is the quantity that determines it; dropping the diurnal modulation of the
+indirect term is correct at leading order.
+
+**Cost.** One extra radiosity sweep and one extra whole-mesh thermal solve, once per run.
+Measured on the 12,800-face `lunar_crater_80N` mesh and the 20,000-face `lunar_crater_85N` mesh:
+12–25% of total wall clock, depending on how much of the run the initial solve represents.
+
+**One pass under-corrects.** The estimate comes from a field that was itself equilibrated without
+indirect flux, so its emitters are too cold and $\langle q_{\text{ind}}\rangle$ is a lower bound.
+Measured on a permanently shadowed lunar crater floor, one pass recovers 95% of the change between
+`off` and the iterated fixed point. The run reports the mean, median and maximum of
+$\langle q_{\text{ind}}\rangle$ so the size of the correction is on the record.
+
+**When it applies.** The pass runs when radiation coupling is active and the window has an
+equilibration phase to correct. It is skipped, with a message naming the reason, when
+`thermal.initial_state_file` is set (a warm-started chunk has no equilibration phase; it inherits
+the column the first chunk equilibrated) or when `equilibration_orbits` leaves no equilibration
+steps. On a mesh with no meaningful inter-face view the pass still runs, measures
+$\langle q_{\text{ind}}\rangle = 0$, reports it, and leaves the run identical to `off` — a measured
+no-op rather than a special case.
+
+**Sources and precedence.**
+
+| Setting | Effect |
+|---|---|
+| `thermal.eq_indirect_source: auto` | Default. Internal pass, as above. |
+| `thermal.eq_indirect_source: off` | Legacy. Equilibration carries no indirect term. Reproduces pre-2026-08 results bit-for-bit. Also selectable through `PTM_EQ_INDIRECT_SOURCE`. |
+| `thermal.eq_indirect_flux_file` | Explicit override, and it always wins. Reads a per-face `'QIND'` file (magic `0x51494E44`, `uint32` face count, then one `float64` per face) written by a prior run's `thermal.indirect_mean_out_file`. Use it to iterate the estimate, or to pin a run to a specific forcing. |
+
+`thermal.indirect_mean_out_file` writes the same quantity the internal pass computes, but from the
+**converged** coupling loop rather than its first sweep. Feeding that file back through
+`eq_indirect_flux_file` is therefore a strictly better estimate; measured on the crater case it
+raised the equilibrated deep column a further 3.4 K (105.19 K to 105.64 K in the window mean).
+
+The two-phase and single-phase solver paths differ in how much this matters. When the
+equilibration cadence equals the output cadence, the coupling loop's selective re-run re-integrates
+the whole span including the equilibration steps, so it largely repairs the omission on its own and
+the correction is small (0.1 K in the deep column on the crater case). When the cadences differ —
+the usual production setup, and the one long campaigns use — the re-run covers the output window
+only, the equilibration phase is never revisited, and the correction is large: 54 K to 126 K in the
+deep column, +10.2 K in the window-mean surface temperature of a permanently shadowed crater floor.
+
 ## 8. Anisotropic beamed emission
 
 By default every face emits as a Lambertian surface. Setting `rms_slope_deg` above 0 enables the

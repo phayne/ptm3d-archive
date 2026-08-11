@@ -689,7 +689,11 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     const std::vector<double>&, int, const thermal::Config&, double, double,
     std::vector<std::vector<double>>*, int, int, int,
     const thermal::Planet* = nullptr,
-    const std::vector<double>* face_Qb = nullptr);  // Per-face heat flow override
+    const std::vector<double>* face_Qb = nullptr,   // Per-face heat flow override
+    // Per-GLOBAL-face time-mean indirect flux added to the equilibration-phase
+    // absorbed flux only (absolute steps [0, equilibration_steps)). Empty =
+    // legacy. Same contract as the GPU and SIMD-batch solvers.
+    const std::vector<double>& eq_indirect_flux = {});
 
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
@@ -708,7 +712,13 @@ bool runThermalModelsForAllFacesBatchSoA(
     int total_time_steps,
     int thermal_threads,
     const std::vector<double>* face_Qb = nullptr,
-    const std::vector<double>* face_H_overrides = nullptr);
+    const std::vector<double>* face_H_overrides = nullptr,
+    // Per-GLOBAL-face time-mean indirect flux <q_ind>[f] (W/m^2) ADDED to the
+    // EQUILIBRATION-phase absorbed flux only, i.e. to absolute steps
+    // [0, equilibration_steps). Empty (default) = legacy: equilibration sees
+    // no indirect term. Same contract as the GPU persistent solver's
+    // eq_indirect_flux argument.
+    const std::vector<double>& eq_indirect_flux = {});
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -3198,7 +3208,8 @@ bool runThermalModelsForAllFaces(
     int total_time_steps,
     int thermal_threads,
     const thermal::Planet* planet,
-    const std::vector<double>* face_Qb) {
+    const std::vector<double>* face_Qb,
+    const std::vector<double>& eq_indirect_flux) {
     
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -3247,6 +3258,30 @@ bool runThermalModelsForAllFaces(
         solar_constant);
     
     size_t n_faces = mesh->faces.size();
+
+    // Deep radiation-coupling: per-face time-mean indirect flux on the
+    // EQUILIBRATION-phase forcing only (absolute steps [0, equilibration_steps)).
+    // Empty vector = legacy, not one element touched.
+    if (!eq_indirect_flux.empty() && equilibration_steps > 0) {
+        if (eq_indirect_flux.size() != n_faces) {
+            std::cerr << "[Thermal] FATAL: eq_indirect_flux has "
+                      << eq_indirect_flux.size() << " entries for " << n_faces
+                      << " faces; refusing to equilibrate against a mismatched"
+                         " forcing.\n";
+            return false;
+        }
+        const int eq_hi = std::min(equilibration_steps, total_time_steps);
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < n_faces; ++f) {
+            const size_t base = f * static_cast<size_t>(total_time_steps);
+            for (int t = 0; t < eq_hi; ++t) {
+                if (base + t < absorbed_flux.size())
+                    absorbed_flux[base + t] += eq_indirect_flux[f];
+            }
+        }
+        std::cerr << "[Thermal] Equilibration forcing carries the per-face mean"
+                     " indirect flux over steps [0, " << eq_hi << ").\n";
+    }
     
     // Print initial message
     std::cerr << "\nRunning thermal models for " << n_faces << " mesh faces..." << std::endl;
@@ -3496,7 +3531,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     int total_time_steps,
     int thermal_threads,
     const std::vector<double>* face_Qb,
-    const std::vector<double>* face_H_overrides)
+    const std::vector<double>* face_H_overrides,
+    const std::vector<double>& eq_indirect_flux)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
@@ -3580,6 +3616,32 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
     }
     std::vector<double>().swap(absorbed_flux_rowmajor);
+
+    // Deep radiation-coupling: add the per-face time-mean indirect flux to the
+    // EQUILIBRATION-phase forcing only, i.e. absolute steps
+    // [0, equilibration_steps). Those steps are the real-ephemeris spin-up
+    // prefix this solver integrates before the output window (the analytic
+    // clear-sky pre-equilibration above is a separate, flux-independent seed
+    // and is deliberately left alone). The output window gets the time-varying
+    // indirect from the coupling loop, so this cannot double-count.
+    // Empty vector = legacy: not a single element is touched.
+    if (!eq_indirect_flux.empty() && equilibration_steps > 0) {
+        if (eq_indirect_flux.size() != n_faces) {
+            std::cerr << "[SIMD Batch] FATAL: eq_indirect_flux has "
+                      << eq_indirect_flux.size() << " entries for " << n_faces
+                      << " faces; refusing to equilibrate against a mismatched"
+                         " forcing.\n";
+            return false;
+        }
+        const int eq_hi = std::min(equilibration_steps, total_time_steps);
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < eq_hi; ++t) {
+            double* col = &flux_column_major[static_cast<size_t>(t) * n_faces];
+            for (size_t f = 0; f < n_faces; ++f) col[f] += eq_indirect_flux[f];
+        }
+        std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
+                     " indirect flux over steps [0, " << eq_hi << ").\n";
+    }
 
     // Initialize output
     if (surface_temps_out) {
@@ -6012,14 +6074,23 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
-                    // Deep radiation-coupling (pass 2): add the per-face time-mean
-                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
-                    // call is uniquely prepare_flux(0, equilibration_steps); the
-                    // output window already gets the time-varying indirect via the
-                    // coupling, so this avoids double-counting there.
-                    if (t_start == 0 && n_steps == equilibration_steps
-                            && equilibration_steps < total_time_steps
-                            && !eq_indirect_flux.empty()
+                    // Deep radiation-coupling: add the per-face time-mean indirect
+                    // flux to the EQUILIBRATION-phase forcing only. The output
+                    // window already gets the time-varying indirect via the
+                    // coupling loop, so this cannot double-count there.
+                    //
+                    // The test is on the ABSOLUTE step index, not on the shape of
+                    // the call. It used to read `t_start == 0 && n_steps ==
+                    // equilibration_steps`, which identifies the eq call only in
+                    // TWO-PHASE mode; the single-phase branch prepares one array
+                    // with prepare_flux(0, total_time_steps) and therefore dropped
+                    // the term entirely -- silently, after printing the "Loaded
+                    // eq-indirect flux" banner. Absolute-step selection covers both
+                    // and is byte-identical on the two-phase path (its eq call has
+                    // t_start = 0 and every step < equilibration_steps; its output
+                    // call has t_start = equilibration_steps and no step qualifies).
+                    if (!eq_indirect_flux.empty()
+                            && (t_start + t) < equilibration_steps
                             && global_f < eq_indirect_flux.size()) {
                         absorbed += eq_indirect_flux[global_f];
                     }
@@ -6647,14 +6718,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                         : base_A;
 
                     double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
-                    // Deep radiation-coupling (pass 2): add the per-face time-mean
-                    // indirect flux to the EQUILIBRATION-phase forcing only. The eq
-                    // call is uniquely prepare_flux(0, equilibration_steps); the
-                    // output window already gets the time-varying indirect via the
-                    // coupling, so this avoids double-counting there.
-                    if (t_start == 0 && n_steps == equilibration_steps
-                            && equilibration_steps < total_time_steps
-                            && !eq_indirect_flux.empty()
+                    // Deep radiation-coupling: equilibration-phase indirect flux,
+                    // selected on the ABSOLUTE step index. See the sibling
+                    // prepare_flux above for why the test is not on the shape of
+                    // the call.
+                    if (!eq_indirect_flux.empty()
+                            && (t_start + t) < equilibration_steps
                             && global_f < eq_indirect_flux.size()) {
                         absorbed += eq_indirect_flux[global_f];
                     }
@@ -10831,6 +10900,42 @@ static int runGpuCalibration(int argc, char** argv) {
 }
 #endif  // PTM_GPU_OPENCL
 
+// ---------------------------------------------------------------------------
+// Equilibration-phase indirect flux: the run record.
+// ---------------------------------------------------------------------------
+// A default that changes the deep column of every radiation-coupled run has to
+// say in the log whether it fired, where the numbers came from, and how big
+// they were. These travel together, so they are one object rather than six
+// loose locals that can drift apart. `provenance == "none"` with an empty
+// `reason` is the state before anything has decided, and is never printed.
+struct EqIndirectRecord {
+    std::string provenance = "none";  // "internal pass" | "file: <path>" | "none"
+    std::string reason;               // why nothing was applied, when nothing was
+    double mean_Wm2   = 0.0;
+    double median_Wm2 = 0.0;
+    double max_Wm2    = 0.0;
+    size_t n_nonzero  = 0;
+
+    // Census of a per-face <q_ind> vector. Median as well as mean because the
+    // distribution is strongly skewed -- a handful of crater floors carry most
+    // of the flux, so the mean alone reads as "negligible" for a correction
+    // that is tens of kelvin on the faces that matter.
+    void census(const std::vector<double>& q) {
+        std::vector<double> sorted = q;
+        std::sort(sorted.begin(), sorted.end());
+        median_Wm2 = sorted.empty() ? 0.0 : sorted[sorted.size() / 2];
+        double sum = 0.0;
+        max_Wm2 = 0.0;
+        n_nonzero = 0;
+        for (double v : q) {
+            sum += v;
+            max_Wm2 = std::max(max_Wm2, v);
+            if (v > 0.0) ++n_nonzero;
+        }
+        mean_Wm2 = sum / std::max<size_t>(1, q.size());
+    }
+};
+
 int main(int argc, char** argv) {
     // Line-buffer stdout so progress prints reach disk before a kernel hang
     // can swallow them. The macOS+AMD OpenCL driver has wedged the box hard
@@ -13484,10 +13589,46 @@ int main(int argc, char** argv) {
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
-    // Deep radiation-coupling (pass 2): per-global-face time-mean indirect flux
-    // loaded from a previous pass-1 run (thermal.eq_indirect_flux_file). Added to
-    // the EQUILIBRATION-phase forcing so the deep column equilibrates consistent
-    // with the wall-heating it receives during the output window. Empty = legacy.
+    // ======================================================================
+    // Equilibration-phase indirect flux (docs/radiation-exchange.md 7.7)
+    // ======================================================================
+    // Per-global-face time-mean indirect flux <q_ind>[f] added to the
+    // EQUILIBRATION-phase forcing, so the deep column equilibrates consistent
+    // with the inter-face infrared it actually receives during the output
+    // window. Without it, a face whose entire forcing is neighbor infrared
+    // equilibrates to the bare geothermal floor and then warms through the
+    // output window, biasing the window mean cold.
+    //
+    // Two sources, in precedence order:
+    //   1. thermal.eq_indirect_flux_file -- an explicit 'QIND' file from a
+    //      prior pass-1 run. Always wins when set.
+    //   2. thermal.eq_indirect_source: auto (default) -- the engine estimates
+    //      it internally inside the radiation-coupling block below.
+    // "off" restores the pre-2026-08 behavior on both.
+    std::string eq_indirect_source = sim_config.thermal.eq_indirect_source;
+    if (const char* e = std::getenv("PTM_EQ_INDIRECT_SOURCE")) {
+        if (*e != '\0' && eq_indirect_source != std::string(e)) {
+            std::cout << "[Deep coupling] PTM_EQ_INDIRECT_SOURCE=" << e
+                      << " overrides thermal.eq_indirect_source: "
+                      << eq_indirect_source << std::endl;
+            eq_indirect_source = e;
+        }
+    }
+    if (eq_indirect_source != "auto" && eq_indirect_source != "off") {
+        std::cerr << "FATAL: unknown thermal.eq_indirect_source '"
+                  << eq_indirect_source << "'. Valid: auto | off.\n";
+        return 1;
+    }
+    // Provenance for the end-of-run banner. Never left as a guess: whichever
+    // branch supplies the vector rewrites it, and a branch that declines says
+    // why. Reported even when nothing was applied.
+    EqIndirectRecord eq_indirect_record;
+    if (!sim_config.thermal.eq_indirect_flux_file.empty()
+            && eq_indirect_source == "off") {
+        std::cout << "[Deep coupling] thermal.eq_indirect_flux_file is set AND "
+                     "eq_indirect_source: off. The explicit file WINS; the "
+                     "equilibration will carry its indirect flux." << std::endl;
+    }
     std::vector<double> eq_indirect_vec;
     if (!sim_config.thermal.eq_indirect_flux_file.empty()) {
         const std::string& path = sim_config.thermal.eq_indirect_flux_file;
@@ -13517,6 +13658,8 @@ int main(int argc, char** argv) {
                           << " faces from " << path << " (mean "
                           << (s / std::max<uint32_t>(1, nf)) << ", max " << mx
                           << " W/m^2) — added to equilibration forcing." << std::endl;
+                eq_indirect_record.census(eq_indirect_vec);
+                eq_indirect_record.provenance = "file: " + path;
             }
         }
     }
@@ -14073,6 +14216,77 @@ int main(int argc, char** argv) {
         }
         const std::vector<double>* face_Qb_ptr = face_Qb.empty() ? nullptr : &face_Qb;
 
+        // ------------------------------------------------------------------
+        // Whole-mesh initial thermal solve, callable a second time.
+        // ------------------------------------------------------------------
+        // The internal equilibration-indirect pass (in the radiation block
+        // below) needs to repeat exactly this solve with an extra per-face
+        // constant on the equilibration forcing. It reads the OUTER-scope
+        // illumination arrays rather than the `_full` aliases, because both
+        // extraction branches below leave the outer arrays populated by the
+        // time the radiation block runs, while `_full` is left empty by the
+        // swap-back on the non-chunked branch.
+        //
+        // `eqi` empty reproduces the legacy call exactly on every solver.
+        auto solveWholeMeshThermal =
+            [&](const std::vector<double>& eqi,
+                const std::vector<double>& ds,
+                const std::vector<double>& pr,
+                const std::vector<double>& pi) -> bool {
+            const bool use_simd_batch_l  = thermal_config.getPropertyBool("use_simd_batch", true);
+            const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
+            ice::IceStabilityAccumulator* ice_acc_l =
+                sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
+            if (use_gpu_thermal_l) {
+                const std::vector<double>* face_H_ptr_l =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                // A loaded thermal-state checkpoint is already equilibrated by
+                // the previous chunk, so there is no equilibration phase to
+                // correct (and eqi is a measured no-op: no step qualifies).
+                int eq_steps_eff = equilibration_steps;
+                if (!sim_config.thermal.initial_state_file.empty()) {
+                    if (eq_steps_eff > 0) {
+                        std::cout << "[GPU Thermal] thermal.initial_state_file is set; "
+                                     "forcing equilibration_steps=0 (was "
+                                  << eq_steps_eff << ")" << std::endl;
+                    }
+                    eq_steps_eff = 0;
+                }
+                const bool ok = runThermalModelsForAllFaces_GPU_Persistent(
+                    mesh, ds, pr, pi, times, total_time_steps, eq_steps_eff,
+                    thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                    face_Qb_ptr, face_H_ptr_l, ice_acc_l,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file,
+                    enable_radiation_exchange ? &rad_post_eq_T : nullptr,
+                    sim_config.thermal.gpu_devices,
+                    sim_config.thermal.gpu_device_ids,
+                    sim_config.thermal.gpu_batch_size,
+                    sim_config.thermal.gpu_inter_batch_pause_ms,
+                    eqi);
+                // This solver — and only this solver — fills the post-eq T(z)
+                // hand-off (argument above). Record it for the PTM-78 tripwire.
+                rad_post_eq_T_expected = enable_radiation_exchange;
+                return ok;
+            }
+            if (use_simd_batch_l) {
+                const std::vector<double>* face_H_ptr_l =
+                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                return runThermalModelsForAllFacesBatchSoA(
+                    output_dir, mesh, ds, pr, pi, times, total_time_steps,
+                    thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                    equilibration_steps, total_time_steps, thermal_threads,
+                    face_Qb_ptr, face_H_ptr_l, eqi);
+            }
+            std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads
+                      << " threads" << std::endl;
+            return runThermalModelsForAllFaces(
+                output_dir, mesh, ds, pr, pi, times, total_time_steps,
+                thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                equilibration_steps, total_time_steps, thermal_threads,
+                &planet, face_Qb_ptr, eqi);
+        };
+
         // Reuse illumination arrays from the outer-scope extraction if already
         // populated. This avoids a second ~180 GB allocation that would OOM.
         std::vector<double> direct_solar_values_full;
@@ -14250,99 +14464,11 @@ int main(int argc, char** argv) {
             }
             std::cout << std::endl;
 
-            // Check which thermal solver to use
-            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
-            bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
-
-            // Schorghofer & Taylor (2007) accumulator pointer. Null when the
-            // user has not requested ice-stability output → zero overhead path.
-            ice::IceStabilityAccumulator* ice_acc_ptr_a =
-                sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
-
-            if (use_gpu_thermal) {
-                const std::vector<double>* face_H_ptr_g =
-                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-                // When loading a thermal-state checkpoint, skip equilibration
-                // entirely — the loaded T(z) is already equilibrated by the
-                // previous chunk.
-                int eq_steps_eff = equilibration_steps;
-                if (!sim_config.thermal.initial_state_file.empty()) {
-                    if (eq_steps_eff > 0) {
-                        std::cout << "[GPU Thermal] thermal.initial_state_file is set; "
-                                     "forcing equilibration_steps=0 (was "
-                                  << eq_steps_eff << ")" << std::endl;
-                    }
-                    eq_steps_eff = 0;
-                }
-                thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    eq_steps_eff,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    face_Qb_ptr,
-                    face_H_ptr_g,
-                    ice_acc_ptr_a,
-                    sim_config.thermal.initial_state_file,
-                    sim_config.thermal.final_state_file,
-                    enable_radiation_exchange ? &rad_post_eq_T : nullptr,
-                    sim_config.thermal.gpu_devices,
-                    sim_config.thermal.gpu_device_ids,
-                    sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms,
-                    eq_indirect_vec
-                );
-                // This solver — and only this solver — fills the post-eq T(z)
-                // hand-off (argument above). Record it for the PTM-78 tripwire.
-                rad_post_eq_T_expected = enable_radiation_exchange;
-            } else if (use_simd_batch) {
-                const std::vector<double>* face_H_ptr_b =
-                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-                thermal_success = runThermalModelsForAllFacesBatchSoA(
-                    output_dir,
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    equilibration_steps,
-                    total_time_steps,
-                    thermal_threads,
-                    face_Qb_ptr,
-                    face_H_ptr_b
-                );
-            } else {
-                std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
-                thermal_success = runThermalModelsForAllFaces(
-                    output_dir,
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    equilibration_steps,
-                    total_time_steps,
-                    thermal_threads,
-                    &planet,  // Pass planet for incidence-dependent albedo
-                    face_Qb_ptr
-                );
-            }
+            thermal_success = solveWholeMeshThermal(
+                eq_indirect_vec,
+                direct_solar_values_full,
+                primary_reflected_values_full,
+                primary_ir_values_full);
 
             // Validate the returned temperature matrix shape (faces x total_time_steps)
             if (thermal_success) {
@@ -14368,96 +14494,11 @@ int main(int argc, char** argv) {
             primary_reflected_values_full.swap(primary_reflected_values);
             primary_ir_values_full.swap(primary_ir_values);
 
-            // Check which thermal solver to use
-            bool use_simd_batch = thermal_config.getPropertyBool("use_simd_batch", true);
-            bool use_gpu_thermal = thermal_config.getPropertyBool("use_gpu_thermal", false);
-
-            // Schorghofer & Taylor (2007) accumulator pointer. Null when the
-            // user has not requested ice-stability output → zero overhead path.
-            ice::IceStabilityAccumulator* ice_acc_ptr_b =
-                sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
-
-            if (use_gpu_thermal) {
-                const std::vector<double>* face_H_ptr_g =
-                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-                int eq_steps_eff = equilibration_steps;
-                if (!sim_config.thermal.initial_state_file.empty()) {
-                    if (eq_steps_eff > 0) {
-                        std::cout << "[GPU Thermal] thermal.initial_state_file is set; "
-                                     "forcing equilibration_steps=0 (was "
-                                  << eq_steps_eff << ")" << std::endl;
-                    }
-                    eq_steps_eff = 0;
-                }
-                thermal_success = runThermalModelsForAllFaces_GPU_Persistent(
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    eq_steps_eff,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    face_Qb_ptr,
-                    face_H_ptr_g,
-                    ice_acc_ptr_b,
-                    sim_config.thermal.initial_state_file,
-                    sim_config.thermal.final_state_file,
-                    enable_radiation_exchange ? &rad_post_eq_T : nullptr,
-                    sim_config.thermal.gpu_devices,
-                    sim_config.thermal.gpu_device_ids,
-                    sim_config.thermal.gpu_batch_size,
-                    sim_config.thermal.gpu_inter_batch_pause_ms,
-                    eq_indirect_vec
-                );
-                // This solver — and only this solver — fills the post-eq T(z)
-                // hand-off (argument above). Record it for the PTM-78 tripwire.
-                rad_post_eq_T_expected = enable_radiation_exchange;
-            } else if (use_simd_batch) {
-                const std::vector<double>* face_H_ptr_b =
-                    planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-                thermal_success = runThermalModelsForAllFacesBatchSoA(
-                    output_dir,
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    equilibration_steps,
-                    total_time_steps,
-                    thermal_threads,
-                    face_Qb_ptr,
-                    face_H_ptr_b
-                );
-            } else {
-                std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads << " threads" << std::endl;
-                thermal_success = runThermalModelsForAllFaces(
-                    output_dir,
-                    mesh,
-                    direct_solar_values_full,
-                    primary_reflected_values_full,
-                    primary_ir_values_full,
-                    times,
-                    total_time_steps,
-                    thermal_config,
-                    default_visible_albedo,
-                    0.02,
-                    &surface_temps,
-                    equilibration_steps,
-                    total_time_steps,
-                    thermal_threads,
-                    &planet,  // Pass planet for incidence-dependent albedo
-                    face_Qb_ptr
-                );
-            }
+            thermal_success = solveWholeMeshThermal(
+                eq_indirect_vec,
+                direct_solar_values_full,
+                primary_reflected_values_full,
+                primary_ir_values_full);
 
             // Validate the returned temperature matrix shape (faces x total_time_steps)
             if (thermal_success) {
@@ -14944,6 +14985,59 @@ int main(int argc, char** argv) {
                 // is no prior, so the selector falls back to absolute flux.
                 std::vector<double> prev_max_indirect(num_faces, 0.0);
 
+                // ---- Internal equilibration-indirect pass: arming -----------
+                // The predicate is deliberately NOT keyed on the coupling mode,
+                // the band count, or how many non-zeros the view-factor operator
+                // holds. Reaching this point already means radiation.enabled is
+                // true, an operator loaded, and rad_manager.prepare() found faces
+                // that exchange. What remains is only: is there an equilibration
+                // phase whose forcing omits a term the output window will carry?
+                //
+                // A mesh with no meaningful inter-face view therefore needs no
+                // special case: the pass runs, measures <q_ind> = 0, says so, and
+                // skips the re-solve. That is a MEASURED no-op, which is worth
+                // more than a coded one.
+                const bool eq_indirect_warm_start =
+                    !sim_config.thermal.initial_state_file.empty();
+                const bool eq_indirect_two_phase_window =
+                    equilibration_steps > 0 && equilibration_steps < total_time_steps;
+                const bool eq_indirect_internal_armed =
+                    (eq_indirect_source == "auto")
+                    && sim_config.thermal.eq_indirect_flux_file.empty()
+                    && eq_indirect_two_phase_window
+                    && !eq_indirect_warm_start;
+                bool eq_indirect_internal_done = false;
+
+                if (eq_indirect_internal_armed) {
+                    std::cout << "  Equilibration indirect flux: INTERNAL PASS (thermal."
+                                 "eq_indirect_source: auto). One extra radiosity sweep"
+                                 " and one extra whole-mesh thermal solve." << std::endl;
+                } else if (!sim_config.thermal.eq_indirect_flux_file.empty()) {
+                    std::cout << "  Equilibration indirect flux: FILE (thermal."
+                                 "eq_indirect_flux_file overrides the internal pass)."
+                              << std::endl;
+                } else if (eq_indirect_source != "auto") {
+                    std::cout << "  Equilibration indirect flux: OFF (thermal."
+                                 "eq_indirect_source: " << eq_indirect_source
+                              << "). The deep column equilibrates without the"
+                                 " inter-face infrared it receives in the output"
+                                 " window." << std::endl;
+                    eq_indirect_record.reason = "eq_indirect_source: " + eq_indirect_source;
+                } else if (eq_indirect_warm_start) {
+                    std::cout << "  Equilibration indirect flux: not applicable —"
+                                 " thermal.initial_state_file is set, so this window has"
+                                 " no equilibration phase. The column it resumes carries"
+                                 " whatever the first chunk equilibrated." << std::endl;
+                    eq_indirect_record.reason = "warm start (no equilibration phase)";
+                } else {
+                    std::cout << "  Equilibration indirect flux: not applicable —"
+                                 " equilibration_steps=" << equilibration_steps
+                              << " of " << total_time_steps
+                              << " leaves no separate equilibration phase to correct."
+                              << std::endl;
+                    eq_indirect_record.reason = "no equilibration phase";
+                }
+
                 // Whether the physics-mode selector is active for this run.
                 const bool rad_coupling_physics_mode =
                     (rad_coupling_select_mode == "physics");
@@ -15381,6 +15475,113 @@ int main(int argc, char** argv) {
                     double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
+
+                    // ==========================================================
+                    // Internal equilibration-indirect pass (thermal.eq_indirect_source: auto)
+                    // ==========================================================
+                    // The sweep just above is pass 1: it produced Q_indirect(i,t)
+                    // from temperatures whose deep column was equilibrated with
+                    // NO indirect term at all. Reduce it to the output-window
+                    // time mean <q_ind>[i] -- the same estimator that
+                    // thermal.indirect_mean_out_file writes -- and repeat the
+                    // whole-mesh thermal solve with <q_ind> on the equilibration
+                    // forcing. Then restart the coupling loop, which now runs
+                    // against a column that was equilibrated against the heat it
+                    // actually receives.
+                    //
+                    // Cost: exactly one extra radiosity sweep (this one) plus one
+                    // extra whole-mesh thermal solve. It fires ONCE per run.
+                    //
+                    // Why the time mean and not the time series: equilibration is
+                    // a DC problem -- it sets the deep column, whose response time
+                    // is many diurnal cycles -- so the cycle-mean forcing is the
+                    // quantity that determines it. Dropping the diurnal modulation
+                    // of the indirect term is correct at leading order and is what
+                    // the manual two-pass file workflow has always done.
+                    //
+                    // One pass UNDER-corrects: pass 1's own emitters are colder
+                    // than the converged state, so <q_ind> is a lower bound. The
+                    // natural place to iterate is right here -- loop this block
+                    // until <q_ind> stops moving -- but no iteration is built
+                    // until the single-pass recovery has been measured.
+                    if (eq_indirect_internal_armed && !eq_indirect_internal_done) {
+                        eq_indirect_internal_done = true;
+
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = total_time_steps;
+                        const int out_n  = std::max(1, out_hi - out_lo);
+                        std::vector<double> q_ind_mean(num_faces, 0.0);
+                        #pragma omp parallel for schedule(static)
+                        for (size_t f = 0; f < num_faces; ++f) {
+                            const auto& row = indirect_flux_series[f];
+                            double acc = 0.0;
+                            for (int t = out_lo; t < out_hi
+                                     && t < static_cast<int>(row.size()); ++t)
+                                acc += row[t];
+                            q_ind_mean[f] = acc / out_n;
+                        }
+                        eq_indirect_record.census(q_ind_mean);
+
+                        const std::ios_base::fmtflags eqi_flags = std::cout.flags();
+                        const std::streamsize eqi_prec = std::cout.precision();
+                        std::cout << std::defaultfloat << std::setprecision(6);
+                        std::cout << "\n  [Eq indirect] Internal pass 1 complete: per-face"
+                                     " output-window mean indirect flux over "
+                                  << out_n << " steps\n"
+                                  << "    mean " << eq_indirect_record.mean_Wm2
+                                  << ", median " << eq_indirect_record.median_Wm2
+                                  << ", max " << eq_indirect_record.max_Wm2 << " W/m^2; "
+                                  << eq_indirect_record.n_nonzero << "/" << num_faces
+                                  << " faces receive any" << std::endl;
+
+                        if (eq_indirect_record.max_Wm2 <= 0.0) {
+                            // A mesh with no inter-face view lands here. Skipping
+                            // the re-solve keeps it bit-identical to legacy AND
+                            // costs nothing, but it must be said out loud.
+                            std::cout << "    No face receives indirect flux — the"
+                                         " equilibration forcing is unchanged and this"
+                                         " run is identical to eq_indirect_source: off."
+                                      << std::endl;
+                            eq_indirect_record.provenance = "internal pass (measured zero)";
+                            std::cout.flags(eqi_flags);
+                            std::cout.precision(eqi_prec);
+                        } else {
+                            std::cout << "    Re-solving the whole-mesh thermal model with"
+                                         " this on the equilibration forcing, then"
+                                         " restarting the coupling loop." << std::endl;
+                            std::cout.flags(eqi_flags);
+                            std::cout.precision(eqi_prec);
+
+                            eq_indirect_vec = q_ind_mean;
+                            const bool ok = solveWholeMeshThermal(
+                                eq_indirect_vec, direct_solar_values,
+                                primary_reflected_values, primary_ir_values);
+                            if (!ok || !validateTemperatureMatrix(
+                                    surface_temps, num_faces, total_time_steps)) {
+                                std::cerr << "[FATAL] Internal equilibration-indirect"
+                                             " pass 2 thermal solve failed; refusing to"
+                                             " write results.\n";
+                                return 1;
+                            }
+                            eq_indirect_record.provenance = "internal pass";
+
+                            // The coupling loop's own state refers to the pass-1
+                            // temperature field, which no longer exists. Reset it
+                            // so iteration 1 below is a genuine first iteration.
+                            prev_temps = surface_temps;
+                            std::fill(prev_max_indirect.begin(),
+                                      prev_max_indirect.end(), 0.0);
+                            for (auto& row : indirect_flux_series)
+                                std::fill(row.begin(), row.end(), 0.0);
+                            for (auto& row : indirect_solar_series)
+                                std::fill(row.begin(), row.end(), 0.0);
+                            for (auto& row : indirect_ir_series)
+                                std::fill(row.begin(), row.end(), 0.0);
+
+                            iter = -1;   // the ++ below makes the next pass iter 0
+                            continue;
+                        }
+                    }
 
                     // Diagnostic: compare indirect flux for high vs low topographic elevation
                     // Uses radial distance from body center as elevation proxy (works on spherical bodies)
@@ -15856,6 +16057,30 @@ int main(int argc, char** argv) {
                 std::cout << "\n=== Radiation Exchange Complete ===" << std::endl;
                 std::cout << "  Mean indirect flux: " << stats.mean_indirect_flux << " W/m2" << std::endl;
                 std::cout << "  Max indirect flux: " << stats.max_indirect_flux << " W/m2" << std::endl;
+
+                // Equilibration-phase indirect flux: the run record. A default
+                // that changes the deep column of every radiation-coupled run
+                // has to say, in the log, whether it fired and on what numbers.
+                {
+                    const std::ios_base::fmtflags fl = std::cout.flags();
+                    const std::streamsize pr = std::cout.precision();
+                    std::cout << std::defaultfloat << std::setprecision(6);
+                    std::cout << "  Equilibration indirect flux: "
+                              << eq_indirect_record.provenance;
+                    if (!eq_indirect_record.reason.empty())
+                        std::cout << " (" << eq_indirect_record.reason << ")";
+                    std::cout << std::endl;
+                    if (eq_indirect_record.provenance != "none") {
+                        std::cout << "    per-face <q_ind>: mean "
+                                  << eq_indirect_record.mean_Wm2 << ", median "
+                                  << eq_indirect_record.median_Wm2 << ", max "
+                                  << eq_indirect_record.max_Wm2 << " W/m^2 over "
+                                  << eq_indirect_record.n_nonzero << "/" << num_faces
+                                  << " faces receiving any" << std::endl;
+                    }
+                    std::cout.flags(fl);
+                    std::cout.precision(pr);
+                }
 
                 // Deep radiation-coupling (pass 1): dump the per-face OUTPUT-window
                 // time-mean indirect flux <q_ind>[f] so a follow-up run can feed it

@@ -385,6 +385,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.checkpoint_every_output_steps = getWithDefault(thermal, "checkpoint_every_output_steps", config.thermal.checkpoint_every_output_steps);
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
+            config.thermal.eq_indirect_source     = getWithDefault(thermal, "eq_indirect_source",     config.thermal.eq_indirect_source);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
                 const auto& is_node = thermal["ice_stability"];

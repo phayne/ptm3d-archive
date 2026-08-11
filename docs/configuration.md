@@ -109,6 +109,9 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration |
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
 | `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only) |
+| `eq_indirect_source` | string | `auto` | Where the equilibration phase gets its indirect flux: `auto` estimates it internally, `off` is the pre-2026-08 behavior ([radiation-exchange.md §7.7](radiation-exchange.md)) |
+| `eq_indirect_flux_file` | string | `""` | Explicit per-face `'QIND'` mean-indirect file; overrides `eq_indirect_source` |
+| `indirect_mean_out_file` | string | `""` | Write the converged per-face output-window mean indirect flux as a `'QIND'` file |
 | `compute_ice_stability` | bool | false | Compute the subsurface ice-stability depth |
 | `enable_shadow_flux` | bool | false | Sub-grid crater shadowing correction |
 | `crater_dd_ratio` | float | 8.0 | Diameter-to-depth ratio for that correction |
