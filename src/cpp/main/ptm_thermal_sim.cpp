@@ -603,12 +603,19 @@ static std::atomic<int> g_thermo_override_applied{0};
 // override". The forwarding block and the tripwire both call this, so a knob
 // added to one can never be missing from the other -- which is the failure mode
 // that would quietly re-open PTM-53 for the next property someone adds.
-static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp) {
+// `geothermal_heat_flow` lives on SimulationConfig::thermal, not on
+// ThermophysicalParams, but it reaches the solvers through the SAME ovr_*
+// channel and must therefore arm the SAME tripwire (PTM-161). It is passed
+// explicitly rather than read from a global so the one definition still owns
+// the whole predicate.
+static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp,
+                                    double geothermal_heat_flow) {
     return (tp.ks_override              > 0.0)
         || (tp.kd_override              > 0.0)
         || (tp.emissivity_override      > 0.0)
         || (tp.albedo_override         >= 0.0)
-        || (tp.constant_thermal_inertia > 0.0);
+        || (tp.constant_thermal_inertia > 0.0)
+        || (geothermal_heat_flow        > 0.0);
 }
 
 // Parse a numeric CLI argument, or refuse the run naming the flag.
@@ -2897,6 +2904,13 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
         {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
         {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
         {"ovr_albedo",     &thermal::Planet::albedo,     "albedo A0",  ""},
+        // PTM-161: `thermal.geothermal_heat_flow` / `--geothermal-heat-flow`
+        // was parsed, applied to the main-scope Planet and announced, and then
+        // discarded by every one of the four solver entry points, which each
+        // rebuild a local Planet from the body NAME. On a built-in body the
+        // knob did nothing on either backend while the log claimed success.
+        // Gated by examples/moon_ico3_qb_falsifier.yaml.
+        {"ovr_Qb",         &thermal::Planet::Qb,         "Qb",         " W/m^2"},
     };
 
     // Only build the echo string on the one call that will actually print it.
@@ -13538,9 +13552,17 @@ int main(int argc, char** argv) {
             auto fwd = [&thermal_config](const char* key, double value) {
                 thermal_config.setProperty(key, fullPrecision(value));
             };
-            if (thermoOverrideRequested(tp)) {
+            if (thermoOverrideRequested(tp, geothermal_heat_flow)) {
                 thermal_config.setProperty("ovr_thermo", "1");  // solver-side fast-path gate
             }
+            // PTM-161. `geothermal_heat_flow` is a `thermal.*` knob, not a
+            // `thermophysical.*` one, but it suffers the identical defect and
+            // rides the identical channel. `planet.Qb` here is post-resolution
+            // (main applies the CLI/YAML value at :11647/:11833), so the solver
+            // sees exactly what main computed. Forwarded ONLY when the user set
+            // it (> 0): the tracked lunar configs all carry -1.0, so they
+            // forward no key and stay byte-identical.
+            if (geothermal_heat_flow   > 0.0) fwd("ovr_Qb",         planet.Qb);
             if (tp.ks_override         > 0.0) fwd("ovr_ks",         planet.ks);
             if (tp.kd_override         > 0.0) fwd("ovr_kd",         planet.kd);
             if (tp.emissivity_override > 0.0) fwd("ovr_emissivity", planet.emissivity);
@@ -14205,7 +14227,7 @@ int main(int argc, char** argv) {
         // that forgets to call applyConfiguredThermo().
         {
             const auto& tp = sim_config.thermophysical;
-            if (thermoOverrideRequested(tp)
+            if (thermoOverrideRequested(tp, geothermal_heat_flow)
                 && g_thermo_override_applied.load(std::memory_order_relaxed) == 0) {
                 std::cerr << "\nFATAL: a thermophysical override was configured but NO thermal "
                              "solver applied it.\n"
@@ -14215,6 +14237,7 @@ int main(int argc, char** argv) {
                           << (tp.emissivity_override      > 0.0 ? " emissivity_override" : "")
                           << (tp.albedo_override         >= 0.0 ? " albedo_override"     : "")
                           << (tp.constant_thermal_inertia > 0.0 ? " constant_thermal_inertia" : "")
+                          << (geothermal_heat_flow        > 0.0 ? " geothermal_heat_flow" : "")
                           << "\n"
                           << "  The run would have reported the override and silently used the "
                              "body defaults (BUGS.md PTM-53).\n"
