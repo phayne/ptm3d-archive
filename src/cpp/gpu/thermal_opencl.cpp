@@ -1034,23 +1034,29 @@ bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
 }
 
 void ThermalOpenCLSolver::buildKernels() {
-    // PTM_SOLVER_EQFIX is implemented on the CPU solver paths ONLY at this
-    // commit; the device twin of the surface-Newton exit criterion and of the
-    // T_geo-floor removal is NOT in this kernel. Running the GPU solver with
-    // the gate set would silently produce a CPU/GPU mismatch -- exactly the
-    // class of quiet substitution that PTM-115/116 were. Refuse instead.
+    // PTM_SOLVER_EQFIX refusal, NARROWED 2026-08-11.
+    //
+    // The surface-Newton exit criterion is no longer part of this gate: the
+    // kernel below implements the same specification as the CPU
+    // solveSurfaceBC, unconditionally. What the gate still asks for is release
+    // of the T_geo floor, and this kernel applies that floor every substep
+    // with no way to switch it off. Accepting the flag and keeping the floor
+    // would be a quiet substitution -- the class of failure PTM-115/116 were.
+    // Refuse instead.
     {
         const char* e = std::getenv("PTM_SOLVER_EQFIX");
         if (e && *e && std::strcmp(e, "0") != 0) {
-            std::cerr << "\n[GPU Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the "
-                         "eqfix solver changes (surface-Newton exit criterion, "
-                         "T_geo-floor removal, R1 deviation form) are implemented "
-                         "on the CPU paths only at this commit.\n"
-                         "  Running the GPU persistent kernel now would use the "
-                         "OLD physics while the CPU paths use the new physics, "
-                         "and nothing would say so.\n"
-                         "  Use a CPU run (thermal.use_gpu: false) or unset "
-                         "PTM_SOLVER_EQFIX." << std::endl;
+            std::cerr << "\n[GPU Thermal] FATAL: PTM_SOLVER_EQFIX asks for the "
+                         "T_geo floor to be released, but the GPU persistent "
+                         "kernel applies it unconditionally, every substep.\n"
+                         "  Running here under the gate would keep the floor while "
+                         "the log claimed it was released, and nothing would say "
+                         "so.\n"
+                         "  (The surface-Newton criterion is NOT the issue: this "
+                         "kernel implements the same specification as the CPU "
+                         "solveSurfaceBC as of fix/surface-bc-unification.)\n"
+                         "  Use a CPU scalar run, or unset PTM_SOLVER_EQFIX."
+                      << std::endl;
             std::exit(1);
         }
     }

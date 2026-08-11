@@ -316,22 +316,28 @@ inline SurfaceBCSolution solveSurfaceBC(double Qs, double T1, double k0, double 
 }
 
 // ---------------------------------------------------------------------------
-// Solver equilibration/accuracy fix set -- ONE gate for the whole set.
+// PTM_SOLVER_EQFIX -- NARROWED 2026-08-11 to ONE remaining change: release of
+// the T_geo floor.
 //
-// The three changes it enables (surface-Newton exit criterion, removal of the
-// T_geo floor, and the R1 deviation form for the interior solve) are NOT
-// independent and must never be enabled separately:
+// The gate used to bundle three changes. Two of them are no longer gated:
 //
-//   * the T_geo floor pins layer 0 at the analytically exact (Qb/(eps*sigma))^
-//     0.25 and thereby MASKS the Newton's +9.686548e-03 K bias -- removing the
-//     floor alone exposes it;
-//   * the floor's Dirichlet pin on nodes 0/1 DEFEATS the deviation form
-//     (measured: arrest onset j=1 with the floor on, none with it off), so
-//     shipping R1 with the floor still in place buys nothing;
-//   * removing the floor creates a sub-22 K population that only the Newton's
-//     ulp floor can terminate.
+//   * the surface-Newton exit criterion is now UNCONDITIONAL on all three
+//     solver paths (see solveSurfaceBC above and gpu/thermal_kernels.cl);
+//   * the R1 deviation form is a proven no-op in float64 (absolute and
+//     deviation forms agree to 6.2e-14 K, the algebraic-identity noise floor),
+//     so it belongs in the GPU float32 kernel, not behind a CPU gate.
 //
-// Default OFF. With the gate off every solver path is byte-identical.
+// What remains is the T_geo floor, which is NOT a correction but a Dirichlet
+// pin: it holds layer 0 at the analytically exact (Qb/(eps*sigma))^0.25 on
+// every steady cold column. It masked the old Newton's +9.686548e-03 K bias;
+// with the criterion fixed, releasing it is a separate physics decision with
+// its own re-bless, and it is still default OFF pending that decision.
+//
+// It is implemented on the CPU SCALAR path only. The CPU SIMD batch path and
+// the GPU persistent kernel apply the floor unconditionally, so they REFUSE to
+// run under the gate rather than accept it and quietly not honor it.
+//
+// Default OFF. With the gate off, the T_geo floor behaves exactly as before.
 // Read once; the value is process-wide and must not vary between faces.
 // ---------------------------------------------------------------------------
 bool solverEqFixEnabled();

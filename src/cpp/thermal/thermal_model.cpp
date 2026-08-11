@@ -1457,9 +1457,11 @@ bool solverEqFixEnabled() {
         const char* e = std::getenv("PTM_SOLVER_EQFIX");
         const bool v = (e && *e && std::strcmp(e, "0") != 0);
         if (v) {
-            std::cout << "[Thermal] PTM_SOLVER_EQFIX=1: surface-Newton exit "
-                         "criterion + T_geo-floor removal + R1 deviation form "
-                         "ENABLED (non-default solver)." << std::endl;
+            std::cout << "[Thermal] PTM_SOLVER_EQFIX=1: T_geo-floor release "
+                         "ENABLED (non-default solver). NOTE: the surface-Newton "
+                         "exit criterion is no longer part of this gate -- it is "
+                         "unconditional on every path as of "
+                         "fix/surface-bc-unification." << std::endl;
         }
         return v;
     }();
@@ -2677,26 +2679,34 @@ void ThermalBatchSoA::setFluxContiguous(const double* flux_values, int num_faces
 }
 
 void ThermalBatchSoA::advanceTimestep(double dt) {
-    // PTM_SOLVER_EQFIX refusal (the general rule, not a special case): under
-    // the gate, any solver path that would run the T_geo-floor removal WITHOUT
-    // the deviation form -- or, here, without even the new surface-Newton
-    // criterion -- is a knowingly-wrong configuration and must be impossible to
-    // execute, not merely discouraged. This path has neither: its surface
-    // Newton (applySurfaceBCBatch) is a separate, weaker solver -- 5 fixed
-    // iterations, no convergence test, a hard [CMB, 500 K] clamp -- and the
-    // deviation form is not implemented here. BUGS.md PTM-216.
+    // PTM_SOLVER_EQFIX refusal, NARROWED 2026-08-11.
+    //
+    // The original refusal rested on three things: this path's private
+    // 5-iteration Newton, the missing R1 deviation form, and the T_geo floor.
+    // The first is gone -- applySurfaceBCBatch now calls the shared
+    // solveSurfaceBC, so this path runs exactly the specification the scalar
+    // path does. What remains is the floor: the loop at the end of this
+    // function applies it UNCONDITIONALLY and there is no code here that
+    // honors the gate's request to release it.
+    //
+    // So the refusal stays, for one reason and stated as that one reason: a
+    // run that sets PTM_SOLVER_EQFIX and gets the floor anyway would be a
+    // silent substitution, which is the failure mode the gate exists to
+    // prevent. Refuse rather than accept-and-ignore. BUGS.md PTM-216.
     static const bool refuse = solverEqFixEnabled();
     if (refuse) {
-        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the CPU SIMD "
-                     "batch path (ThermalBatchSoA::advanceTimestep) implements "
-                     "neither the new surface-Newton exit criterion nor the R1 "
-                     "deviation form.\n"
-                     "  Running it under the gate would release the T_geo floor "
-                     "under an unimproved 5-iteration Newton and leave the "
-                     "interior arrest in place, and nothing would say so.\n"
-                     "  Only the CPU scalar path (Profile::update_T) is covered "
-                     "at this commit. Unset PTM_SOLVER_EQFIX, or use a solver "
-                     "configuration that takes the scalar path." << std::endl;
+        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX asks for the T_geo floor "
+                     "to be released, but the CPU SIMD batch path "
+                     "(ThermalBatchSoA::advanceTimestep) applies it "
+                     "unconditionally.\n"
+                     "  Running here under the gate would keep the floor while "
+                     "the log claimed it was released, and nothing would say so.\n"
+                     "  (The surface-Newton criterion is NOT the issue: this path "
+                     "shares solveSurfaceBC with the scalar path as of "
+                     "fix/surface-bc-unification.)\n"
+                     "  Only the CPU scalar path (Profile::update_T) releases the "
+                     "floor. Unset PTM_SOLVER_EQFIX, or use a configuration that "
+                     "takes the scalar path." << std::endl;
         std::exit(1);
     }
     updateMaterialPropertiesBatchSIMD(*this);
@@ -2714,11 +2724,9 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     // at T_geo corrects only that sub-floor drift (real PSR floors converge to
     // T_geo from above -> no-op). Per-face, physics-set, NOT a fixed clamp.
     //
-    // NOT touched by PTM_SOLVER_EQFIX. This path REFUSES to run under the gate
-    // (see advanceTimestep), because removing the floor here without also
-    // giving this path the new surface-Newton criterion and the deviation form
-    // would leave a weak 5-iteration Newton with its safety net gone -- worse
-    // than either change alone. BUGS.md PTM-216.
+    // NOT touched by PTM_SOLVER_EQFIX: this path REFUSES to run under the gate
+    // (see advanceTimestep) rather than accept the flag and keep the floor
+    // anyway. BUGS.md PTM-216.
     for (int f = 0; f < n_faces; ++f) {
         const double qb = Qb[f];
         if (qb <= 0.0) continue;
