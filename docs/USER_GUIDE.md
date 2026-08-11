@@ -46,7 +46,7 @@ see [../INSTALL.md](../INSTALL.md); for a first run see
                                     v
                         ┌────────────────────────┐
                         │     THERMAL MODEL       │
-                        │  Spectral equilibration │
+                        │  Time-stepped spin-up   │
                         │  Crank-Nicolson solver  │
                         │  T-dependent k(T), cp(T)│
                         └───────────┬─────────────┘
@@ -107,7 +107,7 @@ see [../INSTALL.md](../INSTALL.md); for a first run see
 ```
 src/cpp/
 ├── main/             Main driver (ptm_thermal_sim.cpp)
-├── thermal/          1D heat conduction, spectral equilibration
+├── thermal/          1D heat conduction, time-stepped equilibration
 ├── illumination/     Ray-traced solar flux with SPICE ephemeris
 ├── radiation/        View factors, H-matrix compression, radiosity
 ├── gpu/              OpenCL/HIP/CUDA acceleration
@@ -126,7 +126,7 @@ src/cpp/
 
 | Module | Key Classes | Description |
 |--------|-------------|-------------|
-| **thermal** | `thermal::Model`, `thermal::Profile`, `thermal::Config` | 1D Crank-Nicolson heat conduction with temperature-dependent properties, adaptive depth grids, and FFT-based spectral equilibration for fast spin-up |
+| **thermal** | `thermal::Model`, `thermal::Profile`, `thermal::Config` | 1D Crank-Nicolson heat conduction with temperature-dependent properties, adaptive depth grids, and time-stepped equilibration with an adaptive substep |
 | **illumination** | `IlluminationModel` | Shadow ray tracing (Embree), finite solar disk integration, primary-body reflected and thermal IR flux, eclipse geometry via SPICE |
 | **radiation** | `RadiationExchangeManager`, `RadiositySolver`, `ViewFactorMatrix`, `HMatrixViewFactor` | Face-to-face view factors stored as a sparse matrix (compressed sparse row, "CSR", format) or in hierarchically compressed ("H-matrix") form; Jacobi/Gauss-Seidel radiosity iteration; adaptive thermal-radiation coupling |
 | **gpu** | `ThermalOpenCLSolver`, `RadiosityOpenCLSolver`, `BVHRayTracer` | GPU-accelerated thermal solver (tridiagonal Thomas-algorithm solve), radiosity (sparse matrix–vector Jacobi iteration), and shadow ray tracing |
@@ -147,7 +147,7 @@ src/cpp/
 - Temperature-dependent thermal conductivity: $k(T) = k_c \cdot (1 + \chi \cdot (T/350)^3)$
 - Heat capacity: polynomial for lunar regolith; linear $c_p(T) = 7.49 \cdot T$ for water ice (Europa)
 - Adaptive depth grid with logarithmic spacing
-- Spectral equilibration: FFT decomposition of the diurnal flux into Fourier harmonics, each solved analytically with skin-depth scaling $\delta_n = \delta_1/\sqrt{n}$, converging in 3-5 iterations vs. thousands of time-stepping cycles
+- Equilibration: the diurnal flux is integrated forward in time with the same Crank-Nicolson solver, over `thermal.equilibration_orbits` cycles, with an adaptive substep chosen from the per-layer Fourier mesh number. There is no spectral or harmonic shortcut, and no convergence test — the spin-up length is a user choice, and every shipped configuration is short of the deep column's relaxation time. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 1
 - Validated against Lunar Diviner data (RMS error <4 K)
 
 **Radiation Exchange**:

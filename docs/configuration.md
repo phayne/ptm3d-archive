@@ -81,9 +81,9 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `run_thermal_mesh` | bool | false | Run the thermal solver (illumination only when false) |
 | `threads` | int | 0 | OpenMP thread count (0 = auto) |
 | `thermal_m` | int | 10 | Layers within the upper skin depth |
-| `thermal_n` | int | 15 | Layer growth factor (legacy non-adaptive grid only) |
+| `thermal_n` | int | 15 | Inert. The legacy non-adaptive grid it feeds cannot be selected from any config key, flag or environment variable, so this value and the `--thermal-n` flag have no effect |
 | `thermal_b` | int | 15 | Skin depths to the bottom layer |
-| `equilibration_orbits` | float | 1.0 | Diurnal cycles of spin-up before the output window |
+| `equilibration_orbits` | float | 1.0 | Diurnal cycles of spin-up before the output window. On the GPU persistent solver the integrated total is this value times `equilibration_cycles` (default 2). Choose it with [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 1 |
 | `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
 | `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle; consulted only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
 | `equilibration_cycles` | int | -1 | Passes over the equilibration forcing array, GPU persistent solver only (-1 = the solver's value of 2) |
@@ -99,7 +99,7 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `h_parameter_map` | string | `""` | Per-face `float32` H-parameter map (mutually exclusive with the above) |
 | `use_default_property_map` | bool | false | Auto-discover the bundled property map for the body |
 | `property_maps_directory` | string | `"data/property_maps"` | Where to look for property maps |
-| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default) |
+| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default). **Discarded on built-in bodies** on both backends, while the log announces it — use `heat_flow_mask_file`, or `generic_body.surface.Qb` on a generic body. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 4 |
 | `heat_flow_mask_file` | string | `""` | Face-index file for locally elevated basal flux |
 | `heat_flow_mask_value` | float | 1.0 | Basal flux on the masked faces (W m<sup>-2</sup>) |
 | `integration_days` | float | -1.0 | Statistics-integration window (-1 = the output window) |
@@ -153,8 +153,15 @@ of layers held, and the number of near-degenerate windows.
 `order_p: 4` with five passes, the extrapolated state was 55x closer (sunlit
 faces) and 64x closer (seasonal-terminator faces) to a 200-lunation reference
 than four passes of plain cycling, for 1.18x the wall-clock of four passes. The
-benefit accrues to faces that carry energy; about 70 percent of that mesh is
-already converged at depth after four passes and gains nothing.
+benefit accrues to faces that carry energy.
+
+About 70 percent of that mesh receives no flux during equilibration, and those
+faces gain nothing from extrapolation — but not because they have converged.
+On the GPU path their deep columns stop changing between passes while still
+about 0.36 K short of the steady state, so extrapolating a sequence that has
+already stopped moving has nothing to work with. Do not read "unchanged between
+passes" as "converged"; see
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) sections 1 and 3.
 
 **A known limitation.** The fit assigns a weight to the first snapshot in its
 window, which is the initial guess. For a depth layer that converged early while

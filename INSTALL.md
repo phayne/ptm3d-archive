@@ -201,8 +201,9 @@ figure tooling) and `gui/requirements.txt` (PyQt6, PyVista and the desktop GUI).
 ```bash
 # Radiation gate (Ingersoll bowl crater — analytic):
 cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
-# Spectral equilibration (look for the '[test_equilibration_dt] PASS' verdict line;
-# it gates the worst-case error at the production cadence against the 1 K target):
+# Equilibration substep size (look for the '[test_equilibration_dt] PASS' verdict
+# line; it gates the worst-case error at the production cadence against the 1 K
+# target — the substep, not the spin-up length):
 cmake --build build --target test_equilibration_dt -j && ./build/bin/test_equilibration_dt
 # Runtime-robustness unit tests (no external libraries needed):
 c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o /tmp/tmp_mp && /tmp/tmp_mp

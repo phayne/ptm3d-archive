@@ -32,7 +32,9 @@ sunlight and thermal emission from surrounding terrain.*
 - **Illumination**: Embree ray-traced shadows with finite solar disk penumbra,
   eclipses, and primary-body reflected + IR flux (e.g. Earthshine, Jupiter-shine)
 - **Thermal**: Crank-Nicolson conduction with T-dependent k(T), cp(T), adaptive
-  depth grids, and FFT spectral equilibration for fast spin-up
+  depth grids, and time-stepped spin-up with an adaptive substep. Choosing the
+  spin-up length is the user's, not the engine's — see
+  [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) section 1
 - **Radiation exchange**: face-to-face view factors, stored sparsely or in
   hierarchically compressed ("H-matrix") form to stay affordable at large face
   counts, driving a two-band (solar/IR) radiosity solver coupled to the
@@ -203,7 +205,8 @@ cmake --build build --target test_equilibration_dt -j && ./build/bin/test_equili
 `ptm_qa.py thermal` checks the run's own statistics for NaNs, uncomputed faces
 and range violations. `test_bowl_crater` is the analytic radiation gate (look
 for `Error: 0.49...%` and `Result: PASSED`); `test_equilibration_dt` gates the
-spectral spin-up and prints `[test_equilibration_dt] PASS`. All three are
+substep size used during spin-up — not its length — and prints
+`[test_equilibration_dt] PASS`. All three are
 CPU-only and take seconds. There is no `ctest`/`pytest` — the tests are
 standalone executables, listed in [INSTALL.md §6](INSTALL.md).
 
@@ -260,7 +263,7 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
 | [docs/thermal-model.md](docs/thermal-model.md) · [docs/illumination-model.md](docs/illumination-model.md) · [docs/radiation-exchange.md](docs/radiation-exchange.md) | Physics and numerics of each stage |
 | [docs/api-reference.md](docs/api-reference.md) | C++ types for callers linking against the libraries |
-| [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [docs/PORTABILITY-AUDIT.md](docs/PORTABILITY-AUDIT.md) | What to watch out for — **read this before your first production run** |
+| [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [docs/PORTABILITY-AUDIT.md](docs/PORTABILITY-AUDIT.md) | What is known to be wrong, with measured magnitudes and who it affects; opens with "Is PTM3D right for my problem?" — **read this before your first production run** |
 | [data/README.md](data/README.md) | Science-data catalog, provenance, licenses, `PTM_DATA_ROOT` |
 | [gui/README.md](gui/README.md) | The desktop GUI |
 

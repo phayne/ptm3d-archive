@@ -74,7 +74,12 @@ excluded). Interpretation differs by moment:
   trust first.
 - **`temperature_min`** — the pre-dawn (or eternal-shadow) floor. In PSRs with
   radiation off this approaches the geothermal floor; with radiation on it is
-  set by indirect heating (see tutorial 04).
+  set by indirect heating (see tutorial 04). The solver enforces the geothermal
+  floor `(Q_b/εσ)^(1/4)` as a hard lower bound on every layer — 24.04 K on the
+  Moon, 27.69 K on Europa — so a value sitting exactly there is the bound rather
+  than a converged temperature, and nothing below it can be reported at all. See
+  [`KNOWN_LIMITATIONS.md`](../KNOWN_LIMITATIONS.md) section 2 before using a
+  statistic near it.
 
 Statistics exist for `temperature`, `illumination` (total), `direct_solar`,
 `primary_reflected`, `primary_ir`, and — on radiation runs — `indirect_solar`
