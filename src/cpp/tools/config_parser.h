@@ -72,6 +72,20 @@ struct SimulationConfig {
         // run total_cycles = n_equil_cycles + 1 = 2 over the eq window.
         int equilibration_cycles = -1;
 
+        // Accuracy the spin-up estimator is asked to reach, in kelvin. The
+        // estimator is REPORT-ONLY: it prints how many diurnal cycles THIS
+        // problem needs to settle to this accuracy, from tau1 (the slowest
+        // eigenvalue of the actual discrete column) and the seed's distance
+        // from its own conductive steady profile. It changes no state and
+        // never overrides equilibration_orbits / equilibration_cycles.
+        //
+        // Default 0.1 K. Justification: it is the threshold the equilibration
+        // work already uses for the Kelvin conversions of the residual, and it
+        // sits an order of magnitude below the ~6 K by which the lit faces
+        // miss at the shipped 50-lunation default -- so a run that is actually
+        // wrong says so, and a run that is fine does not cry wolf.
+        double equilibration_target_K = 0.1;
+
         // ---- thermal.eq_extrapolation -------------------------------------
         // Pass-stride RRE extrapolation of the equilibration state. DEFAULT
         // OFF: with method == "off" the solver runs the pre-existing pass loop

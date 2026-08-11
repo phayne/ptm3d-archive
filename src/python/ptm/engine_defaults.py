@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-158 keys across 9 sections.
+159 keys across 9 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -158,6 +158,7 @@ ENGINE_DEFAULTS = {
     'thermal.equilibration_orbits': 1.0,
     'thermal.equilibration_samples_per_diurnal_cycle': -1.0,
     'thermal.equilibration_steps_per_day': -1.0,
+    'thermal.equilibration_target_K': 0.1,
     'thermal.final_state_file': '',
     'thermal.geothermal_heat_flow': -1.0,
     'thermal.gpu_batch_size': None,

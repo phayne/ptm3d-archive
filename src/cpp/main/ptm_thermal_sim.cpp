@@ -36,6 +36,8 @@
 #include "../tools/config_parser.h"
 #include "../tools/run_provenance.h"
 #include "../thermal/thermal_model.h"
+#include "../thermal/eq_certificate.h"
+#include <memory>
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
 #include "../maps/spatial_map.h"
@@ -603,12 +605,19 @@ static std::atomic<int> g_thermo_override_applied{0};
 // override". The forwarding block and the tripwire both call this, so a knob
 // added to one can never be missing from the other -- which is the failure mode
 // that would quietly re-open PTM-53 for the next property someone adds.
-static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp) {
+// `geothermal_heat_flow` lives on SimulationConfig::thermal, not on
+// ThermophysicalParams, but it reaches the solvers through the SAME ovr_*
+// channel and must therefore arm the SAME tripwire (PTM-161). It is passed
+// explicitly rather than read from a global so the one definition still owns
+// the whole predicate.
+static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp,
+                                    double geothermal_heat_flow) {
     return (tp.ks_override              > 0.0)
         || (tp.kd_override              > 0.0)
         || (tp.emissivity_override      > 0.0)
         || (tp.albedo_override         >= 0.0)
-        || (tp.constant_thermal_inertia > 0.0);
+        || (tp.constant_thermal_inertia > 0.0)
+        || (geothermal_heat_flow        > 0.0);
 }
 
 // Parse a numeric CLI argument, or refuse the run naming the flag.
@@ -2897,6 +2906,13 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
         {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
         {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
         {"ovr_albedo",     &thermal::Planet::albedo,     "albedo A0",  ""},
+        // PTM-161: `thermal.geothermal_heat_flow` / `--geothermal-heat-flow`
+        // was parsed, applied to the main-scope Planet and announced, and then
+        // discarded by every one of the four solver entry points, which each
+        // rebuild a local Planet from the body NAME. On a built-in body the
+        // knob did nothing on either backend while the log claimed success.
+        // Gated by examples/moon_ico3_qb_falsifier.yaml.
+        {"ovr_Qb",         &thermal::Planet::Qb,         "Qb",         " W/m^2"},
     };
 
     // Only build the echo string on the one call that will actually print it.
@@ -3659,6 +3675,40 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     bool success = true;
 
+    // Equilibration duration. Hoisted out of the batch loop (it depends only
+    // on config/planet/times, never on the batch) so it is computed once and
+    // the spin-up banner can quote the configured cycle count.
+    double equil_duration_s_shared;
+    if (config.getProperty("using_generic_body") == "true") {
+        // Generic (fast-rotating) body: equilibrate for the CONFIGURED number of
+        // DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps was
+        // sized in main as (output cadence)x(equilibration_orbits)x(diurnal
+        // period), so equilibration_steps x output-cadence dt = the intended
+        // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day) here
+        // would be ~10^4 four-hour cycles (an asteroid's year is that many diurnal
+        // periods) and never finish. Gated -> Moon/Europa untouched.
+        const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
+        const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
+        equil_duration_s_shared = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
+    } else {
+        const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
+                                         std::round(planet.year / planet.day);
+        equil_duration_s_shared = equil_days_needed * planet.day;
+    }
+
+    // ---- Equilibration spin-up estimate (FIX 0) ----------------------------
+    // Report-only and DEFAULT ON: it changes no solver state and the
+    // statistics are byte-identical either way, so gating it off would only
+    // hide the one number a user benefits from. PTM_EQ_CERTIFICATE=0 opts out.
+    const double eq_target_K = config.getPropertyDouble("eq_target_K", 0.1);
+    std::unique_ptr<thermal::EqSpinupCensus> g_spinup_census;
+    if (thermal::eqCertificateEnabled()) {
+        g_spinup_census.reset(new thermal::EqSpinupCensus(
+            planet.day, eq_target_K,
+            /*precision_floor_K=*/0.0,
+            /*seconds_per_cycle=*/0.0));   // nothing measures it; banner says so
+    }
+
     #pragma omp parallel num_threads(thermal_threads)
     {
         // Thread-local batch buffer
@@ -3837,23 +3887,9 @@ bool runThermalModelsForAllFacesBatchSoA(
             // flux trajectory as a quasi-periodic signal and substep it down to
             // dt <= planet.day / 192 so CN accuracy stays within ~1 K worst case
             // (see src/cpp/tools/test_equilibration_dt.cpp for the accuracy study).
-            double equil_duration_s;
-            if (config.getProperty("using_generic_body") == "true") {
-                // Generic (fast-rotating) body: equilibrate for the CONFIGURED number
-                // of DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps
-                // was sized in main as (output cadence)x(equilibration_orbits)x(diurnal
-                // period), so equilibration_steps x output-cadence dt = the intended
-                // equilibration duration in diurnal cycles. NYEARSEQ*round(year/day)
-                // here would be ~10^4 four-hour cycles (an asteroid's year is that many
-                // diurnal periods) and never finish. Gated -> Moon/Europa untouched.
-                const double dt_out = (total_time_steps > 1) ? (times[1] - times[0]) : planet.day;
-                const double eq_secs = static_cast<double>(equilibration_steps) * dt_out;
-                equil_duration_s = (eq_secs > 0.0) ? eq_secs : (40.0 * planet.day);
-            } else {
-                const double equil_days_needed = static_cast<double>(config.NYEARSEQ) *
-                                                 std::round(planet.year / planet.day);
-                equil_duration_s = equil_days_needed * planet.day;
-            }
+            // Computed once above the parallel region (it depends only on
+            // config/planet/times, never on the batch); see equil_duration_s_shared.
+            const double& equil_duration_s = equil_duration_s_shared;
 
             if (equil_duration_s > 0.0 && total_time_steps >= 2) {
                 // Match Model::fastEquilibrate (thermal_model.cpp:2024) exactly:
@@ -3912,6 +3948,55 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
+
+                    // Spin-up estimate (FIX 0, report-only). Scored after the
+                    // FIRST substep of ~30,000, so it still lands before any
+                    // real time is spent, but after advanceTimestep has filled
+                    // batch.k / batch.cp -- initialize() memsets them to zero
+                    // and scoring a zero-conductivity column would report
+                    // nonsense. Reading only; writes no solver state.
+                    if (step == 0 && g_spinup_census) {
+                        const int BS2 = thermal::THERMAL_BATCH_SIZE;
+                        std::vector<double> cz(n_layers), cT(n_layers),
+                                            ck(n_layers), cr(n_layers), cc(n_layers);
+                        for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            for (int i = 0; i < n_layers; ++i) {
+                                cT[i] = batch.T  [i * BS2 + f];
+                                ck[i] = batch.k  [i * BS2 + f];
+                                cr[i] = batch.rho[i * BS2 + f];
+                                cc[i] = batch.cp [i * BS2 + f];
+                            }
+                            thermal::EqSpinupInput ein;
+                            ein.z = cz.data(); ein.T = cT.data(); ein.k = ck.data();
+                            ein.rho = cr.data(); ein.cp = cc.data();
+                            ein.n = n_layers;
+                            ein.Qb  = batch.Qb[f];
+                            ein.eps = batch.emissivity[f];
+                            ein.sigma = thermal::SIGMA_SB;
+                            ein.P = planet.day;
+                            ein.target_K = eq_target_K;
+                            // This path is float64 and carries no arithmetic
+                            // floor; the float32 arrest is a GPU-path property.
+                            ein.precision_floor_K = 0.0;
+                            // Dark iff the face never sees sun in the REAL
+                            // illumination. Using the analytic equilibration
+                            // forcing instead (cos_lat*cos_hour) would call
+                            // every face lit -- it has no topography and no
+                            // shadowing, so cos_lat > 0 everywhere off the
+                            // poles -- and the split that exists to expose the
+                            // frozen dark population would report no dark
+                            // population at all.
+                            double fmax = 0.0;
+                            for (int t = 0; t < total_time_steps; ++t) {
+                                const double v = flux_column_major[
+                                    static_cast<size_t>(t) * n_faces + start_face + f];
+                                if (v > fmax) fmax = v;
+                            }
+                            const bool dark = !(fmax > 0.0);
+                            g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
+                        }
+                    }
                 }
             }
 
@@ -3973,6 +4058,16 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // Equilibration spin-up estimate (FIX 0). Emitted once, after every batch
+    // has contributed. The numbers are a prediction made one substep into a
+    // ~30,000-substep equilibration, not a measurement of what it achieved --
+    // the retrospective certificate is a separate, not-yet-implemented piece.
+    if (g_spinup_census) {
+        const double n_configured = (planet.day > 0.0)
+                                  ? (equil_duration_s_shared / planet.day) : 0.0;
+        g_spinup_census->report(std::cout, n_configured);
+    }
 
     // PTM-51 diagnostic: write the per-face seed terms and the analytic
     // equilibration forcing that actually drove the column.
@@ -13472,6 +13567,12 @@ int main(int argc, char** argv) {
         // out at the solver.
         thermal_config.setProperty("auto_calibrate_gpu", sim_config.thermal.auto_calibrate_gpu);
 
+        // Accuracy the spin-up ESTIMATE targets (report-only; the solvers
+        // rebuild a local Config, so like every other engine knob it has to be
+        // forwarded or it silently reverts to the built-in default).
+        thermal_config.setProperty("eq_target_K",
+                                   fullPrecision(sim_config.thermal.equilibration_target_K));
+
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {
             thermal_config.setProperty("using_generic_body", "true");
@@ -13538,9 +13639,17 @@ int main(int argc, char** argv) {
             auto fwd = [&thermal_config](const char* key, double value) {
                 thermal_config.setProperty(key, fullPrecision(value));
             };
-            if (thermoOverrideRequested(tp)) {
+            if (thermoOverrideRequested(tp, geothermal_heat_flow)) {
                 thermal_config.setProperty("ovr_thermo", "1");  // solver-side fast-path gate
             }
+            // PTM-161. `geothermal_heat_flow` is a `thermal.*` knob, not a
+            // `thermophysical.*` one, but it suffers the identical defect and
+            // rides the identical channel. `planet.Qb` here is post-resolution
+            // (main applies the CLI/YAML value at :11647/:11833), so the solver
+            // sees exactly what main computed. Forwarded ONLY when the user set
+            // it (> 0): the tracked lunar configs all carry -1.0, so they
+            // forward no key and stay byte-identical.
+            if (geothermal_heat_flow   > 0.0) fwd("ovr_Qb",         planet.Qb);
             if (tp.ks_override         > 0.0) fwd("ovr_ks",         planet.ks);
             if (tp.kd_override         > 0.0) fwd("ovr_kd",         planet.kd);
             if (tp.emissivity_override > 0.0) fwd("ovr_emissivity", planet.emissivity);
@@ -14193,6 +14302,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Surface-Newton globalization counters and, under PTM_SOLVER_EQFIX,
+        // the T_geo-floor release census. Both are no-ops unless something
+        // fired; a counter nobody prints is the same as no counter.
+        thermal::reportSurfaceNewtonStats();
+
         // ====================================================================
         // PTM-53 rule-7 tripwire: an override that was requested but never
         // applied must FAIL, not sail through with a reassuring banner.
@@ -14205,7 +14319,7 @@ int main(int argc, char** argv) {
         // that forgets to call applyConfiguredThermo().
         {
             const auto& tp = sim_config.thermophysical;
-            if (thermoOverrideRequested(tp)
+            if (thermoOverrideRequested(tp, geothermal_heat_flow)
                 && g_thermo_override_applied.load(std::memory_order_relaxed) == 0) {
                 std::cerr << "\nFATAL: a thermophysical override was configured but NO thermal "
                              "solver applied it.\n"
@@ -14215,6 +14329,7 @@ int main(int argc, char** argv) {
                           << (tp.emissivity_override      > 0.0 ? " emissivity_override" : "")
                           << (tp.albedo_override         >= 0.0 ? " albedo_override"     : "")
                           << (tp.constant_thermal_inertia > 0.0 ? " constant_thermal_inertia" : "")
+                          << (geothermal_heat_flow        > 0.0 ? " geothermal_heat_flow" : "")
                           << "\n"
                           << "  The run would have reported the override and silently used the "
                              "body defaults (BUGS.md PTM-53).\n"

@@ -6,6 +6,9 @@
 #include <cmath>
 #include <cassert>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <fstream>
 #include <iomanip>
 
@@ -852,6 +855,26 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
 //  - cp polynomial coefficients in planet.cpCoeff (size 0 => constant cp0)
 //  - Conductivity k = kc + R350_val * T^3 (if R350_val != 0)
 //  - Arrays: grid.T, grid.k, grid.cp, grid.kappa, grid.kc, grid.rho, grid.g1, grid.g2 sized appropriately
+// PTM_SOLVER_EQFIX: nodes that the removed T_geo floor WOULD have raised.
+// Counted so the release is reported as a number, never assumed to be a no-op.
+static std::atomic<long long> g_tgeo_would_clamp{0};
+static std::atomic<long long> g_tgeo_tested{0};
+
+void noteTgeoRelease(long long would_clamp, long long tested) {
+    if (would_clamp) g_tgeo_would_clamp.fetch_add(would_clamp, std::memory_order_relaxed);
+    if (tested)      g_tgeo_tested.fetch_add(tested, std::memory_order_relaxed);
+}
+
+// `t_geo_watch` is 0 unless PTM_SOLVER_EQFIX is on AND this face has Qb > 0,
+// so the gate-off path pays one compare against a register and touches no
+// atomics -- the loop above is unchanged and stays byte-identical.
+static inline void countTgeoRelease(const double* T, size_t n, double t_geo_watch) {
+    if (t_geo_watch <= 0.0) return;
+    long long below = 0;
+    for (size_t i = 0; i < n; ++i) if (T[i] < t_geo_watch) ++below;
+    noteTgeoRelease(below, static_cast<long long>(n));
+}
+
 void Profile::update_T(double dt, double Qs, double Qb) {
     // 0) Boundary conditions (update boundary nodes T[0], T[n-1])
     surfTemp(*this, Qs);
@@ -865,10 +888,42 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     // finalize loop at T_lo = max(CMB, T_geo) corrects only that sub-floor
     // drift (real PSR floors converge to T_geo from above -> no-op). Per-face,
     // physics-set, NOT the arbitrary [3,500] K clamp.
+    //
+    // PTM_SOLVER_EQFIX removes it. The floor is not a correction, it is a
+    // Dirichlet pin: it holds layer 0 at the analytically exact
+    // (Qb/(eps*sigma))^0.25 and thereby MASKS the surface Newton's bias, and
+    // its pin on nodes 0/1 defeats the deviation form (measured: arrest onset
+    // j=1 with the floor on, none with it off). Only the absolute physical
+    // floor (the CMB) survives. Nodes that WOULD have been clamped are counted
+    // and reported rather than silently released.
     const double sigma_sb = config ? config->sigma : 5.670374419e-8;
     const double T_geo = (Qb > 0.0)
         ? std::sqrt(std::sqrt(Qb / (emissivity * sigma_sb))) : 0.0;
-    const double T_lo = std::max(ABSOLUTE_ZERO_K, T_geo);
+    //
+    // Correction-3 rule: under the gate, a path carrying the floor removal
+    // WITHOUT the deviation form must refuse, because the two are one physical
+    // change. This path does NOT refuse, and the exemption is measured rather
+    // than argued: the deviation form's entire benefit is float32 quantization.
+    // In the reference measurement (r1_deviation_2026-08-10/arrest_arms2.json)
+    // the absolute and deviation forms agree to 6.2e-14 K in float64 -- the
+    // algebraic-identity noise floor -- while in float32 the deviation form
+    // recovers 0.0649 K of deficit and removes the arrest at j=1. This path
+    // stores T in double, so there is no arrest here for the deviation form to
+    // remove. The static_assert makes that precondition fail the BUILD rather
+    // than the physics if the state type is ever narrowed.
+    static_assert(std::is_same<
+                      std::remove_reference<decltype(grid.T[0])>::type,
+                      double>::value,
+                  "Profile state is no longer float64. The PTM_SOLVER_EQFIX "
+                  "T_geo-floor removal is exempt from the deviation-form "
+                  "requirement ONLY because this path is float64 and cannot "
+                  "arrest. Narrowing it re-arms the arrest: implement the R1 "
+                  "deviation form here, or make this path refuse under the "
+                  "gate like the CPU SIMD and GPU paths do.");
+    const bool   eqfix = solverEqFixEnabled();
+    const double T_lo  = eqfix ? ABSOLUTE_ZERO_K
+                               : std::max(ABSOLUTE_ZERO_K, T_geo);
+    const double T_geo_watch = eqfix ? T_geo : 0.0;
 
     const size_t n_tot = grid.T.size();
     if (n_tot < 3) return;            // need at least 1 interior node
@@ -1132,6 +1187,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
             Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
+        countTgeoRelease(Tptr, n_tot, T_geo_watch);
         return;
     }
 
@@ -1186,6 +1242,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
             Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
         }
+        countTgeoRelease(Tptr, n_tot, T_geo_watch);
         return;
     }
 
@@ -1344,6 +1401,59 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
         Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
     }
+    countTgeoRelease(Tptr, n_tot, T_geo_watch);
+}
+
+// See the declaration in thermal_model.h for why the three changes share one
+// gate. Announced once so a run's log records which solver it used.
+bool solverEqFixEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PTM_SOLVER_EQFIX");
+        const bool v = (e && *e && std::strcmp(e, "0") != 0);
+        if (v) {
+            std::cout << "[Thermal] PTM_SOLVER_EQFIX=1: surface-Newton exit "
+                         "criterion + T_geo-floor removal + R1 deviation form "
+                         "ENABLED (non-default solver)." << std::endl;
+        }
+        return v;
+    }();
+    return on;
+}
+
+// Surface-Newton convergence counters. The step limiter's growth branch is
+// unreachable from the max(T_eq, T1) seed (which is >= the root, so the
+// concave decreasing f is approached monotonically from above); if it ever
+// fires, that premise has broken and the iterate can be off by hundreds of K.
+// Counted, not assumed -- reported by reportSurfaceNewtonStats().
+static std::atomic<long long> g_surf_newton_growth_cap{0};
+static std::atomic<long long> g_surf_newton_iter_cap{0};
+
+void reportSurfaceNewtonStats() {
+    const long long g = g_surf_newton_growth_cap.load(std::memory_order_relaxed);
+    const long long c = g_surf_newton_iter_cap.load(std::memory_order_relaxed);
+    const long long w = g_tgeo_would_clamp.load(std::memory_order_relaxed);
+    const long long n = g_tgeo_tested.load(std::memory_order_relaxed);
+    if (n > 0) {
+        std::cout << "[Thermal] PTM_SOLVER_EQFIX T_geo-floor release: " << w
+                  << " / " << n << " node-updates ("
+                  << (100.0 * static_cast<double>(w) / static_cast<double>(n))
+                  << "%) would have been raised to T_geo by the removed floor "
+                     "and were left at the value the solver computed."
+                  << std::endl;
+    }
+    if (g > 0) {
+        std::cerr << "[Thermal] WARNING: the surface-Newton growth-side step "
+                     "limiter fired " << g << " time(s). It is supposed to be "
+                     "unreachable from the max(T_eq, T1) seed; a below-root "
+                     "start caps growth at 1.5x/iteration and can leave the "
+                     "surface hundreds of K cold. Investigate before trusting "
+                     "surface temperatures." << std::endl;
+    }
+    if (c > 0) {
+        std::cerr << "[Thermal] WARNING: the surface-Newton iteration cap "
+                     "(10) was hit " << c << " time(s) without meeting the "
+                     "convergence criterion." << std::endl;
+    }
 }
 
 void surfTemp(Profile& p, double Qs) {
@@ -1352,7 +1462,7 @@ void surfTemp(Profile& p, double Qs) {
     double k0 = p.k()[0];
     double dz0 = p.dz()[0];
     double T1 = p.T()[1];
-    
+
     // No artificial temperature clamps: the surface energy balance
     // f(T) = Qs + k*(T1-T)/dz - eps*sigma*T^4 is monotonically decreasing in T
     // (df/dT < 0), so it has a unique physical root that the damped Newton
@@ -1384,12 +1494,108 @@ void surfTemp(Profile& p, double Qs) {
         if (T_eq > Tnew) Tnew = T_eq;
     }
 
+    // ---- PTM_SOLVER_EQFIX: residual-based exit criterion -------------------
+    // Three changes, in decreasing order of leverage:
+    //
+    //  1. relaxation 0.8 -> 1.0. This is the larger lever, not the tolerance:
+    //     f is concave and decreasing and the seed is >= the root, so the
+    //     undamped Newton converges monotonically from above with no risk of
+    //     overshoot, and 0.8 merely truncates a converging sequence.
+    //
+    //  2. Exit on the RADIATIVELY NORMALIZED residual |f| <= tol_K*4*eps*sigma
+    //     *T0^3, not on |dT| and not on a raw W/m^2 residual. |df| = k0/dz0 +
+    //     4*eps*sigma*T0^3 >= 4*eps*sigma*T0^3, so this bounds the POSITION
+    //     error by tol_K uniformly in T. A single raw f_tol would span 4300x
+    //     between a 24 K and a 390 K surface, which is worse than the 74x it
+    //     would replace.
+    //
+    //  3. The test runs only AFTER at least one step (MIN_ITER = 1). Testing
+    //     before the first step turns any Q_b = 0 column into a CONTINUUM of
+    //     fixed points of width tol_K: every T whose residual is already
+    //     inside the band is accepted, so the column stops wherever it
+    //     happens to be. Measured on the Qb=0 / Qs=1e-3 drift column: the
+    //     zero-step variant lands +9.99953e-05 K off (exactly the band edge),
+    //     the guarded one +7.1937e-10 K.
+    //
+    // ulp floor. Below ~22 K in float32, |df|*ulp(T0) exceeds tol_K*4*eps*
+    // sigma*T0^3, so a converged iterate cannot CERTIFY convergence and spins
+    // to the iteration cap (measured cap fraction 0.9895 at 1-3 K) while its
+    // true position error is ~4e-8 K. The tolerance is therefore floored at
+    // the residual change one representable step of T0 produces. c = 2 because
+    // eps_mach*T0 is between 1x and 2x the true ulp(T0), and the float32
+    // evaluation of f can itself round by a step; 2 covers both. In float64
+    // the floor is ~1e-16 relative and never binds, so the CPU path keeps its
+    // full accuracy and this is purely the GPU twin's safety net.
+    if (solverEqFixEnabled()) {
+        const int    kMaxIter = 10;
+        // Diagnostic override. The shipping value is 1e-4 K; PTM_SOLVER_EQFIX_TOLK
+        // exists so a test can SWEEP it and thereby attribute a converged-column
+        // bias to the Newton's exit criterion (bias shrinks with tol_K) versus
+        // the interior stencil (bias does not). Both are dt-independent at the
+        // fixed point, so dt cannot separate them and tol_K is the discriminator.
+        static const double kTolK = [] {
+            const char* e = std::getenv("PTM_SOLVER_EQFIX_TOLK");
+            if (!e || !*e) return 1e-4;
+            const double v = std::atof(e);
+            std::cout << "[Thermal] PTM_SOLVER_EQFIX_TOLK=" << v
+                      << " overrides the surface-Newton tolerance (diagnostic)."
+                      << std::endl;
+            return (v > 0.0) ? v : 1e-4;
+        }();
+        const double kUlpC    = 2.0;
+        const double eps_mach = std::numeric_limits<double>::epsilon();
+        int iter = 0;
+        for (; iter < kMaxIter; ++iter) {
+            const double T0 = Tnew;
+            const double T0_cubed  = pow3(T0);
+            const double T0_fourth = T0 * T0_cubed;
+
+            const double f  = Qs + k0 * (T1 - T0) / dz0 - epsilon * sigma * T0_fourth;
+            double df = -k0 / dz0 - 4.0 * epsilon * sigma * T0_cubed;
+            if (std::abs(df) < 1e-10) df = -1e-10;
+
+            // MIN_ITER = 1: skipped on iter 0 so at least one step is taken.
+            if (iter > 0) {
+                const double h_rad   = 4.0 * epsilon * sigma * T0_cubed;
+                const double tol_res = kTolK * h_rad;
+                const double tol_ulp = kUlpC * std::abs(df) * eps_mach * T0;
+                if (std::abs(f) <= std::max(tol_res, tol_ulp)) break;
+            }
+
+            double dTi = f / df;   // relaxation 1.0
+
+            // Step limiter. The COOLING side (dT > 0 lowers T) is what keeps
+            // every iterate strictly positive when df -> 0 on a cold,
+            // low-conductivity face, so it stays at 0.5*T0. The GROWTH side is
+            // widened from 0.5*T0 to 4*T0: at 0.5*T0 it caps growth at
+            // 1.5x/iteration, a factor-57.7 ceiling over 10 iterations that
+            // produced measured errors of -68.5 / -130.5 / -392.3 K from a
+            // below-root start. That start is unreachable from the
+            // max(T_eq, T1) seed, but the code must not silently depend on
+            // that: widening makes the ceiling unreachable too, and the
+            // counter below records any firing.
+            const double cool_cap  = 0.5 * T0;
+            const double growth_cap = 4.0 * T0;
+            if (dTi >  cool_cap)   dTi =  cool_cap;
+            if (dTi < -growth_cap) {
+                dTi = -growth_cap;
+                g_surf_newton_growth_cap.fetch_add(1, std::memory_order_relaxed);
+            }
+            Tnew = T0 - dTi;
+        }
+        if (iter >= kMaxIter) {
+            g_surf_newton_iter_cap.fetch_add(1, std::memory_order_relaxed);
+        }
+        p.T()[0] = Tnew;
+        return;
+    }
+
     // Optimized Newton-Raphson with early termination
     double dT = 1.0;
-    int max_iter = 10; 
+    int max_iter = 10;
     double tolerance = 0.001;
     double relaxation = 0.8;
-    
+
     for (int iter = 0; iter < max_iter && std::abs(dT) > tolerance; iter++) {
         double T0 = Tnew;
         
@@ -2467,6 +2673,28 @@ void ThermalBatchSoA::setFluxContiguous(const double* flux_values, int num_faces
 }
 
 void ThermalBatchSoA::advanceTimestep(double dt) {
+    // PTM_SOLVER_EQFIX refusal (the general rule, not a special case): under
+    // the gate, any solver path that would run the T_geo-floor removal WITHOUT
+    // the deviation form -- or, here, without even the new surface-Newton
+    // criterion -- is a knowingly-wrong configuration and must be impossible to
+    // execute, not merely discouraged. This path has neither: its surface
+    // Newton (applySurfaceBCBatch) is a separate, weaker solver -- 5 fixed
+    // iterations, no convergence test, a hard [CMB, 500 K] clamp -- and the
+    // deviation form is not implemented here. BUGS.md PTM-216.
+    static const bool refuse = solverEqFixEnabled();
+    if (refuse) {
+        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the CPU SIMD "
+                     "batch path (ThermalBatchSoA::advanceTimestep) implements "
+                     "neither the new surface-Newton exit criterion nor the R1 "
+                     "deviation form.\n"
+                     "  Running it under the gate would release the T_geo floor "
+                     "under an unimproved 5-iteration Newton and leave the "
+                     "interior arrest in place, and nothing would say so.\n"
+                     "  Only the CPU scalar path (Profile::update_T) is covered "
+                     "at this commit. Unset PTM_SOLVER_EQFIX, or use a solver "
+                     "configuration that takes the scalar path." << std::endl;
+        std::exit(1);
+    }
     updateMaterialPropertiesBatchSIMD(*this);
     applySurfaceBCBatch(*this, dt);
     buildTridiagonalSystemBatch(*this, dt);
@@ -2481,6 +2709,12 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     // drift numerically below this physical floor; clamping each face's column
     // at T_geo corrects only that sub-floor drift (real PSR floors converge to
     // T_geo from above -> no-op). Per-face, physics-set, NOT a fixed clamp.
+    //
+    // NOT touched by PTM_SOLVER_EQFIX. This path REFUSES to run under the gate
+    // (see advanceTimestep), because removing the floor here without also
+    // giving this path the new surface-Newton criterion and the deviation form
+    // would leave a weak 5-iteration Newton with its safety net gone -- worse
+    // than either change alone. BUGS.md PTM-216.
     for (int f = 0; f < n_faces; ++f) {
         const double qb = Qb[f];
         if (qb <= 0.0) continue;

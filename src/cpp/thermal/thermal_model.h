@@ -161,6 +161,35 @@ const double SIGMA_SB = 5.67051196e-8; // Stefan-Boltzmann Constant
 const double ABSOLUTE_ZERO_K = 2.7;      // Cosmic microwave background temperature (K) - physical minimum
 const double MAX_PHYSICAL_TEMP_K = 500.0; // Maximum physically reasonable temperature for icy bodies (K)
 
+// ---------------------------------------------------------------------------
+// Solver equilibration/accuracy fix set -- ONE gate for the whole set.
+//
+// The three changes it enables (surface-Newton exit criterion, removal of the
+// T_geo floor, and the R1 deviation form for the interior solve) are NOT
+// independent and must never be enabled separately:
+//
+//   * the T_geo floor pins layer 0 at the analytically exact (Qb/(eps*sigma))^
+//     0.25 and thereby MASKS the Newton's +9.686548e-03 K bias -- removing the
+//     floor alone exposes it;
+//   * the floor's Dirichlet pin on nodes 0/1 DEFEATS the deviation form
+//     (measured: arrest onset j=1 with the floor on, none with it off), so
+//     shipping R1 with the floor still in place buys nothing;
+//   * removing the floor creates a sub-22 K population that only the Newton's
+//     ulp floor can terminate.
+//
+// Default OFF. With the gate off every solver path is byte-identical.
+// Read once; the value is process-wide and must not vary between faces.
+// ---------------------------------------------------------------------------
+bool solverEqFixEnabled();
+
+// Emit a warning if the surface-Newton step limiter's growth branch or the
+// iteration cap ever fired. Both are supposed to be unreachable; silence about
+// them is exactly the failure mode PTM-115/116 were.
+void reportSurfaceNewtonStats();
+
+// Record nodes the removed T_geo floor would have raised (PTM_SOLVER_EQFIX).
+void noteTgeoRelease(long long would_clamp, long long tested);
+
 // Helper functions
 double R350(double chi);
 double skinDepth(double P, double kappa);
