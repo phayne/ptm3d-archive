@@ -235,7 +235,7 @@ def test_thermal_inertia_refuses_rather_than_switching_convention(tmp):
             raise AssertionError(
                 f"{why}: thermal_inertia must not silently fall back to "
                 f"thermophysical.constant_thermal_inertia -- that is a "
-                f"different column (39.27 K vs 42.19 K at TI=200)")
+                "different column")
 
 
 def test_the_two_thermal_inertia_conventions_cannot_both_be_swept(tmp):

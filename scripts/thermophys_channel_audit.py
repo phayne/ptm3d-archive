@@ -276,7 +276,7 @@ CASES = [
     C("gb_ks_override", AST_BASE, {"thermophysical.ks_override": 0.03333333},
       ref="ast_base", note="*_override on a generic body"),
 
-    # ---- the two TI conventions on the asteroid (phase 3a's 39.27 / 42.19) --
+    # ---- the two TI conventions on the asteroid (phase 3a's TI pair) -------
     C("ast_ti200_flag", AST_BASE, args=["--thermal-inertia", "200"], ref="ast_base"),
     C("ast_ti200_const", AST_BASE, args=["--constant-thermal-inertia", "200"],
       ref="ast_base"),

@@ -23,6 +23,14 @@ import sys
 import numpy as np
 import openpyxl
 
+# numpy 2.0 renamed ``trapz`` to ``trapezoid`` and REMOVED the old name, so the
+# bare ``np.trapz`` below stopped existing on numpy>=2. Bind whichever spelling
+# this numpy has; the repository's declared floor is numpy>=1.20 and both ends
+# of that range have to work.
+_trapezoid = getattr(np, "trapezoid", None)
+if _trapezoid is None:                  # numpy < 2.0
+    _trapezoid = np.trapz
+
 H, C, KB, SIG = 6.62607015e-34, 2.99792458e8, 1.380649e-23, 5.670374419e-8
 XLSX = (Path(__file__).resolve().parents[2]
         / "docs/lucey_tir_reflection/LVO_ReferenceSpectra15041_62231.xlsx")
@@ -52,15 +60,15 @@ def load_reflectance(lam):
 
 def band_bt(lam, L, lo, hi):
     m = (lam >= lo) & (lam <= hi)
-    tgt = np.trapz(L[m], lam[m])
+    tgt = _trapezoid(L[m], lam[m])
     Ts = np.linspace(40, 320, 2801)
-    integ = np.array([np.trapz(planck(lam[m], T), lam[m]) for T in Ts])
+    integ = np.array([_trapezoid(planck(lam[m], T), lam[m]) for T in Ts])
     return np.interp(tgt, integ, Ts)
 
 
 def bol_bt(lam, L):
     def cs(Lx):
-        return sum(np.trapz(Lx[(lam >= lo) & (lam <= hi)], lam[(lam >= lo) & (lam <= hi)])
+        return sum(_trapezoid(Lx[(lam >= lo) & (lam <= hi)], lam[(lam >= lo) & (lam <= hi)])
                    for lo, hi in DIVINER_CH)
     tgt = cs(L)
     Ts = np.linspace(40, 320, 2801)
@@ -73,7 +81,7 @@ def main():
     R = load_reflectance(lam)
     eps = 1.0 - R
     Lwall = eps * planck(lam, TWALL)
-    wall_int = np.trapz(Lwall, lam)
+    wall_int = _trapezoid(Lwall, lam)
 
     Tfs = np.array([70, 80, 90, 100, 110, 120])
     d814, dbol, b14e = [], [], []
