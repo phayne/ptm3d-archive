@@ -1098,7 +1098,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "thermal:\n";
     out << "  run_thermal_mesh: true              # Run thermal model\n";
     out << "  threads: 0                          # Number of threads (0=auto)\n";
-    out << "  equilibration_orbits: 10            # Day/night cycles for equilibration\n";
+    out << "  equilibration_orbits: 10            # INTEGRATED day/night cycles of spin-up (all paths)\n";
     out << "  equilibration_steps_per_day: -1     # Explicit eq cadence (steps/Earth-day); -1 = auto\n";
     out << "  equilibration_samples_per_diurnal_cycle: 120  # Accuracy target when eq_steps_per_day<=0\n";
     out << "                                      # Calibrated on Moon ico3 vs legacy reference:\n";
@@ -1106,11 +1106,13 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      #   240 -> ~3 K max err (High accuracy)\n";
     out << "                                      #    30 -> ~7 K max err (Fast)\n";
     out << "                                      #   <=0 -> legacy (match output cadence)\n";
-    out << "  # equilibration_cycles: 2           # PASSES over the eq forcing array (GPU solver only).\n";
+    out << "  # equilibration_cycles: 2           # Replays of the eq forcing block (GPU solver only).\n";
     out << "  # equilibration_target_K: 0.1        # accuracy the spin-up ESTIMATE targets (report-only).\n";
-    out << "                                      # Effective eq = cycles x equilibration_orbits diurnal\n";
-    out << "                                      # cycles, at 1x illumination cost and 1x flux RAM.\n";
-    out << "                                      # Unset = the solver legacy value, which is 2 (not 1).\n";
+    out << "                                      # The block is equilibration_orbits / cycles long, so\n";
+    out << "                                      # the INTEGRATED spin-up stays equilibration_orbits and\n";
+    out << "                                      # only the flux RAM and illumination cost fall (by N).\n";
+    out << "                                      # Unset = 1. Before 2026-08-11 the default was 2 and\n";
+    out << "                                      # the integrated total was cycles x orbits.\n";
     out << "  # eq_extrapolation:                  # Pass-stride RRE on the equilibration state. DEFAULT OFF.\n";
     out << "  #   method: off                      #   off | rre\n";
     out << "  #   order_p: 4                       #   3 or 4; needs equilibration_cycles >= order_p + 1\n";

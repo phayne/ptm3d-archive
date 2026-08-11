@@ -13,7 +13,8 @@ mesh:
 thermal:
   run_thermal_mesh: true
   threads: 0
-  equilibration_orbits: 10.0
+  equilibration_cycles: 2
+  equilibration_orbits: 20.0
   use_gpu: true
   compute_statistics: true
   enable_shadow_flux: false

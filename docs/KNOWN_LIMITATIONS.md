@@ -61,8 +61,9 @@ to be judged against.
 | Faces that receive none | 70.3% | 0.36 K, frozen | No — see section 3 |
 
 **Measured.** On a 509,337-face lunar polar terrain mesh, three states of the same run differing
-only in `thermal.equilibration_cycles` (50, 100 and 200 integrated lunations), comparing the mean
-of the bottom five depth nodes (0.85–1.00 m):
+only in `thermal.equilibration_cycles` (50, 100 and 200 integrated lunations — on the pre-2026-08-11
+engine, where that meant 2, 4 and 8 passes over a 25-cycle block), comparing the mean of the bottom
+five depth nodes (0.85–1.00 m):
 
 - 50 → 100 lunations moves the deep column on forced faces by a median of **6.57 K**, maximum
   **21.03 K**.
@@ -83,22 +84,34 @@ the point where two different failures are present.
 
 **What to do instead.**
 
-1. **Compute the integrated cycle count, which is not the number in the config.** On the GPU
-   persistent solver the equilibration forcing block is replayed
-   `thermal.equilibration_cycles` times, default **2**. Integrated cycles are
-   `equilibration_orbits × equilibration_cycles`, so `equilibration_orbits: 25` integrates 50
-   lunations. On the CPU there is no multiplier. The startup banner now prints the true pass count
-   and the equivalent number of diurnal cycles; read it rather than the config.
+1. **Read the integrated cycle count off the banner.** `thermal.equilibration_orbits` is now the
+   integrated number of diurnal cycles of real forcing on every solver path, and every run prints
+   `Equilibration (configured)` and `Equilibration (integrated)` before it starts. Note what that
+   number still excludes: the CPU scalar and SIMD paths run a fixed analytic clear-sky
+   pre-conditioner of `NYEARSEQ × round(year/day)` cycles first — 24 on the Moon, 2 on Europa —
+   which no key configures and the GPU path does not have. The banner prints its length too.
+
+   *Fixed in the 2026-08-11 equilibration-semantics change (BUGS.md PTM-146).* Before that date
+   `equilibration_orbits` was the *block* length and the GPU pass count defaulted to 2, so a GPU run
+   integrated `equilibration_orbits × equilibration_cycles` — twice the stated number — while a CPU
+   run integrated it once. `equilibration_orbits: 25` bought 50 lunations on the GPU and 25 on the
+   CPU. **Every GPU result produced before 2026-08-11 was spun up for twice its config value**, so
+   read an older run's provenance that way; the "shipped 50 lunations" measurements in this section
+   came from `equilibration_orbits: 25` on that pre-change engine. The shipped GPU configurations
+   were rewritten alongside the fix to state the integrated number they had always run (10 became
+   20, with `equilibration_cycles: 2`), so their results did not change.
 
 2. **Count e-foldings.** Divide integrated cycles by the deep relaxation time. Measured anchors:
    roughly **15–23 lunations** on the Moon and about **9.5 orbits** on Europa, both for the engine's
    default depth grid; a deeper grid (`thermal.thermal_b`) is slower. Three e-foldings leaves 5% of
    the initial deep error, seven leaves 0.1%. In this repository, of the 77 configurations that set
-   `equilibration_orbits`, the 16 lunar thermal ones buy **0.01 to 0.13 e-foldings**, the 46 Europa
-   configurations at 10 orbits buy about **1.1**, and the 7 at 20 orbits about **2.1** — none
-   reaches three. (The three generic-body asteroid configurations at 40–50 rotations are a
-   different regime with a much shallower column and have not been scored; two further lunar
-   configurations set 0 and are illumination-only, where that is correct.)
+   `equilibration_orbits`, the 15 lunar thermal ones buy **0.01 to 0.13 e-foldings** and the 55
+   Europa ones buy **0.5 to 2.1** — none reaches three. (The four generic-body asteroid
+   configurations at 40–50 rotations are a different regime with a much shallower column and have
+   not been scored; two further lunar configurations set 0 and are illumination-only, where that is
+   correct.) The Europa figure was quoted as **1.1** before 2026-08-11 because it was read off the
+   config value of a GPU configuration that was silently integrating twice it — a worked example of
+   why this section says to read the banner and not the key.
 
 3. **Run the differential yourself.** Run the same configuration at `N` and `2N` and compare the
    product you intend to report — per population, not as one mesh-wide statistic. If it moves, `N`
