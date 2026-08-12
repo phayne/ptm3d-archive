@@ -293,6 +293,7 @@ private:
     cl_mem buf_Qb_ = nullptr;          // Bottom heat flux
     cl_mem buf_n_substeps_frozen_ = nullptr;  // per-face frozen substep count (R2 fix)
     cl_mem buf_surf_resid_ = nullptr;  // per-face surface-BC residual certificate [K]
+    cl_mem buf_surf_iters_ = nullptr;  // per-face max surface-Newton step count
     cl_mem buf_cp_coeffs_ = nullptr;   // cp polynomial coefficients
 
     // Material parameters
@@ -309,6 +310,8 @@ private:
     // |f| / (4 eps sigma T^3) [K], reduced from buf_surf_resid_.
     float max_surf_resid_K_ = 0.0f;
     float reported_surf_resid_K_ = -1.0f;
+    int       max_surf_iters_    = 0;
+    long long faces_at_iter_cap_ = 0;
 };
 
 /**

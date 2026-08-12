@@ -14,6 +14,7 @@
 #include "machine_profile.h"   // Phase R (R2): per-host dispatch self-chunk ceiling
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -452,7 +453,12 @@ __kernel void persistentThermalKernel(
     // Per-face surface-BC certificate: max over this session's substeps of the
     // achieved |f| / (4 eps sigma T^3) [K] from the surface Newton. Appended
     // after cond_model for the same reason cond_model was appended last.
-    __global float* surf_resid_K)
+    __global float* surf_resid_K,
+    // Companion: max Newton steps this face took in any substep. Without it the
+    // round-off floor's COST is invisible from outside the kernel -- the
+    // residual alone cannot distinguish "exited in 2 steps at the precision
+    // limit" from "spun to the 10-step cap and ended at the same place".
+    __global int* surf_iters)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -618,7 +624,8 @@ __kernel void persistentThermalKernel(
                 // is limited by that floor rather than by tol_K says so.
                 float f = 0.0f;
                 float h_rad = 0.0f;
-                for (int iter = 0; iter < 10; ++iter) {
+                int   iter = 0;
+                for (; iter < 10; ++iter) {
                     float T0 = T_surf;
                     float T3 = T0 * T0 * T0;
 
@@ -672,6 +679,7 @@ __kernel void persistentThermalKernel(
                 {
                     float resid = (h_rad > 0.0f) ? fabs(f) / h_rad : fabs(f);
                     if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
+                    if (iter > surf_iters[face]) surf_iters[face] = iter;
                 }
 
                 T_local[0] = T_surf;
@@ -1190,17 +1198,42 @@ void ThermalOpenCLSolver::reduceSurfaceBCResidual(cl_command_queue queue) {
         const float r = resid[i];
         if (std::isfinite(r) && r > max_surf_resid_K_) max_surf_resid_K_ = r;
     }
+
+    std::vector<int> iters(n_faces_, 0);
+    rerr = clEnqueueReadBuffer(queue, buf_surf_iters_, CL_TRUE, 0,
+                               n_faces_ * sizeof(int), iters.data(),
+                               0, nullptr, nullptr);
+    if (rerr != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] WARNING: could not read the surface-BC "
+                     "iteration counts (" << clErrorString(rerr) << ").\n";
+        return;
+    }
+    long long capped = 0;
+    for (size_t i = 0; i < iters.size(); ++i) {
+        if (iters[i] > max_surf_iters_) max_surf_iters_ = iters[i];
+        if (iters[i] >= 10) ++capped;
+    }
+    faces_at_iter_cap_ = capped;
 }
 
 void ThermalOpenCLSolver::reportSurfaceBCCertificate() {
     if (max_surf_resid_K_ <= 0.0f) return;
     if (max_surf_resid_K_ <= reported_surf_resid_K_) return;   // nothing new
     reported_surf_resid_K_ = max_surf_resid_K_;
-    std::cout << "[GPU Thermal] surface-BC certificate: max achieved "
-                 "|f|/(4 eps sigma T^3) = " << max_surf_resid_K_
-              << " K (tol_K = 1e-4 K). Values above tol_K are the float32 "
-                 "round-off floor of the residual test, not a solver failure -- "
-                 "reported so they are never silent.\n";
+    // Local stream: std::cout arrives here carrying std::fixed <<
+    // setprecision(1) from an earlier banner, which rendered this certificate
+    // as "0.0 K" -- the PTM-05/PTM-55 archetype, and on the one line whose
+    // whole job is to make a small number visible.
+    std::ostringstream o;
+    o << "[GPU Thermal] surface-BC certificate: max achieved "
+         "|f|/(4 eps sigma T^3) = " << std::scientific << std::setprecision(4)
+      << max_surf_resid_K_ << " K (tol_K = 1.0e-04 K); worst face took "
+      << std::defaultfloat << max_surf_iters_ << " Newton steps, "
+      << faces_at_iter_cap_ << " / " << n_faces_
+      << " faces reached the 10-step cap. Values above tol_K are the float32 "
+         "round-off floor of the residual test, not a solver failure -- "
+         "reported so they are never silent.";
+    std::cout << o.str() << std::endl;
 }
 
 void ThermalOpenCLSolver::createBuffers() {
@@ -1277,6 +1310,10 @@ void ThermalOpenCLSolver::createBuffers() {
         std::vector<float> zeros(n_faces_, 0.0f);
         buf_surf_resid_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                          n_faces_ * sizeof(float), zeros.data(), &err);
+        CL_CHECK(err);
+        std::vector<int> izeros(n_faces_, 0);
+        buf_surf_iters_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                         n_faces_ * sizeof(int), izeros.data(), &err);
         CL_CHECK(err);
     }
 
@@ -1591,8 +1628,10 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));
-    // Per-face surface-BC residual certificate (arg 28), appended last.
+    // Per-face surface-BC residual certificate (arg 28) and its iteration
+    // companion (arg 29), appended last.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -2026,8 +2065,10 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));
-    // Per-face surface-BC residual certificate (arg 28), appended last.
+    // Per-face surface-BC residual certificate (arg 28) and its iteration
+    // companion (arg 29), appended last.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -2251,6 +2292,7 @@ void ThermalOpenCLSolver::release() {
     if (buf_Qb_) { clReleaseMemObject(buf_Qb_); buf_Qb_ = nullptr; }
     if (buf_n_substeps_frozen_) { clReleaseMemObject(buf_n_substeps_frozen_); buf_n_substeps_frozen_ = nullptr; }
     if (buf_surf_resid_) { clReleaseMemObject(buf_surf_resid_); buf_surf_resid_ = nullptr; }
+    if (buf_surf_iters_) { clReleaseMemObject(buf_surf_iters_); buf_surf_iters_ = nullptr; }
     if (buf_cp_coeffs_) { clReleaseMemObject(buf_cp_coeffs_); buf_cp_coeffs_ = nullptr; }
 
     // Release context (via unique_ptr)

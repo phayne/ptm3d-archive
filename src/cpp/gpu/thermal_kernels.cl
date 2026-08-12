@@ -304,7 +304,12 @@ __kernel void persistentThermalKernel(
     // Per-face surface-BC certificate: max over this session's substeps of the
     // achieved |f| / (4 eps sigma T^3) [K] from the surface Newton. Appended
     // after cond_model for the same reason cond_model was appended last.
-    __global float* surf_resid_K)
+    __global float* surf_resid_K,
+    // Companion: max Newton steps this face took in any substep. Without it the
+    // round-off floor's COST is invisible from outside the kernel -- the
+    // residual alone cannot distinguish "exited in 2 steps at the precision
+    // limit" from "spun to the 10-step cap and ended at the same place".
+    __global int* surf_iters)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -470,7 +475,8 @@ __kernel void persistentThermalKernel(
                 // is limited by that floor rather than by tol_K says so.
                 float f = 0.0f;
                 float h_rad = 0.0f;
-                for (int iter = 0; iter < 10; ++iter) {
+                int   iter = 0;
+                for (; iter < 10; ++iter) {
                     float T0 = T_surf;
                     float T3 = T0 * T0 * T0;
 
@@ -524,6 +530,7 @@ __kernel void persistentThermalKernel(
                 {
                     float resid = (h_rad > 0.0f) ? fabs(f) / h_rad : fabs(f);
                     if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
+                    if (iter > surf_iters[face]) surf_iters[face] = iter;
                 }
 
                 T_local[0] = T_surf;
