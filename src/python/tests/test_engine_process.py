@@ -14,6 +14,8 @@ Run directly::
 
 from __future__ import annotations
 
+import shlex
+import subprocess
 import sys
 import textwrap
 import time
@@ -171,8 +173,17 @@ out = None
 if "--output" in sys.argv:
     out = sys.argv[sys.argv.index("--output") + 1]
 else:
-    import yaml
-    out = yaml.safe_load(Path(cfg).read_text())["output"]["directory"]
+    # The engine parses its own YAML in C++. This stub reads the one key it
+    # needs out of the fixture config by hand: PyYAML is a declared
+    # dependency of the package under test, not of whatever interpreter is
+    # running the tests, and importing it here made a missing library look
+    # like an engine that exited 1. Absent key is fatal, never a default.
+    for line in Path(cfg).read_text().splitlines():
+        if line.strip().startswith("directory:"):
+            out = line.split(":", 1)[1].strip()
+    if out is None:
+        sys.stderr.write("FATAL [stub]: no output.directory in %s\\n" % cfg)
+        raise SystemExit(2)
 Path(out).mkdir(parents=True, exist_ok=True)
 (Path(out) / "argv.json").write_text(json.dumps(sys.argv[1:]))
 sys.stderr.write("[machine-profile] using CONSERVATIVE defaults\\n")
@@ -188,10 +199,71 @@ raise SystemExit(int(sys.argv[sys.argv.index("--rc") + 1]) if "--rc" in sys.argv
 '''
 
 
+def _require_pyyaml(what):
+    """Fail naming the missing package, not the symptom it produces.
+
+    ``run_engine`` reads ``output.directory`` out of the config with PyYAML.
+    Without it the run still happens, a warning goes to stderr and
+    ``output_dir`` is ``None`` -- so an assertion on ``output_dir`` reports an
+    unsatisfied dependency as though the code were wrong.
+    """
+    try:
+        import yaml                                          # noqa: F401
+    except ImportError:
+        raise AssertionError(
+            f"{what} needs PyYAML, which ptm declares as a runtime dependency "
+            f"(pyproject.toml) and {sys.executable} does not have. Install the "
+            f"package the way CI does -- `python3 -m pip install -e .` from the "
+            f"repository root -- or run these tests with an interpreter that "
+            f"already has PyYAML.")
+
+
+def _check_runnable(exe):
+    """Prove the stub can be executed at all, and say why when it cannot.
+
+    ``run_engine`` takes a path and execs it, so the exec bit and an
+    exec-permitted directory are irreducible here. When either is missing the
+    failure otherwise lands much later as an exit status on an unrelated
+    assertion, which is unreadable; it is diagnosed at the source instead.
+    """
+    try:
+        proc = subprocess.run([str(exe), "--help"], capture_output=True,
+                              text=True, timeout=60)
+    except OSError as exc:
+        raise AssertionError(
+            f"the stub engine {exe} could not be executed ({exc}); its "
+            f"directory must permit execution and the file must keep its exec "
+            f"bit") from exc
+    if proc.returncode != 0 or "--config" not in proc.stdout:
+        raise AssertionError(
+            f"the stub engine ran but did not behave: exit {proc.returncode}, "
+            f"stdout {proc.stdout!r}, stderr {proc.stderr!r}")
+
+
 def _stub_engine(tmp):
+    """A stand-in engine on disk, with no interpreter path in its shebang.
+
+    ``run_engine`` takes one path to one executable file, so the stub must be
+    executable -- but nothing requires the *interpreter* to be named on the
+    ``#!`` line, and naming it there is what made this test report the machine
+    instead of the code. A shebang is parsed by the kernel: it is truncated
+    past a fixed length, it does not quote (a space in the path splits it),
+    and it may not point at another script. An interpreter path that is long,
+    spaced, or itself a wrapper therefore fails as an exec error or as a
+    "command not found" exit status, which surfaces here as "the engine exited
+    127" -- a green-or-red verdict decided by where Python is installed.
+
+    Passing the interpreter to ``/bin/sh`` as a quoted argument has none of
+    those limits: ``/bin/sh`` is POSIX-mandated at a fixed short path, and the
+    interpreter is resolved by the shell rather than the kernel.
+    """
+    payload = tmp / "stub_engine.py"
+    payload.write_text(RUN_STUB)
     exe = tmp / "ptm_thermal_sim"
-    exe.write_text(f"#!{sys.executable}\n" + RUN_STUB)
+    exe.write_text("#!/bin/sh\nexec {} {} \"$@\"\n".format(
+        shlex.quote(sys.executable), shlex.quote(str(payload))))
     exe.chmod(0o755)
+    _check_runnable(exe)
     return exe
 
 
@@ -224,6 +296,9 @@ def test_run_engine_quiet_returns_everything_and_prints_nothing():
         assert "Simulation completed in" in done.text
         # Every progress readout is kept in .lines even when nothing is echoed.
         assert sum("%" in ln for ln in done.lines) == 202, len(done.lines)
+        # output.directory comes from the config, which run_engine reads with
+        # PyYAML; say so rather than asserting into a None.
+        _require_pyyaml("resolving output.directory from the config")
         assert done.output_dir == (tmp / "out" / "run_a").resolve()
         assert done.matching("Simulation completed in"), "matching() found nothing"
 
