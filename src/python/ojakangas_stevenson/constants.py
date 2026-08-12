@@ -22,7 +22,8 @@ T_MELT = 273.0               # Melting temperature of ice I [K]
 # --- Europa surface parameters ---
 SOLAR_FLUX_JUPITER = 50.0    # pi*F_sun at Jupiter orbit [W/m^2] (= S_0 in the paper)
 BOND_ALBEDO = 0.5            # Bond albedo of Europa (p. 237)
-STEFAN_BOLTZMANN = 5.6704e-8 # Stefan-Boltzmann constant [W/(m^2 K^4)]
+STEFAN_BOLTZMANN = 5.670374419e-8 # Stefan-Boltzmann [W/(m^2 K^4)], SI-2019 exact;
+                                  # canonical: src/cpp/constants/stefan_boltzmann.h
 OBLIQUITY = np.radians(3.0)  # Effective obliquity i ~ 3 deg [rad]
 
 # --- Europa orbital parameters ---

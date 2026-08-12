@@ -20,6 +20,7 @@
 #include <random>
 #include <vector>
 #include <stdexcept>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 using gpu::opencl::RadiosityOpenCLSolver;
 using gpu::opencl::RadiosityOpenCLConfig;
@@ -136,7 +137,7 @@ int main(int argc, char** argv) {
     // --- small-scale CPU cross-check (mirror: E=eps sig T^4, src=rho Q, B=E+src+rho F B) ---
     double max_absdiff = -1.0;
     if (cpu_check) {
-        const double SIG = 5.670374419e-8;
+        const double SIG = ptm::kStefanBoltzmann;
         std::vector<double> E(n), src(n), B(n), Bn(n), FB(n);
         for (size_t i = 0; i < n; ++i) { double T = temps[i]; E[i] = 0.95 * SIG * T*T*T*T; src[i] = 0.05 * solar[i]; B[i] = E[i] + src[i]; }
         for (int it = 0; it < 100; ++it) {

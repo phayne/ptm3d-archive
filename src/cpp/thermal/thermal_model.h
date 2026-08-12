@@ -4,6 +4,8 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <limits>    // std::numeric_limits, for the surface-BC ulp floor
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #include <string>
 #include <memory>
 #include <iostream>  // Add this for std::cout
@@ -157,27 +159,185 @@ public:
 };
 
 // Constants
-const double SIGMA_SB = 5.67051196e-8; // Stefan-Boltzmann Constant
+// Stefan-Boltzmann constant. Single definition in constants/stefan_boltzmann.h;
+// this alias exists only because SIGMA_SB is used unqualified in ~40 places.
+const double SIGMA_SB = ptm::kStefanBoltzmann;
 const double ABSOLUTE_ZERO_K = 2.7;      // Cosmic microwave background temperature (K) - physical minimum
 const double MAX_PHYSICAL_TEMP_K = 500.0; // Maximum physically reasonable temperature for icy bodies (K)
 
 // ---------------------------------------------------------------------------
-// Solver equilibration/accuracy fix set -- ONE gate for the whole set.
+// THE SURFACE ENERGY BALANCE -- one solver, every path.
 //
-// The three changes it enables (surface-Newton exit criterion, removal of the
-// T_geo floor, and the R1 deviation form for the interior solve) are NOT
-// independent and must never be enabled separately:
+//     f(T) = Qs + k0*(T1 - T)/dz0 - eps*sigma*T^4 = 0
 //
-//   * the T_geo floor pins layer 0 at the analytically exact (Qb/(eps*sigma))^
-//     0.25 and thereby MASKS the Newton's +9.686548e-03 K bias -- removing the
-//     floor alone exposes it;
-//   * the floor's Dirichlet pin on nodes 0/1 DEFEATS the deviation form
-//     (measured: arrest onset j=1 with the floor on, none with it off), so
-//     shipping R1 with the floor still in place buys nothing;
-//   * removing the floor creates a sub-22 K population that only the Newton's
-//     ulp floor can terminate.
+// Before this function existed the engine carried four independent
+// implementations of this scalar root find (CPU scalar, CPU SIMD batch, GPU
+// persistent kernel, GPU combined kernel) that disagreed with each other by up
+// to 28.7 K on a single call. Maintaining a fourth implementation is what
+// created that; every CPU path now calls THIS function, and the OpenCL kernel
+// implements the identical algorithm in float32 with the same constants.
 //
-// Default OFF. With the gate off every solver path is byte-identical.
+// SEED: max(T_eq, T1) with T_eq = (Qs/(eps*sigma))^0.25, UNCONDITIONALLY.
+// f(T_eq)*f(T1) <= 0, so the unique root is always bracketed by
+// [min(T_eq,T1), max(T_eq,T1)]; the seed is the upper end. Seeding from the
+// PREVIOUS surface temperature (what the SIMD batch used to do) lands
+// off-bracket at any transition and overshoots the concave root -- measured
+// +22.958 K on a 0 -> 127 W/m^2 sunrise, +28.686 K on a 1197 -> 0 sunset.
+//
+// RELAXATION omega = 1.0. f is strictly decreasing (f' < 0) and concave
+// (f'' = -12*eps*sigma*T^2 < 0) and the seed is at or above the root, so
+// undamped Newton converges monotonically from above. omega = 0.8 is not
+// globalization on such a problem -- it is a 0.2-per-iteration linear
+// contraction imposed on a quadratically convergent iteration, and it costs
+// both accuracy and iterations. Globalization is the step limiter below.
+//
+// EXIT CRITERION: the residual normalized by the RADIATIVE stiffness alone,
+//
+//     |f| <= max( tol_K * 4*eps*sigma*T0^3 ,  c_ulp * |df| * eps_mach * T0 )
+//
+//   * |f| / (4*eps*sigma*T0^3) IS the fixed-point displacement in kelvin on a
+//     steady column (there the conduction term is pinned by the interior, so
+//     only radiation can absorb the leftover imbalance), which makes the
+//     criterion read directly in the units the answer is reported in.
+//   * A STEP criterion (|dT| <= tol) is wrong: dT = f/df and
+//     |df| = k0/dz0 + 4*eps*sigma*T0^3 spans 1.08 to 75.8 across a single
+//     lunar mesh, i.e. 74x different physical accuracy from face to face.
+//   * A RAW W/m^2 residual is worse: its kelvin meaning spans 4300x between a
+//     24 K and a 390 K surface.
+//
+// tol_K = 1e-4 K is DERIVED, not tuned. Over 252 cases spanning 5 decades of
+// stiffness (k0/dz0 = 1e-3 .. 100 W/m^2/K) and 4 of forcing (Qs = 0 .. 5444
+// W/m^2, T1 = 5 .. 400 K) the worst position error |T - root| is 1.790e-4 K,
+// against 3.4839 K for the |dT| <= 1e-3 K / omega = 0.8 rule it replaces.
+// src/cpp/tools/test_surface_newton.cpp runs that sweep against this function.
+//
+// THE ULP FLOOR IS NOT OPTIONAL. In float32 the residual test's own round-off
+// noise is 1.08e-4 K at 24 K on the moon3d grid -- i.e. AT tol_K -- so a fully
+// converged iterate cannot certify convergence and spins to the iteration cap.
+// The floor is the residual change that one representable step of T0 produces;
+// c_ulp = 2 because eps_mach*T0 is between 1x and 2x ulp(T0) and the evaluation
+// of f can itself round by a step. In float64 the floor is ~1e-16 relative and
+// never binds. When it DOES bind the solution says so (`ulp_limited`) and the
+// per-run report prints the count -- it is never silent.
+// ---------------------------------------------------------------------------
+constexpr double kSurfaceBCTolK    = 1e-4;   // K, the derived position tolerance
+constexpr int    kSurfaceBCMaxIter = 10;
+constexpr double kSurfaceBCUlpC    = 2.0;
+constexpr double kSurfaceBCCoolCap   = 0.5;  // step limiter, cooling side  (0.5*T0)
+constexpr double kSurfaceBCGrowthCap = 4.0;  // step limiter, growth side   (4.0*T0)
+
+struct SurfaceBCSolution {
+    double T            = 0.0;   // root of the surface energy balance [K]
+    double residual_K   = 0.0;   // achieved |f| / (4*eps*sigma*T^3)   [K]
+    int    iterations   = 0;     // Newton steps actually taken
+    bool   hit_iter_cap = false; // gave up at kSurfaceBCMaxIter
+    bool   ulp_limited  = false; // exited on the round-off floor, not on tol_K
+    bool   growth_capped = false;// the growth-side limiter fired (see below)
+};
+
+// Diagnostic override of tol_K (PTM_SURFACE_BC_TOLK). It exists so a test can
+// SWEEP the tolerance and thereby attribute a converged-column bias to the
+// Newton's exit criterion (bias shrinks with tol_K) rather than to the interior
+// stencil (bias does not). dt cannot separate the two -- the Crank-Nicolson
+// steady state is dt-flat -- so tol_K is the only discriminator.
+double surfaceBCTolK();
+
+// Fold one solve into the per-run surface-BC certificate (max achieved
+// residual, iteration-cap count, ulp-floor count, growth-cap count), reported
+// by reportSurfaceNewtonStats(). A solver that gives up must say so.
+void noteSurfaceBCSolution(const SurfaceBCSolution& s);
+
+inline SurfaceBCSolution solveSurfaceBC(double Qs, double T1, double k0, double dz0,
+                                        double eps, double sigma, double tol_K) {
+    SurfaceBCSolution out;
+
+    double Tn = T1;
+    if (Qs > 0.0) {
+        // sqrt(sqrt(x)) is both faster and more accurate than pow(x, 0.25)
+        const double T_eq = std::sqrt(std::sqrt(Qs / (eps * sigma)));
+        if (T_eq > Tn) Tn = T_eq;
+    }
+
+    const double eps_mach = std::numeric_limits<double>::epsilon();
+    double h_rad = 0.0, f = 0.0;
+    int iter = 0;
+    for (; iter < kSurfaceBCMaxIter; ++iter) {
+        const double T0  = Tn;
+        const double T03 = T0 * T0 * T0;
+
+        f = Qs + k0 * (T1 - T0) / dz0 - eps * sigma * T03 * T0;
+        double df = -k0 / dz0 - 4.0 * eps * sigma * T03;
+        if (std::abs(df) < 1e-10) df = -1e-10;
+        h_rad = 4.0 * eps * sigma * T03;
+
+        // MIN_ITER = 1: the test is skipped on iteration 0 so at least one step
+        // is always taken. Testing before the first step turns any Qb = 0 column
+        // into a CONTINUUM of accepted states of width tol_K -- every T whose
+        // residual already sits inside the band is declared converged, so the
+        // column stops wherever it happens to be. Measured on a Qb = 0 /
+        // Qs = 1e-3 drift column: testing first lands +9.99953e-05 K off
+        // (exactly the band edge), taking a step first lands +7.1937e-10 K.
+        if (iter > 0) {
+            const double tol_res = tol_K * h_rad;
+            const double tol_ulp = kSurfaceBCUlpC * std::abs(df) * eps_mach * T0;
+            if (std::abs(f) <= tol_res || std::abs(f) <= tol_ulp) {
+                out.ulp_limited = (std::abs(f) > tol_res);
+                break;
+            }
+        }
+
+        double dTi = f / df;   // omega = 1.0
+
+        // Step limiter -- globalization, NOT an output clamp. The COOLING side
+        // (dT > 0 lowers T) is what keeps every iterate strictly positive when
+        // df -> 0 on a cold, low-conductivity face. The GROWTH side is 4*T0
+        // rather than 0.5*T0: at 0.5*T0 growth is capped at 1.5x per iteration,
+        // a factor-57.7 ceiling over 10 iterations that produced measured
+        // errors of -68.5 / -130.5 / -392.3 K from a below-root start. That
+        // start is unreachable from the max(T_eq, T1) seed, but the code must
+        // not silently depend on that premise: widening makes the ceiling
+        // unreachable too, and any firing is counted and reported.
+        const double cool_cap   = kSurfaceBCCoolCap * T0;
+        const double growth_cap = kSurfaceBCGrowthCap * T0;
+        if (dTi >  cool_cap) dTi = cool_cap;
+        if (dTi < -growth_cap) { dTi = -growth_cap; out.growth_capped = true; }
+        Tn = T0 - dTi;
+    }
+
+    // Achieved residual at the ACCEPTED iterate. When the loop exited on the
+    // criterion, f/h_rad were evaluated at T0 == Tn, so this is exact; when it
+    // ran to the cap it is the residual one step before, which is the
+    // conservative (larger) of the two.
+    out.T           = Tn;
+    out.residual_K  = (h_rad > 0.0) ? std::abs(f) / h_rad : std::abs(f);
+    out.iterations  = iter;
+    out.hit_iter_cap = (iter >= kSurfaceBCMaxIter);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PTM_SOLVER_EQFIX -- NARROWED 2026-08-11 to ONE remaining change: release of
+// the T_geo floor.
+//
+// The gate used to bundle three changes. Two of them are no longer gated:
+//
+//   * the surface-Newton exit criterion is now UNCONDITIONAL on all three
+//     solver paths (see solveSurfaceBC above and gpu/thermal_kernels.cl);
+//   * the R1 deviation form is a proven no-op in float64 (absolute and
+//     deviation forms agree to 6.2e-14 K, the algebraic-identity noise floor),
+//     so it belongs in the GPU float32 kernel, not behind a CPU gate.
+//
+// What remains is the T_geo floor, which is NOT a correction but a Dirichlet
+// pin: it holds layer 0 at the analytically exact (Qb/(eps*sigma))^0.25 on
+// every steady cold column. It masked the old Newton's +9.686548e-03 K bias;
+// with the criterion fixed, releasing it is a separate physics decision with
+// its own re-bless, and it is still default OFF pending that decision.
+//
+// It is implemented on the CPU SCALAR path only. The CPU SIMD batch path and
+// the GPU persistent kernel apply the floor unconditionally, so they REFUSE to
+// run under the gate rather than accept it and quietly not honor it.
+//
+// Default OFF. With the gate off, the T_geo floor behaves exactly as before.
 // Read once; the value is process-wide and must not vary between faces.
 // ---------------------------------------------------------------------------
 bool solverEqFixEnabled();

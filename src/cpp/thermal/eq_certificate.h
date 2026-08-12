@@ -25,6 +25,7 @@
 #include <iosfwd>
 #include <mutex>
 #include <vector>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace thermal {
 
@@ -55,7 +56,7 @@ struct EqSpinupInput {
     const double* z = nullptr, *T = nullptr, *k = nullptr;
     const double* rho = nullptr, *cp = nullptr;
     int    n = 0;
-    double Qb = 0.0, eps = 0.95, sigma = 5.67051196e-8;
+    double Qb = 0.0, eps = 0.95, sigma = ptm::kStefanBoltzmann;
     double P  = 0.0;             // diurnal period [s]
     double target_K = 0.1;       // the user's requested accuracy
     // Arithmetic floor of the solver path this run will use. Below it no cycle

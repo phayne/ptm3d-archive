@@ -37,7 +37,7 @@ except Exception:                       # fallback: vectorized math.erfc
     from math import erfc as _erfc_s
     _erfc_v = np.vectorize(_erfc_s)
 
-SIGMA = 5.670374e-8
+SIGMA = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 S = 1361.0          # solar constant [W/m^2]
 EPS = 0.95
 A_BOND = 0.12       # solar Bond albedo

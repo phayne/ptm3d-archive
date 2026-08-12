@@ -13,6 +13,7 @@
 #include <memory>
 #include <cstring>
 #include <stdexcept>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace gpu {
 
@@ -268,7 +269,7 @@ struct ThermalSoABuffers {
     int n_cp_coeffs = 0;
 
     // Physical constants
-    float sigma = 5.67051196e-8f;    // Stefan-Boltzmann
+    float sigma = static_cast<float>(ptm::kStefanBoltzmann);  // Stefan-Boltzmann
 
     /**
      * @brief Allocate all buffers

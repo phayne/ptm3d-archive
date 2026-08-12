@@ -9,6 +9,7 @@
 #include "view_factor.h"
 #include "hmatrix_view_factor.h"
 #include "../mesh/mesh_utils.h"
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 // Forward declaration for GPU radiosity solver
 #ifdef PTM_GPU_OPENCL
@@ -23,7 +24,7 @@ namespace opencl {
 namespace radiation {
 
 // Stefan-Boltzmann constant [W m^-2 K^-4]
-constexpr double SIGMA_SB = 5.67051196e-8;
+constexpr double SIGMA_SB = ptm::kStefanBoltzmann;
 
 // Abstract interface for view factor matrix-vector product
 // Allows RadiositySolver to work with either ViewFactorMatrix or HMatrixViewFactor

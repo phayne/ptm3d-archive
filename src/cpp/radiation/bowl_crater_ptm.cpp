@@ -34,11 +34,14 @@
 #include "radiation_config.h"
 #include "view_factor.h"
 #include "radiation_exchange.h"
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace {
 
 constexpr double PI = 3.14159265358979323846;
-constexpr double SIGMA = 5.670374e-8;
+// The Ingersoll validation gate must score the engine with the engine's own
+// constant; it used to carry a sixth value that no solver ever used.
+constexpr double SIGMA = ptm::kStefanBoltzmann;
 constexpr double SOLAR = 1361.0;
 constexpr double ALBEDO = 0.12;
 constexpr double EMISS = 0.95;

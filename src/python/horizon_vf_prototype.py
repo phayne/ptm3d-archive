@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from analyze_floor_vf import face_centroids  # noqa: E402
 
 MD = Path("data/dem/validation/meshes")
-SIG = 5.670374e-8
+SIG = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 
 
 def load(mesh):

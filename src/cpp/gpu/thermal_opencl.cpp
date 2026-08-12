@@ -14,6 +14,7 @@
 #include "machine_profile.h"   // Phase R (R2): per-host dispatch self-chunk ceiling
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -150,8 +151,11 @@ std::string getEmbeddedKernelSource() {
 // Embedded OpenCL kernel source for PTM thermal solver
 #define MAX_LAYERS 64
 
+// Stefan-Boltzmann. OpenCL cannot include constants/stefan_boltzmann.h, so this
+// literal is checked against ptm::kStefanBoltzmann by the static_assert below
+// getEmbeddedKernelSource(); the two cannot drift.
 #ifndef SIGMA
-#define SIGMA 5.67051196e-8f
+#define SIGMA 5.670374419e-8f
 #endif
 
 // --------------------------------------------------------------------------
@@ -445,7 +449,16 @@ __kernel void persistentThermalKernel(
     // Regolith conductivity law: 0 = Hayne 2017 (default), 1 = Martinez &
     // Siegler 2021. Appended LAST on purpose so the hard-coded arg indices
     // kArgNTimesteps(20) / kArgTOffset(25) above stay valid.
-    int cond_model)
+    int cond_model,
+    // Per-face surface-BC certificate: max over this session's substeps of the
+    // achieved |f| / (4 eps sigma T^3) [K] from the surface Newton. Appended
+    // after cond_model for the same reason cond_model was appended last.
+    __global float* surf_resid_K,
+    // Companion: max Newton steps this face took in any substep. Without it the
+    // round-off floor's COST is invisible from outside the kernel -- the
+    // residual alone cannot distinguish "exited in 2 steps at the precision
+    // limit" from "spun to the 10-step cap and ended at the same place".
+    __global int* surf_iters)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -560,7 +573,13 @@ __kernel void persistentThermalKernel(
                 kappa_local[i] = k_local[i] / (rho_local[i] * cp_local[i]);
             }
 
-            // Step 1: Newton-Raphson for surface temperature (matches CPU surfTemp)
+            // Step 1: the surface energy balance.
+            //
+            // THIS IS THE SAME SPECIFICATION AS THE CPU solveSurfaceBC()
+            // (src/cpp/thermal/thermal_model.h), evaluated in float32. Seed,
+            // relaxation, exit criterion, ulp floor, step limiter and
+            // max_iter are identical; the derivation lives in that header and
+            // is not repeated here. A change to one MUST be made to the other.
             // Energy balance at surface: Qs + k*(T1-T0)/dz = eps*sigma*T0^4
             {
                 float dz = z[1] - z[0];
@@ -592,40 +611,75 @@ __kernel void persistentThermalKernel(
                     if (T_eq > T_surf) T_surf = T_eq;
                 }
 
-                // Newton-Raphson iterations with early termination
-                // Matches CPU: max_iter=10, tolerance=0.001, relaxation=0.8
-                float dT_nr = 1.0f;
-                for (int iter = 0; iter < 10 && fabs(dT_nr) > 0.001f; ++iter) {
+                // Exit when the RADIATIVELY NORMALIZED residual is small:
+                //   |f| <= max(tol_K*4*eps*sigma*T0^3, 2*|df|*FLT_EPSILON*T0)
+                // with omega = 1.0 and max_iter = 10.
+                //
+                // THE SECOND TERM IS LOAD-BEARING ON THIS PATH. In float32 the
+                // residual test's own round-off noise is 1.08e-4 K at 24 K on
+                // the moon3d grid -- i.e. AT tol_K -- so without the floor a
+                // fully converged iterate cannot certify convergence and spins
+                // to the iteration cap on essentially every cold face. The
+                // achieved residual is written out per face below so a run that
+                // is limited by that floor rather than by tol_K says so.
+                float f = 0.0f;
+                float h_rad = 0.0f;
+                int   iter = 0;
+                for (; iter < 10; ++iter) {
                     float T0 = T_surf;
                     float T3 = T0 * T0 * T0;
-                    float T4 = T0 * T3;
 
                     // f = Qs + k*(T1 - T0)/dz - eps*sigma*T0^4
-                    float f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T4;
+                    f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T3 * T0;
 
                     // df/dT0 = -k/dz - 4*eps*sigma*T0^3
                     float df = -k0 / dz - 4.0f * eps * sigma * T3;
 
                     if (fabs(df) < 1e-10f) df = -1e-10f;
 
-                    // dT = relaxation * f / df
-                    dT_nr = 0.8f * f / df;
+                    h_rad = 4.0f * eps * sigma * T3;
+
+                    // MIN_ITER = 1: testing before the first step turns a
+                    // Qb = 0 column into a continuum of accepted states of
+                    // width tol_K, so it stops wherever it happens to be.
+                    if (iter > 0) {
+                        float tol_res = 1.0e-4f * h_rad;
+                        float tol_ulp = 2.0f * fabs(df) * FLT_EPSILON * T0;
+                        if (fabs(f) <= tol_res || fabs(f) <= tol_ulp) break;
+                    }
+
+                    float dT_nr = f / df;   // relaxation omega = 1.0
 
                     // Robust-Newton step limiter (globalization, NOT an output
                     // clamp). For very cold, low-conductivity faces (PSR floors)
-                    // df = -k/dz - 4εσT^3 -> 0 as both terms vanish, so an
-                    // unguarded Newton step overshoots past the unique positive
-                    // root of the monotonic f(T) into NEGATIVE T, collapsing the
-                    // column. Capping the step to a fraction of the current T
-                    // keeps every iterate strictly positive and converges to the
-                    // true physical root (e.g. ~25 K from geothermal balance).
-                    // Warm, well-conditioned faces take sub-cap steps, so their
-                    // result is bit-unchanged. The final temperature is still set
-                    // by physics (the root of f), not bounded to a fixed range.
-                    float max_step = 0.5f * T0;
-                    if (dT_nr >  max_step) dT_nr =  max_step;
-                    if (dT_nr < -max_step) dT_nr = -max_step;
+                    // df = -k/dz - 4 eps sigma T^3 -> 0 as both terms vanish, so
+                    // an unguarded Newton step overshoots past the unique
+                    // positive root of the monotonic f(T) into NEGATIVE T,
+                    // collapsing the column. Capping the COOLING step at 0.5*T0
+                    // keeps every iterate strictly positive. The GROWTH side is
+                    // 4*T0 rather than 0.5*T0, which at 1.5x/iteration imposed a
+                    // factor-57.7 ceiling over 10 iterations; that ceiling is
+                    // unreachable from the max(T_eq, T1) seed, and widening it
+                    // means the code does not silently depend on that premise.
+                    // The final temperature is still set by physics (the root of
+                    // f), not bounded to a fixed range.
+                    float cool_cap   = 0.5f * T0;
+                    float growth_cap = 4.0f * T0;
+                    if (dT_nr >  cool_cap)   dT_nr =  cool_cap;
+                    if (dT_nr < -growth_cap) dT_nr = -growth_cap;
                     T_surf = T0 - dT_nr;
+                }
+
+                // Per-face surface-BC certificate: the worst achieved
+                // |f| / (4 eps sigma T^3) [K] over every substep this face
+                // takes. Each work-item owns its own element, so there is no
+                // race. The host reduces it to a per-run maximum and prints it;
+                // that is what keeps the float32 round-off floor from binding
+                // silently.
+                {
+                    float resid = (h_rad > 0.0f) ? fabs(f) / h_rad : fabs(f);
+                    if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
+                    if (iter > surf_iters[face]) surf_iters[face] = iter;
                 }
 
                 T_local[0] = T_surf;
@@ -810,6 +864,22 @@ __kernel void persistentThermalKernel(
 )CL_SOURCE";
 }
 
+// The kernel text above carries its own `#define SIGMA` because OpenCL C cannot
+// include a C++ header. These two lines are the tripwire that keeps it honest:
+// change ptm::kStefanBoltzmann and the build stops here, change the kernel
+// literal and the runtime check below fires. Neither can drift silently.
+static_assert(ptm::kStefanBoltzmann == 5.670374419e-8,
+              "ptm::kStefanBoltzmann changed. Update the `#define SIGMA` in "
+              "getEmbeddedKernelSource() (and re-run "
+              "scripts/sync_cl_from_embedded.py), then update this assert.");
+
+namespace {
+// Verified once, at kernel build time, against the same literal.
+bool kernelSigmaMatchesHost(const std::string& src) {
+    return src.find("#define SIGMA 5.670374419e-8f") != std::string::npos;
+}
+}  // namespace
+
 bool isOpenCLAvailable() {
     cl_uint num_platforms = 0;
     cl_int err = clGetPlatformIDs(0, nullptr, &num_platforms);
@@ -972,29 +1042,42 @@ bool ThermalOpenCLSolver::initialize(const OpenCLDeviceInfo& device_handle) {
 }
 
 void ThermalOpenCLSolver::buildKernels() {
-    // PTM_SOLVER_EQFIX is implemented on the CPU solver paths ONLY at this
-    // commit; the device twin of the surface-Newton exit criterion and of the
-    // T_geo-floor removal is NOT in this kernel. Running the GPU solver with
-    // the gate set would silently produce a CPU/GPU mismatch -- exactly the
-    // class of quiet substitution that PTM-115/116 were. Refuse instead.
+    // PTM_SOLVER_EQFIX refusal, NARROWED 2026-08-11.
+    //
+    // The surface-Newton exit criterion is no longer part of this gate: the
+    // kernel below implements the same specification as the CPU
+    // solveSurfaceBC, unconditionally. What the gate still asks for is release
+    // of the T_geo floor, and this kernel applies that floor every substep
+    // with no way to switch it off. Accepting the flag and keeping the floor
+    // would be a quiet substitution -- the class of failure PTM-115/116 were.
+    // Refuse instead.
     {
         const char* e = std::getenv("PTM_SOLVER_EQFIX");
         if (e && *e && std::strcmp(e, "0") != 0) {
-            std::cerr << "\n[GPU Thermal] FATAL: PTM_SOLVER_EQFIX is set, but the "
-                         "eqfix solver changes (surface-Newton exit criterion, "
-                         "T_geo-floor removal, R1 deviation form) are implemented "
-                         "on the CPU paths only at this commit.\n"
-                         "  Running the GPU persistent kernel now would use the "
-                         "OLD physics while the CPU paths use the new physics, "
-                         "and nothing would say so.\n"
-                         "  Use a CPU run (thermal.use_gpu: false) or unset "
-                         "PTM_SOLVER_EQFIX." << std::endl;
+            std::cerr << "\n[GPU Thermal] FATAL: PTM_SOLVER_EQFIX asks for the "
+                         "T_geo floor to be released, but the GPU persistent "
+                         "kernel applies it unconditionally, every substep.\n"
+                         "  Running here under the gate would keep the floor while "
+                         "the log claimed it was released, and nothing would say "
+                         "so.\n"
+                         "  (The surface-Newton criterion is NOT the issue: this "
+                         "kernel implements the same specification as the CPU "
+                         "solveSurfaceBC as of fix/surface-bc-unification.)\n"
+                         "  Use a CPU scalar run, or unset PTM_SOLVER_EQFIX."
+                      << std::endl;
             std::exit(1);
         }
     }
 
     std::string source;
     const std::string embedded = getEmbeddedKernelSource();
+    if (!kernelSigmaMatchesHost(embedded)) {
+        std::cerr << "\n[GPU Thermal] FATAL: the embedded kernel's Stefan-Boltzmann "
+                     "constant does not match ptm::kStefanBoltzmann. The GPU surface "
+                     "energy balance and the CPU one would disagree by construction. "
+                     "Fix the `#define SIGMA` in getEmbeddedKernelSource().\n";
+        std::exit(1);
+    }
 
     // Phase R / Fermi F5: the kernel source is single-sourced from the embedded
     // string (see scripts/sync_cl_from_embedded.py). buildKernels() must NEVER
@@ -1091,6 +1174,68 @@ void ThermalOpenCLSolver::buildKernels() {
     }
 }
 
+// Reduce the per-face surface-BC certificate to a per-run maximum.
+//
+// The kernel writes, per face, the largest achieved |f| / (4 eps sigma T^3) [K]
+// over every substep it took. That number is the surface Newton's own statement
+// of how far from the energy balance it stopped, in kelvin, and it is the only
+// way the float32 round-off floor in the exit test can be seen from outside the
+// kernel. Read after every dispatch; reported by reportSurfaceBCCertificate().
+void ThermalOpenCLSolver::reduceSurfaceBCResidual(cl_command_queue queue) {
+    if (!buf_surf_resid_ || n_faces_ == 0) return;
+    std::vector<float> resid(n_faces_, 0.0f);
+    cl_int rerr = clEnqueueReadBuffer(queue, buf_surf_resid_, CL_TRUE, 0,
+                                      n_faces_ * sizeof(float), resid.data(),
+                                      0, nullptr, nullptr);
+    if (rerr != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] WARNING: could not read the surface-BC "
+                     "residual certificate (" << clErrorString(rerr)
+                  << "); the surface Newton's achieved accuracy is UNKNOWN for "
+                     "this dispatch.\n";
+        return;
+    }
+    for (size_t i = 0; i < resid.size(); ++i) {
+        const float r = resid[i];
+        if (std::isfinite(r) && r > max_surf_resid_K_) max_surf_resid_K_ = r;
+    }
+
+    std::vector<int> iters(n_faces_, 0);
+    rerr = clEnqueueReadBuffer(queue, buf_surf_iters_, CL_TRUE, 0,
+                               n_faces_ * sizeof(int), iters.data(),
+                               0, nullptr, nullptr);
+    if (rerr != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] WARNING: could not read the surface-BC "
+                     "iteration counts (" << clErrorString(rerr) << ").\n";
+        return;
+    }
+    long long capped = 0;
+    for (size_t i = 0; i < iters.size(); ++i) {
+        if (iters[i] > max_surf_iters_) max_surf_iters_ = iters[i];
+        if (iters[i] >= 10) ++capped;
+    }
+    faces_at_iter_cap_ = capped;
+}
+
+void ThermalOpenCLSolver::reportSurfaceBCCertificate() {
+    if (max_surf_resid_K_ <= 0.0f) return;
+    if (max_surf_resid_K_ <= reported_surf_resid_K_) return;   // nothing new
+    reported_surf_resid_K_ = max_surf_resid_K_;
+    // Local stream: std::cout arrives here carrying std::fixed <<
+    // setprecision(1) from an earlier banner, which rendered this certificate
+    // as "0.0 K" -- the PTM-05/PTM-55 archetype, and on the one line whose
+    // whole job is to make a small number visible.
+    std::ostringstream o;
+    o << "[GPU Thermal] surface-BC certificate: max achieved "
+         "|f|/(4 eps sigma T^3) = " << std::scientific << std::setprecision(4)
+      << max_surf_resid_K_ << " K (tol_K = 1.0e-04 K); worst face took "
+      << std::defaultfloat << max_surf_iters_ << " Newton steps, "
+      << faces_at_iter_cap_ << " / " << n_faces_
+      << " faces reached the 10-step cap. Values above tol_K are the float32 "
+         "round-off floor of the residual test, not a solver failure -- "
+         "reported so they are never silent.";
+    std::cout << o.str() << std::endl;
+}
+
 void ThermalOpenCLSolver::createBuffers() {
     cl_context ctx = context_->context();
     cl_int err;
@@ -1153,6 +1298,24 @@ void ThermalOpenCLSolver::createBuffers() {
     buf_n_substeps_frozen_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
                                             n_faces_ * sizeof(int), nullptr, &err);
     CL_CHECK(err);
+
+    // Per-face surface-BC certificate: max achieved |f|/(4 eps sigma T^3) [K].
+    // Zeroed at allocation and accumulated as a running max by the kernel; the
+    // host reduces it after each dispatch so the float32 round-off floor in the
+    // surface Newton can never bind without the run saying so.
+    {
+        // Zero-initialized at allocation via COPY_HOST_PTR: createBuffers() has
+        // no command queue in scope, and the kernel accumulates a running max
+        // into it, so a defined starting value is mandatory rather than nice.
+        std::vector<float> zeros(n_faces_, 0.0f);
+        buf_surf_resid_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                         n_faces_ * sizeof(float), zeros.data(), &err);
+        CL_CHECK(err);
+        std::vector<int> izeros(n_faces_, 0);
+        buf_surf_iters_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                         n_faces_ * sizeof(int), izeros.data(), &err);
+        CL_CHECK(err);
+    }
 
     // Placeholder for cp_coeffs (will resize when setMaterialParams is called)
     buf_cp_coeffs_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
@@ -1465,6 +1628,10 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));
+    // Per-face surface-BC residual certificate (arg 28) and its iteration
+    // companion (arg 29), appended last.
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -1487,6 +1654,9 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
     }
+
+    reduceSurfaceBCResidual(queue);
+    reportSurfaceBCCertificate();
 
     // Debug output (only when verbose mode is enabled)
     if (config_.verbose) {
@@ -1895,6 +2065,10 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));
+    // Per-face surface-BC residual certificate (arg 28) and its iteration
+    // companion (arg 29), appended last.
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
+    CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -2047,6 +2221,9 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
     }
 
+    reduceSurfaceBCResidual(queue);
+    reportSurfaceBCCertificate();
+
     // Read back the Schorghofer accumulator if requested.
     if (enable_accum) {
         cl_int rerr = clEnqueueReadBuffer(queue, buf_avg_E, CL_TRUE, 0,
@@ -2114,6 +2291,8 @@ void ThermalOpenCLSolver::release() {
     if (buf_T_deep_) { clReleaseMemObject(buf_T_deep_); buf_T_deep_ = nullptr; }
     if (buf_Qb_) { clReleaseMemObject(buf_Qb_); buf_Qb_ = nullptr; }
     if (buf_n_substeps_frozen_) { clReleaseMemObject(buf_n_substeps_frozen_); buf_n_substeps_frozen_ = nullptr; }
+    if (buf_surf_resid_) { clReleaseMemObject(buf_surf_resid_); buf_surf_resid_ = nullptr; }
+    if (buf_surf_iters_) { clReleaseMemObject(buf_surf_iters_); buf_surf_iters_ = nullptr; }
     if (buf_cp_coeffs_) { clReleaseMemObject(buf_cp_coeffs_); buf_cp_coeffs_ = nullptr; }
 
     // Release context (via unique_ptr)

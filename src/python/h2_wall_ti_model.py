@@ -22,7 +22,7 @@ Pure numpy. Run: python3 h2_wall_ti_model.py
 from __future__ import annotations
 import numpy as np
 
-SIGMA = 5.670374e-8
+SIGMA = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 S = 1361.0
 A = 0.12
 EPS = 0.95

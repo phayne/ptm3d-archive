@@ -17,6 +17,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace gpu {
 namespace opencl {
@@ -139,6 +140,14 @@ public:
     void synchronize();
 
     /**
+     * @brief Print the per-run surface-BC certificate (max achieved
+     *        |f| / (4 eps sigma T^3) in kelvin). Prints only when the running
+     *        maximum has grown since the last print, so a chunked or
+     *        multi-cycle run reports every new worst case exactly once.
+     */
+    void reportSurfaceBCCertificate();
+
+    /**
      * @brief Solve ALL timesteps in a single GPU kernel launch
      *
      * This persistent kernel approach minimizes CPU-GPU data transfer:
@@ -246,6 +255,8 @@ public:
 private:
     // Create OpenCL buffers
     void createBuffers();
+    // Reduce the per-face surface-BC certificate into max_surf_resid_K_.
+    void reduceSurfaceBCResidual(cl_command_queue queue);
 
     // Build kernel program
     void buildKernels();
@@ -281,6 +292,8 @@ private:
     cl_mem buf_T_deep_ = nullptr;      // Deep boundary temp
     cl_mem buf_Qb_ = nullptr;          // Bottom heat flux
     cl_mem buf_n_substeps_frozen_ = nullptr;  // per-face frozen substep count (R2 fix)
+    cl_mem buf_surf_resid_ = nullptr;  // per-face surface-BC residual certificate [K]
+    cl_mem buf_surf_iters_ = nullptr;  // per-face max surface-Newton step count
     cl_mem buf_cp_coeffs_ = nullptr;   // cp polynomial coefficients
 
     // Material parameters
@@ -288,11 +301,17 @@ private:
     float R350_ = 0.0f;
     // Conductivity law passed to every kernel (0 = Hayne 2017, 1 = Martinez 2021).
     int   cond_model_ = 0;
-    float sigma_ = 5.67051196e-8f;
+    float sigma_ = static_cast<float>(ptm::kStefanBoltzmann);
     int n_cp_coeffs_ = 0;
 
     bool initialized_ = false;
     float last_kernel_time_ms_ = 0.0f;
+    // Per-run maximum of the surface Newton's achieved
+    // |f| / (4 eps sigma T^3) [K], reduced from buf_surf_resid_.
+    float max_surf_resid_K_ = 0.0f;
+    float reported_surf_resid_K_ = -1.0f;
+    int       max_surf_iters_    = 0;
+    long long faces_at_iter_cap_ = 0;
 };
 
 /**

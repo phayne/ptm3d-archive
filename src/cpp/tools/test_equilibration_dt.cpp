@@ -219,7 +219,7 @@ int main(int argc, char** argv)
     config.F = 0.5;
     config.NPERDAY = 24;
     config.NYEARSEQ = 2;
-    config.sigma = 5.67e-8;
+    config.sigma = ptm::kStefanBoltzmann;
     config.chi = 2.7;
 
     const int days = 24;

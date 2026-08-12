@@ -28,10 +28,12 @@
 #
 # WHAT TO EXPECT, in numbers. The radiative floor a basal flux can hold a face
 # at is T_geo = (Qb / (eps * sigma))^(1/4), with the engine's own constants
-# eps = 0.95 (Moon) and SIGMA_SB = 5.67051196e-8 (thermal_model.h:160):
+# eps = 0.95 (Moon) and SIGMA_SB = 5.670374419e-8
+# (constants/stefan_boltzmann.h; it was 5.67051196e-8 before 2026-08-11, which
+# moves these two floors by +1.5e-4 K and +6.0e-4 K -- below the printed digits):
 #
-#     Qb = 0.018 W/m^2 (Moon default, Langseth et al. 1976)  ->  T_geo =  24.0426 K
-#     Qb = 5.0   W/m^2 (what this file asks for)             ->  T_geo =  98.1536 K
+#     Qb = 0.018 W/m^2 (Moon default, Langseth et al. 1976)  ->  T_geo =  24.0428 K
+#     Qb = 5.0   W/m^2 (what this file asks for)             ->  T_geo =  98.1542 K
 #
 #   * TODAY, DEFECT PRESENT -- min(temperature_min.bin) = 66.3465 K, and every
 #     statistics binary is BYTE-IDENTICAL to the same run with

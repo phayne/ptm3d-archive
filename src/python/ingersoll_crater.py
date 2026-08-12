@@ -50,7 +50,7 @@ from __future__ import annotations
 import numpy as np
 
 
-SIGMA = 5.670374e-8
+SIGMA = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 SOLAR_CONSTANT = 1361.0
 
 

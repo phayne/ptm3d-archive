@@ -34,7 +34,7 @@ from scipy.interpolate import PchipInterpolator
 from ptm.pubstyle import apply_style, DOUBLE_W, panel_label
 
 CMAP = plt.cm.RdBu_r
-SIGMA = 5.670374e-8
+SIGMA = 5.670374419e-8  # SI-2019 (exact); canonical: src/cpp/constants/stefan_boltzmann.h
 EMISS = 0.95
 RENDER_BETAS = (1.0, 10.0)
 

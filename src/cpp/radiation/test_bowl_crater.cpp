@@ -33,6 +33,7 @@
 
 #ifdef PTM_GPU_OPENCL
 #include "../gpu/radiosity_opencl.h"
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 #endif
 
 namespace radiation {
@@ -40,7 +41,7 @@ namespace test {
 
 // Physical constants
 constexpr double PI = 3.14159265358979323846;
-constexpr double SIGMA_SB = 5.67051196e-8;  // Stefan-Boltzmann constant [W/m^2/K^4]
+constexpr double SIGMA_SB = ptm::kStefanBoltzmann;  // [W/m^2/K^4]
 
 /**
  * @brief Generate a bowl-shaped crater mesh as a spherical section

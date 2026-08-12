@@ -155,7 +155,10 @@ double newton_eqfix(double Qs_d, double k0_d, double dz0_d, double T1_d,
     }
 
     const int kMaxIter = 10;
-    const R   kTolK    = static_cast<R>(1e-4);
+    // Read the SHIPPING tolerance rather than a literal, so that sweeping
+    // PTM_SURFACE_BC_TOLK (the whole point of that knob) does not make the
+    // fidelity tripwire below fire against a solver that is behaving.
+    const R   kTolK    = static_cast<R>(thermal::surfaceBCTolK());
     const R   kUlpC    = static_cast<R>(2.0);
     const R   eps_mach = std::numeric_limits<R>::epsilon();
 
@@ -197,6 +200,30 @@ double newton_eqfix(double Qs_d, double k0_d, double dz0_d, double T1_d,
     return static_cast<double>(Tnew);
 }
 
+
+// ---------------------------------------------------------------------------
+// The CPU SIMD batch path's PRIVATE Newton, as it stood before
+// fix/surface-bc-unification (thermal_model.cpp::applySurfaceBCBatch at
+// ce4f617^). Reproduced here, and nowhere else, so the before/after numbers in
+// this program are measured rather than quoted. Five fixed iterations, no
+// convergence test, seed = the PREVIOUS surface temperature, no step limiter,
+// and a hard [ABSOLUTE_ZERO_K, MAX_PHYSICAL_TEMP_K] clamp INSIDE the loop.
+// ---------------------------------------------------------------------------
+double simd_batch_prefix(double Qs, double k0, double dz0, double T1,
+                         double T0_prev, double eps, double sigma)
+{
+    double T = T0_prev;
+    for (int iter = 0; iter < 5; ++iter) {
+        const double T3 = T * T * T;
+        const double f  = Qs + k0 * (T1 - T) / dz0 - eps * sigma * T3 * T;
+        const double df = -k0 / dz0 - 4.0 * eps * sigma * T3;
+        T -= 0.8 * f / df;
+        T = std::max(thermal::ABSOLUTE_ZERO_K,
+                     std::min(thermal::MAX_PHYSICAL_TEMP_K, T));
+    }
+    return T;
+}
+
 struct Case {
     double Qs, k0, dz0, T1, eps;
     double T_ref, T_ship, T_old;
@@ -228,8 +255,16 @@ struct Case {
 //   grid. If this ever stops holding, the grid no longer covers the defect and
 //   the "post-fix residual is small" result is vacuous.
 // ---------------------------------------------------------------------------
-constexpr double kGateMaxResidual_K      = 0.150;
-constexpr double kGatePhysicalResidual_K = 0.001;
+// RE-GATED 2026-08-11 (fix/surface-bc-unification). The two thresholds above
+// described the PRE-unification loop: 10 iterations, omega = 0.8, exit on the
+// step. The shipping loop is now omega = 1.0 with the radiatively normalized
+// residual test, whose position error is bounded by tol_K/A <= tol_K = 1e-4 K
+// analytically. Both are therefore re-gated at 2e-4 K, twice the guaranteed
+// bound -- the same bar Fermi's 252-case derivation sweep passes at 1.790e-4 K
+// worst. The old 0.15 K corner (T1 = 400 K under 5 cm of k = 7.4e-4) is no
+// longer a corner: undamped Newton reaches it in 3 steps.
+constexpr double kGateMaxResidual_K      = 2e-4;
+constexpr double kGatePhysicalResidual_K = 2e-4;
 constexpr double kGateMinDefectDemo_K    = 10.0;
 constexpr double kEmulationTol_K         = 1e-9;
 
@@ -261,6 +296,22 @@ constexpr double kEmulationTol_K         = 1e-9;
 // column: gate-OFF 1.289e-04 K, gate-ON 2.684e-14 K. Gated at 1e-10 K, four
 // orders above the measured value and six below the pre-fix one.
 constexpr double kGateNewtonResidual_K   = 1e-4;   // = tol_K, the guaranteed bound
+
+// G2: the derived 252-case sweep. The criterion's analytic position bound is
+// tol_K/A <= tol_K = 1e-4 K; Fermi's numpy reproduction measured 1.790e-4 K
+// worst, the excess coming from the single unphysically soft G = 1e-3 column
+// that reaches the iteration cap. Gated at 2e-4 K = 2*tol_K.
+constexpr double kGateDerivationSweep_K  = 2e-4;
+
+// G1: the CPU scalar and CPU SIMD batch paths call the SAME function on the
+// same inputs, so they must agree to the last bit. Gated at one ulp of a 500 K
+// temperature rather than 0 only because the two call sites read k0/dz0/T1
+// from different containers; any real algorithmic difference is orders larger.
+constexpr double kGatePathAgreement_K    = 1e-12;
+
+// G3: the pre-unification batch loop MUST still visibly fail on the transition
+// set, or the "it collapses to tolerance" result is vacuous.
+constexpr double kGateMinBatchDefectDemo_K = 10.0;
 constexpr double kSaganSpecNewtonResidual_K = 1e-10;  // reported, MISSES -- see above
 
 }  // namespace
@@ -285,7 +336,7 @@ int main(int argc, char** argv)
     // config->sigma are read by surfTemp.
     Planet planet("Moon");
     Config config;
-    config.sigma = 5.670374419e-8;
+    config.sigma = ptm::kStefanBoltzmann;
     Profile prof(planet, 0.0, config, /*verbose=*/false);
 
     // --- Parameter space -----------------------------------------------------
@@ -346,13 +397,15 @@ int main(int argc, char** argv)
                                                             config.sigma);
                         const double T_old = newton_emulated(Qs, k0, dz0, T1, eps,
                                                              config.sigma, /*new_seed=*/false);
-                        // The emulation must track WHICH loop surfTemp is
-                        // running, or this tripwire fires on the eqfix branch
-                        // and masks every result below it.
-                        const double T_new = eqfix_on
-                            ? newton_eqfix<double>(Qs, k0, dz0, T1, eps, config.sigma)
-                            : newton_emulated(Qs, k0, dz0, T1, eps,
-                                              config.sigma, /*new_seed=*/true);
+                        // The unified criterion is UNCONDITIONAL as of
+                        // fix/surface-bc-unification, so the emulation that the
+                        // tripwire below compares against is always the
+                        // eqfix/solveSurfaceBC loop. newton_emulated() is kept
+                        // only to reproduce the PRE-fix behavior for the
+                        // 'pre-fix' column and the defect-still-demonstrated
+                        // gate; it is no longer a model of shipping code.
+                        const double T_new =
+                            newton_eqfix<double>(Qs, k0, dz0, T1, eps, config.sigma);
 
                         const double d_ship = std::abs(T_ship - T_ref);
                         const double d_old  = std::abs(T_old  - T_ref);
@@ -720,7 +773,7 @@ int main(int argc, char** argv)
         // geothermal floor, quoted in the design note. Printed so the value in
         // the ledger can never drift from the code's own constants.
         {
-            const double Qb = 0.018, e = 0.95, s = 5.67051196e-8;
+            const double Qb = 0.018, e = 0.95, s = ptm::kStefanBoltzmann;
             const double T_geo = std::sqrt(std::sqrt(Qb / (e * s)));
             const double h_rad = 4.0 * e * s * T_geo * T_geo * T_geo;
             std::printf("  A(T_geo=%.4f K): 4*eps*sigma*T^3 = %.6e W/m^2/K\n",
@@ -735,6 +788,196 @@ int main(int argc, char** argv)
             std::printf("    Qs=%.3e k0=%.3e dz0=%.3e T1=%6.1f eps=%.2f | root=%9.4f "
                         "pre-fix=%9.4f shipping=%9.4f\n",
                         c.Qs, c.k0, c.dz0, c.T1, c.eps, c.T_ref, c.T_old, c.T_ship);
+        }
+        std::printf("\n");
+    }
+
+
+    // =======================================================================
+    // G2 -- the DERIVED 252-case sweep, run against the SHIPPED surfTemp.
+    //
+    // This is Fermi's tol_K derivation grid reproduced against the real code
+    // rather than in numpy: G = k0/dz0 over five decades (1e-3 .. 100
+    // W/m^2/K, i.e. m*Gamma*sqrt(pi/P) from an unphysically soft column to a
+    // fast high-inertia asteroid), Qs over four (0 .. 5444 W/m^2), T1 from
+    // 5 to 400 K. 6 x 7 x 6 = 252 cases. Pass = worst |T - root| <= 2e-4 K,
+    // twice the analytic bound tol_K/A <= tol_K.
+    // =======================================================================
+    double g2_worst = -1.0;
+    int    g2_worst_it = 0;
+    double g2_worst_G = 0.0, g2_worst_Qs = 0.0, g2_worst_T1 = 0.0;
+    long   g2_over = 0;
+    {
+        const double eps_g2 = 0.95;
+        prof.emissivity = eps_g2;
+        const double G_list[]  = {1e-3, 1e-2, 0.2239, 1.0, 10.0, 100.0};
+        const double Qs_g2[]   = {0.0, 0.05, 5.0, 50.0, 300.0, 1197.0, 1361.0 * 4.0};
+        const double T1_g2[]   = {5.0, 24.0, 70.0, 130.0, 250.0, 400.0};
+        std::printf("=== G2: the 252-case tol_K derivation sweep, on the shipped "
+                    "surfTemp ===\n");
+        for (double G : G_list) {
+            const double dz0 = 1e-3, k0 = G * dz0;   // only the ratio matters
+            for (double Qs : Qs_g2) {
+                for (double T1 : T1_g2) {
+                    prof.k()[0]  = k0;
+                    prof.dz()[0] = dz0;
+                    prof.T()[1]  = T1;
+                    prof.T()[0]  = 0.0;
+                    thermal::surfTemp(prof, Qs);
+                    const double T   = prof.T()[0];
+                    const double ref = reference_root(Qs, k0, dz0, T1, eps_g2,
+                                                      config.sigma);
+                    const double e = std::abs(T - ref);
+                    if (e > 1e-4) ++g2_over;
+                    if (e > g2_worst) {
+                        g2_worst = e; g2_worst_G = G;
+                        g2_worst_Qs = Qs; g2_worst_T1 = T1;
+                        int it = 0;
+                        newton_eqfix<double>(Qs, k0, dz0, T1, eps_g2, config.sigma,
+                                             nullptr, nullptr, true, true, 1.0, &it);
+                        g2_worst_it = it;
+                    }
+                }
+            }
+        }
+        std::printf("    252 cases, G = 1e-3 .. 100 W/m^2/K, Qs = 0 .. 5444 W/m^2, "
+                    "T1 = 5 .. 400 K\n");
+        std::printf("    worst |T - root| = %.4e K at G=%.4g Qs=%.4g T1=%.4g "
+                    "(%d Newton steps); %ld/252 cases above tol_K\n\n",
+                    g2_worst, g2_worst_G, g2_worst_Qs, g2_worst_T1,
+                    g2_worst_it, g2_over);
+    }
+
+    // =======================================================================
+    // G1a / G3 -- CPU scalar vs CPU SIMD BATCH on the same case, and the
+    // transition cases that the batch path used to fail by tens of kelvin.
+    //
+    // Both arms are the REAL shipped functions: thermal::surfTemp on a real
+    // Profile, and thermal::applySurfaceBCBatch on a real ThermalBatchSoA.
+    // The reference is the bisection root of the same f.
+    // =======================================================================
+    double g1_worst_pair = -1.0;    // |scalar - batch|
+    double g3_worst_new  = -1.0;    // |batch - root|, new code
+    double g3_worst_old  = -1.0;    // |batch - root|, pre-unification loop
+    {
+        struct Trans { const char* name; double Qprev, Qnew, T1; };
+        // Q_prev is what set T0_prev; the batch path used to seed from it.
+        // The first six reproduce Fermi's M6 table (moon3d grid, T1 = 24 K for
+        // the sunrise rows -- a cold column taking a sudden flux, which is what
+        // a terminator crossing at the A3GT 1440-step cadence looks like when
+        // n_sub = 1 puts the whole crossing in one substep).
+        const Trans cases_t[] = {
+            {"sunrise 0 -> 30 W/m^2",       0.0,   30.0,  24.0},
+            {"sunrise 0 -> 127 W/m^2",      0.0,  127.0,  24.0},
+            {"sunrise 0 -> 255 W/m^2",      0.0,  255.0,  24.0},
+            {"sunrise 0 -> 1197 W/m^2",     0.0, 1197.0,  24.0},
+            {"sunset 1197 -> 0, T1=170",  1197.0,   0.0, 170.0},
+            {"sunset 1197 -> 0, T1=100",  1197.0,   0.0, 100.0},
+            {"eclipse 1361 -> 0, T1=350", 1361.0,   0.0, 350.0},
+            {"terminator graze 0 -> 5",     0.0,    5.0,  40.0},
+            {"Europa polar night",          0.0,   0.05,  70.0},
+            {"steady lunar noon",        1197.0, 1197.0, 380.0},
+        };
+        const double eps_t = 0.95;
+        const double k0_t = 7.4e-4, dz0_t = 3.307907e-3;   // the moon3d grid
+        std::printf("=== G1a/G3: CPU scalar vs CPU SIMD batch, and the transition "
+                    "cases ===\n");
+        std::printf("    %-28s %10s %12s %12s %12s\n", "case", "root [K]",
+                    "scalar-root", "batch-root", "PREFIX-root");
+        for (const Trans& tc : cases_t) {
+            const double root = reference_root(tc.Qnew, k0_t, dz0_t, tc.T1, eps_t,
+                                               config.sigma);
+            // T0_prev: the surface the previous flux would have produced.
+            const double T0_prev = reference_root(tc.Qprev, k0_t, dz0_t, tc.T1,
+                                                  eps_t, config.sigma);
+
+            prof.emissivity = eps_t;
+            prof.k()[0]  = k0_t;
+            prof.dz()[0] = dz0_t;
+            prof.T()[1]  = tc.T1;
+            prof.T()[0]  = T0_prev;
+            thermal::surfTemp(prof, tc.Qnew);
+            const double T_scalar = prof.T()[0];
+
+            static thermal::ThermalBatchSoA batch;   // 8-face SoA, one real face
+            batch.n_layers = 3;
+            batch.n_faces  = 1;
+            batch.sigma_sb = config.sigma;
+            batch.dz[0] = dz0_t; batch.dz[1] = dz0_t;
+            batch.z[0] = 0.0; batch.z[1] = dz0_t; batch.z[2] = 2.0 * dz0_t;
+            for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) {
+                batch.emissivity[f] = eps_t;
+                batch.flux[f]       = tc.Qnew;
+                batch.Qb[f]         = 0.0;
+                batch.T[0 * thermal::THERMAL_BATCH_SIZE + f] = T0_prev;
+                batch.T[1 * thermal::THERMAL_BATCH_SIZE + f] = tc.T1;
+                batch.T[2 * thermal::THERMAL_BATCH_SIZE + f] = tc.T1;
+                batch.k[0 * thermal::THERMAL_BATCH_SIZE + f] = k0_t;
+                batch.k[1 * thermal::THERMAL_BATCH_SIZE + f] = k0_t;
+                batch.k[2 * thermal::THERMAL_BATCH_SIZE + f] = k0_t;
+            }
+            thermal::applySurfaceBCBatch(batch, 1.0);
+            const double T_batch = batch.T[0];
+
+            const double T_prefix = simd_batch_prefix(tc.Qnew, k0_t, dz0_t, tc.T1,
+                                                      T0_prev, eps_t, config.sigma);
+
+            g1_worst_pair = std::max(g1_worst_pair, std::abs(T_scalar - T_batch));
+            g3_worst_new  = std::max(g3_worst_new,  std::abs(T_batch - root));
+            g3_worst_old  = std::max(g3_worst_old,  std::abs(T_prefix - root));
+            std::printf("    %-28s %10.4f %+12.3e %+12.3e %+12.3e\n",
+                        tc.name, root, T_scalar - root, T_batch - root,
+                        T_prefix - root);
+        }
+        std::printf("    max |scalar - batch| = %.3e K   "
+                    "max |batch - root| = %.3e K (was %.4f K)\n\n",
+                    g1_worst_pair, g3_worst_new, g3_worst_old);
+    }
+
+    // =======================================================================
+    // G4 -- iteration counts, before and after, on the same cases.
+    // =======================================================================
+    {
+        struct WC { const char* name; double Qs, k0, dz0, T1; };
+        const WC wcs[] = {
+            {"cold zero-forcing column (24 K)",   0.0, 7.4e-4, 3.307907e-3, 24.1226},
+            {"hot lit face (375 K)",           1197.0, 7.4e-4, 3.307907e-3, 370.0},
+            {"terminator (Qs=1361, T1=40 K)",  1361.0, 7.4e-4, 3.307907e-3,  40.0},
+            {"Europa noon",                     170.0, 3.0e-3, 2.0e-3,      120.0},
+        };
+        std::printf("=== G4: Newton work, pre-unification vs shipped ===\n");
+        std::printf("    %-34s %12s %12s %14s %14s\n", "case",
+                    "old steps", "new steps", "old |f|/h [K]", "new |f|/h [K]");
+        for (const WC& w : wcs) {
+            const double eps_w = 0.95, sig = config.sigma;
+            // old: omega = 0.8, exit on |dT| <= 1e-3, same seed
+            double T = w.T1;
+            if (w.Qs > 0.0) {
+                const double Te = std::sqrt(std::sqrt(w.Qs / (eps_w * sig)));
+                if (Te > T) T = Te;
+            }
+            double dT = 1.0; int old_it = 0;
+            for (; old_it < 10 && std::abs(dT) > 1e-3; ++old_it) {
+                const double T0 = T, T3 = T0 * T0 * T0;
+                const double f  = w.Qs + w.k0 * (w.T1 - T0) / w.dz0 - eps_w * sig * T3 * T0;
+                double df = -w.k0 / w.dz0 - 4.0 * eps_w * sig * T3;
+                if (std::abs(df) < 1e-10) df = -1e-10;
+                dT = 0.8 * f / df;
+                const double ms = 0.5 * T0;
+                if (dT > ms) dT = ms;
+                if (dT < -ms) dT = -ms;
+                T = T0 - dT;
+            }
+            const double T3o = T * T * T;
+            const double fo = std::abs(w.Qs + w.k0 * (w.T1 - T) / w.dz0
+                                       - eps_w * sig * T3o * T);
+            const double old_res = fo / (4.0 * eps_w * sig * T3o);
+
+            const thermal::SurfaceBCSolution sN =
+                thermal::solveSurfaceBC(w.Qs, w.T1, w.k0, w.dz0, eps_w, sig,
+                                        thermal::kSurfaceBCTolK);
+            std::printf("    %-34s %12d %12d %14.3e %14.3e\n",
+                        w.name, old_it, sN.iterations, old_res, sN.residual_K);
         }
         std::printf("\n");
     }
@@ -755,20 +998,13 @@ int main(int argc, char** argv)
                     worst_old, kGateMinDefectDemo_K);
         return 1;
     }
-    if (eqfix_on) {
-        std::printf("  NOTE: kGateMaxResidual_K / kGatePhysicalResidual_K describe the\n"
-                    "        PRE-eqfix loop's 10-iteration, 0.8-relaxed truncation. With\n"
-                    "        the gate on they are not the operative bar; the eqfix gate\n"
-                    "        below is. Measured anyway: %.6f K full grid, %.6f K T1<=150 K.\n",
-                    worst_ship, worst_ship_phys);
-    }
-    if (!eqfix_on && !(worst_ship <= kGateMaxResidual_K)) {
+    if (!(worst_ship <= kGateMaxResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K over the full grid, tolerance %.3f K "
                     "(PTM-116).\n", worst_ship, kGateMaxResidual_K);
         return 1;
     }
-    if (!eqfix_on && !(worst_ship_phys <= kGatePhysicalResidual_K)) {
+    if (!(worst_ship_phys <= kGatePhysicalResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K on the science-relevant T1 <= 150 K "
                     "subset, tolerance %.3f K (the Newton loop's own declared "
@@ -776,9 +1012,17 @@ int main(int argc, char** argv)
                     worst_ship_phys, kGatePhysicalResidual_K);
         return 1;
     }
-    // Correction 1: the GATED eqfix quantity is the Newton's own converged
-    // position error, not the column offset. Scored only when the gate is on;
-    // with the gate off the pre-eqfix loop is expected to sit near 1e-04 K.
+    // The GATED quantity is the Newton's own converged position error, not the
+    // column offset.
+    //
+    // Still scored only under PTM_SOLVER_EQFIX, and NOT because the criterion
+    // is gated any more (it is unconditional as of fix/surface-bc-unification)
+    // -- because the T_geo FLOOR is. With the floor on, update_T() overwrites
+    // layer 0 with the analytic (Qb/(eps*sigma))^0.25 after the Newton runs, so
+    // |f|/|df| measured on the relaxed column is the FLOOR's residual and is
+    // blind to the Newton entirely (measured: bit-identical 1.418e-04 K before
+    // and after the criterion changed). Gating it with the floor on would score
+    // a quantity this change does not touch.
     if (thermal::solverEqFixEnabled()) {
         if (!(newton_worst <= kGateNewtonResidual_K)) {
             std::printf("[test_surface_newton] FAIL: with PTM_SOLVER_EQFIX on, the "
@@ -787,7 +1031,7 @@ int main(int argc, char** argv)
                         newton_worst, kGateNewtonResidual_K);
             return 1;
         }
-        std::printf("[test_surface_newton] eqfix PASS: worst converged Newton "
+        std::printf("[test_surface_newton] criterion PASS: worst converged Newton "
                     "position error |f|/|df| = %.3e K over %d columns "
                     "(tol %.1e K = tol_K, the criterion's guaranteed bound).\n",
                     newton_worst, 3, kGateNewtonResidual_K);
@@ -799,6 +1043,38 @@ int main(int argc, char** argv)
                         kSaganSpecNewtonResidual_K, newton_worst);
         }
     }
+
+    if (!(g2_worst <= kGateDerivationSweep_K)) {
+        std::printf("[test_surface_newton] FAIL: G2 -- the 252-case derivation sweep "
+                    "gives worst |T - root| = %.4e K on the shipped surfTemp, "
+                    "tolerance %.1e K.\n", g2_worst, kGateDerivationSweep_K);
+        return 1;
+    }
+    if (!(g1_worst_pair <= kGatePathAgreement_K)) {
+        std::printf("[test_surface_newton] FAIL: G1 -- the CPU scalar and CPU SIMD "
+                    "batch surface BCs disagree by %.3e K, tolerance %.1e K. They "
+                    "call the same function; a difference means one of them is not "
+                    "calling it.\n", g1_worst_pair, kGatePathAgreement_K);
+        return 1;
+    }
+    if (!(g3_worst_new <= kGateDerivationSweep_K)) {
+        std::printf("[test_surface_newton] FAIL: G3 -- the CPU SIMD batch is off the "
+                    "root by %.3e K on a transition case, tolerance %.1e K.\n",
+                    g3_worst_new, kGateDerivationSweep_K);
+        return 1;
+    }
+    if (!(g3_worst_old >= kGateMinBatchDefectDemo_K)) {
+        std::printf("[test_surface_newton] FAIL: G3 -- the pre-unification batch loop "
+                    "no longer fails on these cases (worst %.4f K < %.1f K). The "
+                    "transition set no longer covers the defect, so the post-fix "
+                    "result is vacuous.\n", g3_worst_old, kGateMinBatchDefectDemo_K);
+        return 1;
+    }
+    std::printf("[test_surface_newton] G1/G2/G3 PASS: 252-case sweep worst "
+                "%.4e K (tol %.1e); scalar vs SIMD batch agree to %.3e K "
+                "(tol %.1e); batch transition worst %.3e K, was %.4f K.\n",
+                g2_worst, kGateDerivationSweep_K, g1_worst_pair,
+                kGatePathAgreement_K, g3_worst_new, g3_worst_old);
 
     std::printf("[test_surface_newton] PASS: shipping surfTemp worst |dT| = %.6f K "
                 "full grid (tol %.3f K) / %.6f K for T1 <= 150 K (tol %.3f K); the "

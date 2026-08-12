@@ -13,6 +13,7 @@
 #include "gpu_utils.h"
 #include <vector>
 #include <memory>
+#include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace gpu {
 
@@ -111,7 +112,7 @@ public:
         float cp0,
         const std::vector<float>& cp_coeffs,
         float R350,
-        float sigma = 5.67051196e-8f);
+        float sigma = static_cast<float>(ptm::kStefanBoltzmann));
 
     /**
      * @brief Upload initial temperature profile
