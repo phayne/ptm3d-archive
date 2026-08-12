@@ -377,6 +377,8 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
                    EqSeedResult& r) {
     const EqSeedForcing& fc = *in.forcing;
     r.n_samples = fc.n_samples;
+    r.span_s    = fc.span_s;
+    r.cycle_s   = fc.cycle_s;
 
     const double a = in.emissivity * in.sigma;
     double Qb = in.Qb;
@@ -618,6 +620,8 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
         if (in.anchor == EqSeedAnchor::Warm) {
             r.anchor_status = EqSeedAnchorStatus::WarmRequested;
             r.n_samples     = in.forcing->n_samples;
+            r.span_s        = in.forcing->span_s;
+            r.cycle_s       = in.forcing->cycle_s;
         } else {
             T0 = anchorSolve(in, T0, r);
             r.T_anchor = T0;

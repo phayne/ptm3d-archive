@@ -327,6 +327,13 @@ struct EqSeedResult {
     double gamma_eff = 0.0;   ///< |Y(omega)|/sqrt(omega)        [J/m^2/K/s^0.5]
     double subdiurnal_variance_fraction = 0.0;
     int    n_samples     = 0; ///< QUADRATURE DISCLOSURE -- report this
+    /// The span and cycle the anchor ACTUALLY used, carried out of the result
+    /// rather than recomputed by the caller. A caller-side recomputation is
+    /// not the same object: on the CPU scalar path the outer `times` vector is
+    /// not the per-face matched one each Model receives, and the census
+    /// printed a quadrature 0.42 % off the one the anchor had been given.
+    double span_s        = 0.0;
+    double cycle_s       = 0.0;
     int    n_lit_samples = 0;
     int    anchor_iterations = 0;
 };
