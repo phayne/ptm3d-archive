@@ -1,0 +1,134 @@
+// solver_disclosure.h -- which thermal solver actually ran, and why.
+//
+// The defect this closes
+// ----------------------
+// PTM3D ships four reachable whole-mesh thermal solvers, and one of them is
+// selected by a MEMORY-SIZE ESTIMATE rather than by configuration:
+//
+//   ptm_thermal_sim.cpp:  use_streamed_thermal =
+//                             using_chunked_storage
+//                          && (memory_required_gb_est > STREAM_THRESHOLD_GB)
+//
+// Above that threshold a CPU run silently swaps its solver from the default
+// SIMD batch solver to the scalar solver. The two are NOT interchangeable:
+// they differ in surface boundary condition, spin-up, bottom boundary
+// condition and clamp set (measured up to 5.27 K max / 2.90 K on shadowed
+// faces on a 12,800-face crater). The only thing the log said about it was
+// "Will stream illumination to the thermal solver" -- a statement about
+// ILLUMINATION storage, which never mentions that the SOLVER changed. A
+// 509,337-face x 1440-step lunar run needs ~17.6 GB and crosses the
+// threshold, so production runs took the swap and no log recorded it.
+//
+// The contract
+// ------------
+// Every run states, exactly once and in one place, which thermal solver
+// executed and why it was selected -- to the log and to provenance.txt, so a
+// finished run directory answers the question without its log.
+//
+// The value reported MUST come from the same variable the dispatch branches
+// on. A banner re-derived from a second copy of the predicate can drift out of
+// sync with the branch, and a banner that can disagree with reality is worse
+// than no banner. Callers therefore compute the path ONCE, disclose it, and
+// switch on the same value -- see the `switch` in solveWholeMeshThermal and
+// the streamed branch beside it.
+
+#ifndef PTM_SOLVER_DISCLOSURE_H
+#define PTM_SOLVER_DISCLOSURE_H
+
+#include <string>
+
+namespace ptm {
+
+// The whole-mesh thermal solvers this executable can dispatch to.
+enum class ThermalSolverPath {
+    Unset,          // nothing disclosed yet
+    CpuScalar,      // runThermalModelsForAllFaces
+    CpuSimdBatch,   // runThermalModelsForAllFacesBatchSoA        (default)
+    CpuStreamed,    // runThermalModelsForAllFacesStreamed        (scalar core)
+    GpuPersistent   // runThermalModelsForAllFaces_GPU_Persistent
+};
+
+// Why that path was taken. `MemoryThreshold` is the invisible one this file
+// exists for.
+enum class ThermalSolverReason {
+    Unset,
+    ConfigFlag,       // an explicit request (thermal.use_gpu, --no-simd-batch)
+    Default,          // nothing asked; the shipped default applied
+    MemoryThreshold   // the illumination footprint estimate crossed a threshold
+};
+
+// The radiation-coupling selective re-thermal, which re-solves a SUBSET of
+// faces after each radiosity pass and therefore owns the final temperatures of
+// those faces. It has its own dispatch and its own GPU->CPU fallback.
+enum class RethermalPath {
+    NotRun,           // no radiation coupling, or no face selected
+    GpuSelectedFaces, // runThermalForSelectedFaces_GPU
+    CpuScalarFaces    // runThermalModelWithMatchedTimes, per selected face
+};
+
+// Announce the whole-mesh thermal solver. Prints the banner on the first call.
+//
+// Idempotent by design: solveWholeMeshThermal is invoked more than once on the
+// equilibration-indirect path, and re-announcing would be noise. A repeat with
+// the SAME path is silent. A repeat with a DIFFERENT path means the run
+// changed solver mid-flight, which no caller intends -- that warns loudly and
+// the record becomes "mixed", so provenance.txt cannot claim a single path the
+// run did not have.
+//
+//   path                 the value the dispatch itself switches on
+//   reason               how it was chosen
+//   detail               one line naming the deciding quantity (estimate and
+//                        threshold, flag name, ...). Goes verbatim into
+//                        provenance.txt, so keep it to one line.
+//   simd_batch_requested the effective use_simd_batch setting, so an override
+//                        of it by the streamed path can be reported as such.
+void discloseThermalSolverPath(ThermalSolverPath path,
+                               ThermalSolverReason reason,
+                               const std::string& detail,
+                               bool simd_batch_requested);
+
+// Announce the radiation-coupling selective re-thermal. Same idempotency rule;
+// a GPU->CPU fallback between coupling iterations is a genuine change and is
+// reported as "mixed" rather than hidden behind whichever ran last.
+void discloseRethermalPath(RethermalPath path, const std::string& detail);
+
+// Stable machine-readable ids, for provenance.txt and for tests.
+const char* thermalSolverPathId(ThermalSolverPath p);   // "cpu_simd_batch", ...
+const char* thermalSolverEntryPoint(ThermalSolverPath p);
+// The time integrator a path actually runs. CpuStreamed reports "cpu_scalar"
+// because that is the integrator it loops.
+//
+// This is NOT on its own an answer to "is this the same as a --no-simd-batch
+// run?" -- for the streamed path it is not. That path builds its absorbed flux
+// inline from a per-face CONSTANT albedo, so the configured Hayne/Hapke
+// angular model is dropped, no effective_albedo statistic is produced, and no
+// eq-indirect term is carried. Those are reported separately in the
+// `thermal_solver_caveats` provenance key and in the banner.
+const char* thermalSolverCoreId(ThermalSolverPath p);
+const char* thermalSolverReasonId(ThermalSolverReason r);
+const char* rethermalPathId(RethermalPath p);
+
+// Accessors, for the provenance writer and for callers that need to assert.
+ThermalSolverPath   recordedThermalSolverPath();
+ThermalSolverReason recordedThermalSolverReason();
+std::string         recordedThermalSolverDetail();
+RethermalPath       recordedRethermalPath();
+
+// Append the thermal-solver record to <output_dir>/provenance.txt.
+//
+// Appended rather than written with the rest of the provenance because the
+// rest is written before the expensive work starts (so a run that dies in the
+// solver still leaves a record of what it was), while the solver path is only
+// known once the solver has been dispatched. Returns false and warns on any
+// failure, including "nothing was ever disclosed" -- that case means a solver
+// entry point was added without a disclosure, which is the exact regression
+// this file exists to prevent.
+bool appendThermalSolverProvenance(const std::string& output_dir);
+
+// Test hook: forget the recorded path. Only for unit tests that exercise more
+// than one path in a single process.
+void resetThermalSolverDisclosureForTest();
+
+}  // namespace ptm
+
+#endif  // PTM_SOLVER_DISCLOSURE_H

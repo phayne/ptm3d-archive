@@ -35,6 +35,7 @@
 
 #include "../tools/config_parser.h"
 #include "../tools/run_provenance.h"
+#include "../tools/solver_disclosure.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/eq_certificate.h"
 #include <memory>
@@ -14204,6 +14205,13 @@ int main(int argc, char** argv) {
         use_streamed_thermal = false;
     }
 
+    // The thermal dispatch ~850 lines below recomputes this decision from its
+    // own copy of the predicate, in a scope that shadows these names. Keep the
+    // value under a name it cannot shadow so the two can be compared there; a
+    // disagreement means illumination was prepared for one solver and another
+    // one ran.
+    const bool stream_decision_at_extraction = use_streamed_thermal;
+
     // BUGS.md PTM-76: the T(z) checkpoint is read and written ONLY by the GPU
     // persistent solver. On any CPU path both keys are dropped — no file, no
     // error — so a chunked / warm-start run silently degrades into a set of
@@ -14967,7 +14975,37 @@ int main(int argc, char** argv) {
             const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
             ice::IceStabilityAccumulator* ice_acc_l =
                 sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
-            if (use_gpu_thermal_l) {
+
+            // ONE decision, consumed by BOTH the disclosure and the dispatch
+            // below. Deriving the banner from a second copy of this predicate
+            // is how a banner comes to disagree with the branch it describes.
+            const ptm::ThermalSolverPath solver_path =
+                  use_gpu_thermal_l ? ptm::ThermalSolverPath::GpuPersistent
+                : use_simd_batch_l  ? ptm::ThermalSolverPath::CpuSimdBatch
+                                    : ptm::ThermalSolverPath::CpuScalar;
+            switch (solver_path) {
+                case ptm::ThermalSolverPath::GpuPersistent:
+                    ptm::discloseThermalSolverPath(
+                        solver_path, ptm::ThermalSolverReason::ConfigFlag,
+                        "thermal.use_gpu / --use-gpu-thermal is set",
+                        use_simd_batch_l);
+                    break;
+                case ptm::ThermalSolverPath::CpuSimdBatch:
+                    ptm::discloseThermalSolverPath(
+                        solver_path, ptm::ThermalSolverReason::Default,
+                        "shipped default (use_simd_batch=true); --no-simd-batch "
+                        "selects the CPU scalar solver",
+                        use_simd_batch_l);
+                    break;
+                default:
+                    ptm::discloseThermalSolverPath(
+                        solver_path, ptm::ThermalSolverReason::ConfigFlag,
+                        "--no-simd-batch / use_simd_batch=false",
+                        use_simd_batch_l);
+                    break;
+            }
+
+            if (solver_path == ptm::ThermalSolverPath::GpuPersistent) {
                 const std::vector<double>* face_H_ptr_l =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 // A loaded thermal-state checkpoint is already equilibrated by
@@ -14999,7 +15037,7 @@ int main(int argc, char** argv) {
                 rad_post_eq_T_expected = enable_radiation_exchange;
                 return ok;
             }
-            if (use_simd_batch_l) {
+            if (solver_path == ptm::ThermalSolverPath::CpuSimdBatch) {
                 const std::vector<double>* face_H_ptr_l =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 return runThermalModelsForAllFacesBatchSoA(
@@ -15063,6 +15101,24 @@ int main(int argc, char** argv) {
                       << memory_required_gb_est << " GB RAM" << std::endl;
             std::cout << "  Disabling streaming mode to extract full illumination arrays." << std::endl;
             use_streamed_thermal = false;
+        }
+
+        // This block recomputes the streaming decision that the illumination
+        // extraction block already made ~850 lines above, from a second copy of
+        // the same predicate. They agree today by construction (that block
+        // leaves the outer arrays empty exactly when it streams, which is what
+        // `already_extracted` reads), but two copies of a decision are two
+        // decisions. Cross-check them, because a divergence here would mean the
+        // engine extracted illumination for one solver and then ran another.
+        if (use_streamed_thermal != stream_decision_at_extraction) {
+            std::cerr << "\n[thermal-solver] WARNING: the streaming decision differs between "
+                         "the illumination-extraction block (streamed="
+                      << (stream_decision_at_extraction ? "true" : "false")
+                      << ") and the thermal dispatch (streamed="
+                      << (use_streamed_thermal ? "true" : "false") << ").\n"
+                         "  The two copies of the STREAM_THRESHOLD_GB predicate have drifted; "
+                         "the dispatch value is the one that selects the solver.\n"
+                      << std::endl;
         }
 
         // If using chunked storage, extract the data now (SKIP if we plan to stream)
@@ -15133,6 +15189,26 @@ int main(int argc, char** argv) {
         
         // Execute thermal path
         if (using_chunked_storage && use_streamed_thermal) {
+            // Disclosed INSIDE the branch whose condition selects the solver,
+            // and from the same `memory_required_gb_est` / `STREAM_THRESHOLD_GB`
+            // that condition was built from. This is the swap that used to be
+            // invisible: the banner below this block says only that
+            // ILLUMINATION is streamed, never that the SOLVER changed from the
+            // configured SIMD batch to the scalar one.
+            {
+                std::ostringstream why;
+                why << std::fixed << std::setprecision(1)
+                    << "chunked illumination storage, and the estimated illumination "
+                       "footprint " << memory_required_gb_est
+                    << " GB exceeds the " << STREAM_THRESHOLD_GB
+                    << " GB streaming threshold (PTM_RAM_ILLUM_MAX_GB)";
+                ptm::discloseThermalSolverPath(
+                    ptm::ThermalSolverPath::CpuStreamed,
+                    ptm::ThermalSolverReason::MemoryThreshold,
+                    why.str(),
+                    thermal_config.getPropertyBool("use_simd_batch", true));
+            }
+
             // On-demand getters from illumination model (no large buffers)
             FluxFn get_direct = [&](size_t f, int t) {
                 return illumination_model->getDirectSolarValue(f, t);
@@ -16530,6 +16606,9 @@ int main(int argc, char** argv) {
                             return 1;
                         }
                         std::cout << "  Using GPU thermal solver..." << std::endl;
+                        ptm::discloseRethermalPath(
+                            ptm::RethermalPath::GpuSelectedFaces,
+                            "thermal.use_gpu is set and the selection is >= 100 faces");
                         bool gpu_success = runThermalForSelectedFaces_GPU(
                             mesh,
                             faces_to_rerun,
@@ -16616,6 +16695,16 @@ int main(int argc, char** argv) {
                                       << faces_to_rerun.size() << " faces (BUGS.md PTM-57)."
                                          " The next chunk will cold-start them.\n";
                         }
+                        // Disclosed from `use_gpu_thermal_rerun` itself -- the
+                        // variable this branch tests -- so all three ways to
+                        // land here (no GPU thermal, a selection smaller than
+                        // 100 faces, or a GPU re-thermal that failed and fell
+                        // back) are reported as the CPU scalar re-thermal they
+                        // are.
+                        ptm::discloseRethermalPath(
+                            ptm::RethermalPath::CpuScalarFaces,
+                            "no GPU thermal, fewer than 100 selected faces, or "
+                            "the GPU re-thermal failed and fell back");
                         // CPU path: OpenMP parallel loop
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
@@ -16946,6 +17035,18 @@ int main(int argc, char** argv) {
             std::cout << "=================================================\n" << std::endl;
         }
     }
+
+    // ========================================================================
+    // Which thermal solver actually ran -- into the run directory
+    // ========================================================================
+    // Appended here, not written with the rest of the provenance far above,
+    // for two reasons: the whole-mesh path is not known until the solver has
+    // been dispatched, and the radiation-coupling re-thermal (which owns the
+    // final temperature of every selected face) is not known until the
+    // coupling loop above has finished. A past run's directory can now answer
+    // "which solver produced this?" without its log -- see
+    // tools/solver_disclosure.h for why that question had no answer before.
+    ptm::appendThermalSolverProvenance(output_dir);
 
     // Full arrays exist iff not streaming or we explicitly extracted
     bool have_full_illum_arrays =
