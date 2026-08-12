@@ -281,6 +281,23 @@ struct SimulationConfig {
         //     identical to the pre-2026-08-12 seed.
         std::string seed_anchor = "lumped";
 
+        // What a TWO-TIMESCALE face does. The anchor's closure picks ONE
+        // conductance G from a variance match, and with diurnal AND seasonal
+        // power in the same series that single G is being asked to cover two
+        // regimes at once. Detection is always on and always reported
+        // (status lumped-two-timescale / fallback-two-timescale, with the
+        // measured sub-diurnal variance fraction).
+        //
+        // The ACTION defaults to FALSE -- run the anchor anyway -- because
+        // refusing means substituting T_w, and T_w is the estimator with the
+        // +45 K Jensen bias. Measured on tutorial04_crater80N_radoff (a
+        // 2-lunation span, so the sub-solar declination drift IS a second
+        // timescale): the gate fires on 158 of 12,800 faces, 111 of them dark
+        // and flat where T_w is already right, but 47 of them with a 576 W/m^2
+        // diurnal swing where |T_w - reference| is 70 K median / 84 K max.
+        // Set true to restore the strict refusal.
+        bool seed_anchor_refuse_two_timescale = false;
+
         // Length, in diurnal cycles, of the CPU analytic clear-sky
         // pre-conditioner: `equil_days` cycles of cos(lat)*cos(h) insolation
         // with NO topography, NO shadowing, NO IR and NO indirect flux,

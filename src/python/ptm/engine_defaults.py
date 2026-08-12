@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-162 keys across 9 sections.
+164 keys across 9 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -183,8 +183,9 @@ ENGINE_DEFAULTS = {
     'thermal.integration_steps': -1,
     'thermal.property_maps_directory': 'data/property_maps',
     'thermal.run_thermal_mesh': False,
-    'thermal.spinup_seed': 'physical',
     'thermal.seed_anchor': 'lumped',
+    'thermal.seed_anchor_refuse_two_timescale': False,
+    'thermal.spinup_seed': 'physical',
     'thermal.thermal_b': 15,
     'thermal.thermal_inertia_map': '',
     'thermal.thermal_m': 10,

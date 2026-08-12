@@ -3820,7 +3820,7 @@ static bool eqPerfaceFluxMode() {
 // without it means nothing there.
 // ---------------------------------------------------------------------------
 namespace {
-constexpr int kNAnchorStatus = 13;
+constexpr int kNAnchorStatus = 14;
 struct SeedAnchorCensus {
     std::atomic<long long> n[kNAnchorStatus];
     std::atomic<int>       samples{0};
@@ -3912,6 +3912,7 @@ struct GpuSharedSeedContext {
     double dt_s               = 0.0;
     double cycle_s            = 0.0;
     bool   radiation_coupled  = false;
+    bool   refuse_two_timescale = false;
     double cp0                = 0.0;
     const std::vector<double>* cp_coeff = nullptr;
     SeedAnchorCensus* census  = nullptr;
@@ -3998,6 +3999,7 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                                    ? c.cp_coeff->data() : nullptr;
         fc.n_cp_coeff        = c.cp_coeff ? static_cast<int>(c.cp_coeff->size()) : 0;
         fc.radiation_coupled = c.radiation_coupled;
+        fc.refuse_two_timescale = c.refuse_two_timescale;
         in.anchor            = c.anchor;
         in.forcing           = &fc;
 
@@ -4478,6 +4480,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                                           ? nullptr : planet.cpCoeff.data();
                     sfc_.n_cp_coeff = static_cast<int>(planet.cpCoeff.size());
                     sfc_.radiation_coupled = config.seed_forcing_radiation_coupled;
+                    sfc_.refuse_two_timescale =
+                        config.seed_anchor_refuse_two_timescale;
 
                     thermal::EqSeedInput sin_;
                     sin_.anchor  = config.seed_anchor;
@@ -6696,6 +6700,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.dt_s = gpu_seed_dt_s;
             sc.cycle_s = planet.day;
             sc.radiation_coupled = config.seed_forcing_radiation_coupled;
+            sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
             sc.census = &gpu_anchor_census;
@@ -7374,6 +7379,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.dt_s = gpu_seed_dt_s;
             sc.cycle_s = planet.day;
             sc.radiation_coupled = config.seed_forcing_radiation_coupled;
+            sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
             sc.census = &gpu_anchor_census;
@@ -13952,6 +13958,8 @@ int main(int argc, char** argv) {
     config.spinup_seed          = resolved_seed_mode;
     config.seed_anchor          = resolved_seed_anchor;
     config.seed_forcing_radiation_coupled = sim_config.radiation.enabled;
+    config.seed_anchor_refuse_two_timescale =
+        sim_config.thermal.seed_anchor_refuse_two_timescale;
     config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
 
     // Log the calculation for verification
@@ -14619,6 +14627,8 @@ int main(int argc, char** argv) {
         thermal_config.spinup_seed          = resolved_seed_mode;
         thermal_config.seed_anchor          = resolved_seed_anchor;
         thermal_config.seed_forcing_radiation_coupled = sim_config.radiation.enabled;
+        thermal_config.seed_anchor_refuse_two_timescale =
+            sim_config.thermal.seed_anchor_refuse_two_timescale;
         thermal_config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 

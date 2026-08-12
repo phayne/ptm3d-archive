@@ -353,10 +353,20 @@ void testGates() {
         Case k = moonCase(c, Fs); k.in.forcing = &k.fc;
         k.fc.span_s = ncyc * kMoonDay;
         const auto r = thermal::eqSeedColumn(k.in, nullptr);
-        check(r.anchor_status == thermal::EqSeedAnchorStatus::FallbackTwoTimescale,
-              "diurnal + annual -> two-timescale, reported",
+        check(r.anchor_status == thermal::EqSeedAnchorStatus::LumpedTwoTimescale,
+              "diurnal + annual -> DETECTED and disclosed, anchor still runs",
               "sub-diurnal variance fraction " +
                   std::to_string(r.subdiurnal_variance_fraction));
+        k.fc.refuse_two_timescale = true;
+        const auto r2 = thermal::eqSeedColumn(k.in, nullptr);
+        check(r2.anchor_status == thermal::EqSeedAnchorStatus::FallbackTwoTimescale &&
+              r2.T_surface == r2.T_warm,
+              "seed_anchor_refuse_two_timescale restores the refusal");
+        check(r2.T_cold < r2.T_warm - 1.0,
+              "a refused face still reports BOTH brackets on the series"
+              " quadrature",
+              "T_c " + std::to_string(r2.T_cold) + " T_w " +
+                  std::to_string(r2.T_warm));
     }
     {
         // The SAME 8 lunations with no seasonal envelope must NOT fall back.

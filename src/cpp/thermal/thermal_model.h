@@ -428,6 +428,9 @@ public:
     // re-evaluated inside the Picard loop, so the anchor stands down and says
     // so. Set from radiation.enabled in main().
     bool seed_forcing_radiation_coupled = false;
+    // Whether a two-timescale face REFUSES the anchor (and takes T_w) or runs
+    // it and says so. See thermal.seed_anchor_refuse_two_timescale.
+    bool seed_anchor_refuse_two_timescale = false;
     // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
     // < 0 = unset, follow spinup_seed (Physical -> 0, Legacy -> the historic
     // NYEARSEQ*round(year/day)). >= 0 = use exactly this many, whatever the

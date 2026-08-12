@@ -174,6 +174,7 @@ enum class EqSeedAnchorStatus {
     Lumped,                   ///< the derived anchor ran
     ZeroSwing,                ///< F(t) exactly flat: T_d == T_w, T_w kept bitwise
     LumpedInputLimited,       ///< the anchor ran, but on < 4 lit samples
+    LumpedTwoTimescale,       ///< the anchor ran, but the forcing is two-timescale
     FallbackTwoTimescale,     ///< power below the diurnal fundamental
     FallbackRadiationCoupled, ///< F depends on neighbors this iteration
     FallbackLatentHeat,       ///< a phase change is in the surface budget
@@ -189,7 +190,8 @@ const char* eqSeedAnchorStatusName(EqSeedAnchorStatus s);
 /// True when the status means "the derived anchor was used".
 inline bool eqSeedAnchorRan(EqSeedAnchorStatus s) {
     return s == EqSeedAnchorStatus::Lumped ||
-           s == EqSeedAnchorStatus::LumpedInputLimited;
+           s == EqSeedAnchorStatus::LumpedInputLimited ||
+           s == EqSeedAnchorStatus::LumpedTwoTimescale;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +239,9 @@ struct EqSeedForcing {
     /// way (EqSeedResult::subdiurnal_variance_fraction) so the choice is
     /// auditable rather than invisible.
     double max_subdiurnal_variance_fraction = 0.05;
+    /// What to DO about it. See the measurement note on
+    /// thermal.seed_anchor_refuse_two_timescale in config_parser.h.
+    bool   refuse_two_timescale = false;
     /// Fewest samples with F > 0 before a face is REFUSED the anchor outright.
     /// DEFAULT 0 = never refuse, because refusing means substituting T_w, and
     /// T_w is +28 K on exactly this population: measured on the 24 grazing

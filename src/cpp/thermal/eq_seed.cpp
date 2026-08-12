@@ -56,6 +56,7 @@ const char* eqSeedAnchorStatusName(EqSeedAnchorStatus s) {
         case EqSeedAnchorStatus::NoForcingSeries:          return "no-forcing-series";
         case EqSeedAnchorStatus::Lumped:                   return "lumped";
         case EqSeedAnchorStatus::LumpedInputLimited:       return "lumped-input-limited";
+        case EqSeedAnchorStatus::LumpedTwoTimescale:       return "lumped-two-timescale";
         case EqSeedAnchorStatus::ZeroSwing:                return "zero-swing";
         case EqSeedAnchorStatus::FallbackTwoTimescale:     return "fallback-two-timescale";
         case EqSeedAnchorStatus::FallbackRadiationCoupled: return "fallback-radiation-coupled";
@@ -398,22 +399,36 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
         return T_warm_fallback;
     }
 
-    // --- scan the series: swing, lit-sample count, finiteness ---------------
+    // --- scan the series: swing, lit-sample count, finiteness, brackets -----
+    // The two brackets are computed HERE, before any gate, so they are on the
+    // series' own quadrature and are reported even on a fallback. Acceptance
+    // scaling needs T_w, T_c and the anchor on the SAME quadrature, and a
+    // fallback that reported T_c == T_w would silently make the bracket look
+    // like zero on exactly the faces worth auditing.
     const std::size_t st = (fc.stride > 0) ? fc.stride : 1;
     double fmin = fc.flux[0], fmax = fc.flux[0];
     int n_lit = 0;
     bool bad = false;
+    double sumF = 0.0, sumTc = 0.0;
     for (int i = 0; i < fc.n_samples; ++i) {
         const double v = fc.flux[static_cast<std::size_t>(i) * st];
         if (!std::isfinite(v)) { bad = true; break; }
         if (v < fmin) fmin = v;
         if (v > fmax) fmax = v;
         if (v > 0.0) ++n_lit;
+        const double vp = (v > 0.0) ? v : 0.0;
+        sumF  += vp;
+        sumTc += std::sqrt(std::sqrt((vp + Qb) / a));
     }
     r.n_lit_samples = n_lit;
     if (bad) {
         r.anchor_status = EqSeedAnchorStatus::FallbackBadProperties;
         return T_warm_fallback;
+    }
+    {
+        const double inv_n = 1.0 / static_cast<double>(fc.n_samples);
+        r.T_warm = std::sqrt(std::sqrt((sumF * inv_n + Qb) / a));
+        r.T_cold = sumTc * inv_n;
     }
 
     // ZERO SWING is exact, and it is held exactly: a flat F makes the cold and
@@ -423,8 +438,6 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
     // guarantee instead of a measurement.
     if (fmin == fmax) {
         r.anchor_status = EqSeedAnchorStatus::ZeroSwing;
-        r.T_warm = T_warm_fallback;
-        r.T_cold = T_warm_fallback;
         return T_warm_fallback;
     }
 
@@ -461,8 +474,6 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
     for (int k = 1; k < nb; ++k) S0 += P[k];
     if (!(S0 > 0.0)) {                              // no resolved variance
         r.anchor_status = EqSeedAnchorStatus::ZeroSwing;
-        r.T_warm = T_warm_fallback;
-        r.T_cold = T_warm_fallback;
         return T_warm_fallback;
     }
 
@@ -474,6 +485,7 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
     // function is a variance match, and the T distribution is then a
     // convolution of two very different swings), so that regime falls back.
     // The fraction is reported either way.
+    bool two_timescale = false;
     if (fc.cycle_s > 0.0) {
         const int n_diurnal =
             static_cast<int>(std::lround(fc.span_s / fc.cycle_s));
@@ -481,8 +493,9 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
             double sub = 0.0;
             for (int k = 1; k < std::min(n_diurnal, nb); ++k) sub += P[k];
             r.subdiurnal_variance_fraction = sub / S0;
-            if (r.subdiurnal_variance_fraction >
-                fc.max_subdiurnal_variance_fraction) {
+            two_timescale = r.subdiurnal_variance_fraction >
+                            fc.max_subdiurnal_variance_fraction;
+            if (two_timescale && fc.refuse_two_timescale) {
                 r.anchor_status = EqSeedAnchorStatus::FallbackTwoTimescale;
                 return T_warm_fallback;
             }
@@ -565,7 +578,8 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
         r.anchor_status = EqSeedAnchorStatus::FallbackNotConverged;
         return T_warm_fallback;
     }
-    r.anchor_status = input_limited ? EqSeedAnchorStatus::LumpedInputLimited
+    r.anchor_status = two_timescale ? EqSeedAnchorStatus::LumpedTwoTimescale
+                    : input_limited ? EqSeedAnchorStatus::LumpedInputLimited
                                     : EqSeedAnchorStatus::Lumped;
     return Td;
 }

@@ -1862,6 +1862,7 @@ Model::Model(const Planet& planet, double lat,
             fc.n_cp_coeff         = static_cast<int>(planet.cpCoeff.size());
             fc.radiation_coupled  = config.seed_forcing_radiation_coupled;
             fc.nonuniform_samples = !uniform;
+            fc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             have_forcing = true;
         }
         seed_result    = profile.seedFromMeanFlux(
