@@ -1415,11 +1415,6 @@ bool runThermalModelsForAllFacesStreamed(
     int equilibration_steps,
     const std::vector<double>& eq_indirect_flux);
 
-std::vector<double> computeFaceAlbedos(
-    const std::shared_ptr<Mesh>& mesh,
-    std::shared_ptr<ptm::SpatialMap> albedo_map,
-    double default_visible_albedo);
-
 void fixOutOfRangeAlbedos(
     std::vector<double>& face_albedos,
     const std::shared_ptr<Mesh>& mesh,
@@ -1792,10 +1787,6 @@ public:
         g_eff_albedo_valid = true;
     }
 
-    bool usesIncidenceAlbedo() const { return use_incidence_albedo_; }
-    bool usesHapkeAlbedo()     const { return use_hapke_albedo_; }
-    bool albedoMapLoaded()     const { return albedo_successfully_loaded_; }
-
 private:
     const Mesh*            mesh_   = nullptr;
     const thermal::Planet* planet_ = nullptr;
@@ -1808,6 +1799,30 @@ private:
     bool use_hapke_albedo_           = false;
     bool albedo_successfully_loaded_ = false;
 };
+
+// The explicit thermophysical `albedo_map` FITS key is opened by the CALLER on
+// every path -- AbsorbedFluxComposer::build() consumes an already-loaded map, it
+// never opens that key itself. Shared by the CPU SIMD-batch and streamed callers
+// so the two cannot drift; `tag` is only the log prefix.
+// (runThermalModelsForAllFaces keeps its own copy, which additionally prints the
+// map's resolution/range/extent; it is left alone rather than have this helper
+// grow a verbosity flag for one caller.)
+static std::shared_ptr<ptm::SpatialMap> loadExplicitAlbedoMap(
+    const thermal::Config& config, const char* tag) {
+    std::shared_ptr<ptm::SpatialMap> map;
+    if (config.custom_properties.find("albedo_map") == config.custom_properties.end()) {
+        return map;
+    }
+    const std::string path = config.getProperty("albedo_map");
+    if (path.empty()) return map;
+    map = std::make_shared<ptm::SpatialMap>();
+    if (!map->loadFromFITS(path)) {
+        std::cout << tag << " Failed to load explicit albedo_map: " << path
+                  << " (" << map->getLastError() << ")" << std::endl;
+        map.reset();
+    }
+    return map;
+}
 
 bool AbsorbedFluxComposer::build(
     const std::shared_ptr<ptm::SpatialMap>& albedo_map,
@@ -2651,19 +2666,6 @@ bool exportBodyPositions(
     return true;
 }
 
-std::vector<double> calculateAbsorbedFlux(
-    const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values,
-    const std::vector<double>& primary_ir_values,
-    int time_steps,
-    const std::shared_ptr<ptm::SpatialMap>& albedo_map,
-    const std::shared_ptr<Mesh>& mesh,
-    double default_visible_albedo,
-    double default_ir_albedo,
-    const thermal::Config& config,
-    const thermal::Planet* planet,
-    double solar_constant);
-
 bool exportLocationTemperatureOnly(
     const std::string& output_file,
     const std::string& locations_file,
@@ -3143,21 +3145,10 @@ bool runThermalModelsForAllFacesStreamed(
     // -- no time dimension -- so the memory bound this whole path exists to hold
     // is untouched; only the composition moved.
     //
-    // The explicit `albedo_map` FITS file is loaded by the CALLER on every other
-    // path (calculateAbsorbedFlux consumes an already-loaded map, it does not
-    // open that key itself), so do exactly what the CPU SIMD-batch caller does.
-    std::shared_ptr<ptm::SpatialMap> streamed_albedo_map;
-    if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
-        const std::string path = config.getProperty("albedo_map");
-        if (!path.empty()) {
-            streamed_albedo_map = std::make_shared<ptm::SpatialMap>();
-            if (!streamed_albedo_map->loadFromFITS(path)) {
-                std::cout << "[Streamed] Failed to load explicit albedo_map: " << path
-                          << " (" << streamed_albedo_map->getLastError() << ")" << std::endl;
-                streamed_albedo_map.reset();
-            }
-        }
-    }
+    // The explicit `albedo_map` FITS key is opened by the caller on every path;
+    // same helper the CPU SIMD-batch caller uses.
+    std::shared_ptr<ptm::SpatialMap> streamed_albedo_map =
+        loadExplicitAlbedoMap(config, "[Streamed]");
 
     std::cerr << "[Streamed] Composing absorbed flux "
                  "(per-face spatial + incidence-angle albedo)..." << std::endl;
@@ -3657,18 +3648,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                               && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
     planet.hapke_albedo_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
 
-    std::shared_ptr<ptm::SpatialMap> batch_albedo_map;
-    if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
-        const std::string path = config.getProperty("albedo_map");
-        if (!path.empty()) {
-            batch_albedo_map = std::make_shared<ptm::SpatialMap>();
-            if (!batch_albedo_map->loadFromFITS(path)) {
-                std::cout << "[SIMD Batch] Failed to load explicit albedo_map: " << path
-                          << " (" << batch_albedo_map->getLastError() << ")" << std::endl;
-                batch_albedo_map.reset();
-            }
-        }
-    }
+    std::shared_ptr<ptm::SpatialMap> batch_albedo_map =
+        loadExplicitAlbedoMap(config, "[SIMD Batch]");
 
     std::cerr << "Computing absorbed flux (per-face spatial + incidence-angle albedo)..." << std::endl;
     std::vector<double> absorbed_flux_rowmajor = calculateAbsorbedFlux(
@@ -8177,35 +8158,6 @@ static bool generateDepthProfilePlots(const std::string& csv_dir, const std::str
     }
 
     return true;
-}
-
-// Helper: compute per-face visible albedos once (uses map if available)
-std::vector<double> computeFaceAlbedos(
-    const std::shared_ptr<Mesh>& mesh,
-    std::shared_ptr<ptm::SpatialMap> albedo_map,
-    double default_visible_albedo)
-{
-    const size_t num_faces = mesh->faces.size();
-    std::vector<double> face_albedos(num_faces, default_visible_albedo);
-
-    if (albedo_map && albedo_map->isValid()
-        && mesh->latitudes.size() == num_faces
-        && mesh->longitudes.size() == num_faces)
-    {
-        #pragma omp parallel for schedule(static)
-        for (size_t f = 0; f < num_faces; ++f) {
-            double lon = mesh->longitudes[f];
-            while (lon < 0) lon += 360.0;
-            while (lon >= 360.0) lon -= 360.0;
-            double lat = mesh->latitudes[f];
-            double v = albedo_map->getValue(lon, lat);
-            if (v == albedo_map->getMissingValue() || !std::isfinite(v) || v <= 0.0 || v >= 1.0) {
-                v = default_visible_albedo;
-            }
-            face_albedos[f] = v;
-        }
-    }
-    return face_albedos;
 }
 
 // Helper function to adjust start time
