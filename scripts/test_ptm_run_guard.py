@@ -151,6 +151,21 @@ expect_raises(lambda: ladder3.record_failure(134),
 
 if _fail == 0:
     print("\nALL RUN-GUARD TESTS PASSED")
-    sys.exit(0)
-print(f"\n{_fail} RUN-GUARD TEST(S) FAILED")
-sys.exit(1)
+else:
+    print(f"\n{_fail} RUN-GUARD TEST(S) FAILED")
+
+
+def test_ptm_run_guard():
+    """The verdict, for a collector rather than a shell.
+
+    Everything above runs at import. Calling ``sys.exit`` there too raised
+    ``SystemExit`` inside pytest's collector, which aborts the whole session
+    with an INTERNALERROR -- and the session then reports "no tests ran",
+    which reads as green. The exit code stays under ``__main__`` for the
+    shell (CI runs this file directly); pytest gets an assertion.
+    """
+    assert _fail == 0, f"{_fail} run-guard self-test(s) failed"
+
+
+if __name__ == "__main__":
+    sys.exit(1 if _fail else 0)

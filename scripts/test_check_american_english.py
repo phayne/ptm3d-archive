@@ -221,6 +221,21 @@ check(b"colour" in out.stdout and out.returncode == 1,
 
 if _fail == 0:
     print("\nALL AMERICAN-ENGLISH CHECKER TESTS PASSED")
-    sys.exit(0)
-print(f"\n{_fail} AMERICAN-ENGLISH CHECKER TEST(S) FAILED")
-sys.exit(1)
+else:
+    print(f"\n{_fail} AMERICAN-ENGLISH CHECKER TEST(S) FAILED")
+
+
+def test_american_english_checker():
+    """The verdict, for a collector rather than a shell.
+
+    Everything above runs at import. Calling ``sys.exit`` there too raised
+    ``SystemExit`` inside pytest's collector, which aborts the whole session
+    with an INTERNALERROR -- and the session then reports "no tests ran",
+    which reads as green. The exit code stays under ``__main__`` for the
+    shell (CI runs this file directly); pytest gets an assertion.
+    """
+    assert _fail == 0, f"{_fail} American-English checker self-test(s) failed"
+
+
+if __name__ == "__main__":
+    sys.exit(1 if _fail else 0)
