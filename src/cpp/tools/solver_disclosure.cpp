@@ -88,9 +88,25 @@ const char* rethermalPathId(RethermalPath p) {
     return "not_run";
 }
 
+const char* thermalSolverCaveats(ThermalSolverPath p, bool simd_batch_requested) {
+    // Exactly one case left: a streamed run whose config asked for the SIMD
+    // batch solver got the CPU scalar integrator instead. That is a
+    // SUBSTITUTION the caller did not request, which is reportable on its own
+    // terms; how far the two integrators actually diverge is a separate
+    // question and deliberately not asserted here. Everything else --
+    // including a streamed run that asked for the scalar solver anyway, which
+    // is byte-identical to what it asked for -- has nothing to disclose beyond
+    // its path.
+    if (p == ThermalSolverPath::CpuStreamed && simd_batch_requested) {
+        return "cpu_scalar_integrator_substituted_for_requested_simd_batch";
+    }
+    return "none";
+}
+
 // Long-form label plus, where it matters, what the reader would otherwise get
-// wrong. Only the streamed path carries a caveat, because only the streamed
-// path is a solver substitution the caller did not ask for.
+// wrong. Only one situation still carries a caveat: a streamed run that had
+// asked for the SIMD batch solver, because that -- and only that -- is a
+// substitution of one integrator for another that the caller did not request.
 static const char* pathLabel(ThermalSolverPath p) {
     switch (p) {
         case ThermalSolverPath::CpuScalar:     return "CPU scalar";
@@ -117,9 +133,9 @@ void discloseThermalSolverPath(ThermalSolverPath path,
                   << " (" << thermalSolverEntryPoint(r.path) << ")\n"
                   << "[thermal-solver]   then:  " << pathLabel(path)
                   << " (" << thermalSolverEntryPoint(path) << ")\n"
-                  << "[thermal-solver]   The two do not share a surface boundary "
-                     "condition, a spin-up or a clamp set, so the output field is a "
-                     "mixture.\n"
+                  << "[thermal-solver]   Two solvers contributed to the output field, so "
+                     "no single path id describes it and any comparison against a "
+                     "single-path run is unattributable.\n"
                   << "[thermal-solver]   provenance.txt will record this as 'mixed'."
                   << std::endl;
         r.mixed = true;
@@ -138,32 +154,30 @@ void discloseThermalSolverPath(ThermalSolverPath path,
               << "[thermal-solver] REASON: " << detail << "\n";
 
     if (path == ThermalSolverPath::CpuStreamed) {
-        // The substitution, stated. This is the text whose absence made every
-        // production-mesh CPU comparison unattributable.
+        // The equivalence, stated -- because it IS the answer the reader needs,
+        // and because saying nothing here is what left every production-mesh
+        // CPU comparison unattributable in the first place.
         //
-        // Be precise about WHAT it substitutes. The streamed path reuses the
-        // scalar TIME INTEGRATOR (runThermalModelWithMatchedTimes), but it
-        // builds its own forcing inline instead of routing through
-        // calculateAbsorbedFlux(..., planet, ...). Calling it "the scalar
-        // solver" without saying that would invite the reader to equate this
-        // run with a --no-simd-batch run, which it is NOT: measured 4.82 K max
-        // / 3.97 K mean apart on 11,664 of 12,800 faces of the 80N tutorial
-        // crater, same config, same illumination, 4,200 output steps.
+        // This text used to name three defects: a constant albedo in place of
+        // the configured angular model, no effective_albedo statistic, and no
+        // equilibration indirect-flux term. All three were real, all three were
+        // fixed (66c6dd7, 2aa8f67), and all three were re-measured as absent
+        // on 0bb5218 on 2026-08-12. See solver_disclosure.h for the
+        // falsifiers. Do not reinstate them without re-measuring: a caveat
+        // that outlives its defect is a wrong label with an engine's
+        // authority behind it.
         std::cout
-            << "[thermal-solver] NOTE:   the streamed path reuses the CPU SCALAR time\n"
-            << "[thermal-solver]         integrator (runThermalModelWithMatchedTimes), but it\n"
-            << "[thermal-solver]         is NOT equivalent to a --no-simd-batch run. It builds\n"
-            << "[thermal-solver]         its absorbed flux INLINE, so:\n"
-            << "[thermal-solver]           1. the albedo is a per-face CONSTANT. The configured\n"
-            << "[thermal-solver]              angular-albedo model (Hayne, or Hapke via\n"
-            << "[thermal-solver]              incidence_angle_albedo) is NOT applied -- the\n"
-            << "[thermal-solver]              other CPU paths route through\n"
-            << "[thermal-solver]              calculateAbsorbedFlux(..., planet, ...).\n"
-            << "[thermal-solver]           2. no effective_albedo statistic is produced, because\n"
-            << "[thermal-solver]              A_eff accumulates inside that same function.\n"
-            << "[thermal-solver]           3. the equilibration indirect-flux term is not\n"
-            << "[thermal-solver]              carried; this path takes no eq_indirect argument.\n";
+            << "[thermal-solver] NOTE:   the streamed path is the CPU SCALAR path with an\n"
+            << "[thermal-solver]         on-demand flux getter in front of it. It composes\n"
+            << "[thermal-solver]         absorbed flux through the same AbsorbedFluxComposer and\n"
+            << "[thermal-solver]         loops the same integrator (runThermalModelWithMatchedTimes),\n"
+            << "[thermal-solver]         and its output is BYTE-IDENTICAL to a --no-simd-batch run\n"
+            << "[thermal-solver]         of the same config.\n";
         if (simd_batch_requested) {
+            // Left exactly as it was. It is true, it names the remedy, and it
+            // carries no measurement that another branch could invalidate.
+            // Characterizing HOW the two integrators differ belongs with
+            // whoever settles it -- see the note on thermalSolverCaveats().
             std::cout
                 << "[thermal-solver] WARNING: use_simd_batch is true for this run, but the\n"
                 << "[thermal-solver]         streamed path does not honor it. The SIMD batch\n"
@@ -172,6 +186,10 @@ void discloseThermalSolverPath(ThermalSolverPath path,
                 << "[thermal-solver]         estimate above to keep the SIMD batch solver.\n";
         }
     }
+    // Printed for every path, from the same function the provenance key calls,
+    // so the log and provenance.txt cannot disagree about the caveat.
+    std::cout << "[thermal-solver] CAVEATS: "
+              << thermalSolverCaveats(path, simd_batch_requested) << "\n";
     std::cout << kRule << "\n" << std::endl;
 }
 
@@ -236,15 +254,15 @@ bool appendThermalSolverProvenance(const std::string& output_dir) {
     kv("thermal_solver_reason", r.detail.empty() ? "none" : r.detail);
     kv("thermal_solver_simd_batch_requested", r.simd_batch_requested ? "true" : "false");
     // `thermal_solver_core` names the time integrator, which for the streamed
-    // path is the scalar one. That alone would read as "same as a
-    // --no-simd-batch run", and it is not: the streamed path also drops the
-    // equilibration phase, the angular-albedo model and the eq-indirect term.
-    // A reader who has only the provenance file must be told.
+    // path is the scalar one -- and a streamed run IS byte-identical to a
+    // --no-simd-batch run, so for a reader who asked for the scalar solver
+    // there is nothing further to say. The one thing that still needs saying is
+    // the integrator SUBSTITUTION, when the config asked for the SIMD batch
+    // solver and the memory threshold overrode it. Same function as the banner,
+    // so the two cannot drift apart.
     kv("thermal_solver_caveats",
-       (!r.mixed && r.path == ThermalSolverPath::CpuStreamed)
-           ? "constant_albedo_angular_model_ignored;no_effective_albedo_statistic;"
-             "no_eq_indirect_flux"
-           : "none");
+       r.mixed ? "mixed"
+               : thermalSolverCaveats(r.path, r.simd_batch_requested));
     kv("thermal_rethermal_path",
        r.rethermal_mixed ? "mixed" : rethermalPathId(r.rethermal));
     kv("thermal_rethermal_reason",

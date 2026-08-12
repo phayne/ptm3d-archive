@@ -10,14 +10,35 @@
 //                          && (memory_required_gb_est > STREAM_THRESHOLD_GB)
 //
 // Above that threshold a CPU run silently swaps its solver from the default
-// SIMD batch solver to the scalar solver. The two are NOT interchangeable:
-// they differ in surface boundary condition, spin-up, bottom boundary
-// condition and clamp set (measured up to 5.27 K max / 2.90 K on shadowed
-// faces on a 12,800-face crater). The only thing the log said about it was
-// "Will stream illumination to the thermal solver" -- a statement about
+// SIMD batch solver to the scalar solver. The only thing the log said about it
+// was "Will stream illumination to the thermal solver" -- a statement about
 // ILLUMINATION storage, which never mentions that the SOLVER changed. A
-// 509,337-face x 1440-step lunar run needs ~17.6 GB and crosses the
-// threshold, so production runs took the swap and no log recorded it.
+// 509,337-face x 1440-step lunar run estimates 16.4 GB by that predicate's own
+// arithmetic (faces x steps x 8 B x 3 arrays, divided by 1024^3) and so crosses
+// the 10 GB default; production runs took the swap and no log recorded it.
+//
+// What the swap costs is deliberately NOT characterized here. The streamed
+// path is byte-identical to the --no-simd-batch run the same config would
+// otherwise get (measured on 0bb5218, 80N tutorial crater: only provenance.txt
+// differs, 0.000 K on every temperature statistic, on four config variants), so
+// the substitution that remains is CPU scalar for CPU SIMD batch. How far those
+// two integrators diverge is an open question being settled elsewhere, and a
+// number pinned here would go stale the moment it is answered -- which is the
+// exact failure this file was written to prevent. Report the substitution; let
+// whoever settles the divergence describe it.
+//
+// Three caveats this file used to print are gone, and must not come back. The
+// streamed path applying a constant albedo instead of the configured angular
+// model, producing no effective_albedo statistic, and dropping the
+// equilibration indirect-flux term were all closed by
+// fix/streamed-flux-composition (66c6dd7) and fix/ir-albedo-kirchhoff
+// (2aa8f67). Each was re-measured on 0bb5218 on 2026-08-12 with a falsifier
+// that fires the right way: toggling incidence_angle_albedo moves streamed
+// temperature_avg by 17.0 K mean / 24.5 K max over 11,400 faces, a supplied
+// eq_indirect_flux_file (uniform 2 W/m^2) moves it by 3.00 K mean / 26.0 K max
+// over all 12,800, and effective_albedo.bin is written on every streamed run
+// and md5-equal to the scalar run's. Printing them today would stamp a defect
+// that no longer exists into every run's provenance.
 //
 // The contract
 // ------------
@@ -96,17 +117,24 @@ void discloseRethermalPath(RethermalPath path, const std::string& detail);
 const char* thermalSolverPathId(ThermalSolverPath p);   // "cpu_simd_batch", ...
 const char* thermalSolverEntryPoint(ThermalSolverPath p);
 // The time integrator a path actually runs. CpuStreamed reports "cpu_scalar"
-// because that is the integrator it loops.
+// because that is the integrator it loops -- and on current main a streamed run
+// is byte-identical to a --no-simd-batch run of the same config, so for that
+// path the core id is the whole answer to "did my physics change?".
 //
-// This is NOT on its own an answer to "is this the same as a --no-simd-batch
-// run?" -- for the streamed path it is not. That path builds its absorbed flux
-// inline from a per-face CONSTANT albedo, so the configured Hayne/Hapke
-// angular model is dropped, no effective_albedo statistic is produced, and no
-// eq-indirect term is carried. Those are reported separately in the
-// `thermal_solver_caveats` provenance key and in the banner.
+// Read it together with `thermal_solver_simd_batch_requested`. A run that asked
+// for the SIMD batch solver and got `cpu_scalar` did change integrator. That
+// substitution, and only that, is what `thermal_solver_caveats` now reports --
+// the size of the resulting difference is not asserted here.
 const char* thermalSolverCoreId(ThermalSolverPath p);
 const char* thermalSolverReasonId(ThermalSolverReason r);
 const char* rethermalPathId(RethermalPath p);
+
+// The caveat token for a (path, simd_batch_requested) pair, or "none".
+//
+// ONE definition, called by both the banner and the provenance writer, for the
+// same reason the path itself is computed once: a log line and a provenance key
+// that are derived separately can disagree, and then neither can be trusted.
+const char* thermalSolverCaveats(ThermalSolverPath p, bool simd_batch_requested);
 
 // Accessors, for the provenance writer and for callers that need to assert.
 ThermalSolverPath   recordedThermalSolverPath();
