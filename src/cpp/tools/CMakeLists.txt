@@ -203,6 +203,20 @@ set_target_properties(test_eq_seed
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Lit-face seed anchor gate. The two limits of the lumped-substrate anchor are
+# BOUNDARY CONDITIONS, not statistics, so they are unit tests here; the zero-
+# swing byte-identity and every regime fallback are pinned alongside them.
+add_executable(test_eq_anchor test_eq_anchor.cpp)
+target_link_libraries(test_eq_anchor
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_eq_anchor
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration spin-up estimator gate. Checks tau1 against the analytic
 # quarter-wave slab, the ln(1/target) scaling of n_req, and that an
 # unreachable target returns NO cycle count.
