@@ -71,6 +71,7 @@
 #include <vector>
 
 #include "conductivity_model.h"
+#include "../constants/stefan_boltzmann.h"   // ptm::kStefanBoltzmann
 
 namespace thermal {
 
@@ -103,7 +104,11 @@ struct EqSeedInput {
     double mean_absorbed_flux = 0.0;
     double Qb                 = 0.0;    ///< THIS face's basal flux [W/m^2]
     double emissivity         = 0.95;
-    double sigma              = 5.67051196e-8;
+    /// The seed MUST use the same sigma as the surface BC on its own path, or
+    /// it anchors the column somewhere the BC will not hold it. Since
+    /// fix/surface-bc-unification there is exactly one value engine-wide, so
+    /// this default and every caller's explicit value are the same number.
+    double sigma              = ptm::kStefanBoltzmann;
 
     const double* z   = nullptr;        ///< depth grid [m], n nodes, z[0] == 0
     const double* kc  = nullptr;        ///< conductive k_c(z) [W/m/K], n nodes
