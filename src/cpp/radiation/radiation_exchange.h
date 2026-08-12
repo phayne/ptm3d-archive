@@ -322,6 +322,10 @@ public:
     // Initialize GPU solver if enabled (call after setConfig)
     void initGPU();
 
+    // The emissivity actually in force, i.e. after initCommon applied any
+    // PTM_RAD_EMISSIVITY override. reflectivity_ is exactly 1 - this.
+    const std::vector<double>& operativeEmissivity() const { return emissivity_; }
+
 private:
     // Initialize common data
     void initCommon(const std::vector<double>& emissivity,
@@ -649,6 +653,14 @@ public:
     // Set emissivity for all faces (or use per-face values)
     void setEmissivity(double emissivity);
     void setEmissivity(const std::vector<double>& emissivity);
+
+    // The emissivity the solver OPERATIVELY holds -- i.e. after
+    // RadiositySolver::initCommon has applied any PTM_RAD_EMISSIVITY override,
+    // which is the one way the radiosity's 1-eps can come apart from the
+    // emissivity the thermal path absorbs and emits with. Empty before
+    // prepare(). Read by the engine's Kirchhoff cross-check; do not use it as
+    // a configuration source.
+    const std::vector<double>& operativeEmissivity() const;
 
     // Get/set configuration
     const RadiationConfig& getConfig() const { return config_; }
