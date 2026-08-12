@@ -417,6 +417,17 @@ public:
     // pre-2026-08-11 seed AND its analytic clear-sky pre-conditioner, so one
     // word reproduces any older baseline.
     EqSeedMode spinup_seed = EqSeedMode::Physical;
+    // Which SURFACE ANCHOR that seed hangs from. `Lumped` is the derived
+    // lumped-substrate anchor (the cycle mean); `Warm` restores the
+    // pre-2026-08-12 fourth-moment anchor T_w bit-for-bit. Only consulted
+    // where the caller can supply the face's own forcing series.
+    EqSeedAnchor seed_anchor = EqSeedAnchor::Lumped;
+    // TRUE when radiation exchange is on, i.e. when a face's absorbed flux
+    // depends on its neighbors' temperatures. The lumped anchor's closure
+    // assumes F(t) is an EXTERNAL forcing; under coupling it would have to be
+    // re-evaluated inside the Picard loop, so the anchor stands down and says
+    // so. Set from radiation.enabled in main().
+    bool seed_forcing_radiation_coupled = false;
     // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
     // < 0 = unset, follow spinup_seed (Physical -> 0, Legacy -> the historic
     // NYEARSEQ*round(year/day)). >= 0 = use exactly this many, whatever the
@@ -787,7 +798,9 @@ public:
     // composition averaged over the available forcing span; `Qb` is this
     // face's basal flux. Returns the seed summary (surface/deep temperature
     // and the degenerate-input flags) so the caller can count and report.
-    EqSeedResult seedFromMeanFlux(double mean_absorbed_flux, double Qb);
+    EqSeedResult seedFromMeanFlux(double mean_absorbed_flux, double Qb,
+                                  const EqSeedForcing* forcing = nullptr,
+                                  EqSeedAnchor anchor = EqSeedAnchor::Warm);
 
     void update_cp();
     void update_k();

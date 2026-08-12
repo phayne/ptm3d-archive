@@ -891,10 +891,14 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
     }
 }
 
-EqSeedResult Profile::seedFromMeanFlux(double mean_absorbed_flux, double Qb) {
+EqSeedResult Profile::seedFromMeanFlux(double mean_absorbed_flux, double Qb,
+                                       const EqSeedForcing* forcing,
+                                       EqSeedAnchor anchor) {
     EqSeedInput in;
     in.mean_absorbed_flux = mean_absorbed_flux;
     in.Qb                 = Qb;
+    in.forcing            = forcing;
+    in.anchor             = anchor;
     in.emissivity         = emissivity;
     in.sigma              = config ? config->sigma : SIGMA_SB;
     in.z                  = z().data();
@@ -1832,7 +1836,37 @@ Model::Model(const Planet& planet, double lat,
         double sum = 0.0;
         for (double v : flux_values) sum += v;
         seed_mean_flux = sum / static_cast<double>(flux_values.size());
-        seed_result    = profile.seedFromMeanFlux(seed_mean_flux, planet.Qb);
+
+        // Lit-face anchor: this path already holds the face's own forcing
+        // series, so it gets the same anchor the batch paths get. The rFFT
+        // needs an EVENLY SPACED time base; this path's `times` come straight
+        // from the caller and are not guaranteed uniform (the duplicate-
+        // timestamp cleanup above can leave gaps), so non-uniformity is
+        // detected and DECLARED rather than silently spectrum-analyzed.
+        EqSeedForcing fc;
+        bool have_forcing = false;
+        if (flux_times.size() == flux_values.size() && flux_times.size() >= 2) {
+            const double dt0 = flux_times[1] - flux_times[0];
+            bool uniform = (dt0 > 0.0);
+            for (size_t i = 2; i < flux_times.size() && uniform; ++i) {
+                const double dti = flux_times[i] - flux_times[i - 1];
+                if (std::fabs(dti - dt0) > 1e-6 * dt0) uniform = false;
+            }
+            fc.flux               = flux_values.data();
+            fc.n_samples          = static_cast<int>(flux_values.size());
+            fc.span_s             = dt0 * fc.n_samples;
+            fc.cycle_s            = planet.day;
+            fc.cp0                = planet.cp0;
+            fc.cp_coeff           = planet.cpCoeff.empty() ? nullptr
+                                                           : planet.cpCoeff.data();
+            fc.n_cp_coeff         = static_cast<int>(planet.cpCoeff.size());
+            fc.radiation_coupled  = config.seed_forcing_radiation_coupled;
+            fc.nonuniform_samples = !uniform;
+            have_forcing = true;
+        }
+        seed_result    = profile.seedFromMeanFlux(
+            seed_mean_flux, planet.Qb,
+            have_forcing ? &fc : nullptr, config.seed_anchor);
         seed_applied   = true;
     }
 

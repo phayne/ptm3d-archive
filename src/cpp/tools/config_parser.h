@@ -267,6 +267,20 @@ struct SimulationConfig {
         //     repository before that date. Use it to reproduce an old baseline.
         std::string spinup_seed = "physical";
 
+        // Which SURFACE ANCHOR the shared seed hangs its conductive profile
+        // from (src/cpp/thermal/eq_seed.h). Overridable through
+        // PTM_SEED_ANCHOR. Only reachable under spinup_seed: physical.
+        //   "lumped" (default) -- the derived lumped-substrate anchor: solve
+        //     eps*sigma*T^4 + G*T = F(t) + Qb + G*T_d for T_d = <T(t)>, with G
+        //     fixed by a describing-function variance match against this
+        //     face's own forcing spectrum. Anchors the column at the CYCLE
+        //     MEAN, which is what the conductive profile describes.
+        //   "warm" -- T_0 = ((<F_abs>+Qb)/(eps*sigma))^0.25 only. That is the
+        //     exact FOURTH moment, and by Jensen it is >= <T>: +45 K mean on
+        //     the lit population of the shipped lunar 80N crater. Byte-
+        //     identical to the pre-2026-08-12 seed.
+        std::string seed_anchor = "lumped";
+
         // Length, in diurnal cycles, of the CPU analytic clear-sky
         // pre-conditioner: `equil_days` cycles of cos(lat)*cos(h) insolation
         // with NO topography, NO shadowing, NO IR and NO indirect flux,

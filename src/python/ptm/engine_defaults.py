@@ -184,6 +184,7 @@ ENGINE_DEFAULTS = {
     'thermal.property_maps_directory': 'data/property_maps',
     'thermal.run_thermal_mesh': False,
     'thermal.spinup_seed': 'physical',
+    'thermal.seed_anchor': 'lumped',
     'thermal.thermal_b': 15,
     'thermal.thermal_inertia_map': '',
     'thermal.thermal_m': 10,
