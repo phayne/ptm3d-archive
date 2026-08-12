@@ -112,6 +112,28 @@ struct EqSeedInput {
 
     double            R350 = 0.0;       ///< chi/350^3; 0 disables the T^3 term
     ConductivityModel cond = ConductivityModel::Hayne2017;
+
+    /// REPORT-ONLY diagnostic: the caller's zero-thermal-inertia estimate of
+    /// the cycle-mean surface temperature,
+    ///     <T>_0 = mean_t ( (F(t) + Qb) / (eps*sigma) )^0.25 ,
+    /// over the SAME span as mean_absorbed_flux. It changes no solver state;
+    /// it is dumped alongside the seed so the anchor question can be settled
+    /// with numbers.
+    ///
+    /// WHY IT IS HERE. The conductive part of the seed describes the CYCLE
+    /// MEAN, and at steady state the exact statement the energy balance makes
+    /// is about the FOURTH moment: <eps*sigma*T^4> = <F> + Qb. By Jensen,
+    ///     <T>  <=  (<T^4>)^0.25 = T_0 ,
+    /// with equality only when T(t) is flat. Measured on the shipped lunar
+    /// 80N crater against a 384-lunation reference, T_0 minus the converged
+    /// cycle mean is +0.000 K (median) on the permanently shadowed population
+    /// -- where T(t) IS flat, and where the seed is consequently exact -- but
+    /// +36 K on lit faces (mean diurnal swing 105 K) and +69 K on grazing
+    /// faces (swing 156 K). The two limits bracket the truth:
+    ///     mean_inst_radeq_T  <=  <T>  <=  T_0
+    /// (zero thermal inertia and infinite thermal inertia respectively).
+    /// 0 = not supplied.
+    double mean_inst_radeq_T = 0.0;
 };
 
 struct EqSeedResult {
@@ -171,6 +193,7 @@ private:
     EqSeedRecorder();
     struct Row {
         double mean_flux = 0.0, Qb = 0.0, T_surf = 0.0, T_deep = 0.0;
+        double T_lowinertia = 0.0;
         bool   set = false;
     };
     bool             enabled_ = false;

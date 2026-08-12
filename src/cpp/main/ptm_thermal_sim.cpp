@@ -3720,10 +3720,15 @@ struct GpuSharedSeedContext {
     const std::vector<double>* face_Qb          = nullptr;  // may be null
     size_t batch_start            = 0;
     size_t batch_n                = 0;
-    const std::vector<double>* direct       = nullptr;   // [global_f * T + t]
-    const std::vector<double>* reflected    = nullptr;
-    const std::vector<double>* ir           = nullptr;
-    const std::vector<double>* face_albedos = nullptr;
+    /// The absorbed flux for (global face, absolute step), composed by the
+    /// SAME expression the solver's own prepare_flux uses -- including the
+    /// incidence-angle (Hayne / Hapke) albedo. Passing a callable rather than
+    /// the raw direct/reflected/IR arrays is deliberate: the GPU seed used to
+    /// re-derive absorbed flux inline with a FLAT albedo, twenty lines from a
+    /// prepare_flux that applies A(i), so the seed disagreed with the forcing
+    /// the same function then uploaded (measured: up to 39.5 K on the seed of
+    /// a lunar 80N crater face).
+    const std::function<double(size_t, int)>* absorbed = nullptr;
     int    total_time_steps = 0;
     double R350             = 0.0;
     thermal::ConductivityModel cond = thermal::ConductivityModel::Hayne2017;
@@ -3741,19 +3746,24 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
     for (size_t f = 0; f < c.batch_n; ++f) {
         const size_t global_f = c.batch_start + f;
-        const double albedo   = (*c.face_albedos)[global_f];
 
-        // Time mean of THIS face's absorbed flux over the WHOLE forcing span.
-        double avg_flux = 0.0;
+        // Time mean of THIS face's absorbed flux over the WHOLE forcing span,
+        // and the zero-thermal-inertia bracket on the cycle-mean surface
+        // temperature (report-only; see EqSeedInput::mean_inst_radeq_T).
+        const double qb_f = (c.face_Qb && global_f < c.face_Qb->size())
+                                ? (*c.face_Qb)[global_f] : pl.Qb;
+        double avg_flux = 0.0, sum_inst_T = 0.0;
         const int n_samples = std::max(1, c.total_time_steps);
         for (int t = 0; t < n_samples; ++t) {
-            const size_t idx = global_f * static_cast<size_t>(c.total_time_steps) + t;
-            const double d  = (idx < c.direct->size())    ? (*c.direct)[idx]    : 0.0;
-            const double r  = (idx < c.reflected->size()) ? (*c.reflected)[idx] : 0.0;
-            const double ir = (idx < c.ir->size())        ? (*c.ir)[idx]        : 0.0;
-            avg_flux += (1.0 - albedo) * (d + r) + pl.emissivity * ir;
+            const double Ft = (*c.absorbed)(global_f, t);
+            avg_flux += Ft;
+            const double q = (Ft > 0.0 ? Ft : 0.0) + qb_f;
+            sum_inst_T += (q > 0.0)
+                ? std::sqrt(std::sqrt(q / (pl.emissivity * thermal::SIGMA_SB)))
+                : 0.0;
         }
         avg_flux /= n_samples;
+        sum_inst_T /= n_samples;
 
         // Same expression as the float32 upload loop above, in double.
         if (use_per_face_H) {
@@ -3773,9 +3783,9 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         thermal::EqSeedInput in;
         in.mean_absorbed_flux = avg_flux;
-        in.Qb                 = (c.face_Qb && global_f < c.face_Qb->size())
-                                    ? (*c.face_Qb)[global_f] : pl.Qb;
+        in.Qb                 = qb_f;
         in.emissivity         = pl.emissivity;
+        in.mean_inst_radeq_T  = sum_inst_T;   // report-only
         // The OpenCL kernels carry this value as a literal (they cannot include
         // a C++ header); keeping the host seed on the same constant is what
         // makes gate G1 exact between the CPU and GPU paths.
@@ -4176,14 +4186,26 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // and a different quantity from the GPU path's full-span mean.
                 // Same span on every path is what makes gate G1 exact.
                 double avg_flux = 0.0;
+                // REPORT-ONLY companion: the zero-thermal-inertia estimate of
+                // the cycle-mean surface temperature. The seed's anchor is the
+                // infinite-inertia limit (<T^4>)^0.25; this is the other
+                // bracket. Dumped, never used by the solver. See the note on
+                // EqSeedInput::mean_inst_radeq_T.
+                double sum_inst_T = 0.0;
                 const int flux_avg_window =
                     (seed_mode == thermal::EqSeedMode::Physical)
                         ? total_time_steps
                         : std::min(100, total_time_steps);
                 for (int t = 0; t < flux_avg_window; ++t) {
-                    avg_flux += flux_column_major[t * n_faces + global_f];
+                    const double Ft = flux_column_major[t * n_faces + global_f];
+                    avg_flux += Ft;
+                    const double q = (Ft > 0.0 ? Ft : 0.0) + batch.Qb[f];
+                    sum_inst_T += (q > 0.0)
+                        ? std::sqrt(std::sqrt(q / (batch.emissivity[f] * batch.sigma_sb)))
+                        : 0.0;
                 }
                 avg_flux /= std::max(1, flux_avg_window);
+                sum_inst_T /= std::max(1, flux_avg_window);
 
                 // PTM-46: seed the column at the steady state this face can
                 // actually hold, eps*sigma*T^4 = <F_abs> + Qb. Including the
@@ -4250,6 +4272,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     sin_.n                  = n_layers;
                     sin_.R350               = batch.R350_val;
                     sin_.cond               = batch.cond_model;
+                    sin_.mean_inst_radeq_T  = sum_inst_T;   // report-only
                     const thermal::EqSeedResult sres =
                         thermal::eqSeedColumn(sin_, T_col);
                     if (sres.clamped_low) ++seed_floor_faces;
@@ -6358,6 +6381,51 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<int>(config.conductivity_model)
         );
 
+        // ONE absorbed-flux composition for this batch, used by BOTH the
+        // spin-up seed below and prepare_flux further down. It used to be
+        // written out twice, and the two copies disagreed: prepare_flux
+        // applied the incidence-angle (Hayne / Hapke) albedo A(i) while the
+        // seed used the flat per-face Bond albedo, so the seed was built from
+        // a different forcing than the one the same function then uploaded.
+        // Measured on the lunar 80N crater: up to 48.9 W/m^2 of mean flux and
+        // 39.5 K of seed temperature between the CPU and GPU seeds, all of it
+        // this. Same expression, one place.
+        const double a_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar = planet.S;
+        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
+        // Incidence-dependent albedo fires for Hayne (has_angular) OR the
+        // Hapke gate. Both need S>0 to recover cos(theta) from flux. When both
+        // are off this is false and applyIncidenceAlbedo is bypassed ->
+        // byte-identical constant-albedo path.
+        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
+        const std::function<double(size_t, int)> absorbed_at =
+            [&](size_t global_f, int t_abs) -> double {
+            const size_t flux_idx =
+                global_f * static_cast<size_t>(total_time_steps) + t_abs;
+            const double base_A    = face_albedos[global_f];
+            const double direct    = (flux_idx < direct_solar_values.size())
+                                        ? direct_solar_values[flux_idx] : 0.0;
+            const double reflected = (flux_idx < primary_reflected_values.size())
+                                        ? primary_reflected_values[flux_idx] : 0.0;
+            const double ir        = (flux_idx < primary_ir_values.size())
+                                        ? primary_ir_values[flux_idx] : 0.0;
+            // Hayne (2017): A(theta) = A0 + a*(theta/(pi/4))^3 +
+            // b*(theta/(pi/2))^8. Hapke branch (opt-in): A_h(mu0) =
+            // 1 - gamma*H(mu0,w), which supersedes Hayne and ignores base_A.
+            const double albedo = use_incidence
+                ? applyIncidenceAlbedo(base_A, direct,
+                                       solarConstForStep(t_abs, S_solar),
+                                       a_coef, b_coef, use_hapke, face_w[global_f])
+                : base_A;
+            // Kept as two separate products, NOT (1-A)*(direct+reflected):
+            // a*x + a*y is not bit-identical to a*(x+y) in floating point, and
+            // this expression has to stay byte-identical to the pre-refactor
+            // GPU path under thermal.spinup_seed: legacy.
+            return (1.0 - albedo) * direct + (1.0 - albedo) * reflected
+                 + planet.emissivity * ir;
+        };
+
         // Initial subsurface temperature seed.
         //
         // Generic-body path: seed every face with the smooth, longitude-independent
@@ -6387,10 +6455,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
             sc.batch_n = batch_n;
-            sc.direct = &direct_solar_values;
-            sc.reflected = &primary_reflected_values;
-            sc.ir = &primary_ir_values;
-            sc.face_albedos = &face_albedos;
+            sc.absorbed = &absorbed_at;
             sc.total_time_steps = total_time_steps;
             sc.R350 = R350_val;
             sc.cond = config.conductivity_model;
@@ -6481,16 +6546,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        const double a_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
-        const double b_coef = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
-        const double S_solar = planet.S;
-        const bool   has_angular = (planet.albedoCoef.size() >= 2 && S_solar > 0.0);
-        // Incidence-dependent albedo fires for Hayne (has_angular) OR the Hapke
-        // gate (use_hapke). Both need S>0 to recover cos(theta) from flux. When
-        // both are off this is false and applyIncidenceAlbedo is bypassed →
-        // byte-identical constant-albedo path.
-        const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
-
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
             #pragma omp parallel for schedule(static)
@@ -6499,22 +6554,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double base_A = face_albedos[global_f];
-                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-
-                    // Incidence-angle correction on the base albedo. Hayne (2017):
-                    // A(θ) = A0 + a·(θ/π/4)^3 + b·(θ/π/2)^8. Hapke branch (opt-in):
-                    // A_h(mu0) = 1 - gamma*H(mu0,w), which supersedes Hayne and
-                    // ignores base_A (w already encodes the body Bond albedo).
-                    double albedo = use_incidence
-                        ? applyIncidenceAlbedo(base_A, direct,
-                                               solarConstForStep(t_start + t, S_solar),
-                                               a_coef, b_coef, use_hapke, face_w[global_f])
-                        : base_A;
-
-                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    (void)flux_idx;
+                    double absorbed = absorbed_at(global_f, t_start + t);
                     // Deep radiation-coupling: add the per-face time-mean indirect
                     // flux to the EQUILIBRATION-phase forcing only. The output
                     // window already gets the time-varying indirect via the
@@ -7024,6 +7065,51 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
+        // ONE absorbed-flux composition for this batch, used by BOTH the
+        // spin-up seed below and prepare_flux further down. It used to be
+        // written out twice, and the two copies disagreed: prepare_flux
+        // applied the incidence-angle (Hayne / Hapke) albedo A(i) while the
+        // seed used the flat per-face Bond albedo, so the seed was built from
+        // a different forcing than the one the same function then uploaded.
+        // Measured on the lunar 80N crater: up to 48.9 W/m^2 of mean flux and
+        // 39.5 K of seed temperature between the CPU and GPU seeds, all of it
+        // this. Same expression, one place.
+        const double a_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
+        const double b_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
+        const double S_solar2 = planet.S;
+        const bool   has_angular2 = (planet.albedoCoef.size() >= 2 && S_solar2 > 0.0);
+        // Incidence-dependent albedo fires for Hayne (has_angular) OR the
+        // Hapke gate. Both need S>0 to recover cos(theta) from flux. When both
+        // are off this is false and applyIncidenceAlbedo is bypassed ->
+        // byte-identical constant-albedo path.
+        const bool   use_incidence2 = has_angular2 || (use_hapke && S_solar2 > 0.0);
+        const std::function<double(size_t, int)> absorbed_at =
+            [&](size_t global_f, int t_abs) -> double {
+            const size_t flux_idx =
+                global_f * static_cast<size_t>(total_time_steps) + t_abs;
+            const double base_A    = face_albedos[global_f];
+            const double direct    = (flux_idx < direct_solar_values.size())
+                                        ? direct_solar_values[flux_idx] : 0.0;
+            const double reflected = (flux_idx < primary_reflected_values.size())
+                                        ? primary_reflected_values[flux_idx] : 0.0;
+            const double ir        = (flux_idx < primary_ir_values.size())
+                                        ? primary_ir_values[flux_idx] : 0.0;
+            // Hayne (2017): A(theta) = A0 + a*(theta/(pi/4))^3 +
+            // b*(theta/(pi/2))^8. Hapke branch (opt-in): A_h(mu0) =
+            // 1 - gamma*H(mu0,w), which supersedes Hayne and ignores base_A.
+            const double albedo = use_incidence2
+                ? applyIncidenceAlbedo(base_A, direct,
+                                       solarConstForStep(t_abs, S_solar2),
+                                       a_coef2, b_coef2, use_hapke, face_w[global_f])
+                : base_A;
+            // Kept as two separate products, NOT (1-A)*(direct+reflected):
+            // a*x + a*y is not bit-identical to a*(x+y) in floating point, and
+            // this expression has to stay byte-identical to the pre-refactor
+            // GPU path under thermal.spinup_seed: legacy.
+            return (1.0 - albedo) * direct + (1.0 - albedo) * reflected
+                 + planet.emissivity * ir;
+        };
+
         // Initial subsurface temperature seed. Under thermal.spinup_seed:
         // physical (the default) every path calls the SAME eqSeedColumn; the
         // two legacy branches below are kept verbatim so `legacy` reproduces
@@ -7040,10 +7126,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
             sc.batch_n = batch_n;
-            sc.direct = &direct_solar_values;
-            sc.reflected = &primary_reflected_values;
-            sc.ir = &primary_ir_values;
-            sc.face_albedos = &face_albedos;
+            sc.absorbed = &absorbed_at;
             sc.total_time_steps = total_time_steps;
             sc.R350 = R350_val;
             sc.cond = config.conductivity_model;
@@ -7147,13 +7230,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             }
         }
 
-        const double a_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[0] : 0.0;
-        const double b_coef2 = (planet.albedoCoef.size() >= 2) ? planet.albedoCoef[1] : 0.0;
-        const double S_solar2 = planet.S;
-        const bool   has_angular2 = (planet.albedoCoef.size() >= 2 && S_solar2 > 0.0);
-        // Hayne OR Hapke gate (see prepare_flux above for rationale).
-        const bool   use_incidence2 = has_angular2 || (use_hapke && S_solar2 > 0.0);
-
         // Helper: prepare flux data in timestep-major layout for a range of timesteps.
         auto prepare_flux = [&](int t_start, int n_steps) {
             std::vector<float> flux(static_cast<size_t>(n_steps) * batch_n);
@@ -7163,20 +7239,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     size_t global_f = batch_start + f;
                     size_t flux_idx = global_f * total_time_steps + (t_start + t);
 
-                    double base_A = face_albedos[global_f];
-                    double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
-                    double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
-                    double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-
-                    // Incidence-angle correction (Hayne composes on map A0; Hapke
-                    // closed form supersedes, ignoring base_A).
-                    double albedo = use_incidence2
-                        ? applyIncidenceAlbedo(base_A, direct,
-                                               solarConstForStep(t_start + t, S_solar2),
-                                               a_coef2, b_coef2, use_hapke, face_w[global_f])
-                        : base_A;
-
-                    double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    (void)flux_idx;
+                    double absorbed = absorbed_at(global_f, t_start + t);
                     // Deep radiation-coupling: equilibration-phase indirect flux,
                     // selected on the ABSOLUTE step index. See the sibling
                     // prepare_flux above for why the test is not on the shape of

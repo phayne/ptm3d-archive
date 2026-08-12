@@ -141,6 +141,7 @@ void EqSeedRecorder::record(std::size_t face, const EqSeedInput& in,
     r.Qb        = in.Qb;
     r.T_surf    = res.T_surface;
     r.T_deep    = res.T_deep;
+    r.T_lowinertia = in.mean_inst_radeq_T;
     r.set       = true;
 }
 
@@ -154,12 +155,14 @@ void EqSeedRecorder::write(const std::string& tag) const {
     }
     fh << std::setprecision(17);
     fh << "# PTM3D shared equilibration seed, path=" << tag << "\n";
-    fh << "face,mean_absorbed_flux_Wm2,Qb_Wm2,T_surface_K,T_deep_K\n";
+    fh << "face,mean_absorbed_flux_Wm2,Qb_Wm2,T_surface_K,T_deep_K,"
+          "T_lowinertia_K\n";
     std::size_t written = 0;
     for (std::size_t i = 0; i < rows_.size(); ++i) {
         if (!rows_[i].set) continue;
         fh << i << ',' << rows_[i].mean_flux << ',' << rows_[i].Qb << ','
-           << rows_[i].T_surf << ',' << rows_[i].T_deep << '\n';
+           << rows_[i].T_surf << ',' << rows_[i].T_deep << ','
+           << rows_[i].T_lowinertia << '\n';
         ++written;
     }
     std::cerr << "[eq-seed] wrote " << written << " seed rows to " << path_
