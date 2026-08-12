@@ -189,6 +189,20 @@ set_target_properties(test_surface_newton
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Shared spin-up seed gate. The 46.7 K four-way seed divergence was found by
+# hand because NOTHING compared any two solver paths' initial conditions; this
+# pins the properties every path's seed must have.
+add_executable(test_eq_seed test_eq_seed.cpp)
+target_link_libraries(test_eq_seed
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_eq_seed
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration spin-up estimator gate. Checks tau1 against the analytic
 # quarter-wave slab, the ln(1/target) scaling of n_req, and that an
 # unreachable target returns NO cycle count.

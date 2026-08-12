@@ -254,6 +254,30 @@ struct SimulationConfig {
         // PTM_EQ_INDIRECT_SOURCE, for reproducing a run published under "off".
         std::string eq_indirect_source = "auto";
 
+        // Which INITIAL CONDITION every solver path starts from
+        // (src/cpp/thermal/eq_seed.h). Overridable through PTM_SPINUP_SEED.
+        //   "physical" (default) -- one shared per-face seed: the cycle-mean
+        //     conductive steady profile T(z) = T_0 + Qb*integral dz/k anchored
+        //     at T_0 = ((<F_abs> + Qb)/(eps*sigma))^0.25, with <F_abs> that
+        //     face's own time-mean absorbed flux. A permanently shadowed column
+        //     starts on the geothermal floor instead of 42-47 K above it, and
+        //     the CPU analytic clear-sky pre-conditioner is OFF.
+        //   "legacy" -- each path's pre-2026-08-11 seed AND the analytic
+        //     pre-conditioner, i.e. exactly what produced every result in this
+        //     repository before that date. Use it to reproduce an old baseline.
+        std::string spinup_seed = "physical";
+
+        // Length, in diurnal cycles, of the CPU analytic clear-sky
+        // pre-conditioner: `equil_days` cycles of cos(lat)*cos(h) insolation
+        // with NO topography, NO shadowing, NO IR and NO indirect flux,
+        // integrated before the real forcing. It is a FORCING, not a seed, it
+        // is not counted by equilibration_orbits, and the GPU has no analog.
+        //   -1 (default) = follow spinup_seed (physical -> 0, legacy -> the
+        //     historic NYEARSEQ*round(year/day): Moon 24, Europa 2, Mercury 4)
+        //    0 = off;  > 0 = exactly this many, and the run says so loudly.
+        // Overridable through PTM_ANALYTIC_SEED_CYCLES.
+        double analytic_seed_cycles = -1.0;
+
         // Schorghofer & Taylor (2007) ice-stability output. When enabled,
         // the thermal solver accumulates time-averaged sublimation rate
         // ⟨E(T(z,t))⟩ at each native depth node during the integration
