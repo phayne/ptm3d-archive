@@ -477,14 +477,19 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
         return T_warm_fallback;
     }
 
-    // --- TWO-TIMESCALE gate --------------------------------------------------
+    // --- TWO-TIMESCALE detection ---------------------------------------------
     // Bin n is the physical frequency n*omega1. If the span covers N_cyc
     // diurnal cycles, the diurnal fundamental IS bin N_cyc, and every bin below
-    // it is a LONGER period than a day -- seasonal. A single lumped G cannot
-    // represent a diurnal swing and an annual swing at once (the describing
-    // function is a variance match, and the T distribution is then a
-    // convolution of two very different swings), so that regime falls back.
-    // The fraction is reported either way.
+    // it is a LONGER period than a day -- seasonal. A single lumped G is being
+    // asked to cover two regimes at once there, because the describing function
+    // matches ONE variance.
+    //
+    // DETECTED ALWAYS, REFUSED ONLY ON REQUEST. Refusing means substituting
+    // T_w, and T_w is the estimator with the +45 K Jensen bias: measured on the
+    // 47 non-dark faces this fires on in the shipped 80N crater run, refusing
+    // costs 70.46 K median / 83.94 K max against a 384-lunation reference where
+    // the anchor costs 3.67 / 13.42. See
+    // thermal.seed_anchor_refuse_two_timescale.
     bool two_timescale = false;
     if (fc.cycle_s > 0.0) {
         const int n_diurnal =
@@ -504,7 +509,11 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
 
     // --- the closure --------------------------------------------------------
     static thread_local std::vector<double> u_ws;
-    double Td = T_warm_fallback;
+    // Start from the SERIES' own warm bracket, not the caller's mean-flux one:
+    // the two are the same number whenever the caller averaged the same series,
+    // and where they are not, the closure has to be self-consistent with the
+    // quadrature it is about to analyze.
+    double Td = r.T_warm;
     double G = 0.0, gam = 0.0;
     int iters = -1, pass = 0;
     bool closed = false;
