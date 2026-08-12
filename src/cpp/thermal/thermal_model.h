@@ -16,6 +16,7 @@
 #include <map>       // Add this for std::map
 #include "planetary_properties.h"  // Add this include
 #include "conductivity_model.h"    // Selectable k(T,rho) laws (Hayne 2017 / Martinez 2021)
+#include "eq_seed.h"               // ONE spin-up seed, shared by every solver path
 #include "../maps/spatial_map.h"  // Add this include for SpatialMap class
 
 namespace thermal {
@@ -410,6 +411,19 @@ public:
     // Method to get R350
     double getR350() const { return R350(chi); }
 
+    // ---- Spin-up seed (see thermal/eq_seed.h) ------------------------------
+    // Which initial condition every solver path uses. `Physical` is the shared
+    // per-face conductive steady profile; `Legacy` restores each path's
+    // pre-2026-08-11 seed AND its analytic clear-sky pre-conditioner, so one
+    // word reproduces any older baseline.
+    EqSeedMode spinup_seed = EqSeedMode::Physical;
+    // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
+    // < 0 = unset, follow spinup_seed (Physical -> 0, Legacy -> the historic
+    // NYEARSEQ*round(year/day)). >= 0 = use exactly this many, whatever the
+    // mode. It is a FORCING, not a seed, so a non-zero value is always
+    // reported by the caller.
+    double analytic_seed_cycles = -1.0;
+
     // Regolith conductivity law. DEFAULT MUST REMAIN Hayne2017: every result in
     // this repository was produced with it, and the byte-identity regression
     // depends on the default path being untouched.
@@ -763,6 +777,18 @@ public:
 
     // Methods
     void init_T(const Planet& planet, double lat, bool verbose = false);
+
+    // Re-seed the whole column from THIS face's own cycle-mean absorbed flux,
+    // using the shared eqSeedColumn() (thermal/eq_seed.h) -- the same code the
+    // SIMD batch and the GPU host call. Recomputes k, cp and kappa, so it
+    // leaves the profile in the same state the constructor does.
+    //
+    // `mean_absorbed_flux` [W/m^2] is the caller's own absorbed-flux
+    // composition averaged over the available forcing span; `Qb` is this
+    // face's basal flux. Returns the seed summary (surface/deep temperature
+    // and the degenerate-input flags) so the caller can count and report.
+    EqSeedResult seedFromMeanFlux(double mean_absorbed_flux, double Qb);
+
     void update_cp();
     void update_k();
     void update_T(double dt, double Qs = 0, double Qb = 0);
@@ -838,6 +864,15 @@ public:
     bool use_full_time_series;
     int equilibration_steps;
     int main_simulation_steps;
+
+    // Shared spin-up seed, as applied by the constructor. `seed_applied` is
+    // false under spinup_seed: legacy (or when this Model was handed no
+    // forcing), in which case the other two are meaningless. Exposed so the
+    // mesh drivers can record and report the seed per face without recomputing
+    // it -- the cross-path comparison in gate G1 reads exactly this.
+    bool         seed_applied   = false;
+    double       seed_mean_flux = 0.0;
+    EqSeedResult seed_result;
     
     // Constructor
     Model(const Planet& planet = Planet(), double lat = 0.0, 

@@ -2339,7 +2339,13 @@ std::vector<double> runThermalModelWithMatchedTimes(
     const thermal::Config& config,
     int equilibration_steps,
     double Qb_override = -1.0,
-    double H_override  = -1.0) {
+    double H_override  = -1.0,
+    // Global face index for the cross-path seed dump (PTM_DUMP_SEED) and the
+    // seed guards. -1 = not a mesh face (point mode / standalone), record
+    // nothing. `seed_flags` accumulates {floor_hits, above_500K_hits}.
+    long long seed_record_face = -1,
+    std::atomic<size_t>* seed_floor_faces = nullptr,
+    std::atomic<size_t>* seed_hot_faces   = nullptr) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -2397,6 +2403,22 @@ std::vector<double> runThermalModelWithMatchedTimes(
                             flux_arr,
                             config,
                             false);
+
+        // Shared spin-up seed diagnostics. The constructor has already applied
+        // the seed; record it against this face so the CSV can be diffed
+        // against the SIMD-batch and GPU dumps (gate G1), and count the two
+        // guards so they can be reported instead of swallowed.
+        if (model.seed_applied) {
+            if (model.seed_result.clamped_low && seed_floor_faces) ++(*seed_floor_faces);
+            if (model.seed_result.above_500K  && seed_hot_faces)   ++(*seed_hot_faces);
+            if (seed_record_face >= 0) {
+                thermal::EqSeedInput rec;
+                rec.mean_absorbed_flux = model.seed_mean_flux;
+                rec.Qb                 = planet.Qb;
+                thermal::EqSeedRecorder::instance().record(
+                    static_cast<size_t>(seed_record_face), rec, model.seed_result);
+            }
+        }
 
         // CRITICAL: Don't use internal equilibration - it messes up time alignment
         model.use_full_time_series = true;
@@ -3197,6 +3219,18 @@ bool runThermalModelsForAllFacesStreamed(
     std::cerr << "\n[Streamed] Running thermal models for " << n_faces
               << " faces over " << total_time_steps << " steps..." << std::endl;
 
+    // This path calls the CPU SCALAR solver, not the SIMD batch the banner
+    // elsewhere implies -- so it gets the same shared seed through
+    // runThermalModelWithMatchedTimes.
+    std::atomic<size_t> seed_floor_faces{0};
+    std::atomic<size_t> seed_hot_faces{0};
+    if (config.spinup_seed == thermal::EqSeedMode::Physical) {
+        thermal::EqSeedRecorder::instance().reserve(n_faces);
+        std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
+                     "steady profile [thermal.spinup_seed: physical; streamed "
+                     "path uses the CPU SCALAR solver]" << std::endl;
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     thermal::ProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
 
@@ -3247,7 +3281,8 @@ bool runThermalModelsForAllFacesStreamed(
                           : -1.0;
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
-                face_qb, face_H);
+                face_qb, face_H, static_cast<long long>(f),
+                &seed_floor_faces, &seed_hot_faces);
 
             if (surface_temps_out) {
                 (*surface_temps_out)[f].swap(temps);
@@ -3266,6 +3301,18 @@ bool runThermalModelsForAllFacesStreamed(
     // PTM-107(a): hand the per-face effective albedo to the statistics writer.
     // Without this a streamed run silently shipped no effective_albedo.bin.
     composer.publishEffectiveAlbedo();
+
+    if (seed_floor_faces.load() > 0) {
+        std::cerr << "[Streamed] WARNING: " << seed_floor_faces.load() << " of "
+                  << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
+                  << " K CMB floor (Qb <= 0 AND zero mean absorbed flux).\n";
+    }
+    if (seed_hot_faces.load() > 0) {
+        std::cerr << "[Streamed] WARNING: " << seed_hot_faces.load() << " of "
+                  << n_faces << " faces seed above " << thermal::MAX_PHYSICAL_TEMP_K
+                  << " K, the CPU solver's hard clamp.\n";
+    }
+    thermal::EqSeedRecorder::instance().write("cpu-streamed");
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -3370,7 +3417,28 @@ bool runThermalModelsForAllFaces(
     
     // Print initial message
     std::cerr << "\nRunning thermal models for " << n_faces << " mesh faces..." << std::endl;
-    
+
+    // Shared spin-up seed (thermal/eq_seed.h). This path used to seed every
+    // column from ONE global T_avg = T_ss/sqrt(2) -- flux-blind AND
+    // latitude-blind -- and then integrate 24 lunations of analytic clear-sky
+    // forcing on top. Both are gone under spinup_seed: physical.
+    std::atomic<size_t> seed_floor_faces{0};
+    std::atomic<size_t> seed_hot_faces{0};
+    if (config.spinup_seed == thermal::EqSeedMode::Physical) {
+        thermal::EqSeedRecorder::instance().reserve(n_faces);
+        std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
+                     "steady profile -- T_0=((<F_abs>+Qb)/(eps*sigma))^0.25 with "
+                     "<F_abs> the mean over all " << total_time_steps
+                  << " forcing steps, then T(z)=T_0+Qb*integral dz/k "
+                     "[thermal.spinup_seed: physical; identical on every solver "
+                     "path]" << std::endl;
+    } else {
+        std::cerr << "[eq-seed] equilibration seed: LEGACY CPU scalar global "
+                     "T_avg = T_ss/sqrt(2), flux-blind and latitude-blind, "
+                     "blended surface->deep over the skin depth "
+                     "[thermal.spinup_seed: legacy]" << std::endl;
+    }
+
     // Start timing - Add timer here
     auto start_time = std::chrono::high_resolution_clock::now();
     
@@ -3463,7 +3531,10 @@ bool runThermalModelsForAllFaces(
                     config,
                     equilibration_steps,
                     face_qb,
-                    face_H
+                    face_H,
+                    static_cast<long long>(f),
+                    &seed_floor_faces,
+                    &seed_hot_faces
                 );
 
                 // Store results locally in the chunk
@@ -3556,10 +3627,25 @@ bool runThermalModelsForAllFaces(
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     double seconds = duration.count() / 1000.0;
     
+    // Shared-seed guards, reported rather than swallowed.
+    if (seed_floor_faces.load() > 0) {
+        std::cerr << "WARNING: " << seed_floor_faces.load() << " of " << n_faces
+                  << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
+                  << " K CMB floor (Qb <= 0 AND zero mean absorbed flux)."
+                  << std::endl;
+    }
+    if (seed_hot_faces.load() > 0) {
+        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
+                  << " faces have a cycle-mean radiative-equilibrium seed above "
+                  << thermal::MAX_PHYSICAL_TEMP_K << " K, the CPU solver's hard "
+                     "clamp; the solution WILL be truncated there." << std::endl;
+    }
+    thermal::EqSeedRecorder::instance().write("cpu-scalar");
+
     // Print timing information using cerr to match illumination code
-    std::cerr << "Thermal computation completed in " << std::fixed << std::setprecision(3) 
+    std::cerr << "Thermal computation completed in " << std::fixed << std::setprecision(3)
               << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
-    
+
     if (success) {
         std::cerr << "\nThermal models completed successfully!" << std::endl;
     } else {
@@ -3585,15 +3671,110 @@ static bool eqPerfaceFluxMode() {
     static bool mode = []() {
         const char* e = std::getenv("PTM_EQ_PERFACE_FLUX");
         const bool on = (e && std::string(e) != "0" && e[0] != '\0');
-        std::cerr << "[eq-seed] equilibration seed: "
+        std::cerr << "[eq-seed] LEGACY GPU equilibration seed: "
                   << (on ? "PER-FACE time-mean absorbed flux (PSR floors cold-start "
                            "at the geothermal steady state) [PTM_EQ_PERFACE_FLUX=1]"
-                         : "LEGACY first-10-step instantaneous flux with 100 K "
+                         : "first-10-step instantaneous flux with 100 K "
                            "nightside floor [PTM_EQ_PERFACE_FLUX unset]")
                   << std::endl;
         return on;
     }();
     return mode;
+}
+
+// ---------------------------------------------------------------------------
+// SHARED SEED, GPU host side. Fills the persistent solver's initial-temperature
+// buffer from thermal::eqSeedColumn() -- the same function Profile::
+// seedFromMeanFlux (CPU scalar/streamed/point) and the CPU SIMD batch call.
+//
+// The seed is computed in float64 and cast once, so the only CPU/GPU difference
+// in the initial condition is the float32 storage of the final value.
+//
+// What it REPLACES on this path (all three of these are gone under
+// thermal.spinup_seed: physical):
+//   * `if (T_eq < 40) T_eq = 100.0` -- a warm substitution that stamped every
+//     permanently shadowed face at 100 K and, with no radiation to drain it,
+//     held its deep column ~50 K for the whole run;
+//   * a 10-step INSTANTANEOUS flux mean, which is a body-fixed day/night
+//     snapshot -- on a spinning asteroid that is exactly the longitude
+//     discontinuity that shows up as the "seam";
+//   * the `using_generic_body` branch's flux-blind isothermal reference
+//     profile, which removed the seam by removing the per-face information.
+//     The full-span TIME mean is longitude-independent on a spinning body by
+//     construction, so it does not reintroduce the seam -- verified by
+//     measuring the seed's longitude spread at fixed latitude.
+// ---------------------------------------------------------------------------
+struct GpuSharedSeedContext {
+    const thermal::Planet* planet = nullptr;
+    const double* z               = nullptr;   // reference grid, n_layers nodes
+    size_t n_layers               = 0;
+    const float* kc               = nullptr;   // [layer * batch_n + f]
+    const float* rho              = nullptr;   // [layer * batch_n + f]
+    const float* emissivity       = nullptr;   // [f]
+    const float* Qb               = nullptr;   // [f]
+    size_t batch_start            = 0;
+    size_t batch_n                = 0;
+    const std::vector<double>* direct       = nullptr;   // [global_f * T + t]
+    const std::vector<double>* reflected    = nullptr;
+    const std::vector<double>* ir           = nullptr;
+    const std::vector<double>* face_albedos = nullptr;
+    int    total_time_steps = 0;
+    double R350             = 0.0;
+    thermal::ConductivityModel cond = thermal::ConductivityModel::Hayne2017;
+};
+
+static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
+                              std::vector<float>& T_initial,
+                              size_t& floor_faces, size_t& hot_faces) {
+    std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
+                        rho_col(c.n_layers), T_col(c.n_layers);
+    for (size_t i = 0; i < c.n_layers; ++i) z_col[i] = c.z[i];
+
+    for (size_t f = 0; f < c.batch_n; ++f) {
+        const size_t global_f = c.batch_start + f;
+        const double albedo   = (*c.face_albedos)[global_f];
+
+        // Time mean of THIS face's absorbed flux over the WHOLE forcing span.
+        double avg_flux = 0.0;
+        const int n_samples = std::max(1, c.total_time_steps);
+        for (int t = 0; t < n_samples; ++t) {
+            const size_t idx = global_f * static_cast<size_t>(c.total_time_steps) + t;
+            const double d  = (idx < c.direct->size())    ? (*c.direct)[idx]    : 0.0;
+            const double r  = (idx < c.reflected->size()) ? (*c.reflected)[idx] : 0.0;
+            const double ir = (idx < c.ir->size())        ? (*c.ir)[idx]        : 0.0;
+            avg_flux += (1.0 - albedo) * (d + r) + c.planet->emissivity * ir;
+        }
+        avg_flux /= n_samples;
+
+        for (size_t layer = 0; layer < c.n_layers; ++layer) {
+            const size_t idx = layer * c.batch_n + f;
+            kc_col[layer]  = c.kc[idx];
+            rho_col[layer] = c.rho[idx];
+        }
+
+        thermal::EqSeedInput in;
+        in.mean_absorbed_flux = avg_flux;
+        in.Qb                 = c.Qb[f];
+        in.emissivity         = c.emissivity[f];
+        // The OpenCL kernels carry this value as a literal (they cannot include
+        // a C++ header); keeping the host seed on the same constant is what
+        // makes gate G1 exact between the CPU and GPU paths.
+        in.sigma              = thermal::SIGMA_SB;
+        in.z                  = z_col.data();
+        in.kc                 = kc_col.data();
+        in.rho                = rho_col.data();
+        in.n                  = static_cast<int>(c.n_layers);
+        in.R350               = c.R350;
+        in.cond               = c.cond;
+
+        const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
+        if (res.clamped_low) ++floor_faces;
+        if (res.above_500K)  ++hot_faces;
+        thermal::EqSeedRecorder::instance().record(global_f, in, res);
+
+        for (size_t layer = 0; layer < c.n_layers; ++layer)
+            T_initial[layer * c.batch_n + f] = static_cast<float>(T_col[layer]);
+    }
 }
 
 // =============================================================================
@@ -3742,41 +3923,56 @@ bool runThermalModelsForAllFacesBatchSoA(
     // non-finite Qb is substituted with 0 in the seed, and counted, so the
     // substitution is reported instead of silently swallowed.
     std::atomic<size_t> bad_qb_faces{0};
+    // Seed guards, reported after the loop (never silent):
+    //   seed_floor_faces -- columns pinned at ABSOLUTE_ZERO_K (Qb <= 0 AND no
+    //                       absorbed flux; cp(T) is undefined below that);
+    //   seed_hot_faces   -- columns whose radiative-equilibrium seed exceeds
+    //                       the CPU solver's own MAX_PHYSICAL_TEMP_K clamp, so
+    //                       the run WILL be truncated by that clamp (Mercury).
+    std::atomic<size_t> seed_floor_faces{0};
+    std::atomic<size_t> seed_hot_faces{0};
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // PTM-47: this CPU path has its OWN equilibration seed and does not read
-    // PTM_EQ_PERFACE_FLUX, which gates the GPU persistent path only
-    // (eqPerfaceFluxMode() is called at :4452 and :4998, both GPU blocks).
-    // PTM_EQ_LEGACY_SEED is read by NOTHING in this tree -- it belongs to the
-    // unmerged feat/perface-seed-default branch (674a302) -- so a caller who
-    // sets it gets no effect on either path; it is checked here so that at
-    // least the CPU run says so. Before this banner existed a config could set
-    // PTM_EQ_PERFACE_FLUX in engine_env, run on CPU, and get no per-face seed
-    // and no message at all. State the seed every run, and warn if a caller set
-    // a toggle we are not going to honor.
-    {
+    const thermal::EqSeedMode seed_mode = config.spinup_seed;
+    thermal::EqSeedRecorder::instance().reserve(n_faces);
+
+    // State the seed every run, and warn if a caller set a toggle we are not
+    // going to honor. PTM_EQ_PERFACE_FLUX used to gate the GPU path ONLY, so a
+    // config could set it in engine_env, run on CPU, and silently get a
+    // different initial condition than it asked for.
+    if (seed_mode == thermal::EqSeedMode::Physical) {
+        std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
+                     "steady profile -- T_0=((<F_abs>+Qb)/(eps*sigma))^0.25 "
+                     "with <F_abs> the mean over all " << total_time_steps
+                  << " forcing steps, then T(z)=T_0+Qb*integral dz/k "
+                     "[thermal.spinup_seed: physical; identical on every solver "
+                     "path]" << std::endl;
+    } else {
         const int seed_window = std::min(100, total_time_steps);
-        std::cerr << "[eq-seed] equilibration seed: CPU SIMD-batch per-face "
-                     "steady state T=((<F_abs>+Qb)/(eps*sigma))^0.25, <F_abs> "
-                     "averaged over the first " << seed_window
+        std::cerr << "[eq-seed] equilibration seed: LEGACY CPU SIMD-batch "
+                     "per-face steady state T=((<F_abs>+Qb)/(eps*sigma))^0.25, "
+                     "<F_abs> averaged over the first " << seed_window
                   << " forcing step(s), blended surface->deep over the skin "
-                     "depth [CPU batch path; not env-selectable]" << std::endl;
+                     "depth [thermal.spinup_seed: legacy]" << std::endl;
+    }
+    {
         const char* e_perface = std::getenv("PTM_EQ_PERFACE_FLUX");
         const char* e_legacy  = std::getenv("PTM_EQ_LEGACY_SEED");
         if ((e_perface && e_perface[0] != '\0') ||
             (e_legacy  && e_legacy[0]  != '\0')) {
             std::cerr << "[eq-seed] WARNING: ";
             if (e_perface && e_perface[0] != '\0') {
-                std::cerr << "PTM_EQ_PERFACE_FLUX is set but gates the GPU "
-                             "persistent path only; ";
+                std::cerr << "PTM_EQ_PERFACE_FLUX is set but is superseded by "
+                             "thermal.spinup_seed (the per-face seed is now the "
+                             "default on EVERY path); ";
             }
             if (e_legacy && e_legacy[0] != '\0') {
                 std::cerr << "PTM_EQ_LEGACY_SEED is set but is read by no code "
-                             "path in this build; ";
+                             "path in this build -- use thermal.spinup_seed: "
+                             "legacy; ";
             }
-            std::cerr << "NO effect on this CPU SIMD-batch run (PTM-47). The "
-                         "seed named above is the one actually used."
-                      << std::endl;
+            std::cerr << "NO effect on this run. The seed named above is the "
+                         "one actually used." << std::endl;
         }
     }
 
@@ -3832,8 +4028,36 @@ bool runThermalModelsForAllFacesBatchSoA(
     // Equilibration duration. Hoisted out of the batch loop (it depends only
     // on config/planet/times, never on the batch) so it is computed once and
     // the spin-up banner can quote the configured cycle count.
+    // The analytic clear-sky pre-conditioner. Read thermal/eq_seed.h before
+    // touching this: it is a FORCING with no topography, no shadowing, no IR
+    // and no indirect flux, it is NOT counted by equilibration_orbits, the GPU
+    // has no analog, and it destroys the per-face initial condition computed
+    // above (Fermi measured a permanently shadowed lunar column go 24.043 K ->
+    // 64.375 K surface / +60 K at 1 m under 24 lunations of it). Under
+    // spinup_seed: physical it is OFF unless a config asks for it by name.
     double equil_duration_s_shared;
-    if (config.getProperty("using_generic_body") == "true") {
+    const double analytic_seed_cycles_cfg = thermal::analyticSeedCycles(
+        seed_mode, config.analytic_seed_cycles, planet.day, planet.year,
+        config.NYEARSEQ);
+    if (analytic_seed_cycles_cfg <= 0.0) {
+        equil_duration_s_shared = 0.0;
+        if (seed_mode == thermal::EqSeedMode::Physical) {
+            std::cerr << "[eq-seed] analytic clear-sky pre-conditioner: OFF "
+                         "(thermal.analytic_seed_cycles: 0). Spin-up is the "
+                         "configured equilibration under the REAL forcing."
+                      << std::endl;
+        }
+    } else if (config.analytic_seed_cycles >= 0.0) {
+        // Explicitly requested, whatever the mode.
+        equil_duration_s_shared = analytic_seed_cycles_cfg * planet.day;
+        std::cerr << "[eq-seed] WARNING: analytic clear-sky pre-conditioner ON "
+                     "by request -- " << analytic_seed_cycles_cfg
+                  << " diurnal cycles of cos(lat)*cos(h) insolation with NO "
+                     "topography, NO shadowing, NO IR and NO indirect flux, "
+                     "integrated BEFORE the real forcing and NOT counted by "
+                     "equilibration_orbits. It overwrites the per-face seed."
+                  << std::endl;
+    } else if (config.getProperty("using_generic_body") == "true") {
         // Generic (fast-rotating) body: equilibrate for the CONFIGURED number of
         // DIURNAL cycles, not NYEARSEQ *seasonal* years. equilibration_steps was
         // sized in main as (output cadence)x(equilibration_orbits)x(diurnal
@@ -3924,8 +4148,18 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // Per-face surface estimate from the face's actual average flux
                 // (includes shadowing, reflected, IR — already baked into
                 // flux_column_major by calculateAbsorbedFlux above).
+                //
+                // The window is the WHOLE forcing span under the shared seed.
+                // The legacy window was the first min(100, N) steps, which on
+                // the shipped lunar crater is 0.83 of a lunation starting at an
+                // arbitrary phase — a phase-biased sample, not a cycle mean,
+                // and a different quantity from the GPU path's full-span mean.
+                // Same span on every path is what makes gate G1 exact.
                 double avg_flux = 0.0;
-                const int flux_avg_window = std::min(100, total_time_steps);
+                const int flux_avg_window =
+                    (seed_mode == thermal::EqSeedMode::Physical)
+                        ? total_time_steps
+                        : std::min(100, total_time_steps);
                 for (int t = 0; t < flux_avg_window; ++t) {
                     avg_flux += flux_column_major[t * n_faces + global_f];
                 }
@@ -3966,6 +4200,54 @@ bool runThermalModelsForAllFacesBatchSoA(
                     flux_for_seed = 0.0;
                     ++bad_flux_faces;
                 }
+
+                // ---- SHARED SEED (thermal/eq_seed.h) -----------------------
+                // The same function the CPU scalar path (Profile::
+                // seedFromMeanFlux) and the GPU host seed call. What changes
+                // versus the block below it: the deep column is now the
+                // conductive steady profile T(z) = T_0 + Qb*integral dz/k
+                // instead of an exponential blend to a 50 K-capped T_deep. The
+                // blend put ~63 % of the whole geothermal rise inside ONE skin
+                // depth (3 cm on the Moon) where the true rise is Qb*delta/k_s
+                // = 0.68 K; the rest of the column was then flat, which is the
+                // part that takes hundreds of cycles to correct.
+                if (seed_mode == thermal::EqSeedMode::Physical) {
+                    alignas(64) double kc_col[thermal::MAX_THERMAL_LAYERS];
+                    alignas(64) double rho_col[thermal::MAX_THERMAL_LAYERS];
+                    alignas(64) double T_col[thermal::MAX_THERMAL_LAYERS];
+                    for (int layer = 0; layer < n_layers; ++layer) {
+                        kc_col[layer]  = batch.kc [layer * BS + f];
+                        rho_col[layer] = batch.rho[layer * BS + f];
+                    }
+                    thermal::EqSeedInput sin_;
+                    sin_.mean_absorbed_flux = flux_for_seed;
+                    sin_.Qb                 = qb_for_seed;
+                    sin_.emissivity         = batch.emissivity[f];
+                    sin_.sigma              = batch.sigma_sb;
+                    sin_.z                  = batch.z;
+                    sin_.kc                 = kc_col;
+                    sin_.rho                = rho_col;
+                    sin_.n                  = n_layers;
+                    sin_.R350               = batch.R350_val;
+                    sin_.cond               = batch.cond_model;
+                    const thermal::EqSeedResult sres =
+                        thermal::eqSeedColumn(sin_, T_col);
+                    if (sres.clamped_low) ++seed_floor_faces;
+                    if (sres.above_500K)  ++seed_hot_faces;
+                    thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
+
+                    batch.T_eq_init[f] = sres.T_surface;
+                    for (int layer = 0; layer < n_layers; ++layer)
+                        batch.T[layer * BS + f] = T_col[layer];
+
+                    if (dump_eq_seed) {                   // PTM-51 diagnostic
+                        dbg_avg_flux[global_f]   = avg_flux;
+                        dbg_T_surf_est[global_f] = sres.T_surface;
+                        dbg_dT_geo[global_f]     = sres.T_deep - sres.T_surface;
+                    }
+                    continue;
+                }
+
                 const double ratio = (flux_for_seed + qb_for_seed) / sb_denom;
                 // Clamp the seed to the physical range [T_CMB, 400 K]. The
                 // LOWER bound is load-bearing for a body with Qb <= 0, which is
@@ -4033,6 +4315,63 @@ bool runThermalModelsForAllFacesBatchSoA(
                     batch.T[layer * BS + f] = 200.0;
                 }
             }
+
+            // Spin-up estimate (FIX 0, report-only). Scored after the FIRST
+            // substep of the run -- late enough that advanceTimestep has filled
+            // batch.k / batch.cp (initialize() memsets them to zero and scoring
+            // a zero-conductivity column would report nonsense), early enough
+            // that it lands before any real time is spent. Reading only; writes
+            // no solver state.
+            //
+            // It is a LAMBDA because the analytic pre-conditioner it used to
+            // live inside is now off by default: with no pre-conditioner the
+            // first substep is the first step of the MAIN loop, and the
+            // estimator has to be scored there instead or the run silently
+            // stops reporting it.
+            bool census_scored = false;
+            auto score_spinup_census = [&]() {
+                if (census_scored || !g_spinup_census) return;
+                census_scored = true;
+                const int BS2 = thermal::THERMAL_BATCH_SIZE;
+                std::vector<double> cz(n_layers), cT(n_layers),
+                                    ck(n_layers), cr(n_layers), cc(n_layers);
+                for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    for (int i = 0; i < n_layers; ++i) {
+                        cT[i] = batch.T  [i * BS2 + f];
+                        ck[i] = batch.k  [i * BS2 + f];
+                        cr[i] = batch.rho[i * BS2 + f];
+                        cc[i] = batch.cp [i * BS2 + f];
+                    }
+                    thermal::EqSpinupInput ein;
+                    ein.z = cz.data(); ein.T = cT.data(); ein.k = ck.data();
+                    ein.rho = cr.data(); ein.cp = cc.data();
+                    ein.n = n_layers;
+                    ein.Qb  = batch.Qb[f];
+                    ein.eps = batch.emissivity[f];
+                    ein.sigma = thermal::SIGMA_SB;
+                    ein.P = planet.day;
+                    ein.target_K = eq_target_K;
+                    // This path is float64 and carries no arithmetic floor;
+                    // the float32 arrest is a GPU-path property.
+                    ein.precision_floor_K = 0.0;
+                    // Dark iff the face never sees sun in the REAL
+                    // illumination. Using the analytic equilibration forcing
+                    // instead (cos_lat*cos_hour) would call every face lit --
+                    // it has no topography and no shadowing, so cos_lat > 0
+                    // everywhere off the poles -- and the split that exists to
+                    // expose the frozen dark population would report no dark
+                    // population at all.
+                    double fmax = 0.0;
+                    for (int t = 0; t < total_time_steps; ++t) {
+                        const double v = flux_column_major[
+                            static_cast<size_t>(t) * n_faces + start_face + f];
+                        if (v > fmax) fmax = v;
+                    }
+                    const bool dark = !(fmax > 0.0);
+                    g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
+                }
+            };
 
             // Equilibration phase:
             // Mirror Model::fastEquilibrate — run NYEARSEQ * round(year/day) lunar days
@@ -4108,55 +4447,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
-
-                    // Spin-up estimate (FIX 0, report-only). Scored after the
-                    // FIRST substep of ~30,000, so it still lands before any
-                    // real time is spent, but after advanceTimestep has filled
-                    // batch.k / batch.cp -- initialize() memsets them to zero
-                    // and scoring a zero-conductivity column would report
-                    // nonsense. Reading only; writes no solver state.
-                    if (step == 0 && g_spinup_census) {
-                        const int BS2 = thermal::THERMAL_BATCH_SIZE;
-                        std::vector<double> cz(n_layers), cT(n_layers),
-                                            ck(n_layers), cr(n_layers), cc(n_layers);
-                        for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
-                        for (int f = 0; f < faces_in_batch; ++f) {
-                            for (int i = 0; i < n_layers; ++i) {
-                                cT[i] = batch.T  [i * BS2 + f];
-                                ck[i] = batch.k  [i * BS2 + f];
-                                cr[i] = batch.rho[i * BS2 + f];
-                                cc[i] = batch.cp [i * BS2 + f];
-                            }
-                            thermal::EqSpinupInput ein;
-                            ein.z = cz.data(); ein.T = cT.data(); ein.k = ck.data();
-                            ein.rho = cr.data(); ein.cp = cc.data();
-                            ein.n = n_layers;
-                            ein.Qb  = batch.Qb[f];
-                            ein.eps = batch.emissivity[f];
-                            ein.sigma = thermal::SIGMA_SB;
-                            ein.P = planet.day;
-                            ein.target_K = eq_target_K;
-                            // This path is float64 and carries no arithmetic
-                            // floor; the float32 arrest is a GPU-path property.
-                            ein.precision_floor_K = 0.0;
-                            // Dark iff the face never sees sun in the REAL
-                            // illumination. Using the analytic equilibration
-                            // forcing instead (cos_lat*cos_hour) would call
-                            // every face lit -- it has no topography and no
-                            // shadowing, so cos_lat > 0 everywhere off the
-                            // poles -- and the split that exists to expose the
-                            // frozen dark population would report no dark
-                            // population at all.
-                            double fmax = 0.0;
-                            for (int t = 0; t < total_time_steps; ++t) {
-                                const double v = flux_column_major[
-                                    static_cast<size_t>(t) * n_faces + start_face + f];
-                                if (v > fmax) fmax = v;
-                            }
-                            const bool dark = !(fmax > 0.0);
-                            g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
-                        }
-                    }
+                    if (step == 0) score_spinup_census();
                 }
             }
 
@@ -4204,6 +4495,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     batch.setFluxContiguous(flux_step, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
+                    // Fires only when the analytic pre-conditioner was off (the
+                    // default), in which case this is the run's first substep.
+                    if (!census_scored) score_spinup_census();
                 }
                 if (surface_temps_out) {
                     for (int f = 0; f < faces_in_batch; ++f) {
@@ -4314,6 +4608,28 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "seed issue."
                   << std::endl;
     }
+
+    // Shared-seed guards. Both are physics statements, not tuning knobs, and
+    // both are reported rather than applied silently.
+    if (seed_floor_faces.load() > 0) {
+        std::cerr << "WARNING: " << seed_floor_faces.load() << " of " << n_faces
+                  << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
+                  << " K CMB floor -- they have Qb <= 0 AND zero mean absorbed "
+                     "flux, so the steady-state balance has no positive root. "
+                     "cp(T) is not defined below that."
+                  << std::endl;
+    }
+    if (seed_hot_faces.load() > 0) {
+        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
+                  << " faces have a cycle-mean radiative-equilibrium seed above "
+                  << thermal::MAX_PHYSICAL_TEMP_K
+                  << " K, which is the CPU solver's own hard temperature clamp. "
+                     "The seed is physical (Mercury's subsolar cycle mean is "
+                     "~468 K); the CLAMP will truncate the solution. Results on "
+                     "those faces are not trustworthy."
+                  << std::endl;
+    }
+    thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
 
     // End timing
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -5412,6 +5728,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
 
+    // Shared-seed guards, reported after the batch loop (never silent).
+    size_t gpu_seed_floor_faces = 0, gpu_seed_hot_faces = 0;
+    if (config.spinup_seed == thermal::EqSeedMode::Physical) {
+        thermal::EqSeedRecorder::instance().reserve(mesh->faces.size());
+        std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
+                     "steady profile -- T_0=((<F_abs>+Qb)/(eps*sigma))^0.25 with "
+                     "<F_abs> the mean over all forcing steps, then "
+                     "T(z)=T_0+Qb*integral dz/k [thermal.spinup_seed: physical; "
+                     "identical on every solver path]" << std::endl;
+    }
+
     // Directional-hemispheric (Hapke) albedo gate. The gate is resolved on the
     // main-scope Planet and forwarded as thermal_config properties (see the
     // thermal_config build site). This locally-rebuilt Planet does not inherit
@@ -6029,7 +6356,26 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // built-in Moon/Europa/A3GT runs keep the legacy seed and stay
         // byte-identical to their established baselines.
         std::vector<float> T_initial(batch_n * n_layers);
-        if (config.getProperty("using_generic_body") == "true") {
+        if (config.spinup_seed == thermal::EqSeedMode::Physical) {
+            GpuSharedSeedContext sc;
+            sc.planet = &planet;
+            sc.z = z_grid.data();
+            sc.n_layers = n_layers;
+            sc.kc = kc_batch.data();
+            sc.rho = rho_batch.data();
+            sc.emissivity = emissivity_batch.data();
+            sc.Qb = Qb_batch.data();
+            sc.batch_start = batch_start;
+            sc.batch_n = batch_n;
+            sc.direct = &direct_solar_values;
+            sc.reflected = &primary_reflected_values;
+            sc.ir = &primary_ir_values;
+            sc.face_albedos = &face_albedos;
+            sc.total_time_steps = total_time_steps;
+            sc.R350 = R350_val;
+            sc.cond = config.conductivity_model;
+            gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
+        } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
                 const float Tl = static_cast<float>(T_seed[layer]);
@@ -6658,13 +7004,31 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             static_cast<int>(config.conductivity_model)  // Stefan-Boltzmann
         );
 
-        // Initial subsurface temperature seed. Generic bodies get the smooth
-        // diurnal-mean reference profile (removes the body-fixed asteroid "seam";
-        // see the companion note on the other GPU persistent entry point); built-in
-        // Moon/Europa/A3GT keep the legacy per-face instantaneous-flux seed and stay
-        // byte-identical. Gated on "using_generic_body" (mirrors 710db0f).
+        // Initial subsurface temperature seed. Under thermal.spinup_seed:
+        // physical (the default) every path calls the SAME eqSeedColumn; the
+        // two legacy branches below are kept verbatim so `legacy` reproduces
+        // the pre-2026-08-11 baselines exactly.
         std::vector<float> T_initial(batch_n * n_layers);
-        if (config.getProperty("using_generic_body") == "true") {
+        if (config.spinup_seed == thermal::EqSeedMode::Physical) {
+            GpuSharedSeedContext sc;
+            sc.planet = &planet;
+            sc.z = z_grid.data();
+            sc.n_layers = n_layers;
+            sc.kc = kc_batch.data();
+            sc.rho = rho_batch.data();
+            sc.emissivity = emissivity_batch.data();
+            sc.Qb = Qb_batch.data();
+            sc.batch_start = batch_start;
+            sc.batch_n = batch_n;
+            sc.direct = &direct_solar_values;
+            sc.reflected = &primary_reflected_values;
+            sc.ir = &primary_ir_values;
+            sc.face_albedos = &face_albedos;
+            sc.total_time_steps = total_time_steps;
+            sc.R350 = R350_val;
+            sc.cond = config.conductivity_model;
+            gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
+        } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
                 const float Tl = static_cast<float>(T_seed[layer]);
@@ -7200,6 +7564,22 @@ post_batch_loop:
         *post_eq_T_out = assembled_post_eq_T;
     }
 
+    // Shared-seed guards. Physics statements, reported rather than swallowed.
+    if (gpu_seed_floor_faces > 0) {
+        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_floor_faces << " of "
+                  << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
+                  << " K CMB floor -- Qb <= 0 AND zero mean absorbed flux, so "
+                     "the steady-state balance has no positive root.\n";
+    }
+    if (gpu_seed_hot_faces > 0) {
+        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_hot_faces << " of "
+                  << n_faces << " faces have a cycle-mean radiative-equilibrium "
+                     "seed above " << thermal::MAX_PHYSICAL_TEMP_K
+                  << " K, the CPU solver's hard clamp. The seed is physical; a "
+                     "CPU run of the same case would be truncated there.\n";
+    }
+    thermal::EqSeedRecorder::instance().write("gpu-persistent");
+
     return true;
 }
 
@@ -7252,6 +7632,8 @@ bool runThermalForSelectedFaces_GPU(
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
+    // No seed banner here: this path never seeds. It is warm-started from
+    // post_eq_T_state (uploadAllTemps), so the spin-up seed does not reach it.
     const size_t n_faces_total = mesh->faces.size();
 
     // Directional-hemispheric (Hapke) albedo gate (re-read from config; this
@@ -8425,7 +8807,10 @@ std::vector<double> runThermalModelWithMatchedTimes(
     const thermal::Config& config,
     int equilibration_steps,
     double Qb_override,
-    double H_override);
+    double H_override,
+    long long seed_record_face,
+    std::atomic<size_t>* seed_floor_faces,
+    std::atomic<size_t>* seed_hot_faces);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -13157,6 +13542,54 @@ int main(int argc, char** argv) {
     // Final total simulated span (equilibration + max(output, integration))
     double total_simulation_days = equilibration_days + post_eq_days_needed;
 
+    // ---- Spin-up seed, resolved ONCE for every solver path ------------------
+    // Precedence: PTM_SPINUP_SEED env > thermal.spinup_seed > "physical".
+    // An unparseable value is FATAL: the seed is worth 46.7 K on a permanently
+    // shadowed column, so it must never be chosen for the user by a fallback.
+    thermal::EqSeedMode resolved_seed_mode = thermal::EqSeedMode::Physical;
+    {
+        std::string seed_str = sim_config.thermal.spinup_seed;
+        std::string seed_src = "thermal.spinup_seed";
+        if (const char* e = std::getenv("PTM_SPINUP_SEED")) {
+            if (*e != '\0') {
+                if (seed_str != std::string(e)) {
+                    std::cerr << "[eq-seed] PTM_SPINUP_SEED=" << e
+                              << " overrides thermal.spinup_seed: " << seed_str
+                              << std::endl;
+                }
+                seed_str = e;
+                seed_src = "PTM_SPINUP_SEED";
+            }
+        }
+        if (!thermal::parseEqSeedMode(seed_str, resolved_seed_mode)) {
+            std::cerr << "FATAL: unknown " << seed_src << " '" << seed_str
+                      << "'. Valid: physical | legacy.\n";
+            return 1;
+        }
+    }
+    double resolved_analytic_cycles_cfg = sim_config.thermal.analytic_seed_cycles;
+    if (const char* e = std::getenv("PTM_ANALYTIC_SEED_CYCLES")) {
+        if (*e != '\0') {
+            try {
+                const double v = std::stod(e);
+                if (v < -1.0) throw std::invalid_argument("negative");
+                std::cerr << "[eq-seed] PTM_ANALYTIC_SEED_CYCLES=" << v
+                          << " overrides thermal.analytic_seed_cycles: "
+                          << resolved_analytic_cycles_cfg << std::endl;
+                resolved_analytic_cycles_cfg = v;
+            } catch (const std::exception&) {
+                std::cerr << "FATAL: PTM_ANALYTIC_SEED_CYCLES='" << e
+                          << "' is not a number >= -1.\n";
+                return 1;
+            }
+        }
+    }
+    const double resolved_analytic_cycles = thermal::analyticSeedCycles(
+        resolved_seed_mode, resolved_analytic_cycles_cfg,
+        planet.day, planet.year, kCpuAnalyticSeedYears);
+    config.spinup_seed          = resolved_seed_mode;
+    config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
+
     // Log the calculation for verification
     std::cout << "\n========== Thermal Equilibration Configuration ==========" << std::endl;
     std::cout << "Body: " << planet.name << std::endl;
@@ -13176,24 +13609,40 @@ int main(int argc, char** argv) {
               << (eq_passes_effective != eq_passes_requested
                       ? ", downgraded to 1 pass on this CPU path" : "")
               << "]" << std::endl;
+    std::cout << "Spin-up seed: " << thermal::eqSeedModeName(resolved_seed_mode)
+              << (resolved_seed_mode == thermal::EqSeedMode::Physical
+                      ? "  (shared per-face conductive steady profile, identical"
+                        " on every solver path)"
+                      : "  (pre-2026-08-11 per-path seeds + analytic"
+                        " pre-conditioner)")
+              << std::endl;
     if (!eq_gpu_thermal) {
-        // The CPU scalar and SIMD equilibrators additionally run a fixed
+        // The CPU scalar and SIMD equilibrators can additionally run an
         // analytic clear-sky pre-conditioner that equilibration_orbits does not
-        // count and the GPU path does not have. Print it rather than let it
-        // stay invisible; it dominates the real prefix on short lunar configs.
+        // count and the GPU path does not have. It is OFF by default now; print
+        // its length whenever it is on, because it dominates the real prefix on
+        // short lunar configs and it OVERWRITES the per-face seed.
         // The two CPU paths do NOT agree on its length for a generic body: the
         // SIMD batch path uses the equilibration window (ptm_thermal_sim.cpp,
         // "using_generic_body" branch) while the scalar Model::run always uses
         // NYEARSEQ * round(year/day), which for an asteroid is thousands of
         // rotations. Report whichever this run will take.
         const bool simd_path = config.getPropertyBool("use_simd_batch", true);
-        const double seed_cycles =
-            (simd_path && using_generic_body)
-                ? eq_block_cycles   // generic + SIMD: the equilibration window
-                : cpuAnalyticSeedCycles(planet, kCpuAnalyticSeedYears);
-        std::cout << "Equilibration (analytic seed, CPU paths only): "
-                  << seed_cycles << " day/night cycles  (not configurable; "
-                     "clear-sky forcing, no topography or shadowing)" << std::endl;
+        double seed_cycles = resolved_analytic_cycles;
+        if (resolved_analytic_cycles_cfg < 0.0 && simd_path && using_generic_body
+            && resolved_seed_mode == thermal::EqSeedMode::Legacy) {
+            seed_cycles = eq_block_cycles;  // generic + SIMD: the eq window
+        }
+        if (seed_cycles > 0.0) {
+            std::cout << "Equilibration (analytic seed, CPU paths only): "
+                      << seed_cycles << " day/night cycles  (clear-sky forcing, "
+                         "no topography or shadowing; thermal.analytic_seed_cycles)"
+                      << std::endl;
+        } else {
+            std::cout << "Equilibration (analytic seed, CPU paths only): 0 "
+                         "day/night cycles  (OFF -- spin-up is the configured "
+                         "equilibration under the REAL forcing)" << std::endl;
+        }
         if (!simd_path && using_generic_body && seed_cycles > 1000.0) {
             std::cerr << "[Equilibration] WARNING: the CPU scalar path's analytic "
                          "seed for this generic body is " << seed_cycles
@@ -13775,11 +14224,20 @@ int main(int argc, char** argv) {
         // NYEARSEQ * round(year/day) diurnal cycles (Moon 24, Europa 2). It is
         // NOT counted by thermal.equilibration_orbits and the GPU path has no
         // equivalent; the pre-flight banner prints it for that reason.
+        // NYEARSEQ is now only the LEGACY length -- whether the pre-conditioner
+        // runs at all is thermal.analytic_seed_cycles / thermal.spinup_seed.
         thermal_config.NYEARSEQ = kCpuAnalyticSeedYears;
         // Stefan-Boltzmann for every mesh run. This used to be 5.67e-8, a value
         // no other subsystem used, so the surface energy balance and the
         // radiosity that feeds it did not conserve energy with each other.
         thermal_config.sigma = ptm::kStefanBoltzmann;
+        // The one shared spin-up seed. Resolved once above (env > config), and
+        // carried on the config object that every solver entry point receives,
+        // so no path can pick a different initial condition. The seed reads
+        // config.sigma, so it now shares the single constant above -- which is
+        // what drives the CPU-scalar-vs-SIMD seed residual to zero.
+        thermal_config.spinup_seed          = resolved_seed_mode;
+        thermal_config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 
         // ---- Regolith conductivity law (thermophysical.conductivity_model) ----

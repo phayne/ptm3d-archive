@@ -891,6 +891,31 @@ void Profile::init_T(const Planet& planet, double lat, bool verbose) {
     }
 }
 
+EqSeedResult Profile::seedFromMeanFlux(double mean_absorbed_flux, double Qb) {
+    EqSeedInput in;
+    in.mean_absorbed_flux = mean_absorbed_flux;
+    in.Qb                 = Qb;
+    in.emissivity         = emissivity;
+    in.sigma              = config ? config->sigma : SIGMA_SB;
+    in.z                  = z().data();
+    in.kc                 = kc().data();
+    in.rho                = rho().data();
+    in.n                  = static_cast<int>(nlayers);
+    in.R350               = R350_val;
+    in.cond               = cond_model;
+
+    T().resize(nlayers);
+    const EqSeedResult r = eqSeedColumn(in, T().data());
+
+    // The constructor does this after init_T; a re-seed must leave the profile
+    // in the same state or the first step integrates k/cp/kappa from the OLD
+    // temperatures.
+    update_k();
+    update_cp();
+    recomputeKappa();
+    return r;
+}
+
 // Optimized, race-free, fully vectorized (AVX-512 / AVX2) implementation.
 // Features:
 //  - Optional fused temperature‑dependent material update (k, cp, kappa) each step
@@ -1797,6 +1822,20 @@ Model::Model(const Planet& planet, double lat,
         }
     }
     
+    // ---- Shared spin-up seed (thermal/eq_seed.h) ---------------------------
+    // Profile::init_T ran in the initializer list above and produced the
+    // legacy flux-blind, latitude-blind T_avg = T_ss/sqrt(2) column. Now that
+    // this face's OWN forcing has been extracted, replace it with the shared
+    // per-face conductive steady profile. Legacy mode leaves init_T's answer
+    // in place, so a `spinup_seed: legacy` run reproduces the old baseline.
+    if (config.spinup_seed == EqSeedMode::Physical && !flux_values.empty()) {
+        double sum = 0.0;
+        for (double v : flux_values) sum += v;
+        seed_mean_flux = sum / static_cast<double>(flux_values.size());
+        seed_result    = profile.seedFromMeanFlux(seed_mean_flux, planet.Qb);
+        seed_applied   = true;
+    }
+
     // Calculate physics-based time step using von Neumann stability criterion
     dt = getTimeStep(profile, planet, planet.day, config, show_progress);
     // Initialize adaptive state
@@ -2203,8 +2242,16 @@ void Model::run() {
         t = output_time_points[0];
         ProgressBar progressBar(output_time_points.size(), "Thermal Simulation", 50, show_progress);
 
-        if (config->NYEARSEQ > 0) {
-            int equil_days = config->NYEARSEQ * static_cast<int>(std::round(planet.year / planet.day));
+        // Analytic clear-sky pre-conditioner. This is a FORCING, not a seed:
+        // it integrates `equil_days` diurnal cycles of an idealized
+        // cos(lat)*cos(h) insolation with no topography, no shadowing, no IR
+        // and no indirect flux, and it OVERWRITES the physically correct
+        // per-face initial condition the constructor just computed. Off by
+        // default (spinup_seed: physical); see thermal/eq_seed.h.
+        const int equil_days = static_cast<int>(std::llround(
+            analyticSeedCycles(config->spinup_seed, config->analytic_seed_cycles,
+                               planet.day, planet.year, config->NYEARSEQ)));
+        if (equil_days > 0) {
             fastEquilibrate(equil_days, t);
         }
 

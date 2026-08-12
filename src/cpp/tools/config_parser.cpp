@@ -1,5 +1,6 @@
 #include "config_parser.h"
 #include "../thermal/conductivity_model.h"
+#include "../thermal/eq_seed.h"
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -386,6 +387,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.eq_indirect_source     = getWithDefault(thermal, "eq_indirect_source",     config.thermal.eq_indirect_source);
+            config.thermal.spinup_seed            = getWithDefault(thermal, "spinup_seed",            config.thermal.spinup_seed);
+            config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
                 const auto& is_node = thermal["ice_stability"];
@@ -771,6 +774,12 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.thermal.equilibration_cycles > 0)
             out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
         out << YAML::Key << "equilibration_target_K" << YAML::Value << config.thermal.equilibration_target_K;
+        out << YAML::Key << "spinup_seed" << YAML::Value << config.thermal.spinup_seed;
+        // Only round-trip the pre-conditioner when it was explicitly asked for
+        // (-1 = follow spinup_seed). Writing -1 into every template would make
+        // an off-by-default forcing look like a live knob.
+        if (config.thermal.analytic_seed_cycles >= 0.0)
+            out << YAML::Key << "analytic_seed_cycles" << YAML::Value << config.thermal.analytic_seed_cycles;
         // Same rule: only round-trip the extrapolation block when it is armed,
         // so an OFF run's re-serialized config stays free of the knob entirely.
         if (config.thermal.eq_extrapolation.method != "off") {
@@ -1211,6 +1220,24 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         std::cerr << "Error: equilibration_cycles must be >= 1 "
                      "(or -1 for the solver default); got "
                   << config.thermal.equilibration_cycles << std::endl;
+        valid = false;
+    }
+    // spinup_seed: an unrecognized name is FATAL, never a silent fallback to
+    // the default -- the seed is worth 46.7 K on a permanently shadowed column,
+    // so a typo must not silently choose one for you.
+    {
+        thermal::EqSeedMode dummy;
+        if (!thermal::parseEqSeedMode(config.thermal.spinup_seed, dummy)) {
+            std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
+                         "'legacy'; got '" << config.thermal.spinup_seed << "'"
+                      << std::endl;
+            valid = false;
+        }
+    }
+    if (config.thermal.analytic_seed_cycles < -1.0) {
+        std::cerr << "Error: thermal.analytic_seed_cycles must be >= 0 "
+                     "(or -1 to follow thermal.spinup_seed); got "
+                  << config.thermal.analytic_seed_cycles << std::endl;
         valid = false;
     }
     // eq_extrapolation. Every rejection here is FATAL rather than a silent
