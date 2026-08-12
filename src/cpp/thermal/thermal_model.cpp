@@ -2258,18 +2258,36 @@ void Model::run() {
         // Initialize flux at the first time point
         surfFlux();
 
-        // Small initial settling
+        // Store the first output BEFORE the settling loop below.
+        //
+        // OUTPUT TIME ALIGNMENT. T(0, :) is the state AT output_time_points[0],
+        // and zero time has elapsed there, so it is the initial condition
+        // exactly -- the same thing the SIMD batch driver writes at its index 0
+        // (ptm_thermal_sim.cpp, runThermalModelsForAllFacesBatchSoA). Storing
+        // it after the settling loop (which this did until
+        // fix/output-time-alignment) filed a column that had already relaxed
+        // 0.4*dt toward equilibrium with Qs(t_0) under index 0. Because the
+        // surface node's radiative relaxation time is far shorter than dt, that
+        // is not a small perturbation: measured 141.5 K max / 41.2 K mean
+        // against the shared spin-up seed on tutorial04_crater80N_radoff with
+        // equilibration_orbits = 0.
+        //
+        // It only ever reached a product when there was no equilibration prefix
+        // to discard it (equilibration_orbits = 0); with a prefix, index 0 of
+        // this matrix is an equilibration step that never gets exported.
+        for (int j = 0; j < N_z; j++) T(0, j) = profile.T()[j];
+        lt(0) = output_time_points[0];
+        progressBar.update(1);
+
+        // Small initial settling. Unchanged, so every output from index 1 on is
+        // bit-identical to before: it perturbs the initial condition by 0.4*dt
+        // of integration at Qs(t_0), which the solver then forgets.
         double initial_dt = dt / 10.0;
         for (int i = 0; i < 4; i++) {
             profile.update_T(initial_dt, Qs, planet.Qb);
             t += initial_dt;
         }
         t = output_time_points[0];
-
-        // Store first output
-        for (int j = 0; j < N_z; j++) T(0, j) = profile.T()[j];
-        lt(0) = t;
-        progressBar.update(1);
 
         // Remaining outputs
         int num_outputs = static_cast<int>(output_time_points.size());

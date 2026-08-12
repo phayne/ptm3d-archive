@@ -384,6 +384,20 @@ output/
 count followed by one single-precision float per mesh face (see the tutorial
 `tutorials/06_interpreting_outputs.md` for a reader snippet).
 
+**Time index**: per-step frames are labeled by output index, and index `NNNN`
+means the same thing in every one of them. `temperature/temperature_NNNN.bin`
+holds the surface state **at** the epoch on line `NNNN` of `time_steps.txt`,
+which is the same epoch at which `direct_solar/direct_solar_NNNN.bin` and
+`illumination/illumination_NNNN.bin` are sampled. So index 0 is the state the
+run started from — the spin-up seed, or the checkpoint of a warm-started chunk
+— and no frame reflects flux that arrives after its own epoch. Joining
+temperature to illumination by index is therefore safe, and a chunked run
+merged with `ptm_merge_chunks` tiles the epochs exactly once with no gap and no
+duplicate. To confirm this on a build, run
+`scripts/check_output_time_alignment.py` (it needs an anchor outside the
+series — a warm-start checkpoint or a `PTM_DUMP_SEED` file — because a uniform
+shift of the whole series is invisible from inside it).
+
 **VTK/PVD export**: Use `python src/python/vtk_converter.py` to create ParaView-compatible time series.
 
 **Additional exports**: NetCDF (`netcdf_converter.py`), HDF5 (`ptm_hdf5.py`), GeoTIFF (`ptm_geotiff.py`).
