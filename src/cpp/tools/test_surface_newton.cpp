@@ -155,7 +155,10 @@ double newton_eqfix(double Qs_d, double k0_d, double dz0_d, double T1_d,
     }
 
     const int kMaxIter = 10;
-    const R   kTolK    = static_cast<R>(1e-4);
+    // Read the SHIPPING tolerance rather than a literal, so that sweeping
+    // PTM_SURFACE_BC_TOLK (the whole point of that knob) does not make the
+    // fidelity tripwire below fire against a solver that is behaving.
+    const R   kTolK    = static_cast<R>(thermal::surfaceBCTolK());
     const R   kUlpC    = static_cast<R>(2.0);
     const R   eps_mach = std::numeric_limits<R>::epsilon();
 
