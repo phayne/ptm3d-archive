@@ -8433,7 +8433,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int,
     const thermal::Config&,
     double,
-    double,
     std::vector<std::vector<double>>*,
     const std::vector<double>*,
     const std::vector<double>*,
