@@ -557,6 +557,32 @@ __kernel void persistentThermalKernel(
     // Process ALL output timesteps
     for (int t = 0; t < n_timesteps; ++t) {
         int tg = t_offset + t;   // GLOBAL timestep (== t when un-chunked)
+
+        // OUTPUT TIME ALIGNMENT. output_temps[tg] is the surface state AT
+        // times[tg] -- the same convention as the CPU paths
+        // (thermal_model.cpp Model::run, and the SIMD batch driver in
+        // ptm_thermal_sim.cpp), and the same convention the illumination
+        // frames written alongside it already use: direct_solar[f,tg] is the
+        // instantaneous flux at times[tg].
+        //
+        // So the state is stored BEFORE the interval is integrated, not after.
+        // Storing it after (which this kernel did until fix/output-time-
+        // alignment) put the state at times[tg+1] under index tg: at index 0
+        // the frame showed a column that had already absorbed a full output
+        // interval of flux[0] even though zero time has elapsed at times[0],
+        // and every later frame was one output step early with respect to its
+        // own epoch and its own illumination frame.
+        //
+        // The integration is UNCHANGED: this loop still advances n_timesteps
+        // intervals, so buf_T_ still ends on the state at times[t_offset +
+        // n_timesteps] and downloadAllTemps() still hands the chunk runner the
+        // same checkpoint it always did. Only the index the frame is filed
+        // under moves. The last interval's result is therefore no longer
+        // exported as a frame -- it is the checkpoint the NEXT chunk writes at
+        // its own index 0 -- so a chunked run still tiles the epochs exactly
+        // once, with no gap and no duplicate.
+        output_temps[tg * n_faces + face] = T_local[0];
+
         float Q_surf = flux_all[tg * n_faces + face];
 
         // Sub-stepping loop for numerical stability
@@ -829,10 +855,17 @@ __kernel void persistentThermalKernel(
             }
         }  // End of sub-stepping loop
 
-        // Store surface temperature after all sub-steps are complete
-        output_temps[tg * n_faces + face] = T_local[0];
+        // (The surface temperature for index tg was stored at the TOP of this
+        // loop, before the interval was integrated -- see the note there.)
 
         // Schorghofer & Taylor (2007) sublimation-rate accumulator (optional).
+        // This one is deliberately left sampling the END of interval tg. It is
+        // not a per-step frame with an epoch to be aligned to: it is a
+        // quadrature of <E(z)> over the whole accumulation window, reduced to
+        // the per-face scalar in ice_depth.bin. Interval-end sampling makes it
+        // a right-rectangle rule over [accum_start, accum_end); moving it would
+        // only swap that for a left-rectangle rule and shift ice_depth.bin by
+        // one sample out of n_samples for no gain in correctness.
         // Constants match src/cpp/ice/ice_table.cpp:
         //   PT      = 611.657 Pa  (triple-point pressure)
         //   L_MU/KB = 6139.06 K   (latent heat × molecular mass / Boltzmann)
