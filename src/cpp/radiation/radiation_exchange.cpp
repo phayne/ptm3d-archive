@@ -39,6 +39,12 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
             std::fill(emissivity_.begin(), emissivity_.end(), e);
             std::cout << "  [PTM_RAD_EMISSIVITY] radiosity emissivity forced to " << e
                       << " (reflectivity 1-eps=" << (1.0 - e) << ")" << std::endl;
+            std::cerr << "  [PTM_RAD_EMISSIVITY] WARNING: this moves the RADIOSITY emissivity "
+                         "only. The surface boundary condition still emits with the body's "
+                         "emissivity and the thermal path still absorbs infrared with it, so "
+                         "absorption, emission and scattering no longer agree (Kirchhoff). "
+                         "Use thermophysical.emissivity_override to move all three together; "
+                         "the engine's [kirchhoff] check will fail this run." << std::endl;
         }
     }
 
@@ -2605,6 +2611,13 @@ void RadiationExchangeManager::setEmissivity(double emissivity) {
 
 void RadiationExchangeManager::setEmissivity(const std::vector<double>& emissivity) {
     emissivity_ = emissivity;
+}
+
+const std::vector<double>& RadiationExchangeManager::operativeEmissivity() const {
+    // Prefer the solver's copy: it is the one an override can have moved.
+    static const std::vector<double> kEmpty;
+    if (solver_) return solver_->operativeEmissivity();
+    return emissivity_.empty() ? kEmpty : emissivity_;
 }
 
 void RadiationExchangeManager::setConfig(const RadiationConfig& config) {

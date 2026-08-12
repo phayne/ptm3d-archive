@@ -408,9 +408,134 @@ namespace {
     
     // Default visible albedo if no valid value is found
     constexpr double DEFAULT_ICE_ALBEDO = 0.55;
-    
-    // Default IR albedo used for thermal calculations
-    constexpr double DEFAULT_IR_ALBEDO = 0.1;
+}
+
+// ---------------------------------------------------------------------------
+// Infrared absorptivity -- THE single definition, by Kirchhoff's law.
+//
+// A surface absorbs thermal infrared with exactly the efficiency it emits it,
+// so the infrared absorptivity is not a free constant: it IS the emissivity,
+// and the "IR albedo" is only ever 1 - emissivity. The same number therefore
+// has to appear in all three places:
+//   * here, absorbing the primary body's infrared (Earth-shine, Jupiter-shine);
+//   * in the surface boundary condition, emitting eps*sigma*T^4
+//     (thermal_model.cpp: `this->emissivity = planet.emissivity`);
+//   * in the radiosity solver, scattering rho = 1 - eps
+//     (radiation_exchange.cpp: `reflectivity_[i] = 1.0 - emissivity_[i]`).
+//
+// It used to be none of those. `DEFAULT_IR_ALBEDO = 0.1` was a bare constant
+// from which an "IR emissivity" of 1 - 0.1 = 0.90 was DERIVED -- the dependency
+// inverted -- while the callers that bypassed that override implied
+// 1 - 0.02 = 0.98, and the GPU path had used planet.emissivity all along. On
+// the Moon (emissivity 0.95, Hayne et al. 2017) the engine absorbed infrared as
+// though eps were 0.90 or 0.98 while emitting with 0.95 and scattering with
+// 0.95. Absorption and emission disagreed, and nothing said so.
+//
+// To move it, override the BODY's emissivity (thermophysical.emissivity_override,
+// which is echoed at startup) so all three move together. There is deliberately
+// no way to move this one alone, and recordIrAbsorptivity() below cross-checks
+// at runtime that nothing managed it anyway.
+static inline double thermalIrEmissivity(const thermal::Planet& planet) {
+    return planet.emissivity;
+}
+
+// Kirchhoff cross-check (gate G1). Every site that absorbs primary infrared
+// records the emissivity it actually used; reportKirchhoffConsistency() compares
+// the set against the emissivity the radiosity solver was given and the one the
+// surface BC emits with. Arranging the three to agree is not the same as knowing
+// they agree -- the CPU SIMD-batch path rebuilds its own Planet, and
+// PTM_RAD_EMISSIVITY can move the radiosity's copy on its own.
+static std::mutex               g_ir_eps_mutex;
+static std::map<std::string, double> g_ir_eps_used;   // site tag -> emissivity
+
+static void recordIrAbsorptivity(const char* site, double eps) {
+    std::lock_guard<std::mutex> lk(g_ir_eps_mutex);
+    g_ir_eps_used[site] = eps;
+}
+
+// The emissivity the radiosity solver operatively held, snapshotted while the
+// manager was alive so the end-of-run check can still see it. Empty when
+// radiation is off or the solver never initialized.
+static std::vector<double> g_radiosity_eps_snapshot;
+
+// Gate G1. Compare, for this run:
+//   * every emissivity an infrared-ABSORPTION site actually used;
+//   * the emissivity the surface BC EMITS with (planet.emissivity, which
+//     thermal_model.cpp copies verbatim into Model::emissivity);
+//   * the emissivity the radiosity solver operatively holds AFTER its own
+//     PTM_RAD_EMISSIVITY override, which is the one way the three can still
+//     come apart.
+// `radiosity_eps` is empty when radiation is off; the absorption/emission
+// identity is still checked. Returns false if the identity is broken.
+static bool reportKirchhoffConsistency(double emit_eps,
+                                       const std::vector<double>* radiosity_eps) {
+    std::lock_guard<std::mutex> lk(g_ir_eps_mutex);
+    if (g_ir_eps_used.empty()) {
+        std::cerr << "[kirchhoff] WARNING: no infrared-absorption site reported an "
+                     "emissivity this run, so the Kirchhoff identity could NOT be "
+                     "checked. Do not quote this run as consistent." << std::endl;
+        return true;   // nothing absorbed IR; not a failure, but say so
+    }
+
+    // Exact equality is the right test: every site reads the same double off the
+    // same Planet field, so any difference at all means a second source crept in.
+    bool ok = true;
+    std::ostringstream sites;
+    for (const auto& kv : g_ir_eps_used) {
+        sites << " " << kv.first << "=" << std::setprecision(17) << kv.second;
+        if (kv.second != emit_eps) ok = false;
+    }
+
+    double rad_min = 0.0, rad_max = 0.0;
+    bool have_rad = (radiosity_eps && !radiosity_eps->empty());
+    if (have_rad) {
+        rad_min = *std::min_element(radiosity_eps->begin(), radiosity_eps->end());
+        rad_max = *std::max_element(radiosity_eps->begin(), radiosity_eps->end());
+        if (rad_min != emit_eps || rad_max != emit_eps) ok = false;
+    }
+
+    std::ios_base::fmtflags fl(std::cout.flags());
+    std::streamsize pr = std::cout.precision();
+    if (ok) {
+        std::cout << "[kirchhoff] absorb == emit == scatter: eps = "
+                  << std::defaultfloat << std::setprecision(6) << emit_eps
+                  << " (IR albedo " << (1.0 - emit_eps) << ") at"
+                  << sites.str() << ", emit=" << emit_eps;
+        if (have_rad) std::cout << ", radiosity=[" << rad_min << ", " << rad_max << "]";
+        else          std::cout << ", radiosity=n/a (radiation off)";
+        std::cout << std::endl;
+    } else {
+        std::cerr << "\nFATAL [kirchhoff]: a surface must absorb thermal infrared with the "
+                     "same efficiency it emits it, and this run does not.\n"
+                  << "  absorption sites:" << sites.str() << "\n"
+                  << "  surface BC emits with: " << std::setprecision(17) << emit_eps << "\n";
+        if (have_rad) {
+            std::cerr << "  radiosity scatters 1-eps with eps in [" << rad_min << ", "
+                      << rad_max << "]"
+                      << (std::getenv("PTM_RAD_EMISSIVITY")
+                            ? "  <-- PTM_RAD_EMISSIVITY is set; it moves ONLY the radiosity"
+                            : "")
+                      << "\n";
+        }
+        std::cerr << "  Energy is not conserved between absorption and emission.\n";
+        // Enforcement fails by DEFAULT, with an informed override -- a deliberate
+        // consistency study (that is what PTM_RAD_EMISSIVITY exists for) must
+        // still be possible, but only by saying so, and it stays in the log.
+        if (std::getenv("PTM_ALLOW_KIRCHHOFF_VIOLATION")) {
+            std::cerr << "  PTM_ALLOW_KIRCHHOFF_VIOLATION is set: CONTINUING ANYWAY. This run "
+                         "is a deliberate inconsistency study, NOT a physical result -- do not "
+                         "publish it or compare it against a run without the override."
+                      << std::endl;
+            ok = true;
+        } else {
+            std::cerr << "  Refusing to present this run as physical. Set "
+                         "PTM_ALLOW_KIRCHHOFF_VIOLATION=1 to run it anyway as an explicit "
+                         "inconsistency study." << std::endl;
+        }
+    }
+    std::cout.flags(fl);
+    std::cout.precision(pr);
+    return ok;
 }
 
 // Thread-safe output suppressor class
@@ -687,7 +812,7 @@ static std::string fullPrecision(double v) {
 
 bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>&,
     const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
-    const std::vector<double>&, int, const thermal::Config&, double, double,
+    const std::vector<double>&, int, const thermal::Config&, double,
     std::vector<std::vector<double>>*, int, int, int,
     const thermal::Planet* = nullptr,
     const std::vector<double>* face_Qb = nullptr,   // Per-face heat flow override
@@ -707,7 +832,6 @@ bool runThermalModelsForAllFacesBatchSoA(
     int time_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
@@ -1236,7 +1360,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int equilibration_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
     const std::vector<double>* face_Qb = nullptr,
     const std::vector<double>* face_H_overrides = nullptr,
@@ -1404,7 +1527,6 @@ bool runThermalModelsForAllFacesStreamed(
     int total_time_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     int thermal_threads,
     FluxFn get_direct,
     FluxFn get_reflected,
@@ -1701,14 +1823,15 @@ class AbsorbedFluxComposer {
 public:
     // Resolve the per-face albedo and the angular albedo model. Returns false,
     // having said why, rather than silently substituting a uniform albedo.
+    // The infrared absorptivity is NOT an argument: it is thermalIrEmissivity(*planet).
     bool build(const std::shared_ptr<ptm::SpatialMap>& albedo_map,
                const std::shared_ptr<Mesh>& mesh,
                size_t num_faces,
                double default_visible_albedo,
-               double default_ir_albedo,
                const thermal::Config& config,
                const thermal::Planet* planet,
-               double solar_constant);
+               double solar_constant,
+               const char* site_tag);
 
     // The operative visible albedo for (face, ABSOLUTE timestep). Verbatim from
     // the array loop this was extracted out of.
@@ -1830,13 +1953,22 @@ bool AbsorbedFluxComposer::build(
     const std::shared_ptr<Mesh>& mesh,
     size_t num_faces,
     double default_visible_albedo,
-    double default_ir_albedo,
     const thermal::Config& config,
     const thermal::Planet* planet,
-    double solar_constant) {
+    double solar_constant,
+    const char* site_tag) {
 
-    // Calculate IR emissivity from IR albedo
-    ir_emissivity_  = 1.0 - default_ir_albedo;
+    // Infrared absorptivity = emissivity (Kirchhoff); see thermalIrEmissivity().
+    // Without a Planet there is no defensible value, and substituting one is the
+    // original defect, so refuse.
+    if (!planet) {
+        std::cerr << "FATAL: absorbed flux was composed without a Planet, so the infrared "
+                     "absorptivity is undefined (Kirchhoff: it is the body's emissivity). "
+                     "Refusing to guess.\n";
+        return false;
+    }
+    ir_emissivity_  = thermalIrEmissivity(*planet);
+    recordIrAbsorptivity(site_tag ? site_tag : "cpu_absorbed_flux", ir_emissivity_);
     planet_         = planet;
     solar_constant_ = solar_constant;
     mesh_           = mesh ? mesh.get() : nullptr;
@@ -2244,9 +2376,11 @@ std::vector<double> calculateAbsorbedFlux(
     const std::shared_ptr<ptm::SpatialMap>& albedo_map,
     const std::shared_ptr<Mesh>& mesh,
     double default_visible_albedo,
-    double default_ir_albedo,
     const thermal::Config& config,
-    const thermal::Planet* planet = nullptr,  // Optional planet for incidence-dependent albedo
+    // Required: supplies BOTH the angular albedo model and, by Kirchhoff, the
+    // infrared absorptivity. Defaulted to nullptr only for source compatibility;
+    // build() refuses on a null Planet rather than substituting an albedo.
+    const thermal::Planet* planet = nullptr,
     double solar_constant = 0.0) {            // Solar constant for computing incidence angle
 
     // Derive time_steps if the provided value doesnâ€™t match array sizes
@@ -2296,7 +2430,7 @@ std::vector<double> calculateAbsorbedFlux(
 
     AbsorbedFluxComposer composer;
     if (!composer.build(albedo_map, mesh, num_faces, default_visible_albedo,
-                        default_ir_albedo, config, planet, solar_constant)) {
+                        config, planet, solar_constant, "cpu_array")) {
         return std::vector<double>();
     }
 
@@ -3139,7 +3273,6 @@ bool runThermalModelsForAllFacesStreamed(
     int total_time_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     int thermal_threads,
     FluxFn get_direct,
     FluxFn get_reflected,
@@ -3177,7 +3310,7 @@ bool runThermalModelsForAllFacesStreamed(
                  "(per-face spatial + incidence-angle albedo)..." << std::endl;
     AbsorbedFluxComposer composer;
     if (!composer.build(streamed_albedo_map, mesh, n_faces, default_visible_albedo,
-                        ir_albedo, config, planet, planet ? planet->S : 0.0)) {
+                        config, planet, planet ? planet->S : 0.0, "cpu_streamed")) {
         std::cerr << "[Streamed] Absorbed-flux composition could not be built -- "
                      "refusing to run against an unresolved albedo.\n";
         return false;
@@ -3334,7 +3467,6 @@ bool runThermalModelsForAllFaces(
     int time_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
@@ -3369,9 +3501,6 @@ bool runThermalModelsForAllFaces(
         }
     }
     
-    // Use illumination model's albedo instead of constants::BODY_ALBEDO
-    //double visible_albedo = illumination_model->getAlbedo();
-    ir_albedo = DEFAULT_IR_ALBEDO;
 
     // Calculate total absorbed flux at each face and time
     // Pass planet for incidence-dependent albedo if available
@@ -3384,9 +3513,8 @@ bool runThermalModelsForAllFaces(
         albedo_map,
         mesh,
         default_visible_albedo,
-        ir_albedo,
         config,
-        planet,                         // Pass planet for incidence-dependent albedo
+        planet,                         // angular albedo model + IR absorptivity
         solar_constant);
     
     size_t n_faces = mesh->faces.size();
@@ -3784,7 +3912,10 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         thermal::EqSeedInput in;
         in.mean_absorbed_flux = avg_flux;
         in.Qb                 = qb_f;
-        in.emissivity         = pl.emissivity;
+        // Kirchhoff: the eps that balances <F_abs> at the surface must be the
+        // eps that absorbed it. Same single definition as every flux site, so
+        // the seed anchor cannot drift from the forcing it is anchoring to.
+        in.emissivity         = thermalIrEmissivity(pl);
         in.mean_inst_radeq_T  = sum_inst_T;   // report-only
         // The OpenCL kernels carry this value as a literal (they cannot include
         // a C++ header); keeping the host seed on the same constant is what
@@ -3821,7 +3952,6 @@ bool runThermalModelsForAllFacesBatchSoA(
     int time_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
     int equilibration_steps,
     int total_time_steps,
@@ -3872,7 +4002,6 @@ bool runThermalModelsForAllFacesBatchSoA(
         batch_albedo_map,
         mesh,
         default_visible_albedo,
-        ir_albedo,
         config,
         &planet,
         planet.S);
@@ -4264,6 +4393,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                     thermal::EqSeedInput sin_;
                     sin_.mean_absorbed_flux = flux_for_seed;
                     sin_.Qb                 = qb_for_seed;
+                    // Per-face emissivity array, filled from planet.emissivity
+                    // (thermal_model.cpp) -- i.e. thermalIrEmissivity() by another
+                    // route, and already the value the flux was absorbed with.
                     sin_.emissivity         = batch.emissivity[f];
                     sin_.sigma              = batch.sigma_sb;
                     sin_.z                  = batch.z;
@@ -5729,7 +5861,6 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int equilibration_steps,
     const thermal::Config& config,
     double default_visible_albedo,
-    double ir_albedo,
     std::vector<std::vector<double>>* surface_temps_out,
     const std::vector<double>* face_Qb,
     const std::vector<double>* face_H_overrides,
@@ -5767,6 +5898,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
     applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+    // Kirchhoff (G1): this path rebuilds its own Planet, so record the infrared
+    // absorptivity it will actually use instead of assuming it matches the
+    // main-scope one. reportKirchhoffConsistency() compares the whole set.
+    recordIrAbsorptivity("gpu_persistent", thermalIrEmissivity(planet));
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -6423,7 +6558,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // this expression has to stay byte-identical to the pre-refactor
             // GPU path under thermal.spinup_seed: legacy.
             return (1.0 - albedo) * direct + (1.0 - albedo) * reflected
-                 + planet.emissivity * ir;
+                 + thermalIrEmissivity(planet) * ir;
         };
 
         // Initial subsurface temperature seed.
@@ -6480,7 +6615,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + thermalIrEmissivity(planet) * ir;
                 }
                 avg_flux /= n_samples;
 
@@ -7107,7 +7242,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // this expression has to stay byte-identical to the pre-refactor
             // GPU path under thermal.spinup_seed: legacy.
             return (1.0 - albedo) * direct + (1.0 - albedo) * reflected
-                 + planet.emissivity * ir;
+                 + thermalIrEmissivity(planet) * ir;
         };
 
         // Initial subsurface temperature seed. Under thermal.spinup_seed:
@@ -7153,8 +7288,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
                     double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
                     double ir = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
-                    // Absorbed flux = (1-albedo)*direct + (1-albedo)*reflected + (1-ir_albedo)*ir
-                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + planet.emissivity * ir;
+                    // Absorbed flux = (1-albedo)*(direct+reflected) + eps*ir
+                    // (Kirchhoff: the infrared absorptivity IS the emissivity)
+                    avg_flux += (1.0 - albedo) * direct + (1.0 - albedo) * reflected + thermalIrEmissivity(planet) * ir;
                 }
                 avg_flux /= n_samples;
 
@@ -7713,6 +7849,10 @@ bool runThermalForSelectedFaces_GPU(
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
     applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+    // Kirchhoff (G1): this path rebuilds its own Planet, so record the infrared
+    // absorptivity it will actually use instead of assuming it matches the
+    // main-scope one. reportKirchhoffConsistency() compares the whole set.
+    recordIrAbsorptivity("gpu_rethermal", thermalIrEmissivity(planet));
     thermal::Profile reference_profile(planet, 0.0, config, false);
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
@@ -7982,7 +8122,7 @@ bool runThermalForSelectedFaces_GPU(
                         : base_A;
                     double absorbed = (1.0 - albedo) * direct
                                     + (1.0 - albedo) * reflected
-                                    + planet.emissivity * ir;
+                                    + thermalIrEmissivity(planet) * ir;
                     const auto& irow = indirect_flux_series[global_f];
                     const int oidx = equilibration_steps + map_out;
                     if (oidx < static_cast<int>(irow.size())) absorbed += irow[oidx];
@@ -8041,7 +8181,7 @@ bool runThermalForSelectedFaces_GPU(
 
                 double absorbed = (1.0 - albedo) * direct
                                 + (1.0 - albedo) * reflected
-                                + planet.emissivity * ir;
+                                + thermalIrEmissivity(planet) * ir;
                 if (!indirect_flux_series.empty()
                     && static_cast<size_t>(global_f) < indirect_flux_series.size()
                     && (t_offset + t) < static_cast<int>(indirect_flux_series[global_f].size())) {
@@ -14845,7 +14985,7 @@ int main(int argc, char** argv) {
                 }
                 const bool ok = runThermalModelsForAllFaces_GPU_Persistent(
                     mesh, ds, pr, pi, times, total_time_steps, eq_steps_eff,
-                    thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                    thermal_config, default_visible_albedo, &surface_temps,
                     face_Qb_ptr, face_H_ptr_l, ice_acc_l,
                     sim_config.thermal.initial_state_file,
                     sim_config.thermal.final_state_file,
@@ -14865,7 +15005,7 @@ int main(int argc, char** argv) {
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 return runThermalModelsForAllFacesBatchSoA(
                     output_dir, mesh, ds, pr, pi, times, total_time_steps,
-                    thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                    thermal_config, default_visible_albedo, &surface_temps,
                     equilibration_steps, total_time_steps, thermal_threads,
                     face_Qb_ptr, face_H_ptr_l, eqi);
             }
@@ -14873,7 +15013,7 @@ int main(int argc, char** argv) {
                       << " threads" << std::endl;
             return runThermalModelsForAllFaces(
                 output_dir, mesh, ds, pr, pi, times, total_time_steps,
-                thermal_config, default_visible_albedo, 0.02, &surface_temps,
+                thermal_config, default_visible_albedo, &surface_temps,
                 equilibration_steps, total_time_steps, thermal_threads,
                 &planet, face_Qb_ptr, eqi);
         };
@@ -15016,7 +15156,6 @@ int main(int argc, char** argv) {
                 total_time_steps,
                 thermal_config,
                 default_visible_albedo,
-                /*ir_albedo*/0.02,
                 thermal_threads,
                 get_direct,
                 get_reflected,
@@ -15408,6 +15547,11 @@ int main(int argc, char** argv) {
             } else {
                 std::cout << "Faces requiring radiation exchange: " << rad_manager.numExchangeFaces()
                           << " / " << num_faces << std::endl;
+
+                // Kirchhoff (G1): capture what the radiosity solver will actually
+                // scatter 1-eps with, AFTER any PTM_RAD_EMISSIVITY override, while
+                // the manager is still in scope.
+                g_radiosity_eps_snapshot = rad_manager.operativeEmissivity();
 
                 // Save view factors if computed (not loaded)
                 // Note: Check getHMatrixViewFactors() directly since H-matrix may have been
@@ -16454,7 +16598,7 @@ int main(int argc, char** argv) {
                                     : base_A;
                                 combined_flux[idx][t] = (1.0 - albedo) * direct
                                                       + (1.0 - albedo) * reflected
-                                                      + planet.emissivity * ir
+                                                      + thermalIrEmissivity(planet) * ir
                                                       + indirect_flux_series[f][t];
                             }
                         }
@@ -17510,6 +17654,14 @@ int main(int argc, char** argv) {
         if (run_thermal_mesh) {
             writeEffectiveAlbedo(output_dir);
             reportSourceAlbedoConsistency();
+            // Gate G1: absorb == emit == scatter. planet.emissivity is what
+            // thermal_model.cpp copies into the surface BC, so it is the emission
+            // side by construction; the absorption sites and the radiosity are read
+            // back from what they actually used.
+            if (!reportKirchhoffConsistency(planet.emissivity,
+                                            &g_radiosity_eps_snapshot)) {
+                return 1;
+            }
         }
 
         // Schorghofer & Taylor (2007) ice-stability output. Computed only
