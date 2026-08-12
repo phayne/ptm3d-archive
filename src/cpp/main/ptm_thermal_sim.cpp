@@ -2466,6 +2466,65 @@ std::vector<double> calculateAbsorbedFlux(
 
     return absorbed_flux;
 }
+// ---------------------------------------------------------------------------
+// SEED-ANCHOR CENSUS. Every face's anchor either ran or fell back, and the
+// reason is a per-face enum. Nothing about a run is allowed to be silent, so
+// the counts AND the quadrature the anchor was built from are printed once per
+// solver path. The quadrature matters: on a shadow-edge face, n_samples/cycle
+// bounds the accuracy of the anchor from the input side, and an accuracy claim
+// without it means nothing there.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kNAnchorStatus = 14;
+struct SeedAnchorCensus {
+    std::atomic<long long> n[kNAnchorStatus];
+    std::atomic<int>       samples{0};
+    // The span/cycle come OUT OF THE RESULT, not from a caller-side
+    // recomputation: they must be the pair the anchor was actually given.
+    std::atomic<double>    span_s{0.0};
+    std::atomic<double>    cycle_s{0.0};
+    SeedAnchorCensus() { for (auto& c : n) c.store(0); }
+    void add(const thermal::EqSeedResult& r) {
+        const int i = static_cast<int>(r.anchor_status);
+        if (i >= 0 && i < kNAnchorStatus) ++n[i];
+        if (r.n_samples > 0) samples.store(r.n_samples);
+        if (r.span_s  > 0.0) span_s.store(r.span_s);
+        if (r.cycle_s > 0.0) cycle_s.store(r.cycle_s);
+    }
+    void report(const char* path) const {
+        long long tot = 0;
+        for (const auto& c : n) tot += c.load();
+        if (tot == 0) return;
+        std::cout << "[eq-seed] surface-anchor census (" << path << "): ";
+        bool first = true;
+        for (int i = 0; i < kNAnchorStatus; ++i) {
+            const long long v = n[i].load();
+            if (!v) continue;
+            if (!first) std::cout << ", ";
+            first = false;
+            std::cout << thermal::eqSeedAnchorStatusName(
+                             static_cast<thermal::EqSeedAnchorStatus>(i))
+                      << " " << v;
+        }
+        const int    ns = samples.load();
+        const double sp = span_s.load(), cy = cycle_s.load();
+        // Explicit formatting, restored afterwards. main() leaves std::cout in
+        // fixed/precision(2) for its banner, and inheriting that made this line
+        // print "2.0 diurnal cycles" on one path and "2.00849" on another for
+        // the SAME number -- a quadrature disclosure whose digits depend on
+        // ambient stream state is not a disclosure.
+        std::ostringstream q;
+        q.setf(std::ios::fixed);
+        q << std::setprecision(4) << "  [quadrature: " << ns
+          << " forcing samples over " << (cy > 0.0 ? sp / cy : 0.0)
+          << " diurnal cycles = " << (cy > 0.0 && ns > 0 ? ns * cy / sp : 0.0)
+          << " samples/cycle; span " << std::setprecision(1) << sp
+          << " s, cycle " << cy << " s]";
+        std::cout << q.str() << std::endl;
+    }
+};
+}  // namespace
+
 
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
@@ -2480,7 +2539,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     // nothing. `seed_flags` accumulates {floor_hits, above_500K_hits}.
     long long seed_record_face = -1,
     std::atomic<size_t>* seed_floor_faces = nullptr,
-    std::atomic<size_t>* seed_hot_faces   = nullptr) {
+    std::atomic<size_t>* seed_hot_faces   = nullptr,
+    SeedAnchorCensus*    anchor_census    = nullptr) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -2546,6 +2606,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
         if (model.seed_applied) {
             if (model.seed_result.clamped_low && seed_floor_faces) ++(*seed_floor_faces);
             if (model.seed_result.above_500K  && seed_hot_faces)   ++(*seed_hot_faces);
+            if (anchor_census) anchor_census->add(model.seed_result);
             if (seed_record_face >= 0) {
                 thermal::EqSeedInput rec;
                 rec.mean_absorbed_flux = model.seed_mean_flux;
@@ -3358,6 +3419,7 @@ bool runThermalModelsForAllFacesStreamed(
     // runThermalModelWithMatchedTimes.
     std::atomic<size_t> seed_floor_faces{0};
     std::atomic<size_t> seed_hot_faces{0};
+    SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
@@ -3416,7 +3478,7 @@ bool runThermalModelsForAllFacesStreamed(
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
-                &seed_floor_faces, &seed_hot_faces);
+                &seed_floor_faces, &seed_hot_faces, &anchor_census);
 
             if (surface_temps_out) {
                 (*surface_temps_out)[f].swap(temps);
@@ -3446,6 +3508,7 @@ bool runThermalModelsForAllFacesStreamed(
                   << n_faces << " faces seed above " << thermal::MAX_PHYSICAL_TEMP_K
                   << " K, the CPU solver's hard clamp.\n";
     }
+    anchor_census.report("cpu-streamed");
     thermal::EqSeedRecorder::instance().write("cpu-streamed");
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -3553,6 +3616,7 @@ bool runThermalModelsForAllFaces(
     // forcing on top. Both are gone under spinup_seed: physical.
     std::atomic<size_t> seed_floor_faces{0};
     std::atomic<size_t> seed_hot_faces{0};
+    SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
@@ -3663,7 +3727,8 @@ bool runThermalModelsForAllFaces(
                     face_H,
                     static_cast<long long>(f),
                     &seed_floor_faces,
-                    &seed_hot_faces
+                    &seed_hot_faces,
+                    &anchor_census
                 );
 
                 // Store results locally in the chunk
@@ -3769,6 +3834,7 @@ bool runThermalModelsForAllFaces(
                   << thermal::MAX_PHYSICAL_TEMP_K << " K, the CPU solver's hard "
                      "clamp; the solution WILL be truncated there." << std::endl;
     }
+    anchor_census.report("cpu-scalar");
     thermal::EqSeedRecorder::instance().write("cpu-scalar");
 
     // Print timing information using cerr to match illumination code
@@ -3810,6 +3876,7 @@ static bool eqPerfaceFluxMode() {
     }();
     return mode;
 }
+
 
 // ---------------------------------------------------------------------------
 // SHARED SEED, GPU host side. Fills the persistent solver's initial-temperature
@@ -3861,6 +3928,17 @@ struct GpuSharedSeedContext {
     int    total_time_steps = 0;
     double R350             = 0.0;
     thermal::ConductivityModel cond = thermal::ConductivityModel::Hayne2017;
+    /// Lit-face seed anchor. `dt_s` and `cycle_s` are what turn the sample
+    /// index into a physical frequency for the variance match; without them
+    /// the anchor cannot run and says so (fallback-short-span).
+    thermal::EqSeedAnchor anchor = thermal::EqSeedAnchor::Lumped;
+    double dt_s               = 0.0;
+    double cycle_s            = 0.0;
+    bool   radiation_coupled  = false;
+    bool   refuse_two_timescale = false;
+    double cp0                = 0.0;
+    const std::vector<double>* cp_coeff = nullptr;
+    SeedAnchorCensus* census  = nullptr;
 };
 
 static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
@@ -3868,6 +3946,7 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                               size_t& floor_faces, size_t& hot_faces) {
     std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
                         rho_col(c.n_layers), T_col(c.n_layers);
+    std::vector<double> series;
     for (size_t i = 0; i < c.n_layers; ++i) z_col[i] = c.z[i];
     const thermal::Planet& pl = *c.planet;
     const bool use_per_face_H = (c.face_H_overrides != nullptr) &&
@@ -3883,8 +3962,12 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                                 ? (*c.face_Qb)[global_f] : pl.Qb;
         double avg_flux = 0.0, sum_inst_T = 0.0;
         const int n_samples = std::max(1, c.total_time_steps);
+        // The series is MATERIALIZED (not just accumulated) because the lit-face
+        // anchor needs this face's forcing SPECTRUM, not only its mean.
+        series.resize(static_cast<size_t>(n_samples));
         for (int t = 0; t < n_samples; ++t) {
             const double Ft = (*c.absorbed)(global_f, t);
+            series[t] = Ft;
             avg_flux += Ft;
             const double q = (Ft > 0.0 ? Ft : 0.0) + qb_f;
             sum_inst_T += (q > 0.0)
@@ -3929,9 +4012,24 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         in.R350               = c.R350;
         in.cond               = c.cond;
 
+        thermal::EqSeedForcing fc;
+        fc.flux              = series.data();
+        fc.n_samples         = n_samples;
+        fc.span_s            = c.dt_s * n_samples;
+        fc.cycle_s           = c.cycle_s;
+        fc.cp0               = c.cp0;
+        fc.cp_coeff          = (c.cp_coeff && !c.cp_coeff->empty())
+                                   ? c.cp_coeff->data() : nullptr;
+        fc.n_cp_coeff        = c.cp_coeff ? static_cast<int>(c.cp_coeff->size()) : 0;
+        fc.radiation_coupled = c.radiation_coupled;
+        fc.refuse_two_timescale = c.refuse_two_timescale;
+        in.anchor            = c.anchor;
+        in.forcing           = &fc;
+
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
         if (res.clamped_low) ++floor_faces;
         if (res.above_500K)  ++hot_faces;
+        if (c.census) c.census->add(res);
         thermal::EqSeedRecorder::instance().record(global_f, in, res);
 
         for (size_t layer = 0; layer < c.n_layers; ++layer)
@@ -4095,6 +4193,9 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     const thermal::EqSeedMode seed_mode = config.spinup_seed;
     thermal::EqSeedRecorder::instance().reserve(n_faces);
+    SeedAnchorCensus simd_anchor_census;
+    const double seed_dt_s = (total_time_steps > 1 && times.size() > 1)
+                                 ? (times[1] - times[0]) : planet.day;
 
     // State the seed every run, and warn if a caller set a toggle we are not
     // going to honor. PTM_EQ_PERFACE_FLUX used to gate the GPU path ONLY, so a
@@ -4391,7 +4492,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                         kc_col[layer]  = batch.kc [layer * BS + f];
                         rho_col[layer] = batch.rho[layer * BS + f];
                     }
+                    thermal::EqSeedForcing sfc_;
+                    sfc_.flux       = &flux_column_major[global_f];
+                    sfc_.stride     = static_cast<size_t>(n_faces);
+                    sfc_.n_samples  = flux_avg_window;
+                    sfc_.span_s     = seed_dt_s * flux_avg_window;
+                    sfc_.cycle_s    = planet.day;
+                    sfc_.cp0        = planet.cp0;
+                    sfc_.cp_coeff   = planet.cpCoeff.empty()
+                                          ? nullptr : planet.cpCoeff.data();
+                    sfc_.n_cp_coeff = static_cast<int>(planet.cpCoeff.size());
+                    sfc_.radiation_coupled = config.seed_forcing_radiation_coupled;
+                    sfc_.refuse_two_timescale =
+                        config.seed_anchor_refuse_two_timescale;
+
                     thermal::EqSeedInput sin_;
+                    sin_.anchor  = config.seed_anchor;
+                    sin_.forcing = &sfc_;
                     sin_.mean_absorbed_flux = flux_for_seed;
                     sin_.Qb                 = qb_for_seed;
                     // Per-face emissivity array, filled from planet.emissivity
@@ -4410,6 +4527,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                         thermal::eqSeedColumn(sin_, T_col);
                     if (sres.clamped_low) ++seed_floor_faces;
                     if (sres.above_500K)  ++seed_hot_faces;
+                    simd_anchor_census.add(sres);
                     thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
 
                     batch.T_eq_init[f] = sres.T_surface;
@@ -4805,6 +4923,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "those faces are not trustworthy."
                   << std::endl;
     }
+    simd_anchor_census.report("cpu-simd-batch");
     thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
 
     // End timing
@@ -5909,6 +6028,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Shared-seed guards, reported after the batch loop (never silent).
     size_t gpu_seed_floor_faces = 0, gpu_seed_hot_faces = 0;
+    SeedAnchorCensus gpu_anchor_census;
+    const double gpu_seed_dt_s =
+        (total_time_steps > 1 && times.size() > 1) ? (times[1] - times[0])
+                                                   : planet.day;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(mesh->faces.size());
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
@@ -6595,6 +6718,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.total_time_steps = total_time_steps;
             sc.R350 = R350_val;
             sc.cond = config.conductivity_model;
+            sc.anchor = config.seed_anchor;
+            sc.dt_s = gpu_seed_dt_s;
+            sc.cycle_s = planet.day;
+            sc.radiation_coupled = config.seed_forcing_radiation_coupled;
+            sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
+            sc.cp0 = planet.cp0;
+            sc.cp_coeff = &planet.cpCoeff;
+            sc.census = &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
@@ -7266,6 +7397,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.total_time_steps = total_time_steps;
             sc.R350 = R350_val;
             sc.cond = config.conductivity_model;
+            sc.anchor = config.seed_anchor;
+            sc.dt_s = gpu_seed_dt_s;
+            sc.cycle_s = planet.day;
+            sc.radiation_coupled = config.seed_forcing_radiation_coupled;
+            sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
+            sc.cp0 = planet.cp0;
+            sc.cp_coeff = &planet.cpCoeff;
+            sc.census = &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
@@ -7799,6 +7938,7 @@ post_batch_loop:
                   << " K, the CPU solver's hard clamp. The seed is physical; a "
                      "CPU run of the same case would be truncated there.\n";
     }
+    gpu_anchor_census.report("gpu-persistent");
     thermal::EqSeedRecorder::instance().write("gpu-persistent");
 
     return true;
@@ -13791,6 +13931,31 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // ---- Seed ANCHOR, resolved ONCE for every solver path -------------------
+    // Precedence: PTM_SEED_ANCHOR env > thermal.seed_anchor > "lumped".
+    // Unparseable is FATAL for the same reason the mode is: the anchor is
+    // worth +45 K on the lit population, so a typo must not pick one for you.
+    thermal::EqSeedAnchor resolved_seed_anchor = thermal::EqSeedAnchor::Lumped;
+    {
+        std::string a_str = sim_config.thermal.seed_anchor;
+        std::string a_src = "thermal.seed_anchor";
+        if (const char* e = std::getenv("PTM_SEED_ANCHOR")) {
+            if (*e != '\0') {
+                if (a_str != std::string(e)) {
+                    std::cerr << "[eq-seed] PTM_SEED_ANCHOR=" << e
+                              << " overrides thermal.seed_anchor: " << a_str
+                              << std::endl;
+                }
+                a_str = e;
+                a_src = "PTM_SEED_ANCHOR";
+            }
+        }
+        if (!thermal::parseEqSeedAnchor(a_str, resolved_seed_anchor)) {
+            std::cerr << "FATAL: unknown " << a_src << " '" << a_str
+                      << "'. Valid: lumped | warm.\n";
+            return 1;
+        }
+    }
     double resolved_analytic_cycles_cfg = sim_config.thermal.analytic_seed_cycles;
     if (const char* e = std::getenv("PTM_ANALYTIC_SEED_CYCLES")) {
         if (*e != '\0') {
@@ -13812,6 +13977,10 @@ int main(int argc, char** argv) {
         resolved_seed_mode, resolved_analytic_cycles_cfg,
         planet.day, planet.year, kCpuAnalyticSeedYears);
     config.spinup_seed          = resolved_seed_mode;
+    config.seed_anchor          = resolved_seed_anchor;
+    config.seed_forcing_radiation_coupled = sim_config.radiation.enabled;
+    config.seed_anchor_refuse_two_timescale =
+        sim_config.thermal.seed_anchor_refuse_two_timescale;
     config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
 
     // Log the calculation for verification
@@ -13833,6 +14002,15 @@ int main(int argc, char** argv) {
               << (eq_passes_effective != eq_passes_requested
                       ? ", downgraded to 1 pass on this CPU path" : "")
               << "]" << std::endl;
+    std::cout << "Seed surface anchor: "
+              << thermal::eqSeedAnchorName(resolved_seed_anchor)
+              << (resolved_seed_anchor == thermal::EqSeedAnchor::Lumped
+                      ? "  (cycle-mean lumped-substrate anchor; the run's"
+                        " per-face census and its QUADRATURE are printed by"
+                        " the solver)"
+                      : "  (fourth-moment T_w only -- the pre-2026-08-12"
+                        " anchor)")
+              << std::endl;
     std::cout << "Spin-up seed: " << thermal::eqSeedModeName(resolved_seed_mode)
               << (resolved_seed_mode == thermal::EqSeedMode::Physical
                       ? "  (shared per-face conductive steady profile, identical"
@@ -14468,6 +14646,10 @@ int main(int argc, char** argv) {
         // config.sigma, so it now shares the single constant above -- which is
         // what drives the CPU-scalar-vs-SIMD seed residual to zero.
         thermal_config.spinup_seed          = resolved_seed_mode;
+        thermal_config.seed_anchor          = resolved_seed_anchor;
+        thermal_config.seed_forcing_radiation_coupled = sim_config.radiation.enabled;
+        thermal_config.seed_anchor_refuse_two_timescale =
+            sim_config.thermal.seed_anchor_refuse_two_timescale;
         thermal_config.analytic_seed_cycles = resolved_analytic_cycles_cfg;
         thermal_config.chi = (chi_override >= 0) ? chi_override : 2.7;  // Hayne et al. (2017) default
 

@@ -388,6 +388,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.eq_indirect_source     = getWithDefault(thermal, "eq_indirect_source",     config.thermal.eq_indirect_source);
             config.thermal.spinup_seed            = getWithDefault(thermal, "spinup_seed",            config.thermal.spinup_seed);
+            config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
+            config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
@@ -775,6 +777,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
         out << YAML::Key << "equilibration_target_K" << YAML::Value << config.thermal.equilibration_target_K;
         out << YAML::Key << "spinup_seed" << YAML::Value << config.thermal.spinup_seed;
+        out << YAML::Key << "seed_anchor" << YAML::Value << config.thermal.seed_anchor;
+        out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
         // (-1 = follow spinup_seed). Writing -1 into every template would make
         // an off-by-default forcing look like a live knob.
@@ -1230,6 +1234,13 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         if (!thermal::parseEqSeedMode(config.thermal.spinup_seed, dummy)) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
+                      << std::endl;
+            valid = false;
+        }
+        thermal::EqSeedAnchor dummy_anchor;
+        if (!thermal::parseEqSeedAnchor(config.thermal.seed_anchor, dummy_anchor)) {
+            std::cerr << "Error: thermal.seed_anchor must be 'lumped' or "
+                         "'warm'; got '" << config.thermal.seed_anchor << "'"
                       << std::endl;
             valid = false;
         }
