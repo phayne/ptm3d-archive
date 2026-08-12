@@ -70,13 +70,8 @@ def main(argv: list[str]) -> int:
             print(f"    sigma      (B-A): {stats(b - a)}")
             print(f"    surface BC (C-B): {stats(c - b)}")
             print(f"    total      (C-A): {stats(c - a)}")
-            ident_ba = np.array_equal(
-                (arms["B"] / body / "statistics" / f"{field}.bin").read_bytes(),
-                (arms["A"] / body / "statistics" / f"{field}.bin").read_bytes())
-            ident_cb = np.array_equal(
-                (arms["C"] / body / "statistics" / f"{field}.bin").read_bytes(),
-                (arms["B"] / body / "statistics" / f"{field}.bin").read_bytes())
-            print(f"    byte-identical?  B==A {ident_ba}   C==B {ident_cb}")
+            print(f"    byte-identical?  B==A {not (b - a).any()}   "
+                  f"C==B {not (c - b).any()}")
     return 0
 
 
