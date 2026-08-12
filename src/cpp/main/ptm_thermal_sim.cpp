@@ -3708,10 +3708,16 @@ struct GpuSharedSeedContext {
     const thermal::Planet* planet = nullptr;
     const double* z               = nullptr;   // reference grid, n_layers nodes
     size_t n_layers               = 0;
-    const float* kc               = nullptr;   // [layer * batch_n + f]
-    const float* rho              = nullptr;   // [layer * batch_n + f]
-    const float* emissivity       = nullptr;   // [f]
-    const float* Qb               = nullptr;   // [f]
+    // Material properties are taken in DOUBLE from the reference profile, not
+    // read back out of the float32 upload buffers. Reading the float32 copies
+    // would make the GPU seed differ from the CPU seed by the rounding of kc
+    // and rho -- i.e. it would break gate G1 for no reason. The final T is
+    // cast to float32 once, which is the GPU's storage precision and is the
+    // only remaining CPU/GPU difference in the initial condition.
+    const double* kc_ref          = nullptr;   // reference profile kc(z)
+    const double* rho_ref         = nullptr;   // reference profile rho(z)
+    const std::vector<double>* face_H_overrides = nullptr;  // may be null/empty
+    const std::vector<double>* face_Qb          = nullptr;  // may be null
     size_t batch_start            = 0;
     size_t batch_n                = 0;
     const std::vector<double>* direct       = nullptr;   // [global_f * T + t]
@@ -3729,6 +3735,9 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
     std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
                         rho_col(c.n_layers), T_col(c.n_layers);
     for (size_t i = 0; i < c.n_layers; ++i) z_col[i] = c.z[i];
+    const thermal::Planet& pl = *c.planet;
+    const bool use_per_face_H = (c.face_H_overrides != nullptr) &&
+                                !c.face_H_overrides->empty();
 
     for (size_t f = 0; f < c.batch_n; ++f) {
         const size_t global_f = c.batch_start + f;
@@ -3742,20 +3751,31 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
             const double d  = (idx < c.direct->size())    ? (*c.direct)[idx]    : 0.0;
             const double r  = (idx < c.reflected->size()) ? (*c.reflected)[idx] : 0.0;
             const double ir = (idx < c.ir->size())        ? (*c.ir)[idx]        : 0.0;
-            avg_flux += (1.0 - albedo) * (d + r) + c.planet->emissivity * ir;
+            avg_flux += (1.0 - albedo) * (d + r) + pl.emissivity * ir;
         }
         avg_flux /= n_samples;
 
-        for (size_t layer = 0; layer < c.n_layers; ++layer) {
-            const size_t idx = layer * c.batch_n + f;
-            kc_col[layer]  = c.kc[idx];
-            rho_col[layer] = c.rho[idx];
+        // Same expression as the float32 upload loop above, in double.
+        if (use_per_face_H) {
+            const double H_face = (global_f < c.face_H_overrides->size())
+                                ? (*c.face_H_overrides)[global_f] : pl.H;
+            for (size_t layer = 0; layer < c.n_layers; ++layer) {
+                const double df = std::exp(-z_col[layer] / H_face);
+                rho_col[layer] = pl.rhod + (pl.rhos - pl.rhod) * df;
+                kc_col[layer]  = pl.kd   + (pl.ks   - pl.kd  ) * df;
+            }
+        } else {
+            for (size_t layer = 0; layer < c.n_layers; ++layer) {
+                kc_col[layer]  = c.kc_ref[layer];
+                rho_col[layer] = c.rho_ref[layer];
+            }
         }
 
         thermal::EqSeedInput in;
         in.mean_absorbed_flux = avg_flux;
-        in.Qb                 = c.Qb[f];
-        in.emissivity         = c.emissivity[f];
+        in.Qb                 = (c.face_Qb && global_f < c.face_Qb->size())
+                                    ? (*c.face_Qb)[global_f] : pl.Qb;
+        in.emissivity         = pl.emissivity;
         // The OpenCL kernels carry this value as a literal (they cannot include
         // a C++ header); keeping the host seed on the same constant is what
         // makes gate G1 exact between the CPU and GPU paths.
@@ -6361,10 +6381,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.planet = &planet;
             sc.z = z_grid.data();
             sc.n_layers = n_layers;
-            sc.kc = kc_batch.data();
-            sc.rho = rho_batch.data();
-            sc.emissivity = emissivity_batch.data();
-            sc.Qb = Qb_batch.data();
+            sc.kc_ref = kc_ref.data();
+            sc.rho_ref = rho_ref.data();
+            sc.face_H_overrides = face_H_overrides;
+            sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
             sc.batch_n = batch_n;
             sc.direct = &direct_solar_values;
@@ -7014,10 +7034,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.planet = &planet;
             sc.z = z_grid.data();
             sc.n_layers = n_layers;
-            sc.kc = kc_batch.data();
-            sc.rho = rho_batch.data();
-            sc.emissivity = emissivity_batch.data();
-            sc.Qb = Qb_batch.data();
+            sc.kc_ref = kc_ref.data();
+            sc.rho_ref = rho_ref.data();
+            sc.face_H_overrides = face_H_overrides;
+            sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
             sc.batch_n = batch_n;
             sc.direct = &direct_solar_values;
