@@ -1394,6 +1394,10 @@ void writeHeartbeat(const std::string& msg) {
 }  // namespace
 
 using FluxFn = std::function<double(size_t,int)>;
+// No default arguments: `planet` (the angular albedo model) and
+// `eq_indirect_flux` are exactly the two inputs this path used to drop on the
+// floor, and a defaulted-away argument is how they went missing in the first
+// place. The single caller passes all of them explicitly.
 bool runThermalModelsForAllFacesStreamed(
     const std::shared_ptr<Mesh>& mesh,
     const std::vector<double>& times,
@@ -1406,13 +1410,11 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_reflected,
     FluxFn get_ir,
     std::vector<std::vector<double>>* surface_temps_out,
-    const std::vector<double>* face_Qb = nullptr,
-    const std::vector<double>* face_H_overrides = nullptr);
-
-std::vector<double> computeFaceAlbedos(
-    const std::shared_ptr<Mesh>& mesh,
-    std::shared_ptr<ptm::SpatialMap> albedo_map,
-    double default_visible_albedo);
+    const std::vector<double>* face_Qb,
+    const std::vector<double>* face_H_overrides,
+    const thermal::Planet* planet,
+    int equilibration_steps,
+    const std::vector<double>& eq_indirect_flux);
 
 void fixOutOfRangeAlbedos(
     std::vector<double>& face_albedos,
@@ -1671,71 +1673,193 @@ std::vector<double> importAlbedoMapFromFile(const std::string& filename) {
     }
 }
 
-std::vector<double> calculateAbsorbedFlux(
-    const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values,
-    const std::vector<double>& primary_ir_values,
-    int time_steps,
+// ---------------------------------------------------------------------------
+// AbsorbedFluxComposer -- the ONE implementation of
+//     Q_abs(f,t) = (1 - A_vis(f,t)) * (F_direct + F_reflected) + (1 - A_ir) * F_ir
+// shared by every CPU thermal path.
+//
+// The recipe used to live only inside the array-shaped calculateAbsorbedFlux()
+// below, so the STREAMED path -- which exists precisely so that face x timestep
+// arrays are never materialized -- could not call it and carried an inline copy
+// built on a constant per-face albedo. That copy silently dropped the
+// incidence-angle albedo model (Hayne 2017 / Hapke A_h(i)), never published the
+// per-face effective-albedo statistic, and had nowhere to add a supplied
+// equilibration indirect flux. Splitting the routine in two removes the second
+// implementation WITHOUT giving up the memory bound streaming exists for:
+//   * build()    resolves the per-face albedo map and the angular model ONCE.
+//                O(faces) memory -- three double vectors, no time dimension.
+//   * absorbed() is the per-(face, timestep) kernel.
+// The array caller loops over absorbed(); the streamed caller feeds it one
+// (face, timestep) at a time straight from the chunked illumination store.
+//
+// THREADING: absorbed() accumulates the effective-albedo numerator/denominator
+// into PER-FACE slots without atomics, exactly as the original array loop did.
+// Every caller must therefore be parallel over FACES so that face f is touched
+// by one thread only. Both callers are.
+// ---------------------------------------------------------------------------
+class AbsorbedFluxComposer {
+public:
+    // Resolve the per-face albedo and the angular albedo model. Returns false,
+    // having said why, rather than silently substituting a uniform albedo.
+    bool build(const std::shared_ptr<ptm::SpatialMap>& albedo_map,
+               const std::shared_ptr<Mesh>& mesh,
+               size_t num_faces,
+               double default_visible_albedo,
+               double default_ir_albedo,
+               const thermal::Config& config,
+               const thermal::Planet* planet,
+               double solar_constant);
+
+    // The operative visible albedo for (face, ABSOLUTE timestep). Verbatim from
+    // the array loop this was extracted out of.
+    double visibleAlbedo(size_t f, int t, double direct_flux) const {
+        const double base_albedo = face_albedos_[f];
+        double visible_albedo = base_albedo;
+
+        // Compute incidence-dependent albedo if enabled and face is illuminated.
+        // PTM-28 Fix A: recover cos(theta) against the per-timestep
+        // instantaneous solar constant (falls back to the fixed value when
+        // the table is legacy).
+        if (use_incidence_albedo_ && direct_flux > 0.0) {
+            double cos_theta = direct_flux / solarConstForStep(t, solar_constant_);
+            cos_theta = std::min(1.0, std::max(0.0, cos_theta));
+            double incidence_angle = std::acos(cos_theta);
+
+            // Per-face albedo scaling (defect #2). When a per-face albedo map
+            // was actually loaded, compose the incidence albedo on THIS face's
+            // own A0 (base_albedo) -- Hapke via applyIncidenceAlbedo (the SAME
+            // function + per-face w the GPU flux path uses, so CPU==GPU on
+            // mapped faces), Hayne via the per-face getAlbedoWithIncidence
+            // overload (identical pow polynomial). With NO map loaded, every
+            // face has the uniform default albedo, so we take the EXACT prior
+            // lon/lat path -- byte-identical (paper/polar protection).
+            if (albedo_successfully_loaded_) {
+                if (use_hapke_albedo_) {
+                    visible_albedo = applyIncidenceAlbedo(
+                        base_albedo, direct_flux,
+                        solarConstForStep(t, solar_constant_),
+                        0.0, 0.0, /*use_hapke=*/true, hapkeWFromA0(base_albedo));
+                } else {
+                    visible_albedo = planet_->getAlbedoWithIncidence(
+                        base_albedo, incidence_angle);
+                }
+            } else {
+                visible_albedo = planet_->getAlbedoWithIncidence(
+                    mesh_->longitudes[f] * M_PI / 180.0,  // Convert to radians
+                    mesh_->latitudes[f] * M_PI / 180.0,
+                    incidence_angle);
+            }
+        }
+        return visible_albedo;
+    }
+
+    // The per-(face, timestep) kernel. `t` is the ABSOLUTE timestep index.
+    double absorbed(size_t f, int t, double direct_flux,
+                    double reflected_flux, double ir_flux) {
+        const double visible_albedo = visibleAlbedo(f, t, direct_flux);
+
+        // PTM-107(a): record the OPERATIVE albedo the BC just decided on, flux-
+        // weighted by the direct beam. Per-face accumulators under a loop that
+        // is parallel over FACES, so face f is touched by one thread only.
+        // C2: only over the INTEGRATION window (t is the ABSOLUTE step index --
+        // the table spans equilibration + output). Sweeping the equilibration
+        // block too made this file describe a different window from every other
+        // statistics/*.bin and injected an equilibration-length-dependent
+        // residual into any closure audit that used it.
+        if (direct_flux > 0.0 && aeffStepInWindow(t)) {
+            eff_alb_num_[f] += visible_albedo * direct_flux;
+            eff_alb_den_[f] += direct_flux;
+        }
+
+        // Apply appropriate albedo to each component
+        const double absorbed_direct    = direct_flux * (1.0 - visible_albedo);
+        const double absorbed_reflected = reflected_flux * (1.0 - visible_albedo);
+        const double absorbed_ir        = ir_flux * ir_emissivity_;
+
+        // Sum all components
+        return absorbed_direct + absorbed_reflected + absorbed_ir;
+    }
+
+    // PTM-107(a): publish the operative effective albedo for the statistics
+    // writer. Call once, after every face has been composed.
+    void publishEffectiveAlbedo() {
+        g_eff_albedo_num = std::move(eff_alb_num_);
+        g_eff_albedo_den = std::move(eff_alb_den_);
+        g_eff_albedo_valid = true;
+    }
+
+private:
+    const Mesh*            mesh_   = nullptr;
+    const thermal::Planet* planet_ = nullptr;
+    std::vector<double> face_albedos_;
+    std::vector<double> eff_alb_num_;
+    std::vector<double> eff_alb_den_;
+    double ir_emissivity_  = 1.0;
+    double solar_constant_ = 0.0;
+    bool use_incidence_albedo_       = false;
+    bool use_hapke_albedo_           = false;
+    bool albedo_successfully_loaded_ = false;
+};
+
+// The explicit thermophysical `albedo_map` FITS key is opened by the CALLER on
+// every path -- AbsorbedFluxComposer::build() consumes an already-loaded map, it
+// never opens that key itself. Shared by the CPU SIMD-batch and streamed callers
+// so the two cannot drift; `tag` is only the log prefix.
+// (runThermalModelsForAllFaces keeps its own copy, which additionally prints the
+// map's resolution/range/extent; it is left alone rather than have this helper
+// grow a verbosity flag for one caller.)
+static std::shared_ptr<ptm::SpatialMap> loadExplicitAlbedoMap(
+    const thermal::Config& config, const char* tag) {
+    std::shared_ptr<ptm::SpatialMap> map;
+    if (config.custom_properties.find("albedo_map") == config.custom_properties.end()) {
+        return map;
+    }
+    const std::string path = config.getProperty("albedo_map");
+    if (path.empty()) return map;
+    map = std::make_shared<ptm::SpatialMap>();
+    if (!map->loadFromFITS(path)) {
+        std::cout << tag << " Failed to load explicit albedo_map: " << path
+                  << " (" << map->getLastError() << ")" << std::endl;
+        map.reset();
+    }
+    return map;
+}
+
+bool AbsorbedFluxComposer::build(
     const std::shared_ptr<ptm::SpatialMap>& albedo_map,
     const std::shared_ptr<Mesh>& mesh,
+    size_t num_faces,
     double default_visible_albedo,
     double default_ir_albedo,
     const thermal::Config& config,
-    const thermal::Planet* planet = nullptr,  // Optional planet for incidence-dependent albedo
-    double solar_constant = 0.0) {            // Solar constant for computing incidence angle
-    
+    const thermal::Planet* planet,
+    double solar_constant) {
+
     // Calculate IR emissivity from IR albedo
-    double ir_emissivity = 1.0 - default_ir_albedo;
-    
-    // Derive time_steps if the provided value doesnâ€™t match array sizes
-    const size_t n_values = direct_solar_values.size();
-    const size_t face_count = mesh ? mesh->faces.size() : 0;
-    if (face_count > 0 && n_values % face_count == 0) {
-        int inferred_ts = static_cast<int>(n_values / face_count);
-        if (inferred_ts != time_steps) {
-            std::cout << "Warning: time_steps=" << time_steps
-                      << " mismatches illumination arrays (inferred=" << inferred_ts
-                      << "). Using inferred value." << std::endl;
-            time_steps = inferred_ts;
-        }
-    }
-    
-    // Validate input arrays have expected size
-    if (n_values == 0 || primary_reflected_values.size() != n_values || primary_ir_values.size() != n_values) {
-        std::cerr << "Error: Input arrays must have matching sizes in calculateAbsorbedFlux" << std::endl;
-        std::cerr << "direct_solar: " << direct_solar_values.size() 
-                  << ", primary_reflected: " << primary_reflected_values.size()
-                  << ", primary_ir: " << primary_ir_values.size() << std::endl;
-        return std::vector<double>(); // Return empty vector to signal error
-    }
-    
-    size_t num_faces = n_values / time_steps;
-    
-    // Validate face count makes sense
-    if (num_faces * time_steps != n_values) {
-        std::cerr << "Error: Input array size not divisible by time_steps in calculateAbsorbedFlux" << std::endl;
-        return std::vector<double>();
-    }
-    
+    ir_emissivity_  = 1.0 - default_ir_albedo;
+    planet_         = planet;
+    solar_constant_ = solar_constant;
+    mesh_           = mesh ? mesh.get() : nullptr;
+
     // Validate mesh has expected face count
-    if (mesh->faces.size() < num_faces) {
-        std::cerr << "Error: Mesh has fewer faces (" << mesh->faces.size() 
+    if (!mesh || mesh->faces.size() < num_faces) {
+        std::cerr << "Error: Mesh has fewer faces (" << (mesh ? mesh->faces.size() : 0)
                   << ") than expected (" << num_faces << ")" << std::endl;
-        return std::vector<double>();
+        return false;
     }
-    
+
     // Safety check: ensure latitude/longitude arrays are correctly sized
     if (mesh->latitudes.size() < num_faces || mesh->longitudes.size() < num_faces) {
         std::cerr << "Error: Mesh latitude/longitude arrays too small. "
-                  << "Expected: " << num_faces 
+                  << "Expected: " << num_faces
                   << ", Got: " << mesh->latitudes.size() << "/" << mesh->longitudes.size() << std::endl;
-        return std::vector<double>();
+        return false;
     }
-    
-    std::vector<double> absorbed_flux(n_values);
-    
-    // Pre-calculate albedo for each face
-    std::vector<double> face_albedos(num_faces);
+
+    // Pre-calculate albedo for each face. `face_albedos` is a reference so the
+    // resolution logic below is character-for-character what it always was.
+    face_albedos_.assign(num_faces, 0.0);
+    std::vector<double>& face_albedos = face_albedos_;
 
     // Check if we're using a custom mesh
     bool is_custom_mesh = false;
@@ -1814,7 +1938,7 @@ std::vector<double> calculateAbsorbedFlux(
             std::string body_name = config.getProperty("target_body_name");
             if (body_name.empty()) {
                 std::cerr << "ERROR: Target body name is not specified in config." << std::endl;
-                return std::vector<double>();
+                return false;
             }
 
             // Convert to proper case
@@ -2099,20 +2223,89 @@ std::vector<double> calculateAbsorbedFlux(
         }
     }
 
-    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized here
-    // (not in the parallel region) and published to the file-scope globals after the
-    // loop, so a run that calls calculateAbsorbedFlux more than once reports the
-    // LAST (operative) composition rather than a silent mixture.
-    std::vector<double> eff_alb_num(num_faces, 0.0);
-    std::vector<double> eff_alb_den(num_faces, 0.0);
+    use_hapke_albedo_           = use_hapke_albedo;
+    use_incidence_albedo_       = use_incidence_albedo;
+    albedo_successfully_loaded_ = albedo_successfully_loaded;
 
-    // Apply albedo to calculate absorbed flux for each face at each time step
+    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized
+    // here (never inside a parallel region) and published to the file-scope
+    // globals by publishEffectiveAlbedo(), so a run that composes flux more
+    // than once reports the LAST (operative) composition, not a silent mixture.
+    eff_alb_num_.assign(num_faces, 0.0);
+    eff_alb_den_.assign(num_faces, 0.0);
+    return true;
+}
+
+std::vector<double> calculateAbsorbedFlux(
+    const std::vector<double>& direct_solar_values,
+    const std::vector<double>& primary_reflected_values,
+    const std::vector<double>& primary_ir_values,
+    int time_steps,
+    const std::shared_ptr<ptm::SpatialMap>& albedo_map,
+    const std::shared_ptr<Mesh>& mesh,
+    double default_visible_albedo,
+    double default_ir_albedo,
+    const thermal::Config& config,
+    const thermal::Planet* planet = nullptr,  // Optional planet for incidence-dependent albedo
+    double solar_constant = 0.0) {            // Solar constant for computing incidence angle
+
+    // Derive time_steps if the provided value doesnâ€™t match array sizes
+    const size_t n_values = direct_solar_values.size();
+    const size_t face_count = mesh ? mesh->faces.size() : 0;
+    if (face_count > 0 && n_values % face_count == 0) {
+        int inferred_ts = static_cast<int>(n_values / face_count);
+        if (inferred_ts != time_steps) {
+            std::cout << "Warning: time_steps=" << time_steps
+                      << " mismatches illumination arrays (inferred=" << inferred_ts
+                      << "). Using inferred value." << std::endl;
+            time_steps = inferred_ts;
+        }
+    }
+    
+    // Validate input arrays have expected size
+    if (n_values == 0 || primary_reflected_values.size() != n_values || primary_ir_values.size() != n_values) {
+        std::cerr << "Error: Input arrays must have matching sizes in calculateAbsorbedFlux" << std::endl;
+        std::cerr << "direct_solar: " << direct_solar_values.size() 
+                  << ", primary_reflected: " << primary_reflected_values.size()
+                  << ", primary_ir: " << primary_ir_values.size() << std::endl;
+        return std::vector<double>(); // Return empty vector to signal error
+    }
+    
+    size_t num_faces = n_values / time_steps;
+    
+    // Validate face count makes sense
+    if (num_faces * time_steps != n_values) {
+        std::cerr << "Error: Input array size not divisible by time_steps in calculateAbsorbedFlux" << std::endl;
+        return std::vector<double>();
+    }
+    
+    // Validate mesh has expected face count
+    if (mesh->faces.size() < num_faces) {
+        std::cerr << "Error: Mesh has fewer faces (" << mesh->faces.size() 
+                  << ") than expected (" << num_faces << ")" << std::endl;
+        return std::vector<double>();
+    }
+    
+    // Safety check: ensure latitude/longitude arrays are correctly sized
+    if (mesh->latitudes.size() < num_faces || mesh->longitudes.size() < num_faces) {
+        std::cerr << "Error: Mesh latitude/longitude arrays too small. "
+                  << "Expected: " << num_faces 
+                  << ", Got: " << mesh->latitudes.size() << "/" << mesh->longitudes.size() << std::endl;
+        return std::vector<double>();
+    }
+
+    AbsorbedFluxComposer composer;
+    if (!composer.build(albedo_map, mesh, num_faces, default_visible_albedo,
+                        default_ir_albedo, config, planet, solar_constant)) {
+        return std::vector<double>();
+    }
+
+    std::vector<double> absorbed_flux(n_values);
+
+    // Apply albedo to calculate absorbed flux for each face at each time step.
+    // Parallel over FACES -- required by the composer's per-face accumulators.
     #pragma omp parallel for schedule(dynamic, 1000)
     for (size_t f = 0; f < num_faces; f++) {
-        double base_albedo = face_albedos[f];
-        double face_lat = mesh->latitudes[f];
-        double face_lon = mesh->longitudes[f];
-
         for (size_t t = 0; t < time_steps; t++) {
             size_t idx = f * time_steps + t;
 
@@ -2126,72 +2319,15 @@ std::vector<double> calculateAbsorbedFlux(
                 continue;
             }
 
-            double direct_flux = direct_solar_values[idx];
-            double visible_albedo = base_albedo;
-
-            // Compute incidence-dependent albedo if enabled and face is illuminated.
-            // PTM-28 Fix A: recover cos(theta) against the per-timestep
-            // instantaneous solar constant (falls back to the fixed value when
-            // the table is legacy).
-            if (use_incidence_albedo && direct_flux > 0.0) {
-                double cos_theta = direct_flux /
-                                   solarConstForStep(static_cast<int>(t), solar_constant);
-                cos_theta = std::min(1.0, std::max(0.0, cos_theta));
-                double incidence_angle = std::acos(cos_theta);
-
-                // Per-face albedo scaling (defect #2). When a per-face albedo map
-                // was actually loaded, compose the incidence albedo on THIS face's
-                // own A0 (base_albedo) — Hapke via applyIncidenceAlbedo (the SAME
-                // function + per-face w the GPU flux path uses, so CPU==GPU on
-                // mapped faces), Hayne via the per-face getAlbedoWithIncidence
-                // overload (identical pow polynomial). With NO map loaded, every
-                // face has the uniform default albedo, so we take the EXACT prior
-                // lon/lat path — byte-identical (paper/polar protection).
-                if (albedo_successfully_loaded) {
-                    if (use_hapke_albedo) {
-                        visible_albedo = applyIncidenceAlbedo(
-                            base_albedo, direct_flux,
-                            solarConstForStep(static_cast<int>(t), solar_constant),
-                            0.0, 0.0, /*use_hapke=*/true, hapkeWFromA0(base_albedo));
-                    } else {
-                        visible_albedo = planet->getAlbedoWithIncidence(
-                            base_albedo, incidence_angle);
-                    }
-                } else {
-                    visible_albedo = planet->getAlbedoWithIncidence(
-                        face_lon * M_PI / 180.0,  // Convert to radians
-                        face_lat * M_PI / 180.0,
-                        incidence_angle);
-                }
-            }
-
-            // PTM-107(a): record the OPERATIVE albedo the BC just decided on, flux-
-            // weighted by the direct beam. Per-face accumulators under an omp loop
-            // that is parallel over FACES, so face f is touched by one thread only.
-            // C2: only over the INTEGRATION window (t is the ABSOLUTE step index --
-            // this array spans equilibration + output). Sweeping the equilibration
-            // block too made this file describe a different window from every other
-            // statistics/*.bin and injected an equilibration-length-dependent
-            // residual into any closure audit that used it.
-            if (direct_flux > 0.0 && aeffStepInWindow(static_cast<int>(t))) {
-                eff_alb_num[f] += visible_albedo * direct_flux;
-                eff_alb_den[f] += direct_flux;
-            }
-
-            // Apply appropriate albedo to each component
-            double absorbed_direct = direct_flux * (1.0 - visible_albedo);
-            double absorbed_reflected = primary_reflected_values[idx] * (1.0 - visible_albedo);
-            double absorbed_ir = primary_ir_values[idx] * ir_emissivity;
-
-            // Sum all components
-            absorbed_flux[idx] = absorbed_direct + absorbed_reflected + absorbed_ir;
+            absorbed_flux[idx] = composer.absorbed(
+                f, static_cast<int>(t),
+                direct_solar_values[idx],
+                primary_reflected_values[idx],
+                primary_ir_values[idx]);
         }
     }
 
-    // PTM-107(a): publish the operative effective albedo for the statistics writer.
-    g_eff_albedo_num = std::move(eff_alb_num);
-    g_eff_albedo_den = std::move(eff_alb_den);
-    g_eff_albedo_valid = true;
+    composer.publishEffectiveAlbedo();
 
     return absorbed_flux;
 }
@@ -2530,19 +2666,6 @@ bool exportBodyPositions(
     std::cout << "Body positions written to " << output_file << std::endl;
     return true;
 }
-
-std::vector<double> calculateAbsorbedFlux(
-    const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values,
-    const std::vector<double>& primary_ir_values,
-    int time_steps,
-    const std::shared_ptr<ptm::SpatialMap>& albedo_map,
-    const std::shared_ptr<Mesh>& mesh,
-    double default_visible_albedo,
-    double default_ir_albedo,
-    const thermal::Config& config,
-    const thermal::Planet* planet,
-    double solar_constant);
 
 bool exportLocationTemperatureOnly(
     const std::string& output_file,
@@ -3001,113 +3124,67 @@ bool runThermalModelsForAllFacesStreamed(
     FluxFn get_ir,
     std::vector<std::vector<double>>* surface_temps_out,
     const std::vector<double>* face_Qb,
-    const std::vector<double>* face_H_overrides)
+    const std::vector<double>* face_H_overrides,
+    const thermal::Planet* planet,
+    int equilibration_steps,
+    const std::vector<double>& eq_indirect_flux)
 {
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
         return false;
     }
 
-    // Load per-face albedo: explicit FITS path > binary file > FITS auto-discovery > uniform default
-    std::shared_ptr<ptm::SpatialMap> albedo_map;
     const size_t n_faces = mesh->faces.size();
-    std::vector<double> face_albedos(n_faces, default_visible_albedo);
-    bool albedo_loaded = false;
 
-    // Check if albedo map loading is disabled
-    bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
+    // Absorbed-flux composition runs through the SAME AbsorbedFluxComposer every
+    // array path uses. This block used to be a second, lesser implementation:
+    // its own albedo-map search followed by an inline
+    //     face_flux[t] = (1 - A_vis) * (Fd + Fr) + emiss_ir * Fir
+    // with A_vis a per-face CONSTANT. That silently discarded the incidence-angle
+    // albedo model, never published statistics/effective_albedo.bin, and had
+    // nowhere to add a supplied equilibration indirect flux. build() is O(faces)
+    // -- no time dimension -- so the memory bound this whole path exists to hold
+    // is untouched; only the composition moved.
+    //
+    // The explicit `albedo_map` FITS key is opened by the caller on every path;
+    // same helper the CPU SIMD-batch caller uses.
+    std::shared_ptr<ptm::SpatialMap> streamed_albedo_map =
+        loadExplicitAlbedoMap(config, "[Streamed]");
 
-    // 1. Try explicit FITS path from config
-    if (!albedo_map_disabled && config.custom_properties.count("albedo_map")) {
-        const std::string path = config.getProperty("albedo_map");
-        if (!path.empty()) {
-            auto m = std::make_shared<ptm::SpatialMap>();
-            if (m->loadFromFITS(path)) {
-                albedo_map = m;
-                std::cout << "[Streamed] Loaded explicit albedo map: " << path << std::endl;
-            } else {
-                std::cout << "[Streamed] Failed to load albedo map " << path
-                          << " (" << m->getLastError() << ")\n";
-            }
-        }
+    std::cerr << "[Streamed] Composing absorbed flux "
+                 "(per-face spatial + incidence-angle albedo)..." << std::endl;
+    AbsorbedFluxComposer composer;
+    if (!composer.build(streamed_albedo_map, mesh, n_faces, default_visible_albedo,
+                        ir_albedo, config, planet, planet ? planet->S : 0.0)) {
+        std::cerr << "[Streamed] Absorbed-flux composition could not be built -- "
+                     "refusing to run against an unresolved albedo.\n";
+        return false;
+    }
+    // Rule 7: the angular albedo model is unavailable without a Planet. Every
+    // other CPU path is handed one; say so rather than quietly reverting to the
+    // constant-albedo behavior this fix exists to remove.
+    if (!planet) {
+        std::cerr << "[Streamed] WARNING: no Planet was supplied, so the incidence-angle "
+                     "albedo model A(theta) cannot be applied and a constant per-face "
+                     "albedo is used. Every other CPU thermal path applies it.\n";
     }
 
-    // 2. Try pre-computed binary albedo file (for standard icosphere meshes)
-    if (!albedo_map_disabled && !albedo_map) {
-        std::string body_name = config.getProperty("target_body_name");
-        if (!body_name.empty()) {
-            std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
-            body_name[0] = std::toupper(body_name[0]);
-
-            int mesh_resolution = 5;
-            auto it = config.custom_properties.find("mesh_resolution");
-            if (it != config.custom_properties.end()) {
-                try { mesh_resolution = std::stoi(it->second); } catch (...) {}
-            }
-
-            std::string albedo_maps_dir = "data/albedo_maps";
-            if (config.custom_properties.count("albedo_maps_directory") > 0) {
-                albedo_maps_dir = config.getProperty("albedo_maps_directory");
-            }
-            if (!albedo_maps_dir.empty() && albedo_maps_dir.back() != '/') {
-                albedo_maps_dir += '/';
-            }
-
-            // Try binary file first
-            std::string bin_filename = body_name + "_Albedo_res" + std::to_string(mesh_resolution) + ".bin";
-            std::vector<std::string> bin_paths = {
-                albedo_maps_dir + bin_filename,
-                "../data/albedo_maps/" + bin_filename,
-                "data/albedo_maps/" + bin_filename
-            };
-            for (const auto& bp : bin_paths) {
-                auto loaded = importAlbedoMapFromFile(bp);
-                if (!loaded.empty() && loaded.size() == n_faces) {
-                    std::copy(loaded.begin(), loaded.end(), face_albedos.begin());
-                    albedo_loaded = true;
-                    std::cout << "[Streamed] Loaded binary albedo from: " << bp
-                              << "  range=[" << *std::min_element(loaded.begin(), loaded.end())
-                              << ", " << *std::max_element(loaded.begin(), loaded.end()) << "]" << std::endl;
-                    break;
-                }
-            }
-
-            // If binary not found, try FITS auto-discovery
-            if (!albedo_loaded) {
-                std::string fits_name = body_name + "-0.5deg-BondAlbedo.fits";
-                std::vector<std::string> fits_paths = {
-                    albedo_maps_dir + fits_name,
-                    "../data/albedo_maps/" + fits_name,
-                    "data/albedo_maps/" + fits_name
-                };
-                for (const auto& fp : fits_paths) {
-                    auto m = std::make_shared<ptm::SpatialMap>();
-                    if (m->loadFromFITS(fp)) {
-                        albedo_map = m;
-                        std::cout << "[Streamed] Loaded FITS albedo map: " << fp << std::endl;
-                        break;
-                    }
-                }
-            }
-        }
+    // Deep radiation-coupling: per-face time-mean indirect flux added to the
+    // EQUILIBRATION-phase forcing only, i.e. absolute steps [0, equilibration_steps).
+    // Same gate and same message as the array paths. Empty vector = legacy:
+    // not one element is touched.
+    if (!eq_indirect_flux.empty() && eq_indirect_flux.size() != n_faces) {
+        std::cerr << "[Streamed] FATAL: eq_indirect_flux has "
+                  << eq_indirect_flux.size() << " entries for " << n_faces
+                  << " faces; refusing to equilibrate against a mismatched forcing.\n";
+        return false;
     }
-
-    // Apply FITS albedo map if loaded (interpolate to face centers)
-    if (albedo_map && albedo_map->isValid() && !albedo_loaded) {
-        face_albedos = computeFaceAlbedos(mesh, albedo_map, default_visible_albedo);
-        albedo_loaded = true;
+    const bool add_eq_indirect = (!eq_indirect_flux.empty() && equilibration_steps > 0);
+    const int  eq_hi = std::min(equilibration_steps, total_time_steps);
+    if (add_eq_indirect) {
+        std::cerr << "[Streamed] Equilibration forcing carries the per-face mean"
+                     " indirect flux over steps [0, " << eq_hi << ").\n";
     }
-
-    if (!albedo_loaded) {
-        if (albedo_map_disabled) {
-            std::cout << "[Streamed] Albedo map disabled, using uniform albedo "
-                      << default_visible_albedo << std::endl;
-        } else {
-            std::cout << "[Streamed] No albedo map found, using uniform albedo "
-                      << default_visible_albedo << std::endl;
-        }
-    }
-    const double emiss_ir = 1.0 - ir_albedo;
 
     const size_t CHUNK_SIZE = 100000;
     const size_t NUM_CHUNKS = (n_faces + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -3148,15 +3225,18 @@ bool runThermalModelsForAllFacesStreamed(
         for (size_t i = 0; i < localN; ++i) {
             size_t f = f0 + i;
 
-            // Build on-the-fly absorbed flux for this face across all times
+            // Build on-the-fly absorbed flux for this face across all times.
+            // Same kernel the array paths call; the loop is parallel over FACES,
+            // which is what the composer's per-face accumulators require.
             std::vector<double> face_flux(total_time_steps);
-            const double A_vis = face_albedos[f];
-
             for (int t = 0; t < total_time_steps; ++t) {
-                const double Fd  = get_direct(f, t);
-                const double Fr  = get_reflected(f, t);
-                const double Fir = get_ir(f, t);
-                face_flux[t] = (1.0 - A_vis) * (Fd + Fr) + emiss_ir * Fir;
+                face_flux[t] = composer.absorbed(f, t,
+                                                 get_direct(f, t),
+                                                 get_reflected(f, t),
+                                                 get_ir(f, t));
+            }
+            if (add_eq_indirect) {
+                for (int t = 0; t < eq_hi; ++t) face_flux[t] += eq_indirect_flux[f];
             }
 
             // Solve thermal for this face with matched times
@@ -3182,6 +3262,10 @@ bool runThermalModelsForAllFacesStreamed(
     progress_done.store(true, std::memory_order_relaxed);
     progress_thread.join();
     progressBar.finish();
+
+    // PTM-107(a): hand the per-face effective albedo to the statistics writer.
+    // Without this a streamed run silently shipped no effective_albedo.bin.
+    composer.publishEffectiveAlbedo();
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -3565,18 +3649,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                               && config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
     planet.hapke_albedo_w   = config.getPropertyDouble("hapke_albedo_w", -1.0);
 
-    std::shared_ptr<ptm::SpatialMap> batch_albedo_map;
-    if (config.custom_properties.find("albedo_map") != config.custom_properties.end()) {
-        const std::string path = config.getProperty("albedo_map");
-        if (!path.empty()) {
-            batch_albedo_map = std::make_shared<ptm::SpatialMap>();
-            if (!batch_albedo_map->loadFromFITS(path)) {
-                std::cout << "[SIMD Batch] Failed to load explicit albedo_map: " << path
-                          << " (" << batch_albedo_map->getLastError() << ")" << std::endl;
-                batch_albedo_map.reset();
-            }
-        }
-    }
+    std::shared_ptr<ptm::SpatialMap> batch_albedo_map =
+        loadExplicitAlbedoMap(config, "[SIMD Batch]");
 
     std::cerr << "Computing absorbed flux (per-face spatial + incidence-angle albedo)..." << std::endl;
     std::vector<double> absorbed_flux_rowmajor = calculateAbsorbedFlux(
@@ -8085,35 +8159,6 @@ static bool generateDepthProfilePlots(const std::string& csv_dir, const std::str
     }
 
     return true;
-}
-
-// Helper: compute per-face visible albedos once (uses map if available)
-std::vector<double> computeFaceAlbedos(
-    const std::shared_ptr<Mesh>& mesh,
-    std::shared_ptr<ptm::SpatialMap> albedo_map,
-    double default_visible_albedo)
-{
-    const size_t num_faces = mesh->faces.size();
-    std::vector<double> face_albedos(num_faces, default_visible_albedo);
-
-    if (albedo_map && albedo_map->isValid()
-        && mesh->latitudes.size() == num_faces
-        && mesh->longitudes.size() == num_faces)
-    {
-        #pragma omp parallel for schedule(static)
-        for (size_t f = 0; f < num_faces; ++f) {
-            double lon = mesh->longitudes[f];
-            while (lon < 0) lon += 360.0;
-            while (lon >= 360.0) lon -= 360.0;
-            double lat = mesh->latitudes[f];
-            double v = albedo_map->getValue(lon, lat);
-            if (v == albedo_map->getMissingValue() || !std::isfinite(v) || v <= 0.0 || v >= 1.0) {
-                v = default_visible_albedo;
-            }
-            face_albedos[f] = v;
-        }
-    }
-    return face_albedos;
 }
 
 // Helper function to adjust start time
@@ -14436,7 +14481,13 @@ int main(int argc, char** argv) {
                 get_ir,
                 &surface_temps,
                 face_Qb_ptr,
-                face_H_ptr
+                face_H_ptr,
+                // The angular albedo model and the supplied equilibration
+                // indirect flux: the same two inputs every other CPU path
+                // already receives. This path used to get neither.
+                &planet,
+                equilibration_steps,
+                eq_indirect_vec
             );
 
             if (!thermal_success_streamed) {
