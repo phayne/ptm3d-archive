@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cassert>
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1468,20 +1469,37 @@ bool solverEqFixEnabled() {
     return on;
 }
 
-// Surface-Newton convergence counters. The step limiter's growth branch is
-// unreachable from the max(T_eq, T1) seed (which is >= the root, so the
-// concave decreasing f is approached monotonically from above); if it ever
-// fires, that premise has broken and the iterate can be off by hundreds of K.
-// Counted, not assumed -- reported by reportSurfaceNewtonStats().
-static std::atomic<long long> g_surf_newton_growth_cap{0};
-static std::atomic<long long> g_surf_newton_iter_cap{0};
-// Surface-BC certificate: the per-run maximum of the achieved
-// |f| / (4*eps*sigma*T^3), plus the number of solves that could only be
-// terminated by the round-off floor rather than by tol_K.
-static std::atomic<long long> g_surf_bc_ulp_limited{0};
-static std::atomic<long long> g_surf_bc_solves{0};
-static std::atomic<long long> g_surf_bc_iters{0};
-static std::atomic<double>    g_surf_bc_max_resid{0.0};
+// Surface-BC certificate, accumulated PER THREAD.
+//
+// It records the per-run maximum achieved |f|/(4*eps*sigma*T^3), the mean
+// iteration count, and three exception counts: the step limiter's growth
+// branch (unreachable from the max(T_eq, T1) seed, so if it fires that premise
+// has broken and the iterate can be off by hundreds of K), the iteration cap,
+// and solves that only the round-off floor could terminate.
+//
+// Deliberately NOT atomics. The surface BC runs once per face per substep:
+// 3.8e8 solves on a 12,800-face lunation at hourly cadence. Two contended
+// relaxed fetch_adds per solve cost 8.5x the ENTIRE thermal phase -- measured
+// 2 s -> 17 s on crater80N, with the scalar surface solve itself costing
+// nothing measurable. Each thread owns its block; reportSurfaceNewtonStats()
+// sums them once, at the end.
+namespace {
+struct SurfaceBCTally {
+    long long solves = 0, iters = 0, ulp = 0, growth = 0, cap = 0;
+    double    max_resid = 0.0;
+};
+std::mutex g_tally_mutex;
+std::vector<SurfaceBCTally*> g_tallies;
+
+// Deliberately never freed: the registry must outlive every worker thread, and
+// it is one 48-byte block per thread.
+SurfaceBCTally* newSurfaceBCTally() {
+    auto* t = new SurfaceBCTally();
+    std::lock_guard<std::mutex> lk(g_tally_mutex);
+    g_tallies.push_back(t);
+    return t;
+}
+}  // namespace
 
 double surfaceBCTolK() {
     static const double tol = [] {
@@ -1513,29 +1531,31 @@ double surfaceBCTolK() {
 }
 
 void noteSurfaceBCSolution(const SurfaceBCSolution& s) {
-    g_surf_bc_solves.fetch_add(1, std::memory_order_relaxed);
-    g_surf_bc_iters.fetch_add(s.iterations, std::memory_order_relaxed);
-    if (s.growth_capped) g_surf_newton_growth_cap.fetch_add(1, std::memory_order_relaxed);
-    if (s.hit_iter_cap)  g_surf_newton_iter_cap.fetch_add(1, std::memory_order_relaxed);
-    if (s.ulp_limited)   g_surf_bc_ulp_limited.fetch_add(1, std::memory_order_relaxed);
-    // Monotone max. The relaxed load is the common case; the CAS runs only when
-    // this solve is the new worst, which happens a handful of times per run.
-    double prev = g_surf_bc_max_resid.load(std::memory_order_relaxed);
-    while (s.residual_K > prev &&
-           !g_surf_bc_max_resid.compare_exchange_weak(prev, s.residual_K,
-                                                      std::memory_order_relaxed)) {
-    }
+    static thread_local SurfaceBCTally* t = newSurfaceBCTally();
+    ++t->solves;
+    t->iters += s.iterations;
+    if (s.growth_capped) ++t->growth;
+    if (s.hit_iter_cap)  ++t->cap;
+    if (s.ulp_limited)   ++t->ulp;
+    if (s.residual_K > t->max_resid) t->max_resid = s.residual_K;
 }
 
 void reportSurfaceNewtonStats() {
-    const long long g = g_surf_newton_growth_cap.load(std::memory_order_relaxed);
-    const long long c = g_surf_newton_iter_cap.load(std::memory_order_relaxed);
+    long long g = 0, c = 0, ns = 0, ni = 0, nu = 0;
+    double rm = 0.0;
+    {
+        std::lock_guard<std::mutex> lk(g_tally_mutex);
+        for (const SurfaceBCTally* t : g_tallies) {
+            g  += t->growth;
+            c  += t->cap;
+            ns += t->solves;
+            ni += t->iters;
+            nu += t->ulp;
+            if (t->max_resid > rm) rm = t->max_resid;
+        }
+    }
     const long long w = g_tgeo_would_clamp.load(std::memory_order_relaxed);
     const long long n = g_tgeo_tested.load(std::memory_order_relaxed);
-    const long long ns = g_surf_bc_solves.load(std::memory_order_relaxed);
-    const long long ni = g_surf_bc_iters.load(std::memory_order_relaxed);
-    const long long nu = g_surf_bc_ulp_limited.load(std::memory_order_relaxed);
-    const double    rm = g_surf_bc_max_resid.load(std::memory_order_relaxed);
     // Printed through a LOCAL stream. std::cout arrives here carrying
     // `std::fixed << std::setprecision(1)` from an earlier banner, which
     // renders a 3e-13 K residual as "0.0" -- a run reporting a number that is
