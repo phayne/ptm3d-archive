@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-160 keys across 9 sections.
+162 keys across 9 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -143,6 +143,7 @@ ENGINE_DEFAULTS = {
     'simulation.duration_days': 3.55,
     'simulation.start_time': '2025-01-01T00:00:00',
     'simulation.timesteps': 72,
+    'thermal.analytic_seed_cycles': -1.0,
     'thermal.auto_calibrate_gpu': True,
     'thermal.checkpoint_every_output_steps': 0,
     'thermal.compute_ice_stability': False,
@@ -182,6 +183,7 @@ ENGINE_DEFAULTS = {
     'thermal.integration_steps': -1,
     'thermal.property_maps_directory': 'data/property_maps',
     'thermal.run_thermal_mesh': False,
+    'thermal.spinup_seed': 'physical',
     'thermal.thermal_b': 15,
     'thermal.thermal_inertia_map': '',
     'thermal.thermal_m': 10,
