@@ -1093,6 +1093,23 @@ static void setEffectiveAlbedoWindow(int start_step, int n_steps) {
     g_aeff_win_set   = true;
 }
 
+// Cap on the number of leading forcing steps the EQUILIBRATION SEED averages
+// over. 0 (default) = the whole flux table, which is the historical behavior.
+//
+// The checkpoint look-ahead (thermal.checkpoint_lookahead_steps) appends grid
+// points that are integrated but neither exported nor reduced. Without this
+// cap they would also land in the seed's <F_abs>, so a run's INITIAL CONDITION
+// would depend on a checkpointing option -- measured at 0.014 K mean /
+// 0.71 K max on an 80 N lunar crater, which is enough to break the
+// one-chunk-equals-single-shot invariant. Set once in main().
+static int g_seed_forcing_cap = 0;
+
+static inline int seedForcingSteps(int total_time_steps) {
+    return (g_seed_forcing_cap > 0)
+        ? std::min(g_seed_forcing_cap, total_time_steps)
+        : total_time_steps;
+}
+
 // True when ABSOLUTE timestep t belongs to the integration window. Before the
 // window is published (it is derived after the step counts are known) nothing
 // accumulates: a silent "accumulate everything" default is exactly the eq+output
@@ -4348,7 +4365,7 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         const double qb_f = (c.face_Qb && global_f < c.face_Qb->size())
                                 ? (*c.face_Qb)[global_f] : pl.Qb;
         double avg_flux = 0.0, sum_inst_T = 0.0;
-        const int n_samples = std::max(1, c.total_time_steps);
+        const int n_samples = std::max(1, seedForcingSteps(c.total_time_steps));
         // The series is MATERIALIZED (not just accumulated) because the lit-face
         // anchor needs this face's forcing SPECTRUM, not only its mean.
         series.resize(static_cast<size_t>(n_samples));
@@ -4604,6 +4621,15 @@ bool runThermalModelsForAllFacesBatchSoA(
     const double seed_dt_s = (total_time_steps > 1 && times.size() > 1)
                                  ? (times[1] - times[0]) : planet.day;
 
+    // How many leading forcing steps the seed averages. Defined ONCE, then both
+    // announced below and used by the per-face loop -- the banner is the run's
+    // record of its own initial condition, so it must not be able to drift from
+    // the window the seed actually integrates.
+    const int flux_avg_window =
+        (seed_mode == thermal::EqSeedMode::Physical)
+            ? seedForcingSteps(total_time_steps)
+            : std::min(100, seedForcingSteps(total_time_steps));
+
     // State the seed every run, and warn if a caller set a toggle we are not
     // going to honor. PTM_EQ_PERFACE_FLUX used to gate the GPU path ONLY, so a
     // config could set it in engine_env, run on CPU, and silently get a
@@ -4611,15 +4637,14 @@ bool runThermalModelsForAllFacesBatchSoA(
     if (seed_mode == thermal::EqSeedMode::Physical) {
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
                      "steady profile -- T_0=((<F_abs>+Qb)/(eps*sigma))^0.25 "
-                     "with <F_abs> the mean over all " << total_time_steps
+                     "with <F_abs> the mean over all " << flux_avg_window
                   << " forcing steps, then T(z)=T_0+Qb*integral dz/k "
                      "[thermal.spinup_seed: physical; identical on every solver "
                      "path]" << std::endl;
     } else {
-        const int seed_window = std::min(100, total_time_steps);
         std::cerr << "[eq-seed] equilibration seed: LEGACY CPU SIMD-batch "
                      "per-face steady state T=((<F_abs>+Qb)/(eps*sigma))^0.25, "
-                     "<F_abs> averaged over the first " << seed_window
+                     "<F_abs> averaged over the first " << flux_avg_window
                   << " forcing step(s), blended surface->deep over the skin "
                      "depth [thermal.spinup_seed: legacy]" << std::endl;
     }
@@ -4863,10 +4888,6 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // bracket. Dumped, never used by the solver. See the note on
                 // EqSeedInput::mean_inst_radeq_T.
                 double sum_inst_T = 0.0;
-                const int flux_avg_window =
-                    (seed_mode == thermal::EqSeedMode::Physical)
-                        ? total_time_steps
-                        : std::min(100, total_time_steps);
                 for (int t = 0; t < flux_avg_window; ++t) {
                     const double Ft = flux_column_major[t * n_faces + global_f];
                     avg_flux += Ft;
@@ -7208,7 +7229,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
+                int n_samples = perface ? seedForcingSteps(total_time_steps)
+                                        : std::min(10, seedForcingSteps(total_time_steps));
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -7901,7 +7923,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 size_t global_f = batch_start + f;
                 double albedo = face_albedos[global_f];
                 double avg_flux = 0.0;
-                int n_samples = perface ? total_time_steps : std::min(10, total_time_steps);
+                int n_samples = perface ? seedForcingSteps(total_time_steps)
+                                        : std::min(10, seedForcingSteps(total_time_steps));
                 for (int t = 0; t < n_samples; ++t) {
                     size_t flux_idx = global_f * total_time_steps + t;
                     double direct = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
@@ -10299,6 +10322,15 @@ void showUsage(const char* programName) {
     std::cout << "  --integration-steps N      Integration steps override\n";
     std::cout << "  --integration-offset-days  Offset for integration window (days)\n";
     std::cout << "  --integration-offset-steps Offset for integration window (steps)\n";
+    std::cout << "  --start-offset-seconds S   ET-seconds offset applied after --start is resolved.\n";
+    std::cout << "                             Use this, not a shifted UTC string, to place a window\n";
+    std::cout << "                             boundary an exact number of cadence seconds away.\n";
+    std::cout << "  --checkpoint-lookahead-steps N\n";
+    std::cout << "                             Integrate N extra output steps past the export window and\n";
+    std::cout << "                             write final_state_file there, so the checkpoint lands on\n";
+    std::cout << "                             the NEXT window's first epoch. The extra steps are not\n";
+    std::cout << "                             exported and not reduced into statistics. Chunked runs\n";
+    std::cout << "                             use 1; default 0.\n";
     std::cout << "  --thermal-debug            Enable thermal debug output for equatorial face\n";
     std::cout << "  --thermal-debug-lat DEG    Max latitude for debug face selection (default: 10)\n";
     std::cout << "  --thermal-m N              Layers in upper skin depth (default: 10)\n";
@@ -12354,6 +12386,7 @@ int main(int argc, char** argv) {
 
     // Simulation parameters (from config or defaults)
     std::string start_time = sim_config.time.start_time;
+    double start_time_offset_s = sim_config.time.start_time_offset_seconds;
     double duration_days = sim_config.time.duration_days;
     int mesh_resolution = sim_config.mesh.resolution;
     int time_steps = sim_config.time.timesteps;
@@ -12366,6 +12399,7 @@ int main(int argc, char** argv) {
     int integration_steps_cli = sim_config.thermal.integration_steps;
     double integration_offset_days = sim_config.thermal.integration_offset_days;
     int integration_offset_steps_cli = sim_config.thermal.integration_offset_steps;
+    int checkpoint_lookahead_steps = sim_config.thermal.checkpoint_lookahead_steps;
     std::string positions_file = sim_config.illumination.positions_file;
     bool use_batch_processing = sim_config.illumination.use_batch_processing;
     bool export_locations = !sim_config.output.locations_file.empty();
@@ -12606,6 +12640,8 @@ int main(int argc, char** argv) {
         
         if (arg == "--start" && i + 1 < argc) {
             start_time = argv[++i];
+        } else if (arg == "--start-offset-seconds" && i + 1 < argc) {
+            start_time_offset_s = std::stod(argv[++i]);
         } else if (arg == "--duration" && i + 1 < argc) {
             duration_days = std::stod(argv[++i]);
         } else if (arg == "--resolution" && i + 1 < argc) {
@@ -12921,6 +12957,8 @@ int main(int argc, char** argv) {
             integration_offset_days = std::stod(argv[++i]);
         } else if (std::string(argv[i]) == "--integration-offset-steps" && i + 1 < argc) {
             integration_offset_steps_cli = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--checkpoint-lookahead-steps" && i + 1 < argc) {
+            checkpoint_lookahead_steps = std::stoi(argv[++i]);
         }
         // ===== Radiation Exchange Options =====
         else if (arg == "--radiation-exchange") {
@@ -14532,7 +14570,15 @@ int main(int argc, char** argv) {
     std::cout << "=========================================================\n" << std::endl;
 
     // Calculate adjusted start time that includes equilibration period
-    std::string adjustedStartTime = calculateAdjustedStartTime(start_time, -equilibration_days);
+    std::string adjustedStartTime = calculateAdjustedStartTime(
+        start_time,
+        (start_time_offset_s - equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY)
+            / ptm_thermal::constants::SECONDS_PER_DAY);
+    if (start_time_offset_s != 0.0) {
+        std::cout << "Start-time ET offset: " << std::fixed << std::setprecision(6)
+                  << start_time_offset_s << " s applied to " << start_time
+                  << " (simulation.start_time_offset_seconds)" << std::endl;
+    }
 
     // Decoupled equilibration / output cadences.
     //
@@ -14588,8 +14634,53 @@ int main(int argc, char** argv) {
     int equilibration_steps = (equilibration_days > 0.0 && eq_steps_per_day > 0.0)
         ? static_cast<int>(std::llround(eq_steps_per_day * equilibration_days))
         : 0;
+    // Simulated (integrated) output steps. `output_steps_simulated` is what the
+    // ET grid, the flux tables and the solver see; `output_steps` is the
+    // half-open sampling count the OUTPUT cadence is defined by. They differ
+    // only by the checkpoint look-ahead (below).
     int output_steps = static_cast<int>(std::llround(output_steps_per_day * post_eq_days_needed));
-    int total_time_steps = equilibration_steps + output_steps;
+
+    // Checkpoint handoff look-ahead (thermal.checkpoint_lookahead_steps /
+    // --checkpoint-lookahead-steps). See config_parser.h for the rationale:
+    // it makes final_state_file the state at the NEXT window's first epoch
+    // instead of the state at the last exported frame, which is what lets a
+    // chunked run tile the single-shot epoch grid without duplicating a sample
+    // at every seam.
+    if (checkpoint_lookahead_steps < 0) {
+        std::cerr << "ERROR: checkpoint_lookahead_steps = "
+                  << checkpoint_lookahead_steps
+                  << " is negative; it is a count of extra OUTPUT steps to"
+                     " integrate past the export window.\n";
+        return 1;
+    }
+    if (checkpoint_lookahead_steps > 0 &&
+        sim_config.thermal.final_state_file.empty()) {
+        // The look-ahead exists only to place a checkpoint. Without one it is
+        // pure cost, so say so rather than silently burning the steps.
+        std::cerr << "WARNING: checkpoint_lookahead_steps = "
+                  << checkpoint_lookahead_steps
+                  << " but thermal.final_state_file is empty; the extra step(s)"
+                     " will be integrated and then discarded. Set"
+                     " final_state_file, or set checkpoint_lookahead_steps: 0.\n";
+    }
+    if (output_steps < 1) {
+        std::cerr << "ERROR: the output window resolves to " << output_steps
+                  << " steps (output cadence " << output_steps_per_day
+                  << " steps/day over " << post_eq_days_needed
+                  << " days). The output cadence is what the whole ET grid is"
+                     " built from; check simulation.timesteps and"
+                     " simulation.duration_days.\n";
+        return 1;
+    }
+    const int output_steps_simulated = output_steps + checkpoint_lookahead_steps;
+    int total_time_steps = equilibration_steps + output_steps_simulated;
+
+    // Keep the look-ahead out of the equilibration seed's forcing mean: it is a
+    // checkpointing mechanism, not part of the simulation the user asked for,
+    // and the seed is the run's initial condition.
+    g_seed_forcing_cap = (checkpoint_lookahead_steps > 0)
+        ? (equilibration_steps + output_steps)
+        : 0;
 
     // For sanity, output_steps_expected should match user time_steps (modulo rounding)
     int output_steps_expected = static_cast<int>(std::llround(output_steps_per_day * output_days));
@@ -14612,6 +14703,13 @@ int main(int argc, char** argv) {
     std::cout << "  Total simulation days: " << total_simulation_days << std::endl;
     std::cout << "  Equilibration steps: " << equilibration_steps << std::endl;
     std::cout << "  Output steps:        " << output_steps << std::endl;
+    if (checkpoint_lookahead_steps > 0) {
+        std::cout << "  Checkpoint look-ahead: " << checkpoint_lookahead_steps
+                  << " extra output step(s) integrated past the export window;"
+                     " final_state_file is the state at output step "
+                  << output_steps << " (the next window's first epoch)."
+                     " Not exported, not reduced into statistics." << std::endl;
+    }
     std::cout << "  Total time steps (including equilibration and integration coverage): "
               << total_time_steps << std::endl;
     if (output_steps_expected != time_steps) {
@@ -14628,6 +14726,15 @@ int main(int argc, char** argv) {
         equilibration_steps = std::max(0, total_time_steps - time_steps);
         eq_steps_per_day = output_steps_per_day;
         user_set_eq_cadence = false;
+        if (checkpoint_lookahead_steps > 0) {
+            // The fallback rebuilds the step counts from scratch and has no
+            // room for the look-ahead. Refuse rather than hand back a
+            // checkpoint at the wrong epoch.
+            std::cerr << "ERROR: checkpoint_lookahead_steps > 0 cannot be honored"
+                         " on the legacy fallback cadence; fix the time-step"
+                         " configuration instead.\n";
+            return 1;
+        }
     }
 
     // Publish the integration (statistics) window NOW, before any flux table is
@@ -14636,34 +14743,89 @@ int main(int argc, char** argv) {
     // uses (Fermi condition C2). Same helper the statistics export calls below;
     // the export cross-checks the two and warns if they ever disagree.
     {
+        // The reducible window ends where the EXPORT window ends: the
+        // checkpoint look-ahead's extra step is integrated but has no frame,
+        // so reducing it would put statistics/*.bin over a window wider than
+        // the frames it is supposed to summarize.
         const IntegrationWindow aeff_iw = computeIntegrationWindow(
-            equilibration_steps, total_time_steps, output_steps_per_day,
+            equilibration_steps, total_time_steps - checkpoint_lookahead_steps,
+            output_steps_per_day,
             total_simulation_days, integration_days, output_days,
             integration_steps_cli, integration_offset_steps_cli,
             integration_offset_days);
         setEffectiveAlbedoWindow(aeff_iw.start, aeff_iw.steps);
     }
 
-    // Build the ET grid: coarse equilibration block followed by fine output block.
-    // This is passed to the illumination model via setExternalTimeGrid() so that
-    // ray-tracing + SPICE position queries happen only at these sampled times.
+    // Build the ET grid: equilibration block followed by output block, both
+    // half-open. This is passed to the illumination model via
+    // setExternalTimeGrid() so that ray-tracing + SPICE position queries happen
+    // only at these sampled times.
+    //
+    // The grid is built HERE, and always, because this is the only scope that
+    // knows the equilibration/output split. Until 2026-08-12 it was installed
+    // only for a decoupled equilibration cadence, and the default path fell
+    // back to IlluminationModel's single uniform grid
+    //   et_step = (et_end - et_start) / (time_steps - 1)
+    // over the COMBINED equilibration+output span. That set the OUTPUT cadence
+    // by dividing a span that includes the equilibration prefix, so every run
+    // with equilibration got (a) a cadence stretched by N_tot/(N_tot-1) and
+    // (b) output frame 0 displaced from the nominal start time by
+    // equilibration_days*86400/(N_tot-1) -- 2 h on a 236-step / 29.5-d-eq lunar
+    // crater run. Because N_tot depends on the length of the run, two chunks of
+    // the same simulation got DIFFERENT cadences and their epoch grids did not
+    // tile: max misalignment 14,438 s at 2 chunks, plus a duplicated epoch at
+    // every seam. See docs/chunked-run-equivalence.md.
     std::vector<double> external_ets;
     if (total_time_steps > 0) {
         external_ets.reserve(total_time_steps);
-        double et0 = illumination_model->convertTimeToET(adjustedStartTime);
-        // Equilibration block: uniform cadence strictly inside [et0, et0 + eq_days)
+        // Anchor on the USER's start_time, not on adjustedStartTime. The latter
+        // is a round-trip through et2utc_c(..., "ISOC", 0, ...), which is
+        // whole-second precision, so it carries up to 0.5 s of quantization
+        // into every epoch of the run -- including output frame 0, which is
+        // supposed to BE the requested start.
+        const double et_out_start =
+            illumination_model->convertTimeToET(start_time) + start_time_offset_s;
+        const double out_seconds = post_eq_days_needed * ptm_thermal::constants::SECONDS_PER_DAY;
+
+        // Equilibration block: equilibration_steps samples ending exactly one
+        // cadence BEFORE the nominal start, i.e. half-open over
+        // [et_out_start - eq_days, et_out_start). Anchoring it at its END (not
+        // its start) makes the equilibration -> output seam exactly one
+        // equilibration cadence, and puts output frame 0 exactly at the
+        // requested start_time.
         if (equilibration_steps > 0) {
-            double eq_seconds = equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY;
+            const bool decoupled_eq_cadence =
+                user_set_eq_cadence &&
+                std::abs(eq_steps_per_day - output_steps_per_day) > 1e-6;
+            const double eq_seconds =
+                equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY;
             for (int i = 0; i < equilibration_steps; ++i) {
-                // multiply-before-divide for robust floating-point
-                external_ets.push_back(et0 + (static_cast<double>(i) * eq_seconds) /
-                                              static_cast<double>(equilibration_steps));
+                const double back = static_cast<double>(equilibration_steps - i);
+                if (decoupled_eq_cadence) {
+                    // Coarse equilibration sampling: its own cadence,
+                    // eq_days / equilibration_steps.
+                    external_ets.push_back(et_out_start -
+                        (back * eq_seconds) / static_cast<double>(equilibration_steps));
+                } else {
+                    // Legacy/default: equilibration is sampled at the OUTPUT
+                    // cadence, using the SAME expression, so the equilibration
+                    // and output intervals agree to a rounding unit (~5e-10 s
+                    // here) instead of to the rounding of equilibration_days
+                    // onto an integer number of steps (up to half a cadence,
+                    // ~1e4 s). That matters: the GPU solver switches to its
+                    // two-phase path whenever eq_dt and out_dt differ by more
+                    // than 1e-3 s, and a default-cadence run must not trip it.
+                    external_ets.push_back(et_out_start -
+                        (back * out_seconds) / static_cast<double>(output_steps));
+                }
             }
         }
-        // Output block: uniform fine cadence starting exactly at et0 + equilibration_days
-        double et_out_start = et0 + equilibration_days * ptm_thermal::constants::SECONDS_PER_DAY;
-        double out_seconds = post_eq_days_needed * ptm_thermal::constants::SECONDS_PER_DAY;
-        for (int i = 0; i < output_steps; ++i) {
+        // Output block: half-open, starting exactly at the requested start_time.
+        // The cadence divisor is `output_steps` -- the half-open SAMPLING count
+        // -- even when the look-ahead makes us emit output_steps_simulated
+        // points; the extra points continue the same cadence past the export
+        // window, which is exactly where the next chunk begins.
+        for (int i = 0; i < output_steps_simulated; ++i) {
             external_ets.push_back(et_out_start + (static_cast<double>(i) * out_seconds) /
                                                    static_cast<double>(output_steps));
         }
@@ -14671,12 +14833,14 @@ int main(int argc, char** argv) {
 
     // Update the illumination model with the total time steps and external grid
     illumination_model->setTimeSteps(total_time_steps);
-    if (user_set_eq_cadence &&
-        std::abs(eq_steps_per_day - output_steps_per_day) > 1e-6) {
-        // Only install the external grid when we actually want non-uniform sampling
-        // (keeps legacy behavior byte-identical when user leaves default).
-        illumination_model->setExternalTimeGrid(external_ets);
+    if (static_cast<int>(external_ets.size()) != total_time_steps) {
+        std::cerr << "ERROR: built " << external_ets.size() << " ET grid samples for "
+                  << total_time_steps << " time steps; refusing to fall back to the"
+                     " uniform single-block grid, which would set the OUTPUT cadence"
+                     " from the combined equilibration+output span.\n";
+        return 1;
     }
+    illumination_model->setExternalTimeGrid(external_ets);
 
     // Occluder-only geometry: a coarse ring/annulus (e.g. LOLA out to the
     // physics horizon) added to the shadow-ray BVH so distant topography
@@ -17727,7 +17891,8 @@ int main(int argc, char** argv) {
         // shared with the early publication that drives the effective-albedo
         // accumulators. Same inputs, same call, so the two can never diverge.
         const IntegrationWindow iw = computeIntegrationWindow(
-            equilibration_steps, total_time_steps, output_steps_per_day,
+            equilibration_steps, total_time_steps - checkpoint_lookahead_steps,
+            output_steps_per_day,
             total_simulation_days, integration_days, output_days,
             integration_steps_cli, integration_offset_steps_cli,
             integration_offset_days);

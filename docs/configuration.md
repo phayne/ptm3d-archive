@@ -57,8 +57,45 @@ Runnable examples are in [`../examples/`](../examples/); start with
 |---|---|---|---|
 | `body` | string | `"Europa"` | Planetary body name |
 | `start_time` | string | `"2025-01-01T00:00:00"` | Start time (ISO 8601) |
+| `start_time_offset_seconds` | float | 0.0 | Ephemeris-time offset added after `start_time` is resolved (see [The output epoch grid](#the-output-epoch-grid)) |
 | `duration_days` | float | 3.55 | Simulated duration of the output window |
 | `timesteps` | int | 72 | Number of output timesteps |
+
+### The output epoch grid
+
+The output grid is **half-open**. A window of `timesteps` samples over
+`duration_days` has cadence
+
+```
+dt = duration_days * 86400 / timesteps      [ephemeris seconds]
+```
+
+and samples `start_time + i*dt` for `i` in `[0, timesteps)`. The last sample
+therefore sits one cadence *before* the end of the window, and the next window
+of the same simulation begins exactly at `start_time + timesteps*dt`. That is
+what lets consecutive windows tile: no epoch is sampled twice and none is
+skipped.
+
+An equilibration prefix does not disturb this. `equilibration_orbits` adds its
+own samples *before* `start_time`, so output frame 0 is at `start_time` exactly,
+whatever the equilibration length or cadence.
+
+`start_time_offset_seconds` shifts the whole grid by a number of **ephemeris**
+seconds. Use it, rather than a shifted UTC `start_time` string, whenever a
+window boundary has to land on an exact multiple of the cadence: TDB − UTC
+carries a periodic relativistic term (~1.7 ms amplitude, annual period) and
+steps by a whole second at a leap second, so adding to the UTC string is not the
+same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
+
+> Changed 2026-08-12. Before that date the default (uniform-cadence) path
+> computed `dt = (equilibration_days + duration_days) * 86400 / (total_steps −
+> 1)`: the output cadence was set by dividing a span that included the
+> equilibration prefix, by one fewer interval than there are samples. Output
+> epochs on every run shifted as a result — on an 80 N lunar crater with 236
+> steps over 59.06 days and one equilibration lunation, frame 0 was 1 h 59 m
+> 53.7 s after the nominal start and the cadence was 0.28 % long. Products
+> generated before that date carry those labels. See
+> [chunked-run-equivalence.md](chunked-run-equivalence.md).
 
 ## mesh
 
@@ -108,6 +145,7 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `integration_offset_steps` | int | 0 | Same offset, expressed in steps |
 | `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
+| `checkpoint_lookahead_steps` | int | 0 | Extra output steps integrated past the export window, so `final_state_file` is the state at the NEXT window's first epoch (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only) |
 | `eq_indirect_source` | string | `auto` | Where the equilibration phase gets its indirect flux: `auto` estimates it internally, `off` is the pre-2026-08 behavior ([radiation-exchange.md §7.7](radiation-exchange.md)) |
 | `eq_indirect_flux_file` | string | `""` | Explicit per-face `'QIND'` mean-indirect file; overrides `eq_indirect_source` |
@@ -152,6 +190,17 @@ Three things to know before relying on one.
 Setting `initial_state_file` forces `equilibration_orbits` to 0 and disables the
 analytic clear-sky pre-conditioner: a restored column is a continuation, and
 spinning it up again would discard it. Both are announced in the log.
+
+**Where the checkpoint sits in time.** The solver integrates
+`total_time_steps − 1` intervals, so by default `final_state_file` holds the
+state at the *last exported frame*. On a half-open grid the next window begins
+one cadence later than that, so a handoff needs one extra grid point.
+`thermal.checkpoint_lookahead_steps: 1` supplies it: the run integrates one
+output step past the export window and checkpoints there, and that extra step is
+neither written as a frame nor reduced into `statistics/`. It is also kept out
+of the equilibration seed's forcing mean, so it does not change the run's
+initial condition. `scripts/run_chunked_simulation.py` sets it for every chunk;
+outside the chunked workflow you do not need it.
 
 One case is disclosed rather than refused. With radiation coupling on a CPU
 solver, the coupled re-run keeps no `T(z)` column, so the checkpoint holds the
