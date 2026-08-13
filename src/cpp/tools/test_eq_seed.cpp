@@ -251,6 +251,168 @@ int main() {
               "an unknown seed name is REFUSED, not defaulted");
     }
 
+    // -----------------------------------------------------------------------
+    // 9. THE KIRCHHOFF DEPTH PROFILE and its two EXACT reductions.
+    //
+    // The profile integrates the potential G(T) = T + R4*T^4 rather than T,
+    // which adds R4*W(0) with W(0) = T_w^4 - T_anchor^4. Both reductions below
+    // are exact statements, not tolerances, so they are checked BITWISE:
+    //   * chi == 0   -> G is the identity, nothing to add;
+    //   * zero swing -> the anchor IS T_w, so W(0) is identically zero.
+    // Both are held by control flow (the correction is gated on
+    // eqSeedAnchorRan()), which is why bitwise is achievable at all.
+    // -----------------------------------------------------------------------
+    {
+        std::printf("\n-- Kirchhoff depth profile --\n");
+        const double kMoonDay = 29.530588 * 86400.0;
+        const double kMoonCp0 = -3.6125;
+        static const double kMoonCp[4] = {2.7431, 2.3616e-3, -1.2340e-5, 8.9093e-9};
+
+        // G and its inverse: exact identity at R4 == 0, round trip otherwise.
+        check(thermal::eqSeedKirchhoffG(237.125, 0.0) == 237.125 &&
+              thermal::eqSeedKirchhoffGInv(237.125, 0.0) == 237.125,
+              "G and G^-1 are the EXACT identity at chi == 0 (bitwise)");
+        {
+            const double R4 = thermal::R350(2.7) * 0.25;
+            double worst = 0.0;
+            for (double t = 5.0; t < 700.0; t += 3.7) {
+                const double back =
+                    thermal::eqSeedKirchhoffGInv(thermal::eqSeedKirchhoffG(t, R4), R4);
+                worst = std::max(worst, std::fabs(back - t) / t);
+            }
+            check(worst < 1e-14, "G^-1(G(T)) == T over 5-700 K",
+                  "worst relative " + std::to_string(worst));
+        }
+
+        // A forcing series with a real diurnal swing, so the anchor runs.
+        const int ns = 96;
+        std::vector<double> Fs(ns);
+        for (int i = 0; i < ns; ++i) {
+            const double mu = std::cos(2.0 * M_PI * i / ns);
+            Fs[i] = (mu > 0.0) ? 1361.0 * 0.88 * mu : 0.0;
+        }
+        double sF = 0.0;
+        for (double v : Fs) sF += v;
+
+        thermal::EqSeedForcing fc;
+        fc.flux       = Fs.data();
+        fc.n_samples  = ns;
+        fc.span_s     = kMoonDay;
+        fc.cycle_s    = kMoonDay;
+        fc.cp0        = kMoonCp0;
+        fc.cp_coeff   = kMoonCp;
+        fc.n_cp_coeff = 4;
+
+        thermal::EqSeedInput in = moonInput(col, sF / ns);
+        in.forcing = &fc;
+        std::vector<double> Tk(n);
+        const thermal::EqSeedResult rk = thermal::eqSeedColumn(in, Tk.data());
+
+        check(rk.kirchhoff_profile && thermal::eqSeedAnchorRan(rk.anchor_status),
+              "a swinging lit face gets the Kirchhoff profile",
+              "offset R4*W(0) = " + std::to_string(rk.kirchhoff_surface_offset) + " K");
+        check(rk.kirchhoff_surface_offset > 0.0,
+              "R4*W(0) is POSITIVE once the anchor is below the warm bracket");
+        check(Tk[0] == rk.T_anchor,
+              "the surface node is the anchor, bitwise -- the profile does not "
+              "re-litigate it");
+
+        // The invariant itself: at depth the wave is gone, so
+        // G(T(z)) - G(T_anchor) - R4*W(0) must equal Qb * INT dz/k_c exactly.
+        {
+            double Rk = 0.0;
+            for (int i = 1; i < n; ++i) Rk += (col.z[i] - col.z[i - 1]) / col.kc[i - 1];
+            const double R4 = in.R350 * 0.25;
+            const double lhs = thermal::eqSeedKirchhoffG(Tk[n - 1], R4) -
+                               thermal::eqSeedKirchhoffG(rk.T_anchor, R4) -
+                               rk.kirchhoff_surface_offset;
+            const double rhs = in.Qb * Rk;
+            check(std::fabs(lhs - rhs) < 1e-9 * std::fabs(rhs),
+                  "the deep node satisfies d<G>/dz = Qb/k_c exactly",
+                  "lhs " + std::to_string(lhs) + " rhs " + std::to_string(rhs));
+        }
+
+        // The correction can only WARM the column: W(0) >= 0 raises G. The
+        // comparison has to hold the ANCHOR fixed -- against the warm-anchor
+        // seed the whole column is warmer for a reason that is not this term.
+        {
+            double T = rk.T_anchor;
+            for (int i = 1; i < n; ++i) {
+                const double k = thermal::hayneK(T, col.kc[i - 1], in.R350);
+                if (k > 0.0) T += in.Qb * (col.z[i] - col.z[i - 1]) / k;
+            }
+            check(Tk[n - 1] > T,
+                  "at a FIXED anchor the fourth-moment term warms the deep column",
+                  "kirchhoff " + std::to_string(Tk[n - 1]) + " K vs plain " +
+                      std::to_string(T) + " K");
+        }
+
+        // REDUCTION 1 -- chi == 0. Bitwise against the plain integration.
+        {
+            thermal::EqSeedInput i0 = in;
+            i0.R350 = 0.0;
+            std::vector<double> T0(n);
+            const thermal::EqSeedResult r0 = thermal::eqSeedColumn(i0, T0.data());
+            double T = r0.T_anchor;
+            bool bitwise = (T0[0] == T);
+            for (int i = 1; i < n; ++i) {
+                const double k = thermal::hayneK(T, col.kc[i - 1], 0.0);
+                if (k > 0.0) T += i0.Qb * (col.z[i] - col.z[i - 1]) / k;
+                if (T0[i] != T) bitwise = false;
+            }
+            check(!r0.kirchhoff_profile && bitwise,
+                  "REDUCTION chi == 0: BITWISE identical to the plain profile");
+        }
+
+        // REDUCTION 2 -- zero diurnal swing. A flat series makes the cold and
+        // warm brackets coincide, so W(0) is identically zero.
+        {
+            std::vector<double> Ff(ns, 220.0);
+            thermal::EqSeedForcing ff = fc;
+            ff.flux = Ff.data();
+            thermal::EqSeedInput iz = moonInput(col, 220.0);
+            iz.forcing = &ff;
+            std::vector<double> Tz(n);
+            const thermal::EqSeedResult rz = thermal::eqSeedColumn(iz, Tz.data());
+            double T = rz.T_anchor;
+            bool bitwise = (Tz[0] == T);
+            for (int i = 1; i < n; ++i) {
+                const double k = thermal::hayneK(T, col.kc[i - 1], iz.R350);
+                if (k > 0.0) T += iz.Qb * (col.z[i] - col.z[i - 1]) / k;
+                if (Tz[i] != T) bitwise = false;
+            }
+            check(rz.anchor_status == thermal::EqSeedAnchorStatus::ZeroSwing &&
+                  !rz.kirchhoff_profile && bitwise,
+                  "REDUCTION zero swing: BITWISE identical to the plain profile");
+        }
+
+        // Martinez does not separate as k_c(z)*g(T), so G does not exist for it
+        // -- and that must be REPORTED, not silently skipped.
+        {
+            thermal::EqSeedInput im = in;
+            im.cond = thermal::ConductivityModel::Martinez2021;
+            std::vector<double> Tm(n);
+            const thermal::EqSeedResult rm = thermal::eqSeedColumn(im, Tm.data());
+            check(!rm.kirchhoff_profile,
+                  "Martinez2021 does NOT get the Kirchhoff profile, and says so");
+        }
+
+        // Every anchor fallback must also fall back to the plain profile: the
+        // correction is identically zero whenever the anchor is T_w.
+        {
+            thermal::EqSeedForcing fr = fc;
+            fr.radiation_coupled = true;
+            thermal::EqSeedInput ir = in;
+            ir.forcing = &fr;
+            std::vector<double> Tr(n);
+            const thermal::EqSeedResult rr = thermal::eqSeedColumn(ir, Tr.data());
+            check(rr.anchor_status ==
+                      thermal::EqSeedAnchorStatus::FallbackRadiationCoupled &&
+                  !rr.kirchhoff_profile,
+                  "an anchor FALLBACK also disables the correction it zeroes");
+        }
+    }
+
     std::printf("=== %s (%d failure%s) ===\n", g_fail ? "FAILED" : "OK",
                 g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
