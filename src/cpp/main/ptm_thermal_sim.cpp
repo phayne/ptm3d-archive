@@ -15822,11 +15822,38 @@ int main(int argc, char** argv) {
         // swap-back on the non-chunked branch.
         //
         // `eqi` empty reproduces the legacy call exactly on every solver.
+        //
+        // Phase stopwatches, so the equilibration-indirect accuracy report can
+        // quote a cost in THIS run's own minutes instead of a multiplier
+        // measured on somebody else's mesh. Wall clock, accumulated, never read
+        // by any numerical path -- a run's results do not depend on them.
+        double eqi_t_solve_s = 0.0;   int eqi_n_solve = 0;
+        double eqi_t_sweep_s = 0.0;   int eqi_n_sweep = 0;
+        double eqi_t_loop_s  = 0.0;   // the most recent COMPLETE coupling loop
+        int    eqi_n_iter_loop = 0;   // ... and how many Picard iterations it took
+        std::chrono::steady_clock::time_point eqi_loop_t0 =
+            std::chrono::steady_clock::now();
+        auto eqiElapsed = [](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
         auto solveWholeMeshThermal =
             [&](const std::vector<double>& eqi,
                 const std::vector<double>& ds,
                 const std::vector<double>& pr,
                 const std::vector<double>& pi) -> bool {
+            // Scope timer: the lambda returns from several branches, so an RAII
+            // object is the only way to time all of them without missing one.
+            struct SolveTimer {
+                double& acc; int& n; std::chrono::steady_clock::time_point t0;
+                explicit SolveTimer(double& a, int& c)
+                    : acc(a), n(c), t0(std::chrono::steady_clock::now()) {}
+                ~SolveTimer() {
+                    acc += std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0).count();
+                    ++n;
+                }
+            } eqi_solve_timer(eqi_t_solve_s, eqi_n_solve);
             const bool use_simd_batch_l  = thermal_config.getPropertyBool("use_simd_batch", true);
             const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
             ice::IceStabilityAccumulator* ice_acc_l =
@@ -17139,6 +17166,12 @@ int main(int argc, char** argv) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
                     writeHeartbeat("rad_iter " + std::to_string(iter + 1)
                                    + " start (max=" + std::to_string(rad_max_coupling_iter) + ")");
+                    // A pass that re-solves rewinds to iter 0, so this also
+                    // restarts the loop stopwatch: what the cost report needs is
+                    // the length of the LAST complete loop, not of all of them.
+                    if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
+                    const std::chrono::steady_clock::time_point eqi_sweep_t0 =
+                        std::chrono::steady_clock::now();
 
                     // Step 1: Compute indirect flux at EVERY timestep
                     // This captures time-varying thermal emission from illuminated walls
@@ -17392,6 +17425,8 @@ int main(int argc, char** argv) {
                         }
                     }
                     flux_progress.finish();
+                    eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
+                    ++eqi_n_sweep;
 
                     double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
@@ -17582,6 +17617,8 @@ int main(int argc, char** argv) {
                             if (rc < 0) return 1;
                             if (rc > 0) { iter = -1; continue; }
                         }
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
                         break;
                     }
 
@@ -17848,7 +17885,15 @@ int main(int argc, char** argv) {
                         if (rc < 0) return 1;
                         if (rc > 0) { iter = -1; continue; }  // ++ makes it iter 0
                     }
-                    if (coupling_loop_done) break;
+                    if (coupling_loop_done) {
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
+                        break;
+                    }
+                    if (iter + 1 >= rad_max_coupling_iter) {
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
+                    }
                 }
 
                 // ---- PTM-57: re-archive the checkpoint POST-coupling --------
@@ -17947,6 +17992,178 @@ int main(int argc, char** argv) {
                     }
                     std::cout.flags(fl);
                     std::cout.precision(pr);
+                }
+
+                // ==============================================================
+                // How accurate is THIS run's equilibration forcing?
+                // ==============================================================
+                // Everything below is measured on the mesh in front of us. The
+                // engine holds both halves of the comparison at this point:
+                //   eq_indirect_vec        -- the <q_ind> actually installed on
+                //                             the equilibration forcing;
+                //   indirect_flux_series   -- the CONVERGED coupling loop's
+                //                             indirect flux, i.e. what the output
+                //                             window really carries.
+                // Their difference is this run's own estimator shortfall. No
+                // coefficient is imported from the crater the feature was
+                // measured on, because none is needed -- printing 13.3% or
+                // 3.9 K as a prediction for an arbitrary mesh would be exactly
+                // the authoritative-looking wrong label this engine has been
+                // retiring.
+                //
+                // Kelvin conversion. In cycle-mean steady state a column
+                // radiates what it absorbs, eps*sigma*T_rad^4 = <F_abs> + <q_ind>
+                // + Q_b, so a shortfall dq displaces it by dq/(4*eps*sigma*T_rad^3).
+                // T_rad is the RADIATIVE mean (<T^4>)^(1/4) over the output
+                // window, not <T>: on a strongly modulated lit face those differ
+                // by tens of kelvin and <T> would overstate the stiffness. The
+                // linearization is a first-order estimate and is labeled as one.
+                //
+                // Reported per population, because a mesh-wide number hides the
+                // effect: a face that never sees the sun is heated by nothing
+                // BUT this term, while a lit face barely feels it.
+                if (eq_indirect_record.provenance != "none"
+                        && !eq_indirect_vec.empty()
+                        && eq_indirect_vec.size() == num_faces
+                        && !indirect_flux_series.empty()
+                        && !surface_temps.empty()) {
+                    const int out_lo = equilibration_steps;
+                    const int out_hi = total_time_steps;
+                    const int out_n  = std::max(1, out_hi - out_lo);
+                    const double eps_ir = thermalIrEmissivity(planet);
+
+                    // One parallel pass over faces: reduce the converged series,
+                    // build the radiative-mean anchor, and classify. Serial here
+                    // would be O(num_faces * total_time_steps) three times over,
+                    // which is seconds on a production mesh for a printed line.
+                    std::vector<double> dT_face(num_faces, 0.0);
+                    std::vector<uint8_t> dT_valid(num_faces, 0), dT_lit_flag(num_faces, 0);
+                    double sum_installed = 0.0, sum_converged = 0.0;
+                    #pragma omp parallel for schedule(static) \
+                            reduction(+:sum_installed,sum_converged)
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        const auto& row = indirect_flux_series[f];
+                        double acc = 0.0;
+                        for (int t = out_lo; t < out_hi
+                                 && t < static_cast<int>(row.size()); ++t)
+                            acc += row[t];
+                        const double q_conv = acc / out_n;
+                        const double q_inst = eq_indirect_vec[f];
+                        sum_installed += q_inst;
+                        sum_converged += q_conv;
+                        if (q_conv <= 0.0 && q_inst <= 0.0) continue;
+
+                        // Radiative-mean surface temperature over the window.
+                        double t4 = 0.0; int n_t4 = 0;
+                        if (f < surface_temps.size()) {
+                            for (int t = out_lo; t < out_hi
+                                     && t < static_cast<int>(surface_temps[f].size()); ++t) {
+                                const double T = surface_temps[f][t];
+                                if (T > 0.0) { t4 += T * T * T * T; ++n_t4; }
+                            }
+                        }
+                        if (n_t4 == 0) continue;
+                        const double T_rad = std::pow(t4 / n_t4, 0.25);
+                        const double stiffness = 4.0 * eps_ir * SIGMA_SB
+                                                 * T_rad * T_rad * T_rad;
+                        if (!(stiffness > 0.0)) continue;
+                        dT_face[f]  = (q_conv - q_inst) / stiffness;
+                        dT_valid[f] = 1;
+
+                        // Never-lit means never lit: no direct beam AND no
+                        // primary reflection anywhere in the run. That is the
+                        // population whose column this term ALONE sets, and it
+                        // is why a mesh-wide average is the wrong summary.
+                        for (int t = 0; t < total_time_steps; ++t) {
+                            const size_t k = f * static_cast<size_t>(total_time_steps) + t;
+                            if ((k < direct_solar_values.size()
+                                     && direct_solar_values[k] > 0.0)
+                                || (k < primary_reflected_values.size()
+                                     && primary_reflected_values[k] > 0.0)) {
+                                dT_lit_flag[f] = 1;
+                                break;
+                            }
+                        }
+                    }
+                    std::vector<double> dT_dark, dT_lit;
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        if (!dT_valid[f]) continue;
+                        (dT_lit_flag[f] ? dT_lit : dT_dark).push_back(dT_face[f]);
+                    }
+
+                    auto pct = [](std::vector<double>& v, double q) {
+                        if (v.empty()) return 0.0;
+                        const size_t k = std::min(v.size() - 1,
+                            static_cast<size_t>(q * (v.size() - 1)));
+                        std::nth_element(v.begin(), v.begin() + k, v.end());
+                        return v[k];
+                    };
+                    std::sort(dT_dark.begin(), dT_dark.end());
+                    std::sort(dT_lit.begin(), dT_lit.end());
+                    const double dq_mean = (sum_converged - sum_installed)
+                                           / std::max<size_t>(1, num_faces);
+                    const double rel_pct = (sum_installed > 0.0)
+                        ? 100.0 * (sum_converged - sum_installed) / sum_installed : 0.0;
+                    const double dark_med = pct(dT_dark, 0.50);
+                    const double dark_p90 = pct(dT_dark, 0.90);
+                    const double dark_max = dT_dark.empty() ? 0.0 : dT_dark.back();
+                    const double lit_med  = pct(dT_lit, 0.50);
+
+                    const std::ios_base::fmtflags fl2 = std::cout.flags();
+                    const std::streamsize pr2 = std::cout.precision();
+                    std::cout << std::fixed << std::setprecision(2);
+                    std::cout << "  [Eq indirect] Forcing accuracy, measured on THIS run,"
+                                 " not imported from another mesh: the installed <q_ind>\n"
+                                 "    sits " << std::setprecision(4) << dq_mean
+                              << " W/m^2 (" << std::setprecision(2) << rel_pct
+                              << "%) under the converged coupling loop's -> a residual COLD"
+                                 " bias of\n    " << std::setprecision(2)
+                              << dark_med << " K median (p90 " << dark_p90 << ", max "
+                              << dark_max << ") on the " << dT_dark.size()
+                              << " never-lit and " << lit_med << " K on the "
+                              << dT_lit.size() << " sunlit of the "
+                              << (dT_dark.size() + dT_lit.size())
+                              << " faces that receive any"
+                                 "\n    [first order, dq/(4*eps*sigma*T_rad^3) at each face's"
+                                 " own radiative-mean T].\n";
+                    if (eq_indirect_from_converged) {
+                        std::cout << "    This IS the accurate setting"
+                                     " (thermal.eq_indirect_source: converged, "
+                                  << eq_indirect_passes << " pass"
+                                  << (eq_indirect_passes == 1 ? "" : "es")
+                                  << "); it cost " << std::showpos
+                                  << (eqi_t_loop_s / 60.0) << std::noshowpos
+                                  << " min of extra coupling here.\n";
+                    } else if (eq_indirect_internal_armed) {
+                        // Cost in this run's own minutes, off this run's own
+                        // stopwatches: "converged" buys one more coupling loop and
+                        // one more whole-mesh solve, and gives back the
+                        // iteration-0 passes this run spent. A loop restarted from
+                        // a re-equilibrated field needs at least as many Picard
+                        // iterations as the one just timed and in practice one
+                        // more, so quote a RANGE whose ends are both measured
+                        // here -- rather than one number that is quietly a floor.
+                        const double t_solve = (eqi_n_solve > 0)
+                            ? eqi_t_solve_s / eqi_n_solve : 0.0;
+                        const double t_sweep = (eqi_n_sweep > 0)
+                            ? eqi_t_sweep_s / eqi_n_sweep : 0.0;
+                        const double t_iter = (eqi_n_iter_loop > 0)
+                            ? eqi_t_loop_s / eqi_n_iter_loop : 0.0;
+                        const double lo_min =
+                            (eqi_t_loop_s + t_solve
+                             - eq_indirect_passes_done * (t_sweep + t_solve)) / 60.0;
+                        std::cout << "    thermal.eq_indirect_source: converged removes it"
+                                     " for about " << std::showpos << lo_min << " to "
+                                  << (lo_min + t_iter / 60.0) << std::noshowpos
+                                  << " min on this run (+1 coupling loop, timed here at "
+                                  << (eqi_t_loop_s / 60.0) << " min over "
+                                  << eqi_n_iter_loop << " iterations, -"
+                                  << eq_indirect_passes_done << " iteration-0 pass"
+                                  << (eq_indirect_passes_done == 1 ? "" : "es")
+                                  << "). docs/radiation-exchange.md 7.7.\n";
+                    }
+                    std::cout.flags(fl2);
+                    std::cout.precision(pr2);
                 }
 
                 // Deep radiation-coupling (pass 1): dump the per-face OUTPUT-window

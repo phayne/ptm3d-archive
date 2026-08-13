@@ -531,6 +531,27 @@ moves the dark-face window mean by 0.0004 K and `converged` by 0.019 K — becau
 window gives the deep column almost no time to feed back to the surface. The deep column is the
 quantity these settings control; a long or seasonal window is where it shows up at the surface.
 
+**Every run reports its own accuracy.** None of the numbers above are printed as a prediction for
+your mesh. At the end of the coupling loop the engine holds both halves of the comparison — the
+$\langle q_{\text{ind}}\rangle$ it installed on the equilibration forcing, and the converged
+coupling loop's — so it measures the shortfall on the mesh in front of it and converts it to
+kelvin through the radiative stiffness of each face's own column,
+
+$$\delta T_i \simeq \frac{\delta \langle q_{\text{ind}}\rangle_i}{4\varepsilon\sigma T_{\text{rad},i}^3},
+\qquad T_{\text{rad},i} = \left(\overline{T_i^4}\right)^{1/4},$$
+
+using the *radiative* mean over the output window rather than $\overline{T}$, which on a strongly
+modulated sunlit face differs by tens of kelvin. The report splits the never-lit faces from the
+sunlit ones, because the never-lit column is set by this term alone and a mesh-wide average hides
+the whole effect. It also quotes what `converged` would cost in that run's own minutes, from its
+own phase stopwatches, as a range: the extra coupling loop runs on a re-equilibrated field and
+needs at least as many Picard iterations as the one just timed, in practice one more.
+
+The linearization was checked against the deep columns above at three magnitudes spanning two
+orders: it predicted 3.80, 3.54 and 0.06 K where the re-run measured 3.910, 3.614 and 0.056 K
+(within 7%, and conservative on the large ones). It is a first-order estimate and the run labels
+it as one.
+
 **Cost.** Each `auto` pass is one extra radiosity sweep and one extra whole-mesh thermal solve.
 Each `converged` pass is one extra whole coupling loop and one extra whole-mesh thermal solve. The
 wall-clock share depends on what fraction of a given run those phases are, so the table above names
