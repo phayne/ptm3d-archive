@@ -363,6 +363,13 @@ std::vector<double> heatCapacity(const Planet& planet, const std::vector<double>
 std::vector<double> thermCond(const std::vector<double>& kc, const std::vector<double>& T, double R350);
 void surfTemp(Profile& p, double Qs);
 void botTemp(Profile& p, double Qb);
+
+// OUTPUT-EPOCH SURFACE TEMPERATURE. The value a per-step frame must report at
+// output index t, given the column as it stands AT times[t] and the absorbed
+// flux Qs AT times[t]. Non-mutating by construction -- see the block comment
+// over the definition in thermal_model.cpp for why writing the answer back
+// into the column would move the trajectory on two of the three solver paths.
+double outputSurfaceTemp(const Profile& p, double Qs, double Qb);
 double getTimeStep(const Profile& p, const Planet& planet, double day,
                    const Config& config, bool verbose = false);
 
@@ -1082,6 +1089,11 @@ void buildTridiagonalSystemBatch(ThermalBatchSoA& batch, double dt);
 void solveThomasBatchSIMD(ThermalBatchSoA& batch);
 void applySurfaceBCBatch(ThermalBatchSoA& batch, double dt);
 void applyBottomBCBatch(ThermalBatchSoA& batch);
+
+// Batch flavor of outputSurfaceTemp(): the surface a frame must report for
+// face `face_idx` at an output epoch whose absorbed flux is Qs. Reads the
+// column, writes nothing.
+double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double Qs);
 
 } // namespace thermal
 

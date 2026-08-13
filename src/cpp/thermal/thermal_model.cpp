@@ -1649,6 +1649,88 @@ void surfTemp(Profile& p, double Qs) {
     p.T()[0] = s.T;
 }
 
+// ---------------------------------------------------------------------------
+// OUTPUT-EPOCH SURFACE TEMPERATURE (fix/frame-forcing-epoch)
+//
+// The surface node is MASSLESS: solveSurfaceBC() determines T[0] algebraically
+// from (Qs, T[1], k0, dz0). It is therefore not a state variable that is
+// carried across a step -- it is a DIAGNOSTIC of whatever epoch it was last
+// evaluated at. So a frame filed under output index t must report the surface
+// evaluated with the flux AT times[t] against the interior AT times[t]. That
+// is one of two independent properties of a frame; the other, that the
+// interior is the state at times[t], is what fix/output-time-alignment (PR #66)
+// established.
+//
+// Before this function existed every path reported, instead, whatever the last
+// substep it happened to take had left in T[0], whose flux epoch trails
+// times[t] by:
+//     CPU scalar        one substep      (surfFlux() at the substep START)
+//     CPU SIMD batch    half a substep   (flux sampled at the substep MIDPOINT)
+//     GPU persistent    a full OUTPUT interval  (one flux value is held across
+//                       the whole interval and the frame is stored before it)
+// Scored against a 32x-output-cadence reference run on the 80 N tutorial
+// crater at 118 output steps, the mean error over sunrise frames was 10.4 K,
+// 6.3 K and 188.7 K respectively.
+//
+// NON-MUTATING, deliberately. Writing the answer back into T[0] would change
+// k(T[0]) at the next substep on the GPU and CPU-batch paths -- both refresh
+// material properties BEFORE the surface solve -- and so would move the
+// trajectory. Then chunk-vs-single-shot equivalence and the byte-identity
+// baselines would both be in play for what is an OUTPUT defect. The
+// integration is left exactly as it was; only the reported number changes.
+//
+// The floor is the same one Profile::update_T applies to the column it stores,
+// so the reported number cannot sit below a floor the integrator enforces.
+double outputSurfaceTemp(const Profile& p, double Qs, double Qb) {
+    const double sigma = p.config ? p.config->sigma : ptm::kStefanBoltzmann;
+    const SurfaceBCSolution s = solveSurfaceBC(Qs, p.T()[1], p.k()[0], p.dz()[0],
+                                               p.emissivity, sigma, surfaceBCTolK());
+    // A solve that gives up must be visible in the per-run certificate, the
+    // same as every other solve on this path.
+    noteSurfaceBCSolution(s);
+
+    const double T_geo = (Qb > 0.0)
+        ? std::sqrt(std::sqrt(Qb / (p.emissivity * sigma))) : 0.0;
+    const double T_lo  = solverEqFixEnabled() ? ABSOLUTE_ZERO_K
+                                              : std::max(ABSOLUTE_ZERO_K, T_geo);
+    return std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, s.T));
+}
+
+double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double Qs) {
+    const int f = face_idx;
+    const double T0 = batch.T[0 * THERMAL_BATCH_SIZE + f];
+    const double T1 = batch.T[1 * THERMAL_BATCH_SIZE + f];
+    const double rho0 = batch.rho[0 * THERMAL_BATCH_SIZE + f];
+
+    // k0 exactly as updateMaterialPropertiesBatchSIMD() would set it at the
+    // top of the next substep: from the column's CURRENT T[0]. Reading
+    // batch.k instead would use the value refreshed one substep ago. This runs
+    // once per face per OUTPUT step, not in an inner loop, so it can use the
+    // reference dispatch form that test_conductivity_model.cpp pins rather
+    // than a fourth hand-copy of the two laws.
+    const double k0 = conductivityK(batch.cond_model, T0,
+                                    batch.kc[0 * THERMAL_BATCH_SIZE + f],
+                                    rho0, batch.R350_val);
+
+    const SurfaceBCSolution s = solveSurfaceBC(Qs, T1, k0, batch.dz[0],
+                                               batch.emissivity[f], batch.sigma_sb,
+                                               surfaceBCTolK());
+    noteSurfaceBCSolution(s);
+
+    // Same T_geo floor advanceTimestep() applies to the column it leaves
+    // behind, and -- also matching that path -- NO upper clamp. The scalar
+    // flavor above does apply MAX_PHYSICAL_TEMP_K because Profile::update_T
+    // does; each helper mirrors the bounds of the path it reports for, rather
+    // than inventing a common set. This path refuses to run under
+    // PTM_SOLVER_EQFIX, so there is no floor-release branch here.
+    const double qb = batch.Qb[f];
+    if (qb > 0.0) {
+        const double T_geo = std::sqrt(std::sqrt(qb / (batch.emissivity[f] * batch.sigma_sb)));
+        if (s.T < T_geo) return T_geo;
+    }
+    return s.T;
+}
+
 void botTemp(Profile& p, double Qb) {
     // Set bottom temperature using heat flux boundary condition
     int n = p.T().size() - 1;
@@ -2353,6 +2435,25 @@ void Model::run() {
         // to discard it (equilibration_orbits = 0); with a prefix, index 0 of
         // this matrix is an equilibration step that never gets exported.
         for (int j = 0; j < N_z; j++) T(0, j) = profile.T()[j];
+        // ROW 0 IS THE INITIAL CONDITION, VERBATIM -- INCLUDING ITS SURFACE
+        // NODE. Deliberately NOT re-solved at times[0], unlike every row below
+        // (fix/frame-forcing-epoch). Two shipped gates assert this convention
+        // -- check_output_time_alignment.py's seed and checkpoint anchors, and
+        // the warm-start G1 gate -- and it is a convention question, not a
+        // measurement question, so it is not settled here.
+        //
+        // What it costs, measured on the 80 N crater: with
+        // equilibration_orbits = 0 the analytic seed's surface differs from
+        // the surface that balances flux[0] against the seed's own interior by
+        // up to 226.93 K on 11,641 of 12,800 faces; on a mid-lunation
+        // warm-start seam the restored checkpoint's surface layer differs by
+        // 0.0145 K max. A seam landing on a sunrise would be the former, not
+        // the latter.
+        //
+        // Note this row is only EXPORTED as output index 0 when there is no
+        // equilibration prefix. With a prefix (the default) row 0 is an
+        // equilibration step that is never exported, and the exported index 0
+        // is a row below -- which does get the corrected surface.
         lt(0) = output_time_points[0];
         progressBar.update(1);
 
@@ -2439,6 +2540,20 @@ void Model::run() {
 
             t = target_time;
             for (int j = 0; j < N_z; j++) T(i, j) = profile.T()[j];
+            // FORCING EPOCH (fix/frame-forcing-epoch). The interior is now the
+            // state at target_time, but T[0] is still the surface the LAST
+            // SUBSTEP solved -- flux at target_time - dt_sub, against the
+            // interior at target_time - dt_sub. Re-evaluate the massless
+            // surface at this epoch. surfFlux() reads the member `t`, which
+            // was just pinned to target_time, so Qs is the flux at times[i].
+            //
+            // This does not perturb the run: the next substep calls
+            // surfFlux() at exactly this t and update_T() then solves the
+            // surface from the same (Qs, T[1], k[0]), so the number computed
+            // here is the number that solve produces. Nothing is written back
+            // into the column -- see outputSurfaceTemp().
+            surfFlux();
+            T(i, 0) = outputSurfaceTemp(profile, Qs, planet.Qb);
             lt(i) = target_time;
             progressBar.update(i + 1);
 

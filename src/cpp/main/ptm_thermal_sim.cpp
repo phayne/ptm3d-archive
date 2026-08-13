@@ -5171,6 +5171,14 @@ bool runThermalModelsForAllFacesBatchSoA(
             // the post-advance state at index t+1. Without this the previous
             // code stored the post-advance state at index t (off-by-one) and
             // duplicated the final state into indices total_time_steps-2 and -1.
+            //
+            // ROW 0 IS THE INITIAL CONDITION, VERBATIM -- including its surface
+            // node, which getSurfaceTemp() returns as the seed or the restored
+            // checkpoint left it. Deliberately NOT re-solved at times[0],
+            // unlike every row below (fix/frame-forcing-epoch); see the
+            // matching note in Model::run (thermal_model.cpp) for the measured
+            // cost and why the convention is not settled here. Row 0 is only
+            // EXPORTED as output index 0 when there is no equilibration prefix.
             if (surface_temps_out) {
                 for (int f = 0; f < faces_in_batch; ++f) {
                     (*surface_temps_out)[start_face + f][0] = batch.getSurfaceTemp(f);
@@ -5211,9 +5219,19 @@ bool runThermalModelsForAllFacesBatchSoA(
                     // default), in which case this is the run's first substep.
                     if (!census_scored) score_spinup_census();
                 }
+                // FORCING EPOCH (fix/frame-forcing-epoch). The column is now
+                // the state at times[t+1], but its surface node was solved at
+                // the MIDPOINT of the last substep (alpha = (n_sub-0.5)/n_sub)
+                // against the interior one substep back. Re-evaluate the
+                // massless surface with flux_b -- the flux AT times[t+1] --
+                // against the interior that is now at times[t+1]. Read-only:
+                // writing it back would change k(T[0]) at the next substep,
+                // because advanceTimestep() refreshes materials BEFORE the
+                // surface solve, and that would move the trajectory.
                 if (surface_temps_out) {
                     for (int f = 0; f < faces_in_batch; ++f) {
-                        (*surface_temps_out)[start_face + f][t + 1] = batch.getSurfaceTemp(f);
+                        (*surface_temps_out)[start_face + f][t + 1] =
+                            thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                     }
                 }
             }
