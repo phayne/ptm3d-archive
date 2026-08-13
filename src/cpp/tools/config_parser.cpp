@@ -294,6 +294,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         if (root["simulation"]) {
             const auto& sim = root["simulation"];
             config.time.start_time = getWithDefault(sim, "start_time", config.time.start_time);
+            config.time.start_time_offset_seconds = getWithDefault(sim, "start_time_offset_seconds", config.time.start_time_offset_seconds);
             config.time.duration_days = getWithDefault(sim, "duration_days", config.time.duration_days);
             config.time.timesteps = getWithDefault(sim, "timesteps", config.time.timesteps);
             config.time.body = getWithDefault(sim, "body", config.time.body);
@@ -383,6 +384,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
             config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
             config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            config.thermal.checkpoint_lookahead_steps = getWithDefault(thermal, "checkpoint_lookahead_steps", config.thermal.checkpoint_lookahead_steps);
             config.thermal.checkpoint_every_output_steps = getWithDefault(thermal, "checkpoint_every_output_steps", config.thermal.checkpoint_every_output_steps);
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
@@ -737,6 +739,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // Simulation section
         out << YAML::Key << "simulation" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "start_time" << YAML::Value << config.time.start_time;
+        if (config.time.start_time_offset_seconds != 0.0)
+            out << YAML::Key << "start_time_offset_seconds" << YAML::Value << config.time.start_time_offset_seconds;
         out << YAML::Key << "duration_days" << YAML::Value << config.time.duration_days;
         out << YAML::Key << "timesteps" << YAML::Value << config.time.timesteps;
         out << YAML::Key << "body" << YAML::Value << config.time.body;
@@ -834,6 +838,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "initial_state_file" << YAML::Value << config.thermal.initial_state_file;
         if (!config.thermal.final_state_file.empty())
             out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
+        if (config.thermal.checkpoint_lookahead_steps != 0)
+            out << YAML::Key << "checkpoint_lookahead_steps" << YAML::Value << config.thermal.checkpoint_lookahead_steps;
         if (config.thermal.compute_ice_stability) {
             out << YAML::Key << "compute_ice_stability" << YAML::Value << config.thermal.compute_ice_stability;
             out << YAML::Key << "ice_stability" << YAML::Value << YAML::BeginMap;
@@ -1093,6 +1099,9 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "# ========== Simulation Parameters ==========\n";
     out << "simulation:\n";
     out << "  start_time: \"2025-01-01T00:00:00\"  # ISO 8601 format\n";
+    out << "  start_time_offset_seconds: 0.0      # ET-seconds offset applied after start_time is\n";
+    out << "                                      # resolved (chunked runs use it so a window\n";
+    out << "                                      # boundary is exact in ET, not in UTC)\n";
     out << "  duration_days: 3.55                # Simulation duration\n";
     out << "  timesteps: 72                       # Number of output timesteps\n";
     out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n\n";
@@ -1149,7 +1158,10 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  integration_days: -1                # Integration window (-1=use output window)\n";
     out << "  integration_steps: -1               # Integration steps (-1=auto)\n";
     out << "  integration_offset_days: 0.0        # Offset for integration window\n";
-    out << "  integration_offset_steps: 0         # Offset steps for integration\n\n";
+    out << "  integration_offset_steps: 0         # Offset steps for integration\n";
+    out << "  checkpoint_lookahead_steps: 0       # Extra output steps integrated past the export window,\n";
+    out << "                                      # so final_state_file lands on the NEXT window's first\n";
+    out << "                                      # epoch (chunked runs set 1; not exported, not reduced)\n\n";
     
     out << "# ========== Illumination ==========\n";
     out << "illumination:\n";

@@ -19,6 +19,18 @@ struct SimulationConfig {
     // Time and Simulation
     struct TimeParams {
         std::string start_time = "2025-01-01T00:00:00";
+        // Ephemeris-time offset (seconds) added to start_time AFTER it is
+        // resolved to ET. 0 (default) = start exactly at start_time.
+        //
+        // The epoch grid's cadence is a number of ET seconds, but start_time is
+        // a UTC string. Shifting a window by adding to the UTC string is
+        // therefore not the same shift: TDB - UTC carries a periodic
+        // relativistic term (~1.7 ms amplitude, annual period) and steps by a
+        // whole second at a leap second. Offsetting a 29.5-day chunk boundary
+        // in UTC misplaced it by 2.2e-4 s; across a leap second it would be 1 s.
+        // scripts/run_chunked_simulation.py sets this so chunk k begins exactly
+        // k*N*dt ET-seconds after the base start.
+        double start_time_offset_seconds = 0.0;
         double duration_days = 3.55;
         int timesteps = 72;
         std::string body = "Europa";
@@ -204,6 +216,29 @@ struct SimulationConfig {
         //   (layer-major to match the GPU SoA layout).
         std::string initial_state_file = "";
         std::string final_state_file   = "";
+
+        // Checkpoint handoff look-ahead, in OUTPUT steps. 0 (default) = the
+        // state written to final_state_file is the state at the LAST exported
+        // frame. 1 = the run integrates one extra grid point PAST the exported
+        // output window and checkpoints there, so the checkpoint is the state
+        // at the FIRST epoch of the next window.
+        //
+        // Why this exists. The output grid is half-open: a window of N steps
+        // over D days covers epochs t0 + i*(D/N) for i in [0, N), and the next
+        // window starts at t0 + N*(D/N). The solver integrates
+        // total_time_steps - 1 intervals, so without a look-ahead its final
+        // state sits at t0 + (N-1)*(D/N) -- one cadence short of where the next
+        // window begins. A chunked run must therefore either overlap by one
+        // epoch (duplicating a sample) or hand off a state that is one step
+        // stale. With checkpoint_lookahead_steps = 1 the chunk integrates N
+        // intervals over N+1 grid points, exports and reduces only the first N,
+        // and checkpoints at the extra point -- both properties hold at once.
+        // scripts/run_chunked_simulation.py sets this for every chunk.
+        //
+        // The extra grid point is NOT exported (no frame, no time_steps.txt
+        // row) and NOT reduced into statistics/*.bin; it only costs one extra
+        // illumination sample and one extra integration step.
+        int checkpoint_lookahead_steps = 0;
 
         // Phase R (R4): mid-run thermal-state checkpoint cadence, in OUTPUT
         // steps. 0 (default) = off = checkpoint only at chunk boundaries (the

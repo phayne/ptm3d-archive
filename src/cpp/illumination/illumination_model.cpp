@@ -3488,7 +3488,21 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     } else {
         et_start = convertTimeToET(start_time);
         et_end = et_start + duration_days * constants::SECONDS_PER_DAY;
-        et_step = (et_end - et_start) / (time_steps_ - 1);
+        // HALF-OPEN cadence: time_steps_ samples covering [et_start, et_end),
+        // i.e. et_start + t*(span/time_steps_). This matches the other three
+        // uniform-grid constructions in this file (calculateIllumination,
+        // calculateIlluminationBatch, calculateLocationIllumination), which
+        // have always divided by time_steps_.
+        //
+        // It used to divide by (time_steps_ - 1) -- a closed grid whose last
+        // sample sits exactly on et_end. That is wrong for any windowed or
+        // chunked use: consecutive windows then either overlap by one sample or
+        // gap, and when the caller's span includes an equilibration prefix the
+        // stretch displaces every OUTPUT epoch. ptm_thermal_sim no longer
+        // reaches this branch at all (it always installs an explicit two-block
+        // grid via setExternalTimeGrid), but any other caller gets the tiling
+        // convention. See docs/chunked-run-equivalence.md.
+        et_step = (et_end - et_start) / time_steps_;
     }
     
     // Check if we should use chunked storage for very large meshes
