@@ -339,6 +339,12 @@ private:
     struct Obs {
         long long pass = 0, fail = 0, indet = 0, not_scored = 0;
         std::vector<double> E_hi;
+        // E_lo over the FAILING faces: the phase-stripped residual a FAIL
+        // actually rests on. Reported because "is the reported E inflated by
+        // the un-averaged forcing?" is the first question anyone asks of a
+        // FAIL, and E_lo answers it -- it is the number with the whole
+        // measured phase bound already subtracted.
+        std::vector<double> E_lo_fail;
     };
     struct Bin {
         long long n = 0, invalid = 0, cut_clamped = 0, cut_shallow = 0;

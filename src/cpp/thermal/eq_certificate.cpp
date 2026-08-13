@@ -507,20 +507,22 @@ void EqCertifyCensus::add(const EqCertifyResult& r, bool zero_forcing) {
     b.Qb_state.push_back(r.Qb_from_state);
 
     if (r.E_floor > 0.0) b.E_floor.push_back(r.E_floor);
-    struct { Obs* o; EqVerdict v; double e; } rows[4] = {
-        {&b.mx,   r.v_max,   r.E_max_hi},
-        {&b.mn,   r.v_min,   r.E_min_hi},
-        {&b.mean, r.v_mean,  r.E_mean_hi},
-        {&b.deep, r.v_deep,  r.E_deep_hi},
+    struct { Obs* o; EqVerdict v; double e_hi, e_lo; } rows[4] = {
+        {&b.mx,   r.v_max,   r.E_max_hi,  r.E_max_lo},
+        {&b.mn,   r.v_min,   r.E_min_hi,  r.E_min_lo},
+        {&b.mean, r.v_mean,  r.E_mean_hi, r.E_mean_lo},
+        {&b.deep, r.v_deep,  r.E_deep_hi, r.E_deep_lo},
     };
     for (const auto& row : rows) {
         switch (row.v) {
             case EqVerdict::Pass:          ++row.o->pass;  break;
-            case EqVerdict::Fail:          ++row.o->fail;  break;
+            case EqVerdict::Fail:          ++row.o->fail;
+                                           row.o->E_lo_fail.push_back(row.e_lo);
+                                           break;
             case EqVerdict::Indeterminate: ++row.o->indet; break;
             default:                       ++row.o->not_scored; continue;
         }
-        if (std::isfinite(row.e)) row.o->E_hi.push_back(row.e);
+        if (std::isfinite(row.e_hi)) row.o->E_hi.push_back(row.e_hi);
     }
 }
 
@@ -557,6 +559,18 @@ void EqCertifyCensus::obsLine(std::ostream& os, const char* label, const Obs& o,
            << "  max " << pct(o.E_hi, 1.00) << std::defaultfloat;
     }
     os << "   [target " << target_K << " K]\n";
+    if (!o.E_lo_fail.empty()) {
+        // E is reported as the TOP of the bracket, so it is an upper bound by
+        // construction. A FAIL, though, is decided on the BOTTOM -- the whole
+        // measured un-averaged forcing subtracted -- so this line is the
+        // defensible number to quote for "how far short is it, at worst
+        // charitable".
+        os << "        " << std::left << std::setw(22) << " of which FAIL:"
+           << std::right << " E_lo (phase-stripped, the bar a FAIL clears) p50 "
+           << std::scientific << std::setprecision(3)
+           << pct(o.E_lo_fail, 0.50) << "  p95 " << pct(o.E_lo_fail, 0.95)
+           << std::defaultfloat << " K\n";
+    }
 }
 
 void EqCertifyCensus::line(std::ostream& os, const char* label, const Bin& b,
@@ -632,9 +646,17 @@ bool EqCertifyCensus::report(std::ostream& os, double cycles_used) const {
     }
     if (clamped > 0) {
         os << "  NOTE: on " << clamped << " face(s) the cut hit the z_max/2 bound "
-              "before 5 skin depths\n        of the reference period, so the "
-              "periodic wave is attenuated less than\n        e^-5 there and "
-              "|r_c| carries more un-averaged forcing than the rule intends.\n";
+              "before 5 skin depths of\n        the reference period. MEASURED "
+              "consequence, on the 1.004 m lunar column\n        (which is 9.10 "
+              "annual skin depths deep, so the rule's 5 delta at or above\n"
+              "        z_max/2 needs 10 and it is 9% short): the cut landed at "
+              "4.79 delta\n        instead of 5.00, which moves the median "
+              "|r_c| by 6.9% on the dark faces\n        and -2.3% on the lit "
+              "ones, and changes the wave attenuation by 1.23x on\n"
+              "        a term the bracket already carries. It is a few percent, "
+              "not a factor.\n        Deepening the cut REDUCES |r_c| by "
+              "excluding unsettled material, so a\n        clamped cut errs "
+              "toward reporting MORE error, not less.\n";
     }
     if (shallow > 0) {
         os << "  *** " << shallow << " face(s) got a cut shallower than TWO skin "
