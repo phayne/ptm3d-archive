@@ -2494,6 +2494,14 @@ struct SeedAnchorCensus {
     // recomputation: they must be the pair the anchor was actually given.
     std::atomic<double>    span_s{0.0};
     std::atomic<double>    cycle_s{0.0};
+    // Whether the depth profile was integrated in Kirchhoff G space, and how
+    // big the fourth-moment term was. Counted and printed for the same reason
+    // the anchor statuses are: a run whose seed silently took the plain profile
+    // where the operator expected the correction is a run whose accuracy claim
+    // does not hold, and "no line printed" is indistinguishable from "forgot to
+    // print". Reported on EVERY path, including as an explicit zero.
+    std::atomic<long long> n_kirchhoff{0};
+    std::atomic<double>    kirch_max{0.0};
     SeedAnchorCensus() { for (auto& c : n) c.store(0); }
     void add(const thermal::EqSeedResult& r) {
         const int i = static_cast<int>(r.anchor_status);
@@ -2501,6 +2509,14 @@ struct SeedAnchorCensus {
         if (r.n_samples > 0) samples.store(r.n_samples);
         if (r.span_s  > 0.0) span_s.store(r.span_s);
         if (r.cycle_s > 0.0) cycle_s.store(r.cycle_s);
+        if (r.kirchhoff_profile) {
+            ++n_kirchhoff;
+            double prev = kirch_max.load(std::memory_order_relaxed);
+            while (r.kirchhoff_surface_offset > prev &&
+                   !kirch_max.compare_exchange_weak(
+                        prev, r.kirchhoff_surface_offset,
+                        std::memory_order_relaxed)) {}
+        }
     }
     // `warm_started` = the run restored thermal.initial_state_file, so no face
     // was seeded and there is no anchor to report (BUGS.md PTM-76). Say that,
@@ -2552,7 +2568,14 @@ struct SeedAnchorCensus {
           << " diurnal cycles = " << (cy > 0.0 && ns > 0 ? ns * cy / sp : 0.0)
           << " samples/cycle; span " << std::setprecision(1) << sp
           << " s, cycle " << cy << " s]";
-        std::cout << q.str() << std::endl;
+        std::ostringstream kq;
+        kq.setf(std::ios::fixed);
+        kq << std::setprecision(3) << "  [kirchhoff depth profile: "
+           << n_kirchhoff.load() << " of " << tot << " faces";
+        if (n_kirchhoff.load() > 0)
+            kq << ", max R4*W(0) = " << kirch_max.load() << " K";
+        kq << "]";
+        std::cout << q.str() << kq.str() << std::endl;
     }
 };
 }  // namespace
