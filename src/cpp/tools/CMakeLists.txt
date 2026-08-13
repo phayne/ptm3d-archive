@@ -217,6 +217,20 @@ set_target_properties(test_eq_anchor
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Thermal-state checkpoint gate (BUGS.md PTM-76). Pins the 'PTMT' format, the
+# bit-identical round trip, the single float32 rounding at the write, and the
+# refusal on every malformed or mismatched input. No GPU required.
+add_executable(test_state_io test_state_io.cpp)
+target_link_libraries(test_state_io
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_state_io
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration spin-up estimator gate. Checks tau1 against the analytic
 # quarter-wave slab, the ln(1/target) scaling of n_req, and that an
 # unreachable target returns NO cycle count.

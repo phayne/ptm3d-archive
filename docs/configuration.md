@@ -106,7 +106,7 @@ Runnable examples are in [`../examples/`](../examples/); start with
 | `integration_steps` | int | -1 | Same window, expressed in steps |
 | `integration_offset_days` | float | 0.0 | Offset of the integration window |
 | `integration_offset_steps` | int | 0 | Same offset, expressed in steps |
-| `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration |
+| `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
 | `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only) |
 | `eq_indirect_source` | string | `auto` | Where the equilibration phase gets its indirect flux: `auto` estimates it internally, `off` is the pre-2026-08 behavior ([radiation-exchange.md §7.7](radiation-exchange.md)) |
@@ -119,6 +119,43 @@ Runnable examples are in [`../examples/`](../examples/); start with
 
 The checkpoint files are used by the chunked-run workflow
 (`scripts/run_chunked_simulation.py` and `ptm_merge_chunks`).
+
+
+### Thermal-state checkpoints
+
+`thermal.initial_state_file` and `thermal.final_state_file` hand a whole-mesh
+per-face `T(z)` column between runs. Every whole-mesh solver path reads and
+writes them — the GPU persistent solver, the CPU SIMD batch solver, the CPU
+scalar solver, and the streamed CPU path — in the same format
+(`uint32` magic `0x50544D54` `'PTMT'`, `uint32 n_faces`, `uint32 n_layers`, then
+`n_layers × n_faces` `float32` in layer-major order). A checkpoint written by
+either backend restores on the other.
+
+Three things to know before relying on one.
+
+- **It refuses; it does not degrade.** A missing file, a wrong magic number, a
+  truncated body, a face- or layer-count mismatch, or a destination that cannot
+  be opened for writing aborts the run with a message naming the reason. It
+  never falls back to a cold start, because a silently cold-started chunk
+  reports spin-up as physics.
+- **The file is `float32`, on every path.** The CPU solvers carry `T` in
+  `float64`, so writing a checkpoint rounds each value once, at the write.
+  Restoring is exact. A CPU → file → CPU round trip therefore reproduces the
+  file bit-for-bit and the in-memory column to `float32` precision.
+- **The file does not record the depth grid.** It carries the shape and nothing
+  else, so a checkpoint written on one grid will load onto a different grid that
+  happens to have the same layer count. The engine prints the live grid
+  (`n_layers`, `z[0]`, `dz[0]`, `z_max`) at both the write and the restore, and
+  says in the restore message which quantities it could not verify — compare the
+  two lines when resuming across a configuration change.
+
+Setting `initial_state_file` forces `equilibration_orbits` to 0 and disables the
+analytic clear-sky pre-conditioner: a restored column is a continuation, and
+spinning it up again would discard it. Both are announced in the log.
+
+One case is disclosed rather than refused. With radiation coupling on a CPU
+solver, the coupled re-run keeps no `T(z)` column, so the checkpoint holds the
+**un-coupled** column on the faces the re-run touched. The run says so.
 
 
 ### Equilibration length: what the number means

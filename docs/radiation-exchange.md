@@ -467,7 +467,9 @@ illumination pass.
 - **Post-coupling checkpoint.** When `thermal.final_state_file` is set, the checkpoint written by
   the initial solve is rewritten after the coupling loop with the coupled end-of-window column on
   every face the re-run touched, so a resumed chunk does not cold-start the faces where indirect
-  radiation sets the temperature.
+  radiation sets the temperature. This applies to the **GPU** thermal path only: the CPU re-run
+  keeps no `T(z)` column, so on a CPU solver the archived checkpoint stays the **un-coupled**
+  iter-0 column on the re-run faces. The run reports that rather than implying otherwise.
 
 ### 7.7 Indirect flux during equilibration
 

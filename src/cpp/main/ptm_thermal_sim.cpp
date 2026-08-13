@@ -38,6 +38,7 @@
 #include "../tools/solver_disclosure.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/eq_certificate.h"
+#include "../thermal/thermal_state_io.h"
 #include <memory>
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
@@ -820,7 +821,11 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     // Per-GLOBAL-face time-mean indirect flux added to the equilibration-phase
     // absorbed flux only (absolute steps [0, equilibration_steps)). Empty =
     // legacy. Same contract as the GPU and SIMD-batch solvers.
-    const std::vector<double>& eq_indirect_flux = {});
+    const std::vector<double>& eq_indirect_flux = {},
+    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    // Empty = neither, and this driver is byte-identical to what it was.
+    const std::string& initial_state_file = "",
+    const std::string& final_state_file   = "");
 
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
@@ -844,7 +849,10 @@ bool runThermalModelsForAllFacesBatchSoA(
     // [0, equilibration_steps). Empty (default) = legacy: equilibration sees
     // no indirect term. Same contract as the GPU persistent solver's
     // eq_indirect_flux argument.
-    const std::vector<double>& eq_indirect_flux = {});
+    const std::vector<double>& eq_indirect_flux = {},
+    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    const std::string& initial_state_file = "",
+    const std::string& final_state_file   = "");
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -1537,7 +1545,10 @@ bool runThermalModelsForAllFacesStreamed(
     const std::vector<double>* face_H_overrides,
     const thermal::Planet* planet,
     int equilibration_steps,
-    const std::vector<double>& eq_indirect_flux);
+    const std::vector<double>& eq_indirect_flux,
+    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    const std::string& initial_state_file = "",
+    const std::string& final_state_file   = "");
 
 void fixOutOfRangeAlbedos(
     std::vector<double>& face_albedos,
@@ -2491,9 +2502,30 @@ struct SeedAnchorCensus {
         if (r.span_s  > 0.0) span_s.store(r.span_s);
         if (r.cycle_s > 0.0) cycle_s.store(r.cycle_s);
     }
-    void report(const char* path) const {
+    // `warm_started` = the run restored thermal.initial_state_file, so no face
+    // was seeded and there is no anchor to report (BUGS.md PTM-76). Say that,
+    // rather than printing nothing: a census line that is simply absent is
+    // indistinguishable from a census that was forgotten, and the whole point
+    // of this line is that the seed cannot be silent.
+    void report(const char* path, bool warm_started = false) const {
         long long tot = 0;
         for (const auto& c : n) tot += c.load();
+        if (warm_started) {
+            std::cout << "[eq-seed] surface-anchor census (" << path
+                      << "): NONE -- this run restored a T(z) checkpoint "
+                         "(thermal.initial_state_file), so no face was seeded "
+                         "and no anchor was computed. The initial condition is "
+                         "the checkpoint.";
+            if (tot != 0) {
+                // Cannot happen by construction; if it ever does, the seed and
+                // the restore have both run and the run is reporting two
+                // different initial conditions.
+                std::cout << "  *** BUG: " << tot << " faces nevertheless "
+                             "recorded an anchor. ***";
+            }
+            std::cout << std::endl;
+            return;
+        }
         if (tot == 0) return;
         std::cout << "[eq-seed] surface-anchor census (" << path << "): ";
         bool first = true;
@@ -2526,6 +2558,168 @@ struct SeedAnchorCensus {
 }  // namespace
 
 
+// Per-face warm-start / checkpoint plumbing for the CPU SCALAR solver
+// (BUGS.md PTM-76). One struct rather than four loose arguments, because this
+// function already carries ten and every caller would have to spell all of them.
+//
+// `n_layers` is the depth-grid size the CHECKPOINT was written with. The CPU
+// scalar path builds a Profile per face and, under ADAPTIVE_GRID with a per-face
+// H map, that grid can differ face to face -- so the match is checked per face
+// and a mismatch is a REFUSAL counted in `refusals`, never a silent cold start.
+struct FaceStateIO {
+    const float* in_column  = nullptr;   // restore from, or null
+    float*       out_column = nullptr;   // capture into, or null
+    int          n_layers   = 0;
+    std::atomic<size_t>* refusals = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Whole-mesh thermal-state checkpoint, CPU side (BUGS.md PTM-76).
+//
+// The GPU persistent solver has read and written thermal.initial_state_file /
+// thermal.final_state_file since the chunked workflow was built. No CPU path
+// did. This carries the same format -- literally the same reader and writer,
+// thermal/thermal_state_io.h -- to the CPU scalar, CPU SIMD-batch and streamed
+// drivers, so a file written by either backend is readable by the other.
+//
+// n_layers is derived EXACTLY the way runThermalModelsForAllFaces_GPU_Persistent
+// derives it (Planet from config, applyConfiguredThermo, then a reference
+// Profile at latitude 0). That is what makes a cross-backend restore possible
+// at all: if the two paths sized their grids differently the shape check would
+// fire on every cross-backend load.
+//
+// Every failure here is a REFUSAL. There is no path on which a requested
+// checkpoint is skipped and the run continues.
+// ---------------------------------------------------------------------------
+struct CpuStateCheckpoint {
+    bool   want_in   = false;
+    bool   want_out  = false;
+    size_t n_faces   = 0;
+    size_t n_layers  = 0;
+    std::vector<float> loaded;      // n_layers*n_faces, layer-major (restore)
+    std::vector<float> assembled;   // n_layers*n_faces, layer-major (capture)
+    std::string out_path;
+    std::string tag;
+    std::atomic<size_t> refusals{0};
+
+    // Returns false if the run must abort. Prints the reason itself.
+    bool begin(const std::string& in_path, const std::string& out_path_in,
+               const thermal::Config& config, size_t n_faces_in,
+               const char* tag_in) {
+        tag      = tag_in;
+        want_in  = !in_path.empty();
+        want_out = !out_path_in.empty();
+        out_path = out_path_in;
+        n_faces  = n_faces_in;
+        if (!want_in && !want_out) return true;
+
+        thermal::Planet ref_planet(config.getProperty("planet", "Moon"));
+        applyConfiguredThermo(ref_planet, config);
+        thermal::Profile ref_profile(ref_planet, 0.0, config, false);
+        n_layers = static_cast<size_t>(ref_profile.nlayers);
+        if (n_layers < 2) {
+            std::cerr << tag << " FATAL: reference depth grid has " << n_layers
+                      << " layers; cannot checkpoint a thermal state on it.\n";
+            return false;
+        }
+
+        // The format carries the SHAPE only -- not the depth grid. Print the
+        // live grid at both ends so a restore onto a different grid with the
+        // same layer count is at least visible in the logs. See the note at the
+        // top of thermal/thermal_state_io.h.
+        const std::string fp = thermal::state_io::gridFingerprint(
+            ref_profile.z().data(), n_layers);
+
+        if (want_in) {
+            std::string err;
+            if (!thermal::state_io::read(in_path, n_faces, n_layers,
+                                         loaded, err)) {
+                std::cerr << "\n" << tag << " FATAL: cannot restore "
+                             "thermal.initial_state_file -- " << err << ".\n"
+                          << "  This run was asked to resume from a checkpoint. "
+                             "Cold-starting instead would report spin-up as "
+                             "physics, so it refuses.\n" << std::endl;
+                return false;
+            }
+            std::cout << tag << " Restored T(z) checkpoint: " << in_path
+                      << " (" << n_faces << " faces x " << n_layers
+                      << " layers, "
+                      << (loaded.size() * sizeof(float)) / (1024.0 * 1024.0)
+                      << " MiB)\n"
+                      << tag << "   live grid " << fp
+                      << "; the checkpoint does NOT record the grid it was "
+                         "written on, so z[], the body and the thermophysical "
+                         "properties are UNVERIFIED -- only the "
+                      << n_faces << "x" << n_layers << " shape was checked."
+                      << std::endl;
+        }
+        if (want_out) {
+            assembled.assign(n_layers * n_faces,
+                             std::numeric_limits<float>::quiet_NaN());
+            std::cout << tag << " Will write the end-of-window T(z) checkpoint to "
+                      << out_path << " (" << fp << ")" << std::endl;
+        }
+        return true;
+    }
+
+    // Copy face `f`'s restore column into a contiguous buffer.
+    void gatherIn(size_t f, float* dst) const {
+        for (size_t l = 0; l < n_layers; ++l) dst[l] = loaded[l * n_faces + f];
+    }
+    // Scatter face `f`'s captured column back into the layer-major buffer.
+    void scatterOut(size_t f, const float* src) {
+        for (size_t l = 0; l < n_layers; ++l) assembled[l * n_faces + f] = src[l];
+    }
+
+    // Returns false if the run must be treated as failed.
+    bool finish() {
+        if (!want_out) {
+            if (refusals.load() > 0) {
+                std::cerr << "\n" << tag << " FATAL: " << refusals.load() << " of "
+                          << n_faces << " faces refused the warm start.\n"
+                          << "  Those faces would have cold-started inside a run "
+                             "that asked to resume. Refusing to report results."
+                          << std::endl;
+                return false;
+            }
+            return true;
+        }
+        if (refusals.load() > 0) {
+            std::cerr << "\n" << tag << " FATAL: " << refusals.load() << " of "
+                      << n_faces << " faces produced no T(z) column.\n"
+                      << "  Writing the checkpoint anyway would bank dead columns "
+                         "that the next chunk resumes from (BUGS.md PTM-78). "
+                         "Refusing to write '" << out_path << "'." << std::endl;
+            return false;
+        }
+        // Nothing may reach disk unwritten: the buffer was filled with NaN, so a
+        // face the driver forgot is caught here rather than in the next chunk.
+        size_t n_unset = 0;
+        for (float v : assembled) if (!std::isfinite(v)) ++n_unset;
+        if (n_unset > 0) {
+            std::cerr << "\n" << tag << " FATAL: " << n_unset << " of "
+                      << assembled.size() << " checkpoint values were never "
+                         "written by the solver. Refusing to write '"
+                      << out_path << "'." << std::endl;
+            return false;
+        }
+        std::string err;
+        if (!thermal::state_io::write(out_path, n_faces, n_layers,
+                                      assembled, err)) {
+            std::cerr << "\n" << tag << " FATAL: " << err << ".\n"
+                      << "  thermal.final_state_file was requested; a chunked "
+                         "workflow cannot hand state over without it."
+                      << std::endl;
+            return false;
+        }
+        std::cout << tag << " Wrote final T(z) checkpoint: " << out_path
+                  << " (" << n_faces << " faces x " << n_layers << " layers, "
+                  << (assembled.size() * sizeof(float)) / (1024.0 * 1024.0)
+                  << " MiB)" << std::endl;
+        return true;
+    }
+};
+
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -2540,12 +2734,16 @@ std::vector<double> runThermalModelWithMatchedTimes(
     long long seed_record_face = -1,
     std::atomic<size_t>* seed_floor_faces = nullptr,
     std::atomic<size_t>* seed_hot_faces   = nullptr,
-    SeedAnchorCensus*    anchor_census    = nullptr) {
+    SeedAnchorCensus*    anchor_census    = nullptr,
+    // Warm start / final-state capture. Null = neither, and this function is
+    // then bit-identical to what it was before PTM-76.
+    FaceStateIO* state = nullptr) {
 
     // Validate inputs
     std::vector<double> temps_out;
     if (times.empty() || flux_values.empty()) {
         std::cerr << "runThermalModelWithMatchedTimes: empty input" << std::endl;
+        if (state && state->refusals) ++(*state->refusals);
         return temps_out;
     }
 
@@ -2599,11 +2797,48 @@ std::vector<double> runThermalModelWithMatchedTimes(
                             config,
                             false);
 
+        // ---- Warm start (BUGS.md PTM-76) -------------------------------
+        // Replace the seed the constructor just applied with the checkpointed
+        // column.
+        //
+        // ORDER IS LOAD-BEARING, and it is the opposite of what it was before
+        // the lit-face seed anchor landed. This block runs BEFORE the seed
+        // diagnostics below and suppresses them, because a restored face HAS NO
+        // SEED: the constructor computed one and this throws it away. Reporting
+        // it -- its floor/clamp guards, its PTM_DUMP_SEED row, and now its
+        // anchor status and quadrature -- would label the run with a
+        // computation that never touched the answer. The census in particular
+        // would print a full, plausible, entirely fictional anchor line for a
+        // warm-started chunk.
+        const bool warm_started_face = (state && state->in_column != nullptr);
+        if (state && (state->in_column || state->out_column)) {
+            if (model.N_z != state->n_layers) {
+                std::cerr << "[warm-start] REFUSING face at lat " << latitude
+                          << ": its depth grid has " << model.N_z
+                          << " layers but the checkpoint has " << state->n_layers
+                          << ". A per-face H map with ADAPTIVE_GRID gives each face"
+                             " its own grid; a checkpoint cannot be restored across"
+                             " that." << std::endl;
+                if (state->refusals) ++(*state->refusals);
+                temps_out.assign(N, std::numeric_limits<double>::quiet_NaN());
+                return temps_out;
+            }
+            if (state->in_column && !model.restoreState(state->in_column,
+                                                        state->n_layers)) {
+                std::cerr << "[warm-start] REFUSING face at lat " << latitude
+                          << ": restoreState rejected the checkpoint column."
+                          << std::endl;
+                if (state->refusals) ++(*state->refusals);
+                temps_out.assign(N, std::numeric_limits<double>::quiet_NaN());
+                return temps_out;
+            }
+        }
+
         // Shared spin-up seed diagnostics. The constructor has already applied
         // the seed; record it against this face so the CSV can be diffed
         // against the SIMD-batch and GPU dumps (gate G1), and count the two
         // guards so they can be reported instead of swallowed.
-        if (model.seed_applied) {
+        if (model.seed_applied && !warm_started_face) {
             if (model.seed_result.clamped_low && seed_floor_faces) ++(*seed_floor_faces);
             if (model.seed_result.above_500K  && seed_hot_faces)   ++(*seed_hot_faces);
             if (anchor_census) anchor_census->add(model.seed_result);
@@ -2624,9 +2859,25 @@ std::vector<double> runThermalModelWithMatchedTimes(
         // Run the model
         model.run();
 
+        // End-of-window T(z) for the checkpoint. Captured from the profile,
+        // which is the live state after the last advance -- not from model.T,
+        // whose last row is the same column but stored one output index earlier
+        // in the alignment convention.
+        if (state && state->out_column) {
+            if (!model.captureState(state->out_column, state->n_layers)) {
+                std::cerr << "[warm-start] REFUSING face at lat " << latitude
+                          << ": captureState could not fill a " << state->n_layers
+                          << "-layer column from an " << model.N_z
+                          << "-layer profile." << std::endl;
+                if (state->refusals) ++(*state->refusals);
+                temps_out.assign(N, std::numeric_limits<double>::quiet_NaN());
+                return temps_out;
+            }
+        }
+
         // Extract surface temperatures
         temps_out.resize(N, 0.0);
-        
+
         // The model's T matrix should be N_steps x N_z (time steps x depth layers)
         if (model.T.rows() == N && model.T.cols() > 0) {
             for (int i = 0; i < N; ++i) {
@@ -2644,6 +2895,12 @@ std::vector<double> runThermalModelWithMatchedTimes(
         
     } catch (const std::exception& e) {
         std::cerr << "Exception in thermal model: " << e.what() << std::endl;
+        // A face that threw produced no T(z) column. If a checkpoint was
+        // requested, the assembled buffer would carry zeros here and the next
+        // chunk would resume a dead column (BUGS.md PTM-78's failure mode).
+        // Count it so the driver refuses to write the file at all.
+        if (state && (state->in_column || state->out_column) && state->refusals)
+            ++(*state->refusals);
         temps_out.resize(N, 200.0);  // Default temperature
         return temps_out;
     }
@@ -3344,7 +3601,9 @@ bool runThermalModelsForAllFacesStreamed(
     const std::vector<double>* face_H_overrides,
     const thermal::Planet* planet,
     int equilibration_steps,
-    const std::vector<double>& eq_indirect_flux)
+    const std::vector<double>& eq_indirect_flux,
+    const std::string& initial_state_file,
+    const std::string& final_state_file)
 {
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
@@ -3427,6 +3686,30 @@ bool runThermalModelsForAllFacesStreamed(
                      "path uses the CPU SCALAR solver]" << std::endl;
     }
 
+    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // same reader/writer as the GPU persistent solver.
+    CpuStateCheckpoint ckpt;
+    if (!ckpt.begin(initial_state_file, final_state_file, config, n_faces,
+                    "[Streamed]")) {
+        return false;
+    }
+    // Same refusal as the CPU scalar driver, and for the same reason: this path
+    // calls that solver, so a per-face H map under ADAPTIVE_GRID puts each face
+    // on its own depth grid and a one-shape checkpoint cannot describe it.
+    if ((ckpt.want_in || ckpt.want_out) && face_H_overrides &&
+        !face_H_overrides->empty() && config.ADAPTIVE_GRID) {
+        std::cerr << "\n[Streamed] FATAL: a per-face H map is loaded ("
+                  << face_H_overrides->size() << " faces) and "
+                     "thermal.ADAPTIVE_GRID is on, so the CPU scalar solver this "
+                     "path calls gives each face its OWN depth grid.\n"
+                  << "  A T(z) checkpoint carries one shape for the whole mesh "
+                     "and no depths, so it cannot represent that (BUGS.md "
+                     "PTM-76).\n"
+                  << "  Use the GPU persistent solver, or drop the checkpoint "
+                     "keys." << std::endl;
+        return false;
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     thermal::ProgressBar progressBar(n_faces, "Thermal Simulation", 50, true);
 
@@ -3475,10 +3758,31 @@ bool runThermalModelsForAllFacesStreamed(
             double face_H = (face_H_overrides && f < face_H_overrides->size())
                           ? (*face_H_overrides)[f]
                           : -1.0;
+            // Warm start / final-state capture for this face (PTM-76).
+            std::vector<float> st_in, st_out;
+            FaceStateIO st;
+            FaceStateIO* st_ptr = nullptr;
+            if (ckpt.want_in || ckpt.want_out) {
+                st.n_layers = static_cast<int>(ckpt.n_layers);
+                st.refusals = &ckpt.refusals;
+                if (ckpt.want_in) {
+                    st_in.resize(ckpt.n_layers);
+                    ckpt.gatherIn(f, st_in.data());
+                    st.in_column = st_in.data();
+                }
+                if (ckpt.want_out) {
+                    st_out.assign(ckpt.n_layers, 0.0f);
+                    st.out_column = st_out.data();
+                }
+                st_ptr = &st;
+            }
+
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
-                &seed_floor_faces, &seed_hot_faces, &anchor_census);
+                &seed_floor_faces, &seed_hot_faces, &anchor_census, st_ptr);
+
+            if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
             if (surface_temps_out) {
                 (*surface_temps_out)[f].swap(temps);
@@ -3508,7 +3812,7 @@ bool runThermalModelsForAllFacesStreamed(
                   << n_faces << " faces seed above " << thermal::MAX_PHYSICAL_TEMP_K
                   << " K, the CPU solver's hard clamp.\n";
     }
-    anchor_census.report("cpu-streamed");
+    anchor_census.report("cpu-streamed", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-streamed");
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -3516,6 +3820,8 @@ bool runThermalModelsForAllFacesStreamed(
     std::cerr << "[Streamed] Thermal computation completed in "
               << std::fixed << std::setprecision(3)
               << (ms/1000.0) << " s (" << ms << " ms)" << std::endl;
+
+    if (!ckpt.finish()) return false;
 
     return true;
 }
@@ -3537,8 +3843,10 @@ bool runThermalModelsForAllFaces(
     int thermal_threads,
     const thermal::Planet* planet,
     const std::vector<double>* face_Qb,
-    const std::vector<double>& eq_indirect_flux) {
-    
+    const std::vector<double>& eq_indirect_flux,
+    const std::string& initial_state_file,
+    const std::string& final_state_file) {
+
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
     std::string albedo_map_path;
@@ -3609,6 +3917,37 @@ bool runThermalModelsForAllFaces(
     
     // Print initial message
     std::cerr << "\nRunning thermal models for " << n_faces << " mesh faces..." << std::endl;
+
+    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // same reader/writer as the GPU persistent solver.
+    CpuStateCheckpoint ckpt;
+    if (!ckpt.begin(initial_state_file, final_state_file, config, n_faces,
+                    "[Thermal]")) {
+        return false;
+    }
+    // Unlike every other solver, THIS one builds a Profile per face, and under
+    // ADAPTIVE_GRID the depth grid is a function of that face's H
+    // (thermal_model.cpp, generateAdaptiveGrid). With a per-face H map loaded,
+    // different faces therefore sit on different grids -- and a checkpoint is a
+    // whole-mesh object with exactly one (n_faces, n_layers) shape, so it cannot
+    // describe them. The per-face layer-count check below catches the faces
+    // whose grid has a different SIZE; it cannot catch a face whose grid has the
+    // same size at different depths. Refuse the combination outright rather than
+    // bank a file whose columns mean different things face to face.
+    if ((ckpt.want_in || ckpt.want_out) && planet &&
+        !planet->face_H_overrides.empty() && config.ADAPTIVE_GRID) {
+        std::cerr << "\n[Thermal] FATAL: a per-face H map is loaded ("
+                  << planet->face_H_overrides.size() << " faces) and "
+                     "thermal.ADAPTIVE_GRID is on, so the CPU scalar solver "
+                     "gives each face its OWN depth grid.\n"
+                  << "  A T(z) checkpoint carries one shape for the whole mesh "
+                     "and no depths, so it cannot represent that (BUGS.md "
+                     "PTM-76).\n"
+                  << "  Use the CPU SIMD-batch solver or the GPU persistent "
+                     "solver -- both put every face on one reference grid -- or "
+                     "drop the checkpoint keys." << std::endl;
+        return false;
+    }
 
     // Shared spin-up seed (thermal/eq_seed.h). This path used to seed every
     // column from ONE global T_avg = T_ss/sqrt(2) -- flux-blind AND
@@ -3717,6 +4056,25 @@ bool runThermalModelsForAllFaces(
                 double face_H = (planet && f < planet->face_H_overrides.size())
                               ? planet->face_H_overrides[f]
                               : -1.0;
+                // Warm start / final-state capture for this face (PTM-76).
+                std::vector<float> st_in, st_out;
+                FaceStateIO st;
+                FaceStateIO* st_ptr = nullptr;
+                if (ckpt.want_in || ckpt.want_out) {
+                    st.n_layers = static_cast<int>(ckpt.n_layers);
+                    st.refusals = &ckpt.refusals;
+                    if (ckpt.want_in) {
+                        st_in.resize(ckpt.n_layers);
+                        ckpt.gatherIn(f, st_in.data());
+                        st.in_column = st_in.data();
+                    }
+                    if (ckpt.want_out) {
+                        st_out.assign(ckpt.n_layers, 0.0f);
+                        st.out_column = st_out.data();
+                    }
+                    st_ptr = &st;
+                }
+
                 std::vector<double> temps = runThermalModelWithMatchedTimes(
                     face_flux,
                     times,
@@ -3728,8 +4086,12 @@ bool runThermalModelsForAllFaces(
                     static_cast<long long>(f),
                     &seed_floor_faces,
                     &seed_hot_faces,
-                    &anchor_census
+                    &anchor_census,
+                    st_ptr
                 );
+
+                if (ckpt.want_out && st.out_column)
+                    ckpt.scatterOut(f, st_out.data());
 
                 // Store results locally in the chunk
                 chunk_results[local_idx] = std::move(temps);
@@ -3834,12 +4196,14 @@ bool runThermalModelsForAllFaces(
                   << thermal::MAX_PHYSICAL_TEMP_K << " K, the CPU solver's hard "
                      "clamp; the solution WILL be truncated there." << std::endl;
     }
-    anchor_census.report("cpu-scalar");
+    anchor_census.report("cpu-scalar", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-scalar");
 
     // Print timing information using cerr to match illumination code
     std::cerr << "Thermal computation completed in " << std::fixed << std::setprecision(3)
               << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
+
+    if (!ckpt.finish()) success = false;
 
     if (success) {
         std::cerr << "\nThermal models completed successfully!" << std::endl;
@@ -4057,7 +4421,9 @@ bool runThermalModelsForAllFacesBatchSoA(
     int thermal_threads,
     const std::vector<double>* face_Qb,
     const std::vector<double>* face_H_overrides,
-    const std::vector<double>& eq_indirect_flux)
+    const std::vector<double>& eq_indirect_flux,
+    const std::string& initial_state_file,
+    const std::string& final_state_file)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
@@ -4170,6 +4536,24 @@ bool runThermalModelsForAllFacesBatchSoA(
     const int n_layers = ref_profile.nlayers;
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
+
+    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // same reader/writer as the GPU persistent solver. This batch path shares
+    // ONE grid across every face (the ref_profile above), so unlike the CPU
+    // scalar path it cannot hit a per-face layer-count mismatch.
+    CpuStateCheckpoint ckpt;
+    if (!ckpt.begin(initial_state_file, final_state_file, config, n_faces,
+                    "[SIMD Batch]")) {
+        return false;
+    }
+    if ((ckpt.want_in || ckpt.want_out) &&
+        ckpt.n_layers != static_cast<size_t>(n_layers)) {
+        std::cerr << "\n[SIMD Batch] FATAL: the checkpoint reference grid has "
+                  << ckpt.n_layers << " layers but this solver's reference "
+                     "profile has " << n_layers
+                  << ". Refusing rather than restoring onto a different grid.\n";
+        return false;
+    }
 
     // Progress tracking
     std::atomic<size_t> completed_batches{0};
@@ -4334,6 +4718,18 @@ bool runThermalModelsForAllFacesBatchSoA(
             cpuAnalyticSeedCycles(planet, config.NYEARSEQ) * planet.day;
     }
 
+    // A restored checkpoint is a continuation, so the pre-conditioner would
+    // discard exactly the state the previous chunk produced. Overridden here
+    // rather than left to the config, and said out loud (BUGS.md PTM-76).
+    if (ckpt.want_in && equil_duration_s_shared > 0.0) {
+        std::cerr << "[warm-start] thermal.initial_state_file is set, so the "
+                  << (equil_duration_s_shared / std::max(1.0, planet.day))
+                  << "-cycle analytic clear-sky pre-conditioner is SKIPPED: the "
+                     "restored T(z) is already spun up and the pre-conditioner "
+                     "would overwrite it." << std::endl;
+        equil_duration_s_shared = 0.0;
+    }
+
     // ---- Equilibration spin-up estimate (FIX 0) ----------------------------
     // Report-only and DEFAULT ON: it changes no solver state and the
     // statistics are byte-identical either way, so gating it off would only
@@ -4395,6 +4791,27 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
+            // ---- Warm start (BUGS.md PTM-76) ---------------------------
+            // A restored column REPLACES the seed below. It is applied after
+            // copyGridFromProfile (which fills T with T_eq_init) and before the
+            // first advanceTimestep, which is exactly where the seed would go,
+            // so the solver sees the checkpoint as its initial condition and
+            // nothing else touches T in between.
+            if (ckpt.want_in) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t global_f = start_face + f;
+                    for (int layer = 0; layer < n_layers; ++layer) {
+                        batch.T[layer * BS + f] = static_cast<double>(
+                            ckpt.loaded[static_cast<size_t>(layer) * n_faces
+                                        + global_f]);
+                    }
+                    // T_eq_init is only read by copyGridFromProfile (already
+                    // called) and is not a solver input; keep it consistent with
+                    // the restored surface so a later regrid cannot resurrect a
+                    // stale 200 K.
+                    batch.T_eq_init[f] = batch.T[f];
+                }
+            } else {
             // Initialize temperatures with a depth-dependent profile, mirroring
             // Profile::init_T (thermal_model.cpp:706). A uniform initial T at
             // all depths takes many lunar days of forcing to relax into the
@@ -4601,6 +5018,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     batch.T[layer * BS + f] = T_deep + (T_surf_est - T_deep) * blend;
                 }
             }
+            }   // end of the seed branch (see the warm-start `if` above)
 
             // Zero-pad unused face slots (use a benign mid-range temperature).
             for (int f = faces_in_batch; f < BS; ++f) {
@@ -4800,6 +5218,19 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
+            // End-of-window T(z) for the checkpoint (BUGS.md PTM-76). Taken from
+            // the live batch state after the last advance -- the same instant the
+            // GPU persistent solver samples for its own final_state_file.
+            if (ckpt.want_out) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t global_f = start_face + f;
+                    for (int layer = 0; layer < n_layers; ++layer) {
+                        ckpt.assembled[static_cast<size_t>(layer) * n_faces + global_f]
+                            = static_cast<float>(batch.T[layer * BS + f]);
+                    }
+                }
+            }
+
             // Update progress
             size_t done = ++completed_batches;
             #pragma omp critical
@@ -4923,7 +5354,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "those faces are not trustworthy."
                   << std::endl;
     }
-    simd_anchor_census.report("cpu-simd-batch");
+    simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
 
     // End timing
@@ -4933,6 +5364,8 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     std::cerr << "SIMD Batch thermal computation completed in " << std::fixed << std::setprecision(3)
               << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
+
+    if (!ckpt.finish()) success = false;
 
     if (success) {
         std::cerr << "\nSIMD Batch thermal models completed successfully!" << std::endl;
@@ -6090,48 +6523,29 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     }
 
     // ---- Optional initial / final thermal-state checkpoint -------------
-    // Magic bytes 'PTMT' (0x50544D54) identify the format.
-    constexpr uint32_t kThermalStateMagic = 0x50544D54;
-
-    // Load initial T(z) once; we'll slice per-batch below.
-    // Layout in file: layer-major across ALL faces, float32, size
-    // n_layers * n_faces. Matches the GPU SoA in buf_T_.
+    // The format ('PTMT', layer-major float32) lives in ONE place --
+    // thermal/thermal_state_io.h -- which is what makes a checkpoint written by
+    // this solver readable by the CPU drivers and vice versa (BUGS.md PTM-76).
+    // This block used to be the only copy; the CPU paths had none, and the
+    // PTM-57 rewrite below had a third.
     std::vector<float> loaded_initial_T;
     if (!initial_state_file.empty()) {
-        std::ifstream is(initial_state_file, std::ios::binary);
-        if (!is) {
-            std::cerr << "[GPU Thermal] ERROR: cannot open initial_state_file '"
-                      << initial_state_file << "'\n";
-            return false;
-        }
-        uint32_t magic = 0, file_n_faces = 0, file_n_layers = 0;
-        is.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
-        is.read(reinterpret_cast<char*>(&file_n_faces), sizeof(uint32_t));
-        is.read(reinterpret_cast<char*>(&file_n_layers), sizeof(uint32_t));
-        if (!is || magic != kThermalStateMagic) {
-            std::cerr << "[GPU Thermal] ERROR: bad magic in initial_state_file '"
-                      << initial_state_file << "' (got 0x" << std::hex << magic
-                      << ", expected 0x" << kThermalStateMagic << std::dec << ")\n";
-            return false;
-        }
-        if (file_n_faces != static_cast<uint32_t>(n_faces) ||
-            file_n_layers != static_cast<uint32_t>(n_layers)) {
-            std::cerr << "[GPU Thermal] ERROR: initial_state_file shape mismatch "
-                      << "(file=" << file_n_faces << "x" << file_n_layers
-                      << ", live=" << n_faces << "x" << n_layers << ")\n";
-            return false;
-        }
-        const size_t expected = static_cast<size_t>(file_n_faces) * file_n_layers;
-        loaded_initial_T.resize(expected);
-        is.read(reinterpret_cast<char*>(loaded_initial_T.data()),
-                expected * sizeof(float));
-        if (!is) {
-            std::cerr << "[GPU Thermal] ERROR: short read on initial_state_file\n";
+        std::string st_err;
+        if (!thermal::state_io::read(initial_state_file, n_faces, n_layers,
+                                     loaded_initial_T, st_err)) {
+            std::cerr << "[GPU Thermal] ERROR: cannot restore "
+                         "initial_state_file -- " << st_err << "\n";
             return false;
         }
         std::cout << "[GPU Thermal] Loaded initial T(z) checkpoint: "
                   << initial_state_file << " ("
-                  << expected * sizeof(float) / (1024.0*1024.0) << " MiB)\n";
+                  << loaded_initial_T.size() * sizeof(float) / (1024.0*1024.0)
+                  << " MiB)\n"
+                  << "[GPU Thermal]   live grid "
+                  << thermal::state_io::gridFingerprint(z_grid.data(), n_layers)
+                  << "; the checkpoint does NOT record the grid it was written "
+                     "on, so only the " << n_faces << "x" << n_layers
+                  << " shape was checked.\n";
     }
 
     // A warm-start chunk is one that resumes from a checkpoint. It forces
@@ -6725,8 +7139,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
-            sc.census = &gpu_anchor_census;
-            gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
+            // A warm-started chunk overwrites T_initial with the checkpoint a
+            // few lines below (uploadAllTemps), so the seed computed here never
+            // reaches the answer. Feeding the census and the guards from it
+            // would print a complete, plausible, entirely fictional anchor line
+            // -- with quadrature -- for a run that was seeded by nothing
+            // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
+            // bit-for-bit what it always was; only the REPORTING is suppressed.
+            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
+            gpuFillSharedSeed(sc, T_initial,
+                              warm_start_run ? warm_seed_floor_sink
+                                             : gpu_seed_floor_faces,
+                              warm_start_run ? warm_seed_hot_sink
+                                             : gpu_seed_hot_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -7404,8 +7830,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
-            sc.census = &gpu_anchor_census;
-            gpuFillSharedSeed(sc, T_initial, gpu_seed_floor_faces, gpu_seed_hot_faces);
+            // A warm-started chunk overwrites T_initial with the checkpoint a
+            // few lines below (uploadAllTemps), so the seed computed here never
+            // reaches the answer. Feeding the census and the guards from it
+            // would print a complete, plausible, entirely fictional anchor line
+            // -- with quadrature -- for a run that was seeded by nothing
+            // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
+            // bit-for-bit what it always was; only the REPORTING is suppressed.
+            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
+            gpuFillSharedSeed(sc, T_initial,
+                              warm_start_run ? warm_seed_floor_sink
+                                             : gpu_seed_floor_faces,
+                              warm_start_run ? warm_seed_hot_sink
+                                             : gpu_seed_hot_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -7868,29 +8306,18 @@ post_batch_loop:
                   << n_faces << " faces" << std::endl;
     }
 
-    // Dump final thermal state if requested. PTMT magic + dims + raw float32.
+    // Dump final thermal state if requested. Same writer the CPU drivers use
+    // (thermal/thermal_state_io.h), so the bytes are produced in one place.
     if (dump_final_state) {
-        std::ofstream os(final_state_file, std::ios::binary);
-        if (!os) {
-            std::cerr << "[GPU Thermal] WARNING: cannot open final_state_file '"
-                      << final_state_file << "' for write\n";
+        std::string st_err;
+        if (!thermal::state_io::write(final_state_file, n_faces, n_layers,
+                                      assembled_final_T, st_err)) {
+            std::cerr << "[GPU Thermal] WARNING: " << st_err << "\n";
         } else {
-            uint32_t magic = kThermalStateMagic;
-            uint32_t nf = static_cast<uint32_t>(n_faces);
-            uint32_t nl = static_cast<uint32_t>(n_layers);
-            os.write(reinterpret_cast<const char*>(&magic), sizeof(uint32_t));
-            os.write(reinterpret_cast<const char*>(&nf),    sizeof(uint32_t));
-            os.write(reinterpret_cast<const char*>(&nl),    sizeof(uint32_t));
-            os.write(reinterpret_cast<const char*>(assembled_final_T.data()),
-                     assembled_final_T.size() * sizeof(float));
-            if (!os.good()) {
-                std::cerr << "[GPU Thermal] WARNING: short write on final_state_file\n";
-            } else {
-                std::cout << "[GPU Thermal] Wrote final T(z) checkpoint: "
-                          << final_state_file << " ("
-                          << (assembled_final_T.size() * sizeof(float)) / (1024.0*1024.0)
-                          << " MiB)\n";
-            }
+            std::cout << "[GPU Thermal] Wrote final T(z) checkpoint: "
+                      << final_state_file << " ("
+                      << (assembled_final_T.size() * sizeof(float)) / (1024.0*1024.0)
+                      << " MiB)\n";
         }
     }
 
@@ -7938,7 +8365,7 @@ post_batch_loop:
                   << " K, the CPU solver's hard clamp. The seed is physical; a "
                      "CPU run of the same case would be truncated there.\n";
     }
-    gpu_anchor_census.report("gpu-persistent");
+    gpu_anchor_census.report("gpu-persistent", warm_start_run);
     thermal::EqSeedRecorder::instance().write("gpu-persistent");
 
     return true;
@@ -9174,7 +9601,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double H_override,
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
-    std::atomic<size_t>* seed_hot_faces);
+    std::atomic<size_t>* seed_hot_faces,
+    FaceStateIO* state);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -14390,24 +14818,32 @@ int main(int argc, char** argv) {
     // one ran.
     const bool stream_decision_at_extraction = use_streamed_thermal;
 
-    // BUGS.md PTM-76: the T(z) checkpoint is read and written ONLY by the GPU
-    // persistent solver. On any CPU path both keys are dropped — no file, no
-    // error — so a chunked / warm-start run silently degrades into a set of
-    // independent COLD-STARTED runs that still exit 0. Refuse: a request this
-    // consequential must not be answered with a different simulation.
-    if (!config.getPropertyBool("use_gpu_thermal", false)
-        && (!sim_config.thermal.initial_state_file.empty()
-            || !sim_config.thermal.final_state_file.empty())) {
-        std::cerr << "\nFATAL: thermal.initial_state_file / thermal.final_state_file are set,"
-                     " but this run will not take the GPU persistent solver.\n"
-                  << "  Only that solver reads or writes the T(z) checkpoint (BUGS.md PTM-76);"
-                     " on a CPU path the request is silently dropped and every chunk"
-                     " cold-starts.\n"
-                  << "  Set thermal.use_gpu: true, or drop the checkpoint keys and run the"
-                     " window in one piece.\n"
-                  << "  Refusing to run a chunked workflow that cannot hand state over."
+    // BUGS.md PTM-76 (CLOSED for the whole-mesh solvers). The T(z) checkpoint
+    // used to be read and written ONLY by the GPU persistent solver; on a CPU
+    // path both keys were dropped with no file and no error, so a chunked run
+    // silently degraded into independent COLD-STARTED runs that still exit 0.
+    // The blanket refusal that stood here is gone because the CPU scalar, CPU
+    // SIMD-batch and streamed drivers now carry the same format
+    // (thermal/thermal_state_io.h).
+    //
+    // What is NOT covered, and therefore still refuses: the coupled CPU
+    // re-thermal keeps no T(z) column, so a CPU run that both couples radiation
+    // AND asks for a checkpoint can only archive the UN-COUPLED iter-0 column.
+    // That is disclosed at the re-thermal (BUGS.md PTM-57), not refused, since
+    // the checkpoint it writes is real and usable -- just pre-coupling on the
+    // re-thermal'd faces.
+    if (!sim_config.thermal.initial_state_file.empty() ||
+        !sim_config.thermal.final_state_file.empty()) {
+        std::cout << "[checkpoint] thermal state I/O is active on this run: "
+                  << (sim_config.thermal.initial_state_file.empty()
+                          ? "no restore" : "restore")
+                  << " / "
+                  << (sim_config.thermal.final_state_file.empty()
+                          ? "no write" : "write")
+                  << ". Every solver path reads and writes the same 'PTMT' "
+                     "format; a failure on either side aborts the run rather "
+                     "than degrading to a cold start (BUGS.md PTM-76)."
                   << std::endl;
-        return 1;
     }
 
     // If using chunked storage, extract the data now (SKIP if we plan to stream)
@@ -15222,11 +15658,15 @@ int main(int argc, char** argv) {
             if (solver_path == ptm::ThermalSolverPath::CpuSimdBatch) {
                 const std::vector<double>* face_H_ptr_l =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                // The CPU solvers now carry the T(z) checkpoint too (PTM-76),
+                // in the same format the GPU writes.
                 return runThermalModelsForAllFacesBatchSoA(
                     output_dir, mesh, ds, pr, pi, times, total_time_steps,
                     thermal_config, default_visible_albedo, &surface_temps,
                     equilibration_steps, total_time_steps, thermal_threads,
-                    face_Qb_ptr, face_H_ptr_l, eqi);
+                    face_Qb_ptr, face_H_ptr_l, eqi,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file);
             }
             std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads
                       << " threads" << std::endl;
@@ -15234,7 +15674,9 @@ int main(int argc, char** argv) {
                 output_dir, mesh, ds, pr, pi, times, total_time_steps,
                 thermal_config, default_visible_albedo, &surface_temps,
                 equilibration_steps, total_time_steps, thermal_threads,
-                &planet, face_Qb_ptr, eqi);
+                &planet, face_Qb_ptr, eqi,
+                sim_config.thermal.initial_state_file,
+                sim_config.thermal.final_state_file);
         };
 
         // Reuse illumination arrays from the outer-scope extraction if already
@@ -15425,7 +15867,12 @@ int main(int argc, char** argv) {
                 // already receives. This path used to get neither.
                 &planet,
                 equilibration_steps,
-                eq_indirect_vec
+                eq_indirect_vec,
+                // The T(z) checkpoint (PTM-76). The streamed path exists for
+                // exactly the large meshes the chunked workflow is used on, so
+                // it is the one that most needed it.
+                sim_config.thermal.initial_state_file,
+                sim_config.thermal.final_state_file
             );
 
             if (!thermal_success_streamed) {
@@ -17003,28 +17450,31 @@ int main(int argc, char** argv) {
                     size_t n_touched = 0;
                     for (uint8_t b : rad_final_touched) n_touched += (b != 0);
 
-                    std::ifstream sin(spath, std::ios::binary);
-                    uint32_t magic = 0, f_nf = 0, f_nl = 0;
+                    // Same reader/writer as every other checkpoint site
+                    // (thermal/thermal_state_io.h). This used to be a third
+                    // inline copy of the format.
+                    const size_t f_nl = (num_faces > 0)
+                        ? (rad_final_T.size() / num_faces) : 0;
                     std::vector<float> merged;
-                    bool ok = false;
-                    if (sin) {
-                        sin.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
-                        sin.read(reinterpret_cast<char*>(&f_nf),  sizeof(uint32_t));
-                        sin.read(reinterpret_cast<char*>(&f_nl),  sizeof(uint32_t));
-                        if (sin && magic == 0x50544D54u
-                                && f_nf == static_cast<uint32_t>(num_faces)
-                                && static_cast<size_t>(f_nl) * f_nf == rad_final_T.size()) {
-                            merged.resize(rad_final_T.size());
-                            sin.read(reinterpret_cast<char*>(merged.data()),
-                                     static_cast<std::streamsize>(merged.size()) * sizeof(float));
-                            ok = static_cast<bool>(sin);
-                        }
-                    }
-                    if (!ok) {
-                        std::cerr << "[PTM-57] WARNING: cannot re-read the iter-0 checkpoint '"
-                                  << spath << "' (magic=0x" << std::hex << magic << std::dec
-                                  << ", faces=" << f_nf << ", layers=" << f_nl
-                                  << "); the archived state stays PRE-COUPLING and the next"
+                    std::string st_err;
+                    bool ok = (f_nl > 0) &&
+                              thermal::state_io::read(spath, num_faces, f_nl,
+                                                      merged, st_err);
+                    if (rad_final_T.empty()) {
+                        // Reachable now that the CPU solvers write checkpoints
+                        // too: the coupled end-of-window T(z) hand-off exists
+                        // only on the GPU path, so on CPU there is nothing to
+                        // patch in. Say what the file actually holds.
+                        std::cerr << "[PTM-57] The coupled end-of-window T(z) hand-off is"
+                                     " empty (CPU thermal path). '" << spath
+                                  << "' therefore holds the UN-COUPLED iter-0 column;"
+                                     " the next chunk resumes radiation-fed faces from"
+                                     " it. This is BUGS.md PTM-57 on the CPU path, not a"
+                                     " write failure.\n";
+                    } else if (!ok) {
+                        std::cerr << "[PTM-57] WARNING: cannot re-read the iter-0 checkpoint -- "
+                                  << st_err
+                                  << "; the archived state stays PRE-COUPLING and the next"
                                      " chunk will cold-start its radiation-fed faces.\n";
                     } else if (n_touched == 0) {
                         std::cout << "[PTM-57] No face was re-thermal'd; the checkpoint is"
@@ -17032,33 +17482,20 @@ int main(int argc, char** argv) {
                     } else {
                         for (size_t f = 0; f < num_faces; ++f) {
                             if (!rad_final_touched[f]) continue;
-                            for (uint32_t l = 0; l < f_nl; ++l) {
-                                merged[static_cast<size_t>(l) * num_faces + f] =
-                                    rad_final_T[static_cast<size_t>(l) * num_faces + f];
+                            for (size_t l = 0; l < f_nl; ++l) {
+                                merged[l * num_faces + f] =
+                                    rad_final_T[l * num_faces + f];
                             }
                         }
-                        std::ofstream so(spath, std::ios::binary | std::ios::trunc);
-                        if (!so) {
-                            std::cerr << "[PTM-57] WARNING: cannot reopen '" << spath
-                                      << "' for the post-coupling rewrite; the archived state"
-                                         " stays PRE-COUPLING.\n";
+                        if (!thermal::state_io::write(spath, num_faces, f_nl,
+                                                      merged, st_err)) {
+                            std::cerr << "[PTM-57] WARNING: " << st_err
+                                      << "; the archived state stays PRE-COUPLING.\n";
                         } else {
-                            const uint32_t m = 0x50544D54u;
-                            const uint32_t nf = static_cast<uint32_t>(num_faces);
-                            so.write(reinterpret_cast<const char*>(&m),    sizeof(uint32_t));
-                            so.write(reinterpret_cast<const char*>(&nf),   sizeof(uint32_t));
-                            so.write(reinterpret_cast<const char*>(&f_nl), sizeof(uint32_t));
-                            so.write(reinterpret_cast<const char*>(merged.data()),
-                                     static_cast<std::streamsize>(merged.size()) * sizeof(float));
-                            if (!so.good()) {
-                                std::cerr << "[PTM-57] WARNING: short write on the post-coupling"
-                                             " checkpoint rewrite.\n";
-                            } else {
-                                std::cout << "[PTM-57] Re-archived POST-coupling T(z) checkpoint: "
-                                          << n_touched << "/" << num_faces
-                                          << " faces carry the coupled column -> " << spath
-                                          << std::endl;
-                            }
+                            std::cout << "[PTM-57] Re-archived POST-coupling T(z) checkpoint: "
+                                      << n_touched << "/" << num_faces
+                                      << " faces carry the coupled column -> " << spath
+                                      << std::endl;
                         }
                     }
                 }

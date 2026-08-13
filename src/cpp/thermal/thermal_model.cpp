@@ -2182,6 +2182,35 @@ std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& con
     return z;
 }
 
+// Warm start (BUGS.md PTM-76). See the declaration in thermal_model.h.
+bool Model::restoreState(const float* T_column, int n) {
+    if (!T_column || n <= 0 || n != N_z ||
+        static_cast<int>(profile.T().size()) != n) {
+        return false;
+    }
+    auto& Tv = profile.T();
+    for (int i = 0; i < n; ++i) {
+        // float32 -> float64 is exact; the quantization happened at the write.
+        Tv[i] = static_cast<double>(T_column[i]);
+    }
+    // Same order the constructor uses (update_k, update_cp, recomputeKappa), so
+    // a restored profile is indistinguishable from a freshly seeded one apart
+    // from the temperatures themselves.
+    profile.updateThermalProperties(/*update_k_first=*/true);
+    warm_started = true;
+    return true;
+}
+
+bool Model::captureState(float* T_column, int n) const {
+    if (!T_column || n <= 0 || n != N_z ||
+        static_cast<int>(profile.T().size()) != n) {
+        return false;
+    }
+    const auto& Tv = profile.T();
+    for (int i = 0; i < n; ++i) T_column[i] = static_cast<float>(Tv[i]);
+    return true;
+}
+
 // Run the model
 void Model::run() {
     try {
@@ -2286,7 +2315,20 @@ void Model::run() {
         const int equil_days = static_cast<int>(std::llround(
             analyticSeedCycles(config->spinup_seed, config->analytic_seed_cycles,
                                planet.day, planet.year, config->NYEARSEQ)));
-        if (equil_days > 0) {
+        if (equil_days > 0 && warm_started) {
+            // A restored checkpoint is a continuation. Spinning it up again
+            // under idealized clear-sky forcing would discard exactly the state
+            // the previous chunk spent its integration producing. Skipped, and
+            // said out loud -- once per process, because this runs per face.
+            static std::atomic<bool> announced{false};
+            if (!announced.exchange(true)) {
+                std::cerr << "[warm-start] thermal.initial_state_file is set, so the "
+                          << equil_days << "-cycle analytic clear-sky pre-conditioner "
+                             "is SKIPPED on the CPU scalar path: the restored T(z) is "
+                             "already spun up and the pre-conditioner would overwrite "
+                             "it." << std::endl;
+            }
+        } else if (equil_days > 0) {
             fastEquilibrate(equil_days, t);
         }
 
