@@ -405,6 +405,20 @@ __kernel void persistentThermalKernel(
     }
     float dt = dt_output / (float)n_substeps;  // Actual sub-step size (bit-exact)
 
+    // ROW 0 IS THE ONE FRAME STORED BEFORE ANY SOLVE: it is the initial
+    // condition, verbatim, surface node included. Every other frame reports
+    // the surface re-solved at its own epoch (see the note in the substep loop
+    // below), but two shipped gates assert this convention at index 0 --
+    // check_output_time_alignment.py's checkpoint and seed anchors, and the
+    // warm-start G1 gate -- and it is a convention question rather than a
+    // measurement one. Row 0 is only EXPORTED as output index 0 when there is
+    // no equilibration prefix; with a prefix it is an equilibration step
+    // nobody sees. Hoisted out of the loop so the loop carries no per-step
+    // branch for a case that fires once.
+    if (t_offset == 0 && n_timesteps > 0) {
+        output_temps[face] = T_local[0];
+    }
+
     // Process ALL output timesteps
     for (int t = 0; t < n_timesteps; ++t) {
         int tg = t_offset + t;   // GLOBAL timestep (== t when un-chunked)
@@ -432,7 +446,19 @@ __kernel void persistentThermalKernel(
         // exported as a frame -- it is the checkpoint the NEXT chunk writes at
         // its own index 0 -- so a chunked run still tiles the epochs exactly
         // once, with no gap and no duplicate.
-        output_temps[tg * n_faces + face] = T_local[0];
+        //
+        // FORCING EPOCH (fix/frame-forcing-epoch). The frame is NOT stored
+        // here. T_local[0] at this point is the surface the PREVIOUS interval
+        // solved, i.e. it carries flux_all[tg-1] -- a full output interval
+        // stale, because Q_surf below is held constant across the whole
+        // interval and no amount of substepping removes that. The interior
+        // T_local[1..] IS the state at times[tg] and stays so through the
+        // surface solve, so the frame is stored a few lines into substep 0,
+        // immediately after the surface energy balance has been solved with
+        // Q_surf = flux_all[tg]. That is the same value this kernel was about
+        // to compute anyway: nothing is added to the integration and nothing
+        // is perturbed, the store simply happens after the solve instead of
+        // before it.
 
         float Q_surf = flux_all[tg * n_faces + face];
 
@@ -560,6 +586,19 @@ __kernel void persistentThermalKernel(
                 }
 
                 T_local[0] = T_surf;
+
+                // OUTPUT FRAME for index tg (fix/frame-forcing-epoch). Both
+                // epochs are right here and nowhere else in the interval:
+                // T_surf was just solved with Q_surf = flux_all[tg], the flux
+                // AT times[tg], against T_local[1] which is still the interior
+                // AT times[tg] (the Crank-Nicolson interior solve is below).
+                // The T_geo floor is the one applied to the column at the end
+                // of every substep, so the reported number cannot sit under a
+                // floor the integrator enforces.
+                if (substep == 0 && tg > 0) {
+                    output_temps[tg * n_faces + face] =
+                        (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                }
 
                 // CRITICAL: Recompute surface material properties using NEW surface temperature
                 // This matches CPU order: surfTemp() → material refresh → Thomas solve
