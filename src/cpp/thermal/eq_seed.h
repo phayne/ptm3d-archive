@@ -390,9 +390,13 @@ struct EqSeedResult {
 /// Degenerate inputs are handled explicitly, never silently:
 ///   * non-finite or negative <F_abs> / Qb are treated as 0 and FLAGGED via the
 ///     return value so the caller can count and report them;
-///   * Qb <= 0 gives an isothermal column at T_0, which is the correct steady
-///     state for an insulated base (and matches the Dirichlet/Neumann split the
-///     bottom BC already makes at Qb == 0);
+///   * Qb <= 0 gives an isothermal column at T_0 WHEN chi == 0 or the face does
+///     not swing, which is the correct steady state for an insulated base (and
+///     matches the Dirichlet/Neumann split the bottom BC already makes at
+///     Qb == 0). With chi > 0 and a swinging face it is NOT isothermal: the
+///     Kirchhoff invariant holds <G(T)> constant, so as the diurnal wave dies
+///     the cycle mean RISES to compensate the falling fourth moment. That
+///     rectification is real and is applied;
 ///   * a non-positive k at any node stops the integration there and holds the
 ///     profile constant below, rather than producing an infinite gradient.
 EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out);

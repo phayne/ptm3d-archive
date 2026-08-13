@@ -386,6 +386,27 @@ int main() {
                   "REDUCTION zero swing: BITWISE identical to the plain profile");
         }
 
+        // Qb == 0 is NOT an isothermal column once chi > 0 and the face swings.
+        // d<G>/dz = 0 holds <G> fixed, so as the wave dies <T^4> falls toward
+        // <T>^4 and <T> rises. Suppressing that would be a silent substitution.
+        {
+            thermal::EqSeedInput iq = in;
+            iq.Qb = 0.0;
+            iq.mean_absorbed_flux = in.mean_absorbed_flux;
+            std::vector<double> Tq(n);
+            const thermal::EqSeedResult rq = thermal::eqSeedColumn(iq, Tq.data());
+            const double R4 = iq.R350 * 0.25;
+            // <G> must be CONSTANT down the column: G(T(z)) - R4*W(z) = G(T_0).
+            // At depth W -> 0, so G(T_deep) - G(T_anchor) == R4*W(0) exactly.
+            const double lhs = thermal::eqSeedKirchhoffG(Tq[n - 1], R4) -
+                               thermal::eqSeedKirchhoffG(rq.T_anchor, R4);
+            check(rq.kirchhoff_profile && Tq[n - 1] > Tq[0] &&
+                      std::fabs(lhs - rq.kirchhoff_surface_offset) <
+                          1e-9 * rq.kirchhoff_surface_offset,
+                  "Qb == 0 rectifies rather than staying isothermal",
+                  "T_deep - T_surf = " + std::to_string(Tq[n - 1] - Tq[0]) + " K");
+        }
+
         // Martinez does not separate as k_c(z)*g(T), so G does not exist for it
         // -- and that must be REPORTED, not silently skipped.
         {

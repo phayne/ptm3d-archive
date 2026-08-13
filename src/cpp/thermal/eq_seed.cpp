@@ -723,9 +723,16 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
     // Martinez2021 does not separate as k_c(z)*g(T), so the potential G does
     // not exist for it.
     const double R4 = 0.25 * in.R350;
+    // Note there is NO Qb > 0 condition. With chi > 0 and a diurnal swing the
+    // zero-basal-flux column is NOT isothermal: d<G>/dz = 0 makes <G> constant,
+    // so as the wave dies <T^4> falls toward <T>^4 and <T> must RISE to hold <G>
+    // fixed. That is the rectification of the wave by the temperature-dependent
+    // conductivity, and suppressing it would be a silent substitution on every
+    // Qb = 0 body. The docstring's "Qb <= 0 gives an isothermal column" is only
+    // true at chi == 0.
     if (R4 > 0.0 && in.cond == ConductivityModel::Hayne2017 &&
         eqSeedAnchorRan(r.anchor_status) && wave.valid && in.kc != nullptr &&
-        in.rho != nullptr && in.forcing != nullptr && Qb > 0.0) {
+        in.rho != nullptr && in.forcing != nullptr) {
         // W(0) = <T_0^4> - <T_0>^4, both moments on the anchor's own quadrature.
         // The bracket check in anchorSolve guarantees T_anchor <= T_warm, so
         // this is non-negative; the guard is for the degenerate equal case.
