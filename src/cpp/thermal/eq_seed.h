@@ -56,18 +56,51 @@
 // face. Measured attribution is in the session notes; if a future study shows
 // the surface term binds, add it here so every path gets it at once.
 //
-// ALSO NOT HERE: the Kirchhoff (fourth-moment) depth profile. The exact 1-D
-// periodic steady state for k(z,T) = k_c(z)*g(T) integrates the POTENTIAL
-// G(T) = INT_0^T g(s) ds, not T, so the surface constant is
-// <G(T_0)> = <T_0> + chi*<T_0^4>/(4*350^3) and the extra term over today's
-// profile is R4*W(0) with W(0) = <T_0^4> - T_anchor^4. While the anchor is the
-// warm bracket T_w that term is IDENTICALLY ZERO by construction, because T_w
-// is DEFINED by eps*sigma*T_w^4 = <F>+Qb = eps*sigma*<T_0^4> -- measured, arm
-// A' minus arm A is max 9.16e-4 K over the whole seed field and the cycle
-// counts are bit-for-bit the same 40/56/60. It becomes non-zero the moment the
-// anchor stops being T_w, and is then worth a further 20 -> 3 cycles on lit
-// faces. Separable, and deliberately NOT bundled with the anchor below.
+// THE KIRCHHOFF (FOURTH-MOMENT) DEPTH PROFILE -- now implemented, and gated on
+// the anchor above having run. For k(z,T) = k_c(z)*g(T) the cycle mean of the
+// conducted flux is constant, and because
+//     <k(T) dT/dz> = k_c * d<G(T)>/dz ,   G(T) = INT_0^T g(s) ds = T + R4*T^4,
+//     R4 = chi/(4*350^3),
+// the EXACT 1-D periodic steady state integrates the POTENTIAL G, not T:
+//     d<G(T)>/dz = Qb / k_c(z)      -- note k_c, NOT k(T).
+// Its surface constant is known in closed form, because the fourth moment IS
+// the energy-closure identity the anchor already computes:
+//     <G(T_0)> = <T_0> + R4*<T_0^4> = T_anchor + R4*T_w^4 .
+// Writing <T(z)^4> = <T(z)>^4 + W(z) for the fourth-moment excess,
+//     G(<T(z)>) = G(T_anchor) + R4*W(0) + Qb*INT dz/k_c - R4*W(z),
+//     W(0) = T_w^4 - T_anchor^4  (exact: both moments are known),
+// so the profile is integrated in G space and inverted per layer.
+//
+// WHY IT IS GATED ON THE ANCHOR. While the anchor was the warm bracket T_w the
+// whole term was IDENTICALLY ZERO, because T_w is DEFINED by
+// eps*sigma*T_w^4 = <F>+Qb = eps*sigma*<T_0^4>, so W(0) = T_w^4 - T_w^4 = 0.
+// Measured before the anchor landed: max 9.16e-4 K over the entire seed field
+// and bit-for-bit identical cycle counts 40/56/60. That is why this is gated on
+// eqSeedAnchorRan() rather than on chi -- every fallback to T_w must also fall
+// back to the plain profile, or the seed would apply a correction its own
+// anchor has already zeroed. The two exact reductions (chi == 0, and a
+// zero-swing face) are therefore held by CONTROL FLOW, not by arithmetic.
 // (kirchprofile_2026-08-12/e2_cycles.log, e5_universal.log.)
+//
+// W(z), AND WHY IT IS NOT exp(-2z/delta). W is dominated by the PEAKINESS of
+// T(t), which lives in the high harmonics, and harmonic n decays as
+// exp(-sqrt(n)*zeta) -- so the peak dies far faster than the fundamental. A
+// single-harmonic exp(-2*zeta) retains 2-3x too much wave near the surface and
+// was measured WORSE than doing nothing on the mid and grazing populations.
+// What ships is the variance propagated harmonic by harmonic on the anchor's
+// OWN spectrum, which costs one weighted sum per node and no extra transform:
+//     d(z) = SUM_n Q_n exp(-2 sqrt(n) zeta(z)) / SUM_n Q_n ,
+//     Q_n  = P_n / |h + Gamma_eff sqrt(n omega) e^(i pi/4)|^2 ,
+//     zeta(z) = INT dz'/delta(z'),  delta = sqrt(2k/(rho cp omega)) .
+// Measured against W(z)/W(0) from a converged 200-cycle reference, mean
+// absolute error 0.080 versus 0.164 for exp(-2 zeta) and 0.273 for dropping the
+// wave outright; worst-node injected error 0.65 K versus 1.39 K and 6.24 K.
+// No fitted constant: Q_n, Gamma_eff, rho and cp are the run's own.
+// (kirchprofile_2026-08-12/e6_wdecay.log, e7_decaymodel.log.)
+//
+// HAYNE ONLY. The potential G exists because k separates as k_c(z)*g(T).
+// Martinez2021 does not separate, so the correction is not applied there and
+// EqSeedResult::kirchhoff_profile reports false rather than silently skipping.
 //
 // WHAT IS NOT A SEED AT ALL. Both CPU paths used to integrate
 // NYEARSEQ*round(year/day) diurnal cycles (24 on the Moon) of ANALYTIC
@@ -336,6 +369,19 @@ struct EqSeedResult {
     double cycle_s       = 0.0;
     int    n_lit_samples = 0;
     int    anchor_iterations = 0;
+
+    /// True when the depth profile was integrated in G space with the
+    /// fourth-moment term (see the Kirchhoff note at the top of this file).
+    /// False means the plain dT/dz = Qb/k(T) profile ran, which is the exact
+    /// same object whenever the anchor is T_w. Report-only, but report it: a
+    /// run that expected the correction and silently got the plain profile
+    /// (Martinez conductivity, or any anchor fallback) is a run whose seed
+    /// accuracy claim does not hold.
+    bool   kirchhoff_profile = false;
+    /// R4*W(0), the G-space size of the correction at the surface [K]. 0 when
+    /// the correction did not run. This is the number that was identically zero
+    /// under the warm-bracket anchor.
+    double kirchhoff_surface_offset = 0.0;
 };
 
 /// Fill T_out[0..n-1] with the cycle-mean conductive steady profile described
@@ -344,9 +390,13 @@ struct EqSeedResult {
 /// Degenerate inputs are handled explicitly, never silently:
 ///   * non-finite or negative <F_abs> / Qb are treated as 0 and FLAGGED via the
 ///     return value so the caller can count and report them;
-///   * Qb <= 0 gives an isothermal column at T_0, which is the correct steady
-///     state for an insulated base (and matches the Dirichlet/Neumann split the
-///     bottom BC already makes at Qb == 0);
+///   * Qb <= 0 gives an isothermal column at T_0 WHEN chi == 0 or the face does
+///     not swing, which is the correct steady state for an insulated base (and
+///     matches the Dirichlet/Neumann split the bottom BC already makes at
+///     Qb == 0). With chi > 0 and a swinging face it is NOT isothermal: the
+///     Kirchhoff invariant holds <G(T)> constant, so as the diurnal wave dies
+///     the cycle mean RISES to compensate the falling fourth moment. That
+///     rectification is real and is applied;
 ///   * a non-positive k at any node stops the integration there and holds the
 ///     profile constant below, rather than producing an infinite gradient.
 EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out);
@@ -371,6 +421,20 @@ double eqSeedLumpedAnchor(const double* F, std::size_t stride, int n,
                           double Qb, double eps, double sigma, double G,
                           double* T_warm_out, double* T_cold_out,
                           int* iters_out);
+
+/// The Kirchhoff potential G(T) = INT_0^T g(s) ds = T + R4*T^4 for the Hayne
+/// conductivity g(T) = 1 + 4*R4*T^3, and its inverse. EXACT IDENTITY at R4 == 0
+/// in both directions -- that is the chi == 0 reduction, and it is a returned
+/// value rather than a converged one so it holds to the last bit.
+inline double eqSeedKirchhoffG(double T, double R4) {
+    if (!(R4 > 0.0)) return T;
+    return T + R4 * (T * T) * (T * T);
+}
+
+/// Solve T + R4*T^4 = G for T. G is convex and increasing in T, so Newton from
+/// T = G (where the residual is >= 0) converges monotonically down to the root
+/// with no bracketing. Returns G unchanged when R4 == 0.
+double eqSeedKirchhoffGInv(double G, double R4);
 
 /// One-sided power spectrum P[0..n/2] of the real series x, normalized so that
 /// sum_{k>=1} P[k] is the sample variance of x (P[0] is zeroed by the caller's
@@ -430,6 +494,8 @@ private:
         double T_warm = 0.0, T_cold = 0.0, G = 0.0, gamma_eff = 0.0;
         int    n_samples = 0;
         EqSeedAnchorStatus anchor_status = EqSeedAnchorStatus::NoForcingSeries;
+        bool   kirchhoff = false;
+        double kirch_offset = 0.0;
         bool   set = false;
     };
     bool             enabled_ = false;

@@ -220,6 +220,24 @@ double conductivityAt(const EqSeedInput& in, int node, double T) {
 
 }  // namespace
 
+double eqSeedKirchhoffGInv(double G, double R4) {
+    if (!(R4 > 0.0)) return G;                 // exact identity: the chi==0 arm
+    if (!(G > 0.0)) return G;
+    // f(T) = T + R4*T^4 - G is increasing and convex, and f(G) = R4*G^4 >= 0,
+    // so Newton started at T = G decreases monotonically onto the root. No
+    // bracketing, no step limiter, and it cannot overshoot below the root.
+    double T = G;
+    for (int it = 0; it < 60; ++it) {
+        const double T2 = T * T;
+        const double f  = T + R4 * T2 * T2 - G;
+        const double df = 1.0 + 4.0 * R4 * T2 * T;
+        const double dT = f / df;
+        T -= dT;
+        if (std::fabs(dT) <= 1e-15 * std::fabs(T)) break;
+    }
+    return T;
+}
+
 double eqSeedGammaEff(const EqSeedInput& in, const EqSeedForcing& fc,
                       double omega, double T_ref) {
     if (in.n < 2 || in.z == nullptr || !(omega > 0.0)) return -1.0;
@@ -373,8 +391,18 @@ namespace {
 constexpr int    kAnchorPropertyMax   = 12;
 constexpr double kAnchorPropertyTolK  = 1e-7;
 
+/// The surface-temperature power spectrum the Kirchhoff depth profile needs to
+/// decay W(z), carried OUT of the anchor rather than recomputed. Recomputing it
+/// would mean a second transform and, worse, a second chance to disagree with
+/// the quadrature the anchor actually closed on.
+struct KirchhoffWave {
+    std::vector<double> weight;    ///< Q_n / sum(Q), index = harmonic n, n >= 1
+    double omega1 = 0.0;           ///< fundamental; harmonic n decays at sqrt(n)
+    bool   valid  = false;
+};
+
 double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
-                   EqSeedResult& r) {
+                   EqSeedResult& r, KirchhoffWave* wave) {
     const EqSeedForcing& fc = *in.forcing;
     r.n_samples = fc.n_samples;
     r.span_s    = fc.span_s;
@@ -589,6 +617,32 @@ double anchorSolve(const EqSeedInput& in, double T_warm_fallback,
         r.anchor_status = EqSeedAnchorStatus::FallbackNotConverged;
         return T_warm_fallback;
     }
+    // --- the surface temperature spectrum, for the Kirchhoff depth profile ---
+    // Q_n = P_n / |h + Gamma sqrt(n omega) e^(i pi/4)|^2 is the half-space
+    // temperature response to this face's own forcing -- the same denominator
+    // the variance match above already forms, evaluated once more at the
+    // CONVERGED T_d so the profile and the anchor describe one column.
+    if (wave != nullptr) {
+        const double h_f = 4.0 * a * Td * Td * Td;
+        wave->weight.assign(static_cast<std::size_t>(nb), 0.0);
+        double sum = 0.0;
+        for (int k = 1; k < nb; ++k) {
+            if (P[k] <= 0.0) continue;
+            const double A   = gam * std::sqrt(static_cast<double>(k) * omega1);
+            const double den = h_f * h_f + std::sqrt(2.0) * h_f * A + A * A;
+            if (!(den > 0.0)) continue;
+            const double q = P[k] / den;
+            wave->weight[static_cast<std::size_t>(k)] = q;
+            sum += q;
+        }
+        if (sum > 0.0 && std::isfinite(sum)) {
+            const double inv = 1.0 / sum;
+            for (double& w : wave->weight) w *= inv;
+            wave->omega1 = omega1;
+            wave->valid  = true;
+        }
+    }
+
     r.anchor_status = two_timescale ? EqSeedAnchorStatus::LumpedTwoTimescale
                     : input_limited ? EqSeedAnchorStatus::LumpedInputLimited
                                     : EqSeedAnchorStatus::Lumped;
@@ -616,6 +670,8 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
     // The line above is the WARM BRACKET, exact for <T^4> and biased +45 K in
     // the mean on a lit lunar face. Where the caller supplies the face's own
     // forcing series, replace it with the derived lumped-substrate anchor.
+    static thread_local KirchhoffWave wave;
+    wave.valid = false;
     if (in.forcing != nullptr) {
         if (in.anchor == EqSeedAnchor::Warm) {
             r.anchor_status = EqSeedAnchorStatus::WarmRequested;
@@ -623,7 +679,7 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
             r.span_s        = in.forcing->span_s;
             r.cycle_s       = in.forcing->cycle_s;
         } else {
-            T0 = anchorSolve(in, T0, r);
+            T0 = anchorSolve(in, T0, r, &wave);
             r.T_anchor = T0;
         }
     } else {
@@ -658,6 +714,82 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
         return r;
     }
     if (T_out) T_out[0] = T0;
+
+    // --- Kirchhoff (fourth-moment) depth profile ----------------------------
+    // Runs ONLY where the derived anchor ran: while the anchor is the warm
+    // bracket the correction below is identically zero (see the header note),
+    // so gating on the anchor is what makes the chi == 0 and zero-swing
+    // reductions exact by control flow rather than by arithmetic. Hayne only --
+    // Martinez2021 does not separate as k_c(z)*g(T), so the potential G does
+    // not exist for it.
+    const double R4 = 0.25 * in.R350;
+    // Note there is NO Qb > 0 condition. With chi > 0 and a diurnal swing the
+    // zero-basal-flux column is NOT isothermal: d<G>/dz = 0 makes <G> constant,
+    // so as the wave dies <T^4> falls toward <T>^4 and <T> must RISE to hold <G>
+    // fixed. That is the rectification of the wave by the temperature-dependent
+    // conductivity, and suppressing it would be a silent substitution on every
+    // Qb = 0 body. The docstring's "Qb <= 0 gives an isothermal column" is only
+    // true at chi == 0.
+    if (R4 > 0.0 && in.cond == ConductivityModel::Hayne2017 &&
+        eqSeedAnchorRan(r.anchor_status) && wave.valid && in.kc != nullptr &&
+        in.rho != nullptr && in.forcing != nullptr) {
+        // W(0) = <T_0^4> - <T_0>^4, both moments on the anchor's own quadrature.
+        // The bracket check in anchorSolve guarantees T_anchor <= T_warm, so
+        // this is non-negative; the guard is for the degenerate equal case.
+        const double Tw4 = r.T_warm * r.T_warm * r.T_warm * r.T_warm;
+        const double Ta4 = T0 * T0 * T0 * T0;
+        const double W0  = (Tw4 > Ta4) ? (Tw4 - Ta4) : 0.0;
+        const double dG0 = R4 * W0;              // G-space size of the correction
+        r.kirchhoff_surface_offset = dG0;
+
+        const double Gsurf = eqSeedKirchhoffG(T0, R4);
+        const int    nb    = static_cast<int>(wave.weight.size());
+        const double omega = wave.omega1;
+
+        double Rk   = 0.0;   // INT dz/k_c  -- k_c, not k(T)
+        double zeta = 0.0;   // INT dz/delta
+        double T    = T0;
+        bool   stalled = false;
+        for (int i = 1; i < in.n; ++i) {
+            const double dz   = in.z[i] - in.z[i - 1];
+            const double kc_i = in.kc[i - 1];
+            if (!stalled && kc_i > 0.0 && dz > 0.0) {
+                Rk += dz / kc_i;
+                // zeta accumulates on the LOCAL skin depth of the layered,
+                // temperature-dependent medium: delta = sqrt(2k/(rho cp omega)).
+                const double k_i   = hayneK(T, kc_i, in.R350);
+                const double cp_i  = heatCapacityAt(*in.forcing, T);
+                const double rho_i = in.rho[i - 1];
+                if (k_i > 0.0 && cp_i > 0.0 && rho_i > 0.0 && omega > 0.0) {
+                    const double delta =
+                        std::sqrt(2.0 * k_i / (rho_i * cp_i * omega));
+                    if (delta > 0.0) zeta += dz / delta;
+                }
+            } else {
+                // A non-positive k_c or dz would give an infinite gradient.
+                // Hold the profile below, exactly as the plain branch does.
+                stalled = true;
+            }
+            // d(z): the surface variance propagated harmonic by harmonic.
+            // Harmonic n has skin depth delta/sqrt(n), so it attenuates as
+            // exp(-sqrt(n)*zeta) in amplitude and exp(-2 sqrt(n) zeta) in power.
+            double d = 0.0;
+            if (dG0 > 0.0) {
+                for (int k = 1; k < nb; ++k) {
+                    const double w = wave.weight[static_cast<std::size_t>(k)];
+                    if (w <= 0.0) continue;
+                    d += w * std::exp(-2.0 * std::sqrt(static_cast<double>(k)) * zeta);
+                }
+            }
+            const double G = Gsurf + Qb * Rk + dG0 * (1.0 - d);
+            T = eqSeedKirchhoffGInv(G, R4);
+            if (!std::isfinite(T)) { T = T0; stalled = true; }
+            if (T_out) T_out[i] = T;
+        }
+        r.kirchhoff_profile = true;
+        r.T_deep = T;
+        return r;
+    }
 
     // --- conductive steady gradient: dT/dz = Qb / k(T, z) -------------------
     // Forward integration with k evaluated at the SHALLOWER node, which is the
@@ -737,6 +869,8 @@ void EqSeedRecorder::record(std::size_t face, const EqSeedInput& in,
     r.gamma_eff    = res.gamma_eff;
     r.n_samples    = res.n_samples;
     r.anchor_status = res.anchor_status;
+    r.kirchhoff    = res.kirchhoff_profile;
+    r.kirch_offset = res.kirchhoff_surface_offset;
     r.set       = true;
 }
 
@@ -752,7 +886,7 @@ void EqSeedRecorder::write(const std::string& tag) const {
     fh << "# PTM3D shared equilibration seed, path=" << tag << "\n";
     fh << "face,mean_absorbed_flux_Wm2,Qb_Wm2,T_surface_K,T_deep_K,"
           "T_lowinertia_K,T_warm_K,T_cold_K,G_Wm2K,gamma_eff,"
-          "n_samples,anchor_status\n";
+          "n_samples,anchor_status,kirchhoff,kirchhoff_offset_K\n";
     std::size_t written = 0;
     for (std::size_t i = 0; i < rows_.size(); ++i) {
         if (!rows_[i].set) continue;
@@ -761,7 +895,9 @@ void EqSeedRecorder::write(const std::string& tag) const {
            << rows_[i].T_lowinertia << ',' << rows_[i].T_warm << ','
            << rows_[i].T_cold << ',' << rows_[i].G << ','
            << rows_[i].gamma_eff << ',' << rows_[i].n_samples << ','
-           << eqSeedAnchorStatusName(rows_[i].anchor_status) << '\n';
+           << eqSeedAnchorStatusName(rows_[i].anchor_status) << ','
+           << (rows_[i].kirchhoff ? 1 : 0) << ','
+           << rows_[i].kirch_offset << '\n';
         ++written;
     }
     std::cerr << "[eq-seed] wrote " << written << " seed rows to " << path_
