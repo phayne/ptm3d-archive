@@ -137,6 +137,54 @@ def test_stop_terminates_the_process_group():
     assert proc.process.poll() is not None, "child still running after stop()"
 
 
+def test_output_left_in_the_pipe_at_exit_is_still_split_into_lines():
+    """The end of a run must arrive as lines, not welded into one.
+
+    EngineProcess reads the pipes in 4 KB chunks while the child lives and
+    reads whatever is left once it has exited. That last read routinely holds
+    the whole end of the run, and emitting it unsplit made it a single "line":
+    on_progress fired for none of it, and a consumer that decides from the
+    first percentage in a line -- run_engine's throttle does -- then decided
+    for all of it at once, dropping the completion banner welded in with the
+    bar art. That was a real capture truncation, seen in CI.
+
+    The child flushes and _exit()s, so its death is observed before the reader
+    can drain: a C++ engine exits that way, and CPython only avoids it by
+    spending a few ms in finalization after flushing. It writes more than one
+    4 KB read of bar art, so the final read cannot be empty however the two
+    processes happen to be scheduled.
+    """
+    child = textwrap.dedent("""
+        import os, sys
+        for label in ("Calculating illumination", "SIMD Batch thermal"):
+            for pct in range(0, 101):
+                sys.stdout.write("\\r%s [==] %d%%" % (label, pct))
+            sys.stdout.write("\\n")
+        sys.stdout.write("Simulation completed in 0.010 seconds (10 ms)\\n")
+        sys.stdout.flush()
+        os._exit(0)
+    """)
+    # One list for all three severities, so the check is about line structure
+    # and arrival order and does not depend on how any line is classified.
+    lines, progress = [], []
+    proc = EngineProcess([sys.executable, "-c", child],
+                         on_output=lines.append, on_warning=lines.append,
+                         on_error=lines.append, on_progress=progress.append)
+    assert proc.run() == 0, "child did not exit cleanly"
+
+    welded = [ln for ln in lines if "\r" in ln or "\n" in ln]
+    if welded:
+        worst = max(len(w.replace("\r", "\n").split("\n")) for w in welded)
+        raise AssertionError(
+            f"{len(welded)} callback(s) carried more than one line; the worst "
+            f"held {worst} of them welded together")
+    assert len(progress) == 202, (
+        f"on_progress fired {len(progress)} times, expected 202 -- the "
+        f"readouts in the final read did not reach it")
+    assert progress[-1] == 100.0, progress[-1]
+    assert lines[-1] == "Simulation completed in 0.010 seconds (10 ms)", lines[-1]
+
+
 def test_build_command_shape():
     base = build_command("/bin/engine", "cfg.yaml", None)
     assert base == ["/bin/engine", "--config", "cfg.yaml"]
@@ -422,6 +470,7 @@ TESTS = [
     test_stderr_banners_are_not_errors,
     test_failure_is_reported_and_exit_code_propagates,
     test_stop_terminates_the_process_group,
+    test_output_left_in_the_pipe_at_exit_is_still_split_into_lines,
     test_build_command_shape,
     test_run_engine_quiet_returns_everything_and_prints_nothing,
     test_run_engine_echo_throttles_both_progress_bars,
