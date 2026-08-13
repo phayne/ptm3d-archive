@@ -8,13 +8,38 @@ RAM, runs each via ``ptm_thermal_sim``, and combines the per-chunk
 statistics with ``ptm_merge_chunks`` into a single set of final
 statistics mathematically equivalent to a hypothetical single-shot run.
 
+Epoch grid
+----------
+The output grid is HALF-OPEN. With a cadence ``dt = duration_days /
+timesteps`` from the base config, the single-shot run samples epochs
+``t0 + i*dt`` for ``i`` in ``[0, N_total)``. Chunk ``k`` is handed the
+sub-range ``[c_k, c_k + N_k)`` of that same grid: it starts at
+``t0 + c_k*dt``, exports and reduces exactly ``N_k`` frames, and the
+chunk boundaries therefore partition the single-shot epochs with no
+duplicate and no gap.
+
+The checkpoint needs one more grid point than the export does. The solver
+integrates ``total_time_steps - 1`` intervals, so a chunk that stopped at
+its last exported frame would hand off a state one cadence short of where
+the next chunk begins. Every chunk is therefore run with
+``thermal.checkpoint_lookahead_steps: 1``: it integrates ``N_k`` intervals
+over ``N_k + 1`` grid points, exports and reduces only the first ``N_k``,
+and writes ``final_state_file`` at the extra point — which is the next
+chunk's frame 0. Both properties hold at once.
+
 Each chunk inherits the base config but with:
-- ``simulation.start_time`` shifted by the cumulative chunk offset.
+- ``simulation.start_time_offset_seconds`` = the cumulative chunk offset in
+  ET seconds (an integer step count times the cadence). ``start_time`` itself
+  is left untouched; see make_chunk_yaml for why the offset is not folded
+  into the UTC string.
 - ``simulation.duration_days`` and ``timesteps`` set for that chunk
   (cadence = base ``timesteps`` / ``duration_days`` is preserved).
-- ``thermal.initial_state_file`` = previous chunk's final-state file
-  (chunk 0 leaves it unset and runs full equilibration).
+- ``thermal.initial_state_file`` = previous chunk's final-state file.
+  Chunk 0 runs full equilibration unless the BASE config supplies its own
+  ``thermal.initial_state_file``, in which case chunk 0 warm-starts from it
+  (announced on stdout) and the whole run skips equilibration.
 - ``thermal.final_state_file`` = this chunk's final-state file.
+- ``thermal.checkpoint_lookahead_steps: 1`` (see above).
 - ``output.write_raw_stats: true`` so per-chunk sums/counts and the
   Schorghofer accumulator are persisted for the merge step.
 - ``output.skip_time_series: true`` (per-step files would be huge and
@@ -189,12 +214,29 @@ def parse_iso8601(s: str) -> dt.datetime:
 
 
 def fmt_iso8601(t: dt.datetime) -> str:
-    return t.strftime("%Y-%m-%dT%H:%M:%S")
+    """ISO-8601 with MICROSECOND precision.
+
+    Chunk k's start time has to land on the single-shot epoch grid, and it
+    reaches the engine only as this string (SPICE str2et_c parses it back).
+    Whole-second formatting quantized every chunk boundary to 1 s, which is a
+    real gap/overlap in the merged epoch grid; a chunk cadence is ~2e4 s, so a
+    0.5 s error is 2.3e-5 of a step but it is not zero and it shows up as a
+    non-tiling grid. Microseconds put the round-trip below the ~1e-7 s
+    resolution of a double at J2000+1e9 s, i.e. below the floor.
+    """
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
 # --------------------------------------------------------------------------
 # Per-chunk YAML generation
 # --------------------------------------------------------------------------
+
+# Extra output steps each chunk integrates past its exported window, so that
+# thermal.final_state_file is the state at the NEXT chunk's first epoch rather
+# than at this chunk's last exported frame. 1 is the only value that makes
+# sense here; see the "Epoch grid" note in the module docstring.
+CHECKPOINT_LOOKAHEAD_STEPS = 1
+
 
 def chunk_is_complete(chunk_dir: Path) -> bool:
     """A chunk is considered complete if it has the per-datatype raw
@@ -229,17 +271,24 @@ def is_valid_checkpoint(p: Path) -> bool:
 
 
 def make_chunk_yaml(base_cfg: dict, chunk_dir: Path,
-                    chunk_start_time: dt.datetime,
+                    chunk_index: int,
+                    chunk_start_offset_s: float,
                     chunk_duration_days: float,
                     chunk_timesteps: int,
                     initial_state_file: Path | None,
-                    final_state_file: Path) -> Path:
+                    final_state_file: Path,
+                    checkpoint_lookahead_steps: int) -> Path:
     """Render an isolated chunk config and write it to chunk_dir/config.yaml."""
     cfg = _deep_copy(base_cfg)
 
-    # simulation
+    # simulation. start_time is left EXACTLY as the base config has it and the
+    # chunk offset is carried in ET seconds: the grid cadence is a count of ET
+    # seconds, but start_time is a UTC string, and shifting the string is not
+    # the same shift (TDB - UTC has a ~1.7 ms annual periodic term and jumps a
+    # whole second at a leap second). Offsetting in UTC put a 29.5-day chunk
+    # boundary 2.2e-4 s off the single-shot grid.
     sim = cfg.setdefault("simulation", {})
-    sim["start_time"]    = fmt_iso8601(chunk_start_time)
+    sim["start_time_offset_seconds"] = float(chunk_start_offset_s)
     sim["duration_days"] = float(chunk_duration_days)
     sim["timesteps"]     = int(chunk_timesteps)
 
@@ -250,6 +299,11 @@ def make_chunk_yaml(base_cfg: dict, chunk_dir: Path,
     else:
         th.pop("initial_state_file", None)
     th["final_state_file"]   = str(final_state_file)
+    # Integrate one grid point PAST this chunk's exported window and write the
+    # checkpoint there, so it is the state at the NEXT chunk's first epoch.
+    # Without it the handoff state is one cadence stale and the chunks have to
+    # overlap by a sample to stay continuous. See config_parser.h.
+    th["checkpoint_lookahead_steps"] = int(checkpoint_lookahead_steps)
 
     # output
     out = cfg.setdefault("output", {})
@@ -258,10 +312,13 @@ def make_chunk_yaml(base_cfg: dict, chunk_dir: Path,
     # Per-step time-series files would be huge for long chunked runs.
     # Force-skip them — the orchestrator workflow only needs stats.
     out["skip_time_series"] = True
-    # Chunk 0 (no checkpoint loaded) writes mesh.ply once for the
-    # orchestrator to propagate to the parent dir; chunks 1+ skip the
-    # redundant per-chunk mesh write (~hundreds of MB each).
-    out["skip_mesh"]        = (initial_state_file is not None)
+    # Chunk 0 writes mesh.ply once for the orchestrator to propagate to the
+    # parent dir; chunks 1+ skip the redundant per-chunk mesh write (~hundreds
+    # of MB each). Keyed on the CHUNK INDEX, not on whether a checkpoint is
+    # loaded: chunk 0 warm-starts whenever the base config supplies its own
+    # thermal.initial_state_file, and keying on the state file silently
+    # suppressed mesh.ply for the whole run in exactly that case.
+    out["skip_mesh"]        = (chunk_index > 0)
 
     chunk_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = chunk_dir / "config.yaml"
@@ -400,22 +457,54 @@ def main():
     extras   = total_output_steps - base_per * n_chunks
     chunk_ts_list = [base_per + (1 if i < extras else 0)
                      for i in range(n_chunks)]
+    if min(chunk_ts_list) < 1:
+        sys.exit(f"error: {total_output_steps} output steps cannot be split "
+                 f"across {n_chunks} chunks (some chunk would get 0 steps).")
 
     # Print the plan.
+    #
+    # The epoch grid is HALF-OPEN: chunk k covers epochs
+    #   t_k + i*dt,  i in [0, N_k),   dt = 1 day / output_steps_per_day
+    # and chunk k+1 starts at t_k + N_k*dt. Offsets are accumulated as INTEGER
+    # step counts and converted once, so no chunk boundary inherits a running
+    # floating-point sum, and every chunk start lands on a single-shot grid
+    # epoch by construction.
     print("\n[chunked] chunk plan:")
-    cumdays = 0.0
     plan = []
+    cum_steps = 0
+    cadence_s = base_duration_days * 86400.0 / base_timesteps
     for i, ts in enumerate(chunk_ts_list):
         d_days = ts / output_steps_per_day
-        start_t = base_start + dt.timedelta(days=cumdays)
+        offset_s = cum_steps * cadence_s
+        start_t = base_start + dt.timedelta(seconds=offset_s)
         plan.append({
             "idx": i, "ts": ts, "duration_days": d_days,
-            "start_time": start_t,
+            "start_offset_s": offset_s,
             "chunk_dir": args.output_dir / f"chunk_{i:03d}"
         })
         print(f"  chunk {i:03d}: {ts} ts × {d_days:.3f} d  "
-              f"(start {fmt_iso8601(start_t)})  -> {plan[-1]['chunk_dir']}")
-        cumdays += d_days
+              f"(steps [{cum_steps}, {cum_steps + ts}), "
+              f"start +{offset_s:.6f} s ET ~ {fmt_iso8601(start_t)})  "
+              f"-> {plan[-1]['chunk_dir']}")
+        cum_steps += ts
+    print(f"[chunked] merged grid: {cum_steps} half-open output epochs at "
+          f"{cadence_s:.6f} s cadence; each chunk "
+          f"integrates one extra step and checkpoints there "
+          f"(thermal.checkpoint_lookahead_steps: 1).")
+
+    # A warm start supplied by the BASE config applies to chunk 0. Say so:
+    # chunk 0 then skips equilibration entirely, which is a large physics
+    # difference from the usual cold chunk 0, and it used to be dropped
+    # silently by make_chunk_yaml.
+    base_initial_state = str(base_cfg.get("thermal", {})
+                             .get("initial_state_file", "") or "")
+    if base_initial_state:
+        if not Path(base_initial_state).is_file():
+            sys.exit(f"error: base config sets thermal.initial_state_file="
+                     f"{base_initial_state}, which does not exist.")
+        print(f"[chunked] chunk 000 WARM-STARTS from the base config's "
+              f"thermal.initial_state_file ({base_initial_state}); "
+              f"equilibration is skipped for the whole run.")
 
     if args.dry_run:
         return
@@ -513,7 +602,11 @@ def main():
         # so the user (or an outer driver) can clean and resume.
         prev_state = state_dir / f"thermal_state_after_chunk_{i-1:03d}.bin"
         this_state = state_dir / f"thermal_state_after_chunk_{i:03d}.bin"
-        initial_state = prev_state if i > 0 and prev_state.exists() else None
+        if i == 0:
+            # Chunk 0 warm-starts only if the BASE config asked for it.
+            initial_state = Path(base_initial_state) if base_initial_state else None
+        else:
+            initial_state = prev_state if prev_state.exists() else None
         if i > 0 and initial_state is None:
             sys.exit(f"error: previous chunk's thermal state {prev_state} "
                      f"is missing. Did chunk {i-1} complete?")
@@ -524,10 +617,19 @@ def main():
                      f"and {cd.parent}/chunk_{i-1:03d}/, then re-run with --resume "
                      f"to regenerate.")
 
-        cfg_path = make_chunk_yaml(base_cfg, cd,
-                                   info["start_time"], info["duration_days"],
-                                   info["ts"],
-                                   initial_state, this_state)
+        # One renderer for this chunk, called again verbatim by the
+        # retry-after-cleanup path below -- which exists precisely to put back
+        # the config that rmtree deleted, so it must reproduce it exactly.
+        def render_cfg(_cd=cd, _i=i, _info=info,
+                       _init=initial_state, _final=this_state) -> Path:
+            return make_chunk_yaml(base_cfg, _cd, _i,
+                                   _info["start_offset_s"],
+                                   _info["duration_days"],
+                                   _info["ts"],
+                                   _init, _final,
+                                   CHECKPOINT_LOOKAHEAD_STEPS)
+
+        cfg_path = render_cfg()
 
         print(f"\n[chunked] === chunk {i+1}/{n_chunks}: "
               f"{info['ts']} ts × {info['duration_days']:.3f} d  ===")
@@ -598,11 +700,7 @@ def main():
                     # missing config was downgraded to a warning and the binary
                     # ran a full simulation on built-in defaults into the default
                     # output/ directory. Regenerate it, and prove it is there.
-                    cfg_path = make_chunk_yaml(base_cfg, cd,
-                                               info["start_time"],
-                                               info["duration_days"],
-                                               info["ts"],
-                                               initial_state, this_state)
+                    cfg_path = render_cfg()
                     if not cfg_path.is_file():
                         sys.exit(f"[chunked] chunk {i:03d}: could not regenerate "
                                  f"{cfg_path} after the cleanup; aborting rather "
@@ -654,15 +752,29 @@ def main():
                 os.link(src_mesh, dst)  # hard link to save disk
             except OSError:
                 import shutil; shutil.copy2(src_mesh, dst)
+    elif not (args.output_dir / "mesh.ply").exists():
+        # Downstream consumers (the GUI, ptm.Results, the VTK converter) need
+        # mesh.ply next to statistics/. Never skip this quietly.
+        print(f"[chunked] WARNING: {src_mesh} was not written, so "
+              f"{args.output_dir}/mesh.ply is MISSING. Every downstream "
+              f"consumer that reads geometry from the output directory will "
+              f"fail or fall back. Check chunk 000's output.skip_mesh.",
+              file=sys.stderr)
 
     # Concatenate time_steps.txt across chunks (header from chunk 0).
     ts_out = args.output_dir / "time_steps.txt"
+    epochs: list[float] = []
     try:
         with open(ts_out, "w") as fout:
             wrote_header = False
             for p_ in plan:
                 src = p_["chunk_dir"] / "time_steps.txt"
                 if not src.exists():
+                    print(f"[chunked] WARNING: {src} is missing; "
+                          f"{ts_out} will NOT describe chunk "
+                          f"{p_['idx']:03d}'s frames and the merged epoch "
+                          f"list will be short by {p_['ts']} rows.",
+                          file=sys.stderr)
                     continue
                 with open(src) as fin:
                     for line in fin:
@@ -671,10 +783,37 @@ def main():
                                 fout.write(line)
                             continue
                         fout.write(line)
+                        field = line.split("\t", 1)[0].strip()
+                        if field:
+                            try:
+                                epochs.append(float(field))
+                            except ValueError:
+                                pass
                 wrote_header = True
     except Exception as e:
         print(f"[chunked] warning: could not write {ts_out}: {e}",
               file=sys.stderr)
+
+    # Verify the merged grid actually partitions: N_total rows, strictly
+    # increasing, one uniform cadence end to end. This is cheap and it is the
+    # property the whole chunk construction exists to guarantee, so check it
+    # rather than assert it in a comment.
+    expected_epochs = sum(p_["ts"] for p_ in plan)
+    if len(epochs) == expected_epochs and len(epochs) > 1:
+        gaps = [epochs[k + 1] - epochs[k] for k in range(len(epochs) - 1)]
+        worst = max(abs(g - cadence_s) for g in gaps)
+        dups = sum(1 for g in gaps if g <= 0.0)
+        print(f"[chunked] epoch grid: {len(epochs)} rows, nominal cadence "
+              f"{cadence_s:.6f} s, worst interval deviation {worst:.3e} s, "
+              f"{dups} non-increasing step(s).")
+        if dups or worst > 1e-3:
+            print(f"[chunked] WARNING: the merged epoch grid does NOT tile "
+                  f"uniformly (worst deviation {worst:.6f} s, {dups} "
+                  f"duplicate/backward step(s)). Per-epoch statistics are "
+                  f"weighted wrong wherever that happens.", file=sys.stderr)
+    elif epochs:
+        print(f"[chunked] WARNING: merged time_steps.txt has {len(epochs)} "
+              f"rows, expected {expected_epochs}.", file=sys.stderr)
 
     # Final summary.
     total_wall = sum(chunk_walltimes)
