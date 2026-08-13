@@ -614,7 +614,14 @@ that the value you set is the value that was echoed.
 
 - **A `thermal_state_*.bin` checkpoint carries no depth grid.** It stores a magic number, the face
   and layer counts, and the temperatures — so a checkpoint is not self-describing in meters, and
-  the depths must come from the configuration that produced it.
+  the depths must come from the configuration that produced it. The consequence is specific: a
+  checkpoint written on one depth grid will restore onto a *different* grid whose layer count
+  happens to match, and the temperatures are then reinterpreted at the wrong depths. The engine
+  cannot detect this from the file, so instead it prints the live grid (`n_layers`, `z[0]`,
+  `dz[0]`, `z_max`) at both the write and the restore and states in the restore message that the
+  grid, the body and the thermophysical properties were **not** verified. Compare those two log
+  lines when resuming across any configuration change. Closing the gap properly means adding the
+  grid to the header, which would invalidate every banked state on disk.
 
 ## Data files and maps
 

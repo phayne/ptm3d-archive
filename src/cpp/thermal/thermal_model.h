@@ -897,13 +897,36 @@ public:
           const Config& config = Config(),
           bool show_progress = true);
     
+    // True once restoreState() has replaced the constructor's spin-up seed with
+    // a checkpointed column. run() reads it to skip the analytic clear-sky
+    // pre-conditioner: a restored column is a CONTINUATION of an already-spun-up
+    // trajectory, and the pre-conditioner would overwrite it with an idealized
+    // cos(lat)*cos(h) spin-up that has no topography, no shadowing and no IR.
+    bool warm_started = false;
+
     // Methods
     void run();
     void advance();
     void updateOrbit();
     void surfFlux();
     void fastEquilibrate(int days, double target_time);
-    
+
+    // Warm start (BUGS.md PTM-76). Replace this face's whole T(z) column with a
+    // restored checkpoint column (thermal/thermal_state_io.h; float32 on disk,
+    // widened exactly to the float64 the CPU solvers carry), then recompute k,
+    // cp and kappa so the profile is left in the same self-consistent state the
+    // constructor leaves it in.
+    //
+    // Returns FALSE and changes nothing if `n` does not match this profile's
+    // depth grid -- the caller must treat that as a refusal, not fall through
+    // to a cold start. The grid itself is not verifiable from the checkpoint;
+    // see the note at the top of thermal_state_io.h.
+    bool restoreState(const float* T_column, int n);
+
+    // Copy this face's current T(z) column out for checkpointing, narrowing to
+    // the format's float32. Returns false (writing nothing) on a shape mismatch.
+    bool captureState(float* T_column, int n) const;
+
     // Add this new method
     void setEquilibrationSteps(int steps) {
         equilibration_steps = steps;
