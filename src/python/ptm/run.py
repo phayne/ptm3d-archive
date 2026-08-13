@@ -274,9 +274,20 @@ class EngineProcess:
         else:
             self._emit(self.on_output, text)
 
-    def _drain(self, buf):
+    def _drain(self, buf, final=False):
+        """Emit each complete line in ``buf``; keep the unterminated tail back.
+
+        ``final=True`` emits that trailing segment as well, for the one call
+        made after both pipes are at EOF: nothing more is coming, so a last
+        line with no newline on it is complete after all. Everything the child
+        wrote goes through here, so a line delivered late is still split,
+        still classified, and still counted as progress.
+        """
         parts = re.split(b'[\r\n]', buf)
-        complete, remainder = parts[:-1], (parts[-1] if parts else b"")
+        if final:
+            complete, remainder = parts, b""
+        else:
+            complete, remainder = parts[:-1], (parts[-1] if parts else b"")
         for seg in complete:
             if not seg:
                 continue
@@ -366,16 +377,15 @@ class EngineProcess:
                     stderr_buffer.extend(data)
                     self._drain(stderr_buffer)
 
-        # Whatever is left, classified, so a genuine error in the final chunk
-        # is still reported as one.
+        # Whatever is left, through the same splitter as everything else. The
+        # exit branch above reads both pipes to EOF in one go, so this last
+        # chunk routinely holds the whole end of the run -- every line the
+        # child wrote after the reader's previous pass. Emitting it unsplit
+        # welded those lines into one: no on_progress for any of them, and a
+        # consumer that filters or throttles on the first percentage in a
+        # "line" then acted on all of them at once.
         for buf in (stdout_buffer, stderr_buffer):
-            if buf:
-                try:
-                    tail = buf.decode('utf-8', errors='replace').strip()
-                    if tail:
-                        self._emit_classified(tail)
-                except Exception:
-                    pass
+            self._drain(buf, final=True)
 
         self.process.wait()
         self.returncode = self.process.returncode
