@@ -124,6 +124,8 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
 | `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle; consulted only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
 | `equilibration_cycles` | int | -1 | Replays of the equilibration forcing block used to reach `equilibration_orbits`, GPU persistent solver only (-1 = 1 replay). The block is `equilibration_orbits / equilibration_cycles` cycles long, so the integrated total does not change and only the flux RAM and illumination cost fall |
+| `equilibration_target_K` | float | 0.1 | Accuracy the spin-up estimate targets, and the bar the retrospective certificate must clear — see [Did the column settle?](#did-the-column-settle-the-retrospective-certificate) |
+| `equilibration_stop_on_certificate` | bool | false | End the analytic pre-conditioner when the certificate reaches `equilibration_target_K` instead of at a fixed cycle count. CPU SIMD batch path only; the other solver paths refuse to start with it set |
 | `eq_extrapolation` | map | off | Pass-stride extrapolation of the equilibration state; see below |
 | `compute_statistics` | bool | true | Compute and write per-face statistics |
 | `use_gpu` | bool | false | OpenCL thermal solver (a CPU-only build refuses at startup) |
@@ -258,6 +260,80 @@ had always been running (10 became 20, and so on) with `equilibration_cycles: 2`
 alongside, so their results are unchanged. A configuration written before that
 date and not rewritten will now integrate half of what it used to on the GPU;
 double its `equilibration_orbits` to restore the old behavior.
+
+### Did the column settle? The retrospective certificate
+
+`equilibration_orbits` says how long to spin up. It does not say whether that
+was enough. The certificate answers the second question, and it answers it from
+a conservation law rather than from how much the temperature is still moving.
+
+The quantity is the cycle-mean interface heat flux at a cut depth
+`z_c = min(5 delta_ref, z_max/2)`, measured against the geothermal flux the
+column is driven by, and converted to kelvin:
+
+```
+r_c   = qbar_c - Qb                       [W/m^2]
+E     = |r_c| / h,   h = 4 eps sigma T^3
+```
+
+Below the forced layer a settled column carries exactly `Qb` at every depth,
+because nothing there stores or releases net heat over a cycle. `r_c` is
+therefore a statement about the state's spatial gradient, not about its rate of
+change, and that distinction is the point: when float32 rounding freezes a
+column it stops changing without having converged, so "run until it stops
+moving" and pass-to-pass bit identity both report success at exactly the moment
+they have failed. On the banked 8-pass lunar state — bit-frozen across 100
+further lunations — the certificate still reports 0.26 K against a 0.1 K
+target.
+
+Which `h` depends on the product:
+
+| Observable | `h` |
+|---|---|
+| diurnal maximum | `4 eps sigma T_max^3` |
+| diurnal minimum | `4 eps sigma T_min^3` |
+| diurnal mean | the **harmonic** cycle mean of `4 eps sigma T0(t)^3` |
+| deep products | `E_deep = |r_c| tau1 / C_below` (uncalibrated; reported, never used to pass) |
+
+The mean uses the harmonic cycle mean and not the arithmetic one. The surface
+displacement caused by a flux residual is largest exactly where the radiative
+stiffness is smallest, so the two are anti-correlated and the arithmetic mean
+understates the error — measured at 8.7x on a 25 %/75 % duty cycle between
+350 K and 100 K. The minimum is in the table for the same reason: it is the
+slackest instant of the cycle and therefore the most flux-sensitive surface
+observable. Gating a lunar spin-up on the mean alone stopped it 13.6 cycles
+early and left `temperature_min` 0.69 K from its full-length answer while
+`temperature_max` moved 0.03 K; gating on all three left it at 0.06 K.
+
+**After a run — `build/bin/ptm_eq_certify`.** The certificate runs against a
+banked `PTMT` checkpoint and the statistics beside it, with no mesh, no view
+factors and no GPU, so it can audit a finished run (or a running one's last
+chunk) while another job owns the devices:
+
+```
+build/bin/ptm_eq_certify --config <run>/chunk_000/config.yaml \
+    --state <run>/_thermal_state/thermal_state_after_chunk_000.bin \
+    --stats <run>/chunk_000/statistics --period-ref annual
+```
+
+Exit status 0 = every scored face passed, 2 = at least one FAIL, 3 = at least
+one INDETERMINATE, 1 = the tool refused to run. It will not call a snapshot of
+a forced column a cycle mean, and it will not substitute the arithmetic mean of
+`h` for the harmonic one; where the data cannot decide it reports
+INDETERMINATE and says what would settle it. `Qb` is read out of the state's
+own bottom boundary condition rather than from the config, because
+`geothermal_heat_flow` was inert on every solver entry point for the whole
+moon3d campaign.
+
+**During a run — `thermal.equilibration_stop_on_certificate`.** Default false.
+When true, the analytic clear-sky pre-conditioner ends when all three surface
+observables reach `equilibration_target_K` instead of at its fixed cycle count,
+and the achieved `E` is reported either way. It governs only that phase: the
+real-ephemeris equilibration prefix cannot end early, because its steps are
+epochs on the output grid and stopping it would move the output window rather
+than save spin-up. The key is implemented on the CPU SIMD batch path; every
+other entry point, and a run with no pre-conditioner enabled, refuses to start
+with it set rather than quietly integrating a fixed count.
 
 ### Equilibration extrapolation (`thermal.eq_extrapolation`)
 

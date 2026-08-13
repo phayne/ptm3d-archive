@@ -3531,6 +3531,32 @@ std::vector<double> runThermalModelForFace(
 // Those overrides are therefore forwarded per-knob and applied here on EVERY
 // path. A config that sets no override forwards nothing, so baseline runs stay
 // byte-identical.
+// ---------------------------------------------------------------------------
+// thermal.equilibration_stop_on_certificate is implemented on the CPU SIMD
+// batch path only. Every other entry point REFUSES rather than running a fixed
+// cycle count under a key that asked for a criterion -- a silent downgrade here
+// would be indistinguishable, in the output, from the criterion having been met.
+// ---------------------------------------------------------------------------
+static bool eqStopOnCertificateRequested(const thermal::Config& config) {
+    return config.getPropertyBool("eq_stop_on_certificate", false);
+}
+
+static bool refuseEqStopOnCertificate(const thermal::Config& config,
+                                      const char* path_name) {
+    if (!eqStopOnCertificateRequested(config)) return false;
+    std::cerr << "\nFATAL: thermal.equilibration_stop_on_certificate is set, but "
+                 "this run is on the " << path_name << " path, which does not\n"
+                 "       implement it. Only the CPU SIMD batch path ends "
+                 "equilibration on the certificate.\n"
+                 "       Refusing rather than quietly running the fixed "
+                 "equilibration_orbits count: a run\n"
+                 "       that silently ignored the criterion would be "
+                 "indistinguishable from one that met it.\n"
+                 "       Remedy: unset the key, or run on the CPU batch path "
+                 "(thermal.use_gpu: false).\n";
+    return true;
+}
+
 static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config) {
     double v;
     // ---- generic bodies: repair the placeholder-resolved Planet -------------
@@ -3645,6 +3671,7 @@ bool runThermalModelsForAllFacesStreamed(
     const std::string& initial_state_file,
     const std::string& final_state_file)
 {
+    if (refuseEqStopOnCertificate(config, "streamed CPU")) return false;
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
         return false;
@@ -3886,6 +3913,7 @@ bool runThermalModelsForAllFaces(
     const std::vector<double>& eq_indirect_flux,
     const std::string& initial_state_file,
     const std::string& final_state_file) {
+    if (refuseEqStopOnCertificate(config, "CPU scalar")) return false;
 
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -4783,6 +4811,84 @@ bool runThermalModelsForAllFacesBatchSoA(
     // statistics are byte-identical either way, so gating it off would only
     // hide the one number a user benefits from. PTM_EQ_CERTIFICATE=0 opts out.
     const double eq_target_K = config.getPropertyDouble("eq_target_K", 0.1);
+
+    // ---- Certificate-driven spin-up LENGTH (thermal.equilibration_stop_on_
+    // certificate). DEFAULT OFF; with it off not one substep differs.
+    //
+    // The pre-conditioner is per-face independent (analytic clear-sky forcing,
+    // no coupling between columns), so stopping is decided per BATCH: a batch
+    // stops when every face in it has certified. That is conservative -- a
+    // batch never stops before its slowest face -- and it keeps the SIMD lanes
+    // in step, which stopping per face would not.
+    //
+    // The residual is a TRUE cycle mean here, accumulated over whole cycles of
+    // the forcing, so the verdicts are definitive rather than the
+    // INDETERMINATE a snapshot gets. That is the one thing the inline path can
+    // do that the retrospective tool cannot.
+    const bool eq_stop_on_cert = eqStopOnCertificateRequested(config);
+    // delta_ref on the grid's own terms: delta_0 = z_max/b scaled to the
+    // longest forcing period present. The pre-conditioner's forcing IS the
+    // diurnal cycle -- it has no annual component at all -- so the reference
+    // period here is planet.day, and saying so matters: using the annual skin
+    // depth would place the cut below anything this phase actually drives.
+    double eq_cert_delta_ref = 0.0;
+    if (eq_stop_on_cert) {
+        // THE ONE LENGTH THIS PATH IS FREE TO VARY is the analytic clear-sky
+        // pre-conditioner. The real-ephemeris equilibration prefix is NOT: its
+        // steps are epochs on the output grid, so ending it early would land
+        // the output window at the wrong time, not save spin-up.
+        //
+        // The pre-conditioner is OFF by default (thermal.analytic_seed_cycles
+        // resolves to 0 under the shipped `spinup_seed: physical`). With it off
+        // there is nothing here for a criterion to shorten -- so REFUSE. A run
+        // that accepted a convergence criterion and then quietly integrated a
+        // fixed count would be indistinguishable, in its output, from one that
+        // honored it, and that is the exact failure this key exists to end.
+        if (!(equil_duration_s_shared > 0.0)) {
+            std::cerr << "\nFATAL: thermal.equilibration_stop_on_certificate is "
+                         "set, but this run has NO variable-length\n"
+                         "       spin-up phase for it to govern. The analytic "
+                         "clear-sky pre-conditioner is off\n"
+                         "       (thermal.analytic_seed_cycles resolves to 0), "
+                         "and the real-ephemeris\n"
+                         "       equilibration prefix cannot end early -- its "
+                         "steps are epochs on the output\n"
+                         "       grid, so stopping it would move the output "
+                         "window rather than save spin-up.\n"
+                         "       Remedy: set thermal.analytic_seed_cycles > 0 to "
+                         "give the criterion a phase to\n"
+                         "       shorten, or unset "
+                         "equilibration_stop_on_certificate and read the\n"
+                         "       retrospective certificate after the run "
+                         "(build/bin/ptm_eq_certify).\n";
+            return false;
+        }
+        eq_cert_delta_ref = thermal::eqGridSkinDepth(
+            ref_profile.z().data(), n_layers, config.b);
+        if (!(eq_cert_delta_ref > 0.0)) {
+            std::cerr << "\nFATAL: equilibration_stop_on_certificate is set but "
+                         "the grid's reference skin depth could not be\n"
+                         "       recovered (z_max/b <= 0). Refusing to fall back "
+                         "to a fixed cycle count silently.\n";
+            return false;
+        }
+        std::cout << "[eq-certificate] stopping condition ENABLED: the analytic "
+                     "pre-conditioner ends when the\n"
+                     "                 cycle-mean interface flux residual "
+                     "reaches " << eq_target_K << " K, or at the configured\n"
+                     "                 cycle count, whichever comes first. Cut "
+                     "reference: diurnal, delta_ref = "
+                  << eq_cert_delta_ref << " m on the reference profile\n"
+                     "                 (each batch uses its own grid, which "
+                     "differs only under a per-face H map).\n";
+    }
+    std::unique_ptr<thermal::EqCertifyCensus> g_eq_cert_census;
+    if (eq_stop_on_cert) {
+        g_eq_cert_census.reset(new thermal::EqCertifyCensus(eq_target_K, planet.day));
+    }
+    std::atomic<long long> eq_cert_cycles_sum{0}, eq_cert_batches{0},
+                           eq_cert_early_batches{0};
+
     std::unique_ptr<thermal::EqSpinupCensus> g_spinup_census;
     if (thermal::eqCertificateEnabled()) {
         g_spinup_census.reset(new thermal::EqSpinupCensus(
@@ -5182,6 +5288,42 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
                 const double planetary_absorption = planet.S * (1.0 - planet.albedo);
 
+                // ---- certificate accumulators (only when the stopping
+                // condition is on; all of this is dead weight otherwise) -----
+                // q at the cut, summed over the cycle -> a TRUE cycle mean.
+                // T_max and sum(1/h) -> the two surface observables, with the
+                // HARMONIC mean of h, which is the one the physics wants.
+                thermal::EqCut eq_cut;
+                std::vector<double> cert_qsum, cert_invh, cert_tmax, cert_tmin, cert_qbar;
+                std::vector<thermal::EqCertifyResult> cert_last;
+                int cert_samples = 0;
+                int cert_cycles_used = total_substeps / std::max(1, steps_per_day);
+                bool cert_stopped_early = false;
+                // delta_ref from THIS batch's own grid, not the reference
+                // profile's: with a per-face H map the batch grid differs, and
+                // a cut placed on someone else's grid is a cut at the wrong
+                // depth. Identical to the reference value when no map is loaded.
+                double batch_delta_ref = eq_cert_delta_ref;
+                if (eq_stop_on_cert) {
+                    const double d = thermal::eqGridSkinDepth(batch.z, n_layers,
+                                                              config.b);
+                    if (d > 0.0) batch_delta_ref = d;
+                    eq_cut = thermal::eqChooseCut(batch.z, n_layers, batch_delta_ref);
+                    if (eq_cut.j < 1) {
+                        #pragma omp critical
+                        std::cerr << "\nFATAL: equilibration_stop_on_certificate "
+                                     "could not place a cut in this column "
+                                     "(n_layers=" << n_layers << ").\n";
+                        std::exit(1);
+                    }
+                    cert_qsum.assign(faces_in_batch, 0.0);
+                    cert_invh.assign(faces_in_batch, 0.0);
+                    cert_tmax.assign(faces_in_batch, 0.0);
+                    cert_tmin.assign(faces_in_batch, 1e300);
+                    cert_qbar.assign(n_layers - 1, 0.0);
+                    cert_last.assign(faces_in_batch, thermal::EqCertifyResult());
+                }
+
                 for (int step = 0; step < total_substeps; ++step) {
                     const double day_fraction = static_cast<double>(step % steps_per_day)
                                                 / static_cast<double>(steps_per_day);
@@ -5204,6 +5346,114 @@ bool runThermalModelsForAllFacesBatchSoA(
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
                     if (step == 0) score_spinup_census();
+
+                    // ---- certificate-driven stop ---------------------------
+                    // Everything below is inside `if (eq_stop_on_cert)`, which
+                    // is false by default. Nothing above this point changed.
+                    if (eq_stop_on_cert) {
+                        const int BS2 = thermal::THERMAL_BATCH_SIZE;
+                        const int jc  = eq_cut.j;
+                        const double dzc = batch.z[jc + 1] - batch.z[jc];
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const double Tj  = batch.T[jc * BS2 + f];
+                            const double Tj1 = batch.T[(jc + 1) * BS2 + f];
+                            const double kj  = batch.k[jc * BS2 + f];
+                            cert_qsum[f] += kj * (Tj1 - Tj) / dzc;
+                            const double T0 = batch.getSurfaceTemp(f);
+                            if (T0 > cert_tmax[f]) cert_tmax[f] = T0;
+                            if (T0 < cert_tmin[f]) cert_tmin[f] = T0;
+                            const double h = 4.0 * batch.emissivity[f] *
+                                             thermal::SIGMA_SB * T0 * T0 * T0;
+                            // The HARMONIC mean, accumulated as sum(1/h). The
+                            // arithmetic mean is up to 8.8x optimistic and it
+                            // is optimistic exactly where the error is largest.
+                            if (h > 0.0) cert_invh[f] += 1.0 / h;
+                        }
+                        ++cert_samples;
+
+                        // Score at whole-cycle boundaries only: a partial cycle
+                        // is not a cycle mean.
+                        if (((step + 1) % steps_per_day) == 0) {
+                            bool all_pass = true;
+                            std::vector<double> cz(n_layers), cT(n_layers),
+                                                ck(n_layers), cr(n_layers), cc(n_layers);
+                            for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
+                            // No short circuit: every face is scored on every
+                            // cycle so the census reports the achieved E for
+                            // ALL of them, not only for those ahead of the
+                            // first failure in batch order.
+                            for (int f = 0; f < faces_in_batch; ++f) {
+                                for (int i = 0; i < n_layers; ++i) {
+                                    cT[i] = batch.T  [i * BS2 + f];
+                                    ck[i] = batch.k  [i * BS2 + f];
+                                    cr[i] = batch.rho[i * BS2 + f];
+                                    cc[i] = batch.cp [i * BS2 + f];
+                                }
+                                std::fill(cert_qbar.begin(), cert_qbar.end(), 0.0);
+                                cert_qbar[jc] = cert_qsum[f] / cert_samples;
+
+                                thermal::EqCertifyInput cin;
+                                cin.z = cz.data(); cin.T = cT.data(); cin.k = ck.data();
+                                cin.rho = cr.data(); cin.cp = cc.data();
+                                cin.n = n_layers;
+                                cin.qbar = cert_qbar.data();
+                                cin.Qb = batch.Qb[f];
+                                cin.eps = batch.emissivity[f];
+                                cin.sigma = thermal::SIGMA_SB;
+                                cin.P_ref = planet.day;
+                                cin.delta_ref = batch_delta_ref;
+                                cin.target_K = eq_target_K;
+                                cin.T_max = cert_tmax[f];
+                                cin.T_min = (cert_tmin[f] < 1e299) ? cert_tmin[f] : 0.0;
+                                cin.h_harmonic = (cert_invh[f] > 0.0)
+                                               ? (cert_samples / cert_invh[f]) : 0.0;
+                                cin.q_is_cycle_mean = true;   // it really is one
+                                const thermal::EqCertifyResult cr_ =
+                                    thermal::eqCertifyColumn(cin);
+                                cert_last[f] = cr_;
+                                // Deep is UNCALIBRATED (2.1-3.8x high) and is
+                                // deliberately not allowed to hold a run open.
+                                // ALL THREE surface observables must clear the
+                                // bar, minimum included. Gating on the mean
+                                // alone stopped this run 13.6 cycles early and
+                                // left temperature_min 0.69 K out (measured on
+                                // the lunar ico3 quickstart).
+                                if (cr_.v_max  != thermal::EqVerdict::Pass ||
+                                    cr_.v_min  != thermal::EqVerdict::Pass ||
+                                    cr_.v_mean != thermal::EqVerdict::Pass) {
+                                    all_pass = false;
+                                }
+                            }
+                            // Reset the accumulators: the next verdict must be
+                            // a mean over the NEXT cycle, not a running mean
+                            // over everything since the start (which would
+                            // dilute a still-moving column with its own past).
+                            std::fill(cert_qsum.begin(), cert_qsum.end(), 0.0);
+                            std::fill(cert_invh.begin(), cert_invh.end(), 0.0);
+                            std::fill(cert_tmax.begin(), cert_tmax.end(), 0.0);
+                            std::fill(cert_tmin.begin(), cert_tmin.end(), 1e300);
+                            cert_samples = 0;
+
+                            if (all_pass) {
+                                cert_cycles_used = (step + 1) / steps_per_day;
+                                cert_stopped_early = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (eq_stop_on_cert) {
+                    eq_cert_cycles_sum.fetch_add(cert_cycles_used,
+                                                 std::memory_order_relaxed);
+                    eq_cert_batches.fetch_add(1, std::memory_order_relaxed);
+                    if (cert_stopped_early)
+                        eq_cert_early_batches.fetch_add(1, std::memory_order_relaxed);
+                    // The ACHIEVED certificate, reported whether or not the
+                    // criterion was met -- a run that ran out of cycles must
+                    // say how far short it stopped, not go quiet.
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        g_eq_cert_census->add(cert_last[f], !(cos_lat[f] > 0.0));
+                    }
                 }
             }
 
@@ -5323,6 +5573,26 @@ bool runThermalModelsForAllFacesBatchSoA(
             real_eq_cycles = (times[equilibration_steps] - times[0]) / planet.day;
         }
         g_spinup_census->report(std::cout, seed_cycles + real_eq_cycles);
+    }
+
+    // Certificate-driven spin-up: what the criterion actually bought. Printed
+    // whether or not it stopped anything -- "it ran the full count and is still
+    // 6 K short" is the answer a user most needs and the one a silent
+    // implementation would withhold.
+    if (g_eq_cert_census) {
+        const long long nb = eq_cert_batches.load();
+        const double mean_cycles = (nb > 0)
+            ? static_cast<double>(eq_cert_cycles_sum.load()) / static_cast<double>(nb)
+            : -1.0;
+        std::cout << "\n[eq-certificate] spin-up length driven by the certificate:\n"
+                  << "                 " << eq_cert_early_batches.load() << " of "
+                  << nb << " batches reached " << eq_target_K
+                  << " K and stopped early;\n"
+                  << "                 mean cycles integrated per batch: "
+                  << mean_cycles << " (ceiling "
+                  << (equil_duration_s_shared / std::max(1.0, planet.day))
+                  << ").\n";
+        g_eq_cert_census->report(std::cout, mean_cycles);
     }
 
     // PTM-51 diagnostic: write the per-face seed terms and the analytic
@@ -6489,6 +6759,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     int gpu_inter_batch_pause_ms,
     const std::vector<double>& eq_indirect_flux)
 {
+    if (refuseEqStopOnCertificate(config, "GPU persistent")) return false;
     using namespace gpu::opencl;
 
     // Debug output control - set to true for troubleshooting
@@ -15463,6 +15734,14 @@ int main(int argc, char** argv) {
         // forwarded or it silently reverts to the built-in default).
         thermal_config.setProperty("eq_target_K",
                                    fullPrecision(sim_config.thermal.equilibration_target_K));
+
+        // Certificate-driven spin-up length. DEFAULT OFF. Forwarded the same
+        // way and for the same reason: the solvers rebuild a local Config.
+        // The bool overload, NOT std::string("1"): getPropertyBool tests the
+        // value against the literal "true", so a "1" reads back as FALSE.
+        thermal_config.setProperty(
+            "eq_stop_on_certificate",
+            sim_config.thermal.equilibration_stop_on_certificate);
 
         // Flag generic bodies so albedo map code skips built-in body search
         if (using_generic_body) {

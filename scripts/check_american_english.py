@@ -74,7 +74,13 @@ RULES = [
     (r"(theatre|calibre|sombre|sceptre|spectre|lustre|meagre|manoeuvre)\w*",
      "-er"),
     # -ise / -isation / -yse -> -ize / -ization / -yze
-    (r"\w*(normalis|initialis|optimis|minimis|maximis|summaris|recognis"
+    # `optimis` carries a lookahead the rest of this row does not need:
+    # bare `\w*optimis\w*` also matches OPTIMISTIC, which is correct American
+    # English (opt-imis-tic). That is exactly the class of false positive the
+    # module docstring warns against, and it fires on ordinary numerics prose
+    # ("optimistic by 8.8x"). The verb forms are still caught.
+    (r"\w*(normalis|initialis|optimis(?=e|ed|es|ing|ation|er|ers)"
+     r"|minimis|maximis|summaris|recognis"
      r"|organis|discretis|parameteris|visualis|utilis|stabilis|synchronis"
      r"|serialis|randomis|quantis|linearis|penalis|prioritis|standardis"
      r"|specialis|generalis|centralis|modularis|vectoris|factoris|digitis"
