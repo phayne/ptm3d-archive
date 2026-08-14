@@ -494,7 +494,7 @@ counting. Equilibration sets the deep column, whose response time is many diurna
 cycle-mean forcing is the quantity that determines it; dropping the diurnal modulation of the
 indirect term is correct at leading order.
 
-That is one *pass*. `thermal.eq_indirect_passes` (default 2) sets how many run: pass 2 re-reduces
+That is one *pass*. `thermal.eq_indirect_passes` (default 1) sets how many run: pass 2 re-reduces
 $\langle q_{\text{ind}}\rangle$ from the field pass 1 produced and re-equilibrates against it, and
 so on. This is a fixed-point iteration, and nothing stops it early — the run prints the
 pass-to-pass change in $\langle q_{\text{ind}}\rangle$ so the knee is visible in the log for the
@@ -525,6 +525,20 @@ pass 2 did) and at **1 pass for `converged`** (pass 2 moves it 0.056 K). The `au
 sits 3.61 K below the `converged` one, and no pass count closes that. The `converged` fixed point
 agrees with the manual two-run `eq_indirect_flux_file` workflow below to better than 0.0001 K,
 which is what that workflow has always been doing by hand.
+
+**The default is nevertheless 1 pass, on both estimators**, because a knee is not by itself a
+reason to buy. Read the table across rather than down: the second `auto` pass buys 0.284 K of deep
+column for +0.26× wall, while switching estimator — `converged` at *one* pass — buys 3.90 K for
++0.73×. Per kelvin that is roughly five times worse, and it gets worse as the equilibration
+lengthens: an `auto` pass is a whole-mesh solve over the equilibration span, while a `converged`
+pass adds a coupling loop over the output window only, so the two costs scale with different
+things. Measured on this crater, the second `auto` pass costs +12% of the run at
+`equilibration_orbits: 1` and +21% at 25. Where it crosses over and costs more in absolute wall
+clock than switching estimator does is therefore a property of the equilibration length, not a
+fixed ratio — check the arming banner's numbers against your own run. The pass count is the right
+knob only once
+`eq_indirect_source: converged` is already set. `eq_indirect_passes: 2` remains available and
+remains a real fixed point — it is simply not where the first unit of budget should go.
 
 The consequence for the *output window* on a one-lunation window is small — the second `auto` pass
 moves the dark-face window mean by 0.0004 K and `converged` by 0.019 K — because a one-lunation
@@ -573,7 +587,7 @@ no-op rather than a special case.
 | `thermal.eq_indirect_source: auto` | Default. Internal pass off the coupling loop's iteration-0 sweep, as above. |
 | `thermal.eq_indirect_source: converged` | Internal pass off the **converged** coupling loop. Removes the iteration-0 low bias; costs one extra coupling loop per pass. |
 | `thermal.eq_indirect_source: off` | Legacy. Equilibration carries no indirect term. Reproduces pre-2026-08 results bit-for-bit. Also selectable through `PTM_EQ_INDIRECT_SOURCE`. |
-| `thermal.eq_indirect_passes: N` | How many passes, on whichever estimator. `1` reproduces the 2026-08-11 behavior bit-for-bit. Must be ≥ 1 — `0` is rejected rather than accepted as a second spelling of `off`. Also selectable through `PTM_EQ_INDIRECT_PASSES`. |
+| `thermal.eq_indirect_passes: N` | How many passes, on whichever estimator. Default `1`, which is also the 2026-08-11 behavior bit-for-bit. Must be ≥ 1 — `0` is rejected rather than accepted as a second spelling of `off`. Also selectable through `PTM_EQ_INDIRECT_PASSES`. |
 | `thermal.eq_indirect_flux_file` | Explicit override, and it always wins. Reads a per-face `'QIND'` file (magic `0x51494E44`, `uint32` face count, then one `float64` per face) written by a prior run's `thermal.indirect_mean_out_file`. Use it to pin a run to a specific forcing. |
 
 `thermal.indirect_mean_out_file` writes the same quantity the internal pass computes, but always
