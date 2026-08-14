@@ -2494,7 +2494,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
     }
     if (kernels_path_.empty()) {
         std::cerr << "Error: SPICE kernel directory is unresolved (empty).\n"
-                  << "  Resolution order: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
+                  << "  Resolution order: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
                   << "  compiled-in SPICE_KERNELS_DIR (CMake; default <repo>/data/kernels).\n"
                   << "  Populate the kernel directory with: python3 scripts/fetch_kernels.py\n"
                   << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
@@ -2602,7 +2602,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                     std::cerr << "    " << candidate << "\n";
                 }
                 std::cerr << "  Kernel directory in use: " << kernels_path_ << "\n"
-                          << "  Kernel dir resolution: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
+                          << "  Kernel dir resolution: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
                           << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
                           << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag << "\n"
                           << "  (see INSTALL.md \"SPICE kernel data\"), or correct\n"
