@@ -331,6 +331,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.equilibration_samples_per_diurnal_cycle = getWithDefault(thermal, "equilibration_samples_per_diurnal_cycle", config.thermal.equilibration_samples_per_diurnal_cycle);
             config.thermal.equilibration_cycles = getWithDefault(thermal, "equilibration_cycles", config.thermal.equilibration_cycles);
             config.thermal.equilibration_target_K = getWithDefault(thermal, "equilibration_target_K", config.thermal.equilibration_target_K);
+            config.thermal.equilibration_stop_on_certificate = getWithDefault(thermal, "equilibration_stop_on_certificate", config.thermal.equilibration_stop_on_certificate);
             if (thermal["eq_extrapolation"]) {
                 const auto& ex = thermal["eq_extrapolation"];
                 config.thermal.eq_extrapolation.method =
@@ -780,6 +781,7 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.thermal.equilibration_cycles > 0)
             out << YAML::Key << "equilibration_cycles" << YAML::Value << config.thermal.equilibration_cycles;
         out << YAML::Key << "equilibration_target_K" << YAML::Value << config.thermal.equilibration_target_K;
+        out << YAML::Key << "equilibration_stop_on_certificate" << YAML::Value << config.thermal.equilibration_stop_on_certificate;
         out << YAML::Key << "spinup_seed" << YAML::Value << config.thermal.spinup_seed;
         out << YAML::Key << "seed_anchor" << YAML::Value << config.thermal.seed_anchor;
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
@@ -1130,7 +1132,12 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      #    30 -> ~7 K max err (Fast)\n";
     out << "                                      #   <=0 -> legacy (match output cadence)\n";
     out << "  # equilibration_cycles: 2           # Replays of the eq forcing block (GPU solver only).\n";
-    out << "  # equilibration_target_K: 0.1        # accuracy the spin-up ESTIMATE targets (report-only).\n";
+    out << "  # equilibration_target_K: 0.1        # accuracy the spin-up ESTIMATE targets, and the bar the\n";
+    out << "                                      # retrospective certificate must clear.\n";
+    out << "  # equilibration_stop_on_certificate: false   # end the analytic pre-conditioner when the\n";
+    out << "                                      # certificate reaches equilibration_target_K instead of at a\n";
+    out << "                                      # fixed cycle count. DEFAULT false. CPU SIMD batch path only;\n";
+    out << "                                      # the other solver paths refuse to start with it set.\n";
     out << "                                      # The block is equilibration_orbits / cycles long, so\n";
     out << "                                      # the INTEGRATED spin-up stays equilibration_orbits and\n";
     out << "                                      # only the flux RAM and illumination cost fall (by N).\n";

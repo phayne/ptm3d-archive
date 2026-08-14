@@ -245,6 +245,44 @@ set_target_properties(test_eq_spinup
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Retrospective equilibration certificate, run against a BANKED checkpoint.
+# Links `thermal` so the depth grid and the property model are the ENGINE's,
+# and `ptm_tools` only for yaml-cpp (--config). No mesh, no view factors, no
+# SPICE, no GPU: safe to run while a production job owns the devices.
+add_executable(ptm_eq_certify ptm_eq_certify.cpp)
+target_link_libraries(ptm_eq_certify
+    PRIVATE
+    thermal
+    ptm_tools
+    ${OpenMP_CXX_LIBRARIES}
+)
+if(YAML_CPP_FOUND)
+    target_compile_definitions(ptm_eq_certify PRIVATE HAVE_YAML_CPP)
+endif()
+set_target_properties(ptm_eq_certify
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Retrospective equilibration certificate gate. Built as REDUCTIONS -- a
+# demonstrably settled column and a demonstrably unsettled one, both from
+# closed form -- plus the arrest discrimination the quantity exists for: a
+# frozen-but-unsettled column that every increment test calls converged must
+# still FAIL here. Links `thermal` so it scores the shipping grid and property
+# model; no GPU, no mesh, no simulation.
+add_executable(test_eq_certify test_eq_certify.cpp)
+target_link_libraries(test_eq_certify
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_eq_certify
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Chunked-run statistics merge tool. Combines per-chunk raw statistics
 # (statistics/_raw/) from N chunks into a single set of merged stats
 # (max/avg/min) plus the Schorghofer ice-stability depth recomputed

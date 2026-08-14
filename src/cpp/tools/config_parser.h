@@ -115,6 +115,23 @@ struct SimulationConfig {
         // wrong says so, and a run that is fine does not cry wolf.
         double equilibration_target_K = 0.1;
 
+        // Drive the LENGTH of the analytic clear-sky pre-conditioner from the
+        // retrospective certificate instead of from a fixed cycle count: stop
+        // when the cycle-mean interface flux residual, converted to kelvin,
+        // reaches equilibration_target_K.
+        //
+        // DEFAULT FALSE, so nothing changes for any existing run until it is
+        // asked for. With it false the pre-conditioner loop is byte-identical
+        // to what it was; with it true the loop can end EARLY (never late --
+        // the configured cycle count is still the ceiling), and the achieved
+        // E is reported either way.
+        //
+        // Implemented on the CPU SIMD batch path only. The other three solver
+        // entry points REFUSE to start with it set rather than ignoring it;
+        // silently running a fixed count under a key that asks for a criterion
+        // is exactly the failure this key exists to end.
+        bool equilibration_stop_on_certificate = false;
+
         // ---- thermal.eq_extrapolation -------------------------------------
         // Pass-stride RRE extrapolation of the equilibration state. DEFAULT
         // OFF: with method == "off" the solver runs the pre-existing pass loop
