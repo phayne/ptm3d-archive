@@ -248,9 +248,13 @@ IlluminationModel::IlluminationModel(bool debug_output)
     mesh_resolution_ = 32;
     time_steps_ = 24;
     albedo_ = 0.5;
-    
-    // Get kernels path from config
-    kernels_path_ = ptm_thermal::config::SPICE_KERNELS_DIR;
+
+    // NOTE: kernels_path_ is deliberately left EMPTY here. Pinning it to the
+    // compiled-in SPICE_KERNELS_DIR at construction made initialize_spice()'s
+    // resolution ladder dead code, so $PTM_SPICE_KERNELS never took effect even
+    // though docs/ENVIRONMENT.md advertises it as an override (BUGS.md PTM-145).
+    // The directory is resolved lazily in initialize_spice(): an explicit
+    // setKernelsPath() call, then $PTM_SPICE_KERNELS, then SPICE_KERNELS_DIR.
 
     // NOTE: Do NOT initialize SPICE here. At construction the target body is not
     // yet known, so meta_kernel_filename_ is still the "europa.tm" default. Eagerly
@@ -2532,9 +2536,51 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             errprt_c("SET", 0, const_cast<char*>("NONE"));
 
             std::cout << "Initializing SPICE with meta-kernel" << std::endl;
-            
-            // Use the meta-kernel filename from properties
-            std::string meta_kernel = kernels_path_ + "/" + meta_kernel_filename_;
+
+            // Resolve the meta-kernel path from the configured value.
+            //
+            // An ABSOLUTE value is used EXACTLY as given; only a RELATIVE value is
+            // resolved against a directory. The previous unconditional concatenation
+            // (kernels_path_ + "/" + value) turned an absolute path into
+            // "<kernel dir>//Users/.../metakernel.tm", which cannot exist -- so every
+            // config carrying an absolute generic_body.spice_metakernel (i.e. every
+            // EMA asteroid config) missed, and then fell through to the substitution
+            // below. BUGS.md PTM-145.
+            //
+            // A RELATIVE value is tried in a fixed order, and every candidate is
+            // named if none of them exists:
+            //   1. <kernel dir>/<value>  -- the built-in moon.tm / europa.tm pattern
+            //   2. <cwd>/<value>         -- the repo-root-relative pattern used by the
+            //                               committed data/horizons_cache body configs
+            // The resolved path is echoed on success, so the log always states which
+            // file was actually furnsh'd rather than the raw config string.
+            const std::filesystem::path meta_kernel_arg(meta_kernel_filename_);
+            std::vector<std::string> meta_kernel_candidates;
+            if (meta_kernel_arg.is_absolute()) {
+                meta_kernel_candidates.push_back(
+                    meta_kernel_arg.lexically_normal().string());
+            } else {
+                meta_kernel_candidates.push_back(
+                    (std::filesystem::path(kernels_path_) / meta_kernel_arg)
+                        .lexically_normal().string());
+                std::error_code cwd_ec;
+                const std::filesystem::path cwd = std::filesystem::current_path(cwd_ec);
+                if (!cwd_ec) {
+                    const std::string from_cwd =
+                        (cwd / meta_kernel_arg).lexically_normal().string();
+                    if (from_cwd != meta_kernel_candidates.front()) {
+                        meta_kernel_candidates.push_back(from_cwd);
+                    }
+                }
+            }
+
+            std::string meta_kernel;
+            for (const std::string& candidate : meta_kernel_candidates) {
+                if (std::filesystem::exists(candidate)) {
+                    meta_kernel = candidate;
+                    break;
+                }
+            }
 
             // A Europa/Galilean metakernel (europa.tm) references jup365.bsp,
             // which the default Moon kernel fetch omits. Point the user at the
@@ -2544,8 +2590,18 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                 (meta_kernel_filename_.find("europa") != std::string::npos);
             const char* fetch_bodies_flag = galilean_metakernel ? " --bodies europa" : "";
 
-            if (!std::filesystem::exists(meta_kernel)) {
-                std::cerr << "Error: SPICE meta-kernel not found: " << meta_kernel << "\n"
+            if (meta_kernel.empty()) {
+                std::cerr << "Error: SPICE meta-kernel not found for target '"
+                          << target_body_name_ << "'.\n"
+                          << "  Configured value: '" << meta_kernel_filename_ << "' ("
+                          << (meta_kernel_arg.is_absolute() ? "absolute, used as given"
+                                                            : "relative, resolved below")
+                          << ")\n"
+                          << "  Paths tried:\n";
+                for (const std::string& candidate : meta_kernel_candidates) {
+                    std::cerr << "    " << candidate << "\n";
+                }
+                std::cerr << "  Kernel directory in use: " << kernels_path_ << "\n"
                           << "  Kernel dir resolution: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
                           << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
                           << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag
@@ -2554,8 +2610,9 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                 // Try falling back to default meta-kernel if different
                 if (meta_kernel_filename_ != "europa.tm") {
                     std::cerr << "Attempting to fall back to default europa.tm" << std::endl;
-                    meta_kernel = kernels_path_ + "/europa.tm";
-                    
+                    meta_kernel = (std::filesystem::path(kernels_path_) / "europa.tm")
+                                      .lexically_normal().string();
+
                     if (!std::filesystem::exists(meta_kernel)) {
                         std::cerr << "Error: Default SPICE meta-kernel not found: " << meta_kernel << std::endl;
                         return false;
@@ -2564,7 +2621,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                     return false;
                 }
             }
-            
+
             furnsh_c(meta_kernel.c_str());
 
             // Fail loud if furnsh could not load the metakernel or any kernel it
@@ -2589,9 +2646,13 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                 return false;
             }
 
+            // Always state which file was furnsh'd, resolved, not as configured:
+            // "europa.tm" and a per-body absolute path look identical in a config
+            // dump, and only the resolved path distinguishes them (BUGS.md PTM-145).
+            std::cout << "Loaded SPICE meta-kernel: " << meta_kernel << std::endl;
+
             // Only print detailed messages if verbose mode is enabled
             if (verbose) {
-                std::cout << "Loaded SPICE meta-kernel: " << meta_kernel_filename_ << std::endl;
                 std::cout << "Set planetary body to " << target_body_name_
                         << " with primary " << primary_body_name_
                         << " using meta-kernel " << meta_kernel_filename_ << std::endl;

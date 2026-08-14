@@ -14585,7 +14585,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     illumination_model->setAlbedo(default_visible_albedo);
-    illumination_model->setKernelsPath(SPICE_KERNELS_DIR);
+    // Do NOT pin the kernel directory to the compiled-in SPICE_KERNELS_DIR here.
+    // initialize_spice() above already resolved it (explicit setKernelsPath, then
+    // $PTM_SPICE_KERNELS, then SPICE_KERNELS_DIR); overwriting it afterwards
+    // discarded any $PTM_SPICE_KERNELS override for every later use of the
+    // directory. BUGS.md PTM-145.
     if (!using_generic_body) {
         illumination_model->setIncludePrimaryReflection(include_primary_reflection);
     }

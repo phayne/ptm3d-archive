@@ -480,6 +480,29 @@ carries the full thermophysical property set. See the asteroid examples in
 [`../examples/`](../examples/) and
 [docs/tutorials/](tutorials/).
 
+### How `generic_body.spice_metakernel` is resolved
+
+| Value | Resolved to |
+|---|---|
+| Absolute path (`/…/metakernel.tm`) | Used **exactly as given** — the kernel directory is not prepended |
+| Relative path (`bennu.tm`, `data/horizons_cache/…/metakernel.tm`) | `<kernel dir>/<value>` first, then `<current working directory>/<value>` |
+
+The kernel directory is itself resolved as: an explicit setting, then
+`$PTM_SPICE_KERNELS`, then the compiled-in `SPICE_KERNELS_DIR` (CMake cache
+variable, default `<repo>/data/kernels`) — see
+[ENVIRONMENT.md](ENVIRONMENT.md).
+
+Every run prints the file it actually loaded (`Loaded SPICE meta-kernel: …`).
+If none of the candidates exists the run stops and lists every path it tried;
+it never substitutes another body's metakernel.
+
+Paths **inside** the metakernel (`PATH_VALUES`) are resolved by CSPICE itself,
+relative to the working directory, and are independent of the rule above. The
+shipped `data/kernels/*.tm` use `PATH_VALUES = ( 'data/kernels' )`, so a
+built-in body expects to be run from the repository root; a metakernel with
+absolute `PATH_VALUES` works from anywhere. A `PATH_VALUES` entry longer than
+80 characters must be split with the KPL `+` continuation.
+
 ## Generating a template
 
 ```bash
