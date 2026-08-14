@@ -70,6 +70,35 @@ FITS + regenerated Moon bins (Europa untouched); `data_manifest.json`'s sha256 a
 size are updated to match. If you have a local copy fetched before this revision,
 re-fetch. See `docs/KNOWN_LIMITATIONS.md` (PTM-34 / PTM-35).
 
+### Load-time registration guard
+
+Both defects are invisible to every scalar summary: a rolled or flipped map keeps
+its albedo VALUE distribution, so the map's range, its mean, and the reported
+effective albedo `A_eff` all look completely normal while the albedo sits on the
+wrong terrain. (Measured on `moon_global_res7`: the 180-degree roll moved the
+global mean `A_eff` by 0.0001 and the global mean `T_max` by 0.002 K, but moved
+individual faces by up to 15 K.) A stale local copy therefore produces plausible,
+wrong results indefinitely.
+
+The engine now checks registration spatially when it loads a lunar map, on both
+the CPU and GPU thermal paths, and reports:
+
+```
+[albedo] Lunar map registration check: maria 0.0807 < highlands 0.1597 (contrast 0.0790, ...) -- OK
+```
+
+If the ordering is inverted it prints a loud warning naming the file and
+**continues** — it never silently corrects the map, because the fix belongs in the
+data and a blanket correction here would break Europa, whose FITS registers
+correctly through the same loader. The check only applies to bodies with a
+published dark/bright signature (currently the Moon) and only when the mesh
+actually resolves the reference sites, so regional DEM meshes and non-lunar bodies
+are declined rather than flagged. The two statistics it reports cannot separate a
+longitude roll from a latitude flip; for that, run
+`scripts/verify_moon_albedo_registration.py`, which scores the map against the
+source FITS under all four candidate transforms and names the axis. Regression
+gate: `build/bin/test_albedo_registration_check`.
+
 ## License
 
 Derived from NASA PDS public-domain data; distributed under CC-BY-4.0.

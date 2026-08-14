@@ -146,17 +146,35 @@ def main(argv=None):
         m_mean, h_mean = float(np.mean(m_alb)), float(np.mean(h_alb))
         contrast = h_mean - m_mean
 
-        # RMS vs corrected FITS at TRUE (lat,lon), and vs lon+180 (discriminator)
-        f_true = fits_sample(data, flat, flon)
-        f_flip = fits_sample(data, flat, flon + 180.0)
-        rms_true = float(np.sqrt(np.mean((alb - f_true) ** 2)))
-        rms_flip = float(np.sqrt(np.mean((alb - f_flip) ** 2)))
+        # RMS vs the corrected FITS under every candidate mis-registration. The
+        # transform with the SMALLEST RMS is the one that actually explains the
+        # bin, which is what names the defective axis -- the maria-dark contrast
+        # alone cannot: a pure longitude roll also drives the north/south
+        # statistic negative, and a pure latitude flip lands near the contrast
+        # gate. This is the attribution the engine's load-time guard defers to.
+        transforms = {
+            "true (+lat, lon)": (flat, flon),
+            "lon+180 (PTM-34)": (flat, flon + 180.0),
+            "-lat (PTM-35)": (-flat, flon),
+            "-lat & lon+180": (-flat, flon + 180.0),
+        }
+        rms = {k: float(np.sqrt(np.mean((alb - fits_sample(data, la, lo)) ** 2)))
+               for k, (la, lo) in transforms.items()}
+        rms_true = rms["true (+lat, lon)"]
+        rms_flip = rms["lon+180 (PTM-34)"]
+        best = min(rms, key=rms.get)
 
         verdict = "PASS" if (contrast > 0.02 and rms_true < 0.02 and rms_true < rms_flip) else "FAIL"
         if verdict == "FAIL":
             ok = False
         print(f"[verify] res{res}: faces={nf}  maria={m_mean:.4f} highland={h_mean:.4f} "
               f"contrast={contrast:+.4f}  RMS(true)={rms_true:.4f} RMS(lon+180)={rms_flip:.4f}  -> {verdict}")
+        if verdict == "FAIL":
+            detail = "  ".join(f"{k}={v:.4f}" for k, v in rms.items())
+            print(f"           RMS by transform: {detail}")
+            print(f"           best explanation: '{best}' -> "
+                  + ("registration is CORRECT on both axes; the failure is elsewhere"
+                     if best.startswith("true") else f"the map is mis-registered as '{best}'"))
         if res == 9:
             print("           maria per-anchor:    " +
                   ", ".join(f"{lo:.0f}E={a:.3f}" for (la, lo), a in zip(MARIA, m_alb)))
