@@ -313,20 +313,28 @@ struct SimulationConfig {
         std::string eq_indirect_source = "auto";
 
         // How many times the internal estimate is refreshed and the whole-mesh
-        // solve repeated (eq_indirect_source: auto only). Pass 1 estimates
-        // <q_ind> from temperatures that equilibrated with NO indirect term at
-        // all, so its emitters are too cold and its estimate is a lower bound
-        // -- measured 11.7% low on the 80 N crater. Each further pass re-reduces
-        // <q_ind> from the temperatures the previous pass produced, which is a
-        // fixed-point iteration on the equilibration forcing.
-        //   1 -- the shipped 2026-08-11 behavior, bit-for-bit.
-        //   2 -- default. The second iterate is the fixed point to ~0.3 K on
-        //        the deep column; see docs/radiation-exchange.md 7.7.
+        // solve repeated, on whichever sweep eq_indirect_source selects. Pass 1
+        // estimates <q_ind> from temperatures that equilibrated with NO indirect
+        // term at all, so its emitters are too cold and its estimate is a lower
+        // bound -- measured 11.7% low on the 80 N crater. Each further pass
+        // re-reduces <q_ind> from the temperatures the previous pass produced,
+        // which is a fixed-point iteration on the equilibration forcing.
+        //   1 -- default, and the knee for eq_indirect_source: converged (pass 2
+        //        moved that crater's deep column a further 0.056 K).
+        //   2 -- the knee for eq_indirect_source: auto, but a DOMINATED one. On
+        //        the same crater it bought 0.284 K of deep column for +0.26x
+        //        wall, where switching to eq_indirect_source: converged at ONE
+        //        pass bought 3.90 K for +0.73x. The 3.61 K it cannot reach is a
+        //        property of the iteration-0 estimator, not of the pass count.
+        //        Spend on the estimator first; see docs/radiation-exchange.md
+        //        7.7 for the table both figures come from.
         // COST is linear: each pass is one radiosity sweep plus one whole-mesh
-        // thermal solve over the equilibration+output span. Must be >= 1;
-        // 0 is not an alias for "off" and is rejected. Overridable through
-        // PTM_EQ_INDIRECT_PASSES.
-        int eq_indirect_passes = 2;
+        // thermal solve over the equilibration+output span (under "converged",
+        // one whole extra coupling loop plus that solve). The solve scales with
+        // the equilibration span, so a second pass gets steadily worse value as
+        // equilibration_orbits grows. Must be >= 1; 0 is not an alias for "off"
+        // and is rejected. Overridable through PTM_EQ_INDIRECT_PASSES.
+        int eq_indirect_passes = 1;
 
         // Which INITIAL CONDITION every solver path starts from
         // (src/cpp/thermal/eq_seed.h). Overridable through PTM_SPINUP_SEED.

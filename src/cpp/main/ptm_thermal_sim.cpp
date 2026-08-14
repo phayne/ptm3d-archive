@@ -17064,8 +17064,7 @@ int main(int argc, char** argv) {
                             << "      eq_indirect_source: off run performs. Measured on the"
                                " 12,800-face 80 N crater (CPU): 1.21x the wall time of off"
                                " at 1 pass,\n"
-                            << "      1.47x at 2, 1.71x at 3. Knee at 2 passes (pass 3"
-                               " moved the shadowed deep column a further 0.0015 K).\n"
+                            << "      1.47x at 2, 1.71x at 3.\n"
                             << "    LIMIT OF THIS ESTIMATOR: it reads the coupling"
                                " ITERATION-0 sweep, whose emitters carry no output-window"
                                " indirect yet, so\n"
@@ -17074,7 +17073,17 @@ int main(int argc, char** argv) {
                                " converged\n"
                             << "      one on the shadowed deep column."
                                " thermal.eq_indirect_source: converged removes that gap,"
-                               " at 1.94x instead of 1.47x.\n";
+                               " at 1.94x instead of 1.21x.\n"
+                            << "    Default is 1 pass. Pass 2 IS this estimator's own knee,"
+                               " but it is the worst kelvin per second on offer here: it"
+                               " moved that\n"
+                            << "      deep column 0.284 K for +0.26x wall, where switching"
+                               " to eq_indirect_source: converged at ONE pass moved it"
+                               " 3.90 K for +0.73x.\n"
+                            << "      Its solve also scales with the equilibration span, so"
+                               " it gets worse value as equilibration_orbits grows. Raise"
+                               " the pass count\n"
+                            << "      after switching estimator, not instead of it.\n";
                     }
                     std::cout << "    The pass-to-pass change in <q_ind> is reported below"
                                  " so the knee is visible rather than assumed."
