@@ -954,7 +954,34 @@ static inline void countTgeoRelease(const double* T, size_t n, double t_geo_watc
 void Profile::update_T(double dt, double Qs, double Qb) {
     // 0) Boundary conditions (update boundary nodes T[0], T[n-1])
     surfTemp(*this, Qs);
-    if (Qb != 0.0) botTemp(*this, Qb);
+    // The bottom BC is applied UNCONDITIONALLY. It used to be guarded by
+    // `if (Qb != 0.0)`, which made Qb = 0 mean something no other path meant.
+    //
+    // WHAT THE GUARD DID. The interior Crank-Nicolson solve below runs
+    // i = 1..n_tot-2 and never touches node n-1; surfTemp and the tridiagonal
+    // assembly then CONSUME T[n-1] as a known value. So skipping botTemp does
+    // not give a zero-flux bottom -- it leaves the deepest node frozen at
+    // whatever the initial condition wrote and feeds it back in every step as a
+    // DIRICHLET reservoir. Measured on 623 Chimaera (CPU scalar, Qb = 0, 40
+    // rotations, 8082 steps): T[n-1] drift was 0.000000 K at every step.
+    //
+    // WHY UNCONDITIONAL RATHER THAN `Qb >= 0.0`. botTemp is the discrete
+    // Neumann condition T[n] = T[n-1] + Qb*dz/k; at Qb = 0 it collapses to
+    // T[n] = T[n-1], the insulated boundary, which is what Qb = 0 means
+    // physically. This is also textually what the GPU does -- the persistent
+    // kernel applies the same expression with no branch at all
+    // (gpu/thermal_kernels.cl:614-623) -- so an unconditional call closes a
+    // CPU/GPU divergence. A `Qb >= 0.0` guard would instead open a new one for
+    // Qb < 0 (the GPU would apply the BC and the CPU would not). Qb < 0 is
+    // unreachable in this engine today -- every assignment to planet.Qb is
+    // gated `> 0` or `>= 0` (ptm_thermal_sim.cpp:3551, 13235, 13421) and no
+    // shipped config carries a negative value -- so the two forms are
+    // equivalent on every current run and only the unconditional one stays
+    // equivalent if that ever changes.
+    //
+    // This is NOT a clamp: nothing is bounded, substituted or floored. The
+    // boundary condition is simply evaluated instead of skipped.
+    botTemp(*this, Qb);
 
     // Geothermal-equilibrium floor (mirrors the GPU persistent kernel). In
     // steady darkness the surface radiates the interior heat flux Qb, so no
