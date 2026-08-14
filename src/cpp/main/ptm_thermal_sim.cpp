@@ -15430,9 +15430,42 @@ int main(int argc, char** argv) {
             eq_indirect_source = e;
         }
     }
-    if (eq_indirect_source != "auto" && eq_indirect_source != "off") {
+    if (eq_indirect_source != "auto" && eq_indirect_source != "converged"
+            && eq_indirect_source != "off") {
         std::cerr << "FATAL: unknown thermal.eq_indirect_source '"
-                  << eq_indirect_source << "'. Valid: auto | off.\n";
+                  << eq_indirect_source << "'. Valid: auto | converged | off.\n";
+        return 1;
+    }
+    // How many times the internal estimate is refreshed. Pass 1's emitters
+    // equilibrated with no indirect term at all, so its <q_ind> is a lower
+    // bound; each further pass re-reduces it from the field the previous pass
+    // produced. Linear cost -- one radiosity sweep plus one whole-mesh thermal
+    // solve per pass -- so the count is a knob, not a hidden constant.
+    int eq_indirect_passes = sim_config.thermal.eq_indirect_passes;
+    if (const char* e = std::getenv("PTM_EQ_INDIRECT_PASSES")) {
+        if (*e != '\0') {
+            char* endp = nullptr;
+            const long v = std::strtol(e, &endp, 10);
+            if (endp == e || *endp != '\0') {
+                std::cerr << "FATAL: PTM_EQ_INDIRECT_PASSES='" << e
+                          << "' is not an integer.\n";
+                return 1;
+            }
+            if (static_cast<int>(v) != eq_indirect_passes) {
+                std::cout << "[Deep coupling] PTM_EQ_INDIRECT_PASSES=" << v
+                          << " overrides thermal.eq_indirect_passes: "
+                          << eq_indirect_passes << std::endl;
+                eq_indirect_passes = static_cast<int>(v);
+            }
+        }
+    }
+    if (eq_indirect_passes < 1) {
+        // 0 is deliberately NOT an alias for "off": two spellings of the same
+        // behavior is how a run's provenance stops being readable from its
+        // config. Say which key turns it off.
+        std::cerr << "FATAL: thermal.eq_indirect_passes must be >= 1 (got "
+                  << eq_indirect_passes << "). Use thermal.eq_indirect_source: "
+                     "off to disable the internal pass entirely.\n";
         return 1;
     }
     // Provenance for the end-of-run banner. Never left as a guess: whichever
@@ -16068,11 +16101,38 @@ int main(int argc, char** argv) {
         // swap-back on the non-chunked branch.
         //
         // `eqi` empty reproduces the legacy call exactly on every solver.
+        //
+        // Phase stopwatches, so the equilibration-indirect accuracy report can
+        // quote a cost in THIS run's own minutes instead of a multiplier
+        // measured on somebody else's mesh. Wall clock, accumulated, never read
+        // by any numerical path -- a run's results do not depend on them.
+        double eqi_t_solve_s = 0.0;   int eqi_n_solve = 0;
+        double eqi_t_sweep_s = 0.0;   int eqi_n_sweep = 0;
+        double eqi_t_loop_s  = 0.0;   // the most recent COMPLETE coupling loop
+        int    eqi_n_iter_loop = 0;   // ... and how many Picard iterations it took
+        std::chrono::steady_clock::time_point eqi_loop_t0 =
+            std::chrono::steady_clock::now();
+        auto eqiElapsed = [](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+        };
         auto solveWholeMeshThermal =
             [&](const std::vector<double>& eqi,
                 const std::vector<double>& ds,
                 const std::vector<double>& pr,
                 const std::vector<double>& pi) -> bool {
+            // Scope timer: the lambda returns from several branches, so an RAII
+            // object is the only way to time all of them without missing one.
+            struct SolveTimer {
+                double& acc; int& n; std::chrono::steady_clock::time_point t0;
+                explicit SolveTimer(double& a, int& c)
+                    : acc(a), n(c), t0(std::chrono::steady_clock::now()) {}
+                ~SolveTimer() {
+                    acc += std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0).count();
+                    ++n;
+                }
+            } eqi_solve_timer(eqi_t_solve_s, eqi_n_solve);
             const bool use_simd_batch_l  = thermal_config.getPropertyBool("use_simd_batch", true);
             const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
             ice::IceStabilityAccumulator* ice_acc_l =
@@ -16931,21 +16991,90 @@ int main(int argc, char** argv) {
                 const bool eq_indirect_two_phase_window =
                     equilibration_steps > 0 && equilibration_steps < total_time_steps;
                 const bool eq_indirect_internal_armed =
-                    (eq_indirect_source == "auto")
+                    (eq_indirect_source == "auto"
+                     || eq_indirect_source == "converged")
                     && sim_config.thermal.eq_indirect_flux_file.empty()
                     && eq_indirect_two_phase_window
                     && !eq_indirect_warm_start;
-                bool eq_indirect_internal_done = false;
+                // WHERE each pass reads <q_ind> from. Two different estimators,
+                // two different fixed points -- measured, not assumed, on the
+                // 12,800-face 80 N crater (dark population, n=1086, deep column):
+                //   auto      -- the coupling ITERATION-0 sweep. Its emitters
+                //                still carry no output-window indirect, so it is
+                //                a lower bound on <q_ind> by 13.3% here. Its own
+                //                fixed point is 118.958 K, reached at 2 passes.
+                //   converged -- the sweep after the coupling loop has converged.
+                //                Fixed point 122.626 K, reached at 1 pass. That
+                //                is a further +3.61 K the "auto" estimator cannot
+                //                reach at ANY pass count. Cross-checked against
+                //                the manual two-run eq_indirect_flux_file
+                //                workflow, which lands on the same 122.626 K.
+                // "converged" costs a whole extra coupling loop per pass and is
+                // therefore not the default; "auto" is what shipped 2026-08-11.
+                const bool eq_indirect_from_converged =
+                    (eq_indirect_source == "converged");
+                int  eq_indirect_passes_done = 0;
+                // Set when no further pass can change anything (a measured
+                // <q_ind> of zero). Distinct from the pass counter because the
+                // zero case does NOT restart the coupling loop, so the counter
+                // alone would let the block fire again on a later iteration.
+                bool eq_indirect_internal_finished = false;
 
                 if (eq_indirect_internal_armed) {
-                    std::cout << "  Equilibration indirect flux: INTERNAL PASS (thermal."
-                                 "eq_indirect_source: auto). One extra radiosity sweep"
-                                 " and one extra whole-mesh thermal solve." << std::endl;
+                    // State the price before charging it, and state it in the
+                    // units it is actually paid in: WHOLE-MESH THERMAL SOLVES
+                    // and RADIOSITY SWEEPS. The wall-clock multiplier is not a
+                    // property of this feature -- it depends on what share of
+                    // the run those two phases are -- so quote what was measured
+                    // and name the case, rather than promising a number.
+                    std::cout << "  Equilibration indirect flux: INTERNAL PASS x "
+                              << eq_indirect_passes << " (thermal.eq_indirect_source: "
+                              << eq_indirect_source << ", thermal.eq_indirect_passes: "
+                              << eq_indirect_passes << ").\n";
+                    if (eq_indirect_from_converged) {
+                        std::cout
+                            << "    Each pass re-runs the WHOLE coupling loop and takes"
+                               " <q_ind> from its converged sweep, then re-equilibrates:\n"
+                            << "      + " << eq_indirect_passes << " whole-mesh thermal"
+                               " solve(s) and " << eq_indirect_passes
+                            << " extra coupling loop(s) on top of the one loop an"
+                               " eq_indirect_source: off run performs.\n"
+                            << "      Measured on the 12,800-face 80 N crater (CPU): 1.94x"
+                               " the wall time of eq_indirect_source: off at 1 pass, 2.86x"
+                               " at 2, 3.78x at 3.\n"
+                            << "      This is the estimator that closes the iteration-0"
+                               " bias; eq_indirect_source: auto does not, at any pass"
+                               " count. Knee at 1 pass\n"
+                            << "      (pass 2 moved the shadowed deep column a further"
+                               " 0.06 K on that crater).\n";
+                    } else {
+                        std::cout
+                            << "    Each pass = one radiosity sweep + one whole-mesh"
+                               " thermal solve, on top of the one solve and the coupling"
+                               " sweeps an\n"
+                            << "      eq_indirect_source: off run performs. Measured on the"
+                               " 12,800-face 80 N crater (CPU): 1.21x the wall time of off"
+                               " at 1 pass,\n"
+                            << "      1.47x at 2, 1.71x at 3. Knee at 2 passes (pass 3"
+                               " moved the shadowed deep column a further 0.0015 K).\n"
+                            << "    LIMIT OF THIS ESTIMATOR: it reads the coupling"
+                               " ITERATION-0 sweep, whose emitters carry no output-window"
+                               " indirect yet, so\n"
+                            << "      <q_ind> stays ~13% low no matter how many passes run."
+                               " On that crater the auto fixed point sits 3.61 K BELOW the"
+                               " converged\n"
+                            << "      one on the shadowed deep column."
+                               " thermal.eq_indirect_source: converged removes that gap,"
+                               " at 1.94x instead of 1.47x.\n";
+                    }
+                    std::cout << "    The pass-to-pass change in <q_ind> is reported below"
+                                 " so the knee is visible rather than assumed."
+                              << std::endl;
                 } else if (!sim_config.thermal.eq_indirect_flux_file.empty()) {
                     std::cout << "  Equilibration indirect flux: FILE (thermal."
                                  "eq_indirect_flux_file overrides the internal pass)."
                               << std::endl;
-                } else if (eq_indirect_source != "auto") {
+                } else if (eq_indirect_source == "off") {
                     std::cout << "  Equilibration indirect flux: OFF (thermal."
                                  "eq_indirect_source: " << eq_indirect_source
                               << "). The deep column equilibrates without the"
@@ -17143,10 +17272,185 @@ int main(int argc, char** argv) {
                 }
                 std::cout << "  Coupling under-relaxation ω = " << rad_relax << std::endl;
 
+                // ==============================================================
+                // ONE internal equilibration-indirect pass
+                // ==============================================================
+                // Reduce whatever is currently in indirect_flux_series to the
+                // per-face OUTPUT-WINDOW time mean <q_ind>[i] -- the same
+                // estimator thermal.indirect_mean_out_file writes -- repeat the
+                // whole-mesh thermal solve with <q_ind> added to the absorbed
+                // flux at every EQUILIBRATION step, and hand the caller a
+                // "restart the coupling loop" verdict. The output window is
+                // untouched (it already carries the time-varying indirect from
+                // the coupling), so there is no double counting.
+                //
+                // Why the time mean and not the time series: equilibration is a
+                // DC problem -- it sets the deep column, whose response time is
+                // many diurnal cycles -- so the cycle-mean forcing is what
+                // determines it. Dropping the diurnal modulation of the indirect
+                // term is correct at leading order, and is what the manual
+                // two-pass file workflow has always done.
+                //
+                // WHICH FIELD IS IN indirect_flux_series WHEN THIS RUNS IS THE
+                // WHOLE QUESTION, and it is the caller's choice:
+                //   - thermal.eq_indirect_source: auto      -> the coupling
+                //     ITERATION-0 sweep. Cheap; its own fixed point is reached
+                //     at 2 passes; but its emitters carry no output-window
+                //     indirect, so <q_ind> stays ~13% low forever.
+                //   - thermal.eq_indirect_source: converged -> the sweep after
+                //     the coupling loop has converged. Costs a whole extra
+                //     coupling loop per pass; reaches the fixed point at 1 pass
+                //     and lands +3.63 K higher on the shadowed deep column of
+                //     the 12,800-face 80 N crater.
+                // Both are fixed-point iterations. No convergence test cuts them
+                // short -- the pass-to-pass change is REPORTED instead, so the
+                // knee is something the log shows rather than something the code
+                // decides for a mesh it has not seen.
+                //
+                // Returns: 0 = nothing to do (not armed, passes exhausted, or a
+                // measured <q_ind> of zero), 1 = re-solved, RESTART the coupling
+                // loop, -1 = fatal, refuse to write results.
+                auto runEqIndirectPass = [&](const char* source_desc) -> int {
+                    if (!eq_indirect_internal_armed
+                            || eq_indirect_internal_finished
+                            || eq_indirect_passes_done >= eq_indirect_passes)
+                        return 0;
+                    const int eqi_pass = ++eq_indirect_passes_done;
+
+                    const int out_lo = equilibration_steps;
+                    const int out_hi = total_time_steps;
+                    const int out_n  = std::max(1, out_hi - out_lo);
+                    std::vector<double> q_ind_mean(num_faces, 0.0);
+                    #pragma omp parallel for schedule(static)
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        const auto& row = indirect_flux_series[f];
+                        double acc = 0.0;
+                        for (int t = out_lo; t < out_hi
+                                 && t < static_cast<int>(row.size()); ++t)
+                            acc += row[t];
+                        q_ind_mean[f] = acc / out_n;
+                    }
+
+                    // Pass-to-pass change, against the estimate the previous pass
+                    // installed. This is the convergence evidence: if pass 3 moves
+                    // <q_ind> far less than pass 2 did, the second iterate was the
+                    // fixed point, and the log says so for THIS mesh rather than
+                    // the user trusting a number measured on someone else's crater.
+                    double dq_mean = 0.0, dq_max = 0.0, prev_sum = 0.0;
+                    if (eqi_pass > 1 && eq_indirect_vec.size() == q_ind_mean.size()) {
+                        for (size_t f = 0; f < q_ind_mean.size(); ++f) {
+                            const double d = std::abs(q_ind_mean[f] - eq_indirect_vec[f]);
+                            dq_mean += d;
+                            dq_max = std::max(dq_max, d);
+                            prev_sum += eq_indirect_vec[f];
+                        }
+                        dq_mean /= std::max<size_t>(1, q_ind_mean.size());
+                    }
+
+                    eq_indirect_record.census(q_ind_mean);
+
+                    const std::ios_base::fmtflags eqi_flags = std::cout.flags();
+                    const std::streamsize eqi_prec = std::cout.precision();
+                    std::cout << std::defaultfloat << std::setprecision(6);
+                    std::cout << "\n  [Eq indirect] Internal pass " << eqi_pass
+                              << " of " << eq_indirect_passes << " (source: "
+                              << source_desc << "): per-face output-window mean"
+                                 " indirect flux over " << out_n << " steps\n"
+                              << "    mean " << eq_indirect_record.mean_Wm2
+                              << ", median " << eq_indirect_record.median_Wm2
+                              << ", max " << eq_indirect_record.max_Wm2 << " W/m^2; "
+                              << eq_indirect_record.n_nonzero << "/" << num_faces
+                              << " faces receive any" << std::endl;
+                    if (eqi_pass > 1) {
+                        const double prev_mean =
+                            prev_sum / std::max<size_t>(1, q_ind_mean.size());
+                        std::cout << "    change from pass " << (eqi_pass - 1)
+                                  << ": mean |d<q_ind>| " << dq_mean
+                                  << ", max " << dq_max << " W/m^2 ("
+                                  << (prev_mean > 0.0
+                                          ? 100.0 * (eq_indirect_record.mean_Wm2
+                                                     - prev_mean) / prev_mean
+                                          : 0.0)
+                                  << "% on the mean)" << std::endl;
+                    }
+
+                    if (eq_indirect_record.max_Wm2 <= 0.0) {
+                        // A mesh with no inter-face view lands here. Skipping the
+                        // re-solve keeps it bit-identical to legacy AND costs
+                        // nothing, but it must be said out loud.
+                        std::cout << "    No face receives indirect flux — the"
+                                     " equilibration forcing is unchanged and this"
+                                     " run is identical to eq_indirect_source: off."
+                                  << std::endl;
+                        eq_indirect_record.provenance = "internal pass (measured zero)";
+                        // This branch does NOT restart the loop, so the pass
+                        // counter alone would let the next pass fire mid-Picard
+                        // and corrupt a genuine coupling iteration.
+                        eq_indirect_internal_finished = true;
+                        std::cout.flags(eqi_flags);
+                        std::cout.precision(eqi_prec);
+                        return 0;
+                    }
+
+                    std::cout << "    Re-solving the whole-mesh thermal model with this"
+                                 " on the equilibration forcing, then restarting the"
+                                 " coupling loop"
+                              << (eqi_pass < eq_indirect_passes
+                                      ? " for the next indirect pass." : ".")
+                              << std::endl;
+                    std::cout.flags(eqi_flags);
+                    std::cout.precision(eqi_prec);
+
+                    eq_indirect_vec = q_ind_mean;
+                    const bool ok = solveWholeMeshThermal(
+                        eq_indirect_vec, direct_solar_values,
+                        primary_reflected_values, primary_ir_values);
+                    if (!ok || !validateTemperatureMatrix(
+                            surface_temps, num_faces, total_time_steps)) {
+                        std::cerr << "[FATAL] Internal equilibration-indirect pass "
+                                  << eqi_pass << " thermal re-solve failed; refusing"
+                                     " to write results.\n";
+                        return -1;
+                    }
+                    eq_indirect_record.provenance =
+                        "internal pass (" + std::to_string(eqi_pass) + " of "
+                        + std::to_string(eq_indirect_passes) + ", source: "
+                        + source_desc + ")";
+
+                    // Every piece of coupling-loop state refers to the temperature
+                    // field this re-solve just replaced. Reset all of it, so the
+                    // next sweep is a genuine iteration 0 rather than a Picard step
+                    // against a field that no longer exists.
+                    prev_temps = surface_temps;
+                    std::fill(prev_max_indirect.begin(), prev_max_indirect.end(), 0.0);
+                    for (auto& row : indirect_flux_series)
+                        std::fill(row.begin(), row.end(), 0.0);
+                    for (auto& row : indirect_solar_series)
+                        std::fill(row.begin(), row.end(), 0.0);
+                    for (auto& row : indirect_ir_series)
+                        std::fill(row.begin(), row.end(), 0.0);
+                    // PTM-57's post-coupling checkpoint accumulates end-of-window
+                    // columns across coupling iterations. On a "converged" restart
+                    // it is NON-empty and holds the discarded pass's columns; left
+                    // alone, faces the new loop never re-thermals would keep them.
+                    if (!rad_final_T.empty()) {
+                        std::fill(rad_final_T.begin(), rad_final_T.end(), 0.0f);
+                        std::fill(rad_final_touched.begin(),
+                                  rad_final_touched.end(), uint8_t{0});
+                    }
+                    return 1;
+                };
+
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
                     writeHeartbeat("rad_iter " + std::to_string(iter + 1)
                                    + " start (max=" + std::to_string(rad_max_coupling_iter) + ")");
+                    // A pass that re-solves rewinds to iter 0, so this also
+                    // restarts the loop stopwatch: what the cost report needs is
+                    // the length of the LAST complete loop, not of all of them.
+                    if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
+                    const std::chrono::steady_clock::time_point eqi_sweep_t0 =
+                        std::chrono::steady_clock::now();
 
                     // Step 1: Compute indirect flux at EVERY timestep
                     // This captures time-varying thermal emission from illuminated walls
@@ -17400,116 +17704,24 @@ int main(int argc, char** argv) {
                         }
                     }
                     flux_progress.finish();
+                    eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
+                    ++eqi_n_sweep;
 
                     double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
 
                     // ==========================================================
-                    // Internal equilibration-indirect pass (thermal.eq_indirect_source: auto)
+                    // Internal equilibration-indirect pass, ESTIMATOR "auto"
                     // ==========================================================
-                    // The sweep just above is pass 1: it produced Q_indirect(i,t)
-                    // from temperatures whose deep column was equilibrated with
-                    // NO indirect term at all. Reduce it to the output-window
-                    // time mean <q_ind>[i] -- the same estimator that
-                    // thermal.indirect_mean_out_file writes -- and repeat the
-                    // whole-mesh thermal solve with <q_ind> on the equilibration
-                    // forcing. Then restart the coupling loop, which now runs
-                    // against a column that was equilibrated against the heat it
-                    // actually receives.
-                    //
-                    // Cost: exactly one extra radiosity sweep (this one) plus one
-                    // extra whole-mesh thermal solve. It fires ONCE per run.
-                    //
-                    // Why the time mean and not the time series: equilibration is
-                    // a DC problem -- it sets the deep column, whose response time
-                    // is many diurnal cycles -- so the cycle-mean forcing is the
-                    // quantity that determines it. Dropping the diurnal modulation
-                    // of the indirect term is correct at leading order and is what
-                    // the manual two-pass file workflow has always done.
-                    //
-                    // One pass UNDER-corrects: pass 1's own emitters are colder
-                    // than the converged state, so <q_ind> is a lower bound. The
-                    // natural place to iterate is right here -- loop this block
-                    // until <q_ind> stops moving -- but no iteration is built
-                    // until the single-pass recovery has been measured.
-                    if (eq_indirect_internal_armed && !eq_indirect_internal_done) {
-                        eq_indirect_internal_done = true;
-
-                        const int out_lo = equilibration_steps;
-                        const int out_hi = total_time_steps;
-                        const int out_n  = std::max(1, out_hi - out_lo);
-                        std::vector<double> q_ind_mean(num_faces, 0.0);
-                        #pragma omp parallel for schedule(static)
-                        for (size_t f = 0; f < num_faces; ++f) {
-                            const auto& row = indirect_flux_series[f];
-                            double acc = 0.0;
-                            for (int t = out_lo; t < out_hi
-                                     && t < static_cast<int>(row.size()); ++t)
-                                acc += row[t];
-                            q_ind_mean[f] = acc / out_n;
-                        }
-                        eq_indirect_record.census(q_ind_mean);
-
-                        const std::ios_base::fmtflags eqi_flags = std::cout.flags();
-                        const std::streamsize eqi_prec = std::cout.precision();
-                        std::cout << std::defaultfloat << std::setprecision(6);
-                        std::cout << "\n  [Eq indirect] Internal pass 1 complete: per-face"
-                                     " output-window mean indirect flux over "
-                                  << out_n << " steps\n"
-                                  << "    mean " << eq_indirect_record.mean_Wm2
-                                  << ", median " << eq_indirect_record.median_Wm2
-                                  << ", max " << eq_indirect_record.max_Wm2 << " W/m^2; "
-                                  << eq_indirect_record.n_nonzero << "/" << num_faces
-                                  << " faces receive any" << std::endl;
-
-                        if (eq_indirect_record.max_Wm2 <= 0.0) {
-                            // A mesh with no inter-face view lands here. Skipping
-                            // the re-solve keeps it bit-identical to legacy AND
-                            // costs nothing, but it must be said out loud.
-                            std::cout << "    No face receives indirect flux — the"
-                                         " equilibration forcing is unchanged and this"
-                                         " run is identical to eq_indirect_source: off."
-                                      << std::endl;
-                            eq_indirect_record.provenance = "internal pass (measured zero)";
-                            std::cout.flags(eqi_flags);
-                            std::cout.precision(eqi_prec);
-                        } else {
-                            std::cout << "    Re-solving the whole-mesh thermal model with"
-                                         " this on the equilibration forcing, then"
-                                         " restarting the coupling loop." << std::endl;
-                            std::cout.flags(eqi_flags);
-                            std::cout.precision(eqi_prec);
-
-                            eq_indirect_vec = q_ind_mean;
-                            const bool ok = solveWholeMeshThermal(
-                                eq_indirect_vec, direct_solar_values,
-                                primary_reflected_values, primary_ir_values);
-                            if (!ok || !validateTemperatureMatrix(
-                                    surface_temps, num_faces, total_time_steps)) {
-                                std::cerr << "[FATAL] Internal equilibration-indirect"
-                                             " pass 2 thermal solve failed; refusing to"
-                                             " write results.\n";
-                                return 1;
-                            }
-                            eq_indirect_record.provenance = "internal pass";
-
-                            // The coupling loop's own state refers to the pass-1
-                            // temperature field, which no longer exists. Reset it
-                            // so iteration 1 below is a genuine first iteration.
-                            prev_temps = surface_temps;
-                            std::fill(prev_max_indirect.begin(),
-                                      prev_max_indirect.end(), 0.0);
-                            for (auto& row : indirect_flux_series)
-                                std::fill(row.begin(), row.end(), 0.0);
-                            for (auto& row : indirect_solar_series)
-                                std::fill(row.begin(), row.end(), 0.0);
-                            for (auto& row : indirect_ir_series)
-                                std::fill(row.begin(), row.end(), 0.0);
-
-                            iter = -1;   // the ++ below makes the next pass iter 0
-                            continue;
-                        }
+                    // Fire right off the coupling ITERATION-0 sweep, which is
+                    // what shipped 2026-08-11. runEqIndirectPass() does the work
+                    // and says what it did; see its definition above the loop for
+                    // what this estimator can and cannot reach.
+                    if (!eq_indirect_from_converged) {
+                        const int rc = runEqIndirectPass("iteration-0 sweep");
+                        if (rc < 0) return 1;
+                        if (rc > 0) { iter = -1; continue; }  // ++ makes it iter 0
                     }
 
                     // Diagnostic: compare indirect flux for high vs low topographic elevation
@@ -17672,6 +17884,20 @@ int main(int argc, char** argv) {
 
                     if (faces_to_rerun.empty()) {
                         std::cout << "  No faces need re-run. Converged." << std::endl;
+                        // A second, earlier exit from the coupling loop. The
+                        // "converged" eq-indirect estimator has to fire here too
+                        // -- a run that leaves through this door is just as
+                        // converged as one that leaves through the max-change
+                        // test at the end of the body, and skipping the pass on
+                        // one of two exits is a silent behavior difference.
+                        if (eq_indirect_from_converged) {
+                            const int rc = runEqIndirectPass(
+                                "converged coupling loop (no face needs re-run)");
+                            if (rc < 0) return 1;
+                            if (rc > 0) { iter = -1; continue; }
+                        }
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
                         break;
                     }
 
@@ -17864,6 +18090,7 @@ int main(int argc, char** argv) {
                     // arrays (indirect_solar/ir) are thus one Picard step stale, within
                     // rad_coupling_temp_tol. Iteration cap (max_coupling_iterations)
                     // unchanged. ----
+                    bool coupling_loop_done = false;
                     {
                         double max_change_post = 0.0;
                         size_t count_changing = 0;  // faces (physics) / samples (legacy)
@@ -17897,22 +18124,54 @@ int main(int argc, char** argv) {
                             std::cout << "  Converged on max-temperature criterion ("
                                       << max_change_post << " K < " << rad_coupling_temp_tol
                                       << " K)" << std::endl;
-                            break;
+                            coupling_loop_done = true;
                         }
                         // PTM-89: the face-fraction exit has NO error bound -- it
                         // stops while up to coupling_face_fraction of the mesh is
                         // still moving by an arbitrary amount, and the count is a
                         // max over the window, so a short window reaches it first.
                         // Retained only under coupling_mode: legacy.
-                        if (rad_coupling_legacy_mode
+                        if (!coupling_loop_done && rad_coupling_legacy_mode
                                 && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
                                       << (face_frac * 100) << "% < "
                                       << (rad_coupling_face_frac * 100) << "%)"
                                       << std::fixed << std::endl;
-                            break;
+                            coupling_loop_done = true;
                         }
+                    }
+
+                    // ------ Internal eq-indirect pass, ESTIMATOR "converged" ---
+                    // Fires once the coupling loop has nothing further to say --
+                    // either it converged, or it hit max_coupling_iterations. The
+                    // indirect series is then the best estimate of the flux the
+                    // output window actually carries, which is exactly the
+                    // quantity the equilibration forcing was missing. On a
+                    // restart the whole loop reruns, so this costs one extra
+                    // coupling loop per pass; the arming banner says so.
+                    //
+                    // Deliberately AFTER the convergence test and not inside it:
+                    // an exhausted loop is still the best estimate available, and
+                    // silently declining to correct in that case would be the
+                    // quiet-substitution failure mode.
+                    if (eq_indirect_from_converged
+                            && (coupling_loop_done
+                                || iter + 1 >= rad_max_coupling_iter)) {
+                        const int rc = runEqIndirectPass(
+                            coupling_loop_done ? "converged coupling loop"
+                                               : "coupling loop at iteration cap");
+                        if (rc < 0) return 1;
+                        if (rc > 0) { iter = -1; continue; }  // ++ makes it iter 0
+                    }
+                    if (coupling_loop_done) {
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
+                        break;
+                    }
+                    if (iter + 1 >= rad_max_coupling_iter) {
+                        eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                        eqi_n_iter_loop = iter + 1;
                     }
                 }
 
@@ -18012,6 +18271,178 @@ int main(int argc, char** argv) {
                     }
                     std::cout.flags(fl);
                     std::cout.precision(pr);
+                }
+
+                // ==============================================================
+                // How accurate is THIS run's equilibration forcing?
+                // ==============================================================
+                // Everything below is measured on the mesh in front of us. The
+                // engine holds both halves of the comparison at this point:
+                //   eq_indirect_vec        -- the <q_ind> actually installed on
+                //                             the equilibration forcing;
+                //   indirect_flux_series   -- the CONVERGED coupling loop's
+                //                             indirect flux, i.e. what the output
+                //                             window really carries.
+                // Their difference is this run's own estimator shortfall. No
+                // coefficient is imported from the crater the feature was
+                // measured on, because none is needed -- printing 13.3% or
+                // 3.9 K as a prediction for an arbitrary mesh would be exactly
+                // the authoritative-looking wrong label this engine has been
+                // retiring.
+                //
+                // Kelvin conversion. In cycle-mean steady state a column
+                // radiates what it absorbs, eps*sigma*T_rad^4 = <F_abs> + <q_ind>
+                // + Q_b, so a shortfall dq displaces it by dq/(4*eps*sigma*T_rad^3).
+                // T_rad is the RADIATIVE mean (<T^4>)^(1/4) over the output
+                // window, not <T>: on a strongly modulated lit face those differ
+                // by tens of kelvin and <T> would overstate the stiffness. The
+                // linearization is a first-order estimate and is labeled as one.
+                //
+                // Reported per population, because a mesh-wide number hides the
+                // effect: a face that never sees the sun is heated by nothing
+                // BUT this term, while a lit face barely feels it.
+                if (eq_indirect_record.provenance != "none"
+                        && !eq_indirect_vec.empty()
+                        && eq_indirect_vec.size() == num_faces
+                        && !indirect_flux_series.empty()
+                        && !surface_temps.empty()) {
+                    const int out_lo = equilibration_steps;
+                    const int out_hi = total_time_steps;
+                    const int out_n  = std::max(1, out_hi - out_lo);
+                    const double eps_ir = thermalIrEmissivity(planet);
+
+                    // One parallel pass over faces: reduce the converged series,
+                    // build the radiative-mean anchor, and classify. Serial here
+                    // would be O(num_faces * total_time_steps) three times over,
+                    // which is seconds on a production mesh for a printed line.
+                    std::vector<double> dT_face(num_faces, 0.0);
+                    std::vector<uint8_t> dT_valid(num_faces, 0), dT_lit_flag(num_faces, 0);
+                    double sum_installed = 0.0, sum_converged = 0.0;
+                    #pragma omp parallel for schedule(static) \
+                            reduction(+:sum_installed,sum_converged)
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        const auto& row = indirect_flux_series[f];
+                        double acc = 0.0;
+                        for (int t = out_lo; t < out_hi
+                                 && t < static_cast<int>(row.size()); ++t)
+                            acc += row[t];
+                        const double q_conv = acc / out_n;
+                        const double q_inst = eq_indirect_vec[f];
+                        sum_installed += q_inst;
+                        sum_converged += q_conv;
+                        if (q_conv <= 0.0 && q_inst <= 0.0) continue;
+
+                        // Radiative-mean surface temperature over the window.
+                        double t4 = 0.0; int n_t4 = 0;
+                        if (f < surface_temps.size()) {
+                            for (int t = out_lo; t < out_hi
+                                     && t < static_cast<int>(surface_temps[f].size()); ++t) {
+                                const double T = surface_temps[f][t];
+                                if (T > 0.0) { t4 += T * T * T * T; ++n_t4; }
+                            }
+                        }
+                        if (n_t4 == 0) continue;
+                        const double T_rad = std::pow(t4 / n_t4, 0.25);
+                        const double stiffness = 4.0 * eps_ir * SIGMA_SB
+                                                 * T_rad * T_rad * T_rad;
+                        if (!(stiffness > 0.0)) continue;
+                        dT_face[f]  = (q_conv - q_inst) / stiffness;
+                        dT_valid[f] = 1;
+
+                        // Never-lit means never lit: no direct beam AND no
+                        // primary reflection anywhere in the run. That is the
+                        // population whose column this term ALONE sets, and it
+                        // is why a mesh-wide average is the wrong summary.
+                        for (int t = 0; t < total_time_steps; ++t) {
+                            const size_t k = f * static_cast<size_t>(total_time_steps) + t;
+                            if ((k < direct_solar_values.size()
+                                     && direct_solar_values[k] > 0.0)
+                                || (k < primary_reflected_values.size()
+                                     && primary_reflected_values[k] > 0.0)) {
+                                dT_lit_flag[f] = 1;
+                                break;
+                            }
+                        }
+                    }
+                    std::vector<double> dT_dark, dT_lit;
+                    for (size_t f = 0; f < num_faces; ++f) {
+                        if (!dT_valid[f]) continue;
+                        (dT_lit_flag[f] ? dT_lit : dT_dark).push_back(dT_face[f]);
+                    }
+
+                    auto pct = [](std::vector<double>& v, double q) {
+                        if (v.empty()) return 0.0;
+                        const size_t k = std::min(v.size() - 1,
+                            static_cast<size_t>(q * (v.size() - 1)));
+                        std::nth_element(v.begin(), v.begin() + k, v.end());
+                        return v[k];
+                    };
+                    std::sort(dT_dark.begin(), dT_dark.end());
+                    std::sort(dT_lit.begin(), dT_lit.end());
+                    const double dq_mean = (sum_converged - sum_installed)
+                                           / std::max<size_t>(1, num_faces);
+                    const double rel_pct = (sum_installed > 0.0)
+                        ? 100.0 * (sum_converged - sum_installed) / sum_installed : 0.0;
+                    const double dark_med = pct(dT_dark, 0.50);
+                    const double dark_p90 = pct(dT_dark, 0.90);
+                    const double dark_max = dT_dark.empty() ? 0.0 : dT_dark.back();
+                    const double lit_med  = pct(dT_lit, 0.50);
+
+                    const std::ios_base::fmtflags fl2 = std::cout.flags();
+                    const std::streamsize pr2 = std::cout.precision();
+                    std::cout << std::fixed << std::setprecision(2);
+                    std::cout << "  [Eq indirect] Forcing accuracy, measured on THIS run,"
+                                 " not imported from another mesh: the installed <q_ind>\n"
+                                 "    sits " << std::setprecision(4) << dq_mean
+                              << " W/m^2 (" << std::setprecision(2) << rel_pct
+                              << "%) under the converged coupling loop's -> a residual COLD"
+                                 " bias of\n    " << std::setprecision(2)
+                              << dark_med << " K median (p90 " << dark_p90 << ", max "
+                              << dark_max << ") on the " << dT_dark.size()
+                              << " never-lit and " << lit_med << " K on the "
+                              << dT_lit.size() << " sunlit of the "
+                              << (dT_dark.size() + dT_lit.size())
+                              << " faces that receive any"
+                                 "\n    [first order, dq/(4*eps*sigma*T_rad^3) at each face's"
+                                 " own radiative-mean T].\n";
+                    if (eq_indirect_from_converged) {
+                        std::cout << "    This IS the accurate setting"
+                                     " (thermal.eq_indirect_source: converged, "
+                                  << eq_indirect_passes << " pass"
+                                  << (eq_indirect_passes == 1 ? "" : "es")
+                                  << "); it cost " << std::showpos
+                                  << (eqi_t_loop_s / 60.0) << std::noshowpos
+                                  << " min of extra coupling here.\n";
+                    } else if (eq_indirect_internal_armed) {
+                        // Cost in this run's own minutes, off this run's own
+                        // stopwatches: "converged" buys one more coupling loop and
+                        // one more whole-mesh solve, and gives back the
+                        // iteration-0 passes this run spent. A loop restarted from
+                        // a re-equilibrated field needs at least as many Picard
+                        // iterations as the one just timed and in practice one
+                        // more, so quote a RANGE whose ends are both measured
+                        // here -- rather than one number that is quietly a floor.
+                        const double t_solve = (eqi_n_solve > 0)
+                            ? eqi_t_solve_s / eqi_n_solve : 0.0;
+                        const double t_sweep = (eqi_n_sweep > 0)
+                            ? eqi_t_sweep_s / eqi_n_sweep : 0.0;
+                        const double t_iter = (eqi_n_iter_loop > 0)
+                            ? eqi_t_loop_s / eqi_n_iter_loop : 0.0;
+                        const double lo_min =
+                            (eqi_t_loop_s + t_solve
+                             - eq_indirect_passes_done * (t_sweep + t_solve)) / 60.0;
+                        std::cout << "    thermal.eq_indirect_source: converged removes it"
+                                     " for about " << std::showpos << lo_min << " to "
+                                  << (lo_min + t_iter / 60.0) << std::noshowpos
+                                  << " min on this run (+1 coupling loop, timed here at "
+                                  << (eqi_t_loop_s / 60.0) << " min over "
+                                  << eqi_n_iter_loop << " iterations, -"
+                                  << eq_indirect_passes_done << " iteration-0 pass"
+                                  << (eq_indirect_passes_done == 1 ? "" : "es")
+                                  << "). docs/radiation-exchange.md 7.7.\n";
+                    }
+                    std::cout.flags(fl2);
+                    std::cout.precision(pr2);
                 }
 
                 // Deep radiation-coupling (pass 1): dump the per-face OUTPUT-window

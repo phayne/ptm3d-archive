@@ -482,9 +482,8 @@ statistic taken over that window is biased cold.
 
 PTM3D therefore estimates the equilibration-phase indirect flux and applies it, by default.
 
-**How it is estimated.** With `thermal.eq_indirect_source: auto` (the default), the run performs
-one radiosity sweep over the window using the temperatures of the first thermal solve, reduces it
-to the per-face output-window time mean
+**How it is estimated.** The run performs a radiosity sweep over the window, reduces it to the
+per-face output-window time mean
 
 $$\langle q_{\text{ind}}\rangle_i = \frac{1}{N_{\text{out}}} \sum_{t \in \text{window}} Q_{\text{indirect},i}(t),$$
 
@@ -495,15 +494,69 @@ counting. Equilibration sets the deep column, whose response time is many diurna
 cycle-mean forcing is the quantity that determines it; dropping the diurnal modulation of the
 indirect term is correct at leading order.
 
-**Cost.** One extra radiosity sweep and one extra whole-mesh thermal solve, once per run.
-Measured on the 12,800-face `lunar_crater_80N` mesh and the 20,000-face `lunar_crater_85N` mesh:
-12–25% of total wall clock, depending on how much of the run the initial solve represents.
+That is one *pass*. `thermal.eq_indirect_passes` (default 2) sets how many run: pass 2 re-reduces
+$\langle q_{\text{ind}}\rangle$ from the field pass 1 produced and re-equilibrates against it, and
+so on. This is a fixed-point iteration, and nothing stops it early — the run prints the
+pass-to-pass change in $\langle q_{\text{ind}}\rangle$ so the knee is visible in the log for the
+mesh at hand rather than assumed from someone else's.
 
-**One pass under-corrects.** The estimate comes from a field that was itself equilibrated without
-indirect flux, so its emitters are too cold and $\langle q_{\text{ind}}\rangle$ is a lower bound.
-Measured on a permanently shadowed lunar crater floor, one pass recovers 95% of the change between
-`off` and the iterated fixed point. The run reports the mean, median and maximum of
-$\langle q_{\text{ind}}\rangle$ so the size of the correction is on the record.
+**Two estimators, two fixed points.** `thermal.eq_indirect_source` chooses *which* sweep is
+reduced, and the choice matters more than the pass count:
+
+* `auto` (default) reduces the coupling loop's **iteration-0** sweep. The emitters in that sweep
+  have not yet received any output-window indirect themselves, so $\langle q_{\text{ind}}\rangle$
+  is low — measured 13.3% low on the 80 N crater — and stays low at **any** pass count.
+* `converged` reduces the sweep **after the coupling loop converges**. That is the flux the output
+  window actually carries, so it removes the iteration-0 bias. It costs one extra coupling loop per
+  pass.
+
+Measured on the shipped 12,800-face `lunar_crater_80N` mesh, 25-lunation equilibration at 2
+steps/day, 1-lunation output window, CPU solver, over the 1,086 faces that receive no direct and no
+reflected sunlight anywhere in the run (mean equilibrated deep-column temperature):
+
+| `eq_indirect_source` | 1 pass | 2 passes | 3 passes | 4 passes | wall clock vs `off` |
+|---|---|---|---|---|---|
+| `off` | 28.53 K | — | — | — | 1.00× |
+| `auto` | 118.672 K | 118.956 K | 118.958 K | 118.958 K | 1.21× / 1.47× / 1.71× / 2.01× |
+| `converged` | 122.570 K | 122.626 K | 122.626 K | — | 1.94× / 2.86× / 3.78× |
+
+So the knee is at **2 passes for `auto`** (pass 3 moves the deep column 0.0015 K, 190× less than
+pass 2 did) and at **1 pass for `converged`** (pass 2 moves it 0.056 K). The `auto` fixed point
+sits 3.61 K below the `converged` one, and no pass count closes that. The `converged` fixed point
+agrees with the manual two-run `eq_indirect_flux_file` workflow below to better than 0.0001 K,
+which is what that workflow has always been doing by hand.
+
+The consequence for the *output window* on a one-lunation window is small — the second `auto` pass
+moves the dark-face window mean by 0.0004 K and `converged` by 0.019 K — because a one-lunation
+window gives the deep column almost no time to feed back to the surface. The deep column is the
+quantity these settings control; a long or seasonal window is where it shows up at the surface.
+
+**Every run reports its own accuracy.** None of the numbers above are printed as a prediction for
+your mesh. At the end of the coupling loop the engine holds both halves of the comparison — the
+$\langle q_{\text{ind}}\rangle$ it installed on the equilibration forcing, and the converged
+coupling loop's — so it measures the shortfall on the mesh in front of it and converts it to
+kelvin through the radiative stiffness of each face's own column,
+
+$$\delta T_i \simeq \frac{\delta \langle q_{\text{ind}}\rangle_i}{4\varepsilon\sigma T_{\text{rad},i}^3},
+\qquad T_{\text{rad},i} = \left(\overline{T_i^4}\right)^{1/4},$$
+
+using the *radiative* mean over the output window rather than $\overline{T}$, which on a strongly
+modulated sunlit face differs by tens of kelvin. The report splits the never-lit faces from the
+sunlit ones, because the never-lit column is set by this term alone and a mesh-wide average hides
+the whole effect. It also quotes what `converged` would cost in that run's own minutes, from its
+own phase stopwatches, as a range: the extra coupling loop runs on a re-equilibrated field and
+needs at least as many Picard iterations as the one just timed, in practice one more.
+
+The linearization was checked against the deep columns above at three magnitudes spanning two
+orders: it predicted 3.80, 3.54 and 0.06 K where the re-run measured 3.910, 3.614 and 0.056 K
+(within 7%, and conservative on the large ones). It is a first-order estimate and the run labels
+it as one.
+
+**Cost.** Each `auto` pass is one extra radiosity sweep and one extra whole-mesh thermal solve.
+Each `converged` pass is one extra whole coupling loop and one extra whole-mesh thermal solve. The
+wall-clock share depends on what fraction of a given run those phases are, so the table above names
+its case; on the 20,000-face `lunar_crater_85N` mesh a single `auto` pass measured 12–25%. The run
+states its own expected cost in the arming banner before it charges it.
 
 **When it applies.** The pass runs when radiation coupling is active and the window has an
 equilibration phase to correct. It is skipped, with a message naming the reason, when
@@ -517,14 +570,17 @@ no-op rather than a special case.
 
 | Setting | Effect |
 |---|---|
-| `thermal.eq_indirect_source: auto` | Default. Internal pass, as above. |
+| `thermal.eq_indirect_source: auto` | Default. Internal pass off the coupling loop's iteration-0 sweep, as above. |
+| `thermal.eq_indirect_source: converged` | Internal pass off the **converged** coupling loop. Removes the iteration-0 low bias; costs one extra coupling loop per pass. |
 | `thermal.eq_indirect_source: off` | Legacy. Equilibration carries no indirect term. Reproduces pre-2026-08 results bit-for-bit. Also selectable through `PTM_EQ_INDIRECT_SOURCE`. |
-| `thermal.eq_indirect_flux_file` | Explicit override, and it always wins. Reads a per-face `'QIND'` file (magic `0x51494E44`, `uint32` face count, then one `float64` per face) written by a prior run's `thermal.indirect_mean_out_file`. Use it to iterate the estimate, or to pin a run to a specific forcing. |
+| `thermal.eq_indirect_passes: N` | How many passes, on whichever estimator. `1` reproduces the 2026-08-11 behavior bit-for-bit. Must be ≥ 1 — `0` is rejected rather than accepted as a second spelling of `off`. Also selectable through `PTM_EQ_INDIRECT_PASSES`. |
+| `thermal.eq_indirect_flux_file` | Explicit override, and it always wins. Reads a per-face `'QIND'` file (magic `0x51494E44`, `uint32` face count, then one `float64` per face) written by a prior run's `thermal.indirect_mean_out_file`. Use it to pin a run to a specific forcing. |
 
-`thermal.indirect_mean_out_file` writes the same quantity the internal pass computes, but from the
-**converged** coupling loop rather than its first sweep. Feeding that file back through
-`eq_indirect_flux_file` is therefore a strictly better estimate; measured on the crater case it
-raised the equilibrated deep column a further 3.4 K (105.19 K to 105.64 K in the window mean).
+`thermal.indirect_mean_out_file` writes the same quantity the internal pass computes, but always
+from the **converged** coupling loop. Feeding that file back through `eq_indirect_flux_file` in a
+second run is the manual version of `eq_indirect_source: converged`, and lands on the same fixed
+point (122.626 K on the crater case above, agreeing to better than 0.0001 K). Use the config
+setting unless you need the intermediate file for something else.
 
 The two-phase and single-phase solver paths differ in how much this matters. When the
 equilibration cadence equals the output cadence, the coupling loop's selective re-run re-integrates

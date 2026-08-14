@@ -390,6 +390,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.eq_indirect_source     = getWithDefault(thermal, "eq_indirect_source",     config.thermal.eq_indirect_source);
+            config.thermal.eq_indirect_passes     = getWithDefault(thermal, "eq_indirect_passes",     config.thermal.eq_indirect_passes);
             config.thermal.spinup_seed            = getWithDefault(thermal, "spinup_seed",            config.thermal.spinup_seed);
             config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
