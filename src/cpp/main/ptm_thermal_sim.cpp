@@ -12359,8 +12359,16 @@ bool exportDataAsBinary(
         }
     }
 
-    std::cout << "\nBinary export completed successfully!\n";
-    
+    // Only claim success when there was some. This printed unconditionally, so a run
+    // with failed timesteps announced "completed successfully" and then contradicted
+    // itself with the caller's error. Unchanged when fail_steps == 0.
+    if (fail_steps == 0) {
+        std::cout << "\nBinary export completed successfully!\n";
+    } else {
+        std::cerr << "\n[exportDataAsBinary] ERROR: " << fail_steps << " of "
+                  << time_steps << " timesteps failed to write.\n";
+    }
+
     // Export statistics if enabled
     if (compute_statistics) {
         bool stats_success = exportStatisticsBinary(
@@ -18640,6 +18648,12 @@ int main(int argc, char** argv) {
     // Independent flag: did the stride-based export already write per-step files?
     // (Distinct from have_full_illum_arrays so the stats path can still use stats_fd.)
     bool stride_export_already_done = false;
+    // ...and did it actually succeed? The stride path writes its own files and then
+    // suppresses the normal binary export, so it owns the answer to "were the output
+    // files written?" that the common check at the end of main() reports. Without
+    // this, that check saw a never-set flag and printed "Failed to write output data
+    // files" after every successful large-mesh export (Paul's res-9 global lunar run).
+    bool stride_export_success = false;
 
     // ===== INTEGRATION (statistics) interval =====
     int stats_start_step = 0;
@@ -18778,7 +18792,27 @@ int main(int argc, char** argv) {
             // filterFaceMajorStable allocates full copies which would OOM for ico9.
             const double array_gb = static_cast<double>(face_count) * total_ts * 8.0 / (1024.0*1024.0*1024.0);
 
-            if (array_gb > 10.0 && skip_eq > 0) {
+            // Threshold that selects the stride-based export below. The default
+            // 10 GB is unchanged; PTM_STRIDE_EXPORT_MAX_GB lowers it so the path
+            // can be exercised on a small mesh (it is otherwise only reachable on
+            // a multi-million-face run, which is why its defects went unnoticed).
+            // Diagnostic/test knob only -- it announces itself when set.
+            double stride_export_max_gb = 10.0;
+            if (const char* ev = std::getenv("PTM_STRIDE_EXPORT_MAX_GB")) {
+                const double ev_gb = std::atof(ev);
+                if (ev_gb > 0.0) {
+                    stride_export_max_gb = ev_gb;
+                    // No std::fixed/setprecision here: those stick to std::cerr and
+                    // would silently reformat every later double on that stream.
+                    std::cerr << "[output] WARNING: PTM_STRIDE_EXPORT_MAX_GB="
+                              << stride_export_max_gb
+                              << " GB overrides the 10 GB stride-export threshold "
+                                 "(diagnostic/test knob; arrays are ~"
+                              << array_gb << " GB).\n";
+                }
+            }
+
+            if (array_gb > stride_export_max_gb && skip_eq > 0) {
                 // Large arrays: skip the filter entirely. Instead, pass the
                 // original arrays directly to the export function with the
                 // correct stride (total_ts) and offset (skip_eq). The export
@@ -18807,7 +18841,12 @@ int main(int argc, char** argv) {
                 // the originals with stride/offset.
                 time_steps = requested_out_ts;
 
-                // Export directly from original arrays with stride
+                // Export directly from original arrays with stride.
+                // stride_fail_steps / stride_io_ok record what really happened so the
+                // metadata counters and the end-of-run message can be truthful; every
+                // write below is checked (none of them were).
+                int  stride_fail_steps = 0;
+                bool stride_io_ok      = true;
                 {
                     using std::cout;
                     const size_t F = face_count;
@@ -18818,13 +18857,29 @@ int main(int argc, char** argv) {
                     // Always write mesh + time metadata (downstream stats consumers need them).
                     // Skip mesh.ply when output.skip_mesh is set (chunked-run chunks 1+).
                     namespace fs = std::filesystem;
-                    fs::create_directories(output_dir);
+                    // error_code overloads: an unwritable output tree used to throw
+                    // std::filesystem_error out of here and abort the process after the
+                    // solve had already finished. Report it and carry on to the flag.
+                    auto makeDir = [&](const std::string& d) {
+                        std::error_code ec;
+                        fs::create_directories(d, ec);
+                        if (ec) {
+                            std::cerr << "[stride-export] ERROR: cannot create " << d
+                                      << ": " << ec.message() << "\n";
+                            stride_io_ok = false;
+                        }
+                    };
+                    makeDir(output_dir);
                     if (!sim_config.output.skip_mesh &&
                         !exportMeshToPLY(output_dir + "/mesh.ply", mesh)) {
                         std::cerr << "ERROR exporting mesh\n";
+                        stride_io_ok = false;
                     }
-                    writeTimeStepsFile(output_dir + "/time_steps.txt",
-                                       filtered_times, filtered_time_strings);
+                    if (!writeTimeStepsFile(output_dir + "/time_steps.txt",
+                                            filtered_times, filtered_time_strings)) {
+                        std::cerr << "[stride-export] ERROR writing time metadata\n";
+                        stride_io_ok = false;
+                    }
 
                     if (sim_config.output.skip_time_series) {
                         cout << "[output] skip_time_series=true (stride-based path) — "
@@ -18832,11 +18887,11 @@ int main(int argc, char** argv) {
                         // Fall through to the metadata + skip-the-loop block below.
                     } else {
                     // Create per-step output directories
-                    fs::create_directories(output_dir + "/illumination");
-                    fs::create_directories(output_dir + "/direct_solar");
-                    fs::create_directories(output_dir + "/primary_reflected");
-                    fs::create_directories(output_dir + "/primary_ir");
-                    fs::create_directories(output_dir + "/temperature");
+                    makeDir(output_dir + "/illumination");
+                    makeDir(output_dir + "/direct_solar");
+                    makeDir(output_dir + "/primary_reflected");
+                    makeDir(output_dir + "/primary_ir");
+                    makeDir(output_dir + "/temperature");
 
                     std::cout << "\n[exportDataAsBinary] Stride-based export\n"
                               << "  Faces=" << F << " time_steps=" << out_steps
@@ -18845,15 +18900,42 @@ int main(int argc, char** argv) {
                     std::vector<float> buf(F);
                     int report = std::max(1, out_steps / 20);
 
+                    // The one place a frame file is written. std::ofstream reports
+                    // nothing unless asked, and the three copies this replaces never
+                    // asked: an unwritable directory or a full filesystem produced no
+                    // files, no message, and a metadata.txt claiming full success.
+                    // close() is what catches a deferred flush failure (ENOSPC);
+                    // the destructor would swallow it.
+                    auto writeFrameFile = [&](const std::string& path) -> bool {
+                        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                        if (!out.is_open()) {
+                            std::cerr << "\n[stride-export] ERROR: cannot open "
+                                      << path << " for write\n";
+                            return false;
+                        }
+                        const uint32_t count = static_cast<uint32_t>(F);
+                        out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+                        out.write(reinterpret_cast<const char*>(buf.data()),
+                                  static_cast<std::streamsize>(F) * sizeof(float));
+                        out.close();
+                        if (!out) {
+                            std::cerr << "\n[stride-export] ERROR: write failed for "
+                                      << path << "\n";
+                            return false;
+                        }
+                        return true;
+                    };
+
                     for (int t = 0; t < out_steps; ++t) {
                         if (t % report == 0 || t == out_steps - 1) {
                             cout << "\r  Progress " << (t+1) << "/" << out_steps << std::flush;
                         }
+                        bool step_ok = true;
 
                         auto writeComponent = [&](const std::vector<double>& arr,
                                                    const std::string& dir,
-                                                   const std::string& prefix) {
-                            if (arr.empty()) return;
+                                                   const std::string& prefix) -> bool {
+                            if (arr.empty()) return true;
                             #pragma omp parallel for schedule(static)
                             for (size_t f = 0; f < F; ++f) {
                                 size_t idx = f * static_cast<size_t>(stride) + offset + t;
@@ -18863,11 +18945,7 @@ int main(int argc, char** argv) {
                             std::ostringstream fn;
                             fn << output_dir << "/" << dir << "/" << prefix
                                << "_" << std::setw(4) << std::setfill('0') << t << ".bin";
-
-                            std::ofstream out(fn.str(), std::ios::binary);
-                            uint32_t count = static_cast<uint32_t>(F);
-                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                            return writeFrameFile(fn.str());
                         };
 
                         // Illumination = direct + reflected (reconstruct on the fly)
@@ -18884,15 +18962,12 @@ int main(int argc, char** argv) {
                             std::ostringstream fn;
                             fn << output_dir << "/illumination/illumination_"
                                << std::setw(4) << std::setfill('0') << t << ".bin";
-                            std::ofstream out(fn.str(), std::ios::binary);
-                            uint32_t count = static_cast<uint32_t>(F);
-                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                            step_ok = writeFrameFile(fn.str()) && step_ok;
                         }
 
-                        writeComponent(direct_solar_values, "direct_solar", "direct_solar");
-                        writeComponent(primary_reflected_values, "primary_reflected", "primary_reflected");
-                        writeComponent(primary_ir_values, "primary_ir", "primary_ir");
+                        step_ok = writeComponent(direct_solar_values, "direct_solar", "direct_solar") && step_ok;
+                        step_ok = writeComponent(primary_reflected_values, "primary_reflected", "primary_reflected") && step_ok;
+                        step_ok = writeComponent(primary_ir_values, "primary_ir", "primary_ir") && step_ok;
 
                         // Temperature (face-major vector<vector<double>>)
                         if (!surface_temps.empty()) {
@@ -18911,30 +18986,53 @@ int main(int argc, char** argv) {
                             std::ostringstream fn;
                             fn << output_dir << "/temperature/temperature_"
                                << std::setw(4) << std::setfill('0') << t << ".bin";
-                            std::ofstream out(fn.str(), std::ios::binary);
-                            uint32_t count = static_cast<uint32_t>(F);
-                            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-                            out.write(reinterpret_cast<const char*>(buf.data()), F * sizeof(float));
+                            step_ok = writeFrameFile(fn.str()) && step_ok;
                         }
+
+                        if (!step_ok) ++stride_fail_steps;
                     }
-                    cout << "\n  Export complete: " << out_steps << "/" << out_steps << "\n";
-                    cout << "  Binary export completed successfully!\n";
+                    cout << "\n  Export complete: " << (out_steps - stride_fail_steps)
+                         << "/" << out_steps << "\n";
+                    if (stride_fail_steps == 0) {
+                        cout << "  Binary export completed successfully!\n";
+                    } else {
+                        std::cerr << "  [stride-export] ERROR: " << stride_fail_steps
+                                  << " of " << out_steps
+                                  << " timesteps failed to write.\n";
+                    }
                     } // end else (per-step files written)
                 }
 
-                // Write metadata
+                // Write metadata. The counters below were hardcoded to
+                // "successful_timesteps=<all>, failed_timesteps=0" regardless of what
+                // happened, so a failed export left behind a file asserting success.
+                // With no failures these render exactly as before.
                 {
                     std::ofstream meta(output_dir + "/metadata.txt");
-                    meta << "faces=" << face_count << "\n"
-                         << "time_steps=" << requested_out_ts << "\n"
-                         << "successful_timesteps=" << requested_out_ts << "\n"
-                         << "failed_timesteps=0\n"
-                         << "is_custom_mesh=false\n"
-                         << "components=illumination,direct_solar,primary_reflected,primary_ir,temperature\n";
+                    if (!meta.is_open()) {
+                        std::cerr << "[stride-export] ERROR: cannot write "
+                                  << output_dir << "/metadata.txt\n";
+                        stride_io_ok = false;
+                    } else {
+                        meta << "faces=" << face_count << "\n"
+                             << "time_steps=" << requested_out_ts << "\n"
+                             << "successful_timesteps=" << (requested_out_ts - stride_fail_steps) << "\n"
+                             << "failed_timesteps=" << stride_fail_steps << "\n"
+                             << "is_custom_mesh=false\n"
+                             << "components=illumination,direct_solar,primary_reflected,primary_ir,temperature\n";
+                        meta.close();
+                        if (!meta) {
+                            std::cerr << "[stride-export] ERROR: failed writing "
+                                      << output_dir << "/metadata.txt\n";
+                            stride_io_ok = false;
+                        }
+                    }
                 }
 
-                // Signal the caller to skip the normal binary export below.
+                // Signal the caller to skip the normal binary export below, and hand it
+                // the verified outcome instead of leaving it to guess.
                 stride_export_already_done = true;
+                stride_export_success = stride_io_ok && (stride_fail_steps == 0);
 
             } else {
                 // Normal path (small arrays): allocate filtered copies
@@ -19150,7 +19248,11 @@ int main(int argc, char** argv) {
         complete_vtk_file = output_dir + "/ptm_complete.vtk";
     }
 
-    bool data_write_success = false;
+    // Seeded from the stride-based export when that path ran: it wrote the per-step
+    // files itself and suppresses the binary branch below, so it is the only thing
+    // that knows whether they landed. Every other path assigns this before the
+    // "Failed to write output data files" check at the end of main().
+    bool data_write_success = stride_export_already_done && stride_export_success;
 
     // Handle output based on format selection (binary vs VTK)
     if (output_format == "vtk") {
@@ -19267,7 +19369,11 @@ int main(int argc, char** argv) {
         bool time_ok = writeTimeStepsFile(output_dir + "/time_steps.txt",
                                           filtered_times, filtered_time_strings);
         if (!time_ok) std::cerr << "[output] WARNING: time_steps.txt write failed\n";
-        data_write_success = mesh_ok && time_ok;
+        // With skip_time_series the stride path also runs and writes mesh + time
+        // metadata, so this branch re-writes them and would otherwise overwrite (and
+        // mask) a stride-side failure such as an unwritable metadata.txt.
+        data_write_success = mesh_ok && time_ok
+                             && (!stride_export_already_done || stride_export_success);
     }
 
     // Export statistics over the INTEGRATION window only
