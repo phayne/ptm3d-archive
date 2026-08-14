@@ -43,6 +43,7 @@
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
 #include "../maps/spatial_map.h"
+#include "../maps/albedo_registration_check.h"
 #include "../ice/ice_table.h"
 
 // Radiation exchange module
@@ -2326,7 +2327,23 @@ bool AbsorbedFluxComposer::build(
     if (invalid_count > 0) {
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
-    
+
+    // PTM-34 tripwire (CPU absorbed-flux path). A longitude-rolled albedo map keeps
+    // its value distribution intact, so every scalar summary above (range, mean,
+    // effective albedo) looks correct while the albedo sits on the wrong terrain.
+    // The only observable is spatial, so check it spatially. Detect-and-disclose:
+    // the map is reported, never silently corrected. No-op for any body without a
+    // published reference signature, and for meshes that do not cover the sites.
+    //
+    // Gated on a map actually having loaded: a deliberate uniform-albedo run
+    // (use_albedo_map: false) has zero contrast by construction, and warning about
+    // it would be a false alarm.
+    if (albedo_successfully_loaded) {
+        ptm::checkAlbedoMapRegistration(config.getProperty("target_body_name"),
+                                        mesh->latitudes, mesh->longitudes, face_albedos,
+                                        "CPU absorbed-flux albedo map");
+    }
+
     // Apply the Hayne et al. (2017) incidence-angle correction whenever the
     // body's albedoCoef are set. When a spatially-varying albedo map is in
     // use, the per-face map value supersedes the body default A0; the angular
@@ -7127,6 +7144,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         albedo_maps_dir += '/';
     }
 
+    // Records which file the per-face albedos actually came from, so the PTM-34
+    // registration tripwire below can name it.
+    std::string albedo_source_label = "(no albedo map loaded)";
+
     if (!albedo_map_disabled && is_custom_mesh && !body_name.empty() && !skip_fits) {
         // For custom meshes, load FITS file and interpolate to face centers
         std::cout << "[GPU Thermal] Custom mesh detected - loading FITS albedo map for interpolation" << std::endl;
@@ -7190,6 +7211,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::cout << "[GPU Thermal] FITS interpolation complete: " << valid_count << "/" << n_faces << " faces" << std::endl;
             std::cout << "[GPU Thermal] Albedo range: " << min_albedo << " to " << max_albedo
                       << " (mean: " << avg_albedo << ")" << std::endl;
+            albedo_source_label = found_path;
             albedo_loaded = true;
         } else {
             std::cout << "[GPU Thermal] Could not load FITS albedo map for " << body_name
@@ -7239,6 +7261,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                               << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
                               << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
                     face_albedos = std::move(loaded_albedos);
+                    albedo_source_label = path;
                     albedo_loaded = true;
                 } else {
                     std::cout << "[GPU Thermal] Albedo file size mismatch: expected " << n_faces
@@ -7254,6 +7277,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         }
     } else {
         std::cout << "[GPU Thermal] No body name in config, using default albedo " << default_visible_albedo << std::endl;
+    }
+
+    // PTM-34 tripwire (GPU thermal path). See the CPU-path copy for the rationale:
+    // a longitude-rolled map is invisible to every scalar summary, so the check is
+    // spatial. Detect-and-disclose; the map is named, never silently corrected.
+    if (albedo_loaded) {
+        ptm::checkAlbedoMapRegistration(body_name, mesh->latitudes, mesh->longitudes,
+                                        face_albedos, albedo_source_label);
     }
 
     // Per-face Hapke single-scattering albedo (per-face albedo scaling):
