@@ -157,7 +157,7 @@ ENGINE_DEFAULTS = {
     'thermal.eq_extrapolation.order_p': 4,
     'thermal.eq_extrapolation.tol_K': 0.5,
     'thermal.eq_indirect_flux_file': '',
-    'thermal.eq_indirect_passes': 2,
+    'thermal.eq_indirect_passes': 1,
     'thermal.eq_indirect_source': 'auto',
     'thermal.equilibration_cycles': -1,
     'thermal.equilibration_orbits': 1.0,
