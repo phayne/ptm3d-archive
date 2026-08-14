@@ -2604,22 +2604,17 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                 std::cerr << "  Kernel directory in use: " << kernels_path_ << "\n"
                           << "  Kernel dir resolution: setKernelsPath()/config, $PTM_SPICE_KERNELS,\n"
                           << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
-                          << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag
-                          << "  (see INSTALL.md \"SPICE kernel data\")."
+                          << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag << "\n"
+                          << "  (see INSTALL.md \"SPICE kernel data\"), or correct\n"
+                          << "  generic_body.spice_metakernel in the configuration."
                           << std::endl;
-                // Try falling back to default meta-kernel if different
-                if (meta_kernel_filename_ != "europa.tm") {
-                    std::cerr << "Attempting to fall back to default europa.tm" << std::endl;
-                    meta_kernel = (std::filesystem::path(kernels_path_) / "europa.tm")
-                                      .lexically_normal().string();
-
-                    if (!std::filesystem::exists(meta_kernel)) {
-                        std::cerr << "Error: Default SPICE meta-kernel not found: " << meta_kernel << std::endl;
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
+                // No substitution. This used to fall back to europa.tm, which for
+                // any non-Europa body meant proceeding with EUROPA's ephemeris and
+                // then silently dropping to the Keplerian fallback -- a completed
+                // rc=0 run with the wrong physics, off by up to 52 K per face on a
+                // measured Chimaera case (BUGS.md PTM-145). A metakernel that was
+                // explicitly configured and cannot be found is fatal.
+                return false;
             }
 
             furnsh_c(meta_kernel.c_str());
