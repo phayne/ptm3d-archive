@@ -823,7 +823,37 @@ Profile::Profile(const Planet& planet, double lat, const Config& config, bool ve
     }
 }
 
-void Profile::init_T(const Planet& planet, double lat, bool verbose) {
+// LATITUDE-BLIND BY CONTRACT, NOT BY OVERSIGHT -- and `lat` is deliberately
+// unused. Read this before "fixing" it.
+//
+// Every face gets T_avg = T_ss/sqrt(2) computed from the BODY's solar
+// constant, with no cos(lat) and no per-face flux. On the 623 Chimaera
+// grazing facets that is 178.021482 K at every face and every depth, against
+// 104-107 K from the seed that actually ships -- an E_0 of 72-74 K, and since
+// N = SF*ln(E_0/bar)/(-ln rho) that error sets the equilibration requirement.
+//
+// It is nevertheless CORRECT to leave the arithmetic alone, because this
+// column is not the operative initial condition on any default path. Under
+// thermal.spinup_seed: physical (the DEFAULT) it is overwritten before the
+// first step:
+//   * CPU scalar / streamed / per-location depth series -- Model::Model calls
+//     Profile::seedFromMeanFlux (see the seed block in that constructor),
+//   * CPU SIMD batch -- the per-face seed loop in ptm_thermal_sim.cpp,
+//   * GPU -- GpuSharedSeedContext fills the persistent solver's initial-T
+//     buffer from the same thermal::eqSeedColumn().
+// What survives here is thermal.spinup_seed: legacy, whose documented purpose
+// (config_parser.h) is "exactly what produced every result in this repository
+// before that date. Use it to reproduce an old baseline." Giving this function
+// the latitude it accepts would silently break that reproduction contract,
+// which is the only thing the mode exists to provide.
+//
+// The one way this column reaches a `physical` run is an empty forcing series;
+// Model::Model warns by name when that happens rather than substituting in
+// silence. `lat` is kept in the signature because Profile::Profile and the
+// public header pass it, and removing it is an API change with no caller that
+// wants the behavior.
+void Profile::init_T(const Planet& planet, double /*lat -- see above*/,
+                     bool verbose) {
     // Calculate radiative equilibrium temperature for peak insolation
     // sqrt(sqrt(x)) is faster than pow(x, 0.25) and mathematically equivalent
     double ratio = (1.0 - planet.albedo) * planet.S / (SIGMA_SB * planet.emissivity);
@@ -954,7 +984,34 @@ static inline void countTgeoRelease(const double* T, size_t n, double t_geo_watc
 void Profile::update_T(double dt, double Qs, double Qb) {
     // 0) Boundary conditions (update boundary nodes T[0], T[n-1])
     surfTemp(*this, Qs);
-    if (Qb != 0.0) botTemp(*this, Qb);
+    // The bottom BC is applied UNCONDITIONALLY. It used to be guarded by
+    // `if (Qb != 0.0)`, which made Qb = 0 mean something no other path meant.
+    //
+    // WHAT THE GUARD DID. The interior Crank-Nicolson solve below runs
+    // i = 1..n_tot-2 and never touches node n-1; surfTemp and the tridiagonal
+    // assembly then CONSUME T[n-1] as a known value. So skipping botTemp does
+    // not give a zero-flux bottom -- it leaves the deepest node frozen at
+    // whatever the initial condition wrote and feeds it back in every step as a
+    // DIRICHLET reservoir. Measured on 623 Chimaera (CPU scalar, Qb = 0, 40
+    // rotations, 8082 steps): T[n-1] drift was 0.000000 K at every step.
+    //
+    // WHY UNCONDITIONAL RATHER THAN `Qb >= 0.0`. botTemp is the discrete
+    // Neumann condition T[n] = T[n-1] + Qb*dz/k; at Qb = 0 it collapses to
+    // T[n] = T[n-1], the insulated boundary, which is what Qb = 0 means
+    // physically. This is also textually what the GPU does -- the persistent
+    // kernel applies the same expression with no branch at all
+    // (gpu/thermal_kernels.cl:614-623) -- so an unconditional call closes a
+    // CPU/GPU divergence. A `Qb >= 0.0` guard would instead open a new one for
+    // Qb < 0 (the GPU would apply the BC and the CPU would not). Qb < 0 is
+    // unreachable in this engine today -- every assignment to planet.Qb is
+    // gated `> 0` or `>= 0` (ptm_thermal_sim.cpp:3551, 13235, 13421) and no
+    // shipped config carries a negative value -- so the two forms are
+    // equivalent on every current run and only the unconditional one stays
+    // equivalent if that ever changes.
+    //
+    // This is NOT a clamp: nothing is bounded, substituted or floored. The
+    // boundary condition is simply evaluated instead of skipped.
+    botTemp(*this, Qb);
 
     // Geothermal-equilibrium floor (mirrors the GPU persistent kernel). In
     // steady darkness the surface radiates the interior heat flux Qb, so no
@@ -1829,6 +1886,11 @@ Model::Model(const Planet& planet, double lat,
     N_steps = static_cast<int>(output_time_points.size());
     
     // Extract flux arrays from the input matrix if provided (robust to 2xN or Nx2)
+    // `n_forcing_dropped` / `bad_forcing_shape` are consumed by the seed block
+    // below: an empty forcing series silently changes the initial condition,
+    // so the reason has to survive to the point where that is reported.
+    size_t n_forcing_dropped = 0;
+    bool   bad_forcing_shape = false;
     if (flux_arr.size() > 0) {
         std::vector<std::pair<double,double>> tv;
         tv.reserve(static_cast<size_t>(flux_arr.rows() * flux_arr.cols()));
@@ -1839,16 +1901,36 @@ Model::Model(const Planet& planet, double lat,
                 double tt = flux_arr(0, j);
                 double vv = flux_arr(1, j);
                 if (std::isfinite(tt) && std::isfinite(vv)) tv.emplace_back(tt, vv);
+                else ++n_forcing_dropped;
             }
         } else if (C == 2 && R >= 1) {
             for (int i = 0; i < R; ++i) {
                 double tt = flux_arr(i, 0);
                 double vv = flux_arr(i, 1);
                 if (std::isfinite(tt) && std::isfinite(vv)) tv.emplace_back(tt, vv);
+                else ++n_forcing_dropped;
             }
         } else {
             // Unexpected shape; leave arrays empty => fallback to analytic flux
+            bad_forcing_shape = true;
             tv.clear();
+        }
+
+        // Non-finite samples are DROPPED, which silently shortens the series
+        // the seed averages and the solver interpolates. Say so.
+        if (n_forcing_dropped > 0) {
+            std::cerr << "[thermal] WARNING: dropped " << n_forcing_dropped
+                      << " of " << (R == 2 ? C : R)
+                      << " forcing samples with a non-finite time or flux."
+                         " The remaining " << tv.size()
+                      << " sample(s) are what this column integrates and what"
+                         " its spin-up seed averages." << std::endl;
+        }
+        if (bad_forcing_shape) {
+            std::cerr << "[thermal] WARNING: forcing matrix is " << R << "x" << C
+                      << ", which is neither 2xN nor Nx2; the whole series was"
+                         " discarded and this column falls back to the analytic"
+                         " flux." << std::endl;
         }
 
         // Sort by time and dedupe identical time stamps
@@ -1914,6 +1996,18 @@ Model::Model(const Planet& planet, double lat,
     // this face's OWN forcing has been extracted, replace it with the shared
     // per-face conductive steady profile. Legacy mode leaves init_T's answer
     // in place, so a `spinup_seed: legacy` run reproduces the old baseline.
+    //
+    // The `!flux_values.empty()` term is a SILENT DOWNGRADE if it ever fires
+    // under Physical: the column then integrates init_T's answer while the
+    // run's own banner has already announced the shared per-face seed. It is
+    // reachable without a malformed call -- a forcing series that is entirely
+    // non-finite, or a matrix that is neither 2xN nor Nx2, empties the series
+    // in the block above. Measured difference between the two initial
+    // conditions on the 623 Chimaera grazing facets used as this fix's probe:
+    // init_T gives 178.021482 K at EVERY face and EVERY depth, the shared seed
+    // gives 104.21 / 105.42 / 105.40 / 106.52 K and varies with depth -- an
+    // E_0 of 72-74 K, which dominates the equilibration requirement. That is
+    // not a difference a run may take without saying so.
     if (config.spinup_seed == EqSeedMode::Physical && !flux_values.empty()) {
         double sum = 0.0;
         for (double v : flux_values) sum += v;
@@ -1951,6 +2045,22 @@ Model::Model(const Planet& planet, double lat,
             seed_mean_flux, planet.Qb,
             have_forcing ? &fc : nullptr, config.seed_anchor);
         seed_applied   = true;
+    } else if (config.spinup_seed == EqSeedMode::Physical) {
+        // Asked for the shared seed, could not run it. Name the substitute.
+        std::cerr << "[eq-seed] WARNING: thermal.spinup_seed is 'physical' but "
+                     "this column has NO usable forcing series ("
+                  << (bad_forcing_shape
+                          ? "forcing matrix had an unusable shape"
+                          : (flux_arr.size() == 0
+                                 ? "no forcing matrix was supplied"
+                                 : "every sample was non-finite or dropped"))
+                  << "), so the shared per-face conductive steady profile could "
+                     "NOT be computed. This column is initialized by "
+                     "Profile::init_T instead: T_avg = T_ss/sqrt(2) from the "
+                     "BODY's solar constant, flux-blind and latitude-blind, "
+                     "identical on every face. The per-face seed announced by "
+                     "the run banner does NOT describe this column."
+                  << std::endl;
     }
 
     // Calculate physics-based time step using von Neumann stability criterion

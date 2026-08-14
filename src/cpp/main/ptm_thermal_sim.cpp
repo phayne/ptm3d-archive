@@ -3751,6 +3751,15 @@ bool runThermalModelsForAllFacesStreamed(
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
                      "steady profile [thermal.spinup_seed: physical; streamed "
                      "path uses the CPU SCALAR solver]" << std::endl;
+    } else {
+        // This branch used to print NOTHING, so a legacy streamed run was the
+        // one path that never stated its own initial condition. Every other
+        // path announces both modes.
+        std::cerr << "[eq-seed] equilibration seed: LEGACY Profile::init_T "
+                     "global T_avg = T_ss/sqrt(2), flux-blind and "
+                     "latitude-blind, blended surface->deep over the skin "
+                     "depth [thermal.spinup_seed: legacy; streamed path uses "
+                     "the CPU SCALAR solver]" << std::endl;
     }
 
     // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and

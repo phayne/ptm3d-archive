@@ -434,6 +434,60 @@ int main() {
         }
     }
 
+    // ---- The seed a Model ACTUALLY applies, and the downgrade ------------
+    // Model::Model applies the shared seed only when it holds a usable forcing
+    // series. When it does not, the column keeps Profile::init_T's flux-blind,
+    // latitude-blind T_ss/sqrt(2) answer -- a 72-74 K different initial
+    // condition on the asteroid facets used to measure it. `seed_applied` is
+    // the machine-readable record of which one a given Model got, and these
+    // checks exist so a future edit cannot make the downgrade invisible again.
+    std::printf("\n[Model::Model -- which seed was actually applied]\n");
+    {
+        thermal::Planet moon("Moon");
+        thermal::Config cfg;                 // spinup_seed defaults to Physical
+        std::vector<double> times;
+        for (int i = 0; i < 16; ++i) times.push_back(i * moon.day / 16.0);
+
+        Eigen::MatrixXd good(2, static_cast<int>(times.size()));
+        for (int i = 0; i < static_cast<int>(times.size()); ++i) {
+            good(0, i) = times[i];
+            good(1, i) = 200.0;
+        }
+        thermal::Model m_ok(moon, 0.0, times, good, cfg, false);
+        check(m_ok.seed_applied,
+              "a finite 2xN forcing series gets the SHARED per-face seed");
+
+        // No forcing matrix at all: the shared seed cannot run.
+        Eigen::MatrixXd none;
+        thermal::Model m_none(moon, 0.0, times, none, cfg, false);
+        check(!m_none.seed_applied,
+              "an EMPTY forcing matrix falls back to Profile::init_T "
+              "(warned, not silent)");
+
+        // Entirely non-finite forcing: same downgrade, different cause. This
+        // is the reachable one -- a NaN in the illumination array empties the
+        // series without any malformed call.
+        Eigen::MatrixXd nans(2, static_cast<int>(times.size()));
+        for (int i = 0; i < static_cast<int>(times.size()); ++i) {
+            nans(0, i) = times[i];
+            nans(1, i) = std::nan("");
+        }
+        thermal::Model m_nan(moon, 0.0, times, nans, cfg, false);
+        check(!m_nan.seed_applied,
+              "an all-non-finite forcing series falls back to Profile::init_T "
+              "(warned, not silent)");
+
+        // The two fallbacks must produce the SAME column, and it must be the
+        // latitude-blind one: init_T ignores its lat argument by contract.
+        thermal::Model m_eq(moon, 1.2, times, none, cfg, false);
+        bool same = (m_eq.N_z == m_none.N_z);
+        for (int i = 0; same && i < m_none.N_z; ++i)
+            same = (m_eq.profile.T()[i] == m_none.profile.T()[i]);
+        check(same,
+              "Profile::init_T is latitude-blind: lat=0.0 and lat=1.2 rad give "
+              "a bit-identical column");
+    }
+
     std::printf("=== %s (%d failure%s) ===\n", g_fail ? "FAILED" : "OK",
                 g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
