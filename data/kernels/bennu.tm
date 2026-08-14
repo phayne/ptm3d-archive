@@ -8,12 +8,14 @@ KPL/MK
    repo root (or edit PATH_VALUES to an absolute path).
 
    This file lives in data/kernels/ (a bare filename, like moon.tm/europa.tm/
-   mercury.tm) because generic_body.spice_metakernel is resolved as
-   "<compiled-in SPICE_KERNELS_DIR>/<spice_metakernel value>" (plain string
-   concatenation, illumination_model.cpp initialize_spice()) -- an absolute or
-   data/horizons_cache-relative value there does not resolve. The body-specific
-   ephemeris.spk it loads below is NOT here; it stays with the body under
-   data/horizons_cache/bodies/, resolved via the BODY path symbol instead.
+   mercury.tm) so that generic_body.spice_metakernel resolves it with no
+   further configuration. An absolute path, or a path relative to the working
+   directory, also resolves -- see docs/configuration.md, "How
+   generic_body.spice_metakernel is resolved". (Before BUGS.md PTM-145 was
+   fixed, only the bare-filename form worked; older notes saying so are stale.)
+   The body-specific ephemeris.spk it loads below is NOT here; it stays with
+   the body under data/horizons_cache/bodies/, resolved via the BODY path
+   symbol instead.
 
    Shared kernels (leapseconds, planetary constants, planetary ephemeris) come
    from data/kernels/, populated by:  python3 scripts/fetch_kernels.py --bodies moon
