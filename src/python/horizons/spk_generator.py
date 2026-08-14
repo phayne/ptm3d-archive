@@ -13,6 +13,26 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _default_kernels_base_dir() -> str:
+    """Resolve the shared SPICE kernels directory (lsk/pck/spk/fk) the same
+    way the C++ engine resolves data paths: honor $PTM_DATA_ROOT when set
+    (config_parser.cpp's PTM_DATA_ROOT contract, PTM_DATA_ROOT points AT the
+    data directory), else fall back to <repo>/data/kernels.
+
+    This is NOT the metakernel's own output directory (a body's cache dir
+    under data/horizons_cache/bodies/<body>/) -- pointing PATH_VALUES at the
+    body directory was PTM-145's companion bug: KERNELS_TO_LOAD entries like
+    $KERNELS/lsk/naif0012.tls then look for a lsk/ subdirectory inside the
+    body's own cache dir, where it never exists.
+    """
+    env_root = os.environ.get("PTM_DATA_ROOT")
+    if env_root:
+        return os.path.join(env_root, "kernels")
+    # This file lives at <repo>/src/python/horizons/spk_generator.py.
+    repo_root = Path(__file__).resolve().parents[3]
+    return str(repo_root / "data" / "kernels")
+
 # Standard generic kernels (shipped with CSPICE or widely available)
 DEFAULT_GENERIC_KERNELS = [
     "lsk/naif0012.tls",       # Leap seconds
@@ -64,10 +84,13 @@ class SPKGenerator:
         Parameters
         ----------
         kernels_base_dir : str
-            Base directory where standard SPICE kernels are stored.
-            If empty, uses a relative path placeholder.
+            Base directory where standard SPICE kernels (lsk/pck/spk/fk) are
+            stored. If empty (the default), resolves to the shared
+            data/kernels directory -- see _default_kernels_base_dir() --
+            NOT the metakernel's own output directory (PTM-145's companion
+            bug). Callers that pass a directory explicitly are unaffected.
         """
-        self.kernels_base_dir = kernels_base_dir
+        self.kernels_base_dir = kernels_base_dir or _default_kernels_base_dir()
 
     def create_metakernel(
         self,
