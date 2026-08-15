@@ -382,6 +382,103 @@ int runB1c() {
 }
 
 // ---------------------------------------------------------------------------
+// B1d: with a multi-GPU pool active, the state flags and the per-timestep
+// solve() must agree with the pool being up.
+//
+// initGPU()'s pool rung used to return without ever setting use_gpu_ or
+// two_band_gpu_ok_ (both are set inside the single-GPU lambda). Two consequences,
+// both silent: isGPUTwoBand() reported false on an ACTIVE GPU pool, and the
+// per-timestep solve() -- whose guard is `use_gpu_ && gpu_solver_`, and
+// gpu_solver_ is null on the pool rung -- fell through to the float64 CPU
+// solver. So `radiation.gpu_devices: 2` quietly changed the solver path for
+// every caller that is not the coupled batch sweep.
+//
+// DISCRIMINATING: the pool worker is arithmetically the same code as
+// solveGPUTwoBand, so a pooled single solve must be BIT-IDENTICAL to the
+// single-GPU one. A CPU fallback is float64 and is not (it differs in the
+// float32 ulps this test prints). Requires >= 2 GPUs; SKIPs otherwise, and
+// SKIPs if the pool declines to build (that is a capability fact, not a defect).
+int runB1d() {
+#ifdef PTM_GPU_OPENCL
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+    std::printf("=== B1d: multi-GPU pool state + per-timestep solve() (N=%d, s=%.2f, A=%.2f) ===\n",
+                N, s, A);
+
+    auto make_cfg = [](int devices) {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        cfg.gpu_devices = devices;
+        return cfg;
+    };
+
+    std::vector<double> single_ind;
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(make_cfg(1));
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) {
+            std::printf("  SKIP: single-GPU two-band did not engage (no GPU here).\n\n");
+            return 0;
+        }
+        single_ind = solver.solve(T, solar);
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: single-GPU reference threw (%s).\n\n", e.what());
+        return 0;
+    }
+
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(make_cfg(2));
+        solver.initGPU();
+        if (!solver.hasGPUPool()) {
+            std::printf("  SKIP: the pool did not build (fewer than 2 GPUs on this host).\n\n");
+            return 0;
+        }
+        const bool flag_ok = solver.isGPUTwoBand();
+        std::vector<double> pool_ind = solver.solve(T, solar);
+
+        double maxabs = 0.0;
+        int n_bitdiff = 0;
+        for (int i = 0; i < N; ++i) {
+            maxabs = std::max(maxabs, std::abs(pool_ind[i] - single_ind[i]));
+            if (pool_ind[i] != single_ind[i]) ++n_bitdiff;
+        }
+        std::printf("  pool active: isGPUTwoBand()=%s (want true)\n", flag_ok ? "true" : "false");
+        std::printf("  per-timestep solve(): max|pool - singleGPU| = %.3e over %d faces "
+                    "(%d not bit-identical; want 0)\n", maxabs, N, n_bitdiff);
+
+        int fail = 0;
+        if (!flag_ok) {
+            std::printf("  B1d FAIL: isGPUTwoBand() reports CPU while the GPU pool is active.\n");
+            ++fail;
+        }
+        if (n_bitdiff != 0) {
+            std::printf("  B1d FAIL: the pooled per-timestep solve is not bit-identical to the "
+                        "single-GPU solve -- it ran a different solver (CPU fallback?).\n");
+            ++fail;
+        }
+        std::printf("  B1d verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+        return fail ? 1 : 0;
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: pool init threw (%s).\n\n", e.what());
+        return 0;
+    }
+#else
+    std::printf("=== B1d: SKIP (built without PTM_GPU_OPENCL). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // B1b (BUGS.md PTM-11): the single-GPU two-band gate is ORDERING-SENSITIVE.
 // two_band_gpu_ok_ is set inside initGPU() ONLY if two_band_ is already true at that
 // moment (radiation_exchange.cpp:359-360). So the per-face Bond albedo + enableTwoBand()
@@ -562,10 +659,11 @@ int main() {
     int a2_fail = runA2();
     int b1_fail = runB1();
     int b1c_fail = runB1c();
+    int b1d_fail = runB1d();
     int b1b_fail = runB1b();
 
     std::printf("=== OVERALL: A0/A1 fails=%d  JACOBI fails=%d  A2 fails=%d  B1 fails=%d  "
-                "B1c fails=%d  B1b fails=%d ===\n",
-                n_fail, n_jac_fail, a2_fail, b1_fail, b1c_fail, b1b_fail);
-    return n_fail + n_jac_fail + a2_fail + b1_fail + b1c_fail + b1b_fail;
+                "B1c fails=%d  B1d fails=%d  B1b fails=%d ===\n",
+                n_fail, n_jac_fail, a2_fail, b1_fail, b1c_fail, b1d_fail, b1b_fail);
+    return n_fail + n_jac_fail + a2_fail + b1_fail + b1c_fail + b1d_fail + b1b_fail;
 }

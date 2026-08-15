@@ -766,6 +766,16 @@ void RadiositySolver::initGPU() {
                              "degrading to single-GPU.\n";
                 gpu_pool_.reset();
             } else {
+                // The pool IS a GPU rung: publish it in the same state the
+                // single-GPU rung publishes. Without this use_gpu_ and
+                // two_band_gpu_ok_ stayed false while the pool ran, so
+                // isGPUTwoBand() reported "CPU" on an active GPU pool and the
+                // per-timestep solve() below fell to the CPU solver -- i.e.
+                // setting radiation.gpu_devices: 2 silently changed the solver
+                // path for every non-batch caller. gpu_solver_ stays null; the
+                // dispatch checks distinguish the two rungs.
+                use_gpu_ = true;
+                if (two_band_) two_band_gpu_ok_ = true;
                 pool_batch_size_ = (config_.gpu_batch_size > 0)
                     ? config_.gpu_batch_size
                     : 4 * static_cast<int>(gpu_pool_->numDevices());
@@ -936,6 +946,10 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         std::vector<std::vector<double>> saved_batch;
         saved_batch.swap(solar_albedo_source_batch_);
         const std::vector<double> saved_single = solar_albedo_source_;
+        // Re-entrancy guard: solve() may route a single timestep back through
+        // the pool, and this loop calls solve(). The flag makes that impossible
+        // to turn into recursion regardless of how the veto conditions change.
+        BatchSerialGuard serial_guard(in_batch_serial_);
         if (ptm106_serial_veto && two_band_) {
             last_indirect_ir_batch_.assign(n_steps, {});
             last_indirect_vis_batch_.assign(n_steps, {});
@@ -1108,6 +1122,39 @@ std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatur
     if (use_gpu_ && gpu_solver_
         && ((two_band_gpu_ok_ && src_albedo_gpu_ok_) || !two_band_)) {
         return solveGPU(temperatures, solar_flux);
+    }
+    // Multi-GPU pool rung: there is no single gpu_solver_, so dispatch this one
+    // timestep as a one-step batch. The pool worker is arithmetically the same
+    // code as solveGPUTwoBand, so this keeps a per-timestep caller on the GPU
+    // instead of silently switching it to the float64 CPU solver just because
+    // radiation.gpu_devices > 1. The extra conditions are exactly those under
+    // which solveBatch takes its pool branch, and in_batch_serial_ makes the
+    // solve -> solveBatch -> serial -> solve cycle unreachable.
+    if (use_gpu_ && !gpu_solver_ && gpu_pool_ && !in_batch_serial_
+        && src_albedo_gpu_ok_ && solar_albedo_source_batch_.empty()
+        && (two_band_gpu_ok_ || !two_band_)) {
+        auto out = solveBatch({temperatures}, {solar_flux});
+        if (two_band_) {
+            // Republish the per-band results in the single-solve slots the
+            // two-band consumers read (lastIndirectIR/Visible).
+            if (!last_indirect_ir_batch_.empty())  last_indirect_ir_  = last_indirect_ir_batch_[0];
+            if (!last_indirect_vis_batch_.empty()) last_indirect_vis_ = last_indirect_vis_batch_[0];
+        }
+        return out.empty() ? std::vector<double>(temperatures.size(), 0.0)
+                           : std::move(out[0]);
+    }
+    // A pool is up but this solve cannot use it: say so once rather than change
+    // solver path in silence.
+    if (use_gpu_ && !gpu_solver_ && gpu_pool_ && !in_batch_serial_
+        && !pool_single_fallback_warned_) {
+        pool_single_fallback_warned_ = true;
+        std::cerr << "  [Radiosity] NOTE: the multi-GPU pool is active but this per-timestep "
+                     "solve is running on the CPU (src_albedo_gpu_ok="
+                  << src_albedo_gpu_ok_ << ", per-step source-albedo batch installed="
+                  << (!solar_albedo_source_batch_.empty())
+                  << ", two_band_gpu_ok=" << two_band_gpu_ok_
+                  << "). Results are correct but come from the float64 CPU solver, not the GPU."
+                  << std::endl;
     }
 #endif
 

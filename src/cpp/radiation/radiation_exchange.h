@@ -217,9 +217,11 @@ public:
     // True iff the GPU pool was successfully initialized (gpu_devices > 1).
     bool hasGPUPool() const;
 
-    // True iff the GPU two-band path (solveGPUTwoBand) is active after initGPU()
-    // (band-separated + GPU init succeeded + all Σ_j F_ij ≤ 1). Lets a test confirm
-    // the GPU path actually engaged rather than silently falling back to CPU.
+    // True iff a GPU two-band path is active after initGPU() — either the
+    // single-GPU solveGPUTwoBand or the multi-GPU pool's two-band solveBatch.
+    // Lets a test confirm the GPU path actually engaged rather than silently
+    // falling back to CPU. Before the pool set use_gpu_/two_band_gpu_ok_ this
+    // reported false on an active pool.
     bool isGPUTwoBand() const {
 #ifdef PTM_GPU_OPENCL
         return two_band_gpu_ok_ && use_gpu_;
@@ -468,9 +470,24 @@ private:
     // Multi-GPU dispatch pool (used when gpu_devices > 1). When set, each
     // batch picks the next-idle device's persistent solver and calls solve().
     std::unique_ptr<gpu::opencl::RadiosityGPUDevicePool> gpu_pool_;
+    // True when ANY GPU rung is active. gpu_solver_ != nullptr means the
+    // single-GPU rung; gpu_pool_ != nullptr means the multi-GPU pool rung.
     bool use_gpu_ = false;
     int  pool_batch_size_ = 0;  // resolved from config: 4 * n_devices when 0/auto
+    bool pool_single_fallback_warned_ = false;
 #endif
+
+    // Set while solveBatch runs its serial per-timestep fallback, so solve()
+    // cannot bounce that timestep back into solveBatch. Declared outside the
+    // GPU #ifdef because solveBatch's serial loop is compiled in both builds.
+    bool in_batch_serial_ = false;
+    struct BatchSerialGuard {
+        bool& flag;
+        explicit BatchSerialGuard(bool& f) : flag(f) { flag = true; }
+        ~BatchSerialGuard() { flag = false; }
+        BatchSerialGuard(const BatchSerialGuard&) = delete;
+        BatchSerialGuard& operator=(const BatchSerialGuard&) = delete;
+    };
 
     // Convergence tracking
     int last_iterations_ = 0;
