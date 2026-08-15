@@ -140,12 +140,54 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 // both printed by the same test -- so this is a property of counting rays, not
 // of this particular sequence.
 //
-// N = 512 is therefore the smallest power of two that meets the specified
-// criterion, < 1 % of full flux (0.0082).
+// N = 128 IS A CHOSEN BUDGET, not the smallest N meeting a fixed criterion.
+// The count was 512: the smallest power of two under a purely RELATIVE
+// criterion, "worst error < 1 % of full flux" (0.0082). Restated against the
+// two things that actually constrain it:
+//
+//   accuracy  the fitted law gives worst |dV| = 0.49 * 128^-0.65 = 0.021 (the
+//             measured 0.0175 above is inside it). The full primary flux on
+//             the coldest lunar PSR face is 0.087 W/m^2 -- 0.046 IR + 0.041
+//             reflected, measured over 48 MS3 A03MP026 frames -- which lifts
+//             that face from the 24.04 K geothermal floor to 37.36 K. A 2.1 %
+//             error in the GEOMETRIC visibility factor is therefore worth
+//             <= 0.163 K there, and less on every warmer face, against a 0.1 K
+//             equilibration target and a ~1 K documented spin-up bias. Paul
+//             accepted that bar on 2026-08-14.
+//
+//   cost      the escalation was 91.5 % of the illumination phase on the MS3
+//             lunar polar production config (profiler, 2026-08-14), and
+//             accounted for 102 % of that phase's 5.5x slowdown since July.
+//             Cost is linear in N over the escalated faces, so this is where
+//             the kelvin are cheapest.
+//
+// This is a budget, so it has to be re-derived, not inherited, if either side
+// moves. The kelvin figure is ABSOLUTE and lunar: Jupiter's disk is 6.3x wider
+// than Earth's, and a Europa DEM patch escalates ~24 % of its faces against the
+// Moon's ~7 %. It was measured rather than assumed, 512 -> 128 end to end over
+// 48 frames at production equilibration: worst face-frame |dT| 0.025 K on the
+// MS3 lunar polar patch, 0.0025 K on the Europa Pwyll patch, 8e-6 K on a Europa
+// ico6 global. Europa comes out TEN TIMES quieter than the Moon despite the
+// wider disk, because dT/dF = 1/(4 eps sigma T^3) is ~20x smaller at Europa's
+// ~100 K than at a 37 K lunar PSR floor -- the binding case is cold, not big.
+// So one N serves both; a Europa-specific value would be a separate decision
+// with its own measurement.
 //
 // The cost lands ONLY on faces whose probe was split, i.e. the thin band whose
-// view of the primary is partly blocked by terrain.
-constexpr uint32_t PRIMARY_DISK_SAMPLES = 512;
+// view of the primary is partly blocked by terrain. Audited 2026-08-14:
+// updatePrimaryDiskVisibility is the only engine code that reads this constant
+// (the one other reader anywhere is the gate below, test_primary_disk.cpp), and
+// every non-split outcome -- disk below the horizon, no BVH, probe underflow,
+// probe unanimously clear, probe unanimously blocked -- returns before the
+// sampler.
+constexpr uint32_t PRIMARY_DISK_SAMPLES = 128;
+
+// The worst-case visibility error PRIMARY_DISK_SAMPLES is budgeted for, from
+// the fitted law above. This is the number the kelvin argument was made
+// against, so test_primary_disk gates the MEASURED sweep on it: N and this
+// constant move together, or the gate fails and the budget gets re-derived on
+// purpose rather than by accident.
+constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 
 // Cheap probe: disk center + 4 rim points.  Unanimous probes decide the face
 // without sampling (see illumination_model.cpp computePrimaryDiskVisibility).
