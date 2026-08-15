@@ -990,7 +990,28 @@ void calculateOptimalGridParameters(const Planet& planet, Config& config);
 
 // SIMD width constants - always use 8 for array sizing, runtime check for actual width
 constexpr int THERMAL_BATCH_SIZE = 8;     // 8 doubles = 512 bits (AVX-512)
-constexpr int MAX_THERMAL_LAYERS = 128;   // Maximum supported depth layers
+// Maximum supported depth layers for the CPU SIMD batch path (ThermalBatchSoA
+// below stack-allocates every per-layer array at this fixed size, same
+// contract as the GPU kernel's MAX_LAYERS -- see thermal_opencl.cpp/
+// thermal_kernels.cl -- but independent and NOT required to match it; the two
+// solvers are allowed different ceilings).
+//
+// Raised 128 -> 512 (BUGS.md PTM-SIGSEGV-450LAYER, 2026-08-15): a discrete
+// buried-ice-layer config (generic_body.surface.ice_depth + thermal_m: 150,
+// to resolve the regolith/ice interface) builds a 450-layer reference grid.
+// ThermalBatchSoA::copyGridFromProfile() copied the grid using the profile's
+// own (unclamped) layer count -- 128 was silently insufficient by more than
+// 3x, and unlike ThermalBatchSoA::initialize() (which does clamp), that copy
+// had no bound check at all, so it walked the z/dz/g1/g2 and per-face
+// kc/rho/T arrays 3.5x past their declared extent: a stack-buffer overflow
+// smashing the rest of the (thread-local, OpenMP-per-batch) ThermalBatchSoA
+// object and beyond, confirmed via AddressSanitizer (stack-buffer-overflow,
+// thermal_model.cpp: ThermalBatchSoA::copyGridFromProfile) and reproduced as
+// a bare SIGSEGV on the non-sanitized build. 512 gives ~14% headroom over the
+// known 450-layer case; ThermalBatchSoA::initialize() and
+// copyGridFromProfile() both now refuse loudly (never silently truncate or
+// overflow) if a future config's grid exceeds even this raised ceiling.
+constexpr int MAX_THERMAL_LAYERS = 512;
 
 /**
  * Structure of Arrays (SoA) for batch thermal solving.
