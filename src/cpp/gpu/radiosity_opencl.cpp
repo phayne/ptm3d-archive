@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
@@ -1037,10 +1039,37 @@ void RadiosityOpenCLSolver::solve(
     // Checking every iteration causes PCIe latency overhead; check every N iterations
     converged_ = false;
     last_residual_ = std::numeric_limits<double>::max();
-    const int check_interval = std::max(1, config_.convergence_check_interval);
+    int check_interval = std::max(1, config_.convergence_check_interval);
+
+    // Measurement knob (PTM_RAD_GPU_CHECK_INTERVAL): the shipped interval of 10 means
+    // the solver can only stop at iteration 10, 20, ... regardless of when it actually
+    // converged. This override exists to price that quantization against the cost of
+    // the extra device->host convergence reads it would take to remove it.
+    if (const char* ci = std::getenv("PTM_RAD_GPU_CHECK_INTERVAL")) {
+        const int v = std::atoi(ci);
+        if (v >= 1) {
+            check_interval = v;
+        } else {
+            std::fprintf(stderr, "[radiosity] WARNING: PTM_RAD_GPU_CHECK_INTERVAL='%s' is not "
+                                 "a positive integer; keeping the configured interval %d.\n",
+                         ci, check_interval);
+        }
+    }
 
     // Ensure tolerance is safe for single-precision (float has ~7 significant digits)
     const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);
+
+    // Diagnostic per-iteration trace (PTM_RAD_ITER_TRACE=1). Forces a check every
+    // iteration and reports max|dB| (the GPU criterion), max|B| and their ratio
+    // (the CPU criterion) so the two stopping rules can be scored on one solve.
+    // PTM_RAD_ITER_TRACE_FULL=1 additionally ignores the stopping rule and runs
+    // all max_iterations, exposing the full decay curve past the shipped stop.
+    static const bool iter_trace      = (std::getenv("PTM_RAD_ITER_TRACE") != nullptr);
+    static const bool iter_trace_full = (std::getenv("PTM_RAD_ITER_TRACE_FULL") != nullptr);
+    // Atomic: the multi-GPU pool submits solves on several device threads at once.
+    static std::atomic<long> trace_solve_id{0};
+    const long this_solve = iter_trace ? trace_solve_id.fetch_add(1) + 1 : 0;
+    if (iter_trace) check_interval = 1;
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         // SpMV: F_B = F * radiosity (single-buffer or chunked, PTM-25)
@@ -1083,7 +1112,15 @@ void RadiosityOpenCLSolver::solve(
             last_residual_ = max_change;
             last_iterations_ = iter + 1;
 
-            if (max_change < effective_tolerance) {
+            if (iter_trace) {
+                const double max_b = computeMaxOfBuffer(buf_radiosity_);
+                const double rel = (max_b > 1e-10) ? max_change / max_b : max_change;
+                std::fprintf(stderr,
+                             "[rad-trace] gpu solve=%ld iter=%d dB_abs=%.6e B_max=%.6e rel=%.6e\n",
+                             this_solve, iter + 1, max_change, max_b, rel);
+            }
+
+            if (max_change < effective_tolerance && !iter_trace_full) {
                 converged_ = true;
                 break;
             }
@@ -1123,6 +1160,10 @@ void RadiosityOpenCLSolver::solve(
 }
 
 double RadiosityOpenCLSolver::computeMaxResidual() {
+    return computeMaxOfBuffer(buf_change_);
+}
+
+double RadiosityOpenCLSolver::computeMaxOfBuffer(cl_mem buf) {
     // Use GPU parallel reduction to find max change
     // Two-stage approach:
     // 1. Each work group reduces to one partial max
@@ -1147,7 +1188,7 @@ double RadiosityOpenCLSolver::computeMaxResidual() {
     size_t global_size = n_reduction_groups_ * local_size;
     size_t local_mem_size = local_size * sizeof(float);
 
-    err = clSetKernelArg(max_reduction_kernel_, 0, sizeof(cl_mem), &buf_change_);
+    err = clSetKernelArg(max_reduction_kernel_, 0, sizeof(cl_mem), &buf);
     checkErr(err, "clSetKernelArg(max_reduction,input)");
     err = clSetKernelArg(max_reduction_kernel_, 1, sizeof(cl_mem), &buf_partial_max_);
     checkErr(err, "clSetKernelArg(max_reduction,partial_max)");

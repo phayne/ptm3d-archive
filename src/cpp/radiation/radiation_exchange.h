@@ -474,6 +474,13 @@ private:
     double last_residual_ = 0.0;
     bool converged_ = false;
 
+    // Cost accounting (PTM_RAD_COST_REPORT): traversals of the view-factor matrix
+    // charged by the last solve(). Each solver path sets this itself, because the
+    // relationship between iteration counts and traversals differs per path -- the
+    // fused CPU two-band does ONE width-2 traversal per outer iteration, while the
+    // GPU two-band runs the bands as two separate solves and pays IR + visible.
+    int last_csr_traversals_ = 0;
+
     // Work arrays (reused across calls)
     mutable std::vector<double> radiosity_;
     mutable std::vector<double> radiosity_new_;
