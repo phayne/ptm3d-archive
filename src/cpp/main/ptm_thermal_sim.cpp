@@ -18709,7 +18709,70 @@ int main(int argc, char** argv) {
                     // Check if GPU thermal is enabled
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
 
-                    if (use_gpu_thermal_rerun && faces_to_rerun.size() >= 100) {
+                    // No lower bound on the selection size. This test used to
+                    // read `&& faces_to_rerun.size() >= 100`, which silently
+                    // dropped a 1-99 face selection on the floor: the GPU
+                    // branch was skipped WITHOUT clearing
+                    // use_gpu_thermal_rerun, so both `!use_gpu_thermal_rerun`
+                    // blocks below were skipped too, no re-thermal ran, and
+                    // the post-re-thermal check then read max_change = 0 and
+                    // declared convergence one iteration early. Measured on a
+                    // 12,800-face 80 N crater (coupling_select_dt = 81.4 K,
+                    // 35 faces selected): the coupling correction went from
+                    // 107.2 K to 0.0 K purely because the selection fell 66
+                    // faces below the floor.
+                    //
+                    // The floor is removed rather than answered with
+                    // `use_gpu_thermal_rerun = false;` for two reasons:
+                    //  1. Routing a small selection to the CPU re-thermal is
+                    //     FATAL by construction on any run that armed the
+                    //     default-ON equilibration radiosity skip -- that path
+                    //     re-integrates the equilibration span from a combined
+                    //     flux the skip deliberately left at zero (the refusal
+                    //     below). Every two-phase GPU coupled run is in that
+                    //     state by default since 2026-08-15.
+                    //  2. Switching solvers on selection SIZE means one run
+                    //     uses two different re-thermal physics on two
+                    //     consecutive coupling iterations. The GPU path
+                    //     warm-starts from the post-equilibration T(z)
+                    //     hand-off and returns a column; the CPU path
+                    //     re-integrates from the combined flux and returns
+                    //     none (PTM-57). A size threshold is not a physics
+                    //     criterion.
+                    //
+                    // Cost. The extra DISPATCH is negligible and does not
+                    // scale with the selection: measured on the same crater
+                    // from the engine's own "[GPU Thermal] Persistent kernel"
+                    // line (single W6800X die, 118-step output cycle), 6 faces
+                    // 255/280 ms, 35 faces 254/247 ms, 101 faces 302/319 ms,
+                    // 2,626 faces 289/274 ms -- setup-bound, not width-bound,
+                    // over three orders of magnitude of batch width.
+                    //
+                    // The real cost is the extra coupling ITERATIONS, and it
+                    // is much larger. The floor did not merely skip a
+                    // re-thermal: because surface_temps then came back
+                    // unchanged, the post-re-thermal check read
+                    // max_change_post = 0 and STOPPED the loop. Removing it
+                    // lets the loop keep going, and every further iteration
+                    // pays a full radiosity sweep over
+                    // [rad_sweep_t_lo, total_time_steps) plus a whole-mesh
+                    // selection pass. Measured on the crater at 35 selected
+                    // faces: 1 -> 2 coupling iterations, 7.7/8.2/8.1 s ->
+                    // 10.3/10.1/11.6 s wall (3 repeats each, +~30 %). Those
+                    // wall numbers were taken while another job held the GPU,
+                    // so read the ratio, not the absolutes; the dispatch times
+                    // above were taken on an idle box. On a
+                    // production mesh whose late-iteration selection lands in
+                    // this range, budget up to
+                    // radiation.max_coupling_iterations sweeps where the run
+                    // previously stopped early. Those sweeps were always owed;
+                    // the floor was not saving them, it was skipping them.
+                    //
+                    // faces_to_rerun is guaranteed non-empty here (the empty
+                    // case broke out of the loop above), and
+                    // runThermalForSelectedFaces_GPU also returns early on an
+                    // empty selection, so no size test is needed at all.
+                    if (use_gpu_thermal_rerun) {
                         // The seed guard, restated at the point of consumption:
                         // the GPU re-thermal is the ONLY consumer of the
                         // hand-off, so it must never be entered without one.
@@ -18727,7 +18790,7 @@ int main(int argc, char** argv) {
                         std::cout << "  Using GPU thermal solver..." << std::endl;
                         ptm::discloseRethermalPath(
                             ptm::RethermalPath::GpuSelectedFaces,
-                            "thermal.use_gpu is set and the selection is >= 100 faces");
+                            "thermal.use_gpu is set (any non-empty selection)");
                         bool gpu_success = runThermalForSelectedFaces_GPU(
                             mesh,
                             faces_to_rerun,
@@ -18763,14 +18826,10 @@ int main(int argc, char** argv) {
                     // which is documented at up to ~5.2 GB -- rather than after
                     // paying for it.
                     // Reachable only when the GPU re-thermal was ATTEMPTED and
-                    // FAILED. A selection of 1-99 faces does NOT land here:
-                    // the >= 100 test above skips the GPU branch WITHOUT
-                    // clearing use_gpu_thermal_rerun, so both !use_gpu_...
-                    // blocks below are skipped too and no re-thermal runs at
-                    // all. That is a pre-existing defect (see the disclosure
-                    // note at the CPU branch), not one this gate introduces --
-                    // and it is why this message does not claim the < 100 case
-                    // arrives here.
+                    // FAILED. Since the >= 100 selection floor was removed
+                    // above, a small selection no longer bypasses the GPU
+                    // branch, so it can only arrive here the same way a large
+                    // one does: by failing on the device.
                     if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
                         std::cerr << "\nFATAL: the equilibration radiosity skip is armed but"
                                      " coupling iteration " << (iter + 1) << " fell to the CPU"
@@ -18847,22 +18906,12 @@ int main(int argc, char** argv) {
                                          " The next chunk will cold-start them.\n";
                         }
                         // Disclosed from `use_gpu_thermal_rerun` itself -- the
-                        // variable this branch tests.
-                        // ⚠ CORRECTED 2026-08-15: this used to also name "fewer
-                        // than 100 selected faces" as a way to arrive here. It
-                        // is not one. The `>= 100` test above skips the GPU
-                        // branch without clearing use_gpu_thermal_rerun, so a
-                        // 1-99 face selection on a GPU thermal run reaches
-                        // NEITHER branch: no re-thermal runs, the iteration
-                        // prints "Re-running thermal model for N faces...",
-                        // changes nothing, and the post-re-thermal check then
-                        // reads max_change = 0 and declares convergence. The
-                        // missing `use_gpu_thermal_rerun = false;` is a real
-                        // defect; it is left alone here because fixing it is a
-                        // behavior change that needs its own validation, and
-                        // because with the equilibration skip on by default it
-                        // would convert that case into the FATAL above. Do not
-                        // fix one without the other.
+                        // variable this branch tests. Two ways in: the run has
+                        // no GPU thermal solver at all, or the GPU re-thermal
+                        // was attempted and failed. Selection size is NOT one
+                        // of them -- see the floor-removal note above; before
+                        // 2026-08-15 a 1-99 face selection reached neither
+                        // branch and silently skipped its re-thermal.
                         ptm::discloseRethermalPath(
                             ptm::RethermalPath::CpuScalarFaces,
                             "no GPU thermal, or the GPU re-thermal failed and fell back");
