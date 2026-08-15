@@ -104,7 +104,20 @@ public:
     bool hasExternalTimeGrid() const { return !external_ets_.empty(); }
     void setKernelsPath(const std::string& path) {
         kernels_path_ = path;
+        kernels_path_explicit_ = true;
+        kernels_path_resolved_ = false;   // re-report with this rung on top
     }
+
+    // Every directory the SPICE kernel-resolution ladder considered, in order,
+    // with the source of each rung and which one was taken. Populated by
+    // initialize_spice(); empty before the first call.
+    //
+    // Exposed because the failure this diagnoses happens LATER and ELSEWHERE:
+    // a run whose kernel directory carries no leapseconds kernel dies in
+    // str2et_c with a bare SPICE(NOLEAPSECONDS), several screens after the one
+    // line that named the directory. The report lets that message name every
+    // location that was searched instead of only the fetch command.
+    static const std::string& spiceKernelSearchReport();
 
     // Set the target body (e.g., "EUROPA", "MOON")
     void setTargetBody(const std::string& body_name) {
@@ -647,10 +660,18 @@ private:
     double albedo_ = 0.5;
     // SPICE kernel directory. Intentionally EMPTY by default: it is resolved in
     // initialize_spice() from (in order) an explicit setKernelsPath() call,
-    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
-    // var, default <repo>/data/kernels). Never a hardcoded developer path
-    // (portability audit P0, PORT-02).
+    // $PTM_SPICE_KERNELS, $PTM_DATA_ROOT/kernels, then the compiled-in
+    // SPICE_KERNELS_DIR (CMake cache var, default <repo>/data/kernels). Never a
+    // hardcoded developer path (portability audit P0, PORT-02).
     std::string kernels_path_;
+    // True only when a caller supplied the directory through setKernelsPath().
+    // Without this flag a second initialize_spice() call on the same object
+    // would read its OWN previous result back as if a caller had set it, and
+    // report the wrong rung.
+    bool kernels_path_explicit_ = false;
+    // The ladder runs once per object; re-running it would re-print the
+    // directory line and overwrite the search report with a one-rung version.
+    bool kernels_path_resolved_ = false;
     
     // Embree ray tracing resources
     RTCDevice embree_device_ = nullptr;
