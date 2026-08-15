@@ -2477,27 +2477,123 @@ std::pair<double, double> IlluminationModel::latLonFromCartesian(double x, doubl
     };
 }
 
+// The kernel-directory resolution report, filled in by initialize_spice() and
+// read back by whoever reports a downstream SPICE failure (see the header).
+namespace {
+std::string g_spice_kernel_search_report;
+
+// A kernel directory is USABLE by this engine only if it carries the
+// leapseconds kernel the engine actually loads. Every entry point hardcodes
+// this same relative name (initialize_spice's Keplerian branch,
+// camera_simulator.cpp, ptm/paths.py), and without it str2et_c cannot resolve
+// an epoch on ANY path -- SPICE or Keplerian.
+bool kernelDirIsUsable(const std::string& dir) {
+    if (dir.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(dir) / "lsk" / "naif0012.tls", ec);
+}
+}  // namespace
+
+const std::string& IlluminationModel::spiceKernelSearchReport() {
+    return g_spice_kernel_search_report;
+}
+
 bool IlluminationModel::initialize_spice(bool verbose) {
     static bool spice_initialized = false;
 
-    // Resolve the kernel directory if it was not set explicitly:
-    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
-    // variable; default <repo>/data/kernels). Fail loud rather than fall back
-    // to a developer-machine path (portability audit P0, PORT-02).
-    if (kernels_path_.empty()) {
-        const char* env_kernels = std::getenv("PTM_SPICE_KERNELS");
-        if (env_kernels && *env_kernels) {
-            kernels_path_ = env_kernels;
-        } else {
-            kernels_path_ = ptm_thermal::config::SPICE_KERNELS_DIR;
+    // Resolve the kernel directory. The ladder, in order:
+    //   1. an explicit setKernelsPath() value  -- library callers, camera CLI
+    //   2. $PTM_SPICE_KERNELS                  -- documented override
+    //   3. $PTM_DATA_ROOT/kernels              -- the data-root contract
+    //   4. compiled-in SPICE_KERNELS_DIR       -- last resort (CMake cache var,
+    //                                             default <repo>/data/kernels)
+    //
+    // Rungs 1 and 2 are EXPLICIT instructions and are taken exactly as given,
+    // usable or not: silently demoting one would hide a typo and would undo the
+    // env override PTM-145 restored. Rungs 3 and 4 are implicit, so a rung that
+    // carries no leapseconds kernel is passed over -- otherwise a build whose
+    // compiled-in directory is empty (any fresh worktree or clone: the *.tm
+    // files are tracked, lsk/ pck/ spk/ are not) ends the search on a directory
+    // that cannot serve any run, and dies screens later in str2et_c with a bare
+    // SPICE(NOLEAPSECONDS). If no implicit rung is usable the compiled-in
+    // default is still taken, so the diagnostics keep naming it.
+    //
+    // Never fall back to a developer-machine path (portability audit P0,
+    // PORT-02); every rung is recorded and printed on any failure below.
+    if (!kernels_path_resolved_) {
+        struct Rung {
+            std::string source;
+            std::string path;
+            bool is_explicit;
+        };
+        std::vector<Rung> rungs;
+        if (kernels_path_explicit_ && !kernels_path_.empty()) {
+            rungs.push_back({"setKernelsPath()/CLI", kernels_path_, true});
         }
+        if (const char* env_kernels = std::getenv("PTM_SPICE_KERNELS")) {
+            if (*env_kernels) rungs.push_back({"$PTM_SPICE_KERNELS", env_kernels, true});
+        }
+        if (const char* env_data_root = std::getenv("PTM_DATA_ROOT")) {
+            if (*env_data_root) {
+                rungs.push_back({"$PTM_DATA_ROOT/kernels",
+                                 (std::filesystem::path(env_data_root) / "kernels")
+                                     .lexically_normal().string(),
+                                 false});
+            }
+        }
+        rungs.push_back({"compiled-in SPICE_KERNELS_DIR",
+                         ptm_thermal::config::SPICE_KERNELS_DIR, false});
+
+        std::string chosen;
+        std::string chosen_source;
+        for (const Rung& r : rungs) {
+            if (r.path.empty()) continue;
+            if (r.is_explicit || kernelDirIsUsable(r.path)) {
+                chosen = r.path;
+                chosen_source = r.source;
+                break;
+            }
+        }
+        if (chosen.empty()) {
+            // No usable implicit rung: keep the compiled-in default, which is
+            // what this resolved to before the ladder gained rung 3.
+            chosen = rungs.back().path;
+            chosen_source = rungs.back().source;
+        }
+
+        std::ostringstream report;
+        report << "  SPICE kernel directory resolution (in order):\n";
+        for (const Rung& r : rungs) {
+            const bool taken = (r.path == chosen && r.source == chosen_source);
+            report << "    " << (taken ? "-> " : "   ") << r.source << " = "
+                   << (r.path.empty() ? "(empty)" : r.path);
+            if (r.is_explicit) {
+                report << "  [explicit, taken as given]";
+            } else {
+                report << (kernelDirIsUsable(r.path)
+                               ? "  [has lsk/naif0012.tls]"
+                               : "  [no lsk/naif0012.tls]");
+            }
+            report << "\n";
+        }
+        report << "    (unlisted rungs are unset. Populate a kernel directory with:"
+                  "  python3 scripts/fetch_kernels.py\n"
+                  "     -- see INSTALL.md \"SPICE kernel data\" -- or point"
+                  " $PTM_SPICE_KERNELS at an existing one.)";
+        g_spice_kernel_search_report = report.str();
+
+        kernels_path_ = chosen;
+        kernels_path_resolved_ = true;
+        // Say which directory the run is using, unconditionally. Which kernels
+        // a run read is provenance, not debug output, and the same argument
+        // that made "Loaded SPICE meta-kernel:" unconditional applies here.
+        std::cout << "SPICE kernel directory: " << kernels_path_
+                  << "  (" << chosen_source << ")" << std::endl;
     }
     if (kernels_path_.empty()) {
         std::cerr << "Error: SPICE kernel directory is unresolved (empty).\n"
-                  << "  Resolution order: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
-                  << "  compiled-in SPICE_KERNELS_DIR (CMake; default <repo>/data/kernels).\n"
-                  << "  Populate the kernel directory with: python3 scripts/fetch_kernels.py\n"
-                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+                  << g_spice_kernel_search_report << std::endl;
         return false;
     }
 
@@ -2517,8 +2613,16 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                         std::cout << "Keplerian mode: loaded leapseconds kernel for time conversion" << std::endl;
                     }
                 } else {
-                    std::cout << "Keplerian mode: leapseconds kernel not found at " << lsk_path
-                              << " (time conversion may use approximation)" << std::endl;
+                    // No "may use approximation": there is no approximation
+                    // path. str2et_c cannot convert the configured start_time
+                    // without an LSK and the run dies on it a few screens
+                    // later, so say what will happen and name every directory
+                    // the ladder looked in.
+                    std::cerr << "WARNING: Keplerian mode, but the leapseconds kernel is missing:\n"
+                              << "  " << lsk_path << "\n"
+                              << "  The absolute epoch cannot be resolved without it; the run will\n"
+                              << "  stop at str2et_c with SPICE(NOLEAPSECONDS).\n"
+                              << g_spice_kernel_search_report << std::endl;
                 }
                 spice_initialized = true;
             } catch (const std::exception& e) {
@@ -2602,8 +2706,8 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                     std::cerr << "    " << candidate << "\n";
                 }
                 std::cerr << "  Kernel directory in use: " << kernels_path_ << "\n"
-                          << "  Kernel dir resolution: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
-                          << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
+                          << g_spice_kernel_search_report << "\n"
+                          << "  Fetch kernels + metakernels with:\n"
                           << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag << "\n"
                           << "  (see INSTALL.md \"SPICE kernel data\"), or correct\n"
                           << "  generic_body.spice_metakernel in the configuration."

@@ -9729,7 +9729,18 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
                   << "  The SPICE leapseconds/ephemeris kernels are not loaded, so the absolute\n"
                   << "  epoch cannot be resolved. Populate the kernel directory with:\n"
                   << "      python3 scripts/fetch_kernels.py\n"
-                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+                  << "  (see INSTALL.md, section \"SPICE kernel data\").\n";
+        // Name every directory the kernel ladder searched. This message is the
+        // one a fresh clone actually hits -- including on a Keplerian
+        // generic-body run, which needs no ephemeris but still needs an LSK to
+        // convert start_time -- and "populate the kernel directory" is useless
+        // without saying WHICH directory was looked in.
+        const std::string& ladder = IlluminationModel::spiceKernelSearchReport();
+        std::cerr << (ladder.empty()
+                          ? std::string("  (SPICE kernel directory was never resolved:"
+                                        " initialize_spice() has not run.)")
+                          : ladder)
+                  << std::endl;
         std::exit(1);
     }
 
