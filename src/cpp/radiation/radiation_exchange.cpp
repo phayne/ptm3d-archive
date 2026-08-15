@@ -21,6 +21,52 @@
 
 namespace radiation {
 
+int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
+                         size_t n_faces, bool announce) {
+    if (n_steps <= 0) return 1;
+    const int floor_batch = std::min(n_steps, 4 * std::max(1, n_devices));
+
+    int batch;
+    const char* why;
+    if (configured > 0) {
+        batch = std::min(configured, n_steps);
+        why = "radiation.gpu_batch_size";
+    } else {
+        // Host-memory budget: ~6 vectors of n_faces doubles per timestep live
+        // across the batched call (temps, solar, source albedo, indirect, and
+        // the two per-band batches).
+        constexpr size_t kVectorsPerStep = 6;
+        size_t budget_mb = 4096;
+        if (const char* b = std::getenv("PTM_RAD_POOL_BATCH_BUDGET_MB")) {
+            const long v = std::atol(b);
+            if (v > 0) budget_mb = static_cast<size_t>(v);
+            else std::cerr << "  [Multi-GPU radiosity] WARNING: ignoring "
+                              "PTM_RAD_POOL_BATCH_BUDGET_MB='" << b
+                           << "' (must be a positive integer); using "
+                           << budget_mb << " MB.\n";
+        }
+        const size_t bytes_per_step =
+            std::max<size_t>(1, kVectorsPerStep * n_faces * sizeof(double));
+        const size_t affordable = (budget_mb * 1024ull * 1024ull) / bytes_per_step;
+        batch = static_cast<int>(std::min<size_t>(
+            static_cast<size_t>(n_steps), std::max<size_t>(1, affordable)));
+        why = (batch >= n_steps) ? "auto = whole sweep in one dispatch"
+                                 : "auto, capped by the host batch-memory budget";
+    }
+    // Never worse than the previous default.
+    if (batch < floor_batch) batch = floor_batch;
+
+    if (announce) {
+        const int n_dispatch = (n_steps + batch - 1) / batch;
+        std::cout << "  [Multi-GPU radiosity] dispatching " << batch
+                  << " timesteps/batch across " << n_devices << " GPUs ("
+                  << why << "; " << n_dispatch << " dispatch"
+                  << (n_dispatch == 1 ? "" : "es") << " for " << n_steps
+                  << " timesteps)" << std::endl;
+    }
+    return batch;
+}
+
 // ============================================================================
 // RadiositySolver Implementation
 // ============================================================================
@@ -800,15 +846,21 @@ void RadiositySolver::initGPU() {
                 // dispatch checks distinguish the two rungs.
                 use_gpu_ = true;
                 if (two_band_) two_band_gpu_ok_ = true;
-                pool_batch_size_ = (config_.gpu_batch_size > 0)
-                    ? config_.gpu_batch_size
-                    : 4 * static_cast<int>(gpu_pool_->numDevices());
+                // Advisory only: the dispatching caller resolves the real batch
+                // size per sweep with resolvePoolBatchSize(), which needs the
+                // timestep count this function does not have. Keep this as the
+                // configured value so the two cannot silently disagree -- the
+                // duplicated `4 * n_devices` formula that used to live here was
+                // a second source of truth for the same number.
+                pool_batch_size_ = config_.gpu_batch_size;
                 std::cout << "[Radiosity] ACTIVE RUNG: multi-GPU pool, "
                           << gpu_pool_->numDevices() << " device(s); CSR replica "
                           << gb(needed_bytes) << " GB/device (smallest device "
-                          << gb(min_dev) << " GB VRAM); batch_size="
-                          << pool_batch_size_ << " timesteps/dispatch; row norm applied "
-                             "in-kernel on " << vf_row_norm_count_ << "/" << n << " faces.\n";
+                          << gb(min_dev) << " GB VRAM); gpu_batch_size="
+                          << (pool_batch_size_ > 0 ? std::to_string(pool_batch_size_)
+                                                   : std::string("auto"))
+                          << " (resolved per sweep); row norm applied in-kernel on "
+                          << vf_row_norm_count_ << "/" << n << " faces.\n";
                 return;  // pool active -- done
             }
         }

@@ -684,7 +684,7 @@ warns.
 | `use_gpu` | false | OpenCL radiosity solver |
 | `gpu_devices` | 1 | Devices in the radiosity pool (0 = all enumerated) |
 | `gpu_device_ids` | [] | Explicit device indices; overrides `gpu_devices` |
-| `gpu_batch_size` | 0 | Timesteps per pool round (0 = auto = 4 × devices) |
+| `gpu_batch_size` | 0 | Timesteps per pool dispatch. `0` = auto = **the whole sweep in one dispatch**, reduced only if the host batch buffers (~6 × `n_faces` doubles per timestep) would exceed the 4 GB budget (`PTM_RAD_POOL_BATCH_BUDGET_MB`), and never below the historical `4 × devices`. Small batches split a sweep into many `std::async` round trips: measured 1.37× two-device speedup at batch 8 versus ≈1.94× at whole-sweep on a 472-timestep crater |
 | `gpu_inter_batch_pause_ms` | 0 | Pause between consecutive batches on a device |
 | `verbose` | false | Detailed progress output |
 
