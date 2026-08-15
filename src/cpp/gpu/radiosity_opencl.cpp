@@ -223,12 +223,23 @@ __kernel void solar_source_kernel(
     solar_source[i] = reflectivity[i] * solar_flux[i];
 }
 
-// Jacobi iteration update: B_new = E + solar + rho * (F * B_old)
+// Jacobi iteration update: B_new = E + solar + rho * (rownorm * (F * B_old))
+//
+// row_norm[i] = 1 / max(1, sum_j F_ij) is the SAME energy-conservation
+// renormalization the CPU Jacobi applies to every matvec result
+// (radiation_exchange.cpp solveJacobi / solveTwoBandFused). Applying it here,
+// inside the iteration, is what makes the GPU Jacobi operator identical to the
+// CPU one on a mesh with sum_j F_ij > 1 rows -- previously the GPU applied the
+// row norm only to the FINAL flux, so its iteration matrix was rho*F rather
+// than rho*(norm.F) and the visible band could gain > 1. Where every row sum is
+// <= 1 the buffer is exactly 1.0f and `1.0f * x == x` bitwise, so this is
+// byte-identical to the pre-row-norm kernel on such meshes.
 __kernel void jacobi_kernel(
     __global const float* emission,
     __global const float* solar_source,
     __global const float* reflectivity,
     __global const float* F_B,
+    __global const float* row_norm,
     __global const float* radiosity_old,
     __global float* radiosity_new,
     __global float* change,
@@ -237,23 +248,25 @@ __kernel void jacobi_kernel(
     int i = get_global_id(0);
     if (i >= n_faces) return;
 
-    float B_new = emission[i] + solar_source[i] + reflectivity[i] * F_B[i];
+    float B_new = emission[i] + solar_source[i] + reflectivity[i] * (row_norm[i] * F_B[i]);
     radiosity_new[i] = B_new;
     float diff = B_new - radiosity_old[i];
     change[i] = (diff >= 0.0f) ? diff : -diff;
 }
 
-// Compute absorbed indirect flux: Q_indirect = epsilon * (F * B)
+// Compute absorbed indirect flux: Q_indirect = epsilon * (rownorm * (F * B))
+// Same row normalization as jacobi_kernel; the host no longer post-multiplies.
 __kernel void indirect_flux_kernel(
     __global const float* emissivity,
     __global const float* F_B,
+    __global const float* row_norm,
     __global float* indirect_flux,
     int n_faces)
 {
     int i = get_global_id(0);
     if (i >= n_faces) return;
 
-    indirect_flux[i] = emissivity[i] * F_B[i];
+    indirect_flux[i] = emissivity[i] * (row_norm[i] * F_B[i]);
 }
 )CL_SOURCE";
 }
@@ -261,6 +274,30 @@ __kernel void indirect_flux_kernel(
 static_assert(ptm::kStefanBoltzmann == 5.670374419e-8,
               "ptm::kStefanBoltzmann changed. Update the `#define SIGMA_SB` in "
               "getRadiosityKernelSource(), then update this assert.");
+
+// Convergence-check interval, auto-resolved from the cost of a traversal
+// against the cost of a check. The two constants below are measurements, not
+// tuning: see the derivation and provenance in the header's doc comment for
+// resolveConvergenceCheckInterval(). Changing either changes results at scale,
+// so change them only with a new measurement.
+namespace {
+// Jacobi SpMV throughput on the Radeon Pro W6800X, from the 495,163,704-nnz
+// moon3d CSR at 24.2 ms per traversal (2026-08-15).
+constexpr double kSpmvThroughputNnzPerSec = 2.05e10;
+// Upper bound on one device->host convergence read: the whole fixed per-solve
+// cost of the same arm, which already includes one read (2026-08-15).
+constexpr double kConvergenceReadSeconds = 3.7e-3;
+// Interval used when a traversal is cheaper than a check. This is the shipped
+// historical value, kept so that small meshes stay bit-for-bit on the behavior
+// they were validated against.
+constexpr int kCheapTraversalInterval = 10;
+}  // namespace
+
+int resolveConvergenceCheckInterval(int configured, size_t nnz) {
+    if (configured > 0) return configured;   // pinned by the caller
+    const double t_traversal = static_cast<double>(nnz) / kSpmvThroughputNnzPerSec;
+    return (t_traversal >= kConvergenceReadSeconds) ? 1 : kCheapTraversalInterval;
+}
 
 // RadiosityOpenCLSolver implementation
 
@@ -271,6 +308,24 @@ RadiosityOpenCLSolver::RadiosityOpenCLSolver(size_t n_faces,
     , config_(config)
 {
     change_host_.resize(n_faces);
+
+    // Diagnostic override for the convergence-check interval. Exists so the
+    // auto rule above can be falsified at a new scale without a rebuild; it
+    // changes how many Jacobi iterations run, so it is never silent.
+    if (const char* e = std::getenv("PTM_RAD_GPU_CHECK_INTERVAL")) {
+        const long long v = std::atoll(e);
+        if (v > 0 && v <= 1000000) {
+            config_.convergence_check_interval = static_cast<int>(v);
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_CHECK_INTERVAL=" << v
+                      << ": pinning the convergence-check interval (overrides the "
+                         "auto rule).\n";
+        } else {
+            std::cerr << "  [Radiosity GPU] WARNING: ignoring "
+                         "PTM_RAD_GPU_CHECK_INTERVAL='" << e
+                      << "' (must be a positive integer <= 1000000); the "
+                         "configured/auto interval stands.\n";
+        }
+    }
 }
 
 RadiosityOpenCLSolver::~RadiosityOpenCLSolver() {
@@ -498,6 +553,21 @@ void RadiosityOpenCLSolver::createBuffers() {
     buf_reflectivity_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
                                       n_faces_ * sizeof(float), nullptr, &err);
     check(err, "reflectivity");
+
+    // View-factor row normalization 1/max(1, sum_j F_ij), applied inside the
+    // Jacobi iteration and to the final flux. Seeded to 1.0 (identity) so a
+    // caller that never calls uploadRowNorm() gets exactly the legacy kernel
+    // arithmetic (`1.0f * x == x`).
+    buf_row_norm_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                   n_faces_ * sizeof(float), nullptr, &err);
+    check(err, "row_norm");
+    {
+        const std::vector<float> ones(n_faces_, 1.0f);
+        err = clEnqueueWriteBuffer(context_->queue(), buf_row_norm_, CL_TRUE, 0,
+                                   n_faces_ * sizeof(float), ones.data(),
+                                   0, nullptr, nullptr);
+        check(err, "row_norm(seed=1)");
+    }
 
     buf_change_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
                                 n_faces_ * sizeof(float), nullptr, &err);
@@ -924,6 +994,29 @@ void RadiosityOpenCLSolver::uploadFaceProperties(
     properties_uploaded_ = true;
 }
 
+void RadiosityOpenCLSolver::uploadRowNorm(const std::vector<float>& row_norm)
+{
+    if (!initialized_) {
+        throw std::runtime_error("RadiosityOpenCLSolver not initialized");
+    }
+    // A wrong-length row norm would silently renormalize the wrong faces (or
+    // leave the tail at the 1.0 seed), which is exactly the class of silent
+    // substitution this project refuses. Fail loud.
+    if (row_norm.size() != n_faces_) {
+        throw std::runtime_error("uploadRowNorm: row_norm has " +
+                                 std::to_string(row_norm.size()) + " entries but the solver "
+                                 "was built for " + std::to_string(n_faces_) + " faces");
+    }
+
+    cl_int err = clEnqueueWriteBuffer(context_->queue(), buf_row_norm_, CL_TRUE, 0,
+                                      n_faces_ * sizeof(float), row_norm.data(),
+                                      0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error(std::string("clEnqueueWriteBuffer(row_norm) failed: ") +
+                                 clErrorString(err));
+    }
+}
+
 void RadiosityOpenCLSolver::solve(
     const std::vector<float>& temperatures,
     const std::vector<float>& solar_flux,
@@ -1033,11 +1126,26 @@ void RadiosityOpenCLSolver::solve(
     // SpMV kernel args are set inside enqueueSpMV (which also dispatches to the
     // chunked path when the matrix exceeds the single-buffer wall, PTM-25).
 
-    // Jacobi iteration with periodic convergence checking
-    // Checking every iteration causes PCIe latency overhead; check every N iterations
+    // Jacobi iteration with periodic convergence checking. A check costs one
+    // device->host round trip; not checking costs iterations the solve did not
+    // need. resolveConvergenceCheckInterval() weighs the two for THIS matrix
+    // (see its doc comment for the measurements behind the threshold).
     converged_ = false;
     last_residual_ = std::numeric_limits<double>::max();
-    const int check_interval = std::max(1, config_.convergence_check_interval);
+    const int check_interval =
+        resolveConvergenceCheckInterval(config_.convergence_check_interval, nnz_);
+    if (!logged_check_interval_) {
+        logged_check_interval_ = true;
+        std::cout << "  [Radiosity GPU] convergence check every " << check_interval
+                  << " Jacobi iteration" << (check_interval == 1 ? "" : "s")
+                  << " ("
+                  << (config_.convergence_check_interval > 0
+                          ? "pinned"
+                          : (check_interval == 1
+                                 ? "auto: a traversal of this matrix costs more than a check"
+                                 : "auto: a check costs more than a traversal of this matrix"))
+                  << "; nnz = " << nnz_ << ")\n";
+    }
 
     // Ensure tolerance is safe for single-precision (float has ~7 significant digits)
     const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);
@@ -1057,6 +1165,8 @@ void RadiosityOpenCLSolver::solve(
             checkErr(err, "clSetKernelArg(jacobi_kernel,reflectivity)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_F_B_);
             checkErr(err, "clSetKernelArg(jacobi_kernel,F_B)");
+            err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_row_norm_);
+            checkErr(err, "clSetKernelArg(jacobi_kernel,row_norm)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_radiosity_);
             checkErr(err, "clSetKernelArg(jacobi_kernel,radiosity)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_radiosity_new_);
@@ -1100,6 +1210,8 @@ void RadiosityOpenCLSolver::solve(
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,emissivity)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_F_B_);
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,F_B)");
+        err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_row_norm_);
+        checkErr(err, "clSetKernelArg(indirect_flux_kernel,row_norm)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_indirect_flux_);
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,indirect_flux)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(int), &n_faces);
@@ -1259,6 +1371,7 @@ void RadiosityOpenCLSolver::release() {
     // Release property buffers
     if (buf_emissivity_) { clReleaseMemObject(buf_emissivity_); buf_emissivity_ = nullptr; }
     if (buf_reflectivity_) { clReleaseMemObject(buf_reflectivity_); buf_reflectivity_ = nullptr; }
+    if (buf_row_norm_) { clReleaseMemObject(buf_row_norm_); buf_row_norm_ = nullptr; }
 
     // Release convergence buffer
     if (buf_change_) { clReleaseMemObject(buf_change_); buf_change_ = nullptr; }

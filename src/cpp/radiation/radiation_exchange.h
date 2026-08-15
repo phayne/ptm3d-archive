@@ -26,6 +26,27 @@ namespace radiation {
 // Stefan-Boltzmann constant [W m^-2 K^-4]
 constexpr double SIGMA_SB = ptm::kStefanBoltzmann;
 
+// Resolve how many timesteps the multi-GPU radiosity pool dispatches per batch.
+//
+// `configured` is radiation.gpu_batch_size (0 = auto). Auto now means ONE
+// DISPATCH PER SWEEP, capped only by the host memory the batch buffers need:
+// the old auto of 4 x n_devices split a sweep into dozens of std::async
+// round-trips and measurably cost ~30% of the pool's speedup (1.37x measured at
+// batch 8 vs ~1.94x at whole-sweep, 2 devices, 472-timestep crater).
+//
+// The cap exists because the batched path holds ~6 vectors of n_faces doubles
+// per timestep in HOST memory (temperatures, solar, source albedo, indirect, and
+// the two per-band batches). At 509,337 faces that is ~24 MB per timestep, so a
+// several-hundred-timestep sweep would otherwise reserve many GB. The budget
+// defaults to 4 GB and is overridable with PTM_RAD_POOL_BATCH_BUDGET_MB.
+//
+// Never returns less than 4 x n_devices (the previous default), so this cannot
+// make any run slower than it was, and never more than n_steps.
+//
+// @param announce  print the resolved value and the reason (once per sweep).
+int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
+                         size_t n_faces, bool announce);
+
 // Abstract interface for view factor matrix-vector product
 // Allows RadiositySolver to work with either ViewFactorMatrix or HMatrixViewFactor
 class IViewFactorOperator {
@@ -217,9 +238,11 @@ public:
     // True iff the GPU pool was successfully initialized (gpu_devices > 1).
     bool hasGPUPool() const;
 
-    // True iff the GPU two-band path (solveGPUTwoBand) is active after initGPU()
-    // (band-separated + GPU init succeeded + all Σ_j F_ij ≤ 1). Lets a test confirm
-    // the GPU path actually engaged rather than silently falling back to CPU.
+    // True iff a GPU two-band path is active after initGPU() — either the
+    // single-GPU solveGPUTwoBand or the multi-GPU pool's two-band solveBatch.
+    // Lets a test confirm the GPU path actually engaged rather than silently
+    // falling back to CPU. Before the pool set use_gpu_/two_band_gpu_ok_ this
+    // reported false on an active pool.
     bool isGPUTwoBand() const {
 #ifdef PTM_GPU_OPENCL
         return two_band_gpu_ok_ && use_gpu_;
@@ -419,11 +442,11 @@ private:
     // Enabled by PTM_RAD_TWO_BAND (requires PTM_SOLAR_ALBEDO for the Bond albedo A).
     // OFF by default => the legacy single gray-band path runs, byte-identical.
     bool two_band_ = false;
-    // True iff the GPU is running the two-band solve (B1). Only enabled when every
-    // vf_row_norm_[i] == 1 (no Σ_j F_ij > 1 row), because the GPU Jacobi kernel does
-    // NOT apply the row-norm inside its iteration (the GPU analog of PTM-08). On a
-    // mesh with an overshoot row the GPU visible band would diverge, so two-band with
-    // any Σ>1 row falls back to the row-norm-protected CPU solve (warned in initGPU).
+    // True iff the GPU is running the two-band solve (B1). The GPU Jacobi kernel
+    // now applies vf_row_norm_ inside its iteration (uploadRowNorm), so it runs the
+    // same operator ρ·(norm⊙F) as the CPU and a Σ_j F_ij > 1 row is no longer a
+    // reason to refuse the GPU. What initGPU still checks is the actual divergence
+    // criterion: the Jacobi gain ρ_max · max_i min(Σ_j F_ij, 1) must be < 1.
     bool two_band_gpu_ok_ = false;
     // Absorbed indirect flux from each band, from the last solveTwoBand() (the new
     // per-band product). Their sum is what solve() returns and the surface BC consumes.
@@ -455,6 +478,15 @@ private:
     // solar constant, clamping temperatures to MIN/MAX). Multiplying every F·x
     // result by this factor renormalizes to an energy-conserving F̂·x.
     std::vector<double> vf_row_norm_;
+    // max_i Σ_j F_ij and the count of rows the normalization touched, kept from the
+    // one F·1 matvec above so the GPU gate can score the real divergence criterion
+    // (gain = ρ_max · max_i min(Σ_j F_ij, 1)) instead of re-deriving it.
+    double vf_row_sum_max_ = 0.0;
+    size_t vf_row_norm_count_ = 0;
+    // True when PTM_HMATRIX_VF_REPLACE installed the corrected CSR as a CPU-only
+    // SparseVFOperator (i.e. PTM_HMATRIX_VF_REPLACE_GPU was NOT set). initGPU()
+    // reports it when the config also asked for GPU radiosity.
+    bool vf_replace_cpu_route_ = false;
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL
@@ -463,9 +495,24 @@ private:
     // Multi-GPU dispatch pool (used when gpu_devices > 1). When set, each
     // batch picks the next-idle device's persistent solver and calls solve().
     std::unique_ptr<gpu::opencl::RadiosityGPUDevicePool> gpu_pool_;
+    // True when ANY GPU rung is active. gpu_solver_ != nullptr means the
+    // single-GPU rung; gpu_pool_ != nullptr means the multi-GPU pool rung.
     bool use_gpu_ = false;
     int  pool_batch_size_ = 0;  // resolved from config: 4 * n_devices when 0/auto
+    bool pool_single_fallback_warned_ = false;
 #endif
+
+    // Set while solveBatch runs its serial per-timestep fallback, so solve()
+    // cannot bounce that timestep back into solveBatch. Declared outside the
+    // GPU #ifdef because solveBatch's serial loop is compiled in both builds.
+    bool in_batch_serial_ = false;
+    struct BatchSerialGuard {
+        bool& flag;
+        explicit BatchSerialGuard(bool& f) : flag(f) { flag = true; }
+        ~BatchSerialGuard() { flag = false; }
+        BatchSerialGuard(const BatchSerialGuard&) = delete;
+        BatchSerialGuard& operator=(const BatchSerialGuard&) = delete;
+    };
 
     // Convergence tracking
     int last_iterations_ = 0;

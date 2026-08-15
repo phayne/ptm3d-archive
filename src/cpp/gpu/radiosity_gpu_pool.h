@@ -84,14 +84,20 @@ public:
     /// Returns false if any device fails to initialize.
     bool initialize(size_t n_faces, const RadiosityOpenCLConfig& solver_cfg);
 
-    /// Replicate the CSR view-factor matrix and face properties to every
-    /// initialized device. Returns false if any upload fails.
+    /// Replicate the CSR view-factor matrix, face properties and the
+    /// view-factor row normalization to every initialized device. Returns
+    /// false if any upload fails.
+    ///
+    /// @param row_norm Per-face 1/max(1, sum_j F_ij), applied inside each
+    ///        device's Jacobi iteration. Pass an empty vector to leave every
+    ///        device at the 1.0 identity seed (legacy arithmetic).
     bool uploadStaticData(
         const std::vector<double>& csr_values,
         const std::vector<int>& csr_col_indices,
         const std::vector<int64_t>& csr_row_ptrs,
         const std::vector<float>& emissivity,
-        const std::vector<float>& reflectivity);
+        const std::vector<float>& reflectivity,
+        const std::vector<float>& row_norm = {});
 
     /// Number of devices the pool dispatches across.
     size_t numDevices() const noexcept { return slots_.size(); }
