@@ -4870,6 +4870,34 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
 
+    // BUGS.md PTM-SIGSEGV-450LAYER: the CPU SIMD batch path's ThermalBatchSoA
+    // stack-allocates every per-layer array at a fixed size
+    // (thermal::MAX_THERMAL_LAYERS). A discrete buried-ice-layer grid
+    // (generic_body.surface.ice_depth + a fine thermal_m to resolve the
+    // interface) can need far more layers than a typical column -- 450 on
+    // the configs that first hit this -- which used to overflow those
+    // arrays (a stack-buffer-overflow / SIGSEGV deep inside the parallel
+    // region, confirmed via AddressSanitizer) instead of failing cleanly.
+    // Refuse HERE, before spawning the OpenMP region, mirroring the GPU
+    // host-side MAX_LAYERS preflight check (thermal_opencl.cpp) -- the two
+    // ThermalBatchSoA methods below carry the same check as a backstop, but
+    // this is the one that lets the run exit cleanly (return false) instead
+    // of aborting mid-parallel-region.
+    if (n_layers > thermal::MAX_THERMAL_LAYERS) {
+        std::cerr << "\n[SIMD Batch] FATAL: this run's depth grid has " << n_layers
+                  << " layers, but the CPU SIMD batch solver can only hold "
+                  << thermal::MAX_THERMAL_LAYERS << " (thermal::MAX_THERMAL_LAYERS).\n"
+                     "  Every per-layer array in ThermalBatchSoA is a fixed-size stack "
+                     "buffer; a taller\n"
+                     "  column would overflow it rather than silently truncate.\n"
+                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or "
+                     "raise\n"
+                     "  MAX_THERMAL_LAYERS in thermal_model.h if this column genuinely "
+                     "needs more\n"
+                     "  depth resolution." << std::endl;
+        return false;
+    }
+
     // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
     // same reader/writer as the GPU persistent solver. This batch path shares
     // ONE grid across every face (the ref_profile above), so unlike the CPU
