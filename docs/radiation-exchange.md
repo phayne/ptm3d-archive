@@ -302,6 +302,18 @@ $$\frac{\max_i |B_i^{(k+1)} - B_i^{(k)}|}{\max_i |B_i^{(k+1)}|} < \tau_{\text{so
 (`convergence_tolerance`, default 0.01) or at `max_iterations` (default 100). Diagnostics:
 `getLastIterations()`, `getLastResidual()`, `didConverge()`.
 
+The CPU paths apply that test every iteration — the residual is already in host memory. The GPU
+path must pay a device→host round trip for it, so it tests every
+`convergence_check_interval` iterations and can therefore only stop at a multiple of that
+interval. The default, `0`, resolves the interval per matrix
+(`gpu::opencl::resolveConvergenceCheckInterval`) by weighing the cost of one Jacobi traversal,
+$\approx \text{nnz}/2.05\times10^{10}\,\mathrm{s}$, against the ~3.7 ms of one convergence read:
+above ≈7.6e7 stored non-zeros a traversal is the more expensive of the two and the solver checks
+every iteration; below it, it checks every 10. Both constants were measured on a Radeon Pro
+W6800X on 2026-08-15 (509,337-face lunar CSR at 495,163,704 nnz, and a 12,800-face bowl crater).
+A positive `convergence_check_interval` pins it instead. See
+[ENVIRONMENT.md](ENVIRONMENT.md) `PTM_RAD_GPU_CHECK_INTERVAL` for the diagnostic override.
+
 Absorbed flux is recovered from the converged radiosity by the fixed-point identity
 $w \odot F\mathbf{B} = (\mathbf{B} - \mathbf{E} - \text{source})/\rho$, which avoids a second
 matrix-vector product; where the reflectivity approaches zero the last iterate's normalized
@@ -319,7 +331,7 @@ available as `RadiositySolver::checkEnergyBalance()`.
 
 With `radiation.use_gpu: true` (or `--rad-use-gpu`) the solve is offloaded to OpenCL. The GPU path
 uses CSR sparse matrix-vector multiply for $F\mathbf{B}$, parallel Jacobi iteration with a
-convergence check every 10 iterations, and warm starts from the previous solution in the gray
+periodic convergence check, and warm starts from the previous solution in the gray
 path. Kernels: `spmv_kernel`, `spmv_vector_kernel`, `spmv_chunk_kernel`,
 `spmv_vector_chunk_kernel`, `max_reduction_kernel`, `emission_kernel`, `solar_source_kernel`,
 `jacobi_kernel`, `indirect_flux_kernel`. The chunked variants split very large matrices across

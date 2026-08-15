@@ -34,6 +34,9 @@
 #include "radiation_exchange.h"
 #include "view_factor.h"
 #include "radiation_config.h"
+#ifdef PTM_GPU_OPENCL
+#include "../gpu/radiosity_opencl.h"   // resolveConvergenceCheckInterval (B1e)
+#endif
 
 #include <cstdlib>
 #include <cmath>
@@ -479,6 +482,153 @@ int runB1d() {
 }
 
 // ---------------------------------------------------------------------------
+// B1e: the convergence-check interval the CALLER configures must be the interval
+// the GPU Jacobi uses -- and the auto rule must land on the side each scale's
+// measurement demands.
+//
+// RadiationConfig::convergence_check_interval was never copied into
+// RadiosityOpenCLConfig, so the GPU solver's own hard-coded 10 was the only
+// value that ever existed. On the 509,337-face flagship that ran 10 Jacobi
+// iterations where the solve had already stagnated at 2, and GPU radiosity
+// measured 1.74x SLOWER than the CPU (2026-08-15).
+//
+// DISCRIMINATING, in two independent ways:
+//  1. Pure: resolveConvergenceCheckInterval() must return 1 for the flagship's
+//     nnz and 10 for the crater's. A threshold moved to either side of either
+//     measured arm fails here, without a GPU.
+//  2. Wired: with the interval pinned to k, a Jacobi that first satisfies the
+//     tolerance at iteration m can only stop at ceil(m/k)*k. Measure m with
+//     k = 1, then require exactly that count for k = 3 and k = 7. If the
+//     configured value never reaches the solver, both arms report the
+//     hard-coded 10's multiple instead and this fails. It FAILS rather than
+//     SKIPs when the GPU declines to engage: a silent CPU fallback is the
+//     failure mode under test.
+//     The two-band GPU path reports the VISIBLE band (the second of its two
+//     solves) through getLastIterations(); that is the count used here.
+int runB1e() {
+#ifdef PTM_GPU_OPENCL
+    std::printf("=== B1e: convergence_check_interval is forwarded, and auto is sized ===\n");
+    int fail = 0;
+
+    // --- 1. The auto rule, on the two measured arms and across its threshold.
+    // Threshold = kConvergenceReadSeconds * kSpmvThroughputNnzPerSec
+    //           = 3.7e-3 s * 2.05e10 nnz/s = 7.585e7 nnz.
+    struct RCase { int configured; size_t nnz; int want; const char* why; };
+    const RCase rcases[] = {
+        {0, 495163704u, 1,  "509,337-face moon3d CSR: 24.2 ms/traversal >> a check"},
+        {0,   2000000u, 10, "12,800-face bowl crater: 0.38 ms/traversal << a check"},
+        {0,  75000000u, 10, "just below the break-even (7.585e7 nnz)"},
+        {0,  77000000u, 1,  "just above the break-even (7.585e7 nnz)"},
+        {0,         0u, 10, "empty matrix: never pay for a check"},
+        {7, 495163704u, 7,  "pinned beats auto (flagship)"},
+        {7,      2000u, 7,  "pinned beats auto (tiny)"},
+    };
+    for (const auto& c : rcases) {
+        const int got = gpu::opencl::resolveConvergenceCheckInterval(c.configured, c.nnz);
+        const bool ok = (got == c.want);
+        std::printf("  resolve(configured=%d, nnz=%zu) = %d (want %d) %-6s  %s\n",
+                    c.configured, c.nnz, got, c.want, ok ? "PASS" : "FAIL", c.why);
+        if (!ok) ++fail;
+    }
+
+    // --- 2. The forwarding, measured through the public solver.
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+    // A pinned diagnostic override would defeat the very thing under test.
+    unsetenv("PTM_RAD_GPU_CHECK_INTERVAL");
+
+    auto run_with = [&](int interval, int& iters, std::vector<double>& ind) -> bool {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000;
+        cfg.convergence_tolerance = 1e-6;   // GPU floors this at 1e-5 absolute
+        cfg.use_acceleration = false;
+        cfg.use_gpu = true;
+        cfg.verbose = false;
+        cfg.convergence_check_interval = interval;
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(cfg);
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) return false;
+        ind = solver.solve(T, solar);
+        iters = solver.getLastIterations();
+        return true;
+    };
+
+    int m = 0;
+    std::vector<double> ind1;
+    bool engaged = false;
+    try {
+        engaged = run_with(1, m, ind1);
+    } catch (const std::exception& e) {
+        std::printf("  B1e FAIL: the k=1 reference threw (%s).\n", e.what());
+        return fail + 1;
+    }
+    if (!engaged) {
+        std::printf("  B1e FAIL: single-GPU two-band did not engage, so the forwarding "
+                    "cannot be observed. A CPU fallback here is the defect, not a skip.\n\n");
+        return fail + 1;
+    }
+    std::printf("  k=1: converged at iteration m = %d (the true stopping iteration)\n", m);
+    if (m < 4) {
+        std::printf("  B1e FAIL: m=%d is too small to distinguish k=3, k=7 and the "
+                    "hard-coded 10; the test enclosure no longer discriminates.\n", m);
+        ++fail;
+    }
+
+    for (int k : {3, 7}) {
+        int iters = 0;
+        std::vector<double> indk;
+        bool ok_engage = false;
+        try {
+            ok_engage = run_with(k, iters, indk);
+        } catch (const std::exception& e) {
+            std::printf("  B1e FAIL: k=%d threw (%s).\n", k, e.what());
+            ++fail;
+            continue;
+        }
+        if (!ok_engage) {
+            std::printf("  B1e FAIL: k=%d did not engage the GPU.\n", k);
+            ++fail;
+            continue;
+        }
+        const int want = ((m + k - 1) / k) * k;
+        const bool ok = (iters == want);
+        std::printf("  k=%d: iters = %d (want ceil(%d/%d)*%d = %d) %s\n",
+                    k, iters, m, k, k, want, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            std::printf("       -> the configured interval did not reach the GPU solver "
+                        "(a hard-coded interval would stop at a multiple of itself).\n");
+            ++fail;
+        }
+        // Stopping later cannot change a converged answer by more than the
+        // tolerance; if it does, the tolerance is the thing that is wrong.
+        double maxabs = 0.0;
+        for (int i = 0; i < N; ++i) maxabs = std::max(maxabs, std::abs(indk[i] - ind1[i]));
+        std::printf("       max|Q_ind(k=%d) - Q_ind(k=1)| = %.3e W/m^2 (tolerance 1e-5)\n",
+                    k, maxabs);
+        if (!(maxabs < 1e-4)) {
+            std::printf("  B1e FAIL: checking earlier changed the converged answer by more "
+                        "than the solver tolerance allows.\n");
+            ++fail;
+        }
+    }
+
+    std::printf("  B1e verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+    return fail ? 1 : 0;
+#else
+    std::printf("=== B1e: SKIP (built without PTM_GPU_OPENCL; the interval is a GPU-only "
+                "knob -- the CPU paths test the residual every iteration). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // B1b (BUGS.md PTM-11): the single-GPU two-band gate is ORDERING-SENSITIVE.
 // two_band_gpu_ok_ is set inside initGPU() ONLY if two_band_ is already true at that
 // moment (radiation_exchange.cpp:359-360). So the per-face Bond albedo + enableTwoBand()
@@ -660,10 +810,11 @@ int main() {
     int b1_fail = runB1();
     int b1c_fail = runB1c();
     int b1d_fail = runB1d();
+    int b1e_fail = runB1e();
     int b1b_fail = runB1b();
 
     std::printf("=== OVERALL: A0/A1 fails=%d  JACOBI fails=%d  A2 fails=%d  B1 fails=%d  "
-                "B1c fails=%d  B1d fails=%d  B1b fails=%d ===\n",
-                n_fail, n_jac_fail, a2_fail, b1_fail, b1c_fail, b1d_fail, b1b_fail);
-    return n_fail + n_jac_fail + a2_fail + b1_fail + b1c_fail + b1d_fail + b1b_fail;
+                "B1c fails=%d  B1d fails=%d  B1e fails=%d  B1b fails=%d ===\n",
+                n_fail, n_jac_fail, a2_fail, b1_fail, b1c_fail, b1d_fail, b1e_fail, b1b_fail);
+    return n_fail + n_jac_fail + a2_fail + b1_fail + b1c_fail + b1d_fail + b1e_fail + b1b_fail;
 }
