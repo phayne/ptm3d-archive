@@ -275,6 +275,30 @@ static_assert(ptm::kStefanBoltzmann == 5.670374419e-8,
               "ptm::kStefanBoltzmann changed. Update the `#define SIGMA_SB` in "
               "getRadiosityKernelSource(), then update this assert.");
 
+// Convergence-check interval, auto-resolved from the cost of a traversal
+// against the cost of a check. The two constants below are measurements, not
+// tuning: see the derivation and provenance in the header's doc comment for
+// resolveConvergenceCheckInterval(). Changing either changes results at scale,
+// so change them only with a new measurement.
+namespace {
+// Jacobi SpMV throughput on the Radeon Pro W6800X, from the 495,163,704-nnz
+// moon3d CSR at 24.2 ms per traversal (2026-08-15).
+constexpr double kSpmvThroughputNnzPerSec = 2.05e10;
+// Upper bound on one device->host convergence read: the whole fixed per-solve
+// cost of the same arm, which already includes one read (2026-08-15).
+constexpr double kConvergenceReadSeconds = 3.7e-3;
+// Interval used when a traversal is cheaper than a check. This is the shipped
+// historical value, kept so that small meshes stay bit-for-bit on the behavior
+// they were validated against.
+constexpr int kCheapTraversalInterval = 10;
+}  // namespace
+
+int resolveConvergenceCheckInterval(int configured, size_t nnz) {
+    if (configured > 0) return configured;   // pinned by the caller
+    const double t_traversal = static_cast<double>(nnz) / kSpmvThroughputNnzPerSec;
+    return (t_traversal >= kConvergenceReadSeconds) ? 1 : kCheapTraversalInterval;
+}
+
 // RadiosityOpenCLSolver implementation
 
 RadiosityOpenCLSolver::RadiosityOpenCLSolver(size_t n_faces,
@@ -284,6 +308,24 @@ RadiosityOpenCLSolver::RadiosityOpenCLSolver(size_t n_faces,
     , config_(config)
 {
     change_host_.resize(n_faces);
+
+    // Diagnostic override for the convergence-check interval. Exists so the
+    // auto rule above can be falsified at a new scale without a rebuild; it
+    // changes how many Jacobi iterations run, so it is never silent.
+    if (const char* e = std::getenv("PTM_RAD_GPU_CHECK_INTERVAL")) {
+        const long long v = std::atoll(e);
+        if (v > 0 && v <= 1000000) {
+            config_.convergence_check_interval = static_cast<int>(v);
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_CHECK_INTERVAL=" << v
+                      << ": pinning the convergence-check interval (overrides the "
+                         "auto rule).\n";
+        } else {
+            std::cerr << "  [Radiosity GPU] WARNING: ignoring "
+                         "PTM_RAD_GPU_CHECK_INTERVAL='" << e
+                      << "' (must be a positive integer <= 1000000); the "
+                         "configured/auto interval stands.\n";
+        }
+    }
 }
 
 RadiosityOpenCLSolver::~RadiosityOpenCLSolver() {
@@ -1084,11 +1126,26 @@ void RadiosityOpenCLSolver::solve(
     // SpMV kernel args are set inside enqueueSpMV (which also dispatches to the
     // chunked path when the matrix exceeds the single-buffer wall, PTM-25).
 
-    // Jacobi iteration with periodic convergence checking
-    // Checking every iteration causes PCIe latency overhead; check every N iterations
+    // Jacobi iteration with periodic convergence checking. A check costs one
+    // device->host round trip; not checking costs iterations the solve did not
+    // need. resolveConvergenceCheckInterval() weighs the two for THIS matrix
+    // (see its doc comment for the measurements behind the threshold).
     converged_ = false;
     last_residual_ = std::numeric_limits<double>::max();
-    const int check_interval = std::max(1, config_.convergence_check_interval);
+    const int check_interval =
+        resolveConvergenceCheckInterval(config_.convergence_check_interval, nnz_);
+    if (!logged_check_interval_) {
+        logged_check_interval_ = true;
+        std::cout << "  [Radiosity GPU] convergence check every " << check_interval
+                  << " Jacobi iteration" << (check_interval == 1 ? "" : "s")
+                  << " ("
+                  << (config_.convergence_check_interval > 0
+                          ? "pinned"
+                          : (check_interval == 1
+                                 ? "auto: a traversal of this matrix costs more than a check"
+                                 : "auto: a check costs more than a traversal of this matrix"))
+                  << "; nnz = " << nnz_ << ")\n";
+    }
 
     // Ensure tolerance is safe for single-precision (float has ~7 significant digits)
     const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);

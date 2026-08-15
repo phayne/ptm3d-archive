@@ -27,10 +27,50 @@ struct RadiosityOpenCLConfig {
     size_t work_group_size = 256;      // Work items per work group
     int max_iterations = 100;          // Max Jacobi iterations
     double convergence_tolerance = 1e-4;  // Convergence tolerance (safe for float precision)
-    int convergence_check_interval = 10;  // Check convergence every N iterations
+    // Check convergence every N Jacobi iterations. 0 = auto, resolved per
+    // matrix by resolveConvergenceCheckInterval() below; > 0 pins it.
+    int convergence_check_interval = 0;
     bool warm_start = true;            // Warm start from previous solution
     bool verbose = false;
 };
+
+/**
+ * @brief Resolve the Jacobi convergence-check interval for one matrix.
+ *
+ * A convergence check costs one device->host round trip (a reduction kernel
+ * plus a blocking read of the per-work-group partial maxima). Not checking
+ * costs Jacobi iterations the solve did not need: the loop can only stop at a
+ * multiple of the interval, so a solve that has already stagnated at iteration
+ * 2 still runs to 10. Which of the two dominates is a property of the MATRIX,
+ * not of the mesh's face count, so this compares the two costs directly:
+ *
+ *     t_traversal (per iteration) ~= nnz / kSpmvThroughputNnzPerSec
+ *     t_check     (per check)     ~= kConvergenceReadSeconds
+ *
+ * and checks every iteration only when one traversal costs at least as much as
+ * one check. Both constants are MEASURED on this machine's Radeon Pro W6800X,
+ * 2026-08-15, and are the provenance of the threshold:
+ *
+ *   * 509,337-face moon3d CSR, nnz = 495,163,704: 24.2 ms per Jacobi traversal
+ *     (=> 2.05e10 nnz/s) and 3.7 ms of fixed per-solve cost INCLUDING one
+ *     convergence read -- so 3.7 ms is an upper bound on the read alone. The
+ *     shipped interval of 10 made the GPU sweep 1.74x SLOWER than the CPU
+ *     while the solve reported resid = 0 at iteration 10.
+ *   * 12,800-face bowl crater, sparse VF (~2e6 nnz): 0.38 ms per traversal --
+ *     64x cheaper, while the read is a latency and barely moves with size.
+ *     Forcing a check every iteration there measured +29 % wall clock.
+ *
+ * The resulting threshold, nnz > 7.6e7, sits 6.5x below the flagship and 38x
+ * above the crater: both measured arms are far from it, on the side their own
+ * measurement demands. Deliberately a function of nnz and not of wall clock --
+ * a timing-dependent interval would make the iteration count, and therefore
+ * the bits of the answer, vary run to run.
+ *
+ * @param configured `RadiosityOpenCLConfig::convergence_check_interval`.
+ * @param nnz Stored non-zeros of the view-factor matrix on this device.
+ * @return Iterations between convergence checks (>= 1).
+ */
+int resolveConvergenceCheckInterval(int configured, size_t nnz);
 
 /**
  * @brief OpenCL-accelerated radiosity solver
@@ -270,6 +310,9 @@ private:
     double last_residual_ = 0.0;
     bool converged_ = false;
     float last_solve_time_ms_ = 0.0f;
+    // Announce the resolved check interval once per solver (per device in a
+    // pool), not once per timestep.
+    bool logged_check_interval_ = false;
 };
 
 /**

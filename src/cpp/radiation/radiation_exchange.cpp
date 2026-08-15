@@ -682,6 +682,7 @@ void RadiositySolver::initGPU() {
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
     gpu_config.convergence_tolerance = config_.convergence_tolerance;
+    gpu_config.convergence_check_interval = config_.convergence_check_interval;
     gpu_config.verbose = config_.verbose;
     // Two-band runs two solves per call with different sources; a cold start each
     // solve keeps the visible band from warm-starting off the IR radiosity and makes
@@ -819,6 +820,7 @@ void RadiositySolver::initGPU() {
             gpu::opencl::RadiosityOpenCLConfig solver_cfg;
             solver_cfg.max_iterations = config_.max_iterations;
             solver_cfg.convergence_tolerance = config_.convergence_tolerance;
+            solver_cfg.convergence_check_interval = config_.convergence_check_interval;
             solver_cfg.verbose = config_.verbose;
             // Cross-batch warm-start has no meaning across devices — disable it.
             solver_cfg.warm_start = false;
