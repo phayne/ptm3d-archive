@@ -323,7 +323,7 @@ illumination:
 radiation:
   enabled: false
   use_hmatrix: false
-  max_coupling_iterations: 10
+  max_coupling_iterations: 16
   coupling_temp_threshold: 0.5   # K
   coupling_flux_threshold: 0.1   # W/m^2
   coupling_mode: bounded         # bounded | fixed | legacy (see

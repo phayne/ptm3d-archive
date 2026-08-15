@@ -479,7 +479,7 @@ warm, because restoring a positive absorbed flux can only raise a temperature.
 
 | Quantity | YAML key | Flag | Default |
 |---|---|---|---|
-| $k_{\max}$ | `max_coupling_iterations` | `--rad-coupling-iter` | 10 |
+| $k_{\max}$ | `max_coupling_iterations` | `--rad-coupling-iter` | 16 |
 | $\tau_T$ | `coupling_temp_threshold` | `--rad-coupling-temp-tol` | 0.5 K |
 | $\tau_Q$ | `coupling_flux_threshold` | `--rad-coupling-flux-tol` | 0.1 W m<sup>-2</sup> (`legacy` selection only) |
 | $f_{\text{threshold}}$ | `coupling_face_fraction` | `--rad-coupling-face-frac` | 0.01 (`legacy` coupling mode only) |
@@ -490,6 +490,48 @@ warm, because restoring a positive absorbed flux can only raise a temperature.
 
 An unrecognized `coupling_mode` or `exchange_selection` is fatal at configuration time, before the
 illumination pass.
+
+#### 7.5.1 Choosing $k_{\max}$ from the view-factor spectrum
+
+$k_{\max}$ was raised from 10 to **16** on 2026-08-15, and the reason is that it should never have
+been chosen by habit in the first place. Linearize the outer loop — radiosity, then re-thermal —
+about a converged state. The re-thermal's temperature response to a flux perturbation is
+$G \le D^{-1}$ with $D = \mathrm{diag}(4\varepsilon\sigma T^3)$ (equality in the
+radiative-equilibrium limit; conduction only shrinks it), and the radiosity's response to a
+temperature perturbation is $\varepsilon F (I - \rho_r F)^{-1} D$ with $\rho_r = 1-\varepsilon$.
+The iteration matrix is therefore
+
+$$M = G\,\varepsilon F (I-\rho_r F)^{-1} D,$$
+
+which is similar to $\varepsilon F (I-\rho_r F)^{-1}$ — **the $T^3$ factors cancel**. The
+asymptotic sweep-to-sweep rate is then a property of the geometry alone:
+
+$$r \;\le\; \frac{\varepsilon\,\rho(F)}{1 - (1-\varepsilon)\,\rho(F)},\qquad
+\rho(F) = \text{spectral radius of the view-factor matrix}.$$
+
+Measured at two meshes, three digits:
+
+| mesh | max row sum | $\rho(F)$ | predicted $r$ | measured $r$ |
+|---|---|---|---|---|
+| 509k lunar flagship (`..._corrected_pp.csr`, 495.2M nnz) | 1.0000 | 0.7766 | 0.7676 | **0.7451** |
+| 12,800-face `lunar_crater_80N` (tutorial 04) | 0.13988 | 0.13409 | 0.1282 | **0.077–0.128** |
+
+On the flagship the sweep-to-sweep increment first falls below 2 K at sweep 12, below **1 K at
+sweep 16**, and below 0.1 K at sweep 23. A run capped at 5 sweeps was truncated by up to **+26.2 K**
+on its worst face, and the truncation is one-signed — a capped run is **cold** on the most enclosed
+faces (99.4 % of moving faces warm when the cap is lifted). Cold-trap area statistics moved <0.03 pp,
+but the hot tail did not: faces above 400 K rose 1056 → 1168 and the global maximum 460.7 → 477.1 K.
+
+⚠️ **The 80 N crater is not a proxy for the flagship.** Its maximum row sum is 0.14 against 1.00, it
+reaches 0.01 K by sweep 5, and $k=20$ differs from $k=5$ by 0.0013 K. A coupling-convergence study
+run there will report "5 sweeps is plenty" and tell you nothing about a closed lunar enclosure.
+**Pick the test mesh by its row-sum distribution, not by its name.**
+
+⚠️ Read the row-sum maximum from `vf_rowsum_dump`, not from the run log: the engine's
+`[Radiosity] View-factor row sums Σ_j F_ij: max=…` line prints at default `std::cout` precision, so
+the crater's 0.13988 shows there as `max=0.1`. That rounding is where the crater's ρ was first
+recorded as "≈0.081" — a value Perron-Frobenius makes impossible to distinguish from the real
+0.13409 by eye, since both sit below the true row-sum bound.
 
 ### 7.6 Other coupling behavior
 
@@ -685,7 +727,7 @@ warns.
 | `rms_slope_deg` | 0.0 | Smith beamed emission; 0 = Lambertian |
 | `beam_vf_threshold` | 1e-7 | Smallest renormalized view factor kept as a beam pair |
 | `radiance_prune_eps` | 0.0 | Radiance-weighted pruning threshold, applied at assembly (§11) |
-| `max_coupling_iterations` | 10 | Picard iteration cap |
+| `max_coupling_iterations` | 16 | Picard iteration cap |
 | `coupling_temp_threshold` | 0.5 | Temperature convergence threshold (K) |
 | `coupling_flux_threshold` | 0.1 | Flux threshold (W m<sup>-2</sup>), `legacy` selection |
 | `coupling_face_fraction` | 0.01 | Face-fraction exit, `legacy` coupling mode |

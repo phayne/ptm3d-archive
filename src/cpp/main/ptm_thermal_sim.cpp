@@ -13131,7 +13131,11 @@ int main(int argc, char** argv) {
     bool rad_use_gpu = false;
     bool rad_verbose = false;
     std::string rad_view_factor_file = "";
-    int rad_max_coupling_iter = 10;
+    // Dead initializer: overwritten unconditionally from
+    // sim_config.radiation.max_coupling_iterations below, whose own default is
+    // config_parser.h's 16. Kept in step with it so a reader is not told two
+    // different numbers.
+    int rad_max_coupling_iter = 16;
     double rad_coupling_temp_tol = 2.0;     // Temperature convergence threshold [K]
     double rad_coupling_flux_tol = 0.1;     // Flux change threshold [W/m2] (legacy mode only)
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop

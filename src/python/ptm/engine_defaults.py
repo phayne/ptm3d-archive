@@ -125,7 +125,7 @@ ENGINE_DEFAULTS = {
     'radiation.gpu_devices': 1,
     'radiation.gpu_inter_batch_pause_ms': 0,
     'radiation.hmatrix_threads': 0,
-    'radiation.max_coupling_iterations': 10,
+    'radiation.max_coupling_iterations': 16,
     'radiation.max_neighbors': 500,
     'radiation.mc_rays_per_face': 100000,
     'radiation.min_neighbors': 20,
