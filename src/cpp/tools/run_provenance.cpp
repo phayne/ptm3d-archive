@@ -252,6 +252,16 @@ bool writeRunProvenance(const RunProvenance& p) {
     // Under BUILD_SHARED_LIBS a change confined to (say) libthermal moves the
     // library and leaves this md5 unchanged, so the reader has to be told.
     kv("engine_shared_libraries", PTM_BUILD_SHARED_LIBS);
+    // Embree is the one dependency that is ALWAYS a dynamic library and is NOT
+    // results-neutral, so the md5 above cannot stand in for it: `brew upgrade
+    // embree`, or rebuilding the same prefix with a different EMBREE_MAX_ISA,
+    // changes outputs with every other field here unchanged. Measured
+    // 2026-08-15 on an SSE2 -> multi-ISA swap of identical Embree 4.3.3
+    // sources: Europa and Bennu byte-identical, a lunar polar DEM patch moved
+    // 75 of 260 output files, worst face-frame |dT| 0.0091 K. These two keys
+    // are what lets a future results diff be attributed instead of guessed at.
+    kv("embree_library", PTM_BUILD_EMBREE_LIB);
+    kv("embree_max_isa", PTM_BUILD_EMBREE_MAX_ISA);
     kv("command_line", joinArgv(p.argv));
 
     kv("body", p.body.empty() ? "unknown" : p.body);

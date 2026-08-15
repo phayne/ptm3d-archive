@@ -7,6 +7,7 @@
  */
 
 #include "viewshed_analyzer.h"
+#include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -305,6 +306,7 @@ bool ViewshedAnalyzer::initialize(const std::string& dem_file, double body_radiu
         std::cerr << "Failed to create Embree device" << std::endl;
         return false;
     }
+    ptm::reportEmbreeIsaOnce(embree_device_);
     
     // Create Embree scene
     embree_scene_ = rtcNewScene(embree_device_);
@@ -400,6 +402,7 @@ bool ViewshedAnalyzer::initializeFromMesh(std::shared_ptr<Mesh> mesh) {
         std::cerr << "Failed to create Embree device" << std::endl;
         return false;
     }
+    ptm::reportEmbreeIsaOnce(embree_device_);
 
     // Compute scene origin offset (bounding box center) for Embree float precision
     {
