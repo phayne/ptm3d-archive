@@ -4238,15 +4238,32 @@ void IlluminationModel::createCoordinateSystem(
 //
 // Cost control (fast-path criterion, documented in the derivation note 7.3):
 //   * whole disk below the horizon        -> 0, NO rays;
+//   * no BVH at all                       -> analytic A, NO rays;
 //   * 5-ray probe (center + 4 rim points, above-horizon directions only)
 //     unanimous                           -> V_terrain = 1 or 0, no more rays;
 //   * probe split                         -> PRIMARY_DISK_SAMPLES rays; see
 //                                            primary_disk.h for the MEASURED
 //                                            quantization that fixes the count.
+//
+// AUDITED 2026-08-14, because the escalation is the single most expensive thing
+// the illumination phase does: under the default knobs the sampler at the
+// bottom of the loop is reachable ONLY with 0 < probes_clear < probes_up, i.e.
+// a genuinely SPLIT probe. Every other outcome -- disk below the horizon,
+// A <= 0, no BVH, probe underflow, probe unanimously clear, probe unanimously
+// blocked -- takes a `continue` above it. Fully-visible and fully-occluded
+// faces therefore cost 5 rays, never PRIMARY_DISK_SAMPLES. The one override is
+// PTM_PRIMARY_DISK_ALWAYS_SAMPLE=1, which disables the short-circuit on purpose
+// so that arm is a true upper bound on the fast path's error; it is off by
+// default, read once, and reported by the census. This function is also the
+// only place in the ENGINE that reads PRIMARY_DISK_SAMPLES -- the one other
+// reader anywhere is the standalone gate, tools/test_primary_disk.cpp.
+//
 // On a convex body (every icosphere) an above-horizon ray from an offset origin
-// always escapes, so global meshes pay 5 rays per face instead of 1 and get the
-// analytic horizon ramp for free. PTM_PRIMARY_DISK_ALWAYS_SAMPLE=1 disables the
-// probe short-circuit for validation.
+// almost always escapes, so global meshes pay 5 rays per face instead of 1 and
+// get the analytic horizon ramp for free. "Almost": measured on a Europa ico6
+// global, 76 of 144 epochs escalate exactly 0 faces and the rest escalate 1 to
+// 6 of 81,920 -- limb-grazing faces whose rim probes clip the body. Not zero,
+// but ~5e-5 of the mesh.
 //
 // Results land in the memo members and are consumed by BOTH batch functions:
 // visibility depends only on (mesh, primary position) -- not on the Sun -- and
@@ -4392,26 +4409,38 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             return sd;
         };
 
+        // Visibility only: the caller reads a boolean and never touches u/v/Ng/
+        // geomID, so this is an ANY-hit query, not a closest-hit one. It used
+        // rtcIntersect1, which computes and writes the full hit record and
+        // cannot stop at the first blocker; rtcOccluded1 is the query the rest
+        // of this file already uses for exactly this question (:1186-1190). The ray
+        // itself is unchanged field for field -- same origin, direction, tnear,
+        // tfar, mask -- and rtcInitOccludedArguments defaults flags to
+        // RTC_RAY_QUERY_FLAG_INCOHERENT, the same value :1188 sets explicitly,
+        // so this is a query-kernel swap and nothing else. Both kernels answer
+        // "is there a hit in [tnear, tfar]" from the same triangle intersector,
+        // and the scene is built RTC_SCENE_FLAG_ROBUST (:413), which is the
+        // mode in which Embree guarantees they agree. VERIFIED, not assumed:
+        // every output file byte-identical across the swap on the MS3 lunar
+        // polar patch, the Europa Pwyll patch and the Europa ico6 global (see
+        // the commit message for the digests).
         auto occluded = [&](const std::array<double, 3>& sd) {
-            RTCRayHit rayhit;
-            rayhit.ray.org_x = ray_origin_local[0];
-            rayhit.ray.org_y = ray_origin_local[1];
-            rayhit.ray.org_z = ray_origin_local[2];
-            rayhit.ray.dir_x = sd[0];
-            rayhit.ray.dir_y = sd[1];
-            rayhit.ray.dir_z = sd[2];
-            rayhit.ray.tnear = 1.0e-4f;
-            rayhit.ray.tfar  = tfar_dist;
-            rayhit.ray.mask  = 0xFFFFFFFF;
-            rayhit.ray.flags = 0;
-            rayhit.ray.time  = 0.0f;
-            rayhit.hit.geomID    = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.primID    = RTC_INVALID_GEOMETRY_ID;
-            rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
-            RTCIntersectArguments args;
-            rtcInitIntersectArguments(&args);
-            rtcIntersect1(embree_scene_, &rayhit, &args);
-            return rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID;
+            RTCRay ray{};
+            ray.org_x = ray_origin_local[0];
+            ray.org_y = ray_origin_local[1];
+            ray.org_z = ray_origin_local[2];
+            ray.dir_x = sd[0];
+            ray.dir_y = sd[1];
+            ray.dir_z = sd[2];
+            ray.tnear = 1.0e-4f;
+            ray.tfar  = tfar_dist;
+            ray.mask  = 0xFFFFFFFF;
+            ray.flags = 0;
+            ray.time  = 0.0f;
+            RTCOccludedArguments args;
+            rtcInitOccludedArguments(&args);
+            rtcOccluded1(embree_scene_, &ray, &args);
+            return ray.tfar < 0.0f;                    // Embree's "occluded" flag
         };
 
         // ---- cheap probe: center + 4 rim points, above-horizon only ---------
