@@ -1,14 +1,16 @@
 {
   "269 Justitia (A887 SA)": {
-    "naif_id": "269",
+    "naif_id": "20000269",
     "body_type": "asteroid",
-    "cache_date": "2026-05-06T05:29:03.735301",
-    "spk_start": "",
-    "spk_stop": "",
+    "cache_date": "2026-08-15T14:16:21.677835",
+    "spk_start": "2033-12-15",
+    "spk_stop": "2036-06-01",
     "has_damit_shape": true,
     "damit_id": 2858,
-    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
-    "shape_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj"
+    "config_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
+    "spk_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/ephemeris.spk",
+    "metakernel_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm",
+    "shape_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj"
   },
   "623 Chimaera (A907 BC)": {
     "naif_id": "623",
