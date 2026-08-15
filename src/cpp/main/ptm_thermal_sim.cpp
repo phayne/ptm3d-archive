@@ -828,6 +828,11 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "");
 
+// On-demand illumination accessor: (global face index, absolute timestep) ->
+// W/m^2, read straight from the chunked illumination store. Declared here
+// because the SIMD batch solver below takes an optional triple of these.
+using FluxFn = std::function<double(size_t,int)>;
+
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
     const std::string& thermal_output_dir,
@@ -853,7 +858,17 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::vector<double>& eq_indirect_flux = {},
     // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
     const std::string& initial_state_file = "",
-    const std::string& final_state_file   = "");
+    const std::string& final_state_file   = "",
+    // STREAMED MODE. Supply all three and leave direct_solar_values /
+    // primary_reflected_values / primary_ir_values EMPTY: the solver then
+    // marshals one BATCH-sized (8 faces x total_time_steps) flux tile at a time
+    // straight out of the chunked illumination store instead of materializing
+    // the face x timestep arrays. Same solver, same composer, same seed --
+    // only where the forcing comes from changes. Supplying some but not all
+    // three is fatal, not silently array mode.
+    FluxFn get_direct    = FluxFn(),
+    FluxFn get_reflected = FluxFn(),
+    FluxFn get_ir        = FluxFn());
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -1628,7 +1643,8 @@ void writeHeartbeat(const std::string& msg) {
 }
 }  // namespace
 
-using FluxFn = std::function<double(size_t,int)>;
+// FluxFn is declared above runThermalModelsForAllFacesBatchSoA, which also
+// takes an optional triple of them (streamed mode).
 // No default arguments: `planet` (the angular albedo model) and
 // `eq_indirect_flux` are exactly the two inputs this path used to drop on the
 // floor, and a defaulted-away argument is how they went missing in the first
@@ -4602,13 +4618,45 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::vector<double>* face_H_overrides,
     const std::vector<double>& eq_indirect_flux,
     const std::string& initial_state_file,
-    const std::string& final_state_file)
+    const std::string& final_state_file,
+    FluxFn get_direct,
+    FluxFn get_reflected,
+    FluxFn get_ir)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     const size_t n_batches = (n_faces + BS - 1) / BS;
 
-    std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels) ===" << std::endl;
+    // ---- STREAMED MODE (perf/streamed-simd-batch) --------------------------
+    // Above the 10 GB illumination estimate the engine cannot materialize the
+    // face x timestep arrays, and until now that meant the CPU SCALAR
+    // integrator -- so the LARGEST CPU jobs got the SLOWEST solver, silently
+    // except for the disclosure banner. The forcing is the only thing that has
+    // to change: this solver already consumes its flux one BATCH-wide column at
+    // a time, so a per-thread (BS x total_time_steps) tile marshaled from the
+    // chunked store feeds it with no face x timestep allocation at all.
+    //
+    // All three getters, or none. A partial set would mean the caller thinks it
+    // is streaming while the solver silently reads empty arrays.
+    const int n_getters = (get_direct ? 1 : 0) + (get_reflected ? 1 : 0) + (get_ir ? 1 : 0);
+    const bool streamed = (n_getters == 3);
+    if (n_getters != 0 && n_getters != 3) {
+        std::cerr << "[SIMD Batch] FATAL: streamed mode needs all three flux "
+                     "getters (direct, reflected, IR); " << n_getters
+                  << " were supplied. Refusing to run half-streamed.\n";
+        return false;
+    }
+    if (streamed && !(direct_solar_values.empty() &&
+                      primary_reflected_values.empty() &&
+                      primary_ir_values.empty())) {
+        std::cerr << "[SIMD Batch] FATAL: streamed mode was requested AND the "
+                     "illumination arrays are populated. One of the two is "
+                     "stale; refusing to guess which forcing is meant.\n";
+        return false;
+    }
+
+    std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels"
+              << (streamed ? ", STREAMED flux" : "") << ") ===" << std::endl;
     std::cerr << "Processing " << n_faces << " faces in " << n_batches << " batches of " << BS << std::endl;
 #if defined(__AVX512F__)
     std::cerr << "Using AVX-512 (8 faces per SIMD operation)" << std::endl;
@@ -4637,6 +4685,76 @@ bool runThermalModelsForAllFacesBatchSoA(
     std::shared_ptr<ptm::SpatialMap> batch_albedo_map =
         loadExplicitAlbedoMap(config, "[SIMD Batch]");
 
+    // The absorbed-flux forcing, in one of two shapes.
+    //
+    // ARRAY MODE: the whole face x timestep field, transposed once to
+    // column-major so the batch loop reads BS contiguous doubles per step.
+    // STREAMED MODE: nothing here at all -- each batch marshals its own
+    // (BS x total_time_steps) tile below, through the SAME composer, and the
+    // per-batch tile has the same [t * stride + f] layout with stride = BS.
+    // `flux_base` / `flux_stride` is what the solver below reads, so exactly one
+    // set of index expressions serves both.
+    std::vector<double> flux_column_major;
+    AbsorbedFluxComposer streamed_composer;
+    const int eq_hi_streamed = std::min(equilibration_steps, total_time_steps);
+    bool add_eq_indirect_streamed = false;
+
+    if (streamed) {
+        // Same composer, same inputs, same tag semantics as the array path's
+        // internal one (calculateAbsorbedFlux builds this exact object). Built
+        // once here; absorbed() is then called per (face, timestep) from the
+        // batch loop, which is parallel over batches and therefore over faces --
+        // the accumulator contract the composer documents.
+        std::cerr << "[SIMD Batch] Composing absorbed flux on demand "
+                     "(per-face spatial + incidence-angle albedo, streamed)..."
+                  << std::endl;
+        // The memory claim of this mode, stated rather than assumed. Streaming
+        // exists because RAM is tight, so the replacement allocation is
+        // reported: one tile per THREAD, not one array per mesh. It scales with
+        // total_time_steps, so a few-face / very-many-step chunked run is the
+        // shape that could make it non-trivial -- print it and let the operator
+        // see the number instead of discovering it as an OOM.
+        {
+            const double tile_mb = static_cast<double>(BS) *
+                                   static_cast<double>(total_time_steps) *
+                                   sizeof(double) / (1024.0 * 1024.0);
+            // Built in a local stream, NOT with std::fixed/setprecision on
+            // std::cerr: those stick, and a later cerr diagnostic that relies
+            // on the default format then prints a real 3e-14 residual as
+            // "0.00". Same trap thermal_model.cpp:2224 documents.
+            std::ostringstream m;
+            m << "[SIMD Batch] streamed flux tile: " << std::fixed
+              << std::setprecision(3) << tile_mb << " MB per thread ("
+              << BS << " faces x " << total_time_steps << " steps x 8 B), "
+              << std::setprecision(2)
+              << (tile_mb * std::max(1, thermal_threads) / 1024.0)
+              << " GB across " << std::max(1, thermal_threads)
+              << " threads; the face x timestep arrays ("
+              << (static_cast<double>(n_faces) * total_time_steps * 8.0 * 2.0
+                  / (1024.0 * 1024.0 * 1024.0))
+              << " GB for absorbed + column-major) are never allocated.";
+            std::cerr << m.str() << std::endl;
+        }
+        if (!streamed_composer.build(batch_albedo_map, mesh, n_faces,
+                                     default_visible_albedo, config, &planet,
+                                     planet.S, "cpu_simd_batch_streamed")) {
+            std::cerr << "[SIMD Batch] Absorbed-flux composition could not be built -- "
+                         "refusing to run against an unresolved albedo.\n";
+            return false;
+        }
+        if (!eq_indirect_flux.empty() && equilibration_steps > 0) {
+            if (eq_indirect_flux.size() != n_faces) {
+                std::cerr << "[SIMD Batch] FATAL: eq_indirect_flux has "
+                          << eq_indirect_flux.size() << " entries for " << n_faces
+                          << " faces; refusing to equilibrate against a mismatched"
+                             " forcing.\n";
+                return false;
+            }
+            add_eq_indirect_streamed = true;
+            std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
+                         " indirect flux over steps [0, " << eq_hi_streamed << ").\n";
+        }
+    } else {
     std::cerr << "Computing absorbed flux (per-face spatial + incidence-angle albedo)..." << std::endl;
     std::vector<double> absorbed_flux_rowmajor = calculateAbsorbedFlux(
         direct_solar_values,
@@ -4657,7 +4775,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // Transpose to COLUMN-MAJOR for SIMD efficiency.
     // Layout: flux_column_major[t * n_faces + f] - timestep-major ordering.
-    std::vector<double> flux_column_major(n_faces * total_time_steps, 0.0);
+    flux_column_major.assign(n_faces * total_time_steps, 0.0);
     constexpr size_t BLOCK_F = 64;
     constexpr size_t BLOCK_T = 64;
     #pragma omp parallel for schedule(static) collapse(2)
@@ -4701,6 +4819,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
                      " indirect flux over steps [0, " << eq_hi << ").\n";
     }
+    }   // end array mode
 
     // Initialize output
     if (surface_temps_out) {
@@ -5015,6 +5134,16 @@ bool runThermalModelsForAllFacesBatchSoA(
         batch.initialize(n_layers, BS, planet, config);
         batch.copyGridFromProfile(ref_profile);
 
+        // Streamed mode only: this thread's flux tile, BS faces x every
+        // timestep, laid out [t * BS + f] so it is index-compatible with the
+        // column-major array. 8 x 1440 x 8 B = 92 kB for a lunar production
+        // window -- the memory bound streaming exists to hold is untouched.
+        std::vector<double> flux_tile;
+        if (streamed) {
+            flux_tile.assign(static_cast<size_t>(BS) *
+                             static_cast<size_t>(total_time_steps), 0.0);
+        }
+
         #pragma omp for schedule(dynamic, 1)
         for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
             size_t start_face = batch_idx * BS;
@@ -5022,6 +5151,59 @@ bool runThermalModelsForAllFacesBatchSoA(
             int faces_in_batch = static_cast<int>(end_face - start_face);
 
             batch.n_faces = faces_in_batch;
+
+            // ---- the forcing this batch integrates ------------------------
+            // ONE pair of names for both modes, so every read below is a single
+            // index expression and the two modes cannot drift apart.
+            //   array   : flux_base[t*n_faces + f] == flux_column_major[t*n_faces + start_face + f]
+            //   streamed: flux_base[t*BS      + f] == this batch's own tile
+            const double* flux_base;
+            size_t        flux_stride;
+            if (streamed) {
+                // Per (face, timestep), through the SAME AbsorbedFluxComposer
+                // kernel calculateAbsorbedFlux loops over, in the SAME ascending
+                // t order per face -- the composer's per-face effective-albedo
+                // accumulators are order-dependent, and one thread owns this
+                // batch, so the sums are bit-for-bit the array path's.
+                //
+                // KNOWN, DELIBERATELY NOT FIXED: those accumulators are two
+                // plain double vectors, so an 8-face batch's slots share a
+                // cache line with the neighboring batches' and false-share
+                // under schedule(dynamic,1). Padding them, or accumulating
+                // batch-locally and adding once, would change the summation
+                // ORDER and forfeit the bit-identity gate this whole change is
+                // built on. Measured cost: none visible -- the streamed tile
+                // fill plus solve still beats the array path end to end
+                // (14.83 s vs 18.95 s, 12 threads, 12,800 faces x 7,980 steps).
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t gf = start_face + f;
+                    for (int t = 0; t < total_time_steps; ++t) {
+                        flux_tile[static_cast<size_t>(t) * BS + f] =
+                            streamed_composer.absorbed(gf, t,
+                                                       get_direct(gf, t),
+                                                       get_reflected(gf, t),
+                                                       get_ir(gf, t));
+                    }
+                }
+                if (add_eq_indirect_streamed) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const double q = eq_indirect_flux[start_face + f];
+                        for (int t = 0; t < eq_hi_streamed; ++t)
+                            flux_tile[static_cast<size_t>(t) * BS + f] += q;
+                    }
+                }
+                // A short final batch would otherwise leave the previous
+                // batch's values in the dead lanes. Nothing reads them today;
+                // zero them anyway rather than rely on that staying true.
+                for (int f = faces_in_batch; f < BS; ++f)
+                    for (int t = 0; t < total_time_steps; ++t)
+                        flux_tile[static_cast<size_t>(t) * BS + f] = 0.0;
+                flux_base   = flux_tile.data();
+                flux_stride = static_cast<size_t>(BS);
+            } else {
+                flux_base   = flux_column_major.data() + start_face;
+                flux_stride = n_faces;
+            }
 
             // Per-face H-parameter override: when the planet has a per-face H
             // map loaded (Diviner Hayne+2017 or user-supplied), refresh kc/rho
@@ -5089,8 +5271,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 size_t global_f = start_face + f;
 
                 // Per-face surface estimate from the face's actual average flux
-                // (includes shadowing, reflected, IR — already baked into
-                // flux_column_major by calculateAbsorbedFlux above).
+                // (includes shadowing, reflected, IR — already baked into the
+                // forcing this batch reads: calculateAbsorbedFlux for the array
+                // mode, the per-batch composed tile when streaming).
                 //
                 // The window is the WHOLE forcing span under the shared seed.
                 // The legacy window was the first min(100, N) steps, which on
@@ -5106,7 +5289,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // EqSeedInput::mean_inst_radeq_T.
                 double sum_inst_T = 0.0;
                 for (int t = 0; t < flux_avg_window; ++t) {
-                    const double Ft = flux_column_major[t * n_faces + global_f];
+                    const double Ft = flux_base[static_cast<size_t>(t) * flux_stride + f];
                     avg_flux += Ft;
                     const double q = (Ft > 0.0 ? Ft : 0.0) + batch.Qb[f];
                     sum_inst_T += (q > 0.0)
@@ -5171,8 +5354,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                         rho_col[layer] = batch.rho[layer * BS + f];
                     }
                     thermal::EqSeedForcing sfc_;
-                    sfc_.flux       = &flux_column_major[global_f];
-                    sfc_.stride     = static_cast<size_t>(n_faces);
+                    sfc_.flux       = flux_base + f;
+                    sfc_.stride     = flux_stride;
                     sfc_.n_samples  = flux_avg_window;
                     sfc_.span_s     = seed_dt_s * flux_avg_window;
                     sfc_.cycle_s    = planet.day;
@@ -5337,8 +5520,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                     // population at all.
                     double fmax = 0.0;
                     for (int t = 0; t < total_time_steps; ++t) {
-                        const double v = flux_column_major[
-                            static_cast<size_t>(t) * n_faces + start_face + f];
+                        const double v =
+                            flux_base[static_cast<size_t>(t) * flux_stride + f];
                         if (v > fmax) fmax = v;
                     }
                     const bool dark = !(fmax > 0.0);
@@ -5605,8 +5788,8 @@ bool runThermalModelsForAllFacesBatchSoA(
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
             for (int t = 0; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
-                const double* flux_a = &flux_column_major[t       * n_faces + start_face];
-                const double* flux_b = &flux_column_major[(t + 1) * n_faces + start_face];
+                const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
+                const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
 
                 const int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
@@ -5664,6 +5847,14 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // PTM-107(a): hand the per-face effective albedo to the statistics writer.
+    // In array mode calculateAbsorbedFlux already published its own composer's;
+    // the streamed composer is ours, so we publish it, at the same point in the
+    // run and from the same accumulators. Without this a streamed SIMD-batch
+    // run would ship no effective_albedo.bin -- the exact defect 66c6dd7 removed
+    // from the scalar streamed path.
+    if (streamed) streamed_composer.publishEffectiveAlbedo();
 
     // Equilibration spin-up estimate (FIX 0). Emitted once, after every batch
     // has contributed. The numbers are a prediction made one substep into a
@@ -16475,10 +16666,10 @@ int main(int argc, char** argv) {
         if (using_chunked_storage && use_streamed_thermal) {
             // Disclosed INSIDE the branch whose condition selects the solver,
             // and from the same `memory_required_gb_est` / `STREAM_THRESHOLD_GB`
-            // that condition was built from. This is the swap that used to be
-            // invisible: the banner below this block says only that
-            // ILLUMINATION is streamed, never that the SOLVER changed from the
-            // configured SIMD batch to the scalar one.
+            // that condition was built from. The banner below this block says
+            // only that ILLUMINATION is streamed; which INTEGRATOR runs is said
+            // here, and since perf/streamed-simd-batch it is the configured one.
+            ptm::ThermalSolverPath stream_path = ptm::ThermalSolverPath::Unset;
             {
                 std::ostringstream why;
                 why << std::fixed << std::setprecision(1)
@@ -16486,11 +16677,20 @@ int main(int argc, char** argv) {
                        "footprint " << memory_required_gb_est
                     << " GB exceeds the " << STREAM_THRESHOLD_GB
                     << " GB streaming threshold (PTM_RAM_ILLUM_MAX_GB)";
+                // ONE decision, consumed by both the disclosure and the
+                // dispatch below -- the same rule the non-streamed switch
+                // follows. Streaming is a property of where the FORCING comes
+                // from; it is no longer allowed to pick the integrator.
+                const bool use_simd_batch_s =
+                    thermal_config.getPropertyBool("use_simd_batch", true);
+                stream_path = use_simd_batch_s
+                                  ? ptm::ThermalSolverPath::CpuStreamedBatch
+                                  : ptm::ThermalSolverPath::CpuStreamed;
                 ptm::discloseThermalSolverPath(
-                    ptm::ThermalSolverPath::CpuStreamed,
+                    stream_path,
                     ptm::ThermalSolverReason::MemoryThreshold,
                     why.str(),
-                    thermal_config.getPropertyBool("use_simd_batch", true));
+                    use_simd_batch_s);
             }
 
             // On-demand getters from illumination model (no large buffers)
@@ -16509,7 +16709,36 @@ int main(int argc, char** argv) {
             // own H-driven rho(z), k(z) profile.
             const std::vector<double>* face_H_ptr =
                 planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-            bool thermal_success_streamed = runThermalModelsForAllFacesStreamed(
+            bool thermal_success_streamed;
+            if (stream_path == ptm::ThermalSolverPath::CpuStreamedBatch) {
+                // The configured (shipped-default) integrator, fed from the
+                // chunk store. The three illumination arrays are deliberately
+                // EMPTY here -- that is what puts the solver in streamed mode,
+                // and it refuses if they are not.
+                thermal_success_streamed = runThermalModelsForAllFacesBatchSoA(
+                    output_dir,
+                    mesh,
+                    std::vector<double>(),   // direct    -- streamed
+                    std::vector<double>(),   // reflected -- streamed
+                    std::vector<double>(),   // IR        -- streamed
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads,
+                    face_Qb_ptr,
+                    face_H_ptr,
+                    eq_indirect_vec,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file,
+                    get_direct,
+                    get_reflected,
+                    get_ir);
+            } else {
+            thermal_success_streamed = runThermalModelsForAllFacesStreamed(
                 mesh,
                 times,
                 total_time_steps,
@@ -16534,9 +16763,19 @@ int main(int argc, char** argv) {
                 sim_config.thermal.initial_state_file,
                 sim_config.thermal.final_state_file
             );
+            }
 
             if (!thermal_success_streamed) {
                 std::cerr << "Streamed thermal mesh simulation failed" << std::endl;
+                return 1;
+            }
+            // Shape check, the same one the non-streamed branches run. The
+            // streamed branch never had it; a solver that returned a short or
+            // ragged matrix would previously have been caught only downstream.
+            if (!validateTemperatureMatrix(surface_temps, mesh->faces.size(),
+                                           total_time_steps)) {
+                std::cerr << "[FATAL] Invalid temperature matrix shape after streamed "
+                             "thermal solve; aborting.\n";
                 return 1;
             }
             thermal_success = true;
