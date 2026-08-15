@@ -533,6 +533,17 @@ the crater's 0.13988 shows there as `max=0.1`. That rounding is where the crater
 recorded as "≈0.081" — a value Perron-Frobenius makes impossible to distinguish from the real
 0.13409 by eye, since both sit below the true row-sum bound.
 
+**The engine reports this itself.** Before the first sweep of a coupled run it power-iterates the
+view-factor operator **the solve actually applies** — $\mathrm{diag}(1/\max(1,\sum_j F_{ij}))\,F$,
+because the radiosity renormalizes every row of $F\mathbf{x}$ right after the matvec; iterating raw
+$F$ would over-state $\rho$ on exactly the meshes that renormalization exists for, and could report
+"not a contraction" about a solve that contracts — and prints ρ, the implied $r$, and an upper bound
+on the sweeps needed for a 1 K and a 0.1 K increment, and it **warns** when
+`max_coupling_iterations` is below the 1 K count. The bound extrapolates a pure geometric tail from a first-sweep increment equal to the
+subsolar radiative-equilibrium temperature, so it over-states: on the flagship it says 23 where the
+measured crossing is 16. It is an advisory, not a clamp — the run continues either way.
+`PTM_RHO_ADVISORY=0` skips it (measured 3.0 s at 495M nnz on a 48-core host).
+
 ### 7.6 Other coupling behavior
 
 - **Warm-started thermal re-runs.** Each iteration initializes from the previous iteration's

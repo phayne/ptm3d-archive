@@ -13768,6 +13768,7 @@ int main(int argc, char** argv) {
         // the value before any later read can see a different environment.)
         (void)radGateEnvState("PTM_RAD_SKIP_EQ_STEPS");
         (void)radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW");
+        (void)radGateEnvState("PTM_RHO_ADVISORY");
     }
 
     // ----------------------------------------------------------------------
@@ -17694,6 +17695,148 @@ int main(int argc, char** argv) {
                                  " but there is no equilibration phase (equilibration_steps="
                               << equilibration_steps << " of " << total_time_steps
                               << "), so the reduction bound is unchanged." << std::endl;
+                }
+
+                // ---- rho(F) coupling-convergence advisory -------------------
+                // ADVISORY ONLY. Nothing below changes a number the run
+                // produces; it exists because k_max was being picked by habit
+                // and the habitual 5 truncated the 509k lunar flagship by
+                // +26.2 K on its worst face. Linearizing the outer Picard loop
+                // makes the asymptotic rate a property of the VF SPECTRUM
+                // alone -- the 4 eps sigma T^3 factors cancel -- so
+                //     r <= eps*rho(F) / (1 - (1-eps)*rho(F))
+                // is computable from geometry before the first sweep.
+                // Validated at two meshes against independently measured Picard
+                // ratios: 509k flagship rho = 0.7766 -> r = 0.768 against a
+                // measured 0.745; 12.8k 80 N crater rho = 0.1341 -> r = 0.128
+                // against a measured 0.077-0.128. (The crater's rho was carried
+                // in Fermi's note as "~0.081" from the engine's own row-sum line
+                // rounded to "max=0.1"; the actual maximum row sum is 0.13988,
+                // this power iteration returns 0.134091, and Perron-Frobenius
+                // bounds rho by the max row sum -- 0.081 was the estimate, not
+                // the number.)
+                //
+                // The SWEEP COUNTS are an upper bound and are labeled as one:
+                // they extrapolate a pure geometric tail from the first sweep,
+                // whose increment is much larger than the tail predicts (the
+                // flagship falls 303 -> 68 K, ratio 0.22, against an asymptotic
+                // 0.745), so the bound over-states. On the flagship it says 23
+                // where the measured 1 K crossing is 16. It is quoted rather
+                // than tuned away because an advisory that errs toward "more
+                // sweeps" is the safe direction, and because the alternative --
+                // a measured count -- is not available until the loop has run.
+                if (radGateEnvState("PTM_RHO_ADVISORY") < 0) {
+                    std::cout << "  [rho-advisory] PTM_RHO_ADVISORY=0: skipped. The coupling"
+                                 " loop's sweep count is NOT being checked against rho(F)"
+                                 " on this run." << std::endl;
+                } else if (rad_max_coupling_iter < 2) {
+                    std::cout << "  [rho-advisory] skipped: max_coupling_iterations="
+                              << rad_max_coupling_iter << " leaves no Picard tail to advise on."
+                              << std::endl;
+                } else {
+                    // Save/restore BOTH the float format and the precision.
+                    // std::defaultfloat alone leaves setprecision(1) in place,
+                    // and the next unformatted double in the coupling loop --
+                    // "Max indirect flux", "Max temperature change" -- would
+                    // then print one significant digit (26.2 K as 3e+01). The
+                    // banner block above saves flags()/precision() for exactly
+                    // this reason; PTM-69 is the ledger entry for the class.
+                    const std::ios_base::fmtflags rho_saved_flags = std::cout.flags();
+                    const std::streamsize rho_saved_prec = std::cout.precision();
+                    const radiation::SpectralRadiusEstimate sr =
+                        rad_manager.estimateVFSpectralRadius();
+                    if (!sr.ok) {
+                        std::cout << "  [rho-advisory] UNAVAILABLE: the power iteration on the"
+                                     " view-factor operator did not return a usable rho (n="
+                                  << sr.n << ", iterations=" << sr.iterations
+                                  << "). The sweep count is NOT being checked." << std::endl;
+                    } else {
+                        // The emissivity the RADIOSITY scatters with, which
+                        // PTM_RAD_EMISSIVITY can move away from the thermal
+                        // one. r, the sweep counts and the warning all depend
+                        // on it, so read the operative value, not the config's.
+                        const double eps_rad =
+                            (!g_radiosity_eps_snapshot.empty()
+                             && std::isfinite(g_radiosity_eps_snapshot[0])
+                             && g_radiosity_eps_snapshot[0] > 0.0)
+                                ? g_radiosity_eps_snapshot[0]
+                                : planet.emissivity;
+                        const double rho_F = sr.rho;
+                        std::cout << "  [rho-advisory] rho(F) = " << std::fixed
+                                  << std::setprecision(6) << rho_F
+                                  << std::defaultfloat
+                                  << "  (power iteration, " << sr.iterations << " its, "
+                                  << std::fixed << std::setprecision(1) << sr.seconds
+                                  << " s, n=" << sr.n << ", "
+                                  << (sr.converged ? "converged" : "NOT converged -- treat as a"
+                                                                   " lower bound")
+                                  << ")" << std::defaultfloat << std::endl;
+                        if (!(rho_F < 1.0)) {
+                            std::cout << "  [rho-advisory] WARNING: rho(F) >= 1. The outer"
+                                         " coupling iteration is NOT a contraction on this"
+                                         " operator -- at least one face sees a closed"
+                                         " enclosure (row sum 1, zero sky view). No sweep"
+                                         " count can be quoted; check the view-factor matrix."
+                                      << std::endl;
+                        } else {
+                            const double r_picard =
+                                eps_rad * rho_F / (1.0 - (1.0 - eps_rad) * rho_F);
+                            // Reference first-sweep increment: the run's own
+                            // subsolar radiative-equilibrium temperature, which
+                            // is the scale of "the enclosure switched on from
+                            // zero". A-priori, body-specific, and disclosed --
+                            // not a measured number dressed up as one.
+                            const double dT1_ref =
+                                (planet.S > 0.0 && eps_rad > 0.0)
+                                    ? std::pow((1.0 - planet.albedo) * planet.S
+                                               / (eps_rad * ptm::kStefanBoltzmann), 0.25)
+                                    : 0.0;
+                            std::cout << "  [rho-advisory] implied Picard rate r = eps*rho/"
+                                         "(1-(1-eps)*rho) = " << std::fixed
+                                      << std::setprecision(4) << r_picard
+                                      << "  (eps = " << std::setprecision(3) << eps_rad << ")"
+                                      << std::defaultfloat << std::endl;
+                            if (dT1_ref > 0.0 && r_picard > 0.0 && r_picard < 1.0) {
+                                const double lr = std::log(r_picard);
+                                const int n_1K =
+                                    static_cast<int>(std::ceil(std::log(1.0 / dT1_ref) / lr));
+                                const int n_01K =
+                                    static_cast<int>(std::ceil(std::log(0.1 / dT1_ref) / lr));
+                                std::cout << "  [rho-advisory] sweeps to drive the coupling"
+                                             " increment below 1 K: " << n_1K
+                                          << ";  below 0.1 K: " << n_01K
+                                          << "   (upper bound: geometric tail from a"
+                                             " first-sweep increment of " << std::fixed
+                                          << std::setprecision(1) << dT1_ref
+                                          << " K = subsolar radiative equilibrium)"
+                                          << std::defaultfloat << std::endl;
+                                if (rad_max_coupling_iter < n_1K) {
+                                    std::cout << "  [rho-advisory] WARNING:"
+                                                 " max_coupling_iterations="
+                                              << rad_max_coupling_iter
+                                              << " is BELOW the " << n_1K
+                                              << " sweeps this operator's spectrum implies for"
+                                                 " a 1 K increment. The loop truncates on the"
+                                                 " most enclosed faces, and the truncation is"
+                                                 " one-signed: a capped run is COLD there"
+                                                 " (measured +26.2 K on the worst face of the"
+                                                 " 509k lunar flagship at 5 sweeps). This bound"
+                                                 " is conservative -- that same mesh crossed"
+                                                 " 1 K at 16 measured sweeps against a bound of"
+                                                 " 23 -- so treat it as an upper limit, not a"
+                                                 " required setting. Advisory only; the run"
+                                                 " continues." << std::endl;
+                                }
+                            } else {
+                                std::cout << "  [rho-advisory] sweep count NOT quoted: no"
+                                             " subsolar-equilibrium reference is available"
+                                             " for this body (S=" << planet.S
+                                          << ", eps=" << eps_rad << ")." << std::endl;
+                            }
+                        }
+                    }
+                    std::cout.flags(rho_saved_flags);
+                    std::cout.precision(rho_saved_prec);
                 }
 
                 // Time-varying indirect flux per face [face][timestep]
