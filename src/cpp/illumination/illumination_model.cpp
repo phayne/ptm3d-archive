@@ -308,6 +308,75 @@ static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* s
     std::cerr << "[Embree] Error " << int(error) << ": " << (str ? str : "(null)") << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// Which Embree did we actually link, and does it have kernels for this CPU?
+//
+// Embree ships one library per ISA target chosen AT ITS OWN BUILD TIME and
+// dispatches at run time. A library built with EMBREE_MAX_ISA=SSE2 -- which is
+// what a portable binary distribution has to ship, and what Homebrew's
+// embree 4.3.3 bottle is -- runs its SSE2 BVH4 traversal even on an AVX-512
+// Xeon, and nothing in PTM3D or in Embree's default output says so. Ray
+// traversal is ~83 % of this engine's illumination phase, so the cost is not
+// small. MEASURED 2026-08-15 on this Mac Pro (Xeon W, Cascade Lake) against a
+// multi-ISA build of the IDENTICAL Embree 4.3.3 source:
+//
+//   traversal, single-threaded micro-benchmark, 128-ray bundles from face
+//   origins over a 524k-triangle relief at grazing elevation:
+//       rtcOccluded1  1.22-1.45x faster
+//       rtcOccluded8  a further 1.6-1.8x (the SSE2 build has no such kernel)
+//   end to end, illumination phase, 16 threads, interleaved repeats:
+//       calib120 -14.8 % (paired mean 2.01 s, sd 1.52, n = 10)
+//       prod709  NOT RESOLVED (paired mean -0.21 s, sd 11.33, n = 5)
+//
+// The end-to-end number is quoted with its failure: on a machine carrying three
+// other agents' jobs the longer arm could not separate it from noise, so treat
+// "up to ~15 % of the illumination phase" as the claim and not more.
+//
+// So: say it. RTC_DEVICE_PROPERTY_NATIVE_RAY8_SUPPORTED is 0 exactly when the
+// AVX target was not compiled in, which is the condition worth reporting on a
+// machine whose CPU has AVX. This is a diagnostic only -- it changes no ray,
+// no result and no default.
+static void reportEmbreeIsaOnce(RTCDevice device) {
+    static bool done = false;
+    if (done || !device) return;
+    done = true;
+
+    const bool ray4  = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY4_SUPPORTED)  != 0;
+    const bool ray8  = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY8_SUPPORTED)  != 0;
+    const bool ray16 = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY16_SUPPORTED) != 0;
+
+    // RUNTIME detection, not the __AVX__ compile macros: those follow PTM3D's
+    // own -march flags, so a build without -march=native would report "no AVX"
+    // on an AVX machine and the warning below would silently never fire. The
+    // question here is what the CPU has, not what we were compiled for.
+    bool cpu_has_avx = false, cpu_has_avx512 = false;
+#if defined(__x86_64__) || defined(_M_X64)
+    cpu_has_avx    = __builtin_cpu_supports("avx");
+    cpu_has_avx512 = __builtin_cpu_supports("avx512f");
+#endif
+
+    std::cerr << "[Embree] " << RTC_VERSION_STRING
+              << "  native ray packets: 4=" << (ray4 ? "yes" : "no")
+              << " 8=" << (ray8 ? "yes" : "no")
+              << " 16=" << (ray16 ? "yes" : "no") << std::endl;
+
+    if (cpu_has_avx && !ray8) {
+        std::cerr << "[Embree] WARNING: this Embree has NO AVX kernels, but the CPU has them.\n"
+                  << "         Embree is running SSE2 BVH4 traversal. Ray tracing is ~83 % of\n"
+                  << "         the illumination phase; a multi-ISA build of the same Embree\n"
+                  << "         version measured 1.22-1.45x faster in traversal and up to ~15 %\n"
+                  << "         off the illumination phase on this machine (2026-08-15).\n"
+                  << "         Speed only -- but not a no-op on results: on a lunar polar DEM\n"
+                  << "         patch the ISA swap moved 75 of 260 output files, worst face-frame\n"
+                  << "         |dT| 0.0091 K. To rebuild: -DEMBREE_MAX_ISA=AVX512, then point\n"
+                  << "         CMAKE_PREFIX_PATH at it."
+                  << std::endl;
+    } else if (cpu_has_avx512 && !ray16) {
+        std::cerr << "[Embree] NOTE: no native 16-wide packets; AVX-512 kernels were not compiled"
+                  << " into this Embree." << std::endl;
+    }
+}
+
 bool IlluminationModel::initializeEmbree() {
     if (!embree_device_) {
         embree_device_ = rtcNewDevice("");
@@ -316,6 +385,7 @@ bool IlluminationModel::initializeEmbree() {
             return false;
         }
         rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+        reportEmbreeIsaOnce(embree_device_);
     }
     return true;
 }
@@ -397,6 +467,7 @@ bool IlluminationModel::initializeScene(
             }
             // FIX: use the canonical callback with exact signature
             rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+            reportEmbreeIsaOnce(embree_device_);
         }
 
         if (embree_scene_) {
