@@ -35,11 +35,12 @@ const char* kRule =
 
 const char* thermalSolverPathId(ThermalSolverPath p) {
     switch (p) {
-        case ThermalSolverPath::CpuScalar:     return "cpu_scalar";
-        case ThermalSolverPath::CpuSimdBatch:  return "cpu_simd_batch";
-        case ThermalSolverPath::CpuStreamed:   return "cpu_streamed";
-        case ThermalSolverPath::GpuPersistent: return "gpu_persistent";
-        case ThermalSolverPath::Unset:         break;
+        case ThermalSolverPath::CpuScalar:        return "cpu_scalar";
+        case ThermalSolverPath::CpuSimdBatch:     return "cpu_simd_batch";
+        case ThermalSolverPath::CpuStreamed:      return "cpu_streamed";
+        case ThermalSolverPath::CpuStreamedBatch: return "cpu_streamed_simd_batch";
+        case ThermalSolverPath::GpuPersistent:    return "gpu_persistent";
+        case ThermalSolverPath::Unset:            break;
     }
     return "none";
 }
@@ -49,6 +50,8 @@ const char* thermalSolverEntryPoint(ThermalSolverPath p) {
         case ThermalSolverPath::CpuScalar:     return "runThermalModelsForAllFaces";
         case ThermalSolverPath::CpuSimdBatch:  return "runThermalModelsForAllFacesBatchSoA";
         case ThermalSolverPath::CpuStreamed:   return "runThermalModelsForAllFacesStreamed";
+        case ThermalSolverPath::CpuStreamedBatch:
+            return "runThermalModelsForAllFacesBatchSoA(streamed)";
         case ThermalSolverPath::GpuPersistent: return "runThermalModelsForAllFaces_GPU_Persistent";
         case ThermalSolverPath::Unset:         break;
     }
@@ -57,11 +60,17 @@ const char* thermalSolverEntryPoint(ThermalSolverPath p) {
 
 const char* thermalSolverCoreId(ThermalSolverPath p) {
     switch (p) {
-        // The streamed path is the scalar solver with an on-demand flux getter
-        // in front of it: it loops the same runThermalModelWithMatchedTimes.
-        // Reporting its core as "cpu_scalar" is the whole point of the field.
+        // The scalar streamed path is the scalar solver with an on-demand flux
+        // getter in front of it: it loops the same
+        // runThermalModelWithMatchedTimes. Reporting its core as "cpu_scalar" is
+        // the whole point of the field.
         case ThermalSolverPath::CpuStreamed:
         case ThermalSolverPath::CpuScalar:     return "cpu_scalar";
+        // ... and the streamed SIMD-batch path is that same batch solver with an
+        // on-demand flux getter in front of it: it fills its own per-batch tile
+        // through the same AbsorbedFluxComposer and then runs the identical
+        // ThermalBatchSoA integrator. Same core id, because it IS the same core.
+        case ThermalSolverPath::CpuStreamedBatch:
         case ThermalSolverPath::CpuSimdBatch:  return "cpu_simd_batch";
         case ThermalSolverPath::GpuPersistent: return "gpu_opencl_float32";
         case ThermalSolverPath::Unset:         break;
@@ -89,14 +98,18 @@ const char* rethermalPathId(RethermalPath p) {
 }
 
 const char* thermalSolverCaveats(ThermalSolverPath p, bool simd_batch_requested) {
-    // Exactly one case left: a streamed run whose config asked for the SIMD
-    // batch solver got the CPU scalar integrator instead. That is a
-    // SUBSTITUTION the caller did not request, which is reportable on its own
-    // terms; how far the two integrators actually diverge is a separate
-    // question and deliberately not asserted here. Everything else --
-    // including a streamed run that asked for the scalar solver anyway, which
-    // is byte-identical to what it asked for -- has nothing to disclose beyond
-    // its path.
+    // The one case this existed for -- a streamed run whose config asked for the
+    // SIMD batch solver and got the CPU scalar integrator instead -- is no
+    // longer reachable from the engine's own dispatch: perf/streamed-simd-batch
+    // routes exactly that request to CpuStreamedBatch, which IS the SIMD batch
+    // integrator. The branch stays because "unreachable today" is not
+    // "unreachable", and a future caller that streams while honoring
+    // use_simd_batch=true would otherwise substitute silently -- which is the
+    // failure this whole file exists to prevent.
+    //
+    // Everything else -- a streamed run that asked for the scalar solver (it
+    // gets exactly that, byte-identically), and CpuStreamedBatch (the requested
+    // integrator, fed differently) -- has nothing to disclose beyond its path.
     if (p == ThermalSolverPath::CpuStreamed && simd_batch_requested) {
         return "cpu_scalar_integrator_substituted_for_requested_simd_batch";
     }
@@ -109,11 +122,12 @@ const char* thermalSolverCaveats(ThermalSolverPath p, bool simd_batch_requested)
 // substitution of one integrator for another that the caller did not request.
 static const char* pathLabel(ThermalSolverPath p) {
     switch (p) {
-        case ThermalSolverPath::CpuScalar:     return "CPU scalar";
-        case ThermalSolverPath::CpuSimdBatch:  return "CPU SIMD batch";
-        case ThermalSolverPath::CpuStreamed:   return "CPU streamed";
-        case ThermalSolverPath::GpuPersistent: return "GPU persistent";
-        case ThermalSolverPath::Unset:         break;
+        case ThermalSolverPath::CpuScalar:        return "CPU scalar";
+        case ThermalSolverPath::CpuSimdBatch:     return "CPU SIMD batch";
+        case ThermalSolverPath::CpuStreamed:      return "CPU streamed (scalar core)";
+        case ThermalSolverPath::CpuStreamedBatch: return "CPU streamed SIMD batch";
+        case ThermalSolverPath::GpuPersistent:    return "GPU persistent";
+        case ThermalSolverPath::Unset:            break;
     }
     return "none";
 }
@@ -167,24 +181,39 @@ void discloseThermalSolverPath(ThermalSolverPath path,
         // that outlives its defect is a wrong label with an engine's
         // authority behind it.
         std::cout
-            << "[thermal-solver] NOTE:   the streamed path is the CPU SCALAR path with an\n"
-            << "[thermal-solver]         on-demand flux getter in front of it. It composes\n"
-            << "[thermal-solver]         absorbed flux through the same AbsorbedFluxComposer and\n"
-            << "[thermal-solver]         loops the same integrator (runThermalModelWithMatchedTimes),\n"
-            << "[thermal-solver]         and its output is BYTE-IDENTICAL to a --no-simd-batch run\n"
-            << "[thermal-solver]         of the same config.\n";
+            << "[thermal-solver] NOTE:   this is the CPU SCALAR path with an on-demand flux\n"
+            << "[thermal-solver]         getter in front of it. It composes absorbed flux through\n"
+            << "[thermal-solver]         the same AbsorbedFluxComposer and loops the same integrator\n"
+            << "[thermal-solver]         (runThermalModelWithMatchedTimes), and its output is\n"
+            << "[thermal-solver]         BYTE-IDENTICAL to a --no-simd-batch run of the same config.\n";
         if (simd_batch_requested) {
-            // Left exactly as it was. It is true, it names the remedy, and it
-            // carries no measurement that another branch could invalidate.
-            // Characterizing HOW the two integrators differ belongs with
-            // whoever settles it -- see the note on thermalSolverCaveats().
+            // Not reachable from the engine's own dispatch since
+            // perf/streamed-simd-batch -- kept for the same reason the caveat
+            // token is. See thermalSolverCaveats().
             std::cout
-                << "[thermal-solver] WARNING: use_simd_batch is true for this run, but the\n"
-                << "[thermal-solver]         streamed path does not honor it. The SIMD batch\n"
-                << "[thermal-solver]         solver was NOT used. Raise the streaming\n"
+                << "[thermal-solver] WARNING: use_simd_batch is true for this run, but this\n"
+                << "[thermal-solver]         streamed entry point does not honor it. The SIMD\n"
+                << "[thermal-solver]         batch solver was NOT used. Raise the streaming\n"
                 << "[thermal-solver]         threshold (PTM_RAM_ILLUM_MAX_GB) above the\n"
                 << "[thermal-solver]         estimate above to keep the SIMD batch solver.\n";
         }
+    }
+    if (path == ThermalSolverPath::CpuStreamedBatch) {
+        // The point of the whole change, stated where a reader will see it:
+        // crossing the memory threshold no longer changes the integrator.
+        std::cout
+            << "[thermal-solver] NOTE:   the illumination is streamed, the SOLVER is NOT\n"
+            << "[thermal-solver]         substituted. This is runThermalModelsForAllFacesBatchSoA --\n"
+            << "[thermal-solver]         the same SIMD batch integrator, seed, surface BC and\n"
+            << "[thermal-solver]         bottom BC a non-streamed default run uses -- reading its\n"
+            << "[thermal-solver]         forcing from one 8-face x N-step tile per batch, composed\n"
+            << "[thermal-solver]         on demand through the same AbsorbedFluxComposer, instead\n"
+            << "[thermal-solver]         of from a materialized face x timestep array. Identical by\n"
+            << "[thermal-solver]         construction; measured byte-identical (whole run directory)\n"
+            << "[thermal-solver]         to the non-streamed run on two configs -- the 12,800-face\n"
+            << "[thermal-solver]         80N crater and a 81,920-face lunar ico6. To check it here,\n"
+            << "[thermal-solver]         re-run with PTM_RAM_ILLUM_MAX_GB above the estimate above\n"
+            << "[thermal-solver]         and diff the output directories.\n";
     }
     // Printed for every path, from the same function the provenance key calls,
     // so the log and provenance.txt cannot disagree about the caveat.
