@@ -189,6 +189,45 @@ constexpr uint32_t PRIMARY_DISK_SAMPLES = 128;
 // purpose rather than by accident.
 constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 
+// ---------------------------------------------------------------------------
+// Temporal reuse of the terrain-visibility factor
+// ---------------------------------------------------------------------------
+
+// The terrain-visible fraction V of the primary's disk is the only part of
+// <cos theta> that costs rays; the horizon clip A is closed-form and free.
+// V is a function of (mesh, apparent position of the primary), and the primary
+// barely moves in the body-fixed frame of a tidally locked satellite -- Earth
+// librates ~0.057 deg per timestep on the 949-step MS3 lunation against a
+// 0.95 deg disk radius, Jupiter ~0.09 deg against a 5.98 deg one (both
+// MEASURED, see the primary-position census below). Recomputing V every step
+// re-answers a question whose input moved by a few percent of its own scale.
+//
+// This is the quantization of that input. The primary's body-fixed position is
+// snapped to a cubic lattice of spacing
+//
+//     cell = PRIMARY_DISK_REUSE_CELL_FRACTION * primary_radius_        [km]
+//
+// and V is evaluated at the SNAPPED position, cached, and reused until the
+// snapped position changes. Because alpha ~ R_primary / r, a lattice step of
+// f * R_primary is a step of f * alpha in apparent ANGLE at any distance -- so
+// one dimensionless constant sets the angular tolerance for Earth and Jupiter
+// alike, with no per-body table.
+//
+// Snapping (rather than caching whatever the first step in a cell happened to
+// compute) is deliberate and load-bearing: the cached V then depends ONLY on
+// the lattice cell, not on when a run started or where its chunk boundaries
+// fall. A chunked run, a warm-started run and a single-shot run therefore
+// produce identical numbers, which the equivalent history-dependent scheme
+// would silently break.
+//
+// This CHANGES RESULTS -- it is a controlled approximation, not a refactor --
+// so it is budgeted exactly like PRIMARY_DISK_SAMPLES above, against Paul's
+// 0.163 K worst-face bar, and measured rather than argued. See the commit
+// message for the sweep.
+//
+// 0 disables reuse entirely (recompute every step, the pre-2026-08-15 behavior).
+constexpr double PRIMARY_DISK_REUSE_CELL_FRACTION = 0.0;
+
 // Cheap probe: disk center + 4 rim points.  Unanimous probes decide the face
 // without sampling (see illumination_model.cpp computePrimaryDiskVisibility).
 constexpr uint32_t PRIMARY_DISK_PROBES = 5;
