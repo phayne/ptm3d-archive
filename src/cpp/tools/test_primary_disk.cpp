@@ -296,8 +296,11 @@ static void testHalfPlaneOccluder() {
     }
 
     // (b) worst-case error over the whole sweep, per sample count. This is the
-    //     number that justifies PRIMARY_DISK_SAMPLES: the CRITERION is < 1 % of
-    //     full flux.
+    //     number that justifies PRIMARY_DISK_SAMPLES. The criterion is NOT a
+    //     fixed "< 1 % of full flux" any more: it is the accuracy budget
+    //     PRIMARY_DISK_WORST_VISIBILITY_ERROR that primary_disk.h states and
+    //     converts to kelvin at the coldest lunar face. Changing N without
+    //     re-deriving that budget fails here.
     std::printf("     worst |sampled - analytic| over edge in [-1.2, 1.2]:\n");
     for (uint32_t N : {16u, 32u, 64u, 128u, 256u, 512u}) {
         double worst = 0.0;
@@ -310,9 +313,9 @@ static void testHalfPlaneOccluder() {
                     N, worst, 1.0 / double(N),
                     N == PRIMARY_DISK_SAMPLES ? "   <-- PRIMARY_DISK_SAMPLES" : "");
         if (N == PRIMARY_DISK_SAMPLES) {
-            check(worst < 0.01,
-                  "PRIMARY_DISK_SAMPLES worst error < 1 % of full flux",
-                  worst, 0.0, 0.01);
+            check(worst <= PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+                  "PRIMARY_DISK_SAMPLES worst error within the stated budget",
+                  worst, 0.0, PRIMARY_DISK_WORST_VISIBILITY_ERROR);
         }
     }
 
@@ -343,9 +346,11 @@ static void testHalfPlaneOccluder() {
     }
     check(mono, "visible fraction monotone as the occluder retreats", mono ? 1 : 0, 1, 0);
     // Same criterion as the quantization: no residual discontinuity worth more
-    // than 1 % of full flux. The pre-fix center ray stepped the FULL 1.0000.
-    check(maxstep <= 0.01, "largest single step in the sweep < 1 % of full flux",
-          maxstep, 0.0, 0.01);
+    // than the stated visibility budget. The pre-fix center ray stepped the
+    // FULL 1.0000.
+    check(maxstep <= PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+          "largest single step in the sweep within the stated budget",
+          maxstep, 0.0, PRIMARY_DISK_WORST_VISIBILITY_ERROR);
     std::printf("     (the pre-fix center ray stepped 1.0000 at edge = 0)\n");
 }
 
