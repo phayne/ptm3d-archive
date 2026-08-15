@@ -3028,7 +3028,28 @@ double Model::interpolateFlux(double time) {
 // =============================================================================
 
 void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, const Config& config) {
-    n_layers = std::min(layers, MAX_THERMAL_LAYERS);
+    // BUGS.md PTM-SIGSEGV-450LAYER: this used to silently clamp to
+    // MAX_THERMAL_LAYERS, which looked protective but did nothing --
+    // copyGridFromProfile() (always called right after, see
+    // runThermalModelsForAllFacesBatchSoA) overwrote n_layers again with the
+    // profile's raw, unclamped count and had no bound check of its own, so an
+    // oversized grid silently passed the "clamp" here and then overflowed the
+    // fixed-size per-layer stack arrays there. Refuse loudly instead, at both
+    // call sites, matching the GPU host-side MAX_LAYERS check
+    // (thermal_opencl.cpp) rather than truncating the physics or corrupting
+    // the stack.
+    if (layers > MAX_THERMAL_LAYERS) {
+        std::cerr << "\n[Thermal] FATAL: this run's depth grid has " << layers
+                  << " layers, but the CPU SIMD batch solver (ThermalBatchSoA) can only "
+                     "hold " << MAX_THERMAL_LAYERS << " (MAX_THERMAL_LAYERS).\n"
+                     "  Every per-layer array in this struct is a fixed-size stack buffer; a\n"
+                     "  taller column would overflow it rather than silently truncate.\n"
+                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or raise\n"
+                     "  MAX_THERMAL_LAYERS in thermal_model.h if this column genuinely needs\n"
+                     "  more depth resolution." << std::endl;
+        std::exit(1);
+    }
+    n_layers = layers;
     n_faces = std::min(faces, THERMAL_BATCH_SIZE);
 
     // Store material parameters
@@ -3071,6 +3092,25 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
 
 void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile,
                                           const double* H_per_face) {
+    // BUGS.md PTM-SIGSEGV-450LAYER: the actual overflow site. This used to
+    // assign ref_profile.nlayers straight into n_layers with NO bound check,
+    // then loop z/dz/g1/g2 and (below) the per-face kc/rho/T arrays out to
+    // that unclamped count -- a discrete buried-ice-layer grid (thermal_m:
+    // 150) builds 450 layers, 3.5x past the (then-)128-layer capacity of
+    // every array here, corrupting the rest of this thread-local
+    // ThermalBatchSoA and beyond (confirmed stack-buffer-overflow via
+    // AddressSanitizer). Refuse loudly instead of overflowing.
+    if (ref_profile.nlayers > MAX_THERMAL_LAYERS) {
+        std::cerr << "\n[Thermal] FATAL: this run's reference profile has "
+                  << ref_profile.nlayers << " depth layers, but the CPU SIMD batch "
+                     "solver (ThermalBatchSoA) can only hold " << MAX_THERMAL_LAYERS
+                  << " (MAX_THERMAL_LAYERS).\n"
+                     "  Refusing rather than overflowing the fixed-size z/dz/g1/g2/"
+                     "kc/rho/T stack arrays.\n"
+                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or "
+                     "raise MAX_THERMAL_LAYERS in thermal_model.h." << std::endl;
+        std::exit(1);
+    }
     n_layers = ref_profile.nlayers;
 
     // Copy grid arrays (shared across all faces in batch)
@@ -3232,7 +3272,21 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
 // Initialize batch grid from z-grid vector
 void initializeBatchGrid(ThermalBatchSoA& batch, const std::vector<double>& z_grid,
                          const Planet& planet) {
-    batch.n_layers = std::min(static_cast<int>(z_grid.size()), MAX_THERMAL_LAYERS);
+    // BUGS.md PTM-SIGSEGV-450LAYER: this free function has no caller in the
+    // current tree (found while auditing every MAX_THERMAL_LAYERS silent
+    // std::min alongside ThermalBatchSoA::initialize()'s, which DID have live
+    // callers and DID contribute to the overflow there), but a silent
+    // std::min here is the same contract violation waiting for a caller: it
+    // would quietly integrate a coarser column than the config asked for,
+    // with nothing in the log. Same loud refusal as the two live sites.
+    if (static_cast<int>(z_grid.size()) > MAX_THERMAL_LAYERS) {
+        std::cerr << "\n[Thermal] FATAL: initializeBatchGrid() was given a " << z_grid.size()
+                  << "-layer z-grid, but the CPU SIMD batch solver (ThermalBatchSoA) can only "
+                     "hold " << MAX_THERMAL_LAYERS << " (MAX_THERMAL_LAYERS).\n"
+                     "  Refusing rather than silently truncating the grid." << std::endl;
+        std::exit(1);
+    }
+    batch.n_layers = static_cast<int>(z_grid.size());
 
     // Copy z values
     for (int i = 0; i < batch.n_layers; ++i) {
