@@ -18207,8 +18207,20 @@ int main(int argc, char** argv) {
                     const bool use_pool_dispatch = rad_manager.hasGPUPool();
                     int batch_size = 1;
                     if (use_pool_dispatch) {
+                        // The sweep runs over [rad_sweep_t_lo, total_time_steps),
+                        // so the number of steps to size a batch against is the
+                        // SWEPT span, not the whole window. The progress bar one
+                        // line above already subtracts it; this call did not, and
+                        // neither parent branch had the mismatch -- the merge of
+                        // the equilibration skip with the whole-sweep pool batch
+                        // created it. Byte-identical either way (the dispatch
+                        // loop below already clamps t_end, so a batch wider than
+                        // the span was always one truncated iteration); what it
+                        // fixes is an announce line that would claim 3020
+                        // timesteps/batch for a 20-step sweep, and the host
+                        // memory the budget reserves for that batch.
                         batch_size = radiation::resolvePoolBatchSize(
-                            rad_gpu_batch_size, total_time_steps,
+                            rad_gpu_batch_size, total_time_steps - rad_sweep_t_lo,
                             std::max(1, rad_gpu_devices), num_faces, /*announce=*/true);
                     }
 
