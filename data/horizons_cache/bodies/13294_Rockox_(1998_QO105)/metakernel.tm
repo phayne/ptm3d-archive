@@ -9,16 +9,28 @@ KPL/MK
   Standard kernels: leapseconds, planetary constants, planetary ephemeris.
   Body SPK: ephemeris.spk
 
+  Paths below are RELATIVE to the repository root -- run ptm_thermal_sim
+  from the repo root, or edit the two path entries below to absolute paths
+  (same convention as data/kernels/bennu.tm). An earlier version of this
+  file pointed its one shared-kernel path entry at this body directory
+  instead of the shared data/kernels/ tree, so $KERNELS/lsk/... etc. could
+  never resolve; that is fixed here by giving KERNELS and BODY separate
+  entries, same as bennu.tm.
+
 \begindata
 
-  PATH_VALUES  = ( '/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)' )
-  PATH_SYMBOLS = ( 'KERNELS' )
+  PATH_VALUES  = ( 'data/kernels',
+                    'data/horizons_cache/bodies/13294_Rockox_(1998_QO105)' )
+  PATH_SYMBOLS = ( 'KERNELS',
+                    'BODY' )
 
   KERNELS_TO_LOAD = (
             '$KERNELS/lsk/naif0012.tls'
             '$KERNELS/pck/pck00011.tpc'
             '$KERNELS/spk/de440s.bsp'
-            '/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk'
+            '$BODY/ephemeris.spk'
   )
 
 \begintext
+
+End of MK.
