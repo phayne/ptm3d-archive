@@ -5705,8 +5705,11 @@ bool runThermalModelsForAllFacesBatchSoA(
                                 const thermal::EqCertifyResult cr_ =
                                     thermal::eqCertifyColumn(cin);
                                 cert_last[f] = cr_;
-                                // Deep is UNCALIBRATED (2.1-3.8x high) and is
-                                // deliberately not allowed to hold a run open.
+                                // Deep is UNBIASED, not conservative (pointwise
+                                // 0.91-1.09; the old "2.1-3.8x high" was
+                                // measured on an arrested population -- see
+                                // eq_certificate.h) and is deliberately not
+                                // allowed to hold a run open.
                                 // ALL THREE surface observables must clear the
                                 // bar, minimum included. Gating on the mean
                                 // alone stopped this run 13.6 cycles early and

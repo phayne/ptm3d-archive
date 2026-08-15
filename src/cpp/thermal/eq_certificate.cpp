@@ -473,10 +473,13 @@ EqCertifyResult eqCertifyColumn(const EqCertifyInput& in) {
     }
 
     // ---- observable 3: deep products ---------------------------------------
-    // UNCALIBRATED (2.1-3.8x high against the exactly-known zero-forcing fixed
-    // point). Reported so a deep-product consumer has a number; deliberately
-    // biased high, so a PASS here is meaningful and a FAIL is a prompt to
-    // measure rather than a verdict.
+    // UNBIASED, not conservative: pointwise E_deep/dT_true is 0.91-1.09
+    // (median, six datasets) on freely relaxing columns. The former "2.1-3.8x
+    // high" note was measured on a 100 %-arrested population and read this
+    // estimator's arrest immunity as built-in margin -- a deep PASS carries
+    // NO margin of its own. A safe deep gate needs S = 2.0 held for K = 5
+    // consecutive cycles; see eq_certificate.h, "DEEP products". Reported so a
+    // deep-product consumer has a number; not used to pass anything.
     if (r.tau1 > 0.0) {
         r.E_deep_lo = r_lo * r.tau1 / C;
         r.E_deep_hi = r_hi * r.tau1 / C;

@@ -137,9 +137,30 @@ private:
 //                     bracket 4 eps sigma T_min^3 <= h <= 4 eps sigma T_max^3
 //                     instead, and the verdict comes back INDETERMINATE rather
 //                     than being decided on a substitute.
-//   DEEP products:    E_deep = |r_c| * tau1 / C_below.  UNCALIBRATED: measured
-//                     2.1-3.8x HIGH against the exactly-known zero-forcing
-//                     fixed point. Reported, never used to PASS anything.
+//   DEEP products:    E_deep = |r_c| * tau1 / C_below.  CALIBRATED, and NOT
+//                     conservative. On freely relaxing columns the POINTWISE
+//                     ratio E_deep/dT_true has median 0.91-1.09 over six
+//                     datasets -- i.e. UNBIASED, not high.
+//                       An earlier version of this comment claimed 2.1-3.8x
+//                     HIGH. That factor is real but it is not a calibration:
+//                     it was measured on a population that was 100 % ARRESTED
+//                     (the run's own result3.json records
+//                     arrest_fraction_of_E_true = 1.0, delivered_total = 0 K),
+//                     so it scored this estimator's IMMUNITY TO ARREST -- the
+//                     feature described above -- and read it as conservatism.
+//                     Trusting it and gating on E_deep at S = 1 would release
+//                     70-77 % of faces early.
+//                       Scored against the observable that actually matters --
+//                     the MAX |dT| over nodes below the cut, not the
+//                     C-weighted mean -- a safe gate needs S = 2.0 held for
+//                     K = 5 CONSECUTIVE cycles (100 % safe on 12 of 12
+//                     grid x cut x bar combinations). K = 1 is unsafe by
+//                     17-23 K: at the clamped z_max/2 cut |r_c| passes through
+//                     zero, and only the hysteresis filters that crossing.
+//                     Measurement: project memory note
+//                     edeep-recalibration-arrest-not-physics-2026-08-15.
+//                     Still reported here, and still never used to PASS
+//                     anything.
 //
 // CUT DEPTH z_c = min(5*delta_ref, z_max/2), delta_ref the skin depth of the
 // LONGEST forcing period present. Five skin depths attenuates that period's

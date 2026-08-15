@@ -294,7 +294,7 @@ Which `h` depends on the product:
 | diurnal maximum | `4 eps sigma T_max^3` |
 | diurnal minimum | `4 eps sigma T_min^3` |
 | diurnal mean | the **harmonic** cycle mean of `4 eps sigma T0(t)^3` |
-| deep products | `E_deep = |r_c| tau1 / C_below` (uncalibrated; reported, never used to pass) |
+| deep products | `E_deep = |r_c| tau1 / C_below` (unbiased, **not** conservative — pointwise 0.91–1.09; reported, never used to pass) |
 
 The mean uses the harmonic cycle mean and not the arithmetic one. The surface
 displacement caused by a flux residual is largest exactly where the radiative
