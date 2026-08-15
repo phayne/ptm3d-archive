@@ -332,10 +332,10 @@ thermal pool's dispatch model.
 **Band separation on the GPU** requires a sparse view-factor matrix, and it runs on either a single
 device or the multi-device pool. It does *not* require row sums below 1: the GPU Jacobi kernel
 applies the row renormalization of §4.5 on the device, from a per-face buffer uploaded alongside the
-matrix, so the GPU and CPU iterate the same operator $\rho\,(\hat{\mathbf n}\odot F)$. What is
+matrix, so the GPU and CPU iterate the same operator $\rho\thinspace(\hat{\mathbf n}\odot F)$. What is
 checked instead is the condition under which Jacobi converges at all,
 
-$$\text{gain} \;=\; \rho_{\max}\,\max_i \min\Bigl(\textstyle\sum_j F_{ij},\,1\Bigr) \;<\; 1,$$
+$$\text{gain} \thickspace=\thickspace \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) \thickspace<\thickspace 1,$$
 
 which the renormalization already caps at $\rho_{\max}$; it can only fail for a perfect reflector
 ($A \geq 1$ or $\varepsilon \leq 0$), where no solver converges. When the sparse-matrix requirement
