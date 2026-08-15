@@ -419,11 +419,11 @@ private:
     // Enabled by PTM_RAD_TWO_BAND (requires PTM_SOLAR_ALBEDO for the Bond albedo A).
     // OFF by default => the legacy single gray-band path runs, byte-identical.
     bool two_band_ = false;
-    // True iff the GPU is running the two-band solve (B1). Only enabled when every
-    // vf_row_norm_[i] == 1 (no Σ_j F_ij > 1 row), because the GPU Jacobi kernel does
-    // NOT apply the row-norm inside its iteration (the GPU analog of PTM-08). On a
-    // mesh with an overshoot row the GPU visible band would diverge, so two-band with
-    // any Σ>1 row falls back to the row-norm-protected CPU solve (warned in initGPU).
+    // True iff the GPU is running the two-band solve (B1). The GPU Jacobi kernel
+    // now applies vf_row_norm_ inside its iteration (uploadRowNorm), so it runs the
+    // same operator ρ·(norm⊙F) as the CPU and a Σ_j F_ij > 1 row is no longer a
+    // reason to refuse the GPU. What initGPU still checks is the actual divergence
+    // criterion: the Jacobi gain ρ_max · max_i min(Σ_j F_ij, 1) must be < 1.
     bool two_band_gpu_ok_ = false;
     // Absorbed indirect flux from each band, from the last solveTwoBand() (the new
     // per-band product). Their sum is what solve() returns and the surface BC consumes.
@@ -455,6 +455,11 @@ private:
     // solar constant, clamping temperatures to MIN/MAX). Multiplying every F·x
     // result by this factor renormalizes to an energy-conserving F̂·x.
     std::vector<double> vf_row_norm_;
+    // max_i Σ_j F_ij and the count of rows the normalization touched, kept from the
+    // one F·1 matvec above so the GPU gate can score the real divergence criterion
+    // (gain = ρ_max · max_i min(Σ_j F_ij, 1)) instead of re-deriving it.
+    double vf_row_sum_max_ = 0.0;
+    size_t vf_row_norm_count_ = 0;
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL

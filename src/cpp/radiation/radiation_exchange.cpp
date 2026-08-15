@@ -339,6 +339,8 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
             max_rs = std::max(max_rs, rs);
             sum_rs += rs;
         }
+        vf_row_sum_max_ = max_rs;
+        vf_row_norm_count_ = n_over;
         std::cout << "[Radiosity] View-factor row sums Σ_j F_ij: max=" << max_rs
                   << ", mean=" << (n ? sum_rs / static_cast<double>(n) : 0.0)
                   << " (" << n_over << "/" << n
@@ -512,18 +514,37 @@ void RadiositySolver::initGPU() {
     // Two-band radiosity on the GPU (B1). The GPU path mirrors the CPU two-band by
     // running the two verified gray kernels twice per solve (IR: solar=0, normal
     // ε/1-ε; visible: temps=0, properties ε←1-A, ρ←A, source=A·Q) and summing —
-    // see solveGPU(). BUT the GPU Jacobi kernel does not apply vf_row_norm_ inside
-    // its iteration, so it is only correct where every row sum Σ_j F_ij ≤ 1 (the
-    // usual case). If any row overshoots to Σ>1 (the M1 near-field case that PTM-08
-    // guards on the CPU), the GPU visible band would diverge, so we WARN and force
-    // the row-norm-protected CPU two-band solve rather than run it wrong.
+    // see solveGPU().
+    //
+    // The GPU Jacobi kernel now applies vf_row_norm_ INSIDE its iteration (the
+    // row_norm buffer uploaded below), exactly as the CPU Jacobi does, so both
+    // paths iterate the same operator ρ·(norm⊙F). A Σ_j F_ij > 1 row is therefore
+    // no longer a reason to refuse the GPU.
+    //
+    // What remains is the physics: Jacobi on B = S + ρ⊙(norm⊙F)B converges iff the
+    // iteration matrix has spectral radius < 1, and the row-sum bound on that is
+    //     gain = ρ_max · max_i (norm_i · Σ_j F_ij) = ρ_max · max_i min(Σ_j F_ij, 1).
+    // The row norm caps the second factor at 1, so the gate can only fire for a
+    // genuinely pathological enclosure — a perfect reflector (Bond albedo A ≥ 1 or
+    // emissivity ε ≤ 0), for which the radiosity series does not converge at all
+    // and no tolerance would make it. That is the check below; there is no ε-band
+    // on Σ_j F_ij, so it cannot disagree with the CSR loader's 1 + 1e-6 acceptance
+    // the way the old any_over test did (it vetoed a 509,337-face mesh over a
+    // single row 2.03e-9 above 1 — pure float32 accumulation noise).
     if (two_band_) {
-        bool any_over = false;
-        for (double rn : vf_row_norm_) { if (rn < 1.0) { any_over = true; break; } }
-        if (any_over) {
-            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: mesh has Σ_j F_ij > 1 rows; the "
-                         "GPU Jacobi kernel omits the row-norm (would diverge in the visible "
-                         "band). Forcing the CPU two-band solve (row-norm protected).\n";
+        // Effective row sum after normalization; by construction ≤ 1.
+        const double sigma_eff = std::min(vf_row_sum_max_, 1.0);
+        double rho_max = 0.0;
+        for (double r : reflectivity_) rho_max = std::max(rho_max, r);          // IR: 1-ε
+        for (double a : solar_reflectivity_) rho_max = std::max(rho_max, a);    // visible: A
+        const double gain = rho_max * sigma_eff;
+        if (!std::isfinite(gain) || gain >= 1.0) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: Jacobi gain ρ_max·max_i min(Σ_j F_ij,1)"
+                      << " = " << rho_max << " × " << sigma_eff << " = " << gain
+                      << " ≥ 1 — the radiosity series does not converge on this enclosure "
+                         "(perfect reflector: A ≥ 1 or ε ≤ 0). Forcing the CPU two-band solve, "
+                         "which carries the same divergence but in float64 with a residual "
+                         "report. Fix the optical properties.\n";
             return;
         }
         if (use_hmatrix_ || !F_ptr_) {
@@ -531,14 +552,9 @@ void RadiositySolver::initGPU() {
                          "(H-matrix here); using the CPU two-band solve.\n";
             return;
         }
-        // The multi-GPU pool two-band path is not implemented this pass; if a pool
-        // was requested, run single-GPU two-band (still GPU-accelerated) and say so.
-        if (config_.gpu_devices > 1 || !config_.gpu_device_ids.empty()) {
-            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: multi-GPU pool two-band not yet "
-                         "implemented; using the single-GPU two-band path.\n";
-        }
-        // Fall through to single-GPU initialization below; mark GPU two-band OK so
-        // solveGPU() runs the band-separated orchestration.
+        // Fall through to initialization below (multi-GPU pool first, then
+        // single-GPU); both rungs run the band-separated orchestration —
+        // solveBatch() for the pool, solveGPUTwoBand() for single-GPU.
     }
 
     // GPU solver works best with sparse view factors, not H-matrix
@@ -600,6 +616,15 @@ void RadiositySolver::initGPU() {
         emissivity_f[i] = static_cast<float>(emissivity_[i]);
         reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
     }
+    // The row normalization travels with the operator, not with the band
+    // properties: upload it once per device, alongside the CSR. All-ones (the
+    // common case) is the kernel's identity seed, so uploading it is a no-op
+    // bitwise — we upload unconditionally anyway so there is no second code
+    // path whose behavior depends on the mesh.
+    std::vector<float> row_norm_f(n, 1.0f);
+    for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) {
+        row_norm_f[i] = static_cast<float>(vf_row_norm_[i]);
+    }
 
     // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
     // Every failure is loud (never a silent drop to CPU); the CSR upload is
@@ -633,6 +658,7 @@ void RadiositySolver::initGPU() {
                                            F_ptr_->colIndices(),
                                            F_ptr_->rowPointers());
             gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+            gpu_solver_->uploadRowNorm(row_norm_f);
         } catch (const std::exception& e) {
             std::cerr << "[Radiosity] single-GPU CSR upload failed: " << e.what() << "\n";
             gpu_solver_.reset();
@@ -642,7 +668,9 @@ void RadiositySolver::initGPU() {
         if (two_band_) {
             two_band_gpu_ok_ = true;
             std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: single-GPU band-separated "
-                         "radiosity ENABLED (all Σ_j F_ij ≤ 1; IR solar=0 + visible ε←1-A/ρ←A).\n";
+                         "radiosity ENABLED (IR solar=0 + visible ε←1-A/ρ←A; row norm applied "
+                         "in-kernel on " << vf_row_norm_count_ << "/" << emissivity_.size()
+                      << " faces).\n";
         }
         std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
                   << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
@@ -725,7 +753,8 @@ void RadiositySolver::initGPU() {
                     ok = gpu_pool_->uploadStaticData(F_ptr_->values(),
                                                      F_ptr_->colIndices(),
                                                      F_ptr_->rowPointers(),
-                                                     emissivity_f, reflectivity_f);
+                                                     emissivity_f, reflectivity_f,
+                                                     row_norm_f);
                 } catch (const std::exception& e) {
                     std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
                               << e.what() << "\n";
@@ -744,7 +773,8 @@ void RadiositySolver::initGPU() {
                           << gpu_pool_->numDevices() << " device(s); CSR replica "
                           << gb(needed_bytes) << " GB/device (smallest device "
                           << gb(min_dev) << " GB VRAM); batch_size="
-                          << pool_batch_size_ << " timesteps/dispatch.\n";
+                          << pool_batch_size_ << " timesteps/dispatch; row norm applied "
+                             "in-kernel on " << vf_row_norm_count_ << "/" << n << " faces.\n";
                 return;  // pool active -- done
             }
         }
@@ -812,13 +842,15 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
     last_residual_   = gpu_solver_->getLastResidual();
     converged_       = gpu_solver_->didConverge();
 
+    // vf_row_norm_ is NOT re-applied here: indirect_flux_kernel already folded it
+    // into ir_f/vis_f on the device (uploadRowNorm). Multiplying again would square
+    // the correction on any Σ_j F_ij > 1 face.
     last_indirect_ir_.assign(n, 0.0);
     last_indirect_vis_.assign(n, 0.0);
     std::vector<double> indirect_flux(n, 0.0);
     for (size_t i = 0; i < n; ++i) {
-        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
-        last_indirect_ir_[i]  = static_cast<double>(ir_f[i])  * norm;
-        last_indirect_vis_[i] = static_cast<double>(vis_f[i]) * norm;
+        last_indirect_ir_[i]  = static_cast<double>(ir_f[i]);
+        last_indirect_vis_[i] = static_cast<double>(vis_f[i]);
         indirect_flux[i] = last_indirect_ir_[i] + last_indirect_vis_[i];
     }
     return indirect_flux;
@@ -853,12 +885,12 @@ std::vector<double> RadiositySolver::solveGPU(
     last_residual_ = gpu_solver_->getLastResidual();
     converged_ = gpu_solver_->didConverge();
 
-    // Convert back to double, applying the view-factor row normalization
-    // (Σ_j F_ij ≤ 1) for energy conservation / radiosity-gain stability.
+    // Convert back to double. The view-factor row normalization (Σ_j F_ij ≤ 1) was
+    // applied on the device — inside the Jacobi iteration AND in
+    // indirect_flux_kernel — so it must NOT be applied a second time here.
     std::vector<double> indirect_flux(n);
     for (size_t i = 0; i < n; ++i) {
-        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
-        indirect_flux[i] = static_cast<double>(indirect_f[i]) * norm;
+        indirect_flux[i] = static_cast<double>(indirect_f[i]);
     }
 
     return indirect_flux;
@@ -972,7 +1004,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         if (tb) {
             futures.push_back(gpu_pool_->submit(
                 [&temperatures_per_timestep, &solar_flux_per_timestep,
-                 &indirect_per_timestep, device_steps, n, &row_norm = vf_row_norm_,
+                 &indirect_per_timestep, device_steps, n,
                  &emiss_f, &refl_f, &visE_f, &visR_f,
                  &op_alb = solar_reflectivity_,
                  &src_single = solar_albedo_source_,
@@ -1009,10 +1041,11 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                         auto& out = indirect_per_timestep[k]; out.resize(n);
                         auto& obi = ir_batch[k];
                         auto& obv = vis_batch[k];
+                        // Row norm already applied on-device (uploadStaticData ->
+                        // uploadRowNorm); do not re-apply.
                         for (size_t i = 0; i < n; ++i) {
-                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
-                            const double vir  = static_cast<double>(ir_f[i])  * norm;
-                            const double vvis = static_cast<double>(vis_f[i]) * norm;
+                            const double vir  = static_cast<double>(ir_f[i]);
+                            const double vvis = static_cast<double>(vis_f[i]);
                             obi[i] = vir;
                             obv[i] = vvis;
                             out[i] = vir + vvis;
@@ -1023,8 +1056,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         } else {
             futures.push_back(gpu_pool_->submit(
                 [&temperatures_per_timestep, &solar_flux_per_timestep,
-                 &indirect_per_timestep, device_steps, n,
-                 &row_norm = vf_row_norm_](
+                 &indirect_per_timestep, device_steps, n](
                     gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
                     std::vector<float> temps_f(n), solar_f(n), indirect_f;
                     for (size_t k : device_steps) {
@@ -1037,9 +1069,9 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                         solver.solve(temps_f, solar_f, indirect_f);
                         auto& out = indirect_per_timestep[k];
                         out.resize(n);
+                        // Row norm already applied on-device; do not re-apply.
                         for (size_t i = 0; i < n; ++i) {
-                            const double norm = (i < row_norm.size()) ? row_norm[i] : 1.0;
-                            out[i] = static_cast<double>(indirect_f[i]) * norm;
+                            out[i] = static_cast<double>(indirect_f[i]);
                         }
                     }
                     return true;
