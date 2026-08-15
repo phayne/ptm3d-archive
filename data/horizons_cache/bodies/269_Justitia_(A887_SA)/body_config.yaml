@@ -1,7 +1,7 @@
 generic_body:
   name: 269 Justitia (A887 SA)
-  ephemeris_source: keplerian
-  naif_id: '2000269'
+  ephemeris_source: spice
+  naif_id: '20000269'
   shape:
     type: custom_mesh
     radius_km: 25.364
@@ -29,3 +29,5 @@ generic_body:
     H: 0.05
     cp0: 800.0
     Qb: 0.0
+  spice_metakernel: data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm
+  spk_file: data/horizons_cache/bodies/269_Justitia_(A887_SA)/ephemeris.spk
