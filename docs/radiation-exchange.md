@@ -307,7 +307,7 @@ path must pay a device→host round trip for it, so it tests every
 `convergence_check_interval` iterations and can therefore only stop at a multiple of that
 interval. The default, `0`, resolves the interval per matrix
 (`gpu::opencl::resolveConvergenceCheckInterval`) by weighing the cost of one Jacobi traversal,
-$\approx \text{nnz}/2.05\times10^{10}\,\mathrm{s}$, against the ~3.7 ms of one convergence read:
+$\approx \text{nnz}/2.05\times10^{10}\thinspace\mathrm{s}$, against the ~3.7 ms of one convergence read:
 above ≈7.6e7 stored non-zeros a traversal is the more expensive of the two and the solver checks
 every iteration; below it, it checks every 10. Both constants were measured on a Radeon Pro
 W6800X on 2026-08-15 (509,337-face lunar CSR at 495,163,704 nnz, and a 12,800-face bowl crater).
