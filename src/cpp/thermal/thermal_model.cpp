@@ -2251,7 +2251,34 @@ std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& con
     const int steps_per_day = std::max(1, config.NPERDAY);
     const double dt_ref = planet.day / static_cast<double>(steps_per_day);
 
-    // Stability threshold for explicit criterion used as accuracy proxy
+    // Legacy explicit-FTCS thickness ceiling, RETIRED as the deep constraint
+    // (2026-08) and kept only for the short-column fallback below.
+    //
+    // WHY IT WAS WRONG. dz_stab = sqrt(kappa*dt_ref/Fmax) is the explicit-FTCS
+    // stability bound. This solver is Crank-Nicolson -- unconditionally stable
+    // -- so it bounded nothing, and the inequality is inverted even for FTCS
+    // (FTCS wants dz LARGER than the bound at fixed dt, not smaller). Worse,
+    // kappa cancels against the local skin depth delta(z) = sqrt(2*kappa/omega):
+    //     dz_stab/delta(z) = sqrt(pi/(NPERDAY*Fmax)) = 0.517
+    // independent of depth, body and material. So it silently pinned >= 1.935
+    // layers per LOCAL skin depth all the way down, made the deep column
+    // uniform and shadowed MIN_LAYERS_DEEP_PER_SKIN into dead code. (A float64
+    // column harness put the deep growth ratio at 1.0003 on lunar b=32 and the
+    // proxy as the binding constraint on 31 of its 50 layers.)
+    //
+    // WHAT REPLACES IT. Nothing but the honest resolution target: the deep
+    // thickness is now set by MIN_LAYERS_DEEP_PER_SKIN (default 0.5 layers per
+    // local skin depth) under the same R_MAX growth cap.
+    //
+    // MEASURED COST (engine, tutorial04 lunar 80N crater, 12,800 faces, both
+    // arms same binary options and same view factors; per-face temperature_min):
+    //   b=32 radiation-off, 50 -> 28 layers: worst face 0.029 K (1 eq cycle),
+    //     0.049 K (10 cycles), 0.050 K (50 cycles -- the production length,
+    //     where it saturates)
+    //   b=15 radiation-off, 30 -> 23 layers: worst face 0.052 K
+    //   b=15 radiation-coupled, 30 -> 23 layers: worst face 0.018 K
+    // i.e. at or below the 0.15 K floor of the reference this was scored
+    // against, for a 44% layer cut on the lunar production column.
     const double Fmax = std::min(0.49, config.F);
 
     // Local property models vs. depth (same as Profile ctor uses)
@@ -2298,76 +2325,143 @@ std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& con
         return std::max<double>(config.MIN_LAYERS_DEEP_PER_SKIN, N);
     };
 
-    // Initialize grid
-    std::vector<double> z;
-    z.reserve(static_cast<size_t>(config.m * config.b) + 16);
-    z.push_back(0.0);
-
-    // Pick initial dz constrained by both resolution near surface and stability proxy
-    const double dz0_res  = delta0 / target_layers_per_skin(0.0);
-    const double dz0_stab = std::sqrt(std::max(1e-20, kappa0 * dt_ref / Fmax));
-    double dz_prev = std::max(1e-6, std::min(dz0_res, dz0_stab));
-
-    // Geometric stretching constraints
+    // Geometric stretching constraint
     const double Rmax = std::max(1.05, config.R_MAX); // ensure progress > 1
 
     // Safety guard to avoid runaway layer counts
     const size_t MAX_LAYERS = 100000; // hard cap
 
+    const double dz0_res  = delta0 / target_layers_per_skin(0.0);
+    const double dz0_stab = std::sqrt(std::max(1e-20, kappa0 * dt_ref / Fmax));
+
+    // One march, two constraint sets. apply_stability_proxy = false is the
+    // default (resolution + growth cap only); true reproduces the pre-2026-08
+    // grid exactly and is used only by the short-column fallback below.
+    auto march = [&](bool apply_stability_proxy)->std::vector<double> {
+        std::vector<double> zg;
+        zg.reserve(static_cast<size_t>(config.m * config.b) + 16);
+        zg.push_back(0.0);
+
+        // Pick initial dz from the near-surface resolution target. The proxy
+        // never binds here (N_top >= 4 makes dz0_res <= delta0/4, well below
+        // dz0_stab = 0.517*delta0), so the top layer is identical either way.
+        double dz_prev = std::max(1e-6, apply_stability_proxy
+                                            ? std::min(dz0_res, dz0_stab)
+                                            : dz0_res);
+
+        while (zg.back() < zmax && zg.size() < MAX_LAYERS) {
+            const double z_mid   = zg.back() + 0.5 * dz_prev; // properties at layer midpoint
+            const double kap_mid = kappa_at(z_mid);
+            const double delta_m = (omega > 0.0) ? std::sqrt(2.0 * kap_mid / omega) : delta0;
+
+            // Resolution ceiling: desired dz for current depth based on layers per skin depth
+            const double Nps     = target_layers_per_skin(z_mid);
+            const double dz_res  = std::max(1e-8, delta_m / Nps);
+
+            // Candidate next thickness (respect growth cap)
+            double dz_next = std::min(Rmax * dz_prev, dz_res);
+            if (apply_stability_proxy) {
+                dz_next = std::min(dz_next,
+                                   std::sqrt(std::max(1e-20, kap_mid * dt_ref / Fmax)));
+            }
+
+            // Ensure we always make progress and respect a tiny floor
+            const double dz_floor = 1e-8;
+            dz_next = std::max(dz_next, std::min(0.5 * dz_prev, dz_floor)); // avoid zero step
+
+            // If the next step would overshoot zmax too much, clamp last layer to land exactly on zmax
+            double z_next = zg.back() + dz_next;
+            if (z_next > zmax) {
+                dz_next = zmax - zg.back();
+                z_next  = zmax;
+            }
+
+            // Guard against non-progress due to extreme constraints
+            if (dz_next <= 0.0 || !(z_next > zg.back())) {
+                // Force a minimal increase
+                dz_next = std::max(dz_floor, 1.01 * dz_prev);
+                z_next = std::min(zmax, zg.back() + dz_next);
+            }
+
+            zg.push_back(z_next);
+            dz_prev = dz_next;
+        }
+
+        if (zg.back() < zmax) {
+            // Enforce final depth if loop stopped on MAX_LAYERS
+            zg.back() = zmax;
+        }
+        return zg;
+    };
+
+    std::vector<double> z = march(/*apply_stability_proxy=*/false);
+
+    // Short-column guard. A column this shallow is all near-surface: there is
+    // no deep region to coarsen, and its discretization error lives in the top
+    // few layers, where this change does not reach. (623 Chimaera is the
+    // worked example: the column harness put its error at 1.34 K near-surface
+    // and charged 0.24 K for relaxing R_MAX on it, while the deep floor bought
+    // one layer.) So keep the pre-2026-08 grid rather than shave one or two
+    // layers off it; verified byte-identical on the shipped Chimaera TI-200
+    // configuration, 18 layers, all 18,304 faces.
+    //
+    // THE TEST IS ON THE LEGACY GRID'S HEIGHT, NOT THE COARSENED ONE, and that
+    // distinction is load-bearing. The coarsened count is a function of m as
+    // well as of b, so keying the guard off it makes the grid NON-MONOTONE in
+    // m: on the lunar convergence column, m=5 fell under the threshold and kept
+    // 34 legacy layers while m=10 cleared it and got 33 coarsened ones, so
+    // refining m COARSENED the grid. That broke test_grid_convergence's
+    // Richardson ladder (measured: gate 2 flipped at deep floor 0.5, gate 1 at
+    // 0.33/0.75/1.0; with this trigger the same sweep passes). "Short column"
+    // has to mean a property of the column -- b and the material -- and the
+    // legacy grid's height is the m-robust proxy for it available here.
+    const size_t min_total =
+        static_cast<size_t>(std::max(0, config.MIN_TOTAL_LAYERS_FOR_DEEP_COARSENING));
+    bool used_legacy = false;
+    const size_t n_coarse = z.size();
+    size_t n_legacy = 0;
+    if (z.size() < min_total) {
+        // Only reachable when the coarse grid is already short; the legacy grid
+        // is never shorter than the coarse one for any realistic NPERDAY, so
+        // skipping this march when n_coarse >= min_total decides nothing.
+        std::vector<double> z_legacy = march(/*apply_stability_proxy=*/true);
+        n_legacy = z_legacy.size();
+        if (n_legacy < min_total && n_legacy > n_coarse) {
+            z = std::move(z_legacy);
+            used_legacy = true;
+        }
+    }
+
+    if (used_legacy) {
+        // Once per process: this is a documented guard, not an anomaly, but it
+        // means the run is NOT using the configured deep resolution and that
+        // must not be silent. generateAdaptiveGrid runs once per face on the
+        // scalar path, so a per-call print would bury the run's real output.
+        static std::atomic<bool> announced{false};
+        bool expected = false;
+        if (announced.compare_exchange_strong(expected, true)) {
+            std::ostringstream msg;
+            msg << "[grid] NOTE: short column -- the reference grid is only "
+                << n_legacy << " layers, below the " << min_total
+                << "-layer minimum, so the deep floor was NOT applied (it would"
+                   " have given " << n_coarse << "). Keeping the legacy "
+                   "explicit-FTCS-proxy grid; MIN_LAYERS_DEEP_PER_SKIN="
+                << config.MIN_LAYERS_DEEP_PER_SKIN
+                << " is inactive on this body.\n";
+            std::cout << msg.str();
+        }
+    }
+
     if (verbose) {
         std::cout << "Adaptive grid build:\n"
                   << "  delta0: " << delta0 << " m, zmax: " << zmax << " m\n"
                   << "  dt_ref: " << dt_ref << " s, Fmax: " << Fmax << "\n"
-                  << "  dz0_res: " << dz0_res << " m, dz0_stab: " << dz0_stab << " m\n"
+                  << "  dz0_res: " << dz0_res << " m, dz0_stab: " << dz0_stab
+                  << " m (proxy retired; " << (used_legacy ? "IN USE via short-column fallback"
+                                                           : "not applied") << ")\n"
                   << "  Rmax: " << Rmax << ", N_top: " << N_top
                   << ", N_deep_min: " << config.MIN_LAYERS_DEEP_PER_SKIN
                   << ", RES_DECAY_SKINS: " << e_decay << std::endl;
-    }
-
-    // March downward
-    while (z.back() < zmax && z.size() < MAX_LAYERS) {
-        const double z_mid   = z.back() + 0.5 * dz_prev; // estimate properties at layer midpoint
-        const double kap_mid = kappa_at(z_mid);
-        const double delta_m = (omega > 0.0) ? std::sqrt(2.0 * kap_mid / omega) : delta0;
-
-        // Resolution ceiling: desired dz for current depth based on layers per skin depth
-        const double Nps     = target_layers_per_skin(z_mid);
-        const double dz_res  = std::max(1e-8, delta_m / Nps);
-
-        // Stability/accuracy ceiling: proxy based on explicit criterion with dt_ref
-        const double dz_stab = std::sqrt(std::max(1e-20, kap_mid * dt_ref / Fmax));
-
-        // Candidate next thickness (respect growth cap)
-        double dz_next = std::min({ Rmax * dz_prev, dz_res, dz_stab });
-
-        // Ensure we always make progress and respect a tiny floor
-        const double dz_floor = 1e-8;
-        dz_next = std::max(dz_next, std::min(0.5 * dz_prev, dz_floor)); // avoid zero step
-
-        // If the next step would overshoot zmax too much, clamp last layer to land exactly on zmax
-        double z_next = z.back() + dz_next;
-        if (z_next > zmax) {
-            dz_next = zmax - z.back();
-            z_next  = zmax;
-        }
-
-        // Guard against non-progress due to extreme constraints
-        if (dz_next <= 0.0 || !(z_next > z.back())) {
-            // Force a minimal increase
-            dz_next = std::max(dz_floor, 1.01 * dz_prev);
-            z_next = std::min(zmax, z.back() + dz_next);
-        }
-
-        z.push_back(z_next);
-        dz_prev = dz_next;
-    }
-
-    if (z.back() < zmax) {
-        // Enforce final depth if loop stopped on MAX_LAYERS
-        z.back() = zmax;
-    }
-
-    if (verbose) {
         std::cout << "Adaptive grid layers: " << z.size()
                   << " total depth: " << z.back() << " m\n";
     }

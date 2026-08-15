@@ -87,7 +87,11 @@ The defaults $m = 4$, $n = 10$, $b = 5$ were selected by sensitivity analysis ag
 
 ### 4.3 Adaptive Depth Grid
 
-When `ADAPTIVE_GRID = true` (default), the grid is reconstructed per face from the local diffusivity profile $\kappa(z)$. The number of layers per skin depth decays with depth following an e-folding scale of `RES_DECAY_SKINS = 3.0` (in skin depths), with a floor of `MIN_LAYERS_DEEP_PER_SKIN = 1` and a per-step growth-factor cap `R_MAX = 2.0` to prevent aliasing of strongly stretched layers (`thermal_model.cpp:1611–1745`). The total depth always reaches $b\thinspace\delta_1$.
+When `ADAPTIVE_GRID = true` (default), the grid is reconstructed per face from the local diffusivity profile $\kappa(z)$. The number of layers per skin depth decays with depth following an e-folding scale of `RES_DECAY_SKINS = 3.0` (in skin depths), with a floor of `MIN_LAYERS_DEEP_PER_SKIN = 0.5` and a per-step growth-factor cap `R_MAX = 2.0` to prevent aliasing of strongly stretched layers (`generateAdaptiveGrid`, `thermal_model.cpp`). The total depth always reaches $b\thinspace\delta_1$.
+
+Until 2026-08 the deep thickness was not set by that floor at all. A third constraint, $\Delta z \le \sqrt{\kappa\thinspace\Delta t_\mathrm{ref}/F_\mathrm{max}}$, was applied as an "accuracy proxy". It is the explicit-FTCS stability bound, which does not apply to this unconditionally stable Crank–Nicolson solver, and $\kappa$ cancels against the local skin depth: $\Delta z/\delta(z) = \sqrt{\pi/(\mathrm{NPERDAY}\cdot F_\mathrm{max})} = 0.517$ at every depth, on every body. It therefore pinned $\ge 1.935$ layers per local skin depth all the way down — a float64 column harness measured it as the binding constraint on 31 of the lunar $b = 32$ column's 50 layers, with a deep growth ratio of 1.0003, i.e. a uniform deep grid — and `MIN_LAYERS_DEEP_PER_SKIN` was dead code. Retiring it cuts the lunar $b = 32$ column from 50 to 28 layers for a worst-face diurnal-minimum change of 0.05 K, measured in the engine on the tutorial-04 80°N crater at the production equilibration length (50 integrated cycles); the radiation-coupled arm moves 0.018 K.
+
+Columns whose *pre-2026-08* grid was already shorter than `MIN_TOTAL_LAYERS_FOR_DEEP_COARSENING = 20` layers keep that grid unchanged: they are all near-surface, so there is nothing deep to coarsen, and their discretization error is concentrated in the top layers. Small asteroids fall in this class — 623 Chimaera builds 18 layers on its shipped TI-200 configuration and every one of its 18,304 faces is byte-identical. The test is deliberately on the *old* grid's height and not the new one, because the new count depends on $m$ as well as on $b$: keying the guard off it makes the layer count non-monotone in $m$, which breaks the Richardson ladder in `test_grid_convergence`. The engine prints a one-time `[grid] NOTE:` line whenever this fallback is taken.
 
 ### 4.4 Non-Uniform-Grid Finite-Difference Coefficients
 
@@ -235,7 +239,8 @@ The key user-facing parameters of the thermal solver are summarized below; a com
 | `b` | 5 | Skin depths to the bottom layer (eq. B7) |
 | `ADAPTIVE_GRID` | true | Use per-profile adaptive grid (§4.3) |
 | `RES_DECAY_SKINS` | 3.0 | e-folding scale for resolution decay with depth |
-| `MIN_LAYERS_DEEP_PER_SKIN` | 1 | Floor on layers per skin depth in the deep |
+| `MIN_LAYERS_DEEP_PER_SKIN` | 0.5 | Floor on layers per skin depth in the deep (§4.3) |
+| `MIN_TOTAL_LAYERS_FOR_DEEP_COARSENING` | 20 | Below this layer count the deep floor is not applied (§4.3) |
 | `R_MAX` | 2.0 | Per-step layer-thickness growth cap |
 | `NYEARSEQ` | 1 | Equilibration duration (orbits) |
 | `EQUILIBRATION_STEPS_PER_DAY` | 192 | Equilibration cadence (§7.2) |
