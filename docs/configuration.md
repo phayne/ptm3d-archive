@@ -480,6 +480,37 @@ carries the full thermophysical property set. See the asteroid examples in
 [`../examples/`](../examples/) and
 [docs/tutorials/](tutorials/).
 
+### How `generic_body.spice_metakernel` is resolved
+
+| Value | Resolved to |
+|---|---|
+| Absolute path (`/…/metakernel.tm`) | Used **exactly as given** — the kernel directory is not prepended |
+| Relative `data/…` path (`data/horizons_cache/…/metakernel.tm`) | The same `PTM_DATA_ROOT` contract as `mesh.import_file` and every other data key: `$PTM_DATA_ROOT`, else the repository `data/` found from the config file's directory |
+| Any other relative path (`bennu.tm`) | `<kernel dir>/<value>` first, then `<current working directory>/<value>` |
+
+The kernel directory is itself resolved as: `$PTM_SPICE_KERNELS`, then the
+compiled-in `SPICE_KERNELS_DIR` (CMake cache variable, default
+`<repo>/data/kernels`) — see [ENVIRONMENT.md](ENVIRONMENT.md). There is no
+config key or command-line flag for it; `$PTM_SPICE_KERNELS` **replaces** the
+compiled-in directory rather than adding to it, so an override directory must
+contain the metakernels as well as `lsk/`, `pck/` and `spk/`.
+
+Every run prints the file it actually loaded (`Loaded SPICE meta-kernel: …`).
+If none of the candidates exists the run stops and lists every path it tried;
+it never substitutes a different metakernel for the one you configured.
+
+(Separately, and not covered by that guarantee: a `simulation.body` name other
+than `Moon`, `Mercury` or `Europa` that is *not* backed by a `generic_body:`
+block falls through to Europa's built-in property set and Europa's metakernel.
+Use `generic_body:` for anything outside the three built-ins.)
+
+Paths **inside** the metakernel (`PATH_VALUES`) are resolved by CSPICE itself,
+relative to the working directory, and are independent of the rule above. The
+shipped `data/kernels/*.tm` use `PATH_VALUES = ( 'data/kernels' )`, so a
+built-in body expects to be run from the repository root; a metakernel with
+absolute `PATH_VALUES` works from anywhere. A `PATH_VALUES` entry longer than
+80 characters must be split with the KPL `+` continuation.
+
 ## Generating a template
 
 ```bash

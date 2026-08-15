@@ -718,6 +718,15 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // (the Horizons pipeline can populate it after config load).
             C.generic_body.mesh_file = resolveDataPath(
                 C.generic_body.mesh_file, repo_root, false, "generic_body.mesh_file");
+            // Generic-body metakernel: same contract as its sibling mesh_file, so
+            // the committed data/horizons_cache body configs resolve from any
+            // working directory and honor PTM_DATA_ROOT. NEVER must_exist here:
+            // the bare-filename form (bennu.tm) is resolved later, against the
+            // SPICE kernel directory, by illumination_model.cpp; a miss at this
+            // stage only means "not a data/-relative path", not "not found".
+            C.generic_body.spice_metakernel = resolveDataPath(
+                C.generic_body.spice_metakernel, repo_root, false,
+                "generic_body.spice_metakernel");
         }
 
         std::cout << "Successfully loaded configuration from: " << filename << std::endl;
