@@ -1,4 +1,5 @@
 #include "camera_simulator.h"
+#include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
 
 #include <iostream>
 #include <fstream>
@@ -422,6 +423,7 @@ bool CameraSimulator::initializeEmbree() {
         std::cerr << "[CameraSimulator] Failed to create Embree device" << std::endl;
         return false;
     }
+    ptm::reportEmbreeIsaOnce(embree_device_);
 
     embree_scene_ = rtcNewScene(embree_device_);
     RTCGeometry geom = rtcNewGeometry(embree_device_, RTC_GEOMETRY_TYPE_TRIANGLE);

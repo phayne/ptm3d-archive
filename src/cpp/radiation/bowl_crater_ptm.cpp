@@ -14,6 +14,8 @@
  *
  * Usage: bowl_crater_ptm <out_dir> [dd1 dd2 ...]
  */
+#include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
+
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -388,6 +390,9 @@ int main(int argc, char** argv) {
         double mesh_eps = 1e-4 * b.r_rim;
 
         RTCDevice dev = rtcNewDevice(nullptr);
+        // The Ingersoll gate is exactly where someone checks a correctness or
+        // performance claim, so it must say which Embree it used too.
+        ptm::reportEmbreeIsaOnce(dev);
         RTCScene scene = make_scene(dev, *b.mesh, !no_occ);
 
         double alpha = std::atan(0.5 / dd);

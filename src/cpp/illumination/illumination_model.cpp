@@ -1,5 +1,6 @@
 #include "illumination_model.h"
 #include "primary_disk.h"
+#include "embree_isa_report.h"
 #include "../constants/physics_constants.h"
 #include "../constants/numeric_constants.h"
 #include "../constants/constants.h"  // For ptm_thermal::constants
@@ -316,6 +317,7 @@ bool IlluminationModel::initializeEmbree() {
             return false;
         }
         rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+        ptm::reportEmbreeIsaOnce(embree_device_);
     }
     return true;
 }
@@ -397,6 +399,7 @@ bool IlluminationModel::initializeScene(
             }
             // FIX: use the canonical callback with exact signature
             rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+            ptm::reportEmbreeIsaOnce(embree_device_);
         }
 
         if (embree_scene_) {

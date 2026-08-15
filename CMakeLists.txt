@@ -334,7 +334,56 @@ endif()
 find_package(CFITSIO REQUIRED)
 message(STATUS "Found CFITSIO: ${CFITSIO_LIBRARIES}")
 
+# ============================================================================
 # Embree Configuration
+# ============================================================================
+# WHICH Embree is linked matters, not merely that one exists. Embree compiles a
+# separate BVH traversal kernel per SIMD ISA, chosen at ITS OWN build time via
+# EMBREE_MAX_ISA, and dispatches at run time to the widest one it was built
+# with. A redistributable binary has to run on every CPU it might land on, so
+# Homebrew's embree 4.3.3 bottle is built EMBREE_MAX_ISA=SSE2 -- on an AVX-512
+# Xeon it quietly runs SSE2 BVH4 traversal, and neither Embree nor PTM3D used
+# to say so.
+#
+# That is not a small cost here: ray traversal is roughly 83 % of PTM3D's
+# illumination phase. Measured on this project's Mac Pro (Xeon W-3265M,
+# Cascade Lake) on 2026-08-15, against the IDENTICAL Embree 4.3.3 source
+# rebuilt with -DEMBREE_MAX_ISA=AVX512: rtcOccluded1 1.22-1.45x faster in a
+# traversal micro-benchmark, and -14.8 % on the illumination phase of the
+# calib120 arm end to end.
+#
+# So this block does two things the old one did not: it lets the builder point
+# at a specific Embree, and it always PRINTS which library was taken and which
+# ISA kernels it carries. See INSTALL.md, "Embree ISA (performance)".
+#
+#   cmake -S . -B build -DEMBREE_ROOT=$HOME/opt/embree-4.3.3-avx512
+#
+# The CMake-native spellings still work and are equivalent:
+#   -Dembree_ROOT=<prefix>    -DCMAKE_PREFIX_PATH=<prefix>
+if(NOT EMBREE_ROOT AND DEFINED ENV{EMBREE_ROOT})
+    set(EMBREE_ROOT "$ENV{EMBREE_ROOT}")
+    message(STATUS "Embree: taking EMBREE_ROOT from the environment")
+endif()
+if(EMBREE_ROOT)
+    get_filename_component(EMBREE_ROOT "${EMBREE_ROOT}" ABSOLUTE)
+    if(NOT IS_DIRECTORY "${EMBREE_ROOT}")
+        message(FATAL_ERROR
+            "EMBREE_ROOT=${EMBREE_ROOT} is not a directory.\n"
+            "It must be an Embree INSTALL PREFIX -- the directory containing "
+            "include/embree4 and lib/cmake/embree-<version>.")
+    endif()
+    # Ahead of CMAKE_SYSTEM_PREFIX_PATH so an explicit hint outranks /usr/local.
+    list(INSERT CMAKE_PREFIX_PATH 0 "${EMBREE_ROOT}")
+    # A previous configure of this same build dir cached embree_DIR, and a
+    # cached <pkg>_DIR short-circuits the whole search -- so without this the
+    # hint would be silently outranked by the earlier answer on every
+    # incremental reconfigure, and the guard below would then hard-fail a build
+    # that was only ever asking to switch Embrees. Clearing just this one entry
+    # re-runs the search while leaving CSPICE_ROOT, GPU flags and the rest of
+    # the cache intact.
+    unset(embree_DIR CACHE)
+endif()
+
 find_package(embree 4 QUIET)
 if(NOT embree_FOUND)
     # Try with pkgconfig if CMake module doesn't work
@@ -342,7 +391,7 @@ if(NOT embree_FOUND)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(EMBREE embree4)
     endif()
-    
+
     # If still not found, set manual paths for Mac
     if(NOT EMBREE_FOUND AND APPLE)
         set(EMBREE_INCLUDE_DIRS "/usr/local/include" CACHE PATH "Path to Embree headers")
@@ -351,9 +400,99 @@ if(NOT embree_FOUND)
 endif()
 
 if(EMBREE_FOUND OR embree_FOUND)
-    message(STATUS "Embree found")
+    message(STATUS "Embree: ${EMBREE_LIBRARIES}")
 else()
     message(FATAL_ERROR "Embree not found. Please install Embree 4")
+endif()
+
+# An ignored hint is worse than no hint: it looks like it worked. If the
+# builder named a prefix and the search still landed somewhere else, stop.
+#
+# Only meaningful when the CONFIG package matched: the pkg-config branch yields
+# bare linker flags ("embree4") rather than a path, and pkg_check_modules does
+# not consult CMAKE_PREFIX_PATH at all, so EMBREE_ROOT cannot steer it. Saying
+# so beats failing with "the Embree that was found is embree4".
+if(EMBREE_ROOT AND embree_FOUND)
+    # Compare with a trailing separator on BOTH sides. A bare substring test
+    # accepts sibling prefixes that merely share leading characters --
+    # EMBREE_ROOT=~/opt/embree would happily match ~/opt/embree-4.3.3-sse2 and
+    # wave through exactly the mix-up this guard exists to catch.
+    string(FIND "${EMBREE_LIBRARIES}/" "${EMBREE_ROOT}/" _ptm_embree_under_hint)
+    if(NOT _ptm_embree_under_hint EQUAL 0)
+        message(FATAL_ERROR
+            "EMBREE_ROOT=${EMBREE_ROOT} was requested, but the Embree that was "
+            "found is\n  ${EMBREE_LIBRARIES}\nwhich is not under that prefix. "
+            "Refusing to build against an Embree you did not ask for. Check "
+            "that ${EMBREE_ROOT}/lib/cmake/embree-<version>/embree-config.cmake "
+            "exists, and clear the CMake cache before re-running.")
+    endif()
+elseif(EMBREE_ROOT AND NOT embree_FOUND)
+    message(FATAL_ERROR
+        "EMBREE_ROOT=${EMBREE_ROOT} was requested, but no Embree CMake package "
+        "was found there, so the build fell back to pkg-config or a hardcoded "
+        "path and the hint had no effect. EMBREE_ROOT requires an install "
+        "prefix containing lib/cmake/embree-<version>/embree-config.cmake. "
+        "Refusing to build against an Embree you did not ask for.")
+endif()
+
+# ---------------------------------------------------------------------------
+# Disclose the ISA. This is the whole point of the block above: an SSE2-only
+# Embree on an AVX-512 host must never again be invisible.
+#
+# EMBREE_MAX_ISA / EMBREE_ISA_* come from Embree's own embree-config.cmake, so
+# they are only trustworthy when the CONFIG package was the thing that matched.
+# Found via pkg-config or the hardcoded Apple fallback, we genuinely do not
+# know the ISA -- say that rather than guess it.
+set(PTM_EMBREE_ISA_LIST "unknown")
+set(PTM_EMBREE_MAX_ISA "unknown")
+if(embree_FOUND)
+    # Guarded, not assigned blind: a distro-patched or future embree-config.cmake
+    # that stops setting EMBREE_MAX_ISA would otherwise overwrite the "unknown"
+    # sentinel with an empty string, print "(max )", and silently stop firing
+    # the SSE2 warning below -- the same drift failure the comment further down
+    # is about.
+    if(DEFINED EMBREE_MAX_ISA AND NOT EMBREE_MAX_ISA STREQUAL "")
+        set(PTM_EMBREE_MAX_ISA "${EMBREE_MAX_ISA}")
+    else()
+        message(WARNING
+            "This Embree's CMake package does not report EMBREE_MAX_ISA, so the "
+            "build cannot state which SIMD kernels it carries. Check the run-time "
+            "[Embree] banner instead.")
+    endif()
+    set(_ptm_isas "")
+    foreach(_isa SSE2 SSE42 AVX AVX2 AVX512)
+        if(EMBREE_ISA_${_isa})
+            list(APPEND _ptm_isas "${_isa}")
+        endif()
+    endforeach()
+    if(_ptm_isas)
+        string(REPLACE ";" " " PTM_EMBREE_ISA_LIST "${_ptm_isas}")
+    endif()
+    message(STATUS "Embree: version ${EMBREE_VERSION}, max ISA ${PTM_EMBREE_MAX_ISA}, kernels: ${PTM_EMBREE_ISA_LIST}")
+
+    # The processor test is spelled out inline rather than reusing the
+    # X86_64_ARCHITECTURE variable set ~170 lines above. That is deliberate:
+    # during development this guard was written against a variable name that
+    # does not exist in this file, so the warning silently never fired and the
+    # configure looked clean. A warning whose whole job is to stop something
+    # hiding must not itself depend on a name that can drift.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)" AND PTM_EMBREE_MAX_ISA STREQUAL "SSE2")
+        message(WARNING
+            "This Embree was built EMBREE_MAX_ISA=SSE2. On an x86-64 host with "
+            "AVX/AVX-512 it will run SSE2 BVH4 traversal, which is ~83 % of the "
+            "illumination phase. A multi-ISA rebuild of the same Embree version "
+            "measured -7.0 % on the illumination phase of this project's "
+            "calib120 arm (18 paired repeats, 18/18 same sign, 2026-08-15). "
+            "This is the Homebrew default. See INSTALL.md, "
+            "\"Embree ISA (performance)\", for the rebuild recipe; then "
+            "configure with -DEMBREE_ROOT=<prefix>.")
+    endif()
+else()
+    message(WARNING
+        "Embree was located WITHOUT its CMake package (pkg-config or the "
+        "hardcoded ${CMAKE_SYSTEM_NAME} fallback path), so its ISA kernels are "
+        "unknown at configure time. The engine still reports the native packet "
+        "widths at run time; see the [Embree] banner line.")
 endif()
 
 # Include Embree in all targets that need it
@@ -456,7 +595,17 @@ set(PTM_BUILD_INFO_ARGS
     "-DPTM_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "-DPTM_VERSION=${PROJECT_VERSION}"
     "-DPTM_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
-    "-DPTM_COMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+    "-DPTM_COMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+    # Embree belongs in the engine's identity because swapping it CHANGES
+    # RESULTS (measured 2026-08-15: an SSE2 -> multi-ISA swap moved 75 of 260
+    # lunar output files, worst face-frame |dT| 0.0091 K) while leaving the
+    # executable's md5 untouched -- Embree is a dynamic library, so
+    # `brew upgrade embree` or an in-place rebuild of the same prefix rewrites
+    # the results with every other provenance field unchanged. It is also a
+    # pure function of the configure options, so recording it does not perturb
+    # the md5-stability property this header is built around.
+    "-DPTM_EMBREE_LIB=${EMBREE_LIBRARIES}"
+    "-DPTM_EMBREE_MAX_ISA=${PTM_EMBREE_MAX_ISA}")
 
 
 # ============================================================================
@@ -766,6 +915,7 @@ message(STATUS "  OpenMP:        Found")
 message(STATUS "  Eigen3:        Found")
 message(STATUS "  CSPICE:        ${CSPICE_LIBRARY}")
 message(STATUS "  Embree:        ${EMBREE_LIBRARIES}")
+message(STATUS "  Embree ISA:    ${PTM_EMBREE_ISA_LIST}  (max ${PTM_EMBREE_MAX_ISA})")
 message(STATUS "  CFITSIO:       ${CFITSIO_LIBRARIES}")
 message(STATUS "")
 message(STATUS "Options:")

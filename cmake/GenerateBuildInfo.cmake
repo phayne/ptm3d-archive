@@ -11,6 +11,9 @@
 #   PTM_BUILD_TYPE      CMAKE_BUILD_TYPE
 #   PTM_GPU_LABEL       "ON" or "OFF"
 #   PTM_COMPILER        compiler id + version
+#   PTM_EMBREE_LIB      resolved Embree library path (results-affecting; see
+#                       the note in ptm_build_info.h.in)
+#   PTM_EMBREE_MAX_ISA  that Embree's EMBREE_MAX_ISA, or "unknown"
 #
 # configure_file() writes only when the content differs, which is the whole
 # point: a no-op rebuild must not perturb the executable's md5.

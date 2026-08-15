@@ -1,6 +1,7 @@
 #include "radiation_exchange.h"
 #include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
+#include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
 #include "../thermal/thermal_model.h"  // For ProgressBar
 
 #include <embree4/rtcore.h>
@@ -1771,6 +1772,7 @@ bool RadiationExchangeManager::initializeScene() {
         std::cerr << "Error: Failed to create Embree device" << std::endl;
         return false;
     }
+    ptm::reportEmbreeIsaOnce(static_cast<RTCDevice>(device_));
 
     // Create scene
     scene_ = rtcNewScene(static_cast<RTCDevice>(device_));
