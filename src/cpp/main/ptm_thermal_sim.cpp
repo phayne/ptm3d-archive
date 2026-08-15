@@ -828,6 +828,11 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "");
 
+// On-demand illumination accessor: (global face index, absolute timestep) ->
+// W/m^2, read straight from the chunked illumination store. Declared here
+// because the SIMD batch solver below takes an optional triple of these.
+using FluxFn = std::function<double(size_t,int)>;
+
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
     const std::string& thermal_output_dir,
@@ -853,7 +858,17 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::vector<double>& eq_indirect_flux = {},
     // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
     const std::string& initial_state_file = "",
-    const std::string& final_state_file   = "");
+    const std::string& final_state_file   = "",
+    // STREAMED MODE. Supply all three and leave direct_solar_values /
+    // primary_reflected_values / primary_ir_values EMPTY: the solver then
+    // marshals one BATCH-sized (8 faces x total_time_steps) flux tile at a time
+    // straight out of the chunked illumination store instead of materializing
+    // the face x timestep arrays. Same solver, same composer, same seed --
+    // only where the forcing comes from changes. Supplying some but not all
+    // three is fatal, not silently array mode.
+    FluxFn get_direct    = FluxFn(),
+    FluxFn get_reflected = FluxFn(),
+    FluxFn get_ir        = FluxFn());
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -1372,6 +1387,91 @@ static inline bool legacyRadiosityStaticAlbedo() {
     return legacy;
 }
 
+// ---- PTM_RAD_SKIP_EQ_STEPS: skip the radiosity sweep over EQUILIBRATION ------
+// The coupling loop's radiosity sweep runs t = 0 .. total_time_steps, so on a
+// two-phase run it solves the enclosure at every EQUILIBRATION step as well as
+// every output step -- 3000 of 3020 steps on a production chunk, at the same
+// cost per step. On the GPU re-thermal path those steps feed nothing:
+//   * the whole-mesh GPU solver records surface_temps only over the output
+//     window, so surface_temps[f][t] == 0 for t < equilibration_steps and the
+//     IR band is being solved against a 0 K enclosure;
+//   * runThermalForSelectedFaces_GPU reads indirect_flux_series only at
+//     [equilibration_steps, total_time_steps) (both the output-window flux and
+//     the optional PTM_EQ_WITH_INDIRECT phase map index into that span);
+//   * every estimator and export that reduces indirect_flux_series /
+//     indirect_solar_series / indirect_ir_series uses out_lo =
+//     equilibration_steps or the (narrower) statistics window.
+// The ONE remaining consumer of the equilibration span is the per-face
+// max-indirect that drives face SELECTION, which is reduced over ALL t. So this
+// is NOT unconditionally a no-op: it ships default OFF, and the number of faces
+// whose indirect maximum lands in that span is reported every iteration so the
+// gate-off arm predicts whether the gate-on arm can differ.
+// NOT SOUND on the CPU selected-faces re-thermal: that path re-integrates the
+// whole span from a combined flux that carries indirect_flux_series at every
+// equilibration step. Armed only when thermal.use_gpu is set, and reaching the
+// CPU re-thermal while armed is FATAL rather than silently mis-forced.
+static inline bool radSkipEqStepsRequested() {
+    static bool on = []() {
+        const char* e = std::getenv("PTM_RAD_SKIP_EQ_STEPS");
+        return (e && std::string(e) != "0" && e[0] != '\0');
+    }();
+    return on;
+}
+
+// ---- PTM_RAD_SELECT_OUTPUT_WINDOW -------------------------------------------
+// The coupling loop's face selector reduces max_t indirect_flux_series[f][t]
+// over ALL t and feeds it to a linearized OUTPUT-WINDOW temperature response,
+// dF -> pred_dT = (1-A) dF / (4 eps sigma T^3). On a two-phase run the
+// equilibration part of that maximum was computed against surface_temps == 0
+// (the whole-mesh GPU solver records only the output window), so it is the
+// reflected-sunlight band alone against a 0 K enclosure -- not an indirect flux
+// the output window will ever see. Measured on the 509k lunar flagship it is
+// the LARGER of the two on 35.5% of faces, where it pins dF at 0 and freezes
+// faces whose output-window indirect is still rising: 395 frozen at sweep 5
+// against 155 when the selector looks only at the output window.
+// Restricting the reduction to [equilibration_steps, total) is therefore a
+// candidate FIX, not just a knob -- but it changes which faces are re-thermal'd,
+// so it is a results change and ships default OFF until Paul rules on it.
+static inline bool radSelectOutputWindowRequested() {
+    static bool on = []() {
+        const char* e = std::getenv("PTM_RAD_SELECT_OUTPUT_WINDOW");
+        return (e && std::string(e) != "0" && e[0] != '\0');
+    }();
+    return on;
+}
+
+// Two-phase detection: the equilibration phase is sampled at a different
+// cadence from the output phase, so the GPU thermal solvers run it as a
+// separate solver call at eq_dt and record surface temperatures over the
+// OUTPUT window only. When it is FALSE the whole span is one cadence, the
+// solvers record every step, and the rad-coupling re-thermal reads the flux
+// arrays from t=0 -- which is exactly what makes PTM_RAD_SKIP_EQ_STEPS unsound
+// there. This predicate had three identical spellings (the whole-mesh
+// persistent solver, the selected-faces re-thermal, and now the skip gate that
+// DEPENDS on the other two); two copies agreeing today and drifting later is
+// the PTM-106c class of defect, so there is one.
+static bool rethermalTwoPhase(const std::vector<double>& times,
+                              int equilibration_steps, int total_time_steps,
+                              float* eq_dt_out = nullptr,
+                              float* out_dt_out = nullptr) {
+    const int output_steps = total_time_steps - equilibration_steps;
+    float eq_dt = 0.0f;
+    float out_dt = 0.0f;
+    if (equilibration_steps > 1) {
+        eq_dt = static_cast<float>(times[1] - times[0]);
+    }
+    if (output_steps > 1 && equilibration_steps < total_time_steps) {
+        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
+    } else if (equilibration_steps > 1) {
+        out_dt = eq_dt;
+    }
+    if (equilibration_steps <= 0) eq_dt = out_dt;
+    if (eq_dt_out)  *eq_dt_out  = eq_dt;
+    if (out_dt_out) *out_dt_out = out_dt;
+    return (equilibration_steps > 0 && output_steps > 0 &&
+            std::abs(eq_dt - out_dt) > 1e-3f);
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -1543,7 +1643,8 @@ void writeHeartbeat(const std::string& msg) {
 }
 }  // namespace
 
-using FluxFn = std::function<double(size_t,int)>;
+// FluxFn is declared above runThermalModelsForAllFacesBatchSoA, which also
+// takes an optional triple of them (streamed mode).
 // No default arguments: `planet` (the angular albedo model) and
 // `eq_indirect_flux` are exactly the two inputs this path used to drop on the
 // floor, and a defaulted-away argument is how they went missing in the first
@@ -4517,13 +4618,45 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::vector<double>* face_H_overrides,
     const std::vector<double>& eq_indirect_flux,
     const std::string& initial_state_file,
-    const std::string& final_state_file)
+    const std::string& final_state_file,
+    FluxFn get_direct,
+    FluxFn get_reflected,
+    FluxFn get_ir)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     const size_t n_batches = (n_faces + BS - 1) / BS;
 
-    std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels) ===" << std::endl;
+    // ---- STREAMED MODE (perf/streamed-simd-batch) --------------------------
+    // Above the 10 GB illumination estimate the engine cannot materialize the
+    // face x timestep arrays, and until now that meant the CPU SCALAR
+    // integrator -- so the LARGEST CPU jobs got the SLOWEST solver, silently
+    // except for the disclosure banner. The forcing is the only thing that has
+    // to change: this solver already consumes its flux one BATCH-wide column at
+    // a time, so a per-thread (BS x total_time_steps) tile marshaled from the
+    // chunked store feeds it with no face x timestep allocation at all.
+    //
+    // All three getters, or none. A partial set would mean the caller thinks it
+    // is streaming while the solver silently reads empty arrays.
+    const int n_getters = (get_direct ? 1 : 0) + (get_reflected ? 1 : 0) + (get_ir ? 1 : 0);
+    const bool streamed = (n_getters == 3);
+    if (n_getters != 0 && n_getters != 3) {
+        std::cerr << "[SIMD Batch] FATAL: streamed mode needs all three flux "
+                     "getters (direct, reflected, IR); " << n_getters
+                  << " were supplied. Refusing to run half-streamed.\n";
+        return false;
+    }
+    if (streamed && !(direct_solar_values.empty() &&
+                      primary_reflected_values.empty() &&
+                      primary_ir_values.empty())) {
+        std::cerr << "[SIMD Batch] FATAL: streamed mode was requested AND the "
+                     "illumination arrays are populated. One of the two is "
+                     "stale; refusing to guess which forcing is meant.\n";
+        return false;
+    }
+
+    std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels"
+              << (streamed ? ", STREAMED flux" : "") << ") ===" << std::endl;
     std::cerr << "Processing " << n_faces << " faces in " << n_batches << " batches of " << BS << std::endl;
 #if defined(__AVX512F__)
     std::cerr << "Using AVX-512 (8 faces per SIMD operation)" << std::endl;
@@ -4552,6 +4685,76 @@ bool runThermalModelsForAllFacesBatchSoA(
     std::shared_ptr<ptm::SpatialMap> batch_albedo_map =
         loadExplicitAlbedoMap(config, "[SIMD Batch]");
 
+    // The absorbed-flux forcing, in one of two shapes.
+    //
+    // ARRAY MODE: the whole face x timestep field, transposed once to
+    // column-major so the batch loop reads BS contiguous doubles per step.
+    // STREAMED MODE: nothing here at all -- each batch marshals its own
+    // (BS x total_time_steps) tile below, through the SAME composer, and the
+    // per-batch tile has the same [t * stride + f] layout with stride = BS.
+    // `flux_base` / `flux_stride` is what the solver below reads, so exactly one
+    // set of index expressions serves both.
+    std::vector<double> flux_column_major;
+    AbsorbedFluxComposer streamed_composer;
+    const int eq_hi_streamed = std::min(equilibration_steps, total_time_steps);
+    bool add_eq_indirect_streamed = false;
+
+    if (streamed) {
+        // Same composer, same inputs, same tag semantics as the array path's
+        // internal one (calculateAbsorbedFlux builds this exact object). Built
+        // once here; absorbed() is then called per (face, timestep) from the
+        // batch loop, which is parallel over batches and therefore over faces --
+        // the accumulator contract the composer documents.
+        std::cerr << "[SIMD Batch] Composing absorbed flux on demand "
+                     "(per-face spatial + incidence-angle albedo, streamed)..."
+                  << std::endl;
+        // The memory claim of this mode, stated rather than assumed. Streaming
+        // exists because RAM is tight, so the replacement allocation is
+        // reported: one tile per THREAD, not one array per mesh. It scales with
+        // total_time_steps, so a few-face / very-many-step chunked run is the
+        // shape that could make it non-trivial -- print it and let the operator
+        // see the number instead of discovering it as an OOM.
+        {
+            const double tile_mb = static_cast<double>(BS) *
+                                   static_cast<double>(total_time_steps) *
+                                   sizeof(double) / (1024.0 * 1024.0);
+            // Built in a local stream, NOT with std::fixed/setprecision on
+            // std::cerr: those stick, and a later cerr diagnostic that relies
+            // on the default format then prints a real 3e-14 residual as
+            // "0.00". Same trap thermal_model.cpp:2224 documents.
+            std::ostringstream m;
+            m << "[SIMD Batch] streamed flux tile: " << std::fixed
+              << std::setprecision(3) << tile_mb << " MB per thread ("
+              << BS << " faces x " << total_time_steps << " steps x 8 B), "
+              << std::setprecision(2)
+              << (tile_mb * std::max(1, thermal_threads) / 1024.0)
+              << " GB across " << std::max(1, thermal_threads)
+              << " threads; the face x timestep arrays ("
+              << (static_cast<double>(n_faces) * total_time_steps * 8.0 * 2.0
+                  / (1024.0 * 1024.0 * 1024.0))
+              << " GB for absorbed + column-major) are never allocated.";
+            std::cerr << m.str() << std::endl;
+        }
+        if (!streamed_composer.build(batch_albedo_map, mesh, n_faces,
+                                     default_visible_albedo, config, &planet,
+                                     planet.S, "cpu_simd_batch_streamed")) {
+            std::cerr << "[SIMD Batch] Absorbed-flux composition could not be built -- "
+                         "refusing to run against an unresolved albedo.\n";
+            return false;
+        }
+        if (!eq_indirect_flux.empty() && equilibration_steps > 0) {
+            if (eq_indirect_flux.size() != n_faces) {
+                std::cerr << "[SIMD Batch] FATAL: eq_indirect_flux has "
+                          << eq_indirect_flux.size() << " entries for " << n_faces
+                          << " faces; refusing to equilibrate against a mismatched"
+                             " forcing.\n";
+                return false;
+            }
+            add_eq_indirect_streamed = true;
+            std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
+                         " indirect flux over steps [0, " << eq_hi_streamed << ").\n";
+        }
+    } else {
     std::cerr << "Computing absorbed flux (per-face spatial + incidence-angle albedo)..." << std::endl;
     std::vector<double> absorbed_flux_rowmajor = calculateAbsorbedFlux(
         direct_solar_values,
@@ -4572,7 +4775,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // Transpose to COLUMN-MAJOR for SIMD efficiency.
     // Layout: flux_column_major[t * n_faces + f] - timestep-major ordering.
-    std::vector<double> flux_column_major(n_faces * total_time_steps, 0.0);
+    flux_column_major.assign(n_faces * total_time_steps, 0.0);
     constexpr size_t BLOCK_F = 64;
     constexpr size_t BLOCK_T = 64;
     #pragma omp parallel for schedule(static) collapse(2)
@@ -4616,6 +4819,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
                      " indirect flux over steps [0, " << eq_hi << ").\n";
     }
+    }   // end array mode
 
     // Initialize output
     if (surface_temps_out) {
@@ -4930,6 +5134,16 @@ bool runThermalModelsForAllFacesBatchSoA(
         batch.initialize(n_layers, BS, planet, config);
         batch.copyGridFromProfile(ref_profile);
 
+        // Streamed mode only: this thread's flux tile, BS faces x every
+        // timestep, laid out [t * BS + f] so it is index-compatible with the
+        // column-major array. 8 x 1440 x 8 B = 92 kB for a lunar production
+        // window -- the memory bound streaming exists to hold is untouched.
+        std::vector<double> flux_tile;
+        if (streamed) {
+            flux_tile.assign(static_cast<size_t>(BS) *
+                             static_cast<size_t>(total_time_steps), 0.0);
+        }
+
         #pragma omp for schedule(dynamic, 1)
         for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
             size_t start_face = batch_idx * BS;
@@ -4937,6 +5151,59 @@ bool runThermalModelsForAllFacesBatchSoA(
             int faces_in_batch = static_cast<int>(end_face - start_face);
 
             batch.n_faces = faces_in_batch;
+
+            // ---- the forcing this batch integrates ------------------------
+            // ONE pair of names for both modes, so every read below is a single
+            // index expression and the two modes cannot drift apart.
+            //   array   : flux_base[t*n_faces + f] == flux_column_major[t*n_faces + start_face + f]
+            //   streamed: flux_base[t*BS      + f] == this batch's own tile
+            const double* flux_base;
+            size_t        flux_stride;
+            if (streamed) {
+                // Per (face, timestep), through the SAME AbsorbedFluxComposer
+                // kernel calculateAbsorbedFlux loops over, in the SAME ascending
+                // t order per face -- the composer's per-face effective-albedo
+                // accumulators are order-dependent, and one thread owns this
+                // batch, so the sums are bit-for-bit the array path's.
+                //
+                // KNOWN, DELIBERATELY NOT FIXED: those accumulators are two
+                // plain double vectors, so an 8-face batch's slots share a
+                // cache line with the neighboring batches' and false-share
+                // under schedule(dynamic,1). Padding them, or accumulating
+                // batch-locally and adding once, would change the summation
+                // ORDER and forfeit the bit-identity gate this whole change is
+                // built on. Measured cost: none visible -- the streamed tile
+                // fill plus solve still beats the array path end to end
+                // (14.83 s vs 18.95 s, 12 threads, 12,800 faces x 7,980 steps).
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t gf = start_face + f;
+                    for (int t = 0; t < total_time_steps; ++t) {
+                        flux_tile[static_cast<size_t>(t) * BS + f] =
+                            streamed_composer.absorbed(gf, t,
+                                                       get_direct(gf, t),
+                                                       get_reflected(gf, t),
+                                                       get_ir(gf, t));
+                    }
+                }
+                if (add_eq_indirect_streamed) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const double q = eq_indirect_flux[start_face + f];
+                        for (int t = 0; t < eq_hi_streamed; ++t)
+                            flux_tile[static_cast<size_t>(t) * BS + f] += q;
+                    }
+                }
+                // A short final batch would otherwise leave the previous
+                // batch's values in the dead lanes. Nothing reads them today;
+                // zero them anyway rather than rely on that staying true.
+                for (int f = faces_in_batch; f < BS; ++f)
+                    for (int t = 0; t < total_time_steps; ++t)
+                        flux_tile[static_cast<size_t>(t) * BS + f] = 0.0;
+                flux_base   = flux_tile.data();
+                flux_stride = static_cast<size_t>(BS);
+            } else {
+                flux_base   = flux_column_major.data() + start_face;
+                flux_stride = n_faces;
+            }
 
             // Per-face H-parameter override: when the planet has a per-face H
             // map loaded (Diviner Hayne+2017 or user-supplied), refresh kc/rho
@@ -5004,8 +5271,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 size_t global_f = start_face + f;
 
                 // Per-face surface estimate from the face's actual average flux
-                // (includes shadowing, reflected, IR — already baked into
-                // flux_column_major by calculateAbsorbedFlux above).
+                // (includes shadowing, reflected, IR — already baked into the
+                // forcing this batch reads: calculateAbsorbedFlux for the array
+                // mode, the per-batch composed tile when streaming).
                 //
                 // The window is the WHOLE forcing span under the shared seed.
                 // The legacy window was the first min(100, N) steps, which on
@@ -5021,7 +5289,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // EqSeedInput::mean_inst_radeq_T.
                 double sum_inst_T = 0.0;
                 for (int t = 0; t < flux_avg_window; ++t) {
-                    const double Ft = flux_column_major[t * n_faces + global_f];
+                    const double Ft = flux_base[static_cast<size_t>(t) * flux_stride + f];
                     avg_flux += Ft;
                     const double q = (Ft > 0.0 ? Ft : 0.0) + batch.Qb[f];
                     sum_inst_T += (q > 0.0)
@@ -5086,8 +5354,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                         rho_col[layer] = batch.rho[layer * BS + f];
                     }
                     thermal::EqSeedForcing sfc_;
-                    sfc_.flux       = &flux_column_major[global_f];
-                    sfc_.stride     = static_cast<size_t>(n_faces);
+                    sfc_.flux       = flux_base + f;
+                    sfc_.stride     = flux_stride;
                     sfc_.n_samples  = flux_avg_window;
                     sfc_.span_s     = seed_dt_s * flux_avg_window;
                     sfc_.cycle_s    = planet.day;
@@ -5252,8 +5520,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                     // population at all.
                     double fmax = 0.0;
                     for (int t = 0; t < total_time_steps; ++t) {
-                        const double v = flux_column_major[
-                            static_cast<size_t>(t) * n_faces + start_face + f];
+                        const double v =
+                            flux_base[static_cast<size_t>(t) * flux_stride + f];
                         if (v > fmax) fmax = v;
                     }
                     const bool dark = !(fmax > 0.0);
@@ -5523,8 +5791,8 @@ bool runThermalModelsForAllFacesBatchSoA(
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
             for (int t = 0; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
-                const double* flux_a = &flux_column_major[t       * n_faces + start_face];
-                const double* flux_b = &flux_column_major[(t + 1) * n_faces + start_face];
+                const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
+                const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
 
                 const int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
@@ -5582,6 +5850,14 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     progressBar.finish();
+
+    // PTM-107(a): hand the per-face effective albedo to the statistics writer.
+    // In array mode calculateAbsorbedFlux already published its own composer's;
+    // the streamed composer is ours, so we publish it, at the same point in the
+    // run and from the same accumulators. Without this a streamed SIMD-batch
+    // run would ship no effective_albedo.bin -- the exact defect 66c6dd7 removed
+    // from the scalar streamed path.
+    if (streamed) streamed_composer.publishEffectiveAlbedo();
 
     // Equilibration spin-up estimate (FIX 0). Emitted once, after every batch
     // has contributed. The numbers are a prediction made one substep into a
@@ -6940,20 +7216,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const int output_steps = total_time_steps - equilibration_steps;
     float eq_dt = 0.0f;
     float out_dt = 0.0f;
-    bool two_phase = false;
-
-    if (equilibration_steps > 1) {
-        eq_dt = static_cast<float>(times[1] - times[0]);
-    }
-    if (output_steps > 1 && equilibration_steps < total_time_steps) {
-        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
-    } else if (equilibration_steps > 1) {
-        out_dt = eq_dt;
-    }
-    if (equilibration_steps <= 0) eq_dt = out_dt;
-
-    two_phase = (equilibration_steps > 0 && output_steps > 0 &&
-                 std::abs(eq_dt - out_dt) > 1e-3f);
+    const bool two_phase = rethermalTwoPhase(times, equilibration_steps,
+                                             total_time_steps, &eq_dt, &out_dt);
 
     // For single-phase (legacy), use a single dt.
     float dt = two_phase ? eq_dt : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
@@ -8823,17 +9087,8 @@ bool runThermalForSelectedFaces_GPU(
     const int output_steps = total_time_steps - equilibration_steps;
     float eq_dt = 0.0f;
     float out_dt = 0.0f;
-    if (equilibration_steps > 1) {
-        eq_dt = static_cast<float>(times[1] - times[0]);
-    }
-    if (output_steps > 1 && equilibration_steps < total_time_steps) {
-        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
-    } else if (equilibration_steps > 1) {
-        out_dt = eq_dt;
-    }
-    if (equilibration_steps <= 0) eq_dt = out_dt;
-    const bool two_phase = (equilibration_steps > 0 && output_steps > 0 &&
-                            std::abs(eq_dt - out_dt) > 1e-3f);
+    const bool two_phase = rethermalTwoPhase(times, equilibration_steps,
+                                             total_time_steps, &eq_dt, &out_dt);
     const float dt_single = two_phase
         ? eq_dt
         : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
@@ -9732,7 +9987,18 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
                   << "  The SPICE leapseconds/ephemeris kernels are not loaded, so the absolute\n"
                   << "  epoch cannot be resolved. Populate the kernel directory with:\n"
                   << "      python3 scripts/fetch_kernels.py\n"
-                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+                  << "  (see INSTALL.md, section \"SPICE kernel data\").\n";
+        // Name every directory the kernel ladder searched. This message is the
+        // one a fresh clone actually hits -- including on a Keplerian
+        // generic-body run, which needs no ephemeris but still needs an LSK to
+        // convert start_time -- and "populate the kernel directory" is useless
+        // without saying WHICH directory was looked in.
+        const std::string& ladder = IlluminationModel::spiceKernelSearchReport();
+        std::cerr << (ladder.empty()
+                          ? std::string("  (SPICE kernel directory was never resolved:"
+                                        " initialize_spice() has not run.)")
+                          : ladder)
+                  << std::endl;
         std::exit(1);
     }
 
@@ -16414,10 +16680,10 @@ int main(int argc, char** argv) {
         if (using_chunked_storage && use_streamed_thermal) {
             // Disclosed INSIDE the branch whose condition selects the solver,
             // and from the same `memory_required_gb_est` / `STREAM_THRESHOLD_GB`
-            // that condition was built from. This is the swap that used to be
-            // invisible: the banner below this block says only that
-            // ILLUMINATION is streamed, never that the SOLVER changed from the
-            // configured SIMD batch to the scalar one.
+            // that condition was built from. The banner below this block says
+            // only that ILLUMINATION is streamed; which INTEGRATOR runs is said
+            // here, and since perf/streamed-simd-batch it is the configured one.
+            ptm::ThermalSolverPath stream_path = ptm::ThermalSolverPath::Unset;
             {
                 std::ostringstream why;
                 why << std::fixed << std::setprecision(1)
@@ -16425,11 +16691,20 @@ int main(int argc, char** argv) {
                        "footprint " << memory_required_gb_est
                     << " GB exceeds the " << STREAM_THRESHOLD_GB
                     << " GB streaming threshold (PTM_RAM_ILLUM_MAX_GB)";
+                // ONE decision, consumed by both the disclosure and the
+                // dispatch below -- the same rule the non-streamed switch
+                // follows. Streaming is a property of where the FORCING comes
+                // from; it is no longer allowed to pick the integrator.
+                const bool use_simd_batch_s =
+                    thermal_config.getPropertyBool("use_simd_batch", true);
+                stream_path = use_simd_batch_s
+                                  ? ptm::ThermalSolverPath::CpuStreamedBatch
+                                  : ptm::ThermalSolverPath::CpuStreamed;
                 ptm::discloseThermalSolverPath(
-                    ptm::ThermalSolverPath::CpuStreamed,
+                    stream_path,
                     ptm::ThermalSolverReason::MemoryThreshold,
                     why.str(),
-                    thermal_config.getPropertyBool("use_simd_batch", true));
+                    use_simd_batch_s);
             }
 
             // On-demand getters from illumination model (no large buffers)
@@ -16448,7 +16723,36 @@ int main(int argc, char** argv) {
             // own H-driven rho(z), k(z) profile.
             const std::vector<double>* face_H_ptr =
                 planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-            bool thermal_success_streamed = runThermalModelsForAllFacesStreamed(
+            bool thermal_success_streamed;
+            if (stream_path == ptm::ThermalSolverPath::CpuStreamedBatch) {
+                // The configured (shipped-default) integrator, fed from the
+                // chunk store. The three illumination arrays are deliberately
+                // EMPTY here -- that is what puts the solver in streamed mode,
+                // and it refuses if they are not.
+                thermal_success_streamed = runThermalModelsForAllFacesBatchSoA(
+                    output_dir,
+                    mesh,
+                    std::vector<double>(),   // direct    -- streamed
+                    std::vector<double>(),   // reflected -- streamed
+                    std::vector<double>(),   // IR        -- streamed
+                    times,
+                    total_time_steps,
+                    thermal_config,
+                    default_visible_albedo,
+                    &surface_temps,
+                    equilibration_steps,
+                    total_time_steps,
+                    thermal_threads,
+                    face_Qb_ptr,
+                    face_H_ptr,
+                    eq_indirect_vec,
+                    sim_config.thermal.initial_state_file,
+                    sim_config.thermal.final_state_file,
+                    get_direct,
+                    get_reflected,
+                    get_ir);
+            } else {
+            thermal_success_streamed = runThermalModelsForAllFacesStreamed(
                 mesh,
                 times,
                 total_time_steps,
@@ -16473,9 +16777,19 @@ int main(int argc, char** argv) {
                 sim_config.thermal.initial_state_file,
                 sim_config.thermal.final_state_file
             );
+            }
 
             if (!thermal_success_streamed) {
                 std::cerr << "Streamed thermal mesh simulation failed" << std::endl;
+                return 1;
+            }
+            // Shape check, the same one the non-streamed branches run. The
+            // streamed branch never had it; a solver that returned a short or
+            // ragged matrix would previously have been caught only downstream.
+            if (!validateTemperatureMatrix(surface_temps, mesh->faces.size(),
+                                           total_time_steps)) {
+                std::cerr << "[FATAL] Invalid temperature matrix shape after streamed "
+                             "thermal solve; aborting.\n";
                 return 1;
             }
             thermal_success = true;
@@ -17166,6 +17480,93 @@ int main(int argc, char** argv) {
                 std::cout << "  Face-selection mode: "
                           << rad_coupling_select_mode << std::endl;
 
+                // ---- PTM_RAD_SKIP_EQ_STEPS (default OFF) --------------------
+                // See radSkipEqStepsRequested() for why this is sound only on
+                // the GPU re-thermal path, and for the one consumer that keeps
+                // it from being unconditionally byte-identical.
+                bool rad_skip_eq_steps = false;
+                if (radSkipEqStepsRequested()) {
+                    if (!thermal_config.getPropertyBool("use_gpu_thermal", false)) {
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set but"
+                                     " thermal.use_gpu is false. The CPU selected-faces"
+                                     " re-thermal re-integrates the WHOLE span from a"
+                                     " combined flux built out of indirect_flux_series,"
+                                     " so skipping the equilibration radiosity would"
+                                     " silently change its forcing. Refusing to run.\n";
+                        return 1;
+                    }
+                    if (equilibration_steps <= 0
+                            || equilibration_steps >= total_time_steps) {
+                        std::cout << "  [rad-skip-eq] PTM_RAD_SKIP_EQ_STEPS is set but there"
+                                     " is nothing to skip (equilibration_steps="
+                                  << equilibration_steps << " of " << total_time_steps
+                                  << "); sweeping every timestep." << std::endl;
+                    } else if (export_locations && !locations_file.empty()) {
+                        // exportLocationIlluminationAndTemperature() reads
+                        // indirect_flux[f][t] for t = 0 .. time_steps-1, i.e.
+                        // ABSOLUTE indices that land inside the equilibration
+                        // span on any two-phase run. (That is a pre-existing
+                        // window defect in the location CSV -- it reads the
+                        // equilibration prefix rather than the output window,
+                        // and at the wrong stride for the flat arrays -- but
+                        // arming this gate would additionally turn its
+                        // IndirectFlux column silently into zeros.)
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set and this run"
+                                     " exports location time series ('" << locations_file
+                                  << "'). That export indexes indirect_flux from t=0, so"
+                                     " the skipped span would silently zero its IndirectFlux"
+                                     " column. Refusing to run.\n";
+                        return 1;
+                    } else if (!rethermalTwoPhase(times, equilibration_steps,
+                                                  total_time_steps)) {
+                        // Single-cadence run: the re-thermal integrates from t=0
+                        // and reads indirect_flux_series over the WHOLE span, so
+                        // the equilibration radiosity is load-bearing there.
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set but this run is"
+                                     " NOT two-phase (the equilibration and output cadences"
+                                     " match, so the re-thermal integrates from t=0 and"
+                                     " consumes indirect_flux_series over the whole span)."
+                                     " Refusing to run.\n";
+                        return 1;
+                    } else {
+                        rad_skip_eq_steps = true;
+                        std::cout << "  [rad-skip-eq] PTM_RAD_SKIP_EQ_STEPS: the radiosity"
+                                     " sweep starts at absolute step " << equilibration_steps
+                                  << " of " << total_time_steps << " -- "
+                                  << equilibration_steps << " equilibration steps ("
+                                  << (100.0 * equilibration_steps / total_time_steps)
+                                  << "%) are NOT solved and indirect_flux_series stays 0"
+                                     " there. EXPERIMENTAL: the only consumer of that span"
+                                     " is the face-selection max-indirect; the"
+                                     " '[rad-skip-eq] indirect maximum' line below reports"
+                                     " how many faces it can move." << std::endl;
+                    }
+                }
+                // Absolute step the radiosity sweep starts at, and the exclusive
+                // upper bound of the span the selection audit inspects.
+                const int rad_sweep_t_lo = rad_skip_eq_steps ? equilibration_steps : 0;
+                const int rad_eq_audit_hi =
+                    std::max(0, std::min(equilibration_steps, total_time_steps));
+
+                // ---- PTM_RAD_SELECT_OUTPUT_WINDOW (default OFF) -------------
+                // Lower bound of the face-selector's max-indirect reduction.
+                // 0 (default) reproduces the shipped selector exactly.
+                const bool rad_select_output_window =
+                    radSelectOutputWindowRequested() && rad_eq_audit_hi > 0;
+                const int rad_sel_t_lo = rad_select_output_window ? rad_eq_audit_hi : 0;
+                if (radSelectOutputWindowRequested()) {
+                    std::cout << "  [rad-select-window] PTM_RAD_SELECT_OUTPUT_WINDOW: the"
+                                 " face selector's max-indirect reduction starts at absolute"
+                                 " step " << rad_sel_t_lo << " of " << total_time_steps
+                              << (rad_select_output_window
+                                      ? " -- the equilibration span (solved against a 0 K"
+                                        " enclosure) no longer sets any face's dF."
+                                        " RESULTS CHANGE: this re-thermals faces the shipped"
+                                        " selector freezes."
+                                      : " -- no equilibration phase, so this is a no-op.")
+                              << std::endl;
+                }
+
                 // Time-varying indirect flux per face [face][timestep]
                 // This is the key fix: indirect flux varies with time as wall temperatures change
                 // (indirect_flux_series declared at outer scope for location export)
@@ -17521,7 +17922,11 @@ int main(int argc, char** argv) {
                     double max_indirect = 0.0;
                     double total_indirect_sum = 0.0;
 
-                    thermal::ProgressBar flux_progress(total_time_steps, "Computing indirect flux", 50, true);
+                    // Sized to the span actually swept, so the bar does not jump
+                    // straight to ~99% under PTM_RAD_SKIP_EQ_STEPS. Identical to
+                    // total_time_steps when the gate is off (rad_sweep_t_lo = 0).
+                    thermal::ProgressBar flux_progress(total_time_steps - rad_sweep_t_lo,
+                                                       "Computing indirect flux", 50, true);
 
                     // Multi-GPU radiosity dispatch: when the pool is active,
                     // process timesteps in batches sized to amortize per-batch
@@ -17530,12 +17935,9 @@ int main(int argc, char** argv) {
                     const bool use_pool_dispatch = rad_manager.hasGPUPool();
                     int batch_size = 1;
                     if (use_pool_dispatch) {
-                        batch_size = (rad_gpu_batch_size > 0)
-                            ? rad_gpu_batch_size
-                            : 4 * std::max(1, rad_gpu_devices);
-                        std::cout << "  [Multi-GPU radiosity] dispatching "
-                                  << batch_size << " timesteps/batch across "
-                                  << rad_gpu_devices << " GPUs" << std::endl;
+                        batch_size = radiation::resolvePoolBatchSize(
+                            rad_gpu_batch_size, total_time_steps,
+                            std::max(1, rad_gpu_devices), num_faces, /*announce=*/true);
                     }
 
                     // Hoisted out of the per-timestep loop: these two num_faces-sized
@@ -17609,7 +18011,7 @@ int main(int argc, char** argv) {
                         }
                         if (accumulate) g_src_albedo_valid = true;
                     };
-                    for (int t_start = 0; t_start < total_time_steps;
+                    for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
                             std::min(t_start + batch_size, total_time_steps);
@@ -17764,14 +18166,21 @@ int main(int argc, char** argv) {
                         }
 
                         if (t_end % 10 == 0 || t_end == total_time_steps) {
-                            flux_progress.update(t_end);
+                            flux_progress.update(t_end - rad_sweep_t_lo);
                         }
                     }
                     flux_progress.finish();
                     eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
                     ++eqi_n_sweep;
 
-                    double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
+                    // Denominator is the span actually SWEPT, not the whole table:
+                    // under PTM_RAD_SKIP_EQ_STEPS total_indirect_sum accumulates
+                    // only over [rad_sweep_t_lo, total_time_steps), and dividing
+                    // by the full table would drop this line ~150x on a 3000-of-
+                    // 3020 chunk as a pure artifact -- in the one summary line an
+                    // operator A/B-diffs between the two arms.
+                    double mean_indirect = total_indirect_sum
+                        / (num_faces * static_cast<size_t>(total_time_steps - rad_sweep_t_lo));
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
 
@@ -17854,15 +18263,27 @@ int main(int argc, char** argv) {
                     std::vector<double> face_max_T(num_faces, 0.0);
                     double max_temp_change = 0.0;
                     double total_indirect_per_face_sum = 0.0;
+                    // PTM_RAD_SKIP_EQ_STEPS audit: this reduction is the ONLY
+                    // consumer that reads indirect_flux_series inside the
+                    // equilibration span, so the faces whose maximum is attained
+                    // there are exactly the faces the skip can move. Counted
+                    // unconditionally (one extra compare inside a loop that
+                    // already reads the value) so the gate-OFF arm predicts the
+                    // gate-ON arm instead of the pair being compared blind.
+                    size_t n_eq_attained = 0;
 
                     #pragma omp parallel for schedule(static) \
                         reduction(max:max_temp_change) \
-                        reduction(+:total_indirect_per_face_sum)
+                        reduction(+:total_indirect_per_face_sum,n_eq_attained)
                     for (size_t f = 0; f < num_faces; f++) {
-                        double mi = 0.0, mT = 0.0, odT = 0.0;
+                        double mi = 0.0, mT = 0.0, odT = 0.0, mi_eq = 0.0;
                         for (int t = 0; t < total_time_steps; t++) {
                             const double v = indirect_flux_series[f][t];
-                            if (v > mi) mi = v;
+                            // t >= rad_sel_t_lo is unconditionally true at the
+                            // default rad_sel_t_lo = 0, so the shipped selector
+                            // is reproduced bit for bit.
+                            if (t >= rad_sel_t_lo && v > mi) mi = v;
+                            if (t < rad_eq_audit_hi && v > mi_eq) mi_eq = v;
                             const double T = surface_temps[f][t];
                             if (T > mT) mT = T;
                             const double dT = std::abs(T - prev_temps[f][t]);
@@ -17873,6 +18294,17 @@ int main(int argc, char** argv) {
                         observed_dT[f]       = odT;
                         total_indirect_per_face_sum += mi;
                         if (odT > max_temp_change) max_temp_change = odT;
+                        if (mi_eq > 0.0 && mi_eq >= mi) ++n_eq_attained;
+                    }
+                    if (rad_eq_audit_hi > 0) {
+                        std::cout << "  [rad-skip-eq] indirect maximum attained inside the"
+                                     " equilibration span on " << n_eq_attained << " / "
+                                  << num_faces << " faces"
+                                  << (rad_skip_eq_steps
+                                          ? " (0 by construction -- the span was skipped)"
+                                          : " (these are the faces PTM_RAD_SKIP_EQ_STEPS"
+                                            " could move)")
+                                  << std::endl;
                     }
 
                     // Pick faces to re-run.
@@ -18037,6 +18469,27 @@ int main(int argc, char** argv) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
                             use_gpu_thermal_rerun = false;
                         }
+                    }
+
+                    // PTM_RAD_SKIP_EQ_STEPS is only sound while the GPU
+                    // re-thermal owns this step. Landing on the CPU re-thermal
+                    // with it armed means the equilibration forcing about to be
+                    // integrated is missing its indirect term on every selected
+                    // face. Refuse HERE -- before the combined_flux build below,
+                    // which is documented at up to ~5.2 GB -- rather than after
+                    // paying for it.
+                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is armed but coupling"
+                                     " iteration " << (iter + 1) << " fell to the CPU"
+                                     " selected-faces re-thermal (" << faces_to_rerun.size()
+                                  << " faces; the GPU path needs >= 100 and must not have"
+                                     " failed). That path re-integrates the equilibration"
+                                     " span from a combined flux built out of"
+                                     " indirect_flux_series, which this run deliberately"
+                                     " left at zero there.\n"
+                                  << "  Refusing to write silently mis-forced results."
+                                     " Re-run without PTM_RAD_SKIP_EQ_STEPS.\n";
+                        return 1;
                     }
 
                     // CPU path needs pre-built combined_flux per face. Build it

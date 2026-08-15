@@ -58,6 +58,7 @@ struct RadiationConfig {
     int    mc_rays_per_face     = 100000;
     int    max_iterations       = 100;    // radiosity sweeps
     double convergence_tolerance = 0.01;
+    int    convergence_check_interval = 0;  // GPU only; 0 = auto, sized per matrix
     bool   use_gpu              = false;
     double rms_slope_deg        = 0.0;    // 0 = Lambertian emission
     /* ... */

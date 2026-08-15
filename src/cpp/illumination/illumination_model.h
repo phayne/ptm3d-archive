@@ -104,7 +104,20 @@ public:
     bool hasExternalTimeGrid() const { return !external_ets_.empty(); }
     void setKernelsPath(const std::string& path) {
         kernels_path_ = path;
+        kernels_path_explicit_ = true;
+        kernels_path_resolved_ = false;   // re-report with this rung on top
     }
+
+    // Every directory the SPICE kernel-resolution ladder considered, in order,
+    // with the source of each rung and which one was taken. Populated by
+    // initialize_spice(); empty before the first call.
+    //
+    // Exposed because the failure this diagnoses happens LATER and ELSEWHERE:
+    // a run whose kernel directory carries no leapseconds kernel dies in
+    // str2et_c with a bare SPICE(NOLEAPSECONDS), several screens after the one
+    // line that named the directory. The report lets that message name every
+    // location that was searched instead of only the fetch command.
+    static const std::string& spiceKernelSearchReport();
 
     // Set the target body (e.g., "EUROPA", "MOON")
     void setTargetBody(const std::string& body_name) {
@@ -510,6 +523,23 @@ private:
     std::array<double, 3> primary_vis_key_pos_ = {0.0, 0.0, 0.0};
     size_t primary_vis_key_n_ = static_cast<size_t>(-1);
 
+    // Temporal reuse of the ray-derived terrain factor only (see
+    // PRIMARY_DISK_REUSE_CELL_FRACTION in primary_disk.h). The horizon clip A
+    // and the distance are recomputed from the TRUE primary position on every
+    // call; only this cached V is held across steps, and its lattice cell --
+    // not a step count -- decides when it is refreshed, so the schedule is a
+    // pure function of geometry and survives chunking and warm starts.
+    std::vector<double> primary_vis_terrain_;    // V in [0,1], per face
+    std::array<long long, 3> primary_vis_cell_ = {0, 0, 0};
+    const void* primary_vis_terrain_centers_ = nullptr;
+    const void* primary_vis_terrain_normals_ = nullptr;
+    bool primary_vis_cell_valid_ = false;
+
+    // Reuse cell size, read once from PRIMARY_DISK_REUSE_CELL_FRACTION and the
+    // optional PTM_PRIMARY_DISK_REUSE_FRACTION override. Reports itself when
+    // overridden -- a knob that changes physics must never be silent.
+    static double primaryDiskReuseFraction();
+
     // Generic body / Keplerian propagation support
     bool use_keplerian_ = false;
     std::unique_ptr<orbital::KeplerianPropagator> keplerian_propagator_;
@@ -630,10 +660,18 @@ private:
     double albedo_ = 0.5;
     // SPICE kernel directory. Intentionally EMPTY by default: it is resolved in
     // initialize_spice() from (in order) an explicit setKernelsPath() call,
-    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
-    // var, default <repo>/data/kernels). Never a hardcoded developer path
-    // (portability audit P0, PORT-02).
+    // $PTM_SPICE_KERNELS, $PTM_DATA_ROOT/kernels, then the compiled-in
+    // SPICE_KERNELS_DIR (CMake cache var, default <repo>/data/kernels). Never a
+    // hardcoded developer path (portability audit P0, PORT-02).
     std::string kernels_path_;
+    // True only when a caller supplied the directory through setKernelsPath().
+    // Without this flag a second initialize_spice() call on the same object
+    // would read its OWN previous result back as if a caller had set it, and
+    // report the wrong rung.
+    bool kernels_path_explicit_ = false;
+    // The ladder runs once per object; re-running it would re-print the
+    // directory line and overwrite the search report with a one-rung version.
+    bool kernels_path_resolved_ = false;
     
     // Embree ray tracing resources
     RTCDevice embree_device_ = nullptr;

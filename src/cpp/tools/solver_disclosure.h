@@ -9,23 +9,31 @@
 //                             using_chunked_storage
 //                          && (memory_required_gb_est > STREAM_THRESHOLD_GB)
 //
-// Above that threshold a CPU run silently swaps its solver from the default
-// SIMD batch solver to the scalar solver. The only thing the log said about it
-// was "Will stream illumination to the thermal solver" -- a statement about
-// ILLUMINATION storage, which never mentions that the SOLVER changed. A
-// 509,337-face x 1440-step lunar run estimates 16.4 GB by that predicate's own
-// arithmetic (faces x steps x 8 B x 3 arrays, divided by 1024^3) and so crosses
-// the 10 GB default; production runs took the swap and no log recorded it.
+// Above that threshold a CPU run cannot materialize the face x timestep
+// illumination arrays. The only thing the log said about it was "Will stream
+// illumination to the thermal solver" -- a statement about ILLUMINATION
+// storage, which never mentioned that the SOLVER changed too. A 509,337-face x
+// 1440-step lunar run estimates 16.4 GB by that predicate's own arithmetic
+// (faces x steps x 8 B x 3 arrays, divided by 1024^3) and so crosses the 10 GB
+// default; production runs took the swap and no log recorded it.
 //
-// What the swap costs is deliberately NOT characterized here. The streamed
-// path is byte-identical to the --no-simd-batch run the same config would
-// otherwise get (measured on 0bb5218, 80N tutorial crater: only provenance.txt
-// differs, 0.000 K on every temperature statistic, on four config variants), so
-// the substitution that remains is CPU scalar for CPU SIMD batch. How far those
-// two integrators diverge is an open question being settled elsewhere, and a
-// number pinned here would go stale the moment it is answered -- which is the
-// exact failure this file was written to prevent. Report the substitution; let
-// whoever settles the divergence describe it.
+// SINCE perf/streamed-simd-batch the swap is no longer a swap of SOLVER. The
+// streamed branch now feeds the configured integrator: with the shipped
+// use_simd_batch=true it dispatches runThermalModelsForAllFacesBatchSoA in
+// STREAMED mode (CpuStreamedBatch), which marshals one 8-face x total-steps
+// flux tile per batch out of the chunked store instead of materializing the
+// arrays -- same solver, same composer, same seed as a non-streamed default
+// run. --no-simd-batch still reaches the scalar-core streamed driver
+// (CpuStreamed), which is what that flag asks for.
+//
+// What the scalar-for-batch substitution used to cost is deliberately NOT
+// characterized here. The scalar streamed path is byte-identical to the
+// --no-simd-batch run the same config would otherwise get (measured on
+// 0bb5218, 80N tutorial crater: only provenance.txt differs, 0.000 K on every
+// temperature statistic, on four config variants). How far the two integrators
+// diverge is an open question being settled elsewhere, and a number pinned here
+// would go stale the moment it is answered -- which is the exact failure this
+// file was written to prevent.
 //
 // Three caveats this file used to print are gone, and must not come back. The
 // streamed path applying a constant albedo instead of the configured angular
@@ -62,11 +70,13 @@ namespace ptm {
 
 // The whole-mesh thermal solvers this executable can dispatch to.
 enum class ThermalSolverPath {
-    Unset,          // nothing disclosed yet
-    CpuScalar,      // runThermalModelsForAllFaces
-    CpuSimdBatch,   // runThermalModelsForAllFacesBatchSoA        (default)
-    CpuStreamed,    // runThermalModelsForAllFacesStreamed        (scalar core)
-    GpuPersistent   // runThermalModelsForAllFaces_GPU_Persistent
+    Unset,            // nothing disclosed yet
+    CpuScalar,        // runThermalModelsForAllFaces
+    CpuSimdBatch,     // runThermalModelsForAllFacesBatchSoA        (default)
+    CpuStreamed,      // runThermalModelsForAllFacesStreamed        (scalar core)
+    CpuStreamedBatch, // runThermalModelsForAllFacesBatchSoA, streamed flux
+                      //                                           (SIMD batch core)
+    GpuPersistent     // runThermalModelsForAllFaces_GPU_Persistent
 };
 
 // Why that path was taken. `MemoryThreshold` is the invisible one this file
@@ -116,15 +126,16 @@ void discloseRethermalPath(RethermalPath path, const std::string& detail);
 // Stable machine-readable ids, for provenance.txt and for tests.
 const char* thermalSolverPathId(ThermalSolverPath p);   // "cpu_simd_batch", ...
 const char* thermalSolverEntryPoint(ThermalSolverPath p);
-// The time integrator a path actually runs. CpuStreamed reports "cpu_scalar"
-// because that is the integrator it loops -- and on current main a streamed run
-// is byte-identical to a --no-simd-batch run of the same config, so for that
-// path the core id is the whole answer to "did my physics change?".
+// The time integrator a path actually runs. This is the field that answers "did
+// my physics change?", and it is the reason streaming needs two ids:
+// CpuStreamed reports "cpu_scalar" (the integrator it loops, byte-identical to
+// a --no-simd-batch run), CpuStreamedBatch reports "cpu_simd_batch" (the same
+// integrator a non-streamed default run uses, fed from the chunk store).
 //
 // Read it together with `thermal_solver_simd_batch_requested`. A run that asked
 // for the SIMD batch solver and got `cpu_scalar` did change integrator. That
-// substitution, and only that, is what `thermal_solver_caveats` now reports --
-// the size of the resulting difference is not asserted here.
+// substitution, and only that, is what `thermal_solver_caveats` reports -- the
+// size of the resulting difference is not asserted here.
 const char* thermalSolverCoreId(ThermalSolverPath p);
 const char* thermalSolverReasonId(ThermalSolverReason r);
 const char* rethermalPathId(RethermalPath p);
