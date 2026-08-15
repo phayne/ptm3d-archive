@@ -294,7 +294,7 @@ Which `h` depends on the product:
 | diurnal maximum | `4 eps sigma T_max^3` |
 | diurnal minimum | `4 eps sigma T_min^3` |
 | diurnal mean | the **harmonic** cycle mean of `4 eps sigma T0(t)^3` |
-| deep products | `E_deep = |r_c| tau1 / C_below` (uncalibrated; reported, never used to pass) |
+| deep products | `E_deep = |r_c| tau1 / C_below` (unbiased, **not** conservative — pointwise 0.91–1.09; reported, never used to pass) |
 
 The mean uses the harmonic cycle mean and not the arithmetic one. The surface
 displacement caused by a flux residual is largest exactly where the radiative
@@ -488,16 +488,30 @@ carries the full thermophysical property set. See the asteroid examples in
 | Relative `data/…` path (`data/horizons_cache/…/metakernel.tm`) | The same `PTM_DATA_ROOT` contract as `mesh.import_file` and every other data key: `$PTM_DATA_ROOT`, else the repository `data/` found from the config file's directory |
 | Any other relative path (`bennu.tm`) | `<kernel dir>/<value>` first, then `<current working directory>/<value>` |
 
-The kernel directory is itself resolved as: `$PTM_SPICE_KERNELS`, then the
-compiled-in `SPICE_KERNELS_DIR` (CMake cache variable, default
-`<repo>/data/kernels`) — see [ENVIRONMENT.md](ENVIRONMENT.md). There is no
-config key or command-line flag for it; `$PTM_SPICE_KERNELS` **replaces** the
-compiled-in directory rather than adding to it, so an override directory must
-contain the metakernels as well as `lsk/`, `pck/` and `spk/`.
+The kernel directory is itself resolved as: `$PTM_SPICE_KERNELS`, then
+`$PTM_DATA_ROOT/kernels`, then the compiled-in `SPICE_KERNELS_DIR` (CMake cache
+variable, default `<repo>/data/kernels`) — see
+[ENVIRONMENT.md](ENVIRONMENT.md). There is no config key or command-line flag
+for it in `ptm_thermal_sim` (`ptm_camera_sim` has `--kernels-path`); each rung
+**replaces** the compiled-in directory rather than adding to it, so an override
+directory must contain the metakernels as well as `lsk/`, `pck/` and `spk/`.
 
-Every run prints the file it actually loaded (`Loaded SPICE meta-kernel: …`).
-If none of the candidates exists the run stops and lists every path it tried;
-it never substitutes a different metakernel for the one you configured.
+`$PTM_SPICE_KERNELS` is taken **exactly as given**, populated or not, because it
+is an explicit instruction and demoting it would hide a typo. The two implicit
+rungs are different: a directory with no `lsk/naif0012.tls` cannot serve any run
+(not even a Keplerian one — `start_time` still has to be converted), so it is
+passed over in favor of the next rung. That is what lets a fresh clone or
+worktree, which ships the `*.tm` files but not `lsk/`, `pck/` or `spk/`, find a
+kernel tree through `$PTM_DATA_ROOT` instead of dying several screens later in
+`str2et_c` with a bare `SPICE(NOLEAPSECONDS)`.
+
+Every run prints the kernel directory it resolved and its source (`SPICE kernel
+directory: … ($PTM_DATA_ROOT/kernels)`) and the metakernel file it actually
+loaded (`Loaded SPICE meta-kernel: …`). If none of the candidates exists the run
+stops and lists every path it tried — both the metakernel candidates and the
+whole kernel-directory ladder, in order, with the reason each rung was or was
+not taken. It never substitutes a different metakernel for the one you
+configured.
 
 (Separately, and not covered by that guarantee: a `simulation.body` name other
 than `Moon`, `Mercury` or `Europa` that is *not* backed by a `generic_body:`

@@ -27,6 +27,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <type_traits>
 
 // Conditionally include x86-specific SIMD headers
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -308,6 +309,14 @@ void IlluminationModel::setAlbedo(double albedo) {
 static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* str) {
     std::cerr << "[Embree] Error " << int(error) << ": " << (str ? str : "(null)") << std::endl;
 }
+
+// Which Embree did we actually link, and does it have kernels for this CPU?
+// That disclosure now lives in illumination/embree_isa_report.h as
+// ptm::reportEmbreeIsaOnce(), shared by every Embree consumer (illumination,
+// view factors, camera, viewshed) so the banner prints exactly once per
+// process no matter which of them creates the first RTCDevice. This file used
+// to carry a local static copy; it was removed in the merge that brought the
+// two together -- see that header for the rationale and the measurements.
 
 bool IlluminationModel::initializeEmbree() {
     if (!embree_device_) {
@@ -2480,27 +2489,123 @@ std::pair<double, double> IlluminationModel::latLonFromCartesian(double x, doubl
     };
 }
 
+// The kernel-directory resolution report, filled in by initialize_spice() and
+// read back by whoever reports a downstream SPICE failure (see the header).
+namespace {
+std::string g_spice_kernel_search_report;
+
+// A kernel directory is USABLE by this engine only if it carries the
+// leapseconds kernel the engine actually loads. Every entry point hardcodes
+// this same relative name (initialize_spice's Keplerian branch,
+// camera_simulator.cpp, ptm/paths.py), and without it str2et_c cannot resolve
+// an epoch on ANY path -- SPICE or Keplerian.
+bool kernelDirIsUsable(const std::string& dir) {
+    if (dir.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::exists(
+        std::filesystem::path(dir) / "lsk" / "naif0012.tls", ec);
+}
+}  // namespace
+
+const std::string& IlluminationModel::spiceKernelSearchReport() {
+    return g_spice_kernel_search_report;
+}
+
 bool IlluminationModel::initialize_spice(bool verbose) {
     static bool spice_initialized = false;
 
-    // Resolve the kernel directory if it was not set explicitly:
-    // $PTM_SPICE_KERNELS, then the compiled-in SPICE_KERNELS_DIR (CMake cache
-    // variable; default <repo>/data/kernels). Fail loud rather than fall back
-    // to a developer-machine path (portability audit P0, PORT-02).
-    if (kernels_path_.empty()) {
-        const char* env_kernels = std::getenv("PTM_SPICE_KERNELS");
-        if (env_kernels && *env_kernels) {
-            kernels_path_ = env_kernels;
-        } else {
-            kernels_path_ = ptm_thermal::config::SPICE_KERNELS_DIR;
+    // Resolve the kernel directory. The ladder, in order:
+    //   1. an explicit setKernelsPath() value  -- library callers, camera CLI
+    //   2. $PTM_SPICE_KERNELS                  -- documented override
+    //   3. $PTM_DATA_ROOT/kernels              -- the data-root contract
+    //   4. compiled-in SPICE_KERNELS_DIR       -- last resort (CMake cache var,
+    //                                             default <repo>/data/kernels)
+    //
+    // Rungs 1 and 2 are EXPLICIT instructions and are taken exactly as given,
+    // usable or not: silently demoting one would hide a typo and would undo the
+    // env override PTM-145 restored. Rungs 3 and 4 are implicit, so a rung that
+    // carries no leapseconds kernel is passed over -- otherwise a build whose
+    // compiled-in directory is empty (any fresh worktree or clone: the *.tm
+    // files are tracked, lsk/ pck/ spk/ are not) ends the search on a directory
+    // that cannot serve any run, and dies screens later in str2et_c with a bare
+    // SPICE(NOLEAPSECONDS). If no implicit rung is usable the compiled-in
+    // default is still taken, so the diagnostics keep naming it.
+    //
+    // Never fall back to a developer-machine path (portability audit P0,
+    // PORT-02); every rung is recorded and printed on any failure below.
+    if (!kernels_path_resolved_) {
+        struct Rung {
+            std::string source;
+            std::string path;
+            bool is_explicit;
+        };
+        std::vector<Rung> rungs;
+        if (kernels_path_explicit_ && !kernels_path_.empty()) {
+            rungs.push_back({"setKernelsPath()/CLI", kernels_path_, true});
         }
+        if (const char* env_kernels = std::getenv("PTM_SPICE_KERNELS")) {
+            if (*env_kernels) rungs.push_back({"$PTM_SPICE_KERNELS", env_kernels, true});
+        }
+        if (const char* env_data_root = std::getenv("PTM_DATA_ROOT")) {
+            if (*env_data_root) {
+                rungs.push_back({"$PTM_DATA_ROOT/kernels",
+                                 (std::filesystem::path(env_data_root) / "kernels")
+                                     .lexically_normal().string(),
+                                 false});
+            }
+        }
+        rungs.push_back({"compiled-in SPICE_KERNELS_DIR",
+                         ptm_thermal::config::SPICE_KERNELS_DIR, false});
+
+        std::string chosen;
+        std::string chosen_source;
+        for (const Rung& r : rungs) {
+            if (r.path.empty()) continue;
+            if (r.is_explicit || kernelDirIsUsable(r.path)) {
+                chosen = r.path;
+                chosen_source = r.source;
+                break;
+            }
+        }
+        if (chosen.empty()) {
+            // No usable implicit rung: keep the compiled-in default, which is
+            // what this resolved to before the ladder gained rung 3.
+            chosen = rungs.back().path;
+            chosen_source = rungs.back().source;
+        }
+
+        std::ostringstream report;
+        report << "  SPICE kernel directory resolution (in order):\n";
+        for (const Rung& r : rungs) {
+            const bool taken = (r.path == chosen && r.source == chosen_source);
+            report << "    " << (taken ? "-> " : "   ") << r.source << " = "
+                   << (r.path.empty() ? "(empty)" : r.path);
+            if (r.is_explicit) {
+                report << "  [explicit, taken as given]";
+            } else {
+                report << (kernelDirIsUsable(r.path)
+                               ? "  [has lsk/naif0012.tls]"
+                               : "  [no lsk/naif0012.tls]");
+            }
+            report << "\n";
+        }
+        report << "    (unlisted rungs are unset. Populate a kernel directory with:"
+                  "  python3 scripts/fetch_kernels.py\n"
+                  "     -- see INSTALL.md \"SPICE kernel data\" -- or point"
+                  " $PTM_SPICE_KERNELS at an existing one.)";
+        g_spice_kernel_search_report = report.str();
+
+        kernels_path_ = chosen;
+        kernels_path_resolved_ = true;
+        // Say which directory the run is using, unconditionally. Which kernels
+        // a run read is provenance, not debug output, and the same argument
+        // that made "Loaded SPICE meta-kernel:" unconditional applies here.
+        std::cout << "SPICE kernel directory: " << kernels_path_
+                  << "  (" << chosen_source << ")" << std::endl;
     }
     if (kernels_path_.empty()) {
         std::cerr << "Error: SPICE kernel directory is unresolved (empty).\n"
-                  << "  Resolution order: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
-                  << "  compiled-in SPICE_KERNELS_DIR (CMake; default <repo>/data/kernels).\n"
-                  << "  Populate the kernel directory with: python3 scripts/fetch_kernels.py\n"
-                  << "  (see INSTALL.md, section \"SPICE kernel data\")." << std::endl;
+                  << g_spice_kernel_search_report << std::endl;
         return false;
     }
 
@@ -2520,8 +2625,16 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                         std::cout << "Keplerian mode: loaded leapseconds kernel for time conversion" << std::endl;
                     }
                 } else {
-                    std::cout << "Keplerian mode: leapseconds kernel not found at " << lsk_path
-                              << " (time conversion may use approximation)" << std::endl;
+                    // No "may use approximation": there is no approximation
+                    // path. str2et_c cannot convert the configured start_time
+                    // without an LSK and the run dies on it a few screens
+                    // later, so say what will happen and name every directory
+                    // the ladder looked in.
+                    std::cerr << "WARNING: Keplerian mode, but the leapseconds kernel is missing:\n"
+                              << "  " << lsk_path << "\n"
+                              << "  The absolute epoch cannot be resolved without it; the run will\n"
+                              << "  stop at str2et_c with SPICE(NOLEAPSECONDS).\n"
+                              << g_spice_kernel_search_report << std::endl;
                 }
                 spice_initialized = true;
             } catch (const std::exception& e) {
@@ -2605,8 +2718,8 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                     std::cerr << "    " << candidate << "\n";
                 }
                 std::cerr << "  Kernel directory in use: " << kernels_path_ << "\n"
-                          << "  Kernel dir resolution: setKernelsPath() (library callers), $PTM_SPICE_KERNELS,\n"
-                          << "  compiled-in SPICE_KERNELS_DIR. Fetch kernels + metakernels with:\n"
+                          << g_spice_kernel_search_report << "\n"
+                          << "  Fetch kernels + metakernels with:\n"
                           << "  python3 scripts/fetch_kernels.py" << fetch_bodies_flag << "\n"
                           << "  (see INSTALL.md \"SPICE kernel data\"), or correct\n"
                           << "  generic_body.spice_metakernel in the configuration."
@@ -4302,6 +4415,67 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     primary_vis_dist_km_.assign(num_faces, 0.0);
     if (num_faces == 0) return;
 
+    // ---- temporal reuse of the terrain factor (primary_disk.h) -------------
+    // Everything in this block is geometry, never step counting: the lattice
+    // cell is computed from the primary's position alone, so two runs that
+    // reach the same epoch by different routes (one shot, chunked, warm
+    // started) take the same branch here.
+    const double reuse_fraction = primaryDiskReuseFraction();
+    const bool reuse_enabled = (reuse_fraction > 0.0) && (primary_radius_ > 0.0);
+    std::array<double, 3> ray_primary_position = primary_position;
+    bool reuse_terrain = false;
+    if (reuse_enabled) {
+        const double cell = reuse_fraction * primary_radius_;   // km
+        const std::array<long long, 3> cellid = {
+            static_cast<long long>(std::llround(primary_position[0] / cell)),
+            static_cast<long long>(std::llround(primary_position[1] / cell)),
+            static_cast<long long>(std::llround(primary_position[2] / cell))
+        };
+        // The rays are cast at the lattice point, not at the true position.
+        // That is what makes the cached V a function of the cell alone.
+        ray_primary_position = { cellid[0] * cell, cellid[1] * cell, cellid[2] * cell };
+        // Diagnostic: snap exactly as usual but never serve the cache. Running
+        // a config with and without this must give BYTE-IDENTICAL output, and
+        // that equality IS the chunk-invariance property -- it says the cached
+        // V equals what any process would compute on entering the same cell,
+        // so where a run's chunk boundaries fall cannot matter. Without it the
+        // property is only an argument about the code.
+        static const bool verify_no_cache = [](){
+            const char* e = std::getenv("PTM_PRIMARY_DISK_REUSE_VERIFY");
+            const bool on = e && std::atoi(e) != 0;
+            if (on) {
+                std::cerr << "[illumination] PTM_PRIMARY_DISK_REUSE_VERIFY=1: snapping the "
+                          << "primary position as usual but recomputing the terrain factor "
+                          << "every step (no cache hits). Slow; for the equivalence check only."
+                          << std::endl;
+            }
+            return on;
+        }();
+
+        reuse_terrain = !verify_no_cache
+                     && primary_vis_cell_valid_
+                     && cellid == primary_vis_cell_
+                     && primary_vis_terrain_.size() == num_faces
+                     && primary_vis_terrain_centers_ == static_cast<const void*>(face_centers.data())
+                     && primary_vis_terrain_normals_ == static_cast<const void*>(face_normals.data());
+        if (!reuse_terrain) {
+            primary_vis_cell_valid_ = false;   // published after the loop
+            // NEGATIVE sentinel = "not evaluated in this cell yet", which is a
+            // different statement from "evaluated, and nothing blocks it"
+            // (V = 1). Conflating the two was a real bug: a face whose TRUE
+            // horizon clip is <= 0 exits above the ray section, so the sweep
+            // that owns the cell never fills it in, and a later step in the
+            // same cell -- where the true position has drifted just enough to
+            // lift the disk -- would then read a 1 that no ray ever supported.
+            // Caught by PTM_PRIMARY_DISK_REUSE_VERIFY, not by inspection.
+            primary_vis_terrain_.assign(num_faces, -1.0);
+            primary_vis_cell_ = cellid;
+        }
+    } else {
+        primary_vis_cell_valid_ = false;
+        primary_vis_terrain_.clear();
+    }
+
     // Same |face_center| > 10000 unit discriminator the rest of this file uses
     // (PTM-37 makes it visible and refuses the ambiguous cases at startup).
     const bool centers_in_meters = (vectorLength(face_centers[0]) > 10000.0);
@@ -4324,12 +4498,25 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // blocks grazing rays, so this is not expected to be zero -- but it must be
     // attributable to rays, never to a probe that simply missed the crescent.
     size_t n_zero_by_rays = 0, n_probe_underflow = 0;
+    size_t n_reused = 0;
 
     const uint32_t N_SAMP = ptm::disk::PRIMARY_DISK_SAMPLES;
 
+    // The face sweep is instantiated TWICE, on a compile-time REUSE flag, and
+    // dispatched once per call. That is not style: with reuse compiled out the
+    // loop body is character for character the pre-reuse code, so the compiler
+    // emits the same contractions and the same rounding. Carrying the flag as
+    // a runtime bool instead -- three loop-invariant branches and one extra
+    // captured variable, no arithmetic change whatsoever -- was enough to move
+    // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 MS3 output files
+    // under -ffast-math. Measured, twice, before this was written.
+    auto sweep = [&](auto reuse_tag) {
+    constexpr bool REUSE = decltype(reuse_tag)::value;
+    size_t n_below_l = 0, n_full_l = 0, n_dark_l = 0, n_sampled_l = 0;
+    size_t n_zero_by_rays_l = 0, n_probe_underflow_l = 0, n_reused_l = 0;
     #pragma omp parallel for schedule(dynamic) \
-        reduction(+:n_below, n_full, n_dark, n_sampled, n_zero_by_rays, \
-                    n_probe_underflow)
+        reduction(+:n_below_l, n_full_l, n_dark_l, n_sampled_l, \
+                    n_zero_by_rays_l, n_probe_underflow_l, n_reused_l)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
 
@@ -4353,15 +4540,62 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         const double alpha = std::asin(sin_alpha);
 
         // Whole disk below the face's own horizon plane -> no flux, no rays.
-        if (c0 <= -sin_alpha) { ++n_below; continue; }
+        if (c0 <= -sin_alpha) { ++n_below_l; continue; }
 
+        // The horizon clip is closed-form and is ALWAYS evaluated at the true
+        // position -- reuse never freezes the primary's rise and set, only the
+        // terrain factor that multiplies it.
         const double A = ptm::disk::diskMeanCosAboveHorizon(c0, alpha);
-        if (A <= 0.0) { ++n_below; continue; }
+        if (A <= 0.0) { ++n_below_l; continue; }
 
         if (!embree_scene_) {                          // no BVH -> nothing occludes
             primary_vis_mean_cos_[i] = A;
-            ++n_full;
+            ++n_full_l;
             continue;
+        }
+
+        if constexpr (REUSE) {
+            if (reuse_terrain) {
+                const double v_cached = primary_vis_terrain_[i];
+                if (v_cached >= 0.0) {                 // cached V, no rays
+                    primary_vis_mean_cos_[i] = A * v_cached;
+                    ++n_reused_l;
+                    continue;
+                }
+                // Not evaluated in this cell yet -- fall through and evaluate
+                // it now, at the SAME snapped position the cell's first sweep
+                // would have used, and cache it. The value is therefore the
+                // same whenever it is first asked for, which is what makes the
+                // whole scheme independent of where a run's chunk boundaries
+                // fall.
+            }
+        }
+
+        // The rays below are cast at ray_primary_position. With reuse compiled
+        // out that IS the true position and these four names alias the values
+        // already computed above, so no second evaluation of the same formula
+        // ever happens on the default path.
+        double ray_dist = dist;
+        std::array<double, 3> ray_dir = dir;
+        double ray_c0 = c0;
+        double ray_sin_alpha = sin_alpha;
+        if constexpr (REUSE) {
+            const std::array<double, 3> ray_rel = {
+                ray_primary_position[0] - fc_km[0],
+                ray_primary_position[1] - fc_km[1],
+                ray_primary_position[2] - fc_km[2]
+            };
+            ray_dist = vectorLength(ray_rel);
+            if (ray_dist <= constants::EPSILON) {      // degenerate lattice point
+                primary_vis_mean_cos_[i] = A;
+                primary_vis_terrain_[i] = 1.0;
+                ++n_full_l;
+                continue;
+            }
+            ray_dir = { ray_rel[0]/ray_dist, ray_rel[1]/ray_dist, ray_rel[2]/ray_dist };
+            ray_c0 = dotProduct(fn, ray_dir);
+            ray_sin_alpha = primary_radius_ / ray_dist;
+            if (ray_sin_alpha > 1.0) ray_sin_alpha = 1.0;
         }
 
         const double safe_offset = calculateSafeRayOffset(face_centers[i], fn);
@@ -4372,7 +4606,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         };
         // Stop the ray at the primary's near surface, exactly as the single
         // center ray did. Mesh-native units.
-        const float tfar_dist = static_cast<float>((dist - primary_radius_) * km_to_native);
+        const float tfar_dist = static_cast<float>((ray_dist - primary_radius_) * km_to_native);
 
         // Fermi F1: the probe basis is oriented to the HORIZON, not arbitrarily.
         // u points along the horizon gradient, so probe (+1, 0) is the disk's
@@ -4383,18 +4617,18 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // Europa arm before this fix.
         std::array<double, 3> u, v;
         {
-            std::array<double, 3> up = { fn[0] - c0*dir[0],
-                                         fn[1] - c0*dir[1],
-                                         fn[2] - c0*dir[2] };
+            std::array<double, 3> up = { fn[0] - ray_c0*ray_dir[0],
+                                         fn[1] - ray_c0*ray_dir[1],
+                                         fn[2] - ray_c0*ray_dir[2] };
             const double ul = vectorLength(up);
             if (ul > 1.0e-12) {
                 u = { up[0]/ul, up[1]/ul, up[2]/ul };
-                v = crossProduct(dir, u);          // orthonormal: |dir x u| = 1
+                v = crossProduct(ray_dir, u);      // orthonormal: |dir x u| = 1
             } else {
                 // fn parallel to dir: no horizon gradient exists, and the disk
                 // is entirely above the horizon anyway (|c0| = 1), so any basis
                 // will do.
-                createCoordinateSystem(dir, u, v);
+                createCoordinateSystem(ray_dir, u, v);
             }
         }
 
@@ -4403,9 +4637,9 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // as the solar-disk sampler at :3868.
         auto disk_dir = [&](double dx, double dy) {
             std::array<double, 3> sd = {
-                dir[0] + sin_alpha*(dx*u[0] + dy*v[0]),
-                dir[1] + sin_alpha*(dx*u[1] + dy*v[1]),
-                dir[2] + sin_alpha*(dx*u[2] + dy*v[2])
+                ray_dir[0] + ray_sin_alpha*(dx*u[0] + dy*v[0]),
+                ray_dir[1] + ray_sin_alpha*(dx*u[1] + dy*v[1]),
+                ray_dir[2] + ray_sin_alpha*(dx*u[2] + dy*v[2])
             };
             const double l = vectorLength(sd);
             if (l > constants::EPSILON) { sd[0]/=l; sd[1]/=l; sd[2]/=l; }
@@ -4473,23 +4707,26 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             // the census stays comparable with the geometric count.
             warnPrimaryProbeUnderflowOnce();
             primary_vis_mean_cos_[i] = A;
-            ++n_full;
-            ++n_probe_underflow;
+            if constexpr (REUSE) primary_vis_terrain_[i] = 1.0;
+            ++n_full_l;
+            ++n_probe_underflow_l;
             continue;
         }
         if (!always_sample) {
             if (probes_up > 0 && probes_clear == probes_up) {
                 primary_vis_mean_cos_[i] = A;          // fully visible
-                ++n_full;
+                if constexpr (REUSE) primary_vis_terrain_[i] = 1.0;
+                ++n_full_l;
                 continue;
             }
             if (probes_clear == 0) {
-                ++n_dark;
-                ++n_zero_by_rays;
+                ++n_dark_l;
+                ++n_zero_by_rays_l;
+                if constexpr (REUSE) primary_vis_terrain_[i] = 0.0;
                 continue;                              // fully occluded -> 0
             }
         }
-        ++n_sampled;
+        ++n_sampled_l;
 
         // ---- escalate: cosine-weighted unoccluded fraction of the disk ------
         // V is a RATIO over the same sample set, so the O(alpha^2) bias of
@@ -4506,15 +4743,32 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             w_total += w;
             if (!occluded(sd)) w_clear += w;
         }
-        if (w_total <= 0.0) { ++n_zero_by_rays; continue; }
-        if (w_clear <= 0.0) ++n_zero_by_rays;
+        if (w_total <= 0.0) {                          // no sample carries flux
+            ++n_zero_by_rays_l;
+            if constexpr (REUSE) primary_vis_terrain_[i] = 0.0;
+            continue;
+        }
+        if (w_clear <= 0.0) ++n_zero_by_rays_l;
+        if constexpr (REUSE) primary_vis_terrain_[i] = w_clear / w_total;
         primary_vis_mean_cos_[i] = A * (w_clear / w_total);
     }
+    n_below += n_below_l;   n_full += n_full_l;   n_dark += n_dark_l;
+    n_sampled += n_sampled_l;  n_zero_by_rays += n_zero_by_rays_l;
+    n_probe_underflow += n_probe_underflow_l;  n_reused += n_reused_l;
+    };  // sweep
+
+    if (reuse_enabled) sweep(std::true_type{});
+    else               sweep(std::false_type{});
 
     primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
     primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
     primary_vis_key_pos_     = primary_position;
     primary_vis_key_n_       = num_faces;
+    if (reuse_enabled) {
+        primary_vis_terrain_centers_ = static_cast<const void*>(face_centers.data());
+        primary_vis_terrain_normals_ = static_cast<const void*>(face_normals.data());
+        primary_vis_cell_valid_      = true;
+    }
 
     if (report_stats) {
         std::cerr << "[illumination] primary disk: " << num_faces << " faces -- "
@@ -4522,8 +4776,43 @@ void IlluminationModel::updatePrimaryDiskVisibility(
                   << n_dark << " fully occluded, " << n_sampled << " sampled ("
                   << N_SAMP << " rays each); A>0 zeroed BY RAYS " << n_zero_by_rays
                   << ", probe-underflow fallbacks " << n_probe_underflow
+                  << "; terrain factor " << (reuse_terrain ? "REUSED" : "recomputed")
+                  << " for " << n_reused << " faces"
                   << std::endl;
     }
+}
+
+// Reuse cell size as a fraction of the primary's angular radius. Compile-time
+// default from primary_disk.h; PTM_PRIMARY_DISK_REUSE_FRACTION overrides it for
+// the budget sweep. The override announces itself on first use -- a knob that
+// moves temperatures must never be silent (crew rule: every override warns).
+double IlluminationModel::primaryDiskReuseFraction() {
+    static const double f = [](){
+        double value = ptm::disk::PRIMARY_DISK_REUSE_CELL_FRACTION;
+        const char* e = std::getenv("PTM_PRIMARY_DISK_REUSE_FRACTION");
+        if (e && *e) {
+            char* end = nullptr;
+            const double parsed = std::strtod(e, &end);
+            if (end == e || parsed < 0.0 || !std::isfinite(parsed)) {
+                std::cerr << "[illumination] WARNING: PTM_PRIMARY_DISK_REUSE_FRACTION='"
+                          << e << "' is not a non-negative number -- IGNORED, using the "
+                          << "compiled-in " << value << std::endl;
+            } else {
+                std::cerr << "[illumination] PTM_PRIMARY_DISK_REUSE_FRACTION=" << parsed
+                          << " overrides the compiled-in primary-disk terrain-reuse cell of "
+                          << value << " (fraction of the primary's angular radius). "
+                          << "THIS CHANGES RESULTS." << std::endl;
+                value = parsed;
+            }
+        }
+        if (value > 0.0) {
+            std::cerr << "[illumination] primary-disk terrain visibility is REUSED across "
+                      << "timesteps within " << value << " x the primary's angular radius"
+                      << std::endl;
+        }
+        return value;
+    }();
+    return f;
 }
 
 void IlluminationModel::calculatePrimaryIRBatch(
