@@ -355,6 +355,81 @@ static void testHalfPlaneOccluder() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Temporal reuse of the terrain factor: the SAME budget, applied to the
+//     other approximation in this path.
+//
+// PRIMARY_DISK_REUSE_CELL_FRACTION snaps the primary's position to a lattice of
+// spacing f * R_primary, which is a lattice of f * alpha in apparent ANGLE, and
+// reuses the terrain-visible fraction until the lattice cell changes. The disk
+// therefore sits up to sqrt(3)/2 * f * alpha -- i.e. 0.866 * f disk RADII --
+// away from where the terrain actually is. Note the bound does not depend on
+// how many timesteps the value is reused for: it is set by the cell, not by
+// the dwell, which is the whole reason the value is snapped to the cell rather
+// than cached from whichever step happened to enter it first.
+//
+// Against the half-plane occluder above, the induced visibility error is
+// |V(e) - V(e +- 0.866 f)|, worst ~ (2/pi) * 0.866 * f. This gate holds it to
+// the same PRIMARY_DISK_WORST_VISIBILITY_ERROR that fixes PRIMARY_DISK_SAMPLES,
+// because a kelvin spent here is the same kelvin. Raising the constant past
+// what that budget allows fails HERE, loudly, instead of silently shifting
+// every lunar and Europa temperature.
+// ---------------------------------------------------------------------------
+static void testTerrainReuseBudget() {
+    std::printf("\n4b. Temporal reuse of the terrain factor "
+                "(PRIMARY_DISK_REUSE_CELL_FRACTION)\n");
+
+    auto worstForFraction = [](double f) {
+        const double shift = std::sqrt(3.0) / 2.0 * f;   // disk radii
+        double worst = 0.0;
+        for (int k = -650; k <= 650; ++k) {
+            const double e = k / 500.0;
+            worst = std::max(worst, std::fabs(segmentFraction(e) - segmentFraction(e + shift)));
+            worst = std::max(worst, std::fabs(segmentFraction(e) - segmentFraction(e - shift)));
+        }
+        return worst;
+    };
+
+    std::printf("     worst |dV| from the lattice snap, half-plane occluder:\n");
+    std::printf("       %-8s %-12s %-12s\n", "f", "max shift", "worst |dV|");
+    for (double f : {0.0, 0.02, 0.04, 0.05, 0.1, 0.25, 0.5, 1.0}) {
+        std::printf("       %-8.2f %-12.4f %-12.4f%s\n",
+                    f, std::sqrt(3.0) / 2.0 * f, worstForFraction(f),
+                    f == PRIMARY_DISK_REUSE_CELL_FRACTION ? "   <-- compiled-in default" : "");
+    }
+
+    // The measured end-to-end cost, for whoever raises the constant. These are
+    // EMPIRICAL worst-face numbers over whole runs, not the worst case above,
+    // and they are 20-60x smaller because no real face is a straight edge
+    // cutting the disk in half at the coldest temperature on the mesh. Both
+    // standards are printed on purpose: the worst case is what the N budget was
+    // set against, so it is what this gate enforces.
+    std::printf("     measured worst face-frame |dT| and PRIMARY RAYS REMOVED\n"
+                "     (2026-08-15; Moon MS3 A03MP026 100.6 M face-frames at the 1.0 h\n"
+                "     production cadence, Europa Pwyll DEM 1.36 M at 1.78 h):\n");
+    std::printf("       %-7s %-11s %-9s %-11s %-9s\n",
+                "f", "Moon |dT|", "rays", "Europa |dT|", "rays");
+    std::printf("       %-7s %-11s %-9s %-11s %-9s\n", "0.038", "0.0333 K", "-0 %",  "0.0078 K", "-43 %");
+    std::printf("       %-7s %-11s %-9s %-11s %-9s\n", "0.10",  "0.0411 K", "-15 %", "0.0114 K", "-78 %");
+    std::printf("       %-7s %-11s %-9s %-11s %-9s\n", "0.25",  "0.0599 K", "-45 %", "0.0158 K", "-87 %");
+    std::printf("       %-7s %-11s %-9s %-11s %-9s\n", "0.50",  "0.1512 K", "-64 %", "0.0222 K", "-95 %");
+    std::printf("     Read the Moon row at f = 0.038 before enabling this: at the largest\n"
+                "     f this gate allows, the Moon removes NO rays and still pays 0.033 K,\n"
+                "     because Earth moves 0.052 disk radii per production timestep and the\n"
+                "     cell is smaller than that. Reuse is a Europa/Jupiter-class win and a\n"
+                "     lunar-cadence loss; the deciding number is (apparent motion per step)\n"
+                "     / alpha, not the body.\n");
+
+    const double worst = worstForFraction(PRIMARY_DISK_REUSE_CELL_FRACTION);
+    check(worst <= PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+          "PRIMARY_DISK_REUSE_CELL_FRACTION worst error within the stated budget",
+          worst, 0.0, PRIMARY_DISK_WORST_VISIBILITY_ERROR);
+    if (PRIMARY_DISK_REUSE_CELL_FRACTION == 0.0) {
+        std::printf("     (reuse is OFF by default: the engine recomputes the terrain\n"
+                    "      factor every timestep and this path is exactly free)\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 5. Jupiter-shine at Europa: before/after table.
 // ---------------------------------------------------------------------------
 static void reportJupiterTable() {
@@ -383,6 +458,7 @@ int main() {
     testEnergyClosure();
     testHorizonMeanCos();
     testHalfPlaneOccluder();
+    testTerrainReuseBudget();
     reportJupiterTable();
     std::printf("\n%s (%d failure%s)\n",
                 g_failures == 0 ? "ALL CHECKS PASS" : "FAILURES PRESENT",

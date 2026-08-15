@@ -26,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <type_traits>
 
 // Conditionally include x86-specific SIMD headers
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -308,6 +309,75 @@ static void EmbreeErrorCallback(void* /*userPtr*/, RTCError error, const char* s
     std::cerr << "[Embree] Error " << int(error) << ": " << (str ? str : "(null)") << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// Which Embree did we actually link, and does it have kernels for this CPU?
+//
+// Embree ships one library per ISA target chosen AT ITS OWN BUILD TIME and
+// dispatches at run time. A library built with EMBREE_MAX_ISA=SSE2 -- which is
+// what a portable binary distribution has to ship, and what Homebrew's
+// embree 4.3.3 bottle is -- runs its SSE2 BVH4 traversal even on an AVX-512
+// Xeon, and nothing in PTM3D or in Embree's default output says so. Ray
+// traversal is ~83 % of this engine's illumination phase, so the cost is not
+// small. MEASURED 2026-08-15 on this Mac Pro (Xeon W, Cascade Lake) against a
+// multi-ISA build of the IDENTICAL Embree 4.3.3 source:
+//
+//   traversal, single-threaded micro-benchmark, 128-ray bundles from face
+//   origins over a 524k-triangle relief at grazing elevation:
+//       rtcOccluded1  1.22-1.45x faster
+//       rtcOccluded8  a further 1.6-1.8x (the SSE2 build has no such kernel)
+//   end to end, illumination phase, 16 threads, interleaved repeats:
+//       calib120 -14.8 % (paired mean 2.01 s, sd 1.52, n = 10)
+//       prod709  NOT RESOLVED (paired mean -0.21 s, sd 11.33, n = 5)
+//
+// The end-to-end number is quoted with its failure: on a machine carrying three
+// other agents' jobs the longer arm could not separate it from noise, so treat
+// "up to ~15 % of the illumination phase" as the claim and not more.
+//
+// So: say it. RTC_DEVICE_PROPERTY_NATIVE_RAY8_SUPPORTED is 0 exactly when the
+// AVX target was not compiled in, which is the condition worth reporting on a
+// machine whose CPU has AVX. This is a diagnostic only -- it changes no ray,
+// no result and no default.
+static void reportEmbreeIsaOnce(RTCDevice device) {
+    static bool done = false;
+    if (done || !device) return;
+    done = true;
+
+    const bool ray4  = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY4_SUPPORTED)  != 0;
+    const bool ray8  = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY8_SUPPORTED)  != 0;
+    const bool ray16 = rtcGetDeviceProperty(device, RTC_DEVICE_PROPERTY_NATIVE_RAY16_SUPPORTED) != 0;
+
+    // RUNTIME detection, not the __AVX__ compile macros: those follow PTM3D's
+    // own -march flags, so a build without -march=native would report "no AVX"
+    // on an AVX machine and the warning below would silently never fire. The
+    // question here is what the CPU has, not what we were compiled for.
+    bool cpu_has_avx = false, cpu_has_avx512 = false;
+#if defined(__x86_64__) || defined(_M_X64)
+    cpu_has_avx    = __builtin_cpu_supports("avx");
+    cpu_has_avx512 = __builtin_cpu_supports("avx512f");
+#endif
+
+    std::cerr << "[Embree] " << RTC_VERSION_STRING
+              << "  native ray packets: 4=" << (ray4 ? "yes" : "no")
+              << " 8=" << (ray8 ? "yes" : "no")
+              << " 16=" << (ray16 ? "yes" : "no") << std::endl;
+
+    if (cpu_has_avx && !ray8) {
+        std::cerr << "[Embree] WARNING: this Embree has NO AVX kernels, but the CPU has them.\n"
+                  << "         Embree is running SSE2 BVH4 traversal. Ray tracing is ~83 % of\n"
+                  << "         the illumination phase; a multi-ISA build of the same Embree\n"
+                  << "         version measured 1.22-1.45x faster in traversal and up to ~15 %\n"
+                  << "         off the illumination phase on this machine (2026-08-15).\n"
+                  << "         Speed only -- but not a no-op on results: on a lunar polar DEM\n"
+                  << "         patch the ISA swap moved 75 of 260 output files, worst face-frame\n"
+                  << "         |dT| 0.0091 K. To rebuild: -DEMBREE_MAX_ISA=AVX512, then point\n"
+                  << "         CMAKE_PREFIX_PATH at it."
+                  << std::endl;
+    } else if (cpu_has_avx512 && !ray16) {
+        std::cerr << "[Embree] NOTE: no native 16-wide packets; AVX-512 kernels were not compiled"
+                  << " into this Embree." << std::endl;
+    }
+}
+
 bool IlluminationModel::initializeEmbree() {
     if (!embree_device_) {
         embree_device_ = rtcNewDevice("");
@@ -316,6 +386,7 @@ bool IlluminationModel::initializeEmbree() {
             return false;
         }
         rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+        reportEmbreeIsaOnce(embree_device_);
     }
     return true;
 }
@@ -397,6 +468,7 @@ bool IlluminationModel::initializeScene(
             }
             // FIX: use the canonical callback with exact signature
             rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
+            reportEmbreeIsaOnce(embree_device_);
         }
 
         if (embree_scene_) {
@@ -4403,6 +4475,67 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     primary_vis_dist_km_.assign(num_faces, 0.0);
     if (num_faces == 0) return;
 
+    // ---- temporal reuse of the terrain factor (primary_disk.h) -------------
+    // Everything in this block is geometry, never step counting: the lattice
+    // cell is computed from the primary's position alone, so two runs that
+    // reach the same epoch by different routes (one shot, chunked, warm
+    // started) take the same branch here.
+    const double reuse_fraction = primaryDiskReuseFraction();
+    const bool reuse_enabled = (reuse_fraction > 0.0) && (primary_radius_ > 0.0);
+    std::array<double, 3> ray_primary_position = primary_position;
+    bool reuse_terrain = false;
+    if (reuse_enabled) {
+        const double cell = reuse_fraction * primary_radius_;   // km
+        const std::array<long long, 3> cellid = {
+            static_cast<long long>(std::llround(primary_position[0] / cell)),
+            static_cast<long long>(std::llround(primary_position[1] / cell)),
+            static_cast<long long>(std::llround(primary_position[2] / cell))
+        };
+        // The rays are cast at the lattice point, not at the true position.
+        // That is what makes the cached V a function of the cell alone.
+        ray_primary_position = { cellid[0] * cell, cellid[1] * cell, cellid[2] * cell };
+        // Diagnostic: snap exactly as usual but never serve the cache. Running
+        // a config with and without this must give BYTE-IDENTICAL output, and
+        // that equality IS the chunk-invariance property -- it says the cached
+        // V equals what any process would compute on entering the same cell,
+        // so where a run's chunk boundaries fall cannot matter. Without it the
+        // property is only an argument about the code.
+        static const bool verify_no_cache = [](){
+            const char* e = std::getenv("PTM_PRIMARY_DISK_REUSE_VERIFY");
+            const bool on = e && std::atoi(e) != 0;
+            if (on) {
+                std::cerr << "[illumination] PTM_PRIMARY_DISK_REUSE_VERIFY=1: snapping the "
+                          << "primary position as usual but recomputing the terrain factor "
+                          << "every step (no cache hits). Slow; for the equivalence check only."
+                          << std::endl;
+            }
+            return on;
+        }();
+
+        reuse_terrain = !verify_no_cache
+                     && primary_vis_cell_valid_
+                     && cellid == primary_vis_cell_
+                     && primary_vis_terrain_.size() == num_faces
+                     && primary_vis_terrain_centers_ == static_cast<const void*>(face_centers.data())
+                     && primary_vis_terrain_normals_ == static_cast<const void*>(face_normals.data());
+        if (!reuse_terrain) {
+            primary_vis_cell_valid_ = false;   // published after the loop
+            // NEGATIVE sentinel = "not evaluated in this cell yet", which is a
+            // different statement from "evaluated, and nothing blocks it"
+            // (V = 1). Conflating the two was a real bug: a face whose TRUE
+            // horizon clip is <= 0 exits above the ray section, so the sweep
+            // that owns the cell never fills it in, and a later step in the
+            // same cell -- where the true position has drifted just enough to
+            // lift the disk -- would then read a 1 that no ray ever supported.
+            // Caught by PTM_PRIMARY_DISK_REUSE_VERIFY, not by inspection.
+            primary_vis_terrain_.assign(num_faces, -1.0);
+            primary_vis_cell_ = cellid;
+        }
+    } else {
+        primary_vis_cell_valid_ = false;
+        primary_vis_terrain_.clear();
+    }
+
     // Same |face_center| > 10000 unit discriminator the rest of this file uses
     // (PTM-37 makes it visible and refuses the ambiguous cases at startup).
     const bool centers_in_meters = (vectorLength(face_centers[0]) > 10000.0);
@@ -4425,12 +4558,25 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // blocks grazing rays, so this is not expected to be zero -- but it must be
     // attributable to rays, never to a probe that simply missed the crescent.
     size_t n_zero_by_rays = 0, n_probe_underflow = 0;
+    size_t n_reused = 0;
 
     const uint32_t N_SAMP = ptm::disk::PRIMARY_DISK_SAMPLES;
 
+    // The face sweep is instantiated TWICE, on a compile-time REUSE flag, and
+    // dispatched once per call. That is not style: with reuse compiled out the
+    // loop body is character for character the pre-reuse code, so the compiler
+    // emits the same contractions and the same rounding. Carrying the flag as
+    // a runtime bool instead -- three loop-invariant branches and one extra
+    // captured variable, no arithmetic change whatsoever -- was enough to move
+    // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 MS3 output files
+    // under -ffast-math. Measured, twice, before this was written.
+    auto sweep = [&](auto reuse_tag) {
+    constexpr bool REUSE = decltype(reuse_tag)::value;
+    size_t n_below_l = 0, n_full_l = 0, n_dark_l = 0, n_sampled_l = 0;
+    size_t n_zero_by_rays_l = 0, n_probe_underflow_l = 0, n_reused_l = 0;
     #pragma omp parallel for schedule(dynamic) \
-        reduction(+:n_below, n_full, n_dark, n_sampled, n_zero_by_rays, \
-                    n_probe_underflow)
+        reduction(+:n_below_l, n_full_l, n_dark_l, n_sampled_l, \
+                    n_zero_by_rays_l, n_probe_underflow_l, n_reused_l)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
 
@@ -4454,15 +4600,62 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         const double alpha = std::asin(sin_alpha);
 
         // Whole disk below the face's own horizon plane -> no flux, no rays.
-        if (c0 <= -sin_alpha) { ++n_below; continue; }
+        if (c0 <= -sin_alpha) { ++n_below_l; continue; }
 
+        // The horizon clip is closed-form and is ALWAYS evaluated at the true
+        // position -- reuse never freezes the primary's rise and set, only the
+        // terrain factor that multiplies it.
         const double A = ptm::disk::diskMeanCosAboveHorizon(c0, alpha);
-        if (A <= 0.0) { ++n_below; continue; }
+        if (A <= 0.0) { ++n_below_l; continue; }
 
         if (!embree_scene_) {                          // no BVH -> nothing occludes
             primary_vis_mean_cos_[i] = A;
-            ++n_full;
+            ++n_full_l;
             continue;
+        }
+
+        if constexpr (REUSE) {
+            if (reuse_terrain) {
+                const double v_cached = primary_vis_terrain_[i];
+                if (v_cached >= 0.0) {                 // cached V, no rays
+                    primary_vis_mean_cos_[i] = A * v_cached;
+                    ++n_reused_l;
+                    continue;
+                }
+                // Not evaluated in this cell yet -- fall through and evaluate
+                // it now, at the SAME snapped position the cell's first sweep
+                // would have used, and cache it. The value is therefore the
+                // same whenever it is first asked for, which is what makes the
+                // whole scheme independent of where a run's chunk boundaries
+                // fall.
+            }
+        }
+
+        // The rays below are cast at ray_primary_position. With reuse compiled
+        // out that IS the true position and these four names alias the values
+        // already computed above, so no second evaluation of the same formula
+        // ever happens on the default path.
+        double ray_dist = dist;
+        std::array<double, 3> ray_dir = dir;
+        double ray_c0 = c0;
+        double ray_sin_alpha = sin_alpha;
+        if constexpr (REUSE) {
+            const std::array<double, 3> ray_rel = {
+                ray_primary_position[0] - fc_km[0],
+                ray_primary_position[1] - fc_km[1],
+                ray_primary_position[2] - fc_km[2]
+            };
+            ray_dist = vectorLength(ray_rel);
+            if (ray_dist <= constants::EPSILON) {      // degenerate lattice point
+                primary_vis_mean_cos_[i] = A;
+                primary_vis_terrain_[i] = 1.0;
+                ++n_full_l;
+                continue;
+            }
+            ray_dir = { ray_rel[0]/ray_dist, ray_rel[1]/ray_dist, ray_rel[2]/ray_dist };
+            ray_c0 = dotProduct(fn, ray_dir);
+            ray_sin_alpha = primary_radius_ / ray_dist;
+            if (ray_sin_alpha > 1.0) ray_sin_alpha = 1.0;
         }
 
         const double safe_offset = calculateSafeRayOffset(face_centers[i], fn);
@@ -4473,7 +4666,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         };
         // Stop the ray at the primary's near surface, exactly as the single
         // center ray did. Mesh-native units.
-        const float tfar_dist = static_cast<float>((dist - primary_radius_) * km_to_native);
+        const float tfar_dist = static_cast<float>((ray_dist - primary_radius_) * km_to_native);
 
         // Fermi F1: the probe basis is oriented to the HORIZON, not arbitrarily.
         // u points along the horizon gradient, so probe (+1, 0) is the disk's
@@ -4484,18 +4677,18 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // Europa arm before this fix.
         std::array<double, 3> u, v;
         {
-            std::array<double, 3> up = { fn[0] - c0*dir[0],
-                                         fn[1] - c0*dir[1],
-                                         fn[2] - c0*dir[2] };
+            std::array<double, 3> up = { fn[0] - ray_c0*ray_dir[0],
+                                         fn[1] - ray_c0*ray_dir[1],
+                                         fn[2] - ray_c0*ray_dir[2] };
             const double ul = vectorLength(up);
             if (ul > 1.0e-12) {
                 u = { up[0]/ul, up[1]/ul, up[2]/ul };
-                v = crossProduct(dir, u);          // orthonormal: |dir x u| = 1
+                v = crossProduct(ray_dir, u);      // orthonormal: |dir x u| = 1
             } else {
                 // fn parallel to dir: no horizon gradient exists, and the disk
                 // is entirely above the horizon anyway (|c0| = 1), so any basis
                 // will do.
-                createCoordinateSystem(dir, u, v);
+                createCoordinateSystem(ray_dir, u, v);
             }
         }
 
@@ -4504,9 +4697,9 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // as the solar-disk sampler at :3868.
         auto disk_dir = [&](double dx, double dy) {
             std::array<double, 3> sd = {
-                dir[0] + sin_alpha*(dx*u[0] + dy*v[0]),
-                dir[1] + sin_alpha*(dx*u[1] + dy*v[1]),
-                dir[2] + sin_alpha*(dx*u[2] + dy*v[2])
+                ray_dir[0] + ray_sin_alpha*(dx*u[0] + dy*v[0]),
+                ray_dir[1] + ray_sin_alpha*(dx*u[1] + dy*v[1]),
+                ray_dir[2] + ray_sin_alpha*(dx*u[2] + dy*v[2])
             };
             const double l = vectorLength(sd);
             if (l > constants::EPSILON) { sd[0]/=l; sd[1]/=l; sd[2]/=l; }
@@ -4574,23 +4767,26 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             // the census stays comparable with the geometric count.
             warnPrimaryProbeUnderflowOnce();
             primary_vis_mean_cos_[i] = A;
-            ++n_full;
-            ++n_probe_underflow;
+            if constexpr (REUSE) primary_vis_terrain_[i] = 1.0;
+            ++n_full_l;
+            ++n_probe_underflow_l;
             continue;
         }
         if (!always_sample) {
             if (probes_up > 0 && probes_clear == probes_up) {
                 primary_vis_mean_cos_[i] = A;          // fully visible
-                ++n_full;
+                if constexpr (REUSE) primary_vis_terrain_[i] = 1.0;
+                ++n_full_l;
                 continue;
             }
             if (probes_clear == 0) {
-                ++n_dark;
-                ++n_zero_by_rays;
+                ++n_dark_l;
+                ++n_zero_by_rays_l;
+                if constexpr (REUSE) primary_vis_terrain_[i] = 0.0;
                 continue;                              // fully occluded -> 0
             }
         }
-        ++n_sampled;
+        ++n_sampled_l;
 
         // ---- escalate: cosine-weighted unoccluded fraction of the disk ------
         // V is a RATIO over the same sample set, so the O(alpha^2) bias of
@@ -4607,15 +4803,32 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             w_total += w;
             if (!occluded(sd)) w_clear += w;
         }
-        if (w_total <= 0.0) { ++n_zero_by_rays; continue; }
-        if (w_clear <= 0.0) ++n_zero_by_rays;
+        if (w_total <= 0.0) {                          // no sample carries flux
+            ++n_zero_by_rays_l;
+            if constexpr (REUSE) primary_vis_terrain_[i] = 0.0;
+            continue;
+        }
+        if (w_clear <= 0.0) ++n_zero_by_rays_l;
+        if constexpr (REUSE) primary_vis_terrain_[i] = w_clear / w_total;
         primary_vis_mean_cos_[i] = A * (w_clear / w_total);
     }
+    n_below += n_below_l;   n_full += n_full_l;   n_dark += n_dark_l;
+    n_sampled += n_sampled_l;  n_zero_by_rays += n_zero_by_rays_l;
+    n_probe_underflow += n_probe_underflow_l;  n_reused += n_reused_l;
+    };  // sweep
+
+    if (reuse_enabled) sweep(std::true_type{});
+    else               sweep(std::false_type{});
 
     primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
     primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
     primary_vis_key_pos_     = primary_position;
     primary_vis_key_n_       = num_faces;
+    if (reuse_enabled) {
+        primary_vis_terrain_centers_ = static_cast<const void*>(face_centers.data());
+        primary_vis_terrain_normals_ = static_cast<const void*>(face_normals.data());
+        primary_vis_cell_valid_      = true;
+    }
 
     if (report_stats) {
         std::cerr << "[illumination] primary disk: " << num_faces << " faces -- "
@@ -4623,8 +4836,43 @@ void IlluminationModel::updatePrimaryDiskVisibility(
                   << n_dark << " fully occluded, " << n_sampled << " sampled ("
                   << N_SAMP << " rays each); A>0 zeroed BY RAYS " << n_zero_by_rays
                   << ", probe-underflow fallbacks " << n_probe_underflow
+                  << "; terrain factor " << (reuse_terrain ? "REUSED" : "recomputed")
+                  << " for " << n_reused << " faces"
                   << std::endl;
     }
+}
+
+// Reuse cell size as a fraction of the primary's angular radius. Compile-time
+// default from primary_disk.h; PTM_PRIMARY_DISK_REUSE_FRACTION overrides it for
+// the budget sweep. The override announces itself on first use -- a knob that
+// moves temperatures must never be silent (crew rule: every override warns).
+double IlluminationModel::primaryDiskReuseFraction() {
+    static const double f = [](){
+        double value = ptm::disk::PRIMARY_DISK_REUSE_CELL_FRACTION;
+        const char* e = std::getenv("PTM_PRIMARY_DISK_REUSE_FRACTION");
+        if (e && *e) {
+            char* end = nullptr;
+            const double parsed = std::strtod(e, &end);
+            if (end == e || parsed < 0.0 || !std::isfinite(parsed)) {
+                std::cerr << "[illumination] WARNING: PTM_PRIMARY_DISK_REUSE_FRACTION='"
+                          << e << "' is not a non-negative number -- IGNORED, using the "
+                          << "compiled-in " << value << std::endl;
+            } else {
+                std::cerr << "[illumination] PTM_PRIMARY_DISK_REUSE_FRACTION=" << parsed
+                          << " overrides the compiled-in primary-disk terrain-reuse cell of "
+                          << value << " (fraction of the primary's angular radius). "
+                          << "THIS CHANGES RESULTS." << std::endl;
+                value = parsed;
+            }
+        }
+        if (value > 0.0) {
+            std::cerr << "[illumination] primary-disk terrain visibility is REUSED across "
+                      << "timesteps within " << value << " x the primary's angular radius"
+                      << std::endl;
+        }
+        return value;
+    }();
+    return f;
 }
 
 void IlluminationModel::calculatePrimaryIRBatch(

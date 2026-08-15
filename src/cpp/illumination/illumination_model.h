@@ -523,6 +523,23 @@ private:
     std::array<double, 3> primary_vis_key_pos_ = {0.0, 0.0, 0.0};
     size_t primary_vis_key_n_ = static_cast<size_t>(-1);
 
+    // Temporal reuse of the ray-derived terrain factor only (see
+    // PRIMARY_DISK_REUSE_CELL_FRACTION in primary_disk.h). The horizon clip A
+    // and the distance are recomputed from the TRUE primary position on every
+    // call; only this cached V is held across steps, and its lattice cell --
+    // not a step count -- decides when it is refreshed, so the schedule is a
+    // pure function of geometry and survives chunking and warm starts.
+    std::vector<double> primary_vis_terrain_;    // V in [0,1], per face
+    std::array<long long, 3> primary_vis_cell_ = {0, 0, 0};
+    const void* primary_vis_terrain_centers_ = nullptr;
+    const void* primary_vis_terrain_normals_ = nullptr;
+    bool primary_vis_cell_valid_ = false;
+
+    // Reuse cell size, read once from PRIMARY_DISK_REUSE_CELL_FRACTION and the
+    // optional PTM_PRIMARY_DISK_REUSE_FRACTION override. Reports itself when
+    // overridden -- a knob that changes physics must never be silent.
+    static double primaryDiskReuseFraction();
+
     // Generic body / Keplerian propagation support
     bool use_keplerian_ = false;
     std::unique_ptr<orbital::KeplerianPropagator> keplerian_propagator_;
