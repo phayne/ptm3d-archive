@@ -175,10 +175,17 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
         } else {
             F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
                         std::move(indptr), std::move(cols), std::move(data));
+            // Remember that the corrected matrix went to the CPU-only operator.
+            // initGPU() reports it if the config also asked for GPU radiosity —
+            // otherwise `radiation.use_gpu: true` reads as a GPU run in the
+            // config and runs entirely on the CPU with no signal at all.
+            vf_replace_cpu_route_ = true;
             std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
                          "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
                          "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
-                         "under-coupling; reciprocity by construction." << std::endl;
+                         "under-coupling; reciprocity by construction. Routed to the CPU SparseVFOperator "
+                         "(set PTM_HMATRIX_VF_REPLACE_GPU to route it to the GPU radiosity solver instead)."
+                      << std::endl;
         }
         // If a radiance-prune receipt sidecar sits next to the CSR, surface a
         // one-line provenance summary (eps + max discarded flux). The CSR was
@@ -509,6 +516,23 @@ void RadiositySolver::initGPU() {
             std::cout << "[RadiositySolver] GPU not requested, using CPU path" << std::endl;
         }
         return;
+    }
+
+    // Reachability, stated once and unmissably. PTM_HMATRIX_VF_REPLACE without
+    // PTM_HMATRIX_VF_REPLACE_GPU installs the corrected CSR as a CPU-only
+    // SparseVFOperator, leaving F_ptr_ null -- so every gate below refuses the
+    // GPU and the whole radiosity solve runs on the CPU while the config still
+    // reads `radiation.use_gpu: true`. Every production launcher audited on
+    // 2026-08-15 set only the former, which is why the flagship 509k radiosity
+    // has always been CPU. Name the cause and the fix here, not three fallbacks
+    // later where the message blames the H-matrix.
+    if (vf_replace_cpu_route_) {
+        std::cout << "[RadiositySolver] NOTE: radiation.use_gpu is true, but "
+                     "PTM_HMATRIX_VF_REPLACE was set WITHOUT PTM_HMATRIX_VF_REPLACE_GPU, so the "
+                     "corrected view-factor matrix was installed as a CPU-only SparseVFOperator "
+                     "and the GPU radiosity solver cannot see it. This run's radiosity will be "
+                     "CPU. Set PTM_HMATRIX_VF_REPLACE_GPU=1 to run the same corrected matrix on "
+                     "the GPU.\n";
     }
 
     // Two-band radiosity on the GPU (B1). The GPU path mirrors the CPU two-band by

@@ -329,10 +329,33 @@ Per-timestep solves are independent, so a batch can be split across several devi
 (`gpu_devices`, `gpu_device_ids`, `gpu_batch_size`, `gpu_inter_batch_pause_ms`), mirroring the
 thermal pool's dispatch model.
 
-**Band separation on the GPU** requires a sparse view-factor matrix, a single device, and row sums
-that never exceed 1 — the GPU Jacobi kernel does not apply the row renormalization of §4.5. When
-any of those does not hold, the run says so and the band-separated solve falls back to the CPU,
-which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
+**Band separation on the GPU** requires a sparse view-factor matrix, and it runs on either a single
+device or the multi-device pool. It does *not* require row sums below 1: the GPU Jacobi kernel
+applies the row renormalization of §4.5 on the device, from a per-face buffer uploaded alongside the
+matrix, so the GPU and CPU iterate the same operator $\rho\,(\hat{\mathbf n}\odot F)$. What is
+checked instead is the condition under which Jacobi converges at all,
+
+$$\text{gain} \;=\; \rho_{\max}\,\max_i \min\Bigl(\textstyle\sum_j F_{ij},\,1\Bigr) \;<\; 1,$$
+
+which the renormalization already caps at $\rho_{\max}$; it can only fail for a perfect reflector
+($A \geq 1$ or $\varepsilon \leq 0$), where no solver converges. When the sparse-matrix requirement
+or the gain condition is not met, the run says so and the band-separated solve falls back to the
+CPU, which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
+
+**Reaching the GPU with a corrected view-factor matrix.** `PTM_HMATRIX_VF_REPLACE` on its own
+installs the replacement as a CPU-only operator, so a run that sets `radiation.use_gpu: true` but
+not `PTM_HMATRIX_VF_REPLACE_GPU` does its whole radiosity solve on the CPU. A launch that intends
+GPU radiosity on a corrected matrix needs **both**:
+
+```sh
+PTM_HMATRIX_VF_REPLACE=/path/to/corrected.csr \
+PTM_HMATRIX_VF_REPLACE_GPU=1 \
+ptm_thermal_sim --config run.yaml     # with radiation.use_gpu: true, use_hmatrix: false
+```
+
+The two routes apply identical mesh-identity, row-sum and non-negativity checks; only the operator
+they install differs. The run prints a NOTE naming this condition when `use_gpu` is set and the
+`_GPU` variant is not.
 
 ## 7. Thermal-radiation coupling
 

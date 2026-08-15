@@ -26,6 +26,7 @@ namespace radiation {
 // Stefan-Boltzmann constant [W m^-2 K^-4]
 constexpr double SIGMA_SB = ptm::kStefanBoltzmann;
 
+
 // Abstract interface for view factor matrix-vector product
 // Allows RadiositySolver to work with either ViewFactorMatrix or HMatrixViewFactor
 class IViewFactorOperator {
@@ -462,6 +463,10 @@ private:
     // (gain = ρ_max · max_i min(Σ_j F_ij, 1)) instead of re-deriving it.
     double vf_row_sum_max_ = 0.0;
     size_t vf_row_norm_count_ = 0;
+    // True when PTM_HMATRIX_VF_REPLACE installed the corrected CSR as a CPU-only
+    // SparseVFOperator (i.e. PTM_HMATRIX_VF_REPLACE_GPU was NOT set). initGPU()
+    // reports it when the config also asked for GPU radiosity.
+    bool vf_replace_cpu_route_ = false;
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL
