@@ -398,7 +398,20 @@ public:
     // Adaptive grid controls
     bool   ADAPTIVE_GRID = true;     // Use per-profile adaptive grid instead of fixed geometric
     double R_MAX         = 2.0;     // Max per-step growth factor for dz (geometric stretching cap)
-    int    MIN_LAYERS_DEEP_PER_SKIN = 1;    // Minimum layers per skin depth in the deep
+    // Deep resolution floor, in layers per LOCAL skin depth. This is the only
+    // thing that sets deep layer thickness once the near-surface resolution
+    // ramp (m, RES_DECAY_SKINS) has decayed away. Until 2026-08 it was a dead
+    // int(1) shadowed by an explicit-FTCS stability proxy that silently pinned
+    // 1.935 layers/skin at every depth -- see generateAdaptiveGrid.
+    double MIN_LAYERS_DEEP_PER_SKIN = 0.5;
+    // If the LEGACY (pre-2026-08) grid is shorter than this, the deep
+    // coarsening is not applied at all: such a column is all near-surface, has
+    // no deep region to save, and its error budget is near-surface too, so
+    // cutting it is a pure loss. Small asteroids are this class (623 Chimaera
+    // builds 18 layers on its shipped TI-200 configuration and is unchanged).
+    // The test is deliberately on the legacy height, not the coarsened one --
+    // see the reasoning in generateAdaptiveGrid.
+    int    MIN_TOTAL_LAYERS_FOR_DEEP_COARSENING = 20;
     double RES_DECAY_SKINS = 3.0;    // e-folding depth (in skin depths) for resolution decay
     
     // Accuracy of temperature calculations

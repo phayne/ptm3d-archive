@@ -950,6 +950,21 @@ namespace {
 bool kernelSigmaMatchesHost(const std::string& src) {
     return src.find("#define SIGMA 5.670374419e-8f") != std::string::npos;
 }
+
+// Read MAX_LAYERS out of the kernel source instead of duplicating the number
+// on the host, for the same reason kernelSigmaMatchesHost parses SIGMA rather
+// than trusting a copy: a second literal is a second thing that can drift.
+// Returns -1 if the define is missing or unparseable.
+int kernelMaxLayers(const std::string& src) {
+    const std::string tag = "#define MAX_LAYERS ";
+    const size_t p = src.find(tag);
+    if (p == std::string::npos) return -1;
+    const char* first = src.c_str() + p + tag.size();
+    char* end = nullptr;
+    const long v = std::strtol(first, &end, 10);
+    if (end == first || v <= 0 || v > std::numeric_limits<int>::max()) return -1;
+    return static_cast<int>(v);
+}
 }  // namespace
 
 bool isOpenCLAvailable() {
@@ -1143,6 +1158,37 @@ void ThermalOpenCLSolver::buildKernels() {
 
     std::string source;
     const std::string embedded = getEmbeddedKernelSource();
+
+    // MAX_LAYERS is a hard ceiling, not a tuning knob: the persistent kernel
+    // stack-allocates every per-column scratch array as float[MAX_LAYERS], so a
+    // taller column cannot be represented. The kernels guard themselves with
+    //     if (n_layers > MAX_LAYERS) return;
+    // which is memory-safe and completely silent -- the work item retires
+    // without integrating anything, the run reports success, and the output is
+    // whatever the columns were seeded with. Nothing in the log says so. A
+    // lunar column at thermal_b = 48 built 68 layers on the pre-2026-08 depth
+    // grid and hit exactly this. Refuse at setup instead, naming both numbers.
+    {
+        const int kernel_max_layers = kernelMaxLayers(embedded);
+        if (kernel_max_layers <= 0) {
+            std::cerr << "\n[GPU Thermal] FATAL: could not read `#define MAX_LAYERS` "
+                         "from the embedded kernel source, so the column-height "
+                         "ceiling cannot be checked. Refusing to run rather than "
+                         "risk a silently unintegrated column.\n";
+            std::exit(1);
+        }
+        if (static_cast<long long>(n_layers_) > kernel_max_layers) {
+            std::cerr << "\n[GPU Thermal] FATAL: this run's depth grid has "
+                      << n_layers_ << " layers, but the OpenCL kernel can only "
+                         "integrate " << kernel_max_layers << " (MAX_LAYERS).\n"
+                         "  The kernel would return without integrating ANY "
+                         "column and the run would still report success.\n"
+                         "  Fix by lowering thermal_b (or thermal_m), or run this "
+                         "case on the CPU solver (thermal.use_gpu: false).\n";
+            std::exit(1);
+        }
+    }
+
     if (!kernelSigmaMatchesHost(embedded)) {
         std::cerr << "\n[GPU Thermal] FATAL: the embedded kernel's Stefan-Boltzmann "
                      "constant does not match ptm::kStefanBoltzmann. The GPU surface "
