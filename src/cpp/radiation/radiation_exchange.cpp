@@ -16,7 +16,9 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstdio>
 #include <atomic>
+#include <chrono>
 #include <omp.h>
 
 namespace radiation {
@@ -73,6 +75,79 @@ int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
                   << " timesteps)" << std::endl;
     }
     return batch;
+}
+
+// ============================================================================
+// Per-iteration radiosity trace (diagnostic; off unless PTM_RAD_ITER_TRACE=1)
+// ============================================================================
+// Emits one stderr line per Jacobi sweep with max|dB| (the ABSOLUTE movement,
+// which is what the GPU criterion tests) and max|B| (whose ratio is what the CPU
+// criterion tests), so the two stopping rules can be scored against each other on
+// the same solve. PTM_RAD_ITER_TRACE_FULL=1 also suppresses the early exit, so the
+// decay curve past the shipped stop is visible. The mirror on the GPU side lives
+// in gpu/radiosity_opencl.cpp (RadiosityOpenCLSolver::solve).
+// Atomic: solveJacobi() is documented as safe to call from several threads at once.
+static std::atomic<long> g_rad_trace_solve_id{0};
+
+// Contention-immune cost accounting: total CSR traversals and total in-solver wall
+// time, summed over every radiosity solve in the process and reported once at exit.
+// Whole-run wall clock cannot separate the radiosity phase from illumination and
+// thermal on a shared machine; these two counters can. The unit is a TRAVERSAL of
+// the view-factor matrix, which is what the work actually costs: the fused CPU
+// two-band does one width-2 traversal per outer iteration, while the GPU two-band
+// runs the two bands as separate solves and so pays IR + visible.
+static std::atomic<long>   g_rad_sweeps{0};
+static std::atomic<long>   g_rad_solves{0};
+static std::atomic<double> g_rad_seconds{0.0};
+
+static void radAddSolveCost(int traversals, double seconds) {
+    g_rad_sweeps.fetch_add(traversals, std::memory_order_relaxed);
+    g_rad_solves.fetch_add(1, std::memory_order_relaxed);
+    double cur = g_rad_seconds.load(std::memory_order_relaxed);
+    while (!g_rad_seconds.compare_exchange_weak(cur, cur + seconds,
+                                                std::memory_order_relaxed)) {}
+}
+
+namespace {
+struct RadCostReporter {
+    ~RadCostReporter() {
+        const long solves = g_rad_solves.load();
+        // Separate gate from PTM_RAD_ITER_TRACE on purpose: the trace forces a
+        // convergence check every iteration, which CHANGES the sweep count being
+        // measured. PTM_RAD_COST_REPORT alone reports the shipped behavior.
+        if (solves == 0 || (std::getenv("PTM_RAD_ITER_TRACE") == nullptr
+                            && std::getenv("PTM_RAD_COST_REPORT") == nullptr)) return;
+        const long sweeps = g_rad_sweeps.load();
+        const double secs = g_rad_seconds.load();
+        std::fprintf(stderr,
+                     "[rad-cost] radiosity solves=%ld traversals=%ld (%.3f traversals/solve) "
+                     "in-solver wall=%.3f s (%.3f ms/solve, %.3f ms/traversal)\n",
+                     solves, sweeps,
+                     static_cast<double>(sweeps) / static_cast<double>(solves),
+                     secs, 1e3 * secs / static_cast<double>(solves),
+                     sweeps ? 1e3 * secs / static_cast<double>(sweeps) : 0.0);
+    }
+};
+static RadCostReporter g_rad_cost_reporter;
+}  // namespace
+
+static bool radIterTraceEnabled() {
+    static const bool on = (std::getenv("PTM_RAD_ITER_TRACE") != nullptr);
+    return on;
+}
+
+static bool radIterTraceFull() {
+    static const bool on = (std::getenv("PTM_RAD_ITER_TRACE_FULL") != nullptr);
+    return on;
+}
+
+static void radIterTrace(const char* tag, long solve_id, int iter,
+                         double max_change, double max_val) {
+    if (!radIterTraceEnabled()) return;
+    const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+    std::fprintf(stderr,
+                 "[rad-trace] %s solve=%ld iter=%d dB_abs=%.6e B_max=%.6e rel=%.6e\n",
+                 tag, solve_id, iter, max_change, max_val, rel);
 }
 
 // ============================================================================
@@ -926,6 +1001,7 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
     // IR band (normal properties already uploaded), no solar source.
     std::vector<float> ir_f;
     gpu_solver_->solve(temps_f, zeros_f, ir_f);
+    last_iterations_ir_ = gpu_solver_->getLastIterations();
 
     // Visible band: swap to (1-A, A), no thermal emission (temps = 0), solar = Q.
     gpu_solver_->uploadFaceProperties(visE_f, visR_f);
@@ -934,9 +1010,12 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
     // Restore the thermal/IR properties for the next call.
     gpu_solver_->uploadFaceProperties(emiss_f, refl_f);
 
+    last_iterations_vis_ = gpu_solver_->getLastIterations();
     last_iterations_ = gpu_solver_->getLastIterations();
     last_residual_   = gpu_solver_->getLastResidual();
     converged_       = gpu_solver_->didConverge();
+    // Two independent full solves on this path, so the bands ADD.
+    last_csr_traversals_ = last_iterations_ir_ + last_iterations_vis_;
 
     // vf_row_norm_ is NOT re-applied here: indirect_flux_kernel already folded it
     // into ir_f/vis_f on the device (uploadRowNorm). Multiplying again would square
@@ -978,6 +1057,7 @@ std::vector<double> RadiositySolver::solveGPU(
 
     // Get convergence info
     last_iterations_ = gpu_solver_->getLastIterations();
+    last_csr_traversals_ = last_iterations_;
     last_residual_ = gpu_solver_->getLastResidual();
     converged_ = gpu_solver_->didConverge();
 
@@ -1090,6 +1170,12 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         }
     }
 
+    // Traversal accounting for PTM_RAD_COST_REPORT. Each worker charges the Jacobi
+    // iterations its OWN device actually ran, because the pool rung is the one path
+    // that never writes last_csr_traversals_ -- solve()'s one-step-batch route
+    // through here would otherwise report whatever the previous solve left behind.
+    std::atomic<long> pool_traversals{0};
+
     std::vector<std::future<bool>> futures;
     futures.reserve(n_dev);
 
@@ -1110,7 +1196,8 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                  &src_single = solar_albedo_source_,
                  &src_batch = solar_albedo_source_batch_,
                  &ir_batch = last_indirect_ir_batch_,
-                 &vis_batch = last_indirect_vis_batch_](
+                 &vis_batch = last_indirect_vis_batch_,
+                 &pool_traversals](
                     gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
                     std::vector<float> temps_f(n), solar_f(n), zeros_f(n, 0.0f), ir_f, vis_f;
                     for (size_t k : device_steps) {
@@ -1135,9 +1222,14 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                         // IR band (device holds IR props), then visible, then
                         // restore IR -- identical sequence to solveGPUTwoBand.
                         solver.solve(temps_f, zeros_f, ir_f);
+                        const int it_ir = solver.getLastIterations();
                         solver.uploadFaceProperties(visE_f, visR_f);
                         solver.solve(zeros_f, solar_f, vis_f);
+                        const int it_vis = solver.getLastIterations();
                         solver.uploadFaceProperties(emiss_f, refl_f);
+                        // Two independent full solves per timestep, so the bands ADD.
+                        pool_traversals.fetch_add(it_ir + it_vis,
+                                                  std::memory_order_relaxed);
                         auto& out = indirect_per_timestep[k]; out.resize(n);
                         auto& obi = ir_batch[k];
                         auto& obv = vis_batch[k];
@@ -1156,7 +1248,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         } else {
             futures.push_back(gpu_pool_->submit(
                 [&temperatures_per_timestep, &solar_flux_per_timestep,
-                 &indirect_per_timestep, device_steps, n](
+                 &indirect_per_timestep, device_steps, n, &pool_traversals](
                     gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
                     std::vector<float> temps_f(n), solar_f(n), indirect_f;
                     for (size_t k : device_steps) {
@@ -1167,6 +1259,8 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                             solar_f[i] = static_cast<float>(solar_d[i]);
                         }
                         solver.solve(temps_f, solar_f, indirect_f);
+                        pool_traversals.fetch_add(solver.getLastIterations(),
+                                                  std::memory_order_relaxed);
                         auto& out = indirect_per_timestep[k];
                         out.resize(n);
                         // Row norm already applied on-device; do not re-apply.
@@ -1193,6 +1287,9 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     last_iterations_ = 0;     // not aggregated; caller treats as advisory
     last_residual_ = 0.0;
     converged_ = all_ok;
+    // Traversals ARE aggregated (summed over devices and timesteps), so the cost
+    // report charges this batch's real work rather than the previous solve's.
+    last_csr_traversals_ = static_cast<int>(pool_traversals.load());
 
     return indirect_per_timestep;
 #endif
@@ -1200,6 +1297,23 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
 
 std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatures,
                                             const std::vector<double>& solar_flux) {
+    // Cost accounting around the whole solve, whichever path it takes. Reported by
+    // RadCostReporter at exit under PTM_RAD_COST_REPORT (or PTM_RAD_ITER_TRACE);
+    // silent otherwise. Each path sets last_csr_traversals_ itself -- deriving it
+    // from the per-band iteration members here undercounted the GPU two-band by 2x,
+    // because that path leaves last_iterations_ir_/vis_ untouched.
+    struct CostScope {
+        std::chrono::steady_clock::time_point t0;
+        const RadiositySolver* self;
+        CostScope(const RadiositySolver* s)
+            : t0(std::chrono::steady_clock::now()), self(s) {}
+        ~CostScope() {
+            const double dt = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            radAddSolveCost(self->last_csr_traversals_, dt);
+        }
+    } cost_scope(this);
+
 #ifdef PTM_GPU_OPENCL
     // Use GPU path if available. Guard: if two-band was activated but the GPU
     // two-band path is NOT engaged (e.g. band separation enabled AFTER initGPU, or
@@ -1336,8 +1450,12 @@ std::vector<double> RadiositySolver::solveTwoBand(
     if (use_gs) {
         B_ir  = solveGaussSeidel(emission, zero_source, reflectivity_);
         last_iterations_ir_ = last_iterations_;
+        const int trav_ir = last_csr_traversals_;
         B_vis = solveGaussSeidel(zero_source, vis_source, solar_reflectivity_);
         last_iterations_vis_ = last_iterations_;
+        // Two SEPARATE solves here (unlike the fused Jacobi below): they pay
+        // IR + visible traversals, not max().
+        last_csr_traversals_ = trav_ir + last_csr_traversals_;
     } else {
         solveTwoBandJacobiFused(emission, vis_source, B_ir, B_vis);
     }
@@ -1447,6 +1565,9 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
     bool local_converged = false;
     int local_iterations = 0;
 
+    const long trace_id = radIterTraceEnabled()
+                        ? g_rad_trace_solve_id.fetch_add(1) + 1 : 0;
+
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         // B_new = E + ρ Q_solar + ρ F B
         // Note: matvec is internally parallelized over H-matrix blocks
@@ -1476,7 +1597,9 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
         local_residual = rel_residual;
         local_iterations = iter + 1;
 
-        if (rel_residual < config_.convergence_tolerance) {
+        radIterTrace("cpu-jacobi", trace_id, iter + 1, max_change, max_val);
+
+        if (rel_residual < config_.convergence_tolerance && !radIterTraceFull()) {
             local_converged = true;
             break;
         }
@@ -1485,6 +1608,7 @@ std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emis
     // Update member variables (for diagnostics) - not thread-safe but only for reporting
     last_residual_ = local_residual;
     last_iterations_ = local_iterations;
+    last_csr_traversals_ = local_iterations;   // one matvec per iteration
     converged_ = local_converged;
     // temp_vec holds F·B·vf_row_norm from the final iteration -- the normalized
     // incoming. solveTwoBand uses the (B−E−source)/refl identity for this, and
@@ -1526,6 +1650,8 @@ void RadiositySolver::solveTwoBandJacobiFused(
     double rel_ir  = std::numeric_limits<double>::max();
     double rel_vis = std::numeric_limits<double>::max();
     const double tol = config_.convergence_tolerance;
+    const long trace_id = radIterTraceEnabled()
+                        ? g_rad_trace_solve_id.fetch_add(1) + 1 : 0;
     for (int iter = 0; iter < config_.max_iterations && !(conv_ir && conv_vis); ++iter) {
         if (!conv_ir && !conv_vis) {
             F_op_->matvec2(r_ir, r_vis, tv_ir, tv_vis);   // shared traversal
@@ -1546,7 +1672,8 @@ void RadiositySolver::solveTwoBandJacobiFused(
             it_ir = iter + 1;
             const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
             rel_ir = rel;
-            if (rel < tol) conv_ir = true;
+            radIterTrace("cpu-2band-ir", trace_id, iter + 1, max_change, max_val);
+            if (rel < tol && !radIterTraceFull()) conv_ir = true;
         }
         if (!conv_vis) {
             for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) tv_vis[i] *= vf_row_norm_[i];
@@ -1560,7 +1687,8 @@ void RadiositySolver::solveTwoBandJacobiFused(
             it_vis = iter + 1;
             const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
             rel_vis = rel;
-            if (rel < tol) conv_vis = true;
+            radIterTrace("cpu-2band-vis", trace_id, iter + 1, max_change, max_val);
+            if (rel < tol && !radIterTraceFull()) conv_vis = true;
         }
     }
     // Dead-path fallback source for the #2 identity (refl→0 only): match
@@ -1569,6 +1697,9 @@ void RadiositySolver::solveTwoBandJacobiFused(
     last_iterations_ir_  = it_ir;
     last_iterations_vis_ = it_vis;
     last_iterations_     = it_vis;  // aggregate getter: last band solved, as before
+    // One shared width-2 traversal per outer iteration; the outer loop ran until the
+    // slower band converged, so that is max(it_ir, it_vis), not their sum.
+    last_csr_traversals_ = std::max(it_ir, it_vis);
     // PTM-102: a TWO-band solve has converged only when BOTH bands have, and its
     // residual is the worse of the two. This is deliberately STRICTER than the
     // "two separate solveJacobi calls" aggregate it otherwise mirrors -- that one
@@ -1647,6 +1778,7 @@ std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>&
         }
     }
 
+    last_csr_traversals_ = last_iterations_;   // one row sweep per iteration
     return radiosity_;
 }
 

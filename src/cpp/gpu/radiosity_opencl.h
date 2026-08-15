@@ -214,6 +214,12 @@ private:
     // Compute max residual from change buffer (CPU reduction)
     double computeMaxResidual();
 
+    // Max over faces of a device float buffer, via the same two-stage reduction
+    // computeMaxResidual() uses. Diagnostic only: used by the PTM_RAD_ITER_TRACE
+    // per-iteration trace to report max|B| alongside max|dB|, so the absolute
+    // (GPU) and relative (CPU) stopping criteria can be compared on one run.
+    double computeMaxOfBuffer(cl_mem buf);
+
     // Build the chunked CSR sub-buffers (PTM-25) when the matrix exceeds the
     // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
     void buildChunkedCsr(const std::vector<double>& values,

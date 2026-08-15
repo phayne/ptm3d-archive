@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
@@ -1132,19 +1134,45 @@ void RadiosityOpenCLSolver::solve(
     // (see its doc comment for the measurements behind the threshold).
     converged_ = false;
     last_residual_ = std::numeric_limits<double>::max();
-    const int check_interval =
+    // The interval the shipped rule asks for on THIS matrix. PTM_RAD_GPU_CHECK_INTERVAL
+    // (handled in the constructor) has already pinned config_.convergence_check_interval
+    // if it was set, so it arrives here through the "pinned" branch of the resolver.
+    const int resolved_interval =
         resolveConvergenceCheckInterval(config_.convergence_check_interval, nnz_);
+
+    // Diagnostic per-iteration trace (PTM_RAD_ITER_TRACE=1). Forces a check every
+    // iteration and reports max|dB| (the GPU criterion), max|B| and their ratio
+    // (the CPU criterion) so the two stopping rules can be scored on one solve.
+    // PTM_RAD_ITER_TRACE_FULL=1 additionally ignores the stopping rule and runs
+    // all max_iterations, exposing the full decay curve past the shipped stop.
+    static const bool iter_trace      = (std::getenv("PTM_RAD_ITER_TRACE") != nullptr);
+    static const bool iter_trace_full = (std::getenv("PTM_RAD_ITER_TRACE_FULL") != nullptr);
+    // Atomic: the multi-GPU pool submits solves on several device threads at once.
+    static std::atomic<long> trace_solve_id{0};
+    const long this_solve = iter_trace ? trace_solve_id.fetch_add(1) + 1 : 0;
+    // The trace needs every sweep, so it overrides the resolved interval. That also
+    // moves the STOPPING point (the solve now exits the iteration it converges on
+    // rather than the next multiple of resolved_interval), which is why it is
+    // announced below rather than applied quietly.
+    const int check_interval = iter_trace ? 1 : resolved_interval;
+
     if (!logged_check_interval_) {
         logged_check_interval_ = true;
-        std::cout << "  [Radiosity GPU] convergence check every " << check_interval
-                  << " Jacobi iteration" << (check_interval == 1 ? "" : "s")
+        std::cout << "  [Radiosity GPU] convergence check every " << resolved_interval
+                  << " Jacobi iteration" << (resolved_interval == 1 ? "" : "s")
                   << " ("
                   << (config_.convergence_check_interval > 0
                           ? "pinned"
-                          : (check_interval == 1
+                          : (resolved_interval == 1
                                  ? "auto: a traversal of this matrix costs more than a check"
                                  : "auto: a check costs more than a traversal of this matrix"))
                   << "; nnz = " << nnz_ << ")\n";
+        if (check_interval != resolved_interval) {
+            std::cout << "  [Radiosity GPU] PTM_RAD_ITER_TRACE=1: overriding that to a check "
+                         "every iteration, so each solve stops on the iteration it converges "
+                         "rather than at a multiple of " << resolved_interval
+                      << ". Iteration counts and timings under the trace are NOT shipped cost.\n";
+        }
     }
 
     // Ensure tolerance is safe for single-precision (float has ~7 significant digits)
@@ -1193,7 +1221,15 @@ void RadiosityOpenCLSolver::solve(
             last_residual_ = max_change;
             last_iterations_ = iter + 1;
 
-            if (max_change < effective_tolerance) {
+            if (iter_trace) {
+                const double max_b = computeMaxOfBuffer(buf_radiosity_);
+                const double rel = (max_b > 1e-10) ? max_change / max_b : max_change;
+                std::fprintf(stderr,
+                             "[rad-trace] gpu solve=%ld iter=%d dB_abs=%.6e B_max=%.6e rel=%.6e\n",
+                             this_solve, iter + 1, max_change, max_b, rel);
+            }
+
+            if (max_change < effective_tolerance && !iter_trace_full) {
                 converged_ = true;
                 break;
             }
@@ -1235,6 +1271,10 @@ void RadiosityOpenCLSolver::solve(
 }
 
 double RadiosityOpenCLSolver::computeMaxResidual() {
+    return computeMaxOfBuffer(buf_change_);
+}
+
+double RadiosityOpenCLSolver::computeMaxOfBuffer(cl_mem buf) {
     // Use GPU parallel reduction to find max change
     // Two-stage approach:
     // 1. Each work group reduces to one partial max
@@ -1259,7 +1299,7 @@ double RadiosityOpenCLSolver::computeMaxResidual() {
     size_t global_size = n_reduction_groups_ * local_size;
     size_t local_mem_size = local_size * sizeof(float);
 
-    err = clSetKernelArg(max_reduction_kernel_, 0, sizeof(cl_mem), &buf_change_);
+    err = clSetKernelArg(max_reduction_kernel_, 0, sizeof(cl_mem), &buf);
     checkErr(err, "clSetKernelArg(max_reduction,input)");
     err = clSetKernelArg(max_reduction_kernel_, 1, sizeof(cl_mem), &buf_partial_max_);
     checkErr(err, "clSetKernelArg(max_reduction,partial_max)");
