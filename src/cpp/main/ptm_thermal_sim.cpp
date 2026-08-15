@@ -1372,6 +1372,91 @@ static inline bool legacyRadiosityStaticAlbedo() {
     return legacy;
 }
 
+// ---- PTM_RAD_SKIP_EQ_STEPS: skip the radiosity sweep over EQUILIBRATION ------
+// The coupling loop's radiosity sweep runs t = 0 .. total_time_steps, so on a
+// two-phase run it solves the enclosure at every EQUILIBRATION step as well as
+// every output step -- 3000 of 3020 steps on a production chunk, at the same
+// cost per step. On the GPU re-thermal path those steps feed nothing:
+//   * the whole-mesh GPU solver records surface_temps only over the output
+//     window, so surface_temps[f][t] == 0 for t < equilibration_steps and the
+//     IR band is being solved against a 0 K enclosure;
+//   * runThermalForSelectedFaces_GPU reads indirect_flux_series only at
+//     [equilibration_steps, total_time_steps) (both the output-window flux and
+//     the optional PTM_EQ_WITH_INDIRECT phase map index into that span);
+//   * every estimator and export that reduces indirect_flux_series /
+//     indirect_solar_series / indirect_ir_series uses out_lo =
+//     equilibration_steps or the (narrower) statistics window.
+// The ONE remaining consumer of the equilibration span is the per-face
+// max-indirect that drives face SELECTION, which is reduced over ALL t. So this
+// is NOT unconditionally a no-op: it ships default OFF, and the number of faces
+// whose indirect maximum lands in that span is reported every iteration so the
+// gate-off arm predicts whether the gate-on arm can differ.
+// NOT SOUND on the CPU selected-faces re-thermal: that path re-integrates the
+// whole span from a combined flux that carries indirect_flux_series at every
+// equilibration step. Armed only when thermal.use_gpu is set, and reaching the
+// CPU re-thermal while armed is FATAL rather than silently mis-forced.
+static inline bool radSkipEqStepsRequested() {
+    static bool on = []() {
+        const char* e = std::getenv("PTM_RAD_SKIP_EQ_STEPS");
+        return (e && std::string(e) != "0" && e[0] != '\0');
+    }();
+    return on;
+}
+
+// ---- PTM_RAD_SELECT_OUTPUT_WINDOW -------------------------------------------
+// The coupling loop's face selector reduces max_t indirect_flux_series[f][t]
+// over ALL t and feeds it to a linearized OUTPUT-WINDOW temperature response,
+// dF -> pred_dT = (1-A) dF / (4 eps sigma T^3). On a two-phase run the
+// equilibration part of that maximum was computed against surface_temps == 0
+// (the whole-mesh GPU solver records only the output window), so it is the
+// reflected-sunlight band alone against a 0 K enclosure -- not an indirect flux
+// the output window will ever see. Measured on the 509k lunar flagship it is
+// the LARGER of the two on 35.5% of faces, where it pins dF at 0 and freezes
+// faces whose output-window indirect is still rising: 395 frozen at sweep 5
+// against 155 when the selector looks only at the output window.
+// Restricting the reduction to [equilibration_steps, total) is therefore a
+// candidate FIX, not just a knob -- but it changes which faces are re-thermal'd,
+// so it is a results change and ships default OFF until Paul rules on it.
+static inline bool radSelectOutputWindowRequested() {
+    static bool on = []() {
+        const char* e = std::getenv("PTM_RAD_SELECT_OUTPUT_WINDOW");
+        return (e && std::string(e) != "0" && e[0] != '\0');
+    }();
+    return on;
+}
+
+// Two-phase detection: the equilibration phase is sampled at a different
+// cadence from the output phase, so the GPU thermal solvers run it as a
+// separate solver call at eq_dt and record surface temperatures over the
+// OUTPUT window only. When it is FALSE the whole span is one cadence, the
+// solvers record every step, and the rad-coupling re-thermal reads the flux
+// arrays from t=0 -- which is exactly what makes PTM_RAD_SKIP_EQ_STEPS unsound
+// there. This predicate had three identical spellings (the whole-mesh
+// persistent solver, the selected-faces re-thermal, and now the skip gate that
+// DEPENDS on the other two); two copies agreeing today and drifting later is
+// the PTM-106c class of defect, so there is one.
+static bool rethermalTwoPhase(const std::vector<double>& times,
+                              int equilibration_steps, int total_time_steps,
+                              float* eq_dt_out = nullptr,
+                              float* out_dt_out = nullptr) {
+    const int output_steps = total_time_steps - equilibration_steps;
+    float eq_dt = 0.0f;
+    float out_dt = 0.0f;
+    if (equilibration_steps > 1) {
+        eq_dt = static_cast<float>(times[1] - times[0]);
+    }
+    if (output_steps > 1 && equilibration_steps < total_time_steps) {
+        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
+    } else if (equilibration_steps > 1) {
+        out_dt = eq_dt;
+    }
+    if (equilibration_steps <= 0) eq_dt = out_dt;
+    if (eq_dt_out)  *eq_dt_out  = eq_dt;
+    if (out_dt_out) *out_dt_out = out_dt;
+    return (equilibration_steps > 0 && output_steps > 0 &&
+            std::abs(eq_dt - out_dt) > 1e-3f);
+}
+
 // GPU persistent kernel thermal solver
 // equilibration_steps: number of steps in the equilibration phase (0 = all steps
 // are output). When > 0 and the eq phase has a different dt from the output phase,
@@ -6937,20 +7022,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const int output_steps = total_time_steps - equilibration_steps;
     float eq_dt = 0.0f;
     float out_dt = 0.0f;
-    bool two_phase = false;
-
-    if (equilibration_steps > 1) {
-        eq_dt = static_cast<float>(times[1] - times[0]);
-    }
-    if (output_steps > 1 && equilibration_steps < total_time_steps) {
-        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
-    } else if (equilibration_steps > 1) {
-        out_dt = eq_dt;
-    }
-    if (equilibration_steps <= 0) eq_dt = out_dt;
-
-    two_phase = (equilibration_steps > 0 && output_steps > 0 &&
-                 std::abs(eq_dt - out_dt) > 1e-3f);
+    const bool two_phase = rethermalTwoPhase(times, equilibration_steps,
+                                             total_time_steps, &eq_dt, &out_dt);
 
     // For single-phase (legacy), use a single dt.
     float dt = two_phase ? eq_dt : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
@@ -8820,17 +8893,8 @@ bool runThermalForSelectedFaces_GPU(
     const int output_steps = total_time_steps - equilibration_steps;
     float eq_dt = 0.0f;
     float out_dt = 0.0f;
-    if (equilibration_steps > 1) {
-        eq_dt = static_cast<float>(times[1] - times[0]);
-    }
-    if (output_steps > 1 && equilibration_steps < total_time_steps) {
-        out_dt = static_cast<float>(times[equilibration_steps + 1] - times[equilibration_steps]);
-    } else if (equilibration_steps > 1) {
-        out_dt = eq_dt;
-    }
-    if (equilibration_steps <= 0) eq_dt = out_dt;
-    const bool two_phase = (equilibration_steps > 0 && output_steps > 0 &&
-                            std::abs(eq_dt - out_dt) > 1e-3f);
+    const bool two_phase = rethermalTwoPhase(times, equilibration_steps,
+                                             total_time_steps, &eq_dt, &out_dt);
     const float dt_single = two_phase
         ? eq_dt
         : (total_time_steps > 1 ? static_cast<float>(times[1] - times[0]) : 0.0f);
@@ -17163,6 +17227,93 @@ int main(int argc, char** argv) {
                 std::cout << "  Face-selection mode: "
                           << rad_coupling_select_mode << std::endl;
 
+                // ---- PTM_RAD_SKIP_EQ_STEPS (default OFF) --------------------
+                // See radSkipEqStepsRequested() for why this is sound only on
+                // the GPU re-thermal path, and for the one consumer that keeps
+                // it from being unconditionally byte-identical.
+                bool rad_skip_eq_steps = false;
+                if (radSkipEqStepsRequested()) {
+                    if (!thermal_config.getPropertyBool("use_gpu_thermal", false)) {
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set but"
+                                     " thermal.use_gpu is false. The CPU selected-faces"
+                                     " re-thermal re-integrates the WHOLE span from a"
+                                     " combined flux built out of indirect_flux_series,"
+                                     " so skipping the equilibration radiosity would"
+                                     " silently change its forcing. Refusing to run.\n";
+                        return 1;
+                    }
+                    if (equilibration_steps <= 0
+                            || equilibration_steps >= total_time_steps) {
+                        std::cout << "  [rad-skip-eq] PTM_RAD_SKIP_EQ_STEPS is set but there"
+                                     " is nothing to skip (equilibration_steps="
+                                  << equilibration_steps << " of " << total_time_steps
+                                  << "); sweeping every timestep." << std::endl;
+                    } else if (export_locations && !locations_file.empty()) {
+                        // exportLocationIlluminationAndTemperature() reads
+                        // indirect_flux[f][t] for t = 0 .. time_steps-1, i.e.
+                        // ABSOLUTE indices that land inside the equilibration
+                        // span on any two-phase run. (That is a pre-existing
+                        // window defect in the location CSV -- it reads the
+                        // equilibration prefix rather than the output window,
+                        // and at the wrong stride for the flat arrays -- but
+                        // arming this gate would additionally turn its
+                        // IndirectFlux column silently into zeros.)
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set and this run"
+                                     " exports location time series ('" << locations_file
+                                  << "'). That export indexes indirect_flux from t=0, so"
+                                     " the skipped span would silently zero its IndirectFlux"
+                                     " column. Refusing to run.\n";
+                        return 1;
+                    } else if (!rethermalTwoPhase(times, equilibration_steps,
+                                                  total_time_steps)) {
+                        // Single-cadence run: the re-thermal integrates from t=0
+                        // and reads indirect_flux_series over the WHOLE span, so
+                        // the equilibration radiosity is load-bearing there.
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is set but this run is"
+                                     " NOT two-phase (the equilibration and output cadences"
+                                     " match, so the re-thermal integrates from t=0 and"
+                                     " consumes indirect_flux_series over the whole span)."
+                                     " Refusing to run.\n";
+                        return 1;
+                    } else {
+                        rad_skip_eq_steps = true;
+                        std::cout << "  [rad-skip-eq] PTM_RAD_SKIP_EQ_STEPS: the radiosity"
+                                     " sweep starts at absolute step " << equilibration_steps
+                                  << " of " << total_time_steps << " -- "
+                                  << equilibration_steps << " equilibration steps ("
+                                  << (100.0 * equilibration_steps / total_time_steps)
+                                  << "%) are NOT solved and indirect_flux_series stays 0"
+                                     " there. EXPERIMENTAL: the only consumer of that span"
+                                     " is the face-selection max-indirect; the"
+                                     " '[rad-skip-eq] indirect maximum' line below reports"
+                                     " how many faces it can move." << std::endl;
+                    }
+                }
+                // Absolute step the radiosity sweep starts at, and the exclusive
+                // upper bound of the span the selection audit inspects.
+                const int rad_sweep_t_lo = rad_skip_eq_steps ? equilibration_steps : 0;
+                const int rad_eq_audit_hi =
+                    std::max(0, std::min(equilibration_steps, total_time_steps));
+
+                // ---- PTM_RAD_SELECT_OUTPUT_WINDOW (default OFF) -------------
+                // Lower bound of the face-selector's max-indirect reduction.
+                // 0 (default) reproduces the shipped selector exactly.
+                const bool rad_select_output_window =
+                    radSelectOutputWindowRequested() && rad_eq_audit_hi > 0;
+                const int rad_sel_t_lo = rad_select_output_window ? rad_eq_audit_hi : 0;
+                if (radSelectOutputWindowRequested()) {
+                    std::cout << "  [rad-select-window] PTM_RAD_SELECT_OUTPUT_WINDOW: the"
+                                 " face selector's max-indirect reduction starts at absolute"
+                                 " step " << rad_sel_t_lo << " of " << total_time_steps
+                              << (rad_select_output_window
+                                      ? " -- the equilibration span (solved against a 0 K"
+                                        " enclosure) no longer sets any face's dF."
+                                        " RESULTS CHANGE: this re-thermals faces the shipped"
+                                        " selector freezes."
+                                      : " -- no equilibration phase, so this is a no-op.")
+                              << std::endl;
+                }
+
                 // Time-varying indirect flux per face [face][timestep]
                 // This is the key fix: indirect flux varies with time as wall temperatures change
                 // (indirect_flux_series declared at outer scope for location export)
@@ -17518,7 +17669,11 @@ int main(int argc, char** argv) {
                     double max_indirect = 0.0;
                     double total_indirect_sum = 0.0;
 
-                    thermal::ProgressBar flux_progress(total_time_steps, "Computing indirect flux", 50, true);
+                    // Sized to the span actually swept, so the bar does not jump
+                    // straight to ~99% under PTM_RAD_SKIP_EQ_STEPS. Identical to
+                    // total_time_steps when the gate is off (rad_sweep_t_lo = 0).
+                    thermal::ProgressBar flux_progress(total_time_steps - rad_sweep_t_lo,
+                                                       "Computing indirect flux", 50, true);
 
                     // Multi-GPU radiosity dispatch: when the pool is active,
                     // process timesteps in batches sized to amortize per-batch
@@ -17606,7 +17761,7 @@ int main(int argc, char** argv) {
                         }
                         if (accumulate) g_src_albedo_valid = true;
                     };
-                    for (int t_start = 0; t_start < total_time_steps;
+                    for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
                             std::min(t_start + batch_size, total_time_steps);
@@ -17761,14 +17916,21 @@ int main(int argc, char** argv) {
                         }
 
                         if (t_end % 10 == 0 || t_end == total_time_steps) {
-                            flux_progress.update(t_end);
+                            flux_progress.update(t_end - rad_sweep_t_lo);
                         }
                     }
                     flux_progress.finish();
                     eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
                     ++eqi_n_sweep;
 
-                    double mean_indirect = total_indirect_sum / (num_faces * total_time_steps);
+                    // Denominator is the span actually SWEPT, not the whole table:
+                    // under PTM_RAD_SKIP_EQ_STEPS total_indirect_sum accumulates
+                    // only over [rad_sweep_t_lo, total_time_steps), and dividing
+                    // by the full table would drop this line ~150x on a 3000-of-
+                    // 3020 chunk as a pure artifact -- in the one summary line an
+                    // operator A/B-diffs between the two arms.
+                    double mean_indirect = total_indirect_sum
+                        / (num_faces * static_cast<size_t>(total_time_steps - rad_sweep_t_lo));
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
 
@@ -17851,15 +18013,27 @@ int main(int argc, char** argv) {
                     std::vector<double> face_max_T(num_faces, 0.0);
                     double max_temp_change = 0.0;
                     double total_indirect_per_face_sum = 0.0;
+                    // PTM_RAD_SKIP_EQ_STEPS audit: this reduction is the ONLY
+                    // consumer that reads indirect_flux_series inside the
+                    // equilibration span, so the faces whose maximum is attained
+                    // there are exactly the faces the skip can move. Counted
+                    // unconditionally (one extra compare inside a loop that
+                    // already reads the value) so the gate-OFF arm predicts the
+                    // gate-ON arm instead of the pair being compared blind.
+                    size_t n_eq_attained = 0;
 
                     #pragma omp parallel for schedule(static) \
                         reduction(max:max_temp_change) \
-                        reduction(+:total_indirect_per_face_sum)
+                        reduction(+:total_indirect_per_face_sum,n_eq_attained)
                     for (size_t f = 0; f < num_faces; f++) {
-                        double mi = 0.0, mT = 0.0, odT = 0.0;
+                        double mi = 0.0, mT = 0.0, odT = 0.0, mi_eq = 0.0;
                         for (int t = 0; t < total_time_steps; t++) {
                             const double v = indirect_flux_series[f][t];
-                            if (v > mi) mi = v;
+                            // t >= rad_sel_t_lo is unconditionally true at the
+                            // default rad_sel_t_lo = 0, so the shipped selector
+                            // is reproduced bit for bit.
+                            if (t >= rad_sel_t_lo && v > mi) mi = v;
+                            if (t < rad_eq_audit_hi && v > mi_eq) mi_eq = v;
                             const double T = surface_temps[f][t];
                             if (T > mT) mT = T;
                             const double dT = std::abs(T - prev_temps[f][t]);
@@ -17870,6 +18044,17 @@ int main(int argc, char** argv) {
                         observed_dT[f]       = odT;
                         total_indirect_per_face_sum += mi;
                         if (odT > max_temp_change) max_temp_change = odT;
+                        if (mi_eq > 0.0 && mi_eq >= mi) ++n_eq_attained;
+                    }
+                    if (rad_eq_audit_hi > 0) {
+                        std::cout << "  [rad-skip-eq] indirect maximum attained inside the"
+                                     " equilibration span on " << n_eq_attained << " / "
+                                  << num_faces << " faces"
+                                  << (rad_skip_eq_steps
+                                          ? " (0 by construction -- the span was skipped)"
+                                          : " (these are the faces PTM_RAD_SKIP_EQ_STEPS"
+                                            " could move)")
+                                  << std::endl;
                     }
 
                     // Pick faces to re-run.
@@ -18034,6 +18219,27 @@ int main(int argc, char** argv) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
                             use_gpu_thermal_rerun = false;
                         }
+                    }
+
+                    // PTM_RAD_SKIP_EQ_STEPS is only sound while the GPU
+                    // re-thermal owns this step. Landing on the CPU re-thermal
+                    // with it armed means the equilibration forcing about to be
+                    // integrated is missing its indirect term on every selected
+                    // face. Refuse HERE -- before the combined_flux build below,
+                    // which is documented at up to ~5.2 GB -- rather than after
+                    // paying for it.
+                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS is armed but coupling"
+                                     " iteration " << (iter + 1) << " fell to the CPU"
+                                     " selected-faces re-thermal (" << faces_to_rerun.size()
+                                  << " faces; the GPU path needs >= 100 and must not have"
+                                     " failed). That path re-integrates the equilibration"
+                                     " span from a combined flux built out of"
+                                     " indirect_flux_series, which this run deliberately"
+                                     " left at zero there.\n"
+                                  << "  Refusing to write silently mis-forced results."
+                                     " Re-run without PTM_RAD_SKIP_EQ_STEPS.\n";
+                        return 1;
                     }
 
                     // CPU path needs pre-built combined_flux per face. Build it
