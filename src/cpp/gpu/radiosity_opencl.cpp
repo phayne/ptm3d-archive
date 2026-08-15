@@ -973,7 +973,6 @@ void RadiosityOpenCLSolver::uploadRowNorm(const std::vector<float>& row_norm)
         throw std::runtime_error(std::string("clEnqueueWriteBuffer(row_norm) failed: ") +
                                  clErrorString(err));
     }
-    row_norm_uploaded_ = true;
 }
 
 void RadiosityOpenCLSolver::solve(
@@ -1327,7 +1326,6 @@ void RadiosityOpenCLSolver::release() {
     initialized_ = false;
     view_factors_uploaded_ = false;
     properties_uploaded_ = false;
-    row_norm_uploaded_ = false;
     has_previous_solution_ = false;
 }
 

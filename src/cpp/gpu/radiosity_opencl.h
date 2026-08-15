@@ -263,7 +263,6 @@ private:
     bool initialized_ = false;
     bool view_factors_uploaded_ = false;
     bool properties_uploaded_ = false;
-    bool row_norm_uploaded_ = false;   // false => buffer still at the 1.0 identity seed
     bool has_previous_solution_ = false;  // For warm starting
 
     // Convergence tracking

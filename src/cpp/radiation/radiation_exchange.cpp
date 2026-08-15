@@ -37,13 +37,21 @@ int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
         // the two per-band batches).
         constexpr size_t kVectorsPerStep = 6;
         size_t budget_mb = 4096;
+        // Upper bound keeps budget_mb * 1024 * 1024 from wrapping size_t. A wrap
+        // would silently collapse `affordable` to a tiny number and drop the
+        // batch to the floor -- a bad value must be refused out loud, not
+        // turned into a quietly different answer.
+        constexpr size_t kMaxBudgetMB = size_t{1} << 30;   // 1 PiB
         if (const char* b = std::getenv("PTM_RAD_POOL_BATCH_BUDGET_MB")) {
-            const long v = std::atol(b);
-            if (v > 0) budget_mb = static_cast<size_t>(v);
-            else std::cerr << "  [Multi-GPU radiosity] WARNING: ignoring "
-                              "PTM_RAD_POOL_BATCH_BUDGET_MB='" << b
-                           << "' (must be a positive integer); using "
-                           << budget_mb << " MB.\n";
+            const long long v = std::atoll(b);
+            if (v > 0 && static_cast<unsigned long long>(v) <= kMaxBudgetMB) {
+                budget_mb = static_cast<size_t>(v);
+            } else {
+                std::cerr << "  [Multi-GPU radiosity] WARNING: ignoring "
+                             "PTM_RAD_POOL_BATCH_BUDGET_MB='" << b
+                          << "' (must be a positive integer <= " << kMaxBudgetMB
+                          << "); using " << budget_mb << " MB.\n";
+            }
         }
         const size_t bytes_per_step =
             std::max<size_t>(1, kVectorsPerStep * n_faces * sizeof(double));
