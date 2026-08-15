@@ -88,7 +88,13 @@ radiation:
   verbose: false
   use_gpu: true
   view_factor_file: {vf}
-  max_coupling_iterations: 5
+  # 2026-08-15: was 5, pinned by habit. The outer Picard rate is a property of
+  # the view-factor spectrum, r <= eps*rho(F)/(1-(1-eps)*rho(F)); on an enclosed
+  # lunar mesh (rho(F) = 0.7766) the sweep-to-sweep increment first falls below
+  # 1 K at sweep 16, and a 5-sweep cap left the worst face +26.2 K COLD. 16 is
+  # now the engine default too, so this line only restates it -- the engine's
+  # own '[rho-advisory]' warns per site if a mesh needs more.
+  max_coupling_iterations: 16
   coupling_temp_threshold: 2.0
   coupling_flux_threshold: 0.1
   coupling_face_fraction: 0.01

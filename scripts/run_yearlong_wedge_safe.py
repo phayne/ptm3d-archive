@@ -73,6 +73,25 @@ exactly as run_chunked_simulation.py does, so the existing ptm_merge_chunks
 binary combines them into a single, standard statistics/ directory
 mathematically equivalent to an unchunked run.
 
+PICARD CAP (2026-08-15). Every radiation knob is inherited from the base config
+byte for byte, so a k_max chosen once by habit propagates silently to every
+later generation of that config. The moon3d year-long lineage carried
+`radiation.max_coupling_iterations: 5` from 2026-07 through the V2 launch --
+half the then-default 10, and a third of what that mesh needs (measured
+truncation on the 509k flagship at 5 sweeps: +26.2 K on the worst face,
+one-signed cold; the increment first falls below 1 K at sweep 16). The engine
+default is now 16 and this driver PRINTS the effective cap on every coupled
+launch and WARNS when the base config pins it lower. It does not override --
+see check_coupling_iterations().
+
+⚠️ The base configs that lineage inherits from
+(examples/moon3d_native_yearlong/moon3d_native_yearlong_{coupled,radoff}.yaml,
+themselves derived from examples/moon3d_500k_clean.yaml) are UNTRACKED: they
+exist only in the ~/Projects/ptm working tree, in one checkout, and carry
+machine-absolute mesh/VF/output paths. A campaign's inputs living outside
+version control is how the moon3d_lat_final dataset was lost in 2026-08; treat
+the launch warning above as the only guard until they are brought in.
+
 Usage:
     # 1. Calibrate (cheap, ~a few minutes): measures ms/cycle at n_layers=50
     #    for a 2-orbit probe at the candidate batch size, extrapolates to
@@ -284,6 +303,67 @@ def resolve_gate_mode(gates: str, base_cfg: dict) -> str:
 def gate_check_by_mode(mode: str, log_path: Path) -> list[str]:
     return gate_check_radoff(log_path) if mode == "radoff" \
         else gate_check_radiation(log_path)
+
+
+def _engine_default_coupling_iterations() -> int | None:
+    """The engine's own default for radiation.max_coupling_iterations.
+
+    Read from src/python/ptm/engine_defaults.py, which is GENERATED from
+    src/cpp/tools/config_parser.{h,cpp} and re-derived by
+    src/python/tests/test_config_parity.py on every run -- so this number
+    cannot drift away from the compiled default the way a literal here would.
+    Returns None if the package is not importable; the caller then says so
+    rather than silently skipping the check.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "python"))
+        from ptm.engine_defaults import ENGINE_DEFAULTS  # noqa: PLC0415
+        v = ENGINE_DEFAULTS.get("radiation.max_coupling_iterations")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def check_coupling_iterations(base_cfg: dict, gate_mode: str) -> tuple[int | None, list[str]]:
+    """Report the base config's Picard cap and WARN when it is below the engine
+    default.
+
+    A campaign inherits every radiation knob from its base config byte for byte,
+    so a k_max chosen once by habit propagates to every later generation of that
+    config unnoticed. The moon3d year-long lineage carried
+    `max_coupling_iterations: 5` from 2026-07 through the V2 launch -- HALF the
+    then-default 10, and a third of what that mesh needs: measured truncation on
+    the 509k flagship at 5 sweeps is +26.2 K on the worst face, one-signed cold.
+
+    This warns and returns; it does not override. The engine prints the
+    spectrum-derived sweep count for the actual view-factor operator, which is
+    the authoritative check -- this one fires at launch, before 3 hours of GPU
+    time, on the value the config chose.
+    """
+    if gate_mode == "radoff":
+        return None, []
+    rad = base_cfg.get("radiation", {}) or {}
+    k = rad.get("max_coupling_iterations")
+    engine_default = _engine_default_coupling_iterations()
+    notes: list[str] = []
+    if engine_default is None:
+        notes.append("could not import ptm.engine_defaults; the Picard cap was NOT checked "
+                     "against the engine default")
+        return (int(k) if k is not None else None), notes
+    if k is None:
+        notes.append(f"radiation.max_coupling_iterations is unset -- the run inherits the "
+                     f"engine default {engine_default}")
+        return None, notes
+    k = int(k)
+    if k < engine_default:
+        notes.append(
+            f"radiation.max_coupling_iterations = {k} is BELOW the engine default "
+            f"{engine_default}. The coupling loop truncates on the most enclosed faces and "
+            f"the error is one-signed (a capped run is COLD there: measured +26.2 K on the "
+            f"worst face of the 509k lunar flagship at 5 sweeps). Drop the key to inherit "
+            f"{engine_default}, or set it deliberately from the engine's own "
+            f"'[rho-advisory]' line. NOT overridden -- this run uses {k}.")
+    return k, notes
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +657,18 @@ def mode_run(args):
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     ledger = Ledger(args.output_dir / "chunk_ledger.json")
+
+    # Picard cap disclosure. Printed for every coupled launch, warned about when
+    # the config pins it below the engine default, and recorded either way so a
+    # finished campaign carries the number it actually ran with.
+    k_cap, k_notes = check_coupling_iterations(base_cfg, gate_mode)
+    if gate_mode != "radoff":
+        print(f"[run] radiation.max_coupling_iterations: "
+              f"{k_cap if k_cap is not None else 'unset (engine default)'}", flush=True)
+        for note in k_notes:
+            print(f"[run] WARNING: {note}", flush=True)
+    ledger.record(event="coupling_iterations", gate_mode=gate_mode,
+                  max_coupling_iterations=k_cap, warnings=k_notes)
 
     chunk_a = args.output_dir / "chunk_000"
     chunk_b = args.output_dir / "chunk_001"

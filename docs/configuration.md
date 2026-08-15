@@ -40,7 +40,7 @@ illumination:
 radiation:
   enabled: true
   band_separated: true
-  max_coupling_iterations: 10
+  max_coupling_iterations: 16
 
 output:
   directory: "output/simulation"
@@ -428,7 +428,7 @@ command line wins. The full key list, with the physics behind each, is in
 | `use_hmatrix` | bool | false | Hierarchical-matrix compression for large meshes |
 | `use_monte_carlo_vf` | bool | false | Monte Carlo ray-gather view-factor builder |
 | `coupling_mode` | string | `bounded` | `bounded`, `fixed` or `legacy` |
-| `max_coupling_iterations` | int | 10 | Picard iteration cap |
+| `max_coupling_iterations` | int | 16 | Picard iteration cap (raised from 10 on 2026-08-15; see radiation-exchange.md §7.5) |
 | `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) |
 | `use_gpu` | bool | false | OpenCL radiosity solver |
 | `verbose` | bool | false | Detailed radiation progress |

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <atomic>
 #include <chrono>
+#include <random>
 #include <omp.h>
 
 namespace radiation {
@@ -967,6 +968,68 @@ bool RadiositySolver::hasGPUPool() const {
 #else
     return false;
 #endif
+}
+
+SpectralRadiusEstimate RadiositySolver::estimateSpectralRadius(int max_iterations,
+                                                               double rel_tol,
+                                                               uint64_t seed) const {
+    SpectralRadiusEstimate est;
+    if (!F_op_) return est;                      // no operator loaded
+    const size_t n = F_op_->numRows();
+    est.n = n;
+    if (n == 0 || F_op_->numCols() != n) return est;   // not square: rho undefined
+    if (max_iterations < 1) return est;
+
+    // Fixed-seed non-negative start. F is entrywise >= 0, so a non-negative
+    // start has a component on the Perron vector unless F itself annihilates
+    // it, which the ||F v|| == 0 exit below catches and reports as "not ok"
+    // rather than as rho = 0.
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<double> gauss(0.0, 1.0);
+    std::vector<double> v(n), w(n, 0.0);
+    double vnorm = 0.0;
+    for (size_t i = 0; i < n; ++i) { v[i] = std::abs(gauss(rng)); vnorm += v[i] * v[i]; }
+    vnorm = std::sqrt(vnorm);
+    if (!(vnorm > 0.0)) return est;
+    for (size_t i = 0; i < n; ++i) v[i] /= vnorm;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    double lam = 0.0;
+    int it = 0;
+    for (it = 1; it <= max_iterations; ++it) {
+        F_op_->matvec(v, w);
+        // The solve NEVER applies raw F: solveJacobi (and every GPU/two-band
+        // sibling) multiplies each row of F*x by vf_row_norm_[i] =
+        // 1/max(1, sum_j F_ij) right after the matvec, so the operator the
+        // Picard loop actually experiences is diag(vf_row_norm_)*F. Iterating
+        // raw F would over-state rho on exactly the meshes the renormalization
+        // exists for -- rows summing above 1 -- and could report rho >= 1, and
+        // "not a contraction", on a mesh whose solve contracts perfectly well.
+        // This is a no-op wherever no row sums above 1 (vf_row_norm_ == 1).
+        for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) w[i] *= vf_row_norm_[i];
+        double wnorm = 0.0, rayleigh = 0.0;
+        for (size_t i = 0; i < n; ++i) { rayleigh += v[i] * w[i]; wnorm += w[i] * w[i]; }
+        wnorm = std::sqrt(wnorm);
+        if (!(wnorm > 0.0)) {
+            // F v == 0: the iterate fell into the null space. Report the
+            // failure instead of returning a rho of 0 that looks converged.
+            est.iterations = it;
+            est.seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            return est;
+        }
+        const bool settled = (it > 4)
+            && (std::abs(rayleigh - lam) < rel_tol * std::max(std::abs(rayleigh), 1e-12));
+        lam = rayleigh;
+        for (size_t i = 0; i < n; ++i) v[i] = w[i] / wnorm;
+        if (settled) { est.converged = true; break; }
+    }
+    est.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    est.iterations = std::min(it, max_iterations);
+    est.rho = lam;
+    est.ok = std::isfinite(lam) && lam > 0.0;
+    return est;
 }
 
 #ifdef PTM_GPU_OPENCL
@@ -2924,6 +2987,12 @@ void RadiationExchangeManager::setConfig(const RadiationConfig& config) {
     if (solver_) {
         solver_->setConfig(config_);
     }
+}
+
+SpectralRadiusEstimate RadiationExchangeManager::estimateVFSpectralRadius(
+        int max_iterations, double rel_tol) const {
+    if (!solver_) return SpectralRadiusEstimate{};
+    return solver_->estimateSpectralRadius(max_iterations, rel_tol);
 }
 
 bool RadiationExchangeManager::loadViewFactors(const std::string& filename) {

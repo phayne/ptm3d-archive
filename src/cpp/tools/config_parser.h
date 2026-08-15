@@ -490,7 +490,17 @@ struct SimulationConfig {
         bool verbose = false;
         bool use_gpu = false;
         std::string view_factor_file = "";
-        int max_coupling_iterations = 10;
+        // Picard iteration cap for the radiation-thermal coupling loop.
+        // RAISED 10 -> 16 on 2026-08-15. The outer Picard rate is a property of
+        // the VF SPECTRUM, r <= eps*rho(F)/(1-(1-eps)*rho(F)), and on the 509k
+        // lunar flagship (rho(F) = 0.7766, r measured 0.745) the sweep-to-sweep
+        // increment first falls below 1 K at sweep 16 -- so 10 truncated it, and
+        // the habitual 5 truncated it badly (worst face +26.2 K, monotone
+        // warming, i.e. a capped run is COLD). Cheap now that the default-on
+        // equilibration-radiosity skip removes ~46.5% of a chunk's wall clock.
+        // The engine prints rho(F) and the implied sweep count before the loop
+        // and WARNS when this value is below it -- an advisory, not a clamp.
+        int max_coupling_iterations = 16;
         double coupling_temp_threshold = 0.5;
         double coupling_flux_threshold = 0.1;
         double coupling_face_fraction = 0.01;
