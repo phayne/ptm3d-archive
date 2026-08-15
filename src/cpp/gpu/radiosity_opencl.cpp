@@ -223,12 +223,23 @@ __kernel void solar_source_kernel(
     solar_source[i] = reflectivity[i] * solar_flux[i];
 }
 
-// Jacobi iteration update: B_new = E + solar + rho * (F * B_old)
+// Jacobi iteration update: B_new = E + solar + rho * (rownorm * (F * B_old))
+//
+// row_norm[i] = 1 / max(1, sum_j F_ij) is the SAME energy-conservation
+// renormalization the CPU Jacobi applies to every matvec result
+// (radiation_exchange.cpp solveJacobi / solveTwoBandFused). Applying it here,
+// inside the iteration, is what makes the GPU Jacobi operator identical to the
+// CPU one on a mesh with sum_j F_ij > 1 rows -- previously the GPU applied the
+// row norm only to the FINAL flux, so its iteration matrix was rho*F rather
+// than rho*(norm.F) and the visible band could gain > 1. Where every row sum is
+// <= 1 the buffer is exactly 1.0f and `1.0f * x == x` bitwise, so this is
+// byte-identical to the pre-row-norm kernel on such meshes.
 __kernel void jacobi_kernel(
     __global const float* emission,
     __global const float* solar_source,
     __global const float* reflectivity,
     __global const float* F_B,
+    __global const float* row_norm,
     __global const float* radiosity_old,
     __global float* radiosity_new,
     __global float* change,
@@ -237,23 +248,25 @@ __kernel void jacobi_kernel(
     int i = get_global_id(0);
     if (i >= n_faces) return;
 
-    float B_new = emission[i] + solar_source[i] + reflectivity[i] * F_B[i];
+    float B_new = emission[i] + solar_source[i] + reflectivity[i] * (row_norm[i] * F_B[i]);
     radiosity_new[i] = B_new;
     float diff = B_new - radiosity_old[i];
     change[i] = (diff >= 0.0f) ? diff : -diff;
 }
 
-// Compute absorbed indirect flux: Q_indirect = epsilon * (F * B)
+// Compute absorbed indirect flux: Q_indirect = epsilon * (rownorm * (F * B))
+// Same row normalization as jacobi_kernel; the host no longer post-multiplies.
 __kernel void indirect_flux_kernel(
     __global const float* emissivity,
     __global const float* F_B,
+    __global const float* row_norm,
     __global float* indirect_flux,
     int n_faces)
 {
     int i = get_global_id(0);
     if (i >= n_faces) return;
 
-    indirect_flux[i] = emissivity[i] * F_B[i];
+    indirect_flux[i] = emissivity[i] * (row_norm[i] * F_B[i]);
 }
 )CL_SOURCE";
 }
@@ -498,6 +511,21 @@ void RadiosityOpenCLSolver::createBuffers() {
     buf_reflectivity_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
                                       n_faces_ * sizeof(float), nullptr, &err);
     check(err, "reflectivity");
+
+    // View-factor row normalization 1/max(1, sum_j F_ij), applied inside the
+    // Jacobi iteration and to the final flux. Seeded to 1.0 (identity) so a
+    // caller that never calls uploadRowNorm() gets exactly the legacy kernel
+    // arithmetic (`1.0f * x == x`).
+    buf_row_norm_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                   n_faces_ * sizeof(float), nullptr, &err);
+    check(err, "row_norm");
+    {
+        const std::vector<float> ones(n_faces_, 1.0f);
+        err = clEnqueueWriteBuffer(context_->queue(), buf_row_norm_, CL_TRUE, 0,
+                                   n_faces_ * sizeof(float), ones.data(),
+                                   0, nullptr, nullptr);
+        check(err, "row_norm(seed=1)");
+    }
 
     buf_change_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
                                 n_faces_ * sizeof(float), nullptr, &err);
@@ -924,6 +952,29 @@ void RadiosityOpenCLSolver::uploadFaceProperties(
     properties_uploaded_ = true;
 }
 
+void RadiosityOpenCLSolver::uploadRowNorm(const std::vector<float>& row_norm)
+{
+    if (!initialized_) {
+        throw std::runtime_error("RadiosityOpenCLSolver not initialized");
+    }
+    // A wrong-length row norm would silently renormalize the wrong faces (or
+    // leave the tail at the 1.0 seed), which is exactly the class of silent
+    // substitution this project refuses. Fail loud.
+    if (row_norm.size() != n_faces_) {
+        throw std::runtime_error("uploadRowNorm: row_norm has " +
+                                 std::to_string(row_norm.size()) + " entries but the solver "
+                                 "was built for " + std::to_string(n_faces_) + " faces");
+    }
+
+    cl_int err = clEnqueueWriteBuffer(context_->queue(), buf_row_norm_, CL_TRUE, 0,
+                                      n_faces_ * sizeof(float), row_norm.data(),
+                                      0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error(std::string("clEnqueueWriteBuffer(row_norm) failed: ") +
+                                 clErrorString(err));
+    }
+}
+
 void RadiosityOpenCLSolver::solve(
     const std::vector<float>& temperatures,
     const std::vector<float>& solar_flux,
@@ -1057,6 +1108,8 @@ void RadiosityOpenCLSolver::solve(
             checkErr(err, "clSetKernelArg(jacobi_kernel,reflectivity)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_F_B_);
             checkErr(err, "clSetKernelArg(jacobi_kernel,F_B)");
+            err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_row_norm_);
+            checkErr(err, "clSetKernelArg(jacobi_kernel,row_norm)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_radiosity_);
             checkErr(err, "clSetKernelArg(jacobi_kernel,radiosity)");
             err = clSetKernelArg(jacobi_kernel_, arg++, sizeof(cl_mem), &buf_radiosity_new_);
@@ -1100,6 +1153,8 @@ void RadiosityOpenCLSolver::solve(
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,emissivity)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_F_B_);
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,F_B)");
+        err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_row_norm_);
+        checkErr(err, "clSetKernelArg(indirect_flux_kernel,row_norm)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(cl_mem), &buf_indirect_flux_);
         checkErr(err, "clSetKernelArg(indirect_flux_kernel,indirect_flux)");
         err = clSetKernelArg(indirect_flux_kernel_, arg++, sizeof(int), &n_faces);
@@ -1259,6 +1314,7 @@ void RadiosityOpenCLSolver::release() {
     // Release property buffers
     if (buf_emissivity_) { clReleaseMemObject(buf_emissivity_); buf_emissivity_ = nullptr; }
     if (buf_reflectivity_) { clReleaseMemObject(buf_reflectivity_); buf_reflectivity_ = nullptr; }
+    if (buf_row_norm_) { clReleaseMemObject(buf_row_norm_); buf_row_norm_ = nullptr; }
 
     // Release convergence buffer
     if (buf_change_) { clReleaseMemObject(buf_change_); buf_change_ = nullptr; }

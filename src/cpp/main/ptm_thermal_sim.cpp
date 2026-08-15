@@ -17921,12 +17921,9 @@ int main(int argc, char** argv) {
                     const bool use_pool_dispatch = rad_manager.hasGPUPool();
                     int batch_size = 1;
                     if (use_pool_dispatch) {
-                        batch_size = (rad_gpu_batch_size > 0)
-                            ? rad_gpu_batch_size
-                            : 4 * std::max(1, rad_gpu_devices);
-                        std::cout << "  [Multi-GPU radiosity] dispatching "
-                                  << batch_size << " timesteps/batch across "
-                                  << rad_gpu_devices << " GPUs" << std::endl;
+                        batch_size = radiation::resolvePoolBatchSize(
+                            rad_gpu_batch_size, total_time_steps,
+                            std::max(1, rad_gpu_devices), num_faces, /*announce=*/true);
                     }
 
                     // Hoisted out of the per-timestep loop: these two num_faces-sized

@@ -105,7 +105,10 @@ struct RadiationConfig {
     // mutually independent, so the batch can be split across N GPUs.
     int gpu_devices = 1;                 // 1 = legacy single-GPU; >1 = pool
     std::vector<int> gpu_device_ids;     // Explicit device indices (overrides gpu_devices)
-    int gpu_batch_size = 0;              // Timesteps per pool batch (0 = auto = 4 * gpu_devices)
+    // Timesteps per pool dispatch. 0 = auto = the whole sweep in one dispatch,
+    // capped by the host batch-memory budget and floored at 4 * gpu_devices;
+    // see radiation::resolvePoolBatchSize().
+    int gpu_batch_size = 0;
     int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation, mirrors thermal pool
 
     // H-matrix compression options (for large meshes)

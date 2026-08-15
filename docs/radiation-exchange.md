@@ -329,10 +329,33 @@ Per-timestep solves are independent, so a batch can be split across several devi
 (`gpu_devices`, `gpu_device_ids`, `gpu_batch_size`, `gpu_inter_batch_pause_ms`), mirroring the
 thermal pool's dispatch model.
 
-**Band separation on the GPU** requires a sparse view-factor matrix, a single device, and row sums
-that never exceed 1 — the GPU Jacobi kernel does not apply the row renormalization of §4.5. When
-any of those does not hold, the run says so and the band-separated solve falls back to the CPU,
-which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
+**Band separation on the GPU** requires a sparse view-factor matrix, and it runs on either a single
+device or the multi-device pool. It does *not* require row sums below 1: the GPU Jacobi kernel
+applies the row renormalization of §4.5 on the device, from a per-face buffer uploaded alongside the
+matrix, so the GPU and CPU iterate the same operator $\rho\thinspace(\hat{\mathbf n}\odot F)$. What is
+checked instead is the condition under which Jacobi converges at all,
+
+$$\text{gain} \thickspace=\thickspace \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) \thickspace<\thickspace 1,$$
+
+which the renormalization already caps at $\rho_{\max}$; it can only fail for a perfect reflector
+($A \geq 1$ or $\varepsilon \leq 0$), where no solver converges. When the sparse-matrix requirement
+or the gain condition is not met, the run says so and the band-separated solve falls back to the
+CPU, which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
+
+**Reaching the GPU with a corrected view-factor matrix.** `PTM_HMATRIX_VF_REPLACE` on its own
+installs the replacement as a CPU-only operator, so a run that sets `radiation.use_gpu: true` but
+not `PTM_HMATRIX_VF_REPLACE_GPU` does its whole radiosity solve on the CPU. A launch that intends
+GPU radiosity on a corrected matrix needs **both**:
+
+```sh
+PTM_HMATRIX_VF_REPLACE=/path/to/corrected.csr \
+PTM_HMATRIX_VF_REPLACE_GPU=1 \
+ptm_thermal_sim --config run.yaml     # with radiation.use_gpu: true, use_hmatrix: false
+```
+
+The two routes apply identical mesh-identity, row-sum and non-negativity checks; only the operator
+they install differs. The run prints a NOTE naming this condition when `use_gpu` is set and the
+`_GPU` variant is not.
 
 ## 7. Thermal-radiation coupling
 
@@ -661,7 +684,7 @@ warns.
 | `use_gpu` | false | OpenCL radiosity solver |
 | `gpu_devices` | 1 | Devices in the radiosity pool (0 = all enumerated) |
 | `gpu_device_ids` | [] | Explicit device indices; overrides `gpu_devices` |
-| `gpu_batch_size` | 0 | Timesteps per pool round (0 = auto = 4 × devices) |
+| `gpu_batch_size` | 0 | Timesteps per pool dispatch. `0` = auto = **the whole sweep in one dispatch**, reduced only if the host batch buffers (~6 × `n_faces` doubles per timestep) would exceed the 4 GB budget (`PTM_RAD_POOL_BATCH_BUDGET_MB`), and never below the historical `4 × devices`. Small batches split a sweep into many `std::async` round trips: measured 1.37× two-device speedup at batch 8 versus ≈1.94× at whole-sweep on a 472-timestep crater |
 | `gpu_inter_batch_pause_ms` | 0 | Pause between consecutive batches on a device |
 | `verbose` | false | Detailed progress output |
 

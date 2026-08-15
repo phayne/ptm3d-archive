@@ -101,6 +101,20 @@ public:
         const std::vector<float>& reflectivity);
 
     /**
+     * @brief Upload the view-factor row normalization (call once at start)
+     *
+     * row_norm[i] = 1 / max(1, sum_j F_ij). Applied INSIDE the Jacobi iteration
+     * and to the final absorbed flux, exactly as the CPU solver does, so a mesh
+     * carrying sum_j F_ij > 1 rows runs the same operator on both paths. Never
+     * calling this leaves the buffer at its 1.0 seed (identity), which is
+     * bitwise the pre-row-norm kernel.
+     *
+     * @param row_norm Per-face 1/max(1, sum_j F_ij); must have n_faces entries.
+     * @throws std::runtime_error on a size mismatch (never silently partial).
+     */
+    void uploadRowNorm(const std::vector<float>& row_norm);
+
+    /**
      * @brief Solve radiosity equation for one timestep
      *
      * @param temperatures Surface temperatures [K] for all faces
@@ -236,6 +250,7 @@ private:
     // Face property buffers
     cl_mem buf_emissivity_ = nullptr;      // float [n_faces]
     cl_mem buf_reflectivity_ = nullptr;    // float [n_faces]
+    cl_mem buf_row_norm_ = nullptr;        // float [n_faces] - 1/max(1, sum_j F_ij), seeded to 1
 
     // Convergence checking
     cl_mem buf_change_ = nullptr;          // float [n_faces] - |B_new - B_old|
