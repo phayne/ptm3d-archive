@@ -501,12 +501,12 @@ radiative-equilibrium limit; conduction only shrinks it), and the radiosity's re
 temperature perturbation is $\varepsilon F (I - \rho_r F)^{-1} D$ with $\rho_r = 1-\varepsilon$.
 The iteration matrix is therefore
 
-$$M = G\,\varepsilon F (I-\rho_r F)^{-1} D,$$
+$$M = G\thinspace\varepsilon F (I-\rho_r F)^{-1} D,$$
 
 which is similar to $\varepsilon F (I-\rho_r F)^{-1}$ — **the $T^3$ factors cancel**. The
 asymptotic sweep-to-sweep rate is then a property of the geometry alone:
 
-$$r \;\le\; \frac{\varepsilon\,\rho(F)}{1 - (1-\varepsilon)\,\rho(F)},\qquad
+$$r \thickspace\le\thickspace \frac{\varepsilon\thinspace\rho(F)}{1 - (1-\varepsilon)\thinspace\rho(F)},\qquad
 \rho(F) = \text{spectral radius of the view-factor matrix}.$$
 
 Measured at two meshes, three digits:
@@ -534,7 +534,7 @@ recorded as "≈0.081" — a value Perron-Frobenius makes impossible to distingu
 0.13409 by eye, since both sit below the true row-sum bound.
 
 **The engine reports this itself.** Before the first sweep of a coupled run it power-iterates the
-view-factor operator **the solve actually applies** — $\mathrm{diag}(1/\max(1,\sum_j F_{ij}))\,F$,
+view-factor operator **the solve actually applies** — $\mathrm{diag}(1/\max(1,\sum_j F_{ij}))\thinspace F$,
 because the radiosity renormalizes every row of $F\mathbf{x}$ right after the matvec; iterating raw
 $F$ would over-state $\rho$ on exactly the meshes that renormalization exists for, and could report
 "not a contraction" about a solve that contracts — and prints ρ, the implied $r$, and an upper bound
