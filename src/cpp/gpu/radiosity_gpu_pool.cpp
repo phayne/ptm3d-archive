@@ -62,7 +62,8 @@ bool RadiosityGPUDevicePool::uploadStaticData(
     const std::vector<int>& csr_col_indices,
     const std::vector<int64_t>& csr_row_ptrs,
     const std::vector<float>& emissivity,
-    const std::vector<float>& reflectivity) {
+    const std::vector<float>& reflectivity,
+    const std::vector<float>& row_norm) {
 
     if (!initialized_) {
         std::cerr << "[Radiosity Pool] uploadStaticData() called before initialize()\n";
@@ -80,6 +81,11 @@ bool RadiosityGPUDevicePool::uploadStaticData(
         try {
             slot->solver->uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
             slot->solver->uploadFaceProperties(emissivity, reflectivity);
+            // Row norm is part of the operator, not of the per-batch state: a
+            // device that missed it would run rho*F while its peers run
+            // rho*(norm.F), i.e. a different physics per GPU. Same fail-loud
+            // treatment as the CSR.
+            if (!row_norm.empty()) slot->solver->uploadRowNorm(row_norm);
         } catch (const std::exception& e) {
             std::cerr << "[Radiosity Pool] Static-data upload failed on device " << i
                       << " (" << slot->handle.name << "): " << e.what() << "\n";

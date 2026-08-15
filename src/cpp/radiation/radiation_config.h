@@ -77,6 +77,15 @@ struct RadiationConfig {
     int max_iterations = 100;            // Max Jacobi iterations
     double convergence_tolerance = 0.01; // Relative convergence criterion
     bool use_acceleration = true;        // Use Gauss-Seidel acceleration
+    // Jacobi iterations between convergence checks on the GPU. The CPU paths
+    // test every iteration (the residual is already in host memory there); the
+    // GPU must pay a device->host round trip for it, so it batches. 0 = auto,
+    // weighed per matrix by gpu::opencl::resolveConvergenceCheckInterval();
+    // > 0 pins it. This value reached the GPU solver for the first time on
+    // 2026-08-15 -- before that the solver's own hard-coded 10 was the only
+    // value that existed, and a 509k solve that had stagnated at iteration 2
+    // still ran to 10, making GPU radiosity 1.74x slower than the CPU.
+    int convergence_check_interval = 0;
 
     // Band-separated (visible + thermal-IR) radiosity (PTM-07 fix). Production
     // DEFAULT ON (D2, 2026-07-12): the visible band scatters/absorbs the per-face
@@ -105,7 +114,10 @@ struct RadiationConfig {
     // mutually independent, so the batch can be split across N GPUs.
     int gpu_devices = 1;                 // 1 = legacy single-GPU; >1 = pool
     std::vector<int> gpu_device_ids;     // Explicit device indices (overrides gpu_devices)
-    int gpu_batch_size = 0;              // Timesteps per pool batch (0 = auto = 4 * gpu_devices)
+    // Timesteps per pool dispatch. 0 = auto = the whole sweep in one dispatch,
+    // capped by the host batch-memory budget and floored at 4 * gpu_devices;
+    // see radiation::resolvePoolBatchSize().
+    int gpu_batch_size = 0;
     int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation, mirrors thermal pool
 
     // H-matrix compression options (for large meshes)
