@@ -389,6 +389,83 @@ now holds the matrix and nothing on the host reads the replica again; clearing `
 keeps any mid-run CPU fallback on the fused Jacobi rather than Gauss-Seidel, because `solveTwoBand`
 selects Gauss-Seidel precisely when `F_ptr_` is non-null.
 
+### 6.6 What the GPU radiosity solver costs, measured
+
+All numbers below are measurements on this machine's four AMD Radeon PRO W6800X Duo
+dies, 2026-08-16, on two real view-factor matrices. Nothing here is derived except
+the clearly-labeled campaign projection at the end.
+
+**Traversals.** The honest unit of radiosity cost is the number of times the matrix
+is read, and it is *not* the Jacobi iteration count: every solve also pays one final
+matvec to turn the converged radiosity into absorbed flux, and the band-separated GPU
+route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches.
+
+| route | A3GT A03MP026 (2.485e9 nnz) | moon3d 509k (4.95e8 nnz) |
+|---|---|---|
+| CPU (fused width-2 Jacobi) | 2.000 traversals/solve | 2.792 |
+| GPU, unfused + absolute criterion | 7.000 | 9.927 |
+| GPU, fused only | 4.000 | — |
+| GPU, relative criterion only | 6.000 | — |
+| GPU, fused + relative (current) | **3.500** | **4.375** |
+
+So the GPU's traversal excess over the CPU falls from 3.50x to 1.75x at A3GT and
+from 3.56x to 1.57x at moon3d. The two changes are close to multiplicative
+(1.75 x 1.17 = 2.04 against the 2.00 measured together).
+
+**Sweep wall clock.** Bracketed from the engine's own structural markers
+(`--- Radiation Iteration N ---` to `Computing indirect flux ... 100%`), which is
+uniform across routes; the progress bar is not, because the multi-GPU pool emits a
+single frame per sweep. Four sweeps per arm; the spread is the standard deviation.
+
+| arm | A3GT sweep (s) | g = CPU/arm | moon3d sweep (s) | g |
+|---|---|---|---|---|
+| CPU | 134.62 ± 0.88 | 1.000 | 7.11 ± 0.30 | 1.000 |
+| GPU N=1, unfused + absolute | 82.23 ± 1.47 | 1.637 | 5.20 ± 0.10 | 1.367 |
+| GPU N=1, fused only | 75.34 ± 0.58 | 1.787 | — | — |
+| GPU N=1, relative only | 72.10 ± 0.85 | 1.867 | — | — |
+| GPU N=1, fused + relative | **66.27 ± 0.14** | **2.032** | **3.53 ± 0.10** | **2.014** |
+| GPU N=4 pool, unfused + absolute | 29.53 ± 0.19 | 4.559 | — | — |
+| GPU N=4 pool, fused + relative | **26.74 ± 0.57** | **5.034** | — | — |
+
+⚠️ **The traversal ratio overstates the time saving, and by a lot.** Traversals fell
+2.00x at A3GT but the sweep only 1.24x (1.10x at N=4); at moon3d, 2.27x against
+1.47x. The reason is that a width-2 traversal is *not* the cost of one single-band
+traversal: it shares the CSR value and column reads (8 bytes per stored entry) but
+doubles the gather from the radiosity vector, the arithmetic and the output writes.
+Measured on the fusion-only arm, one fused traversal costs **1.60x** a single-band
+one (time ratio 0.916 against a traversal ratio of 0.571), so fusing two traversals
+into one buys 1.09x, not 1.75x. The criterion change, which removes whole
+single-band traversals at unchanged unit cost, converts almost exactly (1.14x of
+time against 1.17x of traversals).
+
+The practical reading: **this radiosity SpMV is gather-bound, not CSR-stream-bound.**
+Halving the matrix reads is worth far less than halving the traversals, and further
+work should target the gather (column ordering, blocking) rather than the traversal
+count.
+
+**Campaign impact — DERIVED, not measured.** Folding g(N=4) into the measured
+A03MP026 window profile (99.19-min CPU window, radiosity 67.4 %, per-window GPU
+setup penalty +46.3 s at N=4) over 472 windows:
+
+| arm | window (min) | campaign (days) |
+|---|---|---|
+| GPU N=4, unfused + absolute | 47.8 | 15.7 |
+| GPU N=4, fused + relative | 46.4 | **15.2** |
+| Amdahl ceiling (radiosity free) | 33.1 | 10.9 |
+
+That closes about 9 % of the gap to the ceiling, not most of it — because at N=4
+radiosity is already only ~31 % of the window, and because of the gather-bound
+result above.
+
+**Equivalence.** Against the same run's CPU route, worst temperature max\|Δ\|:
+**0.0066 K** at A3GT (weak coupling, max Σ_j F_ij = 0.2) and **0.271 K** at moon3d
+(strong coupling); 14 of 22 statistics products byte-identical in both cases (the 8
+that differ are exactly the radiosity-derived ones), sign census 92–96 % one-sided
+at A3GT and 99.6–99.9 % at moon3d. The relative criterion moved the moon3d delta
+only slightly (0.279 K → 0.271 K): at these scales the CPU/GPU difference is
+dominated by float32-vs-float64, not by where the iteration stops. **The A3GT
+milli-kelvin figure does not transfer to a strongly-coupled mesh.**
+
 ## 7. Thermal-radiation coupling
 
 Surface temperatures depend on indirect flux and indirect flux depends on surface temperatures,
