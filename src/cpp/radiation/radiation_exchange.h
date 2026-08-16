@@ -4,6 +4,7 @@
 #include <array>
 #include <memory>
 #include <functional>
+#include <string>
 
 #include "radiation_config.h"
 #include "view_factor.h"
@@ -185,6 +186,15 @@ public:
     size_t numRows() const override { return n_; }
     size_t numCols() const override { return n_; }
     void getRow(int, std::vector<int>& c, std::vector<double>& v) const override { c.clear(); v.clear(); }
+    // The stored CSR, so initGPU() can promote this operator to a GPU
+    // ViewFactorMatrix without re-reading the file or keeping a second copy
+    // alive from load time. Read-only: the operator stays the owner and stays
+    // installed, which is what makes the GPU's CPU fallback correct by
+    // construction rather than by repair.
+    const std::vector<int64_t>& rowPointers() const { return indptr_; }
+    const std::vector<int32_t>& colIndices() const { return cols_; }
+    const std::vector<float>&   values() const { return data_; }
+
 private:
     size_t n_;
     std::vector<int64_t> indptr_;
@@ -386,6 +396,16 @@ public:
     // Initialize GPU solver if enabled (call after setConfig)
     void initGPU();
 
+    // Promote a PTM_HMATRIX_VF_REPLACE matrix from its CPU SparseVFOperator to a
+    // GPU-capable ViewFactorMatrix (sets F_ptr_ for the upload). Called from
+    // initGPU(), which is the FIRST point at which config_ holds the user's
+    // settings -- initCommon() runs from the constructor, before setConfig().
+    // The CPU operator stays installed throughout, so declining the GPU needs no
+    // repair; releaseVfReplaceGpuOperator() just drops F_ptr_ and the float64
+    // replica. Both are no-ops on every other path.
+    void promoteVfReplaceToGpuOperator();
+    void releaseVfReplaceGpuOperator(const char* why);
+
     // The emissivity actually in force, i.e. after initCommon applied any
     // PTM_RAD_EMISSIVITY override. reflectivity_ is exactly 1 - this.
     const std::vector<double>& operativeEmissivity() const { return emissivity_; }
@@ -524,10 +544,20 @@ private:
     // (gain = ρ_max · max_i min(Σ_j F_ij, 1)) instead of re-deriving it.
     double vf_row_sum_max_ = 0.0;
     size_t vf_row_norm_count_ = 0;
-    // True when PTM_HMATRIX_VF_REPLACE installed the corrected CSR as a CPU-only
-    // SparseVFOperator (i.e. PTM_HMATRIX_VF_REPLACE_GPU was NOT set). initGPU()
-    // reports it when the config also asked for GPU radiosity.
+    // Which route PTM_HMATRIX_VF_REPLACE took for the corrected CSR. Exactly one
+    // is true once it has run (both false when it did not run at all).
+    //   _cpu_ : installed as a CPU-only SparseVFOperator. initGPU() reports it if
+    //           the config also asked for GPU radiosity.
+    //   _gpu_ : installed as a ViewFactorMatrix with F_ptr_ set, for initGPU and
+    //           the pool. If no GPU rung then engages,
+    //           restoreCpuVfOperatorAfterGpuDecline() converts it back so the
+    //           fallback is the production CPU solver rather than Gauss-Seidel.
     bool vf_replace_cpu_route_ = false;
+    bool vf_replace_gpu_route_ = false;
+    // Path the corrected CSR came from, for the promotion message.
+    std::string vf_replace_path_;
+    // use_hmatrix_ as it stood before a promotion, so releasing restores it.
+    bool vf_replace_hmatrix_saved_ = false;
     RadiationConfig config_;
 
 #ifdef PTM_GPU_OPENCL

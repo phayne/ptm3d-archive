@@ -354,20 +354,40 @@ which the renormalization already caps at $\rho_{\max}$; it can only fail for a 
 or the gain condition is not met, the run says so and the band-separated solve falls back to the
 CPU, which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
 
-**Reaching the GPU with a corrected view-factor matrix.** `PTM_HMATRIX_VF_REPLACE` on its own
-installs the replacement as a CPU-only operator, so a run that sets `radiation.use_gpu: true` but
-not `PTM_HMATRIX_VF_REPLACE_GPU` does its whole radiosity solve on the CPU. A launch that intends
-GPU radiosity on a corrected matrix needs **both**:
+**Reaching the GPU with a corrected view-factor matrix.** The route follows the config:
+`PTM_HMATRIX_VF_REPLACE` installs the replacement as the GPU sparse operator when
+`radiation.use_gpu: true`, and as the CPU operator when it is false. Nothing else is needed:
 
 ```sh
 PTM_HMATRIX_VF_REPLACE=/path/to/corrected.csr \
-PTM_HMATRIX_VF_REPLACE_GPU=1 \
 ptm_thermal_sim --config run.yaml     # with radiation.use_gpu: true, use_hmatrix: false
 ```
 
-The two routes apply identical mesh-identity, row-sum and non-negativity checks; only the operator
-they install differs. The run prints a NOTE naming this condition when `use_gpu` is set and the
-`_GPU` variant is not.
+The run names the route it took — `[PTM_HMATRIX_VF_REPLACE] ROUTE = GPU (radiation.use_gpu in the
+config)` — and then names the rung the GPU landed on. `PTM_HMATRIX_VF_REPLACE_GPU` and
+`PTM_HMATRIX_VF_REPLACE_CPU` override the choice in either direction; setting both is fatal.
+
+Until 2026-08-16 the GPU route required `PTM_HMATRIX_VF_REPLACE_GPU` as a *second* switch, which no
+tracked launcher set, so every corrected-matrix run did its whole radiosity solve on the CPU while
+the config read `radiation.use_gpu: true`.
+
+Both routes apply identical mesh-identity, row-sum and non-negativity checks.
+
+**Where the choice is made, and why it is not made at load time.** The matrix is always installed
+first as the CPU `SparseVFOperator`, because the loader runs from the `RadiositySolver` constructor
+and the configuration does not exist yet — `setConfig()` has not been called, so `config_.use_gpu`
+still holds its `false` default whatever the YAML says. `initGPU()` is the first point at which the
+config is populated, so that is where the route is chosen: it *promotes* the CPU operator to a GPU
+`ViewFactorMatrix` (widening the stored `float` values to `double`) and points `F_ptr_` at it for the
+upload.
+
+The CPU operator is never destroyed. That is what makes the fallback correct by construction: if no
+GPU rung engages — no device, or the matrix does not fit VRAM — the engine simply drops `F_ptr_` and
+the float64 replica and continues on the operator it already had, which is the production CPU solver
+(the fused width-2 two-band Jacobi). It does the same after a *successful* upload, since the device
+now holds the matrix and nothing on the host reads the replica again; clearing `F_ptr_` additionally
+keeps any mid-run CPU fallback on the fused Jacobi rather than Gauss-Seidel, because `solveTwoBand`
+selects Gauss-Seidel precisely when `F_ptr_` is non-null.
 
 ## 7. Thermal-radiation coupling
 

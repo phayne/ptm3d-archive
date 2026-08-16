@@ -16,7 +16,16 @@
  * mesh loader reports for a triangulated PLY) and round-trips the result
  * through readBinary as a fail-loud self-check.
  *
+ * Meshes the sim loads but this tool cannot parse -- legacy VTK 5.1 BINARY, for
+ * one, which is what the 509,337-face moon3d flagship ships as -- can supply the
+ * count directly with --faces N. The count is then the CALLER's claim, so it is
+ * echoed and the loader's own face-count/geomhash gate remains the thing that
+ * catches a wrong one (a base .vf whose dimensions disagree with the mesh fails
+ * to load, which is the recompute wedge this tool exists to prevent). Prefer the
+ * PLY form whenever the mesh is a PLY.
+ *
  * Usage: make_empty_vf <mesh.ply> <out.vf>
+ *        make_empty_vf --faces <N> <out.vf>
  */
 #include <cstdint>
 #include <cstdlib>
@@ -55,13 +64,34 @@ static size_t ply_face_count(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: make_empty_vf <mesh.ply> <out.vf>\n";
+    if (argc != 3 && !(argc == 4 && std::string(argv[1]) == "--faces")) {
+        std::cerr << "usage: make_empty_vf <mesh.ply> <out.vf>\n"
+                     "       make_empty_vf --faces <N> <out.vf>   (for meshes this "
+                     "tool cannot parse, e.g. legacy VTK 5.1 BINARY)\n";
         return 2;
     }
-    const std::string mesh = argv[1], out = argv[2];
-    size_t nf = ply_face_count(mesh);
-    std::cout << "mesh " << mesh << ": " << nf << " faces\n";
+
+    size_t nf = 0;
+    std::string out;
+    if (argc == 4) {
+        const std::string nstr = argv[2];
+        out = argv[3];
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(nstr.c_str(), &end, 10);
+        if (!end || *end != '\0' || v == 0) {
+            std::cerr << "FATAL: --faces needs a positive integer, got '" << nstr << "'\n";
+            return 2;
+        }
+        nf = static_cast<size_t>(v);
+        std::cout << "faces " << nf << " (supplied on the command line, NOT read from a "
+                     "mesh -- the engine's own face-count gate is what will catch it if "
+                     "this disagrees with the mesh)\n";
+    } else {
+        const std::string mesh = argv[1];
+        out = argv[2];
+        nf = ply_face_count(mesh);
+        std::cout << "mesh " << mesh << ": " << nf << " faces\n";
+    }
 
     radiation::HMatrixViewFactor H;
     H.setEmptyDimensions(nf);
