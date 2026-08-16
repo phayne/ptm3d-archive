@@ -1,0 +1,84 @@
+# PTM3D validation baseline arm: GPU thermal pool, TWO-PHASE cadence.
+#
+# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# section 1). Derived from examples/tutorial04_crater80N_coupled.yaml with two
+# deliberate changes, each of which turns on a code path the tutorial config
+# cannot reach:
+#
+#   1. thermal.use_gpu: true             -> the persistent-kernel GPU thermal
+#                                           solver and, with --gpu-devices N,
+#                                           the multi-GPU thermal pool.
+#   2. equilibration_samples_per_diurnal_cycle: 24  -> the equilibration cadence
+#      no longer matches the output cadence (118 steps / 29.53 d = 4 per day),
+#      so the run is TWO-PHASE. That is the only configuration in which the
+#      2026-08-15 defaults `PTM_RAD_SKIP_EQ_STEPS` and
+#      `PTM_RAD_SELECT_OUTPUT_WINDOW` are ACTIVE rather than standing down; on
+#      the tutorial config both print "STOOD DOWN" and this suite would bless
+#      nothing about them.
+#
+# Confirm from the log that the gates really engaged before trusting an arm:
+#   grep -E '\[rad-skip-eq\]|\[rad-select-window\]' <log>
+# must NOT say "STOOD DOWN".
+#
+# Radiosity stays on the CPU here (use_hmatrix: true is refused by the GPU
+# radiosity solver, radiation_exchange.cpp) so that the ONLY thing varying
+# across the N=1 / N=2 / N=4 arms is the thermal dispatch. The radiosity pool
+# gets its own arm: baseline_crater80N_radgpu.yaml.
+#
+# Run from the repository root; the suite driver overrides --output and
+# --rad-view-factor-file so every arm shares one prebuilt view-factor set:
+#   ./build/bin/ptm_thermal_sim \
+#       --config examples/validation/baseline_crater80N_gputhermal.yaml \
+#       --gpu-devices 1 --gpu-batch-size 4000
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h output cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  equilibration_samples_per_diurnal_cycle: 24.0   # != output cadence -> TWO-PHASE
+  use_gpu: true
+  gpu_batch_size: 4000           # wedge mitigation; also pins the batch decomposition
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  use_gpu: false                 # CPU two-band radiosity: keeps the thermal pool the only variable
+  use_hmatrix: true
+  use_aca: true
+  aca_tolerance: 0.001
+  hmatrix_threads: 0
+  view_factor_file: ../../output/validation_baseline/crater80N_hmat.vf
+  coupling_mode: fixed           # deterministic sweep count; no early exit to confound a byte diff
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/validation_baseline/crater80N_gputhermal
+  format: binary
+  vtk_mode: thermal
+  write_raw_stats: true
+  skip_time_series: true
+  skip_mesh: true
+advanced:
+  verbose: false

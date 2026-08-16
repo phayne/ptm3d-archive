@@ -1,0 +1,76 @@
+# PTM3D validation baseline arm: GPU radiosity pool (single- and multi-GPU).
+#
+# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# section 1). Derived from examples/tutorial04_crater80N_coupled.yaml with the
+# minimum changes needed to REACH the GPU radiosity solver at all:
+#
+#   1. radiation.use_hmatrix: false / use_aca: false  -> a SPARSE view-factor
+#      matrix is built instead of an H-matrix. The GPU radiosity solver refuses
+#      an H-matrix operator (radiation_exchange.cpp), so with the tutorial
+#      config `radiation.use_gpu: true` silently falls back to the CPU solve and
+#      an N=1-vs-N=4 comparison would be a tautology.
+#   2. radiation.use_gpu: true  -> with --rad-gpu-devices N > 1 this builds the
+#      multi-GPU radiosity pool.
+#
+# thermal.use_gpu stays FALSE so the only thing varying across the N=1 / N=2 /
+# N=4 arms is the radiosity dispatch. The thermal pool gets its own arm:
+# baseline_crater80N_gputhermal.yaml.
+#
+# Confirm from the log that the pool really engaged before trusting an arm:
+#   grep -E '\[Radiosity\] ACTIVE RUNG|Forcing the CPU' <log>
+# N=1 must report the single-GPU rung, N>1 the multi-GPU pool. If it reports
+# "Forcing the CPU two-band solve", the arm proves nothing about the GPU path.
+#
+# Run from the repository root; the suite driver overrides --output and
+# --rad-view-factor-file so every arm shares one prebuilt view-factor set:
+#   ./build/bin/ptm_thermal_sim \
+#       --config examples/validation/baseline_crater80N_radgpu.yaml \
+#       --rad-gpu-devices 1
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h output cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false                 # CPU thermal: keeps the radiosity pool the only variable
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  use_gpu: true
+  use_hmatrix: false             # sparse VF -- required to reach the GPU solver
+  use_aca: false
+  view_factor_file: ../../output/validation_baseline/crater80N_sparse.vf
+  coupling_mode: fixed           # deterministic sweep count; no early exit to confound a byte diff
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/validation_baseline/crater80N_radgpu
+  format: binary
+  vtk_mode: thermal
+  write_raw_stats: true
+  skip_time_series: true
+  skip_mesh: true
+advanced:
+  verbose: false

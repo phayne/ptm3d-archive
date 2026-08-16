@@ -1,0 +1,71 @@
+# PTM3D validation baseline arm: GRAY (non-band-separated) GPU radiosity.
+#
+# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# section 7). Identical to baseline_crater80N_radgpu.yaml except
+# radiation.band_separated: false.
+#
+# This arm exists to pin ONE known code hazard. In gray mode the single-GPU
+# radiosity path clears the solver's warm start only when two-band is active,
+# while the multi-GPU pool clears it unconditionally ("cross-batch warm-start
+# has no meaning across devices", radiation_exchange.cpp). A warm-started and a
+# cold-started iteration can stop at different iterates, so N=1 and N>1 may
+# LEGITIMATELY differ here in a way they cannot in two-band mode.
+#
+# Measured 2026-08-15 at ecf635a: N=1 versus N=4 is byte-identical, 26/26 files.
+# The hazard did not materialize on this mesh -- its view-factor spectral radius
+# is 0.134, so the iteration converges almost immediately from either start. It
+# is untested at the 509k flagship's 0.776. A future difference on this arm is a
+# KNOWN MODE DIFFERENCE to report, not automatically a regression.
+#
+# Gray radiosity also understates reflected sunlight (no separate visible band);
+# the engine warns about that on startup. This arm is a code-path check, not a
+# recommended physics configuration.
+#
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h output cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false                 # CPU thermal: keeps the radiosity pool the only variable
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  band_separated: false   # <-- the only physics difference from the two-band arm
+  enabled: true
+  use_gpu: true
+  use_hmatrix: false             # sparse VF -- required to reach the GPU solver
+  use_aca: false
+  view_factor_file: ../../output/validation_baseline/crater80N_sparse.vf
+  coupling_mode: fixed           # deterministic sweep count; no early exit to confound a byte diff
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/validation_baseline/crater80N_radgpu_gray
+  format: binary
+  vtk_mode: thermal
+  write_raw_stats: true
+  skip_time_series: true
+  skip_mesh: true
+advanced:
+  verbose: false
