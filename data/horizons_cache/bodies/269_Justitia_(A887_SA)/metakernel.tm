@@ -11,11 +11,11 @@ KPL/MK
 
   Paths below are RELATIVE to the repository root -- run ptm_thermal_sim
   from the repo root, or edit the two path entries below to absolute paths
-  (same convention as data/kernels/bennu.tm). An earlier version of this
-  file pointed its one shared-kernel path entry at this body directory
-  instead of the shared data/kernels/ tree, so $KERNELS/lsk/... etc. could
-  never resolve; that is fixed here by giving KERNELS and BODY separate
-  entries, same as bennu.tm.
+  (same convention as data/kernels/bennu.tm). Hand-written relative, NOT
+  regenerated verbatim from SPKGenerator.create_metakernel(), which always
+  emits absolute paths (by design, for the deep-OneDrive-path + SPICE
+  78-char truncation workaround) -- baking those in here would make this
+  committed file resolve only on the machine/worktree that generated it.
 
 \begindata
 

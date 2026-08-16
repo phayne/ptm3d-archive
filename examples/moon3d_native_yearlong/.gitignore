@@ -1,0 +1,6 @@
+# The view-factor matrix for this campaign is ~25 GB and site-local. The configs
+# expect it (or a symlink to it) at view_factors/ -- see README.md. Never commit it.
+view_factors/
+*.vf
+*.vfm
+*.csr
