@@ -355,6 +355,247 @@ static void testHalfPlaneOccluder() {
 }
 
 // ---------------------------------------------------------------------------
+// 4c. PER-FACE ray budget: the ladder, and the kelvin it is tied to.
+//
+// The N = 128 gate above asks one question -- "does the ONE sample count meet
+// the ONE budget at the ONE worst face". The ladder asks it of every rung, and
+// it has to be at least as hard to weaken, or the per-face rule is a way of
+// buying speed with an unexamined constant. Three things are gated here:
+//
+//   (b) every rung's TABULATED worst error is >= what this binary MEASURES for
+//       it, on the x-aligned sweep AND on a sweep over occluder ORIENTATION.
+//       Lowering a tabulated error to buy fewer rays fails here immediately.
+//       Orientation is not decoration: the 5-probe rung has five points and no
+//       rotational symmetry, so an edge at 45 deg is a different question from
+//       an edge at 0 deg, and the low-discrepancy sets are not symmetric either.
+//   (d) the CLOSURE: pushing each rung's tabulated error back through the exact
+//       dT expression, at the flux that made the selector choose that rung,
+//       must land inside PRIMARY_DISK_TEMPERATURE_BUDGET_K. This is what makes
+//       N_f a function of the budget rather than of taste.
+//   (e) the CALIBRATION IDENTITY: on the Moon at the measured peak primary flux
+//       the per-face rule must return the inherited global constant. If the two
+//       disagree, one of them is wrong and this says which.
+// ---------------------------------------------------------------------------
+
+// Half-plane occluder with an arbitrary in-plane orientation: the disk point
+// (dx, dy) is CLEAR when its projection on (cos th, sin th) is >= edge.
+static double sampledVisibleFractionRot(uint32_t N, double edge, double alpha,
+                                        double th) {
+    const double s = std::sin(alpha), ct = std::cos(th), st = std::sin(th);
+    double w_total = 0.0, w_clear = 0.0;
+    for (uint32_t k = 0; k < N; ++k) {
+        double u, v;
+        hammersley(k, N, 0.0, 0.0, u, v);
+        double dx, dy;
+        squareToConcentricDisk(u, v, dx, dy);
+        const double w = 1.0 / std::sqrt(1.0 + s * s * (dx * dx + dy * dy));
+        w_total += w;
+        if (dx * ct + dy * st >= edge) w_clear += w;
+    }
+    return w_total > 0.0 ? w_clear / w_total : 0.0;
+}
+
+// The engine's 5-ray probe, read as an ESTIMATE of V rather than as a yes/no:
+// center plus the four rim points of probeOffset(), cosine weighted exactly as
+// updatePrimaryDiskVisibility now accumulates them.
+static double probeVisibleFraction(double edge, double alpha, double th) {
+    const double s = std::sin(alpha), ct = std::cos(th), st = std::sin(th);
+    double w_total = 0.0, w_clear = 0.0;
+    for (uint32_t k = 0; k < PRIMARY_DISK_PROBES; ++k) {
+        double dx, dy;
+        probeOffset(k, dx, dy);
+        const double w = 1.0 / std::sqrt(1.0 + s * s * (dx * dx + dy * dy));
+        w_total += w;
+        if (dx * ct + dy * st >= edge) w_clear += w;
+    }
+    return w_total > 0.0 ? w_clear / w_total : 0.0;
+}
+
+// Worst |estimate - analytic| for one rung, over edge and (optionally) over
+// occluder orientation. `samples == PRIMARY_DISK_PROBES` selects the probe
+// estimator; `samples == 0` is the no-ray rung and has no estimator at all.
+// Orientations run over a HALF turn, because the edge sweep already covers both
+// signs, and the step has to divide 45 deg: the worst case is on the diagonal
+// of Shirley-Chiu's concentric mapping every single time, and a sweep that
+// steps past 45 and 135 deg reports a comfortable number that is not true.
+// 1 deg steps, verified converged against 0.25 deg and 0.0625 deg.
+static double worstRungError(uint32_t samples, double alpha, int n_orient) {
+    double worst = 0.0;
+    for (int o = 0; o < n_orient; ++o) {
+        const double th = M_PI * double(o) / double(n_orient);
+        for (int k = -600; k <= 600; ++k) {
+            const double e = k / 500.0;
+            const double got = (samples == PRIMARY_DISK_PROBES)
+                ? probeVisibleFraction(e, alpha, th)
+                : sampledVisibleFractionRot(samples, e, alpha, th);
+            worst = std::max(worst, std::fabs(got - segmentFraction(e)));
+        }
+    }
+    return worst;
+}
+
+// The exact temperature error a visibility error dV buys at the cold end,
+// V = 0. Same expression primary_disk.h inverts.
+static double dTforDV(double dv, double f_full, double q_floor, double eps_sigma) {
+    return std::pow((q_floor + dv * f_full) / eps_sigma, 0.25)
+         - std::pow(q_floor / eps_sigma, 0.25);
+}
+
+static void testPerFaceBudget() {
+    std::printf("\n4c. Per-face ray budget (PRIMARY_DISK_TIERS)\n");
+
+    // The budget itself is Paul's, 2026-08-14, and it is the only free
+    // parameter in the whole ladder. Pin it: raising it is a decision, not an
+    // edit, and it has to break something visible.
+    check(std::fabs(PRIMARY_DISK_TEMPERATURE_BUDGET_K - 0.163) < 1e-12,
+          "kelvin budget is the accepted 0.163 K worst face",
+          PRIMARY_DISK_TEMPERATURE_BUDGET_K, 0.163, 1e-12);
+
+    // (a) the selector takes the FIRST rung that fits, so the table has to be
+    //     sorted both ways or it silently returns the wrong rung.
+    bool sorted = true;
+    for (int t = 1; t < PRIMARY_DISK_NUM_TIERS; ++t) {
+        if (!(PRIMARY_DISK_TIERS[t].samples > PRIMARY_DISK_TIERS[t-1].samples)) sorted = false;
+        if (!(PRIMARY_DISK_TIERS[t].worst_visibility_error
+              < PRIMARY_DISK_TIERS[t-1].worst_visibility_error)) sorted = false;
+    }
+    check(sorted, "ladder sorted: samples up, error down", sorted ? 1 : 0, 1, 0);
+    check(PRIMARY_DISK_TIERS[PRIMARY_DISK_NUM_TIERS-1].samples == PRIMARY_DISK_SAMPLES,
+          "top rung is PRIMARY_DISK_SAMPLES",
+          PRIMARY_DISK_TIERS[PRIMARY_DISK_NUM_TIERS-1].samples, PRIMARY_DISK_SAMPLES, 0);
+
+    // (b) every tabulated error against measurement, at 1 deg over a half turn.
+    const double alpha = 5.978 * M_PI / 180.0;
+    std::printf("     tabulated vs MEASURED worst |dV| (x-aligned; over orientation):\n");
+    std::printf("       %-6s %-11s %-13s %-13s\n", "N", "tabulated", "x-aligned", "any orientation");
+    for (int t = 0; t < PRIMARY_DISK_NUM_TIERS; ++t) {
+        const uint32_t N = PRIMARY_DISK_TIERS[t].samples;
+        if (N == 0) {
+            std::printf("       %-6s %-11.4f %-13s %-13s\n", "0 (A)",
+                        PRIMARY_DISK_TIERS[t].worst_visibility_error,
+                        "n/a", "n/a  (V := 1, the full range by construction)");
+            check(PRIMARY_DISK_TIERS[t].worst_visibility_error >= 1.0,
+                  "no-ray rung is budgeted for the whole range",
+                  PRIMARY_DISK_TIERS[t].worst_visibility_error, 1.0, 0.0);
+            continue;
+        }
+        const int n_orient = 180;
+        const double w_axis = worstRungError(N, alpha, 1);
+        const double w_any  = worstRungError(N, alpha, n_orient);
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "N=%-4u tabulated error >= measured worst", N);
+        std::printf("       %-6u %-11.4f %-13.4f %-13.4f\n",
+                    N, PRIMARY_DISK_TIERS[t].worst_visibility_error, w_axis, w_any);
+        check(PRIMARY_DISK_TIERS[t].worst_visibility_error >= w_any, buf,
+              PRIMARY_DISK_TIERS[t].worst_visibility_error, w_any, 0.0);
+    }
+
+    // (f) the two standards, side by side, because one of them is inherited and
+    //     wrong and this is where anyone re-deriving the budget will look.
+    //     Printed rather than asserted -- whether PRIMARY_DISK_SAMPLES should
+    //     move is Paul's call, not this gate's.
+    std::printf("     INHERITED vs CORRECTED at the cap: "
+                "PRIMARY_DISK_WORST_VISIBILITY_ERROR = %.4f (x-aligned sweep only), "
+                "measured over orientation = %.4f, ratio %.2fx.\n",
+                PRIMARY_DISK_WORST_VISIBILITY_ERROR, worstRungError(128, alpha, 180),
+                worstRungError(128, alpha, 180) / PRIMARY_DISK_WORST_VISIBILITY_ERROR);
+    std::printf("     The 0.163 K the cap was accepted against is therefore "
+                "~%.2f K at the coldest lunar face. Unchanged by this ladder; "
+                "N = 512 measures %.4f, so raising N is a poor lever.\n",
+                0.163 * worstRungError(128, alpha, 180) / PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+                worstRungError(512, alpha, 180));
+    std::printf("     fitted 0.49*N^-0.65 at N=64 gives %.4f against a measured "
+                "%.4f -- optimistic\n", 0.49 * std::pow(64.0, -0.65),
+                worstRungError(64, alpha, 180));
+
+    // (e) the ladder must never demote the face the cap was chosen for. On the
+    //     Moon (eps 0.95, Qb 0.018 -> T_floor 24.043 K) at the measured peak
+    //     primary flux of 0.087 W/m^2 -- 0.046 IR + 0.041 reflected over 48 MS3
+    //     A03MP026 frames -- the strict V = 0 rule is STRICTER than the
+    //     inherited constant, so that face keeps every ray it has today.
+    const double sigma = 5.670374419e-8;
+    const double es_moon = 0.95 * sigma, qb_moon = 0.018;
+    const double dv_moon = primaryDiskAllowedVisibilityError(0.087, qb_moon, es_moon);
+    std::printf("     Moon T_floor = %.4f K; at the peak flux 0.087 W/m^2 the rule "
+                "allows dV = %.4f\n", std::pow(qb_moon / es_moon, 0.25), dv_moon);
+    check(dv_moon < PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+          "rule at the peak lunar flux is stricter than the inherited constant",
+          dv_moon, PRIMARY_DISK_WORST_VISIBILITY_ERROR,
+          PRIMARY_DISK_WORST_VISIBILITY_ERROR);
+    check(primaryDiskSamplesForAllowedError(dv_moon) == PRIMARY_DISK_SAMPLES,
+          "so the calibration face keeps PRIMARY_DISK_SAMPLES",
+          primaryDiskSamplesForAllowedError(dv_moon), PRIMARY_DISK_SAMPLES, 0);
+
+    // (d) CLOSURE. Sweep the full-disk flux a face can see, from nothing to the
+    //     Jupiter-at-Europa peak, and check the rung the selector picks keeps
+    //     its own tabulated error inside the budget. This is the check that
+    //     ties N_f to kelvin; it fails if a rung is ever selected above its
+    //     price.
+    std::printf("     closure: selected rung vs budget over the flux range\n");
+    std::printf("       %-12s %-10s %-9s %-10s %-10s\n",
+                "F_full W/m2", "dV allow", "rung", "worst dT", "budget");
+    struct Body { const char* name; double eps; double qb; double fmax; };
+    const Body bodies[2] = { {"Moon",   0.95, 0.018, 0.087},
+                             {"Europa", 0.90, 0.030, 0.280} };
+    for (const Body& b : bodies) {
+        const double es = b.eps * sigma;
+        double worst_over = 0.0;
+        int n_pts = 0;
+        for (int k = 0; k <= 400; ++k) {
+            const double f = b.fmax * std::pow(10.0, -4.0 + 4.0 * k / 400.0);
+            const double dv = primaryDiskAllowedVisibilityError(f, b.qb, es);
+            const uint32_t N = primaryDiskSamplesForAllowedError(dv);
+            // the tabulated error of the rung actually selected
+            double e_rung = PRIMARY_DISK_WORST_VISIBILITY_ERROR;
+            for (int t = 0; t < PRIMARY_DISK_NUM_TIERS; ++t)
+                if (PRIMARY_DISK_TIERS[t].samples == N)
+                    e_rung = PRIMARY_DISK_TIERS[t].worst_visibility_error;
+            // A rung is only ever selected because its error FITS dv, except at
+            // the cap, where the budget is knowingly unreachable and the
+            // behavior is the inherited one. Score the reachable range.
+            if (e_rung > dv) continue;
+            ++n_pts;
+            worst_over = std::max(worst_over, dTforDV(e_rung, f, b.qb, es));
+            if (k % 80 == 0)
+                std::printf("       %-12.3e %-10.4f %-9u %-10.4f %-10.3f  (%s)\n",
+                            f, dv, N, dTforDV(e_rung, f, b.qb, es),
+                            PRIMARY_DISK_TEMPERATURE_BUDGET_K, b.name);
+        }
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%s: every selected rung inside the budget", b.name);
+        check(worst_over <= PRIMARY_DISK_TEMPERATURE_BUDGET_K + 1e-9 && n_pts > 0,
+              buf, worst_over, PRIMARY_DISK_TEMPERATURE_BUDGET_K,
+              PRIMARY_DISK_TEMPERATURE_BUDGET_K);
+    }
+
+    // (c) monotonicity of the selector: more allowance can never buy more rays.
+    bool mono = true;
+    uint32_t prev = PRIMARY_DISK_SAMPLES;
+    for (int k = 0; k <= 2000; ++k) {
+        const uint32_t N = primaryDiskSamplesForAllowedError(k / 2000.0);
+        if (N > prev) mono = false;
+        prev = N;
+    }
+    check(mono, "selector monotone: more allowed error, never more rays",
+          mono ? 1 : 0, 1, 0);
+
+    // A zero-flux face must cost nothing, and a disarmed budget (floor 0) must
+    // fall back to the inherited count on every face -- the two ends of the
+    // rule, both of which the engine relies on.
+    check(primaryDiskSamplesForAllowedError(
+              primaryDiskAllowedVisibilityError(0.0, qb_moon, es_moon)) == 0,
+          "a face with no primary flux casts no primary rays",
+          primaryDiskSamplesForAllowedError(
+              primaryDiskAllowedVisibilityError(0.0, qb_moon, es_moon)), 0, 0);
+    check(primaryDiskSamplesForAllowedError(
+              primaryDiskAllowedVisibilityError(0.087, 0.0, es_moon)) == PRIMARY_DISK_SAMPLES,
+          "no deep-heat floor -> inherited count, not a cheaper one",
+          primaryDiskSamplesForAllowedError(
+              primaryDiskAllowedVisibilityError(0.087, 0.0, es_moon)),
+          PRIMARY_DISK_SAMPLES, 0);
+}
+
+// ---------------------------------------------------------------------------
 // 4b. Temporal reuse of the terrain factor: the SAME budget, applied to the
 //     other approximation in this path.
 //
@@ -458,6 +699,7 @@ int main() {
     testEnergyClosure();
     testHorizonMeanCos();
     testHalfPlaneOccluder();
+    testPerFaceBudget();
     testTerrainReuseBudget();
     reportJupiterTable();
     std::printf("\n%s (%d failure%s)\n",

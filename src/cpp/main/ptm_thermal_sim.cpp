@@ -14939,6 +14939,16 @@ int main(int argc, char** argv) {
         illumination_model->setIncludePrimaryReflection(include_primary_reflection);
     }
 
+    // Per-face primary-disk ray budget (primary_disk.h). The pair handed over is
+    // the SAME pair the thermal solver's own floor comes from -- the banner at
+    // the top of the thermal setup prints T_geo = (Qb/(eps*sigma))^0.25 from
+    // these two -- so the temperature the budget prices against is the
+    // temperature the field actually floors at, not a constant chosen here.
+    // planet.* is final by this point: every property-map, generic-body and
+    // command-line override has already been applied above (the early radiation
+    // manager reads planet.emissivity a few lines earlier).
+    illumination_model->setPrimaryDiskBudget(planet.emissivity, planet.Qb);
+
 #ifdef PTM_GPU_OPENCL
     // Wire up GPU BVH ray tracer if requested. Must happen BEFORE
     // calculateIlluminationFromMesh / initializeScene so the BVH is built

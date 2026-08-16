@@ -190,6 +190,206 @@ constexpr uint32_t PRIMARY_DISK_SAMPLES = 128;
 constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 
 // ---------------------------------------------------------------------------
+// PER-FACE sampling budget
+//
+// Paul's ruling, 2026-08-16: "primary-disk visibility is a secondary effect
+// (except possibly in the very coldest PSRs) that should not be driving
+// illumination cost; we should reduce to the minimum number of rays and checks
+// for reasonable accuracy without spending a lot of computational cycles on
+// it."
+//
+// PRIMARY_DISK_SAMPLES above is ONE number for every face on every body. It was
+// fixed by the single hardest face in the fleet -- the coldest lunar PSR floor,
+// where the whole primary flux is worth 13 K -- and then charged to all
+// 2,397,890 faces of an A3GT production mesh. Measured on the A03MP026 window,
+// current main: 571,917 faces per epoch escalate to 128 rays, 82.8 M
+// primary-disk rays per epoch = 34.5x the entire direct-solar shadow-ray budget,
+// ~900 s of a 2,772 s window. The flux those rays resolve peaks at 0.087 W/m^2.
+//
+// What follows converts the SAME accuracy bar into a per-face ray count. The
+// bar is unchanged; only the pricing is.
+//
+// THE ARITHMETIC. A visibility error dV misplaces dV * F_full watts on a face,
+// where F_full is the irradiance that face would receive from a fully visible
+// primary disk (analytic horizon clip included -- see the caller). The face
+// sits on the radiative balance
+//
+//     eps sigma T^4 = Q_floor + V * F_full + (everything else, all >= 0)
+//
+// so the temperature error the misplaced watts buy is, EXACTLY (no
+// linearization -- it costs nothing to keep the fourth root),
+//
+//     dT(dV, V) = [ (Q_floor + (V+dV) F_full)/(eps sigma) ]^(1/4)
+//               - [ (Q_floor +  V    F_full)/(eps sigma) ]^(1/4)
+//
+// which is largest at V = 0, the cold end: the same watt is worth more kelvin
+// the colder the face, dT/dF = 1/(4 eps sigma T^3). Taking V = 0 is therefore
+// the worst case over the one quantity the sampler has not yet measured, and it
+// needs no assumption about the terrain. Setting that equal to the budget and
+// solving for dV:
+//
+//     dV_allowed = eps sigma [ (T_floor + budget)^4 - T_floor^4 ] / F_full
+//     T_floor    = (Q_floor / (eps sigma))^(1/4)
+//
+// WHERE THE TEMPERATURE COMES FROM, and why it is not the running temperature.
+// The illumination phase computes the WHOLE window up front, before a single
+// thermal step (illumination_model.cpp calculateIlluminationOptimized loops all
+// time_steps_), so no thermal state exists to read -- not the previous step's,
+// not any step's. Three surrogates were considered and two were rejected on
+// physics, not on convenience:
+//   * the current epoch's own direct-solar flux -- REJECTED, and it is not a
+//     near miss. With a massless surface node the balance is
+//     eps sigma T_s^4 = F_abs + k dT/dz|_0, and while a face is HEATING the
+//     conductive term is negative, so T_s < T_eq(F_abs). A sunrise face is
+//     therefore COLDER than its instantaneous radiative equilibrium, and a
+//     surrogate built on it would under-count rays exactly where cold terrain
+//     crosses the terminator.
+//   * a window-mean insolation census -- REJECTED: a mean over the RUN's window
+//     is not a function of geometry alone, so a chunked run and a single-shot
+//     run would price the same epoch differently. Chunk invariance is not
+//     negotiable here.
+//   * Q_floor, the body's deep-heat flux, with V = 0 -- TAKEN. It is a true
+//     lower bound on the face temperature (every term dropped is non-negative),
+//     it is one scalar, it is a pure function of the body, and it is the same
+//     number the engine's own PSR floor already is: T_geo = (Qb/(eps sigma))^0.25
+//     = 24.0428 K on the Moon at Qb = 0.018, which is precisely where the A3GT
+//     temperature field floors.
+// Costed: the strict V = 0 bound is at most one ladder rung more expensive than
+// the self-consistent T_eq(Q_floor + V F_full) it replaces, because Q_floor
+// dominates the sum on every face where the ladder actually saves anything.
+//
+// WHERE THE RULE SITS RELATIVE TO THE INHERITED CONSTANT. On the Moon (eps
+// 0.95, Qb 0.018 -> T_floor 24.0428 K, budget 0.163 K) it returns
+// dV_allowed = 0.0057 at F_full = 0.087 W/m^2, the measured peak lunar primary
+// flux. That is 3.7x STRICTER than PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021,
+// so at and near the peak the ladder asks for more rays than the cap allows and
+// simply keeps the cap. The ladder therefore never demotes the face the N = 128
+// ruling was made on; it only demotes faces whose primary flux is far below the
+// peak, which -- on a lunar polar mesh, where Earth sits within a few degrees of
+// the horizon -- is most of them.
+// (The 0.021 figure comes from evaluating the same expression at V = 1 instead
+// of V = 0, i.e. crediting the face with the very flux whose visibility is in
+// question. That is where the accepted 24.04 -> 37.36 K derivation stands; it is
+// the right reading for a FULLY VISIBLE cold face, which is exactly the face
+// that never escalates. For a face the sampler is actually working on, V is
+// unknown and V = 0 is the worst case.)
+//
+// A face whose budget is not reachable even at PRIMARY_DISK_SAMPLES keeps
+// PRIMARY_DISK_SAMPLES -- today's behavior exactly, no accuracy is given up
+// anywhere -- and the census counts it so the shortfall is visible rather than
+// implied.
+constexpr double PRIMARY_DISK_TEMPERATURE_BUDGET_K = 0.163;
+
+// One rung of the ladder. `worst_visibility_error` is MEASURED, not fitted:
+// test_primary_disk section 4c sweeps a half-plane occluder across the disk in
+// steps of 1/500 of its radius, AT EVERY ORIENTATION, and fails if any rung's
+// measured worst exceeds the number tabulated here. The fitted law
+// 0.49 * N^-0.65 is not usable as the tabulated value -- at N = 64 it gives
+// 0.033 against a measured 0.078.
+//
+// ⚠️ THE ORIENTATION SWEEP IS NEW, AND IT MOVES EVERY NUMBER IN THIS FILE.
+// The table in the PRIMARY_DISK_SAMPLES comment above, and
+// PRIMARY_DISK_WORST_VISIBILITY_ERROR with it, come from a sweep of an
+// x-ALIGNED half-plane only. Measured 2026-08-16, sweeping the occluder's
+// in-plane angle as well (converged: identical at 180, 720 and 2880
+// orientations):
+//
+//     estimator      x-aligned    any orientation   worst angle
+//     5-point probe    0.3002          0.3082          (no diagonal structure)
+//     N =  16          0.0837          0.1860           45 deg
+//     N =  32          0.0484          0.1251          135 deg
+//     N =  64          0.0381          0.0778           45 deg
+//     N = 128          0.0175          0.0613          135 deg
+//     N = 256          0.0159          0.0351           45 deg
+//     N = 512          0.0082          0.0300          135 deg
+//
+// The worst orientation is the DIAGONAL, every time, because that is the
+// structure Shirley-Chiu's concentric mapping puts into the point set: the
+// square's diagonals map to preferred directions on the disk, and an occluder
+// edge lying along one of them cuts the samples along their own grain. A real
+// ridge crest is a half-plane at an arbitrary angle, so the diagonal is not a
+// contrived case; the x-aligned measurement simply never asked.
+//
+// Consequences, stated rather than absorbed:
+//   * PRIMARY_DISK_SAMPLES = 128 does NOT deliver 0.021 worst-case. It delivers
+//     0.0613, so the kelvin it was accepted against -- 0.163 K at the coldest
+//     lunar face -- is really ~0.48 K there. That is a property of main as
+//     shipped, unchanged by this ladder, and it is Paul's call whether 128 is
+//     still the right cap. Nothing here quietly re-tunes it.
+//   * N = 512 (the pre-2026-08-14 count) measures 0.0300, i.e. the 512 -> 128
+//     decision was 0.0082 -> 0.0175 on paper and 0.0300 -> 0.0613 in fact.
+//     Same factor, so that decision stands on its own terms.
+//   * The count is the wrong lever for this error. 128 -> 512 buys 2x for 4x
+//     the rays because the diagonal structure does not average out with N.
+//     `hammersley()` already takes a Cranley-Patterson rotation (uoff, voff)
+//     and the engine passes 0, 0 -- so every face on every body reuses the
+//     identical point set with the identical grain. A per-face rotation is the
+//     obvious repair, it is nearly free, and it changes results, so it needs
+//     its own gate and its own measurement. NOT done here.
+//
+// This ladder prices against the ORIENTATION-WORST column, which is stricter
+// than the standard the cap was accepted under. That direction is deliberate:
+// a rung is only ever selected when it meets 0.163 K on the corrected numbers,
+// so no face is demoted onto an error it cannot afford, and every face the
+// corrected numbers cannot satisfy keeps PRIMARY_DISK_SAMPLES -- which is
+// exactly what main gives it today.
+struct PrimaryDiskTier {
+    uint32_t samples;                 // disk samples; see the two sentinels
+    double   worst_visibility_error;  // measured worst |V_est - V_true|
+};
+
+// Sentinels, both of which mean "cast no ray this face does not already cast":
+//   samples == 0                    -> take the analytic clip, V := 1, NO rays
+//                                      at all, not even the probe. Only for a
+//                                      face that could absorb dV = 1.
+//   samples == PRIMARY_DISK_PROBES  -> stop at the 5-ray probe every escalating
+//                                      face already casts and take its own
+//                                      cosine-weighted clear fraction.
+// Ordered by increasing cost / decreasing error; the selector takes the first
+// rung that fits, so the table must stay sorted both ways (gated in 4c).
+constexpr int PRIMARY_DISK_NUM_TIERS = 6;
+constexpr PrimaryDiskTier PRIMARY_DISK_TIERS[PRIMARY_DISK_NUM_TIERS] = {
+    {   0, 1.0000 },   // V := 1 with no evidence: the error is the full range
+    {   5, 0.3120 },   // 5-probe cosine-weighted fraction   (measured 0.3082)
+    {  16, 0.1880 },   // all five MEASURED over occluder     (measured 0.1860)
+    {  32, 0.1265 },   // orientation by test_primary_disk    (measured 0.1251)
+    {  64, 0.0790 },   // 4c, which FAILS if any of them is   (measured 0.0778)
+    { 128, 0.0620 },   // optimistic by so much as a bit      (measured 0.0613)
+};
+// The ~1.2 % headroom on each rung is deliberate and is not slack in the budget:
+// the worst is a max over a staircase, so it moves in the last digit with
+// -ffast-math codegen, and a gate that fails on codegen jitter gets disabled
+// rather than believed. It errs toward MORE rays.
+
+// Largest visibility error this face can absorb inside the kelvin budget.
+// `eps_sigma` is emissivity * Stefan-Boltzmann, passed in rather than taken
+// from a constants header so this stays the standalone arithmetic the gate
+// links against, and so there is exactly one sigma in play per caller.
+// Returns 1.0 (i.e. "anything") when the face receives no primary flux at all.
+inline double primaryDiskAllowedVisibilityError(double full_disk_flux_w_m2,
+                                                double floor_flux_w_m2,
+                                                double eps_sigma) {
+    if (!(full_disk_flux_w_m2 > 0.0)) return 1.0;
+    if (!(eps_sigma > 0.0))           return 0.0;   // degenerate: buy everything
+    const double q_floor = (floor_flux_w_m2 > 0.0) ? floor_flux_w_m2 : 0.0;
+    const double t_floor = std::pow(q_floor / eps_sigma, 0.25);
+    const double t_hi    = t_floor + PRIMARY_DISK_TEMPERATURE_BUDGET_K;
+    const double dq      = eps_sigma * (t_hi*t_hi*t_hi*t_hi - q_floor / eps_sigma);
+    const double dv      = dq / full_disk_flux_w_m2;
+    return (dv > 1.0) ? 1.0 : dv;
+}
+
+// First rung of the ladder that fits, or PRIMARY_DISK_SAMPLES if none does.
+inline uint32_t primaryDiskSamplesForAllowedError(double allowed_dv) {
+    for (int t = 0; t < PRIMARY_DISK_NUM_TIERS; ++t) {
+        if (PRIMARY_DISK_TIERS[t].worst_visibility_error <= allowed_dv) {
+            return PRIMARY_DISK_TIERS[t].samples;
+        }
+    }
+    return PRIMARY_DISK_SAMPLES;   // budget unreachable: keep today's behavior
+}
+
+// ---------------------------------------------------------------------------
 // Temporal reuse of the terrain-visibility factor
 // ---------------------------------------------------------------------------
 

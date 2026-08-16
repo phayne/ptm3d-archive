@@ -260,6 +260,15 @@ public:
     void setIncludePrimaryReflection(bool include) { include_primary_reflection_ = include; }
     bool getIncludePrimaryReflection() const { return include_primary_reflection_; }
 
+    // Arm the per-face primary-disk ray budget (primary_disk.h). `emissivity`
+    // and `floor_flux_w_m2` are the body's surface emissivity and deep-heat
+    // flux Qb -- the same pair the thermal solver's own T_geo comes from, so
+    // the floor the budget prices against is the floor the temperature field
+    // actually has. Call it before calculateIllumination*; a non-positive Qb
+    // leaves the budget unreachable everywhere, which is the pre-2026-08-16
+    // behavior and is announced once.
+    void setPrimaryDiskBudget(double emissivity, double floor_flux_w_m2);
+
     // Getter methods for component values
     const std::vector<double>& getDirectSolarValues() const { return direct_solar_values_; }
     const std::vector<double>& getPrimaryReflectedValues() const { return primary_reflected_values_; }
@@ -521,6 +530,7 @@ private:
     const void* primary_vis_key_centers_ = nullptr;
     const void* primary_vis_key_normals_ = nullptr;
     std::array<double, 3> primary_vis_key_pos_ = {0.0, 0.0, 0.0};
+    std::array<double, 3> primary_vis_key_sun_ = {0.0, 0.0, 0.0};
     size_t primary_vis_key_n_ = static_cast<size_t>(-1);
 
     // Temporal reuse of the ray-derived terrain factor only (see
@@ -539,6 +549,16 @@ private:
     // optional PTM_PRIMARY_DISK_REUSE_FRACTION override. Reports itself when
     // overridden -- a knob that changes physics must never be silent.
     static double primaryDiskReuseFraction();
+
+    // Per-face primary-disk ray budget (primary_disk.h). Two scalars, both from
+    // the body's own thermophysics, both supplied by the caller: without them
+    // the floor flux is 0, the budget is unreachable on every face, and every
+    // escalation falls back to PRIMARY_DISK_SAMPLES -- i.e. exactly the
+    // pre-2026-08-16 behavior. That fallback ANNOUNCES itself once.
+    double primary_budget_eps_sigma_  = 0.0;   // emissivity * sigma
+    double primary_budget_floor_flux_ = 0.0;   // Qb, W/m^2
+    bool   primary_budget_configured_ = false;
+    void warnPrimaryBudgetUnconfiguredOnce() const;
 
     // Generic body / Keplerian propagation support
     bool use_keplerian_ = false;
@@ -580,10 +600,17 @@ private:
 
     // PTM-44: <cos theta> over the primary's finite disk, horizon-clipped and
     // terrain-weighted. Results in primary_vis_mean_cos_ / primary_vis_dist_km_.
+    // The sun position is needed for the PER-FACE ray budget, not for the
+    // visibility itself: the budget prices a face against the primary flux it
+    // could actually receive, and half of that flux is reflected sunlight whose
+    // magnitude depends on the phase angle. It joins the memo key for the same
+    // reason -- two calls at the same primary position but different sun
+    // positions are not the same question any more.
     void updatePrimaryDiskVisibility(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<std::array<double, 3>>& face_normals,
-        const std::array<double, 3>& primary_position);
+        const std::array<double, 3>& primary_position,
+        const std::array<double, 3>& sun_position);
 
     // Both take mean_cos from updatePrimaryDiskVisibility in place of the old
     // dot(face_normal, primary_direction); the two agree exactly for a fully
@@ -611,6 +638,7 @@ private:
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<std::array<double, 3>>& face_normals,
         const std::array<double, 3>& primary_position,
+        const std::array<double, 3>& sun_position,
         std::vector<double>& ir_values);
 
     void calculateDirectSolarBatchWithFiniteDisk(
