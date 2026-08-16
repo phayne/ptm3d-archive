@@ -489,6 +489,57 @@ int resolveConvergenceCheckInterval(int configured, size_t nnz) {
     return (t_traversal >= kConvergenceReadSeconds) ? 1 : kCheapTraversalInterval;
 }
 
+namespace {
+// Float32 floor on the RELATIVE residual. The reduction that produces
+// max|B_new - B_old| is a float32 sum: at B ~ 1e3 W/m^2 one ulp is 6.1e-5, so
+// max|dB| / max|B| cannot resolve below ~6e-8 no matter how converged the solve
+// is. 1e-6 sits an order of magnitude above that floor. This replaces the old
+// absolute floor of 1e-5 W/m^2, which was the same guard expressed in the wrong
+// units: on a bright surface it demanded a residual ~900x tighter than the
+// configured relative tolerance, and on a dark one it let the solve stop early.
+constexpr double kFloat32RelResidualFloor = 1e-6;
+
+// Restore the legacy ABSOLUTE stopping test (max|dB| < tol, floored at 1e-5
+// W/m^2). Exists so the criterion change can be measured against the route it
+// replaces on one binary, and so a future divergence can be bisected without a
+// rebuild -- not because the absolute test is still a supported physics option.
+// Announced once, because a quietly different convergence rule is exactly the
+// kind of silent substitution that produced this defect.
+bool useLegacyAbsoluteCriterion() {
+    static const bool on = []() {
+        if (!std::getenv("PTM_RAD_GPU_ABS_CRITERION")) return false;
+        std::cout << "  [Radiosity GPU] PTM_RAD_GPU_ABS_CRITERION set: using the LEGACY "
+                     "ABSOLUTE stopping test max|dB| < max(tol, 1e-5) W/m^2 instead of the "
+                     "CPU's relative max|dB|/max|B| < tol. At B ~ 900 W/m^2 that bar is "
+                     "~900x stricter, so the solve does strictly more Jacobi iterations for "
+                     "the same configured tolerance. Diagnostic only.\n";
+        return true;
+    }();
+    return on;
+}
+
+// The one definition of "this band has converged", shared by the gray and the
+// fused two-band GPU paths and matching RadiositySolver::solveJacobi() /
+// solveTwoBandJacobiFused() line for line:
+//     rel = (max|B| > 1e-10) ? max|dB| / max|B| : max|dB|;  converged iff rel < tol
+// The 1e-10 guard is the CPU's, verbatim: it keeps an all-zero band (a fully
+// shadowed visible band, say) from dividing by zero and instead scores it on the
+// absolute change, which for an all-zero band is also zero.
+struct StopTest {
+    double residual;   // the quantity compared against the tolerance
+    bool   converged;
+};
+StopTest radiosityStopTest(double max_change, double max_val, double tolerance) {
+    if (useLegacyAbsoluteCriterion()) {
+        const double tol_abs = std::max(tolerance, 1e-5);
+        return {max_change, max_change < tol_abs};
+    }
+    const double tol_rel = std::max(tolerance, kFloat32RelResidualFloor);
+    const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+    return {rel, rel < tol_rel};
+}
+}  // namespace
+
 // RadiosityOpenCLSolver implementation
 
 RadiosityOpenCLSolver::RadiosityOpenCLSolver(size_t n_faces,
@@ -1641,9 +1692,6 @@ void RadiosityOpenCLSolver::solve(
         }
     }
 
-    // Ensure tolerance is safe for single-precision (float has ~7 significant digits)
-    const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);
-
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
         // SpMV: F_B = F * radiosity (single-buffer or chunked, PTM-25)
         enqueueSpMV(buf_radiosity_, buf_F_B_, global_size, local_size);
@@ -1688,7 +1736,10 @@ void RadiosityOpenCLSolver::solve(
             computeScratchMaxima(2, m);
             const double max_change = m[0];
             const double max_val = m[1];
-            last_residual_ = max_change;
+            const StopTest st = radiosityStopTest(max_change, max_val,
+                                                  config_.convergence_tolerance);
+
+            last_residual_ = st.residual;
             last_iterations_ = iter + 1;
 
             if (iter_trace) {
@@ -1698,7 +1749,7 @@ void RadiosityOpenCLSolver::solve(
                              this_solve, iter + 1, max_change, max_val, rel);
             }
 
-            if (max_change < effective_tolerance && !iter_trace_full) {
+            if (st.converged && !iter_trace_full) {
                 converged_ = true;
                 break;
             }
@@ -1880,8 +1931,6 @@ void RadiosityOpenCLSolver::solveTwoBandFused(
         }
     }
 
-    const double effective_tolerance = std::max(config_.convergence_tolerance, 1e-5);
-
     bool conv_ir = false, conv_vis = false;
     int it_ir = 0, it_vis = 0;
     double res_ir = std::numeric_limits<double>::max();
@@ -1961,14 +2010,21 @@ void RadiosityOpenCLSolver::solveTwoBandFused(
 
             // Stopping criterion, per band, evaluated only for bands still
             // iterating -- the GPU counterpart of the CPU fused solver's
-            // `if (!conv_ir)` / `if (!conv_vis)` blocks. A frozen band keeps the
-            // residual it stopped on; it is never re-scored against a scratch
-            // segment nothing writes any more.
-            if (!conv_ir)  res_ir  = dB_ir;
-            if (!conv_vis) res_vis = dB_vis;
-            if (!iter_trace_full) {
-                if (!conv_ir  && dB_ir  < effective_tolerance) conv_ir  = true;
-                if (!conv_vis && dB_vis < effective_tolerance) conv_vis = true;
+            // `if (!conv_ir)` / `if (!conv_vis)` blocks. Each band is scored on
+            // ITS OWN max|dB| and max|B|; scoring both against a shared maximum
+            // would tie the dim band's stopping point to the bright one's scale.
+            // A frozen band keeps the residual it stopped on; it is never
+            // re-scored against a scratch segment nothing writes any more.
+            const double tol = config_.convergence_tolerance;
+            if (!conv_ir) {
+                const StopTest st = radiosityStopTest(dB_ir, B_ir, tol);
+                res_ir = st.residual;
+                if (st.converged && !iter_trace_full) conv_ir = true;
+            }
+            if (!conv_vis) {
+                const StopTest st = radiosityStopTest(dB_vis, B_vis, tol);
+                res_vis = st.residual;
+                if (st.converged && !iter_trace_full) conv_vis = true;
             }
         }
     }
