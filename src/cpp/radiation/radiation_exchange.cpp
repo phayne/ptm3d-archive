@@ -154,6 +154,35 @@ static void radIterTrace(const char* tag, long solve_id, int iter,
                  tag, solve_id, iter, max_change, max_val, rel);
 }
 
+#ifdef PTM_GPU_OPENCL
+// Fuse the two radiosity bands into one CSR traversal on the GPU (default ON).
+//
+// The band-separated solve runs the SAME matrix twice per timestep; the fused
+// route reads each row once and accumulates both bands, exactly as the CPU
+// solveTwoBandJacobiFused() has always done. Per band the arithmetic is
+// unchanged, so the two routes are expected to agree bit for bit -- the escape
+// hatch exists so that equivalence can be MEASURED (and so a future divergence
+// can be bisected without a rebuild), not because either answer is provisional.
+// Turning it off is announced: a quietly slower path is still a silent override.
+static bool gpuFuseBands() {
+    static const bool on = []() {
+        const char* e = std::getenv("PTM_RAD_GPU_FUSE_BANDS");
+        if (!e) return true;
+        const bool off = (std::string(e) == "0");
+        if (off) {
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_FUSE_BANDS=0: running the LEGACY "
+                         "unfused two-band route (two separate solves over the same CSR, "
+                         "roughly twice the matrix traversals). Diagnostic only.\n";
+        } else {
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_FUSE_BANDS='" << e
+                      << "' is not 0; band fusion stays ON (the default).\n";
+        }
+        return !off;
+    }();
+    return on;
+}
+#endif
+
 // ============================================================================
 // RadiositySolver Implementation
 // ============================================================================
@@ -742,7 +771,16 @@ void RadiositySolver::initGPU() {
     const size_t csr_bytes = nnz * sizeof(float)      // values (float on device)
                            + nnz * sizeof(int)        // column indices
                            + (n + 1) * sizeof(int);   // row pointers (int32 on device)
-    const size_t working_bytes = 12 * n * sizeof(float);  // ~11 state buffers + margin
+    // Working set in units of one n-float buffer, counted rather than guessed --
+    // an under-stated footprint is how a fit check passes and the upload then
+    // fails on the device.
+    //   gray (15): radiosity, radiosity_new, F_B, temperatures, solar_flux,
+    //              emission, solar_source, indirect_flux, emissivity,
+    //              reflectivity, row_norm (11) + the 4-segment residual scratch.
+    //   two-band  (+7): radiosity_vis, radiosity_vis_new, F_B_vis,
+    //              emissivity_vis, reflectivity_vis, indirect_flux_vis, zeros.
+    // Rounded up by one for the partial-max buffers and driver slack.
+    const size_t working_bytes = (two_band_ ? 26 : 16) * n * sizeof(float);
     const size_t needed_bytes = csr_bytes + working_bytes;
 
     // Real VRAM-fit check (replaces the old fixed 50%-of-total folklore, which
@@ -795,6 +833,22 @@ void RadiositySolver::initGPU() {
         row_norm_f[i] = static_cast<float>(vf_row_norm_[i]);
     }
 
+    // Visible-band property pair (1-A, A), uploaded ONCE per device when band
+    // separation is on. The unfused route instead re-uploaded a property pair
+    // twice per timestep; giving the visible band its own device buffers is what
+    // lets one width-2 traversal serve both bands. Built here from the same
+    // solar_reflectivity_ the per-timestep code used, so the values are identical.
+    std::vector<float> vis_emiss_f, vis_refl_f;
+    if (two_band_) {
+        vis_emiss_f.resize(n);
+        vis_refl_f.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+            vis_refl_f[i]  = static_cast<float>(A);
+            vis_emiss_f[i] = static_cast<float>(1.0 - A);
+        }
+    }
+
     // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
     // Every failure is loud (never a silent drop to CPU); the CSR upload is
     // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25).
@@ -828,6 +882,9 @@ void RadiositySolver::initGPU() {
                                            F_ptr_->rowPointers());
             gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
             gpu_solver_->uploadRowNorm(row_norm_f);
+            if (two_band_) {
+                gpu_solver_->uploadVisibleProperties(vis_emiss_f, vis_refl_f);
+            }
         } catch (const std::exception& e) {
             std::cerr << "[Radiosity] single-GPU CSR upload failed: " << e.what() << "\n";
             gpu_solver_.reset();
@@ -927,7 +984,8 @@ void RadiositySolver::initGPU() {
                                                      F_ptr_->colIndices(),
                                                      F_ptr_->rowPointers(),
                                                      emissivity_f, reflectivity_f,
-                                                     row_norm_f);
+                                                     row_norm_f,
+                                                     vis_emiss_f, vis_refl_f);
                 } catch (const std::exception& e) {
                     std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
                               << e.what() << "\n";
@@ -1059,43 +1117,74 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
     // The row-norm is applied to the returned flux below (== 1 under the two-band GPU
     // gate). The two solves cold-start (warm_start off), matching the CPU path.
     const size_t n = temperatures.size();
-    std::vector<float> emiss_f(n), refl_f(n), visE_f(n), visR_f(n);
-    std::vector<float> temps_f(n), flux_f(n), zeros_f(n, 0.0f);
+    // The fused route needs only the per-timestep state (T and the effective
+    // flux); the band property pairs live on the device from initGPU. Only the
+    // legacy unfused route re-uploads them every timestep, so only it pays for
+    // building them -- five n-float vectors per timestep on a 2.4M-face mesh is
+    // 48 MB of host writes that the fused path has no use for.
+    const bool fused = gpuFuseBands() && gpu_solver_->hasVisibleProperties();
+    std::vector<float> emiss_f, refl_f, visE_f, visR_f, zeros_f;
+    std::vector<float> temps_f(n), flux_f(n);
+    if (!fused) {
+        emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
+        zeros_f.assign(n, 0.0f);
+    }
     // PTM-106: the kernel forms solar_source = visR * flux, so a direct-beam source
     // albedo A_src != the operator A is applied by uploading the EFFECTIVE flux
     // Q_i * A_src_i / A_i. Reduces to Q_i exactly when no source albedo is installed
     // (visSourceAlbedo returns solar_reflectivity_ -> ratio == 1 bitwise).
     const std::vector<double>& src_alb = visSourceAlbedoSingle();
     for (size_t i = 0; i < n; ++i) {
-        emiss_f[i] = static_cast<float>(emissivity_[i]);
-        refl_f[i]  = static_cast<float>(reflectivity_[i]);
         const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
-        visR_f[i]  = static_cast<float>(A);
-        visE_f[i]  = static_cast<float>(1.0 - A);
+        if (!fused) {
+            emiss_f[i] = static_cast<float>(emissivity_[i]);
+            refl_f[i]  = static_cast<float>(reflectivity_[i]);
+            visR_f[i]  = static_cast<float>(A);
+            visE_f[i]  = static_cast<float>(1.0 - A);
+        }
         temps_f[i] = static_cast<float>(temperatures[i]);
         const double As = (i < src_alb.size()) ? src_alb[i] : A;
         flux_f[i]  = static_cast<float>((As == A) ? solar_flux[i]
                                                   : solar_flux[i] * (As / A));
     }
 
-    // IR band (normal properties already uploaded), no solar source.
-    std::vector<float> ir_f;
-    gpu_solver_->solve(temps_f, zeros_f, ir_f);
-    last_iterations_ir_ = gpu_solver_->getLastIterations();
+    std::vector<float> ir_f, vis_f;
+    long traversals = 0;
+    if (fused) {
+        // FUSED: one width-2 traversal drives both bands while both iterate, and
+        // one final width-2 traversal produces both absorbed fluxes -- so the
+        // timestep costs max(iters_ir, iters_vis) + 1 traversals instead of
+        // (iters_ir + 1) + (iters_vis + 1). Per band the arithmetic, cold start,
+        // row-norm placement and stopping rule are unchanged.
+        gpu_solver_->solveTwoBandFused(temps_f, flux_f, ir_f, vis_f);
+        last_iterations_ir_  = gpu_solver_->getLastIterationsIR();
+        last_iterations_vis_ = gpu_solver_->getLastIterationsVis();
+        traversals = gpu_solver_->getLastTraversals();
+    } else {
+        // Legacy unfused route: two independent solves over the same matrix, with
+        // a property swap between them.
+        // IR band (normal properties already uploaded), no solar source.
+        gpu_solver_->solve(temps_f, zeros_f, ir_f);
+        last_iterations_ir_ = gpu_solver_->getLastIterations();
+        const long trav_ir = gpu_solver_->getLastTraversals();
 
-    // Visible band: swap to (1-A, A), no thermal emission (temps = 0), solar = Q.
-    gpu_solver_->uploadFaceProperties(visE_f, visR_f);
-    std::vector<float> vis_f;
-    gpu_solver_->solve(zeros_f, flux_f, vis_f);
-    // Restore the thermal/IR properties for the next call.
-    gpu_solver_->uploadFaceProperties(emiss_f, refl_f);
+        // Visible band: swap to (1-A, A), no thermal emission (temps = 0), solar = Q.
+        gpu_solver_->uploadFaceProperties(visE_f, visR_f);
+        gpu_solver_->solve(zeros_f, flux_f, vis_f);
+        // Restore the thermal/IR properties for the next call.
+        gpu_solver_->uploadFaceProperties(emiss_f, refl_f);
+        last_iterations_vis_ = gpu_solver_->getLastIterations();
+        traversals = trav_ir + gpu_solver_->getLastTraversals();
+    }
 
-    last_iterations_vis_ = gpu_solver_->getLastIterations();
     last_iterations_ = gpu_solver_->getLastIterations();
     last_residual_   = gpu_solver_->getLastResidual();
     converged_       = gpu_solver_->didConverge();
-    // Two independent full solves on this path, so the bands ADD.
-    last_csr_traversals_ = last_iterations_ir_ + last_iterations_vis_;
+    // Traversals as DISPATCHED, not as inferred from iteration counts: every
+    // solve also pays a final matvec to turn the converged radiosity into flux,
+    // and the fused route shares traversals between the bands. Deriving this from
+    // the iteration counts undercounted the unfused route by 2 per timestep.
+    last_csr_traversals_ = static_cast<int>(traversals);
 
     // vf_row_norm_ is NOT re-applied here: indirect_flux_kernel already folded it
     // into ir_f/vis_f on the device (uploadRowNorm). Multiplying again would square
@@ -1137,7 +1226,8 @@ std::vector<double> RadiositySolver::solveGPU(
 
     // Get convergence info
     last_iterations_ = gpu_solver_->getLastIterations();
-    last_csr_traversals_ = last_iterations_;
+    // Dispatched traversals, which is iterations + the final flux matvec.
+    last_csr_traversals_ = static_cast<int>(gpu_solver_->getLastTraversals());
     last_residual_ = gpu_solver_->getLastResidual();
     converged_ = gpu_solver_->didConverge();
 
@@ -1268,9 +1358,10 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         if (device_steps.empty()) continue;
 
         if (tb) {
+            const bool fuse = gpuFuseBands();
             futures.push_back(gpu_pool_->submit(
                 [&temperatures_per_timestep, &solar_flux_per_timestep,
-                 &indirect_per_timestep, device_steps, n,
+                 &indirect_per_timestep, device_steps, n, fuse,
                  &emiss_f, &refl_f, &visE_f, &visR_f,
                  &op_alb = solar_reflectivity_,
                  &src_single = solar_albedo_source_,
@@ -1299,17 +1390,27 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                             }
                             solar_f[i] = static_cast<float>(q);
                         }
-                        // IR band (device holds IR props), then visible, then
-                        // restore IR -- identical sequence to solveGPUTwoBand.
-                        solver.solve(temps_f, zeros_f, ir_f);
-                        const int it_ir = solver.getLastIterations();
-                        solver.uploadFaceProperties(visE_f, visR_f);
-                        solver.solve(zeros_f, solar_f, vis_f);
-                        const int it_vis = solver.getLastIterations();
-                        solver.uploadFaceProperties(emiss_f, refl_f);
-                        // Two independent full solves per timestep, so the bands ADD.
-                        pool_traversals.fetch_add(it_ir + it_vis,
-                                                  std::memory_order_relaxed);
+                        if (fuse && solver.hasVisibleProperties()) {
+                            // FUSED: one width-2 traversal per iteration while both
+                            // bands iterate, one final width-2 traversal for both
+                            // fluxes -- arithmetically identical per band to the
+                            // unfused sequence below, and identical to what
+                            // solveGPUTwoBand does on the single-GPU rung.
+                            solver.solveTwoBandFused(temps_f, solar_f, ir_f, vis_f);
+                            pool_traversals.fetch_add(solver.getLastTraversals(),
+                                                      std::memory_order_relaxed);
+                        } else {
+                            // IR band (device holds IR props), then visible, then
+                            // restore IR -- identical sequence to solveGPUTwoBand.
+                            solver.solve(temps_f, zeros_f, ir_f);
+                            const long trav_ir = solver.getLastTraversals();
+                            solver.uploadFaceProperties(visE_f, visR_f);
+                            solver.solve(zeros_f, solar_f, vis_f);
+                            solver.uploadFaceProperties(emiss_f, refl_f);
+                            // Two independent full solves per timestep, so they ADD.
+                            pool_traversals.fetch_add(trav_ir + solver.getLastTraversals(),
+                                                      std::memory_order_relaxed);
+                        }
                         auto& out = indirect_per_timestep[k]; out.resize(n);
                         auto& obi = ir_batch[k];
                         auto& obv = vis_batch[k];
@@ -1339,7 +1440,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                             solar_f[i] = static_cast<float>(solar_d[i]);
                         }
                         solver.solve(temps_f, solar_f, indirect_f);
-                        pool_traversals.fetch_add(solver.getLastIterations(),
+                        pool_traversals.fetch_add(solver.getLastTraversals(),
                                                   std::memory_order_relaxed);
                         auto& out = indirect_per_timestep[k];
                         out.resize(n);

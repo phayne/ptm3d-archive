@@ -155,6 +155,29 @@ public:
     void uploadRowNorm(const std::vector<float>& row_norm);
 
     /**
+     * @brief Upload the VISIBLE-band face properties (call once at start)
+     *
+     * The band-separated solve runs the same operator F against two different
+     * property pairs: IR uses (eps, 1-eps) from uploadFaceProperties(), visible
+     * uses (1-A, A) from this call. Uploading the visible pair to its OWN device
+     * buffers is what lets solveTwoBandFused() advance both bands in one CSR
+     * traversal; the legacy route instead re-uploaded the property pair twice per
+     * timestep and ran two separate solves.
+     *
+     * Calling this also allocates the visible band's state buffers, so a caller
+     * that never asks for two-band keeps exactly the legacy device footprint.
+     *
+     * @param emissivity_vis Visible-band absorptivity 1 - A_i (n_faces entries).
+     * @param reflectivity_vis Visible-band reflectivity A_i (n_faces entries).
+     * @throws std::runtime_error on a size mismatch (never silently partial).
+     */
+    void uploadVisibleProperties(const std::vector<float>& emissivity_vis,
+                                 const std::vector<float>& reflectivity_vis);
+
+    /// True once uploadVisibleProperties() has run, i.e. solveTwoBandFused() is usable.
+    bool hasVisibleProperties() const { return visible_properties_uploaded_; }
+
+    /**
      * @brief Solve radiosity equation for one timestep
      *
      * @param temperatures Surface temperatures [K] for all faces
@@ -167,6 +190,44 @@ public:
         std::vector<float>& indirect_flux_out);
 
     /**
+     * @brief Band-separated (two-band) solve, FUSED over one CSR traversal.
+     *
+     * Solves both bands against the shared view-factor matrix:
+     *   IR      : B_ir  = E + (1-eps) * norm * (F B_ir),    E = eps sigma T^4
+     *   Visible : B_vis = A Q + A     * norm * (F B_vis)
+     * and returns each band's absorbed indirect flux
+     *   Q_ir  = eps   * norm * (F B_ir)
+     *   Q_vis = (1-A) * norm * (F B_vis).
+     *
+     * This is the GPU counterpart of RadiositySolver::solveTwoBandJacobiFused():
+     * while BOTH bands are still iterating, one width-2 SpMV reads each CSR row
+     * once and accumulates both dot products, and one Jacobi launch advances both
+     * band vectors. The instant a band meets the stopping criterion it is FROZEN
+     * (its radiosity kept, its matvec skipped) and the slower band finishes on the
+     * single-band kernels -- so a timestep costs max(iters_ir, iters_vis) + 1
+     * traversals instead of (iters_ir + 1) + (iters_vis + 1).
+     *
+     * Per band the arithmetic is unchanged from two separate solve() calls: same
+     * cold start, same update expression, same row-norm-in-kernel placement, same
+     * per-row summation order and tree reduction, same convergence quantity and
+     * the same check interval. The fused result is therefore expected to be
+     * BIT-IDENTICAL to the unfused route, which is what test_two_band_rownorm's
+     * B1f section asserts.
+     *
+     * @param temperatures Surface temperatures [K] (IR band source).
+     * @param solar_flux Incident solar flux [W/m^2], already carrying any
+     *        direct-beam source-albedo prescale (PTM-106) the caller applies.
+     * @param indirect_ir_out Output: absorbed indirect IR flux [W/m^2].
+     * @param indirect_vis_out Output: absorbed indirect visible flux [W/m^2].
+     * @throws std::runtime_error if uploadVisibleProperties() has not run.
+     */
+    void solveTwoBandFused(
+        const std::vector<float>& temperatures,
+        const std::vector<float>& solar_flux,
+        std::vector<float>& indirect_ir_out,
+        std::vector<float>& indirect_vis_out);
+
+    /**
      * @brief Wait for all operations to complete
      */
     void synchronize();
@@ -175,6 +236,25 @@ public:
      * @brief Get number of iterations in last solve
      */
     int getLastIterations() const { return last_iterations_; }
+
+    /// Jacobi iterations the IR band ran in the last solveTwoBandFused().
+    int getLastIterationsIR() const { return last_iterations_ir_; }
+    /// Jacobi iterations the visible band ran in the last solveTwoBandFused().
+    int getLastIterationsVis() const { return last_iterations_vis_; }
+
+    /**
+     * @brief CSR traversals (matvecs) the last solve actually dispatched.
+     *
+     * The measured cost of a radiosity sweep at campaign scale is the number of
+     * times the matrix is read, and that is NOT the iteration count: every solve
+     * also pays one FINAL matvec to turn the converged radiosity into absorbed
+     * flux, and the fused two-band path shares one traversal between the bands
+     * while both iterate. Counting dispatches here (once per logical matvec,
+     * regardless of how many chunk launches it takes) is the only honest way to
+     * state a before/after traversal ratio -- deriving it from getLastIterations()
+     * undercounts every solve by one and the unfused two-band route by two.
+     */
+    long getLastTraversals() const { return last_traversals_; }
 
     /**
      * @brief Get residual from last solve
@@ -211,15 +291,6 @@ private:
     // Release resources
     void release();
 
-    // Compute max residual from change buffer (CPU reduction)
-    double computeMaxResidual();
-
-    // Max over faces of a device float buffer, via the same two-stage reduction
-    // computeMaxResidual() uses. Diagnostic only: used by the PTM_RAD_ITER_TRACE
-    // per-iteration trace to report max|B| alongside max|dB|, so the absolute
-    // (GPU) and relative (CPU) stopping criteria can be compared on one run.
-    double computeMaxOfBuffer(cl_mem buf);
-
     // Build the chunked CSR sub-buffers (PTM-25) when the matrix exceeds the
     // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
     void buildChunkedCsr(const std::vector<double>& values,
@@ -229,6 +300,26 @@ private:
 
     // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.
     void enqueueSpMV(cl_mem x, cl_mem y, size_t global_size, size_t local_size);
+
+    // Enqueue y1 = F * x1 and y2 = F * x2 in ONE structural traversal (width-2),
+    // dispatching to the single-buffer or chunked kernel. Per band the per-row
+    // stride and tree reduction are identical to enqueueSpMV(), so each output is
+    // bit-identical to the single-band kernel's.
+    void enqueueSpMV2(cl_mem x1, cl_mem x2, cl_mem y1, cl_mem y2);
+
+    // Allocate the visible band's state buffers + the 4-segment band scratch.
+    // Called from uploadVisibleProperties() so a gray-only caller never pays for
+    // them. Idempotent.
+    void createTwoBandBuffers();
+
+    // Reduce the first `n_segments` segments of the residual scratch in ONE
+    // kernel launch and ONE device->host read, writing their maxima to out[0..
+    // n_segments). Same reduction kernel, work-group partitioning and host-side
+    // ordering the pre-scratch single-quantity reduction used, so each value is
+    // bit-identical to reducing that quantity's own n_faces-long array.
+    //   n_segments = 2 : gray / single band  (|dB|, |B|)
+    //   n_segments = 4 : fused two-band      (|dB_ir|, |B_ir|, |dB_vis|, |B_vis|)
+    void computeScratchMaxima(int n_segments, double* out);
 
 public:
     // Benchmark the isolated SpMV kernel (single-buffer path only): run the
@@ -263,6 +354,10 @@ private:
     cl_kernel indirect_flux_kernel_ = nullptr;  // Compute absorbed indirect flux
     cl_kernel spmv_chunk_kernel_ = nullptr;     // Chunked CSR SpMV (PTM-25 workaround)
     cl_kernel spmv_vector_chunk_kernel_ = nullptr;  // Chunked CSR-Vector SpMV (coalesced)
+    cl_kernel spmv_vector2_kernel_ = nullptr;       // Width-2 CSR-Vector SpMV (both bands)
+    cl_kernel spmv_vector2_chunk_kernel_ = nullptr; // Width-2 chunked CSR-Vector SpMV
+    cl_kernel jacobi2_kernel_ = nullptr;            // Fused two-band Jacobi update
+    cl_kernel indirect_flux2_kernel_ = nullptr;     // Fused two-band absorbed flux
 
     // CSR matrix buffers (view factors)
     cl_mem buf_csr_values_ = nullptr;      // float [nnz]
@@ -302,21 +397,56 @@ private:
     cl_mem buf_reflectivity_ = nullptr;    // float [n_faces]
     cl_mem buf_row_norm_ = nullptr;        // float [n_faces] - 1/max(1, sum_j F_ij), seeded to 1
 
-    // Convergence checking
-    cl_mem buf_change_ = nullptr;          // float [n_faces] - |B_new - B_old|
-    cl_mem buf_partial_max_ = nullptr;     // float [n_work_groups] - partial max for reduction
-    size_t n_reduction_groups_ = 0;        // Number of work groups for reduction
+    // Visible-band state, allocated only when uploadVisibleProperties() runs
+    // (createTwoBandBuffers). The IR band reuses the buffers above, so the gray
+    // and IR arithmetic is literally the same code on the same memory.
+    cl_mem buf_radiosity_vis_ = nullptr;      // float [n_faces]
+    cl_mem buf_radiosity_vis_new_ = nullptr;  // float [n_faces]
+    cl_mem buf_F_B_vis_ = nullptr;            // float [n_faces]
+    cl_mem buf_emissivity_vis_ = nullptr;     // float [n_faces] - 1 - A
+    cl_mem buf_reflectivity_vis_ = nullptr;   // float [n_faces] - A
+    cl_mem buf_indirect_flux_vis_ = nullptr;  // float [n_faces]
+    // Persistent all-zero source for the visible band's cold start.
+    // ⛔ Do NOT replace this with clEnqueueFillBuffer: on this machine's
+    // AMD Radeon PRO W6800X Duo (Apple OpenCL 1.2) clEnqueueFillBuffer returns
+    // CL_SUCCESS and leaves the buffer holding GARBAGE (measured 2026-08-16 with
+    // a standalone probe: a buffer seeded to 12345.0 came back as -1.57e6, and
+    // the resulting solve started the visible band at |B| ~ 1e21 and needed 4x
+    // the Jacobi iterations to decay back down). A device-to-device copy from a
+    // buffer zeroed once by clEnqueueWriteBuffer is the reliable mechanism, and
+    // it is also structurally identical to how the unfused route cold-starts
+    // (clEnqueueCopyBuffer from its zero-valued emission buffer).
+    cl_mem buf_zeros_ = nullptr;              // float [n_faces], all 0.0f
 
-    // Host-side buffer for convergence reduction
-    std::vector<float> change_host_;
+    // Residual scratch, allocated for every solver in createBuffers():
+    //   gray / single band : [0*seg,1*seg) |dB|      [1*seg,2*seg) |B|
+    //   fused two-band     : + [2*seg,3*seg) |dB_vis| [3*seg,4*seg) |B_vis|
+    // seg = n_reduction_groups_ * work_group_size >= n_faces, so every segment
+    // starts on a work-group boundary and one reduction launch over the segments
+    // in use yields every maximum with a SINGLE device->host read -- the same one
+    // round trip per check the old single-quantity reduction paid. The
+    // [n_faces, seg) tail of each segment is zero-filled at creation and never
+    // written, so the per-group partial maxima match the old reduction exactly.
+    // Carrying |B| alongside |dB| is what makes a RELATIVE stopping criterion
+    // free: it is reduced in the same launch as the absolute one.
+    cl_mem buf_resid_scratch_ = nullptr;   // float [4 * seg]
+    cl_mem buf_partial_max4_ = nullptr;    // float [4 * n_reduction_groups_]
+    size_t band_segment_ = 0;              // seg
+
+    // Convergence checking
+    size_t n_reduction_groups_ = 0;        // Number of work groups for reduction
 
     bool initialized_ = false;
     bool view_factors_uploaded_ = false;
     bool properties_uploaded_ = false;
+    bool visible_properties_uploaded_ = false;
     bool has_previous_solution_ = false;  // For warm starting
 
     // Convergence tracking
     int last_iterations_ = 0;
+    int last_iterations_ir_ = 0;
+    int last_iterations_vis_ = 0;
+    long last_traversals_ = 0;   // CSR matvecs dispatched by the last solve
     double last_residual_ = 0.0;
     bool converged_ = false;
     float last_solve_time_ms_ = 0.0f;

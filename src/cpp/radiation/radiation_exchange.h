@@ -368,6 +368,12 @@ public:
     // Per-band sweep counts from the last two-band solve (Fermi's measurement).
     int getLastIterationsIR() const { return last_iterations_ir_; }
     int getLastIterationsVis() const { return last_iterations_vis_; }
+    // CSR traversals (matvecs) the last solve actually dispatched. This is the
+    // measured cost of a sweep and it is NOT the iteration count: a solve also
+    // pays a final matvec to turn the converged radiosity into absorbed flux, and
+    // the fused two-band routes (CPU and GPU) share one traversal between the
+    // bands while both iterate.
+    int getLastCsrTraversals() const { return last_csr_traversals_; }
     double getLastResidual() const { return last_residual_; }
     bool didConverge() const { return converged_; }
 
