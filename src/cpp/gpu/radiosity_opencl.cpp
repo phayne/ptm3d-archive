@@ -856,15 +856,41 @@ double RadiosityOpenCLSolver::benchmarkSpMV(int n_reps, int mode)
                    .count() / 1000.0;
     };
 
+    // This benchmark drives the SINGLE-BUFFER kernels directly, so it needs the
+    // single-buffer CSR to exist. On a matrix above the per-chunk budget the CSR
+    // lives in csr_chunks_ and buf_csr_values_/_col_indices_/_row_ptrs_ are all
+    // still nullptr -- and OpenCL PERMITS a NULL cl_mem kernel argument, so the
+    // kernels would run against null pointers and this function would return a
+    // plausible millisecond number measured on nothing. That is exactly the trap
+    // for anyone benchmarking SpMV at campaign scale (>500M nnz), which is the
+    // only regime where it matters. Refuse loudly instead.
+    if (use_chunked_csr_) {
+        throw std::runtime_error(
+            "benchmarkSpMV: this matrix (" + std::to_string(nnz_) +
+            " nnz) was uploaded through the CHUNKED CSR path (PTM-25), so the "
+            "single-buffer CSR buffers this benchmark drives do not exist. "
+            "Benchmarking it here would time the kernels against null buffers "
+            "and report a meaningless number. Use the solver's own per-solve "
+            "timing (getLastSolveTimeMs) at this scale.");
+    }
+    if (!view_factors_uploaded_ || !buf_csr_values_ || !buf_csr_col_indices_ ||
+        !buf_csr_row_ptrs_) {
+        throw std::runtime_error(
+            "benchmarkSpMV: no single-buffer CSR is resident on the device "
+            "(uploadViewFactors has not run, or ran with an empty matrix).");
+    }
+
     if (mode == 0) {
         const size_t local_size = config_.work_group_size;
         const size_t gs = ((n_faces_ + local_size - 1) / local_size) * local_size;
-        clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
-        clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
-        clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
-        clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
-        clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
-        clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces);
+        // Every argument is checked: an unchecked clSetKernelArg turns a wrong
+        // buffer or a stale kernel into a silently wrong timing, not an error.
+        ck(clSetKernelArg(spmv_kernel_, 0, sizeof(cl_mem), &buf_csr_values_), "arg0");
+        ck(clSetKernelArg(spmv_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_), "arg1");
+        ck(clSetKernelArg(spmv_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_), "arg2");
+        ck(clSetKernelArg(spmv_kernel_, 3, sizeof(cl_mem), &buf_radiosity_), "arg3");
+        ck(clSetKernelArg(spmv_kernel_, 4, sizeof(cl_mem), &buf_F_B_), "arg4");
+        ck(clSetKernelArg(spmv_kernel_, 5, sizeof(int), &n_faces), "arg5");
         clFinish(queue);
         const double t0 = tick();
         for (int r = 0; r < n_reps; ++r) {
@@ -877,13 +903,13 @@ double RadiosityOpenCLSolver::benchmarkSpMV(int n_reps, int mode)
     } else {
         const size_t warp = 64;  // AMD wavefront: coalesced cooperative row reads
         const size_t gs = n_faces_ * warp;
-        clSetKernelArg(spmv_vector_kernel_, 0, sizeof(cl_mem), &buf_csr_values_);
-        clSetKernelArg(spmv_vector_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_);
-        clSetKernelArg(spmv_vector_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_);
-        clSetKernelArg(spmv_vector_kernel_, 3, sizeof(cl_mem), &buf_radiosity_);
-        clSetKernelArg(spmv_vector_kernel_, 4, sizeof(cl_mem), &buf_F_B_);
-        clSetKernelArg(spmv_vector_kernel_, 5, sizeof(int), &n_faces);
-        clSetKernelArg(spmv_vector_kernel_, 6, warp * sizeof(float), nullptr);
+        ck(clSetKernelArg(spmv_vector_kernel_, 0, sizeof(cl_mem), &buf_csr_values_), "arg0");
+        ck(clSetKernelArg(spmv_vector_kernel_, 1, sizeof(cl_mem), &buf_csr_col_indices_), "arg1");
+        ck(clSetKernelArg(spmv_vector_kernel_, 2, sizeof(cl_mem), &buf_csr_row_ptrs_), "arg2");
+        ck(clSetKernelArg(spmv_vector_kernel_, 3, sizeof(cl_mem), &buf_radiosity_), "arg3");
+        ck(clSetKernelArg(spmv_vector_kernel_, 4, sizeof(cl_mem), &buf_F_B_), "arg4");
+        ck(clSetKernelArg(spmv_vector_kernel_, 5, sizeof(int), &n_faces), "arg5");
+        ck(clSetKernelArg(spmv_vector_kernel_, 6, warp * sizeof(float), nullptr), "arg6");
         clFinish(queue);
         const double t0 = tick();
         for (int r = 0; r < n_reps; ++r) {

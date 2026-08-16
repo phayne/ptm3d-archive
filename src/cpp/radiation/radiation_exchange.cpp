@@ -14,6 +14,8 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -754,7 +756,18 @@ void RadiositySolver::initGPU() {
         return global_mem > deviceReserve(global_mem)
             && needed_bytes <= global_mem - deviceReserve(global_mem);
     };
-    auto gb = [](size_t b) -> double { return b / (1024.0 * 1024.0 * 1024.0); };
+    // GB, formatted on a LOCAL stream. std::cout arrives here carrying
+    // std::scientific << setprecision(1) from an earlier progress banner, which
+    // rendered the whole ACTIVE RUNG line as "2e+01 GB CSR+working on a 3e+01 GB
+    // device" -- the PTM-05 archetype (same fix as thermal_opencl.cpp's
+    // surface-BC certificate), on the one line whose job is to say exactly how
+    // much memory the run just committed. Never format these through the ambient
+    // std::cout state.
+    auto gb = [](size_t b) -> std::string {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(2) << (b / (1024.0 * 1024.0 * 1024.0));
+        return o.str();
+    };
 
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
@@ -837,8 +850,11 @@ void RadiositySolver::initGPU() {
     // ---- Degrade ladder: multi-GPU pool -> single-GPU -> CPU ----
     // Every downgrade warns (never silent) and the ACTIVE RUNG is always named.
 
-    // Rung 1: multi-GPU pool (only when gpu_devices > 1 / device_ids set, and not
-    // two-band -- 2d). On any failure we fall through to the single-GPU rung.
+    // Rung 1: multi-GPU pool (whenever gpu_devices > 1 / device_ids are set). It
+    // serves BOTH the gray and the band-separated solve -- solveBatch()'s pool
+    // worker runs the same band orchestration as solveGPUTwoBand, and the
+    // two_band_gpu_ok_ publication below covers it. On any failure we fall
+    // through to the single-GPU rung.
     if (want_pool) {
         // Resolve which physical devices to use (mirrors the thermal pool).
         std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =

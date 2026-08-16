@@ -235,6 +235,10 @@ public:
     // chosen kernel n_reps times back-to-back with clFinish fences, return total
     // milliseconds. mode 0 = scalar (one work-item/row), 1 = vector (one
     // wavefront/row, coalesced). Uses the uploaded CSR + buf_radiosity_ as x.
+    // THROWS if the matrix went through the chunked upload path (PTM-25) or no
+    // CSR is resident: the single-buffer kernel arguments would otherwise be NULL
+    // cl_mem handles, which OpenCL accepts, producing a timing measured against
+    // null pointers instead of an error.
     double benchmarkSpMV(int n_reps, int mode);
 private:
 
