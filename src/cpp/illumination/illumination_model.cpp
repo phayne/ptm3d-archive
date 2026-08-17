@@ -2266,6 +2266,7 @@ bool IlluminationModel::calculateIlluminationOptimized(
                     face_centers,
                     face_normals,
                     primary_pos,
+                    sun_pos,
                     timestep_primary_ir
                 );
                 debugPrint("Debug: Primary IR calculation complete for time step " + std::to_string(t+1));
@@ -3773,7 +3774,8 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         calculatePrimaryIRBatch(
             face_centers,                    // Use original face centers
             corrected_normals,                // Use CORRECTED normals
-            primary_position, 
+            primary_position,
+            sun_position,
             primary_ir_batch
         );
         
@@ -4390,7 +4392,8 @@ void IlluminationModel::createCoordinateSystem(
 void IlluminationModel::updatePrimaryDiskVisibility(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
-    const std::array<double, 3>& primary_position) {
+    const std::array<double, 3>& primary_position,
+    const std::array<double, 3>& sun_position) {
 
     const size_t num_faces = face_centers.size();
 
@@ -4400,6 +4403,9 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         primary_vis_key_pos_[0] == primary_position[0] &&
         primary_vis_key_pos_[1] == primary_position[1] &&
         primary_vis_key_pos_[2] == primary_position[2] &&
+        primary_vis_key_sun_[0] == sun_position[0] &&
+        primary_vis_key_sun_[1] == sun_position[1] &&
+        primary_vis_key_sun_[2] == sun_position[2] &&
         primary_vis_mean_cos_.size() == num_faces) {
         return;                                   // memo hit
     }
@@ -4492,7 +4498,36 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         const char* e = std::getenv("PTM_PRIMARY_DISK_STATS");
         return e && std::atoi(e) != 0;
     }();
+    // ---- per-face ray budget (primary_disk.h) ------------------------------
+    // OFF only by explicit opt-out or by the ALWAYS_SAMPLE upper-bound arm,
+    // which has to keep meaning "always sample" or it stops being an upper
+    // bound on the fast path's error (Fermi F1).
+    static const bool budget_opt_out = [](){
+        const char* e = std::getenv("PTM_PRIMARY_DISK_BUDGET");
+        const bool off = e && std::atoi(e) == 0;
+        if (off) {
+            std::cerr << "[illumination] PTM_PRIMARY_DISK_BUDGET=0: the per-face "
+                         "primary-disk ray budget is DISABLED; every escalating face "
+                         "gets " << ptm::disk::PRIMARY_DISK_SAMPLES
+                      << " rays. THIS CHANGES RESULTS (back to the pre-2026-08-16 "
+                         "behavior)." << std::endl;
+        }
+        return off;
+    }();
+    if (!budget_opt_out && !always_sample && !primary_budget_configured_) {
+        warnPrimaryBudgetUnconfiguredOnce();
+    }
+    const bool budget_on = !budget_opt_out && !always_sample
+                        && (primary_budget_eps_sigma_ > 0.0);
+    const double budget_eps_sigma  = primary_budget_eps_sigma_;
+    const double budget_floor_flux = primary_budget_floor_flux_;
+
     size_t n_below = 0, n_full = 0, n_dark = 0, n_sampled = 0;
+    // Census of the ladder: one bucket per rung plus the "budget unreachable,
+    // kept PRIMARY_DISK_SAMPLES" bucket, and the actual ray count. Without the
+    // ray count the census cannot be checked against a stopwatch.
+    std::array<size_t, ptm::disk::PRIMARY_DISK_NUM_TIERS> n_tier{};
+    size_t n_capped = 0, n_rays = 0;
     // Fermi F1 accounting: faces whose analytic clip A is POSITIVE but which end
     // at zero anyway, and why. On a closed convex mesh the limb legitimately
     // blocks grazing rays, so this is not expected to be zero -- but it must be
@@ -4514,9 +4549,14 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     constexpr bool REUSE = decltype(reuse_tag)::value;
     size_t n_below_l = 0, n_full_l = 0, n_dark_l = 0, n_sampled_l = 0;
     size_t n_zero_by_rays_l = 0, n_probe_underflow_l = 0, n_reused_l = 0;
+    size_t n_capped_l = 0, n_rays_l = 0;
+    size_t nt0 = 0, nt1 = 0, nt2 = 0, nt3 = 0, nt4 = 0, nt5 = 0;
+    static_assert(ptm::disk::PRIMARY_DISK_NUM_TIERS == 6,
+                  "the census reduction below names one accumulator per rung");
     #pragma omp parallel for schedule(dynamic) \
         reduction(+:n_below_l, n_full_l, n_dark_l, n_sampled_l, \
-                    n_zero_by_rays_l, n_probe_underflow_l, n_reused_l)
+                    n_zero_by_rays_l, n_probe_underflow_l, n_reused_l, \
+                    n_capped_l, n_rays_l, nt0, nt1, nt2, nt3, nt4, nt5)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
 
@@ -4552,6 +4592,50 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             primary_vis_mean_cos_[i] = A;
             ++n_full_l;
             continue;
+        }
+
+        // ---- per-face ray budget (primary_disk.h) --------------------------
+        // F_full is what a FULLY VISIBLE disk delivers to this face: the same
+        // two photometric models the two batch functions apply downstream,
+        // evaluated at mean_cos = A, so the budget prices the exact quantity a
+        // visibility error moves. Calling them rather than restating them is
+        // deliberate -- a second copy of the Lambert sphere is how PTM-45(ii)
+        // happened. The reflected half is counted only when the run actually
+        // delivers it.
+        uint32_t n_samp_face = N_SAMP;
+        bool budget_unreachable = false;
+        if (budget_on) {
+            double f_full = calculatePrimaryHeating(A, dist);
+            if (include_primary_reflection_) {
+                f_full += calculatePrimaryReflectedLight(
+                    A, dir, sun_position, primary_position, dist);
+            }
+            const double dv_allowed = ptm::disk::primaryDiskAllowedVisibilityError(
+                f_full, budget_floor_flux, budget_eps_sigma);
+            n_samp_face = ptm::disk::primaryDiskSamplesForAllowedError(dv_allowed);
+            budget_unreachable = (dv_allowed <
+                ptm::disk::PRIMARY_DISK_TIERS[ptm::disk::PRIMARY_DISK_NUM_TIERS-1]
+                    .worst_visibility_error);
+            if (n_samp_face == 0) {
+                // This face could absorb dV = 1 -- the whole range -- inside the
+                // kelvin budget. There is nothing a ray could tell it that is
+                // worth the ray, so it takes the analytic clip and casts none,
+                // not even the probe. Bounded by construction: F_full here is
+                // small enough that all of it is worth < the budget.
+                //
+                // It does NOT write the reuse cache. V = 1 here is an
+                // affordability statement about THIS step's A, not a terrain
+                // measurement, and A is recomputed from the true primary
+                // position every step: a later step in the same lattice cell,
+                // with A grown enough to need rays, would otherwise read a 1
+                // that no ray supports. That is the exact bug the negative
+                // "not evaluated" sentinel exists to prevent
+                // (PTM_PRIMARY_DISK_REUSE_VERIFY caught it once already).
+                primary_vis_mean_cos_[i] = A;
+                ++n_full_l;
+                ++nt0;
+                continue;
+            }
         }
 
         if constexpr (REUSE) {
@@ -4681,15 +4765,23 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         };
 
         // ---- cheap probe: center + 4 rim points, above-horizon only ---------
+        // The two cosine accumulators are the probe's own estimate of V, on the
+        // same weighting the escalation uses. They are pure additions: no
+        // control flow moved, and both short-circuits below still assign the
+        // literals 1.0 and 0.0, so a unanimous probe is unaffected.
         uint32_t probes_up = 0, probes_clear = 0;
+        double probe_w_total = 0.0, probe_w_clear = 0.0;
         for (uint32_t k = 0; k < ptm::disk::PRIMARY_DISK_PROBES; ++k) {
             double dx, dy;
             ptm::disk::probeOffset(k, dx, dy);
             const std::array<double, 3> sd = disk_dir(dx, dy);
-            if (dotProduct(fn, sd) <= 0.0) continue;   // carries no flux anyway
+            const double pw = dotProduct(fn, sd);
+            if (pw <= 0.0) continue;                   // carries no flux anyway
             ++probes_up;
-            if (!occluded(sd)) ++probes_clear;
+            probe_w_total += pw;
+            if (!occluded(sd)) { ++probes_clear; probe_w_clear += pw; }
         }
+        n_rays_l += probes_up;
 
         // Everything below is a SHORT-CIRCUIT of the sampler, so all of it is
         // gated on !always_sample: PTM_PRIMARY_DISK_ALWAYS_SAMPLE has to mean
@@ -4728,13 +4820,45 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         }
         ++n_sampled_l;
 
+        // The probe is already paid for. A face whose budget covers the probe's
+        // own worst error stops here and spends nothing further -- this is the
+        // rung that most of an A3GT mesh lands on, and it is why the census's
+        // "sampled" count and its RAY count no longer move together.
+        if (n_samp_face == ptm::disk::PRIMARY_DISK_PROBES) {
+            const double v_probe = (probe_w_total > 0.0)
+                ? (probe_w_clear / probe_w_total) : 0.0;
+            if (v_probe <= 0.0) ++n_zero_by_rays_l;
+            // Not cached, for the same reason the no-ray rung is not: a probe
+            // fraction is only good enough for the rung that asked for it, and
+            // the cache is read by whatever rung comes next in the cell.
+            primary_vis_mean_cos_[i] = A * v_probe;
+            ++nt1;
+            continue;
+        }
+        // Census bucket is looked up in the ladder rather than hard-coded on
+        // the sample count, so editing the ladder cannot silently mislabel a
+        // rung. Rungs 0 and 1 are the two no-extra-ray sentinels handled above.
+        {
+            int rung = ptm::disk::PRIMARY_DISK_NUM_TIERS - 1;
+            for (int t = 2; t < ptm::disk::PRIMARY_DISK_NUM_TIERS; ++t) {
+                if (ptm::disk::PRIMARY_DISK_TIERS[t].samples == n_samp_face) { rung = t; break; }
+            }
+            switch (rung) {
+                case 2:  ++nt2; break;
+                case 3:  ++nt3; break;
+                case 4:  ++nt4; break;
+                default: ++nt5; if (budget_unreachable) ++n_capped_l; break;
+            }
+        }
+        n_rays_l += n_samp_face;
+
         // ---- escalate: cosine-weighted unoccluded fraction of the disk ------
         // V is a RATIO over the same sample set, so the O(alpha^2) bias of
         // sampling a projected disk cancels and V == 1 reproduces A exactly.
         double w_total = 0.0, w_clear = 0.0;
-        for (uint32_t k = 0; k < N_SAMP; ++k) {
+        for (uint32_t k = 0; k < n_samp_face; ++k) {
             double su, sv;
-            ptm::disk::hammersley(k, N_SAMP, 0.0, 0.0, su, sv);
+            ptm::disk::hammersley(k, n_samp_face, 0.0, 0.0, su, sv);
             double dx, dy;
             ptm::disk::squareToConcentricDisk(su, sv, dx, dy);
             const std::array<double, 3> sd = disk_dir(dx, dy);
@@ -4755,6 +4879,9 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     n_below += n_below_l;   n_full += n_full_l;   n_dark += n_dark_l;
     n_sampled += n_sampled_l;  n_zero_by_rays += n_zero_by_rays_l;
     n_probe_underflow += n_probe_underflow_l;  n_reused += n_reused_l;
+    n_capped += n_capped_l;  n_rays += n_rays_l;
+    n_tier[0] += nt0;  n_tier[1] += nt1;  n_tier[2] += nt2;
+    n_tier[3] += nt3;  n_tier[4] += nt4;  n_tier[5] += nt5;
     };  // sweep
 
     if (reuse_enabled) sweep(std::true_type{});
@@ -4763,6 +4890,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
     primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
     primary_vis_key_pos_     = primary_position;
+    primary_vis_key_sun_     = sun_position;
     primary_vis_key_n_       = num_faces;
     if (reuse_enabled) {
         primary_vis_terrain_centers_ = static_cast<const void*>(face_centers.data());
@@ -4773,12 +4901,62 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     if (report_stats) {
         std::cerr << "[illumination] primary disk: " << num_faces << " faces -- "
                   << n_below << " below horizon, " << n_full << " fully visible, "
-                  << n_dark << " fully occluded, " << n_sampled << " sampled ("
-                  << N_SAMP << " rays each); A>0 zeroed BY RAYS " << n_zero_by_rays
+                  << n_dark << " fully occluded, " << n_sampled << " sampled"
+                  << "; A>0 zeroed BY RAYS " << n_zero_by_rays
                   << ", probe-underflow fallbacks " << n_probe_underflow
                   << "; terrain factor " << (reuse_terrain ? "REUSED" : "recomputed")
                   << " for " << n_reused << " faces"
                   << std::endl;
+        // The ladder census. "budget" is the per-face rung; "rays" is what the
+        // epoch actually cast, probes included, which is the number a stopwatch
+        // can be checked against.
+        std::cerr << "[illumination] primary disk budget: ";
+        if (!budget_on) {
+            std::cerr << "OFF (" << (budget_opt_out ? "opt-out" : "no floor flux supplied")
+                      << ") -- ";
+        } else {
+            std::cerr << "floor " << budget_floor_flux << " W/m^2, T_floor "
+                      << std::pow(budget_floor_flux / budget_eps_sigma, 0.25) << " K, "
+                      << ptm::disk::PRIMARY_DISK_TEMPERATURE_BUDGET_K << " K -- ";
+        }
+        for (int t = 0; t < ptm::disk::PRIMARY_DISK_NUM_TIERS; ++t) {
+            std::cerr << "N=" << ptm::disk::PRIMARY_DISK_TIERS[t].samples
+                      << ":" << n_tier[t] << " ";
+        }
+        std::cerr << "(" << n_capped << " over budget at the cap); "
+                  << n_rays << " primary-disk rays this epoch" << std::endl;
+    }
+}
+
+// Rule 7: a caller that never armed the budget gets the pre-2026-08-16 cost,
+// which is a silent 34.5x ray bill if nothing says so.
+void IlluminationModel::warnPrimaryBudgetUnconfiguredOnce() const {
+    static std::once_flag once;
+    std::call_once(once, [](){
+        std::cerr << "[illumination] NOTE: the per-face primary-disk ray budget was "
+                     "never armed (setPrimaryDiskBudget not called, or Qb <= 0). "
+                     "Every escalating face keeps PRIMARY_DISK_SAMPLES rays -- the "
+                     "pre-2026-08-16 cost, and the pre-2026-08-16 accuracy. "
+                     "Warned once." << std::endl;
+    });
+}
+
+void IlluminationModel::setPrimaryDiskBudget(double emissivity, double floor_flux_w_m2) {
+    if (!(emissivity > 0.0)) {
+        std::cerr << "[illumination] WARNING: setPrimaryDiskBudget(emissivity="
+                  << emissivity << ") is not positive -- IGNORED, the per-face "
+                     "primary-disk ray budget stays disarmed." << std::endl;
+        return;
+    }
+    primary_budget_eps_sigma_  = emissivity * constants::STEFAN_BOLTZMANN;
+    primary_budget_floor_flux_ = (floor_flux_w_m2 > 0.0) ? floor_flux_w_m2 : 0.0;
+    primary_budget_configured_ = true;
+    if (!(floor_flux_w_m2 > 0.0)) {
+        std::cerr << "[illumination] NOTE: primary-disk ray budget armed with a "
+                     "deep-heat flux of " << floor_flux_w_m2 << " W/m^2. With no "
+                     "floor the coldest a face can be is 0 K, so the budget is "
+                     "unreachable on every face and every escalation keeps "
+                  << ptm::disk::PRIMARY_DISK_SAMPLES << " rays." << std::endl;
     }
 }
 
@@ -4819,6 +4997,7 @@ void IlluminationModel::calculatePrimaryIRBatch(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
     const std::array<double, 3>& primary_position,
+    const std::array<double, 3>& sun_position,
     std::vector<double>& ir_values) {
     
     size_t num_faces = face_centers.size();
@@ -4850,7 +5029,7 @@ void IlluminationModel::calculatePrimaryIRBatch(
     // PTM-44: one evaluation of the finite disk's visibility, shared with
     // calculatePrimaryReflectedBatch. Replaces the per-face center ray AND the
     // hard cos_angle <= 0 cut that used to live in this loop.
-    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
+    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position, sun_position);
 
     // Process each face in parallel
     #pragma omp parallel for schedule(dynamic)
@@ -4899,7 +5078,7 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
 
     // PTM-44: shared finite-disk visibility (memoized -- the IR batch that runs
     // beside this one gets the same evaluation, not a second set of rays).
-    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position);
+    updatePrimaryDiskVisibility(face_centers, face_normals, primary_position, sun_position);
 
     // Detect if face centers are in meters or kilometers (needed only to put
     // the face center in km for the phase-angle geometry).
