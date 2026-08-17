@@ -19,11 +19,22 @@ coupling ray-traced illumination (Intel Embree + NASA SPICE ephemerides) with a
 1D Crank-Nicolson thermal solver and full inter-face thermal radiation exchange
 on arbitrary 3D terrain. It is built for physical accuracy and computational speed across a range of planetary thermal environments, from permanently shadowed craters to icy satellite surfaces and asteroids.
 
+![Global lunar surface temperatures](docs/figures/moon_global_res9_temperature.png)
+*Global lunar surface temperatures on a 5.2-million-face icosphere
+(resolution 9), one snapshot from a full-lunation PTM3D run with topographic
+shadowing and SPICE solar geometry.*
+
+![Europa surface temperature animation](docs/figures/europa_res7_temperature_animation.gif)
+*Global Europa surface temperatures over one Europan day (3.55 Earth days),
+computed with SPICE geometry, per-face albedo, and Jupiter's reflected light
+and thermal emission included.*
+
 ![Lunar polar crater temperatures](docs/figures/temp_3d_native_twoband_v3.png)
-*A lunar south-polar crater in PTM3D: (a) diurnal-mean surface temperature on
-the native terrain mesh; (b) the warming contributed by inter-face radiation
-exchange (two-band radiosity) — crater walls and floors heated by scattered
-sunlight and thermal emission from surrounding terrain.*
+*A simulated lunar south-polar crater, ~1.5 m in diameter, modeled at ~1 mm
+resolution in PTM3D: (a) diurnal-mean surface temperature on the native
+terrain mesh; (b) the warming contributed by inter-face radiation exchange
+(two-band radiosity) — crater walls and floors heated by scattered sunlight
+and thermal emission from surrounding terrain.*
 
 ## What it does
 
