@@ -63,7 +63,9 @@ bool RadiosityGPUDevicePool::uploadStaticData(
     const std::vector<int64_t>& csr_row_ptrs,
     const std::vector<float>& emissivity,
     const std::vector<float>& reflectivity,
-    const std::vector<float>& row_norm) {
+    const std::vector<float>& row_norm,
+    const std::vector<float>& emissivity_vis,
+    const std::vector<float>& reflectivity_vis) {
 
     if (!initialized_) {
         std::cerr << "[Radiosity Pool] uploadStaticData() called before initialize()\n";
@@ -86,6 +88,14 @@ bool RadiosityGPUDevicePool::uploadStaticData(
             // rho*(norm.F), i.e. a different physics per GPU. Same fail-loud
             // treatment as the CSR.
             if (!row_norm.empty()) slot->solver->uploadRowNorm(row_norm);
+            // Same reasoning as the row norm: the visible-band property pair
+            // decides whether this device runs the fused or the unfused two-band
+            // route. A device that missed it would silently take the slow route
+            // while its peers took the fast one -- same answer, but a per-device
+            // difference that nothing would report.
+            if (!emissivity_vis.empty() || !reflectivity_vis.empty()) {
+                slot->solver->uploadVisibleProperties(emissivity_vis, reflectivity_vis);
+            }
         } catch (const std::exception& e) {
             std::cerr << "[Radiosity Pool] Static-data upload failed on device " << i
                       << " (" << slot->handle.name << "): " << e.what() << "\n";

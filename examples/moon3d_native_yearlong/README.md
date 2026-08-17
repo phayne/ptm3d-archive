@@ -80,14 +80,16 @@ environment because no config key exists for it:
 
 ```sh
 export PTM_HMATRIX_VF_REPLACE=/path/to/moon3d/vf/moon3d_c_cartesian_NEW_500k_clean_corrected_pp.csr
-export PTM_HMATRIX_VF_REPLACE_GPU=1     # required, or the radiosity silently runs on the CPU
 ```
 
-Both are documented in `docs/ENVIRONMENT.md`. Without `..._GPU=1` the replacement is
-installed as a CPU-only operator and `radiation.use_gpu: true` is quietly ignored for the
-radiosity solve. The correct-engagement banner is
-`REPLACED H-matrix with symmetric per-partner referee VF … mesh-hash OK`; again,
-`run_yearlong_wedge_safe.py` checks for it.
+Documented in `docs/ENVIRONMENT.md`. Since 2026-08-16 the operator the replacement lands in
+follows `radiation.use_gpu`, so this one variable is enough; the campaign as originally run
+also exported `PTM_HMATRIX_VF_REPLACE_GPU=1`, which is now redundant but still honored as an
+explicit override. The correct-engagement banner is
+`[PTM_HMATRIX_VF_REPLACE] ROUTE = GPU (radiation.use_gpu in the config) … mesh-hash OK`
+(it read `REPLACED H-matrix with symmetric per-partner referee VF … mesh-hash OK` on the
+CPU route before that date, and still does on the CPU route); `run_yearlong_wedge_safe.py`
+checks for it.
 
 **This path is per machine and is deliberately not recorded in the YAML.** There is no
 in-repository copy and no download.
