@@ -37,26 +37,53 @@ settling in the first ~30 cycles.
 
 ## Manuscript Fig. 5 — Thermal-column validation vs. Diviner and Apollo
 
-![Manuscript Fig. 5: heat1d vs. Hayne et al. (2017), Diviner, and Apollo](figures/validation_fig05_thermal_diviner_apollo.png)
+![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](figures/validation_fig05_ptm3d_hayne_apollo.png)
 
 Manuscript caption: "Validation of the 3D thermophysical model with
 comparison to Diviner data (left panel) and Apollo heat flow probe data
-(right panel)." **Read literally, the plotted model curves in this figure
-are heat1d** — PTM3D's 1D thermal-column reference implementation (same
-author, same Crank–Nicolson conduction physics as PTM3D's own column
-solver) — labeled "(heat1d)" in the left-panel legend and titled "heat1d vs.
-Hayne et al. (2017)" on the figure itself. The manuscript presents this
-heat1d-vs-reference-data match as validating the 3D model's thermal-column
-physics, since that physics is shared between the two codes; it is not a
-run of the 3D radiative-illumination framework end to end. Left panel:
-equatorial, 30°, and 60° diurnal surface-temperature curves vs. Diviner
-brightness temperatures and the Hayne et al. (2017) equatorial peak/night
-reference points. Right panel: diurnal-mean subsurface profiles vs. the
-Apollo 15 and 17 heat-flow-probe sites (Hayne et al. 2017 compilation).
-**Headline:** "surface temperatures during the lunar daytime and nighttime
-from Diviner and subsurface temperatures from Apollo were fit
-simultaneously to within the measurement errors" (no single RMS/bias number
-is given in the manuscript text for this figure).
+(right panel)." **Read literally, the plotted model curves in the
+submitted manuscript's own Fig. 5 are heat1d** — PTM3D's 1D thermal-column
+reference implementation (same author, same Crank–Nicolson conduction
+physics as PTM3D's own column solver) — labeled "(heat1d)" in the
+left-panel legend and titled "heat1d vs. Hayne et al. (2017)" on the figure
+itself. The image above is **not** that figure: it is a PTM3D-native
+re-run of the same tests, run end to end through the 3D
+thermal-illumination framework rather than the 1D reference column, so the
+caveat that applied to the submitted manuscript's own Fig. 5 does not apply
+here. The submitted manuscript itself is unchanged and still plots heat1d;
+this re-run is queued for the manuscript's revisions (tracked separately,
+not made here).
+
+**Recipe:** smooth global icosphere, resolution 6 (81,920 faces; a convex
+body makes `radiation.enabled: false` physically exact, not an
+approximation), CPU-only illumination and thermal solve, body=Moon using
+the manuscript's own Table 1 (Hayne et al. 2017) thermophysical properties
+unmodified (`thermal_m/n/b = 10/15/15`, unchanged from the tracked
+default), `equilibration_orbits: 60` (raised from the example config's
+default of 1 after a 2/5/10/20/30/45-orbit convergence sweep showed the
+≳0.4 m diurnal-mean plateau — the binding observable for the right panel —
+moves <0.02 K/orbit by orbit 45). Reference points (Diviner nighttime dots,
+Hayne et al. 2017 equatorial peak/midnight/minimum squares, Apollo 15/17
+probe points) were digitized directly from the submitted manuscript's own
+`fig05.pdf` vector content (exact marker/axis-tick coordinates, not
+pixel-eyeballing); every reference marker in the source figure carries a
+±5 K error bar, reproduced here unchanged.
+
+Left panel: equatorial, 30°, and 60° PTM3D diurnal surface-temperature
+curves vs. Diviner brightness temperatures and the Hayne et al. (2017)
+equatorial peak/midnight/minimum reference points. Right panel: PTM3D
+diurnal-mean subsurface profiles (to 1 m, matching the source figure's own
+depth axis) at the Apollo 15 (26.13°N) and Apollo 17 (20.19°N) landing-site
+latitudes vs. the Apollo heat-flow-probe points (Hayne et al. 2017
+compilation). **Headline:** max |PTM3D − reference| = **4.5 K** (left
+panel; 60° nighttime branch — 0°/30° branches are ≤1.8 K, and the
+equatorial peak/midnight/minimum anchors are ≤2.2 K, with the "minimum"
+anchor compared extremum-to-extremum since PTM3D's own diurnal minimum
+falls ~8 minutes earlier than heat1d's) and **2.3 K** (right panel) — both
+inside the reference points' own ±5 K error bars, matching the "fit ...
+to within the measurement errors" standard the manuscript's own (heat1d)
+Fig. 5 claims, without a single RMS/bias number given in the manuscript
+text for this test.
 
 ## Manuscript Fig. 6 — Energy conservation
 

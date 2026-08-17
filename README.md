@@ -88,31 +88,42 @@ and thermal emission from surrounding terrain.*
   same comparison at full manuscript resolution (15,840 faces, swept solar
   elevation) matches the analytic permanently-shadowed-interior temperature to
   **0.1 K (≤0.26%)** and the analytic shadow flux to **≤1.2%**
-- **Diviner Lunar Radiometer Experiment**: the model's thermal-column solver
-  (validated here via heat1d, its 1D reference implementation — see the
-  Fig. 5 caption below) matches Diviner-derived equatorial/mid-latitude
-  diurnal brightness temperatures to within the measurement errors. The full
-  3D radiative-coupled model separately matches real Diviner seasonal
-  south-polar temperatures (Williams et al. 2019) at a Haworth-crater
-  cold-trap site to a **+1.9 K** deep-floor summer-maximum bias and
-  **11 K / 6 K RMS** (summer/winter mean) — see the validation gallery below
+- **Diviner Lunar Radiometer Experiment**: PTM3D's thermal-column solver, run
+  end to end (see the Fig. 5 caption below) matches Diviner-derived
+  equatorial/mid-latitude diurnal brightness temperatures to within the
+  measurement errors (max residual **4.5 K**, inside the reference points'
+  own ±5 K error bars). The full 3D radiative-coupled model separately
+  matches real Diviner seasonal south-polar temperatures (Williams et al.
+  2019) at a Haworth-crater cold-trap site to a **+1.9 K** deep-floor
+  summer-maximum bias and **11 K / 6 K RMS** (summer/winter mean) — see the
+  validation gallery below
 - **Hayne et al. (2017)** thermophysical model: reproduces the lunar
-  equatorial diurnal cycle (noon ~388 K, night ~99 K) and, via Apollo 15/17
-  heat-flow-probe comparison, the subsurface diurnal-mean depth profile
+  equatorial diurnal cycle (noon ~383 K, midnight ~101 K) and, via Apollo
+  15/17 heat-flow-probe comparison, the subsurface diurnal-mean depth
+  profile to max residual **2.3 K**
 
 **Full validation gallery (all seven manuscript figures, Figs. 3–9, with
 headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
 
-![Manuscript Fig. 5: heat1d vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_thermal_diviner_apollo.png)
-*Manuscript caption: "Validation of the 3D thermophysical model with
-comparison to Diviner data (left panel) and Apollo heat flow probe data
-(right panel)." Read literally, the plotted model curves are **heat1d** —
-PTM3D's 1D thermal-column reference implementation, sharing the same
-conduction physics as PTM3D's own column solver — labeled "(heat1d)" in the
-left-panel legend, matched against Diviner-derived equatorial/30°/60°
-diurnal temperatures and Apollo 15/17 subsurface diurnal-mean profiles (both
-via the Hayne et al. 2017 compilation). Fit "to within the measurement
-errors" — the manuscript gives no single RMS/bias number for this figure.*
+![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_ptm3d_hayne_apollo.png)
+*PTM3D-native re-run of the submitted manuscript's Fig. 5 tests (`main.tex`,
+"Validation of the 3D thermophysical model with comparison to Diviner data
+(left panel) and Apollo heat flow probe data (right panel)"). The submitted
+manuscript's own Fig. 5 plots heat1d, PTM3D's 1D reference column, not the
+3D model end to end; this render instead runs PTM3D itself — smooth global
+icosphere (radiation exchange OFF is exact for a convex body), CPU-only,
+body=Moon with the manuscript's own Table 1 (Hayne et al. 2017)
+thermophysical properties unmodified, equilibrated 60 lunar day/night
+cycles so the ≳0.4 m diurnal-mean plateau in the right panel is converged.
+Left panel: equatorial/30°/60° PTM3D diurnal surface-temperature curves vs.
+the same Diviner brightness-temperature and Hayne et al. (2017) equatorial
+peak/midnight/minimum reference points the manuscript overlaid (all carry
+the manuscript's own ±5 K error bars). Right panel: PTM3D diurnal-mean
+subsurface profiles at the Apollo 15/17 landing-site latitudes vs. the
+Apollo heat-flow-probe points. **Max |PTM3D − reference| = 4.5 K (left
+panel, 60° nighttime branch) and 2.3 K (right panel)** — both inside the
+reference points' own ±5 K error bars, meeting the "fit to within the
+measurement errors" standard the manuscript's own (heat1d) Fig. 5 claims.*
 
 ![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
