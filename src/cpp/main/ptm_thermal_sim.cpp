@@ -680,6 +680,9 @@ static bool writeLocationDepthCSV(const std::string& out_path,
                            const std::vector<std::string>& time_strings,
                            const std::vector<double>& depths_m,
                            const std::vector<std::vector<double>>& T_depths);
+// `grid_bottom_m`, when non-null, receives the depth of the DEEPEST SOLVED
+// node. Any requested depth below it is a Fourier's-law extrapolation, not a
+// solved value, and the caller is the only place that can say so.
 static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -687,7 +690,8 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Config& config,
     const std::vector<double>& depths_m,
     int equilibration_steps,
-    const thermal::Planet& planet);
+    const thermal::Planet& planet,
+    double* grid_bottom_m = nullptr);
 static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
 
 bool exportLocationTemperatureOnly(const std::string& output_file,
@@ -2019,24 +2023,6 @@ public:
                double solar_constant,
                const char* site_tag);
 
-    // Second entry point, for a caller that has ALREADY resolved its own
-    // per-face base albedo and only needs the angular model + the Kirchhoff
-    // infrared absorptivity. build()'s own resolution logic reads config
-    // properties (`is_custom_mesh`, `mesh_resolution`, `use_albedo_map`) that
-    // only ever land on the thermal_config object -- which is out of scope by
-    // the time the per-location depth export runs, so that caller cannot use
-    // build() without silently resolving a DIFFERENT base albedo than the mesh
-    // did. It hands its already-loaded vector in here instead, and shares
-    // visibleAlbedo()/absorbed() verbatim. Returns false, having said why,
-    // rather than composing flux against an undefined absorptivity.
-    bool bindResolvedAlbedos(const std::shared_ptr<Mesh>& mesh,
-                             std::vector<double> face_albedos,
-                             bool albedo_successfully_loaded,
-                             double default_visible_albedo,
-                             const thermal::Planet* planet,
-                             double solar_constant,
-                             const char* site_tag);
-
     // The operative visible albedo for (face, ABSOLUTE timestep). Verbatim from
     // the array loop this was extracted out of.
     double visibleAlbedo(size_t f, int t, double direct_flux) const {
@@ -2597,65 +2583,6 @@ void AbsorbedFluxComposer::resolveAngularModel(const thermal::Planet* planet,
 
     use_hapke_albedo_     = use_hapke_albedo;
     use_incidence_albedo_ = use_incidence_albedo;
-}
-
-bool AbsorbedFluxComposer::bindResolvedAlbedos(
-    const std::shared_ptr<Mesh>& mesh,
-    std::vector<double> face_albedos,
-    bool albedo_successfully_loaded,
-    double default_visible_albedo,
-    const thermal::Planet* planet,
-    double solar_constant,
-    const char* site_tag) {
-
-    // Same refusal as build(): without a Planet the infrared absorptivity is
-    // undefined (Kirchhoff: it IS the emissivity) and there is no angular
-    // albedo model. Substituting one is the defect, not the fix.
-    if (!planet) {
-        std::cerr << "FATAL: absorbed flux was composed without a Planet, so the infrared "
-                     "absorptivity is undefined (Kirchhoff: it is the body's emissivity). "
-                     "Refusing to guess.\n";
-        return false;
-    }
-    if (!mesh || mesh->faces.size() < face_albedos.size() ||
-        mesh->latitudes.size() < face_albedos.size() ||
-        mesh->longitudes.size() < face_albedos.size()) {
-        std::cerr << "Error: mesh too small for the supplied per-face albedo vector ("
-                  << face_albedos.size() << " faces).\n";
-        return false;
-    }
-
-    ir_emissivity_  = thermalIrEmissivity(*planet);
-    recordIrAbsorptivity(site_tag ? site_tag : "cpu_bound_albedos", ir_emissivity_);
-    planet_         = planet;
-    solar_constant_ = solar_constant;
-    mesh_           = mesh.get();
-    const size_t num_faces = face_albedos.size();
-    face_albedos_   = std::move(face_albedos);
-
-    // Announce: this composition is a SEPARATE decision from the mesh-wide one
-    // and used to be invisible in the log. Rule 7 -- a path that applies (or
-    // cannot apply) the angular albedo model has to say so.
-    std::cout << "[" << (site_tag ? site_tag : "bound") << "] absorbed flux: "
-              << (albedo_successfully_loaded ? "per-face map" : "uniform")
-              << " base albedo, IR absorptivity (Kirchhoff) = "
-              << fmtSig(ir_emissivity_) << std::endl;
-    resolveAngularModel(planet, default_visible_albedo, solar_constant,
-                        /*announce=*/true);
-    if (!use_incidence_albedo_) {
-        std::cout << "[" << (site_tag ? site_tag : "bound")
-                  << "] no incidence-angle albedo model for this body/gate; "
-                     "the constant base albedo is operative." << std::endl;
-    }
-    albedo_successfully_loaded_ = albedo_successfully_loaded;
-
-    // Local accumulators only. publishEffectiveAlbedo() is deliberately NOT
-    // called by this caller: statistics/effective_albedo.bin describes the
-    // MESH-WIDE composition, and overwriting it from a five-face location
-    // export would silently redefine that file.
-    eff_alb_num_.assign(num_faces, 0.0);
-    eff_alb_den_.assign(num_faces, 0.0);
-    return true;
 }
 
 std::vector<double> calculateAbsorbedFlux(
@@ -9976,7 +9903,8 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Config& config,
     const std::vector<double>& depths_m,
     int equilibration_steps,
-    const thermal::Planet& planet)
+    const thermal::Planet& planet,
+    double* grid_bottom_m)
 {
     // Build flux array [2 x N]: times, flux
     Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
@@ -10001,6 +9929,9 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const auto& z_layers = mdl.profile.getGrid().z;
     const int Nz = static_cast<int>(z_layers.size());
     const int Nt = static_cast<int>(times.size());
+    if (grid_bottom_m) {
+        *grid_bottom_m = z_layers.empty() ? 0.0 : z_layers.back();
+    }
     const Eigen::MatrixXd& Tmat = mdl.T;
     const bool rows_are_layers = (Tmat.rows() == Nz && Tmat.cols() == Nt);
     const bool cols_are_layers = (Tmat.cols() == Nz && Tmat.rows() == Nt);
@@ -10190,18 +10121,44 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
     return std::string(time_string);
 }
 
+// Where the per-location exports read illumination from.
+//
+// Exactly ONE of two stores carries a run's illumination by the time these
+// exports run: the flat face x timestep arrays, when the estimated footprint
+// fit under PTM_RAM_ILLUM_MAX_GB and they were extracted; or the illumination
+// model's chunk store, when it did not and the mesh-wide solver was left to
+// stream. Both exports used to index the flat arrays unconditionally, so on the
+// streaming branch every read was out of range, the bounds guards returned 0.0,
+// and the files were written from a flux that was identically zero -- rc 0, no
+// warning. main() resolves the live store ONCE into this and hands it over, so
+// neither export can pick the wrong one and neither can invent a zero.
+struct LocationFluxSource {
+    std::function<double(size_t, int)> total;        // direct + primary-reflected
+    std::function<double(size_t, int)> direct;
+    std::function<double(size_t, int)> reflected;
+    std::function<double(size_t, int)> primary_ir;
+    // Names the store, for the log. Never empty when valid().
+    std::string origin;
+    bool valid() const {
+        return total && direct && reflected && primary_ir && !origin.empty();
+    }
+};
+
 bool exportLocationIlluminationAndTemperature(
     const std::string& output_file,
     const std::string& locations_file,
     const std::shared_ptr<Mesh>& mesh,
-    const std::vector<double>& illumination_values,
-    const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values,
-    const std::vector<double>& primary_ir_values,
+    const LocationFluxSource& flux,
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<std::string>& time_strings,
     int time_steps,
     const std::vector<std::vector<double>>& indirect_flux = {}) {
+    if (!flux.valid()) {
+        std::cerr << "exportLocationIlluminationAndTemperature: no illumination "
+                     "source was bound; refusing to write a file of zeros"
+                  << std::endl;
+        return false;
+    }
     // Basic validations
     if (!mesh) {
         std::cerr << "exportLocationIlluminationAndTemperature: mesh is null" << std::endl;
@@ -10359,12 +10316,7 @@ bool exportLocationIlluminationAndTemperature(
     }
     output << "\n";
 
-    auto get_val = [&](const std::vector<double>& v, size_t f, int t) -> double {
-        if (v.empty()) return 0.0;
-        const size_t stride = static_cast<size_t>(time_steps);
-        const size_t idx = f * stride + static_cast<size_t>(t);
-        return (idx < v.size()) ? v[idx] : 0.0;
-    };
+    std::cout << "Location illumination source: " << flux.origin << std::endl;
 
     // Rows
     for (int t = 0; t < time_steps; ++t) {
@@ -10381,10 +10333,10 @@ bool exportLocationIlluminationAndTemperature(
                 output << ",0";
                 continue;
             }
-            const double tot = get_val(illumination_values, f, t);
-            const double dir = get_val(direct_solar_values, f, t);
-            const double rfl = get_val(primary_reflected_values, f, t);
-            const double pir = get_val(primary_ir_values, f, t);
+            const double tot = flux.total(f, t);
+            const double dir = flux.direct(f, t);
+            const double rfl = flux.reflected(f, t);
+            const double pir = flux.primary_ir(f, t);
 
             double ind = 0.0;
             if (have_indirect && f < indirect_flux.size()) {
@@ -13190,6 +13142,27 @@ int main(int argc, char** argv) {
     // Note: thermal_debug settings are applied later after CLI parsing
     thermal::Config config;
 
+    // The run's REAL thermal configuration -- the one built from the YAML /
+    // CLI (thermal_m/n/b, chi, conductivity_model, spin-up seed, ...) and
+    // handed to every mesh solver. Declared HERE, at main() scope, rather than
+    // inside `if (run_thermal_mesh)` where it is populated, because the
+    // per-location depth export runs after that block closes and used to be
+    // handed `config` above instead -- a default-constructed thermal::Config.
+    // Every depth CSV therefore ignored thermal_m/n/b, chi, conductivity_model,
+    // NYEARSEQ and the seed settings while the mesh-wide field honored them:
+    // measured 2026-08-13/17, the CSVs are byte-identical across thermal_b =
+    // 9..40 and across Hayne2017 vs Martinez2021 while statistics/
+    // temperature_min.bin from the same runs differs every time. The bottom
+    // node sat at the default b = 15 (~50 cm on the Moon) no matter what the
+    // config asked for.
+    //
+    // `thermal_config_populated` is the honest half of the fix: with
+    // run_thermal_mesh false nothing fills this object, and a depth column
+    // solved against an empty one would be the same silent substitution in a
+    // new place. The export refuses instead.
+    thermal::Config thermal_config;
+    bool thermal_config_populated = false;
+
     bool compute_statistics = sim_config.thermal.compute_statistics;
 
     // Schorghofer & Taylor (2007) ice-stability accumulator. Persists from
@@ -15925,6 +15898,43 @@ int main(int argc, char** argv) {
         std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/m^2" << std::endl;
     }
 
+    // Fail BEFORE the thermal solve, not after it. The per-location exports at
+    // the end of main() read either the flat arrays or the illumination model's
+    // chunk store, and which one is live was decided immediately above. If
+    // neither can answer, the exports would compose a flux of exactly zero and
+    // write depth columns pinned at the geothermal floor -- so they refuse. But
+    // refusing down there means refusing after a multi-hour solve has already
+    // written statistics/ and every frame, and scripts/run_chunked_simulation.py
+    // reads a non-zero exit as a retryable chunk failure and CLEARS the chunk
+    // directory before retrying. Check the same predicate here, where the answer
+    // is already known and nothing has been computed yet.
+    if (export_locations && !locations_file.empty()) {
+        const size_t loc_expect_early =
+            num_faces * static_cast<size_t>(total_time_steps);
+        const bool flat_ok_early =
+            direct_solar_values.size()      == loc_expect_early &&
+            primary_reflected_values.size() == loc_expect_early &&
+            primary_ir_values.size()        == loc_expect_early;
+        const bool chunks_ok_early =
+            illumination_model && illumination_model->hasChunkedIllumination();
+        if (!flat_ok_early && !chunks_ok_early) {
+            std::cerr << "\n[FATAL] location export was requested, but after the "
+                         "illumination stage neither store can serve it.\n"
+                      << "  flat arrays: direct=" << direct_solar_values.size()
+                      << " reflected=" << primary_reflected_values.size()
+                      << " primary_ir=" << primary_ir_values.size()
+                      << " (each must be " << loc_expect_early << " = "
+                      << num_faces << " faces x " << total_time_steps << " steps)\n"
+                      << "  chunk store: "
+                      << (chunks_ok_early ? "live" : "released or never built") << "\n"
+                      << "  Aborting now, before the thermal solve, rather than after "
+                         "it -- the location files would be composed from a flux of "
+                         "zeros.\n"
+                      << std::endl;
+            return 1;
+        }
+    }
+
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
@@ -16090,8 +16100,9 @@ int main(int argc, char** argv) {
         std::cout << "OpenMP not available, running in single-threaded mode" << std::endl;
         #endif
         
-        // Set up thermal model configuration
-        thermal::Config thermal_config;
+        // Set up thermal model configuration. Declared at main() scope (see
+        // there) so the per-location depth export solves its columns against
+        // the SAME object the mesh solvers get.
         thermal_config.m = thermal_m;   // Layers in upper skin depth (CLI: --thermal-m)
         thermal_config.n = thermal_n;   // Layer growth factor (CLI: --thermal-n)
         thermal_config.b = thermal_b;   // Skin depths to bottom (CLI: --thermal-b)
@@ -16549,6 +16560,15 @@ int main(int argc, char** argv) {
             thermal_config.setProperty("use_hapke_albedo", true);
             thermal_config.setProperty("hapke_albedo_w", planet.hapke_albedo_w);
         }
+
+        // Last write to thermal_config. Everything below this line only READS
+        // it, so from here on the object is the run's operative thermal
+        // configuration and any later consumer -- notably the per-location
+        // depth export, which runs after this block closes -- may use it.
+        // Keep this assignment immediately after the final setProperty above:
+        // it is a claim about this file's control flow, and moving a write
+        // below it silently makes the claim false.
+        thermal_config_populated = true;
 
         // Debug output to verify properties were set correctly
         if (verbose) {
@@ -17720,14 +17740,16 @@ int main(int argc, char** argv) {
                               << "); sweeping every timestep." << std::endl;
                 } else if (export_locations && !locations_file.empty()) {
                     // exportLocationIlluminationAndTemperature() reads
-                    // indirect_flux[f][t] for t = 0 .. time_steps-1, i.e.
-                    // ABSOLUTE indices that land inside the equilibration
-                    // span on any two-phase run. (That is a pre-existing
-                    // window defect in the location CSV -- it reads the
-                    // equilibration prefix rather than the output window,
-                    // and at the wrong stride for the flat arrays -- but
-                    // arming this gate would additionally turn its
-                    // IndirectFlux column silently into zeros.)
+                    // indirect_flux[f][t] for t = 0 .. total_time_steps-1,
+                    // i.e. ABSOLUTE indices that span the equilibration
+                    // prefix as well as the output window. (The stride half
+                    // of that defect is fixed -- the file used to index the
+                    // flat arrays at f*time_steps + t, a different face at a
+                    // different epoch -- but it still COVERS the
+                    // equilibration prefix, and the per-location depth CSVs
+                    // deliberately do too, so arming this gate would turn
+                    // that part of the IndirectFlux column silently into
+                    // zeros.)
                     if (rad_skip_forced) {
                         std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS=1 was requested and this"
                                      " run exports location time series ('" << locations_file
@@ -20412,6 +20434,24 @@ int main(int argc, char** argv) {
         if (run_thermal_mesh) {
             writeEffectiveAlbedo(output_dir);
             reportSourceAlbedoConsistency();
+            // The per-location depth export composes absorbed flux AFTER this
+            // point, so its infrared absorptivity used to land in the registry
+            // that gate G1 had already read -- recorded, never compared. Record
+            // it HERE instead, from the same expression the export's
+            // AbsorbedFluxComposer::build() will use
+            // (`ir_emissivity_ = thermalIrEmissivity(*planet)`, on this same
+            // main-scope Planet), so the gate covers it. build() records the
+            // identical value again when it runs; the registry is keyed by site
+            // tag, so the second write is the same number under the same key.
+            //
+            // Registering early rather than moving the gate late is deliberate:
+            // G1's refusal has to happen BEFORE the ice-stability, indirect-band
+            // and location outputs are written, or an inconsistent run leaves a
+            // complete-looking output directory behind and only then exits 1.
+            if (export_locations && !locations_file.empty() && !depths_file.empty()) {
+                recordIrAbsorptivity("cpu_location_depth_series",
+                                     thermalIrEmissivity(planet));
+            }
             // Gate G1: absorb == emit == scatter. planet.emissivity is what
             // thermal_model.cpp copies into the surface BC, so it is the emission
             // side by construction; the absorption sites and the radiosity are read
@@ -20607,23 +20647,166 @@ int main(int argc, char** argv) {
 
 
     // ========== LOCATION EXPORT (if requested) ==========
+    //
+    // Bind the ONE illumination store this run actually kept, for both exports
+    // below. See LocationFluxSource. Resolved before either export so the
+    // failure is a refusal here, once, and not a file of zeros twice.
+    LocationFluxSource loc_flux;
+    if (export_locations && !locations_file.empty()) {
+        const size_t loc_stride = static_cast<size_t>(total_time_steps);
+        const size_t loc_expect = num_faces * loc_stride;
+        // The per-component arrays are what "extracted" means; the combined
+        // illumination array is deliberately freed after the thermal solve
+        // ("[Memory] Released combined illumination array"), so its absence is
+        // NOT evidence of streaming and total is reconstructed as
+        // direct + reflected -- the same convention filterFaceMajorStable uses.
+        const bool flat_ready = direct_solar_values.size()      == loc_expect &&
+                                primary_reflected_values.size() == loc_expect &&
+                                primary_ir_values.size()        == loc_expect;
+        const bool chunks_ready =
+            illumination_model && illumination_model->hasChunkedIllumination();
+
+        if (flat_ready) {
+            const bool have_combined = (illumination_values.size() == loc_expect);
+            loc_flux.direct = [&, loc_stride](size_t f, int t) {
+                return direct_solar_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.reflected = [&, loc_stride](size_t f, int t) {
+                return primary_reflected_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.primary_ir = [&, loc_stride](size_t f, int t) {
+                return primary_ir_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.total = [&, loc_stride, have_combined](size_t f, int t) {
+                const size_t idx = f * loc_stride + static_cast<size_t>(t);
+                return have_combined ? illumination_values[idx]
+                                     : (direct_solar_values[idx] +
+                                        primary_reflected_values[idx]);
+            };
+            loc_flux.origin = have_combined
+                ? "extracted flat arrays (combined illumination present)"
+                : "extracted flat arrays (total = direct + primary-reflected; "
+                  "the combined array was released after the thermal solve)";
+        } else if (chunks_ready) {
+            loc_flux.direct = [&](size_t f, int t) {
+                return illumination_model->getDirectSolarValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.reflected = [&](size_t f, int t) {
+                return illumination_model->getPrimaryReflectedValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.primary_ir = [&](size_t f, int t) {
+                return illumination_model->getPrimaryIRValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.total = [&](size_t f, int t) {
+                return illumination_model->getIlluminationValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.origin = "illumination model chunk store (the mesh-wide "
+                              "solver streamed from the same chunks)";
+        } else {
+            // Neither store can answer. Every read would have gone out of
+            // bounds, every guard would have returned 0.0, and both files
+            // would have been written from a flux that is identically zero --
+            // for the depth CSVs that means a column decaying to the
+            // geothermal floor T_geo = (Qb/(eps*sigma))^(1/4) and holding it
+            // for the whole window, at rc 0, with nothing in the log. Measured
+            // 2026-08-17 on Moon ico6 x 7560 steps (13.8 GB > the 10 GB
+            // PTM_RAM_ILLUM_MAX_GB default): all five sites pinned at
+            // 24.042758 K. That flat line was one eyeball away from shipping
+            // as a validation figure. Fail, loudly.
+            std::cerr << "\n[FATAL] the per-location export has no illumination to read.\n"
+                      << "  flat arrays: direct=" << direct_solar_values.size()
+                      << " reflected=" << primary_reflected_values.size()
+                      << " primary_ir=" << primary_ir_values.size()
+                      << " (each must be " << loc_expect << " = "
+                      << num_faces << " faces x " << total_time_steps << " steps)\n"
+                      << "  illumination model chunk store: "
+                      << (illumination_model ? (chunks_ready ? "live" : "released or never built")
+                                             : "model already destroyed") << "\n"
+                      << "  Refusing to write location files composed from a flux of zeros.\n"
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "[location export] illumination source: " << loc_flux.origin
+                  << std::endl;
+
+        // The depth columns are solved against thermal_config, the run's real
+        // thermal configuration. It is only built inside `if (run_thermal_mesh)`
+        // above, so a run that asks for depth profiles WITHOUT a mesh thermal
+        // solve has nothing to solve them against. Substituting a
+        // default-constructed thermal::Config is exactly the defect being
+        // removed here -- it would put m/n/b = 10/15/15 and chi = 2.7 back under
+        // columns the config asked to be something else. Refuse, and say which
+        // key would fix it. Checked HERE, before either location product is
+        // written, so the refusal does not leave a half-populated locations
+        // directory behind.
+        if (!depths_file.empty() && !thermal_config_populated) {
+            std::cerr << "\n[FATAL] the per-location depth export needs this run's thermal "
+                         "configuration (thermal_m/n/b, chi, conductivity_model, spin-up "
+                         "seed), and it is only built when the mesh thermal solve runs.\n"
+                      << "  thermal.run_thermal_mesh is false, so there is none.\n"
+                      << "  Refusing to solve depth columns against defaults the config did "
+                         "not ask for. Set thermal.run_thermal_mesh: true, or drop "
+                         "output.depths_file.\n"
+                      << std::endl;
+            return 1;
+        }
+    }
+
     if (export_locations && !locations_file.empty()) {
         try {
             const std::string series_out_path =
                 (output_dir.empty() ? series_output
                                     : (output_dir.back() == '/' ? output_dir + series_output
                                                                 : output_dir + "/" + series_output));
+            // total_time_steps, NOT time_steps. The flat arrays and the chunk
+            // store are both strided by total_time_steps (equilibration +
+            // output), and time_strings / surface_temps are ALLOCATED that long
+            // too, so passing the OUTPUT step count made this file index face
+            // f's series at f*time_steps + t -- a different face at a different
+            // epoch on every run with an equilibration prefix. Verified on the
+            // 2026-08-17 lunar control (48 output steps, 168 total): the
+            // 30 N column reported 1218.74 W/m^2 of direct solar next to a
+            // total of 0, against timestamps from five lunations BEFORE the
+            // simulation's own start_time. The depth CSVs next to it already
+            // wrote time_strings.size() rows, so this also makes the two
+            // location products cover the same span.
+            //
+            // ALLOCATED is not the same as WRITTEN: on the two-phase GPU path
+            // surface_temps[f][0 .. equilibration_steps-1] is never filled (the
+            // download starts at copy_offset = equilibration_steps), so the Ts
+            // column over the equilibration prefix is a zero fill, not a
+            // temperature. The flux columns there are real. Say so rather than
+            // let a reader take the zeros for physics.
+            if (equilibration_steps > 0 && !surface_temps.empty()) {
+                size_t probed = 0, all_zero_prefix = 0;
+                for (size_t f = 0; f < surface_temps.size() && probed < 16; ++f) {
+                    const auto& row = surface_temps[f];
+                    if (row.size() < static_cast<size_t>(equilibration_steps)) continue;
+                    ++probed;
+                    bool zero = true;
+                    for (int t = 0; t < equilibration_steps; ++t) {
+                        if (row[static_cast<size_t>(t)] != 0.0) { zero = false; break; }
+                    }
+                    if (zero) ++all_zero_prefix;
+                }
+                if (probed > 0 && all_zero_prefix == probed) {
+                    std::cerr << "[location export] WARNING: the surface-temperature column "
+                                 "is a ZERO FILL over the first " << equilibration_steps
+                              << " (equilibration) rows -- this run's solver did not hand "
+                                 "back equilibration-phase temperatures (two-phase GPU). "
+                                 "The flux columns on those rows are real; the Ts column is "
+                                 "not. Read Ts from row " << equilibration_steps
+                              << " onward." << std::endl;
+                }
+            }
             if (!exportLocationIlluminationAndTemperature(
                     series_out_path,
                     locations_file,
                     mesh,
-                    illumination_values,
-                    direct_solar_values,
-                    primary_reflected_values,
-                    primary_ir_values,
+                    loc_flux,
                     surface_temps,
                     time_strings,
-                    time_steps,
+                    total_time_steps,
                     indirect_flux_series)) {
                 std::cerr << "Warning: Failed to export location data to "
                           << series_out_path << std::endl;
@@ -20637,7 +20820,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Optional per-location depth profiles
+    // Optional per-location depth profiles. The thermal_config_populated
+    // refusal that guards these columns is checked above, next to the
+    // illumination-source binding, so it fires before anything is written.
     if (export_locations && !locations_file.empty() && !depths_file.empty()) {
         try {
             auto locs = readLocationsCSV(locations_file);
@@ -20651,33 +20836,6 @@ int main(int argc, char** argv) {
                 std::cout << "Depth profile export: " << locs.size()
                           << " locations, " << depths_m.size()
                           << " depths -> " << loc_out_dir << std::endl;
-
-                // Load per-face albedo from binary map (same as thermal solver)
-                std::vector<double> loc_face_albedos(mesh->faces.size(), default_visible_albedo);
-                bool loc_albedo_loaded = false;
-                {
-                    std::string body_name = planet.name;
-                    std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
-                    if (!body_name.empty()) body_name[0] = std::toupper(body_name[0]);
-                    std::string albedo_filename = body_name + "_Albedo_res"
-                        + std::to_string(mesh_resolution) + ".bin";
-                    std::string adir = albedo_maps_directory;
-                    if (!adir.empty() && adir.back() != '/' && adir.back() != '\\') adir += '/';
-                    std::vector<std::string> search_paths = {
-                        adir + albedo_filename,
-                        "../data/albedo_maps/" + albedo_filename,
-                        "data/albedo_maps/" + albedo_filename
-                    };
-                    for (const auto& path : search_paths) {
-                        auto loaded = importAlbedoMapFromFile(path);
-                        if (!loaded.empty() && loaded.size() == mesh->faces.size()) {
-                            std::copy(loaded.begin(), loaded.end(), loc_face_albedos.begin());
-                            loc_albedo_loaded = true;
-                            std::cout << "Location export: using per-face albedo from " << path << std::endl;
-                            break;
-                        }
-                    }
-                }
 
                 // The absorbed flux for these columns goes through the SAME
                 // AbsorbedFluxComposer kernel every mesh face uses. This block
@@ -20703,42 +20861,30 @@ int main(int argc, char** argv) {
                 // Moon that term is ~0.005 W/m^2 (Earth-shine), so the numerical
                 // effect is ~1 mK -- but it was the only IR-absorption site not
                 // using thermalIrEmissivity(), and it registers with the
-                // Kirchhoff registry now. NOTE it registers too LATE to be
-                // COMPARED: reportKirchhoffConsistency() (gate G1) has already
-                // printed by the time the location export runs, so the value is
-                // recorded but not cross-checked this run -- which is why the
-                // banner below prints the absorptivity outright.
-
-                // BASE-albedo sanitization. This block always clamped to [0,1];
-                // std::clamp propagates NaN, and a single NaN in
-                // <Body>_Albedo_res<N>.bin would give an all-NaN depth CSV,
-                // whereas build() substitutes the default and says so. Substitute
-                // and count instead of clamping silently. NOTE this is still not
-                // build()'s FULL validation: build() also rejects finite values
-                // outside [MIN_VALID_ALBEDO, MAX_VALID_ALBEDO] = [0.01, 0.99] and
-                // runs ptm::checkAlbedoMapRegistration(). Widening this to match
-                // would change which faces get substituted on a corrupt map, so it
-                // is left as the pre-existing [0,1] rule and disclosed here rather
-                // than changed without a test.
-                {
-                    size_t loc_bad_albedo = 0;
-                    for (double& a : loc_face_albedos) {
-                        if (std::isnan(a) || std::isinf(a) || a < 0.0 || a > 1.0) {
-                            a = default_visible_albedo;
-                            ++loc_bad_albedo;
-                        }
-                    }
-                    if (loc_bad_albedo > 0) {
-                        std::cerr << "[location export] WARNING: substituted the default albedo "
-                                  << fmtSig(default_visible_albedo) << " for " << loc_bad_albedo
-                                  << " non-finite / out-of-[0,1] per-face values." << std::endl;
-                    }
-                }
-
+                // Kirchhoff registry now.
+                //
+                // The base albedo now comes from build(), the SAME resolver the
+                // mesh-wide composer uses, driven by the SAME thermal_config.
+                // This block used to hand-roll its own lookup, which
+                //   (a) only ever searched the per-face binary map
+                //       <Body>_Albedo_res<N>.bin, so a custom (DEM) mesh -- the
+                //       branch where mesh_resolution is meaningless and no .bin
+                //       exists -- got the UNIFORM default A0 in the CSVs while
+                //       the mesh-wide field used an explicit or auto-discovered
+                //       FITS map, and
+                //   (b) sanitized to [0, 1] instead of build()'s
+                //       [MIN_VALID_ALBEDO, MAX_VALID_ALBEDO] = [0.01, 0.99],
+                //       and skipped ptm::checkAlbedoMapRegistration() (PTM-34).
+                // Two resolvers for one quantity is the defect; deleting one is
+                // the fix. AbsorbedFluxComposer::bindResolvedAlbedos(), which
+                // existed only because thermal_config used to be out of scope
+                // here, goes with it -- it had no other caller.
+                std::shared_ptr<ptm::SpatialMap> loc_albedo_map =
+                    loadExplicitAlbedoMap(thermal_config, "[location depth export]");
                 AbsorbedFluxComposer loc_composer;
-                const bool loc_composer_ready = loc_composer.bindResolvedAlbedos(
-                    mesh, loc_face_albedos, loc_albedo_loaded,
-                    default_visible_albedo, &planet, planet.S,
+                const bool loc_composer_ready = loc_composer.build(
+                    loc_albedo_map, mesh, mesh->faces.size(),
+                    default_visible_albedo, thermal_config, &planet, planet.S,
                     "cpu_location_depth_series");
                 if (!loc_composer_ready) {
                     std::cerr << "Warning: could not compose absorbed flux for the "
@@ -20746,39 +20892,47 @@ int main(int argc, char** argv) {
                                  "writing columns from an unresolved albedo." << std::endl;
                 }
 
-                // Rule 7 -- two KNOWN remaining ways these columns can still
-                // disagree with the mesh-wide field for the same face. Neither is
-                // fixed here (each needs its own measurement, and radiation was
-                // OFF in the runs that validated the A(theta) fix), so each is
-                // announced instead of left to be discovered from a figure.
-                //
-                // (1) Indirect (terrain-scattered + terrain-IR) flux. The
-                //     mesh-wide re-thermal adds indirect_flux_series[f][t]; this
-                //     export does not. At shadowed / high-latitude faces that is
-                //     the dominant daytime term.
-                if (!indirect_flux_series.empty()) {
-                    std::cerr << "[location export] WARNING: these depth columns EXCLUDE the "
-                                 "indirect (terrain-scattered + terrain-IR) flux that the "
-                                 "mesh-wide field includes. They are NOT comparable to the "
-                                 "mesh-wide temperature at the same face for a "
-                                 "radiation-coupled run." << std::endl;
-                }
-                // (2) Base-albedo source. This export only ever searched the
-                //     per-face binary map <Body>_Albedo_res<N>.bin. The mesh-wide
-                //     composer also resolves an explicit FITS `albedo_map` and the
-                //     global FITS auto-search -- the branch a custom (DEM) mesh
-                //     takes, where mesh_resolution is meaningless and no .bin is
-                //     found. On such a run these columns use the UNIFORM default
-                //     A0 while the mesh uses per-face FITS values.
-                if (!loc_albedo_loaded &&
-                    (!config.getProperty("albedo_map").empty() ||
-                     !albedo_maps_directory.empty())) {
-                    std::cerr << "[location export] WARNING: an albedo map is configured but no "
-                                 "per-face binary map was found for this mesh, so these depth "
-                                 "columns use the UNIFORM base albedo "
-                              << fmtSig(default_visible_albedo)
-                              << ". If the mesh-wide field resolved a FITS albedo map, the two "
-                                 "do not share a base albedo." << std::endl;
+                // Indirect (terrain-scattered + terrain-IR) flux, added exactly
+                // as the coupled re-thermal adds it: already an ABSORBED
+                // quantity, indexed by the ABSOLUTE step, summed onto the
+                // composed absorbed flux (see the re-thermal's
+                // `absorbed += indirect_flux_series[global_f][t_offset + t]`).
+                // Omitting it made these columns cold by the dominant daytime
+                // term at shadowed and high-latitude faces, which is precisely
+                // where a validation figure is read.
+                const bool loc_have_indirect = !indirect_flux_series.empty();
+                if (loc_have_indirect) {
+                    std::cout << "[location export] including the indirect "
+                                 "(terrain-scattered + terrain-IR) flux, the same "
+                                 "series the mesh-wide re-thermal consumes."
+                              << std::endl;
+                    // CAVEAT, stated because it is the one way this can now be
+                    // wrong in the OTHER direction. The mesh-wide field gets
+                    // the per-step indirect term only on faces the coupling
+                    // loop SELECTED for re-thermal; unselected faces keep their
+                    // iteration-0 temperature. Under the shipped PTM-89 bounded
+                    // mode the selection threshold is 0 K -- every face carrying
+                    // indirect flux is selected -- so the two agree. Raise
+                    // radiation.coupling_temp_threshold and a face can carry
+                    // indirect flux here that the mesh-wide field never saw,
+                    // making the CSV WARMER than the mesh at that face. Print
+                    // the per-site magnitude so the term is visible either way.
+                    if (sim_config.radiation.coupling_temp_threshold > 0.0) {
+                        std::cerr << "[location export] NOTE: radiation.coupling_temp_threshold = "
+                                  << fmtSig(sim_config.radiation.coupling_temp_threshold)
+                                  << " K, so the mesh-wide re-thermal may have skipped faces that "
+                                     "DO carry indirect flux. These depth columns include the term "
+                                     "at every site, so at a skipped face the CSV will read WARMER "
+                                     "than the mesh-wide temperature." << std::endl;
+                    }
+                } else if (sim_config.radiation.enabled) {
+                    // Radiation was asked for but no series exists: the columns
+                    // are then direct + primary only, and that has to be said.
+                    std::cerr << "[location export] WARNING: radiation.enabled is true but "
+                                 "no indirect flux series was produced, so these depth "
+                                 "columns carry only the direct + primary terms and will "
+                                 "read COLD against the mesh-wide field at shadowed faces."
+                              << std::endl;
                 }
 
                 auto sanitize = [](std::string s) {
@@ -20788,6 +20942,7 @@ int main(int argc, char** argv) {
                     return s;
                 };
 
+                int loc_depth_reach_reported = 0;
                 for (size_t i = 0; loc_composer_ready && i < locs.size(); ++i) {
                     const auto& tup = locs[i];
                     const std::string name = std::get<0>(tup);
@@ -20803,25 +20958,72 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Absorbed flux through the shared composer (see above).
+                    // Absorbed flux through the shared composer (see above),
+                    // read from the illumination store this run actually kept
+                    // (loc_flux) rather than from the flat arrays directly --
+                    // those are EMPTY whenever the mesh-wide solver streamed,
+                    // and the old bounds guard turned that into a silent 0.0.
                     // Use total_time_steps (including equilibration) so the location
                     // thermal model receives the full cycled illumination, matching
                     // how mesh faces are handled. `t` is the ABSOLUTE step index,
                     // which is what the composer's per-step instantaneous solar
                     // constant and the effective-albedo window both expect.
+                    const size_t fi = static_cast<size_t>(face_idx);
+                    const std::vector<double>* ind_row =
+                        (loc_have_indirect && fi < indirect_flux_series.size())
+                            ? &indirect_flux_series[fi] : nullptr;
                     std::vector<double> flux_sum(static_cast<size_t>(total_time_steps), 0.0);
                     for (int t = 0; t < total_time_steps; ++t) {
-                        const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(total_time_steps)
-                                          + static_cast<size_t>(t);
-                        const double direct = (flat < direct_solar_values.size()) ? direct_solar_values[flat] : 0.0;
-                        const double refl   = (flat < primary_reflected_values.size()) ? primary_reflected_values[flat] : 0.0;
-                        const double pir    = (flat < primary_ir_values.size()) ? primary_ir_values[flat] : 0.0;
-                        flux_sum[static_cast<size_t>(t)] = loc_composer.absorbed(
-                            static_cast<size_t>(face_idx), t, direct, refl, pir);
+                        const double direct = loc_flux.direct(fi, t);
+                        const double refl   = loc_flux.reflected(fi, t);
+                        const double pir    = loc_flux.primary_ir(fi, t);
+                        double absorbed = loc_composer.absorbed(fi, t, direct, refl, pir);
+                        if (ind_row && static_cast<size_t>(t) < ind_row->size()) {
+                            absorbed += (*ind_row)[static_cast<size_t>(t)];
+                        }
+                        flux_sum[static_cast<size_t>(t)] = absorbed;
                     }
 
+                    // thermal_config, NOT the default-constructed `config`. See
+                    // thermal_config's declaration in main() for what the wrong
+                    // object cost: thermal_m/n/b, chi, conductivity_model,
+                    // NYEARSEQ and the spin-up seed never reached these columns,
+                    // so the depth axis stopped at the DEFAULT b = 15 (~50 cm on
+                    // the Moon) no matter what the config asked for, and every
+                    // depth below that was a Fourier's-law extrapolation of a
+                    // grid the user did not configure.
+                    double grid_bottom_m = 0.0;
                     auto T_depths = runThermalModelDepthSeries(
-                        flux_sum, times, lat_deg, config, depths_m, equilibration_steps, planet);
+                        flux_sum, times, lat_deg, thermal_config, depths_m,
+                        equilibration_steps, planet, &grid_bottom_m);
+
+                    // How deep the column was actually SOLVED. Everything below
+                    // is T_bottom + Qb*(z - z_bottom)/k_bottom -- a straight line
+                    // through a grid the run never integrated. It used to take a
+                    // constant-offset detector on consecutive CSV columns to find
+                    // that out after the fact; state it in the run's own log.
+                    if (loc_depth_reach_reported == 0) {
+                        const size_t n_extrap = static_cast<size_t>(std::count_if(
+                            depths_m.begin(), depths_m.end(),
+                            [&](double z) { return z > grid_bottom_m; }));
+                        std::cout << "[location export] depth grid (thermal_m/n/b = "
+                                  << thermal_config.m << "/" << thermal_config.n << "/"
+                                  << thermal_config.b << "): deepest SOLVED node at "
+                                  << std::fixed << std::setprecision(4) << grid_bottom_m
+                                  << " m, at site '"
+                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                  << "'." << std::endl;
+                        if (n_extrap > 0) {
+                            std::cerr << "[location export] WARNING: " << n_extrap << " of "
+                                      << depths_m.size() << " requested depths lie BELOW "
+                                      << std::fixed << std::setprecision(4) << grid_bottom_m
+                                      << " m and are a Fourier's-law extrapolation "
+                                         "T = T_bottom + Qb*(z - z_bottom)/k_bottom, not a "
+                                         "solved temperature. Raise thermal.thermal_b to solve "
+                                         "them." << std::endl;
+                        }
+                        ++loc_depth_reach_reported;
+                    }
 
                     std::string base = sanitize(name.empty() ? ("loc_" + std::to_string(i)) : name);
                     const std::string out_path = loc_out_dir + "/" + base + "_depths.csv";
