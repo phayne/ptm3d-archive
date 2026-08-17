@@ -103,22 +103,60 @@ static int gpuMaxTimestepsPerDispatch() {
 // kArgTOffset (this function sets those per sub-dispatch). do_accumulate /
 // accum_start / accum_end are in the GLOBAL frame and are honored unchanged.
 // Returns CL_SUCCESS, or the first failing clEnqueue/clFinish error.
+//
+// CLOSED LOOP (2026-08-16). max_ts is only an UPPER bound. The calibrated
+// ceiling is derived from a probe that integrates a cold, dark, near-equilibrium
+// column (uniform 5 W/m^2, T=120 K), while production integrates a warm,
+// illuminated one where the chi*T^3 radiative-conductivity term raises the
+// effective diffusivity and therefore the von-Neumann substep count. The probe
+// is thus biased OPTIMISTIC, one-directionally, and by a lot: on
+// examples/europa_high_res.yaml (ico7, 327,680 faces) the profile's 8.372
+// ms/step became a measured 26.1 ms/step in the real solve, 3.1x, so a ceiling
+// "derived to keep one dispatch under 2 s" produced 6.2 s dispatches.
+//
+// No fudge factor fixes that honestly — the bias depends on the illumination
+// state. Instead: start small, TIME every sub-dispatch, and size the next one
+// from what the GPU actually just did. Converges to the largest chunk that fits
+// the budget within a couple of iterations and reacts to a mid-run slowdown.
+// Still NUMERICALLY INERT: the split point is arbitrary by construction (the
+// kernel carries state in buf_T_ and indexes flux/output by the global
+// t_offset), so varying the chunk sizes cannot change a computed value.
+//
+// PTM_MAX_TIMESTEPS_PER_DISPATCH disables the loop entirely: the operator's
+// production mitigation is used verbatim, exactly as it was before this change.
 static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
                                            cl_command_queue queue,
                                            int n_timesteps, int max_ts,
                                            size_t global_size, size_t local_size) {
     if (max_ts < 1) max_ts = 1;
-    int n_sub = (n_timesteps + max_ts - 1) / max_ts;   // ceil
-    if (n_sub < 1) n_sub = 1;
     // Wedge-efficacy instrumentation (Fermi acceptance test D): when
     // PTM_LOG_SUBDISPATCH is set, time each sub-dispatch's clFinish so a run
     // can prove every command buffer stayed bounded. Logging only — inert.
     static const bool log_sub = (std::getenv("PTM_LOG_SUBDISPATCH") != nullptr);
+    // Operator pin => no adaptation, verbatim fixed-size chunks (prior behavior).
+    static const bool operator_pinned = []() -> bool {
+        const char* e = std::getenv("PTM_MAX_TIMESTEPS_PER_DISPATCH");
+        return e != nullptr && e[0] != '\0';
+    }();
+
+    const double budget_s = gpu::kSafeDispatchCeilingSeconds;
+    // Slow start: the first dispatch of a session runs at the uncalibrated
+    // conservative step count, which is the largest number with a clean
+    // survival record on an unmeasured grid. Every later chunk is sized from
+    // measurement, so this only costs a few extra clFinish (~0.24 ms each).
+    int cur = max_ts;
+    if (!operator_pinned) {
+        const int seed =
+            gpu::MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+        if (seed > 0 && seed < cur) cur = seed;
+    }
+
     cl_int err = CL_SUCCESS;
-    for (int s = 0; s < n_sub; ++s) {
-        int g0 = s * max_ts;
+    int g0 = 0;
+    int index = 0;
+    for (; g0 < n_timesteps; ++index) {
         int sub_n = n_timesteps - g0;
-        if (sub_n > max_ts) sub_n = max_ts;
+        if (sub_n > cur) sub_n = cur;
         err = clSetKernelArg(kernel, kArgNTimesteps, sizeof(int), &sub_n);
         if (err != CL_SUCCESS) return err;
         err = clSetKernelArg(kernel, kArgTOffset, sizeof(int), &g0);
@@ -128,18 +166,51 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
                                      &global_size, &local_size, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) return err;
         // Bounded command buffer: host sync between sub-dispatches. Inert
-        // (no computed value changes); for n_sub==1 this is exactly the single
-        // enqueue + clFinish the pre-R2 code already performed.
+        // (no computed value changes); when the whole session fits in one chunk
+        // this is exactly the single enqueue + clFinish the pre-R2 code did.
         err = clFinish(queue);
         if (err != CL_SUCCESS) return err;
+        auto t1 = std::chrono::high_resolution_clock::now();
+        const double elapsed_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0).count();
         if (log_sub) {
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::duration<double>>(
-                            t1 - t0).count() * 1000.0;
-            std::cerr << "[GPU Thermal][subdispatch] " << (s + 1) << "/" << n_sub
+            std::cerr << "[GPU Thermal][subdispatch] " << (index + 1)
                       << " steps [" << g0 << "," << (g0 + sub_n) << ") in "
-                      << ms << " ms\n";
+                      << (elapsed_s * 1000.0) << " ms\n";
         }
+        g0 += sub_n;
+
+        if (operator_pinned || g0 >= n_timesteps) continue;
+        // Size the next chunk from what this one actually cost.
+        const double per_step_s = elapsed_s / static_cast<double>(sub_n);
+        int target = max_ts;
+        if (per_step_s > 0.0) {
+            long t = static_cast<long>(budget_s / per_step_s);
+            if (t < 1) t = 1;
+            if (t > max_ts) t = max_ts;
+            target = static_cast<int>(t);
+        }
+        int next = target;
+        if (next > cur * 2) next = cur * 2;   // grow at most 2x per step
+        if (next < 1) next = 1;
+        if (next < cur) {
+            // Never silent: a shrink means the calibrated ceiling was optimistic
+            // for this grid's real illumination state.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::cerr << "[GPU Thermal] dispatch took " << elapsed_s
+                          << " s (" << (per_step_s * 1000.0) << " ms/step over "
+                          << sub_n << " steps), above the " << budget_s
+                          << " s watchdog budget; shrinking the self-chunk size "
+                          << cur << " -> " << next
+                          << " timesteps/dispatch for the rest of this run. The "
+                             "calibrated ceiling (" << max_ts
+                          << ") was measured on a colder, darker probe column "
+                             "than this solve.\n";
+            }
+        }
+        cur = next;
     }
     return err;
 }

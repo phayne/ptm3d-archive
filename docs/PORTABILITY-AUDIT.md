@@ -108,7 +108,11 @@ sparse-VF only, ≤100k faces, ≤360 steps resident (per the plan).
   `recommended_batch_size`; wire defaults to consume it. **P1**.
 - **Dispatch/watchdog ceilings** — previously implicit; now first-class in
   `gpu/machine_profile.h` (`max_timesteps_per_dispatch`, `safe_dispatch_ceiling_s`) + enforced by
-  the R2 self-chunking. Conservative default 300 timesteps/25 s if un-profiled.
+  the R2 self-chunking. Conservative default 50 timesteps / 2 s if un-profiled (`2 s` =
+  `kSafeDispatchCeilingSeconds`, the measured macOS+AMD watchdog patience on this host; it was
+  25 s until 2026-08-16, when a 5.0 s launch was killed with `gpusKillClientExt`). A profile
+  cached under an older, laxer budget is re-derived DOWN on load from its own measured per-step
+  cost. **P1** — the 2 s constant is this host's, not a portable one.
 - **Thread counts** — defaults are `0 = auto` (`config_parser.h:47` thermal `threads`, `:261`
   `hmatrix_threads`; `ptm_thermal_sim.cpp:8312` `rad_hmatrix_threads`), and `viewshed_analyzer.cpp:193`
   uses `std::thread::hardware_concurrency()`. **No hardcoded 48-thread default was found** (the `48`

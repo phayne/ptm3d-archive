@@ -32,8 +32,8 @@ int main() {
     {
         MachineProfile d = MachineProfile::conservativeDefault();
         CHECK(!d.valid, "conservativeDefault marked invalid (not calibrated)");
-        CHECK(d.max_timesteps_per_dispatch == 300, "default ceiling == 300 timesteps");
-        CHECK(approx(d.safe_dispatch_ceiling_s, 25.0), "default ceiling == 25 s");
+        CHECK(d.max_timesteps_per_dispatch == 50, "default ceiling == 50 timesteps");
+        CHECK(approx(d.safe_dispatch_ceiling_s, 2.0), "default ceiling == 2 s");
         CHECK(d.recommended_batch_size == 8000, "default batch == 8000");
     }
 
@@ -116,8 +116,65 @@ int main() {
         MachineProfile q;
         CHECK(!loadMachineProfile(q, missing), "loadMachineProfile fails on missing file");
         MachineProfile d = loadMachineProfileOrDefault(missing);  // WARNS to stderr
-        CHECK(!d.valid && d.max_timesteps_per_dispatch == 300,
+        CHECK(!d.valid && d.max_timesteps_per_dispatch == 50,
               "load-or-default returns conservative default on miss");
+    }
+
+    // 3b. Stale ceiling (calibrated against the pre-2026-08-16 25 s budget) is
+    //     re-derived DOWN on load from its own measured per-step cost, so a
+    //     cached profile cannot keep a ~25 s launch alive. This is the exact
+    //     record that killed examples/europa_high_res.yaml: 2986 timesteps at
+    //     8.371841 ms/step = 25.0 s per dispatch.
+    {
+        const std::string stale = "/tmp/ptm_test_stale_profile.json";
+        MachineProfile p;
+        p.valid = true;
+        p.safe_dispatch_ceiling_s = 25.0;
+        p.max_timesteps_per_dispatch = 2986;
+        p.kernel_ms_per_step_per_batch = 8.371841;
+        p.n_layers_probe = 21;
+        p.batch_size_probe = 327680;
+        p.dz_min_probe = 3.762306e-03;
+        p.dt_output_probe_s = 2556.0;
+        p.kappa_probe = 2.412985e-08;
+        p.is_run_grid = 1;
+        CHECK(saveMachineProfile(p, stale), "stale profile written");
+
+        MachineProfile q;
+        CHECK(loadMachineProfile(q, stale), "stale profile still loads");
+        CHECK(q.max_timesteps_per_dispatch == 238,
+              "stale 25 s ceiling re-derived to 238 timesteps (2 s budget)");
+        CHECK(approx(q.safe_dispatch_ceiling_s, 2.0),
+              "stale profile's declared budget updated to 2 s");
+        const double implied = q.max_timesteps_per_dispatch *
+                               q.kernel_ms_per_step_per_batch / 1000.0;
+        CHECK(implied <= 2.0, "re-derived ceiling implies a <= 2 s launch");
+        // The grid signature must survive the downgrade untouched, or the
+        // profile would stop matching its own run grid and re-probe forever.
+        CHECK(q.n_layers_probe == 21 && q.is_run_grid == 1,
+              "downgrade preserves grid provenance");
+
+        // A profile already inside the budget is left exactly as stored.
+        MachineProfile ok = p;
+        ok.max_timesteps_per_dispatch = 100;   // 100 * 8.37 ms = 0.84 s
+        ok.safe_dispatch_ceiling_s = 2.0;
+        CHECK(saveMachineProfile(ok, stale), "in-budget profile written");
+        MachineProfile r;
+        CHECK(loadMachineProfile(r, stale), "in-budget profile loads");
+        CHECK(r.max_timesteps_per_dispatch == 100,
+              "in-budget ceiling is NOT touched");
+
+        // No measured per-step cost + a laxer declared budget => clamp to the
+        // uncalibrated default rather than trust it.
+        FILE* f = std::fopen(stale.c_str(), "w");
+        std::fputs("{ \"schema_version\": 1, \"max_timesteps_per_dispatch\": 7523, "
+                   "\"safe_dispatch_ceiling_s\": 25.0 }", f);
+        std::fclose(f);
+        MachineProfile s1;
+        CHECK(loadMachineProfile(s1, stale), "schema-1 profile loads");
+        CHECK(s1.max_timesteps_per_dispatch == 50,
+              "schema-1 profile with no per-step cost clamped to 50");
+        std::remove(stale.c_str());
     }
 
     // 4. Corrupt profile (non-positive ceiling) is rejected, not silently used.

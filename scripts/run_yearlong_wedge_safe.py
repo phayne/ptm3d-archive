@@ -868,9 +868,17 @@ def main():
     p.add_argument("--probe-timeout-min", type=float, default=15.0)
     p.add_argument("--real-orbits", type=float, default=13.0)
     p.add_argument("--safe-ceiling-s", type=float, default=25.0,
-                   help="Conservative single-dispatch ceiling; memory "
-                        "gpu_hang_amd_macos.md documents ~15-30s launches "
-                        "surviving repeatedly on this hardware.")
+                   help="Per-BATCH stage-duration verdict threshold for this "
+                        "calibrate mode. NOTE: this is NOT the single-kernel "
+                        "watchdog budget — that lives in C++ "
+                        "(gpu/machine_profile.h kSafeDispatchCeilingSeconds, "
+                        "2 s) and is enforced by the solver's own R2 "
+                        "self-chunking, which splits a batch into many "
+                        "dispatches. The old help here claimed '~15-30s "
+                        "launches survive repeatedly'; that reading of memory "
+                        "gpu_hang_amd_macos.md is WRONG and cost a run on "
+                        "2026-08-16 (a 5.0 s launch was killed with "
+                        "gpusKillClientExt).")
     # run-mode args
     p.add_argument("--stage-a-output-steps", type=int, default=20)
     p.add_argument("--stage-a-batch-size", type=int, default=8000)
