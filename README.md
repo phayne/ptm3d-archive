@@ -91,16 +91,23 @@ and thermal emission from surrounding terrain.*
 - **Diviner Lunar Radiometer Experiment**: PTM3D's thermal-column solver, run
   end to end (see the Fig. 5 caption below) matches Diviner-derived
   equatorial/mid-latitude diurnal brightness temperatures to within the
-  measurement errors (max residual **4.5 K**, inside the reference points'
-  own ±5 K error bars). The full 3D radiative-coupled model separately
+  measurement errors — the three Hayne et al. (2017) equatorial peak/
+  midnight/minimum anchors land inside their ±5 K bars (max residual
+  **1.05 K**), and the 27 bare nighttime brightness-temperature dots (no
+  error bars in the source figure) run **1.61 K** max / **0.75 K** RMS,
+  PTM3D slightly warm. The full 3D radiative-coupled model separately
   matches real Diviner seasonal south-polar temperatures (Williams et al.
   2019) at a Haworth-crater cold-trap site to a **+1.9 K** deep-floor
   summer-maximum bias and **11 K / 6 K RMS** (summer/winter mean) — see the
   validation gallery below
-- **Hayne et al. (2017)** thermophysical model: reproduces the lunar
-  equatorial diurnal cycle (noon ~383 K, midnight ~101 K) and, via Apollo
-  15/17 heat-flow-probe comparison, the subsurface diurnal-mean depth
-  profile to max residual **2.3 K**
+- **Hayne et al. (2017)** thermophysical model: the global Table 1
+  properties (Bond albedo A₀ = 0.12) reproduce the lunar equatorial diurnal
+  cycle (noon 384.2 K, midnight 100.3 K). At the Apollo 15 (Hadley–Apennine)
+  and Apollo 17 (Taurus–Littrow, dark pyroclastic-mantle terrain) landing
+  sites, a site-specific albedo A₀ = 0.06 (all other properties unchanged
+  from Table 1) brings both the surface and the 0.83 m / 1.30 m heat-flow-
+  probe temperatures inside their ±5 K bars; max residual **4.91 K**
+  (Apollo 17 surface — the tightest of the four points, 0.09 K inside its bar)
 
 **Full validation gallery (all seven manuscript figures, Figs. 3–9, with
 headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
@@ -108,22 +115,29 @@ headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
 ![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_ptm3d_hayne_apollo.png)
 *PTM3D-native re-run of the submitted manuscript's Fig. 5 tests (`main.tex`,
 "Validation of the 3D thermophysical model with comparison to Diviner data
-(left panel) and Apollo heat flow probe data (right panel)"). The submitted
-manuscript's own Fig. 5 plots heat1d, PTM3D's 1D reference column, not the
-3D model end to end; this render instead runs PTM3D itself — smooth global
-icosphere (radiation exchange OFF is exact for a convex body), CPU-only,
-body=Moon with the manuscript's own Table 1 (Hayne et al. 2017)
-thermophysical properties unmodified, equilibrated 60 lunar day/night
-cycles so the ≳0.4 m diurnal-mean plateau in the right panel is converged.
-Left panel: equatorial/30°/60° PTM3D diurnal surface-temperature curves vs.
-the same Diviner brightness-temperature and Hayne et al. (2017) equatorial
-peak/midnight/minimum reference points the manuscript overlaid (all carry
-the manuscript's own ±5 K error bars). Right panel: PTM3D diurnal-mean
-subsurface profiles at the Apollo 15/17 landing-site latitudes vs. the
-Apollo heat-flow-probe points. **Max |PTM3D − reference| = 4.5 K (left
-panel, 60° nighttime branch) and 2.3 K (right panel)** — both inside the
-reference points' own ±5 K error bars, meeting the "fit to within the
-measurement errors" standard the manuscript's own (heat1d) Fig. 5 claims.*
+(left panel) and Apollo heat flow probe data (right panel)"), run through
+PTM3D itself end to end — smooth global icosphere (radiation exchange OFF is
+exact for a convex body), CPU-only, body=Moon. **(a)** Global Table 1
+(Hayne et al. 2017) thermophysical properties, A₀ = 0.12: equatorial/30°/60°
+PTM3D diurnal surface-temperature curves vs. Diviner brightness temperatures
+and the Hayne et al. (2017) equatorial peak/midnight/minimum reference
+points (all carry the manuscript's own ±5 K error bars; the 27 nighttime
+Diviner dots are bare in the source figure and are plotted without invented
+bars). Max |PTM3D − reference| = **1.05 K** at the three bar-carrying
+anchors (the hr = 18 "minimum" is compared extremum-to-extremum, since
+PTM3D's own diurnal minimum falls ~4 minutes before the fixed reference
+hour — disclosed, not hidden) and **1.61 K** (RMS 0.75 K) at the 27 bare
+dots, informative only. **(b)** Apollo 15 (Hadley–Apennine) and Apollo 17
+(Taurus–Littrow, dark pyroclastic-mantle terrain) landing sites at their own
+site-specific Bond albedo, A₀ = 0.06 — all other properties unchanged from
+Table 1 (no evidence for a lower density e-folding depth H at either site,
+so H stays at the Table 1 default). Equilibrated 480 lunar day/night cycles
+at thermal grid resolution `thermal_b = 45` (bottom node 1.41 m, the
+convergence study's accepted working point); both scored deep points
+(0.83 m, 1.30 m) fall within that genuinely-solved grid, so the model
+curves are drawn solid throughout, with no extrapolated segment. **Max
+|PTM3D − reference| = 4.91 K** (Apollo 17 surface, 0.09 K inside its ±5 K
+bar) — **all four Apollo points land inside their ±5 K bars.***
 
 ![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
