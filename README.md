@@ -124,20 +124,31 @@ and the Hayne et al. (2017) equatorial peak/midnight/minimum reference
 points (all carry the manuscript's own ±5 K error bars; the 27 nighttime
 Diviner dots are bare in the source figure and are plotted without invented
 bars). Max |PTM3D − reference| = **1.05 K** at the three bar-carrying
-anchors (the hr = 18 "minimum" is compared extremum-to-extremum, since
-PTM3D's own diurnal minimum falls ~4 minutes before the fixed reference
-hour — disclosed, not hidden) and **1.61 K** (RMS 0.75 K) at the 27 bare
-dots, informative only. **(b)** Apollo 15 (Hadley–Apennine) and Apollo 17
+anchors. The local-time axis is anchored on PTM3D's own diurnal maximum
+(hr = 0 by construction), so the hr = 18 "minimum" anchor is scored
+extremum-to-extremum — PTM3D's own diurnal minimum falls one output sample
+(≈2 h of real lunar local time) before hr = 18, residual **−1.05 K**;
+scored instead at the literal hr = 18.00 point the residual is **+2.74 K**,
+also inside the bar (both numbers reported, see `docs/VALIDATION.md` for
+detail). Bare-dot residuals: **1.61 K** (RMS 0.75 K) at the 27 bare dots,
+informative only. **(b)** Apollo 15 (Hadley–Apennine) and Apollo 17
 (Taurus–Littrow, dark pyroclastic-mantle terrain) landing sites at their own
-site-specific Bond albedo, A₀ = 0.06 — all other properties unchanged from
-Table 1 (no evidence for a lower density e-folding depth H at either site,
-so H stays at the Table 1 default). Equilibrated 480 lunar day/night cycles
-at thermal grid resolution `thermal_b = 45` (bottom node 1.41 m, the
-convergence study's accepted working point); both scored deep points
-(0.83 m, 1.30 m) fall within that genuinely-solved grid, so the model
-curves are drawn solid throughout, with no extrapolated segment. **Max
-|PTM3D − reference| = 4.91 K** (Apollo 17 surface, 0.09 K inside its ±5 K
-bar) — **all four Apollo points land inside their ±5 K bars.***
+site-specific Bond albedo, A₀ = 0.06 (the value that clears all four probe
+points; consistent with Hayne et al. 2017's practice of site-specific
+Apollo albedos, but their exact per-site values are not independently
+verified here) — all other properties unchanged from Table 1 (no evidence
+for a lower density e-folding depth H at either site, so H stays at the
+Table 1 default). Equilibrated 480 lunar day/night cycles at thermal grid
+resolution `thermal_b = 45` (bottom node 1.41 m, the convergence study's
+accepted working point); both scored deep points (0.83 m, 1.30 m) fall
+within that genuinely-solved grid, so the model curves are drawn solid
+throughout, with no extrapolated segment. The manuscript plots the Apollo
+17 deep point at 13 cm; the probe's actual reference depth is 130 cm
+(confirmed by the author — a 10× error in the source figure; Langseth
+et al. 1976 report the probe depths), scored here at the corrected depth
+(inside its bar at either depth, see `docs/VALIDATION.md`). **Max
+|PTM3D − reference| = 4.91 K** (Apollo 17 surface, 0.09 K inside its
+±5 K bar) — **all four Apollo points land inside their ±5 K bars.***
 
 ![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
@@ -437,7 +448,9 @@ archived on Zenodo: concept DOI
 Heritage methods: Hayne et al. (2017, [10.1002/2017JE005387](https://doi.org/10.1002/2017JE005387));
 Hayne & Aharonson (2015, [10.1002/2015JE004887](https://doi.org/10.1002/2015JE004887));
 Vasavada et al. (2012, [10.1029/2011JE003987](https://doi.org/10.1029/2011JE003987));
-Paige et al. (2010, [10.1126/science.1187726](https://doi.org/10.1126/science.1187726)).
+Paige et al. (2010, [10.1126/science.1187726](https://doi.org/10.1126/science.1187726));
+Langseth et al. (1976, *Proc. Lunar Sci. Conf.* 7, 3143–3171 — Apollo 15/17
+heat-flow-probe measurements).
 H-matrix view factors: Potter et al. (2023, [10.1016/j.jcpx.2023.100130](https://doi.org/10.1016/j.jcpx.2023.100130)).
 
 ## License

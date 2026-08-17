@@ -56,47 +56,80 @@ unchanged from the tracked default), `equilibration_orbits: 60` (a
 2/5/10/20/30/45-orbit convergence sweep showed the ≳0.4 m diurnal-mean
 plateau moves <0.02 K/orbit by orbit 45, so 60 is converged).
 
-**Recipe, panel (b):** identical mesh/solver settings, but with a
+**Recipe, panel (b):** identical mesh and physics settings, but with a
 site-specific Bond albedo A₀ = 0.06 at the Apollo 15 (26.13°N,
 Hadley–Apennine) and Apollo 17 (20.19°N, Taurus–Littrow, dark
-pyroclastic-mantle terrain) landing-site latitudes — physically consistent
-with both sites sitting in lower-albedo terrain than the Table 1 global
-mean, and reproducing the site-specific albedo Hayne et al. (2017) itself
-used at these two sites. All other properties stay at their Table 1
-values, including the density e-folding depth H (there is no evidence for
-a lower H at either site). This panel is equilibrated **480** lunar
-day/night cycles at thermal grid resolution `thermal_b = 45` (bottom node
-1.4119 m) — a dedicated equilibration × grid-resolution convergence study
-found the 0.83 m / 1.30 m deep-column nodes need hundreds of spin-up
-cycles once genuinely resolved at this depth (eq = 480 residual-to-
-asymptote +0.13 / +0.14 K by Aitken extrapolation; `thermal_b = 45` vs. 52
-agree to 0.07–0.08 K). Both scored deep points fall within that
-genuinely-solved 1.41 m grid, so the model curves are drawn solid
-throughout — no extrapolated segment.
+pyroclastic-mantle terrain) landing-site latitudes. A₀ = 0.06 is the value
+that brings all four probe points (two sites × surface/deep) inside their
+±5 K bars — for Apollo 17 it is also physically consistent with the dark
+pyroclastic-mantle terrain at Taurus–Littrow (lower albedo than the Table 1
+global mean); Apollo 15 (Hadley–Apennine) has no comparable terrain-based
+justification identified here and uses the same calibrated value. This is
+consistent with Hayne et al. (2017)'s own *practice* of assigning
+site-specific Apollo albedos rather than the Table 1 global default — the
+exact 2017 per-site values are not independently verified here, so no
+specific number from that compilation is claimed to be reproduced. All
+other properties stay at their Table 1 values, including the density
+e-folding depth H (there is no evidence for a lower H at either site). The
+two panels are run on different binaries/solver paths: panel (a) is
+`equilibration_orbits = 60`, `thermal_b = 15`, binary md5 `a1f465a3…`,
+`thermal_solver_path = cpu_simd_batch`; panel (b) is `equilibration_orbits
+= 480`, `thermal_b = 45` (bottom node 1.4119 m), binary md5 `47d9d49b…`,
+`thermal_solver_path = cpu_streamed_simd_batch` — panel (a) only plots the
+surface curve, which a dedicated convergence study found is
+eq-orbit-insensitive (converges in a handful of cycles), so the shorter
+eq=60/b=15 run is not a shortcut on the quantity panel (a) actually shows.
+Panel (b)'s own deep nodes need the longer eq=480/b=45 run: a dedicated
+equilibration × grid-resolution convergence study found the 0.83 m /
+1.30 m deep-column nodes need hundreds of spin-up cycles once genuinely
+resolved at this depth (eq = 480 residual-to-asymptote +0.13 / +0.14 K by
+Aitken extrapolation; `thermal_b = 45` vs. 52 agree to 0.07–0.08 K). Both
+scored deep points fall within that genuinely-solved 1.41 m grid, so the
+model curves are drawn solid throughout — no extrapolated segment.
 
 Reference points (Diviner nighttime dots, Hayne et al. 2017 equatorial
 peak/midnight/minimum squares, Apollo 15/17 probe points) were digitized
-directly from the submitted manuscript's own `fig05.pdf` vector content
-(exact marker/axis-tick coordinates, not pixel-eyeballing); every reference
-marker in the source figure carries a ±5 K error bar, reproduced here
-unchanged.
+from the submitted manuscript's own `fig05.pdf` vector content (exact
+marker/axis-tick coordinates, not pixel-eyeballing), **with one correction**:
+the manuscript plots the Apollo 17 deep point at a depth of 13 cm, but the
+probe's actual reference depth is 130 cm (confirmed by the author; the
+original measurements are Langseth et al. 1976's Apollo 17 heat-flow-probe
+depths) — a 10× digitization/transcription error in the source figure. This
+render scores Apollo 17's deep point at the corrected 130 cm; the point is
+inside its ±5 K bar at either depth (**−0.89 K** at the literal 13 cm the
+manuscript plots, **+2.55 K** at the corrected 130 cm), so the correction
+does not change the pass/fail outcome, only which depth is being claimed.
+Every reference marker in the source figure carries a ±5 K error bar,
+reproduced here unchanged. The Apollo probe temperatures and Diviner
+brightness temperatures are themselves independent measurements —
+Langseth et al. (1976) for the former, the Diviner Lunar Radiometer
+Experiment (Paige et al. 2010) for the latter — digitized here via the
+Hayne et al. (2017) compilation, which shares an author with PTM3D and is
+not itself an independent check.
 
 Panel (a): equatorial, 30°, and 60° PTM3D diurnal surface-temperature
 curves vs. Diviner brightness temperatures and the Hayne et al. (2017)
 equatorial peak/midnight/minimum reference points. Panel (b): PTM3D
 diurnal-mean subsurface profiles (to 1.30 m) at the Apollo 15/17
-landing-site latitudes vs. the Apollo heat-flow-probe points (Hayne et al.
-2017 compilation), each site at its own A₀ = 0.06.
+landing-site latitudes vs. the Apollo heat-flow-probe points, each site at
+its own A₀ = 0.06.
 **Headline:** panel (a) max |PTM3D − reference| = **1.05 K** at the three
-bar-carrying Hayne et al. (2017) anchors (0°/30° nighttime branches are
-≤0.79 K, 60° is ≤1.61 K; the "minimum" anchor is compared
-extremum-to-extremum since PTM3D's own diurnal minimum falls ~4 minutes
-before the fixed reference hour) and **1.61 K** max / **0.75 K** RMS at the
-27 bare Diviner dots (informative only — no error bars in the source
-figure, so no pass/fail claim). Panel (b) max |PTM3D − reference| =
-**4.91 K** (Apollo 17 surface — the tightest of the four Apollo points,
-0.09 K inside its ±5 K bar; the two deep points score +0.98 K and +2.55 K)
-— **all four Apollo points land inside their ±5 K bars.**
+bar-carrying Hayne et al. (2017) anchors (0° nighttime branch ≤1.00 K, 30°
+≤0.79 K, 60° ≤1.61 K). The "minimum" anchor (hr = 18) is scored
+extremum-to-extremum: the plotted local-time axis is anchored on PTM3D's
+own diurnal maximum (hr = 0 by construction, not an independent clock), so
+its diurnal minimum is read wherever it actually falls — one output sample
+(0.07 h on this axis, ≈2 h of real lunar local time) before hr = 18,
+giving **−1.05 K**. Scored instead at the literal hr = 18.00 grid point
+(no extremum search), the residual is **+2.74 K** — also inside the ±5 K
+bar, so the extremum-vs-literal choice does not change the verdict, only
+its sign and size; both numbers are reported so neither reads as
+convention-shopping. The 27 bare Diviner dots (informative only — no error
+bars in the source figure, so no pass/fail claim) run **1.61 K** max /
+**0.75 K** RMS. Panel (b) max |PTM3D − reference| = **4.91 K** (Apollo 17
+surface — the tightest of the four Apollo points, 0.09 K inside its ±5 K
+bar; the two deep points score +0.98 K and +2.55 K) — **all four Apollo
+points land inside their ±5 K bars.**
 
 ## Manuscript Fig. 6 — Energy conservation
 
