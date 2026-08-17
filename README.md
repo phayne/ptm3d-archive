@@ -64,10 +64,29 @@ and thermal emission from surrounding terrain.*
   reciprocity to machine precision. It is the gate every radiation change has to
   pass; the CPU build and this gate are wired into the repository's CI workflow
   ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), Linux + macOS)
-- **Lunar Diviner** radiometer: RMS <4 K against measured bolometric temperatures
+- **Diviner Lunar Radiometer Experiment** (compared via the Hayne et al. 2017
+  Diviner-derived lunar regolith model, not a direct replay of raw radiometer
+  counts): PTM3D's post-sunset cooling curve matches the published reference
+  points to **0.97 K RMS** across fifteen nighttime samples spanning three
+  latitudes
 - **Hayne et al. (2017)** 1D thermophysical model: reproduces the lunar
-  equatorial diurnal cycle (noon ~388 K, night ~99 K) —
-  ![see the comparison](docs/figures/lunar_validation.png)
+  equatorial diurnal cycle (noon ~388 K, night ~99 K)
+
+![Ingersoll bowl-crater radiation-exchange validation](docs/figures/validation_bowl_crater_ingersoll.png)
+*PTM3D vs. the analytic two-zone bowl-crater solution of Ingersoll, Svitek &
+Murray (1992). **(a)** Floor equilibrium temperature vs. solar elevation for
+three crater depth-to-diameter ratios — PTM3D curves are visually
+indistinguishable from the analytic solution. **(b)** Floor sky-view-factor
+F_sky from the PTM3D mesh (circles, per-face range) vs. the analytic value
+sin²α (dashed line): agreement within 0.49%.*
+
+![Diviner / Hayne et al. (2017) lunar surface-temperature validation](docs/figures/validation_lunar_diviner_hayne2017.png)
+*PTM3D global lunar surface temperatures (327,680-face icosphere) vs. the
+Hayne et al. (2017) Diviner-derived lunar regolith model. **(a)** Equatorial
+diurnal cycle, with Hayne (2017) peak/midnight/post-dawn-minimum reference
+points overlaid. **(b)** Post-sunset cooling at 0°, 30°, and 60° latitude vs.
+Hayne (2017) reference points — 0.97 K RMS across the fifteen plotted
+nighttime points.*
 
 ## Get started
 
