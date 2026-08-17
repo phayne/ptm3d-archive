@@ -6695,11 +6695,14 @@ struct CalibrationProbe {
     double emissivity    = 0.95;
     double T_deep        = 100.0;     // deep boundary temp [K] (probe only)
     double T_initial     = 120.0;     // uniform initial temp [K] (probe only)
-    double ceiling_s     = 25.0;      // safe per-dispatch wall budget
+    double ceiling_s     = gpu::kSafeDispatchCeilingSeconds;  // per-dispatch wall budget
     double safety_factor = 4.0;       // F3 clamp (generic path only)
     int    probe_steps_1 = 30;
     int    probe_steps_2 = 120;
-    double probe_budget_s = 15.0;     // wedge guard: abort if 30-step wall exceeds this
+    // Wedge guard: abort before the 4x point if the small point already blew
+    // this. Tied to the dispatch budget — a probe point that takes multiples of
+    // the watchdog budget is itself the hazard we are trying to avoid.
+    double probe_budget_s = 2.0 * gpu::kSafeDispatchCeilingSeconds;
     bool   is_run_grid   = false;     // true relaxes the F3 4x clamp -> INFO
 };
 
@@ -7051,9 +7054,9 @@ static void ensureGpuCalibrated(const thermal::Config& config,
     pr.cond_model = static_cast<int>(config.conductivity_model);
     pr.cp_eff = cp_eff;              // effective cp used for the S signature
     pr.emissivity = (planet.emissivity > 0.0) ? planet.emissivity : 0.95;
-    pr.ceiling_s  = 25.0;             // documented survivable per-dispatch window
+    pr.ceiling_s  = gpu::kSafeDispatchCeilingSeconds;  // measured survivable window
     pr.is_run_grid = true;
-    pr.probe_budget_s = 15.0;
+    pr.probe_budget_s = 2.0 * gpu::kSafeDispatchCeilingSeconds;
 
     gpu::MachineProfile out;
     int rc = 4;
@@ -12762,7 +12765,7 @@ static int runGpuCalibration(int argc, char** argv) {
     // (default ON) which probes the LOADED run's own grid instead of these.
     int    batch_size    = 8000;
     int    n_layers      = 50;
-    double ceiling_s     = 25.0;
+    double ceiling_s     = gpu::kSafeDispatchCeilingSeconds;  // --safe-ceiling-s overrides
     double dz0           = 5.0e-4;   // first-layer thickness [m] (fine near-surface)
     double grid_ratio    = 1.2;      // geometric growth of dz with depth
     double dt_output_s   = 3600.0;   // OUTPUT timestep [s]
