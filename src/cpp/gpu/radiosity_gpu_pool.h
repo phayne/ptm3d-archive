@@ -91,13 +91,22 @@ public:
     /// @param row_norm Per-face 1/max(1, sum_j F_ij), applied inside each
     ///        device's Jacobi iteration. Pass an empty vector to leave every
     ///        device at the 1.0 identity seed (legacy arithmetic).
+    /// @param emissivity_vis Visible-band absorptivity 1 - A_i. Pass empty (the
+    ///        default) for a gray run; passing it enables the FUSED two-band
+    ///        solve on every device, which shares one CSR traversal between the
+    ///        bands. Like row_norm this is operator-level state: a device that
+    ///        missed it would run a different route from its peers, so a partial
+    ///        upload fails the whole pool rather than producing a mixed fleet.
+    /// @param reflectivity_vis Visible-band reflectivity A_i (paired with the above).
     bool uploadStaticData(
         const std::vector<double>& csr_values,
         const std::vector<int>& csr_col_indices,
         const std::vector<int64_t>& csr_row_ptrs,
         const std::vector<float>& emissivity,
         const std::vector<float>& reflectivity,
-        const std::vector<float>& row_norm = {});
+        const std::vector<float>& row_norm = {},
+        const std::vector<float>& emissivity_vis = {},
+        const std::vector<float>& reflectivity_vis = {});
 
     /// Number of devices the pool dispatches across.
     size_t numDevices() const noexcept { return slots_.size(); }
