@@ -683,6 +683,12 @@ static bool writeLocationDepthCSV(const std::string& out_path,
 // `grid_bottom_m`, when non-null, receives the depth of the DEEPEST SOLVED
 // node. Any requested depth below it is a Fourier's-law extrapolation, not a
 // solved value, and the caller is the only place that can say so.
+//
+// `face_idx` is this site's mesh face. It exists so the column is solved with
+// THIS face's H (planet.H_for_face) when a per-face H map is loaded; -1 means
+// "not a mesh face", which falls back to the scalar planet.H. `H_used`, when
+// non-null, receives the H the column was actually built with, so the caller
+// can report it instead of assuming.
 static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -691,7 +697,9 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& depths_m,
     int equilibration_steps,
     const thermal::Planet& planet,
-    double* grid_bottom_m = nullptr);
+    double* grid_bottom_m = nullptr,
+    int face_idx = -1,
+    double* H_used = nullptr);
 static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
 
 bool exportLocationTemperatureOnly(const std::string& output_file,
@@ -748,6 +756,25 @@ std::vector<double> runThermalModelForFace(const std::vector<double>&, const std
 // above the definition). See the definition for why this is needed.
 static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config);
 
+// The H the SHARED reference depth grid is built at, or -1 for "use planet.H".
+//
+// The CPU SIMD-batch solver and both GPU solvers put every face on ONE depth
+// grid and then give each face its own rho(z)/kc(z) from its own H. But the
+// grid is a function of H as well -- generateAdaptiveGrid() marches on
+// kappa(z), which carries exp(-z/H) -- so building it at the body-default
+// planet.H while the faces ran at a map's H made those paths disagree with the
+// per-face-grid CPU scalar path even for a UNIFORM map. Measured on the ico3
+// Moon at H = 0.03125 m: 23 layers vs the scalar path's 22, and 0.008 K.
+//
+// main() publishes the map's median H under "refgrid_H" so that every site that
+// derives this grid reads ONE number -- including CpuStateCheckpoint, which has
+// no Planet and must land on the same layer count or every cross-backend
+// restore fails its shape check. Absent the key (no per-face map loaded) this
+// returns -1.0, Profile falls back to planet.H, and nothing moves.
+static inline double refGridHOverride(const thermal::Config& config) {
+    return config.getPropertyDouble("refgrid_H", -1.0);
+}
+
 // PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
 // applies a user-configured scalar override to a solver-local Planet; main()
 // FAILS the run if an override was configured and this stayed at zero, so an
@@ -767,6 +794,7 @@ static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalP
                                     double geothermal_heat_flow) {
     return (tp.ks_override              > 0.0)
         || (tp.kd_override              > 0.0)
+        || (tp.H_override               > 0.0)
         || (tp.emissivity_override      > 0.0)
         || (tp.albedo_override         >= 0.0)
         || (tp.constant_thermal_inertia > 0.0)
@@ -2843,7 +2871,8 @@ struct CpuStateCheckpoint {
 
         thermal::Planet ref_planet(config.getProperty("planet", "Moon"));
         applyConfiguredThermo(ref_planet, config);
-        thermal::Profile ref_profile(ref_planet, 0.0, config, false);
+        thermal::Profile ref_profile(ref_planet, 0.0, config, false,
+                                     refGridHOverride(config));
         n_layers = static_cast<size_t>(ref_profile.nlayers);
         if (n_layers < 2) {
             std::cerr << tag << " FATAL: reference depth grid has " << n_layers
@@ -3782,6 +3811,11 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
                           const char* label; const char* unit; } kScalarOverrides[] = {
         {"ovr_ks",         &thermal::Planet::ks,         "ks",         " W/m/K"},
         {"ovr_kd",         &thermal::Planet::kd,         "kd",         " W/m/K"},
+        // Regolith density/conductivity e-folding depth. Reaches the solver on
+        // the SAME channel as ks/kd because it is the third parameter of the
+        // same rho(z)/kc(z) law -- a sweep that moves ks and kd but not H is
+        // sweeping two thirds of the profile.
+        {"ovr_H",          &thermal::Planet::H,          "H",          " m"},
         {"ovr_rhod",       &thermal::Planet::rhod,       "rhod",       " kg/m^3"},
         {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
         {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
@@ -4901,7 +4935,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     // Create reference profile for grid parameters (reuses `planet` above).
-    thermal::Profile ref_profile(planet, 0.0, config, false);
+    thermal::Profile ref_profile(planet, 0.0, config, false,
+                                 refGridHOverride(config));
     const int n_layers = ref_profile.nlayers;
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
@@ -7195,7 +7230,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
     recordIrAbsorptivity("gpu_persistent", thermalIrEmissivity(planet));
-    thermal::Profile reference_profile(planet, 0.0, config, false);
+    thermal::Profile reference_profile(planet, 0.0, config, false,
+                                       refGridHOverride(config));
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
 
@@ -9168,7 +9204,8 @@ bool runThermalForSelectedFaces_GPU(
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
     recordIrAbsorptivity("gpu_rethermal", thermalIrEmissivity(planet));
-    thermal::Profile reference_profile(planet, 0.0, config, false);
+    thermal::Profile reference_profile(planet, 0.0, config, false,
+                                       refGridHOverride(config));
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
     // No seed banner here: this path never seeds. It is warm-started from
@@ -9634,6 +9671,20 @@ bool runThermalForSelectedFaces_GPU(
                           << std::endl;
                 pool_ptr = nullptr;
             }
+            // The pool's device buffers are n_layers * max_n_faces, so a pool
+            // sized for a DIFFERENT grid is not merely suboptimal -- the
+            // uploads land at the wrong stride. ThermalGPUPoolConfig::n_layers
+            // exists to be checked here (thermal_gpu_pool.h:92-95) and was
+            // never checked: only capacity was. Any knob that moves the depth
+            // grid between the pool's construction and this solve reaches this
+            // line, which is how the per-face-H reference-grid change found it.
+            if (pool_ptr != nullptr && pool_ptr->nLayers() != n_layers) {
+                std::cerr << "  [GPU Thermal Pool] Shared pool was sized for "
+                          << pool_ptr->nLayers() << " depth layers but this solve needs "
+                          << n_layers << "; falling back to a local pool rather than "
+                             "uploading at the wrong stride." << std::endl;
+                pool_ptr = nullptr;
+            }
         }
 
         if (pool_ptr == nullptr) {
@@ -9904,7 +9955,9 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& depths_m,
     int equilibration_steps,
     const thermal::Planet& planet,
-    double* grid_bottom_m)
+    double* grid_bottom_m,
+    int face_idx,
+    double* H_used)
 {
     // Build flux array [2 x N]: times, flux
     Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
@@ -9912,9 +9965,24 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
         flux_arr(0, i) = times[i];
         flux_arr(1, i) = (i < static_cast<int>(flux_values.size())) ? flux_values[i] : 0.0;
     }
+
+    // Per-face H (Diviner / Hayne+2017 map, thermal_inertia_map, or a custom
+    // h_parameter_map). This used to be the one solver entry point that did not
+    // look it up: the Model constructor builds its Profile with the default
+    // H_override = -1, so these columns fell back to the scalar planet.H and a
+    // per-face H map was a SILENT no-op on every *_depths.csv -- including the
+    // Apollo validation columns, where the map is exactly the point. Feeding a
+    // Planet copy whose H is this face's is equivalent to the H_override
+    // parameter the mesh solvers pass (Profile's ctor does `this->planet.H =
+    // H_face` with it), so the two paths build the same grid and the same
+    // rho(z)/kc(z).
+    thermal::Planet face_planet = planet;
+    face_planet.H = planet.H_for_face(face_idx);
+    if (H_used) *H_used = face_planet.H;
+
     // Create and run model
     thermal::Model mdl(
-        planet,
+        face_planet,
         latitude_deg * M_PI / 180.0,
         times,
         flux_arr,
@@ -10364,7 +10432,13 @@ bool exportLocationIlluminationAndTemperature(
     return true;
 }
 
-// Run the thermal model for a face with matched times
+// Run the thermal model for a face with matched times.
+//
+// This re-declares the definition above (:2951); it does NOT repeat its default
+// arguments, which C++ forbids. It also used to omit `SeedAnchorCensus*`
+// entirely, which made it a SECOND, never-defined overload rather than a
+// redeclaration -- inert only because no call site supplied 11 arguments, and a
+// link error waiting for the one that did.
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -10376,6 +10450,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
     std::atomic<size_t>* seed_hot_faces,
+    SeedAnchorCensus*    anchor_census,
     FaceStateIO* state);
 
 // Write a complete VTK file with both illumination and thermal data
@@ -14377,6 +14452,56 @@ int main(int argc, char** argv) {
                       << " -> " << tp.kd_override << " W/m/K" << std::endl;
             planet.kd = tp.kd_override;
         }
+        if (tp.H_override > 0.0) {
+            // fmtSig, NOT bare `<<`. std::cout arrives here already carrying
+            // `std::fixed << std::setprecision(1)` from an earlier progress
+            // banner, under which H = 0.06 m renders as "0.1" -- a run
+            // reporting a number it did not use (the same PTM-05/PTM-55
+            // archetype fmtSig exists for; the albedo-map rule-7 warning
+            // further down still prints 0.06 as "0.1" today -- observed in this
+            // branch's own ico6 log, reported to the ledger 2026-08-17, and NOT
+            // fixed here because it is not this key's line).
+            std::cout << "Property override (requested): H " << fmtSig(planet.H)
+                      << " -> " << fmtSig(tp.H_override) << " m" << std::endl;
+            planet.H = tp.H_override;
+
+            // Rule 7, case 1: constant_thermal_inertia collapses kd -> ks and
+            // rhod -> rhos below, which makes exp(-z/H) multiply zero. H is
+            // then EXACTLY inert and an H sweep would return N identical runs.
+            if (tp.constant_thermal_inertia > 0.0) {
+                std::cerr << "WARNING: thermophysical.H_override = "
+                          << fmtSig(tp.H_override) << " m is set together with "
+                             "constant_thermal_inertia = "
+                          << fmtSig(tp.constant_thermal_inertia) << ".\n"
+                          << "  Constant-TI mode collapses kd -> ks and rhod -> rhos, so "
+                             "rho(z) and kc(z) are uniform with depth and H multiplies "
+                             "nothing.\n"
+                          << "  This run is IDENTICAL to one without the H override; an H "
+                             "sweep under constant_thermal_inertia measures nothing."
+                          << std::endl;
+            }
+            // Rule 7, case 2: a per-face H map out-ranks this scalar on every
+            // face it covers, exactly as a per-face albedo map out-ranks
+            // albedo_override. The map is loaded further down (see the
+            // [property-map] block); say so here rather than let an H sweep
+            // flatline against a map the user forgot was configured.
+            if (!h_parameter_map_file.empty() || !thermal_inertia_map_file.empty()
+                || use_default_property_map) {
+                std::cerr << "WARNING: thermophysical.H_override = "
+                          << fmtSig(tp.H_override)
+                          << " m is set AND a per-face H map is configured "
+                             "(thermal."
+                          << (!h_parameter_map_file.empty()   ? "h_parameter_map"
+                            : !thermal_inertia_map_file.empty() ? "thermal_inertia_map"
+                            : "use_default_property_map")
+                          << ").\n"
+                          << "  If the map loads, ITS per-face H governs rho(z) and kc(z); "
+                             "the scalar survives only as the fallback for faces the map "
+                             "does not cover.\n"
+                          << "  Check the [property-map] line below, and drop the map to "
+                             "sweep H directly." << std::endl;
+            }
+        }
 
         // Directional-hemispheric (Hapke) albedo gate. Opt-in; default OFF ->
         // untouched baseline. When on, the single-scattering albedo w is taken
@@ -14787,16 +14912,59 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (tpm && tpm->H_values().empty()) {
+            // Every consumer below dereferences this vector -- min_element,
+            // max_element and the median all read past the end on an empty
+            // load, and planet.face_H_overrides would be an empty map that
+            // H_for_face() silently treats as "no map". Refuse instead.
+            std::cerr << "\n[property-map] FATAL: " << source_label
+                      << " loaded with ZERO faces. Refusing rather than running "
+                         "with a per-face map that covers nothing.\n";
+            return 1;
+        }
         if (tpm) {
             set_planet_overrides(*tpm);
+            const double H_lo = *std::min_element(tpm->H_values().begin(), tpm->H_values().end());
+            const double H_hi = *std::max_element(tpm->H_values().begin(), tpm->H_values().end());
             std::cout << "[property-map] " << map_mode_label
                       << "  source=" << source_label
                       << "  faces=" << tpm->H_values().size()
                       << "  default_fraction="
                       << (tpm->fraction_default() * 100.0) << "%"
-                      << "  H[range]=" << *std::min_element(tpm->H_values().begin(), tpm->H_values().end())
-                      << ".." << *std::max_element(tpm->H_values().begin(), tpm->H_values().end())
+                      << "  H[range]=" << H_lo << ".." << H_hi
                       << " m\n";
+
+            // The ONE H the shared reference depth grid is built at, published
+            // here so the CPU SIMD-batch solver, both GPU solvers and
+            // CpuStateCheckpoint all derive the SAME grid (see
+            // refGridHOverride). Before this, those paths gave each face its own
+            // rho(z)/kc(z) from the map but built the grid at the body-default
+            // planet.H, so even a UNIFORM map disagreed with the per-face-grid
+            // CPU scalar path -- 23 layers vs 22, 0.008 K, on the ico3 Moon at
+            // H = 0.03125 m.
+            //
+            // The median, not the mean: it is the value an actual face has, it
+            // is insensitive to the default-filled tail that `fraction_default`
+            // counts, and for a uniform map it IS that map's H, which is what
+            // makes uniform-map == scalar H_override an exact identity rather
+            // than an approximation.
+            std::vector<double> H_sorted = tpm->H_values();
+            const size_t mid = H_sorted.size() / 2;
+            std::nth_element(H_sorted.begin(), H_sorted.begin() + mid, H_sorted.end());
+            const double H_ref = H_sorted[mid];
+            thermal_config.setProperty("refgrid_H", fullPrecision(H_ref));
+            std::cout << "[property-map] shared reference depth grid built at H = "
+                      << fmtSig(H_ref) << " m (median of the map). Each face still gets"
+                         " its OWN rho(z), kc(z) from its own H; only the grid is shared"
+                         " on the CPU SIMD-batch and GPU paths.\n";
+            if (H_lo > 0.0 && H_hi / H_lo > 2.0) {
+                std::cerr << "[property-map] WARNING: this map spans H = " << fmtSig(H_lo)
+                          << " .. " << fmtSig(H_hi) << " m (ratio " << fmtSig(H_hi / H_lo)
+                          << "x). One shared depth grid cannot resolve that whole span"
+                             " equally well on the CPU SIMD-batch / GPU paths; the CPU"
+                             " scalar solver (--no-simd-batch) gives every face its own"
+                             " grid at the cost of speed.\n";
+            }
         } else if (!h_parameter_map_file.empty() ||
                    !thermal_inertia_map_file.empty() ||
                    use_default_property_map) {
@@ -16389,6 +16557,7 @@ int main(int argc, char** argv) {
             if (geothermal_heat_flow   > 0.0) fwd("ovr_Qb",         planet.Qb);
             if (tp.ks_override         > 0.0) fwd("ovr_ks",         planet.ks);
             if (tp.kd_override         > 0.0) fwd("ovr_kd",         planet.kd);
+            if (tp.H_override          > 0.0) fwd("ovr_H",          planet.H);
             if (tp.emissivity_override > 0.0) fwd("ovr_emissivity", planet.emissivity);
             if (tp.albedo_override    >= 0.0) fwd("ovr_albedo",     planet.albedo);
             // Rule 7: albedo_override is the one knob a per-face albedo MAP can
@@ -17123,6 +17292,7 @@ int main(int argc, char** argv) {
                           << "  Requested:"
                           << (tp.ks_override              > 0.0 ? " ks_override"         : "")
                           << (tp.kd_override              > 0.0 ? " kd_override"         : "")
+                          << (tp.H_override               > 0.0 ? " H_override"          : "")
                           << (tp.emissivity_override      > 0.0 ? " emissivity_override" : "")
                           << (tp.albedo_override         >= 0.0 ? " albedo_override"     : "")
                           << (tp.constant_thermal_inertia > 0.0 ? " constant_thermal_inertia" : "")
@@ -18126,8 +18296,18 @@ int main(int argc, char** argv) {
                         // there; we size for the 50000 cap so the same pool
                         // covers every iter's re-thermal regardless of the
                         // selected-face count.
+                        // refGridHOverride, for the same reason every other
+                        // shared-grid site takes it: with a per-face H map
+                        // loaded, runThermalForSelectedFaces_GPU builds its
+                        // reference profile at the map's median H. Sizing the
+                        // pool from the body-default grid instead would hand it
+                        // a DIFFERENT layer count -- 23 against the solver's 22
+                        // on this branch's own ico3 measurement at H = 0.03125
+                        // m -- and the pool's device buffers are n_layers *
+                        // max_n_faces.
                         thermal::Profile rerun_profile(planet, 0.0,
-                                                       thermal_config, false);
+                                                       thermal_config, false,
+                                                       refGridHOverride(thermal_config));
                         const size_t rerun_n_layers = rerun_profile.z().size();
                         constexpr size_t kRerunBatchCap = 50000;
 
@@ -19095,18 +19275,54 @@ int main(int argc, char** argv) {
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
 
+                        // The other half of the same defect, NOT fixed here.
+                        // This call also drops the per-face Qb the heat-flow
+                        // mask supplies (every array solver passes it), so a
+                        // coupled CPU run with a mask re-thermals the selected
+                        // faces at the SCALAR planet.Qb. Fixing it is a results
+                        // change on a path this branch does not otherwise
+                        // touch, so it is disclosed rather than silently
+                        // altered (reported to the ledger 2026-08-17).
+                        if (!sim_config.thermal.heat_flow_mask_file.empty()) {
+                            std::cerr << "  [Re-thermal] WARNING: a per-face geothermal heat-flow"
+                                         " mask is loaded, but the CPU selected-faces re-thermal"
+                                         " passes no per-face Qb: these "
+                                      << faces_to_rerun.size()
+                                      << " faces are re-integrated at the scalar Qb = "
+                                      << fmtSig(planet.Qb) << " W/m^2. Use the GPU re-thermal,"
+                                         " or treat the mask as unapplied on those faces.\n";
+                        }
+
                         #pragma omp parallel for schedule(dynamic, 10) num_threads(thermal_threads > 0 ? thermal_threads : omp_get_max_threads())
                         for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
                             int f = faces_to_rerun[idx];
 
                             // Run thermal model using the standard function
                             double latitude = mesh->latitudes[f];
+                            // Per-face H (property map). The argument list here
+                            // used to end at `equilibration_steps`, leaving
+                            // H_override at its default, so the coupled CPU
+                            // re-thermal rebuilt every selected face's column at
+                            // the SCALAR planet.H while iteration 0 had solved
+                            // it at the map's -- the map silently reverted on
+                            // exactly the faces radiation coupling touches.
+                            // Measured on the shipped 80 N crater with a uniform
+                            // H = 0.03125 m map: 2,626 of 12,800 faces diverged
+                            // from the equivalent scalar override, worst
+                            // temperature_min 3.75 K. H_for_face() returns
+                            // planet.H when no map is loaded, so a no-map run is
+                            // unchanged.
+                            const double face_H = planet.face_H_overrides.empty()
+                                                ? -1.0
+                                                : planet.H_for_face(f);
                             std::vector<double> new_temps = runThermalModelWithMatchedTimes(
                                 combined_flux[idx],
                                 times,
                                 latitude,
                                 thermal_config,
-                                equilibration_steps
+                                equilibration_steps,
+                                /*Qb_override=*/-1.0,
+                                face_H
                             );
 
                             // Store results
@@ -20942,7 +21158,8 @@ int main(int argc, char** argv) {
                     return s;
                 };
 
-                int loc_depth_reach_reported = 0;
+                int    loc_depth_reach_reported = 0;
+                double loc_depth_reach_last_m   = 0.0;  // last grid bottom announced
                 for (size_t i = 0; loc_composer_ready && i < locs.size(); ++i) {
                     const auto& tup = locs[i];
                     const std::string name = std::get<0>(tup);
@@ -20993,28 +21210,78 @@ int main(int argc, char** argv) {
                     // depth below that was a Fourier's-law extrapolation of a
                     // grid the user did not configure.
                     double grid_bottom_m = 0.0;
+                    double loc_H_used = 0.0;
                     auto T_depths = runThermalModelDepthSeries(
                         flux_sum, times, lat_deg, thermal_config, depths_m,
-                        equilibration_steps, planet, &grid_bottom_m);
+                        equilibration_steps, planet, &grid_bottom_m,
+                        face_idx, &loc_H_used);
+                    // `face_idx`, not -1: with a per-face H map loaded these
+                    // columns used to be solved at the scalar planet.H while
+                    // the mesh-wide field used the map, so the CSVs and the
+                    // mesh disagreed by construction and a uniform H map was a
+                    // proven no-op here. Report the H each site actually got --
+                    // "the map is loaded" is not evidence that this path read
+                    // it.
+                    if (!planet.face_H_overrides.empty()) {
+                        std::cout << "[location export] site '"
+                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                  << "' face " << face_idx << ": H = "
+                                  << fmtSig(loc_H_used) << " m (per-face map)"
+                                  << std::endl;
+                        // ...and the one way this can still disagree with the
+                        // mesh-wide field, said out loud. This column is solved
+                        // on ITS OWN grid at ITS OWN H (the CPU scalar column
+                        // routine), while the CPU SIMD-batch and GPU solvers put
+                        // the whole mesh on ONE grid at the map's median H. For
+                        // a uniform map those are the same number and the two
+                        // agree exactly; for a NON-uniform map they are not, and
+                        // this site's column is then the better-resolved of the
+                        // two rather than the matching one.
+                        const double loc_H_ref = refGridHOverride(thermal_config);
+                        if (loc_H_ref > 0.0 && std::abs(loc_H_used - loc_H_ref) > 1e-12) {
+                            std::cerr << "[location export] NOTE: this column uses H = "
+                                      << fmtSig(loc_H_used)
+                                      << " m and therefore its own depth grid, while the "
+                                         "mesh-wide solve used one shared grid at the map's "
+                                         "median H = " << fmtSig(loc_H_ref)
+                                      << " m. Expect a small CSV-vs-mesh offset at this site."
+                                      << std::endl;
+                        }
+                    }
 
                     // How deep the column was actually SOLVED. Everything below
                     // is T_bottom + Qb*(z - z_bottom)/k_bottom -- a straight line
                     // through a grid the run never integrated. It used to take a
                     // constant-offset detector on consecutive CSV columns to find
                     // that out after the fact; state it in the run's own log.
-                    if (loc_depth_reach_reported == 0) {
+                    //
+                    // PER SITE, not once. The one-shot latch was correct while
+                    // every site shared one grid; a per-face H map gives each
+                    // site its OWN grid, and a map with H = 0.30 m at site A and
+                    // 0.03 m at site B would have let site A report its bottom,
+                    // clear the warning, and leave site B silently extrapolating
+                    // from a much shallower grid. The full grid line still
+                    // prints only when the reach CHANGES, so a uniform map (or
+                    // no map at all) reads exactly as it did before.
+                    {
                         const size_t n_extrap = static_cast<size_t>(std::count_if(
                             depths_m.begin(), depths_m.end(),
                             [&](double z) { return z > grid_bottom_m; }));
-                        std::cout << "[location export] depth grid (thermal_m/n/b = "
-                                  << thermal_config.m << "/" << thermal_config.n << "/"
-                                  << thermal_config.b << "): deepest SOLVED node at "
-                                  << std::fixed << std::setprecision(4) << grid_bottom_m
-                                  << " m, at site '"
-                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
-                                  << "'." << std::endl;
+                        if (loc_depth_reach_reported == 0
+                            || std::abs(grid_bottom_m - loc_depth_reach_last_m) > 1e-9) {
+                            std::cout << "[location export] depth grid (thermal_m/n/b = "
+                                      << thermal_config.m << "/" << thermal_config.n << "/"
+                                      << thermal_config.b << "): deepest SOLVED node at "
+                                      << std::fixed << std::setprecision(4) << grid_bottom_m
+                                      << " m, at site '"
+                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                      << "'." << std::endl;
+                            loc_depth_reach_last_m = grid_bottom_m;
+                        }
                         if (n_extrap > 0) {
-                            std::cerr << "[location export] WARNING: " << n_extrap << " of "
+                            std::cerr << "[location export] WARNING: site '"
+                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                      << "': " << n_extrap << " of "
                                       << depths_m.size() << " requested depths lie BELOW "
                                       << std::fixed << std::setprecision(4) << grid_bottom_m
                                       << " m and are a Fourier's-law extrapolation "

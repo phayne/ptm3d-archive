@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-168 keys across 9 sections.
+169 keys across 9 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -197,6 +197,7 @@ ENGINE_DEFAULTS = {
     'thermal.threads': 0,
     'thermal.use_default_property_map': False,
     'thermal.use_gpu': False,
+    'thermophysical.H_override': -1.0,
     'thermophysical.albedo_hapke_w': -1.0,
     'thermophysical.albedo_model': '',
     'thermophysical.albedo_override': -1.0,

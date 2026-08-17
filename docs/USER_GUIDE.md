@@ -210,7 +210,7 @@ src/cpp/
 Two scalar properties can be set from the command line on any body, built-in or
 generic, without editing the YAML. Both go through the same override channel the
 solvers already honor (`thermophysical.albedo_override`, `ks_override`,
-`kd_override`), so the run prints `[Thermo override] applied at solver: ...`
+`kd_override`, `H_override`), so the run prints `[Thermo override] applied at solver: ...`
 confirming the value reached the solver and not merely `main()`.
 
 ```

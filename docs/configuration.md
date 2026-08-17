@@ -467,6 +467,7 @@ See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 | `emissivity_override` | float | -1.0 | Emissivity override |
 | `ks_override` | float | -1.0 | Surface conductivity override |
 | `kd_override` | float | -1.0 | Deep conductivity override |
+| `H_override` | float | -1.0 | Regolith density/conductivity e-folding depth H, in meters — the scale in `rho(z) = rhod + (rhos-rhod)·exp(-z/H)` and `kc(z) = kd + (ks-kd)·exp(-z/H)`. Inert when `constant_thermal_inertia > 0` (which makes those exponentials multiply zero) and out-ranked per face by `thermal.h_parameter_map` / `thermal.thermal_inertia_map`; both cases warn |
 | `incidence_angle_albedo` | bool | false | Enable the Hapke directional-hemispheric albedo |
 | `albedo_model` | string | `""` | `hapke` is equivalent to the key above |
 | `albedo_hapke_w` | float | -1.0 | Single-scattering albedo (below 0 = derive from the Bond albedo) |
