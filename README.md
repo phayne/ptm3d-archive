@@ -88,32 +88,39 @@ and thermal emission from surrounding terrain.*
   same comparison at full manuscript resolution (15,840 faces, swept solar
   elevation) matches the analytic permanently-shadowed-interior temperature to
   **0.1 K (≤0.26%)** and the analytic shadow flux to **≤1.2%**
-- **Diviner Lunar Radiometer Experiment**: PTM3D vs. the Williams et al. (2019)
-  seasonal south-polar bolometric temperature product at a Haworth-crater
-  cold-trap site (88.18°S, 6.04°E) — the previously reported PSR cold bias is
-  largely eliminated. Deep-floor (Diviner summer max < 110 K) summer-maximum
-  bias is **+1.9 K** on average (cross-checked at +1.1 K on a second,
-  independently-centered mesh), with **11 K / 6 K RMS** (summer/winter mean)
-  over the full 250 m-cell comparison window
-- **Hayne et al. (2017)** 1D thermophysical model: reproduces the lunar
-  equatorial diurnal cycle (noon ~388 K, night ~99 K)
+- **Diviner Lunar Radiometer Experiment**: the model's thermal-column solver
+  (validated here via heat1d, its 1D reference implementation — see the
+  Fig. 5 caption below) matches Diviner-derived equatorial/mid-latitude
+  diurnal brightness temperatures to within the measurement errors. The full
+  3D radiative-coupled model separately matches real Diviner seasonal
+  south-polar temperatures (Williams et al. 2019) at a Haworth-crater
+  cold-trap site to a **+1.9 K** deep-floor summer-maximum bias and
+  **11 K / 6 K RMS** (summer/winter mean) — see the validation gallery below
+- **Hayne et al. (2017)** thermophysical model: reproduces the lunar
+  equatorial diurnal cycle (noon ~388 K, night ~99 K) and, via Apollo 15/17
+  heat-flow-probe comparison, the subsurface diurnal-mean depth profile
 
-![Ingersoll bowl-crater radiation-exchange validation](docs/figures/validation_bowl_crater_ingersoll.png)
+**Full validation gallery (all seven manuscript figures, Figs. 3–9, with
+headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
+
+![Manuscript Fig. 5: heat1d vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_thermal_diviner_apollo.png)
+*Manuscript caption: "Validation of the 3D thermophysical model with
+comparison to Diviner data (left panel) and Apollo heat flow probe data
+(right panel)." Read literally, the plotted model curves are **heat1d** —
+PTM3D's 1D thermal-column reference implementation, sharing the same
+conduction physics as PTM3D's own column solver — labeled "(heat1d)" in the
+left-panel legend, matched against Diviner-derived equatorial/30°/60°
+diurnal temperatures and Apollo 15/17 subsurface diurnal-mean profiles (both
+via the Hayne et al. 2017 compilation). Fit "to within the measurement
+errors" — the manuscript gives no single RMS/bias number for this figure.*
+
+![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
-(1992) — Fig. 7 of the submitted Moon3D manuscript. **(a)** Equilibrium
-temperature renders for three crater depth-to-diameter ratios at two solar
-elevations. **(b)** Permanently-shadowed-interior mean temperature vs. solar
-elevation: numerical (circles) vs. analytic (lines), agreement within 0.1 K
-(≤0.26%). **(c)** Shadow-flux error relative to the analytic solution, ≤1.2%.*
-
-![Diviner seasonal PSR temperature validation](docs/figures/validation_diviner_seasonal_psr_scatter.png)
-*Modeled (PTM3D) vs. Diviner bolometric temperature for every valid 250 m
-cell of a Haworth-crater SE-rim comparison window (88.18°S, 6.04°E) — Fig. 9
-of the submitted Moon3D manuscript (site map and per-statistic difference
-maps are its companion Fig. 8, not reproduced here). Filled contours show
-point density for the radiation-coupled run; the gray line is 1:1. Deep-floor
-summer-maximum bias is +1.9 K; RMS is 11 K (summer mean) / 6 K (winter mean)
-over the full window.*
+(1992). **(a)** Equilibrium-temperature renders for three crater
+depth-to-diameter ratios at two solar elevations. **(b)** Permanently-
+shadowed-interior mean temperature vs. solar elevation: numerical (circles)
+vs. analytic (lines), agreement within 0.1 K (≤0.26%). **(c)** Shadow-flux
+error relative to the analytic solution, ≤1.2%.*
 
 ## Get started
 
