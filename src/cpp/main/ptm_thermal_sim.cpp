@@ -414,6 +414,26 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------
+// PTM-09 class: format a small dimensionless number (an albedo, a Hayne
+// coefficient) through a LOCAL stream.
+//
+// std::cout arrives at the albedo banners already carrying
+// `std::fixed << std::setprecision(1)` left set by an earlier progress line
+// (the chunked-illumination "Extracting data: X.X%" report, and friends). Under
+// that state the Moon's A0 = 0.12 prints as "0.1", the Hayne et al. (2017)
+// coefficients a = 0.06 and b = 0.25 print as "0.1" and "0.2" -- three distinct
+// numbers rendered as two, and a run reporting values it did not use. That cost
+// a runner a bug chase on 2026-08-17 (it reads exactly like a hard-coded 0.1
+// albedo). Same archetype as PTM-05/PTM-55 and the conductivity-model banner at
+// the `std::ostringstream cmb` site further down: a local stream starts in the
+// default format and cannot inherit std::cout's state.
+static inline std::string fmtSig(double v, int sig = 6) {
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(sig) << v;
+    return os.str();
+}
+
+// ---------------------------------------------------------------------------
 // Infrared absorptivity -- THE single definition, by Kirchhoff's law.
 //
 // A surface absorbs thermal infrared with exactly the efficiency it emits it,
@@ -1999,6 +2019,24 @@ public:
                double solar_constant,
                const char* site_tag);
 
+    // Second entry point, for a caller that has ALREADY resolved its own
+    // per-face base albedo and only needs the angular model + the Kirchhoff
+    // infrared absorptivity. build()'s own resolution logic reads config
+    // properties (`is_custom_mesh`, `mesh_resolution`, `use_albedo_map`) that
+    // only ever land on the thermal_config object -- which is out of scope by
+    // the time the per-location depth export runs, so that caller cannot use
+    // build() without silently resolving a DIFFERENT base albedo than the mesh
+    // did. It hands its already-loaded vector in here instead, and shares
+    // visibleAlbedo()/absorbed() verbatim. Returns false, having said why,
+    // rather than composing flux against an undefined absorptivity.
+    bool bindResolvedAlbedos(const std::shared_ptr<Mesh>& mesh,
+                             std::vector<double> face_albedos,
+                             bool albedo_successfully_loaded,
+                             double default_visible_albedo,
+                             const thermal::Planet* planet,
+                             double solar_constant,
+                             const char* site_tag);
+
     // The operative visible albedo for (face, ABSOLUTE timestep). Verbatim from
     // the array loop this was extracted out of.
     double visibleAlbedo(size_t f, int t, double direct_flux) const {
@@ -2078,6 +2116,14 @@ public:
     }
 
 private:
+    // Resolve the angular albedo model and (optionally) announce it. Called by
+    // BOTH entry points so the two gates cannot come apart -- the whole point of
+    // this class is that there is one such decision in the program.
+    void resolveAngularModel(const thermal::Planet* planet,
+                             double default_visible_albedo,
+                             double solar_constant,
+                             bool announce);
+
     const Mesh*            mesh_   = nullptr;
     const thermal::Planet* planet_ = nullptr;
     std::vector<double> face_albedos_;
@@ -2171,7 +2217,7 @@ bool AbsorbedFluxComposer::build(
     }
 
     std::cout << "Using " << (is_custom_mesh ? "custom" : "standard") << " mesh mode" << std::endl;
-    std::cout << "Default albedo: " << default_visible_albedo << std::endl;
+    std::cout << "Default albedo: " << fmtSig(default_visible_albedo) << std::endl;
 
     // Initialize all faces with default albedo
     std::fill(face_albedos.begin(), face_albedos.end(), default_visible_albedo);
@@ -2192,7 +2238,7 @@ bool AbsorbedFluxComposer::build(
     }
     else if (albedo_map_disabled) {
         std::cout << "Albedo map loading disabled (use_albedo_map: false), "
-                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
+                  << "using uniform albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
     // For custom mesh without explicit albedo map, try to load global albedo map
     // Skip if: (a) user explicitly set a uniform albedo (use_default_albedo: false), or
@@ -2220,11 +2266,11 @@ bool AbsorbedFluxComposer::build(
 
         if (skip_fits) {
             if (albedo_explicit) {
-                std::cout << "Using explicit uniform albedo " << default_visible_albedo
+                std::cout << "Using explicit uniform albedo " << fmtSig(default_visible_albedo)
                           << " (thermophysical override, FITS auto-search disabled)" << std::endl;
             } else {
                 std::cout << "Albedo maps directory is empty, skipping FITS auto-search. "
-                          << "Using uniform albedo " << default_visible_albedo << std::endl;
+                          << "Using uniform albedo " << fmtSig(default_visible_albedo) << std::endl;
             }
         } else {
             // Ensure directory has trailing slash
@@ -2263,10 +2309,10 @@ bool AbsorbedFluxComposer::build(
                     std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
                     std::cout << "Map dimensions: " << global_albedo_map->getWidth()
                             << "x" << global_albedo_map->getHeight() << std::endl;
-                    std::cout << "Albedo range in map: " << global_albedo_map->getMin()
-                            << " to " << global_albedo_map->getMax() << std::endl;
+                    std::cout << "Albedo range in map: " << fmtSig(global_albedo_map->getMin())
+                            << " to " << fmtSig(global_albedo_map->getMax()) << std::endl;
                     std::cout << "NOTE: Global albedo map overrides default uniform albedo ("
-                            << default_visible_albedo << "). To disable, set "
+                            << fmtSig(default_visible_albedo) << "). To disable, set "
                             << "albedo_maps_directory to empty in config YAML." << std::endl;
                     albedo_map_to_use = global_albedo_map;
                     albedo_successfully_loaded = true;
@@ -2276,7 +2322,7 @@ bool AbsorbedFluxComposer::build(
             }
             if (!found) {
                 std::cout << "No global albedo map found for " << body_name
-                        << ", using default albedo " << default_visible_albedo << std::endl;
+                        << ", using default albedo " << fmtSig(default_visible_albedo) << std::endl;
             }
         }
     }
@@ -2286,7 +2332,7 @@ bool AbsorbedFluxComposer::build(
         bool is_generic_body = (config.getProperty("using_generic_body") == "true");
         if (is_generic_body) {
             std::cout << "Generic body: skipping binary albedo map search, using default albedo "
-                      << default_visible_albedo << std::endl;
+                      << fmtSig(default_visible_albedo) << std::endl;
         }
 
         if (!is_generic_body) {
@@ -2348,8 +2394,10 @@ bool AbsorbedFluxComposer::build(
 
             if (!loaded_albedos.empty() && loaded_albedos.size() == num_faces) {
                 std::cout << "Successfully loaded " << loaded_albedos.size() << " albedo values from: " << found_path << std::endl;
-                std::cout << "Albedo range: " << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
-                        << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+                std::cout << "Albedo range: "
+                        << fmtSig(*std::min_element(loaded_albedos.begin(), loaded_albedos.end()))
+                        << " to "
+                        << fmtSig(*std::max_element(loaded_albedos.begin(), loaded_albedos.end())) << std::endl;
 
                 // Copy the loaded albedo values to face_albedos
                 std::copy(loaded_albedos.begin(), loaded_albedos.end(), face_albedos.begin());
@@ -2361,7 +2409,7 @@ bool AbsorbedFluxComposer::build(
                     std::cout << "Binary albedo file size mismatch: expected " << num_faces
                             << " faces, got " << loaded_albedos.size() << " values" << std::endl;
                 }
-                std::cout << "Using default albedo " << default_visible_albedo << " for all faces" << std::endl;
+                std::cout << "Using default albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
             }
         }
         } // end if (!is_generic_body)
@@ -2418,8 +2466,8 @@ bool AbsorbedFluxComposer::build(
         std::cout << "FITS albedo interpolation complete:" << std::endl;
         std::cout << "  Valid interpolations: " << valid_interpolations << " faces" << std::endl;
         std::cout << "  Invalid/default values: " << invalid_interpolations << " faces" << std::endl;
-        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
-        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+        std::cout << "  Albedo range: " << fmtSig(min_albedo) << " to " << fmtSig(max_albedo) << std::endl;
+        std::cout << "  Average albedo: " << fmtSig(avg_albedo) << std::endl;
         albedo_successfully_loaded = true;
     } else if (albedo_successfully_loaded) {
         // Binary albedo file was already loaded - just report statistics
@@ -2427,10 +2475,10 @@ bool AbsorbedFluxComposer::build(
         double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
         double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / face_albedos.size();
         std::cout << "Using binary albedo map:" << std::endl;
-        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
-        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+        std::cout << "  Albedo range: " << fmtSig(min_albedo) << " to " << fmtSig(max_albedo) << std::endl;
+        std::cout << "  Average albedo: " << fmtSig(avg_albedo) << std::endl;
     } else {
-        std::cout << "Using constant albedo " << default_visible_albedo << " for all faces" << std::endl;
+        std::cout << "Using constant albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
 
     // Final validation
@@ -2492,12 +2540,29 @@ bool AbsorbedFluxComposer::build(
     // hemispheric gate is on. getAlbedoWithIncidence() internally routes to the
     // correct model (Hapke branch first when use_hapke_albedo). When neither is
     // set the constant Bond albedo is used and the path is byte-identical.
-    bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
-                             planet->hapke_albedo_w >= 0.0);
-    bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
-                                 (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
+    resolveAngularModel(planet, default_visible_albedo, solar_constant,
+                        /*announce=*/true);
+    albedo_successfully_loaded_ = albedo_successfully_loaded;
 
-    if (use_incidence_albedo) {
+    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized
+    // here (never inside a parallel region) and published to the file-scope
+    // globals by publishEffectiveAlbedo(), so a run that composes flux more
+    // than once reports the LAST (operative) composition, not a silent mixture.
+    eff_alb_num_.assign(num_faces, 0.0);
+    eff_alb_den_.assign(num_faces, 0.0);
+    return true;
+}
+
+void AbsorbedFluxComposer::resolveAngularModel(const thermal::Planet* planet,
+                                               double default_visible_albedo,
+                                               double solar_constant,
+                                               bool announce) {
+    const bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
+                                   planet->hapke_albedo_w >= 0.0);
+    const bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
+                                       (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
+
+    if (use_incidence_albedo && announce) {
         // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
         // initialized to), not the Planet's, and say so when they differ. On
         // the CPU path the two agree today -- `planet` here IS the main-scope
@@ -2507,44 +2572,87 @@ bool AbsorbedFluxComposer::build(
             // PTM-09 class: std::cerr/std::cout inherit whatever precision the
             // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
             // so a diagnostic that exists to show a DISAGREEMENT would print
-            // two identical numbers. Format explicitly, then restore.
-            std::ios_base::fmtflags f(std::cerr.flags());
-            std::streamsize pr = std::cerr.precision();
-            std::cerr << std::defaultfloat << std::setprecision(6)
-                      << "[albedo] WARNING: Planet(\"" << planet->name
-                      << "\") carries albedo " << planet->albedo
+            // two identical numbers. Format explicitly through fmtSig().
+            std::cerr << "[albedo] WARNING: Planet(\"" << planet->name
+                      << "\") carries albedo " << fmtSig(planet->albedo)
                       << ", which DISAGREES with the operative "
-                      << default_visible_albedo
+                      << fmtSig(default_visible_albedo)
                       << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md (PTM-55)."
                       << std::endl;
-            std::cerr.flags(f);
-            std::cerr.precision(pr);
         }
         if (use_hapke_albedo) {
             std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
                          "1 - gamma*H(mu0,w)" << std::endl;
-            std::cout << "  Base albedo A0 = " << std::defaultfloat
-                      << std::setprecision(6) << default_visible_albedo
-                      << " (operative), single-scattering w = " << planet->hapke_albedo_w
-                      << std::endl;
+            std::cout << "  Base albedo A0 = " << fmtSig(default_visible_albedo)
+                      << " (operative), single-scattering w = "
+                      << fmtSig(planet->hapke_albedo_w) << std::endl;
         } else {
             std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-            std::cout << "  Base albedo A0 = " << std::defaultfloat
-                      << std::setprecision(6) << default_visible_albedo
+            std::cout << "  Base albedo A0 = " << fmtSig(default_visible_albedo)
                       << " (operative)" << std::endl;
-            std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
-                      << ", b = " << planet->albedoCoef[1] << std::endl;
+            std::cout << "  Coefficients: a = " << fmtSig(planet->albedoCoef[0])
+                      << ", b = " << fmtSig(planet->albedoCoef[1]) << std::endl;
         }
     }
 
-    use_hapke_albedo_           = use_hapke_albedo;
-    use_incidence_albedo_       = use_incidence_albedo;
+    use_hapke_albedo_     = use_hapke_albedo;
+    use_incidence_albedo_ = use_incidence_albedo;
+}
+
+bool AbsorbedFluxComposer::bindResolvedAlbedos(
+    const std::shared_ptr<Mesh>& mesh,
+    std::vector<double> face_albedos,
+    bool albedo_successfully_loaded,
+    double default_visible_albedo,
+    const thermal::Planet* planet,
+    double solar_constant,
+    const char* site_tag) {
+
+    // Same refusal as build(): without a Planet the infrared absorptivity is
+    // undefined (Kirchhoff: it IS the emissivity) and there is no angular
+    // albedo model. Substituting one is the defect, not the fix.
+    if (!planet) {
+        std::cerr << "FATAL: absorbed flux was composed without a Planet, so the infrared "
+                     "absorptivity is undefined (Kirchhoff: it is the body's emissivity). "
+                     "Refusing to guess.\n";
+        return false;
+    }
+    if (!mesh || mesh->faces.size() < face_albedos.size() ||
+        mesh->latitudes.size() < face_albedos.size() ||
+        mesh->longitudes.size() < face_albedos.size()) {
+        std::cerr << "Error: mesh too small for the supplied per-face albedo vector ("
+                  << face_albedos.size() << " faces).\n";
+        return false;
+    }
+
+    ir_emissivity_  = thermalIrEmissivity(*planet);
+    recordIrAbsorptivity(site_tag ? site_tag : "cpu_bound_albedos", ir_emissivity_);
+    planet_         = planet;
+    solar_constant_ = solar_constant;
+    mesh_           = mesh.get();
+    const size_t num_faces = face_albedos.size();
+    face_albedos_   = std::move(face_albedos);
+
+    // Announce: this composition is a SEPARATE decision from the mesh-wide one
+    // and used to be invisible in the log. Rule 7 -- a path that applies (or
+    // cannot apply) the angular albedo model has to say so.
+    std::cout << "[" << (site_tag ? site_tag : "bound") << "] absorbed flux: "
+              << (albedo_successfully_loaded ? "per-face map" : "uniform")
+              << " base albedo, IR absorptivity (Kirchhoff) = "
+              << fmtSig(ir_emissivity_) << std::endl;
+    resolveAngularModel(planet, default_visible_albedo, solar_constant,
+                        /*announce=*/true);
+    if (!use_incidence_albedo_) {
+        std::cout << "[" << (site_tag ? site_tag : "bound")
+                  << "] no incidence-angle albedo model for this body/gate; "
+                     "the constant base albedo is operative." << std::endl;
+    }
     albedo_successfully_loaded_ = albedo_successfully_loaded;
 
-    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized
-    // here (never inside a parallel region) and published to the file-scope
-    // globals by publishEffectiveAlbedo(), so a run that composes flux more
-    // than once reports the LAST (operative) composition, not a silent mixture.
+    // Local accumulators only. publishEffectiveAlbedo() is deliberately NOT
+    // called by this caller: statistics/effective_albedo.bin describes the
+    // MESH-WIDE composition, and overwriting it from a five-face location
+    // export would silently redefine that file.
     eff_alb_num_.assign(num_faces, 0.0);
     eff_alb_den_.assign(num_faces, 0.0);
     return true;
@@ -4092,7 +4200,8 @@ bool runThermalModelsForAllFaces(
                 
                 // Print some statistics about the map
                 std::cout << "  - Map resolution: " << albedo_map->getWidth() << "x" << albedo_map->getHeight() << std::endl;
-                std::cout << "  - Albedo range: " << albedo_map->getMin() << " to " << albedo_map->getMax() << std::endl;
+                std::cout << "  - Albedo range: " << fmtSig(albedo_map->getMin())
+                          << " to " << fmtSig(albedo_map->getMax()) << std::endl;
                 std::cout << "  - Coordinate range: Lon [" << albedo_map->getLonMin() << "," << albedo_map->getLonMax() 
                           << "], Lat [" << albedo_map->getLatMin() << "," << albedo_map->getLatMax() << "]" << std::endl;
             } else {
@@ -7203,11 +7312,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // main scope, "A0 = 0.1" here) with no way for a reader to tell which
         // the solver saw. Report the operative value, and say where it came
         // from -- per PTM-05.
-        std::cout << "[GPU Thermal]   Base albedo A0 = " << std::defaultfloat
-                  << std::setprecision(6) << default_visible_albedo
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << fmtSig(default_visible_albedo)
                   << " (operative: face_albedos is initialized to this; a loaded "
                      "albedo map supersedes it per face), single-scattering w = "
-                  << hapke_w << std::endl;
+                  << fmtSig(hapke_w) << std::endl;
         if (std::abs(planet.albedo - default_visible_albedo) > 1e-9) {
             // Explicit precision -- see the CPU sibling: the inherited stream
             // state can print two different values identically (PTM-09 class).
@@ -7215,9 +7323,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::streamsize pr = std::cerr.precision();
             std::cerr << std::defaultfloat << std::setprecision(6)
                       << "[GPU Thermal] WARNING: the solver-scope Planet(\""
-                      << planet.name << "\") carries albedo " << planet.albedo
+                      << planet.name << "\") carries albedo " << fmtSig(planet.albedo)
                       << ", which DISAGREES with the operative "
-                      << default_visible_albedo
+                      << fmtSig(default_visible_albedo)
                       << ". The operative value is what the flux uses; the "
                          "solver-scope Planet's albedo is used for nothing else. "
                          "See docs/KNOWN_LIMITATIONS.md (PTM-55)." << std::endl;
@@ -7454,7 +7562,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
     if (albedo_map_disabled) {
         std::cout << "[GPU Thermal] Albedo map loading disabled (use_albedo_map: false), "
-                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
+                  << "using uniform albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
 
     // Get albedo maps directory from config
@@ -7509,10 +7617,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::cout << "[GPU Thermal] Loaded FITS albedo map from: " << found_path << std::endl;
             std::cout << "[GPU Thermal] Map dimensions: " << albedo_map->getWidth()
                       << "x" << albedo_map->getHeight() << std::endl;
-            std::cout << "[GPU Thermal] Albedo range in map: " << albedo_map->getMin()
-                      << " to " << albedo_map->getMax() << std::endl;
+            std::cout << "[GPU Thermal] Albedo range in map: " << fmtSig(albedo_map->getMin())
+                      << " to " << fmtSig(albedo_map->getMax()) << std::endl;
             std::cout << "[GPU Thermal] NOTE: Global albedo map overrides default uniform albedo ("
-                      << default_visible_albedo << "). To disable, set "
+                      << fmtSig(default_visible_albedo) << "). To disable, set "
                       << "albedo_maps_directory to empty in config YAML." << std::endl;
 
             // Interpolate FITS map to each face center
@@ -7542,23 +7650,24 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
             double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / n_faces;
             std::cout << "[GPU Thermal] FITS interpolation complete: " << valid_count << "/" << n_faces << " faces" << std::endl;
-            std::cout << "[GPU Thermal] Albedo range: " << min_albedo << " to " << max_albedo
-                      << " (mean: " << avg_albedo << ")" << std::endl;
+            std::cout << "[GPU Thermal] Albedo range: " << fmtSig(min_albedo)
+                      << " to " << fmtSig(max_albedo)
+                      << " (mean: " << fmtSig(avg_albedo) << ")" << std::endl;
             albedo_source_label = found_path;
             albedo_loaded = true;
         } else {
             std::cout << "[GPU Thermal] Could not load FITS albedo map for " << body_name
-                      << ", using default albedo " << default_visible_albedo << std::endl;
+                      << ", using default albedo " << fmtSig(default_visible_albedo) << std::endl;
         }
     }
     else if (!albedo_map_disabled && is_custom_mesh && skip_fits) {
         // User explicitly set albedo or albedo_maps_directory is empty — skip FITS search
         if (albedo_explicit) {
-            std::cout << "[GPU Thermal] Using explicit uniform albedo " << default_visible_albedo
+            std::cout << "[GPU Thermal] Using explicit uniform albedo " << fmtSig(default_visible_albedo)
                       << " (thermophysical override, FITS auto-search disabled)" << std::endl;
         } else {
             std::cout << "[GPU Thermal] Albedo maps directory is empty, skipping FITS auto-search. "
-                      << "Using uniform albedo " << default_visible_albedo << std::endl;
+                      << "Using uniform albedo " << fmtSig(default_visible_albedo) << std::endl;
         }
     }
     else if (!albedo_map_disabled && !body_name.empty() && config.getProperty("using_generic_body") != "true") {
@@ -7591,8 +7700,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 if (loaded_albedos.size() == n_faces) {
                     std::cout << "[GPU Thermal] Loaded binary albedo map from: " << path << std::endl;
                     std::cout << "[GPU Thermal] Albedo range: "
-                              << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
-                              << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+                              << fmtSig(*std::min_element(loaded_albedos.begin(), loaded_albedos.end()))
+                              << " to "
+                              << fmtSig(*std::max_element(loaded_albedos.begin(), loaded_albedos.end())) << std::endl;
                     face_albedos = std::move(loaded_albedos);
                     albedo_source_label = path;
                     albedo_loaded = true;
@@ -7606,10 +7716,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
         if (!albedo_loaded) {
             std::cout << "[GPU Thermal] No binary albedo map found for " << body_name
-                      << " res" << mesh_resolution << ", using default albedo " << default_visible_albedo << std::endl;
+                      << " res" << mesh_resolution << ", using default albedo "
+                      << fmtSig(default_visible_albedo) << std::endl;
         }
     } else {
-        std::cout << "[GPU Thermal] No body name in config, using default albedo " << default_visible_albedo << std::endl;
+        std::cout << "[GPU Thermal] No body name in config, using default albedo "
+                  << fmtSig(default_visible_albedo) << std::endl;
     }
 
     // PTM-34 tripwire (GPU thermal path). See the CPU-path copy for the rationale:
@@ -10638,7 +10750,7 @@ void fixOutOfRangeAlbedos(
         face_albedos[idx] = default_visible_albedo;
     }
     
-    std::cout << "Fixed albedo values using planet default: " << default_visible_albedo << std::endl;
+    std::cout << "Fixed albedo values using planet default: " << fmtSig(default_visible_albedo) << std::endl;
 }
 
 // Add this function to your declarations section
@@ -13566,8 +13678,8 @@ int main(int argc, char** argv) {
                     
                     std::cout << "Shadow flux calculation enabled with:" << std::endl;
                     std::cout << "  Diameter/depth ratio D = " << crater_diameter_depth_ratio << std::endl;
-                    std::cout << "  Body albedo = " << planet.albedo << std::endl;
-                    std::cout << "  Body emissivity = " << planet.emissivity << std::endl;
+                    std::cout << "  Body albedo = " << fmtSig(planet.albedo) << std::endl;
+                    std::cout << "  Body emissivity = " << fmtSig(planet.emissivity) << std::endl;
                 }
                 
                 // Set the planetary body in the illumination model
@@ -14273,8 +14385,8 @@ int main(int argc, char** argv) {
     {
         const auto& tp = sim_config.thermophysical;
         if (tp.albedo_override >= 0.0) {
-            std::cout << "Property override (requested): albedo A0 " << planet.albedo
-                      << " -> " << tp.albedo_override << std::endl;
+            std::cout << "Property override (requested): albedo A0 " << fmtSig(planet.albedo)
+                      << " -> " << fmtSig(tp.albedo_override) << std::endl;
             planet.albedo = tp.albedo_override;
         }
         if (tp.emissivity_override > 0.0) {
@@ -14916,8 +15028,9 @@ int main(int argc, char** argv) {
         : illumination_model->getAlbedo();
     // Ensure we're using the planet's albedo, not a hardcoded value
     if (std::abs(default_visible_albedo - planet.albedo) > 0.001) {
-        std::cout << "Warning: Mismatch between illumination albedo (" << default_visible_albedo
-                << ") and planet albedo (" << planet.albedo << "). Using planet value." << std::endl;
+        std::cout << "Warning: Mismatch between illumination albedo (" << fmtSig(default_visible_albedo)
+                << ") and planet albedo (" << fmtSig(planet.albedo)
+                << "). Using planet value." << std::endl;
         default_visible_albedo = planet.albedo;
     }
     // Load SPICE kernels for the CONFIGURED body/metakernel. This must run after
@@ -17237,7 +17350,7 @@ int main(int argc, char** argv) {
                                  "source falls back to the THERMAL reflectivity 1-eps = "
                               << std::defaultfloat << std::setprecision(6)
                               << (1.0 - planet.emissivity)
-                              << " (not A0 = " << default_visible_albedo
+                              << " (not A0 = " << fmtSig(default_visible_albedo)
                               << ", and not the BC's A(theta)). Reflected sunlight in the "
                                  "enclosure is therefore understated for this run. Set "
                                  "band_separated: true for the incidence-consistent source."
@@ -20541,6 +20654,7 @@ int main(int argc, char** argv) {
 
                 // Load per-face albedo from binary map (same as thermal solver)
                 std::vector<double> loc_face_albedos(mesh->faces.size(), default_visible_albedo);
+                bool loc_albedo_loaded = false;
                 {
                     std::string body_name = planet.name;
                     std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
@@ -20558,10 +20672,113 @@ int main(int argc, char** argv) {
                         auto loaded = importAlbedoMapFromFile(path);
                         if (!loaded.empty() && loaded.size() == mesh->faces.size()) {
                             std::copy(loaded.begin(), loaded.end(), loc_face_albedos.begin());
+                            loc_albedo_loaded = true;
                             std::cout << "Location export: using per-face albedo from " << path << std::endl;
                             break;
                         }
                     }
+                }
+
+                // The absorbed flux for these columns goes through the SAME
+                // AbsorbedFluxComposer kernel every mesh face uses. This block
+                // used to compose it by hand:
+                //     A_vis = loc_face_albedos[face];            // hoisted
+                //     flux  = (1 - A_vis)*(direct + refl) + pir; // per step
+                // -- a per-face CONSTANT albedo, so the incidence-angle albedo
+                // model (Hayne et al. 2017 A(theta) = A0 + a(theta/45)^3 +
+                // b(theta/90)^8, or the Hapke A_h(i) gate) never reached the
+                // per-location depth CSVs even though the log announced it and
+                // the mesh-wide field applied it. One run therefore reported TWO
+                // surface temperatures for the same face: measured on the
+                // 2026-08-17 Fig. 5 reproduction (Moon, ico6, A0 = 0.12), the
+                // 60N face read 308.1 K mesh-wide and 327.8 K in its own CSV --
+                // 19.7 K apart, growing with latitude (equator 0.05 K, 30N
+                // 2.8 K) exactly as a missing A(theta) does. The CSVs are what
+                // the Fig. 5 validation figure is plotted from, so the figure
+                // was drawn against physics the engine does not use.
+                // Composing through the shared kernel also fixes this path's
+                // infrared absorptivity: it absorbed primary infrared with an
+                // absorptivity of 1.0 (a bare `+ pir`) while the body emits with
+                // planet.emissivity and every other path absorbs with it. On the
+                // Moon that term is ~0.005 W/m^2 (Earth-shine), so the numerical
+                // effect is ~1 mK -- but it was the only IR-absorption site not
+                // using thermalIrEmissivity(), and it registers with the
+                // Kirchhoff registry now. NOTE it registers too LATE to be
+                // COMPARED: reportKirchhoffConsistency() (gate G1) has already
+                // printed by the time the location export runs, so the value is
+                // recorded but not cross-checked this run -- which is why the
+                // banner below prints the absorptivity outright.
+
+                // BASE-albedo sanitization. This block always clamped to [0,1];
+                // std::clamp propagates NaN, and a single NaN in
+                // <Body>_Albedo_res<N>.bin would give an all-NaN depth CSV,
+                // whereas build() substitutes the default and says so. Substitute
+                // and count instead of clamping silently. NOTE this is still not
+                // build()'s FULL validation: build() also rejects finite values
+                // outside [MIN_VALID_ALBEDO, MAX_VALID_ALBEDO] = [0.01, 0.99] and
+                // runs ptm::checkAlbedoMapRegistration(). Widening this to match
+                // would change which faces get substituted on a corrupt map, so it
+                // is left as the pre-existing [0,1] rule and disclosed here rather
+                // than changed without a test.
+                {
+                    size_t loc_bad_albedo = 0;
+                    for (double& a : loc_face_albedos) {
+                        if (std::isnan(a) || std::isinf(a) || a < 0.0 || a > 1.0) {
+                            a = default_visible_albedo;
+                            ++loc_bad_albedo;
+                        }
+                    }
+                    if (loc_bad_albedo > 0) {
+                        std::cerr << "[location export] WARNING: substituted the default albedo "
+                                  << fmtSig(default_visible_albedo) << " for " << loc_bad_albedo
+                                  << " non-finite / out-of-[0,1] per-face values." << std::endl;
+                    }
+                }
+
+                AbsorbedFluxComposer loc_composer;
+                const bool loc_composer_ready = loc_composer.bindResolvedAlbedos(
+                    mesh, loc_face_albedos, loc_albedo_loaded,
+                    default_visible_albedo, &planet, planet.S,
+                    "cpu_location_depth_series");
+                if (!loc_composer_ready) {
+                    std::cerr << "Warning: could not compose absorbed flux for the "
+                                 "per-location depth profiles; skipping them rather than "
+                                 "writing columns from an unresolved albedo." << std::endl;
+                }
+
+                // Rule 7 -- two KNOWN remaining ways these columns can still
+                // disagree with the mesh-wide field for the same face. Neither is
+                // fixed here (each needs its own measurement, and radiation was
+                // OFF in the runs that validated the A(theta) fix), so each is
+                // announced instead of left to be discovered from a figure.
+                //
+                // (1) Indirect (terrain-scattered + terrain-IR) flux. The
+                //     mesh-wide re-thermal adds indirect_flux_series[f][t]; this
+                //     export does not. At shadowed / high-latitude faces that is
+                //     the dominant daytime term.
+                if (!indirect_flux_series.empty()) {
+                    std::cerr << "[location export] WARNING: these depth columns EXCLUDE the "
+                                 "indirect (terrain-scattered + terrain-IR) flux that the "
+                                 "mesh-wide field includes. They are NOT comparable to the "
+                                 "mesh-wide temperature at the same face for a "
+                                 "radiation-coupled run." << std::endl;
+                }
+                // (2) Base-albedo source. This export only ever searched the
+                //     per-face binary map <Body>_Albedo_res<N>.bin. The mesh-wide
+                //     composer also resolves an explicit FITS `albedo_map` and the
+                //     global FITS auto-search -- the branch a custom (DEM) mesh
+                //     takes, where mesh_resolution is meaningless and no .bin is
+                //     found. On such a run these columns use the UNIFORM default
+                //     A0 while the mesh uses per-face FITS values.
+                if (!loc_albedo_loaded &&
+                    (!config.getProperty("albedo_map").empty() ||
+                     !albedo_maps_directory.empty())) {
+                    std::cerr << "[location export] WARNING: an albedo map is configured but no "
+                                 "per-face binary map was found for this mesh, so these depth "
+                                 "columns use the UNIFORM base albedo "
+                              << fmtSig(default_visible_albedo)
+                              << ". If the mesh-wide field resolved a FITS albedo map, the two "
+                                 "do not share a base albedo." << std::endl;
                 }
 
                 auto sanitize = [](std::string s) {
@@ -20571,7 +20788,7 @@ int main(int argc, char** argv) {
                     return s;
                 };
 
-                for (size_t i = 0; i < locs.size(); ++i) {
+                for (size_t i = 0; loc_composer_ready && i < locs.size(); ++i) {
                     const auto& tup = locs[i];
                     const std::string name = std::get<0>(tup);
                     const double lat_deg = std::get<1>(tup);
@@ -20586,21 +20803,21 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Absorbed flux: (1 - A_vis)*(direct+reflected) + primary_ir
+                    // Absorbed flux through the shared composer (see above).
                     // Use total_time_steps (including equilibration) so the location
                     // thermal model receives the full cycled illumination, matching
-                    // how mesh faces are handled.
+                    // how mesh faces are handled. `t` is the ABSOLUTE step index,
+                    // which is what the composer's per-step instantaneous solar
+                    // constant and the effective-albedo window both expect.
                     std::vector<double> flux_sum(static_cast<size_t>(total_time_steps), 0.0);
-                    double A_vis = loc_face_albedos[static_cast<size_t>(face_idx)];
-                    A_vis = std::clamp(A_vis, 0.0, 1.0);
-
                     for (int t = 0; t < total_time_steps; ++t) {
                         const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(total_time_steps)
                                           + static_cast<size_t>(t);
                         const double direct = (flat < direct_solar_values.size()) ? direct_solar_values[flat] : 0.0;
                         const double refl   = (flat < primary_reflected_values.size()) ? primary_reflected_values[flat] : 0.0;
                         const double pir    = (flat < primary_ir_values.size()) ? primary_ir_values[flat] : 0.0;
-                        flux_sum[static_cast<size_t>(t)] = (1.0 - A_vis) * (direct + refl) + pir;
+                        flux_sum[static_cast<size_t>(t)] = loc_composer.absorbed(
+                            static_cast<size_t>(face_idx), t, direct, refl, pir);
                     }
 
                     auto T_depths = runThermalModelDepthSeries(
@@ -20614,9 +20831,16 @@ int main(int argc, char** argv) {
                         std::cout << "Wrote depth temperature series: " << out_path << std::endl;
                     }
                 }
-                // Generate plots if enabled
-                if (generate_depth_plots) {
+                // Generate plots if enabled. Gated on the composition having
+                // succeeded: on a rerun into an existing output directory this
+                // would otherwise regenerate figures from the PREVIOUS run's
+                // stale *_depths.csv and report success.
+                if (generate_depth_plots && loc_composer_ready) {
                     generateDepthProfilePlots(loc_out_dir, executable_path);
+                } else if (generate_depth_plots) {
+                    std::cerr << "Warning: skipping depth-profile plots -- the absorbed-flux "
+                                 "composition failed, so any *_depths.csv present is from an "
+                                 "earlier run." << std::endl;
                 }
             }
         } catch (const std::exception& e) {
