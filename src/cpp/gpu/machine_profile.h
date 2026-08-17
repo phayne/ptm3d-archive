@@ -12,9 +12,11 @@
  * run and a macOS+AMD gpusKillClientExt command-buffer watchdog kill:
  *
  *   - safe_dispatch_ceiling_s : max wall-clock a SINGLE clEnqueueNDRangeKernel
- *                               may take before the driver watchdog risk. From
- *                               memory/gpu_hang_amd_macos.md: ~15-30 s launches
- *                               survive repeatedly on this hardware.
+ *                               may take before the driver watchdog risk.
+ *                               See kSafeDispatchCeilingSeconds below — the
+ *                               older "~15-30 s launches survive" reading of
+ *                               memory/gpu_hang_amd_macos.md was WRONG and cost
+ *                               a run on 2026-08-16.
  *   - max_timesteps_per_dispatch : the derived ceiling the solver actually
  *                               enforces — the persistent kernel loops this
  *                               many timesteps per launch at most. Derived from
@@ -52,6 +54,41 @@
 
 namespace gpu {
 
+/// Wall-clock budget for ONE clEnqueueNDRangeKernel of pure stepping, in
+/// seconds. Everything else in this header (and the calibrator) derives the
+/// enforced timestep ceiling from this number and the measured per-step cost.
+///
+/// 2.0 s, not the 25 s this file shipped with through 2026-08-16. The 25 s came
+/// from reading memory/gpu_hang_amd_macos.md as "~15-30 s launches survive
+/// repeatedly"; the surviving-run record on this host (macOS + AMD Radeon PRO
+/// W6800X Duo) says the driver's real patience is ~2-3 s:
+///
+///   - 2026-08-16: `examples/europa_high_res.yaml` (ico7, 327,680 faces) was
+///     auto-calibrated to 2986 timesteps/dispatch under the 25 s target and
+///     dispatched all 600 equilibration steps in one ~5.0 s launch. The driver
+///     killed the client (`gpusKillClientExt`, SIGABRT). A ~5 s launch is not
+///     survivable here.
+///   - Every long production run that DID survive kept dispatches under ~2.5 s:
+///     the standing mitigation is `PTM_MAX_TIMESTEPS_PER_DISPATCH=50`, which is
+///     ~2.5 s at 509k faces, and the 2026-08-14 MS3 lunar run's single
+///     dispatches measured 2.0-2.9 s.
+///   - The historical wedge trio (2026-07-16..20) were all multi-thousand-step
+///     single dispatches (1560-8000 steps), i.e. tens of seconds.
+///
+/// This is a HOST-driver property, not a physics knob: the self-chunk split is
+/// numerically inert (same CN updates, same order — see thermal_opencl.cpp
+/// enqueuePersistentSelfChunked), and the measured cost of an extra chunk
+/// boundary on this host is ~0.24 ms (overhead_per_batch_s), so a 2 s budget
+/// costs ~0.012% wall time versus 25 s.
+///
+/// Escape hatch for a host with a more patient driver: set
+/// PTM_MAX_TIMESTEPS_PER_DISPATCH (honored ahead of everything here), or
+/// `--calibrate-gpu --safe-ceiling-s <s>` for the hand-run profile path.
+///
+/// TODO(PTM-276): source this per-host from the machine profile / a probed
+/// watchdog measurement rather than a compile-time constant.
+constexpr double kSafeDispatchCeilingSeconds = 2.0;
+
 struct MachineProfile {
     int         schema_version          = 2;
     bool        valid                   = false;   // true only if loaded from a real file
@@ -61,8 +98,8 @@ struct MachineProfile {
     std::string created_utc             = "";
 
     // The enforced limits.
-    double      safe_dispatch_ceiling_s = 25.0;    // per single kernel launch
-    int         max_timesteps_per_dispatch = 300;  // the R2 self-chunking ceiling
+    double      safe_dispatch_ceiling_s = kSafeDispatchCeilingSeconds;  // per launch
+    int         max_timesteps_per_dispatch = 50;   // the R2 self-chunking ceiling
     int         recommended_batch_size  = 8000;
 
     // The measured cost-model terms (informational; used to (re)derive the
@@ -86,9 +123,15 @@ struct MachineProfile {
     int         is_run_grid             = 0;     // 1 = calibrated on a representative run grid
 
     /// A deliberately conservative profile for hosts with no calibration.
-    /// 300 timesteps/dispatch sits safely between the proven-safe ~240 and
-    /// the yearlong wedge at 1560; 25 s ceiling matches the documented
-    /// survivable-launch window.
+    /// 50 timesteps/dispatch is the standing production mitigation on this host
+    /// (`PTM_MAX_TIMESTEPS_PER_DISPATCH=50`, ~2.5 s at 509k faces) — the largest
+    /// uncalibrated step count with a clean survival record here. It replaces
+    /// the old 300, which was only ever safe when the per-step cost was small:
+    /// at the 8.4 ms/step measured on Europa ico7 (327,680 faces) a 300-step
+    /// dispatch is 2.5 s, and at 509k lunar faces (~50 ms/step) it is 15 s —
+    /// i.e. the old "conservative" default was itself above the watchdog.
+    /// This value also bounds the auto-calibrate PROBE's own launches, which
+    /// run before any per-step cost is known.
     static MachineProfile conservativeDefault() {
         MachineProfile p;
         p.valid = false;
@@ -153,6 +196,68 @@ inline bool getStr(const std::string& t, const std::string& k, std::string& v) {
 
 }  // namespace machine_profile_detail
 
+/// Re-derive a loaded profile's dispatch ceiling against the CURRENT watchdog
+/// budget (kSafeDispatchCeilingSeconds) and downgrade it if the stored ceiling
+/// implies a launch longer than that budget.
+///
+/// Why this exists: profiles written before 2026-08-16 were calibrated against
+/// a 25 s target and are on disk right now with ceilings up to 7523
+/// timesteps/dispatch (~25 s launches). Bumping the constant alone would leave
+/// every one of those caches live and the machine just as wedge-prone, because
+/// the reuse paths in ensureGpuCalibrated take the stored ceiling verbatim
+/// without re-probing. Re-deriving from the profile's own measured per-step
+/// cost repairs them in place, with no re-probe (the measurement is still good;
+/// only the budget it was divided into changed).
+///
+/// Only ever LOWERS the ceiling — a hand-written profile that asks for a
+/// stricter budget is left alone. Never silent: any downgrade warns once per
+/// path, per the Phase R fail-loud rule.
+inline void enforceWatchdogCeiling(MachineProfile& mp, const std::string& path) {
+    if (mp.max_timesteps_per_dispatch <= 0) return;
+    const double budget_s = kSafeDispatchCeilingSeconds;
+    const double per_step_s = mp.kernel_ms_per_step_per_batch / 1000.0;
+
+    if (per_step_s > 0.0) {
+        // Measured cost available: the honest test is the implied launch time.
+        const double implied_s = mp.max_timesteps_per_dispatch * per_step_s;
+        if (implied_s <= budget_s) return;              // already within budget
+        long derived = static_cast<long>(budget_s / per_step_s);
+        if (derived < 1) derived = 1;
+        const int old_ts = mp.max_timesteps_per_dispatch;
+        mp.max_timesteps_per_dispatch = static_cast<int>(derived);
+        mp.safe_dispatch_ceiling_s    = budget_s;
+        std::cerr << "[machine-profile] NOTE: profile at " << path
+                  << " was calibrated against a " << implied_s
+                  << " s per-dispatch launch (" << old_ts
+                  << " timesteps at " << mp.kernel_ms_per_step_per_batch
+                  << " ms/step), above this host's " << budget_s
+                  << " s watchdog budget; re-derived ceiling to "
+                  << mp.max_timesteps_per_dispatch
+                  << " timesteps/dispatch from its own measured per-step cost "
+                     "(no re-probe needed).\n";
+        return;
+    }
+
+    // No measured per-step cost (schema-1 / hand-written profile): we cannot
+    // re-derive, so fall back to the uncalibrated step ceiling if the stored
+    // budget is laxer than ours.
+    if (mp.safe_dispatch_ceiling_s > budget_s) {
+        const int cons = MachineProfile::conservativeDefault().max_timesteps_per_dispatch;
+        if (mp.max_timesteps_per_dispatch > cons) {
+            const int old_ts = mp.max_timesteps_per_dispatch;
+            mp.max_timesteps_per_dispatch = cons;
+            std::cerr << "[machine-profile] WARNING: profile at " << path
+                      << " declares a " << mp.safe_dispatch_ceiling_s
+                      << " s dispatch budget (this host's is " << budget_s
+                      << " s) and carries no measured per-step cost to re-derive "
+                         "from; clamping its ceiling " << old_ts << " -> " << cons
+                      << " timesteps/dispatch. Re-run `ptm_thermal_sim "
+                         "--calibrate-gpu` to replace it.\n";
+        }
+        mp.safe_dispatch_ceiling_s = budget_s;
+    }
+}
+
 /// Load the profile from `path` (or the resolved default path if empty).
 /// Returns true and fills `out` (with out.valid=true) on success.
 inline bool loadMachineProfile(MachineProfile& out, const std::string& path = "") {
@@ -191,6 +296,10 @@ inline bool loadMachineProfile(MachineProfile& out, const std::string& path = ""
                      "using conservative defaults.\n";
         return false;
     }
+    // Stale-cache guard: a ceiling calibrated against an older, laxer
+    // per-dispatch budget must not survive a load. See enforceWatchdogCeiling.
+    enforceWatchdogCeiling(mp, p);
+
     mp.valid = true;
     if (mp.source == "conservative-default") mp.source = p;
     out = mp;
