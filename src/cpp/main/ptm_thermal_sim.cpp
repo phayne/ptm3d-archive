@@ -1,5 +1,6 @@
 #include "../mesh/mesh_utils.h"
 #include "../illumination/illumination_model.h"
+#include "../fluxcubes/flux_cube_pass.h"
 #include "../constants/constants.h"
 // Header-only, and deliberately NOT behind the GPU guard: the eq_extrapolation
 // knob has to be parsed and refused in CPU-only builds too.
@@ -16283,6 +16284,24 @@ int main(int argc, char** argv) {
     // indirect_flux_series exactly (== the PTM_DUMP_QIND_SERIES 'QIDT' total).
     std::vector<std::vector<double>> indirect_solar_series;  // (1-A)·Σ F·B_vis
     std::vector<std::vector<double>> indirect_ir_series;     //   ε·Σ F·B_ir
+
+    // --- flux-cube pass inputs, hoisted to this scope -----------------------
+    // The post-solve flux-cube pass runs near the end of main(), where the
+    // radiation block's own locals are long out of scope. Copies are taken
+    // INSIDE that block (a copy, not a reference: the source is block-scoped)
+    // and only when flux cubes are enabled, so an unconfigured run allocates
+    // nothing and behaves identically.
+    //
+    // A_src(t) is deliberately NOT stored. ptm106_fill is just
+    //   applyIncidenceAlbedo(base_A, q, solarConstForStep(t,S), a, b, hapke, w)
+    // -- a pure function of quantities that all survive to post-solve -- so the
+    // pass calls that same function rather than caching 2.4M x n_steps values,
+    // and rather than acquiring a second spelling of it.
+    std::vector<double> fluxcube_face_albedos;   // Bond albedo the solver used
+    std::vector<double> fluxcube_emissivity;     // operative emissivity
+    bool   fluxcube_ptm106_active = false;
+    double fluxcube_ptm106_a = 0.0, fluxcube_ptm106_b = 0.0, fluxcube_ptm106_S = 0.0;
+    bool   fluxcube_ptm106_hapke = false;
     // Set true once a two-band solve populated the per-timestep bands.
     bool indirect_bands_available = false;
     // Set true (once, with a warning) if any timestep went through the multi-GPU
@@ -18667,6 +18686,19 @@ int main(int argc, char** argv) {
                                              && !legacyRadiosityStaticAlbedo();
                     std::vector<double> srcalb_t;
                     if (ptm106_active) srcalb_t.resize(num_faces);
+                    // Capture the flux-cube pass's inputs while they are in scope.
+                    // COPIES: face_albedos_rad and these coefficients are locals of
+                    // this block and are gone by the time the post-solve pass runs.
+                    // Gated on the config so an unconfigured run allocates nothing.
+                    if (sim_config.flux_cubes.enabled) {
+                        fluxcube_face_albedos = face_albedos_rad;
+                        fluxcube_ptm106_active = ptm106_active;
+                        fluxcube_ptm106_a = ptm106_a_coef;
+                        fluxcube_ptm106_b = ptm106_b_coef;
+                        fluxcube_ptm106_S = ptm106_S;
+                        fluxcube_ptm106_hapke = ptm106_hapke;
+                        fluxcube_emissivity = rad_manager.operativeEmissivity();
+                    }
                     // Self-check accumulators (see reportSourceAlbedoConsistency).
                     // Filled on coupling iteration 0 only -- every iteration sweeps the
                     // same timesteps, so accumulating them all would just re-weight the
@@ -20917,6 +20949,96 @@ int main(int argc, char** argv) {
     std::cout << "  Minimum flux (non-zero): " << min_flux << " W/m^2" << std::endl;
     std::cout << "  Output written to " << output_dir << std::endl;
 
+
+    // ========== FLUX CUBES (if requested) ==========
+    //
+    // A post-solve pass over the CONVERGED band series. Passive by
+    // construction: it reads arrays and writes its own files, and touches no
+    // mesh field, so `flux_cubes.enabled: false` (the default) must leave every
+    // other output byte-identical -- and `true` must too.
+    //
+    // ⛔ Indexing: the flat per-component arrays are strided by
+    // total_time_steps, NOT by the output count. The neighbouring location
+    // export passes `time_steps` against these same arrays, which is a live
+    // defect; do not copy its pattern here.
+    if (sim_config.flux_cubes.enabled) {
+        std::cout << "\n[flux-cubes] enabled; running post-solve pass." << std::endl;
+        ptm::fluxcubes::PassInputs fcin;
+        fcin.cache_file = sim_config.flux_cubes.cache_file;
+        fcin.n_faces_core = num_faces;
+        // The same mesh-identity hash the corrected-VF gate uses.
+        {
+            double gh = 0.0;
+            for (size_t i = 0; i < num_faces; ++i) {
+                const double a = meshUtils.getFaceArea(static_cast<int>(i));
+                gh += a + static_cast<double>(i + 1) * a * 1e-9;
+            }
+            fcin.geomhash_core = gh;
+        }
+        fcin.times = &filtered_times;
+        fcin.time_strings = &filtered_time_strings;
+        fcin.equilibration_steps = equilibration_steps;
+        fcin.total_time_steps = total_time_steps;
+        fcin.direct_solar = &direct_solar_values;
+        fcin.surface_temps = &surface_temps;
+        fcin.indirect_solar_series =
+            indirect_solar_series.empty() ? nullptr : &indirect_solar_series;
+        fcin.indirect_ir_series =
+            indirect_ir_series.empty() ? nullptr : &indirect_ir_series;
+        fcin.emissivity = fluxcube_emissivity.empty()
+            ? std::vector<double>(num_faces, planet.emissivity) : fluxcube_emissivity;
+        fcin.bond_albedo = fluxcube_face_albedos.empty()
+            ? std::vector<double>(num_faces, planet.albedo) : fluxcube_face_albedos;
+        fcin.sun_positions = &sun_positions;
+        fcin.primary_positions = &primary_positions;
+        fcin.primary_radius_km = illumination_model
+            ? illumination_model->primaryRadiusKm() : 0.0;
+        fcin.output_dir = output_dir;
+        fcin.write_binary = sim_config.flux_cubes.write_binary;
+        fcin.write_csv = sim_config.flux_cubes.write_csv;
+        fcin.write_csv_max_cubes = sim_config.flux_cubes.write_csv_max_cubes;
+        fcin.shadow_probe_rays = sim_config.flux_cubes.shadow_probe_rays;
+
+        const double fc_S = planet.S;
+        fcin.solar_const = [fc_S](int t) { return solarConstForStep(t, fc_S); };
+        if (fluxcube_ptm106_active) {
+            const double a = fluxcube_ptm106_a, b = fluxcube_ptm106_b;
+            const bool hk = fluxcube_ptm106_hapke;
+            fcin.source_albedo = [a, b, hk](double A0, double q, double S) {
+                return applyIncidenceAlbedo(A0, q, S, a, b, hk, hapkeWFromA0(A0));
+            };
+        }
+        // The ray tracer and the primary-body physics are the ENGINE'S OWN,
+        // reached through the thin public probe wrappers. If the illumination
+        // model has no Embree scene here, leave `occluded` null: the pass then
+        // REFUSES, rather than treating every cube as unshadowed.
+        if (illumination_model && illumination_model->hasEmbreeScene()) {
+            IlluminationModel* im = illumination_model.get();
+            fcin.occluded = [im](const std::array<double, 3>& o,
+                                 const std::array<double, 3>& d) {
+                return im->probeOccluded(o, d);
+            };
+            fcin.primary_heating = [im](double mc, double dist) {
+                return im->probePrimaryHeating(mc, dist);
+            };
+            fcin.primary_reflected = [im](double mc, const std::array<double, 3>& pd,
+                                          const std::array<double, 3>& sp,
+                                          const std::array<double, 3>& pp, double dist) {
+                return im->probePrimaryReflected(mc, pd, sp, pp, dist);
+            };
+        } else {
+            std::cerr << "[flux-cubes] the illumination model has no ray-traced scene at "
+                         "post-solve time; the pass will refuse rather than assume every "
+                         "cube is unshadowed.\n";
+        }
+        std::string fc_err;
+        if (!ptm::fluxcubes::runFluxCubePass(fcin, fc_err)) {
+            // A run that was asked for a product and made none must FAIL, never
+            // downgrade to "ran without cubes".
+            std::cerr << "[FATAL] flux cubes: " << fc_err << std::endl;
+            return 1;
+        }
+    }
 
     // ========== LOCATION EXPORT (if requested) ==========
     //
