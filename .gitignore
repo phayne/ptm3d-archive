@@ -60,6 +60,11 @@ results/
 data/maps/*.fits
 data/meshes/moon3d_cartesian_double.ply
 data/emission/
+# fetch_data.py keeps the verified tarballs it downloaded (~1.4 GB after
+# --core) so that --verify can re-hash them without re-downloading. Every
+# unpack DESTINATION is ignored below, but this cache was not, leaving it the
+# one thing `git status` reports after a documented data fetch.
+data/_downloads/
 data/dem/**
 !data/dem/**/
 !data/dem/**/README.md
