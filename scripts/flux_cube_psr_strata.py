@@ -112,7 +112,48 @@ def main():
                          percentile(vals, 0.5), mx, share))
             print("")
 
+    # --- COLD stratum, cut on the cube's own minimum T_face over the window ---
+    # A site/window can contain NO permanently shadowed cube at all and still
+    # have a cold stratum that matters: the epoch-wise minimum is when a
+    # radiator sees its coldest sink, and it is where the small components stop
+    # being negligible. Cutting on peak direct solar alone cannot find it, so
+    # this cut is always reported, PSR cubes or not.
+    tmin = [min(d["t_face"][cu * ns:(cu + 1) * ns]) for cu in range(nc)]
+    order = sorted(range(nc), key=lambda c: tmin[c])
+    ncold = max(1, nc // 10)
+    cold, warm = order[:ncold], order[-ncold:]
+    print("\n=== COLD stratum: coldest %d cubes by min T_face (%.2f .. %.2f K) ==="
+          % (ncold, tmin[cold[0]], tmin[cold[-1]]))
+    print("    (warmest %d for contrast: %.2f .. %.2f K)"
+          % (ncold, tmin[warm[0]], tmin[warm[-1]]))
+    for label, grp in (("cold", cold), ("warm", warm)):
+        print("\n  -- %s --" % label)
+        print("  %-8s %14s %14s %14s %10s" %
+              ("face", "terrain_ir", "primary_ir", "primary_refl", "pIR/tIR"))
+        for fa in range(nf):
+            # Evaluate at each cube's OWN coldest epoch: that is the moment the
+            # question is about, and a window max would hide it.
+            tir = pir = prf = 0.0
+            for cu in grp:
+                seg = d["t_face"][cu * ns:(cu + 1) * ns]
+                st = seg.index(min(seg))
+                tir += d["flux"][idx(d, cu, fa, 2, st)]
+                pir += d["flux"][idx(d, cu, fa, 4, st)]
+                prf += d["flux"][idx(d, cu, fa, 3, st)]
+            n = len(grp)
+            tir, pir, prf = tir / n, pir / n, prf / n
+            r = (pir / tir) if tir > 0 else float("nan")
+            print("  %-8s %14.6g %14.6g %14.6g %10.4f"
+                  % (FACE_NAMES[fa], tir, pir, prf, r))
+    print("\n  (means over the stratum, each cube evaluated at its OWN coldest epoch)")
+
     # --- the PSR headline: is Earthshine comparable to terrain IR there? ---
+    if not strata["PSR"]:
+        print("\n--- PSR headline: NOT AVAILABLE for this product ---")
+        print("  This site/window contains NO permanently shadowed cube: every one of the")
+        print("  %d cubes receives direct sunlight at some epoch. The PSR stratum is" % nc)
+        print("  therefore UNEXERCISED here, and no PSR number should be quoted from this")
+        print("  file. Use the COLD stratum above, or a winter window, for that question.")
     if strata["PSR"]:
         print("--- PSR headline: primary-body IR vs terrain IR ---")
         print("%-8s %14s %14s %10s" % ("face", "terrain_ir max", "primary_ir max", "ratio"))
