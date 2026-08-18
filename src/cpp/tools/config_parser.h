@@ -460,7 +460,34 @@ struct SimulationConfig {
         // the redundant ~hundreds-of-MB write per chunk.
         bool skip_mesh = false;
     } output;
-    
+
+    // Flux cubes -- a grid of PASSIVE virtual measurement fixtures on the
+    // terrain. Reports incident irradiance on six oriented faces, component
+    // resolved, at every output step. Cubes never occlude, emit, scatter, or
+    // enter the radiosity solve, so `enabled: true` must be byte-neutral to
+    // every mesh-wide field.
+    //
+    // TOP LEVEL, deliberately: nested under `output:` it would be reachable by
+    // the body-defaults machinery that makes `thermophysical:` decorative on a
+    // built-in body (PTM-67). See docs/flux-cubes.md.
+    struct FluxCubeParams {
+        bool enabled = false;
+        // Geometry cache from ptm_flux_cube_geom. REQUIRED when enabled; a
+        // missing or key-mismatched cache is a hard error, never a downgrade to
+        // "run without cubes" -- a run asked for a product must not succeed
+        // quietly having produced none.
+        std::string cache_file = "";
+        bool write_binary = true;      // flux_cubes/flux_cubes.fcb
+        bool write_csv = true;         // flux_cubes/csv/cube_XXXXX.csv
+        // 0 = every cube. On a 720-step production window the full fan-out is
+        // 1,257 files per window; cap it here and let the binary carry them all.
+        int  write_csv_max_cubes = 0;
+        // Solar shadow probe: 1 = center ray only, 5 = center + the four
+        // horizontal face centers (spread = edge_m), which also sets the
+        // per-epoch `penumbral` flag when the five disagree.
+        int  shadow_probe_rays = 5;
+    } flux_cubes;
+
     // Radiation Exchange
     struct RadiationParams {
         bool enabled = false;
