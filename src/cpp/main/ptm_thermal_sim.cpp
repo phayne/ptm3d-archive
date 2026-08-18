@@ -20993,6 +20993,22 @@ int main(int argc, char** argv) {
         fcin.primary_positions = &primary_positions;
         fcin.primary_radius_km = illumination_model
             ? illumination_model->primaryRadiusKm() : 0.0;
+        // ⛔ UNITS: primary/sun positions are in KM; the mesh may be in metres
+        // (lunar/Europa DEMs) or km (asteroid shape models). Same detection the
+        // illumination model uses at illumination_model.cpp:5085.
+        {
+            double r0 = 0.0;
+            if (num_faces > 0) {
+                const auto& fc0 = mesh->face_centers[0];
+                r0 = std::sqrt(fc0[0]*fc0[0] + fc0[1]*fc0[1] + fc0[2]*fc0[2]);
+            }
+            const bool centers_in_meters = (r0 > 10000.0);
+            fcin.mesh_to_km = centers_in_meters ? 1.0e-3 : 1.0;
+            std::cout << "[flux-cubes] mesh frame detected as "
+                      << (centers_in_meters ? "METRES" : "KILOMETRES")
+                      << " (|face_center[0]| = " << r0 << "); mesh_to_km = "
+                      << fcin.mesh_to_km << std::endl;
+        }
         fcin.output_dir = output_dir;
         fcin.write_binary = sim_config.flux_cubes.write_binary;
         fcin.write_csv = sim_config.flux_cubes.write_csv;

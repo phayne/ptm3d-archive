@@ -68,7 +68,7 @@ def write_ply(path, verts, faces):
             f.write(struct.pack("<B3i", 3, *tri))
 
 
-def make_plane(path, half_extent, cell):
+def make_plane(path, half_extent, cell, offset=0.0):
     """Flat square patch tangent to the body at lat=0, lon=0 (surface normal +x).
 
     Vertices are emitted at radius R_BODY so the tool's outward-normal test
@@ -78,7 +78,8 @@ def make_plane(path, half_extent, cell):
     verts, faces = [], []
     for i in range(n):
         for j in range(n):
-            verts.append((R_BODY, -half_extent + i * cell, -half_extent + j * cell))
+            verts.append((R_BODY, -half_extent + i * cell + offset,
+                          -half_extent + j * cell + offset))
     for i in range(n - 1):
         for j in range(n - 1):
             a = i * n + j
@@ -201,6 +202,88 @@ def arm2(binpath, workdir, n_rays, fails):
     print("%-28s %10d" % ("nadir row_len (partners)", nad["row_len"]))
 
 
+def arm3(binpath, workdir, n_rays, fails):
+    """FLUSH LIMIT (design section 10.4), in its geometric form.
+
+    As the patch is lowered onto a facet, its ray-traced view-factor row must
+    converge to that single facet: f_max -> 1 and n_faces_50pct -> 1. This is
+    the one arm that compares the cube's ray-traced row against the real
+    triangulation rather than against an analytic surface, and it is monotone
+    or it is wrong.
+
+    The plane is deliberately OFFSET by a third of a cell so the lattice origin
+    lands in a triangle INTERIOR. See arm 4 for why that matters.
+    """
+    L, cell = 50.0, 1.0
+    plane = os.path.join(workdir, "plane_offset.ply")
+    make_plane(plane, L, cell, offset=0.37)
+    print("\n=== ARM 3: flush limit -- the row collapses onto one facet as h -> 0 ===")
+    print("plane of %.1f m cells (facet area %.3f m^2), cube in a triangle interior" %
+          (cell, 0.5 * cell * cell))
+    print("%10s %10s %10s %12s" % ("height_m", "f_max", "n50", "row_len"))
+    prev = -1.0
+    rows = []
+    for h in (1.0, 0.1, 0.01):
+        out = os.path.join(workdir, "flush_h%g.fcg" % h)
+        r = run_geom(binpath, plane, out, h, 100.0, 1.0, n_rays)
+        if r.returncode != 0:
+            print(r.stdout[-1500:]); print(r.stderr[-1500:])
+            fails.append("arm3: geom tool rc=%d at h=%g" % (r.returncode, h))
+            return
+        fcg = read_fcg(out)
+        nad = fcg["patches"][1]
+        rows.append((h, nad["f_max"], nad["n_faces_50pct"] if "n_faces_50pct" in nad else 0,
+                     nad["row_len"]))
+        print("%10.2f %10.4f %10s %12d" % (h, nad["f_max"], "-", nad["row_len"]))
+        if nad["f_max"] < prev:
+            fails.append("arm3: f_max not monotone (h=%g gave %.4f after %.4f)"
+                         % (h, nad["f_max"], prev))
+        prev = nad["f_max"]
+    final = rows[-1][1]
+    ok = final > 0.99
+    print("h = 0.01 m: f_max = %.4f  (want > 0.99)  %s" % (final, "PASS" if ok else "FAIL"))
+    if not ok:
+        fails.append("arm3: f_max only reached %.4f at h=0.01 m" % final)
+
+
+def arm4(binpath, workdir, n_rays, fails):
+    """VERTEX DEGENERACY -- a disclosure test, not a defect test.
+
+    On a REGULAR mesh a lattice-aligned cube grid can land exactly on a mesh
+    vertex. The nadir patch is then a 4-way average of the facets meeting there
+    and f_max saturates at ~1/4 no matter how far the cube is lowered -- it never
+    becomes the single-facet sensor the height factor is chosen to produce.
+
+    This is not a bug in the estimator: the answer is correct for that geometry.
+    It is a property a consumer must be able to SEE, which is exactly why f_max
+    and n_faces_50pct are emitted per patch. This arm asserts that the
+    diagnostic actually reveals it, so the disclosure cannot quietly stop
+    working.
+
+    A03MP026 is an irregular Delaunay triangulation and does not show this
+    (measured nadir f_max p50 = 0.85), but a regularly-gridded DEM might.
+    """
+    L, cell = 50.0, 1.0
+    plane = os.path.join(workdir, "plane_aligned.ply")
+    make_plane(plane, L, cell, offset=0.0)   # vertex exactly at the lattice origin
+    out = os.path.join(workdir, "vertex_h0.01.fcg")
+    r = run_geom(binpath, plane, out, 0.01, 100.0, 1.0, n_rays)
+    print("\n=== ARM 4: vertex-aligned placement is DISCLOSED by f_max ===")
+    if r.returncode != 0:
+        fails.append("arm4: geom tool rc=%d" % r.returncode)
+        return
+    fcg = read_fcg(out)
+    nad = fcg["patches"][1]
+    print("cube on a mesh VERTEX at h = 0.01 m: f_max = %.4f, row_len = %d" %
+          (nad["f_max"], nad["row_len"]))
+    print("  (arm 3, same height, cube in a facet interior: f_max -> 0.999)")
+    ok = nad["f_max"] < 0.5
+    print("  f_max saturates well below 1, so the diagnostic reveals it: %s"
+          % ("PASS" if ok else "FAIL"))
+    if not ok:
+        fails.append("arm4: f_max = %.4f did not reveal the vertex degeneracy" % nad["f_max"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -211,6 +294,8 @@ def main():
     fails = []
     arm1(a.bin, a.workdir, a.n_rays, fails)
     arm2(a.bin, a.workdir, a.n_rays, fails)
+    arm3(a.bin, a.workdir, a.n_rays, fails)
+    arm4(a.bin, a.workdir, a.n_rays, fails)
     print("\n==== flux-cube closed-form check: %d failure(s) ====" % len(fails))
     for f in fails:
         print("  FAIL:", f)

@@ -84,13 +84,17 @@ bool loadCache(const std::string& path, Cache& c, std::string& err) {
 // Sample points on the primary body's disk as seen from `origin`. Returns unit
 // directions. With radius_km <= 0 the primary is a POINT source and this
 // returns the single center direction -- recorded in the header, not hidden.
-void sampleDisk(const V3& origin, const V3& primary_pos_m, double radius_m,
+// EVERY argument here is in KILOMETRES -- origin, position and radius alike.
+// The returned directions are unit vectors and therefore frame-independent, so
+// they may be cast in the mesh frame without conversion.
+void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
                 int n_samples, std::vector<V3>& out) {
     out.clear();
-    const V3 d = sub(primary_pos_m, origin);
+    const V3 d = sub(primary_pos_km, origin_km);
     const double dist = len3(d);
+    if (dist <= 0.0) { out.push_back(V3{0, 0, 1}); return; }
     const V3 c = mul(d, 1.0 / dist);
-    if (radius_m <= 0.0 || n_samples <= 1 || dist <= radius_m) {
+    if (radius_km <= 0.0 || n_samples <= 1 || dist <= radius_km) {
         out.push_back(c);
         return;
     }
@@ -102,7 +106,7 @@ void sampleDisk(const V3& origin, const V3& primary_pos_m, double radius_m,
     const double golden = kPi * (3.0 - std::sqrt(5.0));
     out.reserve(n_samples);
     for (int k = 0; k < n_samples; ++k) {
-        const double r = radius_m * std::sqrt((k + 0.5) / n_samples);
+        const double r = radius_km * std::sqrt((k + 0.5) / n_samples);
         const double th = k * golden;
         const V3 p = add(add(mul(t, r * std::cos(th)), mul(b, r * std::sin(th))),
                          mul(c, dist));
@@ -243,7 +247,12 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
     const V3 U = mk(c.h.frame_up), N = mk(c.h.frame_north), E = mk(c.h.frame_east);
     const std::array<V3, kNumFaces> fn = {U, mul(U, -1.0), N, mul(N, -1.0), E, mul(E, -1.0)};
     const double half_edge = 0.5 * c.h.edge_m;
-    const double primary_radius_m = in.primary_radius_km * 1000.0;
+    // Disk sampling and the distance handed to the engine's primary-body
+    // functions are done in KM, because that is the unit those functions and
+    // primary_positions use. Ray DIRECTIONS are dimensionless, so they are
+    // valid in the mesh frame without conversion.
+    const double to_km = in.mesh_to_km;
+    size_t n_primary_lit = 0;
 
     std::vector<double> B_vis(n_part, 0.0), B_ir(n_part, 0.0);
 
@@ -323,15 +332,24 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             double p_dist_km = 0.0;
             V3 p_hat{0, 0, 0};
             if (have_primary) {
+                const V3 xc_km = mul(xc, to_km);          // cube centre in KM
                 std::vector<V3> dirs;
-                sampleDisk(xc, p_pos, primary_radius_m, in.primary_disk_samples, dirs);
-                p_dist_km = len3(sub(p_pos, xc)) / 1000.0;
-                p_hat = unit3(sub(p_pos, xc));
+                sampleDisk(xc_km, p_pos, in.primary_radius_km,
+                           in.primary_disk_samples, dirs);
+                p_dist_km = len3(sub(p_pos, xc_km));
+                p_hat = unit3(sub(p_pos, xc_km));
                 const double invK = 1.0 / static_cast<double>(dirs.size());
                 for (const V3& d : dirs) {
+                    // Directions are dimensionless: cast in the MESH frame.
                     if (in.occluded(arr(xc), arr(d))) continue;
                     for (int fa = 0; fa < kNumFaces; ++fa)
                         mean_cos[fa] += std::max(0.0, dot3(fn[fa], d)) * invK;
+                }
+                double mc_sum = 0.0;
+                for (int fa = 0; fa < kNumFaces; ++fa) mc_sum += mean_cos[fa];
+                if (mc_sum > 0.0) {
+                    #pragma omp atomic
+                    ++n_primary_lit;
                 }
             }
 
@@ -373,6 +391,21 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             std::cout << "\r[flux-cubes] step " << (k + 1) << "/" << n_steps << std::flush;
     }
     std::cout << "\n";
+
+    // Make a silent zero impossible. If the primary body is present in the
+    // ephemeris but NO cube ever sees it, that is either a real geometric fact
+    // (the primary is permanently below every horizon) or a units/frame slip --
+    // and the two must not look alike. At a lunar PSR the primary's IR is
+    // 12.8-38.8% of the floor flux, so a quiet zero here is a large error.
+    if (in.primary_positions && !in.primary_positions->empty() && n_primary_lit == 0) {
+        std::cerr << "  [flux-cubes] WARNING: the primary body is in the ephemeris but NO "
+                     "cube saw it at ANY epoch, so primary_refl and primary_ir are "
+                     "identically zero in this product. Confirm that is geometry and not a "
+                     "units/frame mismatch (mesh_to_km = " << to_km << ").\n";
+    } else if (in.primary_positions && !in.primary_positions->empty()) {
+        std::cout << "[flux-cubes] primary body visible at " << n_primary_lit << "/"
+                  << (n_cubes * static_cast<size_t>(n_steps)) << " cube-epochs\n";
+    }
 
     // ----------------------------------------------------------------- write
     const std::string dir = in.output_dir + "/flux_cubes";

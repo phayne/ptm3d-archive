@@ -80,6 +80,16 @@ struct PassInputs {
     double primary_radius_km = 0.0;    // 0 => the primary is treated as a POINT
                                        // source and the header says so.
     int primary_disk_samples = 128;
+    // ⛔ UNITS. sun_positions / primary_positions are in KILOMETRES, while the
+    // mesh (and therefore every cube center) is in the mesh's own frame --
+    // METRES for lunar/Europa DEMs, kilometres for asteroid shape models. The
+    // engine handles this explicitly (illumination_model.cpp:5099, metersToKm
+    // gated on centres_in_meters) and so must this pass: subtracting a metres
+    // position from a kilometres one produces a direction pointing INTO the
+    // ground, every disk sample reads as occluded, and the primary-body flux
+    // collapses to exactly zero without any error. That is not hypothetical --
+    // it is what this field was added to fix.
+    double mesh_to_km = 1.0;           // multiply a mesh coordinate to get km
 
     // --- injected engine functions ---------------------------------------
     // occluded(origin, unit_direction) -> true when terrain blocks the ray.
