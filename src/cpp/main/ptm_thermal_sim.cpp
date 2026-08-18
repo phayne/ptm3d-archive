@@ -689,6 +689,12 @@ static bool writeLocationDepthCSV(const std::string& out_path,
 // "not a mesh face", which falls back to the scalar planet.H. `H_used`, when
 // non-null, receives the H the column was actually built with, so the caller
 // can report it instead of assuming.
+//
+// `seed_out`, when non-null, receives the spin-up seed's own EqSeedResult --
+// anchor status, brackets, quadrature, whether the Kirchhoff depth profile
+// ran. The caller is the only place that can census it, and until it did the
+// per-location path was the one solver entry point whose initial condition was
+// never reported at all.
 static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -699,7 +705,9 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Planet& planet,
     double* grid_bottom_m = nullptr,
     int face_idx = -1,
-    double* H_used = nullptr);
+    double* H_used = nullptr,
+    thermal::EqSeedResult* seed_out = nullptr,
+    bool* seed_applied_out = nullptr);
 static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
 
 bool exportLocationTemperatureOnly(const std::string& output_file,
@@ -9957,13 +9965,55 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Planet& planet,
     double* grid_bottom_m,
     int face_idx,
-    double* H_used)
+    double* H_used,
+    thermal::EqSeedResult* seed_out,
+    bool* seed_applied_out)
 {
     // Build flux array [2 x N]: times, flux
     Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
     for (int i = 0; i < static_cast<int>(times.size()); ++i) {
         flux_arr(0, i) = times[i];
         flux_arr(1, i) = (i < static_cast<int>(flux_values.size())) ? flux_values[i] : 0.0;
+    }
+
+    // ---- SEED WINDOW: offer the equilibration segment as a repair ----------
+    // `times` here is the CONCATENATION of the equilibration window and the
+    // output window. When the equilibration cadence is DECOUPLED
+    // (thermal.equilibration_samples_per_diurnal_cycle set to something other
+    // than the output cadence) the two blocks are sampled differently -- a
+    // Fig-5 lunar run: 7200 steps at 21262 s, then 360 at 7087 s -- and the
+    // surface anchor's rFFT needs an evenly spaced time base. So on those runs
+    // thermal_model.cpp set `nonuniform_samples`, eq_seed.cpp returned the
+    // warm bracket T_w with NO Kirchhoff depth profile, and nothing said so:
+    // the columns were seeded +71 K hot at the surface and +29.3 K at 0.83 m,
+    // and `thermal.seed_anchor: lumped` vs `warm` was bit-identical on the
+    // location CSVs while every mesh face moved.
+    //
+    // The equilibration block on its own is uniform, so it is offered as a
+    // REPAIR WINDOW rather than an unconditional cut. thermal_model.cpp
+    // consults it only after the full series has already failed the uniformity
+    // test. That distinction is load-bearing: on the DEFAULT cadence the
+    // equilibration block is generated at the output cadence (see the
+    // `decoupled_eq_cadence` branch that builds `external_ets`), the
+    // concatenated series is uniform, and the anchor already ran on all
+    // 7560 samples. Cutting there unconditionally would have shortened the
+    // span for no reason -- and for a short equilibration it would have pushed
+    // the window under the anchor's own one-cycle minimum and REINSTATED the
+    // warm-bracket fallback this exists to remove.
+    //
+    // NOT IDENTICAL TO THE MESH-WIDE PATH, stated rather than papered over.
+    // The CPU SIMD-batch seed takes the WHOLE table and labels every sample
+    // with the equilibration cadence (`seed_dt_s`) -- so on the same Fig-5 run
+    // it anchors on "63 diurnal cycles" of which the last 3 are the
+    // one-lunation output window stretched 3x. That mislabeling is the batch
+    // path's own defect (very likely why the batch census reports
+    // `lumped-two-timescale` where this path, on a correctly labeled window,
+    // reports plain `lumped`); correcting it would move every mesh-wide field,
+    // so it is left alone here and filed instead.
+    thermal::Config seed_config = config;   // must outlive `mdl` (Model holds a pointer)
+    if (equilibration_steps > 0 &&
+        equilibration_steps < static_cast<int>(times.size())) {
+        seed_config.seed_forcing_steps = equilibration_steps;
     }
 
     // Per-face H (Diviner / Hayne+2017 map, thermal_inertia_map, or a custom
@@ -9986,9 +10036,15 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
         latitude_deg * M_PI / 180.0,
         times,
         flux_arr,
-        config,
+        seed_config,
         /*show_progress=*/false
     );
+    // The seed ran in the constructor, so read it out BEFORE run() -- and read
+    // it out unconditionally, so the caller can report a column that was NOT
+    // seeded (spinup_seed: legacy, or an empty forcing series) as exactly that
+    // rather than as a missing line.
+    if (seed_out)         *seed_out         = mdl.seed_result;
+    if (seed_applied_out) *seed_applied_out = mdl.seed_applied;
     if (equilibration_steps > 0) {
         mdl.setEquilibrationSteps(equilibration_steps);
     }
@@ -21160,6 +21216,34 @@ int main(int argc, char** argv) {
 
                 int    loc_depth_reach_reported = 0;
                 double loc_depth_reach_last_m   = 0.0;  // last grid bottom announced
+
+                // ---- SEED-ANCHOR CENSUS for the location depth path --------
+                // Same disclosure the mesh-wide paths print, for the same
+                // reason: this path's initial condition used to be reported
+                // NOWHERE, and it was silently taking the warm-bracket
+                // fallback on every site (the concatenated eq+output forcing
+                // series is non-uniform; see runThermalModelDepthSeries). A
+                // census that is simply absent is indistinguishable from a
+                // census that was forgotten.
+                SeedAnchorCensus loc_anchor_census;
+                size_t loc_sites_seeded = 0, loc_sites_unseeded = 0;
+                if (loc_composer_ready && !locs.empty()) {
+                    const int loc_seed_steps =
+                        (equilibration_steps > 0 &&
+                         equilibration_steps < static_cast<int>(times.size()))
+                            ? equilibration_steps : 0;
+                    std::cout << "[eq-seed] location depth series: the surface anchor "
+                                 "analyzes the full " << times.size()
+                              << "-sample forcing series when it is evenly spaced, and "
+                                 "falls back to the leading "
+                              << loc_seed_steps
+                              << " equilibration samples when it is not (a decoupled "
+                                 "equilibration cadence makes the concatenated "
+                                 "eq+output series change cadence at the seam). The "
+                                 "window each site actually used is the sample count "
+                                 "in its census line below." << std::endl;
+                }
+
                 for (size_t i = 0; loc_composer_ready && i < locs.size(); ++i) {
                     const auto& tup = locs[i];
                     const std::string name = std::get<0>(tup);
@@ -21211,10 +21295,97 @@ int main(int argc, char** argv) {
                     // grid the user did not configure.
                     double grid_bottom_m = 0.0;
                     double loc_H_used = 0.0;
+                    thermal::EqSeedResult loc_seed;
+                    bool loc_seed_applied = false;
                     auto T_depths = runThermalModelDepthSeries(
                         flux_sum, times, lat_deg, thermal_config, depths_m,
                         equilibration_steps, planet, &grid_bottom_m,
-                        face_idx, &loc_H_used);
+                        face_idx, &loc_H_used, &loc_seed, &loc_seed_applied);
+
+                    // Per-site anchor status + Kirchhoff yes/no. Printed per
+                    // SITE, not just aggregated: the sites are individually
+                    // named validation points, and "3 of 5 anchored" does not
+                    // tell you which two columns you may not quote.
+                    {
+                        const std::string site_label =
+                            name.empty() ? ("loc_" + std::to_string(i)) : name;
+                        if (!loc_seed_applied) {
+                            std::cerr << "[eq-seed] location depth series, site '"
+                                      << site_label << "' (face " << face_idx
+                                      << "): NO shared seed was applied -- this column "
+                                         "was initialized by Profile::init_T "
+                                         "(thermal.spinup_seed: legacy, or an unusable "
+                                         "forcing series). Its initial condition is NOT "
+                                         "the one the mesh-wide field used."
+                                      << std::endl;
+                            ++loc_sites_unseeded;
+                        } else {
+                            loc_anchor_census.add(loc_seed);
+                            ++loc_sites_seeded;
+                            std::cout << "[eq-seed] location depth series, site '"
+                                      << site_label << "' (face " << face_idx
+                                      << "): anchor "
+                                      << thermal::eqSeedAnchorStatusName(
+                                             loc_seed.anchor_status)
+                                      << ", T_anchor = " << fmtSig(loc_seed.T_anchor)
+                                      << " K [T_cold " << fmtSig(loc_seed.T_cold)
+                                      << ", T_warm " << fmtSig(loc_seed.T_warm)
+                                      << "], seed T(0) = " << fmtSig(loc_seed.T_surface)
+                                      << " K, T(z_max) = " << fmtSig(loc_seed.T_deep)
+                                      << " K, kirchhoff depth profile "
+                                      << (loc_seed.kirchhoff_profile ? "YES" : "NO");
+                            if (loc_seed.kirchhoff_profile) {
+                                std::cout << " (R4*W(0) = "
+                                          << fmtSig(loc_seed.kirchhoff_surface_offset)
+                                          << " K)";
+                            }
+                            std::cout << ", window " << loc_seed.n_samples << "/"
+                                      << times.size() << " forcing samples"
+                                      << std::endl;
+
+                            // WHICH statuses get a warning. NOT simply
+                            // !eqSeedAnchorRan(): that is also false for
+                            // ZeroSwing (F(t) exactly flat, where T_d == T_w
+                            // bitwise and there is provably no bias -- every
+                            // permanently shadowed site) and for
+                            // WarmRequested (the user asked for T_w). Warning
+                            // on those would cry wolf on exactly the runs that
+                            // are behaving.
+                            using thermal::EqSeedAnchorStatus;
+                            const EqSeedAnchorStatus st = loc_seed.anchor_status;
+                            const bool real_fallback =
+                                !thermal::eqSeedAnchorRan(st) &&
+                                st != EqSeedAnchorStatus::ZeroSwing &&
+                                st != EqSeedAnchorStatus::WarmRequested;
+                            if (st == EqSeedAnchorStatus::FallbackRadiationCoupled) {
+                                // A sanctioned stand-down, not a defect: the
+                                // lumped closure assumes F(t) is external, and
+                                // under coupling it is not. Say it anyway --
+                                // the column IS seeded at T_w -- but say what
+                                // it means, which is that the CSV and the
+                                // mesh-wide field stood down together.
+                                std::cerr << "[eq-seed] NOTE: site '" << site_label
+                                          << "': radiation.enabled is true, so the "
+                                             "surface anchor stood down here exactly as "
+                                             "it does on the mesh-wide paths, and this "
+                                             "column is seeded at T_w = <F^4>^(1/4) with "
+                                             "no Kirchhoff depth profile. The CSV and the "
+                                             "mesh agree; both carry the T_w seed bias."
+                                          << std::endl;
+                            } else if (real_fallback) {
+                                std::cerr << "[eq-seed] WARNING: site '" << site_label
+                                          << "' took the WARM-BRACKET fallback ("
+                                          << thermal::eqSeedAnchorStatusName(st)
+                                          << "), so this column is seeded at "
+                                             "T_w = <F^4>^(1/4) with no Kirchhoff depth "
+                                             "profile. On a lunar equatorial column that "
+                                             "is tens of kelvin hot at the surface and "
+                                             "still tens of kelvin hot near 1 m, and a "
+                                             "short equilibration will not shed it."
+                                          << std::endl;
+                            }
+                        }
+                    }
                     // `face_idx`, not -1: with a per-face H map loaded these
                     // columns used to be solved at the scalar planet.H while
                     // the mesh-wide field used the map, so the CSVs and the
@@ -21300,6 +21471,31 @@ int main(int argc, char** argv) {
                         std::cout << "Wrote depth temperature series: " << out_path << std::endl;
                     }
                 }
+
+                // Aggregate census, in the same format and from the same
+                // struct the mesh-wide paths use, so the two lines can be read
+                // against each other in one log.
+                if (loc_sites_seeded > 0) {
+                    loc_anchor_census.report("cpu-location-depth-series");
+                } else if (loc_composer_ready && !locs.empty()) {
+                    // Distinguish the two ways this can be empty. "No site was
+                    // seeded" and "no site was solved at all" have completely
+                    // different remedies, and one line that covers both tells
+                    // you neither.
+                    std::cout << "[eq-seed] surface-anchor census "
+                                 "(cpu-location-depth-series): NONE -- ";
+                    if (loc_sites_unseeded > 0) {
+                        std::cout << loc_sites_unseeded
+                                  << " of " << locs.size()
+                                  << " site(s) were solved but NOT seeded by the shared "
+                                     "spin-up seed; they fell back to Profile::init_T.";
+                    } else {
+                        std::cout << "no site was solved: none of the " << locs.size()
+                                  << " requested location(s) mapped to a mesh face.";
+                    }
+                    std::cout << std::endl;
+                }
+
                 // Generate plots if enabled. Gated on the composition having
                 // succeeded: on a rerun into an existing output directory this
                 // would otherwise regenerate figures from the PREVIOUS run's

@@ -451,6 +451,32 @@ public:
     // Whether a two-timescale face REFUSES the anchor (and takes T_w) or runs
     // it and says so. See thermal.seed_anchor_refuse_two_timescale.
     bool seed_anchor_refuse_two_timescale = false;
+    // REPAIR WINDOW for a forcing series that is not evenly spaced. 0 (the
+    // default, and what every mesh-wide path passes) disables it entirely.
+    //
+    // A caller whose series is the CONCATENATION of the equilibration window
+    // and the output window sets this to the equilibration step count. It is
+    // consulted ONLY when the full series fails the uniformity test, and it is
+    // honored only if the leading `seed_forcing_steps` samples pass it. So:
+    //   * full series uniform  -> ignored, byte-identical to before;
+    //   * full series non-uniform, prefix uniform -> anchor on the prefix;
+    //   * both non-uniform     -> FallbackNonUniformSamples, as before.
+    // It can never make a run that HAD an anchor lose one, which matters
+    // because the two windows only differ when the equilibration cadence is
+    // decoupled (thermal.equilibration_samples_per_diurnal_cycle); on the
+    // default cadence the equilibration block is generated at the OUTPUT
+    // cadence and the concatenated series is already uniform.
+    //
+    // What it repairs, when it does fire: on a decoupled-cadence run (a Fig-5
+    // lunar run samples equilibration at 21262 s and output at 7087 s) the
+    // concatenated series set `nonuniform_samples`, took the
+    // FallbackNonUniformSamples branch in eq_seed.cpp, and returned the warm
+    // bracket T_w with NO Kirchhoff depth profile. Measured cost on the
+    // per-location depth CSVs: +71 K at the surface and +29.3 K at 0.83 m, and
+    // `thermal.seed_anchor: lumped` vs `warm` was BIT-IDENTICAL there while
+    // every mesh face moved -- the discriminator for the feature could not see
+    // the path that had lost it.
+    int seed_forcing_steps = 0;
     // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
     // < 0 = unset, follow spinup_seed (Physical -> 0, Legacy -> the historic
     // NYEARSEQ*round(year/day)). >= 0 = use exactly this many, whatever the
