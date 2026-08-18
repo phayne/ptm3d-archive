@@ -662,6 +662,19 @@ struct SimulationConfig {
         double emissivity_override = -1.0;  // >0:  override emissivity
         double ks_override = -1.0;          // >0:  override surface conductivity ks
         double kd_override = -1.0;          // >0:  override deep conductivity kd
+        // Regolith density/conductivity e-folding depth H (m), the Hayne et al.
+        // (2017) Table-A1 scale over which rho(z) and kc(z) relax from their
+        // surface to their deep values:
+        //     rho(z) = rhod + (rhos - rhod) * exp(-z/H)
+        //     kc(z)  = kd   + (ks   - kd  ) * exp(-z/H)
+        // Only the per-face `thermal.h_parameter_map` / `thermal.thermal_inertia_map`
+        // channel could reach H before this key existed, so a scalar H sweep on a
+        // built-in body was not expressible at all (a plain `thermophysical.H`
+        // landed in the dead-key warning). NOTE H is inert when ks == kd AND
+        // rhos == rhod -- which `constant_thermal_inertia` deliberately forces --
+        // and a per-face H map out-ranks this scalar on every face it covers;
+        // both cases warn at startup rather than flatlining a sweep in silence.
+        double H_override = -1.0;           // >0:  override e-folding depth H (m)
 
         // Directional-hemispheric (Hapke) albedo model, OFF by default. When
         // enabled, the absorbed-solar term uses the analytic closed form

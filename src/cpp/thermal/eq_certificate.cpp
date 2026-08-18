@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 
 namespace thermal {
 
@@ -261,9 +262,90 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
     }
     const double worst = std::max(pct(zero_.n_req, 0.95), pct(forced_.n_req, 0.95));
     if (n_configured > 0.0 && worst > n_configured) {
-        os << "  NOTE: the " << n_configured << " cycles this run integrates is "
-              "BELOW the p95 requirement (" << std::fixed << std::setprecision(1)
-           << worst << ").\n        Report-only at this stage -- the run proceeds.\n";
+        // A WARNING, not a note. This banner CAUGHT the 2026-08-17 deep-column
+        // miss -- it printed "median 468.8, p95 500.4" against 60 integrated
+        // cycles, and the run's deep anchors came out +11 K / +14 K hot -- and
+        // it was read past because it was worded as a note among 30 lines of
+        // model exposition. The run still proceeds (this whole module is
+        // report-only and byte-identity depends on it staying that way), but
+        // the operator is told what the shortfall is WORTH, in kelvin, not
+        // just that one number is smaller than another.
+        //
+        // The residual is the seed's own departure decaying at the column's
+        // slowest mode: E(N) = E0 * exp(-N/tau1), the same single-mode model
+        // n_req inverts. It is a PREDICTION, and a ~1.9x-conservative one (see
+        // the calibration paragraph above), not a measurement.
+        //
+        // COMPUTED PER FACE, THEN ORDERED. E0 and tau1 are pushed together in
+        // add(), so index i is one face; pct() sorts each vector
+        // independently, and E0_median paired with tau1_median is a face that
+        // need not exist. It also answers the wrong question: the warning
+        // fires on the p95 of n_req, so a MEDIAN residual can come out below
+        // target and have the warning contradict itself in its own text.
+        auto residuals = [&](const Bin& b) {
+            std::vector<double> r;
+            const size_t m = std::min(b.E0.size(), b.tau1_cycles.size());
+            r.reserve(m);
+            for (size_t i = 0; i < m; ++i) {
+                const double t1 = b.tau1_cycles[i];
+                if (t1 > 0.0) r.push_back(b.E0[i] * std::exp(-n_configured / t1));
+            }
+            return r;
+        };
+        std::ostringstream w;
+        w.setf(std::ios::fixed);
+        w << "\n  *** WARNING: this run integrates " << std::setprecision(1)
+          << n_configured << " equilibration cycles, BELOW the p95 requirement of "
+          << worst << " cycles\n"
+             "      for the requested " << std::setprecision(3) << target_K_
+          << " K. The run PROCEEDS -- this estimate changes no solver state --\n"
+             "      but the spin-up bias it predicts is still in the answer.\n"
+             "      Predicted residual seed error E0*exp(-N/tau1), per face, "
+             "at N = " << std::setprecision(1) << n_configured << " cycles:\n";
+        struct { const char* label; const Bin* b; } pops[2] = {
+            {"dark  (Qs=0)", &zero_}, {"lit   (Qs>0)", &forced_}
+        };
+        for (const auto& p : pops) {
+            if (p.b->n == 0) continue;
+            const std::vector<double> r = residuals(*p.b);
+            w << "        " << p.label << "  ";
+            if (r.empty()) {
+                w << "not scored (no face with a resolved tau1)\n";
+                continue;
+            }
+            w << "median " << std::setprecision(3) << pct(r, 0.50)
+              << " K, p95 " << pct(r, 0.95) << " K"
+              << "   [E0 median " << pct(p.b->E0, 0.50)
+              << " K, tau1 median " << std::setprecision(2)
+              << pct(p.b->tau1_cycles, 0.50) << " cycles]\n";
+        }
+        w << "      Remedy: raise thermal.equilibration_orbits toward "
+          << std::setprecision(0) << std::ceil(worst)
+          << ", or quote these results with the residual above\n"
+             "      stated as a systematic. Deep nodes carry it longest: the "
+             "requirement scales with the\n"
+             "      column depth (tau1 ~ z_max^1.75), so raising thermal_b "
+             "WITHOUT raising the orbit count\n"
+             "      makes the deep answer worse before it gets better. ***\n";
+        // WHERE IT GOES. The block itself goes to stderr, which is where every
+        // other warning in this engine goes and where a console that is not
+        // capturing stdout still shows it. The banner stream gets a ONE-LINE
+        // marker instead of a copy: production runs are launched as
+        // `> run.log 2>&1`, so emitting the full block to both put it in the
+        // log TWICE, which reads as a bug and trains the reader to skim it --
+        // the exact failure this promotion exists to undo.
+        if (&os != &std::cerr) {
+            // Own formatting, like the seed-anchor census: a disclosure whose
+            // digits depend on ambient stream state is not a disclosure.
+            std::ostringstream m;
+            m.setf(std::ios::fixed);
+            m << "\n  *** WARNING: " << std::setprecision(1) << n_configured
+              << " cycles integrated vs a p95 requirement of " << worst
+              << " -- full warning, with the\n      predicted residual in "
+                 "kelvin, on stderr. ***\n";
+            os << m.str();
+        }
+        std::cerr << w.str() << std::flush;
     }
     if (!(sec_per_cycle_ > 0.0)) {
         os << "  Wall-clock is not shown: nothing measured a seconds-per-cycle for\n"

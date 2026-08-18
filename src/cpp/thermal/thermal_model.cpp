@@ -2009,27 +2009,61 @@ Model::Model(const Planet& planet, double lat,
     // E_0 of 72-74 K, which dominates the equilibration requirement. That is
     // not a difference a run may take without saying so.
     if (config.spinup_seed == EqSeedMode::Physical && !flux_values.empty()) {
-        double sum = 0.0;
-        for (double v : flux_values) sum += v;
-        seed_mean_flux = sum / static_cast<double>(flux_values.size());
-
         // Lit-face anchor: this path already holds the face's own forcing
         // series, so it gets the same anchor the batch paths get. The rFFT
         // needs an EVENLY SPACED time base; this path's `times` come straight
         // from the caller and are not guaranteed uniform (the duplicate-
-        // timestamp cleanup above can leave gaps), so non-uniformity is
-        // detected and DECLARED rather than silently spectrum-analyzed.
+        // timestamp cleanup above can leave gaps, and a concatenated
+        // equilibration+output series changes cadence at the seam), so
+        // non-uniformity is detected and DECLARED rather than silently
+        // spectrum-analyzed.
+        //
+        // seed_forcing_steps is the REPAIR for the seam case, and it is
+        // strictly a repair: consulted only once the FULL series has already
+        // failed the test, and honored only if the prefix passes it. A run
+        // whose series was uniform takes the identical path it always did, and
+        // a prefix that is itself non-uniform (because the sanitization above
+        // dropped or merged samples and moved the seam) changes nothing and
+        // still reports FallbackNonUniformSamples. See
+        // Config::seed_forcing_steps.
+        const std::size_t n_all = flux_values.size();
+        auto uniform_over = [&](std::size_t n) {
+            if (n < 2) return false;
+            const double dt0 = flux_times[1] - flux_times[0];
+            if (!(dt0 > 0.0)) return false;
+            for (std::size_t i = 2; i < n; ++i) {
+                const double dti = flux_times[i] - flux_times[i - 1];
+                if (std::fabs(dti - dt0) > 1e-6 * dt0) return false;
+            }
+            return true;
+        };
+
+        std::size_t n_seed = n_all;
+        bool uniform = false;
+        if (flux_times.size() == n_all && n_all >= 2) {
+            uniform = uniform_over(n_all);
+            if (!uniform && config.seed_forcing_steps > 0 &&
+                static_cast<std::size_t>(config.seed_forcing_steps) < n_all &&
+                uniform_over(static_cast<std::size_t>(config.seed_forcing_steps))) {
+                n_seed  = static_cast<std::size_t>(config.seed_forcing_steps);
+                uniform = true;
+            }
+        }
+
+        // The MEAN and the anchor window are deliberately the SAME object: the
+        // closure is solved against the series' own warm bracket, and a mean
+        // taken over a different quadrature than the spectrum would make the
+        // two inconsistent.
+        double sum = 0.0;
+        for (std::size_t i = 0; i < n_seed; ++i) sum += flux_values[i];
+        seed_mean_flux = sum / static_cast<double>(n_seed);
+
         EqSeedForcing fc;
         bool have_forcing = false;
-        if (flux_times.size() == flux_values.size() && flux_times.size() >= 2) {
+        if (flux_times.size() == n_all && n_seed >= 2) {
             const double dt0 = flux_times[1] - flux_times[0];
-            bool uniform = (dt0 > 0.0);
-            for (size_t i = 2; i < flux_times.size() && uniform; ++i) {
-                const double dti = flux_times[i] - flux_times[i - 1];
-                if (std::fabs(dti - dt0) > 1e-6 * dt0) uniform = false;
-            }
             fc.flux               = flux_values.data();
-            fc.n_samples          = static_cast<int>(flux_values.size());
+            fc.n_samples          = static_cast<int>(n_seed);
             fc.span_s             = dt0 * fc.n_samples;
             fc.cycle_s            = planet.day;
             fc.cp0                = planet.cp0;
