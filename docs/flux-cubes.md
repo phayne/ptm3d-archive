@@ -250,3 +250,118 @@ against closed forms using the estimator's a-priori binomial error bar:
   between the inscribed and circumscribed disk values, `0.8000 <= sum_j F <= 0.8889`. Measured
   0.83130. A uniform-hemisphere sampler would read 0.5528, so this arm discriminates the cosine
   weighting rather than merely accommodating it.
+
+---
+
+## 6. The engine pass
+
+Flux cubes are evaluated in a **post-solve pass**, once, after the radiation coupling loop has
+converged and immediately before the location export. Not inside the loop, for three reasons: the
+sweep is the hot loop and only the converged answer is a product; inside the loop the band series
+are Picard-blended and `B_ir` carries an emission term that moves with `T` between iterations, so
+a blended `B` is not the `B` of any state; and the loop has two dispatch sites (single-timestep and
+multi-GPU pool), so evaluating there would mean two insertion points that must agree forever. After
+the loop both routes have written the same series, and that confluence is what makes the pass
+**route-blind**.
+
+### Reconstruction, not readback
+
+The converged radiosity vectors are function-local in `solveTwoBand` and on the GPU pool never
+leave the device. Rather than add a device-to-host transfer to a kernel path that is currently
+bit-identical to the CPU, the host inverts the solver's own two closing identities:
+
+```
+  B_ir [j] = eps_j*sigma*T_j^4 + (1 - eps_j) * ( Q_ind_ir [j] / eps_j    )
+  B_vis[j] = A_src_j * Q_dir_j +      A_j    * ( Q_ind_vis[j] / (1 - A_j) )
+```
+
+This is exact, not approximate, and it is spelled **once**, in
+`src/cpp/radiation/radiosity_reconstruction.h`, called by both the pass and its test.
+Measured against the solver's own retained `B`: **7.7e-17 relative** (bar 1e-12).
+
+`A_src(t)` is not cached. `ptm106_fill` is just `applyIncidenceAlbedo()` of quantities that all
+survive to post-solve, so the pass calls that same function rather than storing
+`n_faces x n_steps` values or writing the formula a second time.
+
+### Refusals
+
+Every one of these is a hard error with a reason, and each has a negative-control test:
+
+| condition | why it is refused |
+|---|---|
+| cache built for a different mesh | never apply a foreign cache; the exact regeneration command is printed, and it is never rebuilt inline (PTM-19) |
+| `equilibration_steps + n_steps != total_time_steps` | cube rows would stop lining up with `time_steps.txt` (PTM-250/251) |
+| gray path (no band-separated series) | one mixed radiosity cannot be split; emitting zeros or a merged column would be worse than failing |
+| no ray-occlusion function | assuming every cube is unshadowed fabricates direct solar flux at every PSR in the grid |
+| `eps` or `(1-A)` collapsing | the inversion is ill-posed and the solver's own `REFL_GUARD` fallback is invisible from the host |
+
+A pass failure aborts the run. A run that was asked for a product and made none must fail, not
+succeed quietly.
+
+### Units
+
+⛔ `sun_positions` and `primary_positions` are in **kilometres**; the mesh is in metres for lunar
+and Europa DEMs and kilometres for asteroid shape models. `PassInputs::mesh_to_km` carries the
+conversion, set at the call site by the same magnitude test the illumination model uses. Getting
+this wrong does not raise an error: the direction to the primary points into the ground, every
+disk sample reads as occluded, and the primary-body flux comes out **exactly zero**. That happened
+during development and was caught only by comparing against the engine's own `primary_ir`
+statistics. The pass now warns whenever the primary is in the ephemeris and no cube sees it at any
+epoch.
+
+## 7. Configuration
+
+```yaml
+flux_cubes:
+  enabled: false            # default OFF; ON must be byte-neutral to every mesh field
+  cache_file: ''            # REQUIRED when enabled; built by ptm_flux_cube_geom
+  write_binary: true        # flux_cubes/flux_cubes.fcb
+  write_csv: true           # flux_cubes/csv/cube_XXXXX.csv
+  write_csv_max_cubes: 0    # 0 = every cube; cap it on long production windows
+  shadow_probe_rays: 5      # 1 = centre only; 5 = centre + four rim points
+```
+
+The block is **top level**, not nested under `output:`, so it cannot be reached by the
+body-defaults machinery that makes `thermophysical:` decorative on a built-in body (PTM-67). A
+`warnUnreadFluxCubeKeys()` names any key the parser does not consume. The geometry keys
+(`spacing_m`, `height_factor`, `n_rays`, ...) are accepted but reported as **inert**: they live in
+the cache header, and honoring a YAML copy would create two sources of truth for one number.
+
+## 8. Outputs
+
+| file | producer |
+|---|---|
+| `flux_cubes/flux_cubes.fcb` | engine, float64 flux `[cube][face][component][step]` |
+| `flux_cubes/csv/cube_NNNNN.csv` | engine, one row per output step, 36 flux columns |
+| `<site>_flux_cubes.h5` | `scripts/ptm_flux_cubes_to_hdf5.py` (h5py, `europa_viz`) |
+
+HDF5 is written from Python, not C++: the repo declares HDF5 off by default in-tree to avoid
+macOS/Conda link issues, and adding an HDF5 link would change the production binary's provenance
+for every remaining site run in order to serve a file format. The requirement -- CSV **and** HDF5
+-- is met; only the producer moves.
+
+The packager's `--qa` mode can fail, and is meant to: `total == sum(components)`, no NaN or
+negative irradiance, closure per patch, and `nadir terrain_ir >= eps*sigma*T_face^4 * f_max`, which
+is the check that catches a mis-indexed cube-to-face mapping that every purely structural check
+would pass.
+
+## 9. Validation status
+
+| gate | result |
+|---|---|
+| radiosity reconstruction vs the solver's own `B` | 7.7e-17 / 9.4e-17 relative (bar 1e-12) |
+| closed forms, infinite plane | `f_sky` 1.00000 / 0.00000 / 0.50014, 3-sigma bar 0.00586 |
+| cosine weighting, analytic bracket | `sum_j F` = 0.83080 in [0.8000, 0.8889]; uniform would give 0.5528 |
+| flush limit, h = 1.0 / 0.1 / 0.01 m | `f_max` 0.1307 -> 0.9095 -> 0.9990, monotone |
+| pass unit test (3 arms, 5 negative controls) | 0 failures; nadir `terrain_ir` = 904.784902 W/m^2 at 360 K |
+| Ingersoll bowl crater | PASSED, 0.492713% |
+| mesh-wide passivity, cubes ON and OFF | byte-identical to the pristine baseline engine |
+
+**Passivity is the load-bearing one.** On the 12,800-face crater80N config, 862 physics output
+files, the aggregate md5 is `cab1be996c71c52543c006822e6a9deb` for all of: the pristine engine, this
+engine with no `flux_cubes` block, this engine with `enabled: false`, and this engine with
+**`enabled: true`**. The probe does not perturb the simulation.
+
+⛔ **What that does NOT cover.** Moon, built-in body, CPU `SparseVFOperator` route, two-band
+radiosity, single-shot (non-chunked) run. It says nothing about Europa, generic bodies, the gray
+path, the GPU pool route, the H-matrix route, or the chunked/warm-start path.
