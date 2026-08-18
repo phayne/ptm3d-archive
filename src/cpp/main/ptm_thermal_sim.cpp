@@ -414,6 +414,26 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------
+// PTM-09 class: format a small dimensionless number (an albedo, a Hayne
+// coefficient) through a LOCAL stream.
+//
+// std::cout arrives at the albedo banners already carrying
+// `std::fixed << std::setprecision(1)` left set by an earlier progress line
+// (the chunked-illumination "Extracting data: X.X%" report, and friends). Under
+// that state the Moon's A0 = 0.12 prints as "0.1", the Hayne et al. (2017)
+// coefficients a = 0.06 and b = 0.25 print as "0.1" and "0.2" -- three distinct
+// numbers rendered as two, and a run reporting values it did not use. That cost
+// a runner a bug chase on 2026-08-17 (it reads exactly like a hard-coded 0.1
+// albedo). Same archetype as PTM-05/PTM-55 and the conductivity-model banner at
+// the `std::ostringstream cmb` site further down: a local stream starts in the
+// default format and cannot inherit std::cout's state.
+static inline std::string fmtSig(double v, int sig = 6) {
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(sig) << v;
+    return os.str();
+}
+
+// ---------------------------------------------------------------------------
 // Infrared absorptivity -- THE single definition, by Kirchhoff's law.
 //
 // A surface absorbs thermal infrared with exactly the efficiency it emits it,
@@ -660,6 +680,21 @@ static bool writeLocationDepthCSV(const std::string& out_path,
                            const std::vector<std::string>& time_strings,
                            const std::vector<double>& depths_m,
                            const std::vector<std::vector<double>>& T_depths);
+// `grid_bottom_m`, when non-null, receives the depth of the DEEPEST SOLVED
+// node. Any requested depth below it is a Fourier's-law extrapolation, not a
+// solved value, and the caller is the only place that can say so.
+//
+// `face_idx` is this site's mesh face. It exists so the column is solved with
+// THIS face's H (planet.H_for_face) when a per-face H map is loaded; -1 means
+// "not a mesh face", which falls back to the scalar planet.H. `H_used`, when
+// non-null, receives the H the column was actually built with, so the caller
+// can report it instead of assuming.
+//
+// `seed_out`, when non-null, receives the spin-up seed's own EqSeedResult --
+// anchor status, brackets, quadrature, whether the Kirchhoff depth profile
+// ran. The caller is the only place that can census it, and until it did the
+// per-location path was the one solver entry point whose initial condition was
+// never reported at all.
 static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -667,7 +702,12 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Config& config,
     const std::vector<double>& depths_m,
     int equilibration_steps,
-    const thermal::Planet& planet);
+    const thermal::Planet& planet,
+    double* grid_bottom_m = nullptr,
+    int face_idx = -1,
+    double* H_used = nullptr,
+    thermal::EqSeedResult* seed_out = nullptr,
+    bool* seed_applied_out = nullptr);
 static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
 
 bool exportLocationTemperatureOnly(const std::string& output_file,
@@ -724,6 +764,25 @@ std::vector<double> runThermalModelForFace(const std::vector<double>&, const std
 // above the definition). See the definition for why this is needed.
 static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config);
 
+// The H the SHARED reference depth grid is built at, or -1 for "use planet.H".
+//
+// The CPU SIMD-batch solver and both GPU solvers put every face on ONE depth
+// grid and then give each face its own rho(z)/kc(z) from its own H. But the
+// grid is a function of H as well -- generateAdaptiveGrid() marches on
+// kappa(z), which carries exp(-z/H) -- so building it at the body-default
+// planet.H while the faces ran at a map's H made those paths disagree with the
+// per-face-grid CPU scalar path even for a UNIFORM map. Measured on the ico3
+// Moon at H = 0.03125 m: 23 layers vs the scalar path's 22, and 0.008 K.
+//
+// main() publishes the map's median H under "refgrid_H" so that every site that
+// derives this grid reads ONE number -- including CpuStateCheckpoint, which has
+// no Planet and must land on the same layer count or every cross-backend
+// restore fails its shape check. Absent the key (no per-face map loaded) this
+// returns -1.0, Profile falls back to planet.H, and nothing moves.
+static inline double refGridHOverride(const thermal::Config& config) {
+    return config.getPropertyDouble("refgrid_H", -1.0);
+}
+
 // PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
 // applies a user-configured scalar override to a solver-local Planet; main()
 // FAILS the run if an override was configured and this stayed at zero, so an
@@ -743,6 +802,7 @@ static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalP
                                     double geothermal_heat_flow) {
     return (tp.ks_override              > 0.0)
         || (tp.kd_override              > 0.0)
+        || (tp.H_override               > 0.0)
         || (tp.emissivity_override      > 0.0)
         || (tp.albedo_override         >= 0.0)
         || (tp.constant_thermal_inertia > 0.0)
@@ -2078,6 +2138,14 @@ public:
     }
 
 private:
+    // Resolve the angular albedo model and (optionally) announce it. Called by
+    // BOTH entry points so the two gates cannot come apart -- the whole point of
+    // this class is that there is one such decision in the program.
+    void resolveAngularModel(const thermal::Planet* planet,
+                             double default_visible_albedo,
+                             double solar_constant,
+                             bool announce);
+
     const Mesh*            mesh_   = nullptr;
     const thermal::Planet* planet_ = nullptr;
     std::vector<double> face_albedos_;
@@ -2171,7 +2239,7 @@ bool AbsorbedFluxComposer::build(
     }
 
     std::cout << "Using " << (is_custom_mesh ? "custom" : "standard") << " mesh mode" << std::endl;
-    std::cout << "Default albedo: " << default_visible_albedo << std::endl;
+    std::cout << "Default albedo: " << fmtSig(default_visible_albedo) << std::endl;
 
     // Initialize all faces with default albedo
     std::fill(face_albedos.begin(), face_albedos.end(), default_visible_albedo);
@@ -2192,7 +2260,7 @@ bool AbsorbedFluxComposer::build(
     }
     else if (albedo_map_disabled) {
         std::cout << "Albedo map loading disabled (use_albedo_map: false), "
-                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
+                  << "using uniform albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
     // For custom mesh without explicit albedo map, try to load global albedo map
     // Skip if: (a) user explicitly set a uniform albedo (use_default_albedo: false), or
@@ -2220,11 +2288,11 @@ bool AbsorbedFluxComposer::build(
 
         if (skip_fits) {
             if (albedo_explicit) {
-                std::cout << "Using explicit uniform albedo " << default_visible_albedo
+                std::cout << "Using explicit uniform albedo " << fmtSig(default_visible_albedo)
                           << " (thermophysical override, FITS auto-search disabled)" << std::endl;
             } else {
                 std::cout << "Albedo maps directory is empty, skipping FITS auto-search. "
-                          << "Using uniform albedo " << default_visible_albedo << std::endl;
+                          << "Using uniform albedo " << fmtSig(default_visible_albedo) << std::endl;
             }
         } else {
             // Ensure directory has trailing slash
@@ -2263,10 +2331,10 @@ bool AbsorbedFluxComposer::build(
                     std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
                     std::cout << "Map dimensions: " << global_albedo_map->getWidth()
                             << "x" << global_albedo_map->getHeight() << std::endl;
-                    std::cout << "Albedo range in map: " << global_albedo_map->getMin()
-                            << " to " << global_albedo_map->getMax() << std::endl;
+                    std::cout << "Albedo range in map: " << fmtSig(global_albedo_map->getMin())
+                            << " to " << fmtSig(global_albedo_map->getMax()) << std::endl;
                     std::cout << "NOTE: Global albedo map overrides default uniform albedo ("
-                            << default_visible_albedo << "). To disable, set "
+                            << fmtSig(default_visible_albedo) << "). To disable, set "
                             << "albedo_maps_directory to empty in config YAML." << std::endl;
                     albedo_map_to_use = global_albedo_map;
                     albedo_successfully_loaded = true;
@@ -2276,7 +2344,7 @@ bool AbsorbedFluxComposer::build(
             }
             if (!found) {
                 std::cout << "No global albedo map found for " << body_name
-                        << ", using default albedo " << default_visible_albedo << std::endl;
+                        << ", using default albedo " << fmtSig(default_visible_albedo) << std::endl;
             }
         }
     }
@@ -2286,7 +2354,7 @@ bool AbsorbedFluxComposer::build(
         bool is_generic_body = (config.getProperty("using_generic_body") == "true");
         if (is_generic_body) {
             std::cout << "Generic body: skipping binary albedo map search, using default albedo "
-                      << default_visible_albedo << std::endl;
+                      << fmtSig(default_visible_albedo) << std::endl;
         }
 
         if (!is_generic_body) {
@@ -2348,8 +2416,10 @@ bool AbsorbedFluxComposer::build(
 
             if (!loaded_albedos.empty() && loaded_albedos.size() == num_faces) {
                 std::cout << "Successfully loaded " << loaded_albedos.size() << " albedo values from: " << found_path << std::endl;
-                std::cout << "Albedo range: " << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
-                        << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+                std::cout << "Albedo range: "
+                        << fmtSig(*std::min_element(loaded_albedos.begin(), loaded_albedos.end()))
+                        << " to "
+                        << fmtSig(*std::max_element(loaded_albedos.begin(), loaded_albedos.end())) << std::endl;
 
                 // Copy the loaded albedo values to face_albedos
                 std::copy(loaded_albedos.begin(), loaded_albedos.end(), face_albedos.begin());
@@ -2361,7 +2431,7 @@ bool AbsorbedFluxComposer::build(
                     std::cout << "Binary albedo file size mismatch: expected " << num_faces
                             << " faces, got " << loaded_albedos.size() << " values" << std::endl;
                 }
-                std::cout << "Using default albedo " << default_visible_albedo << " for all faces" << std::endl;
+                std::cout << "Using default albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
             }
         }
         } // end if (!is_generic_body)
@@ -2418,8 +2488,8 @@ bool AbsorbedFluxComposer::build(
         std::cout << "FITS albedo interpolation complete:" << std::endl;
         std::cout << "  Valid interpolations: " << valid_interpolations << " faces" << std::endl;
         std::cout << "  Invalid/default values: " << invalid_interpolations << " faces" << std::endl;
-        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
-        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+        std::cout << "  Albedo range: " << fmtSig(min_albedo) << " to " << fmtSig(max_albedo) << std::endl;
+        std::cout << "  Average albedo: " << fmtSig(avg_albedo) << std::endl;
         albedo_successfully_loaded = true;
     } else if (albedo_successfully_loaded) {
         // Binary albedo file was already loaded - just report statistics
@@ -2427,10 +2497,10 @@ bool AbsorbedFluxComposer::build(
         double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
         double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / face_albedos.size();
         std::cout << "Using binary albedo map:" << std::endl;
-        std::cout << "  Albedo range: " << min_albedo << " to " << max_albedo << std::endl;
-        std::cout << "  Average albedo: " << avg_albedo << std::endl;
+        std::cout << "  Albedo range: " << fmtSig(min_albedo) << " to " << fmtSig(max_albedo) << std::endl;
+        std::cout << "  Average albedo: " << fmtSig(avg_albedo) << std::endl;
     } else {
-        std::cout << "Using constant albedo " << default_visible_albedo << " for all faces" << std::endl;
+        std::cout << "Using constant albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
 
     // Final validation
@@ -2492,53 +2562,8 @@ bool AbsorbedFluxComposer::build(
     // hemispheric gate is on. getAlbedoWithIncidence() internally routes to the
     // correct model (Hapke branch first when use_hapke_albedo). When neither is
     // set the constant Bond albedo is used and the path is byte-identical.
-    bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
-                             planet->hapke_albedo_w >= 0.0);
-    bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
-                                 (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
-
-    if (use_incidence_albedo) {
-        // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
-        // initialized to), not the Planet's, and say so when they differ. On
-        // the CPU path the two agree today -- `planet` here IS the main-scope
-        // Planet -- but the GPU path rebuilds its Planet, and a banner that can
-        // silently mean two things is exactly what PTM-55 is.
-        if (std::abs(planet->albedo - default_visible_albedo) > 1e-9) {
-            // PTM-09 class: std::cerr/std::cout inherit whatever precision the
-            // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
-            // so a diagnostic that exists to show a DISAGREEMENT would print
-            // two identical numbers. Format explicitly, then restore.
-            std::ios_base::fmtflags f(std::cerr.flags());
-            std::streamsize pr = std::cerr.precision();
-            std::cerr << std::defaultfloat << std::setprecision(6)
-                      << "[albedo] WARNING: Planet(\"" << planet->name
-                      << "\") carries albedo " << planet->albedo
-                      << ", which DISAGREES with the operative "
-                      << default_visible_albedo
-                      << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md (PTM-55)."
-                      << std::endl;
-            std::cerr.flags(f);
-            std::cerr.precision(pr);
-        }
-        if (use_hapke_albedo) {
-            std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
-                         "1 - gamma*H(mu0,w)" << std::endl;
-            std::cout << "  Base albedo A0 = " << std::defaultfloat
-                      << std::setprecision(6) << default_visible_albedo
-                      << " (operative), single-scattering w = " << planet->hapke_albedo_w
-                      << std::endl;
-        } else {
-            std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
-            std::cout << "  Base albedo A0 = " << std::defaultfloat
-                      << std::setprecision(6) << default_visible_albedo
-                      << " (operative)" << std::endl;
-            std::cout << "  Coefficients: a = " << planet->albedoCoef[0]
-                      << ", b = " << planet->albedoCoef[1] << std::endl;
-        }
-    }
-
-    use_hapke_albedo_           = use_hapke_albedo;
-    use_incidence_albedo_       = use_incidence_albedo;
+    resolveAngularModel(planet, default_visible_albedo, solar_constant,
+                        /*announce=*/true);
     albedo_successfully_loaded_ = albedo_successfully_loaded;
 
     // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized
@@ -2548,6 +2573,52 @@ bool AbsorbedFluxComposer::build(
     eff_alb_num_.assign(num_faces, 0.0);
     eff_alb_den_.assign(num_faces, 0.0);
     return true;
+}
+
+void AbsorbedFluxComposer::resolveAngularModel(const thermal::Planet* planet,
+                                               double default_visible_albedo,
+                                               double solar_constant,
+                                               bool announce) {
+    const bool use_hapke_albedo = (planet != nullptr && planet->use_hapke_albedo &&
+                                   planet->hapke_albedo_w >= 0.0);
+    const bool use_incidence_albedo = (planet != nullptr && solar_constant > 0.0 &&
+                                       (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
+
+    if (use_incidence_albedo && announce) {
+        // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
+        // initialized to), not the Planet's, and say so when they differ. On
+        // the CPU path the two agree today -- `planet` here IS the main-scope
+        // Planet -- but the GPU path rebuilds its Planet, and a banner that can
+        // silently mean two things is exactly what PTM-55 is.
+        if (std::abs(planet->albedo - default_visible_albedo) > 1e-9) {
+            // PTM-09 class: std::cerr/std::cout inherit whatever precision the
+            // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
+            // so a diagnostic that exists to show a DISAGREEMENT would print
+            // two identical numbers. Format explicitly through fmtSig().
+            std::cerr << "[albedo] WARNING: Planet(\"" << planet->name
+                      << "\") carries albedo " << fmtSig(planet->albedo)
+                      << ", which DISAGREES with the operative "
+                      << fmtSig(default_visible_albedo)
+                      << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md (PTM-55)."
+                      << std::endl;
+        }
+        if (use_hapke_albedo) {
+            std::cout << "Using directional-hemispheric (Hapke) albedo A_h(i) = "
+                         "1 - gamma*H(mu0,w)" << std::endl;
+            std::cout << "  Base albedo A0 = " << fmtSig(default_visible_albedo)
+                      << " (operative), single-scattering w = "
+                      << fmtSig(planet->hapke_albedo_w) << std::endl;
+        } else {
+            std::cout << "Using incidence-angle-dependent albedo (Hayne et al. 2017 formula)" << std::endl;
+            std::cout << "  Base albedo A0 = " << fmtSig(default_visible_albedo)
+                      << " (operative)" << std::endl;
+            std::cout << "  Coefficients: a = " << fmtSig(planet->albedoCoef[0])
+                      << ", b = " << fmtSig(planet->albedoCoef[1]) << std::endl;
+        }
+    }
+
+    use_hapke_albedo_     = use_hapke_albedo;
+    use_incidence_albedo_ = use_incidence_albedo;
 }
 
 std::vector<double> calculateAbsorbedFlux(
@@ -2808,7 +2879,8 @@ struct CpuStateCheckpoint {
 
         thermal::Planet ref_planet(config.getProperty("planet", "Moon"));
         applyConfiguredThermo(ref_planet, config);
-        thermal::Profile ref_profile(ref_planet, 0.0, config, false);
+        thermal::Profile ref_profile(ref_planet, 0.0, config, false,
+                                     refGridHOverride(config));
         n_layers = static_cast<size_t>(ref_profile.nlayers);
         if (n_layers < 2) {
             std::cerr << tag << " FATAL: reference depth grid has " << n_layers
@@ -3747,6 +3819,11 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
                           const char* label; const char* unit; } kScalarOverrides[] = {
         {"ovr_ks",         &thermal::Planet::ks,         "ks",         " W/m/K"},
         {"ovr_kd",         &thermal::Planet::kd,         "kd",         " W/m/K"},
+        // Regolith density/conductivity e-folding depth. Reaches the solver on
+        // the SAME channel as ks/kd because it is the third parameter of the
+        // same rho(z)/kc(z) law -- a sweep that moves ks and kd but not H is
+        // sweeping two thirds of the profile.
+        {"ovr_H",          &thermal::Planet::H,          "H",          " m"},
         {"ovr_rhod",       &thermal::Planet::rhod,       "rhod",       " kg/m^3"},
         {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
         {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
@@ -4092,7 +4169,8 @@ bool runThermalModelsForAllFaces(
                 
                 // Print some statistics about the map
                 std::cout << "  - Map resolution: " << albedo_map->getWidth() << "x" << albedo_map->getHeight() << std::endl;
-                std::cout << "  - Albedo range: " << albedo_map->getMin() << " to " << albedo_map->getMax() << std::endl;
+                std::cout << "  - Albedo range: " << fmtSig(albedo_map->getMin())
+                          << " to " << fmtSig(albedo_map->getMax()) << std::endl;
                 std::cout << "  - Coordinate range: Lon [" << albedo_map->getLonMin() << "," << albedo_map->getLonMax() 
                           << "], Lat [" << albedo_map->getLatMin() << "," << albedo_map->getLatMax() << "]" << std::endl;
             } else {
@@ -4865,7 +4943,8 @@ bool runThermalModelsForAllFacesBatchSoA(
     }
 
     // Create reference profile for grid parameters (reuses `planet` above).
-    thermal::Profile ref_profile(planet, 0.0, config, false);
+    thermal::Profile ref_profile(planet, 0.0, config, false,
+                                 refGridHOverride(config));
     const int n_layers = ref_profile.nlayers;
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
@@ -7159,7 +7238,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
     recordIrAbsorptivity("gpu_persistent", thermalIrEmissivity(planet));
-    thermal::Profile reference_profile(planet, 0.0, config, false);
+    thermal::Profile reference_profile(planet, 0.0, config, false,
+                                       refGridHOverride(config));
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
 
@@ -7203,11 +7283,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // main scope, "A0 = 0.1" here) with no way for a reader to tell which
         // the solver saw. Report the operative value, and say where it came
         // from -- per PTM-05.
-        std::cout << "[GPU Thermal]   Base albedo A0 = " << std::defaultfloat
-                  << std::setprecision(6) << default_visible_albedo
+        std::cout << "[GPU Thermal]   Base albedo A0 = " << fmtSig(default_visible_albedo)
                   << " (operative: face_albedos is initialized to this; a loaded "
                      "albedo map supersedes it per face), single-scattering w = "
-                  << hapke_w << std::endl;
+                  << fmtSig(hapke_w) << std::endl;
         if (std::abs(planet.albedo - default_visible_albedo) > 1e-9) {
             // Explicit precision -- see the CPU sibling: the inherited stream
             // state can print two different values identically (PTM-09 class).
@@ -7215,9 +7294,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::streamsize pr = std::cerr.precision();
             std::cerr << std::defaultfloat << std::setprecision(6)
                       << "[GPU Thermal] WARNING: the solver-scope Planet(\""
-                      << planet.name << "\") carries albedo " << planet.albedo
+                      << planet.name << "\") carries albedo " << fmtSig(planet.albedo)
                       << ", which DISAGREES with the operative "
-                      << default_visible_albedo
+                      << fmtSig(default_visible_albedo)
                       << ". The operative value is what the flux uses; the "
                          "solver-scope Planet's albedo is used for nothing else. "
                          "See docs/KNOWN_LIMITATIONS.md (PTM-55)." << std::endl;
@@ -7454,7 +7533,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     bool albedo_map_disabled = (config.getProperty("use_albedo_map") == "0");
     if (albedo_map_disabled) {
         std::cout << "[GPU Thermal] Albedo map loading disabled (use_albedo_map: false), "
-                  << "using uniform albedo " << default_visible_albedo << " for all faces" << std::endl;
+                  << "using uniform albedo " << fmtSig(default_visible_albedo) << " for all faces" << std::endl;
     }
 
     // Get albedo maps directory from config
@@ -7509,10 +7588,10 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::cout << "[GPU Thermal] Loaded FITS albedo map from: " << found_path << std::endl;
             std::cout << "[GPU Thermal] Map dimensions: " << albedo_map->getWidth()
                       << "x" << albedo_map->getHeight() << std::endl;
-            std::cout << "[GPU Thermal] Albedo range in map: " << albedo_map->getMin()
-                      << " to " << albedo_map->getMax() << std::endl;
+            std::cout << "[GPU Thermal] Albedo range in map: " << fmtSig(albedo_map->getMin())
+                      << " to " << fmtSig(albedo_map->getMax()) << std::endl;
             std::cout << "[GPU Thermal] NOTE: Global albedo map overrides default uniform albedo ("
-                      << default_visible_albedo << "). To disable, set "
+                      << fmtSig(default_visible_albedo) << "). To disable, set "
                       << "albedo_maps_directory to empty in config YAML." << std::endl;
 
             // Interpolate FITS map to each face center
@@ -7542,23 +7621,24 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             double max_albedo = *std::max_element(face_albedos.begin(), face_albedos.end());
             double avg_albedo = std::accumulate(face_albedos.begin(), face_albedos.end(), 0.0) / n_faces;
             std::cout << "[GPU Thermal] FITS interpolation complete: " << valid_count << "/" << n_faces << " faces" << std::endl;
-            std::cout << "[GPU Thermal] Albedo range: " << min_albedo << " to " << max_albedo
-                      << " (mean: " << avg_albedo << ")" << std::endl;
+            std::cout << "[GPU Thermal] Albedo range: " << fmtSig(min_albedo)
+                      << " to " << fmtSig(max_albedo)
+                      << " (mean: " << fmtSig(avg_albedo) << ")" << std::endl;
             albedo_source_label = found_path;
             albedo_loaded = true;
         } else {
             std::cout << "[GPU Thermal] Could not load FITS albedo map for " << body_name
-                      << ", using default albedo " << default_visible_albedo << std::endl;
+                      << ", using default albedo " << fmtSig(default_visible_albedo) << std::endl;
         }
     }
     else if (!albedo_map_disabled && is_custom_mesh && skip_fits) {
         // User explicitly set albedo or albedo_maps_directory is empty — skip FITS search
         if (albedo_explicit) {
-            std::cout << "[GPU Thermal] Using explicit uniform albedo " << default_visible_albedo
+            std::cout << "[GPU Thermal] Using explicit uniform albedo " << fmtSig(default_visible_albedo)
                       << " (thermophysical override, FITS auto-search disabled)" << std::endl;
         } else {
             std::cout << "[GPU Thermal] Albedo maps directory is empty, skipping FITS auto-search. "
-                      << "Using uniform albedo " << default_visible_albedo << std::endl;
+                      << "Using uniform albedo " << fmtSig(default_visible_albedo) << std::endl;
         }
     }
     else if (!albedo_map_disabled && !body_name.empty() && config.getProperty("using_generic_body") != "true") {
@@ -7591,8 +7671,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 if (loaded_albedos.size() == n_faces) {
                     std::cout << "[GPU Thermal] Loaded binary albedo map from: " << path << std::endl;
                     std::cout << "[GPU Thermal] Albedo range: "
-                              << *std::min_element(loaded_albedos.begin(), loaded_albedos.end())
-                              << " to " << *std::max_element(loaded_albedos.begin(), loaded_albedos.end()) << std::endl;
+                              << fmtSig(*std::min_element(loaded_albedos.begin(), loaded_albedos.end()))
+                              << " to "
+                              << fmtSig(*std::max_element(loaded_albedos.begin(), loaded_albedos.end())) << std::endl;
                     face_albedos = std::move(loaded_albedos);
                     albedo_source_label = path;
                     albedo_loaded = true;
@@ -7606,10 +7687,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
         if (!albedo_loaded) {
             std::cout << "[GPU Thermal] No binary albedo map found for " << body_name
-                      << " res" << mesh_resolution << ", using default albedo " << default_visible_albedo << std::endl;
+                      << " res" << mesh_resolution << ", using default albedo "
+                      << fmtSig(default_visible_albedo) << std::endl;
         }
     } else {
-        std::cout << "[GPU Thermal] No body name in config, using default albedo " << default_visible_albedo << std::endl;
+        std::cout << "[GPU Thermal] No body name in config, using default albedo "
+                  << fmtSig(default_visible_albedo) << std::endl;
     }
 
     // PTM-34 tripwire (GPU thermal path). See the CPU-path copy for the rationale:
@@ -9129,7 +9212,8 @@ bool runThermalForSelectedFaces_GPU(
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
     recordIrAbsorptivity("gpu_rethermal", thermalIrEmissivity(planet));
-    thermal::Profile reference_profile(planet, 0.0, config, false);
+    thermal::Profile reference_profile(planet, 0.0, config, false,
+                                       refGridHOverride(config));
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
     // No seed banner here: this path never seeds. It is warm-started from
@@ -9595,6 +9679,20 @@ bool runThermalForSelectedFaces_GPU(
                           << std::endl;
                 pool_ptr = nullptr;
             }
+            // The pool's device buffers are n_layers * max_n_faces, so a pool
+            // sized for a DIFFERENT grid is not merely suboptimal -- the
+            // uploads land at the wrong stride. ThermalGPUPoolConfig::n_layers
+            // exists to be checked here (thermal_gpu_pool.h:92-95) and was
+            // never checked: only capacity was. Any knob that moves the depth
+            // grid between the pool's construction and this solve reaches this
+            // line, which is how the per-face-H reference-grid change found it.
+            if (pool_ptr != nullptr && pool_ptr->nLayers() != n_layers) {
+                std::cerr << "  [GPU Thermal Pool] Shared pool was sized for "
+                          << pool_ptr->nLayers() << " depth layers but this solve needs "
+                          << n_layers << "; falling back to a local pool rather than "
+                             "uploading at the wrong stride." << std::endl;
+                pool_ptr = nullptr;
+            }
         }
 
         if (pool_ptr == nullptr) {
@@ -9864,7 +9962,12 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const thermal::Config& config,
     const std::vector<double>& depths_m,
     int equilibration_steps,
-    const thermal::Planet& planet)
+    const thermal::Planet& planet,
+    double* grid_bottom_m,
+    int face_idx,
+    double* H_used,
+    thermal::EqSeedResult* seed_out,
+    bool* seed_applied_out)
 {
     // Build flux array [2 x N]: times, flux
     Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
@@ -9872,15 +9975,76 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
         flux_arr(0, i) = times[i];
         flux_arr(1, i) = (i < static_cast<int>(flux_values.size())) ? flux_values[i] : 0.0;
     }
+
+    // ---- SEED WINDOW: offer the equilibration segment as a repair ----------
+    // `times` here is the CONCATENATION of the equilibration window and the
+    // output window. When the equilibration cadence is DECOUPLED
+    // (thermal.equilibration_samples_per_diurnal_cycle set to something other
+    // than the output cadence) the two blocks are sampled differently -- a
+    // Fig-5 lunar run: 7200 steps at 21262 s, then 360 at 7087 s -- and the
+    // surface anchor's rFFT needs an evenly spaced time base. So on those runs
+    // thermal_model.cpp set `nonuniform_samples`, eq_seed.cpp returned the
+    // warm bracket T_w with NO Kirchhoff depth profile, and nothing said so:
+    // the columns were seeded +71 K hot at the surface and +29.3 K at 0.83 m,
+    // and `thermal.seed_anchor: lumped` vs `warm` was bit-identical on the
+    // location CSVs while every mesh face moved.
+    //
+    // The equilibration block on its own is uniform, so it is offered as a
+    // REPAIR WINDOW rather than an unconditional cut. thermal_model.cpp
+    // consults it only after the full series has already failed the uniformity
+    // test. That distinction is load-bearing: on the DEFAULT cadence the
+    // equilibration block is generated at the output cadence (see the
+    // `decoupled_eq_cadence` branch that builds `external_ets`), the
+    // concatenated series is uniform, and the anchor already ran on all
+    // 7560 samples. Cutting there unconditionally would have shortened the
+    // span for no reason -- and for a short equilibration it would have pushed
+    // the window under the anchor's own one-cycle minimum and REINSTATED the
+    // warm-bracket fallback this exists to remove.
+    //
+    // NOT IDENTICAL TO THE MESH-WIDE PATH, stated rather than papered over.
+    // The CPU SIMD-batch seed takes the WHOLE table and labels every sample
+    // with the equilibration cadence (`seed_dt_s`) -- so on the same Fig-5 run
+    // it anchors on "63 diurnal cycles" of which the last 3 are the
+    // one-lunation output window stretched 3x. That mislabeling is the batch
+    // path's own defect (very likely why the batch census reports
+    // `lumped-two-timescale` where this path, on a correctly labeled window,
+    // reports plain `lumped`); correcting it would move every mesh-wide field,
+    // so it is left alone here and filed instead.
+    thermal::Config seed_config = config;   // must outlive `mdl` (Model holds a pointer)
+    if (equilibration_steps > 0 &&
+        equilibration_steps < static_cast<int>(times.size())) {
+        seed_config.seed_forcing_steps = equilibration_steps;
+    }
+
+    // Per-face H (Diviner / Hayne+2017 map, thermal_inertia_map, or a custom
+    // h_parameter_map). This used to be the one solver entry point that did not
+    // look it up: the Model constructor builds its Profile with the default
+    // H_override = -1, so these columns fell back to the scalar planet.H and a
+    // per-face H map was a SILENT no-op on every *_depths.csv -- including the
+    // Apollo validation columns, where the map is exactly the point. Feeding a
+    // Planet copy whose H is this face's is equivalent to the H_override
+    // parameter the mesh solvers pass (Profile's ctor does `this->planet.H =
+    // H_face` with it), so the two paths build the same grid and the same
+    // rho(z)/kc(z).
+    thermal::Planet face_planet = planet;
+    face_planet.H = planet.H_for_face(face_idx);
+    if (H_used) *H_used = face_planet.H;
+
     // Create and run model
     thermal::Model mdl(
-        planet,
+        face_planet,
         latitude_deg * M_PI / 180.0,
         times,
         flux_arr,
-        config,
+        seed_config,
         /*show_progress=*/false
     );
+    // The seed ran in the constructor, so read it out BEFORE run() -- and read
+    // it out unconditionally, so the caller can report a column that was NOT
+    // seeded (spinup_seed: legacy, or an empty forcing series) as exactly that
+    // rather than as a missing line.
+    if (seed_out)         *seed_out         = mdl.seed_result;
+    if (seed_applied_out) *seed_applied_out = mdl.seed_applied;
     if (equilibration_steps > 0) {
         mdl.setEquilibrationSteps(equilibration_steps);
     }
@@ -9889,6 +10053,9 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const auto& z_layers = mdl.profile.getGrid().z;
     const int Nz = static_cast<int>(z_layers.size());
     const int Nt = static_cast<int>(times.size());
+    if (grid_bottom_m) {
+        *grid_bottom_m = z_layers.empty() ? 0.0 : z_layers.back();
+    }
     const Eigen::MatrixXd& Tmat = mdl.T;
     const bool rows_are_layers = (Tmat.rows() == Nz && Tmat.cols() == Nt);
     const bool cols_are_layers = (Tmat.cols() == Nz && Tmat.rows() == Nt);
@@ -10078,18 +10245,44 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
     return std::string(time_string);
 }
 
+// Where the per-location exports read illumination from.
+//
+// Exactly ONE of two stores carries a run's illumination by the time these
+// exports run: the flat face x timestep arrays, when the estimated footprint
+// fit under PTM_RAM_ILLUM_MAX_GB and they were extracted; or the illumination
+// model's chunk store, when it did not and the mesh-wide solver was left to
+// stream. Both exports used to index the flat arrays unconditionally, so on the
+// streaming branch every read was out of range, the bounds guards returned 0.0,
+// and the files were written from a flux that was identically zero -- rc 0, no
+// warning. main() resolves the live store ONCE into this and hands it over, so
+// neither export can pick the wrong one and neither can invent a zero.
+struct LocationFluxSource {
+    std::function<double(size_t, int)> total;        // direct + primary-reflected
+    std::function<double(size_t, int)> direct;
+    std::function<double(size_t, int)> reflected;
+    std::function<double(size_t, int)> primary_ir;
+    // Names the store, for the log. Never empty when valid().
+    std::string origin;
+    bool valid() const {
+        return total && direct && reflected && primary_ir && !origin.empty();
+    }
+};
+
 bool exportLocationIlluminationAndTemperature(
     const std::string& output_file,
     const std::string& locations_file,
     const std::shared_ptr<Mesh>& mesh,
-    const std::vector<double>& illumination_values,
-    const std::vector<double>& direct_solar_values,
-    const std::vector<double>& primary_reflected_values,
-    const std::vector<double>& primary_ir_values,
+    const LocationFluxSource& flux,
     const std::vector<std::vector<double>>& surface_temps,
     const std::vector<std::string>& time_strings,
     int time_steps,
     const std::vector<std::vector<double>>& indirect_flux = {}) {
+    if (!flux.valid()) {
+        std::cerr << "exportLocationIlluminationAndTemperature: no illumination "
+                     "source was bound; refusing to write a file of zeros"
+                  << std::endl;
+        return false;
+    }
     // Basic validations
     if (!mesh) {
         std::cerr << "exportLocationIlluminationAndTemperature: mesh is null" << std::endl;
@@ -10247,12 +10440,7 @@ bool exportLocationIlluminationAndTemperature(
     }
     output << "\n";
 
-    auto get_val = [&](const std::vector<double>& v, size_t f, int t) -> double {
-        if (v.empty()) return 0.0;
-        const size_t stride = static_cast<size_t>(time_steps);
-        const size_t idx = f * stride + static_cast<size_t>(t);
-        return (idx < v.size()) ? v[idx] : 0.0;
-    };
+    std::cout << "Location illumination source: " << flux.origin << std::endl;
 
     // Rows
     for (int t = 0; t < time_steps; ++t) {
@@ -10269,10 +10457,10 @@ bool exportLocationIlluminationAndTemperature(
                 output << ",0";
                 continue;
             }
-            const double tot = get_val(illumination_values, f, t);
-            const double dir = get_val(direct_solar_values, f, t);
-            const double rfl = get_val(primary_reflected_values, f, t);
-            const double pir = get_val(primary_ir_values, f, t);
+            const double tot = flux.total(f, t);
+            const double dir = flux.direct(f, t);
+            const double rfl = flux.reflected(f, t);
+            const double pir = flux.primary_ir(f, t);
 
             double ind = 0.0;
             if (have_indirect && f < indirect_flux.size()) {
@@ -10300,7 +10488,13 @@ bool exportLocationIlluminationAndTemperature(
     return true;
 }
 
-// Run the thermal model for a face with matched times
+// Run the thermal model for a face with matched times.
+//
+// This re-declares the definition above (:2951); it does NOT repeat its default
+// arguments, which C++ forbids. It also used to omit `SeedAnchorCensus*`
+// entirely, which made it a SECOND, never-defined overload rather than a
+// redeclaration -- inert only because no call site supplied 11 arguments, and a
+// link error waiting for the one that did.
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -10312,6 +10506,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
     std::atomic<size_t>* seed_hot_faces,
+    SeedAnchorCensus*    anchor_census,
     FaceStateIO* state);
 
 // Write a complete VTK file with both illumination and thermal data
@@ -10638,7 +10833,7 @@ void fixOutOfRangeAlbedos(
         face_albedos[idx] = default_visible_albedo;
     }
     
-    std::cout << "Fixed albedo values using planet default: " << default_visible_albedo << std::endl;
+    std::cout << "Fixed albedo values using planet default: " << fmtSig(default_visible_albedo) << std::endl;
 }
 
 // Add this function to your declarations section
@@ -13078,6 +13273,27 @@ int main(int argc, char** argv) {
     // Note: thermal_debug settings are applied later after CLI parsing
     thermal::Config config;
 
+    // The run's REAL thermal configuration -- the one built from the YAML /
+    // CLI (thermal_m/n/b, chi, conductivity_model, spin-up seed, ...) and
+    // handed to every mesh solver. Declared HERE, at main() scope, rather than
+    // inside `if (run_thermal_mesh)` where it is populated, because the
+    // per-location depth export runs after that block closes and used to be
+    // handed `config` above instead -- a default-constructed thermal::Config.
+    // Every depth CSV therefore ignored thermal_m/n/b, chi, conductivity_model,
+    // NYEARSEQ and the seed settings while the mesh-wide field honored them:
+    // measured 2026-08-13/17, the CSVs are byte-identical across thermal_b =
+    // 9..40 and across Hayne2017 vs Martinez2021 while statistics/
+    // temperature_min.bin from the same runs differs every time. The bottom
+    // node sat at the default b = 15 (~50 cm on the Moon) no matter what the
+    // config asked for.
+    //
+    // `thermal_config_populated` is the honest half of the fix: with
+    // run_thermal_mesh false nothing fills this object, and a depth column
+    // solved against an empty one would be the same silent substitution in a
+    // new place. The export refuses instead.
+    thermal::Config thermal_config;
+    bool thermal_config_populated = false;
+
     bool compute_statistics = sim_config.thermal.compute_statistics;
 
     // Schorghofer & Taylor (2007) ice-stability accumulator. Persists from
@@ -13566,8 +13782,8 @@ int main(int argc, char** argv) {
                     
                     std::cout << "Shadow flux calculation enabled with:" << std::endl;
                     std::cout << "  Diameter/depth ratio D = " << crater_diameter_depth_ratio << std::endl;
-                    std::cout << "  Body albedo = " << planet.albedo << std::endl;
-                    std::cout << "  Body emissivity = " << planet.emissivity << std::endl;
+                    std::cout << "  Body albedo = " << fmtSig(planet.albedo) << std::endl;
+                    std::cout << "  Body emissivity = " << fmtSig(planet.emissivity) << std::endl;
                 }
                 
                 // Set the planetary body in the illumination model
@@ -14273,8 +14489,8 @@ int main(int argc, char** argv) {
     {
         const auto& tp = sim_config.thermophysical;
         if (tp.albedo_override >= 0.0) {
-            std::cout << "Property override (requested): albedo A0 " << planet.albedo
-                      << " -> " << tp.albedo_override << std::endl;
+            std::cout << "Property override (requested): albedo A0 " << fmtSig(planet.albedo)
+                      << " -> " << fmtSig(tp.albedo_override) << std::endl;
             planet.albedo = tp.albedo_override;
         }
         if (tp.emissivity_override > 0.0) {
@@ -14291,6 +14507,56 @@ int main(int argc, char** argv) {
             std::cout << "Property override (requested): kd " << planet.kd
                       << " -> " << tp.kd_override << " W/m/K" << std::endl;
             planet.kd = tp.kd_override;
+        }
+        if (tp.H_override > 0.0) {
+            // fmtSig, NOT bare `<<`. std::cout arrives here already carrying
+            // `std::fixed << std::setprecision(1)` from an earlier progress
+            // banner, under which H = 0.06 m renders as "0.1" -- a run
+            // reporting a number it did not use (the same PTM-05/PTM-55
+            // archetype fmtSig exists for; the albedo-map rule-7 warning
+            // further down still prints 0.06 as "0.1" today -- observed in this
+            // branch's own ico6 log, reported to the ledger 2026-08-17, and NOT
+            // fixed here because it is not this key's line).
+            std::cout << "Property override (requested): H " << fmtSig(planet.H)
+                      << " -> " << fmtSig(tp.H_override) << " m" << std::endl;
+            planet.H = tp.H_override;
+
+            // Rule 7, case 1: constant_thermal_inertia collapses kd -> ks and
+            // rhod -> rhos below, which makes exp(-z/H) multiply zero. H is
+            // then EXACTLY inert and an H sweep would return N identical runs.
+            if (tp.constant_thermal_inertia > 0.0) {
+                std::cerr << "WARNING: thermophysical.H_override = "
+                          << fmtSig(tp.H_override) << " m is set together with "
+                             "constant_thermal_inertia = "
+                          << fmtSig(tp.constant_thermal_inertia) << ".\n"
+                          << "  Constant-TI mode collapses kd -> ks and rhod -> rhos, so "
+                             "rho(z) and kc(z) are uniform with depth and H multiplies "
+                             "nothing.\n"
+                          << "  This run is IDENTICAL to one without the H override; an H "
+                             "sweep under constant_thermal_inertia measures nothing."
+                          << std::endl;
+            }
+            // Rule 7, case 2: a per-face H map out-ranks this scalar on every
+            // face it covers, exactly as a per-face albedo map out-ranks
+            // albedo_override. The map is loaded further down (see the
+            // [property-map] block); say so here rather than let an H sweep
+            // flatline against a map the user forgot was configured.
+            if (!h_parameter_map_file.empty() || !thermal_inertia_map_file.empty()
+                || use_default_property_map) {
+                std::cerr << "WARNING: thermophysical.H_override = "
+                          << fmtSig(tp.H_override)
+                          << " m is set AND a per-face H map is configured "
+                             "(thermal."
+                          << (!h_parameter_map_file.empty()   ? "h_parameter_map"
+                            : !thermal_inertia_map_file.empty() ? "thermal_inertia_map"
+                            : "use_default_property_map")
+                          << ").\n"
+                          << "  If the map loads, ITS per-face H governs rho(z) and kc(z); "
+                             "the scalar survives only as the fallback for faces the map "
+                             "does not cover.\n"
+                          << "  Check the [property-map] line below, and drop the map to "
+                             "sweep H directly." << std::endl;
+            }
         }
 
         // Directional-hemispheric (Hapke) albedo gate. Opt-in; default OFF ->
@@ -14702,16 +14968,59 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (tpm && tpm->H_values().empty()) {
+            // Every consumer below dereferences this vector -- min_element,
+            // max_element and the median all read past the end on an empty
+            // load, and planet.face_H_overrides would be an empty map that
+            // H_for_face() silently treats as "no map". Refuse instead.
+            std::cerr << "\n[property-map] FATAL: " << source_label
+                      << " loaded with ZERO faces. Refusing rather than running "
+                         "with a per-face map that covers nothing.\n";
+            return 1;
+        }
         if (tpm) {
             set_planet_overrides(*tpm);
+            const double H_lo = *std::min_element(tpm->H_values().begin(), tpm->H_values().end());
+            const double H_hi = *std::max_element(tpm->H_values().begin(), tpm->H_values().end());
             std::cout << "[property-map] " << map_mode_label
                       << "  source=" << source_label
                       << "  faces=" << tpm->H_values().size()
                       << "  default_fraction="
                       << (tpm->fraction_default() * 100.0) << "%"
-                      << "  H[range]=" << *std::min_element(tpm->H_values().begin(), tpm->H_values().end())
-                      << ".." << *std::max_element(tpm->H_values().begin(), tpm->H_values().end())
+                      << "  H[range]=" << H_lo << ".." << H_hi
                       << " m\n";
+
+            // The ONE H the shared reference depth grid is built at, published
+            // here so the CPU SIMD-batch solver, both GPU solvers and
+            // CpuStateCheckpoint all derive the SAME grid (see
+            // refGridHOverride). Before this, those paths gave each face its own
+            // rho(z)/kc(z) from the map but built the grid at the body-default
+            // planet.H, so even a UNIFORM map disagreed with the per-face-grid
+            // CPU scalar path -- 23 layers vs 22, 0.008 K, on the ico3 Moon at
+            // H = 0.03125 m.
+            //
+            // The median, not the mean: it is the value an actual face has, it
+            // is insensitive to the default-filled tail that `fraction_default`
+            // counts, and for a uniform map it IS that map's H, which is what
+            // makes uniform-map == scalar H_override an exact identity rather
+            // than an approximation.
+            std::vector<double> H_sorted = tpm->H_values();
+            const size_t mid = H_sorted.size() / 2;
+            std::nth_element(H_sorted.begin(), H_sorted.begin() + mid, H_sorted.end());
+            const double H_ref = H_sorted[mid];
+            thermal_config.setProperty("refgrid_H", fullPrecision(H_ref));
+            std::cout << "[property-map] shared reference depth grid built at H = "
+                      << fmtSig(H_ref) << " m (median of the map). Each face still gets"
+                         " its OWN rho(z), kc(z) from its own H; only the grid is shared"
+                         " on the CPU SIMD-batch and GPU paths.\n";
+            if (H_lo > 0.0 && H_hi / H_lo > 2.0) {
+                std::cerr << "[property-map] WARNING: this map spans H = " << fmtSig(H_lo)
+                          << " .. " << fmtSig(H_hi) << " m (ratio " << fmtSig(H_hi / H_lo)
+                          << "x). One shared depth grid cannot resolve that whole span"
+                             " equally well on the CPU SIMD-batch / GPU paths; the CPU"
+                             " scalar solver (--no-simd-batch) gives every face its own"
+                             " grid at the cost of speed.\n";
+            }
         } else if (!h_parameter_map_file.empty() ||
                    !thermal_inertia_map_file.empty() ||
                    use_default_property_map) {
@@ -14916,8 +15225,9 @@ int main(int argc, char** argv) {
         : illumination_model->getAlbedo();
     // Ensure we're using the planet's albedo, not a hardcoded value
     if (std::abs(default_visible_albedo - planet.albedo) > 0.001) {
-        std::cout << "Warning: Mismatch between illumination albedo (" << default_visible_albedo
-                << ") and planet albedo (" << planet.albedo << "). Using planet value." << std::endl;
+        std::cout << "Warning: Mismatch between illumination albedo (" << fmtSig(default_visible_albedo)
+                << ") and planet albedo (" << fmtSig(planet.albedo)
+                << "). Using planet value." << std::endl;
         default_visible_albedo = planet.albedo;
     }
     // Load SPICE kernels for the CONFIGURED body/metakernel. This must run after
@@ -15812,6 +16122,43 @@ int main(int argc, char** argv) {
         std::cout << "  Average non-zero illumination: " << (total_illumination / non_zero_illumination) << " W/m^2" << std::endl;
     }
 
+    // Fail BEFORE the thermal solve, not after it. The per-location exports at
+    // the end of main() read either the flat arrays or the illumination model's
+    // chunk store, and which one is live was decided immediately above. If
+    // neither can answer, the exports would compose a flux of exactly zero and
+    // write depth columns pinned at the geothermal floor -- so they refuse. But
+    // refusing down there means refusing after a multi-hour solve has already
+    // written statistics/ and every frame, and scripts/run_chunked_simulation.py
+    // reads a non-zero exit as a retryable chunk failure and CLEARS the chunk
+    // directory before retrying. Check the same predicate here, where the answer
+    // is already known and nothing has been computed yet.
+    if (export_locations && !locations_file.empty()) {
+        const size_t loc_expect_early =
+            num_faces * static_cast<size_t>(total_time_steps);
+        const bool flat_ok_early =
+            direct_solar_values.size()      == loc_expect_early &&
+            primary_reflected_values.size() == loc_expect_early &&
+            primary_ir_values.size()        == loc_expect_early;
+        const bool chunks_ok_early =
+            illumination_model && illumination_model->hasChunkedIllumination();
+        if (!flat_ok_early && !chunks_ok_early) {
+            std::cerr << "\n[FATAL] location export was requested, but after the "
+                         "illumination stage neither store can serve it.\n"
+                      << "  flat arrays: direct=" << direct_solar_values.size()
+                      << " reflected=" << primary_reflected_values.size()
+                      << " primary_ir=" << primary_ir_values.size()
+                      << " (each must be " << loc_expect_early << " = "
+                      << num_faces << " faces x " << total_time_steps << " steps)\n"
+                      << "  chunk store: "
+                      << (chunks_ok_early ? "live" : "released or never built") << "\n"
+                      << "  Aborting now, before the thermal solve, rather than after "
+                         "it -- the location files would be composed from a flux of "
+                         "zeros.\n"
+                      << std::endl;
+            return 1;
+        }
+    }
+
     // DON'T filter illumination yet - run thermal model with full dataset first
     std::vector<std::vector<double>> surface_temps;
 
@@ -15977,8 +16324,9 @@ int main(int argc, char** argv) {
         std::cout << "OpenMP not available, running in single-threaded mode" << std::endl;
         #endif
         
-        // Set up thermal model configuration
-        thermal::Config thermal_config;
+        // Set up thermal model configuration. Declared at main() scope (see
+        // there) so the per-location depth export solves its columns against
+        // the SAME object the mesh solvers get.
         thermal_config.m = thermal_m;   // Layers in upper skin depth (CLI: --thermal-m)
         thermal_config.n = thermal_n;   // Layer growth factor (CLI: --thermal-n)
         thermal_config.b = thermal_b;   // Skin depths to bottom (CLI: --thermal-b)
@@ -16265,6 +16613,7 @@ int main(int argc, char** argv) {
             if (geothermal_heat_flow   > 0.0) fwd("ovr_Qb",         planet.Qb);
             if (tp.ks_override         > 0.0) fwd("ovr_ks",         planet.ks);
             if (tp.kd_override         > 0.0) fwd("ovr_kd",         planet.kd);
+            if (tp.H_override          > 0.0) fwd("ovr_H",          planet.H);
             if (tp.emissivity_override > 0.0) fwd("ovr_emissivity", planet.emissivity);
             if (tp.albedo_override    >= 0.0) fwd("ovr_albedo",     planet.albedo);
             // Rule 7: albedo_override is the one knob a per-face albedo MAP can
@@ -16436,6 +16785,15 @@ int main(int argc, char** argv) {
             thermal_config.setProperty("use_hapke_albedo", true);
             thermal_config.setProperty("hapke_albedo_w", planet.hapke_albedo_w);
         }
+
+        // Last write to thermal_config. Everything below this line only READS
+        // it, so from here on the object is the run's operative thermal
+        // configuration and any later consumer -- notably the per-location
+        // depth export, which runs after this block closes -- may use it.
+        // Keep this assignment immediately after the final setProperty above:
+        // it is a claim about this file's control flow, and moving a write
+        // below it silently makes the claim false.
+        thermal_config_populated = true;
 
         // Debug output to verify properties were set correctly
         if (verbose) {
@@ -16990,6 +17348,7 @@ int main(int argc, char** argv) {
                           << "  Requested:"
                           << (tp.ks_override              > 0.0 ? " ks_override"         : "")
                           << (tp.kd_override              > 0.0 ? " kd_override"         : "")
+                          << (tp.H_override               > 0.0 ? " H_override"          : "")
                           << (tp.emissivity_override      > 0.0 ? " emissivity_override" : "")
                           << (tp.albedo_override         >= 0.0 ? " albedo_override"     : "")
                           << (tp.constant_thermal_inertia > 0.0 ? " constant_thermal_inertia" : "")
@@ -17237,7 +17596,7 @@ int main(int argc, char** argv) {
                                  "source falls back to the THERMAL reflectivity 1-eps = "
                               << std::defaultfloat << std::setprecision(6)
                               << (1.0 - planet.emissivity)
-                              << " (not A0 = " << default_visible_albedo
+                              << " (not A0 = " << fmtSig(default_visible_albedo)
                               << ", and not the BC's A(theta)). Reflected sunlight in the "
                                  "enclosure is therefore understated for this run. Set "
                                  "band_separated: true for the incidence-consistent source."
@@ -17607,14 +17966,16 @@ int main(int argc, char** argv) {
                               << "); sweeping every timestep." << std::endl;
                 } else if (export_locations && !locations_file.empty()) {
                     // exportLocationIlluminationAndTemperature() reads
-                    // indirect_flux[f][t] for t = 0 .. time_steps-1, i.e.
-                    // ABSOLUTE indices that land inside the equilibration
-                    // span on any two-phase run. (That is a pre-existing
-                    // window defect in the location CSV -- it reads the
-                    // equilibration prefix rather than the output window,
-                    // and at the wrong stride for the flat arrays -- but
-                    // arming this gate would additionally turn its
-                    // IndirectFlux column silently into zeros.)
+                    // indirect_flux[f][t] for t = 0 .. total_time_steps-1,
+                    // i.e. ABSOLUTE indices that span the equilibration
+                    // prefix as well as the output window. (The stride half
+                    // of that defect is fixed -- the file used to index the
+                    // flat arrays at f*time_steps + t, a different face at a
+                    // different epoch -- but it still COVERS the
+                    // equilibration prefix, and the per-location depth CSVs
+                    // deliberately do too, so arming this gate would turn
+                    // that part of the IndirectFlux column silently into
+                    // zeros.)
                     if (rad_skip_forced) {
                         std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS=1 was requested and this"
                                      " run exports location time series ('" << locations_file
@@ -17991,8 +18352,18 @@ int main(int argc, char** argv) {
                         // there; we size for the 50000 cap so the same pool
                         // covers every iter's re-thermal regardless of the
                         // selected-face count.
+                        // refGridHOverride, for the same reason every other
+                        // shared-grid site takes it: with a per-face H map
+                        // loaded, runThermalForSelectedFaces_GPU builds its
+                        // reference profile at the map's median H. Sizing the
+                        // pool from the body-default grid instead would hand it
+                        // a DIFFERENT layer count -- 23 against the solver's 22
+                        // on this branch's own ico3 measurement at H = 0.03125
+                        // m -- and the pool's device buffers are n_layers *
+                        // max_n_faces.
                         thermal::Profile rerun_profile(planet, 0.0,
-                                                       thermal_config, false);
+                                                       thermal_config, false,
+                                                       refGridHOverride(thermal_config));
                         const size_t rerun_n_layers = rerun_profile.z().size();
                         constexpr size_t kRerunBatchCap = 50000;
 
@@ -18960,18 +19331,54 @@ int main(int argc, char** argv) {
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
 
+                        // The other half of the same defect, NOT fixed here.
+                        // This call also drops the per-face Qb the heat-flow
+                        // mask supplies (every array solver passes it), so a
+                        // coupled CPU run with a mask re-thermals the selected
+                        // faces at the SCALAR planet.Qb. Fixing it is a results
+                        // change on a path this branch does not otherwise
+                        // touch, so it is disclosed rather than silently
+                        // altered (reported to the ledger 2026-08-17).
+                        if (!sim_config.thermal.heat_flow_mask_file.empty()) {
+                            std::cerr << "  [Re-thermal] WARNING: a per-face geothermal heat-flow"
+                                         " mask is loaded, but the CPU selected-faces re-thermal"
+                                         " passes no per-face Qb: these "
+                                      << faces_to_rerun.size()
+                                      << " faces are re-integrated at the scalar Qb = "
+                                      << fmtSig(planet.Qb) << " W/m^2. Use the GPU re-thermal,"
+                                         " or treat the mask as unapplied on those faces.\n";
+                        }
+
                         #pragma omp parallel for schedule(dynamic, 10) num_threads(thermal_threads > 0 ? thermal_threads : omp_get_max_threads())
                         for (size_t idx = 0; idx < faces_to_rerun.size(); idx++) {
                             int f = faces_to_rerun[idx];
 
                             // Run thermal model using the standard function
                             double latitude = mesh->latitudes[f];
+                            // Per-face H (property map). The argument list here
+                            // used to end at `equilibration_steps`, leaving
+                            // H_override at its default, so the coupled CPU
+                            // re-thermal rebuilt every selected face's column at
+                            // the SCALAR planet.H while iteration 0 had solved
+                            // it at the map's -- the map silently reverted on
+                            // exactly the faces radiation coupling touches.
+                            // Measured on the shipped 80 N crater with a uniform
+                            // H = 0.03125 m map: 2,626 of 12,800 faces diverged
+                            // from the equivalent scalar override, worst
+                            // temperature_min 3.75 K. H_for_face() returns
+                            // planet.H when no map is loaded, so a no-map run is
+                            // unchanged.
+                            const double face_H = planet.face_H_overrides.empty()
+                                                ? -1.0
+                                                : planet.H_for_face(f);
                             std::vector<double> new_temps = runThermalModelWithMatchedTimes(
                                 combined_flux[idx],
                                 times,
                                 latitude,
                                 thermal_config,
-                                equilibration_steps
+                                equilibration_steps,
+                                /*Qb_override=*/-1.0,
+                                face_H
                             );
 
                             // Store results
@@ -20299,6 +20706,24 @@ int main(int argc, char** argv) {
         if (run_thermal_mesh) {
             writeEffectiveAlbedo(output_dir);
             reportSourceAlbedoConsistency();
+            // The per-location depth export composes absorbed flux AFTER this
+            // point, so its infrared absorptivity used to land in the registry
+            // that gate G1 had already read -- recorded, never compared. Record
+            // it HERE instead, from the same expression the export's
+            // AbsorbedFluxComposer::build() will use
+            // (`ir_emissivity_ = thermalIrEmissivity(*planet)`, on this same
+            // main-scope Planet), so the gate covers it. build() records the
+            // identical value again when it runs; the registry is keyed by site
+            // tag, so the second write is the same number under the same key.
+            //
+            // Registering early rather than moving the gate late is deliberate:
+            // G1's refusal has to happen BEFORE the ice-stability, indirect-band
+            // and location outputs are written, or an inconsistent run leaves a
+            // complete-looking output directory behind and only then exits 1.
+            if (export_locations && !locations_file.empty() && !depths_file.empty()) {
+                recordIrAbsorptivity("cpu_location_depth_series",
+                                     thermalIrEmissivity(planet));
+            }
             // Gate G1: absorb == emit == scatter. planet.emissivity is what
             // thermal_model.cpp copies into the surface BC, so it is the emission
             // side by construction; the absorption sites and the radiosity are read
@@ -20494,23 +20919,166 @@ int main(int argc, char** argv) {
 
 
     // ========== LOCATION EXPORT (if requested) ==========
+    //
+    // Bind the ONE illumination store this run actually kept, for both exports
+    // below. See LocationFluxSource. Resolved before either export so the
+    // failure is a refusal here, once, and not a file of zeros twice.
+    LocationFluxSource loc_flux;
+    if (export_locations && !locations_file.empty()) {
+        const size_t loc_stride = static_cast<size_t>(total_time_steps);
+        const size_t loc_expect = num_faces * loc_stride;
+        // The per-component arrays are what "extracted" means; the combined
+        // illumination array is deliberately freed after the thermal solve
+        // ("[Memory] Released combined illumination array"), so its absence is
+        // NOT evidence of streaming and total is reconstructed as
+        // direct + reflected -- the same convention filterFaceMajorStable uses.
+        const bool flat_ready = direct_solar_values.size()      == loc_expect &&
+                                primary_reflected_values.size() == loc_expect &&
+                                primary_ir_values.size()        == loc_expect;
+        const bool chunks_ready =
+            illumination_model && illumination_model->hasChunkedIllumination();
+
+        if (flat_ready) {
+            const bool have_combined = (illumination_values.size() == loc_expect);
+            loc_flux.direct = [&, loc_stride](size_t f, int t) {
+                return direct_solar_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.reflected = [&, loc_stride](size_t f, int t) {
+                return primary_reflected_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.primary_ir = [&, loc_stride](size_t f, int t) {
+                return primary_ir_values[f * loc_stride + static_cast<size_t>(t)];
+            };
+            loc_flux.total = [&, loc_stride, have_combined](size_t f, int t) {
+                const size_t idx = f * loc_stride + static_cast<size_t>(t);
+                return have_combined ? illumination_values[idx]
+                                     : (direct_solar_values[idx] +
+                                        primary_reflected_values[idx]);
+            };
+            loc_flux.origin = have_combined
+                ? "extracted flat arrays (combined illumination present)"
+                : "extracted flat arrays (total = direct + primary-reflected; "
+                  "the combined array was released after the thermal solve)";
+        } else if (chunks_ready) {
+            loc_flux.direct = [&](size_t f, int t) {
+                return illumination_model->getDirectSolarValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.reflected = [&](size_t f, int t) {
+                return illumination_model->getPrimaryReflectedValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.primary_ir = [&](size_t f, int t) {
+                return illumination_model->getPrimaryIRValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.total = [&](size_t f, int t) {
+                return illumination_model->getIlluminationValue(f, static_cast<size_t>(t));
+            };
+            loc_flux.origin = "illumination model chunk store (the mesh-wide "
+                              "solver streamed from the same chunks)";
+        } else {
+            // Neither store can answer. Every read would have gone out of
+            // bounds, every guard would have returned 0.0, and both files
+            // would have been written from a flux that is identically zero --
+            // for the depth CSVs that means a column decaying to the
+            // geothermal floor T_geo = (Qb/(eps*sigma))^(1/4) and holding it
+            // for the whole window, at rc 0, with nothing in the log. Measured
+            // 2026-08-17 on Moon ico6 x 7560 steps (13.8 GB > the 10 GB
+            // PTM_RAM_ILLUM_MAX_GB default): all five sites pinned at
+            // 24.042758 K. That flat line was one eyeball away from shipping
+            // as a validation figure. Fail, loudly.
+            std::cerr << "\n[FATAL] the per-location export has no illumination to read.\n"
+                      << "  flat arrays: direct=" << direct_solar_values.size()
+                      << " reflected=" << primary_reflected_values.size()
+                      << " primary_ir=" << primary_ir_values.size()
+                      << " (each must be " << loc_expect << " = "
+                      << num_faces << " faces x " << total_time_steps << " steps)\n"
+                      << "  illumination model chunk store: "
+                      << (illumination_model ? (chunks_ready ? "live" : "released or never built")
+                                             : "model already destroyed") << "\n"
+                      << "  Refusing to write location files composed from a flux of zeros.\n"
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "[location export] illumination source: " << loc_flux.origin
+                  << std::endl;
+
+        // The depth columns are solved against thermal_config, the run's real
+        // thermal configuration. It is only built inside `if (run_thermal_mesh)`
+        // above, so a run that asks for depth profiles WITHOUT a mesh thermal
+        // solve has nothing to solve them against. Substituting a
+        // default-constructed thermal::Config is exactly the defect being
+        // removed here -- it would put m/n/b = 10/15/15 and chi = 2.7 back under
+        // columns the config asked to be something else. Refuse, and say which
+        // key would fix it. Checked HERE, before either location product is
+        // written, so the refusal does not leave a half-populated locations
+        // directory behind.
+        if (!depths_file.empty() && !thermal_config_populated) {
+            std::cerr << "\n[FATAL] the per-location depth export needs this run's thermal "
+                         "configuration (thermal_m/n/b, chi, conductivity_model, spin-up "
+                         "seed), and it is only built when the mesh thermal solve runs.\n"
+                      << "  thermal.run_thermal_mesh is false, so there is none.\n"
+                      << "  Refusing to solve depth columns against defaults the config did "
+                         "not ask for. Set thermal.run_thermal_mesh: true, or drop "
+                         "output.depths_file.\n"
+                      << std::endl;
+            return 1;
+        }
+    }
+
     if (export_locations && !locations_file.empty()) {
         try {
             const std::string series_out_path =
                 (output_dir.empty() ? series_output
                                     : (output_dir.back() == '/' ? output_dir + series_output
                                                                 : output_dir + "/" + series_output));
+            // total_time_steps, NOT time_steps. The flat arrays and the chunk
+            // store are both strided by total_time_steps (equilibration +
+            // output), and time_strings / surface_temps are ALLOCATED that long
+            // too, so passing the OUTPUT step count made this file index face
+            // f's series at f*time_steps + t -- a different face at a different
+            // epoch on every run with an equilibration prefix. Verified on the
+            // 2026-08-17 lunar control (48 output steps, 168 total): the
+            // 30 N column reported 1218.74 W/m^2 of direct solar next to a
+            // total of 0, against timestamps from five lunations BEFORE the
+            // simulation's own start_time. The depth CSVs next to it already
+            // wrote time_strings.size() rows, so this also makes the two
+            // location products cover the same span.
+            //
+            // ALLOCATED is not the same as WRITTEN: on the two-phase GPU path
+            // surface_temps[f][0 .. equilibration_steps-1] is never filled (the
+            // download starts at copy_offset = equilibration_steps), so the Ts
+            // column over the equilibration prefix is a zero fill, not a
+            // temperature. The flux columns there are real. Say so rather than
+            // let a reader take the zeros for physics.
+            if (equilibration_steps > 0 && !surface_temps.empty()) {
+                size_t probed = 0, all_zero_prefix = 0;
+                for (size_t f = 0; f < surface_temps.size() && probed < 16; ++f) {
+                    const auto& row = surface_temps[f];
+                    if (row.size() < static_cast<size_t>(equilibration_steps)) continue;
+                    ++probed;
+                    bool zero = true;
+                    for (int t = 0; t < equilibration_steps; ++t) {
+                        if (row[static_cast<size_t>(t)] != 0.0) { zero = false; break; }
+                    }
+                    if (zero) ++all_zero_prefix;
+                }
+                if (probed > 0 && all_zero_prefix == probed) {
+                    std::cerr << "[location export] WARNING: the surface-temperature column "
+                                 "is a ZERO FILL over the first " << equilibration_steps
+                              << " (equilibration) rows -- this run's solver did not hand "
+                                 "back equilibration-phase temperatures (two-phase GPU). "
+                                 "The flux columns on those rows are real; the Ts column is "
+                                 "not. Read Ts from row " << equilibration_steps
+                              << " onward." << std::endl;
+                }
+            }
             if (!exportLocationIlluminationAndTemperature(
                     series_out_path,
                     locations_file,
                     mesh,
-                    illumination_values,
-                    direct_solar_values,
-                    primary_reflected_values,
-                    primary_ir_values,
+                    loc_flux,
                     surface_temps,
                     time_strings,
-                    time_steps,
+                    total_time_steps,
                     indirect_flux_series)) {
                 std::cerr << "Warning: Failed to export location data to "
                           << series_out_path << std::endl;
@@ -20524,7 +21092,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Optional per-location depth profiles
+    // Optional per-location depth profiles. The thermal_config_populated
+    // refusal that guards these columns is checked above, next to the
+    // illumination-source binding, so it fires before anything is written.
     if (export_locations && !locations_file.empty() && !depths_file.empty()) {
         try {
             auto locs = readLocationsCSV(locations_file);
@@ -20539,29 +21109,102 @@ int main(int argc, char** argv) {
                           << " locations, " << depths_m.size()
                           << " depths -> " << loc_out_dir << std::endl;
 
-                // Load per-face albedo from binary map (same as thermal solver)
-                std::vector<double> loc_face_albedos(mesh->faces.size(), default_visible_albedo);
-                {
-                    std::string body_name = planet.name;
-                    std::transform(body_name.begin(), body_name.end(), body_name.begin(), ::tolower);
-                    if (!body_name.empty()) body_name[0] = std::toupper(body_name[0]);
-                    std::string albedo_filename = body_name + "_Albedo_res"
-                        + std::to_string(mesh_resolution) + ".bin";
-                    std::string adir = albedo_maps_directory;
-                    if (!adir.empty() && adir.back() != '/' && adir.back() != '\\') adir += '/';
-                    std::vector<std::string> search_paths = {
-                        adir + albedo_filename,
-                        "../data/albedo_maps/" + albedo_filename,
-                        "data/albedo_maps/" + albedo_filename
-                    };
-                    for (const auto& path : search_paths) {
-                        auto loaded = importAlbedoMapFromFile(path);
-                        if (!loaded.empty() && loaded.size() == mesh->faces.size()) {
-                            std::copy(loaded.begin(), loaded.end(), loc_face_albedos.begin());
-                            std::cout << "Location export: using per-face albedo from " << path << std::endl;
-                            break;
-                        }
+                // The absorbed flux for these columns goes through the SAME
+                // AbsorbedFluxComposer kernel every mesh face uses. This block
+                // used to compose it by hand:
+                //     A_vis = loc_face_albedos[face];            // hoisted
+                //     flux  = (1 - A_vis)*(direct + refl) + pir; // per step
+                // -- a per-face CONSTANT albedo, so the incidence-angle albedo
+                // model (Hayne et al. 2017 A(theta) = A0 + a(theta/45)^3 +
+                // b(theta/90)^8, or the Hapke A_h(i) gate) never reached the
+                // per-location depth CSVs even though the log announced it and
+                // the mesh-wide field applied it. One run therefore reported TWO
+                // surface temperatures for the same face: measured on the
+                // 2026-08-17 Fig. 5 reproduction (Moon, ico6, A0 = 0.12), the
+                // 60N face read 308.1 K mesh-wide and 327.8 K in its own CSV --
+                // 19.7 K apart, growing with latitude (equator 0.05 K, 30N
+                // 2.8 K) exactly as a missing A(theta) does. The CSVs are what
+                // the Fig. 5 validation figure is plotted from, so the figure
+                // was drawn against physics the engine does not use.
+                // Composing through the shared kernel also fixes this path's
+                // infrared absorptivity: it absorbed primary infrared with an
+                // absorptivity of 1.0 (a bare `+ pir`) while the body emits with
+                // planet.emissivity and every other path absorbs with it. On the
+                // Moon that term is ~0.005 W/m^2 (Earth-shine), so the numerical
+                // effect is ~1 mK -- but it was the only IR-absorption site not
+                // using thermalIrEmissivity(), and it registers with the
+                // Kirchhoff registry now.
+                //
+                // The base albedo now comes from build(), the SAME resolver the
+                // mesh-wide composer uses, driven by the SAME thermal_config.
+                // This block used to hand-roll its own lookup, which
+                //   (a) only ever searched the per-face binary map
+                //       <Body>_Albedo_res<N>.bin, so a custom (DEM) mesh -- the
+                //       branch where mesh_resolution is meaningless and no .bin
+                //       exists -- got the UNIFORM default A0 in the CSVs while
+                //       the mesh-wide field used an explicit or auto-discovered
+                //       FITS map, and
+                //   (b) sanitized to [0, 1] instead of build()'s
+                //       [MIN_VALID_ALBEDO, MAX_VALID_ALBEDO] = [0.01, 0.99],
+                //       and skipped ptm::checkAlbedoMapRegistration() (PTM-34).
+                // Two resolvers for one quantity is the defect; deleting one is
+                // the fix. AbsorbedFluxComposer::bindResolvedAlbedos(), which
+                // existed only because thermal_config used to be out of scope
+                // here, goes with it -- it had no other caller.
+                std::shared_ptr<ptm::SpatialMap> loc_albedo_map =
+                    loadExplicitAlbedoMap(thermal_config, "[location depth export]");
+                AbsorbedFluxComposer loc_composer;
+                const bool loc_composer_ready = loc_composer.build(
+                    loc_albedo_map, mesh, mesh->faces.size(),
+                    default_visible_albedo, thermal_config, &planet, planet.S,
+                    "cpu_location_depth_series");
+                if (!loc_composer_ready) {
+                    std::cerr << "Warning: could not compose absorbed flux for the "
+                                 "per-location depth profiles; skipping them rather than "
+                                 "writing columns from an unresolved albedo." << std::endl;
+                }
+
+                // Indirect (terrain-scattered + terrain-IR) flux, added exactly
+                // as the coupled re-thermal adds it: already an ABSORBED
+                // quantity, indexed by the ABSOLUTE step, summed onto the
+                // composed absorbed flux (see the re-thermal's
+                // `absorbed += indirect_flux_series[global_f][t_offset + t]`).
+                // Omitting it made these columns cold by the dominant daytime
+                // term at shadowed and high-latitude faces, which is precisely
+                // where a validation figure is read.
+                const bool loc_have_indirect = !indirect_flux_series.empty();
+                if (loc_have_indirect) {
+                    std::cout << "[location export] including the indirect "
+                                 "(terrain-scattered + terrain-IR) flux, the same "
+                                 "series the mesh-wide re-thermal consumes."
+                              << std::endl;
+                    // CAVEAT, stated because it is the one way this can now be
+                    // wrong in the OTHER direction. The mesh-wide field gets
+                    // the per-step indirect term only on faces the coupling
+                    // loop SELECTED for re-thermal; unselected faces keep their
+                    // iteration-0 temperature. Under the shipped PTM-89 bounded
+                    // mode the selection threshold is 0 K -- every face carrying
+                    // indirect flux is selected -- so the two agree. Raise
+                    // radiation.coupling_temp_threshold and a face can carry
+                    // indirect flux here that the mesh-wide field never saw,
+                    // making the CSV WARMER than the mesh at that face. Print
+                    // the per-site magnitude so the term is visible either way.
+                    if (sim_config.radiation.coupling_temp_threshold > 0.0) {
+                        std::cerr << "[location export] NOTE: radiation.coupling_temp_threshold = "
+                                  << fmtSig(sim_config.radiation.coupling_temp_threshold)
+                                  << " K, so the mesh-wide re-thermal may have skipped faces that "
+                                     "DO carry indirect flux. These depth columns include the term "
+                                     "at every site, so at a skipped face the CSV will read WARMER "
+                                     "than the mesh-wide temperature." << std::endl;
                     }
+                } else if (sim_config.radiation.enabled) {
+                    // Radiation was asked for but no series exists: the columns
+                    // are then direct + primary only, and that has to be said.
+                    std::cerr << "[location export] WARNING: radiation.enabled is true but "
+                                 "no indirect flux series was produced, so these depth "
+                                 "columns carry only the direct + primary terms and will "
+                                 "read COLD against the mesh-wide field at shadowed faces."
+                              << std::endl;
                 }
 
                 auto sanitize = [](std::string s) {
@@ -20571,7 +21214,37 @@ int main(int argc, char** argv) {
                     return s;
                 };
 
-                for (size_t i = 0; i < locs.size(); ++i) {
+                int    loc_depth_reach_reported = 0;
+                double loc_depth_reach_last_m   = 0.0;  // last grid bottom announced
+
+                // ---- SEED-ANCHOR CENSUS for the location depth path --------
+                // Same disclosure the mesh-wide paths print, for the same
+                // reason: this path's initial condition used to be reported
+                // NOWHERE, and it was silently taking the warm-bracket
+                // fallback on every site (the concatenated eq+output forcing
+                // series is non-uniform; see runThermalModelDepthSeries). A
+                // census that is simply absent is indistinguishable from a
+                // census that was forgotten.
+                SeedAnchorCensus loc_anchor_census;
+                size_t loc_sites_seeded = 0, loc_sites_unseeded = 0;
+                if (loc_composer_ready && !locs.empty()) {
+                    const int loc_seed_steps =
+                        (equilibration_steps > 0 &&
+                         equilibration_steps < static_cast<int>(times.size()))
+                            ? equilibration_steps : 0;
+                    std::cout << "[eq-seed] location depth series: the surface anchor "
+                                 "analyzes the full " << times.size()
+                              << "-sample forcing series when it is evenly spaced, and "
+                                 "falls back to the leading "
+                              << loc_seed_steps
+                              << " equilibration samples when it is not (a decoupled "
+                                 "equilibration cadence makes the concatenated "
+                                 "eq+output series change cadence at the seam). The "
+                                 "window each site actually used is the sample count "
+                                 "in its census line below." << std::endl;
+                }
+
+                for (size_t i = 0; loc_composer_ready && i < locs.size(); ++i) {
                     const auto& tup = locs[i];
                     const std::string name = std::get<0>(tup);
                     const double lat_deg = std::get<1>(tup);
@@ -20586,25 +21259,209 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Absorbed flux: (1 - A_vis)*(direct+reflected) + primary_ir
+                    // Absorbed flux through the shared composer (see above),
+                    // read from the illumination store this run actually kept
+                    // (loc_flux) rather than from the flat arrays directly --
+                    // those are EMPTY whenever the mesh-wide solver streamed,
+                    // and the old bounds guard turned that into a silent 0.0.
                     // Use total_time_steps (including equilibration) so the location
                     // thermal model receives the full cycled illumination, matching
-                    // how mesh faces are handled.
+                    // how mesh faces are handled. `t` is the ABSOLUTE step index,
+                    // which is what the composer's per-step instantaneous solar
+                    // constant and the effective-albedo window both expect.
+                    const size_t fi = static_cast<size_t>(face_idx);
+                    const std::vector<double>* ind_row =
+                        (loc_have_indirect && fi < indirect_flux_series.size())
+                            ? &indirect_flux_series[fi] : nullptr;
                     std::vector<double> flux_sum(static_cast<size_t>(total_time_steps), 0.0);
-                    double A_vis = loc_face_albedos[static_cast<size_t>(face_idx)];
-                    A_vis = std::clamp(A_vis, 0.0, 1.0);
-
                     for (int t = 0; t < total_time_steps; ++t) {
-                        const size_t flat = static_cast<size_t>(face_idx) * static_cast<size_t>(total_time_steps)
-                                          + static_cast<size_t>(t);
-                        const double direct = (flat < direct_solar_values.size()) ? direct_solar_values[flat] : 0.0;
-                        const double refl   = (flat < primary_reflected_values.size()) ? primary_reflected_values[flat] : 0.0;
-                        const double pir    = (flat < primary_ir_values.size()) ? primary_ir_values[flat] : 0.0;
-                        flux_sum[static_cast<size_t>(t)] = (1.0 - A_vis) * (direct + refl) + pir;
+                        const double direct = loc_flux.direct(fi, t);
+                        const double refl   = loc_flux.reflected(fi, t);
+                        const double pir    = loc_flux.primary_ir(fi, t);
+                        double absorbed = loc_composer.absorbed(fi, t, direct, refl, pir);
+                        if (ind_row && static_cast<size_t>(t) < ind_row->size()) {
+                            absorbed += (*ind_row)[static_cast<size_t>(t)];
+                        }
+                        flux_sum[static_cast<size_t>(t)] = absorbed;
                     }
 
+                    // thermal_config, NOT the default-constructed `config`. See
+                    // thermal_config's declaration in main() for what the wrong
+                    // object cost: thermal_m/n/b, chi, conductivity_model,
+                    // NYEARSEQ and the spin-up seed never reached these columns,
+                    // so the depth axis stopped at the DEFAULT b = 15 (~50 cm on
+                    // the Moon) no matter what the config asked for, and every
+                    // depth below that was a Fourier's-law extrapolation of a
+                    // grid the user did not configure.
+                    double grid_bottom_m = 0.0;
+                    double loc_H_used = 0.0;
+                    thermal::EqSeedResult loc_seed;
+                    bool loc_seed_applied = false;
                     auto T_depths = runThermalModelDepthSeries(
-                        flux_sum, times, lat_deg, config, depths_m, equilibration_steps, planet);
+                        flux_sum, times, lat_deg, thermal_config, depths_m,
+                        equilibration_steps, planet, &grid_bottom_m,
+                        face_idx, &loc_H_used, &loc_seed, &loc_seed_applied);
+
+                    // Per-site anchor status + Kirchhoff yes/no. Printed per
+                    // SITE, not just aggregated: the sites are individually
+                    // named validation points, and "3 of 5 anchored" does not
+                    // tell you which two columns you may not quote.
+                    {
+                        const std::string site_label =
+                            name.empty() ? ("loc_" + std::to_string(i)) : name;
+                        if (!loc_seed_applied) {
+                            std::cerr << "[eq-seed] location depth series, site '"
+                                      << site_label << "' (face " << face_idx
+                                      << "): NO shared seed was applied -- this column "
+                                         "was initialized by Profile::init_T "
+                                         "(thermal.spinup_seed: legacy, or an unusable "
+                                         "forcing series). Its initial condition is NOT "
+                                         "the one the mesh-wide field used."
+                                      << std::endl;
+                            ++loc_sites_unseeded;
+                        } else {
+                            loc_anchor_census.add(loc_seed);
+                            ++loc_sites_seeded;
+                            std::cout << "[eq-seed] location depth series, site '"
+                                      << site_label << "' (face " << face_idx
+                                      << "): anchor "
+                                      << thermal::eqSeedAnchorStatusName(
+                                             loc_seed.anchor_status)
+                                      << ", T_anchor = " << fmtSig(loc_seed.T_anchor)
+                                      << " K [T_cold " << fmtSig(loc_seed.T_cold)
+                                      << ", T_warm " << fmtSig(loc_seed.T_warm)
+                                      << "], seed T(0) = " << fmtSig(loc_seed.T_surface)
+                                      << " K, T(z_max) = " << fmtSig(loc_seed.T_deep)
+                                      << " K, kirchhoff depth profile "
+                                      << (loc_seed.kirchhoff_profile ? "YES" : "NO");
+                            if (loc_seed.kirchhoff_profile) {
+                                std::cout << " (R4*W(0) = "
+                                          << fmtSig(loc_seed.kirchhoff_surface_offset)
+                                          << " K)";
+                            }
+                            std::cout << ", window " << loc_seed.n_samples << "/"
+                                      << times.size() << " forcing samples"
+                                      << std::endl;
+
+                            // WHICH statuses get a warning. NOT simply
+                            // !eqSeedAnchorRan(): that is also false for
+                            // ZeroSwing (F(t) exactly flat, where T_d == T_w
+                            // bitwise and there is provably no bias -- every
+                            // permanently shadowed site) and for
+                            // WarmRequested (the user asked for T_w). Warning
+                            // on those would cry wolf on exactly the runs that
+                            // are behaving.
+                            using thermal::EqSeedAnchorStatus;
+                            const EqSeedAnchorStatus st = loc_seed.anchor_status;
+                            const bool real_fallback =
+                                !thermal::eqSeedAnchorRan(st) &&
+                                st != EqSeedAnchorStatus::ZeroSwing &&
+                                st != EqSeedAnchorStatus::WarmRequested;
+                            if (st == EqSeedAnchorStatus::FallbackRadiationCoupled) {
+                                // A sanctioned stand-down, not a defect: the
+                                // lumped closure assumes F(t) is external, and
+                                // under coupling it is not. Say it anyway --
+                                // the column IS seeded at T_w -- but say what
+                                // it means, which is that the CSV and the
+                                // mesh-wide field stood down together.
+                                std::cerr << "[eq-seed] NOTE: site '" << site_label
+                                          << "': radiation.enabled is true, so the "
+                                             "surface anchor stood down here exactly as "
+                                             "it does on the mesh-wide paths, and this "
+                                             "column is seeded at T_w = <F^4>^(1/4) with "
+                                             "no Kirchhoff depth profile. The CSV and the "
+                                             "mesh agree; both carry the T_w seed bias."
+                                          << std::endl;
+                            } else if (real_fallback) {
+                                std::cerr << "[eq-seed] WARNING: site '" << site_label
+                                          << "' took the WARM-BRACKET fallback ("
+                                          << thermal::eqSeedAnchorStatusName(st)
+                                          << "), so this column is seeded at "
+                                             "T_w = <F^4>^(1/4) with no Kirchhoff depth "
+                                             "profile. On a lunar equatorial column that "
+                                             "is tens of kelvin hot at the surface and "
+                                             "still tens of kelvin hot near 1 m, and a "
+                                             "short equilibration will not shed it."
+                                          << std::endl;
+                            }
+                        }
+                    }
+                    // `face_idx`, not -1: with a per-face H map loaded these
+                    // columns used to be solved at the scalar planet.H while
+                    // the mesh-wide field used the map, so the CSVs and the
+                    // mesh disagreed by construction and a uniform H map was a
+                    // proven no-op here. Report the H each site actually got --
+                    // "the map is loaded" is not evidence that this path read
+                    // it.
+                    if (!planet.face_H_overrides.empty()) {
+                        std::cout << "[location export] site '"
+                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                  << "' face " << face_idx << ": H = "
+                                  << fmtSig(loc_H_used) << " m (per-face map)"
+                                  << std::endl;
+                        // ...and the one way this can still disagree with the
+                        // mesh-wide field, said out loud. This column is solved
+                        // on ITS OWN grid at ITS OWN H (the CPU scalar column
+                        // routine), while the CPU SIMD-batch and GPU solvers put
+                        // the whole mesh on ONE grid at the map's median H. For
+                        // a uniform map those are the same number and the two
+                        // agree exactly; for a NON-uniform map they are not, and
+                        // this site's column is then the better-resolved of the
+                        // two rather than the matching one.
+                        const double loc_H_ref = refGridHOverride(thermal_config);
+                        if (loc_H_ref > 0.0 && std::abs(loc_H_used - loc_H_ref) > 1e-12) {
+                            std::cerr << "[location export] NOTE: this column uses H = "
+                                      << fmtSig(loc_H_used)
+                                      << " m and therefore its own depth grid, while the "
+                                         "mesh-wide solve used one shared grid at the map's "
+                                         "median H = " << fmtSig(loc_H_ref)
+                                      << " m. Expect a small CSV-vs-mesh offset at this site."
+                                      << std::endl;
+                        }
+                    }
+
+                    // How deep the column was actually SOLVED. Everything below
+                    // is T_bottom + Qb*(z - z_bottom)/k_bottom -- a straight line
+                    // through a grid the run never integrated. It used to take a
+                    // constant-offset detector on consecutive CSV columns to find
+                    // that out after the fact; state it in the run's own log.
+                    //
+                    // PER SITE, not once. The one-shot latch was correct while
+                    // every site shared one grid; a per-face H map gives each
+                    // site its OWN grid, and a map with H = 0.30 m at site A and
+                    // 0.03 m at site B would have let site A report its bottom,
+                    // clear the warning, and leave site B silently extrapolating
+                    // from a much shallower grid. The full grid line still
+                    // prints only when the reach CHANGES, so a uniform map (or
+                    // no map at all) reads exactly as it did before.
+                    {
+                        const size_t n_extrap = static_cast<size_t>(std::count_if(
+                            depths_m.begin(), depths_m.end(),
+                            [&](double z) { return z > grid_bottom_m; }));
+                        if (loc_depth_reach_reported == 0
+                            || std::abs(grid_bottom_m - loc_depth_reach_last_m) > 1e-9) {
+                            std::cout << "[location export] depth grid (thermal_m/n/b = "
+                                      << thermal_config.m << "/" << thermal_config.n << "/"
+                                      << thermal_config.b << "): deepest SOLVED node at "
+                                      << std::fixed << std::setprecision(4) << grid_bottom_m
+                                      << " m, at site '"
+                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                      << "'." << std::endl;
+                            loc_depth_reach_last_m = grid_bottom_m;
+                        }
+                        if (n_extrap > 0) {
+                            std::cerr << "[location export] WARNING: site '"
+                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                      << "': " << n_extrap << " of "
+                                      << depths_m.size() << " requested depths lie BELOW "
+                                      << std::fixed << std::setprecision(4) << grid_bottom_m
+                                      << " m and are a Fourier's-law extrapolation "
+                                         "T = T_bottom + Qb*(z - z_bottom)/k_bottom, not a "
+                                         "solved temperature. Raise thermal.thermal_b to solve "
+                                         "them." << std::endl;
+                        }
+                        ++loc_depth_reach_reported;
+                    }
 
                     std::string base = sanitize(name.empty() ? ("loc_" + std::to_string(i)) : name);
                     const std::string out_path = loc_out_dir + "/" + base + "_depths.csv";
@@ -20614,9 +21471,41 @@ int main(int argc, char** argv) {
                         std::cout << "Wrote depth temperature series: " << out_path << std::endl;
                     }
                 }
-                // Generate plots if enabled
-                if (generate_depth_plots) {
+
+                // Aggregate census, in the same format and from the same
+                // struct the mesh-wide paths use, so the two lines can be read
+                // against each other in one log.
+                if (loc_sites_seeded > 0) {
+                    loc_anchor_census.report("cpu-location-depth-series");
+                } else if (loc_composer_ready && !locs.empty()) {
+                    // Distinguish the two ways this can be empty. "No site was
+                    // seeded" and "no site was solved at all" have completely
+                    // different remedies, and one line that covers both tells
+                    // you neither.
+                    std::cout << "[eq-seed] surface-anchor census "
+                                 "(cpu-location-depth-series): NONE -- ";
+                    if (loc_sites_unseeded > 0) {
+                        std::cout << loc_sites_unseeded
+                                  << " of " << locs.size()
+                                  << " site(s) were solved but NOT seeded by the shared "
+                                     "spin-up seed; they fell back to Profile::init_T.";
+                    } else {
+                        std::cout << "no site was solved: none of the " << locs.size()
+                                  << " requested location(s) mapped to a mesh face.";
+                    }
+                    std::cout << std::endl;
+                }
+
+                // Generate plots if enabled. Gated on the composition having
+                // succeeded: on a rerun into an existing output directory this
+                // would otherwise regenerate figures from the PREVIOUS run's
+                // stale *_depths.csv and report success.
+                if (generate_depth_plots && loc_composer_ready) {
                     generateDepthProfilePlots(loc_out_dir, executable_path);
+                } else if (generate_depth_plots) {
+                    std::cerr << "Warning: skipping depth-profile plots -- the absorbed-flux "
+                                 "composition failed, so any *_depths.csv present is from an "
+                                 "earlier run." << std::endl;
                 }
             }
         } catch (const std::exception& e) {

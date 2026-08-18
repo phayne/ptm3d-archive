@@ -471,6 +471,35 @@ private:
     double getChunkedValue(const std::vector<std::vector<double>>& chunks, size_t face_idx, size_t time_idx) const;
 
 public:
+    // TRUE when this model still holds illumination in the chunk store, i.e.
+    // when getDirectSolarValue(f,t) / getPrimaryReflectedValue(f,t) /
+    // getPrimaryIRValue(f,t) can still answer for every (face, timestep).
+    // A caller that reads the FLAT arrays has to know whether they were ever
+    // extracted; the flat arrays being empty is not by itself proof that the
+    // chunks can answer, because releaseChunkedStorage() empties them too.
+    // Checks every chunk, not just the outer vector: a partially released
+    // store would otherwise report ready and then return 0.0 per element,
+    // which is the exact silent-zero failure this accessor exists to prevent.
+    bool hasChunkedIllumination() const {
+        if (!using_chunked_storage_) return false;
+        // Every one of the four OUTER vectors has to be non-empty in its own
+        // right. Testing only direct_solar_chunks_ and then range-for-ing the
+        // other three would pass an empty outer vector for free -- its loop
+        // body never runs -- and the corresponding getter would return 0.0 per
+        // element, which is the silent zero this accessor exists to prevent.
+        // They are resized together by initializeChunkedStorage(), so this is a
+        // tripwire, not a live case; a tripwire that cannot fire is not one.
+        auto chunks_ready = [](const std::vector<std::vector<double>>& chunks) {
+            if (chunks.empty()) return false;
+            for (const auto& c : chunks) if (c.empty()) return false;
+            return true;
+        };
+        return chunks_ready(direct_solar_chunks_) &&
+               chunks_ready(primary_reflected_chunks_) &&
+               chunks_ready(primary_ir_chunks_) &&
+               chunks_ready(illumination_chunks_);
+    }
+
     // Release chunked storage memory after extraction to flat arrays.
     void releaseChunkedStorage() {
         for (auto& c : illumination_chunks_)       std::vector<double>().swap(c);

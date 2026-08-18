@@ -359,8 +359,8 @@ with an `e-9` term becomes `0.000000` in the list. Where zero is a legal value �
 
 **What to do instead.** Keep every `generic_body.surface` value at or above 5e-7, and check the
 delivered thermal inertia against what you asked for. Where the property has an `*_override` form
-(`ks_override`, `kd_override`, `emissivity_override`, `albedo_override`) that channel uses full
-precision and is not affected.
+(`ks_override`, `kd_override`, `H_override`, `emissivity_override`, `albedo_override`) that channel
+uses full precision and is not affected.
 
 **Status.** Open.
 
@@ -459,14 +459,16 @@ that the value you set is the value that was echoed.
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,
-  `kd_override`, `incidence_angle_albedo`, `albedo_model`, `albedo_hapke_w` and
+  `kd_override`, `H_override`, `incidence_angle_albedo`, `albedo_model`, `albedo_hapke_w` and
   `conductivity_model`. Plain-named properties (`ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`, `Qb`,
   `chi`, `albedo`, `emissivity`) and every `use_default_*` flag other than `use_default_albedo`
   are **decorative there** — they are honored only under `generic_body.surface:`. Editing them on
   a named body changes nothing. As of v1.0.3 the engine prints one `[config] WARNING:` line naming
   every such key it found, instead of dropping them in silence; **it does not start honoring
   them**, because doing so would change results for the 130+ shipped configs that carry them.
-  There is still no config route to a non-default `H` on a named body except `h_parameter_map`.
+  `H` is the one that gained a route: `thermophysical.H_override` (meters) sets it on any body,
+  alongside `thermal.h_parameter_map` for the per-face case. A plain `thermophysical.H` is still
+  dead and still lands in that warning.
 
 - **A malformed config file is now fatal.** Previously a YAML parse failure — a bad scalar, a
   malformed document, a rejected enum value — was downgraded to a `Warning:` and the entire
@@ -487,8 +489,32 @@ that the value you set is the value that was echoed.
   the map (`use_albedo_map: false`) or scale the map itself. `ks_override`, `kd_override` and
   `emissivity_override` are unaffected by this and apply in full.
 
+- **`H_override` has the same relationship to a per-face H map, and two other traps.**
+  `thermal.h_parameter_map` / `thermal.thermal_inertia_map` / `use_default_property_map` supply a
+  per-face H that out-ranks `thermophysical.H_override` on every face the map covers; the scalar
+  then only serves faces the map does not. The run warns when both are set. `H_override` is also
+  **exactly inert under `constant_thermal_inertia > 0`**, which collapses `kd→ks` and `rhod→rhos`
+  so that `exp(-z/H)` multiplies zero — an H sweep in constant-TI mode returns N identical runs,
+  and that combination warns too. Finally, H changes the *depth grid* as well as `rho(z)`/`kc(z)`
+  (`generateAdaptiveGrid` marches on `kappa(z)`), so a run at a different H may have a different
+  layer count; the log's `Using N depth layers per profile` line is the check.
+
+- **A uniform per-face H map and the equivalent scalar `H_override` now agree exactly.** They used
+  to disagree on the CPU SIMD-batch and GPU solvers, which put every face on one reference grid
+  built at the body-default `planet.H` while giving each face its own `rho(z)`/`kc(z)` from the
+  map — 23 layers against the CPU scalar path's 22, and 0.008 K, on the ico3 Moon at H = 0.03125 m.
+  The shared grid is now built at the map's **median** H, printed as `[property-map] shared
+  reference depth grid built at H = …`. A map whose H spans more than 2× also warns that one shared
+  grid cannot resolve the whole span; `--no-simd-batch` gives every face its own grid instead.
+  **This changes results for existing runs that load a per-face H/TI map on the batch or GPU
+  solvers** (four shipped example configs; no production campaign). It also changes the *layer
+  count* those runs use, so a `thermal.initial_state_file` written by an older binary for a
+  map-loading run will fail the checkpoint shape check and must be regenerated. Runs with no
+  per-face map are untouched, checkpoints included.
+
 - **A requested property override that no solver applies now aborts the run.** `ks_override`,
-  `kd_override`, `emissivity_override`, `albedo_override` and `constant_thermal_inertia` were
+  `kd_override`, `H_override`, `emissivity_override`, `albedo_override` and
+  `constant_thermal_inertia` were
   previously reported in the log and then ignored on built-in bodies (Moon/Europa/Mercury) for every
   mesh run — the sweep measured nothing and said it had worked. They now apply on all bodies, and a
   run that cannot apply a configured override exits non-zero before writing any statistics. Confirm

@@ -34,7 +34,8 @@ thermophysical:
   # On a BUILT-IN body (Moon/Europa/Mercury) this block reads only:
   #   use_default_albedo, constant_thermal_inertia, incidence_angle_albedo,
   #   albedo_model, albedo_hapke_w, conductivity_model, and the *_override keys
-  #   (albedo_override / emissivity_override / ks_override / kd_override).
+  #   (albedo_override / emissivity_override / ks_override / kd_override /
+  #    H_override).
   # Plainly-named properties (albedo, emissivity, ks, kd, H, rhos, ...) are
   # honored only under `generic_body.surface:`; here they change nothing and the
   # run warns about them. See docs/KNOWN_LIMITATIONS.md (PTM-67).

@@ -160,6 +160,8 @@ CASES = [
       note="4x Moon ks (7.4e-4)"),
     C("kd_override", MOON_BASE, {"thermophysical.kd_override": 0.014},
       note="4x Moon kd (3.5e-3)"),
+    C("H_override", MOON_BASE, {"thermophysical.H_override": 0.03},
+      note="H 0.06 -> 0.03 m (Hayne+2017 Table A1 e-folding depth)"),
     C("albedo_override", MOON_BASE, {"thermophysical.albedo_override": 0.30},
       note="A0 0.12 -> 0.30"),
     C("emissivity_override", MOON_BASE, {"thermophysical.emissivity_override": 0.80},
@@ -233,6 +235,32 @@ CASES = [
       note="uniform TI=200 map over all 1280 faces", expect="LIVE"),
     C("h_parameter_map", MOON_BASE, {"thermal.h_parameter_map": "HMAP"},
       note="uniform H=0.30 m map", expect="LIVE"),
+
+    # ---- the per-face-H equivalence discriminator ---------------------------
+    # A UNIFORM per-face H map states exactly the same physics as the scalar
+    # H_override, so on any path that honors both they must agree. This is the
+    # check that catches a silent no-op: "the map loaded" is a log line, "the
+    # map changed the answer, by the right amount" is evidence.
+    #
+    # TWO tolerances, deliberately. The map is float32 on disk, so a YAML 0.03
+    # and a map 0.03 are NOT the same number (0.03 has no exact binary32 form);
+    # that pair can only be compared to round-off. 0.03125 = 2^-5 IS exact in
+    # both, so that pair must be BYTE-IDENTICAL -- which is the stronger claim,
+    # and the one that proves the two channels reach the same code rather than
+    # merely landing nearby.
+    C("h_map_0p06", MOON_BASE, {"thermal.h_parameter_map": "HMAP06"},
+      note="uniform H = the Moon default 0.06 m; must equal moon_base to f32",
+      expect="~SAME"),
+    C("h_map_0p03", MOON_BASE, {"thermal.h_parameter_map": "HMAP03"},
+      ref="H_override",
+      note="uniform H=0.03 map vs scalar H_override=0.03 (f32 round-off only)",
+      expect="~SAME"),
+    C("H_override_exact", MOON_BASE, {"thermophysical.H_override": 0.03125},
+      note="H 0.06 -> 0.03125 m (2^-5: exact in binary32 AND binary64)"),
+    C("h_map_exact", MOON_BASE, {"thermal.h_parameter_map": "HMAPX"},
+      ref="H_override_exact",
+      note="uniform H=0.03125 map vs the same scalar -- must be BYTE-IDENTICAL",
+      expect="IDENTICAL"),
     C("use_default_property_map", MOON_BASE,
       {"thermal.use_default_property_map": True},
       note="bundled Moon H map for ico3", expect="LIVE"),
@@ -309,6 +337,13 @@ CASES = [
       args=["--no-simd-batch"], ref="scalar_base", expect="?"),
     C("scalar_hapke_w", MOON_BASE, {"thermophysical.albedo_hapke_w": 0.90},
       args=["--no-simd-batch"], ref="scalar_base", expect="?"),
+    C("scalar_H_override", MOON_BASE, {"thermophysical.H_override": 0.03125},
+      args=["--no-simd-batch"], ref="scalar_base",
+      note="H 0.06 -> 0.03125 on the legacy CPU scalar column"),
+    C("scalar_h_map_exact", MOON_BASE, {"thermal.h_parameter_map": "HMAPX"},
+      args=["--no-simd-batch"], ref="scalar_H_override",
+      note="uniform H=0.03125 map vs the same scalar, CPU scalar path",
+      expect="IDENTICAL"),
 ]
 
 
@@ -350,7 +385,22 @@ def main(argv=None):
     hmap = work / "h_map_0p30_ico3.bin"
     if not hmap.exists():
         hmap.write_bytes(np.full(1280, 0.30, dtype="<f4").tobytes())
-    subs = {"HEATMASK": str(mask), "TIMAP": str(timap), "HMAP": str(hmap)}
+    # The equivalence pair: a uniform map at the body default (0.06 m) and one
+    # at the swept value (0.03 m). float32 on disk, so the literals are chosen
+    # to round-trip exactly in binary32 -- 0.03 does not, which is precisely why
+    # the scalar arm below reads its target back out of the file rather than
+    # trusting the YAML literal.
+    hmap06 = work / "h_map_0p06_ico3.bin"
+    if not hmap06.exists():
+        hmap06.write_bytes(np.full(1280, 0.06, dtype="<f4").tobytes())
+    hmap03 = work / "h_map_0p03_ico3.bin"
+    if not hmap03.exists():
+        hmap03.write_bytes(np.full(1280, 0.03, dtype="<f4").tobytes())
+    hmapx = work / "h_map_0p03125_ico3.bin"
+    if not hmapx.exists():
+        hmapx.write_bytes(np.full(1280, 0.03125, dtype="<f4").tobytes())
+    subs = {"HEATMASK": str(mask), "TIMAP": str(timap), "HMAP": str(hmap),
+            "HMAP06": str(hmap06), "HMAP03": str(hmap03), "HMAPX": str(hmapx)}
 
     engine = Path(args.engine)
     if not engine.is_absolute():

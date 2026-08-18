@@ -163,6 +163,7 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
     // false-negative in this list, recorded here rather than left to be
     // rediscovered.
     static const char* const kRead[] = {
+        "H_override",          // ASCII sort: uppercase sorts before lowercase
         "albedo_hapke_w",
         "albedo_model",
         "albedo_override",
@@ -613,6 +614,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 thermo, "ks_override", config.thermophysical.ks_override);
             config.thermophysical.kd_override = getWithDefault(
                 thermo, "kd_override", config.thermophysical.kd_override);
+            config.thermophysical.H_override = getWithDefault(
+                thermo, "H_override", config.thermophysical.H_override);
 
             // Directional-hemispheric (Hapke) albedo gate. Two equivalent opt-in
             // spellings: the previously-dead `incidence_angle_albedo` bool, or
