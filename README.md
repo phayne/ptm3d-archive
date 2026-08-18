@@ -88,32 +88,75 @@ and thermal emission from surrounding terrain.*
   same comparison at full manuscript resolution (15,840 faces, swept solar
   elevation) matches the analytic permanently-shadowed-interior temperature to
   **0.1 K (≤0.26%)** and the analytic shadow flux to **≤1.2%**
-- **Diviner Lunar Radiometer Experiment**: PTM3D vs. the Williams et al. (2019)
-  seasonal south-polar bolometric temperature product at a Haworth-crater
-  cold-trap site (88.18°S, 6.04°E) — the previously reported PSR cold bias is
-  largely eliminated. Deep-floor (Diviner summer max < 110 K) summer-maximum
-  bias is **+1.9 K** on average (cross-checked at +1.1 K on a second,
-  independently-centered mesh), with **11 K / 6 K RMS** (summer/winter mean)
-  over the full 250 m-cell comparison window
-- **Hayne et al. (2017)** 1D thermophysical model: reproduces the lunar
-  equatorial diurnal cycle (noon ~388 K, night ~99 K)
+- **Diviner Lunar Radiometer Experiment**: PTM3D's thermal-column solver, run
+  end to end (see the Fig. 5 caption below) matches Diviner-derived
+  equatorial/mid-latitude diurnal brightness temperatures to within the
+  measurement errors — the three Hayne et al. (2017) equatorial peak/
+  midnight/minimum anchors land inside their ±5 K bars (max residual
+  **1.05 K**), and the 27 bare nighttime brightness-temperature dots (no
+  error bars in the source figure) run **1.61 K** max / **0.75 K** RMS,
+  PTM3D slightly warm. The full 3D radiative-coupled model separately
+  matches real Diviner seasonal south-polar temperatures (Williams et al.
+  2019) at a Haworth-crater cold-trap site to a **+1.9 K** deep-floor
+  summer-maximum bias and **11 K / 6 K RMS** (summer/winter mean) — see the
+  validation gallery below
+- **Hayne et al. (2017)** thermophysical model: the global Table 1
+  properties (Bond albedo A₀ = 0.12) reproduce the lunar equatorial diurnal
+  cycle (noon 384.2 K, midnight 100.3 K). At the Apollo 15 (Hadley–Apennine)
+  and Apollo 17 (Taurus–Littrow, dark pyroclastic-mantle terrain) landing
+  sites, a site-specific albedo A₀ = 0.06 (all other properties unchanged
+  from Table 1) brings both the surface and the 0.83 m / 1.30 m heat-flow-
+  probe temperatures inside their ±5 K bars; max residual **4.91 K**
+  (Apollo 17 surface — the tightest of the four points, 0.09 K inside its bar)
 
-![Ingersoll bowl-crater radiation-exchange validation](docs/figures/validation_bowl_crater_ingersoll.png)
+**Full validation gallery (all seven manuscript figures, Figs. 3–9, with
+headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
+
+![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_ptm3d_hayne_apollo.png)
+*PTM3D-native re-run of the submitted manuscript's Fig. 5 tests (`main.tex`,
+"Validation of the 3D thermophysical model with comparison to Diviner data
+(left panel) and Apollo heat flow probe data (right panel)"), run through
+PTM3D itself end to end — smooth global icosphere (radiation exchange OFF is
+exact for a convex body), CPU-only, body=Moon. **(a)** Global Table 1
+(Hayne et al. 2017) thermophysical properties, A₀ = 0.12: equatorial/30°/60°
+PTM3D diurnal surface-temperature curves vs. Diviner brightness temperatures
+and the Hayne et al. (2017) equatorial peak/midnight/minimum reference
+points (all carry the manuscript's own ±5 K error bars; the 27 nighttime
+Diviner dots are bare in the source figure and are plotted without invented
+bars). Max |PTM3D − reference| = **1.05 K** at the three bar-carrying
+anchors. The local-time axis is anchored on PTM3D's own diurnal maximum
+(hr = 0 by construction), so the hr = 18 "minimum" anchor is scored
+extremum-to-extremum — PTM3D's own diurnal minimum falls one output sample
+(≈2 h of real lunar local time) before hr = 18, residual **−1.05 K**;
+scored instead at the literal hr = 18.00 point the residual is **+2.74 K**,
+also inside the bar (both numbers reported, see `docs/VALIDATION.md` for
+detail). Bare-dot residuals: **1.61 K** (RMS 0.75 K) at the 27 bare dots,
+informative only. **(b)** Apollo 15 (Hadley–Apennine) and Apollo 17
+(Taurus–Littrow, dark pyroclastic-mantle terrain) landing sites at their own
+site-specific Bond albedo, A₀ = 0.06 (the value that clears all four probe
+points; consistent with Hayne et al. 2017's practice of site-specific
+Apollo albedos, but their exact per-site values are not independently
+verified here) — all other properties unchanged from Table 1 (no evidence
+for a lower density e-folding depth H at either site, so H stays at the
+Table 1 default). Equilibrated 480 lunar day/night cycles at thermal grid
+resolution `thermal_b = 45` (bottom node 1.41 m, the convergence study's
+accepted working point); both scored deep points (0.83 m, 1.30 m) fall
+within that genuinely-solved grid, so the model curves are drawn solid
+throughout, with no extrapolated segment. The manuscript plots the Apollo
+17 deep point at 13 cm; the probe's actual reference depth is 130 cm
+(confirmed by the author — a 10× error in the source figure; Langseth
+et al. 1976 report the probe depths), scored here at the corrected depth
+(inside its bar at either depth, see `docs/VALIDATION.md`). **Max
+|PTM3D − reference| = 4.91 K** (Apollo 17 surface, 0.09 K inside its
+±5 K bar) — **all four Apollo points land inside their ±5 K bars.***
+
+![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
-(1992) — Fig. 7 of the submitted Moon3D manuscript. **(a)** Equilibrium
-temperature renders for three crater depth-to-diameter ratios at two solar
-elevations. **(b)** Permanently-shadowed-interior mean temperature vs. solar
-elevation: numerical (circles) vs. analytic (lines), agreement within 0.1 K
-(≤0.26%). **(c)** Shadow-flux error relative to the analytic solution, ≤1.2%.*
-
-![Diviner seasonal PSR temperature validation](docs/figures/validation_diviner_seasonal_psr_scatter.png)
-*Modeled (PTM3D) vs. Diviner bolometric temperature for every valid 250 m
-cell of a Haworth-crater SE-rim comparison window (88.18°S, 6.04°E) — Fig. 9
-of the submitted Moon3D manuscript (site map and per-statistic difference
-maps are its companion Fig. 8, not reproduced here). Filled contours show
-point density for the radiation-coupled run; the gray line is 1:1. Deep-floor
-summer-maximum bias is +1.9 K; RMS is 11 K (summer mean) / 6 K (winter mean)
-over the full window.*
+(1992). **(a)** Equilibrium-temperature renders for three crater
+depth-to-diameter ratios at two solar elevations. **(b)** Permanently-
+shadowed-interior mean temperature vs. solar elevation: numerical (circles)
+vs. analytic (lines), agreement within 0.1 K (≤0.26%). **(c)** Shadow-flux
+error relative to the analytic solution, ≤1.2%.*
 
 ## Get started
 
@@ -405,7 +448,9 @@ archived on Zenodo: concept DOI
 Heritage methods: Hayne et al. (2017, [10.1002/2017JE005387](https://doi.org/10.1002/2017JE005387));
 Hayne & Aharonson (2015, [10.1002/2015JE004887](https://doi.org/10.1002/2015JE004887));
 Vasavada et al. (2012, [10.1029/2011JE003987](https://doi.org/10.1029/2011JE003987));
-Paige et al. (2010, [10.1126/science.1187726](https://doi.org/10.1126/science.1187726)).
+Paige et al. (2010, [10.1126/science.1187726](https://doi.org/10.1126/science.1187726));
+Langseth et al. (1976, *Proc. Lunar Sci. Conf.* 7, 3143–3171 — Apollo 15/17
+heat-flow-probe measurements).
 H-matrix view factors: Potter et al. (2023, [10.1016/j.jcpx.2023.100130](https://doi.org/10.1016/j.jcpx.2023.100130)).
 
 ## License
