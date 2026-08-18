@@ -37,20 +37,19 @@ settling in the first ~30 cycles.
 
 ## Manuscript Fig. 5 — Thermal-column validation vs. Diviner and Apollo
 
-![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](figures/validation_fig05_ptm3d_hayne_apollo.png)
+![PTM3D-modeled lunar diurnal temperatures vs. Diviner and Apollo 15/17 measurements](figures/validation_fig05_ptm3d_hayne_apollo.png)
 
-Manuscript caption: "Validation of the 3D thermophysical model with
-comparison to Diviner data (left panel) and Apollo heat flow probe data
-(right panel)." The image above is a PTM3D-native re-run of the same two
-tests, run end to end through the 3D thermal-illumination framework: **(a)**
-the global diurnal-cycle/Diviner comparison at the manuscript's Table 1
-(Hayne et al. 2017) properties, and **(b)** the Apollo 15/17 heat-flow-probe
-comparison at each site's own albedo.
+PTM3D modeled two thermal-column comparisons end to end through the full 3D
+thermal-illumination framework (this corresponds to Figure 5 of the
+submitted Moon3D manuscript, currently in review): **(a)** a global
+diurnal-cycle comparison against Diviner brightness temperatures at Hayne
+et al. (2017) Table 1 properties, and **(b)** an Apollo 15/17
+heat-flow-probe comparison at each site's own albedo.
 
 **Recipe, panel (a):** smooth global icosphere, resolution 6 (81,920 faces;
 a convex body makes `radiation.enabled: false` physically exact, not an
 approximation), CPU-only illumination and thermal solve, body=Moon using
-the manuscript's own Table 1 properties unmodified — Bond albedo
+Hayne et al. (2017) Table 1 properties unmodified — Bond albedo
 A₀ = 0.12, all other properties Table 1 (`thermal_m/n/b = 10/15/15`,
 unchanged from the tracked default), `equilibration_orbits: 60` (a
 2/5/10/20/30/45-orbit convergence sweep showed the ≳0.4 m diurnal-mean
@@ -89,16 +88,16 @@ model curves are drawn solid throughout — no extrapolated segment.
 
 Reference points (Diviner nighttime dots, Hayne et al. 2017 equatorial
 peak/midnight/minimum squares, Apollo 15/17 probe points) were digitized
-from the submitted manuscript's own `fig05.pdf` vector content (exact
-marker/axis-tick coordinates, not pixel-eyeballing), **with one correction**:
-the manuscript plots the Apollo 17 deep point at a depth of 13 cm, but the
-probe's actual reference depth is 130 cm (confirmed by the author; the
-original measurements are Langseth et al. 1976's Apollo 17 heat-flow-probe
-depths) — a 10× digitization/transcription error in the source figure. This
-render scores Apollo 17's deep point at the corrected 130 cm; the point is
-inside its ±5 K bar at either depth (**−0.89 K** at the literal 13 cm the
-manuscript plots, **+2.55 K** at the corrected 130 cm), so the correction
-does not change the pass/fail outcome, only which depth is being claimed.
+from Hayne et al. (2017)'s own Figure 5 vector content, as reproduced in
+the submitted Moon3D manuscript (exact marker/axis-tick coordinates, not
+pixel-eyeballing), **with one correction**: that figure plots the Apollo 17
+deep point at a depth of 13 cm, but the probe's actual reference depth is
+130 cm (Langseth et al. 1976 report the probe depths; confirmed directly
+with the author) — a 10× digitization/transcription error. This render
+scores Apollo 17's deep point at the corrected 130 cm; the point is inside
+its ±5 K bar at either depth (**−0.89 K** at the literal 13 cm,
+**+2.55 K** at the corrected 130 cm), so the correction does not change the
+pass/fail outcome, only which depth is being claimed.
 Every reference marker in the source figure carries a ±5 K error bar,
 reproduced here unchanged. The Apollo probe temperatures and Diviner
 brightness temperatures are themselves independent measurements —
