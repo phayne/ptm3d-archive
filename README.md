@@ -19,15 +19,36 @@ coupling ray-traced illumination (Intel Embree + NASA SPICE ephemerides) with a
 1D Crank-Nicolson thermal solver and full inter-face thermal radiation exchange
 on arbitrary 3D terrain. It is built for physical accuracy and computational speed across a range of planetary thermal environments, from permanently shadowed craters to icy satellite surfaces and asteroids.
 
+<table>
+<tr>
+<td width="60%">
+
 ![Global lunar surface temperatures](docs/figures/moon_global_res9_temperature.png)
+
+</td>
+<td width="40%">
+
 *Global lunar surface temperatures on a 5.2-million-face icosphere
 (resolution 9), one snapshot from a full-lunation PTM3D run with topographic
 shadowing and SPICE solar geometry.*
 
+</td>
+</tr>
+<tr>
+<td width="60%">
+
 ![Europa surface temperature animation](docs/figures/europa_res7_temperature_animation.gif)
+
+</td>
+<td width="40%">
+
 *Global Europa surface temperatures over one Europan day (3.55 Earth days),
 computed with SPICE geometry, per-face albedo, and Jupiter's reflected light
 and thermal emission included.*
+
+</td>
+</tr>
+</table>
 
 ![Lunar polar crater temperatures](docs/figures/temp_3d_native_twoband_v3.png)
 *A simulated lunar south-polar crater, ~1.5 m in diameter, modeled at ~1 mm
@@ -63,30 +84,36 @@ and thermal emission from surrounding terrain.*
   reproduces the analytic wall view factor to **0.49%** and satisfies view-factor
   reciprocity to machine precision. It is the gate every radiation change has to
   pass; the CPU build and this gate are wired into the repository's CI workflow
-  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), Linux + macOS)
-- **Diviner Lunar Radiometer Experiment** (compared via the Hayne et al. 2017
-  Diviner-derived lunar regolith model, not a direct replay of raw radiometer
-  counts): PTM3D's post-sunset cooling curve matches the published reference
-  points to **0.97 K RMS** across fifteen nighttime samples spanning three
-  latitudes
+  ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), Linux + macOS). The
+  same comparison at full manuscript resolution (15,840 faces, swept solar
+  elevation) matches the analytic permanently-shadowed-interior temperature to
+  **0.1 K (≤0.26%)** and the analytic shadow flux to **≤1.2%**
+- **Diviner Lunar Radiometer Experiment**: PTM3D vs. the Williams et al. (2019)
+  seasonal south-polar bolometric temperature product at a Haworth-crater
+  cold-trap site (88.18°S, 6.04°E) — the previously reported PSR cold bias is
+  largely eliminated. Deep-floor (Diviner summer max < 110 K) summer-maximum
+  bias is **+1.9 K** on average (cross-checked at +1.1 K on a second,
+  independently-centered mesh), with **11 K / 6 K RMS** (summer/winter mean)
+  over the full 250 m-cell comparison window
 - **Hayne et al. (2017)** 1D thermophysical model: reproduces the lunar
   equatorial diurnal cycle (noon ~388 K, night ~99 K)
 
 ![Ingersoll bowl-crater radiation-exchange validation](docs/figures/validation_bowl_crater_ingersoll.png)
-*PTM3D vs. the analytic two-zone bowl-crater solution of Ingersoll, Svitek &
-Murray (1992). **(a)** Floor equilibrium temperature vs. solar elevation for
-three crater depth-to-diameter ratios — PTM3D curves are visually
-indistinguishable from the analytic solution. **(b)** Floor sky-view-factor
-F_sky from the PTM3D mesh (circles, per-face range) vs. the analytic value
-sin²α (dashed line): agreement within 0.49%.*
+*PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
+(1992) — Fig. 7 of the submitted Moon3D manuscript. **(a)** Equilibrium
+temperature renders for three crater depth-to-diameter ratios at two solar
+elevations. **(b)** Permanently-shadowed-interior mean temperature vs. solar
+elevation: numerical (circles) vs. analytic (lines), agreement within 0.1 K
+(≤0.26%). **(c)** Shadow-flux error relative to the analytic solution, ≤1.2%.*
 
-![Diviner / Hayne et al. (2017) lunar surface-temperature validation](docs/figures/validation_lunar_diviner_hayne2017.png)
-*PTM3D global lunar surface temperatures (327,680-face icosphere) vs. the
-Hayne et al. (2017) Diviner-derived lunar regolith model. **(a)** Equatorial
-diurnal cycle, with Hayne (2017) peak/midnight/post-dawn-minimum reference
-points overlaid. **(b)** Post-sunset cooling at 0°, 30°, and 60° latitude vs.
-Hayne (2017) reference points — 0.97 K RMS across the fifteen plotted
-nighttime points.*
+![Diviner seasonal PSR temperature validation](docs/figures/validation_diviner_seasonal_psr_scatter.png)
+*Modeled (PTM3D) vs. Diviner bolometric temperature for every valid 250 m
+cell of a Haworth-crater SE-rim comparison window (88.18°S, 6.04°E) — Fig. 9
+of the submitted Moon3D manuscript (site map and per-statistic difference
+maps are its companion Fig. 8, not reproduced here). Filled contours show
+point density for the radiation-coupled run; the gray line is 1:1. Deep-floor
+summer-maximum bias is +1.9 K; RMS is 11 K (summer mean) / 6 K (winter mean)
+over the full window.*
 
 ## Get started
 
