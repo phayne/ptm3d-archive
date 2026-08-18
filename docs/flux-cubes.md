@@ -345,6 +345,20 @@ negative irradiance, closure per patch, and `nadir terrain_ir >= eps*sigma*T_fac
 is the check that catches a mis-indexed cube-to-face mapping that every purely structural check
 would pass.
 
+### Compatibility with `skip_time_series`
+
+The chunked-run orchestrator forces `output.skip_time_series = True` unconditionally
+(`scripts/run_chunked_simulation.py`). Flux cubes read the **in-memory** band series, not the
+per-step frames on disk, so the two are compatible -- but that was a claim, and it has now been
+measured rather than assumed: on the crater80N config the `.fcb` is **byte-identical**
+(md5 `0133a0e073a3162ee21ce2dc38066b59`) with `skip_time_series` true and false, while the
+per-step frame count goes 118 -> 0.
+
+⛔ **The pass is NOT chunk-aware.** Under the chunked runner each chunk would run its own
+post-solve pass over its own sub-window and emit its own `flux_cubes.fcb`, and `ptm_merge_chunks`
+has no rule for merging them. Run a window that needs cubes as a **single direct engine run**, or
+treat the per-chunk files as separate products. Making the cube axis mergeable is a v2 item.
+
 ## 9. Validation status
 
 | gate | result |
