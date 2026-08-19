@@ -168,6 +168,17 @@ def arm2(binpath, workdir, n_rays, fails):
     # cube would see an asymmetric square and the inscribed-disk bound would not
     # apply).
     r = run_geom(binpath, plane, out, h, 100.0, 1.0, n_rays)
+    # EXACT closed form (minor 9): differential planar element to a coaxial,
+    # directly-opposed square 2L x 2L at height h --
+    #   F = (2/pi) [ X/sqrt(1+X^2) * atan(Y/sqrt(1+X^2))
+    #              + Y/sqrt(1+Y^2) * atan(X/sqrt(1+Y^2)) ],  X = Y = L/h.
+    # The inscribed/circumscribed disk BRACKET below is retained only as a sanity
+    # frame; quoting a bracket where an exact value exists under-claims the test
+    # by ~2 orders of magnitude.
+    X = Y = L / h
+    rx = math.sqrt(1.0 + X * X)
+    ry = math.sqrt(1.0 + Y * Y)
+    exact = (2.0 / math.pi) * (X / rx * math.atan(Y / rx) + Y / ry * math.atan(X / ry))
     lo = L * L / (L * L + h * h)
     hi = 2 * L * L / (2 * L * L + h * h)
     uniform_wrong = 1.0 - h / math.sqrt(L * L + h * h)
@@ -186,9 +197,14 @@ def arm2(binpath, workdir, n_rays, fails):
     nad = fcg["patches"][1]           # cube 0, face index 1 = nadir
     sumF = 1.0 - nad["f_sky"] - nad["f_ring"]
     zen = fcg["patches"][0]
-    ok = (lo <= sumF <= hi)
+    rel = abs(sumF - exact) / exact
+    ok = rel < 3e-3          # scored against the EXACT value, not the bracket
     if not ok:
-        fails.append("arm2: nadir sum_j F = %.5f outside [%.5f, %.5f]" % (sumF, lo, hi))
+        fails.append("arm2: nadir sum_j F = %.6f vs exact %.6f (rel %.2e)" % (sumF, exact, rel))
+    print("  EXACT closed form (differential element -> coaxial square): %.6f" % exact)
+    print("  measured %.6f  =>  relative error %.2e  (bar 3e-3)" % (sumF, rel))
+    if not (lo <= sumF <= hi):
+        fails.append("arm2: also outside the disk bracket [%.5f, %.5f]" % (lo, hi))
     print("\n%-28s %10s %10s %8s" % ("quantity", "measured", "expected", "verdict"))
     print("%-28s %10.5f %10s %8s" % ("nadir sum_j F", sumF,
                                      "[%.3f,%.3f]" % (lo, hi), "PASS" if ok else "FAIL"))

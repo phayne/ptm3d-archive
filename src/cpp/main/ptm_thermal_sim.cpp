@@ -36,6 +36,7 @@
 
 #include "../tools/config_parser.h"
 #include "../tools/run_provenance.h"
+#include "ptm_build_info.h"
 #include "../tools/solver_disclosure.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/eq_certificate.h"
@@ -21014,6 +21015,24 @@ int main(int argc, char** argv) {
         fcin.write_csv = sim_config.flux_cubes.write_csv;
         fcin.write_csv_max_cubes = sim_config.flux_cubes.write_csv_max_cubes;
         fcin.shadow_probe_rays = sim_config.flux_cubes.shadow_probe_rays;
+        fcin.solar_radius_km = constants::SUN_RADIUS;   // Finding 2: finite solar disk
+        // Minor 6: FNV-1a 64 over the run's occluder PLY, so the pass can verify
+        // the cache was built against THIS ring.
+        if (!sim_config.mesh.occluder_file.empty()) {
+            std::ifstream rf(sim_config.mesh.occluder_file, std::ios::binary);
+            if (rf) {
+                uint64_t h64 = 1469598103934665603ULL;
+                std::vector<char> buf(1 << 16);
+                while (rf.read(buf.data(), buf.size()) || rf.gcount() > 0) {
+                    const std::streamsize n = rf.gcount();
+                    for (std::streamsize i2 = 0; i2 < n; ++i2) {
+                        h64 ^= static_cast<uint8_t>(buf[i2]);
+                        h64 *= 1099511628211ULL;
+                    }
+                }
+                fcin.ring_hash = h64;
+            }
+        }
         for (const auto& L : sim_config.flux_cubes.locations)
             fcin.expected_location_names.push_back(L.name);
         if (!fcin.expected_location_names.empty())
@@ -21052,6 +21071,38 @@ int main(int argc, char** argv) {
                          "post-solve time; the pass will refuse rather than assume every "
                          "cube is unshadowed.\n";
         }
+        // Finding 3: populate the provenance the pass writes into the product.
+        // Leaving this empty is what left both delivered files with no engine
+        // identity at all; a product that cannot be traced to the code that made
+        // it is not a deliverable.
+        {
+            std::ostringstream pj;
+            pj << "{\"engine_git_sha\":\"" << PTM_BUILD_GIT_SHA << "\""
+               << ",\"engine_build_type\":\"" << PTM_BUILD_TYPE << "\""
+               << ",\"config_used_path\":\"" << (output_dir + "/config_used.yaml") << "\""
+               << ",\"mesh_core\":\"" << sim_config.mesh.import_file << "\""
+               << ",\"mesh_ring\":\"" << sim_config.mesh.occluder_file << "\""
+               << ",\"n_faces_core\":" << num_faces
+               << ",\"geomhash_core\":" << fcin.geomhash_core
+               << ",\"radiation_use_gpu\":"
+               << (sim_config.radiation.use_gpu ? "true" : "false")
+               << ",\"vf_replace\":\""
+               << (std::getenv("PTM_HMATRIX_VF_REPLACE")
+                       ? std::getenv("PTM_HMATRIX_VF_REPLACE") : "")
+               << "\"}";
+            fcin.provenance_json = pj.str();
+        }
+        // Finding 14: never let the property arrays fall back silently.
+        std::cout << "[flux-cubes] emissivity source: "
+                  << (fluxcube_emissivity.empty()
+                          ? "UNIFORM planet.emissivity FALLBACK (the radiation manager published "
+                            "no per-face array -- the product's IR reconstruction uses one scalar)"
+                          : "per-face operativeEmissivity() from the radiation manager")
+                  << "\n[flux-cubes] Bond albedo source: "
+                  << (fluxcube_face_albedos.empty()
+                          ? "UNIFORM planet.albedo FALLBACK (no per-face array was captured)"
+                          : "per-face face_albedos_rad captured at the radiation block")
+                  << std::endl;
         std::string fc_err;
         if (!ptm::fluxcubes::runFluxCubePass(fcin, fc_err)) {
             // A run that was asked for a product and made none must FAIL, never

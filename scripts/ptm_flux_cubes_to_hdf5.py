@@ -57,7 +57,35 @@ ZENITH_TIR_CAVEAT = (
     "numbers -- is dominated by a single facet at f_max ~0.85 and is not implicated.")
 
 ENGINEER_SUMMARY = (
-    "PTM3D flux cubes: incident irradiance (W m-2) on six oriented faces of virtual measurement cubes on the lunar surface, component-resolved into direct solar, terrain-scattered visible, terrain thermal IR, primary-body (Earth) reflected and primary-body IR. No albedo, emissivity or cube material is applied -- apply your own optical model. Faces are ordered zenith, nadir, north, south, east, west in a site-local ENU frame (right-handed, E x N = U); heights are plumb-line along the site vertical.")
+    "This is a passive, component-resolved incident-irradiance product (W/m^2, no albedo, no "
+    "emissivity, no cube material applied) on six axis-aligned faces at 1,257 points on a 25 m "
+    "lattice over a 500 m radius at A03MP026, validated for the *sunlit and terrain-dominated* "
+    "load regime: direct solar, terrain-scattered visible, terrain thermal IR and Earthshine are "
+    "each independently reproduced against the model's own fields and against closed-form "
+    "geometry to better than 1e-4 relative, and enabling the probe is byte-identical to the "
+    "surface simulation. It is *not* validated as a permanently-shadowed-region product, its "
+    "terrain IR excludes the 3-27 km occluder ring (up to ~4% of a side face's budget, ~6 W/m^2 "
+    "on the worst patch), its upward-facing terrain-IR is a differential-point reading that runs "
+    "a measured factor ~1.8 below the model's own facet-averaged value, and its direct-solar "
+    "term is a binary point-sun test that can be wrong by up to ~1.2 kW/m^2 at the ~0.5% of "
+    "epochs when a cube straddles a shadow edge -- treat all four as one-sided *under*-estimates "
+    "and carry margin accordingly.")
+
+# Fermi's summary above is preserved VERBATIM. Two of its clauses are being
+# overtaken by the fixes and are annotated rather than silently edited, because
+# the sentence is the engineer-forwardable one and its provenance matters:
+#   * "factor ~1.8" -- FC-08 has since localized this to a FAR-FIELD (>10 m)
+#     view-factor disagreement, with the near field agreeing and both of the
+#     original hypotheses excluded. The magnitude stands; the attribution is open.
+#   * "binary point-sun test" -- fixed for products written by an engine at or
+#     after the finite-solar-disk commit; such files carry solar_model =
+#     "finite_disk" in the header, and the clause applies only to files that say
+#     "point_sun".
+SUMMARY_CAVEAT = (
+    "The 'factor ~1.8' clause records the measured magnitude; FC-08 has since localized it to a "
+    "far-field (>10 m) view-factor disagreement with the near field in agreement, so the "
+    "attribution is open. The 'binary point-sun' clause applies only to files whose header says "
+    "solar_model = point_sun; a file saying finite_disk was written after that fix.")
 
 RING_NOTE = (
     "terrain_vis and terrain_ir EXCLUDE the occluder-ring contribution: the ring is a "
@@ -192,10 +220,34 @@ def qa(d):
     if n_neg:
         fails.append("%d negative flux values" % n_neg)
 
-    # Nadir consistency: the facet beneath cannot contribute less than its own
-    # blackbody-floor emission times its own view factor. Catches a mis-indexed
-    # cube -> face mapping that every structural check would pass.
-    eps_lo = 0.90          # lunar regolith is ~0.95; use a conservative floor
+    # Minor 8: the ONE-SIDED check below pads eps to 0.90 against a model eps of
+    # 0.95, so its "margin" is mostly the padding -- at the model's own eps the
+    # one-sided ratio is 1.0025, a near-tautology. The TWO-SIDED ratio
+    #     tIR_nadir / (eps*sigma*T_face^4 * sum_j F)
+    # is the meaningful statistic: it is the flush limit in disguise, and it
+    # should sit at 1 when the nadir patch is dominated by the facet beneath.
+    # Reported first, and it is not padded.
+    try:
+        import numpy as _np
+        Fl = _np.asarray(d["flux"], dtype=_np.float64).reshape(nc, nf, d["n_comp"], ns)
+        Tf = _np.asarray(d["t_face"], dtype=_np.float64).reshape(nc, ns)
+        fsky = _np.asarray(d["f_sky"], _np.float64).reshape(nc, nf)[:, 1]
+        fring = _np.asarray(d["f_ring"], _np.float64).reshape(nc, nf)[:, 1]
+        sumF = (1.0 - fsky - fring)[:, None]
+        denom = 0.95 * SIGMA * Tf ** 4 * sumF
+        good = denom > 0
+        two = Fl[:, 1, 2, :][good] / denom[good]
+        qs = _np.percentile(two, [1, 50, 99])
+        print("  nadir two-sided ratio tIR/(eps*sigma*T^4*sumF): "
+              "p01 %.4f  MEDIAN %.4f  p99 %.4f   (unpadded; 1.0 = flush limit)"
+              % (qs[0], qs[1], qs[2]))
+        if not (0.95 <= qs[1] <= 1.05):
+            fails.append("nadir two-sided median ratio %.4f is not ~1" % qs[1])
+    except ImportError:
+        pass
+
+    eps_lo = 0.90          # PADDED floor; see the note above -- retained only as
+                           # a crude one-sided guard, not quoted as a margin
     worst_ratio = 1e30
     worst_at = None
     for cu in range(nc):
@@ -365,6 +417,7 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         h.attrs["ring_note"] = RING_NOTE
         h.attrs["time_axis_source"] = "time_steps.txt"
         h.attrs["summary"] = ENGINEER_SUMMARY
+        h.attrs["summary_caveat"] = SUMMARY_CAVEAT
         # --- Finding 3: the normative orientation frame, in the file itself ---
         h.attrs["face_order"] = [x.encode() for x in FACE_NAMES]
         h.attrs["component_order"] = [x.encode() for x in COMP_NAMES]

@@ -404,7 +404,11 @@ int main(int argc, char** argv) {
         std::printf("center    : (not given) using core centroid direction "
                     "lat=%.6f lon=%.6f\n", args.center_lat, args.center_lon);
     }
-    const Vec3 U = unit(C);                       // local vertical (plumb line)
+    // U = C, NOT unit(C): dirFromLatLon already normalized, and the centroid
+    // branch below normalizes its own average. Re-normalizing here divided by a
+    // |C| that differs from 1 by an ulp and put the site frame one bit away from
+    // the direction a named location computes from the same lat/lon.
+    const Vec3 U = C;                             // local vertical (plumb line)
     const Vec3 zbody(0, 0, 1);
     const double zdotu = dot(zbody, U);
     if (std::fabs(zdotu) > std::cos(0.1 * kPi / 180.0)) {
@@ -624,14 +628,12 @@ int main(int argc, char** argv) {
         // lat/lon -> the SITE frame, via the same basis the lattice uses. At the
         // site's own lat/lon this yields exactly (0, 0), so a named location
         // placed there reproduces the lattice origin cube bit for bit.
-        // The site frame is U = unit(C) where C = dirFromLatLon(...), i.e. the
-        // direction is normalized TWICE (dirFromLatLon already returns a unit
-        // vector). Applying the same FORMULA once was not enough -- the second
-        // normalization divides by a |C| that differs from 1 by an ulp, so d
-        // and U disagreed in the last bit and left ~2e-11 m in the offset. The
-        // two paths must apply the same SEQUENCE of operations, not merely the
-        // same algebra; hence the deliberate second unit() here.
-        const Vec3 d = unit(dirFromLatLon(L.lat, L.lon));
+        // dirFromLatLon already returns a unit vector and the site frame now
+        // takes U = C directly, so ONE call is the whole story on both paths.
+        // (An earlier version compensated by normalizing twice here to match a
+        // double-normalized U -- symptom-matching. The clean fix is to stop
+        // normalizing twice on the other side, which is what U = C does.)
+        const Vec3 d = dirFromLatLon(L.lat, L.lon);
         // Difference the DIRECTIONS first, then scale. The algebraically
         // identical `d * r_mean - org` subtracts two ~1.7e6 m vectors to get a
         // ~0 m result -- catastrophic cancellation that left a ~1e-11 m residue

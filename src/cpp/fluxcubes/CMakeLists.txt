@@ -48,6 +48,14 @@ target_include_directories(ptm_flux_cube_geom PRIVATE
 if(OpenMP_CXX_FOUND)
     target_link_libraries(ptm_flux_cube_geom PRIVATE OpenMP::OpenMP_CXX)
 endif()
+# Minor 12: pin FP contraction OFF for this TU. The grid-vs-named bit-identity
+# check depends on two call sites evaluating the same trig identically; with
+# contraction enabled the optimizer may fuse one and not the other, and the
+# check fails for a reason that has nothing to do with the geometry. Pinning it
+# makes the guarantee a property of the build, not of the optimizer's mood.
+if(NOT MSVC)
+    target_compile_options(ptm_flux_cube_geom PRIVATE -ffp-contract=off)
+endif()
 set_target_properties(ptm_flux_cube_geom PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )

@@ -49,6 +49,13 @@ struct PassInputs {
     std::string cache_file;
     double geomhash_core = 0.0;     // sum_i (A_i + (i+1)*A_i*1e-9) over CORE faces
     size_t n_faces_core = 0;
+    // FNV-1a 64 of the occluder PLY the RUN is using. The cache records the hash
+    // of the ring it was built against, and the ring changes every sky fraction
+    // in the file -- so a cache built against a different ring is as wrong as one
+    // built against a different core, and until this was checked it loaded
+    // silently. 0 => the caller could not compute one; then the check is skipped
+    // and the pass SAYS SO rather than implying it verified something.
+    uint64_t ring_hash = 0;
 
     // --- time axis -------------------------------------------------------
     // MUST be the same (times, time_strings) pair that was handed to
@@ -114,6 +121,14 @@ struct PassInputs {
     bool write_csv = true;
     int  write_csv_max_cubes = 0;      // 0 = every cube
     int  shadow_probe_rays = 5;        // 1 = center only; 5 = center + 4 rim
+    // FINITE SOLAR DISK. The Sun is not a point: its angular radius is ~0.26 deg
+    // at 1 AU, so a shadow edge is smeared by dist*tan(alpha) -- 0.045 m at a
+    // 10 m occluder, 0.45 m at 100 m. A binary point-sun test therefore returns
+    // a hard 0 or 1 where the engine resolves a partial disk, and the error is
+    // the FULL beam (up to ~1.2 kW/m^2) at the epochs where a cube straddles an
+    // edge. 0 => point sun (the old behaviour), recorded in the header.
+    double solar_radius_km = 0.0;
+    int    solar_disk_samples = 128;   // escalation count when the 5-probe splits
     std::string provenance_json;       // engine sha / md5 / config, echoed verbatim
     // Names the CONFIG asked for. The pass verifies the cache actually contains
     // every one and REFUSES otherwise -- editing the YAML without rebuilding the

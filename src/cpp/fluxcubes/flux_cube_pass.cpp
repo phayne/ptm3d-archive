@@ -3,6 +3,7 @@
 
 #include "flux_cube_format.h"
 #include "../radiation/radiosity_reconstruction.h"
+#include "../illumination/primary_disk.h"
 
 #include <algorithm>
 #include <cmath>
@@ -131,6 +132,56 @@ void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
     }
 }
 
+// Unoccluded fraction of the SOLAR DISK seen from `o`, using the ENGINE'S OWN
+// ladder primitives (ptm::disk::probeOffset / hammersley / squareToConcentricDisk,
+// the same functions illumination_model.cpp:4360-4368 escalates through). Not a
+// second sampler: the shape of the ladder and the point set are the engine's.
+//
+//   alpha <= 0            -> point sun, binary test (legacy behaviour)
+//   5-probe unanimous     -> 1 or 0, no further rays
+//   5-probe split         -> `samples` directions across the disk
+//
+// Returns the fraction in [0,1]; `split` reports whether the disk was partially
+// occluded, which is what the penumbral flag should mean.
+double solarDiskVisibility(const V3& o, const V3& s_hat, double alpha,
+                           int samples,
+                           const std::function<bool(const std::array<double,3>&,
+                                                    const std::array<double,3>&)>& occluded,
+                           bool& split) {
+    split = false;
+    if (alpha <= 0.0) return occluded(arr(o), arr(s_hat)) ? 0.0 : 1.0;
+    // Disk basis perpendicular to the Sun direction.
+    const V3 a = (std::fabs(s_hat.z) < 0.9) ? V3{0, 0, 1} : V3{1, 0, 0};
+    const V3 t = unit3({a.y * s_hat.z - a.z * s_hat.y,
+                        a.z * s_hat.x - a.x * s_hat.z,
+                        a.x * s_hat.y - a.y * s_hat.x});
+    const V3 b = {s_hat.y * t.z - s_hat.z * t.y,
+                  s_hat.z * t.x - s_hat.x * t.z,
+                  s_hat.x * t.y - s_hat.y * t.x};
+    const double ta = std::tan(alpha);
+    auto dir = [&](double dx, double dy) {
+        return unit3(add(s_hat, add(mul(t, dx * ta), mul(b, dy * ta))));
+    };
+    int clear = 0;
+    for (uint32_t k = 0; k < ptm::disk::PRIMARY_DISK_PROBES; ++k) {
+        double dx, dy;
+        ptm::disk::probeOffset(k, dx, dy);
+        if (!occluded(arr(o), arr(dir(dx, dy)))) ++clear;
+    }
+    if (clear == 0) return 0.0;
+    if (clear == static_cast<int>(ptm::disk::PRIMARY_DISK_PROBES)) return 1.0;
+    split = true;
+    const uint32_t N = static_cast<uint32_t>(std::max(8, samples));
+    int hit = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+        double u, v, dx, dy;
+        ptm::disk::hammersley(i, N, 0.0, 0.0, u, v);
+        ptm::disk::squareToConcentricDisk(u, v, dx, dy);
+        if (!occluded(arr(o), arr(dir(dx, dy)))) ++hit;
+    }
+    return static_cast<double>(hit) / static_cast<double>(N);
+}
+
 }  // namespace
 
 bool runFluxCubePass(const PassInputs& in, std::string& err) {
@@ -207,6 +258,21 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                       << in.expected_location_names.size()
                       << "; all configured names are present, the extras come from the cache.\n";
     }
+
+    // Minor 6: the ring identity, not just the core's.
+    if (c.h.ring_hash != 0 && in.ring_hash != 0 && c.h.ring_hash != in.ring_hash) {
+        std::ostringstream m;
+        m << "flux cubes: the cache was built against a DIFFERENT occluder ring (cache hash "
+          << c.h.ring_hash << " vs run " << in.ring_hash
+          << "). The ring sets every sky fraction in the file, so this is as wrong as a "
+             "mismatched core mesh. Rebuild the cache against the run's ring.";
+        err = m.str();
+        return false;
+    }
+    if (c.h.ring_hash == 0 || in.ring_hash == 0)
+        std::cout << "  [flux-cubes] NOTE: ring identity NOT verified (cache hash "
+                  << c.h.ring_hash << ", run hash " << in.ring_hash
+                  << "); only the core mesh was checked.\n";
 
     const size_t nf = in.n_faces_core;
     if (in.emissivity.size() != nf || in.bond_albedo.size() != nf) {
@@ -333,6 +399,15 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             const V3 v{sp[0], sp[1], sp[2]};
             if (len3(v) > 0) { s_hat = unit3(v); have_sun = true; }
         }
+        // Solar angular radius this epoch, from the actual Sun distance.
+        double solar_alpha = 0.0;
+        if (have_sun && in.solar_radius_km > 0.0 && in.sun_positions
+            && t < static_cast<int>(in.sun_positions->size())) {
+            const auto& sp = (*in.sun_positions)[t];
+            const double dist_km = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
+            if (dist_km > in.solar_radius_km)
+                solar_alpha = std::asin(in.solar_radius_km / dist_km);
+        }
         V3 p_pos{0, 0, 0};
         bool have_primary = false;
         if (in.primary_positions && t < static_cast<int>(in.primary_positions->size())) {
@@ -355,23 +430,31 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             // an answer with no physical referent.
             double v_sun = 0.0;
             if (have_sun) {
-                int clear = 0, total = 0;
-                std::array<V3, 5> probes = {xc, xc, xc, xc, xc};
-                int n_probe = 1;
+                // ANGULAR (finite solar disk) at the cube centre, plus the
+                // SPATIAL spread over the cube's own extent. The two smear the
+                // shadow edge on comparable scales at this height and neither
+                // subsumes the other: the disk is ~0.045 m at a 10 m occluder,
+                // the cube is edge_m ~0.11 m. Averaging the disk fraction over
+                // the spatial probe points captures both.
+                const double he = (cr.edge_m > 0.0f) ? 0.5 * cr.edge_m : header_half_edge;
+                std::array<V3, 5> pts = {xc, xc, xc, xc, xc};
+                int n_pt = 1;
                 if (in.shadow_probe_rays >= 5) {
-                    const double he = (cr.edge_m > 0.0f) ? 0.5 * cr.edge_m : header_half_edge;
-                    probes[1] = add(xc, mul(E, he));
-                    probes[2] = sub(xc, mul(E, he));
-                    probes[3] = add(xc, mul(N, he));
-                    probes[4] = sub(xc, mul(N, he));
-                    n_probe = 5;
+                    pts[1] = add(xc, mul(E, he)); pts[2] = sub(xc, mul(E, he));
+                    pts[3] = add(xc, mul(N, he)); pts[4] = sub(xc, mul(N, he));
+                    n_pt = 5;
                 }
-                for (int q = 0; q < n_probe; ++q) {
-                    ++total;
-                    if (!in.occluded(arr(probes[q]), arr(s_hat))) ++clear;
+                double acc = 0.0; bool any_split = false;
+                for (int q = 0; q < n_pt; ++q) {
+                    bool sp = false;
+                    acc += solarDiskVisibility(pts[q], s_hat, solar_alpha,
+                                               in.solar_disk_samples, in.occluded, sp);
+                    any_split = any_split || sp;
                 }
-                v_sun = static_cast<double>(clear) / total;
-                if (clear > 0 && clear < total)
+                v_sun = acc / n_pt;
+                // Penumbral now means what it says: the disk was partially
+                // occluded, or the spatial probes disagreed.
+                if (any_split || (v_sun > 0.0 && v_sun < 1.0))
                     penumbral[static_cast<size_t>(cu) * n_steps + k] = 1;
             }
 
@@ -502,6 +585,9 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
        << "\",\"primary_disk_samples\":"
        << (in.primary_radius_km > 0.0 ? in.primary_disk_samples : 1) << ","
        << "\"shadow_probe_rays\":" << (in.shadow_probe_rays >= 5 ? 5 : 1) << ","
+       << "\"solar_model\":\"" << (in.solar_radius_km > 0.0 ? "finite_disk" : "point_sun")
+       << "\",\"solar_disk_samples\":"
+       << (in.solar_radius_km > 0.0 ? in.solar_disk_samples : 1) << ","
        << "\"geometry_cache\":\"" << in.cache_file << "\","
        << "\"provenance\":" << (in.provenance_json.empty() ? "null" : in.provenance_json)
        << "}";
