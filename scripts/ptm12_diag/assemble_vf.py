@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Assemble the per-partner referee sweep into a SYMMETRIC (reciprocal) sparse VF.
-S_ij = A_i F_ij ; symmetric S_sym per undirected pair = mean of available directions ;
+S_ij = A_i F_ij ; symmetric S_sym per undirected pair = mean over the 2 ray directions
+TRIED (divisor 2, a direction with no hit counts as the measured zero) ;
 directed F_ij = S_sym/A_i. Enforce ΣF<=1. Validate ΣF vs moon3d_rowfix_refSigF.bin anchor.
 Writes CSR: n(int32) indptr(n+1 int64) nnz(int64) indices(nnz int32) data(nnz float32)."""
 import numpy as np, glob, time, sys
@@ -38,8 +39,12 @@ del order
 bnd=np.concatenate(([0],np.nonzero(np.diff(key))[0]+1,[len(key)]))
 gstart=bnd[:-1]; gend=bnd[1:]
 csum=np.concatenate(([0.0],np.cumsum(S)))
-gsum=csum[gend]-csum[gstart]; gcnt=(gend-gstart).astype(np.float64)
-Ssym=gsum/gcnt                    # mean of available directions
+gsum=csum[gend]-csum[gstart]
+# FC-08 (2026-08-19): divide by the 2 ray directions TRIED, not by the number that
+# happened to hit. A direction with no hit is the measured zero it is (the sweep visits
+# every face in both roles); dividing by the hit count conditions on detection and
+# inflates far-field entries by up to 2x. See assemble_vf_haworth.py for the full note.
+Ssym=gsum/2.0                     # mean over the two ray directions tried (unbiased)
 a=lo[gstart]; bb=hi[gstart]       # undirected pair endpoints (a<bb)
 print("unique undirected pairs %d (%.1fM)  %.0fs"%(len(a),len(a)/1e6,time.time()-t0)); sys.stdout.flush()
 # emit symmetric directed entries: (a,bb,Ssym/A_a) and (bb,a,Ssym/A_bb)

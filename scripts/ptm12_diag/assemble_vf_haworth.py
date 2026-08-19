@@ -11,6 +11,10 @@ Haworth build this script is invoked with MIN_HITS matching what the sweep used 
 so this second filter is a no-op safety net, not a re-introduction of the old bug: it
 uses the SAME NRAYS the sweep actually ran at (passed explicitly, no silent default).
 
+Symmetrization divides each undirected pair by the 2 ray directions that were TRIED, not
+by the number that happened to hit (FC-08, 2026-08-19) -- see the comment at the
+symmetrize block and scripts/ptm12_diag/test_vf_assembler_gate.py.
+
 Usage: assemble_vf_haworth.py <mesh.ply> <sweep_chunks_glob> <nrays> <min_hits> <out.csr>
   [--floor-idx floor_idx.npy]   # for the before/after floor-far-wall-aggregate report
 """
@@ -179,6 +183,15 @@ def main():
                          "(W/m^2, e.g. an illumination-proxy). Required when --radiance-prune-eps>0.")
     ap.add_argument("--radiance-albedo", type=float, default=0.12,
                     help="A0 for the visible-band radiance weight (reflected solar). Default 0.12.")
+    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits"), default="tried",
+                    help="Divisor used when averaging the two ray directions of an undirected "
+                         "pair. 'tried' (DEFAULT, correct): divide by the 2 directions that were "
+                         "TRIED, counting a direction that registered no hit as the measured zero "
+                         "it is -- unbiased at every ray budget. 'hits' reproduces the "
+                         "pre-2026-08-19 DEFECTIVE estimator (divide by the number of directions "
+                         "that happened to hit), which inflates far-field entries by up to 2x. "
+                         "'hits' exists ONLY so the regression gate can prove the defect; it must "
+                         "never be used to build a view-factor matrix for science.")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -229,14 +242,39 @@ def main():
               f"NEW-rule (min_hits={a.min_hits}) kept aggregate ΣF(far)={new_far_sum:.5f}  "
               f"ratio new/old={new_far_sum/max(old_far_sum,1e-12):.2f}x")
 
-    # ---- symmetrize (mean of available directions) ----
+    # ---- symmetrize: mean over the TWO ray directions that were TRIED ----
+    # S_ij = A_i F_ij carries two independent unbiased Monte-Carlo estimates, one per
+    # ray direction. Their plain mean -- divisor 2, with a direction that registered no
+    # hit counted as the measured ZERO it is -- is unbiased at every ray budget. The
+    # sweep visits every face in both roles (the run's coverage line proves it), so a
+    # missing direction is a measurement, not missing data.
+    #
+    # FC-08 (2026-08-19): this line used to divide by the number of directions that
+    # HAPPENED TO REGISTER A HIT. That conditions on detection and inflates the result
+    # by E[assembled]/S_true = 2 - (p1+p2)/2, where p_k = P(direction k hits at least
+    # once): 1 where both directions are well sampled, and exactly 2 in the far field
+    # where neither fires reliably. Closed-form arbitration on a coaxial disk
+    # (F = a^2/(a^2+H^2) = 0.250000): raw MC 0.249965, old divisor 0.437889 (+75%),
+    # divisor 2 -> 0.251458. The old estimator is also ray-budget dependent; this one
+    # is not. See test_vf_assembler_gate.py and
+    # SESSION-NOTES-2026-08-19-fc08-far-field-vf-rootcause.md.
     S = area[I] * V.astype(np.float64)
     lo = np.minimum(I, J).astype(np.int64); hi = np.maximum(I, J).astype(np.int64)
     key = lo * np.int64(N) + hi
     o = np.argsort(key, kind="stable"); key = key[o]; S = S[o]; lo = lo[o]; hi = hi[o]
     bnd = np.concatenate(([0], np.nonzero(np.diff(key))[0] + 1, [len(key)]))
     gs = bnd[:-1]; ge = bnd[1:]; csum = np.concatenate(([0.0], np.cumsum(S)))
-    Ssym = (csum[ge] - csum[gs]) / (ge - gs).astype(np.float64)
+    if a.symmetrize_divisor == "hits":
+        print("[assemble] *** WARNING: --symmetrize-divisor hits reproduces the pre-2026-08-19 "
+              "DEFECTIVE FC-08 estimator: far-field entries are inflated by up to 2x and the "
+              "result depends on the ray budget. This CSR is for gate use only -- DO NOT USE "
+              "IT FOR SCIENCE. ***", file=sys.stderr)
+        ndir = (ge - gs).astype(np.float64)
+    else:
+        ndir = 2.0
+    Ssym = (csum[ge] - csum[gs]) / ndir
+    print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
+          f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else 'directions HIT -- DEFECTIVE, gate use only'})")
     a_idx = lo[gs]; b_idx = hi[gs]
     print(f"[assemble] unique undirected pairs={len(a_idx)} ({len(a_idx)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
