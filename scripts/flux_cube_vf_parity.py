@@ -8,9 +8,10 @@ rows agree the flux gap is not a view-factor gap, and if they disagree the gap
 is exactly the disagreement.
 
 Three-way outcome:
-  A. Row sums agree (within MC error) -> the cube's VF row is right, and the
-     0.55-0.60x flux ratio is NOT a view-factor effect. It is then the
-     differential-point vs facet-area-average distinction, i.e. a disclosure.
+  A. Row sums agree (within MC error) -> the cube's VF row is right.
+     RESOLVED 2026-08-19: this is the outcome against the CORRECTED matrix. The
+     original 0.51x was outcome B, and the defect was in the offline assembler
+     (divide by hit count rather than by 2), not in the cube.
   B. The ENGINE's row sum is systematically LARGER than the ray-traced one, by
      about the observed flux ratio -> the engine over-counts near-field view
      factor on level terrain. Documented failure class; the cube is the
@@ -123,9 +124,14 @@ def main():
     print("\nINTERPRETATION")
     m = np.nanmedian(rr)
     if 0.9 <= m <= 1.1:
-        print("  Outcome A: the two view-factor rows AGREE. The 0.55-0.60x flux gap is")
-        print("  therefore NOT a view-factor effect -- it is the differential-point vs")
-        print("  facet-area-average distinction, and belongs in the header as a disclosure.")
+        print("  Outcome A: the two view-factor rows AGREE.")
+        print("  NOTE (2026-08-19): against the ORIGINAL MP026 matrix this ratio was 0.51 and")
+        print("  outcome B held. The cause was found in the OFFLINE ASSEMBLER -- entries were")
+        print("  divided by the hit count instead of by 2, inflating far-field view factors by")
+        print("  up to exactly 2x (fixed on fix/vf-assembler-divisor). Against the re-assembled")
+        print("  matrix, with the cube's rows UNCHANGED, the ratio is ~0.98-0.99. If you are")
+        print("  seeing outcome A, you are pointed at a corrected matrix; if you see 0.51, you")
+        print("  are pointed at a pre-fix one.")
     elif m < 0.9:
         print("  Outcome B: the ENGINE's row carries %.2fx the geometric weight the ray-traced" % (1.0 / m))
         print("  hemisphere finds, on LEVEL terrain where the true answer is bounded by the")

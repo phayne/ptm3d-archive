@@ -44,17 +44,18 @@ COMP_NAMES = ["direct", "terrain_vis", "terrain_ir", "primary_refl", "primary_ir
 SIGMA = 5.670374419e-8
 
 ZENITH_TIR_CAVEAT = (
-    "NOT ENGINEERING-GRADE: the zenith terrain_ir column. At parity height the cube's "
-    "ray-traced upward view-factor row sums to ~0.51x the engine's own view-factor row for "
-    "the same facet (measured on 40 level facets of the A03MP026 core). The disagreement is "
-    "GEOMETRIC, not statistical: the cube's row is converged (-0.9% for 16x the rays) and the "
-    "near field agrees (2-10 m within 15%); the gap is entirely beyond 10 m, where the engine "
-    "assigns ~1.9x more weight. It is also NOT the differential-point vs facet-area-average "
-    "distinction, which predicts a dependence on facet size that is absent (Pearson r = +0.035 "
-    "over 40 facets). Until this is resolved, treat zenith terrain_ir as indicative only. "
-    "Every OTHER face and component is unaffected: on those the terrain-IR path reproduces the "
-    "engine's own frames to 7.4e-15, and the nadir face -- which carries the large terrain-IR "
-    "numbers -- is dominated by a single facet at f_max ~0.85 and is not implicated.")
+    "FC-08, RESOLVED -- EXONERATED. Earlier versions of this file flagged the zenith terrain_ir "
+    "column as not engineering-grade, on a measured 0.51x parity between the cube's ray-traced "
+    "upward view-factor row and the model's own row for the same facet. That flag is WITHDRAWN. "
+    "The discrepancy was traced to the REFERENCE matrix: the offline view-factor assembler "
+    "divided entries by the hit count instead of by 2, inflating far-field view factors by up to "
+    "exactly 2x (fixed on fix/vf-assembler-divisor). Re-running the same parity check against the "
+    "re-assembled matrix, with the cube's own rows unchanged, moves the median ratio from 0.513 "
+    "to 0.978-0.99 over 40 level facets -- a ~2% residual inside sampling scatter. The cube was "
+    "correct, and is the instrument that exposed the defect. CAVEAT ON THE DATA IN THIS FILE: it "
+    "was computed against the PRE-FIX matrix, so its absolute terrain fluxes inherit that defect "
+    "through the underlying thermal solution, in common with the rest of that campaign "
+    "generation. The correction is not applied retroactively here.")
 
 ENGINEER_SUMMARY = (
     "This is a passive, component-resolved incident-irradiance product (W/m^2, no albedo, no "
@@ -70,17 +71,35 @@ ENGINEER_SUMMARY = (
     "reaching 0.6 kW/m^2 (summer) and 1.0 kW/m^2 (winter) on ~1% of face-epochs, with the "
     "direct-energy integral preserved to better than 0.02% -- carry margin symmetrically at "
     "shadow edges, and treat the edge position itself as resolved only to the ~1 m facet scale of "
-    "the underlying terrain. It is *not* validated as a permanently-shadowed-region product. Two "
-    "one-sided UNDER-estimates remain: terrain IR excludes the 3-27 km occluder ring entirely -- "
+    "the underlying terrain. It is *not* validated as a permanently-shadowed-region product. One "
+    "one-sided UNDER-estimate remains: terrain IR excludes the 3-27 km occluder ring entirely -- "
     "the per-patch omission is in /geometry/missing_ring_flux_Wm2 (mean 0.61, max 6.46 W/m^2 "
     "summer; 0.69 and 7.34 W/m^2 winter, evaluated at the core mesh's own median radiosity and "
     "linearly rescalable), which is at most 3.9% of a patch's hemisphere but reaches tens of "
     "percent of the terrain IR actually reported on the worst west-facing patches and exceeds it "
-    "on the zenith face -- and the zenith terrain_ir column alone is NOT ENGINEERING-GRADE: its "
-    "ray-traced upward view-factor row sums to 0.51x the model's own row for the same facet, a "
-    "converged, purely far-field (>10 m) geometric disagreement whose attribution is open "
-    "(FC-08), so use that one column as indicative only. Every other face and component is "
-    "unaffected.")
+    "on the zenith face. The zenith terrain_ir column carried an indicative-only flag in earlier "
+    "versions of this file; that flag is WITHDRAWN. The 0.51x parity gap behind it was traced to "
+    "the REFERENCE matrix, not to this product: the offline view-factor assembler divided "
+    "entries by the hit count instead of by 2, inflating far-field view factors by up to exactly "
+    "2x (fixed on fix/vf-assembler-divisor). Against the re-assembled matrix the cube-to-model "
+    "parity is 0.978-0.99 median over 40 level facets with the cube's own rows unchanged, a ~2% "
+    "residual inside sampling scatter -- the cube was correct and is what exposed the defect "
+    "(FC-08, resolved). NOTE that the flux values in THIS file were computed against the "
+    "PRE-FIX matrix, so their absolute terrain fluxes inherit whatever that defect did to the "
+    "underlying thermal solution, in common with the rest of that campaign generation; the "
+    "correction is not applied retroactively here.")
+
+# v2 is archived rather than deleted, for the same reason v1 was: a caveat that
+# has been WITHDRAWN must be recognisable in copies already in circulation, and
+# a sibling attribute does not travel with a pasted sentence.
+SUMMARY_V2 = (
+    "SUPERSEDED -- do not forward. This v2 sentence flagged the zenith terrain_ir column as "
+    "'NOT ENGINEERING-GRADE ... use that one column as indicative only', attributing a 0.51x "
+    "view-factor parity gap to an open question about the cube. That flag is WITHDRAWN and the "
+    "attribution was wrong in the cube's disfavour: the defect was in the offline view-factor "
+    "ASSEMBLER (entries divided by hit count rather than by 2, up to 2x far-field inflation), "
+    "and after re-assembly the parity is 0.978-0.99 median with the cube's rows unchanged. "
+    "Retained only so a copy already in circulation can be recognised and replaced by v3.")
 
 # v1 is archived in the file rather than deleted. Fermi's reason for replacing it
 # is the reason it is archived and not silently dropped: a sibling caveat
@@ -455,7 +474,8 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         h.attrs["time_axis_source"] = "time_steps.txt"
         h.attrs["summary"] = ENGINEER_SUMMARY
         h.attrs["summary_v1"] = SUMMARY_V1
-        h.attrs["summary_version"] = 2
+        h.attrs["summary_v2"] = SUMMARY_V2
+        h.attrs["summary_version"] = 3
         # --- Finding 3: the normative orientation frame, in the file itself ---
         h.attrs["face_order"] = [x.encode() for x in FACE_NAMES]
         h.attrs["component_order"] = [x.encode() for x in COMP_NAMES]

@@ -517,17 +517,23 @@ made "the same point" mean two slightly different points.
 
 ## 13. Known limitations and disclosure (post-gate)
 
-### Zenith terrain-IR is not engineering-grade (FC-08)
-At parity height the cube's upward view-factor row sums to ~0.51× the engine's own row for the
-same facet, measured on 40 level A03MP026 facets. The disagreement is **geometric, not
-statistical** — the cube's row is converged (−0.9% for 16× the rays), the near field agrees
-(2–10 m ratio 1.14, individual partners to ~4%), and the entire gap is beyond 10 m. It is **not**
-the differential-point vs facet-area-average distinction either: that predicts a facet-size
-dependence which is absent (r = +0.035 over 40 facets). Attribution is open; the referee VF's own
-reciprocity/renormalization step is a third candidate. Use `scripts/flux_cube_vf_parity.py` to
-reproduce. **Until resolved, treat zenith `terrain_ir` as indicative only.** No other face or
-component is implicated, and the nadir face that carries the large terrain-IR numbers is
-single-facet dominated (`f_max` p50 0.85).
+### Zenith terrain-IR — FC-08 RESOLVED, cube EXONERATED
+An earlier version of this document flagged the zenith `terrain_ir` column as not
+engineering-grade, on a measured 0.51× parity between the cube's ray-traced upward view-factor row
+and the model's own row for the same facet. **That flag is withdrawn.**
+
+The discrepancy was in the **reference matrix**, not the cube: the offline view-factor assembler
+divided entries by the hit count instead of by 2, inflating far-field view factors by up to exactly
+2× (fixed on `fix/vf-assembler-divisor`). Re-running the same check
+(`scripts/flux_cube_vf_parity.py`) against the re-assembled matrix, **with the cube's own rows
+unchanged**, moves the median ratio **0.513 → 0.978–0.99** over 40 level facets — a ~2% residual
+inside sampling scatter. The near-field agreement, the ray-count convergence and the absent
+facet-size dependence that this branch measured were all pointing at the reference all along.
+
+⚠️ **The delivered products predate the fix.** Their absolute terrain fluxes inherit the assembler
+defect through the underlying thermal solution, in common with the rest of that campaign
+generation. The correction is not applied retroactively; a re-run against the corrected matrix
+would be needed for that.
 
 ### Sampling budget is per-patch, not per-face-orientation
 The ray budget was set from a B-free split-half total variation that converges at ~N^-0.23, where
