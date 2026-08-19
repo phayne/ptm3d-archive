@@ -191,6 +191,7 @@ struct PatchRecord {
 //   double epoch_et [n_steps]
 //   char   epoch_utc[n_steps][24]
 //   char   json[json_len]
+//   char   names[n_cubes][kNameLen]        ONLY when has_names == 1
 // float64 for flux is deliberate: the dynamic range at a polar site runs from
 // ~0.01 W/m^2 (PSR Earthshine) to ~1000 W/m^2 (noon), and the PSR end is the
 // end that sizes a radiator.
@@ -213,7 +214,9 @@ struct FcbHeader {
     double   frame_north[3];
     double   frame_up[3];
     uint32_t json_len;
-    uint32_t reserved;
+    // 1 => a names block of n_cubes * kNameLen bytes follows the JSON, same
+    // trailing-block convention as the .fcg. (This slot was `reserved`.)
+    uint32_t has_names;
 };
 
 #pragma pack(pop)

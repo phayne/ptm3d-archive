@@ -21014,6 +21014,11 @@ int main(int argc, char** argv) {
         fcin.write_csv = sim_config.flux_cubes.write_csv;
         fcin.write_csv_max_cubes = sim_config.flux_cubes.write_csv_max_cubes;
         fcin.shadow_probe_rays = sim_config.flux_cubes.shadow_probe_rays;
+        for (const auto& L : sim_config.flux_cubes.locations)
+            fcin.expected_location_names.push_back(L.name);
+        if (!fcin.expected_location_names.empty())
+            std::cout << "[flux-cubes] config names " << fcin.expected_location_names.size()
+                      << " location(s); the cache must contain every one." << std::endl;
 
         const double fc_S = planet.S;
         fcin.solar_const = [fc_S](int t) { return solarConstForStep(t, fc_S); };
@@ -21051,7 +21056,7 @@ int main(int argc, char** argv) {
         if (!ptm::fluxcubes::runFluxCubePass(fcin, fc_err)) {
             // A run that was asked for a product and made none must FAIL, never
             // downgrade to "ran without cubes".
-            std::cerr << "[FATAL] flux cubes: " << fc_err << std::endl;
+            std::cerr << "[FATAL] " << fc_err << std::endl;   // fc_err is already prefixed
             return 1;
         }
     }

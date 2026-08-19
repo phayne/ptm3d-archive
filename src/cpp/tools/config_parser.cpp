@@ -221,6 +221,7 @@ void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
     static const char* const kRead[] = {
         "cache_file",
         "enabled",
+        "locations",
         "shadow_probe_rays",
         "write_binary",
         "write_csv",
@@ -539,6 +540,23 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.flux_cubes.write_csv = getWithDefault(fc, "write_csv", config.flux_cubes.write_csv);
             config.flux_cubes.write_csv_max_cubes = getWithDefault(fc, "write_csv_max_cubes", config.flux_cubes.write_csv_max_cubes);
             config.flux_cubes.shadow_probe_rays = getWithDefault(fc, "shadow_probe_rays", config.flux_cubes.shadow_probe_rays);
+            if (fc["locations"] && fc["locations"].IsSequence()) {
+                for (const auto& L : fc["locations"]) {
+                    SimulationConfig::FluxCubeParams::NamedLocation nl;
+                    nl.name     = getWithDefault(L, "name", std::string());
+                    nl.lat_deg  = getWithDefault(L, "lat_deg", 0.0);
+                    nl.lon_deg  = getWithDefault(L, "lon_deg", 0.0);
+                    nl.height_m = getWithDefault(L, "height_m", -1.0);
+                    nl.edge_m   = getWithDefault(L, "edge_m", -1.0);
+                    if (nl.name.empty()) {
+                        std::cerr << "[config] WARNING: a flux_cubes.locations entry has no "
+                                     "`name:` and will be ignored -- outputs are keyed by name."
+                                  << std::endl;
+                        continue;
+                    }
+                    config.flux_cubes.locations.push_back(nl);
+                }
+            }
             warnUnreadFluxCubeKeys(fc);
         }
 

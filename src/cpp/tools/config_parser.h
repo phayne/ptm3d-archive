@@ -486,6 +486,22 @@ struct SimulationConfig {
         // horizontal face centers (spread = edge_m), which also sets the
         // per-epoch `penumbral` flag when the five disagree.
         int  shadow_probe_rays = 5;
+        // Named lat/lon locations, the user-facing analog of the engine's
+        // `locations:` mechanism. These do NOT place anything by themselves --
+        // placement is baked into the cache by ptm_flux_cube_geom, which is the
+        // only thing that may touch geometry. What the engine does with this
+        // list is VERIFY that the cache actually contains every name asked for,
+        // and refuse otherwise. That closes the "edited the YAML, forgot to
+        // rebuild the cache" trap, which would otherwise hand back a product
+        // silently describing the previous set of locations.
+        struct NamedLocation {
+            std::string name;
+            double lat_deg = 0.0;
+            double lon_deg = 0.0;
+            double height_m = -1.0;   // <0 => cache/site default
+            double edge_m = -1.0;     // <0 => cache/site default
+        };
+        std::vector<NamedLocation> locations;
     } flux_cubes;
 
     // Radiation Exchange

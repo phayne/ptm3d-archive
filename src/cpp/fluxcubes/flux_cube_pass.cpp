@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -44,6 +45,7 @@ struct Cache {
     std::vector<int32_t> cols;
     std::vector<float> vals;
     std::string json;
+    std::vector<std::string> names;   // empty, or one per cube
 };
 
 bool loadCache(const std::string& path, Cache& c, std::string& err) {
@@ -78,6 +80,21 @@ bool loadCache(const std::string& path, Cache& c, std::string& err) {
     c.json.resize(c.h.json_len);
     if (c.h.json_len) f.read(&c.json[0], c.h.json_len);
     if (!f) { err = "flux-cube cache '" + path + "' is truncated"; return false; }
+    // Names, if present, sit AFTER the JSON -- see flux_cube_format.h.
+    if (c.h.has_names) {
+        std::vector<char> nb(static_cast<size_t>(c.h.n_cubes) * kNameLen, 0);
+        f.read(nb.data(), static_cast<std::streamsize>(nb.size()));
+        if (!f) {
+            err = "flux-cube cache '" + path + "' declares named locations but its names "
+                  "block is truncated";
+            return false;
+        }
+        c.names.resize(c.h.n_cubes);
+        for (uint32_t k = 0; k < c.h.n_cubes; ++k) {
+            const char* p0 = &nb[static_cast<size_t>(k) * kNameLen];
+            c.names[k].assign(p0, ::strnlen(p0, kNameLen));
+        }
+    }
     return true;
 }
 
@@ -160,6 +177,35 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
           << " --out " << in.cache_file;
         err = m.str();
         return false;
+    }
+
+    // --- the configured names must actually be in the cache -----------------
+    if (!in.expected_location_names.empty()) {
+        std::vector<std::string> missing;
+        for (const std::string& want : in.expected_location_names) {
+            bool found = false;
+            for (const std::string& got : c.names) if (got == want) { found = true; break; }
+            if (!found) missing.push_back(want);
+        }
+        if (!missing.empty()) {
+            std::ostringstream m;
+            m << "flux cubes: the geometry cache does not contain " << missing.size()
+              << " location(s) named in flux_cubes.locations:";
+            for (const std::string& s2 : missing) m << " '" << s2 << "'";
+            m << ". The cache is built by ptm_flux_cube_geom --locations, so editing the YAML "
+                 "does not move a cube. Rebuild the cache with the current location list, or "
+                 "remove the entries. Refusing rather than returning a product that silently "
+                 "describes the PREVIOUS set of locations.";
+            err = m.str();
+            return false;
+        }
+        size_t n_named = 0;
+        for (const std::string& got : c.names) if (!got.empty()) ++n_named;
+        if (n_named != in.expected_location_names.size())
+            std::cout << "  [flux-cubes] NOTE: the cache carries " << n_named
+                      << " named location(s) but the config lists "
+                      << in.expected_location_names.size()
+                      << "; all configured names are present, the extras come from the cache.\n";
     }
 
     const size_t nf = in.n_faces_core;
@@ -246,7 +292,11 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
 
     const V3 U = mk(c.h.frame_up), N = mk(c.h.frame_north), E = mk(c.h.frame_east);
     const std::array<V3, kNumFaces> fn = {U, mul(U, -1.0), N, mul(N, -1.0), E, mul(E, -1.0)};
-    const double half_edge = 0.5 * c.h.edge_m;
+    // PER-CUBE edge: a named location may override the cache-level value, so the
+    // shadow-probe spread must come from the cube, not the header. Falls back to
+    // the header for caches written before the field existed (it was a pad, so
+    // an old cache reads 0 there).
+    const double header_half_edge = 0.5 * c.h.edge_m;
     // Disk sampling and the distance handed to the engine's primary-body
     // functions are done in KM, because that is the unit those functions and
     // primary_positions use. Ray DIRECTIONS are dimensionless, so they are
@@ -309,10 +359,11 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                 std::array<V3, 5> probes = {xc, xc, xc, xc, xc};
                 int n_probe = 1;
                 if (in.shadow_probe_rays >= 5) {
-                    probes[1] = add(xc, mul(E, half_edge));
-                    probes[2] = sub(xc, mul(E, half_edge));
-                    probes[3] = add(xc, mul(N, half_edge));
-                    probes[4] = sub(xc, mul(N, half_edge));
+                    const double he = (cr.edge_m > 0.0f) ? 0.5 * cr.edge_m : header_half_edge;
+                    probes[1] = add(xc, mul(E, he));
+                    probes[2] = sub(xc, mul(E, he));
+                    probes[3] = add(xc, mul(N, he));
+                    probes[4] = sub(xc, mul(N, he));
                     n_probe = 5;
                 }
                 for (int q = 0; q < n_probe; ++q) {
@@ -475,6 +526,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
         std::memcpy(h.frame_north, c.h.frame_north, sizeof(h.frame_north));
         std::memcpy(h.frame_up, c.h.frame_up, sizeof(h.frame_up));
         h.json_len = static_cast<uint32_t>(json.size());
+        h.has_names = c.names.empty() ? 0u : 1u;
 
         const std::string fp = dir + "/flux_cubes.fcb";
         std::ofstream o(fp, std::ios::binary);
@@ -506,6 +558,15 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             o.write(buf, sizeof(buf));
         }
         o.write(json.data(), static_cast<std::streamsize>(json.size()));
+        // Names LAST, after the JSON, exactly as in the .fcg: a reader written
+        // against the original .fcb layout parses everything before this at
+        // unchanged offsets and ignores the tail.
+        if (!c.names.empty()) {
+            std::vector<char> nb(static_cast<size_t>(n_cubes) * kNameLen, 0);
+            for (size_t k = 0; k < n_cubes && k < c.names.size(); ++k)
+                std::strncpy(&nb[k * kNameLen], c.names[k].c_str(), kNameLen - 1);
+            o.write(nb.data(), static_cast<std::streamsize>(nb.size()));
+        }
         o.close();
         std::cout << "[flux-cubes] wrote " << fp << " ("
                   << (flux.size() * 8 / 1048576.0) << " MB of flux)\n";
@@ -515,21 +576,39 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
         const std::string cdir = dir + "/csv";
         try { std::filesystem::create_directories(cdir); }
         catch (const std::exception& e) { err = std::string("flux cubes: cannot create csv dir: ") + e.what(); return false; }
-        const size_t n_write = (in.write_csv_max_cubes > 0)
+        // A cap on the lattice fan-out must never drop a NAMED location: those
+        // were asked for explicitly by name, and silently omitting one would be
+        // the same class of failure as silently dropping a cube at placement.
+        size_t n_write = (in.write_csv_max_cubes > 0)
             ? std::min<size_t>(n_cubes, static_cast<size_t>(in.write_csv_max_cubes)) : n_cubes;
+        for (size_t k = 0; k < n_cubes; ++k)
+            if (k < c.names.size() && !c.names[k].empty()) n_write = n_cubes;
         for (size_t cu = 0; cu < n_write; ++cu) {
-            char nm[64];
-            std::snprintf(nm, sizeof(nm), "/cube_%05zu.csv", cu);
+            char nm[96];
+            // Outputs are keyed by NAME for named locations -- that is the point
+            // of naming them -- and by index for lattice cubes.
+            if (cu < c.names.size() && !c.names[cu].empty())
+                std::snprintf(nm, sizeof(nm), "/cube_%s.csv", c.names[cu].c_str());
+            else
+                std::snprintf(nm, sizeof(nm), "/cube_%05zu.csv", cu);
             std::ofstream o(cdir + nm);
             if (!o) { err = "flux cubes: cannot write " + cdir + nm; return false; }
             const CubeRecord& cr = c.cubes[cu];
-            o << "# ptm3d_flux_cubes v1  cube=" << cu
+            const bool is_named = (cu < c.names.size() && !c.names[cu].empty());
+            o << "# ptm3d_flux_cubes v1  cube=" << cu;
+            if (is_named) o << "  name=" << c.names[cu];
+            o << (is_named ? "  placement=named_location"
+                           : "  placement=lattice")
               << "  grid_ij=(" << cr.grid_i << "," << cr.grid_j << ")"
               << "  x_m=" << cr.x_m << " y_m=" << cr.y_m << "\n"
               << "# face_id=" << cr.face_id << " slope_deg=" << cr.slope_deg
               << " aspect_deg=" << cr.aspect_deg << " area_m2=" << cr.area_m2
               << " elev_m=" << cr.elev_m << " height_m=" << cr.height_achieved_m
-              << " edge_m=" << c.h.edge_m << "\n"
+              // PER-CUBE edge, not the cache-level one: a named location may
+              // override it, and printing the header value here reported 2.71 m
+              // for a cube that was actually built with 1.00 m.
+              << " edge_m=" << ((cr.edge_m > 0.0f) ? static_cast<double>(cr.edge_m) : c.h.edge_m)
+              << "\n"
               << "# frame: site-local ENU at " << c.h.center_lat_deg << ", "
               << c.h.center_lon_deg << "; up=+U north=+N east=+E, right-handed\n"
               << "# units: W/m^2 INCIDENT (no albedo/emissivity applied); T in K\n"

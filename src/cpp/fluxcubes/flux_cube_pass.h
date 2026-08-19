@@ -115,6 +115,12 @@ struct PassInputs {
     int  write_csv_max_cubes = 0;      // 0 = every cube
     int  shadow_probe_rays = 5;        // 1 = center only; 5 = center + 4 rim
     std::string provenance_json;       // engine sha / md5 / config, echoed verbatim
+    // Names the CONFIG asked for. The pass verifies the cache actually contains
+    // every one and REFUSES otherwise -- editing the YAML without rebuilding the
+    // cache would otherwise yield a product silently describing the previous set
+    // of locations, which is the exact failure mode naming them was meant to
+    // prevent. Empty => no check.
+    std::vector<std::string> expected_location_names;
 };
 
 // Returns true on success. On failure returns false and fills `err` with a
