@@ -292,7 +292,7 @@ Every one of these is a hard error with a reason, and each has a negative-contro
 | cache built for a different mesh | never apply a foreign cache; the exact regeneration command is printed, and it is never rebuilt inline (PTM-19) |
 | `equilibration_steps + n_steps != total_time_steps` | cube rows would stop lining up with `time_steps.txt` (PTM-250/251) |
 | gray path (no band-separated series) | one mixed radiosity cannot be split; emitting zeros or a merged column would be worse than failing |
-| no ray-occlusion function | assuming every cube is unshadowed fabricates direct solar flux at every PSR in the grid |
+| no ray-occlusion function | assuming every cube is unshadowed fabricates direct solar flux at every shadowed cube in the grid |
 | `eps` or `(1-A)` collapsing | the inversion is ill-posed and the solver's own `REFL_GUARD` fallback is invisible from the host |
 
 A pass failure aborts the run. A run that was asked for a product and made none must fail, not
@@ -379,3 +379,78 @@ engine with no `flux_cubes` block, this engine with `enabled: false`, and this e
 ⛔ **What that does NOT cover.** Moon, built-in body, CPU `SparseVFOperator` route, two-band
 radiosity, single-shot (non-chunked) run. It says nothing about Europa, generic bodies, the gray
 path, the GPU pool route, the H-matrix route, or the chunked/warm-start path.
+
+---
+
+## 10. Shadow strata: "window-dark" is not "PSR"
+
+A **permanently shadowed region (PSR)** is dark in **all seasons**. A cube that receives no direct
+solar flux during one evaluated window is **window-dark**, which is a different and weaker claim:
+if the cube were truly permanently shadowed it would also have been dark in the summer window.
+
+The distinction is not pedantic, because the two answer different questions:
+
+- **window-dark** exercises the **indirect-only flux path** — direct solar identically zero,
+  terrain IR down in the tens of mW/m², the primary body's IR no longer negligible. That is the
+  physics regime a PSR cube lives in, and it is what validates the dark-flux code path.
+- **PSR** is a statement about the *site*, decided by the site's `psr_mask` across all seasons, not
+  by any single window.
+
+`scripts/flux_cube_strata.py` reports the `window_dark` stratum and refuses to call it PSR.
+
+### Whether a genuine PSR is even reachable at A03MP026
+
+Measured directly from the campaign's own `cogs/A03MP026/psr_mask.tif` (1 m polar-stereographic;
+the mask is 0/1 at 99.87% of valid pixels, the remaining 0.13% being the COG's linear-interpolation
+boundary, so both a strict and an inclusive count are given):
+
+| quantity | value |
+|---|---|
+| PSR pixels within 500 m of the site | **441** inclusive (`>= 0.5`) / 346 strict (`== 1`) |
+| nearest PSR pixel to the site | **118.7 m** |
+| distinct PSR patches inside the grid | 7 |
+| largest patch | **195 m²**, only **15 × 15 m** across, centre at site ENU E = −109.9 m, N = +62.8 m (lat −84.220932, lon 33.466089) |
+| PSR areal fraction of the grid | 441 m² / 0.785 km² ≈ **0.056%** |
+| 25 m production lattice points landing on PSR | **0 of 1257** (≈0.7 expected by area) |
+
+⚠️ The site-local ENU frame is rotated from the projection's axes by the site longitude (33.5°) —
+in a south-polar stereographic projection with `lon_0 = 0`, local north is the *radial outward*
+direction, not projected +Y. Skipping that rotation moves the patch centroid by tens of metres and
+changes which lattice points appear to be on PSR.
+
+**Consequence: the production 25 m lattice cannot sample a genuine PSR at this site.** The patches
+are far smaller than the lattice spacing. Reaching one requires a *targeted dense array*, not a
+finer global grid — see §11.
+
+## 11. Targeted PSR array (designed, not yet run)
+
+To obtain a true-PSR stratum, place a second, small, dense array on the largest in-grid PSR patch.
+
+Recommended: **spacing 1.0 m, radius 10 m, centred on lat −84.220932, lon 33.466089**
+→ 317 cubes, of which **196 (62%) fall on PSR pixels**. Sizing alternatives, all measured against
+the mask:
+
+| spacing | radius | cubes | on PSR |
+|---|---|---|---|
+| 5.0 m | 20 m | 49 | 9 (18%) |
+| 2.0 m | 12 m | 113 | 51 (45%) |
+| 2.0 m | 20 m | 317 | 51 (16%) |
+| **1.0 m** | **10 m** | **317** | **196 (62%)** |
+
+⚠️ At 1 m spacing the site-relative height rule gives h = 0.1083 m from a 1.08 m median facet, so
+the cubes are ~10 spacings apart vertically — fine, but the array is dense relative to the mesh and
+`f_max` should be inspected for the vertex degeneracy of §2/FC-04.
+
+**Tooling status.** `ptm_flux_cube_geom` already accepts an arbitrary `--center-lat/--center-lon`
+with its own `--spacing/--radius`, so building the targeted cache needs **no code change**. What
+the engine does *not* yet support is **two arrays in one run**: `flux_cubes.cache_file` is a single
+path, and the `.fcg` has no array identifier, so cubes from two lattices would share one `(i, j)`
+index space ambiguously. Two options:
+
+1. **Second run** (no code change): one extra ~40 min winter-window run against a second cache.
+2. **Combined cache** (format v2): add an `array_id` to `CubeRecord` and let the geometry tool
+   append a second lattice. One run, one product, at the cost of a format revision and a reader
+   update in the packager.
+
+Option 1 is recommended first — it needs nothing new and keeps the two products independently
+auditable. Option 2 is worth doing only if targeted arrays become routine across sites.

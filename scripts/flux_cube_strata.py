@@ -1,26 +1,42 @@
 #!/usr/bin/env python3
 """Stratified analysis of a flux-cube product, for the Fermi gate.
 
+TERMINOLOGY, and it matters
+---------------------------
+A **PSR** -- permanently shadowed region -- is dark in ALL seasons. A cube that
+is dark for one evaluated window is NOT a PSR sample: if it were truly
+permanently shadowed it would also have been dark in the summer window. This
+script therefore calls that stratum **window-dark**, never "PSR".
+
+  window-dark   max direct solar == 0 over the ENTIRE evaluated window
+  grazing       0 < max direct <= 50 W/m^2
+  sunlit        max direct  > 50 W/m^2
+
+The window-dark stratum is still the right thing to measure: it exercises the
+**indirect-only flux path** -- the physics regime a genuine PSR cube lives in,
+where direct solar is identically zero, terrain IR falls to the tens of
+mW/m^2, and the primary body's IR stops being negligible. It validates the
+dark-flux path. It does not sample a PSR, and this script will not say it does.
+
+Whether a cube sits on a genuine PSR is a separate question answered by the
+site's psr_mask, not by any single window. Measured for A03MP026 inside the
+500 m production grid: 441 one-metre PSR pixels (346 counting only mask==1
+interior), nearest 118.7 m from the site, in 7 patches, the largest 195 m^2 and
+only 15 x 15 m across. Against a 0.785 km^2 grid that is ~0.06% areal coverage,
+so a 25 m lattice is expected to land on ~0.7 of them -- and in fact lands on
+**0 of 1257**. Genuine PSR cubes require a targeted dense array, not a finer
+global lattice.
+
 The sunlit stratum is forgiving: direct solar is ~1000 W/m^2 and swamps
-everything, so a sign error, a dropped term or a units slip in any of the small
-components is invisible there. The PSR stratum is where those become visible --
-direct solar is identically zero, terrain IR falls to ~0.02 W/m^2, and the
-primary body's IR becomes COMPARABLE to the entire terrain budget. That is the
-stratum this script exists to expose.
-
-Strata are defined on the cube's own window-maximum direct-solar irradiance
-across its six faces:
-
-  PSR          max direct == 0            never sees the Sun at any epoch
-  grazing      0 < max direct <= 50 W/m^2  terminator / low-Sun
-  sunlit       max direct  > 50 W/m^2
+everything, so a sign error, a dropped term or a units slip in any small
+component is invisible there. The dark strata are where those become visible.
 
 Reported per stratum, per face: the window max and median of every component,
 the component's share of the total, and the dynamic range. Nothing is
 thresholded or hidden -- Fermi reads the numbers, not a verdict.
 
 Usage:
-  python3 scripts/flux_cube_psr_strata.py <run>/flux_cubes/flux_cubes.fcb
+  python3 scripts/flux_cube_strata.py <run>/flux_cubes/flux_cubes.fcb
 """
 
 import argparse
@@ -57,10 +73,10 @@ def main():
             b = idx(d, cu, fa, 0, 0)
             m = max(m, max(d["flux"][b:b + ns]))
         peak.append(m)
-    strata = {"PSR": [], "grazing": [], "sunlit": []}
+    strata = {"window_dark": [], "grazing": [], "sunlit": []}
     for cu in range(nc):
         if peak[cu] <= 0.0:
-            strata["PSR"].append(cu)
+            strata["window_dark"].append(cu)
         elif peak[cu] <= a.grazing_max:
             strata["grazing"].append(cu)
         else:
@@ -70,24 +86,25 @@ def main():
     print("file: %s" % a.fcb)
     print("cubes %d, faces %d, output steps %d, height %.4f m"
           % (nc, nf, ns, d["height_m"]))
-    print("\nstrata (by the cube's window-max direct solar across its six faces):")
-    for k in ("PSR", "grazing", "sunlit"):
+    print("\nstrata (by the cube's window-max direct solar across its six faces).")
+    print("NOTE: window-dark is NOT a PSR sample -- a PSR is dark in ALL seasons.")
+    for k in ("window_dark", "grazing", "sunlit"):
         n = len(strata[k])
-        print("  %-8s %5d cubes (%5.1f%%)" % (k, n, 100.0 * n / max(1, nc)))
+        print("  %-12s %5d cubes (%5.1f%%)" % (k, n, 100.0 * n / max(1, nc)))
 
     # --- T_face by stratum: the independent cross-check on the classification
     print("\n--- underlying face temperature by stratum (K) ---")
-    print("%-8s %10s %10s %10s" % ("stratum", "min", "median", "max"))
-    for k in ("PSR", "grazing", "sunlit"):
+    print("%-12s %10s %10s %10s" % ("stratum", "min", "median", "max"))
+    for k in ("window_dark", "grazing", "sunlit"):
         vals = []
         for cu in strata[k]:
             vals.extend(d["t_face"][cu * ns:(cu + 1) * ns])
         if vals:
-            print("%-8s %10.3f %10.3f %10.3f"
+            print("%-12s %10.3f %10.3f %10.3f"
                   % (k, min(vals), percentile(vals, 0.5), max(vals)))
 
     # --- per stratum, per face, per component ---
-    for k in ("PSR", "grazing", "sunlit"):
+    for k in ("window_dark", "grazing", "sunlit"):
         cubes = strata[k]
         if not cubes:
             continue
@@ -147,27 +164,31 @@ def main():
                   % (FACE_NAMES[fa], tir, pir, prf, r))
     print("\n  (means over the stratum, each cube evaluated at its OWN coldest epoch)")
 
-    # --- the PSR headline: is Earthshine comparable to terrain IR there? ---
-    if not strata["PSR"]:
-        print("\n--- PSR headline: NOT AVAILABLE for this product ---")
-        print("  This site/window contains NO permanently shadowed cube: every one of the")
-        print("  %d cubes receives direct sunlight at some epoch. The PSR stratum is" % nc)
-        print("  therefore UNEXERCISED here, and no PSR number should be quoted from this")
-        print("  file. Use the COLD stratum above, or a winter window, for that question.")
-    if strata["PSR"]:
-        print("--- PSR headline: primary-body IR vs terrain IR ---")
+    # --- dark-flux headline: is Earthshine comparable to terrain IR there? ---
+    if not strata["window_dark"]:
+        print("\n--- dark-flux headline: NOT AVAILABLE for this product ---")
+        print("  Every one of the %d cubes receives direct sunlight at some epoch of this" % nc)
+        print("  window, so there is no window-dark stratum and the indirect-only flux path")
+        print("  is UNEXERCISED here. Use the COLD decile above, or a winter window.")
+        print("  (Separately: a window-dark cube would still NOT be a PSR sample.)")
+    if strata["window_dark"]:
+        print("--- dark-flux headline: primary-body IR vs terrain IR (WINDOW-DARK stratum) ---")
         print("%-8s %14s %14s %10s" % ("face", "terrain_ir max", "primary_ir max", "ratio"))
         for fa in range(nf):
             tir = pir = 0.0
-            for cu in strata["PSR"]:
+            for cu in strata["window_dark"]:
                 b2 = idx(d, cu, fa, 2, 0)
                 b4 = idx(d, cu, fa, 4, 0)
                 tir = max(tir, max(d["flux"][b2:b2 + ns]))
                 pir = max(pir, max(d["flux"][b4:b4 + ns]))
             r = (pir / tir) if tir > 0 else float("nan")
             print("%-8s %14.6g %14.6g %10.4f" % (FACE_NAMES[fa], tir, pir, r))
-        print("\n(The design's expectation is that these are COMPARABLE in a PSR --")
-        print(" the stratum where a sign error or a dropped term is visible at all.)")
+        print("\n(These are expected to become COMPARABLE where direct solar is zero --")
+        print(" the regime where a sign error or a dropped term is visible at all.)")
+        print(" ⛔ This is the WINDOW-DARK stratum, which validates the indirect-only flux")
+        print(" path. It is NOT a permanently-shadowed sample: a PSR is dark in all seasons,")
+        print(" and whether a cube sits on one is decided by the site psr_mask, not by this")
+        print(" window. At A03MP026 no 25 m lattice point lands on a PSR pixel (0 of 1257).")
 
     # --- dynamic range, which sets the float64 requirement ---
     allv = [x for x in d["flux"] if x > 0]
