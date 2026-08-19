@@ -437,3 +437,78 @@ cancelled on relevance, not on cost or difficulty.**
 The §10 site measurement stays, because "the production lattice lands on 0 of 1257 PSR pixels" is
 the evidence that this was a judgement about what is worth measuring, rather than a gap the tooling
 could not close.
+
+---
+
+## 12. Named locations (arbitrary lat/lon cubes)
+
+Cubes can be placed at arbitrary named lat/lon points, alongside or instead of the grid. Outputs
+are keyed by name — the flux-cube analog of the engine's existing `locations:` mechanism.
+
+### Building the geometry
+
+```
+ptm_flux_cube_geom --core <core.ply> --ring <ring.ply> \
+    --center-lat -84.223 --center-lon 33.502 \
+    --spacing 25 --radius 500 \
+    --locations pads.csv --out site.fcg
+```
+
+`pads.csv`, one entry per line, header optional:
+
+```
+name,lat_deg,lon_deg,height_m,edge_m
+pad_A,-84.2210,33.4700
+pad_B,-84.2195,33.4820,2.0,1.0
+```
+
+`height_m` and `edge_m` are optional per-entry overrides; omitted, each falls back to the
+site-relative value (§1). **`--radius <0` disables the lattice entirely**, for named locations
+only; `--radius 0` still yields the single origin cube, which is a different thing.
+
+Named cubes are appended after the lattice in **one cache**, so a single run covers both. They
+carry a sentinel grid index (`-2147483648`) so the two kinds are distinguishable, and a names block
+is appended after the JSON in both `.fcg` and `.fcb` — a reader written against the original layout
+parses everything before it at unchanged offsets and ignores the tail, so no format version bump
+was needed.
+
+### Declaring them in the config
+
+```yaml
+flux_cubes:
+  enabled: true
+  cache_file: site.fcg
+  locations:
+    - {name: pad_A, lat_deg: -84.2210, lon_deg: 33.4700}
+    - {name: pad_B, lat_deg: -84.2195, lon_deg: 33.4820, height_m: 2.0, edge_m: 1.0}
+```
+
+⛔ **The config list does not place anything.** Placement belongs to `ptm_flux_cube_geom`, the only
+component permitted to touch geometry. What the engine does with this list is **verify** that the
+cache contains every name, and **refuse** otherwise — closing the trap the feature would otherwise
+create: edit the YAML, forget to rebuild the cache, and receive a product silently describing the
+previous set of locations.
+
+Outputs: `flux_cubes/csv/cube_<name>.csv` for named locations (index-keyed for lattice cubes), with
+`name=` and `placement=named_location` in the header. `write_csv_max_cubes` caps the lattice
+fan-out but **never** drops a named location.
+
+### The discriminator
+
+`scripts/flux_cube_location_check.py` requires that a cube placed **by name** at the site's own
+lat/lon reproduces the **lattice** origin cube **bit for bit** — every `CubeRecord` field beyond the
+deliberately-differing grid indices, all six `PatchRecord`s, and all view-factor columns *and*
+values. It passes.
+
+Reaching that took three fixes, and the reason they are worth recording is that they are one lesson
+in three costumes — **"the same formula" is not "the same computation"**:
+
+1. `d * r_mean - org` subtracts two ~1.7e6 m vectors to reach ~0 m. Catastrophic cancellation left
+   ~2e-11 m in the recorded offset. Difference the *directions* first, then scale.
+2. The same three trig lines written at two call sites are not the same computation — the optimizer
+   may contract them differently. One shared `noinline dirFromLatLon()` now serves both.
+3. Even then, the site frame normalized the direction **twice** (`U = unit(C)` where `C` was already
+   unit) while the named path normalized once. Same algebra, different *sequence*, one ulp apart.
+
+A tolerance would have hidden all three. None was a physics error; all three would have quietly
+made "the same point" mean two slightly different points.
