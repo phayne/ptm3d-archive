@@ -422,35 +422,18 @@ changes which lattice points appear to be on PSR.
 are far smaller than the lattice spacing. Reaching one requires a *targeted dense array*, not a
 finer global grid — see §11.
 
-## 11. Targeted PSR array (designed, not yet run)
+## 11. Targeted PSR array — CANCELLED
 
-To obtain a true-PSR stratum, place a second, small, dense array on the largest in-grid PSR patch.
+**Paul's ruling (2026-08-19): PSR flux cubes serve no engineering need**, because landed hardware
+and crew will never remain inside a permanently shadowed region long enough for the distinction to
+matter. The targeted dense array is **cancelled permanently**, not deferred.
 
-Recommended: **spacing 1.0 m, radius 10 m, centred on lat −84.220932, lon 33.466089**
-→ 317 cubes, of which **196 (62%) fall on PSR pixels**. Sizing alternatives, all measured against
-the mask:
+The design is retained here only so the descope is auditable and nobody rediscovers it and assumes
+it was merely never got to. It was sized against real data: spacing 1.0 m, radius 10 m on the
+largest in-grid patch (lat −84.220932, lon 33.466089) would have placed 317 cubes with 196 (62%)
+on PSR pixels, needing no code change to `ptm_flux_cube_geom` and one extra ~40 min run. **It is
+cancelled on relevance, not on cost or difficulty.**
 
-| spacing | radius | cubes | on PSR |
-|---|---|---|---|
-| 5.0 m | 20 m | 49 | 9 (18%) |
-| 2.0 m | 12 m | 113 | 51 (45%) |
-| 2.0 m | 20 m | 317 | 51 (16%) |
-| **1.0 m** | **10 m** | **317** | **196 (62%)** |
-
-⚠️ At 1 m spacing the site-relative height rule gives h = 0.1083 m from a 1.08 m median facet, so
-the cubes are ~10 spacings apart vertically — fine, but the array is dense relative to the mesh and
-`f_max` should be inspected for the vertex degeneracy of §2/FC-04.
-
-**Tooling status.** `ptm_flux_cube_geom` already accepts an arbitrary `--center-lat/--center-lon`
-with its own `--spacing/--radius`, so building the targeted cache needs **no code change**. What
-the engine does *not* yet support is **two arrays in one run**: `flux_cubes.cache_file` is a single
-path, and the `.fcg` has no array identifier, so cubes from two lattices would share one `(i, j)`
-index space ambiguously. Two options:
-
-1. **Second run** (no code change): one extra ~40 min winter-window run against a second cache.
-2. **Combined cache** (format v2): add an `array_id` to `CubeRecord` and let the geometry tool
-   append a second lattice. One run, one product, at the cost of a format revision and a reader
-   update in the packager.
-
-Option 1 is recommended first — it needs nothing new and keeps the two products independently
-auditable. Option 2 is worth doing only if targeted arrays become routine across sites.
+The §10 site measurement stays, because "the production lattice lands on 0 of 1257 PSR pixels" is
+the evidence that this was a judgement about what is worth measuring, rather than a gap the tooling
+could not close.
