@@ -190,6 +190,54 @@ The sparse matrix is stored in Compressed Sparse Row form: `values_` (non-zero $
 `col_indices_` (partner index) and `row_ptrs_` (size $N+1$). Operations are `matvec`
 ($\mathbf{y} = F\mathbf{x}$), `matvecTranspose`, `get(i,j)`, `getRow(i)` and `rowSums`.
 
+### 4.7 Offline per-partner referee assembly, and its symmetrization estimator
+
+For meshes where the in-code builders are impractical, an offline pipeline builds the matrix
+once and the simulator loads it through `PTM_HMATRIX_VF_REPLACE`. `scripts/ptm12_diag/mc_ref_pp`
+sweeps every face as a ray source and writes the raw per-partner hit fractions; then
+`scripts/ptm12_diag/assemble_vf_haworth.py` symmetrizes them into a reciprocal CSR matrix,
+applies a reciprocity-preserving $\Sigma F \le 1$ congruence, and writes the v2 header
+(face count, float64 geometry hash, `indptr`, `nnz`, columns, values).
+
+**The symmetrization estimator.** Every undirected pair $\{i,j\}$ is measured twice, once from
+each end. Both are unbiased estimates of $S_{ij} = A_i F_{ij}$, so the assembler averages them:
+
+$$S_{ij}^{\text{sym}} = \tfrac{1}{2}\left(\hat{S}_{i\to j} + \hat{S}_{j\to i}\right)$$
+
+The divisor is **2 — the number of ray directions tried** — and a direction that registered no
+hit contributes the zero it measured. That matters because in the far field neither direction
+fires reliably. Dividing instead by the number of directions that *happened to hit* conditions on
+detection and inflates the estimate by
+
+$$\frac{\mathbb{E}[S^{\text{asm}}]}{S^{\text{true}}} = 2 - \frac{p_1 + p_2}{2},
+\qquad p_k = \Pr(\text{direction } k \text{ registers} \ge 1 \text{ hit})$$
+
+which is 1 where both directions are well sampled and exactly 2 where neither is. The severity is
+governed by $\lambda = N_{\text{rays}} F_{ij}$, so it scales with mesh *fineness*, not with
+distance in meters. That estimator was in use until 2026-08-19; matrices built before then carry
+far-field entries up to twice their true value and must be re-assembled from their raw sweeps.
+
+**Preconditions the divisor depends on.** The sweep must cover every face exactly once (a missing
+face halves every pair that touches it; a duplicate doubles it), and no assembler-side minimum-hit
+filter may discard a direction that did fire. The assembler now gates on both: it counts records
+per source face and refuses to run on an incomplete sweep unless `--allow-incomplete-sweep` is
+given, and it rejects `min_hits > 1` outright.
+
+**Provenance.** Each assembly writes `<out>.csr.provenance.json` recording the estimator, ray
+budget, minimum-hit rule, mesh identity and measured sweep coverage. A CSR matrix *without* that
+sidecar predates the fix.
+
+**Why the standing invariants do not police this.** Reciprocity and $\Sigma F \le 1$ both pass on
+the defective matrices — measured reciprocity residual $2.7\times10^{-8}$ (float32 round-off) and
+a peak row sum of 0.18, far from the cap. The matrix is symmetrized and then capped by a symmetric
+congruence, so it is exactly reciprocal by construction while its entries are twice too large.
+Those invariants constrain the *shape* of a row, never its *scale*. The bowl-crater test of §10 is
+blind here too: it builds its view factors with the in-code calculator and never runs this
+pipeline. The arbiter is closed-form geometry, in
+`scripts/ptm12_diag/test_vf_assembler_gate.py`: a coaxial parallel disk with
+$F = a^2/(a^2+H^2) = 0.250000$ driven end to end through the real pipeline, plus a ray-budget
+invariance check. Run it after any change to the assembler or the referee.
+
 ## 5. H-matrix compression
 
 For large meshes the full sparse matrix becomes expensive to store and to multiply. Following

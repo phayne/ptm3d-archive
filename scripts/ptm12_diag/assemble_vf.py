@@ -3,7 +3,14 @@
 S_ij = A_i F_ij ; symmetric S_sym per undirected pair = mean over the 2 ray directions
 TRIED (divisor 2, a direction with no hit counts as the measured zero) ;
 directed F_ij = S_sym/A_i. Enforce ΣF<=1. Validate ΣF vs moon3d_rowfix_refSigF.bin anchor.
-Writes CSR: n(int32) indptr(n+1 int64) nnz(int64) indices(nnz int32) data(nnz float32)."""
+
+⚠️ LEGACY v1 CSR HEADER, NOT LOADABLE BY THE CURRENT SIMULATOR. This writes
+n(int32) indptr(n+1 int64) nnz(int64) indices(nnz int32) data(nnz float32) -- with NO
+float64 geomhash. The PTM_HMATRIX_VF_REPLACE loader (radiation_exchange.cpp) reads 8
+bytes of geomhash immediately after n, so it would read indptr[0] as the mesh hash,
+abort on the mismatch, and have the whole array off by 8 bytes. Use
+assemble_vf_haworth.py, which writes the v2 header, for anything the simulator loads.
+This script is kept for the historical moon3d reconstruction only."""
 import numpy as np, glob, time, sys
 DIAG="/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/scripts/ptm12_diag"
 N=509337

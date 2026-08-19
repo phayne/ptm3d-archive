@@ -192,6 +192,10 @@ def main():
                          "that happened to hit), which inflates far-field entries by up to 2x. "
                          "'hits' exists ONLY so the regression gate can prove the defect; it must "
                          "never be used to build a view-factor matrix for science.")
+    ap.add_argument("--allow-incomplete-sweep", action="store_true",
+                    help="Assemble even when the sweep does not cover every face exactly once. "
+                         "The result is BIASED on the affected faces (divisor 2 assumes both ray "
+                         "directions were tried). Warns loudly; never silent.")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -205,13 +209,34 @@ def main():
     assert files, f"no chunk files matched {a.chunks_glob}"
     print(f"[assemble] {len(files)} chunk file(s), NRAYS={a.nrays}, MIN_HITS={a.min_hits} (FTHR={FTHR:.3g})")
 
+    # Divisor 2 is unbiased only because BOTH ray directions of every pair were tried.
+    # An assembler-side MIN-HIT filter with min_hits > 1 breaks that: it discards a
+    # direction that DID fire, and the divisor then counts it as a measured zero. The
+    # reverse direction of an unequal-area pair fires ~A_i/A_j times less often, so it is
+    # the one systematically filtered -- an up-to-2x UNDER-estimate, the mirror image of
+    # the FC-08 bias. The sweep must also have run at min_hits=1 (mc_ref_pp applies its
+    # own absolute keep-rule); this script cannot verify that, so it is stated here.
+    if a.min_hits > 1 and a.symmetrize_divisor == "tried":
+        raise SystemExit(
+            f"FATAL: min_hits={a.min_hits} with --symmetrize-divisor tried. The filter drops "
+            "ray directions that DID register hits, which the divisor then counts as measured "
+            "zeros -- an up-to-2x UNDER-estimate on unequal-area pairs. Pass min_hits=1 (the "
+            "referee's own absolute keep-rule already applies at sweep time). See FC-08.")
+
+    seen = np.zeros(N, dtype=np.int32)   # sweep coverage: records per source face
     Is, Js, Vs = [], [], []
     Is_old, Js_old, Vs_old = [], [], []  # also track what the OLD fractional rule would have kept
+    truncated = []
     for p in files:
         raw = np.frombuffer(open(p, "rb").read(), dtype=np.uint8)
         b = memoryview(raw); q = 0; L = len(raw)
         while q + 8 <= L:
             src = int(np.frombuffer(b[q:q+4], "<i4")[0]); nnz = int(np.frombuffer(b[q+4:q+8], "<i4")[0]); q += 8
+            if nnz < 0 or q + nnz * 8 > L:
+                truncated.append(Path(p).name)   # a killed sweep leaves a parseable short file
+                break
+            if 0 <= src < N:
+                seen[src] += 1
             if nnz > 0:
                 arr = np.frombuffer(b[q:q+nnz*8], dtype=np.dtype([("j", "<i4"), ("f", "<f4")]))
                 keep = arr["f"] >= FTHR
@@ -223,6 +248,27 @@ def main():
                     Is_old.append(np.full(int(keep_old.sum()), src, dtype=np.int32))
                     Js_old.append(arr["j"][keep_old].copy()); Vs_old.append(arr["f"][keep_old].copy())
             q += nnz * 8
+
+    # ---- sweep-coverage gate ----
+    # Divisor 2 makes complete coverage a HARD precondition: a face missing from the sweep
+    # leaves every pair that touches it with one direction instead of two, and the result is
+    # silently HALVED. A face appearing twice (stale chunk files from an earlier sweep with a
+    # different chunk count) DOUBLES it. Under the old divisor both self-corrected, so this
+    # gate did not exist; it does now.
+    n_missing = int((seen == 0).sum()); n_dup = int((seen > 1).sum())
+    print(f"[assemble] sweep coverage: {int((seen == 1).sum())}/{N} faces swept exactly once "
+          f"(missing {n_missing}, duplicated {n_dup}, truncated chunks {len(truncated)})")
+    if n_missing or n_dup or truncated:
+        msg = (f"sweep coverage is INCOMPLETE: {n_missing} face(s) never swept, {n_dup} swept "
+               f"more than once, {len(truncated)} truncated chunk file(s) {truncated[:3]}. "
+               "With --symmetrize-divisor tried this silently halves (or doubles) every pair "
+               "touching those faces.")
+        if not a.allow_incomplete_sweep:
+            raise SystemExit("FATAL: " + msg + " Re-run the missing bins, or pass "
+                             "--allow-incomplete-sweep if you accept the bias.")
+        print("[assemble] *** WARNING: " + msg + " --allow-incomplete-sweep was given, so the "
+              "matrix below IS BIASED on those faces. ***", file=sys.stderr)
+
     I = np.concatenate(Is); J = np.concatenate(Js); V = np.concatenate(Vs)
     print(f"[assemble] NEW rule directed nnz={len(I)} ({len(I)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
@@ -319,6 +365,35 @@ def main():
         F.astype(np.float32).tofile(fh)
     print(f"[assemble] wrote {out}  nnz={len(F)}  {os.path.getsize(out)/1e9:.3f} GB  geomhash={GEOMHASH:.6f}  {time.time()-t0:.0f}s")
     np.save(str(Path(out).with_suffix(".rowsum.npy")), rs)
+
+    # ---- provenance sidecar ----
+    # The CSR header carries only N and the mesh-identity geomhash, so nothing in the file
+    # itself distinguishes a matrix built with the corrected divisor from one built with the
+    # pre-2026-08-19 estimator. Every .csr already on disk predates the fix and loads
+    # silently. This sidecar makes the estimator, the ray budget and the sweep coverage
+    # readable after the fact; a .csr WITHOUT one was built before FC-08 was fixed.
+    prov = {
+        "estimator": "FC-08 corrected" if a.symmetrize_divisor == "tried" else "PRE-FC-08 DEFECTIVE",
+        "symmetrize_divisor": a.symmetrize_divisor,
+        "symmetrize_divisor_meaning": ("mean over the 2 ray directions TRIED (unbiased)"
+                                       if a.symmetrize_divisor == "tried"
+                                       else "mean over the directions that HIT (inflates far field up to 2x)"),
+        "nrays": int(a.nrays), "min_hits": float(a.min_hits),
+        "mesh": str(a.mesh), "n_faces": int(N), "nnz": int(len(F)),
+        "geomhash": float(GEOMHASH), "total_area_m2": float(area.sum()),
+        "sweep_glob": str(a.chunks_glob), "sweep_chunk_files": len(files),
+        "sweep_coverage_exactly_once": int((seen == 1).sum()),
+        "sweep_coverage_missing": n_missing, "sweep_coverage_duplicated": n_dup,
+        "sweep_truncated_chunks": len(truncated),
+        "allow_incomplete_sweep": bool(a.allow_incomplete_sweep),
+        "sigma_f_max": float(rs.max()), "sigma_f_mean": float(rs.mean()),
+        "radiance_prune_eps": float(a.radiance_prune_eps),
+        "assembler": str(Path(__file__).resolve()),
+        "assembled_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with open(str(out) + ".provenance.json", "w") as fh:
+        json.dump(prov, fh, indent=2)
+    print(f"[assemble] provenance -> {out}.provenance.json  (estimator: {prov['estimator']})")
 
 
 if __name__ == "__main__":

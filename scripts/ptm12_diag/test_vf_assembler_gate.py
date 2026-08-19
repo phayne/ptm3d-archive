@@ -157,6 +157,12 @@ def convert_ascii_ply(src, dst):
 # referee pipeline
 # --------------------------------------------------------------------------------------
 def find_or_build_mc_ref_pp(explicit, work):
+    # An EXPLICITLY named binary that cannot be used is fatal: the point of naming one is
+    # to gate that build, and silently substituting a fresh compile would return a PASS
+    # that describes a different binary.
+    if explicit and not (Path(explicit).is_file() and os.access(str(explicit), os.X_OK)):
+        raise SystemExit(f"FATAL: --mc-ref-pp {explicit} is missing or not executable. "
+                         "Refusing to substitute a different binary.")
     for cand in (explicit, os.environ.get("PTM_MC_REF_PP"), HERE / "mc_ref_pp"):
         if cand and Path(cand).is_file() and os.access(str(cand), os.X_OK):
             print(f"  mc_ref_pp: using existing {cand}")
@@ -331,6 +337,14 @@ def main():
     ap.add_argument("--nrays-closed-form", type=int, default=200000)
     ap.add_argument("--nrays-lo", type=int, default=4000)
     ap.add_argument("--nrays-hi", type=int, default=200000)
+    # Arm A's residual is NOT a random draw: mc_ref_pp uses deterministic Halton QMC, so a
+    # given binary/Embree-ISA pair reproduces it bit for bit. Measured 2026-08-19 with
+    # Embree 4 (Homebrew, the build production used): +0.583%, against a 1.0% tolerance.
+    # The residual is dominated by the REVERSE direction (partner -> element), where a
+    # single stray hit carries A_j/A_0 ~ 10.5 times the element's own weight; the forward
+    # direction alone lands near 0.3%. If this arm ever fails at 1.0-1.5%, suspect the
+    # Embree ISA before suspecting the estimator, and raise --nrays-closed-form to confirm:
+    # a true bias does not shrink with ray budget, this noise term does.
     ap.add_argument("--closed-form-tol-pct", type=float, default=1.0)
     ap.add_argument("--closed-form-defect-min-pct", type=float, default=10.0)
     ap.add_argument("--invariance-tol-pct", type=float, default=0.1)
@@ -342,6 +356,9 @@ def main():
         raise SystemExit(f"FATAL: {ASSEMBLER} not found")
     work = Path(a.work) if a.work else Path(
         os.environ.get("TMPDIR", "/tmp")) / f"vfgate_{os.getpid()}"
+    # Only ever delete a directory this run created -- never a pre-existing --work dir,
+    # which may hold results that have nothing to do with the gate.
+    we_made_it = not work.exists()
     work.mkdir(parents=True, exist_ok=True)
     print(f"[vf-gate] work dir {work}  jobs={a.jobs}")
     binary = find_or_build_mc_ref_pp(a.mc_ref_pp, work)
@@ -359,10 +376,11 @@ def main():
     print(f"\n=== SUMMARY ({time.time()-t0:.0f}s) ===")
     for k, v in results.items():
         print(f"  {k:<32} {'PASS' if v else 'FAIL'}")
-    if not a.keep:
-        shutil.rmtree(work, ignore_errors=True)
+    if a.keep or not we_made_it:
+        print(f"  artifacts kept in {work}"
+              + ("" if we_made_it else " (pre-existing directory; never auto-removed)"))
     else:
-        print(f"  artifacts kept in {work}")
+        shutil.rmtree(work, ignore_errors=True)
     sys.exit(0 if all(results.values()) else 1)
 
 
