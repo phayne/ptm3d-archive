@@ -512,3 +512,43 @@ in three costumes — **"the same formula" is not "the same computation"**:
 
 A tolerance would have hidden all three. None was a physics error; all three would have quietly
 made "the same point" mean two slightly different points.
+
+---
+
+## 13. Known limitations and disclosure (post-gate)
+
+### Zenith terrain-IR is not engineering-grade (FC-08)
+At parity height the cube's upward view-factor row sums to ~0.51× the engine's own row for the
+same facet, measured on 40 level A03MP026 facets. The disagreement is **geometric, not
+statistical** — the cube's row is converged (−0.9% for 16× the rays), the near field agrees
+(2–10 m ratio 1.14, individual partners to ~4%), and the entire gap is beyond 10 m. It is **not**
+the differential-point vs facet-area-average distinction either: that predicts a facet-size
+dependence which is absent (r = +0.035 over 40 facets). Attribution is open; the referee VF's own
+reciprocity/renormalization step is a third candidate. Use `scripts/flux_cube_vf_parity.py` to
+reproduce. **Until resolved, treat zenith `terrain_ir` as indicative only.** No other face or
+component is implicated, and the nadir face that carries the large terrain-IR numbers is
+single-facet dominated (`f_max` p50 0.85).
+
+### Sampling budget is per-patch, not per-face-orientation
+The ray budget was set from a B-free split-half total variation that converges at ~N^-0.23, where
+design §7.2 specified a **flux-referenced** metric. Against the flux, the true sampling error is
+**nadir and sides 0.01–0.04% (p50) but zenith 3.98% p50 / 18.97% p95** — the zenith is the
+under-sampled face by two orders of magnitude, because it is nearly all sky and its small terrain
+row is what the estimator must resolve.
+
+⛔ **Owed:** emit the flux-referenced split-half and set **per-face-orientation** budgets. This
+needs the geometry tool to retain both half-rows (the cache currently stores only their sum), so
+it is a format change, not a reporting change. Until then the single global `n_rays` is chosen for
+the *binding side faces*, and the zenith is under-sampled at that budget.
+
+### Shadow-probe spread is tied to DEM resolution, not hardware scale
+`edge_m` defaults to 0.1 × the local facet scale, so the spatial probe spread is set by mesh
+resolution rather than by the size of the object being modelled (the design recommended a fixed
+0.30 m avionics-box scale). At A03MP026 that gives edge 0.108 m. Note also that the **nadir face
+therefore sits at h − edge/2 = 0.054 m above the surface**, not at h. Use the per-entry `edge_m`
+override (§12) when the hardware scale is known.
+
+### Direct solar
+Files whose header says `solar_model = finite_disk` resolve the partial solar disk with the
+engine's own ladder. Files saying `point_sun` predate that fix and carry a binary shadow test that
+can be wrong by the full beam at shadow edges.
