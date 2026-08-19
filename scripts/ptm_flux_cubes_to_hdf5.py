@@ -61,31 +61,46 @@ ENGINEER_SUMMARY = (
     "emissivity, no cube material applied) on six axis-aligned faces at 1,257 points on a 25 m "
     "lattice over a 500 m radius at A03MP026, validated for the *sunlit and terrain-dominated* "
     "load regime: direct solar, terrain-scattered visible, terrain thermal IR and Earthshine are "
-    "each independently reproduced against the model's own fields and against closed-form "
-    "geometry to better than 1e-4 relative, and enabling the probe is byte-identical to the "
-    "surface simulation. It is *not* validated as a permanently-shadowed-region product, its "
-    "terrain IR excludes the 3-27 km occluder ring (up to ~4% of a side face's budget, ~6 W/m^2 "
-    "on the worst patch), its upward-facing terrain-IR is a differential-point reading that runs "
-    "a measured factor ~1.8 below the model's own facet-averaged value, and its direct-solar "
-    "term is a binary point-sun test that can be wrong by up to ~1.2 kW/m^2 at the ~0.5% of "
-    "epochs when a cube straddles a shadow edge -- treat all four as one-sided *under*-estimates "
-    "and carry margin accordingly.")
+    "each independently reproduced against the model's own fields -- 7.4e-15 relative on the "
+    "terrain-IR reconstruction, five significant figures on the closed-form Earthshine -- and "
+    "against closed-form geometry to ~3e-4, and enabling the probe leaves all 22 statistics "
+    "fields of the surface simulation byte-identical. Direct solar resolves the finite solar disk "
+    "composed with the cube's own extent (header solar_model = finite_disk), so shadow edges are "
+    "graded rather than binary; what remains there is a TWO-SIDED edge-placement uncertainty "
+    "reaching 0.6 kW/m^2 (summer) and 1.0 kW/m^2 (winter) on ~1% of face-epochs, with the "
+    "direct-energy integral preserved to better than 0.02% -- carry margin symmetrically at "
+    "shadow edges, and treat the edge position itself as resolved only to the ~1 m facet scale of "
+    "the underlying terrain. It is *not* validated as a permanently-shadowed-region product. Two "
+    "one-sided UNDER-estimates remain: terrain IR excludes the 3-27 km occluder ring entirely -- "
+    "the per-patch omission is in /geometry/missing_ring_flux_Wm2 (mean 0.61, max 6.46 W/m^2 "
+    "summer; 0.69 and 7.34 W/m^2 winter, evaluated at the core mesh's own median radiosity and "
+    "linearly rescalable), which is at most 3.9% of a patch's hemisphere but reaches tens of "
+    "percent of the terrain IR actually reported on the worst west-facing patches and exceeds it "
+    "on the zenith face -- and the zenith terrain_ir column alone is NOT ENGINEERING-GRADE: its "
+    "ray-traced upward view-factor row sums to 0.51x the model's own row for the same facet, a "
+    "converged, purely far-field (>10 m) geometric disagreement whose attribution is open "
+    "(FC-08), so use that one column as indicative only. Every other face and component is "
+    "unaffected.")
 
-# Fermi's summary above is preserved VERBATIM. Two of its clauses are being
-# overtaken by the fixes and are annotated rather than silently edited, because
-# the sentence is the engineer-forwardable one and its provenance matters:
-#   * "factor ~1.8" -- FC-08 has since localized this to a FAR-FIELD (>10 m)
-#     view-factor disagreement, with the near field agreeing and both of the
-#     original hypotheses excluded. The magnitude stands; the attribution is open.
-#   * "binary point-sun test" -- fixed for products written by an engine at or
-#     after the finite-solar-disk commit; such files carry solar_model =
-#     "finite_disk" in the header, and the clause applies only to files that say
-#     "point_sun".
-SUMMARY_CAVEAT = (
-    "The 'factor ~1.8' clause records the measured magnitude; FC-08 has since localized it to a "
-    "far-field (>10 m) view-factor disagreement with the near field in agreement, so the "
-    "attribution is open. The 'binary point-sun' clause applies only to files whose header says "
-    "solar_model = point_sun; a file saying finite_disk was written after that fix.")
+# v1 is archived in the file rather than deleted. Fermi's reason for replacing it
+# is the reason it is archived and not silently dropped: a sibling caveat
+# attribute does not travel with a copy-pasted sentence, so v1 -- which is now
+# false in three places, including telling the reader to carry margin in ONE
+# direction on a term that is now two-sided -- must be visibly superseded rather
+# than left to circulate.
+SUMMARY_V1 = (
+    "SUPERSEDED -- do not forward. This v1 sentence predates the finite-solar-disk fix and the "
+    "FC-08 measurement. It is false in three places: it calls the direct-solar term a binary "
+    "point-sun test (it now resolves the finite disk), it directs the reader to treat all four "
+    "caveats as one-sided UNDER-estimates (the direct term is now two-sided, so that margin "
+    "guidance points the wrong way), and it attributes the zenith terrain-IR gap to a "
+    "differential-point vs facet-averaged distinction (excluded by measurement; FC-08). Retained "
+    "only so a copy already in circulation can be recognised and replaced. Original text: "
+    "'... its upward-facing terrain-IR is a differential-point reading that runs a measured "
+    "factor ~1.8 below the model's own facet-averaged value, and its direct-solar term is a "
+    "binary point-sun test that can be wrong by up to ~1.2 kW/m^2 at the ~0.5% of epochs when a "
+    "cube straddles a shadow edge -- treat all four as one-sided *under*-estimates and carry "
+    "margin accordingly.'")
 
 RING_NOTE = (
     "terrain_vis and terrain_ir EXCLUDE the occluder-ring contribution: the ring is a "
@@ -340,7 +355,21 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         t = h.create_dataset("T_face", data=np.asarray(d["t_face"]).reshape(nc, ns))
         t.attrs["units"] = "K"
         t.attrs["note"] = "temperature of the mesh face beneath each cube"
-        h.create_dataset("penumbral", data=np.asarray(d["penumbral"], np.uint8).reshape(nc, ns))
+        pen = h.create_dataset("penumbral",
+                               data=np.asarray(d["penumbral"], np.uint8).reshape(nc, ns))
+        pen.attrs["units"] = "boolean flag"
+        pen.attrs["definition"] = (
+            "1 where the cube's view of the Sun was PARTIAL at that epoch: either the finite "
+            "solar disk was partially occluded, or the five spatial probe points over the cube's "
+            "own extent disagreed. Indexed [cube, step] -- it is a PER-CUBE property, not "
+            "per-face, because terrain occlusion is a property of the point and the face normal "
+            "enters only through max(0, n.s).")
+        pen.attrs["note_meaning_changed"] = (
+            "This flag's MEANING changed with the finite-solar-disk fix. In files whose header "
+            "says solar_model = point_sun it means only that the five spatial probes disagreed, "
+            "and it fires on roughly 1% of the cases the model itself treats as partial. In "
+            "solar_model = finite_disk files it additionally fires on a partially occluded disk, "
+            "which is 27-35x more often. Do not compare counts across the two.")
         g = h.create_group("geometry")
         for name, key in (("f_sky", "f_sky"), ("f_ring", "f_ring"), ("f_max", "f_max")):
             g.create_dataset(name, data=np.asarray(d[key], np.float32).reshape(nc, nf))
@@ -397,15 +426,23 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         g["slope_deg"].attrs["definition"] = "acos(n_face . U) of the mesh face beneath the cube"
         g["aspect_deg"].attrs["definition"] = "atan2(n . E, n . N), clockwise from north"
         g["face_id"].attrs["definition"] = "index of the CORE mesh face beneath the cube"
-        g["grid_i"].attrs["definition"] = (
-            "lattice index; -2147483648 marks a cube placed by NAMED LOCATION rather than "
-            "by the lattice")
+        for gi in ("grid_i", "grid_j"):
+            g[gi].attrs["definition"] = (
+                "lattice index (x = grid_i * spacing_m east, y = grid_j * spacing_m north). "
+                "BOTH indices are set to the sentinel -2147483648 when the cube was placed by "
+                "NAMED LOCATION rather than by the lattice; in that case use /geometry/x_m and "
+                "y_m for its position and /geometry/name for its label.")
         if d.get("names"):
             g.create_dataset("name", data=np.array([s2.encode() for s2 in d["names"]]))
             g["name"].attrs["definition"] = (
                 "named-location label, empty for lattice cubes; outputs are keyed by this")
         tg = h.create_group("time")
-        tg.create_dataset("et", data=np.asarray(d["et"]))
+        et_ds = tg.create_dataset("et", data=np.asarray(d["et"]))
+        et_ds.attrs["units"] = "s"
+        et_ds.attrs["definition"] = (
+            "SPICE ephemeris time: TDB seconds past the J2000 epoch (2000-01-01T12:00:00 TDB). "
+            "Not UTC seconds and not a run-relative offset; /time/utc is the matching UTC string "
+            "for each row.")
         tg.create_dataset("utc", data=np.array([s.encode() for s in d["utc"]]))
         for k, v in (("ptm3d_flux_cubes_schema", 1), ("height_m", d["height_m"]),
                      ("edge_m", d["edge_m"]), ("spacing_m", d["spacing_m"]),
@@ -417,7 +454,8 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         h.attrs["ring_note"] = RING_NOTE
         h.attrs["time_axis_source"] = "time_steps.txt"
         h.attrs["summary"] = ENGINEER_SUMMARY
-        h.attrs["summary_caveat"] = SUMMARY_CAVEAT
+        h.attrs["summary_v1"] = SUMMARY_V1
+        h.attrs["summary_version"] = 2
         # --- Finding 3: the normative orientation frame, in the file itself ---
         h.attrs["face_order"] = [x.encode() for x in FACE_NAMES]
         h.attrs["component_order"] = [x.encode() for x in COMP_NAMES]
@@ -434,7 +472,10 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         if prov:
             for k in ("engine_git_sha", "engine_binary_md5", "config_md5", "config_used_path",
                       "engine_build_type", "engine_working_tree", "hostname", "run_started_utc"):
-                if k in prov:
+                # `extra` is applied AFTER this block and deliberately wins: an
+                # explicit --engine-sha is a correction of what the binary
+                # recorded, so it must not be overwritten by the wrong value.
+                if k in prov and k not in (extra or {}):
                     h.attrs[k] = prov[k]
             h.attrs["provenance_source"] = "run provenance.txt (injected by the packager)"
         else:
@@ -466,6 +507,17 @@ def main():
                     help="<run>/statistics/temperature_max.bin -- anchors the ring bound "
                          "on the CORE mesh's own measured radiosity (Finding 4)")
     ap.add_argument("--emissivity", type=float, default=0.95)
+    ap.add_argument("--engine-sha", default=None,
+                    help="Authoritative engine sha, OVERRIDING the one the binary recorded. "
+                         "A binary built from a dirty tree records the last COMMIT, not the code "
+                         "it was built from; an auditor rebuilding that sha gets different "
+                         "physics and rightly concludes the acceptance numbers are fabricated.")
+    ap.add_argument("--engine-tree-state", default=None,
+                    help="How the recorded sha relates to the built code.")
+    ap.add_argument("--fcg", default=None,
+                    help="geometry cache, hashed into the root: the cache is otherwise "
+                         "identified by PATH only, so a cache edited or rebuilt in place is "
+                         "undetectable from the product")
     a = ap.parse_args()
     d = read_fcb(a.fcb)
     prov = read_provenance(a.provenance) if a.provenance else None
@@ -478,6 +530,13 @@ def main():
         extra["mesh_ring_md5"] = file_md5(a.ring_mesh) or "unavailable"
     extra["fcb_path"] = a.fcb
     extra["fcb_md5"] = file_md5(a.fcb) or "unavailable"
+    if a.fcg:
+        extra["fcg_path"] = a.fcg
+        extra["fcg_md5"] = file_md5(a.fcg) or "unavailable"
+    if a.engine_sha:
+        extra["engine_git_sha"] = a.engine_sha
+    if a.engine_tree_state:
+        extra["engine_tree_state"] = a.engine_tree_state
     core_B = None
     if a.temperature_max:
         try:

@@ -440,8 +440,25 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                 std::array<V3, 5> pts = {xc, xc, xc, xc, xc};
                 int n_pt = 1;
                 if (in.shadow_probe_rays >= 5) {
-                    pts[1] = add(xc, mul(E, he)); pts[2] = sub(xc, mul(E, he));
-                    pts[3] = add(xc, mul(N, he)); pts[4] = sub(xc, mul(N, he));
+                    // Fermi's falsifying test (PTM_FLUXCUBE_PROBE_AXIS=U): the
+                    // horizontal probe does NOT sample the cube's VERTICAL
+                    // extent, and at grazing sun -- winter is entirely
+                    // -4.3..+7.3 deg -- the unsampled +-edge/2 of HEIGHT maps to
+                    // 8-19x the horizontal extent along the shadow direction.
+                    // This arm displaces the same five points along U instead,
+                    // so the diff against the shipped product measures exactly
+                    // the sensitivity the default probe cannot see.
+                    static const bool probe_u = [] {
+                        const char* e = std::getenv("PTM_FLUXCUBE_PROBE_AXIS");
+                        return e && (e[0] == 'U' || e[0] == 'u');
+                    }();
+                    if (probe_u) {
+                        pts[1] = add(xc, mul(U, he)); pts[2] = sub(xc, mul(U, he));
+                        pts[3] = add(xc, mul(E, he)); pts[4] = sub(xc, mul(E, he));
+                    } else {
+                        pts[1] = add(xc, mul(E, he)); pts[2] = sub(xc, mul(E, he));
+                        pts[3] = add(xc, mul(N, he)); pts[4] = sub(xc, mul(N, he));
+                    }
                     n_pt = 5;
                 }
                 double acc = 0.0; bool any_split = false;
