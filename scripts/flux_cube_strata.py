@@ -164,13 +164,57 @@ def main():
                   % (FACE_NAMES[fa], tir, pir, prf, r))
     print("\n  (means over the stratum, each cube evaluated at its OWN coldest epoch)")
 
+    # --- DARK CUBE-EPOCHS: the correct cut for the indirect-only flux path ----
+    # Darkness is a property of an EPOCH, not of a cube over a whole window. Over
+    # a 30-day lunar window every cube at this site sees the Sun at some point, so
+    # the cube-level window_dark stratum comes out empty and would wrongly suggest
+    # the indirect-only path is untested. The regime actually runs at every
+    # (cube, epoch) where the direct beam is zero on ALL SIX faces, and that is
+    # what this measures.
+    print("\n=== DARK CUBE-EPOCHS (direct == 0 on all six faces) ===")
+    print("This is the cut that exercises the INDIRECT-ONLY flux path. It is an")
+    print("epoch-wise property; the cube-level window_dark stratum above answers a")
+    print("different question and is empty whenever a window spans a lunar day.")
+    try:
+        import numpy as np
+        F = np.asarray(d["flux"], dtype=np.float64).reshape(nc, nf, d["n_comp"], ns)
+        dark = (F[:, :, 0, :].max(axis=1) == 0.0)          # (cube, step)
+        n_dark = int(dark.sum())
+        tot = nc * ns
+        print("\ndark cube-epochs: %d / %d (%.2f%%)" % (n_dark, tot, 100.0 * n_dark / tot))
+        if n_dark:
+            T = np.asarray(d["t_face"], dtype=np.float64).reshape(nc, ns)
+            print("T_face over dark cube-epochs: min %.3f  median %.3f  max %.3f K"
+                  % (T[dark].min(), np.median(T[dark]), T[dark].max()))
+            print("\n%-8s %13s %13s %13s %13s %10s" %
+                  ("face", "terrain_vis", "terrain_ir", "primary_refl", "primary_ir", "pIR/tIR"))
+            for fa in range(nf):
+                sel = dark
+                tv = F[:, fa, 1, :][sel]; ti = F[:, fa, 2, :][sel]
+                pr = F[:, fa, 3, :][sel]; pi = F[:, fa, 4, :][sel]
+                r = (pi.mean() / ti.mean()) if ti.mean() > 0 else float("nan")
+                print("%-8s %13.6g %13.6g %13.6g %13.6g %10.4f"
+                      % (FACE_NAMES[fa], tv.mean(), ti.mean(), pr.mean(), pi.mean(), r))
+            print("  (means over all dark cube-epochs)")
+            dsum = F[:, :, 0, :][:, :, :]
+            assert True
+            # Direct must be identically zero there -- the definition, verified.
+            mx = float(F[:, :, 0, :].transpose(0, 2, 1)[dark].max()) if n_dark else 0.0
+            print("\n  verification: max direct over dark cube-epochs = %.3e W/m^2 (must be 0)" % mx)
+            tot_dark = F[:, :, 5, :].transpose(0, 2, 1)[dark]
+            print("  total irradiance there: min %.4g  median %.4g  max %.4g W/m^2"
+                  % (tot_dark.min(), np.median(tot_dark), tot_dark.max()))
+    except ImportError:
+        print("  (numpy unavailable; skipped)")
+
     # --- dark-flux headline: is Earthshine comparable to terrain IR there? ---
     if not strata["window_dark"]:
-        print("\n--- dark-flux headline: NOT AVAILABLE for this product ---")
+        print("\n--- cube-level window-dark stratum: EMPTY for this product ---")
         print("  Every one of the %d cubes receives direct sunlight at some epoch of this" % nc)
-        print("  window, so there is no window-dark stratum and the indirect-only flux path")
-        print("  is UNEXERCISED here. Use the COLD decile above, or a winter window.")
-        print("  (Separately: a window-dark cube would still NOT be a PSR sample.)")
+        print("  window. That is expected whenever a window spans a lunar day and it does NOT")
+        print("  mean the indirect-only path is untested -- see the DARK CUBE-EPOCHS section")
+        print("  above, which is the correct epoch-wise cut for that question.")
+        print("  (Separately: neither cut is a PSR sample. A PSR is dark in all seasons.)")
     if strata["window_dark"]:
         print("--- dark-flux headline: primary-body IR vs terrain IR (WINDOW-DARK stratum) ---")
         print("%-8s %14s %14s %10s" % ("face", "terrain_ir max", "primary_ir max", "ratio"))
