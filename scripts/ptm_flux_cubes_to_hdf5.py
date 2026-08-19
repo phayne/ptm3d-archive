@@ -37,16 +37,36 @@ import struct
 import sys
 
 FCB_HDR = "<4sIIIIIQQdddd3d3d3d3dII"
+NAME_LEN = 32
 CUBE_FMT = "<iidd3diiffffd"
 FACE_NAMES = ["zenith", "nadir", "north", "south", "east", "west"]
 COMP_NAMES = ["direct", "terrain_vis", "terrain_ir", "primary_refl", "primary_ir", "total"]
 SIGMA = 5.670374419e-8
 
+ZENITH_TIR_CAVEAT = (
+    "NOT ENGINEERING-GRADE: the zenith terrain_ir column. At parity height the cube's "
+    "ray-traced upward view-factor row sums to ~0.51x the engine's own view-factor row for "
+    "the same facet (measured on 40 level facets of the A03MP026 core). The disagreement is "
+    "GEOMETRIC, not statistical: the cube's row is converged (-0.9% for 16x the rays) and the "
+    "near field agrees (2-10 m within 15%); the gap is entirely beyond 10 m, where the engine "
+    "assigns ~1.9x more weight. It is also NOT the differential-point vs facet-area-average "
+    "distinction, which predicts a dependence on facet size that is absent (Pearson r = +0.035 "
+    "over 40 facets). Until this is resolved, treat zenith terrain_ir as indicative only. "
+    "Every OTHER face and component is unaffected: on those the terrain-IR path reproduces the "
+    "engine's own frames to 7.4e-15, and the nadir face -- which carries the large terrain-IR "
+    "numbers -- is dominated by a single facet at f_max ~0.85 and is not implicated.")
+
+ENGINEER_SUMMARY = (
+    "PTM3D flux cubes: incident irradiance (W m-2) on six oriented faces of virtual measurement cubes on the lunar surface, component-resolved into direct solar, terrain-scattered visible, terrain thermal IR, primary-body (Earth) reflected and primary-body IR. No albedo, emissivity or cube material is applied -- apply your own optical model. Faces are ordered zenith, nadir, north, south, east, west in a site-local ENU frame (right-handed, E x N = U); heights are plumb-line along the site vertical.")
+
 RING_NOTE = (
     "terrain_vis and terrain_ir EXCLUDE the occluder-ring contribution: the ring is a "
     "shadow-only body with no thermal solution and therefore no radiosity. The omitted "
-    "irradiance on a patch is bounded by f_ring * sigma*T_ring^4 for any assumed ring "
-    "temperature; per-patch f_ring is in this file."
+    "irradiance on a patch is f_ring * B_ring for the ring's true outgoing radiosity B_ring. "
+    "B_ring is not modelled, but the CORE mesh's own measured radiosity is the right anchor "
+    "for it, not an arbitrary cold temperature: see /geometry/missing_ring_flux_Wm2, which "
+    "evaluates the bound at the core's median eps*sigma*T_max^4 for this run. An earlier "
+    "version of this note anchored the bound at 100 K and understated it by roughly 27x."
 )
 UNITS_NOTE = (
     "All flux values are INCIDENT irradiance in W m-2. No albedo, no emissivity and no "
@@ -63,7 +83,9 @@ def read_fcb(path):
         raise SystemExit("not an FCB1 file: %r" % (v[0],))
     d = dict(version=v[1], n_cubes=v[2], n_faces=v[3], n_comp=v[4], n_steps=v[5],
              equilibration_steps=v[6], total_time_steps=v[7],
-             height_m=v[8], edge_m=v[9], spacing_m=v[10], radius_m=v[11])
+             height_m=v[8], edge_m=v[9], spacing_m=v[10], radius_m=v[11],
+             frame_origin=v[12:15], frame_east=v[15:18],
+             frame_north=v[18:21], frame_up=v[21:24])
     json_len = v[-2]
     nc, nf, ncp, ns = d["n_cubes"], d["n_faces"], d["n_comp"], d["n_steps"]
     off = hs
@@ -83,15 +105,57 @@ def read_fcb(path):
     for k in range(ns):
         utc.append(blob[off:off + 24].split(b"\0")[0].decode("ascii", "replace"))
         off += 24
+    names = []
     meta = {}
     if json_len:
         try:
             meta = json.loads(blob[off:off + json_len].decode("utf-8"))
         except Exception as e:
             print("  warning: header JSON did not parse (%s)" % e)
+    # Names, when present, follow the JSON (see flux_cube_format.h).
+    if v[-1] == 1:
+        noff = off + json_len
+        for k in range(nc):
+            names.append(blob[noff + k * NAME_LEN: noff + (k + 1) * NAME_LEN]
+                         .split(b"\0")[0].decode("ascii", "replace"))
     d.update(flux=flux, t_face=tf, penumbral=pen, f_sky=fsky, f_ring=fring,
-             f_max=fmax, cubes=cubes, et=et, utc=utc, meta=meta)
+             f_max=fmax, cubes=cubes, et=et, utc=utc, meta=meta, names=names)
     return d
+
+
+def read_provenance(path):
+    """Parse a run's provenance.txt into a dict.
+
+    The engine did not populate PassInputs::provenance_json for the two
+    delivered products, so their .fcb headers carry no engine identity at all.
+    Rather than re-run 40 minutes of GPU to fix a header, the packager can be
+    pointed at the run's own provenance.txt and config_used.yaml and inject the
+    same fields. Future runs get it from the engine directly; this path exists
+    so an already-delivered product can be made self-describing.
+    """
+    out = {}
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, val = line.split("=", 1)
+            out[k.strip()] = val.strip()
+    except OSError:
+        return {}
+    return out
+
+
+def file_md5(path):
+    import hashlib
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 def idx(d, cu, fa, co, st):
@@ -200,7 +264,7 @@ def summarize(d):
     print("  " + RING_NOTE)
 
 
-def write_hdf5(d, out):
+def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
     try:
         import h5py
         import numpy as np
@@ -220,6 +284,7 @@ def write_hdf5(d, out):
         ds.attrs["axes"] = "cube, face, component, step"
         ds.attrs["face_order"] = [s.encode() for s in FACE_NAMES]
         ds.attrs["component_order"] = [s.encode() for s in COMP_NAMES]
+        ds.attrs["caveat_zenith_terrain_ir"] = ZENITH_TIR_CAVEAT
         t = h.create_dataset("T_face", data=np.asarray(d["t_face"]).reshape(nc, ns))
         t.attrs["units"] = "K"
         t.attrs["note"] = "temperature of the mesh face beneath each cube"
@@ -227,7 +292,36 @@ def write_hdf5(d, out):
         g = h.create_group("geometry")
         for name, key in (("f_sky", "f_sky"), ("f_ring", "f_ring"), ("f_max", "f_max")):
             g.create_dataset(name, data=np.asarray(d[key], np.float32).reshape(nc, nf))
+        # Finding 5 minor: every geometry dataset gets a definition, including
+        # the fact that f_sky is COSINE-weighted -- an unlabeled "sky fraction"
+        # invites a solid-angle reading, which is a different number.
+        g["f_sky"].attrs["units"] = "dimensionless"
+        g["f_sky"].attrs["definition"] = (
+            "COSINE-WEIGHTED fraction of the patch hemisphere that escapes to space. "
+            "This is the coefficient on a deep-space sink, NOT a solid-angle fraction. "
+            "f_sky + sum_j F_j + f_ring = 1 exactly, by construction of the estimator.")
+        g["f_ring"].attrs["units"] = "dimensionless"
+        g["f_ring"].attrs["definition"] = (
+            "cosine-weighted fraction of the patch hemisphere intercepted by the occluder "
+            "ring, which carries no thermal solution and therefore contributes no flux.")
         g["f_ring"].attrs["note"] = RING_NOTE
+        g["f_max"].attrs["units"] = "dimensionless"
+        # Finding 4: emit the missing ring flux per patch, anchored on the CORE
+        # mesh's own measured radiosity rather than on a guessed temperature.
+        if core_B_p50:
+            miss = np.asarray(d["f_ring"], np.float64).reshape(nc, nf) * float(core_B_p50)
+            ds2 = g.create_dataset("missing_ring_flux_Wm2", data=miss.astype(np.float32))
+            ds2.attrs["units"] = "W m-2"
+            ds2.attrs["definition"] = (
+                "f_ring * B_core_p50: the irradiance this patch is MISSING because the "
+                "occluder ring has no radiosity, evaluated at the core mesh's own median "
+                "outgoing radiosity for this run. An estimate of the omission, not a bound: "
+                "if the ring is colder than the core it is an over-estimate, if warmer an "
+                "under-estimate. Scale linearly for any other assumed B_ring.")
+            ds2.attrs["B_core_p50_Wm2"] = float(core_B_p50)
+            ds2.attrs["B_core_definition"] = (
+                "median over core faces of eps*sigma*T_max^4 with eps = 0.95, from this run's "
+                "own statistics/temperature_max.bin")
         g["f_max"].attrs["note"] = (
             "largest single view-factor entry in the patch's row. At a site-relative "
             "height a LARGE value on the nadir face is the intended behaviour: the face "
@@ -243,6 +337,21 @@ def write_hdf5(d, out):
         for nm in ("grid_i", "grid_j", "x_m", "y_m", "face_id", "slope_deg",
                    "aspect_deg", "area_m2", "elev_m"):
             g.create_dataset(nm, data=cb[nm])
+        for nm, u in (("x_m", "m"), ("y_m", "m"), ("slope_deg", "degree"),
+                      ("aspect_deg", "degree"), ("area_m2", "m2"), ("elev_m", "m")):
+            g[nm].attrs["units"] = u
+        g["x_m"].attrs["definition"] = "site-frame EAST offset from the grid centre"
+        g["y_m"].attrs["definition"] = "site-frame NORTH offset from the grid centre"
+        g["slope_deg"].attrs["definition"] = "acos(n_face . U) of the mesh face beneath the cube"
+        g["aspect_deg"].attrs["definition"] = "atan2(n . E, n . N), clockwise from north"
+        g["face_id"].attrs["definition"] = "index of the CORE mesh face beneath the cube"
+        g["grid_i"].attrs["definition"] = (
+            "lattice index; -2147483648 marks a cube placed by NAMED LOCATION rather than "
+            "by the lattice")
+        if d.get("names"):
+            g.create_dataset("name", data=np.array([s2.encode() for s2 in d["names"]]))
+            g["name"].attrs["definition"] = (
+                "named-location label, empty for lattice cubes; outputs are keyed by this")
         tg = h.create_group("time")
         tg.create_dataset("et", data=np.asarray(d["et"]))
         tg.create_dataset("utc", data=np.array([s.encode() for s in d["utc"]]))
@@ -255,6 +364,33 @@ def write_hdf5(d, out):
         h.attrs["units"] = UNITS_NOTE
         h.attrs["ring_note"] = RING_NOTE
         h.attrs["time_axis_source"] = "time_steps.txt"
+        h.attrs["summary"] = ENGINEER_SUMMARY
+        # --- Finding 3: the normative orientation frame, in the file itself ---
+        h.attrs["face_order"] = [x.encode() for x in FACE_NAMES]
+        h.attrs["component_order"] = [x.encode() for x in COMP_NAMES]
+        h.attrs["frame"] = (
+            "site-local ENU, right-handed, E x N = U. U = outward radial at the site "
+            "(local vertical); N = normalize(z_body - (z_body.U) U); E = N x U. Face normals: "
+            "zenith +U, nadir -U, north +N, south -N, east +E, west -E. Heights are PLUMB-LINE "
+            "along U, not along the local face normal.")
+        for k, nm in (("frame_origin", "frame_origin_xyz_m"), ("frame_east", "frame_east_unit"),
+                      ("frame_north", "frame_north_unit"), ("frame_up", "frame_up_unit")):
+            if k in d:
+                h.attrs[nm] = np.asarray(d[k], dtype=np.float64)
+        # --- Finding 3: engine / config / mesh identity ---
+        if prov:
+            for k in ("engine_git_sha", "engine_binary_md5", "config_md5", "config_used_path",
+                      "engine_build_type", "engine_working_tree", "hostname", "run_started_utc"):
+                if k in prov:
+                    h.attrs[k] = prov[k]
+            h.attrs["provenance_source"] = "run provenance.txt (injected by the packager)"
+        else:
+            h.attrs["provenance_warning"] = (
+                "NO engine provenance was available when this file was written. Pass "
+                "--provenance <run>/provenance.txt to embed engine sha, binary md5 and config "
+                "hash. A product without provenance cannot be traced to the code that made it.")
+        for k, v2 in (extra or {}).items():
+            h.attrs[k] = v2
         for k, v in (d["meta"] or {}).items():
             try:
                 h.attrs["engine_" + k] = v if not isinstance(v, (dict, list)) else json.dumps(v)
@@ -269,12 +405,41 @@ def main():
     ap.add_argument("fcb")
     ap.add_argument("--out", default=None, help="HDF5 output path")
     ap.add_argument("--qa", action="store_true")
+    ap.add_argument("--provenance", default=None,
+                    help="<run>/provenance.txt -- embeds engine sha/md5 and config hash")
+    ap.add_argument("--core-mesh", default=None, help="core PLY, for a mesh identity hash")
+    ap.add_argument("--ring-mesh", default=None, help="ring PLY, for a ring identity hash")
+    ap.add_argument("--temperature-max", default=None,
+                    help="<run>/statistics/temperature_max.bin -- anchors the ring bound "
+                         "on the CORE mesh's own measured radiosity (Finding 4)")
+    ap.add_argument("--emissivity", type=float, default=0.95)
     a = ap.parse_args()
     d = read_fcb(a.fcb)
+    prov = read_provenance(a.provenance) if a.provenance else None
+    extra = {}
+    if a.core_mesh:
+        extra["mesh_core_path"] = a.core_mesh
+        extra["mesh_core_md5"] = file_md5(a.core_mesh) or "unavailable"
+    if a.ring_mesh:
+        extra["mesh_ring_path"] = a.ring_mesh
+        extra["mesh_ring_md5"] = file_md5(a.ring_mesh) or "unavailable"
+    extra["fcb_path"] = a.fcb
+    extra["fcb_md5"] = file_md5(a.fcb) or "unavailable"
+    core_B = None
+    if a.temperature_max:
+        try:
+            import numpy as _np
+            T = _np.fromfile(a.temperature_max, dtype=_np.float32)
+            T = T[_np.isfinite(T) & (T > 0)]
+            core_B = float(_np.median(a.emissivity * 5.670374419e-8 * T.astype(_np.float64) ** 4))
+            print("core radiosity anchor: median eps*sigma*T_max^4 = %.2f W/m^2 "
+                  "(eps=%.2f, %d faces)" % (core_B, a.emissivity, T.size))
+        except Exception as e:
+            print("  could not read --temperature-max (%s); ring bound will be omitted" % e)
     summarize(d)
     fails = qa(d) if a.qa else []
     if a.out:
-        write_hdf5(d, a.out)
+        write_hdf5(d, a.out, prov=prov, core_B_p50=core_B, extra=extra)
     if fails:
         print("\n==== %d QA FAILURE(S) ====" % len(fails))
         for f in fails:
