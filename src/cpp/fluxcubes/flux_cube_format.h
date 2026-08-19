@@ -87,6 +87,7 @@ enum SamplerId : uint32_t {
 //   int32_t      row_cols[total_nnz]               (CORE face ids)
 //   float        row_vals[total_nnz]               (view factors F[c][p][j])
 //   char         json[json_len]                    (provenance, not parsed by C++)
+//   char         names[n_cubes][kNameLen]          ONLY when has_names == 1
 // ---------------------------------------------------------------------------
 struct FcgHeader {
     char     magic[4];            // "FCG1"
@@ -125,16 +126,37 @@ struct FcgHeader {
     double   frame_max_tilt_deg;  // max angle between the site U and each cube's own radial
 
     uint32_t json_len;
-    uint32_t reserved;
+    // 1 => a names block of n_cubes * kNameLen bytes is appended AFTER the JSON
+    // blob. Placed last on purpose: every reader written against the original
+    // layout parses header, cubes, patches, rows and JSON at unchanged offsets
+    // and simply ignores the trailing bytes, so adding named locations did not
+    // break the format or require a version bump. (This slot was `reserved`.)
+    uint32_t has_names;
 };
+
+// Maximum length of a named-location label, including the terminating NUL.
+constexpr int kNameLen = 32;
+
+// Sentinel grid index marking a cube that came from a NAMED LOCATION rather
+// than the lattice. Both grid_i and grid_j are set to it, so the two kinds are
+// distinguishable without consulting the names block.
+constexpr int32_t kNamedGridIndex = -2147483647 - 1;
 
 // One cube: placement and the mesh face beneath it.
 struct CubeRecord {
-    int32_t  grid_i, grid_j;      // lattice indices; x = i*spacing, y = j*spacing
+    // For a LATTICE cube these are the grid indices and x = i*spacing,
+    // y = j*spacing. For a NAMED LOCATION both are set to kNamedGridIndex
+    // (-2147483648) so the two kinds are distinguishable without consulting the
+    // names block, and x_m/y_m carry its resolved site-frame offsets.
+    int32_t  grid_i, grid_j;
     double   x_m, y_m;            // site-frame offsets from C (east, north)
     double   center[3];           // cube center, body-fixed meters
     int32_t  face_id;             // CORE mesh face beneath (from the drop ray)
-    int32_t  pad;
+    float    edge_m;              // PER-CUBE cube edge; sets the shadow-probe
+                                  // spread. Equals the cache-level edge for
+                                  // lattice cubes; a named location may override
+                                  // it. (This slot was an unused pad, so adding
+                                  // it changed no offset and no struct size.)
     float    slope_deg;           // acos(n_j . U)
     float    aspect_deg;          // atan2(n_j . E, n_j . N), clockwise from north
     float    area_m2;             // area of the underlying face

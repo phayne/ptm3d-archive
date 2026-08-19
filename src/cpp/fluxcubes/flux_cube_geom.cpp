@@ -50,6 +50,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,22 @@ inline Vec3 cross(const Vec3& a, const Vec3& b) {
 }
 inline double norm(const Vec3& a) { return std::sqrt(dot(a, a)); }
 inline Vec3 unit(const Vec3& a) { const double n = norm(a); return n > 0 ? a * (1.0 / n) : a; }
+
+// Unit direction from geodetic-style lat/lon. ONE spelling, called by both the
+// site-frame construction and the named-location resolver. Writing the same
+// three trig lines in two places is not equivalent: the optimizer is free to
+// contract them differently at each site, and the two results then differ by an
+// ulp -- which showed up as a ~2e-11 m residue in a named location placed at the
+// site's own coordinates, breaking the grid-vs-named bit-identity check. Marked
+// noinline so both callers demonstrably execute the same instructions.
+__attribute__((noinline))
+Vec3 dirFromLatLon(double lat_deg, double lon_deg) {
+    const double la = lat_deg * kPi / 180.0;
+    const double lo = lon_deg * kPi / 180.0;
+    return unit(Vec3(std::cos(la) * std::cos(lo),
+                     std::cos(la) * std::sin(lo),
+                     std::sin(la)));
+}
 
 // Equivalent edge of an equilateral triangle of the given area:
 // A = (sqrt(3)/4) e^2  =>  e = sqrt(4A/sqrt(3)). This is the definition the
@@ -150,6 +167,17 @@ struct Args {
     uint64_t seed = 0;
     double truncate_rel = 0.0;
     int threads = 8;
+    std::string locations;        // CSV: name,lat_deg,lon_deg[,height_m[,edge_m]]
+};
+
+// A named location, resolved to the site frame by the same drop-ray path the
+// lattice uses -- deliberately the same path, so a named cube placed at a
+// lattice cube's own coordinates lands on bit-identical geometry.
+struct NamedLoc {
+    std::string name;
+    double lat = 0.0, lon = 0.0;
+    double height_m = -1.0;   // <0 => use the cache-level height
+    double edge_m = -1.0;     // <0 => use the cache-level edge
 };
 
 void usage() {
@@ -161,7 +189,8 @@ void usage() {
 "  --center-lat <deg>      site center latitude   (default: core mesh centroid)\n"
 "  --center-lon <deg>      site center longitude\n"
 "  --spacing <m>           lattice spacing        (default 25)\n"
-"  --radius <m>            grid radius            (default 500)\n"
+"  --radius <m>            grid radius (default 500; <0 = NO lattice,\n"
+"                          named locations only)\n"
 "  --height-factor <f>     cube center height = f * local median facet edge (default 0.1)\n"
 "  --height-m <m>          ABSOLUTE height override; wins over --height-factor\n"
 "  --edge-factor <f>       cube edge = f * local median facet edge (default 0.1)\n"
@@ -169,7 +198,12 @@ void usage() {
 "  --n-rays <N>            rays per patch         (default 16384)\n"
 "  --seed <n>              Cranley-Patterson seed (default 0)\n"
 "  --truncate-rel <f>      drop partners below f of the row max (default 0 = keep all)\n"
-"  --threads <n>           OpenMP threads         (default 8)\n");
+"  --threads <n>           OpenMP threads         (default 8)\n"
+"  --locations <csv>       named locations, one per line:\n"
+"                            name,lat_deg,lon_deg[,height_m[,edge_m]]\n"
+"                          Appended AFTER the lattice (use --radius 0 for\n"
+"                          named locations only). Blank lines and # comments\n"
+"                          are skipped; a malformed line is a hard error.\n");
 }
 
 bool parseArgs(int argc, char** argv, Args& a) {
@@ -191,10 +225,80 @@ bool parseArgs(int argc, char** argv, Args& a) {
         else if (s == "--n-rays" && i + 1 < argc) a.n_rays  = static_cast<uint32_t>(std::atoll(argv[++i]));
         else if (s == "--seed"   && i + 1 < argc) a.seed    = static_cast<uint64_t>(std::atoll(argv[++i]));
         else if (s == "--threads"&& i + 1 < argc) a.threads = std::atoi(argv[++i]);
+        else if (s == "--locations" && i + 1 < argc) a.locations = argv[++i];
         else if (s == "-h" || s == "--help") { usage(); std::exit(0); }
         else { std::cerr << "unknown argument: " << s << "\n"; return false; }
     }
     return !a.core.empty() && !a.out.empty();
+}
+
+// Parse the named-location CSV. A malformed line is a HARD ERROR, never a skip:
+// silently dropping a requested location would change the cube set between runs
+// of the same configuration, which is the same failure mode the lattice's
+// miss-is-fatal rule exists to prevent.
+bool parseLocations(const std::string& path, std::vector<NamedLoc>& out, std::string& err) {
+    std::ifstream f(path);
+    if (!f) { err = "cannot open --locations file '" + path + "'"; return false; }
+    std::string line;
+    int lineno = 0;
+    while (std::getline(f, line)) {
+        ++lineno;
+        // strip comments and whitespace
+        const size_t h = line.find('#');
+        if (h != std::string::npos) line = line.substr(0, h);
+        size_t b = line.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) continue;
+        size_t e2 = line.find_last_not_of(" \t\r\n");
+        line = line.substr(b, e2 - b + 1);
+        if (line.empty()) continue;
+        std::vector<std::string> tok;
+        std::string cur;
+        std::istringstream ss(line);
+        while (std::getline(ss, cur, ',')) {
+            size_t p0 = cur.find_first_not_of(" \t");
+            size_t p1 = cur.find_last_not_of(" \t");
+            tok.push_back(p0 == std::string::npos ? std::string() : cur.substr(p0, p1 - p0 + 1));
+        }
+        // Header row, at ANY column count. Keying this on tok.size()==3 meant a
+        // header that also declared the optional height/edge columns was parsed
+        // as data and the run died on "could not parse a numeric field".
+        if (!tok.empty() && tok[0] == "name") continue;
+        if (tok.size() < 3 || tok.size() > 5) {
+            err = path + ":" + std::to_string(lineno) +
+                  ": expected name,lat_deg,lon_deg[,height_m[,edge_m]] -- got " +
+                  std::to_string(tok.size()) + " field(s)";
+            return false;
+        }
+        NamedLoc L;
+        L.name = tok[0];
+        if (L.name.empty()) { err = path + ":" + std::to_string(lineno) + ": empty name"; return false; }
+        if (L.name.size() >= static_cast<size_t>(kNameLen)) {
+            err = path + ":" + std::to_string(lineno) + ": name '" + L.name + "' exceeds " +
+                  std::to_string(kNameLen - 1) + " characters";
+            return false;
+        }
+        try {
+            L.lat = std::stod(tok[1]);
+            L.lon = std::stod(tok[2]);
+            if (tok.size() >= 4 && !tok[3].empty()) L.height_m = std::stod(tok[3]);
+            if (tok.size() >= 5 && !tok[4].empty()) L.edge_m = std::stod(tok[4]);
+        } catch (const std::exception&) {
+            err = path + ":" + std::to_string(lineno) + ": could not parse a numeric field";
+            return false;
+        }
+        if (L.lat < -90.0 || L.lat > 90.0) {
+            err = path + ":" + std::to_string(lineno) + ": latitude " + tok[1] + " out of range";
+            return false;
+        }
+        for (const NamedLoc& q : out)
+            if (q.name == L.name) {
+                err = path + ":" + std::to_string(lineno) + ": duplicate location name '" +
+                      L.name + "' -- outputs are keyed by name, so names must be unique";
+                return false;
+            }
+        out.push_back(L);
+    }
+    return true;
 }
 
 void embreeError(void*, RTCError code, const char* str) {
@@ -212,6 +316,17 @@ int main(int argc, char** argv) {
 #endif
 
     std::printf("=== ptm_flux_cube_geom ===\n");
+
+    std::vector<NamedLoc> named;
+    if (!args.locations.empty()) {
+        std::string lerr;
+        if (!parseLocations(args.locations, named, lerr)) {
+            std::cerr << "FATAL: " << lerr << "\n";
+            return 2;
+        }
+        std::printf("locations : %s -> %zu named entr%s\n", args.locations.c_str(),
+                    named.size(), named.size() == 1 ? "y" : "ies");
+    }
 
     // ---------------------------------------------------------------- meshes
     ptm::MeshUtils core_utils;
@@ -279,9 +394,7 @@ int main(int argc, char** argv) {
     Vec3 C;
     if (args.have_center) {
         // Direction from lat/lon; radius resolved by the drop ray below.
-        const double la = args.center_lat * kPi / 180.0;
-        const double lo = args.center_lon * kPi / 180.0;
-        C = Vec3(std::cos(la) * std::cos(lo), std::cos(la) * std::sin(lo), std::sin(la));
+        C = dirFromLatLon(args.center_lat, args.center_lon);
     } else {
         Vec3 s(0, 0, 0);
         for (size_t i = 0; i < n_core_f; ++i) s = s + fc[i];
@@ -324,25 +437,35 @@ int main(int argc, char** argv) {
     // mesh-wide statistics, which at a refined site are several times coarser
     // than the terrain the cubes actually sit on.
     const Vec3 C_surf_guess = U * r_mean;
+    const double kLocalScaleDisk =
+        (args.radius_m >= 50.0) ? args.radius_m : 50.0;
     std::vector<double> local_edges;
     local_edges.reserve(n_core_f / 4 + 16);
     for (size_t i = 0; i < n_core_f; ++i) {
         const Vec3 d = fc[i] - C_surf_guess;
         const double de = dot(d, E), dn = dot(d, N);
-        if (de * de + dn * dn <= args.radius_m * args.radius_m)
+        // The local length scale is a property of the TERRAIN, not of the
+        // lattice, so it is measured over a sensible neighbourhood even when the
+        // lattice is tiny or absent. Without the floor, --radius 0 (one origin
+        // cube) and --radius <0 (named locations only) sample an empty disk and
+        // the tool aborts with "no core faces inside the grid disk".
+        if (de * de + dn * dn <= kLocalScaleDisk * kLocalScaleDisk)
             local_edges.push_back(equivalentEdge(farea[i]));
     }
     if (local_edges.empty()) {
-        std::cerr << "FATAL: no core faces inside the " << args.radius_m
-                  << " m grid disk at the requested center. The grid does not overlap the "
+        std::cerr << "FATAL: no core faces within " << kLocalScaleDisk
+                  << " m of the requested center. The grid does not overlap the "
                      "core mesh; check --center-lat/--center-lon.\n";
         return 3;
     }
     std::nth_element(local_edges.begin(), local_edges.begin() + local_edges.size() / 2,
                      local_edges.end());
     const double local_median_edge = local_edges[local_edges.size() / 2];
-    std::printf("local scale: %zu core faces inside the grid disk, median equivalent edge "
-                "%.4f m\n", local_edges.size(), local_median_edge);
+    std::printf("local scale: %zu core faces within %.0f m, median equivalent edge %.4f m%s\n",
+                local_edges.size(), kLocalScaleDisk, local_median_edge,
+                (kLocalScaleDisk != args.radius_m)
+                    ? "  (neighbourhood floored at 50 m: the terrain scale is not the lattice's)"
+                    : "");
 
     const bool height_abs = (args.height_m > 0.0);
     const bool edge_abs   = (args.edge_m   > 0.0);
@@ -429,46 +552,105 @@ int main(int argc, char** argv) {
     int n_miss = 0, n_ring_hit = 0;
     double max_tilt = 0.0;
 
-    for (int i = -n_lat; i <= n_lat; ++i) {
-        for (int j = -n_lat; j <= n_lat; ++j) {
-            const double x = i * args.spacing_m, y = j * args.spacing_m;
-            if (x * x + y * y > args.radius_m * args.radius_m) continue;
-            const Vec3 start = org + E * x + N * y + U * H_hi;
-            unsigned gid, pid; float t;
-            castRay(start, U * -1.0, 0.0f, static_cast<float>(H_hi + relief + 200.0), gid, pid, t);
-            if (gid == RTC_INVALID_GEOMETRY_ID) {
-                if (n_miss < 5)
-                    std::cerr << "FATAL: lattice point (" << i << "," << j << ") at ("
-                              << x << ", " << y << ") m found no terrain below it.\n";
-                ++n_miss; continue;
-            }
-            if (gid != geom_core) {
-                if (n_ring_hit < 5)
-                    std::cerr << "FATAL: lattice point (" << i << "," << j
-                              << ") landed on the OCCLUDER RING, which carries no thermal "
-                                 "solution -- there is no T_face and no radiosity there.\n";
-                ++n_ring_hit; continue;
-            }
-            const Vec3 P = start + (U * -1.0) * static_cast<double>(t);
-            CubeRecord cr{};
-            cr.grid_i = i; cr.grid_j = j;
-            cr.x_m = x; cr.y_m = y;
-            const Vec3 xc = P + U * height;
-            cr.center[0] = xc.x; cr.center[1] = xc.y; cr.center[2] = xc.z;
-            cr.face_id = static_cast<int32_t>(pid);
-            const Vec3& nj = fn[pid];
-            cr.slope_deg  = static_cast<float>(std::acos(std::max(-1.0, std::min(1.0, dot(nj, U)))) * 180.0 / kPi);
-            double asp = std::atan2(dot(nj, E), dot(nj, N)) * 180.0 / kPi;
-            if (asp < 0) asp += 360.0;
-            cr.aspect_deg = static_cast<float>(asp);
-            cr.area_m2 = static_cast<float>(farea[pid]);
-            cr.elev_m  = static_cast<float>(dot(P - org, U));
-            cr.height_achieved_m = height;
-            cubes.push_back(cr);
-            centers.push_back(xc);
-            max_tilt = std::max(max_tilt,
-                std::acos(std::max(-1.0, std::min(1.0, dot(U, unit(xc))))) * 180.0 / kPi);
+    // ONE placement routine for both the lattice and the named locations. That
+    // is deliberate and it is what the byte-identity discriminator tests: a
+    // named location given a lattice cube's own coordinates must produce a
+    // bit-identical cube, which can only hold if neither path has its own copy
+    // of the drop ray, the frame projection, or the slope/aspect arithmetic.
+    std::vector<std::string> names;
+    const bool want_names = !named.empty();
+    auto place = [&](double x, double y, double h_use, double e_use,
+                     int gi, int gj, const char* what) -> bool {
+        const Vec3 start = org + E * x + N * y + U * H_hi;
+        unsigned gid, pid; float t;
+        castRay(start, U * -1.0, 0.0f, static_cast<float>(H_hi + relief + 200.0), gid, pid, t);
+        if (gid == RTC_INVALID_GEOMETRY_ID) {
+            if (n_miss < 5)
+                std::cerr << "FATAL: " << what << " at (" << x << ", " << y
+                          << ") m found no terrain below it.\n";
+            ++n_miss; return false;
         }
+        if (gid != geom_core) {
+            if (n_ring_hit < 5)
+                std::cerr << "FATAL: " << what << " at (" << x << ", " << y
+                          << ") m landed on the OCCLUDER RING, which carries no thermal "
+                             "solution -- there is no T_face and no radiosity there.\n";
+            ++n_ring_hit; return false;
+        }
+        const Vec3 P = start + (U * -1.0) * static_cast<double>(t);
+        CubeRecord cr{};
+        cr.grid_i = gi; cr.grid_j = gj;
+        cr.x_m = x; cr.y_m = y;
+        const Vec3 xc = P + U * h_use;
+        cr.center[0] = xc.x; cr.center[1] = xc.y; cr.center[2] = xc.z;
+        cr.face_id = static_cast<int32_t>(pid);
+        cr.edge_m = static_cast<float>(e_use);
+        const Vec3& nj = fn[pid];
+        cr.slope_deg  = static_cast<float>(std::acos(std::max(-1.0, std::min(1.0, dot(nj, U)))) * 180.0 / kPi);
+        double asp = std::atan2(dot(nj, E), dot(nj, N)) * 180.0 / kPi;
+        if (asp < 0) asp += 360.0;
+        cr.aspect_deg = static_cast<float>(asp);
+        cr.area_m2 = static_cast<float>(farea[pid]);
+        cr.elev_m  = static_cast<float>(dot(P - org, U));
+        cr.height_achieved_m = h_use;
+        cubes.push_back(cr);
+        centers.push_back(xc);
+        max_tilt = std::max(max_tilt,
+            std::acos(std::max(-1.0, std::min(1.0, dot(U, unit(xc))))) * 180.0 / kPi);
+        return true;
+    };
+
+    // radius < 0 means NO lattice at all -- named locations only. (radius == 0
+    // still yields the single origin cube, which is a different, useful thing.)
+    if (args.radius_m >= 0.0) {
+        for (int i = -n_lat; i <= n_lat; ++i) {
+            for (int j = -n_lat; j <= n_lat; ++j) {
+                const double x = i * args.spacing_m, y = j * args.spacing_m;
+                if (x * x + y * y > args.radius_m * args.radius_m) continue;
+                if (place(x, y, height, edge, i, j, "lattice point") && want_names)
+                    names.emplace_back();      // lattice cubes carry an empty name
+            }
+        }
+    } else if (named.empty()) {
+        std::cerr << "FATAL: --radius < 0 disables the lattice, but no --locations were given, "
+                     "so there would be no cubes at all.\n";
+        rtcReleaseScene(scene); rtcReleaseDevice(dev);
+        return 3;
+    }
+    const size_t n_lattice = cubes.size();
+
+    // --- named locations, appended after the lattice -----------------------
+    for (const NamedLoc& L : named) {
+        // lat/lon -> the SITE frame, via the same basis the lattice uses. At the
+        // site's own lat/lon this yields exactly (0, 0), so a named location
+        // placed there reproduces the lattice origin cube bit for bit.
+        // The site frame is U = unit(C) where C = dirFromLatLon(...), i.e. the
+        // direction is normalized TWICE (dirFromLatLon already returns a unit
+        // vector). Applying the same FORMULA once was not enough -- the second
+        // normalization divides by a |C| that differs from 1 by an ulp, so d
+        // and U disagreed in the last bit and left ~2e-11 m in the offset. The
+        // two paths must apply the same SEQUENCE of operations, not merely the
+        // same algebra; hence the deliberate second unit() here.
+        const Vec3 d = unit(dirFromLatLon(L.lat, L.lon));
+        // Difference the DIRECTIONS first, then scale. The algebraically
+        // identical `d * r_mean - org` subtracts two ~1.7e6 m vectors to get a
+        // ~0 m result -- catastrophic cancellation that left a ~1e-11 m residue
+        // in the recorded offset even when the directions agreed exactly, and
+        // broke the grid-vs-named bit-identity check. Differencing first makes
+        // the site-centre case exactly zero instead of nearly zero.
+        const Vec3 rel = (d - U) * r_mean;
+        const double x = dot(rel, E), y = dot(rel, N);
+        const double rr = std::sqrt(x * x + y * y);
+        if (rr > args.radius_m + 1e-9)
+            std::printf("  NOTE: named location '%s' sits %.1f m from the site centre, "
+                        "outside the %.1f m grid radius. That is allowed -- named locations are "
+                        "not constrained by the lattice -- but it must be inside the CORE mesh.\n",
+                        L.name.c_str(), rr, args.radius_m);
+        const double h_use = (L.height_m > 0.0) ? L.height_m : height;
+        const double e_use = (L.edge_m   > 0.0) ? L.edge_m   : edge;
+        const std::string what = "named location '" + L.name + "'";
+        if (place(x, y, h_use, e_use, kNamedGridIndex, kNamedGridIndex, what.c_str()))
+            names.push_back(L.name);
     }
     if (n_miss || n_ring_hit) {
         std::cerr << "FATAL: " << n_miss << " lattice point(s) missed the terrain and "
@@ -478,9 +660,14 @@ int main(int argc, char** argv) {
         return 3;
     }
     const size_t n_cubes = cubes.size();
-    std::printf("placement : %zu cubes on a %.1f m lattice inside r <= %.1f m "
-                "(frame max tilt %.4f deg across the grid)\n",
-                n_cubes, args.spacing_m, args.radius_m, max_tilt);
+    std::printf("placement : %zu cubes = %zu on a %.1f m lattice inside r <= %.1f m",
+                n_cubes, n_lattice, args.spacing_m, args.radius_m);
+    if (n_cubes > n_lattice) std::printf(" + %zu named location(s)", n_cubes - n_lattice);
+    std::printf("  (frame max tilt %.4f deg)\n", max_tilt);
+    for (size_t k = n_lattice; k < n_cubes; ++k)
+        std::printf("            '%s': E=%+.2f N=%+.2f m, face %d, h=%.4f m, edge=%.4f m\n",
+                    names[k].c_str(), cubes[k].x_m, cubes[k].y_m,
+                    cubes[k].face_id, cubes[k].height_achieved_m, cubes[k].edge_m);
 
     // ---------------------------------------------------------- hemisphere sweep
     const std::array<Vec3, kNumFaces> face_normals = {
@@ -711,6 +898,7 @@ int main(int argc, char** argv) {
     h.frame_up[0]    = U.x; h.frame_up[1]    = U.y; h.frame_up[2]    = U.z;
     h.frame_max_tilt_deg = max_tilt;
     h.json_len = json_len;
+    h.has_names = want_names ? 1u : 0u;
 
     std::ofstream out(args.out, std::ios::binary);
     if (!out) { std::cerr << "FATAL: cannot open '" << args.out << "' for writing\n"; return 3; }
@@ -726,6 +914,15 @@ int main(int argc, char** argv) {
         out.write(reinterpret_cast<const char*>(rows_v[p].data()),
                   static_cast<std::streamsize>(rows_v[p].size() * sizeof(float)));
     out.write(json, json_len);
+    // Names LAST, after the JSON: every reader written against the original
+    // layout parses everything before this at unchanged offsets and ignores
+    // the tail, so adding named locations did not break the format.
+    if (want_names) {
+        std::vector<char> nb(static_cast<size_t>(n_cubes) * kNameLen, 0);
+        for (size_t k = 0; k < n_cubes && k < names.size(); ++k)
+            std::strncpy(&nb[k * kNameLen], names[k].c_str(), kNameLen - 1);
+        out.write(nb.data(), static_cast<std::streamsize>(nb.size()));
+    }
     out.close();
 
     const double mb = (sizeof(FcgHeader) + cubes.size() * sizeof(CubeRecord)
