@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""FC-08 regression gate for the offline view-factor assembler.
+"""FC-08 regression gate for the offline view-factor referee and assembler.
 
-Two arms. Both drive the ACTUAL referee pipeline end to end -- mc_ref_pp sweep ->
+Three arms. A and B drive the ACTUAL referee pipeline end to end -- mc_ref_pp sweep ->
 assemble_vf_haworth.py -> CSR -- so a defect anywhere between the ray sampler and the
 written matrix is in scope.
 
@@ -12,6 +12,12 @@ written matrix is in scope.
          O((e0/H)^2) ~ 2e-6.  The disk is cut into ~99,800 facets so every pair sits at
          lambda = NRAYS * F_ij of order 1 -- the production regime.  The assembled row 0
          must reproduce 0.250000 to within --closed-form-tol-pct.
+
+  ARM C  BACK-FACE CULL (Paul's ruling, 2026-08-19).  A ray striking the BACK of a
+         one-sided facet has reached the underside of opaque terrain: it is blocked, but
+         the facet cannot exchange radiation with the source and is not a partner.  On
+         geometry where no such hit is possible the cull must be provably inert; on an
+         open heightfield it may only ever REMOVE partner weight.
 
   ARM B  RAY-BUDGET INVARIANCE.  Assemble one and the same geometry (the repo's
          lunar_crater_80N mesh) from two sweeps that differ only in ray budget.  An
@@ -36,11 +42,13 @@ Runtime on the 48-core Mac Pro: a few minutes.
 
 Usage:
   test_vf_assembler_gate.py [--work DIR] [--jobs N] [--mc-ref-pp PATH]
-                            [--arm A|B|both] [--keep]
+                            [--arm A|B|C|all] [--keep]
 """
 import argparse
 import glob
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -191,12 +199,34 @@ def write_tmax(path, n, value=100.0):
         np.full(n, value, dtype="<f4").tofile(f)
 
 
-def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs):
+def backface_counts(outdir, jobs):
+    """Parse mc_ref_pp's BACKFACE summary out of the per-chunk logs. Returns
+    (detected, blocked) summed over chunks. Fails loud if the banner is missing --
+    a silently absent counter would make arm C vacuous."""
+    det = blk = 0
+    seen = 0
+    for k in range(jobs):
+        for ln in (outdir / f"log_{k:02d}.txt").read_text(errors="replace").splitlines():
+            if "BACKFACE summary" in ln:
+                m = re.search(r"(\d+) back-side hits DETECTED .*?; (\d+) BLOCKED", ln)
+                if not m:
+                    raise SystemExit(f"FATAL: unparsable BACKFACE banner: {ln}")
+                det += int(m.group(1)); blk += int(m.group(2)); seen += 1
+    if seen != jobs:
+        raise SystemExit(f"FATAL: BACKFACE banner found in {seen}/{jobs} chunk logs. The "
+                         "counter is missing, so arm C would be vacuous.")
+    return det, blk
+
+
+def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=False):
     """Run the per-partner referee over every face, in `jobs` parallel chunks."""
     outdir.mkdir(parents=True, exist_ok=True)
     chunks = np.array_split(np.arange(nfaces), jobs)
     env = dict(os.environ)
     env.pop("PTM_PP_RING_PLY", None)          # no occluder mesh in either arm
+    env.pop("PTM_PP_NO_BACKFACE_CULL", None)
+    if no_backface_cull:
+        env["PTM_PP_NO_BACKFACE_CULL"] = "1"
     procs = []
     t0 = time.time()
     for k, ch in enumerate(chunks):
@@ -327,15 +357,83 @@ def arm_b(work, binary, jobs, nr_lo, nr_hi, tol_pct, defect_min_pct):
     return ok and teeth
 
 
+def arm_c(work, binary, jobs, nrays):
+    """Back-face cull (Paul's ruling, 2026-08-19). A ray striking the BACK of a one-sided
+    facet has reached the underside of opaque terrain: it is blocked, and the facet is not a
+    radiative partner. On geometry where no such hit is possible the cull must be inert."""
+    print("\n=== ARM C: back-face cull -- inert where impossible, counted where real ===")
+    ok = True
+
+    # C1: the coaxial disk. Element and disk face each other, so no ray can reach a back
+    # side. Detected must be 0 AND the raw sweep must be byte-identical with the cull off,
+    # which also proves the cull cannot perturb arm A's closed-form number.
+    mesh = work / "disk.ply"
+    if not mesh.is_file():
+        make_disk_mesh(mesh)
+    tmax = work / "disk_tmax.bin"
+    if not tmax.is_file():
+        write_tmax(tmax, 3 + DISK_NTH * (2 * DISK_K - 1))
+    nfaces = 3 + DISK_NTH * (2 * DISK_K - 1) - 2   # 1 element + disk facets
+    nfaces = 1 + DISK_NTH * (2 * DISK_K - 1)
+    digests = {}
+    det = {}
+    for tag, off in (("cull", False), ("nocull", True)):
+        d = work / f"bf_disk_{tag}"
+        sweep(binary, mesh, tmax, nfaces, nrays, d, jobs, no_backface_cull=off)
+        det[tag] = backface_counts(d, jobs)[0]
+        h = hashlib.md5()
+        for k in range(jobs):
+            h.update((d / f"pp_{k:02d}.bin").read_bytes())
+        digests[tag] = h.hexdigest()
+    same = digests["cull"] == digests["nocull"]
+    print(f"  disk ({nfaces} faces): back-side hits detected = {det['cull']} "
+          f"(cull off: {det['nocull']}); sweep digest "
+          f"{'IDENTICAL' if same else 'DIFFERS'} ({digests['cull'][:12]})")
+    c1 = (det["cull"] == 0 and det["nocull"] == 0 and same)
+    print(f"  [C1] cull inert on front-to-front geometry : {'PASS' if c1 else 'FAIL'}")
+    ok &= c1
+
+    # C2: the open crater heightfield. Back hits are real here. The cull may only ever
+    # REMOVE partner weight, never add it -- an increase would mean the test is inverted.
+    cmesh = work / "crater80N_tri.ply"
+    if not cmesh.is_file():
+        convert_ascii_ply(CRATER_PLY, cmesh)
+    ctmax = work / "crater_tmax.bin"
+    if not ctmax.is_file():
+        write_tmax(ctmax, 12800)
+    sig = {}
+    cdet = {}
+    for tag, off in (("cull", False), ("nocull", True)):
+        d = work / f"bf_crater_{tag}"
+        g = sweep(binary, cmesh, ctmax, 12800, nrays, d, jobs, no_backface_cull=off)
+        cdet[tag] = backface_counts(d, jobs)
+        csr = assemble(cmesh, g, nrays, work / f"bf_crater_{tag}.csr", "tried")
+        sig[tag] = mean_sigma_f(csr)
+    print(f"  crater80N (12800 faces, open): back-side hits detected = {cdet['cull'][0]} "
+          f"(blocked {cdet['cull'][1]}); cull off detects {cdet['nocull'][0]}, blocks "
+          f"{cdet['nocull'][1]}")
+    print(f"  mean SigmaF: cull ON {sig['cull']:.6f}  vs OFF {sig['nocull']:.6f}  "
+          f"({100*(sig['cull']/sig['nocull']-1):+.3f}%)")
+    c2 = (cdet["cull"][0] == cdet["nocull"][0]          # detection is cull-independent
+          and cdet["cull"][1] == cdet["cull"][0]        # ON blocks everything it detects
+          and cdet["nocull"][1] == 0                    # OFF blocks nothing
+          and sig["cull"] <= sig["nocull"])             # cull can only remove weight
+    print(f"  [C2] cull removes only, and OFF admits what it keeps : "
+          f"{'PASS' if c2 else 'FAIL'}")
+    return ok and c2
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=None, help="scratch directory (default: a temp dir)")
     ap.add_argument("--jobs", type=int, default=min(20, os.cpu_count() or 4))
     ap.add_argument("--mc-ref-pp", default=None, help="prebuilt referee binary")
-    ap.add_argument("--arm", choices=("A", "B", "both"), default="both")
+    ap.add_argument("--arm", choices=("A", "B", "C", "all"), default="all")
     ap.add_argument("--nrays-closed-form", type=int, default=200000)
     ap.add_argument("--nrays-lo", type=int, default=4000)
+    ap.add_argument("--nrays-backface", type=int, default=20000,
+                    help="Ray budget for arm C. Back-face incidence is a GEOMETRIC\nproperty, not a convergence one, so this need not match the other arms.")
     ap.add_argument("--nrays-hi", type=int, default=200000)
     # Arm A's residual is NOT a random draw: mc_ref_pp uses deterministic Halton QMC, so a
     # given binary/Embree-ISA pair reproduces it bit for bit. Measured 2026-08-19 with
@@ -365,13 +463,15 @@ def main():
 
     t0 = time.time()
     results = {}
-    if a.arm in ("A", "both"):
+    if a.arm in ("A", "all"):
         results["A closed form"] = arm_a(work, binary, a.jobs, a.nrays_closed_form,
                                          a.closed_form_tol_pct, a.closed_form_defect_min_pct)
-    if a.arm in ("B", "both"):
+    if a.arm in ("B", "all"):
         results["B ray-budget invariance"] = arm_b(work, binary, a.jobs, a.nrays_lo, a.nrays_hi,
                                                    a.invariance_tol_pct,
                                                    a.invariance_defect_min_pct)
+    if a.arm in ("C", "all"):
+        results["C back-face cull"] = arm_c(work, binary, a.jobs, a.nrays_backface)
 
     print(f"\n=== SUMMARY ({time.time()-t0:.0f}s) ===")
     for k, v in results.items():
