@@ -396,14 +396,28 @@ public:
     // Initialize GPU solver if enabled (call after setConfig)
     void initGPU();
 
-    // Promote a PTM_HMATRIX_VF_REPLACE matrix from its CPU SparseVFOperator to a
-    // GPU-capable ViewFactorMatrix (sets F_ptr_ for the upload). Called from
-    // initGPU(), which is the FIRST point at which config_ holds the user's
-    // settings -- initCommon() runs from the constructor, before setConfig().
+    // Nominate a PTM_HMATRIX_VF_REPLACE matrix, sitting in its CPU
+    // SparseVFOperator, as the CSR the GPU rungs upload. Called from initGPU(),
+    // which is the FIRST point at which config_ holds the user's settings --
+    // initCommon() runs from the constructor, before setConfig().
+    //
+    // This does NOT copy the matrix: the operator's own float32 CSR is what the
+    // uploader consumes, because float32 IS the device format. (It used to
+    // widen that CSR into a float64 ViewFactorMatrix replica for an fp64-only
+    // uploader that narrowed it straight back -- nnz*12 host bytes, 26.6 GB on
+    // A03MP026's v3 matrix and 42.5 GB on A03N1016's, with no reader.)
+    //
     // The CPU operator stays installed throughout, so declining the GPU needs no
-    // repair; releaseVfReplaceGpuOperator() just drops F_ptr_ and the float64
-    // replica. Both are no-ops on every other path.
-    void promoteVfReplaceToGpuOperator();
+    // repair; releaseVfReplaceGpuOperator() just drops the nomination. Both are
+    // no-ops on every other path.
+    //
+    // @param gpu_rung_reachable false when the caller will return before the
+    //        degrade ladder (radiation.use_gpu is off), so nothing could consume
+    //        a GPU nomination. A forced PTM_HMATRIX_VF_REPLACE_GPU is then
+    //        refused in one line and the CPU route is taken -- the env var
+    //        becomes a genuine no-op instead of silently swapping the CPU
+    //        solver and leaving an unread matrix resident.
+    void promoteVfReplaceToGpuOperator(bool gpu_rung_reachable);
     void releaseVfReplaceGpuOperator(const char* why);
 
     // The emissivity actually in force, i.e. after initCommon applied any
@@ -460,12 +474,47 @@ private:
                                         const std::vector<double>& solar_flux);
 #endif
 
+    // The CSR the GPU rungs upload has exactly two producers, and initGPU() is
+    // the only reader of either:
+    //   * VF_REPLACE routed to the GPU -> vf_replace_gpu_src_, the CPU
+    //     SparseVFOperator's own float32 CSR, uploaded BY REFERENCE (the
+    //     operator owns it and stays installed, so this is always valid while
+    //     the nomination stands).
+    //   * every other sparse path -> F_ptr_, a caller-owned float64
+    //     ViewFactorMatrix.
+    // Nothing else may consult vf_replace_gpu_src_: Gauss-Seidel row access and
+    // the `use_gs` predicate stay keyed on F_ptr_ alone, exactly as before.
+    bool gpuCsrAvailable() const {
+        return vf_replace_gpu_src_ != nullptr || F_ptr_ != nullptr;
+    }
+    size_t gpuCsrNumNonZeros() const {
+        if (vf_replace_gpu_src_) return vf_replace_gpu_src_->values().size();
+        return F_ptr_ ? F_ptr_->numNonZeros() : 0;
+    }
+    // Hand (values, col_indices, row_ptrs) to `fn` from whichever producer is
+    // live. Both GPU rungs upload through THIS one resolution, so they cannot
+    // end up committing different matrices to different devices -- the failure
+    // mode a per-rung `if (vf_replace_gpu_src_) ... else ...` invites. `fn` is a
+    // generic lambda because the two producers differ in the value type (float
+    // vs double) that selects the uploader's overload.
+    template <typename Fn>
+    void withGpuCsr(Fn&& fn) const {
+        if (vf_replace_gpu_src_) {
+            fn(vf_replace_gpu_src_->values(),
+               vf_replace_gpu_src_->colIndices(),
+               vf_replace_gpu_src_->rowPointers());
+        } else if (F_ptr_) {
+            fn(F_ptr_->values(), F_ptr_->colIndices(), F_ptr_->rowPointers());
+        }
+    }
+
     // Data members
     std::unique_ptr<IViewFactorOperator> F_op_;
     const ViewFactorMatrix* F_ptr_ = nullptr;  // For row access in Gauss-Seidel
-    // Owns a ViewFactorMatrix built from a VF_REPLACE corrected CSR when routed
-    // to the GPU pool (PTM_HMATRIX_VF_REPLACE_GPU); F_ptr_ points into it.
-    std::unique_ptr<ViewFactorMatrix> owned_vf_;
+    // Non-owning: points at the SparseVFOperator held by F_op_ when a
+    // VF_REPLACE corrected CSR is routed to a GPU rung. Null on every other
+    // path and after releaseVfReplaceGpuOperator().
+    const SparseVFOperator* vf_replace_gpu_src_ = nullptr;
     bool use_hmatrix_ = false;
     std::vector<double> emissivity_;
     std::vector<double> reflectivity_;  // 1 - emissivity (thermal reflectivity)
@@ -548,10 +597,11 @@ private:
     // is true once it has run (both false when it did not run at all).
     //   _cpu_ : installed as a CPU-only SparseVFOperator. initGPU() reports it if
     //           the config also asked for GPU radiosity.
-    //   _gpu_ : installed as a ViewFactorMatrix with F_ptr_ set, for initGPU and
-    //           the pool. If no GPU rung then engages,
-    //           restoreCpuVfOperatorAfterGpuDecline() converts it back so the
-    //           fallback is the production CPU solver rather than Gauss-Seidel.
+    //   _gpu_ : nominated for upload via vf_replace_gpu_src_, for initGPU and
+    //           the pool. The SparseVFOperator is never uninstalled, so if no
+    //           GPU rung engages, releaseVfReplaceGpuOperator() only has to drop
+    //           the nomination and the fallback is the production CPU solver
+    //           rather than Gauss-Seidel.
     bool vf_replace_cpu_route_ = false;
     bool vf_replace_gpu_route_ = false;
     // Path the corrected CSR came from, for the promotion message.

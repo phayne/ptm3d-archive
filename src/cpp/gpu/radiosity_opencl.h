@@ -121,7 +121,37 @@ public:
     /**
      * @brief Upload CSR view factor matrix (call once at start)
      *
-     * @param values Non-zero values of view factor matrix
+     * float32 IS the device format: the SpMV kernel reads a `__global const
+     * float*`, so this overload hands the caller's array straight to
+     * clEnqueueWriteBuffer with no host-side copy of the values, on both the
+     * single-buffer and the chunked (PTM-25) path. A caller that already holds
+     * float32 -- the PTM_HMATRIX_VF_REPLACE CSR is float32 on disk AND float32
+     * in the CPU SparseVFOperator -- must use this overload, not the fp64 one.
+     *
+     * @param values Non-zero values of the view factor matrix (float32)
+     * @param col_indices Column indices for each non-zero
+     * @param row_ptrs Row pointers (size = n_faces + 1)
+     */
+    void uploadViewFactors(
+        const std::vector<float>& values,
+        const std::vector<int>& col_indices,
+        const std::vector<int64_t>& row_ptrs);
+
+    /**
+     * @brief fp64 overload for callers holding a ViewFactorMatrix.
+     *
+     * ViewFactorMatrix stores values in float64 and the device stores float32,
+     * so somebody has to narrow; this is the only place left on the upload path
+     * that does. The narrowing granularity is unchanged from before the overload
+     * split -- whole-matrix on the single-buffer path (bounded by the ~2 GB
+     * per-buffer budget), per chunk on the chunked path -- so a huge float64
+     * matrix never needs a second full copy of itself resident.
+     *
+     * float32 -> float64 -> float32 is value-preserving, so widening a float32
+     * CSR just to come back through here is pure cost with no numerical effect:
+     * a float32 caller should use the overload above.
+     *
+     * @param values Non-zero values of the view factor matrix (float64)
      * @param col_indices Column indices for each non-zero
      * @param row_ptrs Row pointers (size = n_faces + 1)
      */
@@ -291,12 +321,24 @@ private:
     // Release resources
     void release();
 
+    // Shared implementation of both uploadViewFactors() overloads. ValueT is
+    // float (the device format -- written by reference, zero host copies) or
+    // double (narrowed, at the granularity documented on the public overload).
+    // Defined in the .cpp; both instantiations are used from that same TU.
+    template <typename ValueT>
+    void uploadViewFactorsT(const std::vector<ValueT>& values,
+                            const std::vector<int>& col_indices,
+                            const std::vector<int64_t>& row_ptrs);
+
     // Build the chunked CSR sub-buffers (PTM-25) when the matrix exceeds the
     // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
-    void buildChunkedCsr(const std::vector<double>& values,
-                         const std::vector<int>& col_indices,
-                         const std::vector<int64_t>& row_ptrs,
-                         size_t max_chunk_nnz);
+    // float32 values are written to each chunk buffer directly out of the
+    // caller's array; float64 values are narrowed one chunk at a time.
+    template <typename ValueT>
+    void buildChunkedCsrT(const std::vector<ValueT>& values,
+                          const std::vector<int>& col_indices,
+                          const std::vector<int64_t>& row_ptrs,
+                          size_t max_chunk_nnz);
 
     // Enqueue y = F * x, dispatching to the single-buffer or chunked SpMV path.
     void enqueueSpMV(cl_mem x, cl_mem y, size_t global_size, size_t local_size);
