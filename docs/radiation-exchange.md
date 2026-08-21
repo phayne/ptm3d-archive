@@ -199,7 +199,7 @@ sweeps every face as a ray source and writes the raw per-partner hit fractions; 
 applies a reciprocity-preserving $\Sigma F \le 1$ congruence, and writes the v2 header
 (face count, float64 geometry hash, `indptr`, `nnz`, columns, values).
 
-**The symmetrization estimator.** Every undirected pair $\{i,j\}$ is measured twice, once from
+**The symmetrization estimator.** Every undirected pair $\lbrace i,j\rbrace$ is measured twice, once from
 each end. Both are unbiased estimates of $S_{ij} = A_i F_{ij}$, so the assembler averages them:
 
 $$S_{ij}^{\text{sym}} = \tfrac{1}{2}\left(\hat{S}_{i\to j} + \hat{S}_{j\to i}\right)$$
