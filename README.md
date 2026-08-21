@@ -112,43 +112,19 @@ and thermal emission from surrounding terrain.*
 **Full validation gallery (all seven manuscript figures, Figs. 3–9, with
 headline numbers for each): [`docs/VALIDATION.md`](docs/VALIDATION.md).**
 
-![PTM3D re-run of manuscript Fig. 5's tests: PTM3D vs. Hayne et al. (2017), Diviner, and Apollo](docs/figures/validation_fig05_ptm3d_hayne_apollo.png)
-*PTM3D-native re-run of the submitted manuscript's Fig. 5 tests (`main.tex`,
-"Validation of the 3D thermophysical model with comparison to Diviner data
-(left panel) and Apollo heat flow probe data (right panel)"), run through
-PTM3D itself end to end — smooth global icosphere (radiation exchange OFF is
-exact for a convex body), CPU-only, body=Moon. **(a)** Global Table 1
-(Hayne et al. 2017) thermophysical properties, A₀ = 0.12: equatorial/30°/60°
-PTM3D diurnal surface-temperature curves vs. Diviner brightness temperatures
-and the Hayne et al. (2017) equatorial peak/midnight/minimum reference
-points (all carry the manuscript's own ±5 K error bars; the 27 nighttime
-Diviner dots are bare in the source figure and are plotted without invented
-bars). Max |PTM3D − reference| = **1.05 K** at the three bar-carrying
-anchors. The local-time axis is anchored on PTM3D's own diurnal maximum
-(hr = 0 by construction), so the hr = 18 "minimum" anchor is scored
-extremum-to-extremum — PTM3D's own diurnal minimum falls one output sample
-(≈2 h of real lunar local time) before hr = 18, residual **−1.05 K**;
-scored instead at the literal hr = 18.00 point the residual is **+2.74 K**,
-also inside the bar (both numbers reported, see `docs/VALIDATION.md` for
-detail). Bare-dot residuals: **1.61 K** (RMS 0.75 K) at the 27 bare dots,
-informative only. **(b)** Apollo 15 (Hadley–Apennine) and Apollo 17
-(Taurus–Littrow, dark pyroclastic-mantle terrain) landing sites at their own
-site-specific Bond albedo, A₀ = 0.06 (the value that clears all four probe
-points; consistent with Hayne et al. 2017's practice of site-specific
-Apollo albedos, but their exact per-site values are not independently
-verified here) — all other properties unchanged from Table 1 (no evidence
-for a lower density e-folding depth H at either site, so H stays at the
-Table 1 default). Equilibrated 480 lunar day/night cycles at thermal grid
-resolution `thermal_b = 45` (bottom node 1.41 m, the convergence study's
-accepted working point); both scored deep points (0.83 m, 1.30 m) fall
-within that genuinely-solved grid, so the model curves are drawn solid
-throughout, with no extrapolated segment. The manuscript plots the Apollo
-17 deep point at 13 cm; the probe's actual reference depth is 130 cm
-(confirmed by the author — a 10× error in the source figure; Langseth
-et al. 1976 report the probe depths), scored here at the corrected depth
-(inside its bar at either depth, see `docs/VALIDATION.md`). **Max
-|PTM3D − reference| = 4.91 K** (Apollo 17 surface, 0.09 K inside its
-±5 K bar) — **all four Apollo points land inside their ±5 K bars.***
+![PTM3D-modeled lunar diurnal temperatures vs. Diviner and Apollo 15/17 measurements](docs/figures/validation_fig05_ptm3d_hayne_apollo.png)
+*PTM3D-modeled lunar diurnal temperatures compared with Diviner Lunar Radiometer
+Experiment brightness temperatures and Apollo 15/17 heat-flow-probe measurements
+(Langseth et al. 1976). **(a)** Modeled surface temperature at the equator, 30°N,
+and 60°N over one lunation, using global Table 1 thermophysical properties,
+against Diviner nighttime brightness temperatures and the Hayne et al. (2017)
+noon/midnight/minimum reference points; residuals are ≤1.6 K wherever the
+reference data carry uncertainties (±5 K). **(b)** Modeled diurnal-mean
+subsurface temperature at the Apollo 15 (Hadley–Apennine) and Apollo 17
+(Taurus–Littrow) landing sites, each modeled at its own Bond albedo
+(A₀ = 0.06) rather than the Table 1 global default; residuals at the surface
+and at the probes' own depths are ≤4.9 K, inside the ±5 K measurement
+uncertainty at both sites. Details: [`docs/VALIDATION.md`](docs/VALIDATION.md).*
 
 ![Manuscript Fig. 7: bowl-crater comparison to Ingersoll et al. (1992)](docs/figures/validation_fig07_bowl_crater_ingersoll.png)
 *PTM3D vs. the analytic bowl-crater solution of Ingersoll, Svitek & Murray
