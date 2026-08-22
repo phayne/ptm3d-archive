@@ -559,7 +559,11 @@ def main():
                         f"-1 = automatic: {DEFAULT_GPU_STALL_MIN:g} min for a "
                         "GPU run, off for a CPU run. 0 disables it. Catches a "
                         "wedged GPU long before --chunk-timeout-min does, and "
-                        "catches the case where the engine is alive but frozen.")
+                        "catches the case where the engine is alive but frozen. "
+                        "RAISE IT if your run has a legitimately silent phase "
+                        "longer than the timeout (a very large view-factor "
+                        "matrix read from slow or cloud-backed storage is the "
+                        "one to watch): a false kill costs the whole attempt.")
     p.add_argument("--log-dir", type=Path, default=None,
                    help="Directory for per-attempt engine logs. Default "
                         "<output-dir>/logs. Engine output is TEED: it still "

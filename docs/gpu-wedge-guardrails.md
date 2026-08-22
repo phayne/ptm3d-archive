@@ -169,7 +169,13 @@ note rather than a warning.
   nothing at all for the timeout, and counts the attempt as a retryable
   failure. Silence, not slowness, is the wedge signature; waiting out
   `--chunk-timeout-min` only holds the GPU longer. Cost: none on a healthy run,
-  which writes progress continuously.
+  which writes progress continuously — **but a run with a legitimately silent
+  phase longer than the timeout would be killed for no reason**, and that costs
+  the whole attempt. The phase to watch is a very large view-factor matrix read
+  from slow or cloud-backed storage. Raise `--stall-min` if that is your
+  situation; the 45 min default is chosen well above every silent phase
+  measured on the A3GT windows (the longest is the ~13 min illumination pass,
+  which is not silent at all).
 - **Rotated logs** move an existing `<output-dir>/logs/` to
   `logs.prev-<UTC>` at startup and write one log per attempt
   (`chunk_NNN_attempt_M.log`). Attempt numbering restarts on a rerun, so
