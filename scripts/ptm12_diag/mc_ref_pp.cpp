@@ -184,13 +184,33 @@ int main(int argc,char**argv){
       t.read((char*)tmax.data(),nf*4); }
     const double SIG=5.670374419e-8, EPS=0.95;
     std::vector<long> want; { std::ifstream L(fl); long x; while(L>>x)want.push_back(x); }
-    fprintf(stderr,"# CORRECTED referee: offset=%.6g m  keps=%.3f  nrays=%d%s\n",OFF,KEPS,NR,hasRing?"  (+ring occluder)":"");
+    // FC-08 follow-up (2026-08-19, Paul's ruling): BACK-FACE CULL, default ON.
+    // A ray that strikes the BACK of a core face has reached the underside of an opaque,
+    // one-sided surface. That face cannot radiate toward the source and cannot receive from
+    // it, so it is NOT a radiative partner -- but the surface is still opaque, so the ray is
+    // BLOCKED, exactly as a ring hit is: not sky, not a partner. Before this, such a hit was
+    // recorded as a full partner; after the divisor fix it would have been kept at half
+    // weight, which is not better than dropping a physically impossible exchange.
+    // The test is n_j . d >= 0, with n_j the RAW winding normal (this tool never radially
+    // flips) and d the ray direction. On a closed mesh it can never fire.
+    // WINDING WARNING: on a mesh with inconsistent winding a genuine partner reads as
+    // back-facing and its flux is lost. The cull count is therefore ALWAYS reported, and a
+    // large fraction means "check the winding", not "the cull is working".
+    // Set PTM_PP_NO_BACKFACE_CULL=1 to restore the pre-ruling behavior (A/B measurement only).
+    bool BACKCULL=true;
+    if(const char* e=std::getenv("PTM_PP_NO_BACKFACE_CULL")) if(e[0]=='1'){
+        BACKCULL=false;
+        fprintf(stderr,"# *** WARNING: PTM_PP_NO_BACKFACE_CULL=1 -- back-face hits are recorded as "
+                       "radiative partners. This is the pre-2026-08-19 behavior and is PHYSICALLY "
+                       "WRONG on open meshes. A/B measurement only. ***\n"); }
+    fprintf(stderr,"# CORRECTED referee: offset=%.6g m  keps=%.3f  nrays=%d%s  backface_cull=%s\n",
+            OFF,KEPS,NR,hasRing?"  (+ring occluder)":"",BACKCULL?"ON":"OFF");
     printf("# face SumF F_sky F_warm384 Qir\n");
     RTCIntersectArguments ia; rtcInitIntersectArguments(&ia);
-    long ring_total=0, ray_total=0;
+    long ring_total=0, ray_total=0, back_total=0, backseen_total=0;
     for(long pf:want){ if(pf<0||pf>=(long)nf)continue; const V3&c=ctr[pf]; V3 ax=nn[pf]; double heps=KEPS*edge[pf];
         V3 t=(std::fabs(ax[2])<0.9)?V3{{0,0,1}}:V3{{1,0,0}}; V3 bx=nrm(cross(ax,t)),by=cross(ax,bx);
-        long terr=0,warm=0,tot=0,ringhit=0; double Qir=0; std::unordered_map<int,long> hits;
+        long terr=0,warm=0,tot=0,ringhit=0,backhit=0,backseen=0; double Qir=0; std::unordered_map<int,long> hits;
         for(int s=0;s<NR;++s){
             double u1=halton(s+1,2),u2=halton(s+1,3), rr=std::sqrt(u1),ph=2*M_PI*u2;  // deterministic QMC
             V3 d=nrm({{ rr*std::cos(ph)*bx[0]+rr*std::sin(ph)*by[0]+std::sqrt(1-u1)*ax[0],
@@ -214,17 +234,28 @@ int main(int argc,char**argv){
                 // A ring hit is a different geometry, so it can never be the launch face's own
                 // self-relief (the p==pf skip is gated on isCore). Above the relief floor it
                 // blocks the ray as a genuine occluder without becoming a partner.
-                if(rise>=heps && !(isCore && (long)p==pf)){ hitface = isCore ? (long)p : -2; break; }
+                if(rise>=heps && !(isCore && (long)p==pf)){
+                    // Back-face cull: we struck the underside of an opaque one-sided facet.
+                    // It blocks the ray but can exchange no radiation -> -3, like a ring hit.
+                    // The geometric condition is counted whether or not the cull ACTS, so the
+                    // OFF arm reports the same population it is choosing to keep.
+                    if(isCore && dot(nn[p],d)>=0.0){
+                        backseen++;
+                        if(BACKCULL){ hitface=-3; break; }
+                    }
+                    hitface = isCore ? (long)p : -2; break;
+                }
                 tstart=thit+1e-5;  // self-relief or self: advance past and continue
             }
             if(hitface>=0){ terr++; double Tj=tmax[hitface]; if(Tj>384.f)warm++; Qir+=SIG*Tj*Tj*Tj*Tj; hits[hitface]++; }
             else if(hitface==-2){ ringhit++; }  // occluded by ring: not sky, not a partner
+            else if(hitface==-3){ backhit++; }  // opaque back side: not sky, not a partner
         }
-        // F_sky excludes ring occlusion (a blocked ray is not sky). Byte-identical to 1-SumF
-        // when no ring is loaded (ringhit==0).
-        double SumF=double(terr)/tot, Fsky=double(tot-terr-ringhit)/tot, Fw=double(warm)/tot, Qir_abs=EPS*EPS*(Qir/tot);
+        // F_sky excludes ring occlusion and back-face blocking (a blocked ray is not sky).
+        // Byte-identical to 1-SumF when neither fires (ringhit==0 && backhit==0).
+        double SumF=double(terr)/tot, Fsky=double(tot-terr-ringhit-backhit)/tot, Fw=double(warm)/tot, Qir_abs=EPS*EPS*(Qir/tot);
         printf("%7ld %.4f %.4f %.4f %.1f\n",pf,SumF,Fsky,Fw,Qir_abs);
-        ring_total+=ringhit; ray_total+=tot;
+        ring_total+=ringhit; ray_total+=tot; back_total+=backhit; backseen_total+=backseen;
         { static FILE* fb=fopen(OUTB,"wb"); int nnz=0; for(auto&kv:hits){ if(kv.second>=MIN_HITS) nnz++; }
           int src=(int)pf; fwrite(&src,4,1,fb); fwrite(&nnz,4,1,fb);
           for(auto&kv:hits){ double F=(double)kv.second/tot; if(kv.second>=MIN_HITS){ int j=kv.first; float ff=(float)F; fwrite(&j,4,1,fb); fwrite(&ff,4,1,fb);} }
@@ -232,5 +263,12 @@ int main(int argc,char**argv){
     }
     if(hasRing) fprintf(stderr,"# RING summary: %ld ring-occlusion hits over %ld rays (%.4f) -- none recorded as partners\n",
                         ring_total,ray_total,ray_total?double(ring_total)/ray_total:0.0);
+    // ALWAYS reported, including the zero: a closed mesh must show 0, and a large fraction on
+    // an open mesh means "check the mesh winding" before it means "the cull is working".
+    fprintf(stderr,"# BACKFACE summary: cull=%s  %ld back-side hits DETECTED over %ld rays (%.6f); "
+                   "%ld BLOCKED (not sky, not a partner), %ld recorded as partners anyway%s\n",
+            BACKCULL?"ON":"OFF",backseen_total,ray_total,
+            ray_total?double(backseen_total)/ray_total:0.0,back_total,backseen_total-back_total,
+            BACKCULL?"":"  <-- PHYSICALLY WRONG, cull disabled by env");
     rtcReleaseScene(sc);rtcReleaseDevice(dev); return 0;
 }
