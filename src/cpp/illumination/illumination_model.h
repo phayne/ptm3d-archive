@@ -512,6 +512,34 @@ public:
         primary_ir_chunks_.clear();
         using_chunked_storage_ = false;
     }
+
+    // --- passive-probe access (flux cubes) --------------------------------
+    // A flux cube is a measurement fixture, not a body: it must ask the scene
+    // "is this ray blocked?" and reuse the engine's own primary-body physics
+    // WITHOUT becoming part of either -- it never occludes, emits, scatters, or
+    // enters the view-factor matrix.
+    //
+    // These are thin PUBLIC wrappers over machinery that is otherwise private.
+    // They add no physics of their own; that is the point. A probe that wrote
+    // its own shadow test or its own Earthshine formula would be a second
+    // spelling, and the two would agree today and drift later.
+    //
+    // probeOccluded returns false when the scene is not built, and says so once
+    // rather than reporting "clear" forever -- an unbuilt scene must not read as
+    // an unshadowed sky.
+    bool probeOccluded(const std::array<double, 3>& origin,
+                       const std::array<double, 3>& direction);
+    double probePrimaryHeating(double mean_cos, double primary_distance);
+    double probePrimaryReflected(double mean_cos,
+                                 const std::array<double, 3>& primary_direction,
+                                 const std::array<double, 3>& sun_position,
+                                 const std::array<double, 3>& primary_position,
+                                 double primary_distance);
+    // Primary-body radius in km, or 0 when this body has no primary (in which
+    // case a probe treats it as absent, not as a point source at the origin).
+    double primaryRadiusKm() const { return has_primary_body_ ? primary_radius_ : 0.0; }
+    bool hasEmbreeScene() const { return embree_scene_ != nullptr; }
+
 private:
     
     // Mutex for thread synchronization when processing batches
