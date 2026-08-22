@@ -540,14 +540,32 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.flux_cubes.write_csv = getWithDefault(fc, "write_csv", config.flux_cubes.write_csv);
             config.flux_cubes.write_csv_max_cubes = getWithDefault(fc, "write_csv_max_cubes", config.flux_cubes.write_csv_max_cubes);
             config.flux_cubes.shadow_probe_rays = getWithDefault(fc, "shadow_probe_rays", config.flux_cubes.shadow_probe_rays);
+            // `locations` is a SEQUENCE OF MAPS -- the only one in this parser.
+            // Its per-entry fields are read with direct node access rather than
+            // getWithDefault, deliberately: getWithDefault's first argument is
+            // how the engine-config extractor identifies which YAML SECTION a
+            // key belongs to, and a loop variable is not a section. Writing
+            // `getWithDefault(entry, "name", ...)` made the extractor emit a
+            // phantom key under an unresolvable node and fail the parity test.
+            //
+            // Reading them directly is also the CORRECT surface: there is no
+            // dotted key `flux_cubes.locations.name` for a user to write -- the
+            // name lives inside a list element -- so publishing one in the
+            // engine-config table would tell the GUI writer and the dead-key
+            // audit that a key exists which does not. The table documents
+            // `flux_cubes.locations` itself; the per-entry schema is in
+            // docs/flux-cubes.md section 12.
+            //
+            // Semantics are unchanged: getWithDefault is `node[key] ? as<T>() :
+            // default`, which is exactly what each line below does.
             if (fc["locations"] && fc["locations"].IsSequence()) {
-                for (const auto& L : fc["locations"]) {
+                for (const auto& entry : fc["locations"]) {
                     SimulationConfig::FluxCubeParams::NamedLocation nl;
-                    nl.name     = getWithDefault(L, "name", std::string());
-                    nl.lat_deg  = getWithDefault(L, "lat_deg", 0.0);
-                    nl.lon_deg  = getWithDefault(L, "lon_deg", 0.0);
-                    nl.height_m = getWithDefault(L, "height_m", -1.0);
-                    nl.edge_m   = getWithDefault(L, "edge_m", -1.0);
+                    if (entry["name"])     nl.name     = entry["name"].as<std::string>();
+                    if (entry["lat_deg"])  nl.lat_deg  = entry["lat_deg"].as<double>();
+                    if (entry["lon_deg"])  nl.lon_deg  = entry["lon_deg"].as<double>();
+                    if (entry["height_m"]) nl.height_m = entry["height_m"].as<double>();
+                    if (entry["edge_m"])   nl.edge_m   = entry["edge_m"].as<double>();
                     if (nl.name.empty()) {
                         std::cerr << "[config] WARNING: a flux_cubes.locations entry has no "
                                      "`name:` and will be ignored -- outputs are keyed by name."
