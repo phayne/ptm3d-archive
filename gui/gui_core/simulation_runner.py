@@ -83,6 +83,14 @@ class SimulationThread(QThread):
             if applied:
                 self.output_ready.emit("[run] engine env: " + " ".join(applied))
 
+            # A long GPU run launched from the GUI is ONE engine process, so it
+            # gets none of the chunked runner's GPU-wedge guardrails. Say so in
+            # the console rather than rerouting: the chunked workflow produces
+            # merged statistics and no per-step series, which is the user's
+            # call, not a warning's. Shared with the CLI (ptm.run).
+            for msg in ptm_run.long_run_advisory(self.config_dict or {}):
+                self.warning_ready.emit(msg)
+
             self._engine = EngineProcess(
                 command,
                 working_dir=self.working_dir,

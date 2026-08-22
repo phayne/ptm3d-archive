@@ -222,6 +222,65 @@ def build_command(executable, config_file, config_dict=None):
     return command
 
 
+#: A run at or above this many simulated days is "long" for the purposes of the
+#: GPU-wedge advisory below. 30 days is one A3GT production window and the
+#: length at which the 2026-08 wedges occurred; shorter runs finish inside the
+#: driver's healthy window even on the affected hardware.
+LONG_RUN_DAYS = 30.0
+
+#: Same, in output timesteps, for a config whose duration is short but whose
+#: cadence is fine enough to keep the GPU busy for hours.
+LONG_RUN_TIMESTEPS = 2000
+
+
+def long_run_advisory(config_dict, chunked=False):
+    """Messages to show before launching a LONG GPU run as a single process.
+
+    The GUI, the ``ptm run`` CLI and the notebook helper all launch one
+    ``ptm_thermal_sim`` directly. That is the right thing for a short run, and
+    it means those users get none of the chunked runner's GPU-wedge guardrails:
+    the inter-chunk cool-down, the heartbeat stall abort, and per-attempt logs
+    that are rotated rather than overwritten. On macOS+AMD an overnight GPU run
+    launched this way can wedge the machine and leave no record of where.
+
+    Advisory only -- it never refuses and never reroutes. Rerouting a GUI run
+    into the chunked workflow would change its output layout (merged
+    statistics, no per-step series), which is a decision for the user, not for
+    a warning. Returns a list of strings; empty when the advice does not apply.
+    """
+    if chunked:
+        return []
+    cfg = config_dict or {}
+    uses_gpu = any(bool((cfg.get(s) or {}).get("use_gpu", False))
+                   for s in ("thermal", "radiation", "illumination"))
+    if not uses_gpu:
+        return []
+    sim = cfg.get("simulation") or {}
+    try:
+        days = float(sim.get("duration_days", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        days = 0.0
+    try:
+        steps = int(sim.get("timesteps", 0) or 0)
+    except (TypeError, ValueError):
+        steps = 0
+    if days < LONG_RUN_DAYS and steps < LONG_RUN_TIMESTEPS:
+        return []
+    return [
+        f"[gpu-guardrails] this is a long GPU run ({days:g} simulated days, "
+        f"{steps} timesteps) launched as ONE engine process. The chunked "
+        f"runner adds the GPU-wedge guardrails this path does not have: an "
+        f"inter-chunk cool-down, a stall abort that kills a wedged engine "
+        f"instead of waiting for it, and per-attempt logs rotated to "
+        f"logs.prev-<UTC> so a rerun cannot destroy the failed attempt's "
+        f"record.",
+        "[gpu-guardrails] to use it:  python3 scripts/run_chunked_simulation.py "
+        "--config <this config> --total-days <days> --output-dir <dir>   "
+        "(see docs/gpu-wedge-guardrails.md). Note it produces merged "
+        "statistics and no per-step series.",
+    ]
+
+
 class EngineProcess:
     """Run an engine command, reporting output through plain callables.
 
@@ -829,6 +888,8 @@ def run_engine(config, exe=None, cwd=None, echo=False, progress_every=25.0,
     if echo:
         print("Running:", " ".join(str(c) for c in command))
         print(f"(cwd={cwd})\n")
+    for msg in long_run_advisory(config_dict):
+        print(msg, file=sys.stderr)
 
     started = time.time()
     process = EngineProcess(command, working_dir=cwd, env=env, on_output=take,

@@ -71,8 +71,10 @@ import atexit
 import datetime as dt
 import os
 import platform
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -182,6 +184,182 @@ def estimate_max_chunk_timesteps(n_faces: int, ram_gb: float,
     budget = max(0.0, ram_gb * safety - overhead_gb) * (1024 ** 3)
     raw = budget / (n_faces * bytes_per_facestep)
     return max(1, int(raw))
+
+
+# --------------------------------------------------------------------------
+# GPU-wedge guardrails (see docs/gpu-wedge-guardrails.md)
+#
+# Three defaults that used to live only in the campaign drivers, so a CLI or
+# GUI user got none of them:
+#   * an inter-chunk GPU cool-down,
+#   * a heartbeat-staleness abort (generalized from the orchestrator's
+#     --window-stall-min, one level down),
+#   * per-attempt logs that are ROTATED, not overwritten.
+# The last one is not a nicety: a rerun overwriting the previous attempt's log
+# destroyed the entire forensic record of the 2026-08-20 wedge within 16 h.
+# --------------------------------------------------------------------------
+
+#: Inter-chunk cool-down for a GPU run on the wedge-prone platform (macOS+AMD).
+#: Prophylaxis against the documented PROGRESSIVE wedge (memory
+#: gpu_hang_amd_macos: ~30 clean windows, then degradation). Cool-downs do not
+#: clear a degraded driver; they slow its accumulation. NOT a proven fix.
+DEFAULT_GPU_COOLDOWN_S = 300
+
+#: Silence (no engine output at all) after which a GPU chunk is presumed
+#: wedged and killed. Generous on purpose: a healthy run writes progress
+#: continuously, and the cost of a false kill is a wasted chunk while the cost
+#: of no watchdog is an overnight batch that sits on a dead GPU until morning.
+DEFAULT_GPU_STALL_MIN = 45.0
+
+
+def config_uses_gpu(cfg: dict) -> bool:
+    """True if any solver in this config asks for the GPU."""
+    for section in ("thermal", "radiation", "illumination"):
+        if bool((cfg.get(section) or {}).get("use_gpu", False)):
+            return True
+    return False
+
+
+def host_is_wedge_prone() -> bool:
+    """macOS is the platform the AMD GPU wedge was measured on. The engine
+    refines this with the device vendor; here only the OS is known, so the
+    gate is the OS. Elsewhere the GPU-specific defaults stay off."""
+    return platform.system() == "Darwin"
+
+
+def utc_stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def rotate_log_dir(log_dir: Path) -> Optional[Path]:
+    """Move a non-empty log directory aside to ``logs.prev-<UTC>``.
+
+    Per-attempt log names restart at attempt 0 on a rerun, so without this a
+    rerun overwrites exactly the record you need when the previous attempt is
+    the one that failed. Returns the path it moved the old logs to, or None.
+    """
+    if not log_dir.is_dir() or not any(log_dir.iterdir()):
+        return None
+    dest = log_dir.parent / f"{log_dir.name}.prev-{utc_stamp()}"
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = log_dir.parent / f"{log_dir.name}.prev-{utc_stamp()}-{n}"
+    log_dir.rename(dest)
+    return dest
+
+
+_CURRENT_ENGINE: Optional[subprocess.Popen] = None
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM then SIGKILL the child's whole process group. The engine runs in
+    its own session, so a bare proc.kill() would orphan anything it spawned."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _terminate_engine(*_args) -> None:
+    if _CURRENT_ENGINE is not None and _CURRENT_ENGINE.poll() is None:
+        _kill_process_group(_CURRENT_ENGINE)
+
+
+def _engine_signal_cleanup(signum, _frame) -> None:
+    """The engine runs in its own session, so Ctrl-C at the terminal no longer
+    reaches it. Forward the teardown explicitly, then die conventionally."""
+    _terminate_engine()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def run_engine_supervised(cmd: list[str], log_path: Optional[Path],
+                          timeout_s: Optional[float],
+                          stall_s: Optional[float]) -> tuple[Optional[int], str]:
+    """Run the engine, teeing its output, under two independent watchdogs.
+
+    Returns ``(returncode, reason)``; ``returncode`` is None when the process
+    was killed, and ``reason`` is one of ``"exit"``, ``"timeout"``, ``"stall"``.
+
+      timeout_s  total wall-clock cap for this attempt (--chunk-timeout-min)
+      stall_s    silence cap: no output at all for this long => presumed wedged
+
+    Output is teed as RAW BYTES to both this process's stdout and the per-
+    attempt log, so a progress bar's carriage returns survive and the log's
+    mtime advances continuously -- an outer watchdog (the orchestrator) reads
+    that mtime as its own heartbeat.
+    """
+    global _CURRENT_ENGINE
+    log_fh = open(log_path, "wb") if log_path is not None else None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    _CURRENT_ENGINE = proc
+    last_output = [time.time()]
+
+    def pump() -> None:
+        fd = proc.stdout.fileno()
+        while True:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            last_output[0] = time.time()
+            try:
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            except (BrokenPipeError, ValueError):
+                pass
+            if log_fh is not None:
+                log_fh.write(data)
+                log_fh.flush()
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+
+    t0 = time.time()
+    reason = "exit"
+    rc: Optional[int] = None
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=5.0)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.time()
+            if timeout_s is not None and (now - t0) >= timeout_s:
+                reason = "timeout"
+                _kill_process_group(proc)
+                rc = None
+                break
+            if stall_s is not None and (now - last_output[0]) >= stall_s:
+                reason = "stall"
+                _kill_process_group(proc)
+                rc = None
+                break
+    finally:
+        reader.join(timeout=10)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        if log_fh is not None:
+            log_fh.close()
+        _CURRENT_ENGINE = None
+    return rc, reason
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +545,30 @@ def main():
                         "and the attempt counts as a retryable failure. Prevents "
                         "GPU-driver hangs from stalling overnight batches forever. "
                         "Set <=0 to disable the timeout.")
+    p.add_argument("--gpu-cooldown-s", type=float, default=-1.0,
+                   help="Idle seconds between chunks so the GPU driver can "
+                        "settle. Default -1 = automatic: "
+                        f"{DEFAULT_GPU_COOLDOWN_S} s when the config uses the "
+                        "GPU and the host is macOS (the platform the AMD wedge "
+                        "was measured on), 0 otherwise. 0 disables it. "
+                        "Prophylaxis against the documented progressive wedge, "
+                        "not a proven fix.")
+    p.add_argument("--stall-min", type=float, default=-1.0,
+                   help="Kill a chunk that produces NO output for this many "
+                        "minutes and count it as a retryable failure. Default "
+                        f"-1 = automatic: {DEFAULT_GPU_STALL_MIN:g} min for a "
+                        "GPU run, off for a CPU run. 0 disables it. Catches a "
+                        "wedged GPU long before --chunk-timeout-min does, and "
+                        "catches the case where the engine is alive but frozen.")
+    p.add_argument("--log-dir", type=Path, default=None,
+                   help="Directory for per-attempt engine logs. Default "
+                        "<output-dir>/logs. Engine output is TEED: it still "
+                        "goes to this process's stdout.")
+    p.add_argument("--no-log-rotate", action="store_true",
+                   help="Do not move an existing log directory aside to "
+                        "logs.prev-<UTC> at startup. The default is to rotate: "
+                        "a rerun overwriting the previous attempt's log is how "
+                        "the 2026-08-20 wedge lost its entire forensic record.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the chunk plan and exit without running anything.")
     p.add_argument("--ptm-bin", type=Path,
@@ -506,12 +708,84 @@ def main():
               f"thermal.initial_state_file ({base_initial_state}); "
               f"equilibration is skipped for the whole run.")
 
+    # ----------------------------------------------------------------------
+    # GPU-wedge guardrails: resolve the three defaults and SAY what was chosen
+    # and why. An automatic default that changes how long a run takes has to
+    # be visible in the log, not inferred from the source.
+    # ----------------------------------------------------------------------
+    gpu_run = config_uses_gpu(base_cfg)
+    wedge_prone = host_is_wedge_prone()
+    if args.gpu_cooldown_s >= 0:
+        cooldown_s = args.gpu_cooldown_s
+        cooldown_why = "--gpu-cooldown-s"
+    elif gpu_run and wedge_prone:
+        cooldown_s = float(DEFAULT_GPU_COOLDOWN_S)
+        cooldown_why = "automatic (GPU run on macOS)"
+    else:
+        cooldown_s = 0.0
+        cooldown_why = ("automatic (CPU run)" if not gpu_run
+                        else "automatic (GPU run, but not the wedge-prone platform)")
+    if args.stall_min >= 0:
+        stall_min = args.stall_min
+        stall_why = "--stall-min"
+    elif gpu_run:
+        stall_min = DEFAULT_GPU_STALL_MIN
+        stall_why = "automatic (GPU run)"
+    else:
+        stall_min = 0.0
+        stall_why = "automatic (CPU run)"
+    stall_s = stall_min * 60.0 if stall_min > 0 else None
+
+    log_dir = args.log_dir if args.log_dir is not None else args.output_dir / "logs"
+    print(f"[chunked] guardrails: inter-chunk cool-down {cooldown_s:g}s "
+          f"[{cooldown_why}], stall abort "
+          f"{('%g min' % stall_min) if stall_min > 0 else 'off'} [{stall_why}], "
+          f"per-attempt logs -> {log_dir}"
+          f"{'' if args.no_log_rotate else ' (rotated)'}")
+
     if args.dry_run:
         return
 
     # Run each chunk.
     state_dir = args.output_dir / "_thermal_state"
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-attempt engine logs. Rotate FIRST, before anything can be written
+    # into the directory, so a rerun never overwrites the record of the
+    # attempt that failed (2026-08-20: gen2_driver overwrote the wedge log
+    # within 16 h of the event and it is gone for good).
+    if not args.no_log_rotate:
+        moved = rotate_log_dir(log_dir)
+        if moved is not None:
+            print(f"[chunked] rotated previous logs -> {moved}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runner_log = log_dir / "runner.log"
+
+    def note(msg: str) -> None:
+        """Print AND persist a guardrail decision. stdout may be redirected by
+        a caller that later loses the file; the run's own directory is the one
+        place the record is sure to survive."""
+        print(msg, flush=True)
+        try:
+            with open(runner_log, "a") as fh:
+                fh.write(f"[{dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}] "
+                         f"{msg}\n")
+        except OSError:
+            pass
+
+    note(f"[chunked] start: {n_chunks} chunk(s), gpu_run={gpu_run}, "
+         f"cooldown={cooldown_s:g}s, stall={stall_min:g}min, "
+         f"chunk_timeout={args.chunk_timeout_min:g}min, retries={args.retries}")
+
+    # The engine now runs in its own session so a stalled one can be killed as
+    # a group; that also means an interactive Ctrl-C no longer reaches it.
+    # Forward the teardown explicitly rather than leaving a GPU job orphaned.
+    atexit.register(_terminate_engine)
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _engine_signal_cleanup)
+        except (ValueError, OSError):
+            pass    # not on the main thread, or the platform disallows it
 
     # Optional thermal-monitor sidecar. Logs per-GPU temperature/power
     # to <output-dir>/thermal.csv and maintains <output-dir>/thermal.flag
@@ -558,6 +832,7 @@ def main():
         atexit.register(_stop_monitor)
 
     chunk_walltimes: list[float] = []
+    ran_a_chunk = False
     for i, info in enumerate(plan):
         cd = info["chunk_dir"]
         # Resume: skip if already complete.
@@ -565,6 +840,13 @@ def main():
             print(f"\n[chunked] chunk {i:03d}: complete (resume), skipping.")
             chunk_walltimes.append(0.0)
             continue
+
+        # Inter-chunk GPU cool-down. Between chunks that actually RAN: a
+        # resumed/skipped chunk did no GPU work, so there is nothing to cool.
+        if ran_a_chunk and cooldown_s > 0:
+            note(f"[chunked] chunk {i:03d}: GPU cool-down {cooldown_s:g}s "
+                 f"before launch (wedge guardrail; {cooldown_why})")
+            time.sleep(cooldown_s)
 
         # Thermal gate. If the sidecar has the hot-flag up, hold here
         # until the GPUs cool below --thermal-cool-c (capped by
@@ -658,21 +940,35 @@ def main():
                       f"waiting {cooldown}s for GPU to settle...",
                       flush=True)
                 time.sleep(cooldown)
-            try:
-                ret = subprocess.run(
-                    [str(args.ptm_bin), "--config", str(cfg_path)],
-                    timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                # subprocess.run already SIGKILLed the child on timeout. Treat
-                # this as a retryable failure (matches the orchestrator's
-                # established AMD-GPU-hang recovery model).
+            # One log per ATTEMPT: attempt 1's log must still be there after
+            # attempt 2 overwrites nothing.
+            attempt_log = log_dir / f"chunk_{i:03d}_attempt_{attempt}.log"
+            rc, reason = run_engine_supervised(
+                [str(args.ptm_bin), "--config", str(cfg_path)],
+                attempt_log, timeout_s, stall_s)
+            ran_a_chunk = True
+            if reason == "timeout":
                 ret = None
                 last_failure = (f"hang past --chunk-timeout-min "
                                 f"({args.chunk_timeout_min:g} min)")
-                print(f"[chunked] chunk {i:03d}: {last_failure}; killed.",
-                      flush=True)
+                note(f"[chunked] chunk {i:03d}: {last_failure}; process group "
+                     f"killed. Log: {attempt_log}")
                 attempt += 1
                 continue
+            if reason == "stall":
+                # Silence, not slowness: the engine wrote nothing at all for
+                # --stall-min. On macOS+AMD that is the wedge signature, and
+                # waiting out the full chunk timeout only holds the GPU longer.
+                ret = None
+                last_failure = (f"no output for --stall-min "
+                                f"({stall_min:g} min) -- presumed GPU wedge")
+                note(f"[chunked] chunk {i:03d}: {last_failure}; process group "
+                     f"killed. Log: {attempt_log}")
+                attempt += 1
+                continue
+            ret = subprocess.CompletedProcess(
+                args=[str(args.ptm_bin), "--config", str(cfg_path)],
+                returncode=rc if rc is not None else -1)
             if ret.returncode == 0 and chunk_is_complete(cd):
                 # Post-write checkpoint validation. If the OS or OneDrive
                 # corrupted the new state file (right size, wrong magic),
@@ -715,10 +1011,13 @@ def main():
         dt_s = time.time() - t0
         chunk_walltimes.append(dt_s)
         if ret is None or ret.returncode != 0:
-            rc = "timeout" if ret is None else f"exit code {ret.returncode}"
-            sys.exit(f"\n[chunked] chunk {i:03d} FAILED ({rc}) after "
+            why = last_failure if ret is None else f"exit code {ret.returncode}"
+            note(f"[chunked] chunk {i:03d} FAILED ({why}) after "
+                 f"{attempt} attempt(s); logs in {log_dir}")
+            sys.exit(f"\n[chunked] chunk {i:03d} FAILED ({why}) after "
                      f"{attempt} attempt(s). Re-run with --resume to retry "
-                     "from this chunk (prior chunks will be skipped).")
+                     "from this chunk (prior chunks will be skipped). "
+                     f"Per-attempt logs: {log_dir}")
         if not chunk_is_complete(cd):
             sys.exit(f"\n[chunked] chunk {i:03d} exited cleanly but did not "
                      "produce expected statistics/_raw/ output. Check the "
@@ -728,10 +1027,10 @@ def main():
         actual = [w for w in chunk_walltimes if w > 0]
         avg = sum(actual) / max(1, len(actual))
         remaining = (n_chunks - i - 1) * avg
-        print(f"[chunked] chunk {i:03d} done in {fmt_duration(dt_s)} "
-              f"(avg {fmt_duration(avg)}); "
-              f"ETA for remaining {n_chunks - i - 1} chunk(s): "
-              f"{fmt_duration(remaining)}")
+        note(f"[chunked] chunk {i:03d} done in {fmt_duration(dt_s)} "
+             f"(avg {fmt_duration(avg)}); "
+             f"ETA for remaining {n_chunks - i - 1} chunk(s): "
+             f"{fmt_duration(remaining)}")
 
     # Merge.
     print(f"\n[chunked] merging {n_chunks} chunk(s) into {args.output_dir}/statistics/ ...")
