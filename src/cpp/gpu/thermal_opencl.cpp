@@ -12,13 +12,21 @@
 
 #include "thermal_opencl.h"
 #include "machine_profile.h"   // Phase R (R2): per-host dispatch self-chunk ceiling
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <fstream>
+#include <iostream>
+#include <memory>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <limits>   // eq-extrap: quiet_NaN sentinel for "face not extrapolated"
 
 namespace gpu {

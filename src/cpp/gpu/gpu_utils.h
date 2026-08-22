@@ -6,6 +6,7 @@
  */
 
 #include "gpu_config.h"
+#include <cstddef>
 #include <iostream>
 #include <sstream>
 #include <chrono>

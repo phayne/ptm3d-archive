@@ -9,10 +9,14 @@
  */
 
 #include "gpu_config.h"
+#include <algorithm>
+#include <cstddef>
 #include <vector>
 #include <memory>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
 namespace gpu {

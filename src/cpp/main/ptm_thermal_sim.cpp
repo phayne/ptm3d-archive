@@ -21,8 +21,11 @@
 #include <SpiceUsr.h>  // Include SPICE functions
 #include <functional>
 #include <atomic>
+#include <future>
 #include <mutex>
+#include <stdexcept>
 #include <tuple>
+#include <utility>
 #include <cctype>
 #include <algorithm>
 

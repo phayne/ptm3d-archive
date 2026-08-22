@@ -26,6 +26,8 @@
 #include "radiosity_opencl.h"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>

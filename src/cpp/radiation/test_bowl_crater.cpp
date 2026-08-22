@@ -16,6 +16,8 @@
  * 4. Comparison with analytical solutions for spherical cavities
  */
 
+#include <algorithm>
+#include <cstddef>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -25,6 +27,7 @@
 #include <iomanip>
 #include <chrono>
 #include <atomic>
+#include <exception>
 
 #include "../mesh/mesh_utils.h"
 #include "radiation_config.h"

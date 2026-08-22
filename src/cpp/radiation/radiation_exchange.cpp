@@ -21,12 +21,19 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <future>
+#include <memory>
 #include <random>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 #include <omp.h>
 
 namespace radiation {

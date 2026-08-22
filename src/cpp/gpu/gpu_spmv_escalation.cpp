@@ -11,6 +11,7 @@
 #ifdef PTM_GPU_OPENCL
 #include "radiosity_opencl.h"
 #include "opencl_config.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,8 @@
 #include <cmath>
 #include <chrono>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 #include <stdexcept>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)

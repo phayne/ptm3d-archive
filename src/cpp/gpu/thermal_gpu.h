@@ -11,6 +11,7 @@
 #include "gpu_config.h"
 #include "gpu_memory.h"
 #include "gpu_utils.h"
+#include <cstddef>
 #include <vector>
 #include <memory>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)

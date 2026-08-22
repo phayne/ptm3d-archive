@@ -10,12 +10,21 @@
 #include <sstream>
 #include <chrono>
 #include <type_traits>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 
 namespace gpu {

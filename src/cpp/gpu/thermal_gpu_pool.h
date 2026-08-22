@@ -27,6 +27,7 @@
 #include "thermal_opencl.h"
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <future>
 #include <memory>
