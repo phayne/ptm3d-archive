@@ -238,8 +238,8 @@ Results land in `output/quickstart_moon_diurnal/` (~10 MB): per-timestep
 `temperature/`, `illumination/` and flux directories, the `mesh.ply` they index,
 and `statistics/` with the per-face extremes over the run. Expect
 `temperature_max.bin` to peak at **385.0 K** (equatorial noon) and
-`temperature_min.bin` to bottom at **66.3 K** (a polar face), with the mean
-per-face minimum ~90.8 K. Every `statistics/*.bin` starts with a 4-byte
+`temperature_min.bin` to bottom at **63.4 K** (a polar face), with the mean
+per-face minimum ~90.1 K. Every `statistics/*.bin` starts with a 4-byte
 face-count header, then `float32` per face:
 
 ```bash
@@ -248,7 +248,7 @@ import struct, array
 b = open('output/quickstart_moon_diurnal/statistics/temperature_max.bin','rb').read()
 n = struct.unpack('<i', b[:4])[0]; a = array.array('f'); a.frombytes(b[4:4+4*n])
 print(n, 'faces; Tmax range', round(min(a),1), '-', round(max(a),1), 'K')"
-# -> 1280 faces; Tmax range 182.0 - 385.0 K
+# -> 1280 faces; Tmax range 181.8 - 385.0 K
 ```
 
 For a 3D view of the same output, point the [GUI](#gui) at the run directory, or
@@ -263,9 +263,14 @@ below, the tutorial notebooks and every plotting route need a few packages:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -r requirements.txt   # numpy, matplotlib, pyyaml, jupyterlab, spiceypy
+python3 -m pip install -e .                  # the repository's own `ptm` package — every notebook imports it
 ```
 
-That is the whole environment for the documented path.
+That is the whole environment for the documented path. The `-e .` line is not
+optional for step 7: each tutorial notebook opens with `from ptm import ...`, so
+without it the first code cell stops at `ModuleNotFoundError: No module named
+'ptm'`.
+
 [`scripts/requirements.txt`](scripts/requirements.txt) adds the wider analysis
 tooling (scipy, astropy) and [`gui/requirements.txt`](gui/requirements.txt) the
 desktop GUI; neither is needed for the walkthrough.
