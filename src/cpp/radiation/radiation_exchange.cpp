@@ -20,6 +20,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <random>
@@ -783,9 +784,63 @@ void RadiositySolver::initGPU() {
         return std::max<size_t>((global_mem / 100) * 15,
                                 static_cast<size_t>(2) * 1024 * 1024 * 1024);
     };
+    // Operator-settable floor on the headroom this check is allowed to leave
+    // behind, in GiB. Default 0.0 = the historical test, unchanged.
+    //
+    // Why this exists (2026-08-21 forensics): the reserve above is ONE lump that
+    // is silently shared with every other consumer of the same die -- above all
+    // the GPU thermal pool, which allocates its own per-device working set
+    // (~0.77 GiB at gpu_batch_size=100000, n_layers=23, 961 steps) on the very
+    // dies that hold the CSR replica, while the replica stays resident for the
+    // whole window. Nothing in either path knows about the other. A3GT A03N1016
+    // passed this check with 0.63 GiB of nominal margin -- less than the thermal
+    // solver's own ask -- and that promotion happened by accident: the FC-08
+    // divisor fix shrank the matrix 8.4% and carried it across the threshold
+    // from "refused, run radiosity on the CPU" to "accepted, 26.55 GiB on four
+    // dies". Set a floor so that crossing is a decision, not a side effect.
+    auto minMarginBytes = []() -> size_t {
+        const char* env = std::getenv("PTM_GPU_MIN_VRAM_MARGIN_GIB");
+        if (env == nullptr || *env == '\0') return 0;
+        char* end = nullptr;
+        const double gib = std::strtod(env, &end);
+        if (end == env || !(gib >= 0.0)) {
+            std::cerr << "[Radiosity] WARNING: PTM_GPU_MIN_VRAM_MARGIN_GIB=\""
+                      << env << "\" is not a non-negative number; ignoring "
+                         "(no margin floor applied).\n";
+            return 0;
+        }
+        return static_cast<size_t>(gib * 1024.0 * 1024.0 * 1024.0);
+    };
+    const size_t min_margin_bytes = minMarginBytes();
+    auto deviceMargin = [&](size_t global_mem) -> long long {
+        // Signed: a negative margin is the interesting case and must not wrap.
+        const long long avail =
+            static_cast<long long>(global_mem) -
+            static_cast<long long>(deviceReserve(global_mem));
+        return avail - static_cast<long long>(needed_bytes);
+    };
     auto fitsDevice = [&](size_t global_mem) -> bool {
-        return global_mem > deviceReserve(global_mem)
+        const bool fits_raw =
+            global_mem > deviceReserve(global_mem)
             && needed_bytes <= global_mem - deviceReserve(global_mem);
+        if (!fits_raw) return false;
+        if (min_margin_bytes == 0) return true;
+        const long long margin = deviceMargin(global_mem);
+        if (margin >= static_cast<long long>(min_margin_bytes)) return true;
+        // Refuse LOUDLY and name the policy -- a quiet downgrade here is how a
+        // run ends up on a rung nobody chose. Formatted on a LOCAL stream: see
+        // the gb() note below (PTM-05 -- std::cout arrives here carrying
+        // scientific/setprecision(1) from a progress banner).
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2)
+            << "[Radiosity] VRAM-margin policy: replica would fit with "
+            << (margin / (1024.0 * 1024.0 * 1024.0))
+            << " GiB of margin, below the "
+            << (min_margin_bytes / (1024.0 * 1024.0 * 1024.0))
+            << " GiB floor set by PTM_GPU_MIN_VRAM_MARGIN_GIB; "
+               "REFUSING this GPU rung.\n";
+        std::cout << msg.str();
+        return false;
     };
     // GB, formatted on a LOCAL stream. std::cout arrives here carrying
     // std::scientific << setprecision(1) from an earlier progress banner, which
@@ -798,6 +853,42 @@ void RadiositySolver::initGPU() {
         std::ostringstream o;
         o << std::fixed << std::setprecision(2) << (b / (1024.0 * 1024.0 * 1024.0));
         return o.str();
+    };
+    // Same, for the signed margin (a negative value must read as negative, not
+    // wrap through size_t).
+    auto signedGb = [](long long b) -> std::string {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(2)
+          << std::showpos << (b / (1024.0 * 1024.0 * 1024.0));
+        return o.str();
+    };
+    // Advisory, always on: the margin this check leaves is NOT free space, it is
+    // the budget every other consumer of the same die draws on. The one we can
+    // size is the GPU thermal pool, which allocates on these same dies while the
+    // replica stays resident: ~0.77 GiB/device at the A3GT production settings
+    // (gpu_batch_size=100000, n_layers=23, 961 steps -- thermal_opencl.cpp
+    // buf_flux_all + buf_output_temps dominate at n_faces*n_steps*4 B each).
+    // Below ~2 GiB the thermal pool alone is a large fraction of what is left,
+    // so say so out loud rather than leaving it to be rediscovered from a
+    // power-off. Threshold is advisory only; PTM_GPU_MIN_VRAM_MARGIN_GIB is the
+    // knob that actually refuses.
+    auto warnIfThinMargin = [&](size_t global_mem, size_t n_dev) {
+        constexpr double kAdvisoryMarginGiB = 2.0;
+        const double margin_gib =
+            deviceMargin(global_mem) / (1024.0 * 1024.0 * 1024.0);
+        if (min_margin_bytes != 0) return;   // an explicit policy is in force
+        if (margin_gib >= kAdvisoryMarginGiB) return;
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2)
+            << "[Radiosity] WARNING: only " << margin_gib
+            << " GiB of VRAM margin per device after this replica, on "
+            << n_dev << " device(s). The GPU thermal pool allocates on these "
+               "same dies while the replica stays resident (~0.77 GiB/device "
+               "at gpu_batch_size=100000, n_layers=23, 961 steps) and is NOT "
+               "counted by this check. Set PTM_GPU_MIN_VRAM_MARGIN_GIB to "
+               "refuse thin-margin GPU rungs, or lower radiation.gpu_devices / "
+               "thermal.gpu_devices so the two pools do not share dies.\n";
+        std::cout << msg.str();
     };
 
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
@@ -862,8 +953,13 @@ void RadiositySolver::initGPU() {
         }
         const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
         if (!fitsDevice(dev_mem)) {
+            // Say WHICH test rejected it. "does not fit" printed after a policy
+            // refusal is a false statement about the hardware.
             std::cout << "[Radiosity] single-GPU: CSR replica + working "
-                      << gb(needed_bytes) << " GB does not fit device ("
+                      << gb(needed_bytes) << " GB "
+                      << (deviceMargin(dev_mem) >= 0
+                              ? "refused by the VRAM-margin policy on device ("
+                              : "does not fit device (")
                       << gb(dev_mem) << " GB VRAM, reserve "
                       << gb(deviceReserve(dev_mem)) << " GB).\n";
             gpu_solver_.reset();
@@ -893,7 +989,10 @@ void RadiositySolver::initGPU() {
         }
         std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
                   << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
-                  << " GB device).\n";
+                  << " GB device, margin " << signedGb(deviceMargin(dev_mem))
+                  << " GiB over the " << gb(deviceReserve(dev_mem))
+                  << " GB reserve).\n";
+        warnIfThinMargin(dev_mem, 1);
         // The matrix is resident on the device now, so the host-side float64
         // replica has no remaining reader. Dropping it also clears F_ptr_, which
         // is what keeps a mid-run CPU fallback on the production fused width-2
@@ -944,8 +1043,13 @@ void RadiositySolver::initGPU() {
             for (const auto& d : chosen) min_dev = std::min(min_dev, d.global_mem_size);
             if (!fitsDevice(min_dev)) {
                 pool_ok = false;
+                // Say WHICH test rejected it -- see the single-GPU twin below.
                 std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
-                          << " GB does not fit the smallest device (" << gb(min_dev)
+                          << " GB "
+                          << (deviceMargin(min_dev) >= 0
+                                  ? "refused by the VRAM-margin policy on the smallest device ("
+                                  : "does not fit the smallest device (")
+                          << gb(min_dev)
                           << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
                           << " GB); degrading to single-GPU.\n";
             }
@@ -1015,11 +1119,15 @@ void RadiositySolver::initGPU() {
                 std::cout << "[Radiosity] ACTIVE RUNG: multi-GPU pool, "
                           << gpu_pool_->numDevices() << " device(s); CSR replica "
                           << gb(needed_bytes) << " GB/device (smallest device "
-                          << gb(min_dev) << " GB VRAM); gpu_batch_size="
+                          << gb(min_dev) << " GB VRAM, margin "
+                          << signedGb(deviceMargin(min_dev))
+                          << " GiB over the " << gb(deviceReserve(min_dev))
+                          << " GB reserve); gpu_batch_size="
                           << (pool_batch_size_ > 0 ? std::to_string(pool_batch_size_)
                                                    : std::string("auto"))
                           << " (resolved per sweep); row norm applied in-kernel on "
                           << vf_row_norm_count_ << "/" << n << " faces.\n";
+                warnIfThinMargin(min_dev, gpu_pool_->numDevices());
                 releaseVfReplaceGpuOperator("CSR replicated to every pool device.");
                 return;  // pool active -- done
             }
