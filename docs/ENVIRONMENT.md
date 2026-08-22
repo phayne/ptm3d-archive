@@ -181,5 +181,7 @@ Rules:
 - [../INSTALL.md](../INSTALL.md) — build + SPICE kernel data
 - [configuration.md](configuration.md) — the YAML configuration reference
   (config keys, not env vars)
+- [gpu-wedge-guardrails.md](gpu-wedge-guardrails.md) — what the GPU guardrail
+  variables above are guarding against, and which platform each is active on
 - [USER_GUIDE.md](USER_GUIDE.md) — CLI reference and output formats
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — known caveats

@@ -128,6 +128,35 @@ cmake --build build --target ptm_thermal_sim -j
 On macOS the legacy `-DENABLE_GPU=ON` still works (it is the compatibility alias for
 `PTM_ENABLE_GPU`). Apple Silicon has no OpenCL future — use the CPU core there.
 
+#### GPU checklist before a long run (macOS)
+
+A long PTM3D GPU run on macOS with AMD hardware can wedge the GPU hard enough to
+power-cycle the machine. Three items, once per host:
+
+1. **Disable sleep and display sleep.** A display or system sleep transition issues a
+   GPU modeset, which is the documented trigger of the wedge; the last logged system
+   event before the 2026-08-20 power-off was `Display is turned off`.
+   ```bash
+   sudo pmset -a disablesleep 1 displaysleep 0     # before a campaign
+   sudo pmset -a disablesleep 0 displaysleep 30    # after
+   ```
+   The engine checks this itself and warns at startup if it is not set — it reads
+   `pmset -g custom`, which needs no privileges, and it never changes a setting.
+2. **Calibrate the dispatch ceiling** (`--calibrate-gpu`, above). Uncalibrated hosts
+   fall back to conservative limits and say so.
+3. **Use the chunked runner for anything long**, so a wedge is caught by the stall
+   abort and the failed attempt's log survives the rerun:
+   ```bash
+   python3 scripts/run_chunked_simulation.py --config <config> \
+       --total-days <days> --output-dir <dir>
+   ```
+
+If a run wedges: the log stops mid-phase while the process stays alive, and after the
+reboot `pmset -g log | grep -i "shutdown cause"` reports a negative SMC code
+(`-108`/`-128`). `log show` needs sudo; `pmset -g log` does not and keeps about a week.
+The recovery procedure and the reasoning behind every guardrail — including which ones
+are macOS+AMD-only — are in [docs/gpu-wedge-guardrails.md](docs/gpu-wedge-guardrails.md).
+
 ### Embree ISA (performance)
 
 **A stock package-manager Embree is usually compiled SSE2-only, and on a modern x86 CPU that
@@ -355,4 +384,7 @@ not distributed.
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver
-  falls back to conservative limits and says so in the log.
+  falls back to conservative limits and says so in the log. The wedge guardrails in
+  [docs/gpu-wedge-guardrails.md](docs/gpu-wedge-guardrails.md) are gated the same way: the ones
+  that cost wall time or change a solver rung enforce on macOS+AMD and are advisory elsewhere,
+  so they have **not** been exercised in their enforcing mode on any other platform.
