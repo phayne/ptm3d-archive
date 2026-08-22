@@ -9641,8 +9641,18 @@ bool runThermalForSelectedFaces_GPU(
     // Multi-GPU dispatch (opt-in): mirrors the all-faces path. When enabled,
     // the per-batch lambda above runs concurrently across N devices via the
     // ThermalGPUDevicePool (~3x speedup measured on the 4-die W6800X Duo).
+    // A hoisted pool from the caller ALSO takes this path, even at one device.
+    // Without that clause the pool path was unreachable whenever the re-thermal
+    // concurrency cap did its job: the cap lowers the device count to 1, this
+    // test then reads "single GPU", and the serial branch below constructs and
+    // destroys its own solver on every coupling iteration -- which is the same
+    // per-iteration context churn the hoisted pool exists to remove, merely one
+    // context per iteration instead of four. Measured on the 12,800-face
+    // crater80N arm: the hoisted pool was built and then never used, and one
+    // "compiling kernels" line still appeared per coupling iteration.
     const bool use_multi_gpu =
-        (gpu_devices != 1) || !gpu_device_ids.empty();
+        (shared_thermal_pool != nullptr)
+        || (gpu_devices != 1) || !gpu_device_ids.empty();
     if (use_multi_gpu) {
         auto all_gpus = OpenCLContext::enumerateGPUs(/*only_available=*/true);
         std::vector<OpenCLDeviceInfo> selected;
@@ -9704,8 +9714,17 @@ bool runThermalForSelectedFaces_GPU(
         }
 
         if (pool_ptr == nullptr) {
+            // This is the PER-ITERATION path: the pool built here is destroyed
+            // when this call returns, so a coupled run pays a full OpenCL
+            // context create/teardown (and a kernel build per device) on every
+            // coupling iteration. That churn is the documented trigger of an
+            // SMC -108 forced reset, which is why the caller hoists a shared
+            // pool. Say plainly that the hoist did not reach us.
             std::cout << "  [GPU Thermal Pool] Selected-faces multi-GPU dispatch "
-                         "across " << selected.size() << " device(s)" << std::endl;
+                         "across " << selected.size() << " device(s)"
+                      << " -- LOCAL pool (no hoisted pool supplied): this"
+                         " context is built and torn down every coupling"
+                         " iteration" << std::endl;
 
             ThermalOpenCLConfig opencl_config;
             opencl_config.verbose = false;
@@ -18307,6 +18326,11 @@ int main(int argc, char** argv) {
                 // re-thermal hard cap (50000 faces) — actual batches narrow
                 // via setActiveFaceCount.
                 void* shared_rerun_pool = nullptr;
+                // Device count the selected-faces re-thermal is ACTUALLY allowed
+                // to use. Starts at the config value and is lowered by the
+                // PTM_RAD_RERUN_MAX_GPUS cap below, so the cap reaches the
+                // fallback path too (see the note at that cap).
+                int rerun_gpu_devices = sim_config.thermal.gpu_devices;
 #ifdef PTM_GPU_OPENCL
                 std::unique_ptr<gpu::opencl::ThermalGPUDevicePool> rerun_pool;
                 if (thermal_config.getPropertyBool("use_gpu_thermal", false)
@@ -18369,9 +18393,29 @@ int main(int argc, char** argv) {
                                       << std::endl;
                             rerun_devs.resize(rerun_max);
                         }
+                        // The cap used to stop here, and stopping here made it
+                        // INERT at its own default. Two links were missing
+                        // (measured 2026-08-21 on the A3GT gen-2 logs):
+                        //   1. the hoisted pool below was gated on size() >= 2,
+                        //      so capping to 1 skipped the hoist entirely and
+                        //      left shared_rerun_pool null;
+                        //   2. with a null shared pool,
+                        //      runThermalForSelectedFaces_GPU builds a LOCAL
+                        //      pool from sim_config.thermal.gpu_devices -- the
+                        //      uncapped 4 -- and destroys it again every
+                        //      coupling iteration.
+                        // Net effect in production: every window printed
+                        // "Capping re-thermal concurrency at 1 device(s)" and
+                        // then ran the re-thermal on 4 devices, rebuilding 4
+                        // OpenCL contexts per coupling iteration -- exactly the
+                        // per-iter context churn this pool was hoisted to stop
+                        // (see the SMC -108 note at its declaration). A03MP026
+                        // windows show 24 kernel compiles where 8 suffice, and
+                        // zero "Hoisted re-thermal pool" lines.
+                        rerun_gpu_devices = static_cast<int>(rerun_devs.size());
                     }
 
-                    if (rerun_devs.size() >= 2) {
+                    if (!rerun_devs.empty()) {
                         // Match the n_layers and BATCH_SIZE that
                         // runThermalForSelectedFaces_GPU computes internally.
                         // BATCH_SIZE is hardcoded to min(memory-limit, 50000)
@@ -19256,7 +19300,11 @@ int main(int argc, char** argv) {
                             thermal_config,
                             surface_temps,
                             face_albedos_rad,   // per-face A0 (per-face albedo scaling)
-                            sim_config.thermal.gpu_devices,
+                            // Capped count, NOT sim_config.thermal.gpu_devices:
+                            // if the hoisted pool is unavailable this is the
+                            // only thing standing between the cap and a local
+                            // 4-device pool rebuilt every coupling iteration.
+                            rerun_gpu_devices,
                             sim_config.thermal.gpu_device_ids,
                             sim_config.thermal.gpu_inter_batch_pause_ms,
                             shared_rerun_pool,
