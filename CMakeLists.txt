@@ -845,6 +845,7 @@ endif()
 
 add_subdirectory(src/cpp/illumination)
 add_subdirectory(src/cpp/radiation)
+add_subdirectory(src/cpp/fluxcubes)   # flux-cube geometry cache + post-solve pass
 add_subdirectory(src/cpp/fileio)
 add_subdirectory(src/cpp/tools)
 

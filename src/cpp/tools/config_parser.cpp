@@ -14,6 +14,11 @@
 
 // std::sort, for the PTM-67 unread-key report (deterministic key order).
 #include <algorithm>
+// Added for the flux-cube code below: libstdc++ does not pull these in
+// transitively the way libc++ does, which cost a Linux-only CI failure.
+#include <cstddef>
+#include <string>
+#include <vector>
 
 namespace ptm {
 
@@ -195,6 +200,76 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
     line << " -- editing them changes no result. Named properties are honored only under "
             "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
             "See docs/KNOWN_LIMITATIONS.md (PTM-67).";
+    std::cerr << line.str() << std::endl;
+}
+
+// Same contract as warnUnreadThermophysicalKeys, for `flux_cubes:`. PTM-67 is
+// the trap where a block's keys are read by nothing and the run prints one
+// warning rather than honoring them; the flux-cube block is top-level to stay
+// out of that machinery, and this warner is the second guard.
+//
+// INVARIANT: every key the `root["flux_cubes"]` branch consumes must appear
+// here. The reads are individual statements, so the list cannot be derived --
+// it is maintained by hand and this comment is the contract.
+//
+// The geometry keys (spacing_m, radius_m, height_factor, height_m, edge_factor,
+// edge_m, center_lat_deg, center_lon_deg, n_rays, sampler, seed, truncate_rel)
+// are deliberately NOT read here: they are inputs to ptm_flux_cube_geom and are
+// baked into the cache. The engine reads them back OUT of the cache header and
+// refuses on a mismatch, so honoring a YAML copy would create two sources of
+// truth for one number. They are listed as ACCEPTED-BUT-INERT below so a config
+// that carries them (for provenance, which is reasonable) is not scolded, while
+// a genuine typo still is.
+void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
+    if (!fc || !fc.IsMap()) return;
+
+    static const char* const kRead[] = {
+        "cache_file",
+        "enabled",
+        "locations",
+        "shadow_probe_rays",
+        "write_binary",
+        "write_csv",
+        "write_csv_max_cubes",
+    };
+    // Accepted, echoed, and deliberately inert: these live in the cache header.
+    static const char* const kInertGeometry[] = {
+        "center_lat_deg", "center_lon_deg", "edge_factor", "edge_m",
+        "height_factor", "height_m", "n_rays", "radius_m", "sampler",
+        "seed", "spacing_m", "truncate_rel",
+    };
+
+    std::vector<std::string> dead, inert;
+    for (const auto& kv : fc) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        bool is_read = false;
+        for (const char* r : kRead) { if (key == r) { is_read = true; break; } }
+        if (is_read) continue;
+        bool is_inert = false;
+        for (const char* r : kInertGeometry) { if (key == r) { is_inert = true; break; } }
+        if (is_inert) inert.push_back(key); else dead.push_back(key);
+    }
+
+    if (!inert.empty()) {
+        std::sort(inert.begin(), inert.end());
+        std::ostringstream line;
+        line << "[config] NOTE: " << inert.size()
+             << " geometry key(s) under `flux_cubes:` are recorded by the cache, not by the "
+                "engine, and are IGNORED here: ";
+        for (size_t i = 0; i < inert.size(); ++i) line << (i ? ", " : "") << inert[i];
+        line << " -- they are inputs to ptm_flux_cube_geom. The engine takes these values from "
+                "the cache header and refuses a cache whose key does not match the run.";
+        std::cerr << line.str() << std::endl;
+    }
+    if (dead.empty()) return;
+
+    std::sort(dead.begin(), dead.end());
+    std::ostringstream line;
+    line << "[config] WARNING: " << dead.size()
+         << " key(s) under `flux_cubes:` are read by nothing and have NO effect: ";
+    for (size_t i = 0; i < dead.size(); ++i) line << (i ? ", " : "") << dead[i];
+    line << " -- editing them changes no result. See docs/flux-cubes.md.";
     std::cerr << line.str() << std::endl;
 }
 } // namespace
@@ -460,7 +535,54 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.write_raw_stats = getWithDefault(output, "write_raw_stats", config.output.write_raw_stats);
             config.output.skip_mesh = getWithDefault(output, "skip_mesh", config.output.skip_mesh);
         }
-        
+
+        // Parse Flux Cubes section (TOP LEVEL -- see FluxCubeParams and PTM-67)
+        if (root["flux_cubes"]) {
+            const auto& fc = root["flux_cubes"];
+            config.flux_cubes.enabled = getWithDefault(fc, "enabled", config.flux_cubes.enabled);
+            config.flux_cubes.cache_file = getWithDefault(fc, "cache_file", config.flux_cubes.cache_file);
+            config.flux_cubes.write_binary = getWithDefault(fc, "write_binary", config.flux_cubes.write_binary);
+            config.flux_cubes.write_csv = getWithDefault(fc, "write_csv", config.flux_cubes.write_csv);
+            config.flux_cubes.write_csv_max_cubes = getWithDefault(fc, "write_csv_max_cubes", config.flux_cubes.write_csv_max_cubes);
+            config.flux_cubes.shadow_probe_rays = getWithDefault(fc, "shadow_probe_rays", config.flux_cubes.shadow_probe_rays);
+            // `locations` is a SEQUENCE OF MAPS -- the only one in this parser.
+            // Its per-entry fields are read with direct node access rather than
+            // getWithDefault, deliberately: getWithDefault's first argument is
+            // how the engine-config extractor identifies which YAML SECTION a
+            // key belongs to, and a loop variable is not a section. Writing
+            // `getWithDefault(entry, "name", ...)` made the extractor emit a
+            // phantom key under an unresolvable node and fail the parity test.
+            //
+            // Reading them directly is also the CORRECT surface: there is no
+            // dotted key `flux_cubes.locations.name` for a user to write -- the
+            // name lives inside a list element -- so publishing one in the
+            // engine-config table would tell the GUI writer and the dead-key
+            // audit that a key exists which does not. The table documents
+            // `flux_cubes.locations` itself; the per-entry schema is in
+            // docs/flux-cubes.md section 12.
+            //
+            // Semantics are unchanged: getWithDefault is `node[key] ? as<T>() :
+            // default`, which is exactly what each line below does.
+            if (fc["locations"] && fc["locations"].IsSequence()) {
+                for (const auto& entry : fc["locations"]) {
+                    SimulationConfig::FluxCubeParams::NamedLocation nl;
+                    if (entry["name"])     nl.name     = entry["name"].as<std::string>();
+                    if (entry["lat_deg"])  nl.lat_deg  = entry["lat_deg"].as<double>();
+                    if (entry["lon_deg"])  nl.lon_deg  = entry["lon_deg"].as<double>();
+                    if (entry["height_m"]) nl.height_m = entry["height_m"].as<double>();
+                    if (entry["edge_m"])   nl.edge_m   = entry["edge_m"].as<double>();
+                    if (nl.name.empty()) {
+                        std::cerr << "[config] WARNING: a flux_cubes.locations entry has no "
+                                     "`name:` and will be ignored -- outputs are keyed by name."
+                                  << std::endl;
+                        continue;
+                    }
+                    config.flux_cubes.locations.push_back(nl);
+                }
+            }
+            warnUnreadFluxCubeKeys(fc);
+        }
+
         // Parse Radiation section
         if (root["radiation"]) {
             const auto& rad = root["radiation"];

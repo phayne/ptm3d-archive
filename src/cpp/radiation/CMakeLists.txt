@@ -80,6 +80,26 @@ set_target_properties(test_two_band_rownorm PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# STAGE 0 of the flux cubes: the host-side reconstruction of the terrain
+# radiosity B_vis/B_ir must equal the solver's own converged B to 1e-12
+# relative, with negative controls that are REQUIRED to fail. Falsifies
+# design decision D3 (reconstruct on the host, no GPU readback).
+add_executable(test_flux_cube_identity test_flux_cube_identity.cpp)
+target_link_libraries(test_flux_cube_identity PRIVATE
+    radiation
+    mesh_utils
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_flux_cube_identity PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    target_link_libraries(test_flux_cube_identity PRIVATE ptm_gpu)
+    target_compile_definitions(test_flux_cube_identity PRIVATE PTM_GPU_OPENCL)
+endif()
+set_target_properties(test_flux_cube_identity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Ingersoll bowl-crater validation driven by the PRODUCTION radiation module
 # (Embree-occluded ViewFactorCalculator + RadiositySolver). Writes .npy outputs.
 add_executable(bowl_crater_ptm bowl_crater_ptm.cpp)

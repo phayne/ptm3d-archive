@@ -6276,3 +6276,41 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
 #endif  // PTM_GPU_OPENCL
 
 } // namespace ptm
+// ---------------------------------------------------------------------------
+// Passive-probe access for flux cubes. See the header for why these exist as
+// thin wrappers rather than as new physics.
+// ---------------------------------------------------------------------------
+namespace ptm {
+
+bool IlluminationModel::probeOccluded(const std::array<double, 3>& origin,
+                                      const std::array<double, 3>& direction) {
+    if (!embree_scene_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[IlluminationModel] WARNING: probeOccluded called with no Embree "
+                         "scene; reporting NOT-occluded. A passive probe reading an unbuilt "
+                         "scene as clear sky would fabricate direct flux -- the caller is "
+                         "expected to refuse rather than consume this.\n";
+        }
+        return false;
+    }
+    std::vector<std::array<double, 3>> o{origin}, d{direction};
+    const std::vector<int> hit = intersectsFirst(o, d);
+    return !hit.empty() && hit[0] >= 0;
+}
+
+double IlluminationModel::probePrimaryHeating(double mean_cos, double primary_distance) {
+    return calculatePrimaryHeating(mean_cos, primary_distance);
+}
+
+double IlluminationModel::probePrimaryReflected(double mean_cos,
+                                                const std::array<double, 3>& primary_direction,
+                                                const std::array<double, 3>& sun_position,
+                                                const std::array<double, 3>& primary_position,
+                                                double primary_distance) {
+    return calculatePrimaryReflectedLight(mean_cos, primary_direction, sun_position,
+                                          primary_position, primary_distance);
+}
+
+}  // namespace ptm

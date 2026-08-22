@@ -22,6 +22,7 @@ target_link_libraries(ptm_thermal_sim
     ice_table
     fileio
     radiation
+    flux_cubes
     ${CSPICE_LIBRARIES}
     ${EMBREE_LIBRARIES}
     ${OpenMP_CXX_LIBRARIES}

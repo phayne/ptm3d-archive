@@ -13,18 +13,16 @@ Severity: **P0** blocks a non-Mac / non-this-host build or run · **P1** wrong/s
 
 ## 1. Hardcoded absolute paths
 
-### 1a. Shipped example configs (P1 — the plan's known follow-up)
-`267` of the `examples/*.yaml|*.ptm3d` files embed a machine-specific absolute path
-(`/Users/…`, an `OneDrive-…` path, or `/Volumes/…`):
+### 1a. Shipped example configs (P1 — RESOLVED)
+Historically `267` of the `examples/*.yaml|*.ptm3d` files embedded a machine-specific
+absolute path (`/Users/…`, an `OneDrive-…` path, or `/Volumes/…`). The planned
+disposition — relativize to `PTM_DATA_ROOT` / config-relative resolution (see §4), ship a
+curated set of RELATIVE example configs, and quarantine the rest as non-shipped campaign
+artifacts — has been carried out. Re-measured on a fresh clone, 2026-08-18:
 
 ```
-grep -rlE '/Users/|OneDrive|/Volumes/' examples/ | wc -l   ->  267
+grep -rlE '/Users/|OneDrive|/Volumes/' examples/ | wc -l   ->  0
 ```
-
-These will not resolve on any other machine (or even this one after the OneDrive→`~/projects`
-migration). Phase-1 disposition: relativize to `PTM_DATA_ROOT` / config-relative resolution
-(see §4) and ship a small curated set of RELATIVE example configs; quarantine the rest as
-non-shipped campaign artifacts.
 
 ### 1b. Compiled-in default paths in SOURCE (P0/P1 — ship in the binary)
 - **`src/cpp/illumination/illumination_model.h:602`** —
