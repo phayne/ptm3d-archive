@@ -42,15 +42,18 @@
  * into the GPU translation unit for one tiny record.
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <ctime>
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
 namespace gpu {
 
@@ -194,6 +197,51 @@ inline bool getStr(const std::string& t, const std::string& k, std::string& v) {
     return jsonFind(t, k, v);
 }
 
+inline bool getSize(const std::string& t, const std::string& k, size_t& v) {
+    std::string s; if (!jsonFind(t, k, s)) return false;
+    try { v = static_cast<size_t>(std::stoull(s)); return true; } catch (...) { return false; }
+}
+inline bool getLL(const std::string& t, const std::string& k, long long& v) {
+    std::string s; if (!jsonFind(t, k, s)) return false;
+    try { v = std::stoll(s); return true; } catch (...) { return false; }
+}
+
+/// mkdir -p the parent directory of `full`. Walks the components so a nested
+/// profile path works; EEXIST is ignored.
+inline void mkdirParents(const std::string& full) {
+    size_t slash = full.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) return;
+    const std::string dir = full.substr(0, slash);
+    const bool absolute = (!dir.empty() && dir[0] == '/');
+    std::string acc;
+    std::stringstream ds(dir);
+    std::string part;
+    while (std::getline(ds, part, '/')) {
+        if (part.empty()) { if (absolute && acc.empty()) acc = ""; continue; }
+        acc += "/" + part;
+        ::mkdir(acc.c_str(), 0755);   // ignore EEXIST
+    }
+}
+
+inline std::string hostName() {
+    char buf[256] = {0};
+    if (::gethostname(buf, sizeof(buf) - 1) != 0) return "unknown-host";
+    return std::string(buf);
+}
+
+inline std::string utcNow() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_utc{};
+#if defined(_WIN32)
+    gmtime_s(&tm_utc, &t);
+#else
+    gmtime_r(&t, &tm_utc);
+#endif
+    char buf[32] = {0};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+    return std::string(buf);
+}
+
 }  // namespace machine_profile_detail
 
 /// Re-derive a loaded profile's dispatch ceiling against the CURRENT watchdog
@@ -330,21 +378,7 @@ inline bool saveMachineProfile(const MachineProfile& p, const std::string& path 
                      "(set $PTM_MACHINE_PROFILE or $HOME).\n";
         return false;
     }
-    // mkdir -p the parent directory (single-level create is enough for
-    // ~/.ptm3d, but walk components to be safe).
-    size_t slash = full.find_last_of('/');
-    if (slash != std::string::npos && slash > 0) {
-        std::string dir = full.substr(0, slash);
-        std::string acc;
-        std::stringstream ds(dir);
-        std::string part;
-        bool absolute = (!dir.empty() && dir[0] == '/');
-        while (std::getline(ds, part, '/')) {
-            if (part.empty()) { if (absolute && acc.empty()) acc = ""; continue; }
-            acc += "/" + part;
-            ::mkdir(acc.c_str(), 0755);   // ignore EEXIST
-        }
-    }
+    machine_profile_detail::mkdirParents(full);
     std::ofstream f(full);
     if (!f.good()) {
         std::cerr << "[machine-profile] failed to open " << full << " for writing.\n";
@@ -485,6 +519,138 @@ inline bool loadMatchingCachedProfile(int run_n_layers, double run_dz_min,
     }
     ::closedir(d);
     return found;
+}
+
+// ---------------------------------------------------------------------------
+// Per-host VRAM record (schema 1)
+//
+// The dispatch profile above answers "how long may one kernel launch be here".
+// This one answers "how much device memory does this host have, and what is
+// the largest radiosity CSR replica it has ever committed successfully". Both
+// are host facts that a threshold should come from instead of a constant
+// written for one 32 GiB Navi21 die.
+//
+// It lives in its OWN file (<profile dir>/vram_profile.json), not in
+// machine_profile.json: that file is written by --calibrate-gpu and is keyed to
+// a representative grid, and a read-modify-write from an unrelated code path is
+// how a calibration record gets clobbered.
+//
+// Written after a SUCCESSFUL upload only. A refusal or a failed upload teaches
+// nothing about what this host can carry, and recording an attempt as if it had
+// succeeded would turn the file into a source of false confidence.
+// ---------------------------------------------------------------------------
+
+struct VramProfile {
+    int schema_version = 1;
+    bool valid = false;
+    std::string host;
+    std::string device_name;
+    std::string vendor;
+    std::string updated_utc;
+    int n_devices = 0;                             ///< enumerated at last write
+    size_t vram_total_bytes = 0;                   ///< smallest device seen
+    size_t largest_committed_replica_bytes = 0;    ///< per device
+    long long committed_margin_bytes = 0;          ///< margin left by that commit
+    int committed_devices = 0;                     ///< devices that commit spanned
+};
+
+inline std::string vramProfilePath() {
+    if (const char* env = std::getenv("PTM_VRAM_PROFILE")) {
+        if (env[0] != '\0') return std::string(env);
+    }
+    std::string base = machine_profile_detail::defaultProfilePath();
+    if (base.empty()) return "";
+    size_t slash = base.find_last_of('/');
+    std::string dir = (slash == std::string::npos) ? std::string(".")
+                                                   : base.substr(0, slash);
+    return dir + "/vram_profile.json";
+}
+
+inline bool loadVramProfile(VramProfile& out) {
+    const std::string p = vramProfilePath();
+    if (p.empty()) return false;
+    std::ifstream f(p);
+    if (!f.good()) return false;
+    std::stringstream ss; ss << f.rdbuf();
+    const std::string text = ss.str();
+    if (text.find('{') == std::string::npos) return false;
+
+    VramProfile v;
+    using namespace machine_profile_detail;
+    getInt(text, "schema_version", v.schema_version);
+    getStr(text, "host", v.host);
+    getStr(text, "device_name", v.device_name);
+    getStr(text, "vendor", v.vendor);
+    getStr(text, "updated_utc", v.updated_utc);
+    getInt(text, "n_devices", v.n_devices);
+    getSize(text, "vram_total_bytes", v.vram_total_bytes);
+    getSize(text, "largest_committed_replica_bytes",
+            v.largest_committed_replica_bytes);
+    getLL(text, "committed_margin_bytes", v.committed_margin_bytes);
+    getInt(text, "committed_devices", v.committed_devices);
+    v.valid = true;
+    out = v;
+    return true;
+}
+
+inline bool saveVramProfile(const VramProfile& v) {
+    const std::string p = vramProfilePath();
+    if (p.empty()) return false;
+    machine_profile_detail::mkdirParents(p);
+    std::ofstream f(p);
+    if (!f.good()) return false;
+    f << "{\n";
+    f << "  \"schema_version\": " << v.schema_version << ",\n";
+    f << "  \"host\": \"" << v.host << "\",\n";
+    f << "  \"device_name\": \"" << v.device_name << "\",\n";
+    f << "  \"vendor\": \"" << v.vendor << "\",\n";
+    f << "  \"updated_utc\": \"" << v.updated_utc << "\",\n";
+    f << "  \"n_devices\": " << v.n_devices << ",\n";
+    f << "  \"vram_total_bytes\": " << v.vram_total_bytes << ",\n";
+    f << "  \"largest_committed_replica_bytes\": "
+      << v.largest_committed_replica_bytes << ",\n";
+    f << "  \"committed_margin_bytes\": " << v.committed_margin_bytes << ",\n";
+    f << "  \"committed_devices\": " << v.committed_devices << "\n";
+    f << "}\n";
+    return f.good();
+}
+
+/// Record what this host's smallest participating device has. Cheap and
+/// idempotent; only grows the record's knowledge (the device fields track the
+/// SMALLEST device seen, because that is the one every fit check is bound by).
+inline void noteVramDevice(size_t total_bytes, int n_devices,
+                           const std::string& device_name,
+                           const std::string& vendor) {
+    if (total_bytes == 0) return;
+    VramProfile v;
+    loadVramProfile(v);
+    if (v.vram_total_bytes == 0 || total_bytes < v.vram_total_bytes) {
+        v.vram_total_bytes = total_bytes;
+        v.device_name = device_name;
+        v.vendor = vendor;
+    }
+    v.n_devices = std::max(v.n_devices, n_devices);
+    v.host = machine_profile_detail::hostName();
+    v.updated_utc = machine_profile_detail::utcNow();
+    saveVramProfile(v);
+}
+
+/// Record a replica this host actually carried, with the margin it left.
+/// Only ever raises the high-water mark. Call AFTER the upload succeeded.
+inline void noteCommittedReplica(size_t bytes_per_device,
+                                 long long margin_bytes,
+                                 int n_devices) {
+    if (bytes_per_device == 0) return;
+    VramProfile v;
+    loadVramProfile(v);
+    if (bytes_per_device > v.largest_committed_replica_bytes) {
+        v.largest_committed_replica_bytes = bytes_per_device;
+        v.committed_margin_bytes = margin_bytes;
+        v.committed_devices = n_devices;
+    }
+    v.host = machine_profile_detail::hostName();
+    v.updated_utc = machine_profile_detail::utcNow();
+    saveVramProfile(v);
 }
 
 }  // namespace gpu

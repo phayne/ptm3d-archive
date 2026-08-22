@@ -4,6 +4,7 @@
 #include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
 #include "../thermal/thermal_model.h"  // For ProgressBar
 #include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
+#include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_ray.h>
@@ -903,6 +904,45 @@ void RadiositySolver::initGPU() {
                "radiation.gpu_devices / thermal.gpu_devices.\n";
         std::cout << msg.str();
     };
+    // Per-host VRAM record. The thresholds above have defaults calibrated on
+    // one 32 GiB Navi21 die; this is where the engine learns what THIS host
+    // actually has and what it has actually carried, and says so once per run.
+    // See gpu/machine_profile.h -- the record is written after a successful
+    // upload only, never after a refusal.
+    bool host_vram_context_printed = false;
+    auto noteHostVram = [&](size_t global_mem, int n_dev,
+                            const std::string& name, const std::string& vendor) {
+        gpu::noteVramDevice(global_mem, n_dev, name, vendor);
+        if (host_vram_context_printed) return;
+        host_vram_context_printed = true;
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const double dev_gib = global_mem / kGiB;
+        if (min_margin_gib > 0.0 && dev_gib > 0.0
+            && min_margin_gib > 0.10 * dev_gib) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] NOTE: the " << min_margin_gib
+              << " GiB VRAM-margin floor is "
+              << (100.0 * min_margin_gib / dev_gib)
+              << "% of this device's " << dev_gib
+              << " GiB. The 2.0 GiB default was calibrated on 32 GiB dies; on a "
+                 "smaller device set gpu.min_vram_margin_gib to something this "
+                 "host can actually leave behind.\n";
+            std::cout << m.str();
+        }
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)
+            && rec.largest_committed_replica_bytes > 0) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] host VRAM record: largest replica committed here "
+              << (rec.largest_committed_replica_bytes / kGiB) << " GiB/device on "
+              << rec.committed_devices << " device(s), leaving "
+              << (rec.committed_margin_bytes / kGiB) << " GiB of margin ("
+              << rec.updated_utc << ", " << gpu::vramProfilePath() << ").\n";
+            std::cout << m.str();
+        }
+    };
 
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
     gpu_config.max_iterations = config_.max_iterations;
@@ -966,6 +1006,7 @@ void RadiositySolver::initGPU() {
         }
         const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
         const std::string dev_vendor = gpu_solver_->getDeviceInfo().vendor;
+        noteHostVram(dev_mem, 1, gpu_solver_->getDeviceInfo().name, dev_vendor);
         if (!fitsDevice(dev_mem, dev_vendor)) {
             // Say WHICH test rejected it. "does not fit" printed after a policy
             // refusal is a false statement about the hardware.
@@ -993,6 +1034,9 @@ void RadiositySolver::initGPU() {
             gpu_solver_.reset();
             return false;
         }
+        // The upload SUCCEEDED, so this host demonstrably carries a replica
+        // this large. Record it (high-water mark only).
+        gpu::noteCommittedReplica(needed_bytes, deviceMargin(dev_mem), 1);
         use_gpu_ = true;
         if (two_band_) {
             two_band_gpu_ok_ = true;
@@ -1103,6 +1147,8 @@ void RadiositySolver::initGPU() {
                     min_dev_vendor = d.vendor;
                 }
             }
+            noteHostVram(min_dev, static_cast<int>(chosen.size()),
+                         chosen.front().name, min_dev_vendor);
             if (!fitsDevice(min_dev, min_dev_vendor)) {
                 pool_ok = false;
                 // Say WHICH test rejected it -- see the single-GPU twin below.
@@ -1161,6 +1207,10 @@ void RadiositySolver::initGPU() {
                              "degrading to single-GPU.\n";
                 gpu_pool_.reset();
             } else {
+                // Upload succeeded on every pool device: record what this host
+                // demonstrably carried (high-water mark only, never a refusal).
+                gpu::noteCommittedReplica(needed_bytes, deviceMargin(min_dev),
+                                          static_cast<int>(gpu_pool_->numDevices()));
                 // The pool IS a GPU rung: publish it in the same state the
                 // single-GPU rung publishes. Without this use_gpu_ and
                 // two_band_gpu_ok_ stayed false while the pool ran, so
