@@ -740,15 +740,16 @@ struct SimulationConfig {
         // Margin below which `auto` separates the two pools [GiB].
         double placement_margin_gib = 4.0;
         // What a margin below min_vram_margin_gib DOES:
-        //   refuse   = give up the GPU rung (radiosity on the CPU). Default,
-        //              and the behavior committed on 2026-08-22.
         //   separate = keep the GPU rung, but only behind disjoint placement,
-        //              and refuse only below hard_min_vram_margin_gib.
-        // The two differ by a lot on a large-matrix site: measured on A3GT
-        // A03N1016, the CPU radiosity rung cost 108.9 min/window against
-        // 31.4 min on the GPU pool, while separation costs a derived
+        //              and refuse only below hard_min_vram_margin_gib. DEFAULT
+        //              (Paul's ruling, 2026-08-22).
+        //   refuse   = give up the GPU rung (radiosity on the CPU).
+        // Both remove the co-residency the 2026-08 wedges died in; they differ
+        // by a lot in price on a large-matrix site. Measured on A3GT A03N1016,
+        // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
+        // GPU pool (+77.5 measured), while separation costs a derived
         // +7-10 min. See docs/gpu-wedge-guardrails.md.
-        std::string thin_margin_policy = "refuse";
+        std::string thin_margin_policy = "separate";
         // The floor below which even `separate` refuses [GiB].
         double hard_min_vram_margin_gib = 0.25;
         // NOT a YAML key: true when min_vram_margin_gib was written in the

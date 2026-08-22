@@ -77,7 +77,7 @@ ENGINE_DEFAULTS = {
     'gpu.min_vram_margin_gib': 2.0,
     'gpu.placement_margin_gib': 4.0,
     'gpu.placement_policy': 'auto',
-    'gpu.thin_margin_policy': 'refuse',
+    'gpu.thin_margin_policy': 'separate',
     'illumination.albedo_map': '',
     'illumination.albedo_maps_directory': 'data/albedo_maps',
     'illumination.bvh_cache_file': '',

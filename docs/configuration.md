@@ -447,7 +447,7 @@ cost of each guardrail are in
 | `min_vram_margin_gib` | float | 2.0 | Floor on the per-device VRAM headroom a resident radiosity CSR replica may leave behind. A rung with less is refused (see gating below). 0 = fit check only, the pre-2026-08-22 behavior |
 | `placement_policy` | string | `auto` | `auto`, `shared` or `disjoint`: may the radiosity replica and the GPU thermal pool occupy the same devices? |
 | `placement_margin_gib` | float | 4.0 | Margin below which `auto` separates the two pools onto disjoint devices, and below which the thin-margin advisory prints |
-| `thin_margin_policy` | string | `refuse` | What a margin below `min_vram_margin_gib` does: `refuse` the GPU rung, or `separate` the two pools and keep it |
+| `thin_margin_policy` | string | `separate` | What a margin below `min_vram_margin_gib` does: `separate` the two pools onto disjoint devices and keep the GPU rung, or `refuse` the rung outright |
 | `hard_min_vram_margin_gib` | float | 0.25 | Under `separate`, the floor below which the GPU rung is refused anyway |
 
 **Platform gating.** The failure these guard against — a wedged GPU that takes
@@ -463,17 +463,18 @@ Setting `min_vram_margin_gib` in the config (or `PTM_GPU_MIN_VRAM_MARGIN_GIB`
 in the environment) makes it enforcing on **every** host: an operator who asks
 for a policy gets the policy.
 
-**What the 2.0 default costs.** A site whose CSR replica fits by less than
-2 GiB now degrades — loudly — to CPU radiosity. That is deliberate: the GPU
-thermal pool allocates roughly 0.77 GiB per device on the *same* dies while the
-replica is resident (A3GT production settings), and the fit check does not
-count it. On the A3GT campaign this affects one site, A03N1016, whose replica
-fit by 0.64 GiB — and for that site the cost is **large and measured**:
-108.9 min/window on the CPU radiosity rung against 31.4 min on the GPU pool
-(8 windows each). `thin_margin_policy: separate` keeps the GPU rung behind
-disjoint device sets instead, for a derived +7-10 min; see
-[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md) for the comparison and why
-the default is still `refuse`.
+**What the 2.0 default does.** A site whose CSR replica fits by less than 2 GiB
+is treated as thin, and by default (`thin_margin_policy: separate`) the engine
+moves the radiosity replica and the GPU thermal pool onto **disjoint devices**
+and keeps the GPU rung — a derived +7-10 min per A3GT-scale window. It gives up
+the rung only below `hard_min_vram_margin_gib` (0.25), or on a rung that cannot
+be separated. That matters because the alternative is expensive: measured on
+A03N1016 (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window against
+31.4 min on the GPU pool, 8 windows each. The reason the margin needs guarding
+at all is that the GPU thermal pool allocates roughly 0.77 GiB per device on
+the *same* dies while the replica is resident, and the fit check does not count
+it. Set `thin_margin_policy: refuse` to give up the rung instead; see
+[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
 
 `auto` only engages when **all** of: the thermal solver is on the GPU, the two
 device sets overlap, the margin is below `placement_margin_gib`, the host is

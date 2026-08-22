@@ -32,7 +32,7 @@ static void check(const std::string& what, bool ok) {
 
 static void resetPolicy(const std::string& placement, double placement_margin,
                         double min_margin, bool explicit_margin,
-                        const std::string& thin_margin_policy = "refuse",
+                        const std::string& thin_margin_policy = "separate",
                         double hard_floor = 0.25) {
     gg::Policy& p = gg::policy();
     p.placement = placement;
@@ -79,17 +79,34 @@ int main(int argc, char** argv) {
     check("default floor on a non-AMD device follows the platform gate too",
           gg::enforceVramMargin(nvidia) == gg::wedgeProneDriver(nvidia));
 
-    // ---- thin-margin ORDERING: refuse-first vs separate-first -------------
+    // ---- thin-margin ORDERING: separate (default) vs refuse ---------------
     // A03N1016's real geometry: the replica fits by +0.64 GiB against a 2.0
-    // GiB floor. Under "refuse" that site loses the GPU radiosity rung, which
-    // MEASURED 108.9 min/window against 31.4 min on the GPU pool. Under
-    // "separate" it keeps the rung behind disjoint dies, at a derived
-    // +7-10 min. These cases pin which verdict each ordering produces.
+    // GiB floor. Under the DEFAULT ("separate", Paul's ruling 2026-08-22) that
+    // site keeps the GPU radiosity rung behind disjoint dies at a derived
+    // +7-10 min/window; under the explicit "refuse" it loses the rung, which
+    // MEASURED 108.9 min/window against 31.4 on the GPU pool. These cases pin
+    // which verdict each ordering produces.
     using V = gg::MarginVerdict;
     const double n1016 = 0.64;
 
+    // The BUILT-IN default, before anything sets it. config_parser.h carries
+    // the same string; the generated engine-config table is what keeps those
+    // two honest (src/python/ptm/engine_defaults.py).
+    check("built-in default thin_margin_policy is 'separate'",
+          gg::Policy().thin_margin_policy == "separate");
+    check("built-in default hard floor is 0.25 GiB",
+          gg::Policy().hard_min_vram_margin_gib == 0.25);
+
+    resetPolicy("auto", 4.0, 2.0, true);          // default thin-margin policy
+    check("DEFAULT: N1016's +0.64 GiB KEEPS the GPU rung when separated",
+          gg::judgeVramMargin(n1016, /*separated=*/true, false, amd)
+              == V::WaiveSeparation);
+    check("DEFAULT: the same margin still refuses when NOT separated",
+          gg::judgeVramMargin(n1016, false, false, amd) == V::Refuse);
+
     resetPolicy("auto", 4.0, 2.0, true, "refuse");
-    check("refuse: N1016's +0.64 GiB loses the GPU rung even when separated",
+    check("explicit refuse: N1016's +0.64 GiB loses the GPU rung even when "
+          "separated",
           gg::judgeVramMargin(n1016, /*separated=*/true, false, amd) == V::Refuse);
 
     resetPolicy("auto", 4.0, 2.0, true, "separate", 0.25);
@@ -107,12 +124,17 @@ int main(int argc, char** argv) {
     check("either ordering: a fat margin just passes",
           gg::judgeVramMargin(27.18, false, false, amd) == V::Pass);
 
-    resetPolicy("auto", 4.0, 0.0, false, "refuse");
+    resetPolicy("auto", 4.0, 0.0, false);
     check("floor of 0 disables the test entirely",
           gg::judgeVramMargin(0.0, false, false, amd) == V::Pass);
 
+    resetPolicy("auto", 4.0, 2.0, false);         // default thin-margin policy
+    check("DEFAULT: a thin margin on a non-enforcing platform is ADVISORY, "
+          "not a refusal",
+          gg::judgeVramMargin(n1016, false, false, amd)
+              == (gate_amd ? V::Refuse : V::Advisory));
     resetPolicy("auto", 4.0, 2.0, false, "refuse");
-    check("a thin margin on a non-enforcing platform is ADVISORY, not a refusal",
+    check("explicit refuse: the platform gate still comes first",
           gg::judgeVramMargin(n1016, false, false, amd)
               == (gate_amd ? V::Refuse : V::Advisory));
 

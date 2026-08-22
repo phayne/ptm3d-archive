@@ -132,14 +132,16 @@ struct Policy {
     double placement_margin_gib = 4.0;
 
     /// What a margin below min_vram_margin_gib should DO. See judgeVramMargin().
-    ///   "refuse"   -- give up the GPU rung (radiosity runs on the CPU)
     ///   "separate" -- keep the GPU rung but only behind disjoint placement,
-    ///                 refusing only below hard_min_vram_margin_gib
-    /// Default "refuse" is the behavior committed on 2026-08-22; "separate"
-    /// exists because the measured cost of the refusal is far larger than the
-    /// cost of the separation on a large-matrix site (see
-    /// docs/gpu-wedge-guardrails.md "Two ways to treat a thin margin").
-    std::string thin_margin_policy = "refuse";
+    ///                 refusing only below hard_min_vram_margin_gib (DEFAULT)
+    ///   "refuse"   -- give up the GPU rung (radiosity runs on the CPU)
+    /// Default is "separate" (Paul's ruling, 2026-08-22): both orderings remove
+    /// the co-residency the wedges died in, but on a large-matrix site the
+    /// refusal costs a MEASURED +77.5 min/window (A3GT A03N1016: 108.9 min on
+    /// the CPU radiosity rung against 31.4 on the GPU pool, 8 windows each)
+    /// while the separation costs a derived +7-10 min. See
+    /// docs/gpu-wedge-guardrails.md "Two ways to treat a thin margin".
+    std::string thin_margin_policy = "separate";
     /// The floor below which even "separate" refuses, in GiB.
     double hard_min_vram_margin_gib = 0.25;
 };

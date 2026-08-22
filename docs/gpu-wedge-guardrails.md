@@ -83,15 +83,20 @@ unmeasured wall cost.
 *Engine.* Enforced on macOS+AMD or when set explicitly; advisory elsewhere.
 
 A radiosity CSR replica that fits with less than this much headroom per device
-is refused, and radiosity runs on the CPU. The reserve the fit check leaves is
+is **thin**. What happens next is `gpu.thin_margin_policy`, below: by default
+the rung is kept and the two pools are moved onto disjoint dies; only below the
+0.25 GiB hard floor (or on a rung that cannot be separated) is the GPU rung
+given up and radiosity run on the CPU. The reserve the fit check leaves is
 one lump shared with every other consumer of the same die — above all the GPU
 thermal pool, which allocates ~0.77 GiB/device at A3GT production settings
 (`gpu_batch_size=100000`, 23 layers, 961 steps) on the very dies holding the
 replica, and which the fit check does not count.
 
-Cost: a site in the thin band loses GPU radiosity, and on a large matrix that
-is expensive. **Measured on A3GT A03N1016** (1,798,135 faces, 3.5 G nnz), eight
-standard windows per generation:
+Cost: under the default ordering a thin-band site keeps the GPU rung and pays
+the separation (~+7-10 min/window, derived). What it would cost to *lose* the
+rung instead — the `refuse` ordering, and what happens below the hard floor
+either way — is large on a big matrix. **Measured on A3GT A03N1016**
+(1,798,135 faces, 3.5 G nnz), eight standard windows per generation:
 
 | rung | windows | mean wall | range |
 |---|---|---|---|
@@ -120,13 +125,13 @@ replica sharing dies with the GPU thermal pool — by different means, at very
 different prices. `gpu.thin_margin_policy` decides which one a thin margin
 triggers:
 
-| | `refuse` (default) | `separate` |
+| | `separate` (**default**) | `refuse` |
 |---|---|---|
-| below `min_vram_margin_gib` | give up the GPU rung | keep it, **but only when the two pools are on disjoint dies** |
-| refuses only below | — | `hard_min_vram_margin_gib` (default 0.25 GiB) |
-| escape below the hard floor | — | this host's own VRAM record shows it already committed a replica this large |
-| cost for A03N1016 (+0.64 GiB) | **+78 min/window** (measured) | **+7-10 min/window** (derived) |
-| removes co-residency? | yes, by removing the GPU rung | yes, by separating the dies |
+| below `min_vram_margin_gib` | keep the GPU rung, **but only when the two pools are on disjoint dies** | give up the GPU rung |
+| refuses only below | `hard_min_vram_margin_gib` (default 0.25 GiB) | — |
+| escape below the hard floor | this host's own VRAM record shows it already committed a replica this large | — |
+| cost for A03N1016 (+0.64 GiB) | **+7-10 min/window** (derived) | **+78 min/window** (measured) |
+| removes co-residency? | yes, by separating the dies | yes, by removing the GPU rung |
 
 `separate` never waives the floor on a rung where the separation could not
 actually be applied — the single-GPU rung cannot choose its device, and a
@@ -135,10 +140,11 @@ mitigation was missing. A floor waived for a mitigation that is not in force
 would be a guardrail that reports itself active while doing nothing, which is
 the failure this whole page exists to remove.
 
-**The default is `refuse`** until the trade is ruled on: it is the
-conservative one, and it is what the rest of this branch was validated with.
-Switching an N1016-class site to `separate` is the difference between a
-109 min window and a ~39 min window.
+**The default is `separate`.** Both orderings remove the condition the wedges
+died in; they differ by a factor of ten in price. On an A03N1016-class site the
+refusal is a 109 min window against ~39 min, i.e. ~16.3 h against ~5.9 h for
+that site's nine windows. Set `gpu.thin_margin_policy: refuse` when you would
+rather lose the GPU radiosity rung than run one at all on a thin margin.
 
 ### G3 — pool placement (`gpu.placement_policy`, default `auto`)
 
@@ -232,6 +238,31 @@ driver interactions. The per-dispatch timestep ceiling (`--calibrate-gpu`,
 mitigation for the `gpusKillClientExt` command-buffer watchdog; leave it alone.
 
 ---
+
+## 2b. What changes for a run that worked before
+
+Every item below is new default behavior as of 2026-08-22, on macOS+AMD unless
+noted. Nothing here changes physics: the crater regression arm is byte-identical
+in the default state, with the pools separated, and at one device.
+
+1. **A thin-margin site keeps the GPU radiosity rung, on disjoint dies.** Below
+   `gpu.min_vram_margin_gib` (2.0) the engine moves the radiosity replica and
+   the thermal pool onto separate devices and carries on — about **+8
+   min/window** on an A3GT-scale site. The GPU rung is given up only below the
+   0.25 GiB hard floor, or on a rung that cannot be separated at all, or if you
+   set `gpu.thin_margin_policy: refuse` (which costs a measured +78 min/window
+   on A03N1016).
+2. **The two pools may be moved onto disjoint devices** whenever the margin is
+   below `gpu.placement_margin_gib` (4.0), even if the floor is not in play.
+3. **The re-thermal pool is hoisted once** instead of rebuilt per coupling
+   iteration; the "Capping re-thermal concurrency at 1 device(s)" line is gone
+   and the width is unchanged.
+4. **The radiosity batch floor uses the real pool device count**, which can
+   change the resolved batch only above ~11 M faces.
+5. **A chunked GPU run on macOS waits 300 s between chunks**, aborts a chunk
+   that has been silent for 45 min, and rotates its logs instead of
+   overwriting them.
+6. **A startup advisory** reports unsafe macOS sleep settings before a GPU run.
 
 ## 3. Platform-gating table
 

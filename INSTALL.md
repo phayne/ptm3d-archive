@@ -151,6 +151,13 @@ power-cycle the machine. Three items, once per host:
        --total-days <days> --output-dir <dir>
    ```
 
+Expect one thing to look different on a big radiation run: when the view-factor
+replica leaves less than 2 GiB of VRAM headroom per device, the engine puts the
+radiosity replica and the GPU thermal pool on **disjoint devices** and says so
+on the `[Radiosity] ACTIVE RUNG` line (roughly +8 min on a 30-minute window).
+It gives up GPU radiosity entirely only below a 0.25 GiB hard floor. Both
+behaviors are configurable under `gpu:` and are macOS+AMD-gated.
+
 If a run wedges: the log stops mid-phase while the process stays alive, and after the
 reboot `pmset -g log | grep -i "shutdown cause"` reports a negative SMC code
 (`-108`/`-128`). `log show` needs sudo; `pmset -g log` does not and keeps about a week.
