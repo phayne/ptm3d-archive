@@ -70,7 +70,7 @@ def main():
 
     csv = os.path.join(a.workdir, "one.csv")
     with open(csv, "w") as f:
-        f.write("name,lat_deg,lon_deg\nsite_centre,%r,%r\n" % (a.lat, a.lon))
+        f.write("name,lat_deg,lon_deg\nsite_center,%r,%r\n" % (a.lat, a.lon))
 
     common = [a.bin, "--core", a.core, "--center-lat", str(a.lat), "--center-lon", str(a.lon),
               "--spacing", "100", "--height-m", "1.0", "--edge-m", "0.5",

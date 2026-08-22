@@ -449,7 +449,7 @@ int main(int argc, char** argv) {
         const Vec3 d = fc[i] - C_surf_guess;
         const double de = dot(d, E), dn = dot(d, N);
         // The local length scale is a property of the TERRAIN, not of the
-        // lattice, so it is measured over a sensible neighbourhood even when the
+        // lattice, so it is measured over a sensible neighborhood even when the
         // lattice is tiny or absent. Without the floor, --radius 0 (one origin
         // cube) and --radius <0 (named locations only) sample an empty disk and
         // the tool aborts with "no core faces inside the grid disk".
@@ -468,7 +468,7 @@ int main(int argc, char** argv) {
     std::printf("local scale: %zu core faces within %.0f m, median equivalent edge %.4f m%s\n",
                 local_edges.size(), kLocalScaleDisk, local_median_edge,
                 (kLocalScaleDisk != args.radius_m)
-                    ? "  (neighbourhood floored at 50 m: the terrain scale is not the lattice's)"
+                    ? "  (neighborhood floored at 50 m: the terrain scale is not the lattice's)"
                     : "");
 
     const bool height_abs = (args.height_m > 0.0);
@@ -639,12 +639,12 @@ int main(int argc, char** argv) {
         // ~0 m result -- catastrophic cancellation that left a ~1e-11 m residue
         // in the recorded offset even when the directions agreed exactly, and
         // broke the grid-vs-named bit-identity check. Differencing first makes
-        // the site-centre case exactly zero instead of nearly zero.
+        // the site-center case exactly zero instead of nearly zero.
         const Vec3 rel = (d - U) * r_mean;
         const double x = dot(rel, E), y = dot(rel, N);
         const double rr = std::sqrt(x * x + y * y);
         if (rr > args.radius_m + 1e-9)
-            std::printf("  NOTE: named location '%s' sits %.1f m from the site centre, "
+            std::printf("  NOTE: named location '%s' sits %.1f m from the site center, "
                         "outside the %.1f m grid radius. That is allowed -- named locations are "
                         "not constrained by the lattice -- but it must be inside the CORE mesh.\n",
                         L.name.c_str(), rr, args.radius_m);

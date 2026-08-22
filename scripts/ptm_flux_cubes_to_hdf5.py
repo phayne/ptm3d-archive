@@ -95,17 +95,30 @@ MATRIX_NOTE = (
 )
 
 # v3 is archived rather than deleted, same reason as v1 and v2: a superseded
-# statement has to be recognisable in copies already circulating.
+# statement has to be recognizable in copies already circulating.
+# american-english: allow-begin -- ARCHIVED SUMMARY, VERBATIM. These strings
+# reproduce text that has already been shipped in earlier files, and their
+# whole purpose is that a reader holding a circulating copy can match it
+# against this one. Americanizing the spelling would break exactly that
+# match, so the checker is told to leave them alone rather than the text
+# being edited to satisfy it.
 SUMMARY_V3 = (
     "SUPERSEDED by v4 -- do not forward. v3 was correct in substance (it already withdrew the "
     "zenith flag and named the assembler defect) but it described data computed against the "
     "PRE-FIX matrix and said so. This file is the re-run against the corrected v3 matrix, so that "
     "caveat no longer applies and has been removed. Retained so a v3-era copy can be recognised "
     "and replaced.")
+# american-english: allow-end
 
 # v2 is archived rather than deleted, for the same reason v1 was: a caveat that
-# has been WITHDRAWN must be recognisable in copies already in circulation, and
+# has been WITHDRAWN must be recognizable in copies already in circulation, and
 # a sibling attribute does not travel with a pasted sentence.
+# american-english: allow-begin -- ARCHIVED SUMMARY, VERBATIM. These strings
+# reproduce text that has already been shipped in earlier files, and their
+# whole purpose is that a reader holding a circulating copy can match it
+# against this one. Americanizing the spelling would break exactly that
+# match, so the checker is told to leave them alone rather than the text
+# being edited to satisfy it.
 SUMMARY_V2 = (
     "SUPERSEDED -- do not forward. This v2 sentence flagged the zenith terrain_ir column as "
     "'NOT ENGINEERING-GRADE ... use that one column as indicative only', attributing a 0.51x "
@@ -114,6 +127,7 @@ SUMMARY_V2 = (
     "ASSEMBLER (entries divided by hit count rather than by 2, up to 2x far-field inflation), "
     "and after re-assembly the parity is 0.978-0.99 median with the cube's rows unchanged. "
     "Retained only so a copy already in circulation can be recognised and replaced by v3.")
+# american-english: allow-end
 
 # v1 is archived in the file rather than deleted. Fermi's reason for replacing it
 # is the reason it is archived and not silently dropped: a sibling caveat
@@ -121,6 +135,12 @@ SUMMARY_V2 = (
 # false in three places, including telling the reader to carry margin in ONE
 # direction on a term that is now two-sided -- must be visibly superseded rather
 # than left to circulate.
+# american-english: allow-begin -- ARCHIVED SUMMARY, VERBATIM. These strings
+# reproduce text that has already been shipped in earlier files, and their
+# whole purpose is that a reader holding a circulating copy can match it
+# against this one. Americanizing the spelling would break exactly that
+# match, so the checker is told to leave them alone rather than the text
+# being edited to satisfy it.
 SUMMARY_V1 = (
     "SUPERSEDED -- do not forward. This v1 sentence predates the finite-solar-disk fix and the "
     "FC-08 measurement. It is false in three places: it calls the direct-solar term a binary "
@@ -134,12 +154,13 @@ SUMMARY_V1 = (
     "binary point-sun test that can be wrong by up to ~1.2 kW/m^2 at the ~0.5% of epochs when a "
     "cube straddles a shadow edge -- treat all four as one-sided *under*-estimates and carry "
     "margin accordingly.'")
+# american-english: allow-end
 
 RING_NOTE = (
     "terrain_vis and terrain_ir EXCLUDE the occluder-ring contribution: the ring is a "
     "shadow-only body with no thermal solution and therefore no radiosity. The omitted "
     "irradiance on a patch is f_ring * B_ring for the ring's true outgoing radiosity B_ring. "
-    "B_ring is not modelled, but the CORE mesh's own measured radiosity is the right anchor "
+    "B_ring is not modeled, but the CORE mesh's own measured radiosity is the right anchor "
     "for it, not an arbitrary cold temperature: see /geometry/missing_ring_flux_Wm2, which "
     "evaluates the bound at the core's median eps*sigma*T_max^4 for this run. An earlier "
     "version of this note anchored the bound at 100 K and understated it by roughly 27x."
@@ -438,7 +459,7 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
                 "own statistics/temperature_max.bin")
         g["f_max"].attrs["note"] = (
             "largest single view-factor entry in the patch's row. At a site-relative "
-            "height a LARGE value on the nadir face is the intended behaviour: the face "
+            "height a LARGE value on the nadir face is the intended behavior: the face "
             "is a near-unity-view-factor sensor of the facet beneath it. A value near "
             "1/4 that does not grow as the height falls means the cube sits on a mesh "
             "vertex and the reading is a multi-facet average.")
@@ -454,8 +475,8 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         for nm, u in (("x_m", "m"), ("y_m", "m"), ("slope_deg", "degree"),
                       ("aspect_deg", "degree"), ("area_m2", "m2"), ("elev_m", "m")):
             g[nm].attrs["units"] = u
-        g["x_m"].attrs["definition"] = "site-frame EAST offset from the grid centre"
-        g["y_m"].attrs["definition"] = "site-frame NORTH offset from the grid centre"
+        g["x_m"].attrs["definition"] = "site-frame EAST offset from the grid center"
+        g["y_m"].attrs["definition"] = "site-frame NORTH offset from the grid center"
         g["slope_deg"].attrs["definition"] = "acos(n_face . U) of the mesh face beneath the cube"
         g["aspect_deg"].attrs["definition"] = "atan2(n . E, n . N), clockwise from north"
         g["face_id"].attrs["definition"] = "index of the CORE mesh face beneath the cube"

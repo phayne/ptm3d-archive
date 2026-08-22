@@ -70,7 +70,7 @@ struct PassInputs {
 
     // --- fields, indexed by ABSOLUTE step ---------------------------------
     // direct_solar is FLAT with stride total_time_steps: [f*total_time_steps + t].
-    // Do not copy the neighbouring location-export call's stride; it passes the
+    // Do not copy the neighboring location-export call's stride; it passes the
     // OUTPUT count against arrays strided by the total, which is a live defect.
     const std::vector<double>* direct_solar = nullptr;
     const std::vector<std::vector<double>>* surface_temps = nullptr;          // [f][t]
@@ -87,12 +87,12 @@ struct PassInputs {
     double primary_radius_km = 0.0;    // 0 => the primary is treated as a POINT
                                        // source and the header says so.
     int primary_disk_samples = 128;
-    // ⛔ UNITS. sun_positions / primary_positions are in KILOMETRES, while the
+    // ⛔ UNITS. sun_positions / primary_positions are in KILOMETERS, while the
     // mesh (and therefore every cube center) is in the mesh's own frame --
-    // METRES for lunar/Europa DEMs, kilometres for asteroid shape models. The
+    // METERS for lunar/Europa DEMs, kilometers for asteroid shape models. The
     // engine handles this explicitly (illumination_model.cpp:5099, metersToKm
-    // gated on centres_in_meters) and so must this pass: subtracting a metres
-    // position from a kilometres one produces a direction pointing INTO the
+    // gated on centers_in_meters) and so must this pass: subtracting a meters
+    // position from a kilometers one produces a direction pointing INTO the
     // ground, every disk sample reads as occluded, and the primary-body flux
     // collapses to exactly zero without any error. That is not hypothetical --
     // it is what this field was added to fix.
@@ -106,7 +106,7 @@ struct PassInputs {
     std::function<double(int)> solar_const;
     // The engine's own applyIncidenceAlbedo(base_A, direct_flux, S) with the
     // PTM-106 coefficients already bound. Null => the source albedo falls back
-    // to the Bond value, which is the legacy (pre-PTM-106) behaviour and is
+    // to the Bond value, which is the legacy (pre-PTM-106) behavior and is
     // recorded in the header rather than assumed.
     std::function<double(double, double, double)> source_albedo;
     // The engine's own primary-body physics, taking mean_cos (not a normal).
@@ -126,7 +126,7 @@ struct PassInputs {
     // 10 m occluder, 0.45 m at 100 m. A binary point-sun test therefore returns
     // a hard 0 or 1 where the engine resolves a partial disk, and the error is
     // the FULL beam (up to ~1.2 kW/m^2) at the epochs where a cube straddles an
-    // edge. 0 => point sun (the old behaviour), recorded in the header.
+    // edge. 0 => point sun (the old behavior), recorded in the header.
     double solar_radius_km = 0.0;
     int    solar_disk_samples = 128;   // escalation count when the 5-probe splits
     std::string provenance_json;       // engine sha / md5 / config, echoed verbatim

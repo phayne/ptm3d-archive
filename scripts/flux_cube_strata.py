@@ -20,7 +20,7 @@ dark-flux path. It does not sample a PSR, and this script will not say it does.
 
 Whether a cube sits on a genuine PSR is a separate question answered by the
 site's psr_mask, not by any single window. Measured for A03MP026 inside the
-500 m production grid: 441 one-metre PSR pixels (346 counting only mask==1
+500 m production grid: 441 one-meter PSR pixels (346 counting only mask==1
 interior), nearest 118.7 m from the site, in 7 patches, the largest 195 m^2 and
 only 15 x 15 m across. Against a 0.785 km^2 grid that is ~0.06% areal coverage,
 so a 25 m lattice is expected to land on ~0.7 of them -- and in fact lands on

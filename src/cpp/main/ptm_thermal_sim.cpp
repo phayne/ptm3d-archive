@@ -20959,7 +20959,7 @@ int main(int argc, char** argv) {
     // other output byte-identical -- and `true` must too.
     //
     // ⛔ Indexing: the flat per-component arrays are strided by
-    // total_time_steps, NOT by the output count. The neighbouring location
+    // total_time_steps, NOT by the output count. The neighboring location
     // export passes `time_steps` against these same arrays, which is a live
     // defect; do not copy its pattern here.
     if (sim_config.flux_cubes.enabled) {
@@ -20994,7 +20994,7 @@ int main(int argc, char** argv) {
         fcin.primary_positions = &primary_positions;
         fcin.primary_radius_km = illumination_model
             ? illumination_model->primaryRadiusKm() : 0.0;
-        // ⛔ UNITS: primary/sun positions are in KM; the mesh may be in metres
+        // ⛔ UNITS: primary/sun positions are in KM; the mesh may be in meters
         // (lunar/Europa DEMs) or km (asteroid shape models). Same detection the
         // illumination model uses at illumination_model.cpp:5085.
         {
@@ -21006,7 +21006,7 @@ int main(int argc, char** argv) {
             const bool centers_in_meters = (r0 > 10000.0);
             fcin.mesh_to_km = centers_in_meters ? 1.0e-3 : 1.0;
             std::cout << "[flux-cubes] mesh frame detected as "
-                      << (centers_in_meters ? "METRES" : "KILOMETRES")
+                      << (centers_in_meters ? "METERS" : "KILOMETERS")
                       << " (|face_center[0]| = " << r0 << "); mesh_to_km = "
                       << fcin.mesh_to_km << std::endl;
         }

@@ -102,7 +102,7 @@ bool loadCache(const std::string& path, Cache& c, std::string& err) {
 // Sample points on the primary body's disk as seen from `origin`. Returns unit
 // directions. With radius_km <= 0 the primary is a POINT source and this
 // returns the single center direction -- recorded in the header, not hidden.
-// EVERY argument here is in KILOMETRES -- origin, position and radius alike.
+// EVERY argument here is in KILOMETERS -- origin, position and radius alike.
 // The returned directions are unit vectors and therefore frame-independent, so
 // they may be cast in the mesh frame without conversion.
 void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
@@ -137,7 +137,7 @@ void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
 // the same functions illumination_model.cpp:4360-4368 escalates through). Not a
 // second sampler: the shape of the ladder and the point set are the engine's.
 //
-//   alpha <= 0            -> point sun, binary test (legacy behaviour)
+//   alpha <= 0            -> point sun, binary test (legacy behavior)
 //   5-probe unanimous     -> 1 or 0, no further rays
 //   5-probe split         -> `samples` directions across the disk
 //
@@ -340,7 +340,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
     if (!in.source_albedo)
         std::cout << "[flux-cubes] NOTE: no incidence-albedo function supplied; the visible "
                      "source albedo falls back to the Bond value (legacy pre-PTM-106 "
-                     "behaviour). Recorded in the file header.\n";
+                     "behavior). Recorded in the file header.\n";
     if (in.primary_radius_km <= 0.0)
         std::cout << "[flux-cubes] NOTE: primary body treated as a POINT source "
                      "(no radius supplied); mean_cos is the single center direction. "
@@ -430,7 +430,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             // an answer with no physical referent.
             double v_sun = 0.0;
             if (have_sun) {
-                // ANGULAR (finite solar disk) at the cube centre, plus the
+                // ANGULAR (finite solar disk) at the cube center, plus the
                 // SPATIAL spread over the cube's own extent. The two smear the
                 // shadow edge on comparable scales at this height and neither
                 // subsumes the other: the disk is ~0.045 m at a 10 m occluder,
@@ -483,7 +483,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             double p_dist_km = 0.0;
             V3 p_hat{0, 0, 0};
             if (have_primary) {
-                const V3 xc_km = mul(xc, to_km);          // cube centre in KM
+                const V3 xc_km = mul(xc, to_km);          // cube center in KM
                 std::vector<V3> dirs;
                 sampleDisk(xc_km, p_pos, in.primary_radius_km,
                            in.primary_disk_samples, dirs);

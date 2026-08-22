@@ -14,7 +14,7 @@ Turning cubes on must not move a single byte of the mesh temperature or flux fie
 
 ---
 
-## 1. Geometry: the cube is sized to the mesh, not to a fixed number of metres
+## 1. Geometry: the cube is sized to the mesh, not to a fixed number of meters
 
 The cube center height and edge are **site-relative by default**:
 
@@ -29,7 +29,7 @@ The cube center height and edge are **site-relative by default**:
 
 `height_m` is a **plumb-line** height along the site vertical `U` — what a leveled lander leg
 gives — not a height along the local face normal. The two differ by `h(1 - cos slope)`, which is
-sub-millimetre at the measured 4 degree median inner slope, but they must never be mixed and
+sub-millimeter at the measured 4 degree median inner slope, but they must never be mixed and
 hardware people assume the plumb line.
 
 The definitions are not assumed: the tool measures `local_median_edge` on the actual mesh, prints
@@ -42,7 +42,7 @@ override the factors, and the file header records `height_factor = 0` to say so.
 > it only means "just above the ground" where the mesh is fine. A03MP026 has a dedicated
 > high-resolution SfS core (median equivalent edge 1.083 m in the grid region) and resolves to
 > **h = 0.1083 m**. A03SP010 has only the generic 80 m/px LOLA base and an 8,746-face core; there
-> a 0.1x height is **metres above the ground**, which is a different instrument entirely. Set
+> a 0.1x height is **meters above the ground**, which is a different instrument entirely. Set
 > `height_m` explicitly at such sites.
 
 Measured at A03MP026 (2,397,890-face core, 724,593 faces inside the 500 m grid disk):
@@ -64,7 +64,7 @@ entire incident terrain flux that comes from one mesh facet. `n_faces_50pct` is 
 it takes to reach half the terrain weight.
 
 At a **site-relative height of 0.1 x the local facet edge, a large `f_max` on the nadir face is
-the intended behaviour, not a defect.** The whole point of putting the cube ~11 cm above a ~1.1 m
+the intended behavior, not a defect.** The whole point of putting the cube ~11 cm above a ~1.1 m
 facet is that the nadir face becomes a near-unity-view-factor sensor of the facet beneath it.
 
 Measured at A03MP026, `h = 0.1083 m`, 65,536 rays per patch:
@@ -93,7 +93,7 @@ instruments* and the error moves in opposite directions:
 
 **The numerical error falls.** The ray-traced row integrates the true facet geometry exactly, so
 there is no error from the facet *count*; the only error is within-facet radiosity
-non-uniformity. At the measured median `f_max = 0.852`, the neighbouring facets carry the
+non-uniformity. At the measured median `f_max = 0.852`, the neighboring facets carry the
 remaining 0.148, and the measured facet-to-facet relative `B_ir` spread inside 1 m is 2.7%. So
 the reported nadir irradiance deviates from the underlying facet's own radiosity by
 
@@ -140,7 +140,7 @@ produce a **coherent stripe across the flux map** rather than white noise. The r
 **`closure_residual` cannot measure sampling accuracy and must never be quoted as if it did.**
 This estimator sums to 1 by construction, so the residual is identically zero (measured: 0.000e+00
 on every patch at every budget). It is retained as a **bookkeeping** check — it catches a dropped
-or double-counted ray channel — and it is labelled as such in the file.
+or double-counted ray channel — and it is labeled as such in the file.
 
 The metric that does measure accuracy is the **split-half total variation** between two
 independently rotated half-rows:
@@ -300,8 +300,8 @@ succeed quietly.
 
 ### Units
 
-⛔ `sun_positions` and `primary_positions` are in **kilometres**; the mesh is in metres for lunar
-and Europa DEMs and kilometres for asteroid shape models. `PassInputs::mesh_to_km` carries the
+⛔ `sun_positions` and `primary_positions` are in **kilometers**; the mesh is in meters for lunar
+and Europa DEMs and kilometers for asteroid shape models. `PassInputs::mesh_to_km` carries the
 conversion, set at the call site by the same magnitude test the illumination model uses. Getting
 this wrong does not raise an error: the direction to the primary points into the ground, every
 disk sample reads as occluded, and the primary-body flux comes out **exactly zero**. That happened
@@ -318,7 +318,7 @@ flux_cubes:
   write_binary: true        # flux_cubes/flux_cubes.fcb
   write_csv: true           # flux_cubes/csv/cube_XXXXX.csv
   write_csv_max_cubes: 0    # 0 = every cube; cap it on long production windows
-  shadow_probe_rays: 5      # 1 = centre only; 5 = centre + four rim points
+  shadow_probe_rays: 5      # 1 = center only; 5 = center + four rim points
 ```
 
 The block is **top level**, not nested under `output:`, so it cannot be reached by the
@@ -409,33 +409,33 @@ boundary, so both a strict and an inclusive count are given):
 | PSR pixels within 500 m of the site | **441** inclusive (`>= 0.5`) / 346 strict (`== 1`) |
 | nearest PSR pixel to the site | **118.7 m** |
 | distinct PSR patches inside the grid | 7 |
-| largest patch | **195 m²**, only **15 × 15 m** across, centre at site ENU E = −109.9 m, N = +62.8 m (lat −84.220932, lon 33.466089) |
+| largest patch | **195 m²**, only **15 × 15 m** across, center at site ENU E = −109.9 m, N = +62.8 m (lat −84.220932, lon 33.466089) |
 | PSR areal fraction of the grid | 441 m² / 0.785 km² ≈ **0.056%** |
 | 25 m production lattice points landing on PSR | **0 of 1257** (≈0.7 expected by area) |
 
 ⚠️ The site-local ENU frame is rotated from the projection's axes by the site longitude (33.5°) —
 in a south-polar stereographic projection with `lon_0 = 0`, local north is the *radial outward*
-direction, not projected +Y. Skipping that rotation moves the patch centroid by tens of metres and
+direction, not projected +Y. Skipping that rotation moves the patch centroid by tens of meters and
 changes which lattice points appear to be on PSR.
 
 **Consequence: the production 25 m lattice cannot sample a genuine PSR at this site.** The patches
 are far smaller than the lattice spacing. Reaching one requires a *targeted dense array*, not a
 finer global grid — see §11.
 
-## 11. Targeted PSR array — CANCELLED
+## 11. Targeted PSR array — CANCELED
 
 **Paul's ruling (2026-08-19): PSR flux cubes serve no engineering need**, because landed hardware
 and crew will never remain inside a permanently shadowed region long enough for the distinction to
-matter. The targeted dense array is **cancelled permanently**, not deferred.
+matter. The targeted dense array is **canceled permanently**, not deferred.
 
 The design is retained here only so the descope is auditable and nobody rediscovers it and assumes
 it was merely never got to. It was sized against real data: spacing 1.0 m, radius 10 m on the
 largest in-grid patch (lat −84.220932, lon 33.466089) would have placed 317 cubes with 196 (62%)
 on PSR pixels, needing no code change to `ptm_flux_cube_geom` and one extra ~40 min run. **It is
-cancelled on relevance, not on cost or difficulty.**
+canceled on relevance, not on cost or difficulty.**
 
 The §10 site measurement stays, because "the production lattice lands on 0 of 1257 PSR pixels" is
-the evidence that this was a judgement about what is worth measuring, rather than a gap the tooling
+the evidence that this was a judgment about what is worth measuring, rather than a gap the tooling
 could not close.
 
 ---
@@ -549,7 +549,7 @@ the *binding side faces*, and the zenith is under-sampled at that budget.
 
 ### Shadow-probe spread is tied to DEM resolution, not hardware scale
 `edge_m` defaults to 0.1 × the local facet scale, so the spatial probe spread is set by mesh
-resolution rather than by the size of the object being modelled (the design recommended a fixed
+resolution rather than by the size of the object being modeled (the design recommended a fixed
 0.30 m avionics-box scale). At A03MP026 that gives edge 0.108 m. Note also that the **nadir face
 therefore sits at h − edge/2 = 0.054 m above the surface**, not at h. Use the per-entry `edge_m`
 override (§12) when the hardware scale is known.

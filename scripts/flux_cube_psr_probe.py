@@ -22,7 +22,7 @@ TWO THINGS THAT WILL GIVE WRONG ANSWERS IF SKIPPED
    the site's local NORTH is the radial-outward direction, not projected +Y,
    and local EAST is perpendicular to it. The rotation equals the site
    longitude (33.5 deg at A03MP026). Treating projected axes as ENU moves the
-   patch centroid by tens of metres and changes which lattice points look like
+   patch centroid by tens of meters and changes which lattice points look like
    they are on PSR -- it changed the production-lattice hit count from 1 to 0
    when this was corrected.
 2. MASK SEMANTICS. The COG psr_mask is 0/1 at ~99.87% of valid pixels, but the
