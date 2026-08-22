@@ -51,6 +51,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <cstddef>
 
 using radiation::RadiationConfig;
 using radiation::RadiositySolver;

@@ -53,6 +53,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cstddef>
+#include <cstdlib>
+#include <stdexcept>
+#include <utility>
 
 #ifdef _OPENMP
 #include <omp.h>

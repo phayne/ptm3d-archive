@@ -14,6 +14,11 @@
 
 // std::sort, for the PTM-67 unread-key report (deterministic key order).
 #include <algorithm>
+// Added for the flux-cube code below: libstdc++ does not pull these in
+// transitively the way libc++ does, which cost a Linux-only CI failure.
+#include <cstddef>
+#include <string>
+#include <vector>
 
 namespace ptm {
 

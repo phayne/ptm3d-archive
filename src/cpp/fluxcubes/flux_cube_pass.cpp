@@ -17,6 +17,12 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <functional>
+#include <stdexcept>
+#include <string>
 
 #ifdef _OPENMP
 #include <omp.h>

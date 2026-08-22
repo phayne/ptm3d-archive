@@ -67,6 +67,12 @@
 #include "../gpu/machine_profile.h"
 #include <unistd.h>   // gethostname
 #include <ctime>
+// Added for the flux-cube code below: libstdc++ does not pull these in
+// transitively the way libc++ does, which cost a Linux-only CI failure.
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 
 #ifdef _OPENMP
 #include <omp.h>

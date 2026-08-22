@@ -41,6 +41,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <cstddef>
 
 namespace ptm {
 namespace fluxcubes {
