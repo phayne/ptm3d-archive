@@ -597,7 +597,14 @@ inline bool saveVramProfile(const VramProfile& v) {
     const std::string p = vramProfilePath();
     if (p.empty()) return false;
     machine_profile_detail::mkdirParents(p);
-    std::ofstream f(p);
+    // Write-then-rename: this file is updated by EVERY GPU run, so two
+    // concurrent runs can write it at once. A torn write would leave
+    // unparsable JSON and silently discard the host's whole history; rename(2)
+    // is atomic within a filesystem, so a reader sees either the old file or
+    // the new one. The temp name carries the pid so the two writers do not
+    // collide in the temp file either.
+    const std::string tmp = p + ".tmp." + std::to_string(static_cast<long>(::getpid()));
+    std::ofstream f(tmp);
     if (!f.good()) return false;
     f << "{\n";
     f << "  \"schema_version\": " << v.schema_version << ",\n";
@@ -612,7 +619,13 @@ inline bool saveVramProfile(const VramProfile& v) {
     f << "  \"committed_margin_bytes\": " << v.committed_margin_bytes << ",\n";
     f << "  \"committed_devices\": " << v.committed_devices << "\n";
     f << "}\n";
-    return f.good();
+    const bool ok = f.good();
+    f.close();
+    if (!ok || std::rename(tmp.c_str(), p.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 /// Record what this host's smallest participating device has. Cheap and
