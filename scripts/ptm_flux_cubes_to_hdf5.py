@@ -60,34 +60,48 @@ ZENITH_TIR_CAVEAT = (
 ENGINEER_SUMMARY = (
     "This is a passive, component-resolved incident-irradiance product (W/m^2, no albedo, no "
     "emissivity, no cube material applied) on six axis-aligned faces at 1,257 points on a 25 m "
-    "lattice over a 500 m radius at A03MP026, validated for the *sunlit and terrain-dominated* "
-    "load regime: direct solar, terrain-scattered visible, terrain thermal IR and Earthshine are "
-    "each independently reproduced against the model's own fields -- 7.4e-15 relative on the "
-    "terrain-IR reconstruction, five significant figures on the closed-form Earthshine -- and "
-    "against closed-form geometry to ~3e-4, and enabling the probe leaves all 22 statistics "
-    "fields of the surface simulation byte-identical. Direct solar resolves the finite solar disk "
-    "composed with the cube's own extent (header solar_model = finite_disk), so shadow edges are "
-    "graded rather than binary; what remains there is a TWO-SIDED edge-placement uncertainty "
-    "reaching 0.6 kW/m^2 (summer) and 1.0 kW/m^2 (winter) on ~1% of face-epochs, with the "
-    "direct-energy integral preserved to better than 0.02% -- carry margin symmetrically at "
-    "shadow edges, and treat the edge position itself as resolved only to the ~1 m facet scale of "
-    "the underlying terrain. It is *not* validated as a permanently-shadowed-region product. One "
-    "one-sided UNDER-estimate remains: terrain IR excludes the 3-27 km occluder ring entirely -- "
-    "the per-patch omission is in /geometry/missing_ring_flux_Wm2 (mean 0.61, max 6.46 W/m^2 "
-    "summer; 0.69 and 7.34 W/m^2 winter, evaluated at the core mesh's own median radiosity and "
-    "linearly rescalable), which is at most 3.9% of a patch's hemisphere but reaches tens of "
-    "percent of the terrain IR actually reported on the worst west-facing patches and exceeds it "
-    "on the zenith face. The zenith terrain_ir column carried an indicative-only flag in earlier "
-    "versions of this file; that flag is WITHDRAWN. The 0.51x parity gap behind it was traced to "
-    "the REFERENCE matrix, not to this product: the offline view-factor assembler divided "
-    "entries by the hit count instead of by 2, inflating far-field view factors by up to exactly "
-    "2x (fixed on fix/vf-assembler-divisor). Against the re-assembled matrix the cube-to-model "
-    "parity is 0.978-0.99 median over 40 level facets with the cube's own rows unchanged, a ~2% "
-    "residual inside sampling scatter -- the cube was correct and is what exposed the defect "
-    "(FC-08, resolved). NOTE that the flux values in THIS file were computed against the "
-    "PRE-FIX matrix, so their absolute terrain fluxes inherit whatever that defect did to the "
-    "underlying thermal solution, in common with the rest of that campaign generation; the "
-    "correction is not applied retroactively here.")
+    "lattice over a 500 m radius at A03MP026, computed against the CORRECTED v3 view-factor "
+    "matrix (divisor2 + cull; see matrix_generation). Validated for the *sunlit and "
+    "terrain-dominated* load regime: direct solar, terrain-scattered visible, terrain thermal IR "
+    "and Earthshine are each independently reproduced against the model's own fields -- 7.4e-15 "
+    "relative on the terrain-IR reconstruction, five significant figures on the closed-form "
+    "Earthshine -- and against closed-form geometry to ~3e-4, and enabling the probe leaves the "
+    "surface simulation byte-identical. Direct solar resolves the finite solar disk composed with "
+    "the cube's own extent (solar_model = finite_disk), so shadow edges are graded rather than "
+    "binary; what remains there is a TWO-SIDED edge-placement uncertainty reaching 0.6 kW/m^2 "
+    "(summer) and 1.0 kW/m^2 (winter) on ~1% of face-epochs, with the direct-energy integral "
+    "preserved to better than 0.02% -- carry margin symmetrically at shadow edges, and treat the "
+    "edge position itself as resolved only to the ~1 m facet scale of the underlying terrain. It "
+    "is *not* validated as a permanently-shadowed-region product. One one-sided UNDER-estimate "
+    "remains: terrain IR excludes the 3-27 km occluder ring entirely -- the per-patch omission is "
+    "in /geometry/missing_ring_flux_Wm2, at most 3.9% of a patch's hemisphere but reaching tens "
+    "of percent of the terrain IR actually reported on the worst west-facing patches and "
+    "exceeding it on the zenith face. The zenith indicative-only flag carried by earlier versions "
+    "is WITHDRAWN: that gap was a defect in the reference matrix (the offline assembler divided "
+    "entries by hit count instead of by 2, inflating far-field view factors up to 2x), not in "
+    "this product, and it is fixed in the matrix this file was built on (FC-08, resolved; the "
+    "cube was correct and is what exposed it).")
+
+MATRIX_NOTE = (
+    "Built against A03MP026_corrected_vf_v3.csr (divisor2 + cull), nnz 2,216,190,708. Effect of "
+    "the correction on this product, measured against the same window run on the pre-fix matrix: "
+    "direct, primary_refl and primary_ir are EXACTLY unchanged (0 samples moved); terrain_ir mean "
+    "-0.30% (summer) / -0.29% (winter); total mean -0.05%. The bulk effect is small because the "
+    "cube dots its OWN ray-traced view-factor row -- unaffected by the assembler -- against a "
+    "radiosity field that is only weakly perturbed. It is NOT uniformly small: the cold tail moves "
+    "much more, T_face p01 -3.2 K and min -11.3 K (summer), terrain_ir -3.97% over dark "
+    "cube-epochs, and |delta total|/total reaches 36% on individual samples. A design sized "
+    "against the cold sink should use this generation, not the pre-fix one."
+)
+
+# v3 is archived rather than deleted, same reason as v1 and v2: a superseded
+# statement has to be recognisable in copies already circulating.
+SUMMARY_V3 = (
+    "SUPERSEDED by v4 -- do not forward. v3 was correct in substance (it already withdrew the "
+    "zenith flag and named the assembler defect) but it described data computed against the "
+    "PRE-FIX matrix and said so. This file is the re-run against the corrected v3 matrix, so that "
+    "caveat no longer applies and has been removed. Retained so a v3-era copy can be recognised "
+    "and replaced.")
 
 # v2 is archived rather than deleted, for the same reason v1 was: a caveat that
 # has been WITHDRAWN must be recognisable in copies already in circulation, and
@@ -475,7 +489,9 @@ def write_hdf5(d, out, prov=None, core_B_p50=None, extra=None):
         h.attrs["summary"] = ENGINEER_SUMMARY
         h.attrs["summary_v1"] = SUMMARY_V1
         h.attrs["summary_v2"] = SUMMARY_V2
-        h.attrs["summary_version"] = 3
+        h.attrs["summary_v3"] = SUMMARY_V3
+        h.attrs["summary_version"] = 4
+        h.attrs["matrix_note"] = MATRIX_NOTE
         # --- Finding 3: the normative orientation frame, in the file itself ---
         h.attrs["face_order"] = [x.encode() for x in FACE_NAMES]
         h.attrs["component_order"] = [x.encode() for x in COMP_NAMES]
@@ -534,6 +550,11 @@ def main():
                          "physics and rightly concludes the acceptance numbers are fabricated.")
     ap.add_argument("--engine-tree-state", default=None,
                     help="How the recorded sha relates to the built code.")
+    ap.add_argument("--matrix-csr", default=None,
+                    help="the view-factor matrix the run used; hashed by SIZE+nnz header (the "
+                         "file is ~18 GB, so a full md5 is not free) and recorded in the root")
+    ap.add_argument("--matrix-generation", default=None,
+                    help="human label for the matrix generation, e.g. 'v3 (divisor2+cull)'")
     ap.add_argument("--fcg", default=None,
                     help="geometry cache, hashed into the root: the cache is otherwise "
                          "identified by PATH only, so a cache edited or rebuilt in place is "
@@ -553,6 +574,23 @@ def main():
     if a.fcg:
         extra["fcg_path"] = a.fcg
         extra["fcg_md5"] = file_md5(a.fcg) or "unavailable"
+    if a.matrix_csr:
+        import os as _os, struct as _st
+        extra["matrix_csr_path"] = a.matrix_csr
+        try:
+            with open(a.matrix_csr, "rb") as _f:
+                _n = _st.unpack("<i", _f.read(4))[0]
+                _gh = _st.unpack("<d", _f.read(8))[0]
+                _f.seek(12 + 8 * (_n + 1))
+                _nnz = _st.unpack("<q", _f.read(8))[0]
+            extra["matrix_n_faces"] = _n
+            extra["matrix_geomhash"] = _gh
+            extra["matrix_nnz"] = _nnz
+            extra["matrix_size_bytes"] = _os.path.getsize(a.matrix_csr)
+        except OSError as _e:
+            extra["matrix_csr_warning"] = "could not read header: %s" % _e
+    if a.matrix_generation:
+        extra["matrix_generation"] = a.matrix_generation
     if a.engine_sha:
         extra["engine_git_sha"] = a.engine_sha
     if a.engine_tree_state:
