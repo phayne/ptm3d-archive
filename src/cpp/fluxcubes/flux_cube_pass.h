@@ -37,6 +37,7 @@
 #define PTM_FLUX_CUBE_PASS_H
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>

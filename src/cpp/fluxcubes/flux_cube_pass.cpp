@@ -1,5 +1,6 @@
 // flux_cube_pass.cpp -- see flux_cube_pass.h for the design rationale.
 #include "flux_cube_pass.h"
+#include <cstdint>
 
 #include "flux_cube_format.h"
 #include "../radiation/radiosity_reconstruction.h"
