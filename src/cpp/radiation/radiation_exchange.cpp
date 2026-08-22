@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <random>
+#include <type_traits>
 #include <omp.h>
 
 namespace radiation {
@@ -331,10 +332,10 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
         //
         // So the decision moved to initGPU(), which runs after setConfig() and is
         // the one place that knows whether a GPU rung is even possible:
-        // promoteVfReplaceToGpuOperator() builds the ViewFactorMatrix from THIS
-        // operator's own CSR and sets F_ptr_ for the upload. The CPU operator is
-        // never destroyed, so the fallback when the GPU declines is the production
-        // CPU solver by construction rather than by repair.
+        // promoteVfReplaceToGpuOperator() nominates THIS operator's own float32
+        // CSR for the upload. The CPU operator is never destroyed (and is not even
+        // copied), so the fallback when the GPU declines is the production CPU
+        // solver by construction rather than by repair.
         {
             F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
                         std::move(indptr), std::move(cols), std::move(data));
@@ -347,6 +348,26 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                          "SparseVFOperator; initGPU() promotes it to the GPU radiosity operator when "
                          "radiation.use_gpu is set, and names the route it took."
                       << std::endl;
+            // TRIPWIRE (diagnostic only -- changes no number). F_ptr_ is the
+            // constructor's ViewFactorMatrix and this replacement does NOT
+            // repoint it, so if the solver was built by the SPARSE constructor
+            // (a real .vf base rather than the H-matrix/empty-stub base every
+            // A3GT config uses) two different matrices are now live at once:
+            // F_op_ holds the corrected CSR, F_ptr_ still points at the
+            // uncorrected loaded one. Gauss-Seidel reads F_ptr_ ONLY, so the
+            // CPU route would silently solve the uncorrected matrix while the
+            // banner claims otherwise. Shout; do not guess a repair.
+            if (F_ptr_ != nullptr) {
+                std::cerr << "  [PTM_HMATRIX_VF_REPLACE] WARNING: the solver also holds a "
+                             "SEPARATE loaded view-factor matrix (" << F_ptr_->numNonZeros()
+                          << " nnz) that this replacement does NOT correct. Gauss-Seidel and "
+                             "the GPU-decline paths read THAT matrix, not the corrected CSR, so "
+                             "results from this configuration may not be the corrected physics. "
+                             "Every validated A3GT config pairs the corrected CSR with an "
+                             "H-matrix/empty-stub base, where this cannot happen. If you see "
+                             "this line, verify which matrix your run actually solved before "
+                             "trusting it.\n";
+            }
         }
         // If a radiance-prune receipt sidecar sits next to the CSR, surface a
         // one-line provenance summary (eps + max discarded flux). The CSR was
@@ -676,14 +697,22 @@ void RadiositySolver::initGPU() {
         if (config_.verbose) {
             std::cout << "[RadiositySolver] GPU not requested, using CPU path" << std::endl;
         }
-        promoteVfReplaceToGpuOperator();   // reports ROUTE = CPU, or honors a forced _GPU
+        // gpu_rung_reachable = FALSE: this function returns before the degrade
+        // ladder, so no rung is ever attempted from here and a forced GPU route
+        // would have no consumer. Promoting anyway used to change the run
+        // instead of doing nothing -- clearing use_hmatrix_ and pointing F_ptr_
+        // at the promoted matrix flipped the CPU solve from the fused two-band
+        // Jacobi to Gauss-Seidel, and the promoted copy stayed resident for the
+        // whole run with nothing reading it. An env var that cannot be honored
+        // must say so and change nothing.
+        promoteVfReplaceToGpuOperator(false);   // reports ROUTE = CPU
         return;
     }
 
     // A PTM_HMATRIX_VF_REPLACE matrix is installed as a CPU operator at load time
     // (initCommon runs before setConfig, so it cannot know the route). THIS is
     // where the config is available, so this is where the route is chosen.
-    promoteVfReplaceToGpuOperator();
+    promoteVfReplaceToGpuOperator(true);
 
     // Reachability, stated once and unmissably. PTM_HMATRIX_VF_REPLACE without
     // Two-band radiosity on the GPU (B1). The GPU path mirrors the CPU two-band by
@@ -723,7 +752,7 @@ void RadiositySolver::initGPU() {
             releaseVfReplaceGpuOperator("GPU two-band declined this enclosure.");
             return;
         }
-        if (use_hmatrix_ || !F_ptr_) {
+        if (use_hmatrix_ || !gpuCsrAvailable()) {
             std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: GPU two-band needs a sparse VF "
                          "(H-matrix here); using the CPU two-band solve.\n";
             releaseVfReplaceGpuOperator("GPU two-band declined this enclosure.");
@@ -742,14 +771,14 @@ void RadiositySolver::initGPU() {
         return;
     }
 
-    if (!F_ptr_) {
+    if (!gpuCsrAvailable()) {
         std::cerr << "Warning: GPU radiosity solver requires sparse view factor matrix\n";
         releaseVfReplaceGpuOperator("No GPU rung engaged.");
         return;
     }
 
     size_t n = emissivity_.size();
-    size_t nnz = F_ptr_->numNonZeros();
+    size_t nnz = gpuCsrNumNonZeros();
 
     // The multi-GPU pool handles both gray and two-band (2d): the per-device
     // solvers do the IR + visible solve with per-band capture in solveBatch().
@@ -863,16 +892,20 @@ void RadiositySolver::initGPU() {
         const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
         if (!fitsDevice(dev_mem)) {
             std::cout << "[Radiosity] single-GPU: CSR replica + working "
-                      << gb(needed_bytes) << " GB does not fit device ("
+                      << gb(needed_bytes) << " GB (values fp32, indices int32) "
+                         "does not fit device ("
                       << gb(dev_mem) << " GB VRAM, reserve "
                       << gb(deviceReserve(dev_mem)) << " GB).\n";
             gpu_solver_.reset();
             return false;
         }
         try {
-            gpu_solver_->uploadViewFactors(F_ptr_->values(),
-                                           F_ptr_->colIndices(),
-                                           F_ptr_->rowPointers());
+            // Two producers, one upload; see withGpuCsr(). VF_REPLACE arrays are
+            // float32 already (the device format) and go up by reference; a
+            // ViewFactorMatrix takes the uploader's fp64 overload, unchanged.
+            withGpuCsr([&](const auto& vals, const auto& cols, const auto& rowptr) {
+                gpu_solver_->uploadViewFactors(vals, cols, rowptr);
+            });
             gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
             gpu_solver_->uploadRowNorm(row_norm_f);
             if (two_band_) {
@@ -894,10 +927,10 @@ void RadiositySolver::initGPU() {
         std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
                   << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
                   << " GB device).\n";
-        // The matrix is resident on the device now, so the host-side float64
-        // replica has no remaining reader. Dropping it also clears F_ptr_, which
-        // is what keeps a mid-run CPU fallback on the production fused width-2
-        // two-band Jacobi instead of Gauss-Seidel (`use_gs` keys on F_ptr_).
+        // The matrix is resident on the device now, so the nomination has no
+        // remaining reader. Dropping it also clears F_ptr_, which is what keeps
+        // a mid-run CPU fallback on the production fused width-2 two-band
+        // Jacobi instead of Gauss-Seidel (`use_gs` keys on F_ptr_).
         releaseVfReplaceGpuOperator("CSR uploaded to the device.");
         return true;
     };
@@ -945,7 +978,8 @@ void RadiositySolver::initGPU() {
             if (!fitsDevice(min_dev)) {
                 pool_ok = false;
                 std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
-                          << " GB does not fit the smallest device (" << gb(min_dev)
+                          << " GB (values fp32, indices int32) does not fit the smallest "
+                             "device (" << gb(min_dev)
                           << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
                           << " GB); degrading to single-GPU.\n";
             }
@@ -978,12 +1012,14 @@ void RadiositySolver::initGPU() {
             bool ok = gpu_pool_->initialize(n, solver_cfg);
             if (ok) {
                 try {
-                    ok = gpu_pool_->uploadStaticData(F_ptr_->values(),
-                                                     F_ptr_->colIndices(),
-                                                     F_ptr_->rowPointers(),
-                                                     emissivity_f, reflectivity_f,
-                                                     row_norm_f,
-                                                     vis_emiss_f, vis_refl_f);
+                    // Same one resolution as the single-GPU rung above.
+                    withGpuCsr([&](const auto& vals, const auto& cols,
+                                   const auto& rowptr) {
+                        ok = gpu_pool_->uploadStaticData(vals, cols, rowptr,
+                                                         emissivity_f, reflectivity_f,
+                                                         row_norm_f,
+                                                         vis_emiss_f, vis_refl_f);
+                    });
                 } catch (const std::exception& e) {
                     std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
                               << e.what() << "\n";
@@ -1036,7 +1072,7 @@ void RadiositySolver::initGPU() {
 #endif
 }
 
-void RadiositySolver::promoteVfReplaceToGpuOperator() {
+void RadiositySolver::promoteVfReplaceToGpuOperator(bool gpu_rung_reachable) {
     // Only for a PTM_HMATRIX_VF_REPLACE matrix sitting in a CPU SparseVFOperator.
     if (!vf_replace_cpu_route_ || vf_replace_gpu_route_) return;
     auto* sparse = dynamic_cast<SparseVFOperator*>(F_op_.get());
@@ -1053,40 +1089,53 @@ void RadiositySolver::promoteVfReplaceToGpuOperator() {
                      "refusing to guess which one you meant. Unset one.\n";
         std::exit(3);
     }
-    const bool want_gpu = force_gpu ? true : (force_cpu ? false : config_.use_gpu);
+    bool want_gpu = force_gpu ? true : (force_cpu ? false : config_.use_gpu);
     const char* why = force_gpu ? "PTM_HMATRIX_VF_REPLACE_GPU forces it"
                     : force_cpu ? "PTM_HMATRIX_VF_REPLACE_CPU forces it"
                                 : "radiation.use_gpu in the config";
+    if (want_gpu && !gpu_rung_reachable) {
+        // The caller already knows no GPU rung will be attempted (initGPU()
+        // returns early when radiation.use_gpu is false). Honoring the forced
+        // route here would nominate a matrix nothing can consume AND change the
+        // CPU solve as a side effect. Refuse it in one coherent line rather
+        // than announcing ROUTE = GPU and quietly undoing it.
+        std::cout << "  [PTM_HMATRIX_VF_REPLACE] " << why << ", but radiation.use_gpu is false "
+                     "so no GPU rung is attempted at all -- the forced GPU route CANNOT be "
+                     "honored and is being IGNORED. Set radiation.use_gpu: true to reach a GPU "
+                     "rung.\n";
+        want_gpu = false;
+        why = "forced GPU route unreachable with radiation.use_gpu false";
+    }
     if (!want_gpu) {
         std::cout << "  [PTM_HMATRIX_VF_REPLACE] ROUTE = CPU (" << why
                   << "): running the CPU SparseVFOperator (fused width-2 two-band Jacobi).\n";
         return;
     }
 
-    // Widen the stored float CSR to the double ViewFactorMatrix the GPU uploader
-    // and the pool consume. The SparseVFOperator KEEPS its copy and stays
-    // installed as F_op_, so nothing here can leave the run on a different CPU
-    // solver: if no rung takes it, releaseVfReplaceGpuOperator() drops F_ptr_ and
-    // this replica and the run continues on the operator it already had.
-    const std::vector<int64_t>& rp = sparse->rowPointers();
-    const std::vector<int32_t>& cs = sparse->colIndices();
-    const std::vector<float>&   vs = sparse->values();
-    std::vector<int64_t> indptr(rp.begin(), rp.end());
-    std::vector<int>     cols(cs.begin(), cs.end());
-    std::vector<double>  vals(vs.begin(), vs.end());
-
-    owned_vf_ = std::make_unique<ViewFactorMatrix>();
-    owned_vf_->setFromCSR(sparse->numRows(), std::move(indptr), std::move(cols),
-                          std::move(vals));
-    F_ptr_ = owned_vf_.get();
+    // Nominate the operator's OWN CSR for upload -- no copy, no widening. The
+    // device stores CSR values as float32 and the SparseVFOperator already holds
+    // float32 (as does the .csr on disk), so the arrays are handed to
+    // uploadViewFactors() by reference. The SparseVFOperator KEEPS them and
+    // stays installed as F_op_, so nothing here can leave the run on a different
+    // CPU solver: if no rung takes it, releaseVfReplaceGpuOperator() drops the
+    // nomination and the run continues on the operator it already had.
+    //
+    // int32_t and int must be the same type for colIndices() to bind to the
+    // uploader's `const std::vector<int>&`. They are on every platform this
+    // builds on; assert it rather than let a hypothetical one fail obscurely.
+    static_assert(std::is_same<int32_t, int>::value,
+                  "GPU CSR upload binds SparseVFOperator's std::vector<int32_t> column "
+                  "indices to std::vector<int>; these must be the same type.");
+    vf_replace_gpu_src_ = sparse;
     vf_replace_hmatrix_saved_ = use_hmatrix_;
-    use_hmatrix_ = false;   // it is a sparse ViewFactorMatrix now, not an H-matrix
+    use_hmatrix_ = false;   // a sparse CSR is going to the device, not an H-matrix
     vf_replace_gpu_route_ = true;
     vf_replace_cpu_route_ = false;   // no longer the ACTIVE route; the operator stays
 
     std::cout << "  [PTM_HMATRIX_VF_REPLACE] ROUTE = GPU (" << why << "): promoted the corrected "
                  "VF from '" << vf_replace_path_ << "' to the GPU radiosity operator ("
-              << owned_vf_->numNonZeros() << " stored entries). The CPU SparseVFOperator stays "
+              << sparse->values().size() << " stored entries, float32 -- uploaded straight from "
+                 "the CPU operator's own CSR, no host replica). The CPU SparseVFOperator stays "
                  "installed, so if no GPU rung engages this run falls back to the production CPU "
                  "solver, not to Gauss-Seidel.\n";
 }
@@ -1094,12 +1143,12 @@ void RadiositySolver::promoteVfReplaceToGpuOperator() {
 void RadiositySolver::releaseVfReplaceGpuOperator(const char* why) {
     if (!vf_replace_gpu_route_) return;
     F_ptr_ = nullptr;                  // keeps solveTwoBand on the fused Jacobi
-    owned_vf_.reset();                 // frees the float64 replica (~1.5x the CSR)
+    vf_replace_gpu_src_ = nullptr;     // drop the nomination; the operator keeps its CSR
     use_hmatrix_ = vf_replace_hmatrix_saved_;
     vf_replace_gpu_route_ = false;
     vf_replace_cpu_route_ = true;
     std::cout << "  [PTM_HMATRIX_VF_REPLACE] " << why
-              << " Dropped the GPU operator and the float64 replica; the CPU SparseVFOperator "
+              << " Dropped the GPU nomination; the CPU SparseVFOperator "
                  "that was installed all along is what this run uses.\n";
 }
 
@@ -1717,6 +1766,15 @@ std::vector<double> RadiositySolver::solveTwoBand(
                   << (use_gs ? " (Gauss-Seidel, separate)"
                              : " (fused width-2 matvec while both iterate; freeze after)")
                   << std::endl;
+    }
+
+    // Opt-in retention of the converged OUTGOING radiosity, for the flux-cube
+    // reconstruction discriminator only (setRetainRadiosityB, default false).
+    // Off => one predicted branch and nothing else; the published numbers below
+    // are untouched either way.
+    if (retain_radiosity_b_) {
+        retained_b_ir_ = B_ir;
+        retained_b_vis_ = B_vis;
     }
 
     // Fixed-point identity (Tier 1 #2), applied to each converged band: the

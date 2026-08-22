@@ -74,7 +74,12 @@ from ptm.engine_config import (ENGINE_DEFAULTS, ENGINE_SECTIONS,  # noqa: E402
 # track the exact number, which assertion 2 pins precisely.
 MIN_KEYS = 140
 EXPECTED_SECTIONS = (
-    "advanced", "generic_body", "illumination", "mesh", "output",
+    # `flux_cubes` is a real new top-level section (the passive flux-cube probe,
+    # docs/flux-cubes.md), not a stray. Its `locations` key is the parser's only
+    # SEQUENCE OF MAPS; its per-entry fields are deliberately absent from the
+    # table because there is no dotted key for them -- see the note at the
+    # locations block in config_parser.cpp.
+    "advanced", "flux_cubes", "generic_body", "illumination", "mesh", "output",
     "radiation", "simulation", "thermal", "thermophysical",
 )
 

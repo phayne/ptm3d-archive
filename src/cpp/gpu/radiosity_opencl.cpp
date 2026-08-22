@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <chrono>
+#include <type_traits>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -865,8 +866,32 @@ void RadiosityOpenCLSolver::createBuffers() {
     // (since we don't know nnz yet)
 }
 
+// Both public overloads are thin: the value type is the ONLY thing that differs,
+// and it is resolved with `if constexpr` inside the one implementation so the two
+// entry points cannot drift apart. Narrowing, where it is needed at all, happens
+// at exactly the same granularity it always did -- whole-matrix on the
+// single-buffer path (which is capped at the ~2 GB per-buffer budget anyway) and
+// PER CHUNK on the chunked path, so a huge float64 matrix does not suddenly need
+// a whole extra float32 copy of itself resident.
 void RadiosityOpenCLSolver::uploadViewFactors(
     const std::vector<double>& values,
+    const std::vector<int>& col_indices,
+    const std::vector<int64_t>& row_ptrs)
+{
+    uploadViewFactorsT(values, col_indices, row_ptrs);
+}
+
+void RadiosityOpenCLSolver::uploadViewFactors(
+    const std::vector<float>& values,
+    const std::vector<int>& col_indices,
+    const std::vector<int64_t>& row_ptrs)
+{
+    uploadViewFactorsT(values, col_indices, row_ptrs);
+}
+
+template <typename ValueT>
+void RadiosityOpenCLSolver::uploadViewFactorsT(
+    const std::vector<ValueT>& values,
     const std::vector<int>& col_indices,
     const std::vector<int64_t>& row_ptrs)
 {
@@ -927,7 +952,7 @@ void RadiosityOpenCLSolver::uploadViewFactors(
 
         if (nnz_ > max_chunk_nnz) {
             use_chunked_csr_ = true;
-            buildChunkedCsr(values, col_indices, row_ptrs, max_chunk_nnz);
+            buildChunkedCsrT(values, col_indices, row_ptrs, max_chunk_nnz);
             view_factors_uploaded_ = true;
             return;
         }
@@ -937,10 +962,20 @@ void RadiosityOpenCLSolver::uploadViewFactors(
     cl_command_queue queue = context_->queue();
     cl_int err;
 
-    // Convert double values to float
-    std::vector<float> values_f(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        values_f[i] = static_cast<float>(values[i]);
+    // The device's CSR value format is float32. When the caller already holds
+    // float32 there is nothing to convert and nothing to stage -- the write
+    // below reads straight out of `values`. A float64 caller (ViewFactorMatrix)
+    // is narrowed into `staged` here; this path is only reached below the
+    // per-buffer budget (~500 M nnz, ~2 GB of float32), so the transient is
+    // bounded and unchanged from before the overload split.
+    std::vector<float> staged;
+    const float* values_f = nullptr;
+    if constexpr (std::is_same_v<ValueT, float>) {
+        values_f = values.data();
+    } else {
+        staged.resize(nnz_);
+        for (size_t i = 0; i < nnz_; ++i) staged[i] = static_cast<float>(values[i]);
+        values_f = staged.data();
     }
 
     // Helper for error checking without CL_CHECK macro (avoids SIGILL issue)
@@ -975,7 +1010,7 @@ void RadiosityOpenCLSolver::uploadViewFactors(
     // Upload CSR data
     err = clEnqueueWriteBuffer(queue, buf_csr_values_, CL_FALSE, 0,
                                nnz_ * sizeof(float),
-                               values_f.data(), 0, nullptr, nullptr);
+                               values_f, 0, nullptr, nullptr);
     checkErr(err, "clEnqueueWriteBuffer(csr_values)");
 
     err = clEnqueueWriteBuffer(queue, buf_csr_col_indices_, CL_FALSE, 0,
@@ -998,8 +1033,9 @@ void RadiosityOpenCLSolver::uploadViewFactors(
     }
 }
 
-void RadiosityOpenCLSolver::buildChunkedCsr(
-    const std::vector<double>& values,
+template <typename ValueT>
+void RadiosityOpenCLSolver::buildChunkedCsrT(
+    const std::vector<ValueT>& values,
     const std::vector<int>& col_indices,
     const std::vector<int64_t>& row_ptrs,
     size_t max_chunk_nnz)
@@ -1068,10 +1104,23 @@ void RadiosityOpenCLSolver::buildChunkedCsr(
             local_rowptr[static_cast<size_t>(r)] = static_cast<int>(local);
         }
 
-        // Convert this chunk's values slice to float.
-        std::vector<float> vals_f(chunk_nnz);
-        for (size_t k = 0; k < chunk_nnz; ++k) {
-            vals_f[k] = static_cast<float>(values[base + k]);
+        // float32 caller: write this chunk straight out of the caller's array,
+        // exactly as the column-index slice below has always been written -- no
+        // staging copy at all. float64 caller: narrow THIS CHUNK only (<=
+        // max_chunk_nnz floats, ~2 GB), which is what this function has always
+        // done; converting the whole matrix up front instead would add a second
+        // full copy of a matrix that is in the chunked path precisely because it
+        // is enormous.
+        std::vector<float> chunk_staged;
+        const float* chunk_vals = nullptr;
+        if constexpr (std::is_same_v<ValueT, float>) {
+            chunk_vals = values.data() + base;
+        } else {
+            chunk_staged.resize(chunk_nnz);
+            for (size_t k = 0; k < chunk_nnz; ++k) {
+                chunk_staged[k] = static_cast<float>(values[base + k]);
+            }
+            chunk_vals = chunk_staged.data();
         }
 
         chunk.values = clCreateBuffer(ctx, CL_MEM_READ_ONLY,
@@ -1087,7 +1136,7 @@ void RadiosityOpenCLSolver::buildChunkedCsr(
 
         err = clEnqueueWriteBuffer(queue, chunk.values, CL_FALSE, 0,
                                    chunk_nnz * sizeof(float),
-                                   vals_f.data(), 0, nullptr, nullptr);
+                                   chunk_vals, 0, nullptr, nullptr);
         checkErr(err, "clEnqueueWriteBuffer(chunk values)");
         err = clEnqueueWriteBuffer(queue, chunk.col_indices, CL_FALSE, 0,
                                    chunk_nnz * sizeof(int),
