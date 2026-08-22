@@ -6,9 +6,20 @@
 # pass locally; the Linux legs and the correctness-battery build wiring are
 # first-exercised on push. Treat the first green run as the real validation.
 #
-# Matrix: ubuntu + macos, CPU-ONLY (PTM_ENABLE_GPU=OFF, PTM_ARCH_NATIVE=OFF).
-# GPU (OpenCL) is an optional accelerator, never required (portability plan
-# decision 1: CPU-first). Nothing merges that breaks a platform.
+# Jobs:
+#   * python-layer     — ubuntu + macos, no compiler.
+#   * build-and-test   — ubuntu + macos, CPU-ONLY (PTM_ENABLE_GPU=OFF,
+#                        PTM_ARCH_NATIVE=OFF). GPU (OpenCL) is an optional
+#                        accelerator, never required (portability plan
+#                        decision 1: CPU-first).
+#   * gpu-portable-isa — ubuntu only, PTM_ENABLE_GPU=ON + PTM_ARCH_NATIVE=OFF:
+#                        the combination INSTALL.md section 3 teaches a
+#                        colleague on a GPU host, and the ONE the two CPU-only
+#                        legs above cannot see. Needs OpenCL headers and the
+#                        ICD loader, but NO GPU device. Added 2026-08-22 after
+#                        an Eigen-ABI split in exactly this configuration made
+#                        a shipped example SIGABRT for a month.
+# Nothing merges that breaks a platform.
 #
 # Known fragile bits, flagged for the first-push shakeout:
 #   * CSPICE has no apt/brew package -> fetched from NAIF in install-deps.
@@ -289,3 +300,202 @@ jobs:
           assert 50 < min(tmin) < 110, f"night-side Tmin {min(tmin):.1f} K out of range"
           print(f"OK: Tmax {max(tmax):.1f} K, Tmin {min(tmin):.1f} K over {len(tmax)} faces")
           EOF
+
+  # ==========================================================================
+  # The combination the build-and-test job above CANNOT see.
+  # ==========================================================================
+  # build-and-test builds PTM_ENABLE_GPU=OFF, which is uniform in instruction
+  # set by construction. That blind spot let a real defect live on main for a
+  # month: with -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF (the two commands
+  # INSTALL.md section 3 teaches, combined) third_party/tinybvh pushed
+  # -mavx2 -mfma through ptm_gpu into radiation/illumination_model/
+  # ptm_thermal_sim while thermal/, ice/, maps/, tools/, fileio/ and mesh/
+  # stayed at the x86-64 baseline. Eigen's allocator and its fixed-size
+  # alignment both follow the ISA, so half the build called plain
+  # malloc()/free() and half called handmade_aligned_malloc()/free(); the
+  # linker keeps one copy of each shared Eigen weak symbol, and the shipped
+  # examples/tutorial04_crater80N_coupled.yaml aborted with SIGABRT.
+  #
+  # This job exists so the configure-time assertion in CMakeLists.txt ("ISA
+  # uniformity assertion") actually EXECUTES on every push, in the exact
+  # configuration a colleague following INSTALL.md on a GPU host would get.
+  #
+  # Linux x86_64 only, deliberately: macos-latest is arm64 (no AVX to leak,
+  # and Apple's OpenCL is deprecated), and OpenCL headers/ICD loader are a
+  # normal apt package on Ubuntu. NO GPU DEVICE IS REQUIRED -- OpenCL is a
+  # compile/link-time dependency here; nothing in this job dispatches a kernel.
+  gpu-portable-isa:
+    name: ubuntu GPU=ON portable (Eigen ABI / ISA uniformity)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux, incl. OpenCL headers + ICD loader)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake g++ libomp-dev libeigen3-dev libcfitsio-dev libyaml-cpp-dev \
+            libembree-dev pkg-config binutils \
+            opencl-headers ocl-icd-opencl-dev
+
+      # Same cache key as build-and-test, so whichever job runs first warms it.
+      - name: Cache CSPICE toolkit
+        id: cache-cspice
+        uses: actions/cache@v4
+        with:
+          path: ~/cspice_install
+          key: cspice-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Fetch CSPICE (NAIF, on cache miss)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/cspice_install"
+          cd "$HOME/cspice_install"
+          if [ ! -f cspice/lib/libcspice.a ]; then
+            curl --retry 5 --retry-all-errors --retry-delay 10 \
+                 --connect-timeout 30 --max-time 600 -sSL \
+                 "https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z" \
+                 -o cspice.tar.Z
+            gzip -d cspice.tar.Z
+            tar xf cspice.tar
+            if [ -f cspice/lib/cspice.a ]; then cp cspice/lib/cspice.a cspice/lib/libcspice.a; fi
+          else
+            echo "CSPICE restored from cache — skipping NAIF download."
+          fi
+          echo "CSPICE_ROOT=$HOME/cspice_install/cspice" >> "$GITHUB_ENV"
+
+      # --- The detector itself ----------------------------------------------
+      # A FATAL_ERROR here means two targets resolved to different Eigen ABIs.
+      # Read the "Effective Eigen ABI per target" table it prints; the fix is
+      # always to select the ISA once, at the top of the root CMakeLists.txt.
+      - name: Configure (GPU=ON, portable baseline — the onboarding combination)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gpu \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPTM_ENABLE_GPU=ON \
+            -DGPU_BACKEND=OPENCL \
+            -DPTM_ARCH_NATIVE=OFF \
+            -DCSPICE_ROOT="$CSPICE_ROOT" 2>&1 | tee configure-gpu.log
+
+      # WITHOUT this step the job is a tautology. If OpenCL is not found,
+      # src/cpp/gpu/CMakeLists.txt creates a stub INTERFACE ptm_gpu and
+      # returns early -- nothing links tinybvh, so no ISA can leak and the
+      # assertion passes for the wrong reason. Note we grep the POST-detection
+      # line "GPU backend: OPENCL", not "GPU acceleration enabled (backend:
+      # ...)", which merely echoes the option and prints even when the
+      # detection later fails.
+      - name: Assert the OpenCL backend was really detected (anti-tautology)
+        run: |
+          set -euo pipefail
+          grep -q 'GPU backend: OPENCL' configure-gpu.log || {
+            echo '::error::PTM_ENABLE_GPU=ON but no OpenCL backend was detected — ptm_gpu fell back to the stub, so this job tested nothing. Fix the OpenCL packages before trusting a green run.'
+            grep -iE 'opencl|gpu' configure-gpu.log || true
+            exit 1
+          }
+          grep -q 'Eigen ABI uniformity: OK' configure-gpu.log || {
+            echo '::error::the ISA-uniformity assertion did not run — has the block been removed from CMakeLists.txt?'
+            exit 1
+          }
+          grep -E 'Eigen ABI uniformity|^-- ISA' configure-gpu.log
+
+      - name: Build core binary (GPU=ON, portable)
+        run: cmake --build build-gpu --target ptm_thermal_sim -j2
+
+      - name: Assert the binary really is the GPU build (anti-tautology)
+        run: |
+          set -euo pipefail
+          ldd build-gpu/bin/ptm_thermal_sim | grep -i opencl || {
+            echo '::error::ptm_thermal_sim is not linked against OpenCL — this is a CPU-only binary and the job proves nothing about the GPU configuration.'
+            exit 1
+          }
+
+      # The portability contract: -DPTM_ARCH_NATIVE=OFF promises a generic
+      # x86-64 binary. Before the tinybvh fix this same build carried 11,704
+      # AVX2/FMA instructions and would SIGILL on a host without AVX2.
+      - name: Assert the portable binary contains no AVX/AVX-512 instructions
+        run: |
+          set -euo pipefail
+          objdump -d build-gpu/bin/ptm_thermal_sim > disasm.txt
+          lines=$(wc -l < disasm.txt)
+          # Guard the guard: an empty or truncated disassembly would make the
+          # count below trivially zero and the assertion meaningless.
+          if [ "$lines" -lt 10000 ]; then
+            echo "::error::objdump produced only $lines lines — the AVX check would be vacuous."
+            exit 1
+          fi
+          n=$(grep -cE '%[yz]mm[0-9]' disasm.txt || true)
+          echo "AVX/AVX-512 register references in the portable binary: $n (of $lines disassembled lines)"
+          if [ "$n" -ne 0 ]; then
+            echo '::error::PTM_ARCH_NATIVE=OFF produced a binary containing AVX/AVX-512 instructions. It will SIGILL on a host without them. Some target is still adding an ISA flag.'
+            grep -m20 -E '%[yz]mm[0-9]' disasm.txt
+            exit 1
+          fi
+
+      # Negative control. An assertion that has never been seen to FAIL is not
+      # evidence of anything. Force exactly the topology the tinybvh INTERFACE
+      # flag used to create (radiation and its consumers wide, the rest
+      # baseline) and require the configure to die with the right message.
+      - name: Negative control — a forced ISA split must FAIL the configure
+        run: |
+          set -uo pipefail
+          echo 'target_compile_options(radiation PUBLIC -mavx2 -mfma)' \
+            >> src/cpp/radiation/CMakeLists.txt
+          if cmake -S . -B build-split-probe \
+               -DCMAKE_BUILD_TYPE=Release \
+               -DPTM_ENABLE_GPU=ON -DGPU_BACKEND=OPENCL \
+               -DPTM_ARCH_NATIVE=OFF \
+               -DCSPICE_ROOT="$CSPICE_ROOT" > split-probe.log 2>&1; then
+            git checkout -- src/cpp/radiation/CMakeLists.txt
+            echo '::error::the ISA-uniformity assertion did NOT fire on a deliberately split build. The detector is broken; do not trust the green runs above.'
+            tail -40 split-probe.log
+            exit 1
+          fi
+          git checkout -- src/cpp/radiation/CMakeLists.txt
+          # Scope this to the one file the probe touched. A bare `git diff
+          # --exit-code` audits the whole tree and would red on any unrelated
+          # working-tree change (it did, the first time this step was rehearsed).
+          git diff --exit-code -- src/cpp/radiation/CMakeLists.txt || {
+            echo '::error::failed to restore src/cpp/radiation/CMakeLists.txt after the probe.'
+            exit 1
+          }
+          grep -q 'different Eigen ABIs' split-probe.log || {
+            echo '::error::the split configure failed, but not with the ISA-uniformity error — it died for some other reason.'
+            tail -40 split-probe.log
+            exit 1
+          }
+          grep -q 'radiation' split-probe.log || {
+            echo '::error::the ISA-uniformity error did not name the offending target.'
+            exit 1
+          }
+          echo "OK: forced split rejected at configure time."
+          grep -m1 -A6 'different Eigen ABIs' split-probe.log
+
+      # --- The reported failures, end to end --------------------------------
+      - name: Bowl-crater radiation gate (GPU=ON, portable)
+        run: |
+          cmake --build build-gpu --target test_bowl_crater -j2
+          ./build-gpu/bin/test_bowl_crater
+
+      - name: Fetch SPICE kernels (NAIF, Moon core, ~44 MB)
+        run: python3 scripts/fetch_kernels.py --bodies moon
+
+      # This exact shipped example returned rc=134 with no statistics written
+      # on -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF. It uses the shipped
+      # 12,800-face crater mesh and sets use_gpu: false throughout, so it runs
+      # entirely on the CPU paths and needs no GPU device.
+      - name: End-to-end — tutorial 04 coupled crater (the SIGABRT reproducer)
+        run: |
+          set -euo pipefail
+          ./build-gpu/bin/ptm_thermal_sim \
+            --config examples/tutorial04_crater80N_coupled.yaml \
+            --output output/ci_tutorial04
+          n=$(ls output/ci_tutorial04/statistics/*.bin | wc -l)
+          echo "statistics files written: $n"
+          # rc=0 is not success: the abort used to happen before any statistics
+          # existed, and a silent early return would also leave this empty.
+          [ "$n" -ge 20 ] || {
+            echo "::error::tutorial 04 exited 0 but wrote only $n statistics files."
+            exit 1
+          }
