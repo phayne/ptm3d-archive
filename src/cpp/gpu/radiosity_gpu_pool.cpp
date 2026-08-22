@@ -58,9 +58,41 @@ bool RadiosityGPUDevicePool::initialize(size_t n_faces,
 }
 
 bool RadiosityGPUDevicePool::uploadStaticData(
+    const std::vector<float>& csr_values,
+    const std::vector<int>& csr_col_indices,
+    const std::vector<int64_t>& csr_row_ptrs,
+    const std::vector<float>& emissivity,
+    const std::vector<float>& reflectivity,
+    const std::vector<float>& row_norm,
+    const std::vector<float>& emissivity_vis,
+    const std::vector<float>& reflectivity_vis) {
+
+    return uploadStaticDataCommon(
+        [&](RadiosityOpenCLSolver& s) {
+            s.uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
+        },
+        emissivity, reflectivity, row_norm, emissivity_vis, reflectivity_vis);
+}
+
+bool RadiosityGPUDevicePool::uploadStaticData(
     const std::vector<double>& csr_values,
     const std::vector<int>& csr_col_indices,
     const std::vector<int64_t>& csr_row_ptrs,
+    const std::vector<float>& emissivity,
+    const std::vector<float>& reflectivity,
+    const std::vector<float>& row_norm,
+    const std::vector<float>& emissivity_vis,
+    const std::vector<float>& reflectivity_vis) {
+
+    return uploadStaticDataCommon(
+        [&](RadiosityOpenCLSolver& s) {
+            s.uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
+        },
+        emissivity, reflectivity, row_norm, emissivity_vis, reflectivity_vis);
+}
+
+bool RadiosityGPUDevicePool::uploadStaticDataCommon(
+    const std::function<void(RadiosityOpenCLSolver&)>& upload_csr,
     const std::vector<float>& emissivity,
     const std::vector<float>& reflectivity,
     const std::vector<float>& row_norm,
@@ -81,7 +113,7 @@ bool RadiosityGPUDevicePool::uploadStaticData(
         // the pool cannot serve this matrix -- fail loud rather than run a
         // partially-loaded pool.
         try {
-            slot->solver->uploadViewFactors(csr_values, csr_col_indices, csr_row_ptrs);
+            upload_csr(*slot->solver);
             slot->solver->uploadFaceProperties(emissivity, reflectivity);
             // Row norm is part of the operator, not of the per-batch state: a
             // device that missed it would run rho*F while its peers run

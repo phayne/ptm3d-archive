@@ -98,6 +98,26 @@ public:
     ///        missed it would run a different route from its peers, so a partial
     ///        upload fails the whole pool rather than producing a mixed fleet.
     /// @param reflectivity_vis Visible-band reflectivity A_i (paired with the above).
+    ///
+    /// @param csr_values float32 -- the device's own CSR value format. Passed
+    ///        by reference to every device's uploadViewFactors(), so a caller
+    ///        that already holds float32 (the PTM_HMATRIX_VF_REPLACE CSR) pays
+    ///        no host copy of the matrix at all, on any device.
+    bool uploadStaticData(
+        const std::vector<float>& csr_values,
+        const std::vector<int>& csr_col_indices,
+        const std::vector<int64_t>& csr_row_ptrs,
+        const std::vector<float>& emissivity,
+        const std::vector<float>& reflectivity,
+        const std::vector<float>& row_norm = {},
+        const std::vector<float>& emissivity_vis = {},
+        const std::vector<float>& reflectivity_vis = {});
+
+    /// fp64 adapter for callers holding a ViewFactorMatrix. Each device narrows
+    /// the matrix itself (RadiosityOpenCLSolver's fp64 overload) rather than the
+    /// pool staging one float32 copy for the whole fleet, so the host transient
+    /// stays at one device's worth instead of the whole matrix -- unchanged from
+    /// before this overload split existed.
     bool uploadStaticData(
         const std::vector<double>& csr_values,
         const std::vector<int>& csr_col_indices,
@@ -144,6 +164,19 @@ private:
 
     /// Round-robin index of the next device to assign. Wrap with mtx_.
     size_t pickNextDeviceIdx();
+
+    /// Shared body of both uploadStaticData() overloads. `upload_csr` is the
+    /// only part that differs between them (which uploadViewFactors overload to
+    /// call); everything else -- the per-device loop, the fail-loud handling and
+    /// the property/row-norm/visible-band uploads -- is one implementation, so
+    /// the two entry points cannot drift apart.
+    bool uploadStaticDataCommon(
+        const std::function<void(RadiosityOpenCLSolver&)>& upload_csr,
+        const std::vector<float>& emissivity,
+        const std::vector<float>& reflectivity,
+        const std::vector<float>& row_norm,
+        const std::vector<float>& emissivity_vis,
+        const std::vector<float>& reflectivity_vis);
 
     RadiosityGPUPoolConfig                    cfg_;
     std::vector<std::unique_ptr<DeviceSlot>>  slots_;
