@@ -34,6 +34,7 @@
 #include <ctime>      // for gmtime_r / strftime (heartbeat)
 
 #include "../tools/config_parser.h"
+#include "../gpu/gpu_guardrails.h"   // GPU safety policy (no OpenCL dependency)
 #include "../tools/run_provenance.h"
 #include "../tools/solver_disclosure.h"
 #include "../thermal/thermal_model.h"
@@ -14133,6 +14134,81 @@ int main(int argc, char** argv) {
 #endif
     }
 
+    // ----------------------------------------------------------------------
+    // GPU safety policy, AT CONFIG TIME (same rationale as the blocks above: a
+    // typo must cost nothing, and a policy that will change a solver rung has
+    // to be on the record before the run starts, not inferred from a log).
+    //
+    // The `gpu:` config section is cross-cutting policy -- whether a GPU rung
+    // is ALLOWED and which dies each pool may use -- as distinct from the
+    // per-solver gpu_devices / gpu_batch_size tuning keys. It is published into
+    // the process-global policy record read by the radiosity solver's VRAM fit
+    // check. See src/cpp/gpu/gpu_guardrails.h and docs/gpu-wedge-guardrails.md.
+    // ----------------------------------------------------------------------
+    {
+        auto& gpol = gpu::guardrails::policy();
+        gpol.min_vram_margin_gib      = sim_config.gpu.min_vram_margin_gib;
+        gpol.min_vram_margin_explicit = sim_config.gpu.min_vram_margin_explicit;
+        gpol.placement                = sim_config.gpu.placement_policy;
+        gpol.placement_margin_gib     = sim_config.gpu.placement_margin_gib;
+
+        const std::string place = gpu::guardrails::toLower(gpol.placement);
+        if (place != "auto" && place != "shared" && place != "disjoint") {
+            std::cerr << "FATAL [gpu]: gpu.placement_policy='" << gpol.placement
+                      << "' is not one of auto|shared|disjoint.\n"
+                         "  auto     = separate the radiosity replica from the GPU thermal pool\n"
+                         "             only when the post-fit VRAM margin is thin, on the host\n"
+                         "             where the co-residency wedge was measured (macOS+AMD).\n"
+                         "  shared   = never separate them (the behavior before 2026-08-22).\n"
+                         "  disjoint = always separate them when both pools want the GPU."
+                      << std::endl;
+            return 1;
+        }
+        if (!(gpol.min_vram_margin_gib >= 0.0)) {
+            std::cerr << "FATAL [gpu]: gpu.min_vram_margin_gib="
+                      << gpol.min_vram_margin_gib << " must be >= 0." << std::endl;
+            return 1;
+        }
+        if (!(gpol.placement_margin_gib >= 0.0)) {
+            std::cerr << "FATAL [gpu]: gpu.placement_margin_gib="
+                      << gpol.placement_margin_gib << " must be >= 0." << std::endl;
+            return 1;
+        }
+
+        const bool any_gpu = config.getPropertyBool("use_gpu_thermal", false)
+                             || sim_config.illumination.use_gpu || rad_use_gpu;
+        if (any_gpu) {
+            // Resolve the floor NOW (this is also where an environment override
+            // announces itself) so the number in the banner is the number the
+            // fit check will use.
+            const double floor_gib = gpu::guardrails::minVramMarginGib();
+            std::cout << "[gpu-guardrails] policy: min_vram_margin_gib="
+                      << floor_gib
+                      << (gpol.min_vram_margin_explicit
+                              ? " (explicit: enforced on every platform)"
+                              : " (default: enforced on macOS+AMD, advisory elsewhere)")
+                      << ", placement_policy=" << place
+                      << ", placement_margin_gib=" << gpol.placement_margin_gib
+                      << std::endl;
+
+            // Publish what the thermal solver intends to do, so the radiosity
+            // solver -- the only place that knows the replica's per-device
+            // footprint -- can decide whether the two may share dies.
+            auto& intent = gpu::guardrails::thermalIntent();
+            intent.published  = true;
+            intent.use_gpu    = config.getPropertyBool("use_gpu_thermal", false);
+            intent.devices    = sim_config.thermal.gpu_devices;
+            intent.device_ids = sim_config.thermal.gpu_device_ids;
+
+            // Host power settings (macOS). Read-only, unprivileged, and a
+            // no-op elsewhere. Wedge #1's last logged system event of any kind
+            // was a display modeset -- the documented trigger of the 2026-06-23
+            // SMC -128 wedge on this hardware -- and the mitigation had never
+            // been applied. Nothing else in the run would have told anyone.
+            (void)gpu::guardrails::powerSettingsAdvisory(any_gpu);
+        }
+    }
+
     // Override planet geothermal heat flow if specified in config or command line
     if (geothermal_heat_flow > 0) {
         planet.Qb = geothermal_heat_flow;
@@ -17632,6 +17708,36 @@ int main(int argc, char** argv) {
                 std::cout << "Faces requiring radiation exchange: " << rad_manager.numExchangeFaces()
                           << " / " << num_faces << std::endl;
 
+                // ---- GPU placement policy: apply the THERMAL half ----------
+                // prepare() ran the radiosity solver's initGPU, which is the
+                // only place that knows the replica's per-device footprint and
+                // therefore the only place that can decide whether the two
+                // pools may share dies. If it decided they may not, move the
+                // thermal pool now, before any thermal solve that runs while
+                // the replica is resident. Every later thermal call resolves
+                // its devices from sim_config.thermal.gpu_device_ids, so this
+                // one assignment covers the whole-mesh solves, the hoisted
+                // re-thermal pool and the selected-faces fallback.
+                {
+                    const auto& place = gpu::guardrails::placementDecision();
+                    if (place.disjoint && !place.thermal_ids.empty()) {
+                        std::cout << "[gpu-guardrails] thermal pool moved to "
+                                     "device(s) "
+                                  << gpu::guardrails::idsToString(place.thermal_ids)
+                                  << " (was gpu_devices="
+                                  << sim_config.thermal.gpu_devices
+                                  << ", gpu_device_ids="
+                                  << gpu::guardrails::idsToString(
+                                         sim_config.thermal.gpu_device_ids)
+                                  << ") so no die holds the radiosity replica "
+                                     "and a thermal working set at once."
+                                  << std::endl;
+                        sim_config.thermal.gpu_device_ids = place.thermal_ids;
+                        sim_config.thermal.gpu_devices =
+                            static_cast<int>(place.thermal_ids.size());
+                    }
+                }
+
                 // Kirchhoff (G1): capture what the radiosity solver will actually
                 // scatter 1-eps with, AFTER any PTM_RAD_EMISSIVITY override, while
                 // the manager is still in scope.
@@ -18692,9 +18798,34 @@ int main(int argc, char** argv) {
                         // fixes is an announce line that would claim 3020
                         // timesteps/batch for a 20-step sweep, and the host
                         // memory the budget reserves for that batch.
+                        // Device count: the ACTIVE pool's, not the configured
+                        // rad_gpu_devices. The configured value ignores
+                        // radiation.gpu_device_ids, the degrade ladder and the
+                        // placement policy, so the announce line printed
+                        // "across 4 GPUs" for a 2-device pool -- a log line
+                        // that contradicted the ACTIVE RUNG line three lines
+                        // above it, and the thing an operator checks first.
+                        // It also feeds the batch FLOOR (4 * n_devices), so a
+                        // stale count sized the floor for devices that were not
+                        // there; with a 4096 MiB host budget the floor only
+                        // binds above ~11 M faces, but "only rarely wrong" is
+                        // not a reason to keep computing it from a number that
+                        // is not true.
+                        const int rad_pool_devices =
+                            std::max(1, rad_manager.gpuPoolDeviceCount());
+                        if (rad_pool_devices != std::max(1, rad_gpu_devices)) {
+                            std::cout << "  [Multi-GPU radiosity] NOTE: pool is "
+                                         "running on " << rad_pool_devices
+                                      << " device(s); radiation.gpu_devices="
+                                      << rad_gpu_devices
+                                      << " (device ids, the degrade ladder or "
+                                         "gpu.placement_policy changed it). The "
+                                         "batch below is sized for the real "
+                                         "count." << std::endl;
+                        }
                         batch_size = radiation::resolvePoolBatchSize(
                             rad_gpu_batch_size, total_time_steps - rad_sweep_t_lo,
-                            std::max(1, rad_gpu_devices), num_faces, /*announce=*/true);
+                            rad_pool_devices, num_faces, /*announce=*/true);
                     }
 
                     // Hoisted out of the per-timestep loop: these two num_faces-sized

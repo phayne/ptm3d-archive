@@ -74,7 +74,7 @@ from ptm.engine_config import (ENGINE_DEFAULTS, ENGINE_SECTIONS,  # noqa: E402
 # track the exact number, which assertion 2 pins precisely.
 MIN_KEYS = 140
 EXPECTED_SECTIONS = (
-    "advanced", "generic_body", "illumination", "mesh", "output",
+    "advanced", "generic_body", "gpu", "illumination", "mesh", "output",
     "radiation", "simulation", "thermal", "thermophysical",
 )
 

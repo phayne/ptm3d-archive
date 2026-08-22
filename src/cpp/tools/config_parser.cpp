@@ -671,6 +671,21 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.advanced.default_visible_albedo = getWithDefault(adv, "default_visible_albedo", config.advanced.default_visible_albedo);
         }
 
+        // Parse GPU safety-policy section (see src/cpp/gpu/gpu_guardrails.h).
+        // The local alias is gpu_sec, not gpu, so it cannot shadow the gpu::
+        // namespace for a future reader of this file.
+        if (root["gpu"]) {
+            const auto& gpu_sec = root["gpu"];
+            config.gpu.min_vram_margin_gib = getWithDefault(gpu_sec, "min_vram_margin_gib", config.gpu.min_vram_margin_gib);
+            config.gpu.placement_policy = getWithDefault(gpu_sec, "placement_policy", config.gpu.placement_policy);
+            config.gpu.placement_margin_gib = getWithDefault(gpu_sec, "placement_margin_gib", config.gpu.placement_margin_gib);
+            // Presence, not value: an explicitly requested margin floor is
+            // enforced on every platform, while the built-in default only
+            // enforces on the wedge-prone one (macOS + AMD).
+            config.gpu.min_vram_margin_explicit =
+                static_cast<bool>(gpu_sec["min_vram_margin_gib"]);
+        }
+
         // ---- Apply the PTM_DATA_ROOT resolution contract to every data-path
         // key (rules + actionable errors: see the helpers above). Required
         // inputs are only enforced when their feature is actually in use, so

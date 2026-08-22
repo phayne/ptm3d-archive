@@ -265,6 +265,13 @@ public:
     // True iff the GPU pool was successfully initialized (gpu_devices > 1).
     bool hasGPUPool() const;
 
+    // Devices in the ACTIVE radiosity pool, 0 when no pool is active. This is
+    // the only honest source for "how many GPUs is radiosity using": the
+    // configured radiation.gpu_devices ignores gpu_device_ids, the degrade
+    // ladder, and the placement policy, and the dispatch announce used to
+    // print it as if it were fact.
+    int gpuPoolDeviceCount() const;
+
     // Power-iterate the view-factor operator the SOLVE applies -- that is
     // diag(vf_row_norm_)·F, not raw F, because solveJacobi and every GPU/
     // two-band sibling renormalize each row of F·x by 1/max(1, Σ_j F_ij)
@@ -711,6 +718,10 @@ public:
 
     // True iff multi-GPU radiosity dispatch is active.
     bool hasGPUPool() const;
+
+    // Devices in the ACTIVE radiosity pool (0 = no pool). See the solver's
+    // twin: the configured count is not evidence of what is running.
+    int gpuPoolDeviceCount() const;
 
     // Set the per-face visible Bond albedo A_i for the two-band radiosity (A2).
     // Stored and forwarded to the underlying RadiositySolver. May be called before

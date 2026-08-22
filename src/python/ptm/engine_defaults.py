@@ -9,13 +9,14 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-169 keys across 9 sections.
+172 keys across 10 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
 ENGINE_SECTIONS = (
     'advanced',
     'generic_body',
+    'gpu',
     'illumination',
     'mesh',
     'output',
@@ -72,6 +73,9 @@ ENGINE_DEFAULTS = {
     'generic_body.surface.ks': -1.0,
     'generic_body.surface.rhod': -1.0,
     'generic_body.surface.rhos': -1.0,
+    'gpu.min_vram_margin_gib': 2.0,
+    'gpu.placement_margin_gib': 4.0,
+    'gpu.placement_policy': 'auto',
     'illumination.albedo_map': '',
     'illumination.albedo_maps_directory': 'data/albedo_maps',
     'illumination.bvh_cache_file': '',
