@@ -18330,62 +18330,79 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Cap re-thermal concurrency to 1 GPU by default.
-                    // Rationale (May 12, 2026 production campaign):
-                    //  * At N=2 (the previous default), ~25% of high-load
-                    //    winter windows (~640 K selected faces) hit the
-                    //    `gpusKillClientExt` hang and required the chunked
-                    //    runner's 3-attempt retry budget; 3 of 88 windows
-                    //    failed outright and needed a follow-up --resume.
-                    //  * At N=1, the May 12 recovery cleared all 3 failed
-                    //    windows in 81 minutes with zero retries.
-                    //  * Per-window wall at N=1 (~23 min) measured within
-                    //    noise of clean N=2 (~25 min) — the re-thermal
-                    //    phase isn't 2× slower because the inter-batch
-                    //    pause overhead is preserved across N and the
-                    //    kernel time is not the dominant cost. Net: N=1
-                    //    is the same speed and removes the failure mode.
-                    // Skip the cap when the user passed explicit
-                    // gpu_device_ids — that's an opt-in to expert config.
-                    // Override the default with PTM_RAD_RERUN_MAX_GPUS=N.
+                    // Re-thermal concurrency. DEFAULT = the configured device
+                    // count, with the shared pool below hoisted ONCE for the
+                    // whole coupling loop. PTM_RAD_RERUN_MAX_GPUS=N lowers it.
+                    //
+                    // History, because the default moved twice and the reason
+                    // matters (2026-08-21 forensics, SESSION-NOTES-2026-08-21):
+                    //  * May 12, 2026: the default was a hard cap to 1 device.
+                    //    At N=2, ~25% of high-load winter windows (~640 K
+                    //    selected faces) hit `gpusKillClientExt` and burned the
+                    //    chunked runner's retry budget; at N=1 the recovery ran
+                    //    clean and per-window wall was within noise (~23 vs
+                    //    ~25 min), because the inter-batch pause dominates the
+                    //    re-thermal phase. That measurement was taken when the
+                    //    re-thermal built a LOCAL pool per coupling iteration.
+                    //  * Then the hoisted pool landed, gated on
+                    //    rerun_devs.size() >= 2, and the cap became INERT: every
+                    //    window printed "Capping re-thermal concurrency at 1
+                    //    device(s)" and then ran the re-thermal on 4 devices,
+                    //    rebuilding 4 OpenCL contexts per coupling iteration --
+                    //    the exact churn this pool exists to remove (see the
+                    //    SMC -108 note at its declaration). A03MP026 windows
+                    //    show 24 kernel compiles where 8 suffice and ZERO
+                    //    "Hoisted re-thermal pool" lines.
+                    //  * The prior commit made the cap real. Leaving its old
+                    //    default of 1 in place would then have been a genuine
+                    //    4->1 concurrency cut whose wall cost is UNMEASURED at
+                    //    production scale. So the default is now "keep the
+                    //    configured width, hoist the pool once" -- byte-for-byte
+                    //    the concurrency production has actually been running,
+                    //    minus the per-iteration context churn.
+                    //
+                    // To restore the May-12 intent (genuinely serialize the
+                    // re-thermal on one device) set PTM_RAD_RERUN_MAX_GPUS=1;
+                    // it is honored now, and it really does drop to 1 device.
+                    // Explicit gpu_device_ids still skip the cap entirely --
+                    // that is an opt-in to expert config.
                     {
-                        int rerun_max = 1;
+                        int rerun_max = static_cast<int>(rerun_devs.size());
+                        bool rerun_max_from_env = false;
                         if (const char* env =
                                 std::getenv("PTM_RAD_RERUN_MAX_GPUS")) {
                             int v = std::atoi(env);
-                            if (v > 0) rerun_max = v;
+                            if (v > 0) {
+                                rerun_max = v;
+                                rerun_max_from_env = true;
+                            } else {
+                                std::cerr << "  [GPU Thermal Pool] WARNING: "
+                                             "PTM_RAD_RERUN_MAX_GPUS=\"" << env
+                                          << "\" is not a positive integer; "
+                                             "ignoring it and using the "
+                                             "configured device count."
+                                          << std::endl;
+                            }
                         }
                         if (sim_config.thermal.gpu_device_ids.empty()
                             && static_cast<int>(rerun_devs.size()) > rerun_max) {
                             std::cout << "  [GPU Thermal Pool] Capping "
                                          "re-thermal concurrency at "
                                       << rerun_max << " device(s) (was "
-                                      << rerun_devs.size()
+                                      << rerun_devs.size() << "; "
+                                      << (rerun_max_from_env
+                                              ? "PTM_RAD_RERUN_MAX_GPUS"
+                                              : "built-in default")
                                       << ") to reduce macOS+AMD driver "
-                                         "pressure during rad-coupling. "
-                                         "Override: PTM_RAD_RERUN_MAX_GPUS env."
+                                         "pressure during rad-coupling."
                                       << std::endl;
                             rerun_devs.resize(rerun_max);
                         }
-                        // The cap used to stop here, and stopping here made it
-                        // INERT at its own default. Two links were missing
-                        // (measured 2026-08-21 on the A3GT gen-2 logs):
-                        //   1. the hoisted pool below was gated on size() >= 2,
-                        //      so capping to 1 skipped the hoist entirely and
-                        //      left shared_rerun_pool null;
-                        //   2. with a null shared pool,
-                        //      runThermalForSelectedFaces_GPU builds a LOCAL
-                        //      pool from sim_config.thermal.gpu_devices -- the
-                        //      uncapped 4 -- and destroys it again every
-                        //      coupling iteration.
-                        // Net effect in production: every window printed
-                        // "Capping re-thermal concurrency at 1 device(s)" and
-                        // then ran the re-thermal on 4 devices, rebuilding 4
-                        // OpenCL contexts per coupling iteration -- exactly the
-                        // per-iter context churn this pool was hoisted to stop
-                        // (see the SMC -108 note at its declaration). A03MP026
-                        // windows show 24 kernel compiles where 8 suffice, and
-                        // zero "Hoisted re-thermal pool" lines.
+                        // The cap used to stop here, and stopping here is what
+                        // made it inert: with a null shared pool,
+                        // runThermalForSelectedFaces_GPU builds a LOCAL pool
+                        // from sim_config.thermal.gpu_devices -- the uncapped
+                        // count -- and destroys it again every iteration.
                         rerun_gpu_devices = static_cast<int>(rerun_devs.size());
                     }
 
