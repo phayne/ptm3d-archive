@@ -79,7 +79,9 @@ EXPECTED_SECTIONS = (
     # SEQUENCE OF MAPS; its per-entry fields are deliberately absent from the
     # table because there is no dotted key for them -- see the note at the
     # locations block in config_parser.cpp.
-    "advanced", "flux_cubes", "generic_body", "illumination", "mesh", "output",
+    # `gpu` is the cross-cutting GPU safety policy (docs/gpu-wedge-guardrails.md).
+    "advanced", "flux_cubes", "generic_body", "gpu", "illumination", "mesh",
+    "output",
     "radiation", "simulation", "thermal", "thermophysical",
 )
 

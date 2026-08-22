@@ -295,6 +295,8 @@ def _do_run(args):
     print(f"[ptm] {' '.join(command)}")
     if workdir:
         print(f"[ptm] working directory: {workdir}")
+    for msg in run_mod.long_run_advisory(config_dict):
+        print(msg, file=sys.stderr)
 
     process = run_mod.EngineProcess(
         command, working_dir=workdir,

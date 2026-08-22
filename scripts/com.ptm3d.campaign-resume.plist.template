@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PTM3D campaign resume after a power cycle (macOS launchd). TEMPLATE.
+
+  DOCUMENTED, NOT INSTALLED. Nothing in the PTM3D build or test path installs
+  this file and nothing depends on it. Read it, decide whether you want it,
+  edit the two placeholders, and install it yourself. The rationale, the
+  install and remove commands, and the reasons you might NOT want it are in
+  docs/gpu-wedge-guardrails.md, section "Unattended resume after a power
+  cycle".
+
+  Short version: a wedged GPU can power-cycle the machine mid campaign, and
+  this agent runs one resume command at the next login. It can therefore also
+  re-wedge the machine unattended, so put a relaunch budget in the resume
+  script, not in launchd.
+
+  RunAtLoad with KeepAlive false is deliberate: run once at login, and never
+  restart the command if it exits. KeepAlive would turn a failing resume into
+  a relaunch loop against a sick GPU.
+
+  (XML comments cannot contain a double hyphen, so command examples with long
+  option flags live in the documentation rather than here.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ptm3d.campaign-resume</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-lc</string>
+        <!-- Replace with the ONE command that resumes your campaign; see
+             docs/gpu-wedge-guardrails.md for a worked example. -->
+        <string>__RESUME_COMMAND__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- An existing directory you own. launchd does not create it, and it does
+         not rotate these two files: the chunked runner rotates its own
+         per-attempt logs, but these are appended to by launchd, so trim them
+         yourself if they grow. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/campaign-resume.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/campaign-resume.err.log</string>
+
+    <!-- launchd agents inherit almost no environment. Anything the resume
+         command needs (PATH, PTM_DATA_ROOT, conda) must be set here or by the
+         login shell that "sh -lc" starts. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Give the machine a minute after login before hitting the GPU again. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

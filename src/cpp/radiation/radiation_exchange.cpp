@@ -3,6 +3,8 @@
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
 #include "../thermal/thermal_model.h"  // For ProgressBar
+#include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
+#include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_ray.h>
@@ -813,8 +815,11 @@ void RadiositySolver::initGPU() {
         return std::max<size_t>((global_mem / 100) * 15,
                                 static_cast<size_t>(2) * 1024 * 1024 * 1024);
     };
-    // Operator-settable floor on the headroom this check is allowed to leave
-    // behind, in GiB. Default 0.0 = the historical test, unchanged.
+    // Floor on the headroom this check is allowed to leave behind, in GiB:
+    // gpu.min_vram_margin_gib (default 2.0), overridable with
+    // PTM_GPU_MIN_VRAM_MARGIN_GIB. Resolved in ONE place (gpu_guardrails.h) so
+    // the engine cannot hold two opinions about the same number. 0 = the
+    // pre-2026-08-22 behavior, fit check only.
     //
     // Why this exists (2026-08-21 forensics): the reserve above is ONE lump that
     // is silently shared with every other consumer of the same die -- above all
@@ -826,21 +831,12 @@ void RadiositySolver::initGPU() {
     // solver's own ask -- and that promotion happened by accident: the FC-08
     // divisor fix shrank the matrix 8.4% and carried it across the threshold
     // from "refused, run radiosity on the CPU" to "accepted, 26.55 GiB on four
-    // dies". Set a floor so that crossing is a decision, not a side effect.
-    auto minMarginBytes = []() -> size_t {
-        const char* env = std::getenv("PTM_GPU_MIN_VRAM_MARGIN_GIB");
-        if (env == nullptr || *env == '\0') return 0;
-        char* end = nullptr;
-        const double gib = std::strtod(env, &end);
-        if (end == env || !(gib >= 0.0)) {
-            std::cerr << "[Radiosity] WARNING: PTM_GPU_MIN_VRAM_MARGIN_GIB=\""
-                      << env << "\" is not a non-negative number; ignoring "
-                         "(no margin floor applied).\n";
-            return 0;
-        }
-        return static_cast<size_t>(gib * 1024.0 * 1024.0 * 1024.0);
-    };
-    const size_t min_margin_bytes = minMarginBytes();
+    // dies". The floor makes that crossing a decision, not a side effect.
+    const double min_margin_gib = gpu::guardrails::minVramMarginGib();
+    const size_t min_margin_bytes =
+        (min_margin_gib > 0.0)
+            ? static_cast<size_t>(min_margin_gib * 1024.0 * 1024.0 * 1024.0)
+            : 0;
     auto deviceMargin = [&](size_t global_mem) -> long long {
         // Signed: a negative margin is the interesting case and must not wrap.
         const long long avail =
@@ -848,28 +844,95 @@ void RadiositySolver::initGPU() {
             static_cast<long long>(deviceReserve(global_mem));
         return avail - static_cast<long long>(needed_bytes);
     };
-    auto fitsDevice = [&](size_t global_mem) -> bool {
+    // Has THIS host already carried a replica at least this large? Measured,
+    // not assumed: the record is written only after a successful upload.
+    bool host_carried_before = false;
+    {
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)) {
+            host_carried_before =
+                rec.largest_committed_replica_bytes >= needed_bytes;
+        }
+    }
+    auto fitsDevice = [&](size_t global_mem, const std::string& vendor) -> bool {
         const bool fits_raw =
             global_mem > deviceReserve(global_mem)
             && needed_bytes <= global_mem - deviceReserve(global_mem);
         if (!fits_raw) return false;
         if (min_margin_bytes == 0) return true;
         const long long margin = deviceMargin(global_mem);
-        if (margin >= static_cast<long long>(min_margin_bytes)) return true;
-        // Refuse LOUDLY and name the policy -- a quiet downgrade here is how a
-        // run ends up on a rung nobody chose. Formatted on a LOCAL stream: see
-        // the gb() note below (PTM-05 -- std::cout arrives here carrying
-        // scientific/setprecision(1) from a progress banner).
+        const double margin_gib = margin / (1024.0 * 1024.0 * 1024.0);
+        // The mitigation the floor stands in for, and whether it is ACTUALLY in
+        // force on this rung -- not whether it would be nice if it were. The
+        // placement decision is taken before this check in the pool path and is
+        // false on the single-GPU rung, which cannot choose its device.
+        const bool separation_in_force =
+            gpu::guardrails::placementDecision().disjoint;
+        const auto verdict = gpu::guardrails::judgeVramMargin(
+            margin_gib, separation_in_force, host_carried_before, vendor);
+        if (verdict == gpu::guardrails::MarginVerdict::Pass) return true;
+        // Everything below is loud. A quiet downgrade is how a run ends up on a
+        // rung nobody chose; a quiet ENFORCEMENT on a platform where the failure
+        // was never observed is the same sin in the other direction; and a
+        // quiet WAIVER would be the worst of the three. Formatted on a LOCAL
+        // stream: see the gb() note below (PTM-05 -- std::cout arrives here
+        // carrying scientific/setprecision(1) from a progress banner).
         std::ostringstream msg;
         msg << std::fixed << std::setprecision(2)
             << "[Radiosity] VRAM-margin policy: replica would fit with "
-            << (margin / (1024.0 * 1024.0 * 1024.0))
-            << " GiB of margin, below the "
-            << (min_margin_bytes / (1024.0 * 1024.0 * 1024.0))
-            << " GiB floor set by PTM_GPU_MIN_VRAM_MARGIN_GIB; "
-               "REFUSING this GPU rung.\n";
+            << margin_gib << " GiB of margin, below the " << min_margin_gib
+            << " GiB floor (gpu.min_vram_margin_gib"
+            << (gpu::guardrails::policy().min_vram_margin_explicit
+                    ? ", set explicitly"
+                    : ", built-in default")
+            << "). ";
+        switch (verdict) {
+            case gpu::guardrails::MarginVerdict::Pass:
+                break;                                  // handled above
+            case gpu::guardrails::MarginVerdict::Advisory:
+                msg << "ADVISORY ONLY on this host -- the co-residency wedge "
+                       "this floor guards against was measured on macOS+AMD. "
+                       "Proceeding with the GPU rung. Set "
+                       "gpu.min_vram_margin_gib explicitly (or "
+                       "PTM_GPU_MIN_VRAM_MARGIN_GIB) to enforce it here.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveSeparation:
+                msg << "WAIVED by gpu.thin_margin_policy: separate -- the "
+                       "radiosity replica and the GPU thermal pool are on "
+                       "DISJOINT dies, which is the co-residency mitigation "
+                       "this floor stands in for, and the margin is above the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor. Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveHostRecord:
+                msg << "WAIVED below the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor on MEASURED host history: this host has "
+                       "already committed a replica at least this large "
+                       "successfully, and the pools are on disjoint dies. "
+                       "Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::Refuse:
+                msg << "REFUSING this GPU rung on this host (macOS+AMD, or an "
+                       "explicit policy): the GPU thermal pool allocates on the "
+                       "same dies and is not counted by the fit check.";
+                if (gpu::guardrails::toLower(
+                        gpu::guardrails::policy().thin_margin_policy)
+                        == "separate"
+                    && !separation_in_force) {
+                    msg << " gpu.thin_margin_policy: separate could NOT be "
+                           "honored here -- the two pools are not on disjoint "
+                           "dies (the single-GPU rung cannot choose its device, "
+                           "and a one-GPU host cannot be split), so there is no "
+                           "mitigation to waive the floor for.";
+                }
+                msg << "\n";
+                break;
+        }
         std::cout << msg.str();
-        return false;
+        return verdict == gpu::guardrails::MarginVerdict::Advisory
+            || verdict == gpu::guardrails::MarginVerdict::WaiveSeparation
+            || verdict == gpu::guardrails::MarginVerdict::WaiveHostRecord;
     };
     // GB, formatted on a LOCAL stream. std::cout arrives here carrying
     // std::scientific << setprecision(1) from an earlier progress banner, which
@@ -897,16 +960,17 @@ void RadiositySolver::initGPU() {
     // replica stays resident: ~0.77 GiB/device at the A3GT production settings
     // (gpu_batch_size=100000, n_layers=23, 961 steps -- thermal_opencl.cpp
     // buf_flux_all + buf_output_temps dominate at n_faces*n_steps*4 B each).
-    // Below ~2 GiB the thermal pool alone is a large fraction of what is left,
-    // so say so out loud rather than leaving it to be rediscovered from a
-    // power-off. Threshold is advisory only; PTM_GPU_MIN_VRAM_MARGIN_GIB is the
-    // knob that actually refuses.
+    // Below the placement threshold (gpu.placement_margin_gib, default 4 GiB)
+    // the thermal pool alone is a large fraction of what is left, so say so out
+    // loud rather than leaving it to be rediscovered from a power-off. This is
+    // advisory; gpu.min_vram_margin_gib is the knob that actually refuses and
+    // gpu.placement_policy is the one that separates the dies.
     auto warnIfThinMargin = [&](size_t global_mem, size_t n_dev) {
-        constexpr double kAdvisoryMarginGiB = 2.0;
+        const double advisory_gib =
+            gpu::guardrails::policy().placement_margin_gib;
         const double margin_gib =
             deviceMargin(global_mem) / (1024.0 * 1024.0 * 1024.0);
-        if (min_margin_bytes != 0) return;   // an explicit policy is in force
-        if (margin_gib >= kAdvisoryMarginGiB) return;
+        if (margin_gib >= advisory_gib) return;
         std::ostringstream msg;
         msg << std::fixed << std::setprecision(2)
             << "[Radiosity] WARNING: only " << margin_gib
@@ -914,10 +978,50 @@ void RadiositySolver::initGPU() {
             << n_dev << " device(s). The GPU thermal pool allocates on these "
                "same dies while the replica stays resident (~0.77 GiB/device "
                "at gpu_batch_size=100000, n_layers=23, 961 steps) and is NOT "
-               "counted by this check. Set PTM_GPU_MIN_VRAM_MARGIN_GIB to "
-               "refuse thin-margin GPU rungs, or lower radiation.gpu_devices / "
-               "thermal.gpu_devices so the two pools do not share dies.\n";
+               "counted by this check. Raise gpu.min_vram_margin_gib to refuse "
+               "thin-margin GPU rungs, set gpu.placement_policy: disjoint to "
+               "keep the two pools off the same dies, or lower "
+               "radiation.gpu_devices / thermal.gpu_devices.\n";
         std::cout << msg.str();
+    };
+    // Per-host VRAM record. The thresholds above have defaults calibrated on
+    // one 32 GiB Navi21 die; this is where the engine learns what THIS host
+    // actually has and what it has actually carried, and says so once per run.
+    // See gpu/machine_profile.h -- the record is written after a successful
+    // upload only, never after a refusal.
+    bool host_vram_context_printed = false;
+    auto noteHostVram = [&](size_t global_mem, int n_dev,
+                            const std::string& name, const std::string& vendor) {
+        gpu::noteVramDevice(global_mem, n_dev, name, vendor);
+        if (host_vram_context_printed) return;
+        host_vram_context_printed = true;
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const double dev_gib = global_mem / kGiB;
+        if (min_margin_gib > 0.0 && dev_gib > 0.0
+            && min_margin_gib > 0.10 * dev_gib) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] NOTE: the " << min_margin_gib
+              << " GiB VRAM-margin floor is "
+              << (100.0 * min_margin_gib / dev_gib)
+              << "% of this device's " << dev_gib
+              << " GiB. The 2.0 GiB default was calibrated on 32 GiB dies; on a "
+                 "smaller device set gpu.min_vram_margin_gib to something this "
+                 "host can actually leave behind.\n";
+            std::cout << m.str();
+        }
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)
+            && rec.largest_committed_replica_bytes > 0) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] host VRAM record: largest replica committed here "
+              << (rec.largest_committed_replica_bytes / kGiB) << " GiB/device on "
+              << rec.committed_devices << " device(s), leaving "
+              << (rec.committed_margin_bytes / kGiB) << " GiB of margin ("
+              << rec.updated_utc << ", " << gpu::vramProfilePath() << ").\n";
+            std::cout << m.str();
+        }
     };
 
     gpu::opencl::RadiosityOpenCLConfig gpu_config;
@@ -981,7 +1085,9 @@ void RadiositySolver::initGPU() {
             return false;
         }
         const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
-        if (!fitsDevice(dev_mem)) {
+        const std::string dev_vendor = gpu_solver_->getDeviceInfo().vendor;
+        noteHostVram(dev_mem, 1, gpu_solver_->getDeviceInfo().name, dev_vendor);
+        if (!fitsDevice(dev_mem, dev_vendor)) {
             // Say WHICH test rejected it. "does not fit" printed after a policy
             // refusal is a false statement about the hardware.
             std::cout << "[Radiosity] single-GPU: CSR replica + working "
@@ -1011,6 +1117,9 @@ void RadiositySolver::initGPU() {
             gpu_solver_.reset();
             return false;
         }
+        // The upload SUCCEEDED, so this host demonstrably carries a replica
+        // this large. Record it (high-water mark only).
+        gpu::noteCommittedReplica(needed_bytes, deviceMargin(dev_mem), 1);
         use_gpu_ = true;
         if (two_band_) {
             two_band_gpu_ok_ = true;
@@ -1019,11 +1128,15 @@ void RadiositySolver::initGPU() {
                          "in-kernel on " << vf_row_norm_count_ << "/" << emissivity_.size()
                       << " faces).\n";
         }
+        gpu::guardrails::advisePlacementUnavailable(
+            "single-GPU radiosity rung",
+            deviceMargin(dev_mem) / (1024.0 * 1024.0 * 1024.0), dev_vendor);
         std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
                   << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
                   << " GB device, margin " << signedGb(deviceMargin(dev_mem))
                   << " GiB over the " << gb(deviceReserve(dev_mem))
-                  << " GB reserve).\n";
+                  << " GB reserve); placement: "
+                  << gpu::guardrails::placementDecision().summary << ".\n";
         warnIfThinMargin(dev_mem, 1);
         // The matrix is resident on the device now, so the nomination has no
         // remaining reader. Dropping it also clears F_ptr_, which is what keeps
@@ -1045,11 +1158,11 @@ void RadiositySolver::initGPU() {
         // Resolve which physical devices to use (mirrors the thermal pool).
         std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
             gpu::opencl::OpenCLContext::enumerateGPUs(true);
-        std::vector<gpu::opencl::OpenCLDeviceInfo> chosen;
+        std::vector<int> chosen_ids;
         if (!config_.gpu_device_ids.empty()) {
             for (int id : config_.gpu_device_ids) {
                 if (id >= 0 && static_cast<size_t>(id) < all_gpus.size()) {
-                    chosen.push_back(all_gpus[id]);
+                    chosen_ids.push_back(id);
                 } else {
                     std::cerr << "Warning: rad-gpu-device-id " << id
                               << " out of range (have " << all_gpus.size()
@@ -1061,8 +1174,46 @@ void RadiositySolver::initGPU() {
                 ? static_cast<int>(all_gpus.size())
                 : std::min<int>(config_.gpu_devices,
                                 static_cast<int>(all_gpus.size()));
-            for (int i = 0; i < n_req; ++i) chosen.push_back(all_gpus[i]);
+            for (int i = 0; i < n_req; ++i) chosen_ids.push_back(i);
         }
+
+        // ---- GPU placement policy (gpu.placement_policy) ------------------
+        // Evaluated BEFORE the fit check, because it changes WHICH devices are
+        // in the pool and the fit check is per-device. Both 2026-08 wedges died
+        // in a GPU thermal dispatch while this replica was resident on the same
+        // dies; when the margin is thin, `auto` hands the two pools disjoint
+        // device sets so that condition cannot arise. The main program applies
+        // the thermal half of the decision after prepare() returns.
+        if (!chosen_ids.empty()) {
+            size_t probe_mem = all_gpus[chosen_ids.front()].global_mem_size;
+            std::string probe_vendor = all_gpus[chosen_ids.front()].vendor;
+            for (int id : chosen_ids) {
+                if (all_gpus[id].global_mem_size < probe_mem) {
+                    probe_mem = all_gpus[id].global_mem_size;
+                    probe_vendor = all_gpus[id].vendor;
+                }
+            }
+            const double probe_margin_gib =
+                deviceMargin(probe_mem) / (1024.0 * 1024.0 * 1024.0);
+            const std::vector<int> before = chosen_ids;
+            chosen_ids = gpu::guardrails::decidePlacement(
+                chosen_ids, static_cast<int>(all_gpus.size()), probe_margin_gib,
+                probe_vendor, !config_.gpu_device_ids.empty());
+            // The pool needs >= 2 devices; below that this rung degrades to the
+            // single-GPU solver, which picks its own device and would leave the
+            // announced separation half-applied. Refuse to half-apply it.
+            if (gpu::guardrails::placementDecision().disjoint
+                && chosen_ids.size() < 2) {
+                gpu::guardrails::revertPlacementToShared(
+                    "the radiosity pool would be left with fewer than 2 devices "
+                    "and would degrade to the single-GPU rung, which does not "
+                    "choose its own device");
+                chosen_ids = before;
+            }
+        }
+
+        std::vector<gpu::opencl::OpenCLDeviceInfo> chosen;
+        for (int id : chosen_ids) chosen.push_back(all_gpus[id]);
 
         bool pool_ok = chosen.size() >= 2;
         if (!pool_ok) {
@@ -1071,9 +1222,17 @@ void RadiositySolver::initGPU() {
         }
         // Real per-device fit: each device replicates the full CSR.
         size_t min_dev = pool_ok ? chosen.front().global_mem_size : 0;
+        std::string min_dev_vendor = pool_ok ? chosen.front().vendor : std::string();
         if (pool_ok) {
-            for (const auto& d : chosen) min_dev = std::min(min_dev, d.global_mem_size);
-            if (!fitsDevice(min_dev)) {
+            for (const auto& d : chosen) {
+                if (d.global_mem_size < min_dev) {
+                    min_dev = d.global_mem_size;
+                    min_dev_vendor = d.vendor;
+                }
+            }
+            noteHostVram(min_dev, static_cast<int>(chosen.size()),
+                         chosen.front().name, min_dev_vendor);
+            if (!fitsDevice(min_dev, min_dev_vendor)) {
                 pool_ok = false;
                 // Say WHICH test rejected it -- see the single-GPU twin below.
                 std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
@@ -1133,6 +1292,10 @@ void RadiositySolver::initGPU() {
                              "degrading to single-GPU.\n";
                 gpu_pool_.reset();
             } else {
+                // Upload succeeded on every pool device: record what this host
+                // demonstrably carried (high-water mark only, never a refusal).
+                gpu::noteCommittedReplica(needed_bytes, deviceMargin(min_dev),
+                                          static_cast<int>(gpu_pool_->numDevices()));
                 // The pool IS a GPU rung: publish it in the same state the
                 // single-GPU rung publishes. Without this use_gpu_ and
                 // two_band_gpu_ok_ stayed false while the pool ran, so
@@ -1160,7 +1323,9 @@ void RadiositySolver::initGPU() {
                           << (pool_batch_size_ > 0 ? std::to_string(pool_batch_size_)
                                                    : std::string("auto"))
                           << " (resolved per sweep); row norm applied in-kernel on "
-                          << vf_row_norm_count_ << "/" << n << " faces.\n";
+                          << vf_row_norm_count_ << "/" << n << " faces; "
+                             "placement: "
+                          << gpu::guardrails::placementDecision().summary << ".\n";
                 warnIfThinMargin(min_dev, gpu_pool_->numDevices());
                 releaseVfReplaceGpuOperator("CSR replicated to every pool device.");
                 return;  // pool active -- done
@@ -1263,6 +1428,14 @@ bool RadiositySolver::hasGPUPool() const {
     return gpu_pool_ != nullptr;
 #else
     return false;
+#endif
+}
+
+int RadiositySolver::gpuPoolDeviceCount() const {
+#ifdef PTM_GPU_OPENCL
+    return gpu_pool_ ? static_cast<int>(gpu_pool_->numDevices()) : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -2939,6 +3112,10 @@ bool RadiationExchangeManager::prepare(
 
 bool RadiationExchangeManager::hasGPUPool() const {
     return solver_ ? solver_->hasGPUPool() : false;
+}
+
+int RadiationExchangeManager::gpuPoolDeviceCount() const {
+    return solver_ ? solver_->gpuPoolDeviceCount() : 0;
 }
 
 void RadiationExchangeManager::setSolarAlbedo(const std::vector<double>& solar_albedo) {

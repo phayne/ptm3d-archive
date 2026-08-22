@@ -758,6 +758,48 @@ struct SimulationConfig {
         bool verbose = false;
         double default_visible_albedo = -1.0;  // -1 = use planet default
     } advanced;
+
+    // GPU safety policy (cross-cutting, not per-solver tuning).
+    //
+    // These keys decide whether a GPU rung is ALLOWED and which dies each pool
+    // may use; the per-solver gpu_devices / gpu_device_ids / gpu_batch_size
+    // keys decide how a rung that is allowed then runs. They came out of the
+    // 2026-08-20/21 wedge forensics: see src/cpp/gpu/gpu_guardrails.h for the
+    // mechanism and docs/gpu-wedge-guardrails.md for the platform-gating table
+    // and the cost of each guardrail.
+    struct GpuParams {
+        // Floor on the per-device VRAM headroom a resident radiosity CSR
+        // replica may leave behind [GiB]. A rung with less is refused on
+        // macOS+AMD (or wherever this is set explicitly) and flagged
+        // elsewhere. 0 = the pre-2026-08-22 behavior (fit check only).
+        // Consequence of the 2.0 default, accepted deliberately: a site whose
+        // replica fits by less than 2 GiB now degrades -- loudly -- to CPU
+        // radiosity instead of running on a margin thinner than the thermal
+        // pool's own per-device ask.
+        double min_vram_margin_gib = 2.0;
+        // auto | shared | disjoint. Whether the radiosity replica and the GPU
+        // thermal pool may occupy the same dies. See decidePlacement().
+        std::string placement_policy = "auto";
+        // Margin below which `auto` separates the two pools [GiB].
+        double placement_margin_gib = 4.0;
+        // What a margin below min_vram_margin_gib DOES:
+        //   separate = keep the GPU rung, but only behind disjoint placement,
+        //              and refuse only below hard_min_vram_margin_gib. DEFAULT
+        //              (Paul's ruling, 2026-08-22).
+        //   refuse   = give up the GPU rung (radiosity on the CPU).
+        // Both remove the co-residency the 2026-08 wedges died in; they differ
+        // by a lot in price on a large-matrix site. Measured on A3GT A03N1016,
+        // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
+        // GPU pool (+77.5 measured), while separation costs a derived
+        // +7-10 min. See docs/gpu-wedge-guardrails.md.
+        std::string thin_margin_policy = "separate";
+        // The floor below which even `separate` refuses [GiB].
+        double hard_min_vram_margin_gib = 0.25;
+        // NOT a YAML key: true when min_vram_margin_gib was written in the
+        // config or the environment, which makes the floor enforcing on every
+        // platform rather than only on the wedge-prone one.
+        bool min_vram_margin_explicit = false;
+    } gpu;
 };
 
 /**

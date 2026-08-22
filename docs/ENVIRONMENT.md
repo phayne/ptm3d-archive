@@ -154,6 +154,10 @@ Rules:
 | `PTM_MAX_TIMESTEPS_PER_DISPATCH` | machine profile, else 300 | Ceiling on how many thermal timesteps one GPU work submission may contain (protection against GPU driver timeouts); normally supplied by `--calibrate-gpu`. Setting it explicitly also disables the inline auto-calibration probe. | [tuning] |
 | `PTM_NO_AUTO_CALIBRATE` | unset | Disables the inline GPU auto-calibration probe (`thermal.auto_calibrate_gpu`, default on), restoring the machine-profile or conservative dispatch ceiling. Affects dispatch batching only, never the physics. | [tuning] |
 | `PTM_LOG_SUBDISPATCH` | off | Log the timing of each GPU work submission (diagnostics for GPU driver hangs). | [internal] |
+| `PTM_GPU_MIN_VRAM_MARGIN_GIB` | config `gpu.min_vram_margin_gib` (2.0) | Floor on the per-device VRAM headroom a resident radiosity CSR replica may leave behind, in GiB. Overrides the config key, announces the override, and makes the floor **enforcing on every platform** (the config default enforces only on macOS+AMD and is advisory elsewhere). A malformed value warns and is ignored. `0` = fit check only, the pre-2026-08-22 behavior. See [gpu-wedge-guardrails.md](gpu-wedge-guardrails.md). | [tuning] |
+| `PTM_RAD_RERUN_MAX_GPUS` | configured thermal device count | Lowers the device count the selected-faces radiation-coupling re-thermal may use. `=1` genuinely serializes it on one device. Since 2026-08-22 the default no longer caps: the shared re-thermal pool is hoisted once at the configured width instead of being rebuilt every coupling iteration. A non-positive value warns and is ignored. | [tuning] |
+| `PTM_GPU_FORCE_WEDGE_PLATFORM` | unset | Test hook for the platform gate: `=1` treats the host as macOS+AMD (guardrails ENFORCE), `=0` treats it as not wedge-prone (guardrails ADVISORY). Announces itself on stdout. Use it to exercise both branches of the VRAM-margin and placement policies on one machine. | [internal] |
+| `PTM_GPU_POWER_PROBE_FILE` | unset | Test hook for the macOS power-settings advisory: read this file instead of running `pmset -g custom`. Announces itself. | [internal] |
 
 ## Diagnostics and internal tooling
 
@@ -177,5 +181,7 @@ Rules:
 - [../INSTALL.md](../INSTALL.md) — build + SPICE kernel data
 - [configuration.md](configuration.md) — the YAML configuration reference
   (config keys, not env vars)
+- [gpu-wedge-guardrails.md](gpu-wedge-guardrails.md) — what the GPU guardrail
+  variables above are guarding against, and which platform each is active on
 - [USER_GUIDE.md](USER_GUIDE.md) — CLI reference and output formats
 - [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — known caveats

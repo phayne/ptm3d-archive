@@ -12,10 +12,10 @@ parser applies when a key is absent (`src/cpp/tools/config_parser.cpp`).
 
 ## Structure
 
-A configuration file has up to eight top-level sections: `simulation`, `mesh`,
-`thermal`, `illumination`, `radiation`, `output`, `generic_body` and
-`thermophysical`, plus the optional `engine_env` block. Every section is
-optional; absent keys take the defaults below.
+A configuration file has up to ten top-level sections: `simulation`, `mesh`,
+`thermal`, `illumination`, `radiation`, `output`, `generic_body`,
+`thermophysical`, `gpu` and `advanced`, plus the optional `engine_env` block.
+Every section is optional; absent keys take the defaults below.
 
 ```yaml
 simulation:
@@ -432,6 +432,63 @@ command line wins. The full key list, with the physics behind each, is in
 | `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) |
 | `use_gpu` | bool | false | OpenCL radiosity solver |
 | `verbose` | bool | false | Detailed radiation progress |
+
+## gpu
+
+Cross-cutting GPU **safety policy**: whether a GPU rung is allowed at all, and
+which devices each pool may use. This is distinct from the per-solver
+`gpu_devices` / `gpu_device_ids` / `gpu_batch_size` keys, which tune a rung that
+has already been allowed. The full rationale, the platform-gating table and the
+cost of each guardrail are in
+[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `min_vram_margin_gib` | float | 2.0 | Floor on the per-device VRAM headroom a resident radiosity CSR replica may leave behind. A rung with less is refused (see gating below). 0 = fit check only, the pre-2026-08-22 behavior |
+| `placement_policy` | string | `auto` | `auto`, `shared` or `disjoint`: may the radiosity replica and the GPU thermal pool occupy the same devices? |
+| `placement_margin_gib` | float | 4.0 | Margin below which `auto` separates the two pools onto disjoint devices, and below which the thin-margin advisory prints |
+| `thin_margin_policy` | string | `separate` | What a margin below `min_vram_margin_gib` does: `separate` the two pools onto disjoint devices and keep the GPU rung, or `refuse` the rung outright |
+| `hard_min_vram_margin_gib` | float | 0.25 | Under `separate`, the floor below which the GPU rung is refused anyway |
+
+**Platform gating.** The failure these guard against — a wedged GPU that takes
+the machine down with it — was measured on macOS with AMD (Navi21) devices.
+
+| | macOS + AMD | every other host |
+|---|---|---|
+| `min_vram_margin_gib` | **enforces**: a thin rung is refused and radiosity runs on the CPU | **advisory**: prints the same message and proceeds |
+| `placement_policy: auto` | separates the pools when the margin is thin | never separates; prints a note when it would have |
+| `placement_policy: disjoint` | separates | separates (an explicit instruction is obeyed everywhere) |
+
+Setting `min_vram_margin_gib` in the config (or `PTM_GPU_MIN_VRAM_MARGIN_GIB`
+in the environment) makes it enforcing on **every** host: an operator who asks
+for a policy gets the policy.
+
+**What the 2.0 default does.** A site whose CSR replica fits by less than 2 GiB
+is treated as thin, and by default (`thin_margin_policy: separate`) the engine
+moves the radiosity replica and the GPU thermal pool onto **disjoint devices**
+and keeps the GPU rung — a derived +7-10 min per A3GT-scale window. It gives up
+the rung only below `hard_min_vram_margin_gib` (0.25), or on a rung that cannot
+be separated. That matters because the alternative is expensive: measured on
+A03N1016 (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window against
+31.4 min on the GPU pool, 8 windows each. The reason the margin needs guarding
+at all is that the GPU thermal pool allocates roughly 0.77 GiB per device on
+the *same* dies while the replica is resident, and the fit check does not count
+it. Set `thin_margin_policy: refuse` to give up the rung instead; see
+[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+
+`auto` only engages when **all** of: the thermal solver is on the GPU, the two
+device sets overlap, the margin is below `placement_margin_gib`, the host is
+macOS + AMD, and neither side pinned explicit device ids. An explicit pin is an
+operator decision and `auto` will not overrule it — it warns instead. The
+single-GPU radiosity rung cannot select its device, so the separation is not
+available there; the engine says so rather than sharing the die in silence.
+
+```yaml
+gpu:
+  min_vram_margin_gib: 2.0
+  placement_policy: auto
+  placement_margin_gib: 4.0
+```
 
 ## output
 
