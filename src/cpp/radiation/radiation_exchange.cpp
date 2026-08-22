@@ -815,6 +815,16 @@ void RadiositySolver::initGPU() {
             static_cast<long long>(deviceReserve(global_mem));
         return avail - static_cast<long long>(needed_bytes);
     };
+    // Has THIS host already carried a replica at least this large? Measured,
+    // not assumed: the record is written only after a successful upload.
+    bool host_carried_before = false;
+    {
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)) {
+            host_carried_before =
+                rec.largest_committed_replica_bytes >= needed_bytes;
+        }
+    }
     auto fitsDevice = [&](size_t global_mem, const std::string& vendor) -> bool {
         const bool fits_raw =
             global_mem > deviceReserve(global_mem)
@@ -822,37 +832,78 @@ void RadiositySolver::initGPU() {
         if (!fits_raw) return false;
         if (min_margin_bytes == 0) return true;
         const long long margin = deviceMargin(global_mem);
-        if (margin >= static_cast<long long>(min_margin_bytes)) return true;
-        // Below the floor. Refuse LOUDLY where the wedge was measured, and say
-        // so just as loudly (but without changing the rung) everywhere else --
-        // a quiet downgrade is how a run ends up on a rung nobody chose, and a
-        // quiet ENFORCEMENT on a platform where the failure was never observed
-        // would be the same sin in the other direction. Formatted on a LOCAL
+        const double margin_gib = margin / (1024.0 * 1024.0 * 1024.0);
+        // The mitigation the floor stands in for, and whether it is ACTUALLY in
+        // force on this rung -- not whether it would be nice if it were. The
+        // placement decision is taken before this check in the pool path and is
+        // false on the single-GPU rung, which cannot choose its device.
+        const bool separation_in_force =
+            gpu::guardrails::placementDecision().disjoint;
+        const auto verdict = gpu::guardrails::judgeVramMargin(
+            margin_gib, separation_in_force, host_carried_before, vendor);
+        if (verdict == gpu::guardrails::MarginVerdict::Pass) return true;
+        // Everything below is loud. A quiet downgrade is how a run ends up on a
+        // rung nobody chose; a quiet ENFORCEMENT on a platform where the failure
+        // was never observed is the same sin in the other direction; and a
+        // quiet WAIVER would be the worst of the three. Formatted on a LOCAL
         // stream: see the gb() note below (PTM-05 -- std::cout arrives here
         // carrying scientific/setprecision(1) from a progress banner).
-        const bool enforce = gpu::guardrails::enforceVramMargin(vendor);
         std::ostringstream msg;
         msg << std::fixed << std::setprecision(2)
             << "[Radiosity] VRAM-margin policy: replica would fit with "
-            << (margin / (1024.0 * 1024.0 * 1024.0))
-            << " GiB of margin, below the " << min_margin_gib
+            << margin_gib << " GiB of margin, below the " << min_margin_gib
             << " GiB floor (gpu.min_vram_margin_gib"
             << (gpu::guardrails::policy().min_vram_margin_explicit
                     ? ", set explicitly"
                     : ", built-in default")
             << "). ";
-        if (enforce) {
-            msg << "REFUSING this GPU rung on this host (macOS+AMD, or an "
-                   "explicit policy): the GPU thermal pool allocates on the "
-                   "same dies and is not counted by the fit check.\n";
-        } else {
-            msg << "ADVISORY ONLY on this host -- the co-residency wedge this "
-                   "floor guards against was measured on macOS+AMD. Proceeding "
-                   "with the GPU rung. Set gpu.min_vram_margin_gib explicitly "
-                   "(or PTM_GPU_MIN_VRAM_MARGIN_GIB) to enforce it here.\n";
+        switch (verdict) {
+            case gpu::guardrails::MarginVerdict::Pass:
+                break;                                  // handled above
+            case gpu::guardrails::MarginVerdict::Advisory:
+                msg << "ADVISORY ONLY on this host -- the co-residency wedge "
+                       "this floor guards against was measured on macOS+AMD. "
+                       "Proceeding with the GPU rung. Set "
+                       "gpu.min_vram_margin_gib explicitly (or "
+                       "PTM_GPU_MIN_VRAM_MARGIN_GIB) to enforce it here.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveSeparation:
+                msg << "WAIVED by gpu.thin_margin_policy: separate -- the "
+                       "radiosity replica and the GPU thermal pool are on "
+                       "DISJOINT dies, which is the co-residency mitigation "
+                       "this floor stands in for, and the margin is above the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor. Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveHostRecord:
+                msg << "WAIVED below the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor on MEASURED host history: this host has "
+                       "already committed a replica at least this large "
+                       "successfully, and the pools are on disjoint dies. "
+                       "Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::Refuse:
+                msg << "REFUSING this GPU rung on this host (macOS+AMD, or an "
+                       "explicit policy): the GPU thermal pool allocates on the "
+                       "same dies and is not counted by the fit check.";
+                if (gpu::guardrails::toLower(
+                        gpu::guardrails::policy().thin_margin_policy)
+                        == "separate"
+                    && !separation_in_force) {
+                    msg << " gpu.thin_margin_policy: separate could NOT be "
+                           "honored here -- the two pools are not on disjoint "
+                           "dies (the single-GPU rung cannot choose its device, "
+                           "and a one-GPU host cannot be split), so there is no "
+                           "mitigation to waive the floor for.";
+                }
+                msg << "\n";
+                break;
         }
         std::cout << msg.str();
-        return !enforce;
+        return verdict == gpu::guardrails::MarginVerdict::Advisory
+            || verdict == gpu::guardrails::MarginVerdict::WaiveSeparation
+            || verdict == gpu::guardrails::MarginVerdict::WaiveHostRecord;
     };
     // GB, formatted on a LOCAL stream. std::cout arrives here carrying
     // std::scientific << setprecision(1) from an earlier progress banner, which

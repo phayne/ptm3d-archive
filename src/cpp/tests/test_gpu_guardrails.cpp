@@ -31,12 +31,16 @@ static void check(const std::string& what, bool ok) {
 }
 
 static void resetPolicy(const std::string& placement, double placement_margin,
-                        double min_margin, bool explicit_margin) {
+                        double min_margin, bool explicit_margin,
+                        const std::string& thin_margin_policy = "refuse",
+                        double hard_floor = 0.25) {
     gg::Policy& p = gg::policy();
     p.placement = placement;
     p.placement_margin_gib = placement_margin;
     p.min_vram_margin_gib = min_margin;
     p.min_vram_margin_explicit = explicit_margin;
+    p.thin_margin_policy = thin_margin_policy;
+    p.hard_min_vram_margin_gib = hard_floor;
     gg::PlacementDecision& d = gg::placementDecision();
     d = gg::PlacementDecision();
 }
@@ -74,6 +78,43 @@ int main(int argc, char** argv) {
     resetPolicy("auto", 4.0, 2.0, /*explicit=*/false);
     check("default floor on a non-AMD device follows the platform gate too",
           gg::enforceVramMargin(nvidia) == gg::wedgeProneDriver(nvidia));
+
+    // ---- thin-margin ORDERING: refuse-first vs separate-first -------------
+    // A03N1016's real geometry: the replica fits by +0.64 GiB against a 2.0
+    // GiB floor. Under "refuse" that site loses the GPU radiosity rung, which
+    // MEASURED 108.9 min/window against 31.4 min on the GPU pool. Under
+    // "separate" it keeps the rung behind disjoint dies, at a derived
+    // +7-10 min. These cases pin which verdict each ordering produces.
+    using V = gg::MarginVerdict;
+    const double n1016 = 0.64;
+
+    resetPolicy("auto", 4.0, 2.0, true, "refuse");
+    check("refuse: N1016's +0.64 GiB loses the GPU rung even when separated",
+          gg::judgeVramMargin(n1016, /*separated=*/true, false, amd) == V::Refuse);
+
+    resetPolicy("auto", 4.0, 2.0, true, "separate", 0.25);
+    check("separate: N1016's +0.64 GiB KEEPS the GPU rung when separated",
+          gg::judgeVramMargin(n1016, true, false, amd) == V::WaiveSeparation);
+    check("separate: the same margin still refuses when NOT separated",
+          gg::judgeVramMargin(n1016, false, false, amd) == V::Refuse);
+    check("separate: below the hard floor with no host history -> refuse",
+          gg::judgeVramMargin(0.10, true, false, amd) == V::Refuse);
+    check("separate: below the hard floor but this host carried it before "
+          "-> waive on the measurement",
+          gg::judgeVramMargin(0.10, true, true, amd) == V::WaiveHostRecord);
+    check("separate: host history does NOT waive without the separation",
+          gg::judgeVramMargin(0.10, false, true, amd) == V::Refuse);
+    check("either ordering: a fat margin just passes",
+          gg::judgeVramMargin(27.18, false, false, amd) == V::Pass);
+
+    resetPolicy("auto", 4.0, 0.0, false, "refuse");
+    check("floor of 0 disables the test entirely",
+          gg::judgeVramMargin(0.0, false, false, amd) == V::Pass);
+
+    resetPolicy("auto", 4.0, 2.0, false, "refuse");
+    check("a thin margin on a non-enforcing platform is ADVISORY, not a refusal",
+          gg::judgeVramMargin(n1016, false, false, amd)
+              == (gate_amd ? V::Refuse : V::Advisory));
 
     // ---- placement: shared / disjoint / auto ------------------------------
     const std::vector<int> four = {0, 1, 2, 3};

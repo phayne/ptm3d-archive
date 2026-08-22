@@ -14151,6 +14151,8 @@ int main(int argc, char** argv) {
         gpol.min_vram_margin_explicit = sim_config.gpu.min_vram_margin_explicit;
         gpol.placement                = sim_config.gpu.placement_policy;
         gpol.placement_margin_gib     = sim_config.gpu.placement_margin_gib;
+        gpol.thin_margin_policy       = sim_config.gpu.thin_margin_policy;
+        gpol.hard_min_vram_margin_gib = sim_config.gpu.hard_min_vram_margin_gib;
 
         const std::string place = gpu::guardrails::toLower(gpol.placement);
         if (place != "auto" && place != "shared" && place != "disjoint") {
@@ -14174,6 +14176,33 @@ int main(int argc, char** argv) {
                       << gpol.placement_margin_gib << " must be >= 0." << std::endl;
             return 1;
         }
+        const std::string thin = gpu::guardrails::toLower(gpol.thin_margin_policy);
+        if (thin != "refuse" && thin != "separate") {
+            std::cerr << "FATAL [gpu]: gpu.thin_margin_policy='"
+                      << gpol.thin_margin_policy << "' is not one of refuse|separate.\n"
+                         "  refuse   = a margin below gpu.min_vram_margin_gib gives up the GPU\n"
+                         "             rung and radiosity runs on the CPU (default).\n"
+                         "  separate = keep the GPU rung when the two pools are on DISJOINT\n"
+                         "             dies, and refuse only below gpu.hard_min_vram_margin_gib."
+                      << std::endl;
+            return 1;
+        }
+        if (!(gpol.hard_min_vram_margin_gib >= 0.0)) {
+            std::cerr << "FATAL [gpu]: gpu.hard_min_vram_margin_gib="
+                      << gpol.hard_min_vram_margin_gib << " must be >= 0." << std::endl;
+            return 1;
+        }
+        if (thin == "separate"
+            && gpol.hard_min_vram_margin_gib > gpol.min_vram_margin_gib) {
+            std::cerr << "FATAL [gpu]: gpu.hard_min_vram_margin_gib="
+                      << gpol.hard_min_vram_margin_gib
+                      << " is above gpu.min_vram_margin_gib="
+                      << gpol.min_vram_margin_gib
+                      << ", so the 'separate' band is empty and the hard floor would be\n"
+                         "  the only test. Lower the hard floor, or use "
+                         "gpu.thin_margin_policy: refuse." << std::endl;
+            return 1;
+        }
 
         const bool any_gpu = config.getPropertyBool("use_gpu_thermal", false)
                              || sim_config.illumination.use_gpu || rad_use_gpu;
@@ -14189,6 +14218,12 @@ int main(int argc, char** argv) {
                               : " (default: enforced on macOS+AMD, advisory elsewhere)")
                       << ", placement_policy=" << place
                       << ", placement_margin_gib=" << gpol.placement_margin_gib
+                      << ", thin_margin_policy=" << thin
+                      << (thin == "separate"
+                              ? (" (hard floor "
+                                 + std::to_string(gpol.hard_min_vram_margin_gib)
+                                 + " GiB)")
+                              : std::string())
                       << std::endl;
 
             // Publish what the thermal solver intends to do, so the radiosity

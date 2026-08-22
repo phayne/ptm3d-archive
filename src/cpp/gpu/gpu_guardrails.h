@@ -130,6 +130,18 @@ struct Policy {
     /// Margin below which `auto` separates the radiation and thermal pools
     /// onto disjoint dies, in GiB.
     double placement_margin_gib = 4.0;
+
+    /// What a margin below min_vram_margin_gib should DO. See judgeVramMargin().
+    ///   "refuse"   -- give up the GPU rung (radiosity runs on the CPU)
+    ///   "separate" -- keep the GPU rung but only behind disjoint placement,
+    ///                 refusing only below hard_min_vram_margin_gib
+    /// Default "refuse" is the behavior committed on 2026-08-22; "separate"
+    /// exists because the measured cost of the refusal is far larger than the
+    /// cost of the separation on a large-matrix site (see
+    /// docs/gpu-wedge-guardrails.md "Two ways to treat a thin margin").
+    std::string thin_margin_policy = "refuse";
+    /// The floor below which even "separate" refuses, in GiB.
+    double hard_min_vram_margin_gib = 0.25;
 };
 
 inline Policy& policy() {
@@ -172,6 +184,63 @@ inline double minVramMarginGib() {
 /// Whether a margin below the floor REFUSES the GPU rung (true) or only warns.
 inline bool enforceVramMargin(const std::string& vendor) {
     return policy().min_vram_margin_explicit || wedgeProneDriver(vendor);
+}
+
+/// What to do about a given per-device margin.
+enum class MarginVerdict {
+    Pass,              ///< at or above the floor (or no floor set)
+    Advisory,          ///< below the floor, but this platform only advises
+    Refuse,            ///< below the floor: give up this GPU rung
+    WaiveSeparation,   ///< below the floor but above the hard floor, and the
+                       ///< radiosity replica and thermal pool are on separate
+                       ///< dies, which is the mitigation the floor stands in for
+    WaiveHostRecord    ///< below even the hard floor, separated, and THIS host
+                       ///< has already carried a replica this large
+};
+
+/**
+ * Decide what a thin per-device VRAM margin means for this rung.
+ *
+ * Two orderings, selected by gpu.thin_margin_policy:
+ *
+ *   "refuse"   (default, and what shipped on 2026-08-22) -- below
+ *              gpu.min_vram_margin_gib the GPU rung is given up and radiosity
+ *              falls to the CPU. Simple and safe, and on a large-matrix site
+ *              very expensive: measured on A3GT A03N1016, the CPU radiosity
+ *              rung cost 108.9 min/window against 31.4 min on the GPU pool
+ *              (8 windows each, gen-1 vs gen-2) -- about +78 min/window.
+ *
+ *   "separate" -- the thin-margin risk is co-residency (both 2026-08 wedges
+ *              died in a GPU thermal dispatch while the replica was resident
+ *              on the same dies), and disjoint placement addresses exactly
+ *              that at a derived +7-10 min/window. So: keep the GPU rung, but
+ *              ONLY when the separation is actually in force, and refuse below
+ *              a much lower hard floor. Below the hard floor there is one
+ *              further escape, and it is a measurement rather than a guess:
+ *              if this host's own VRAM record shows it has already committed a
+ *              replica at least this large, the hardware has demonstrated it.
+ *
+ * The waiver is deliberately conditional on `separation_in_force`. A floor
+ * waived because a mitigation "would" apply, on a rung where it could not be
+ * applied (the single-GPU rung cannot choose its device; a one-GPU host cannot
+ * split), would be a guardrail that reports itself as active while doing
+ * nothing -- the exact failure this branch exists to remove.
+ */
+inline MarginVerdict judgeVramMargin(double margin_gib,
+                                     bool separation_in_force,
+                                     bool host_carried_before,
+                                     const std::string& vendor) {
+    const Policy& p = policy();
+    if (!(p.min_vram_margin_gib > 0.0)) return MarginVerdict::Pass;
+    if (margin_gib >= p.min_vram_margin_gib) return MarginVerdict::Pass;
+    if (!enforceVramMargin(vendor)) return MarginVerdict::Advisory;
+    if (toLower(p.thin_margin_policy) != "separate") return MarginVerdict::Refuse;
+    if (!separation_in_force) return MarginVerdict::Refuse;
+    if (margin_gib >= p.hard_min_vram_margin_gib) {
+        return MarginVerdict::WaiveSeparation;
+    }
+    return host_carried_before ? MarginVerdict::WaiveHostRecord
+                               : MarginVerdict::Refuse;
 }
 
 // ---------------------------------------------------------------------------

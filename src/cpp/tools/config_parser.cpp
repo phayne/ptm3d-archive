@@ -679,6 +679,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.gpu.min_vram_margin_gib = getWithDefault(gpu_sec, "min_vram_margin_gib", config.gpu.min_vram_margin_gib);
             config.gpu.placement_policy = getWithDefault(gpu_sec, "placement_policy", config.gpu.placement_policy);
             config.gpu.placement_margin_gib = getWithDefault(gpu_sec, "placement_margin_gib", config.gpu.placement_margin_gib);
+            config.gpu.thin_margin_policy = getWithDefault(gpu_sec, "thin_margin_policy", config.gpu.thin_margin_policy);
+            config.gpu.hard_min_vram_margin_gib = getWithDefault(gpu_sec, "hard_min_vram_margin_gib", config.gpu.hard_min_vram_margin_gib);
             // Presence, not value: an explicitly requested margin floor is
             // enforced on every platform, while the built-in default only
             // enforces on the wedge-prone one (macOS + AMD).

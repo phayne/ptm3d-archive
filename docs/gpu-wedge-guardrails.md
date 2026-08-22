@@ -89,17 +89,56 @@ thermal pool, which allocates ~0.77 GiB/device at A3GT production settings
 (`gpu_batch_size=100000`, 23 layers, 961 steps) on the very dies holding the
 replica, and which the fit check does not count.
 
-Cost: a site in the thin band loses GPU radiosity. On A3GT that is one site
-(A03N1016, which fit by 0.64 GiB) and roughly 3 min of a ~30 min window — GPU
-radiosity is only ~10% of that window's wall time. **Paul accepted this trade
-deliberately**: a rung nobody chose is worse than a rung that is 3 min slower.
-Set `gpu.min_vram_margin_gib: 0` for the pre-2026-08-22 behavior.
+Cost: a site in the thin band loses GPU radiosity, and on a large matrix that
+is expensive. **Measured on A3GT A03N1016** (1,798,135 faces, 3.5 G nnz), eight
+standard windows per generation:
+
+| rung | windows | mean wall | range |
+|---|---|---|---|
+| CPU radiosity (gen-1, replica refused) | 8 | **108.9 min** | 103.4-115.5 |
+| multi-GPU pool (gen-2, replica accepted) | 8 | **31.4 min** | 28.5-37.2 |
+
+**About +78 min per window, a factor of 3.5** — and about +71 min after
+correcting for the 9.2% larger matrix gen-1 carried, if the CPU sweep scales
+with nnz. Do not confuse this with the ~3 min the *GPU* sweeps themselves take:
+that is what radiosity costs when it is on the GPU, not what the CPU
+alternative costs. The GPU sweep is ~10% of the window; the CPU sweep is not.
+
+That is why the ordering below exists. Set `gpu.min_vram_margin_gib: 0` for the
+pre-2026-08-22 behavior (fit check only).
 
 The engine also records what this host has actually carried
 (`~/.ptm3d/vram_profile.json`) and prints it once per run: *"largest replica
 committed here 26.55 GiB/device on 4 device(s), leaving 0.64 GiB of margin"*.
 That line is what nobody had when a physics fix silently moved a site onto the
 largest VRAM commitment the machine had ever made.
+
+#### Two ways to treat a thin margin (`gpu.thin_margin_policy`)
+
+The floor and the placement policy address the **same** risk — the radiosity
+replica sharing dies with the GPU thermal pool — by different means, at very
+different prices. `gpu.thin_margin_policy` decides which one a thin margin
+triggers:
+
+| | `refuse` (default) | `separate` |
+|---|---|---|
+| below `min_vram_margin_gib` | give up the GPU rung | keep it, **but only when the two pools are on disjoint dies** |
+| refuses only below | — | `hard_min_vram_margin_gib` (default 0.25 GiB) |
+| escape below the hard floor | — | this host's own VRAM record shows it already committed a replica this large |
+| cost for A03N1016 (+0.64 GiB) | **+78 min/window** (measured) | **+7-10 min/window** (derived) |
+| removes co-residency? | yes, by removing the GPU rung | yes, by separating the dies |
+
+`separate` never waives the floor on a rung where the separation could not
+actually be applied — the single-GPU rung cannot choose its device, and a
+one-GPU host cannot be split. In those cases it refuses and says which
+mitigation was missing. A floor waived for a mitigation that is not in force
+would be a guardrail that reports itself active while doing nothing, which is
+the failure this whole page exists to remove.
+
+**The default is `refuse`** until the trade is ruled on: it is the
+conservative one, and it is what the rest of this branch was validated with.
+Switching an N1016-class site to `separate` is the difference between a
+109 min window and a ~39 min window.
 
 ### G3 — pool placement (`gpu.placement_policy`, default `auto`)
 
