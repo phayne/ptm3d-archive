@@ -367,6 +367,20 @@ public:
     const std::vector<double>& lastIndirectVisible() const { return last_indirect_vis_; }
     const std::vector<double>& lastIndirectIR() const { return last_indirect_ir_; }
 
+    // OPT-IN retention of the converged OUTGOING radiosity vectors from
+    // solveTwoBand. Default OFF, and off costs exactly one branch per solve --
+    // no allocation, no copy, no change to any published number.
+    //
+    // This exists for ONE purpose: to let test_flux_cube_identity falsify the
+    // host-side reconstruction in radiosity_reconstruction.h against the
+    // solver's own B. Production code must NOT consume these; it consumes the
+    // reconstruction, which is route-blind (the GPU pool never brings B back to
+    // the host, so a production dependency on these would silently work on the
+    // CPU route and silently produce nothing on the GPU one).
+    void setRetainRadiosityB(bool on) { retain_radiosity_b_ = on; }
+    const std::vector<double>& retainedBIR() const { return retained_b_ir_; }
+    const std::vector<double>& retainedBVis() const { return retained_b_vis_; }
+
     // Per-band batch results from the last two-band solveBatch() (multi-GPU pool
     // path), indexed [timestep][face]. Empty on the gray path and on the
     // single-timestep two-band path (use lastIndirect{Visible,IR}() there).
@@ -565,6 +579,11 @@ private:
     // device); do not call concurrently on the same RadiositySolver.
     std::vector<double> last_indirect_vis_;
     std::vector<double> last_indirect_ir_;
+    // Opt-in copies of the converged OUTGOING radiosity (see setRetainRadiosityB).
+    // Written by solveTwoBand ONLY when retain_radiosity_b_ is true; empty otherwise.
+    bool retain_radiosity_b_ = false;
+    std::vector<double> retained_b_ir_;
+    std::vector<double> retained_b_vis_;
     std::vector<std::vector<double>> last_indirect_vis_batch_;  // [step][face], pool two-band
     std::vector<std::vector<double>> last_indirect_ir_batch_;   // [step][face], pool two-band
     // Final normalized incoming (F·B·vf_row_norm) from the last solveJacobi call.

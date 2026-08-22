@@ -1768,6 +1768,15 @@ std::vector<double> RadiositySolver::solveTwoBand(
                   << std::endl;
     }
 
+    // Opt-in retention of the converged OUTGOING radiosity, for the flux-cube
+    // reconstruction discriminator only (setRetainRadiosityB, default false).
+    // Off => one predicted branch and nothing else; the published numbers below
+    // are untouched either way.
+    if (retain_radiosity_b_) {
+        retained_b_ir_ = B_ir;
+        retained_b_vis_ = B_vis;
+    }
+
     // Fixed-point identity (Tier 1 #2), applied to each converged band: the
     // normalized incoming F·B·vf_row_norm = (B − E − source)/refl (avoids a second
     // SpMV). Guard refl→0 (blackbody) with the last Jacobi normalized incoming.

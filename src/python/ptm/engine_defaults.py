@@ -9,12 +9,13 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-169 keys across 9 sections.
+176 keys across 10 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
 ENGINE_SECTIONS = (
     'advanced',
+    'flux_cubes',
     'generic_body',
     'illumination',
     'mesh',
@@ -29,6 +30,7 @@ ENGINE_SECTIONS = (
 #: one nested list. Their entry in ENGINE_DEFAULTS is None, which means "no
 #: default in the parser", not "defaults to null".
 KEYS_WITHOUT_DEFAULT = (
+    'flux_cubes.locations',
     'generic_body.shape.semi_axes_km',
     'illumination.gpu_device_ids',
     'radiation.gpu_device_ids',
@@ -41,6 +43,13 @@ KEYS_WITHOUT_DEFAULT = (
 ENGINE_DEFAULTS = {
     'advanced.default_visible_albedo': -1.0,
     'advanced.verbose': False,
+    'flux_cubes.cache_file': '',
+    'flux_cubes.enabled': False,
+    'flux_cubes.locations': None,
+    'flux_cubes.shadow_probe_rays': 5,
+    'flux_cubes.write_binary': True,
+    'flux_cubes.write_csv': True,
+    'flux_cubes.write_csv_max_cubes': 0,
     'generic_body.config_file': '',
     'generic_body.ephemeris_source': 'auto',
     'generic_body.naif_id': '',
