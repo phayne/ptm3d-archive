@@ -100,6 +100,26 @@ set_target_properties(test_flux_cube_identity PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Closed-form gate on the PRODUCTION in-engine view-factor path. test_bowl_crater
+# builds its view factors from its own inline centroid kernel and never calls
+# ViewFactorCalculator, which is why FC-08 (a 2x far-field inflation) lived for
+# months under a green run of it. This target drives the real Embree-occluded
+# ViewFactorCalculator against the Ingersoll spherical cap and a coaxial
+# parallel-disk pair, and carries its own fault-injection negative controls.
+add_executable(test_vf_production test_vf_production.cpp)
+target_link_libraries(test_vf_production PRIVATE
+    radiation
+    mesh_utils
+    ${EMBREE_LIBRARIES}
+)
+target_include_directories(test_vf_production PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_vf_production PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(test_vf_production PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Ingersoll bowl-crater validation driven by the PRODUCTION radiation module
 # (Embree-occluded ViewFactorCalculator + RadiositySolver). Writes .npy outputs.
 add_executable(bowl_crater_ptm bowl_crater_ptm.cpp)
