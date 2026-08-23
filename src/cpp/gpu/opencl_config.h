@@ -16,7 +16,9 @@
     #include <CL/cl.h>
 #endif
 
+#include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 #include <stdexcept>
 #include <iostream>

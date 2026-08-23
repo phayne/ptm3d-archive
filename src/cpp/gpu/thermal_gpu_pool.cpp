@@ -2,8 +2,19 @@
 
 #include "thermal_gpu_pool.h"
 
+// Include what this file uses, not what thermal_gpu_pool.h happens to drag in:
+// libc++ supplies <thread> transitively here, libstdc++ does not, and the first
+// Linux compile of this TU failed on std::this_thread::sleep_for below.
+#include <chrono>
+#include <cstddef>
+#include <functional>
+#include <future>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 
 namespace gpu {
 namespace opencl {

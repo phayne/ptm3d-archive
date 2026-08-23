@@ -8,6 +8,7 @@
  * Supports HIP (AMD/NVIDIA portable), CUDA, and OpenCL backends.
  */
 
+#include <algorithm>
 #include <string>
 #include <cstdint>
 

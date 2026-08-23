@@ -8,10 +8,17 @@
 #include "bvh_opencl.h"
 #include <fstream>
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <chrono>
 #include <iostream>
 #include <cmath>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace gpu {
 namespace opencl {

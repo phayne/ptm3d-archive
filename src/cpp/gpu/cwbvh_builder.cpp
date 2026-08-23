@@ -6,9 +6,14 @@
 #define TINYBVH_IMPLEMENTATION
 #include "tiny_bvh.h"
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace gpu {
 namespace opencl {

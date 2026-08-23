@@ -10,6 +10,7 @@
  */
 
 #include "gpu_config.h"
+#include <cstddef>
 
 namespace gpu {
 namespace kernels {

@@ -14,6 +14,8 @@
 
 #include "opencl_config.h"
 #include "thermal/eq_extrapolation.h"
+#include <cstddef>
+#include <iostream>
 #include <vector>
 #include <memory>
 #include <string>

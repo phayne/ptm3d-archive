@@ -2,7 +2,18 @@
 
 #include "radiosity_gpu_pool.h"
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <future>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace gpu {
 namespace opencl {

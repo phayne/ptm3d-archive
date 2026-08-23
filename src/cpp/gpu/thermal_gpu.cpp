@@ -14,6 +14,10 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
 namespace gpu {
 

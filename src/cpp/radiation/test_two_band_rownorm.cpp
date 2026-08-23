@@ -38,9 +38,12 @@
 #include "../gpu/radiosity_opencl.h"   // resolveConvergenceCheckInterval (B1e)
 #endif
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <string>

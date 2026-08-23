@@ -861,6 +861,216 @@ if(BUILD_PYTHON_BINDINGS)
 endif()
 
 # ============================================================================
+# ISA uniformity assertion  (do not remove -- this is a correctness gate)
+# ============================================================================
+# Every PTM translation unit must be compiled with the SAME instruction-set
+# selection. This is not a tuning preference; it is an ABI requirement.
+#
+# Eigen derives EIGEN_MAX_ALIGN_BYTES from the enabled ISA (16 x86-64 baseline,
+# 32 with AVX, 64 with AVX-512), and on macOS EIGEN_MALLOC_ALREADY_ALIGNED is 1
+# only when that value is 16. So a baseline TU compiles Eigen's aligned_malloc/
+# aligned_free down to plain malloc()/free(), while an AVX TU compiles them to
+# handmade_aligned_malloc()/handmade_aligned_free() -- an over-allocating
+# scheme that returns an interior pointer and stashes the offset just below it.
+# The two schemes are not interchangeable. Because Eigen's storage helpers are
+# templates, the linker keeps exactly ONE copy of each shared weak symbol, so a
+# mixed build ends up freeing interior pointers (or reading heap metadata as an
+# offset) and aborts inside a destructor -- typically far from the flag that
+# caused it, and only on some code paths. The ISA also changes the alignment of
+# fixed-size Eigen types, which is a plain one-definition-rule violation.
+#
+# This fired for real: with -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF the
+# vendored tinybvh INTERFACE target used to push -mavx2 -mfma through ptm_gpu
+# into radiation/illumination_model/ptm_thermal_sim while thermal/, ice/,
+# maps/, tools/, fileio/ and mesh/ stayed at the baseline. Both
+# examples/tutorial04_crater80N_coupled.yaml and the CPU selected-faces
+# re-thermal path aborted with SIGABRT and wrote no output.
+#
+# Coverage note: this checks target-level COMPILE_OPTIONS, the target's
+# directory COMPILE_OPTIONS, and the transitive INTERFACE_COMPILE_OPTIONS of
+# everything it links. It does NOT see per-source COMPILE_OPTIONS/COMPILE_FLAGS
+# or ISA flags hidden inside a generator expression; those remain the
+# reviewer's job.
+
+# Collect every target defined by this project, recursively.
+function(_ptm_collect_targets dir out_var)
+    get_property(_tgts DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    get_property(_subs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(_sub IN LISTS _subs)
+        _ptm_collect_targets("${_sub}" _sub_tgts)
+        list(APPEND _tgts ${_sub_tgts})
+    endforeach()
+    set(${out_var} "${_tgts}" PARENT_SCOPE)
+endfunction()
+
+# The ISA-selecting compile options a target is actually built with.
+function(_ptm_effective_isa tgt out_var)
+    set(_opts "")
+
+    get_target_property(_src_dir ${tgt} SOURCE_DIR)
+    if(_src_dir)
+        get_property(_dir_opts DIRECTORY "${_src_dir}" PROPERTY COMPILE_OPTIONS)
+        if(_dir_opts)
+            list(APPEND _opts ${_dir_opts})
+        endif()
+    endif()
+
+    # Breadth-first walk of the link graph (CMake 3.10: no list(POP_FRONT)).
+    set(_todo "${tgt}")
+    set(_seen "")
+    while(_todo)
+        list(GET _todo 0 _t)
+        list(REMOVE_AT _todo 0)
+        if(NOT TARGET ${_t})
+            continue()
+        endif()
+        if("${_t}" IN_LIST _seen)
+            continue()
+        endif()
+        list(APPEND _seen "${_t}")
+        get_target_property(_type ${_t} TYPE)
+        if("${_t}" STREQUAL "${tgt}" AND NOT _type STREQUAL "INTERFACE_LIBRARY")
+            get_target_property(_own ${_t} COMPILE_OPTIONS)
+            if(_own)
+                list(APPEND _opts ${_own})
+            endif()
+        endif()
+        get_target_property(_iface ${_t} INTERFACE_COMPILE_OPTIONS)
+        if(_iface)
+            list(APPEND _opts ${_iface})
+        endif()
+        if(_type STREQUAL "INTERFACE_LIBRARY")
+            get_target_property(_links ${_t} INTERFACE_LINK_LIBRARIES)
+        else()
+            get_target_property(_links ${_t} LINK_LIBRARIES)
+        endif()
+        if(_links)
+            list(APPEND _todo ${_links})
+        endif()
+    endwhile()
+
+    set(_isa "")
+    foreach(_o IN LISTS _opts)
+        if(_o MATCHES "\\$<")
+            continue()   # generator expression: not statically inspectable
+        endif()
+        if(_o MATCHES "^-m(no-)?(avx|sse|fma|f16c|arch=|cpu=|tune=)"
+           OR _o MATCHES "^/arch:")
+            list(APPEND _isa "${_o}")
+        endif()
+    endforeach()
+    if(_isa)
+        list(REMOVE_DUPLICATES _isa)
+        list(SORT _isa)
+    endif()
+    set(${out_var} "${_isa}" PARENT_SCOPE)
+endfunction()
+
+# The property that must match EXACTLY is the widest enabled vector ISA plus
+# the -march/-mcpu/-mtune selection, because that pair is what fixes
+# EIGEN_MAX_ALIGN_BYTES (and -march=native can enable AVX-512 without any
+# -mavx512* token appearing here). A target that adds further subsets at the
+# same width -- exosphere_core opts into avx512bw/cd/vl on top of the
+# project's avx512f/dq -- does not move EIGEN_MAX_ALIGN_BYTES, so it is
+# reported rather than rejected.
+function(_ptm_eigen_align_class isa out_class out_arch)
+    set(_class 16)
+    set(_arch "")
+    foreach(_o IN LISTS isa)
+        if(_o MATCHES "^-mno-")
+            # A negative flag can only narrow. Treat it as "not this width" and
+            # let the remaining tokens decide, rather than reading -mno-avx as
+            # a request for 32-byte alignment.
+        elseif(_o MATCHES "avx512" OR _o MATCHES "^/arch:AVX512")
+            set(_class 64)
+        elseif(_o MATCHES "avx" OR _o MATCHES "^/arch:AVX")
+            if(_class LESS 32)
+                set(_class 32)
+            endif()
+        endif()
+        if(_o MATCHES "^-m(arch|cpu|tune)=")
+            list(APPEND _arch "${_o}")
+        endif()
+    endforeach()
+    if(_arch)
+        list(SORT _arch)
+    endif()
+    set(${out_class} "${_class}" PARENT_SCOPE)
+    set(${out_arch} "${_arch}" PARENT_SCOPE)
+endfunction()
+
+_ptm_collect_targets("${CMAKE_CURRENT_SOURCE_DIR}" _ptm_targets)
+set(_ptm_abi_variants "")     # (alignment class, -march/-mcpu/-mtune) pairs
+set(_ptm_abi_report "")
+set(_ptm_isa_sets "")         # distinct ISA token sets, order-independent
+set(_ptm_isa_counts "")       # how many targets carry each set
+set(_ptm_isa_first "")        # one example target per set
+foreach(_t IN LISTS _ptm_targets)
+    get_target_property(_type ${_t} TYPE)
+    if(NOT _type MATCHES "^(STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY|EXECUTABLE)$")
+        continue()
+    endif()
+    _ptm_effective_isa(${_t} _t_isa)
+    string(REPLACE ";" " " _t_isa_str "${_t_isa}")
+    if(NOT _t_isa_str)
+        set(_t_isa_str "<project baseline: no explicit ISA flag>")
+    endif()
+    if(NOT "${_t_isa_str}" IN_LIST _ptm_isa_sets)
+        list(APPEND _ptm_isa_sets "${_t_isa_str}")
+        list(APPEND _ptm_isa_counts 1)
+        list(APPEND _ptm_isa_first "${_t}")
+    else()
+        list(FIND _ptm_isa_sets "${_t_isa_str}" _i)
+        list(GET _ptm_isa_counts ${_i} _c)
+        math(EXPR _c "${_c} + 1")
+        list(REMOVE_AT _ptm_isa_counts ${_i})
+        list(INSERT _ptm_isa_counts ${_i} ${_c})
+    endif()
+
+    _ptm_eigen_align_class("${_t_isa}" _t_class _t_arch)
+    string(REPLACE ";" " " _t_arch_str "${_t_arch}")
+    set(_t_abi "EIGEN_MAX_ALIGN_BYTES=${_t_class} ${_t_arch_str}")
+    if(NOT "${_t_abi}" IN_LIST _ptm_abi_variants)
+        list(APPEND _ptm_abi_variants "${_t_abi}")
+    endif()
+    list(APPEND _ptm_abi_report "${_t_abi}  <-  ${_t}  [${_t_isa_str}]")
+endforeach()
+
+list(LENGTH _ptm_abi_variants _ptm_abi_variant_count)
+if(_ptm_abi_variant_count GREATER 1)
+    list(SORT _ptm_abi_report)
+    string(REPLACE ";" "\n    " _ptm_abi_report_str "${_ptm_abi_report}")
+    message(FATAL_ERROR
+        "PTM3D would be built across ${_ptm_abi_variant_count} different Eigen "
+        "ABIs. That is not a tuning difference: EIGEN_MAX_ALIGN_BYTES follows "
+        "the widest enabled vector ISA, it selects Eigen's allocator "
+        "(EIGEN_MALLOC_ALREADY_ALIGNED) and the alignment of every fixed-size "
+        "Eigen type, and the linker keeps only one copy of each shared Eigen "
+        "weak symbol. A mixed build frees Eigen storage with the wrong "
+        "deallocator and aborts inside a destructor, far from the flag that "
+        "caused it. Select the ISA once, at the top of this file, via "
+        "PTM_ARCH_NATIVE / ENABLE_AVX2 / ENABLE_AVX512, and reconfigure.\n"
+        "  Effective Eigen ABI per target:\n    ${_ptm_abi_report_str}\n")
+endif()
+message(STATUS "Eigen ABI uniformity: OK (${_ptm_abi_variants})")
+# The ABI is uniform, but the ISA token sets need not be identical (a target may
+# opt into extra subsets at the same vector width). Say so out loud rather than
+# leaving a real flag difference invisible: name every set and its members.
+list(LENGTH _ptm_isa_sets _ptm_isa_set_count)
+if(_ptm_isa_set_count GREATER 1)
+    message(STATUS "ISA: ${_ptm_isa_set_count} token sets, same Eigen ABI (wider subsets only):")
+    math(EXPR _last "${_ptm_isa_set_count} - 1")
+    foreach(_i RANGE ${_last})
+        list(GET _ptm_isa_sets   ${_i} _s)
+        list(GET _ptm_isa_counts ${_i} _n)
+        list(GET _ptm_isa_first  ${_i} _eg)
+        message(STATUS "  [${_n} target(s), e.g. ${_eg}] ${_s}")
+    endforeach()
+else()
+    message(STATUS "ISA (all targets): ${_ptm_isa_sets}")
+endif()
+
+# ============================================================================
 # Testing
 # ============================================================================
 option(BUILD_TESTS "Build test programs" OFF)
