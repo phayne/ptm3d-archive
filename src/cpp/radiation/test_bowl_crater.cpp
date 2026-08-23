@@ -47,6 +47,37 @@ constexpr double PI = 3.14159265358979323846;
 constexpr double SIGMA_SB = ptm::kStefanBoltzmann;  // [W/m^2/K^4]
 
 /**
+ * @brief Running tally of the pass/fail verdicts, so main() can set the exit status.
+ *
+ * Every sub-test records its verdict here and main() returns nonzero if any of
+ * them failed. Before this existed the program printed "FAILED" and still
+ * returned 0, so a broken Ingersoll gate was invisible to CI, to rebuild.sh,
+ * and to anyone running it from a shell.
+ *
+ * A SKIPPED arm is counted separately and does NOT fail the run. The only arm
+ * that can skip is the GPU-vs-CPU comparison on a host with no OpenCL device
+ * (the GPU=ON portable CI runner is exactly that): a missing device is a fact
+ * about the machine, not a radiation regression. An arm that initialized and
+ * then produced a wrong answer -- or threw -- is a real failure and is recorded
+ * as one.
+ */
+struct VerdictTally {
+    int passed = 0;
+    int failed = 0;
+    int skipped = 0;
+
+    void record(bool ok) {
+        if (ok) {
+            ++passed;
+        } else {
+            ++failed;
+        }
+    }
+    void skip() { ++skipped; }
+    int checked() const { return passed + failed; }
+};
+
+/**
  * @brief Generate a bowl-shaped crater mesh as a spherical section
  *
  * The crater is modeled as a spherical cap with the opening facing upward.
@@ -476,12 +507,15 @@ bool testClosure(const ViewFactorMatrix& F,
 
 /**
  * @brief Run complete validation test for bowl-shaped crater
+ *
+ * @param tally Receives one verdict per assertion this case evaluates.
  */
 void runBowlCraterTest(double diameter,
                        double depth_to_diameter,
                        int n_rings,
                        int n_azimuth,
-                       double latitude_deg) {
+                       double latitude_deg,
+                       VerdictTally& tally) {
     std::cout << "\n============================================================" << std::endl;
     std::cout << "Bowl Crater Test" << std::endl;
     std::cout << "============================================================" << std::endl;
@@ -717,6 +751,7 @@ void runBowlCraterTest(double diameter,
     }
     bool reciprocity_passed = testReciprocity(F, areas, 0.05);
     std::cout << "  Result: " << (reciprocity_passed ? "PASSED" : "FAILED") << std::endl;
+    tally.record(reciprocity_passed);
 
     // Compute expected sky view factors for all faces
     // For simplicity, estimate based on face position in crater
@@ -810,8 +845,15 @@ void runBowlCraterTest(double diameter,
 
     std::cout << "  Initializing GPU solver..." << std::flush;
     if (!gpu_solver.initialize()) {
-        std::cout << " FAILED" << std::endl;
-        std::cout << "  Note: OpenCL kernel compilation may fail on some AMD GPU drivers" << std::endl;
+        // Deliberately NOT the token "FAILED". A host with no OpenCL device
+        // (the GPU=ON portable CI runner) lands here, and the CI log grep must
+        // be able to tell that apart from a GPU arm that ran and disagreed with
+        // the CPU. Print an unambiguous SKIPPED verdict instead.
+        std::cout << " unavailable" << std::endl;
+        std::cout << "  Note: no usable OpenCL device, or kernel compilation was rejected"
+                  << " by the driver" << std::endl;
+        std::cout << "  GPU vs CPU validation: SKIPPED (no OpenCL device)" << std::endl;
+        tally.skip();
     } else {
         std::cout << " done" << std::endl;
 
@@ -869,13 +911,20 @@ void runBowlCraterTest(double diameter,
         std::cout << "    Avg difference: " << avg_diff << " W/m^2" << std::endl;
         std::cout << "    Relative error: " << (100.0 * max_diff / avg_flux) << "%" << std::endl;
 
-        if (max_diff < avg_flux * 0.01) {
+        bool gpu_passed = (max_diff < avg_flux * 0.01);
+        if (gpu_passed) {
             std::cout << "  GPU vs CPU validation: PASSED (< 1% relative error)" << std::endl;
         } else {
             std::cout << "  GPU vs CPU validation: FAILED (>= 1% relative error)" << std::endl;
         }
+        tally.record(gpu_passed);
         } catch (const std::exception& e) {
+            // The solver initialized, so a device exists: this is the GPU arm
+            // running and faulting, not an absent device. It is a failure.
             std::cerr << "\n  GPU test error: " << e.what() << std::endl;
+            std::cout << "  GPU vs CPU validation: FAILED (exception during the GPU arm)"
+                      << std::endl;
+            tally.record(false);
         }
     }
 #endif
@@ -898,17 +947,16 @@ int main(int argc, char** argv) {
     int n_rings = 20;
     int n_azimuth = 36;
 
-    // Test at equator (0°)
-    radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings, n_azimuth, 0.0);
+    // Equator, then 70 deg, 80 deg, and 85 deg (near pole).
+    const double latitudes_deg[] = {0.0, 70.0, 80.0, 85.0};
+    const int n_cases =
+        static_cast<int>(sizeof(latitudes_deg) / sizeof(latitudes_deg[0]));
 
-    // Test at 70° latitude
-    radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings, n_azimuth, 70.0);
-
-    // Test at 80° latitude
-    radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings, n_azimuth, 80.0);
-
-    // Test at 85° latitude (near pole)
-    radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings, n_azimuth, 85.0);
+    radiation::test::VerdictTally tally;
+    for (int c = 0; c < n_cases; ++c) {
+        radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings,
+                                           n_azimuth, latitudes_deg[c], tally);
+    }
 
     // Test with different depth/diameter ratios
     std::cout << "\n\n========== Depth/Diameter Ratio Study ==========" << std::endl;
@@ -920,5 +968,33 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "\nTest completed." << std::endl;
+
+    // ---- Verdict -------------------------------------------------------------
+    // Printed on ONE greppable line, and reflected in the exit status. CI greps
+    // for "[test_bowl_crater] PASS".
+    //
+    // The PASS line must not contain the substring "fail" in ANY case. Callers
+    // scan this output for failure words, and one of them
+    // (scripts/ptm_r2_acceptance.py, test C) upper-cases the whole stream before
+    // looking -- so a summary reading "0 failed" would report a green run as a
+    // failure. Say what passed and what skipped; do not name a zero count of
+    // failures.
+    if (tally.checked() < n_cases) {
+        std::cout << "[test_bowl_crater] FAIL: only " << tally.checked()
+                  << " verdicts were recorded across " << n_cases
+                  << " latitudes -- the reciprocity assertion is no longer running,"
+                     " so this program is not testing what it claims." << std::endl;
+        return 1;
+    }
+    if (tally.failed > 0) {
+        std::cout << "[test_bowl_crater] FAIL: " << tally.failed << " of "
+                  << tally.checked() << " verdicts failed (" << tally.passed
+                  << " passed, " << tally.skipped << " skipped, " << n_cases
+                  << " latitudes)." << std::endl;
+        return 1;
+    }
+    std::cout << "[test_bowl_crater] PASS: " << tally.passed << " of "
+              << tally.checked() << " verdicts passed (" << tally.skipped
+              << " skipped, " << n_cases << " latitudes)." << std::endl;
     return 0;
 }
