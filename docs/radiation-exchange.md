@@ -137,8 +137,8 @@ sum is divided by the **total** $m^4$ pair count, not by the survivors. Dividing
 would condition the estimate on detection and inflate the near field.
 
 Before 2026-08-23 this estimator was one-sided (a point emitter at one face's centroid against a
-closed vertex lattice on the other, 45 points at `subdivision_level: 3`) and read $-3.9\%$
-mass-weighted, $-21.7\%$ on edge/vertex-touching pairs, against a Richardson double-area reference
+closed vertex lattice on the other, 45 points at `subdivision_level: 3`) and read $-3.9$%
+mass-weighted, $-21.7$% on edge/vertex-touching pairs, against a Richardson double-area reference
 on `data/meshes/lunar_crater_80N.ply`. `subdivision_level` no longer exists: the replacement key
 counts sub-triangles per edge, not lattice refinements, so the two numbers are not interchangeable.
 
