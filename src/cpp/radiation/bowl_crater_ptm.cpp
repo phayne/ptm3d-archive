@@ -241,6 +241,10 @@ bool shadowed(RTCScene scene, const std::array<double, 3>& c,
 //                     still means the legacy kernel, but it warns, and the CSV
 //                     always records "m2_onesided_legacy" so a probe row can
 //                     never be confused with a production "m2" row.
+//   PTM_BOWL_QUADORDER=<m>                           : radiation.nearfield_quadrature_order
+//                     for the production path (default = the shipped value). With
+//                     PTM_BOWL_NSTHRESH=1e12 every pair goes to M2, so vf_seconds
+//                     then measures the near-field kernel alone.
 //   PTM_BOWL_RESULTS=<path.csv>                       : append one result row (default
 //                     output/bowl_conv/results.csv)
 const char* env_c(const char* k) { return std::getenv(k); }
@@ -386,8 +390,17 @@ int main(int argc, char** argv) {
     const bool no_occ = env_flag("PTM_BOWL_NOOCCLUSION");
     const bool recip = env_flag("PTM_BOWL_RECIP");
     const bool vf_only = env_flag("PTM_BOWL_VFONLY");
-    const std::string kprobe = env_s("PTM_BOWL_KPROBE", "");   // "", m1, m2, refined
+    const std::string kprobe = env_s("PTM_BOWL_KPROBE", "");   // "", m1, m2_legacy, refined
     const std::string results_path = env_s("PTM_BOWL_RESULTS", out_dir + "/results.csv");
+    // Near-field quadrature order for the production path. Default = whatever
+    // RadiationConfig ships, so an unset variable reproduces prior behavior.
+    const int quad_order = env_int("PTM_BOWL_QUADORDER",
+                                   radiation::RadiationConfig{}.nearfield_quadrature_order);
+    if (quad_order < 1 || quad_order > radiation::kMaxNearFieldQuadOrder) {
+        std::cerr << "FATAL: PTM_BOWL_QUADORDER=" << quad_order << " is outside 1.."
+                  << radiation::kMaxNearFieldQuadOrder << "." << std::endl;
+        return 1;
+    }
 
     // CSV header (only if the file does not yet exist).
     {
@@ -436,6 +449,11 @@ int main(int argc, char** argv) {
             cfg.method = radiation::RadiationConfig::ViewFactorMethod::CENTROID;
             cfg.adaptive_neighbors = false;
             cfg.adaptive_ns_threshold = ns_thresh;   // 0 => pure M1; huge => pure M2
+            // Near-field quadrature order. Paired with PTM_BOWL_NSTHRESH=1e12
+            // (every pair goes to M2) this makes vf_seconds a clean measurement
+            // of the near-field kernel alone, which is what the order actually
+            // costs: m^4 evaluations per directed pair.
+            cfg.nearfield_quadrature_order = quad_order;
             cfg.captured_energy_target = 1.0;
 
             radiation::ViewFactorCalculator calc(b.mesh, dev, scene, cfg);
