@@ -396,9 +396,9 @@ int main(int argc, char** argv) {
     // RadiationConfig ships, so an unset variable reproduces prior behavior.
     const int quad_order = env_int("PTM_BOWL_QUADORDER",
                                    radiation::RadiationConfig{}.nearfield_quadrature_order);
-    if (quad_order < 1 || quad_order > radiation::kMaxNearFieldQuadOrder) {
+    if (quad_order < 1 || quad_order > radiation::kMaxConfigNearFieldQuadOrder) {
         std::cerr << "FATAL: PTM_BOWL_QUADORDER=" << quad_order << " is outside 1.."
-                  << radiation::kMaxNearFieldQuadOrder << "." << std::endl;
+                  << radiation::kMaxConfigNearFieldQuadOrder << "." << std::endl;
         return 1;
     }
 

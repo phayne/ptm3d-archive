@@ -1586,6 +1586,12 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     auto end_time = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(end_time - start_time).count();
 
+    // Near-field physical-bound tripwire. Deliberately OUTSIDE the verbose
+    // block: a clamped view factor is an energy-conservation event, and it
+    // prints nothing when it did not fire.
+    reportNearFieldBoundClamps("H-matrix builder",
+                               rad_config_.nearfield_quadrature_order);
+
     if (config_.verbose) {
         std::cout << "  H-matrix build completed in " << elapsed << " seconds" << std::endl;
         std::cout << "  Phase timing breakdown:" << std::endl;
@@ -3955,82 +3961,73 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     return estimated_F;
 }
 
-double HMatrixViewFactor::computeViewFactorRefined(int fi, int fj) const {
-    // F_ij = (1/A_i) * integral_Ai integral_Aj (cos_i cos_j)/(pi r^2) dA_j dA_i,
-    // evaluated by subdividing each triangle into m^2 congruent sub-triangles
-    // and summing over their centroids (the M1 estimator is the m=1 case).
-    const auto& Fi = mesh_->faces[fi];
-    const auto& Fj = mesh_->faces[fj];
-    const auto& a0 = mesh_->vertices[Fi[0]];
-    const auto& a1 = mesh_->vertices[Fi[1]];
-    const auto& a2 = mesh_->vertices[Fi[2]];
-    const auto& b0 = mesh_->vertices[Fj[0]];
-    const auto& b1 = mesh_->vertices[Fj[1]];
-    const auto& b2 = mesh_->vertices[Fj[2]];
-    const auto& n_i = vfNormal(fi);
-    const auto& n_j = vfNormal(fj);
-    const double A_i = face_areas_[fi];
-    const double A_j = face_areas_[fj];
-
-    // Subdivision count from proximity (numerical resolution, not a clamp):
-    // m ~ 2 for adjacent pairs, growing as the pair gets closer.
-    const double d = std::sqrt(A_i) + std::sqrt(A_j);
+int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
+    // The H-matrix raises the quadrature order on pairs that are close relative
+    // to their own size -- m ~ 2 for adjacent pairs, growing as the pair closes
+    // -- and the configured order is the FLOOR under that, not a replacement
+    // for it. Measured on lunar_crater_80N (60 faces, 10,319 near pairs, vs a
+    // Richardson m = 8/16 double-area reference, 2026-08-23):
+    //
+    //   rule                            massW    worst pair   evals/pair
+    //   adaptive only (pre-2026-08-23) +0.734%       -8.33%          142
+    //   fixed m = 3 (sparse path's)    +2.899%      +31.75%           81
+    //   max(3, adaptive)  <- SHIPPED   +0.729%       +7.10%          191
+    //
+    // so pinning this path to the sparse path's fixed order -- the tidy "one
+    // key, one number" unification -- would have been a 4x mass-weighted
+    // accuracy REGRESSION on this builder, and is not what shipped. The key
+    // governs both paths as a floor: raise it and both get finer, and the
+    // H-matrix is never coarser than the sparse builder on the same pair.
+    //
+    // Both inputs are symmetric in (fi, fj), so the order is too.
+    const double d = std::sqrt(face_areas_[fi]) + std::sqrt(face_areas_[fj]);
     auto rv = subtract(face_centers_[fj], face_centers_[fi]);
     const double r0 = std::sqrt(dot(rv, rv));
-    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(4.0 * d / r0)) : 16;
+    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(4.0 * d / r0))
+                         : radiation::kMaxNearFieldQuadOrder;
+    m = std::max(m, rad_config_.nearfield_quadrature_order);
     if (m < 1) m = 1;
-    if (m > 16) m = 16;  // quadrature resolution ceiling (numerical, not physical)
+    // Resolution ceiling: numerical, and also the capacity of the shared
+    // kernel's on-stack sample buffers.
+    if (m > radiation::kMaxNearFieldQuadOrder) m = radiation::kMaxNearFieldQuadOrder;
+    return m;
+}
 
-    // Centroids of the m^2 sub-triangles of a triangle (p0,p1,p2), in
-    // barycentric coordinates over edges e1=p1-p0, e2=p2-p0.
-    auto sub_centroids = [&](const std::array<double, 3>& p0,
-                             const std::array<double, 3>& p1,
-                             const std::array<double, 3>& p2,
-                             std::vector<std::array<double, 3>>& out) {
-        out.clear();
-        out.reserve(static_cast<size_t>(m) * m);
-        const std::array<double, 3> e1 = {{p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}};
-        const std::array<double, 3> e2 = {{p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]}};
-        auto at = [&](double u, double v) {
-            return std::array<double, 3>{{p0[0] + u * e1[0] + v * e2[0],
-                                          p0[1] + u * e1[1] + v * e2[1],
-                                          p0[2] + u * e1[2] + v * e2[2]}};
-        };
-        const double inv3m = 1.0 / (3.0 * m);
-        for (int i = 0; i < m; ++i) {
-            for (int j = 0; j < m - i; ++j) {
-                out.push_back(at((3.0 * i + 1.0) * inv3m, (3.0 * j + 1.0) * inv3m));      // "up"
-                if (j < m - 1 - i) {
-                    out.push_back(at((3.0 * i + 2.0) * inv3m, (3.0 * j + 2.0) * inv3m));  // "down"
-                }
-            }
-        }
-    };
+double HMatrixViewFactor::computeViewFactorRefined(int fi, int fj) const {
+    // Near-field (M2) refinement of the M1 centroid estimate. The estimator is
+    // radiation::nearFieldPairIntegral() in nearfield_quadrature.h -- the SAME
+    // function the sparse builder calls, so the two paths can no longer drift
+    // apart. What this builder still chooses for itself is the order (above)
+    // and the occlusion ray (the callers batch theirs through Embree).
+    //
+    // What the shared kernel adds here, which the local copy did not have:
+    //
+    //  * the physical bound A_i F_ij <= min(A_i, A_j), with a counted, printed
+    //    tripwire. The local copy was UNBOUNDED, and this quadrature diverges
+    //    on a closing concave crease: measured on two unit triangles sharing an
+    //    edge, this builder's own adaptive order read F_ij = 4.59 at a 10
+    //    degree dihedral and 16.75 at 5 degrees, against references 0.84 and
+    //    0.93. Fabricated energy, which the downstream row-sum renormalization
+    //    would have absorbed silently by zeroing the face's sky view factor.
+    //  * bit-exact reciprocity. The pair is passed in canonical (min, max)
+    //    index order, so A_i F_ij and A_j F_ji come from the same summation in
+    //    the same sequence. The local copy summed in row-major order over face
+    //    i's samples, which is not the same sequence when the pair is asked the
+    //    other way round.
+    //  * the 1e-6 grazing cut, matching M1 and the sparse builder. The local
+    //    copy cut at exactly 0.
+    const int fa = std::min(fi, fj);
+    const int fb = std::max(fi, fj);
+    const auto& tri_a = mesh_->faces[fa];
+    const auto& tri_b = mesh_->faces[fb];
 
-    std::vector<std::array<double, 3>> si, sj;
-    sub_centroids(a0, a1, a2, si);
-    sub_centroids(b0, b1, b2, sj);
-    if (si.empty() || sj.empty()) return 0.0;  // m>=1 makes this unreachable
+    const double g = radiation::nearFieldPairIntegral(
+        mesh_->vertices[tri_a[0]], mesh_->vertices[tri_a[1]], mesh_->vertices[tri_a[2]],
+        mesh_->vertices[tri_b[0]], mesh_->vertices[tri_b[1]], mesh_->vertices[tri_b[2]],
+        vfNormal(fa), vfNormal(fb),
+        face_areas_[fa], face_areas_[fb], refinedQuadratureOrder(fi, fj));
 
-    const double wi = A_i / static_cast<double>(si.size());  // equal sub-triangle areas
-    const double wj = A_j / static_cast<double>(sj.size());
-
-    double sum = 0.0;
-    for (const auto& p : si) {
-        for (const auto& q : sj) {
-            const std::array<double, 3> rvec = {{q[0] - p[0], q[1] - p[1], q[2] - p[2]}};
-            const double r2 = dot(rvec, rvec);
-            if (r2 < 1e-18) continue;
-            const double rinv = 1.0 / std::sqrt(r2);
-            const std::array<double, 3> rh = {{rvec[0] * rinv, rvec[1] * rinv, rvec[2] * rinv}};
-            const double ci = dot(n_i, rh);
-            const double cj = -dot(n_j, rh);
-            if (ci > 0.0 && cj > 0.0) {
-                sum += (ci * cj) / (M_PI * r2) * wi * wj;
-            }
-        }
-    }
-    return sum / A_i;
+    return g / face_areas_[fi];
 }
 
 bool HMatrixViewFactor::isVisible(const std::array<double, 3>& p1,

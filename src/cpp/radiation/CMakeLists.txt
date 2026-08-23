@@ -3,6 +3,7 @@
 
 add_library(radiation STATIC
     view_factor.cpp
+    nearfield_quadrature.cpp
     radiation_exchange.cpp
     face_selection.cpp
     hmatrix_view_factor.cpp

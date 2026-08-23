@@ -812,9 +812,9 @@ int main(int argc, char** argv) {
             char* end = nullptr;
             const long v = std::strtol(argv[++i], &end, 10);
             if (end == argv[i] || *end != '\0' || v < 1 ||
-                v > radiation::kMaxNearFieldQuadOrder) {
+                v > radiation::kMaxConfigNearFieldQuadOrder) {
                 std::cerr << "--quad-order expects an integer 1.."
-                          << radiation::kMaxNearFieldQuadOrder << ", got '" << argv[i]
+                          << radiation::kMaxConfigNearFieldQuadOrder << ", got '" << argv[i]
                           << "'\n";
                 return 2;
             }

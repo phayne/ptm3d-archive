@@ -145,6 +145,40 @@ counts sub-triangles per edge, not lattice refinements, so the two numbers are n
 The switch between M1 and M2 is `adaptive_ns_threshold` (default 5.0); `method` may also be pinned
 to `CENTROID` or `SUBDIVISION`.
 
+**One kernel, two builders.** Since 2026-08-23 the M2 integral above lives in exactly one place,
+`src/cpp/radiation/nearfield_quadrature.h`, and both in-engine view-factor builders call it. Before
+that the H-matrix builder carried a private copy which was already double-area but had **no
+physical bound**: on a closing concave crease this quadrature diverges, and its copy read
+$F_{ij} = 4.59$ at a $10°$ dihedral and $16.75$ at $5°$ against references $0.84$ and $0.93$ —
+fabricated energy that the downstream row-sum renormalization would have absorbed by zeroing that
+face's sky view factor. The shared kernel clamps at $A_i F_{ij} \le \min(A_i, A_j)$, which is a
+conservation bound and not a tuning parameter, counts every clamp, and prints a tripwire on stderr
+naming the builder that fired it.
+
+The two builders reach the ORDER differently, and `nearfield_quadrature_order` governs both:
+
+| builder | order on a pair |
+|---|---|
+| sparse (`view_factor.cpp`) | exactly `nearfield_quadrature_order` |
+| H-matrix (`hmatrix_view_factor.cpp`) | `nearfield_quadrature_order` raised to $\lceil 4d/r \rceil$ where that is larger, capped at 16, with $d = \sqrt{A_i} + \sqrt{A_j}$ |
+
+so the configured value is the ORDER on one path and a FLOOR on the other: raising it refines both,
+and the H-matrix is never coarser than the sparse builder on the same pair. Pinning the H-matrix to
+the sparse builder's fixed order — the tidier unification — was measured and **rejected**. Against a
+Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces, 10,319 near pairs,
+2026-08-23):
+
+| H-matrix order rule | mass-weighted error | worst pair | kernel evaluations/pair |
+|---|---|---|---|
+| adaptive only (pre-2026-08-23) | $+0.734$ percent | $-8.33$ percent | 142 |
+| fixed $m = 3$ (the sparse rule) | $+2.899$ percent | $+31.75$ percent | 81 |
+| $\max(3, \text{adaptive})$ — shipped | $+0.729$ percent | $+7.10$ percent | 191 |
+
+The near/far SWITCH is still not unified — sparse uses $N_s \le 5$, the H-matrix uses
+$r < 4(\sqrt{A_i} + \sqrt{A_j})$, a wider window. That difference, the caller-level grazing culls
+($10^{-6}$ against $0.01$ on the centroid cosines) and the neighbor-selection rule are the remaining
+declared differences between the two paths; arm `[H4]` of `test_vf_production` bounds what they cost.
+
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
 cosine-weighted hemispherical rays and count first hits, giving $F_{ij} \approx \text{hits}_j/N$.
 The result is a sparse CSR matrix with row sums $\le 1$ by construction, and it plugs into the
@@ -896,7 +930,7 @@ warns.
 | `max_neighbors` | 500 | Ceiling on partners per face |
 | `min_neighbors` | 20 | Floor on partners per face |
 | `use_cluster_cull` | true | Conservative cluster-level back-face pre-cull |
-| `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8 |
+| `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8. The exact order on the sparse builder, a FLOOR on the H-matrix builder |
 | `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
 | `rms_slope_deg` | 0.0 | Smith beamed emission; 0 = Lambertian |

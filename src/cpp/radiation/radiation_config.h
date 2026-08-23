@@ -5,12 +5,32 @@
 
 namespace radiation {
 
-// Near-field (M2) quadrature ceiling. Order m puts m^2 sample points on a face,
-// so an unordered pair costs m^4 kernel evaluations. The ceiling exists so the
-// sample buffers can live on the stack and stay thread-safe without a per-call
-// allocation; it lives next to nearfield_quadrature_order below because it is
-// the bound on that field.
-constexpr int kMaxNearFieldQuadOrder = 8;
+// Near-field (M2) quadrature ceilings. Order m puts m^2 sample points on a
+// face, so an unordered pair costs m^4 kernel evaluations.
+//
+// TWO ceilings, because the two builders reach the order differently:
+//
+//   kMaxNearFieldQuadOrder      what the KERNEL can hold. It sizes the on-stack
+//                               sample buffers (SubCentroidSamples, ~6 kB each
+//                               at 16, two per pair), so it must cover the
+//                               HIGHEST order any caller can ask for. The
+//                               H-matrix builder raises its own order
+//                               adaptively on very close pairs, historically as
+//                               far as 16, and lowering that ceiling to 8 was
+//                               measured to cost it: mass-weighted near-field
+//                               error +0.73% -> +1.20%, worst pair -8.3% ->
+//                               +12.4% on lunar_crater_80N (2026-08-23). So it
+//                               is 16, and the H-matrix keeps its reach.
+//
+//   kMaxConfigNearFieldQuadOrder what a CONFIG FILE may ask for. Deliberately
+//                               narrower: nearfield_quadrature_order is a
+//                               fixed order on the sparse path, and m = 16
+//                               there is 65,536 kernel evaluations per pair on
+//                               EVERY near pair -- a foot-gun, not a setting.
+//                               ptm_thermal_sim rejects anything above this at
+//                               startup (FATAL, not clamped).
+constexpr int kMaxNearFieldQuadOrder = 16;
+constexpr int kMaxConfigNearFieldQuadOrder = 8;
 constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQuadOrder;
 
 // Configuration for radiation exchange computation
@@ -83,11 +103,19 @@ struct RadiationConfig {
     // identity. Default 3 (9 points/face, 81 evaluations/pair) reads +0.32%
     // mass-weighted against a Richardson double-area reference on
     // lunar_crater_80N.ply; m = 2 reads +0.30% for 16 evaluations/pair and is
-    // the fast option. Valid range 1..kMaxNearFieldQuadOrder (view_factor.h);
-    // an out-of-range value is FATAL at configuration time, not clamped.
+    // the fast option. Valid range 1..kMaxConfigNearFieldQuadOrder above; an
+    // out-of-range value is FATAL at configuration time, not clamped.
     // Replaced the pre-2026-08-23 `subdivision_level`, a one-sided rule with a
     // DIFFERENT meaning (2^level per edge, 45 lattice points at level 3) --
     // carrying the old value forward would silently change the physics.
+    //
+    // It governs BOTH view-factor builders, but not identically -- see
+    // nearfield_quadrature.h. Sparse (view_factor.cpp): this IS the order.
+    // H-matrix (hmatrix_view_factor.cpp): this is the FLOOR under an order the
+    // builder raises adaptively on close pairs, m = clamp(max(this,
+    // ceil(4 d / r)), 1, kMaxNearFieldQuadOrder). Raising the key raises the
+    // resolution on both; the H-matrix is never coarser than the sparse path,
+    // and on the tightest pairs it is finer.
     int nearfield_quadrature_order = 3;
     double adaptive_ns_threshold = 5.0;  // Ns threshold: use M2 when r/sqrt(A) < 5
 
