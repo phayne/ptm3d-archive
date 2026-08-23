@@ -80,8 +80,10 @@ global mean `A_eff` by 0.0001 and the global mean `T_max` by 0.002 K, but moved
 individual faces by up to 15 K.) A stale local copy therefore produces plausible,
 wrong results indefinitely.
 
-The engine now checks registration spatially when it loads a lunar map, on both
-the CPU and GPU thermal paths, and reports:
+The engine checks registration spatially at **every** site that loads a per-face
+albedo map — the CPU absorbed-flux path, the GPU persistent thermal path, and the
+radiation-coupling load that feeds the two-band radiosity source albedo — and
+reports:
 
 ```
 [albedo] Lunar map registration check: maria 0.0807 < highlands 0.1597 (contrast 0.0790, ...) -- OK
@@ -98,6 +100,36 @@ longitude roll from a latitude flip; for that, run
 `scripts/verify_moon_albedo_registration.py`, which scores the map against the
 source FITS under all four candidate transforms and names the axis. Regression
 gate: `build/bin/test_albedo_registration_check`.
+
+Each of the three sites checks independently rather than trusting that an earlier
+one ran: a config can reach the radiation-coupling load on a path the
+absorbed-flux check never sees. The per-location depth-profile export — often the
+only product a study actually reads — is covered without a fourth copy, because it
+no longer resolves an albedo of its own: it composes absorbed flux through the
+shared `AbsorbedFluxComposer`, and the check runs inside `build()`.
+
+### Checking a local copy for staleness
+
+The engine's guard fires only once a run reaches a map. To audit a checkout up
+front:
+
+```bash
+python3 scripts/fetch_data.py --dataset albedo-maps --verify   # exit 1 if stale
+python3 scripts/verify_moon_albedo_registration.py \
+    --bins-dir data/albedo_maps --topo-dir data/topo/moon --geographic
+```
+
+`--verify` re-hashes the downloaded archive **and every file it was unpacked to**.
+That second half matters: the `.unpacked` marker records only that an unpack once
+happened, so before this check a tree whose marker matched the manifest could
+still hold the old 180°-rolled bins and pass verification cleanly. That is
+precisely how PTM-34 survived a corrected archive — the archive was right, the
+loader was right, and nothing compared them to the bytes on disk.
+
+The `--geographic` mode of the verify script needs no FITS and is the cheapest
+independent detector: the nearside is mare-dominated and must read **darker** than
+the farside. Correct maps give nearside ≈ 0.1165 vs farside ≈ 0.1511 (res6);
+180°-rolled maps give exactly the inverse.
 
 ## License
 

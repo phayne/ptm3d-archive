@@ -12,7 +12,7 @@ Usage (from the repository root):
     python3 scripts/fetch_data.py --list             # show the catalog
     python3 scripts/fetch_data.py --core             # every tier="core" dataset (~1.7 GB)
     python3 scripts/fetch_data.py --dataset moon-topo --dataset albedo-maps
-    python3 scripts/fetch_data.py --verify           # re-hash everything present
+    python3 scripts/fetch_data.py --verify --core    # re-hash archives AND unpacked files
 
 Destination: --dest, else $PTM_DATA_ROOT, else <repo>/data. Downloaded
 archives are kept under <dest>/_downloads/ (so re-runs are cheap) and unpacked
@@ -23,6 +23,7 @@ point --base-url at a staging copy (https://... or file:///...) to test.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -69,8 +70,10 @@ def safe_members(tf, dest):
         yield m
 
 
-def fetch_dataset(name, ds, root, base_url, verify_full):
+def fetch_dataset(name, ds, root, base_url, verify_full, unverifiable=None):
     print(f"\n=== {name} ({ds.get('tier', 'core')}): {ds.get('description', '')}")
+    if unverifiable is None:
+        unverifiable = []
     ok = True
     for fe in ds["files"]:
         fname = fe["name"]
@@ -91,9 +94,20 @@ def fetch_dataset(name, ds, root, base_url, verify_full):
             if os.path.exists(marker) and open(marker).read().strip() == fe["sha256"]:
                 if os.path.isdir(target_dir) and os.listdir(target_dir):
                     print(f"  {fname}: already unpacked into {target_dir} — skipping")
-                    if verify_full and os.path.exists(tarball):
-                        if not verify_download(tarball, fe):
+                    if verify_full:
+                        archive_ok = True
+                        if os.path.exists(tarball):
+                            archive_ok = verify_download(tarball, fe)
+                            if not archive_ok:
+                                ok = False
+                        # A matching marker only means an unpack happened once. Verify
+                        # what is actually on disk now, or a stale tree passes silently.
+                        status = report_unpacked(name, fname, tarball, target_dir,
+                                                 archive_ok)
+                        if status == "stale":
                             ok = False
+                        elif status == "unknown":
+                            unverifiable.append(f"{name}/{fname}")
                     continue
             print(f"  [{fname}] <- {url}")
             if not download(url, tarball, fe["sha256"]):
@@ -128,6 +142,101 @@ def verify_download(path, fe):
     return good
 
 
+def _stream_sha256(fh):
+    """sha256 of an open file object (sha256_of's counterpart for a stream)."""
+    h = hashlib.sha256()
+    for chunk in iter(lambda: fh.read(1 << 20), b""):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_unpacked(tarball, target_dir):
+    """Verify the files ON DISK still match the archive they came from.
+
+    The `.unpacked` marker records only that an unpack once HAPPENED with a given
+    archive checksum. It says nothing about the files afterwards, so a tree whose
+    marker matches the manifest can still hold stale or hand-edited data. That is
+    not hypothetical: it is exactly how the PTM-34 lunar albedo misregistration
+    survived a corrected archive for months -- the archive was right, the loader
+    was right, and every check that existed passed while the bins on disk were the
+    old 180-degree-rolled ones. Checking the archive alone cannot see that.
+
+    Returns (ok, n_checked, mismatched, missing). Raises OSError/tarfile.TarError
+    if the archive itself cannot be read; the caller decides how to report that
+    (it means "cannot tell", not "clean").
+    """
+    mismatched, missing, n = [], [], 0
+    with tarfile.open(tarball, "r:gz") as tf:
+        # Iterate SEQUENTIALLY (`for m in tf`, not getmembers() + random access):
+        # seeking backwards in a gzip stream re-decompresses from the start, so
+        # random member access costs one full pass per member. Forward-only access
+        # keeps the whole verification to a single pass over the archive.
+        for m in tf:
+            if not m.isfile():
+                continue
+            n += 1
+            on_disk = os.path.join(target_dir, m.name)
+            if not os.path.exists(on_disk):
+                missing.append(m.name)
+                continue
+            if os.path.getsize(on_disk) != m.size:
+                mismatched.append(m.name)
+                continue
+            src = tf.extractfile(m)
+            if src is None:
+                continue
+            if _stream_sha256(src) != sha256_of(on_disk):
+                mismatched.append(m.name)
+    return (not mismatched and not missing), n, mismatched, missing
+
+
+def report_unpacked(dataset, fname, tarball, target_dir, archive_ok):
+    """Verify unpacked content and say so loudly in every case.
+
+    Returns "ok" | "stale" | "unknown". "unknown" means the check could not be
+    made at all -- never conflate that with a pass, but do not report it as a
+    corrupt data tree either, because the user's files may be perfectly fine.
+    """
+    def remedy(*paths):
+        return (f"\n      rm -f {' '.join(repr(p) for p in paths)} && "
+                f"python3 scripts/fetch_data.py --dataset {dataset}")
+
+    def unknown(reason, *paths):
+        print(f"  {fname}: unpacked content NOT VERIFIED — {reason}{remedy(*paths)}")
+        return "unknown"
+
+    if not os.path.exists(tarball):
+        return unknown(
+            f"the archive is no longer in _downloads/ (cache reclaimed?), so "
+            f"{target_dir} cannot be checked against it. To audit it, re-fetch "
+            f"the archive:", f"{tarball}.unpacked")
+    if not archive_ok:
+        # The archive already failed its own sha256. Comparing files against it
+        # would name the user's (possibly good) data as the culprit.
+        return unknown(
+            "the archive in _downloads/ is itself corrupt, so it is not a valid "
+            "reference. Re-download it:", tarball, f"{tarball}.unpacked")
+    try:
+        ok, n, mismatched, missing = verify_unpacked(tarball, target_dir)
+    except (OSError, tarfile.TarError) as e:
+        return unknown(
+            f"cannot read the archive ({e.__class__.__name__}: {e}). Re-download it:",
+            tarball, f"{tarball}.unpacked")
+    if ok:
+        print(f"  {fname}: unpacked content OK ({n} files match the archive)")
+        return "ok"
+    bad = mismatched + missing
+    print(f"  {fname}: unpacked content MISMATCH in {target_dir} — "
+          f"{len(mismatched)} differ, {len(missing)} missing, of {n} files.")
+    for nm in bad[:12]:
+        print(f"      {nm}")
+    if len(bad) > 12:
+        print(f"      ... and {len(bad) - 12} more")
+    print(f"  These files are STALE or locally modified. Re-fetch with:"
+          f"{remedy(f'{tarball}.unpacked')}")
+    return "stale"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--manifest", default=os.path.join(REPO_ROOT, "data", "data_manifest.json"))
@@ -138,7 +247,8 @@ def main():
     ap.add_argument("--base-url", default=None,
                     help="override the manifest base URL (staging: https://... or file:///...)")
     ap.add_argument("--verify", action="store_true",
-                    help="fully re-hash files that are already present")
+                    help="re-hash the downloaded archives AND the files they were "
+                         "unpacked to, catching a stale or locally modified data tree")
     args = ap.parse_args()
 
     m = load_manifest(args.manifest)
@@ -167,12 +277,20 @@ def main():
     print(f"Data root: {root}")
 
     all_ok = True
+    unverifiable = []
     for name in selected:
-        all_ok = fetch_dataset(name, datasets[name], root, base_url, args.verify) and all_ok
+        all_ok = fetch_dataset(name, datasets[name], root, base_url, args.verify,
+                               unverifiable) and all_ok
 
     if not all_ok:
         print("\nOne or more datasets FAILED — see above.")
         return 1
+    if unverifiable:
+        # Not a failure, but not a clean bill of health either -- say which.
+        print(f"\nAll selected datasets present. NOTE: the unpacked content of "
+              f"{len(unverifiable)} could not be checked "
+              f"({', '.join(unverifiable)}) — see above.")
+        return 0
     print("\nAll selected datasets present and verified.")
     return 0
 

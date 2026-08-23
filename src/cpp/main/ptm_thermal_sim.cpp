@@ -17652,8 +17652,16 @@ int main(int argc, char** argv) {
             // Reused below by the physics-mode selector (ΔT/ΔF).
             std::vector<double> face_albedos_rad(num_faces, planet.albedo);
             {
+                // Normalize to the "Moon"/"Europa" title case the map files actually
+                // use. Uppercasing only the FIRST character left an all-caps config
+                // value ("MOON") intact, producing "MOON_Albedo_res5.bin" -- which
+                // resolves on a case-insensitive filesystem (macOS APFS) and fails on a
+                // case-sensitive one (Linux), where this path then fell back silently to
+                // the uniform planet.albedo. Same normalization as the other load sites.
                 std::string body_name_rad = thermal_config.getProperty("target_body_name");
-                if (!body_name_rad.empty() && std::islower(body_name_rad[0])) {
+                std::transform(body_name_rad.begin(), body_name_rad.end(),
+                               body_name_rad.begin(), ::tolower);
+                if (!body_name_rad.empty()) {
                     body_name_rad[0] = std::toupper(body_name_rad[0]);
                 }
                 int mesh_res_rad = 5;
@@ -17677,13 +17685,87 @@ int main(int argc, char** argv) {
                     "data/albedo_maps/" + albedo_filename
                 };
 
+                std::string albedo_source_rad;
                 for (const auto& apath : albedo_search_paths) {
                     auto loaded = importAlbedoMapFromFile(apath);
                     if (!loaded.empty() && loaded.size() == num_faces) {
                         face_albedos_rad = std::move(loaded);
+                        albedo_source_rad = apath;
                         std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
                         break;
                     }
+                }
+
+                // Never substitute silently: if no per-face map resolved, this path is
+                // running the two-band radiosity on a UNIFORM albedo while the absorbed
+                // flux above may be using a per-face map, and nothing else says so.
+                //
+                // Scoped so it cannot cry wolf on configurations where "no map" is the
+                // intended state: a generic body has no published map, a custom/regional
+                // DEM mesh can never match a global icosphere bin's face count, and
+                // use_albedo_map:false is an explicit request for a uniform albedo.
+                // Mirrors the GPU path's gate (see the albedo_map_disabled branches).
+                const bool rad_albedo_map_disabled =
+                    (thermal_config.getProperty("use_albedo_map") == "0");
+                bool rad_is_custom_mesh = false;
+                {
+                    auto it = thermal_config.custom_properties.find("is_custom_mesh");
+                    if (it != thermal_config.custom_properties.end()) {
+                        rad_is_custom_mesh = (it->second == "1" || it->second == "true");
+                    }
+                }
+                const bool rad_map_expected =
+                    !rad_albedo_map_disabled && !rad_is_custom_mesh &&
+                    !body_name_rad.empty() &&
+                    thermal_config.getProperty("using_generic_body") != "true";
+
+                // Format albedo explicitly: std::cout is left in `fixed` with
+                // precision 1 at this point in the run, which renders 0.12 as "0.1"
+                // and has already been mistaken for a real albedo bug once.
+                auto fmt_albedo = [](double a) {
+                    std::ostringstream os;
+                    os << std::fixed << std::setprecision(4) << a;
+                    return os.str();
+                };
+
+                if (albedo_source_rad.empty() && rad_map_expected) {
+                    std::cout << "  WARNING: no per-face albedo map found for "
+                              << body_name_rad << " res" << mesh_res_rad
+                              << " (searched " << albedo_search_paths.front()
+                              << " and the two repo-relative fallbacks). Radiation"
+                                 " coupling is using the UNIFORM body albedo "
+                              << fmt_albedo(planet.albedo) << " instead." << std::endl;
+                }
+
+                // The reverse divergence, and the more dangerous one: the thermal
+                // surface BC honors use_albedo_map, this radiation-coupling load never
+                // has. With use_albedo_map:false the BC runs a uniform albedo while the
+                // two-band radiosity source albedo is per-face off the map -- two
+                // different albedo fields in one run. Behavior is left AS IS here (that
+                // is a physics decision, not a disclosure one), but it is no longer
+                // silent. See BUGS.md.
+                if (!albedo_source_rad.empty() && rad_albedo_map_disabled) {
+                    std::cout << "  WARNING: use_albedo_map is FALSE, so the thermal"
+                                 " surface boundary condition is using the uniform albedo "
+                              << fmt_albedo(planet.albedo) << ", but radiation coupling has loaded the"
+                                 " per-face map " << albedo_source_rad
+                              << " anyway. The two-band radiosity source albedo and the"
+                                 " absorbed-flux albedo are therefore DIFFERENT fields in"
+                                 " this run." << std::endl;
+                }
+
+                // PTM-34 tripwire (radiation-coupling path). See the CPU absorbed-flux
+                // copy for the rationale. This load is a SEPARATE read of the same map
+                // that feeds the two-band radiosity source albedo, and a run can reach
+                // it on a config the absorbed-flux tripwire never sees, so it needs its
+                // own check rather than relying on the earlier one having fired.
+                // Gated on a map actually having loaded: without one, face_albedos_rad
+                // is the uniform planet.albedo and zero contrast is by construction.
+                if (!albedo_source_rad.empty()) {
+                    ptm::checkAlbedoMapRegistration(body_name_rad, mesh->latitudes,
+                                                    mesh->longitudes, face_albedos_rad,
+                                                    "radiation-coupling albedo map (" +
+                                                        albedo_source_rad + ")");
                 }
             }
 
