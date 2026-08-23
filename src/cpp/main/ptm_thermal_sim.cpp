@@ -13439,6 +13439,7 @@ int main(int argc, char** argv) {
     int rad_min_neighbors = 20;                  // Minimum neighbors per face
     int rad_max_neighbors_override = -1;         // -1 = use adaptive, >0 = fixed override
     bool rad_use_cluster_cull = true;            // Conservative octree cluster-pair cull before ranking
+    int rad_nearfield_quadrature_order = 3;      // M2 symmetric double-area quadrature order (sparse builder)
     bool rad_force_hmatrix = false;              // Bypass historical H-matrix auto-disable (vestigial)
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
@@ -13480,6 +13481,25 @@ int main(int argc, char** argv) {
     rad_max_neighbors = sim_config.radiation.max_neighbors;
     rad_min_neighbors = sim_config.radiation.min_neighbors;
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
+    rad_nearfield_quadrature_order = sim_config.radiation.nearfield_quadrature_order;
+    if (rad_nearfield_quadrature_order < 1 ||
+        rad_nearfield_quadrature_order > radiation::kMaxNearFieldQuadOrder) {
+        std::cerr << "\nFATAL: radiation.nearfield_quadrature_order = "
+                  << rad_nearfield_quadrature_order << " is out of range. It is the order m of "
+                  << "the near-field\n       double-area quadrature (m^2 sample points per face, "
+                  << "m^4 kernel evaluations per\n       pair) and must be between 1 and "
+                  << radiation::kMaxNearFieldQuadOrder
+                  << ". The production default is 3.\n" << std::endl;
+        std::exit(1);
+    }
+    if (rad_nearfield_quadrature_order == 1) {
+        std::cout << "[config] WARNING: radiation.nearfield_quadrature_order = 1 puts ONE "
+                     "sample at each\n         face centroid, which is exactly the M1 "
+                     "centroid estimator -- the near field\n         gets no special "
+                     "treatment at all. On the touching-pair closed form it reads\n"
+                     "         +51.7% (order 3 reads +18.5%). This is a diagnostic setting, "
+                     "not a\n         production one." << std::endl;
+    }
     rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
     rad_rms_slope_deg = sim_config.radiation.rms_slope_deg;
@@ -15265,6 +15285,7 @@ int main(int argc, char** argv) {
             early_rad_config.max_neighbors = rad_max_neighbors;
             early_rad_config.min_neighbors = rad_min_neighbors;
             early_rad_config.use_cluster_cull = rad_use_cluster_cull;
+            early_rad_config.nearfield_quadrature_order = rad_nearfield_quadrature_order;
             early_rad_config.force_hmatrix = rad_force_hmatrix;
             early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
@@ -17575,6 +17596,7 @@ int main(int argc, char** argv) {
             rad_config.max_neighbors = rad_max_neighbors;
             rad_config.min_neighbors = rad_min_neighbors;
             rad_config.use_cluster_cull = rad_use_cluster_cull;
+            rad_config.nearfield_quadrature_order = rad_nearfield_quadrature_order;
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;

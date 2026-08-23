@@ -111,6 +111,16 @@ private:
                                       // so CSRs with > 2^31 nnz do not overflow
 };
 
+// Sample points for one face at a given near-field quadrature order; capacity
+// is kMaxNearFieldQuadPoints (radiation_config.h). Deliberately NOT
+// value-initialized: two of these are stack-constructed per near pair and only
+// p[0 .. count) is ever read, so zeroing the tail would memset ~3 kB per call
+// for nothing.
+struct SubCentroidSamples {
+    int count = 0;
+    std::array<std::array<double, 3>, kMaxNearFieldQuadPoints> p;
+};
+
 // View factor calculator using Embree for visibility
 class ViewFactorCalculator {
 public:
@@ -137,6 +147,10 @@ public:
     // Compute sky view factor for a face (1 - sum of terrain view factors)
     double computeSkyViewFactor(int face_idx);
 
+    // Report (and reset) the near-field physical-bound tripwire. Called at the
+    // end of every matrix assembly; prints nothing when it did not fire.
+    void reportNearFieldBoundClamps();
+
     // Get precomputed face data
     const std::vector<std::array<double, 3>>& getFaceCenters() const { return face_centers_; }
     const std::vector<std::array<double, 3>>& getFaceNormals() const { return face_normals_; }
@@ -145,7 +159,7 @@ public:
 private:
     // View factor methods
     double computeCentroid(int face_i, int face_j);
-    double computeSubdivision(int face_i, int face_j, int level);
+    double computeSubdivision(int face_i, int face_j, int order);
     double computeAdaptive(int face_i, int face_j);
 
     // View factor computation using precomputed geometry (avoids redundant calculations)
@@ -202,10 +216,10 @@ private:
     static double length(const std::array<double, 3>& v);
     static std::array<double, 3> normalize(const std::array<double, 3>& v);
 
-    // Subdivision sampling points on a triangle
-    void getSubdivisionPoints(int face_idx, int level,
-                              std::vector<std::array<double, 3>>& points,
-                              std::vector<double>& weights);
+    // Equal-area sub-triangle centroids on a triangle (m^2 points at order m).
+    // Open rule: no sample sits on an edge or a vertex, which is what makes the
+    // near-field quadrature usable on edge-touching pairs.
+    void getSubCentroidPoints(int face_idx, int order, SubCentroidSamples& out) const;
 
     // Data members
     std::shared_ptr<ptm::Mesh> mesh_;

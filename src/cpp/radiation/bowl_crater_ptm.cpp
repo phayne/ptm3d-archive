@@ -231,9 +231,16 @@ bool shadowed(RTCScene scene, const std::array<double, 3>& c,
 //                     (assume-all-visible; ideal for a fully-concave bowl)
 //   PTM_BOWL_RECIP=1                                 : symmetrize A_i F_ij = A_j F_ji
 //   PTM_BOWL_VFONLY=1                                : F_sky stats only, skip beta sweep + npy
-//   PTM_BOWL_KPROBE=m1|m2|refined                    : compute floor F_sky directly from
+//   PTM_BOWL_KPROBE=m1|m2_legacy|refined             : compute floor F_sky directly from
 //                     geometry with a chosen kernel + identical occlusion (bypasses
-//                     ViewFactorCalculator) so the KERNEL is isolated cleanly
+//                     ViewFactorCalculator) so the KERNEL is isolated cleanly.
+//                     ⚠ "m2_legacy" is the RETIRED one-sided (receiver-only)
+//                     subdivision rule. Production's near-field M2 has been the
+//                     symmetric double-area quadrature since 2026-08-23, which
+//                     here is "refined". The spelling "m2" is still accepted and
+//                     still means the legacy kernel, but it warns, and the CSV
+//                     always records "m2_onesided_legacy" so a probe row can
+//                     never be confused with a production "m2" row.
 //   PTM_BOWL_RESULTS=<path.csv>                       : append one result row (default
 //                     output/bowl_conv/results.csv)
 const char* env_c(const char* k) { return std::getenv(k); }
@@ -292,9 +299,16 @@ void tri_subcentroids(const std::array<double, 3>& p0, const std::array<double, 
 }
 
 // Harness-local view-factor kernels (double precision), used by the KPROBE mode
-// so the KERNEL can be isolated with identical occlusion/pair-set. These mirror
-// the production formulas exactly (M1 centroid, M2 receiver-only subdivision,
-// refined area-to-area double quadrature).
+// so the KERNEL can be isolated with identical occlusion/pair-set.
+//   vf_m1        mirrors production M1 (centroid) exactly.
+//   vf_refined   mirrors production near-field M2 as of 2026-08-23 (symmetric
+//                double-area sub-centroid quadrature) up to the sub-centroid
+//                COUNT: production takes m from radiation.nearfield_quadrature_
+//                order (default 3), this harness picks m adaptively from
+//                proximity, as HMatrixViewFactor::computeViewFactorRefined does.
+//   vf_m2_legacy_onesided  is the RETIRED receiver-only rule. It no longer
+//                exists anywhere in production; it is kept so the pre-fix
+//                near field can still be reproduced for attribution.
 double vf_m1(const std::array<double, 3>& ci, const std::array<double, 3>& ni,
              const std::array<double, 3>& cj, const std::array<double, 3>& nj, double Aj) {
     std::array<double, 3> rv = {{cj[0] - ci[0], cj[1] - ci[1], cj[2] - ci[2]}};
@@ -306,8 +320,11 @@ double vf_m1(const std::array<double, 3>& ci, const std::array<double, 3>& ni,
     if (cos_i < 1e-6 || cos_j < 1e-6) return 0.0;
     return (Aj / M_PI) * cos_i * cos_j / r2;
 }
-// M2: source = centroid of i, integrate over subdivided receiver j.
-double vf_m2(const std::array<double, 3>& ci, const std::array<double, 3>& ni,
+// RETIRED M2: source = point at the centroid of i, integrate over subdivided
+// receiver j. Removed from production 2026-08-23 (view_factor.cpp) -- it read
+// -21.7% mass-weighted on edge/vertex-touching pairs. Kept here for attribution
+// only; do not reintroduce it as "M2".
+double vf_m2_legacy_onesided(const std::array<double, 3>& ci, const std::array<double, 3>& ni,
              const std::array<double, 3>& nj, double Aj,
              const std::vector<std::array<double, 3>>& sub_j) {
     double s = 0.0; int n = 0;
@@ -439,7 +456,23 @@ int main(int argc, char** argv) {
         } else {
             // ---- kernel-probe path: floor F_sky directly from geometry, with a
             //      chosen kernel + identical occlusion (isolates the kernel). ----
-            kernel_label = kprobe;
+            // The CSV `kernel` column must never carry a name that also means
+            // something else in the production path. Production writes "m2" for
+            // the SYMMETRIC double-area rule; the probe's "m2" is the retired
+            // one-sided kernel, so it is recorded under its own name.
+            if (kprobe == "m2" || kprobe == "m2_legacy") {
+                if (kprobe == "m2") {
+                    std::cerr << "[bowl] WARNING: PTM_BOWL_KPROBE=m2 selects the RETIRED "
+                                 "one-sided near-field kernel, which production dropped on "
+                                 "2026-08-23. Production's near-field M2 is now the "
+                                 "symmetric double-area rule -- that is PTM_BOWL_KPROBE="
+                                 "refined. Recording this row as m2_onesided_legacy."
+                              << std::endl;
+                }
+                kernel_label = "m2_onesided_legacy";
+            } else {
+                kernel_label = kprobe;
+            }
             std::vector<int> floor_idx;
             for (size_t i = 0; i < nf; ++i) if (b.mask[i] == 1) floor_idx.push_back(int(i));
             fsky_face.assign(floor_idx.size(), 0.0);
@@ -460,8 +493,8 @@ int main(int argc, char** argv) {
                 m = std::max(1, std::min(16, m));
                 std::vector<std::array<double, 3>> sj;
                 tri_subcentroids(V[Fc[j][0]], V[Fc[j][1]], V[Fc[j][2]], m, sj);
-                if (kprobe == "m2")
-                    return vf_m2(C[i], N[i], N[j], b.areas[j], sj);
+                if (kprobe == "m2" || kprobe == "m2_legacy")
+                    return vf_m2_legacy_onesided(C[i], N[i], N[j], b.areas[j], sj);
                 std::vector<std::array<double, 3>> si;
                 tri_subcentroids(V[Fc[i][0]], V[Fc[i][1]], V[Fc[i][2]], m, si);
                 return vf_refined(N[i], N[j], b.areas[i], b.areas[j], si, sj);

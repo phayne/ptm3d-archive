@@ -121,13 +121,29 @@ with $\cos\theta_i = \hat{n}_i \cdot \hat{r}_{ij}$ and $\cos\theta_j = -\hat{n}_
 $\hat{r}_{ij}$ the unit vector from centroid $i$ to centroid $j$. A single Embree ray verifies
 visibility. This follows the M1 formulation of Rezac & Zhao (2020).
 
-*M3, subdivision* (near field, $N_s \le 5$) subdivides the receiving face into sample points
-(about 10 points at `subdivision_level: 3`) and averages:
+*M2, symmetric double-area quadrature* (near field, $N_s \le 5$) samples **both** faces at the
+centroids of $m \times m$ equal-area sub-triangles, $m$ = `nearfield_quadrature_order` (default 3,
+so $m^2 = 9$ points per face and $m^4 = 81$ kernel evaluations per unordered pair):
 
-$$F_{ij} \approx \frac{A_j}{\pi n_{\text{pts}}} \sum_{k=1}^{n_{\text{pts}}} \frac{\cos\theta_{i,k} \cos\theta_{j,k}}{r_k^2}$$
+$$A_i F_{ij} \approx \frac{A_i A_j}{\pi m^4} \sum_{p=1}^{m^2} \sum_{q=1}^{m^2} \frac{\cos\theta_{i,p} \cos\theta_{j,q}}{r_{pq}^2}$$
 
-The switch between them is `adaptive_ns_threshold` (default 5.0); `method` may also be pinned to
-`CENTROID` or `SUBDIVISION`.
+The sample points are an *open* rule — none sits on an edge or a vertex — so an edge-touching pair
+never evaluates the integrable $1/r^2$ singularity at $r = 0$. Because the sum is one quantity for
+both directions, and is accumulated with $\min(i,j)$ as the outer loop, reciprocity
+$A_i F_{ij} = A_j F_{ji}$ holds to the last bit rather than only in the refinement limit.
+
+Grazing sample pairs are rejected by the same $10^{-6}$ cosine cut as M1 and contribute zero; the
+sum is divided by the **total** $m^4$ pair count, not by the survivors. Dividing by the survivors
+would condition the estimate on detection and inflate the near field.
+
+Before 2026-08-23 this estimator was one-sided (a point emitter at one face's centroid against a
+closed vertex lattice on the other, 45 points at `subdivision_level: 3`) and read $-3.9\%$
+mass-weighted, $-21.7\%$ on edge/vertex-touching pairs, against a Richardson double-area reference
+on `data/meshes/lunar_crater_80N.ply`. `subdivision_level` no longer exists: the replacement key
+counts sub-triangles per edge, not lattice refinements, so the two numbers are not interchangeable.
+
+The switch between M1 and M2 is `adaptive_ns_threshold` (default 5.0); `method` may also be pinned
+to `CENTROID` or `SUBDIVISION`.
 
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
 cosine-weighted hemispherical rays and count first hits, giving $F_{ij} \approx \text{hits}_j/N$.
@@ -141,7 +157,9 @@ The default 100,000 rays per face gives roughly 10% relative error on $F_{ij} \s
 Visibility between face pairs is tested with Intel Embree:
 
 - single rays for M1 centroid pairs;
-- batched queries for M3 subdivision points;
+- a single centroid-to-centroid ray for an M2 near pair as well — the quadrature points do **not**
+  carry their own visibility, so a partially occluded near pair is all-or-nothing. The query is
+  issued in canonical $\min(i,j)$ order so the decision cannot depend on the direction asked;
 - SIMD ray packets during H-matrix construction — AVX-512 16-wide (`rtcIntersect16`) or AVX2
   8-wide (`rtcIntersect8`), selected at runtime from CPU support.
 
@@ -878,6 +896,7 @@ warns.
 | `max_neighbors` | 500 | Ceiling on partners per face |
 | `min_neighbors` | 20 | Floor on partners per face |
 | `use_cluster_cull` | true | Conservative cluster-level back-face pre-cull |
+| `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8 |
 | `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
 | `rms_slope_deg` | 0.0 | Smith beamed emission; 0 = Lambertian |
