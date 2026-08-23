@@ -54,6 +54,9 @@ constexpr double SIGMA_SB = ptm::kStefanBoltzmann;  // [W/m^2/K^4]
  * returned 0, so a broken Ingersoll gate was invisible to CI, to rebuild.sh,
  * and to anyone running it from a shell.
  *
+ * Per latitude case the recorded assertions are: the Ingersoll floor view
+ * factor, reciprocity, closure, and -- where a device exists -- GPU vs CPU.
+ *
  * A SKIPPED arm is counted separately and does NOT fail the run. The only arm
  * that can skip is the GPU-vs-CPU comparison on a host with no OpenCL device
  * (the GPU=ON portable CI runner is exactly that): a missing device is a fact
@@ -65,6 +68,12 @@ struct VerdictTally {
     int passed = 0;
     int failed = 0;
     int skipped = 0;
+    // Verdicts from arms that MUST run on every host. Counted separately from
+    // the total so that the optional GPU arm cannot pad it: if the completeness
+    // guard in main() scored checked(), then on a machine with a device the four
+    // GPU verdicts would exactly cover the loss of one mandatory assertion, and
+    // the guard would stay silent for the regression it exists to catch.
+    int required = 0;
 
     void record(bool ok) {
         if (ok) {
@@ -72,6 +81,10 @@ struct VerdictTally {
         } else {
             ++failed;
         }
+    }
+    void recordRequired(bool ok) {
+        ++required;
+        record(ok);
     }
     void skip() { ++skipped; }
     int checked() const { return passed + failed; }
@@ -378,6 +391,16 @@ double analyticalFloorSkyViewFactor(double depth_to_diameter) {
 /**
  * @brief Test view factor reciprocity
  * Checks that A_i * F_ij = A_j * F_ji for all pairs
+ *
+ * NOTE ON WHAT THIS DOES AND DOES NOT PROVE. This harness does not call the
+ * production view-factor assembler: it fills F itself from the point-to-point
+ * kernel F_ij = (A_j / pi) * cos_i * cos_j / r^2 (see runBowlCraterTest). For
+ * that expression A_i * F_ij and A_j * F_ji are the same product of the same
+ * factors, so reciprocity is an algebraic identity and the residual is at
+ * floating-point rounding level. The check is kept because it is cheap and it
+ * would still catch an indexing, transpose, or storage regression in
+ * ViewFactorMatrix -- but it is NOT evidence that the production assembler is
+ * reciprocal. Do not cite it as such.
  */
 bool testReciprocity(const ViewFactorMatrix& F,
                      const std::vector<double>& areas,
@@ -465,6 +488,20 @@ bool testReciprocity(const ViewFactorMatrix& F,
 /**
  * @brief Test view factor closure (sum rule)
  * For each face: sum_j F_ij + F_i,sky = 1
+ *
+ * The reference passed in must be the ANALYTIC sky view factor per face. For a
+ * spherical bowl that reference is exact and uniform: every interior point of a
+ * sphere sees a patch with view factor A_patch / (4 pi R^2), and the aperture is
+ * radiatively equivalent to the complementary cap, so
+ *     F_sky = 1 - f,   f = d^2 / (d^2 + r_rim^2)
+ * for every face of the cap regardless of where it sits. Any per-face spread in
+ * 1 - sum_j F_ij is therefore numerical view-factor error, which is exactly what
+ * this test measures. (See the Ingersoll spherical-Lambert property; the same
+ * identity is what makes analyticalFloorSkyViewFactor() a whole-cap value and
+ * not just a floor-center value.)
+ *
+ * The max/mean deviation is printed unconditionally, so the log carries the
+ * number whether or not the run trips the tolerance.
  */
 bool testClosure(const ViewFactorMatrix& F,
                  const std::vector<double>& expected_sky_view,
@@ -472,7 +509,19 @@ bool testClosure(const ViewFactorMatrix& F,
     bool passed = true;
     auto row_sums = F.rowSums();
 
+    // A short reference vector would read out of bounds below and hand back a
+    // garbage verdict. Fail loudly instead: a mis-sized reference is a defect in
+    // the caller, and a gate that cannot be trusted must not report PASSED.
+    if (expected_sky_view.size() != row_sums.size()) {
+        std::cerr << "  Closure test cannot run: reference has "
+                  << expected_sky_view.size() << " entries, matrix has "
+                  << row_sums.size() << " rows" << std::endl;
+        return false;
+    }
+
     double max_error = 0.0;
+    double sum_error = 0.0;
+    size_t worst_face = 0;
     int error_count = 0;
 
     for (size_t i = 0; i < row_sums.size(); ++i) {
@@ -483,9 +532,14 @@ bool testClosure(const ViewFactorMatrix& F,
         double error = std::abs(F_sky_computed - F_sky_expected) /
                       std::max(1e-10, F_sky_expected);
 
+        if (error > max_error) {
+            max_error = error;
+            worst_face = i;
+        }
+        sum_error += error;
+
         if (error > tolerance) {
             error_count++;
-            max_error = std::max(max_error, error);
             if (error_count <= 5) {
                 std::cerr << "  Closure violation: face " << i
                           << ", F_sky computed = " << F_sky_computed
@@ -495,10 +549,19 @@ bool testClosure(const ViewFactorMatrix& F,
         }
     }
 
+    double mean_error = row_sums.empty()
+                            ? 0.0
+                            : (sum_error / static_cast<double>(row_sums.size()));
+    std::cout << "  Max relative F_sky deviation: " << (max_error * 100) << "%"
+              << " (face " << worst_face << ")"
+              << "   mean: " << (mean_error * 100) << "%"
+              << "   over " << row_sums.size() << " faces" << std::endl;
+    std::cout << "  Tolerance: " << (tolerance * 100) << "%" << std::endl;
+
     if (error_count > 0) {
         std::cerr << "  Total closure violations: " << error_count
                   << " / " << row_sums.size()
-                  << ", max error = " << (max_error * 100) << "%" << std::endl;
+                  << ", max error (all faces) = " << (max_error * 100) << "%" << std::endl;
         passed = false;
     }
 
@@ -735,8 +798,48 @@ void runBowlCraterTest(double diameter,
     double floor_error = std::abs(F_terrain_floor - F_wall_analytical) / F_wall_analytical;
     std::cout << "  Error: " << (floor_error * 100) << "%" << std::endl;
 
+    // --- Ingersoll floor view-factor gate ------------------------------------
+    // This number was computed and printed since the file was written (8178972,
+    // 2026-01-22) and never compared against anything, so the headline Ingersoll
+    // comparison could drift arbitrarily without the program noticing. It is now
+    // a verdict.
+    //
+    // WHICH quantity: the relative error of the FLOOR face's terrain view factor
+    // sum_j F_0j against the analytic spherical-cap value f = d^2/(d^2+r_rim^2).
+    // The denominator is f (~0.138 at d/D=0.2), not F_sky (~0.862), so the same
+    // absolute view-factor error reads (1-f)/f = 6.25x larger here than it does
+    // in the closure test below. Both are printed so the two cannot be confused.
+    //
+    // WHY 1%: the residual is the flat-triangle faceting of a curved cap, a
+    // known and understood discretization effect that shrinks as 1/sqrt(N) --
+    // not a defect in the assembler. At this mesh (20 rings x 36 azimuth) it
+    // sits near 0.49%, so 1% is roughly a factor of two of headroom: loose
+    // enough that faceting alone cannot trip it, tight enough that a real
+    // regression in the kernel, the areas, or the row sums will.
+    const double kIngersollFloorTolerance = 0.01;
+    const double floor_error_vs_sky =
+        std::abs(F_sky_floor - F_sky_analytical) / F_sky_analytical;
+    bool ingersoll_passed = (floor_error <= kIngersollFloorTolerance);
+    std::cout << "\n--- Ingersoll Floor View Factor Test ---" << std::endl;
+    std::cout << "  Quantity: relative error of face " << floor_face
+              << "'s terrain view factor sum_j F_ij vs analytic f = 1 - F_sky"
+              << std::endl;
+    std::cout << "  Error: " << (floor_error * 100) << "%"
+              << "   tolerance: " << (kIngersollFloorTolerance * 100) << "%"
+              << std::endl;
+    std::cout << "  Same absolute error referenced to F_sky: "
+              << (floor_error_vs_sky * 100) << "%" << std::endl;
+    std::cout << "  Result: " << (ingersoll_passed ? "PASSED" : "FAILED") << std::endl;
+    tally.recordRequired(ingersoll_passed);
+
     // Test reciprocity
-    std::cout << "\n--- Reciprocity Test ---" << std::endl;
+    std::cout << "\n--- Reciprocity Test (analytic matrix; near-tautology) ---" << std::endl;
+    std::cout << "  Note: this harness fills F itself from"
+                 " F_ij = (A_j/pi) cos_i cos_j / r^2, so A_i F_ij and A_j F_ji"
+                 " are the same product and reciprocity holds by construction,"
+                 " at rounding level. It guards ViewFactorMatrix indexing and"
+                 " storage; it does not validate the production assembler."
+              << std::endl;
     // Debug: check a specific pair that fails
     if (latitude_deg == 0.0) {
         int i = 36, j = 107;
@@ -751,18 +854,22 @@ void runBowlCraterTest(double diameter,
     }
     bool reciprocity_passed = testReciprocity(F, areas, 0.05);
     std::cout << "  Result: " << (reciprocity_passed ? "PASSED" : "FAILED") << std::endl;
-    tally.record(reciprocity_passed);
+    tally.recordRequired(reciprocity_passed);
 
-    // Compute expected sky view factors for all faces
-    // For simplicity, estimate based on face position in crater
-    std::vector<double> expected_sky_view(mesh->faces.size());
-    for (size_t i = 0; i < mesh->faces.size(); ++i) {
-        // Rough estimate: faces near rim see more sky
-        // Use the normal direction - more upward = more sky
-        double nz = mesh->face_normals[i][2];
-        // This is a rough approximation
-        expected_sky_view[i] = std::max(0.0, std::min(1.0, 0.5 * (1.0 + nz)));
-    }
+    // Expected sky view factor for every face.
+    //
+    // This array used to hold 0.5 * (1 + n_z), the sky view factor of a tilted
+    // plane on an OPEN plain. That is the wrong geometry for a bowl: it returns
+    // 1.0 at the crater floor, where the true value is F_sky = 1 - f = 0.862 at
+    // d/D = 0.2, a 16% error. It was never consumed -- testClosure() was defined
+    // and never called, in any commit, back to the file's first (8178972) -- so
+    // nothing ever noticed. Feeding the placeholder to a live gate would have
+    // failed the run for a defect in the reference, not in the code under test.
+    //
+    // The correct reference is exact and UNIFORM over a spherical cap: every
+    // interior point of a sphere sees the aperture with the same view factor.
+    // Both floor and rim faces must read analyticalFloorSkyViewFactor(d/D).
+    std::vector<double> expected_sky_view(mesh->faces.size(), F_sky_analytical);
 
     // Statistics on sky view factors
     double min_sky = 1.0, max_sky = 0.0, avg_sky = 0.0;
@@ -778,6 +885,36 @@ void runBowlCraterTest(double diameter,
     std::cout << "  Min: " << min_sky << std::endl;
     std::cout << "  Max: " << max_sky << std::endl;
     std::cout << "  Avg: " << avg_sky << std::endl;
+    std::cout << "  Analytic (uniform over the cap): " << F_sky_analytical << std::endl;
+
+    // --- Closure gate --------------------------------------------------------
+    // sum_j F_ij + F_i,sky = 1, checked per face against the analytic uniform
+    // cap value. Where the Ingersoll gate above scores ONE face (the floor),
+    // this scores all of them, so it is the check that sees a defect confined to
+    // the rim or to one ring.
+    //
+    // Same caveat as reciprocity: F here is the harness's own point-to-point
+    // kernel, not the production ViewFactorCalculator. What this gate scores is
+    // that kernel plus the mesh generator. It is a guard against a regression in
+    // either; it is not a validation of the production assembler.
+    //
+    // WHY 1%: same faceting argument as the Ingersoll gate, and the same 1% line
+    // Paul set for it. The peak per-face deviation at this mesh is about 0.31%
+    // (min 0.859417 / max 0.863588 vs analytic 0.862069), so the gate carries
+    // roughly 3x headroom over the known discretization error. Note this error
+    // is referenced to F_sky, so it reads 6.25x SMALLER than the same absolute
+    // view-factor error does in the Ingersoll gate above.
+    //
+    // The reported worst-face INDEX is not stable and is not meant to be: the
+    // outer ring's 72 faces are related by the mesh's azimuthal symmetry and
+    // carry the same deviation, so which one wins is decided by rounding and
+    // moves with the latitude rotation and with the compiler's ISA. The VALUE
+    // is what the gate scores, and it is identical across both.
+    const double kClosureTolerance = 0.01;
+    std::cout << "\n--- Closure Test (sum_j F_ij + F_sky = 1) ---" << std::endl;
+    bool closure_passed = testClosure(F, expected_sky_view, kClosureTolerance);
+    std::cout << "  Result: " << (closure_passed ? "PASSED" : "FAILED") << std::endl;
+    tally.recordRequired(closure_passed);
 
     // Test radiosity solver
     std::cout << "\n--- Radiosity Solver Test ---" << std::endl;
@@ -952,6 +1089,21 @@ int main(int argc, char** argv) {
     const int n_cases =
         static_cast<int>(sizeof(latitudes_deg) / sizeof(latitudes_deg[0]));
 
+    // Assertions every latitude case must record, regardless of hardware:
+    // Ingersoll floor view factor, reciprocity, closure. These go through
+    // recordRequired() and are scored below against tally.required, NOT against
+    // tally.checked(): the GPU-vs-CPU arm is optional (it skips on a host with
+    // no device), and if it counted toward the total then on a machine WITH a
+    // device its four verdicts would exactly mask the loss of one mandatory
+    // assertion and the guard would never fire.
+    //
+    // These 12 are 3 distinct assertions repeated 4 times, not 12 independent
+    // ones. The latitude parameter rigidly rotates the mesh and the view-factor
+    // matrix is rotation-invariant, so all four cases produce bit-identical
+    // Ingersoll and closure numbers. Latitude varies the illumination and
+    // radiosity part of the case, not these gates.
+    const int n_assertions_per_case = 3;
+
     radiation::test::VerdictTally tally;
     for (int c = 0; c < n_cases; ++c) {
         radiation::test::runBowlCraterTest(diameter, depth_to_diameter, n_rings,
@@ -979,11 +1131,15 @@ int main(int argc, char** argv) {
     // looking -- so a summary reading "0 failed" would report a green run as a
     // failure. Say what passed and what skipped; do not name a zero count of
     // failures.
-    if (tally.checked() < n_cases) {
-        std::cout << "[test_bowl_crater] FAIL: only " << tally.checked()
-                  << " verdicts were recorded across " << n_cases
-                  << " latitudes -- the reciprocity assertion is no longer running,"
-                     " so this program is not testing what it claims." << std::endl;
+    if (tally.required < n_assertions_per_case * n_cases) {
+        std::cout << "[test_bowl_crater] FAIL: only " << tally.required
+                  << " mandatory verdicts were recorded, expected "
+                  << (n_assertions_per_case * n_cases) << " ("
+                  << n_assertions_per_case << " assertions x " << n_cases
+                  << " latitudes) -- one of the Ingersoll, reciprocity, or"
+                     " closure assertions is no longer running, so this program"
+                     " is not testing what it claims. Verdicts of every kind: "
+                  << tally.checked() << "." << std::endl;
         return 1;
     }
     if (tally.failed > 0) {
