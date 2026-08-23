@@ -135,7 +135,15 @@ def test_C(args, work: Path) -> bool:
         print("  C: SKIP (no --bowl-bin)"); return True
     env = dict(os.environ); env["PTM_MAX_TIMESTEPS_PER_DISPATCH"] = "7"
     r = subprocess.run([str(args.bowl_bin)], capture_output=True, text=True, env=env)
-    passed = ("PASS" in r.stdout) and r.returncode == 0 and "FAIL" not in r.stdout.upper().replace("PASS", "")
+    # test_bowl_crater now aggregates its sub-test verdicts and returns nonzero
+    # if any failed, so the exit code is the primary gate. Keep a log check too,
+    # because a future edit that drops the assertions would exit 0 again -- but
+    # match the one explicit verdict line rather than scanning the whole stream
+    # for the word "FAIL". The old heuristic upper-cased everything, so any
+    # summary phrased "0 failed" scored a green run as a failure.
+    verdict_pass = any(l.startswith("[test_bowl_crater] PASS") for l in r.stdout.splitlines())
+    saw_failed_verdict = "FAILED" in r.stdout  # a skipped GPU arm prints SKIPPED, never this
+    passed = r.returncode == 0 and verdict_pass and not saw_failed_verdict
     print(r.stdout[-800:])
     print("  C: " + ("PASS" if passed else "FAIL (bowl-crater gate)"))
     return passed

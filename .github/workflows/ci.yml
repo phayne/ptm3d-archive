@@ -250,9 +250,31 @@ jobs:
 
       # --- Correctness battery (CPU) -----------------------------------------
       - name: Build + run bowl-crater radiation gate
+        # The program's exit status is now a real gate: main() aggregates every
+        # sub-test verdict (reciprocity at each of 4 latitudes, plus the
+        # GPU-vs-CPU comparison when a device exists) and returns nonzero if any
+        # of them failed. Grep the log as well, belt and suspenders, for two
+        # reasons: the default shell here is `bash -e` WITHOUT pipefail, so a
+        # nonzero rc on the left of a pipe would be swallowed; and a future edit
+        # that drops the assertions would exit 0 again and this step would
+        # silently stop testing anything.
+        #
+        # The uppercase token FAILED is rejected anywhere in the log. A host
+        # with no OpenCL device prints "GPU vs CPU validation: SKIPPED (no
+        # OpenCL device)" and never that token, so an absent GPU cannot be
+        # mistaken for an Ingersoll regression.
         run: |
+          set -uo pipefail
           cmake --build build --target test_bowl_crater -j2
-          ./build/bin/test_bowl_crater
+          rc=0
+          ./build/bin/test_bowl_crater | tee bowl_crater.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_bowl_crater exited $rc"; exit 1; }
+          grep -q '^\[test_bowl_crater\] PASS' bowl_crater.log \
+            || { echo '::error::test_bowl_crater printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' bowl_crater.log; then
+            echo '::error::test_bowl_crater logged a FAILED verdict (lines above).'
+            exit 1
+          fi
 
       - name: Build + run spectral-equilibration test
         # The program's exit status is now a real gate (worst max|dT| at the
@@ -474,9 +496,27 @@ jobs:
 
       # --- The reported failures, end to end --------------------------------
       - name: Bowl-crater radiation gate (GPU=ON, portable)
+        # Same gate as the CPU job above -- see the comment there for why both
+        # the exit status and a log grep are checked.
+        #
+        # This runner is GPU=ON but has NO OpenCL device, so the GPU-vs-CPU arm
+        # skips: the log carries "GPU vs CPU validation: SKIPPED (no OpenCL
+        # device)" and the summary reports 4 verdicts passed / 4 skipped. That
+        # is a fact about the runner, not a regression, and must stay green.
+        # The grep below only rejects the uppercase token FAILED, which the skip
+        # path deliberately never prints.
         run: |
+          set -uo pipefail
           cmake --build build-gpu --target test_bowl_crater -j2
-          ./build-gpu/bin/test_bowl_crater
+          rc=0
+          ./build-gpu/bin/test_bowl_crater | tee bowl_crater_gpu.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_bowl_crater (GPU=ON) exited $rc"; exit 1; }
+          grep -q '^\[test_bowl_crater\] PASS' bowl_crater_gpu.log \
+            || { echo '::error::test_bowl_crater (GPU=ON) printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' bowl_crater_gpu.log; then
+            echo '::error::test_bowl_crater (GPU=ON) logged a FAILED verdict (lines above).'
+            exit 1
+          fi
 
       - name: Fetch SPICE kernels (NAIF, Moon core, ~44 MB)
         run: python3 scripts/fetch_kernels.py --bodies moon
