@@ -21,7 +21,7 @@
 #include <sstream>
 #include <embree4/rtcore.h>
 #include <unordered_map>
-#include <cstdio>
+#include <algorithm>  // std::max/min({...}) initializer-list overloads: NOT transitive on Linux libstdc++
 using V3=std::array<double,3>;
 static double dot(const V3&a,const V3&b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 static V3 cross(const V3&a,const V3&b){return{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]}};}
