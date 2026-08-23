@@ -5,6 +5,14 @@
 
 namespace radiation {
 
+// Near-field (M2) quadrature ceiling. Order m puts m^2 sample points on a face,
+// so an unordered pair costs m^4 kernel evaluations. The ceiling exists so the
+// sample buffers can live on the stack and stay thread-safe without a per-call
+// allocation; it lives next to nearfield_quadrature_order below because it is
+// the bound on that field.
+constexpr int kMaxNearFieldQuadOrder = 8;
+constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQuadOrder;
+
 // Configuration for radiation exchange computation
 struct RadiationConfig {
     // Master enable/disable
@@ -69,8 +77,18 @@ struct RadiationConfig {
     };
     ViewFactorMethod method = ViewFactorMethod::ADAPTIVE;
 
-    // Subdivision parameters (for M2/M3 method)
-    int subdivision_level = 3;           // Subdivision levels for receiving face (10 points at level 3)
+    // Near-field (M2) quadrature. Order m samples BOTH faces at the centroids of
+    // m x m equal-area sub-triangles: m^2 points per face, m^4 kernel
+    // evaluations per unordered pair, and A_i F_ij == A_j F_ji as an algebraic
+    // identity. Default 3 (9 points/face, 81 evaluations/pair) reads +0.32%
+    // mass-weighted against a Richardson double-area reference on
+    // lunar_crater_80N.ply; m = 2 reads +0.30% for 16 evaluations/pair and is
+    // the fast option. Valid range 1..kMaxNearFieldQuadOrder (view_factor.h);
+    // an out-of-range value is FATAL at configuration time, not clamped.
+    // Replaced the pre-2026-08-23 `subdivision_level`, a one-sided rule with a
+    // DIFFERENT meaning (2^level per edge, 45 lattice points at level 3) --
+    // carrying the old value forward would silently change the physics.
+    int nearfield_quadrature_order = 3;
     double adaptive_ns_threshold = 5.0;  // Ns threshold: use M2 when r/sqrt(A) < 5
 
     // Radiosity solver parameters

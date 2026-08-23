@@ -539,7 +539,16 @@ size_t ViewFactorMatrix::memoryUsage() const {
 
 // Magic number for sparse view factor file format: "VFFM" = View Factor File Matrix
 static constexpr uint32_t SPARSE_VF_MAGIC = 0x5646464D;
-static constexpr uint32_t SPARSE_VF_VERSION = 1;
+
+// On-disk version. The BYTE LAYOUT is unchanged between 1 and 2; the version is
+// a PHYSICS provenance stamp. A v1 file was written by the pre-2026-08-23
+// one-sided near-field (M2) estimator, whose edge/vertex-touching entries read
+// about -22% low. Loading one is legal -- refusing would force a rebuild of
+// multi-GB production matrices, which is the PTM-19 wedge trap -- but it is
+// announced, because a v1 and a v2 matrix on the same mesh are DIFFERENT
+// physics and the outputs do not say so.
+static constexpr uint32_t SPARSE_VF_VERSION = 2;
+static constexpr uint32_t SPARSE_VF_VERSION_MIN_SUPPORTED = 1;
 
 bool ViewFactorMatrix::writeBinary(const std::string& filename) const {
     std::ofstream file(filename, std::ios::binary);
@@ -604,16 +613,32 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
                   << std::hex << magic << std::dec << ")" << std::endl;
         return false;
     }
-    if (version != SPARSE_VF_VERSION) {
-        std::cerr << "Unsupported sparse view factor file version: " << version << std::endl;
+    if (version < SPARSE_VF_VERSION_MIN_SUPPORTED || version > SPARSE_VF_VERSION) {
+        std::cerr << "Unsupported sparse view factor file version: " << version
+                  << " (this build reads " << SPARSE_VF_VERSION_MIN_SUPPORTED
+                  << ".." << SPARSE_VF_VERSION << ")" << std::endl;
         return false;
     }
-
     // Read header
     uint64_t nrows, ncols, nnz;
     file.read(reinterpret_cast<char*>(&nrows), sizeof(uint64_t));
     file.read(reinterpret_cast<char*>(&ncols), sizeof(uint64_t));
     file.read(reinterpret_cast<char*>(&nnz), sizeof(uint64_t));
+
+    if (version < SPARSE_VF_VERSION && nnz > 0) {
+        // Same bytes, different physics. Say so; do not refuse (PTM-19).
+        // An empty stub (nnz == 0) carries no near-field entries, so it is not
+        // announced -- the A3GT VF_REPLACE route deliberately loads one.
+        std::cout << "\n  *** LOADED A v" << version << " SPARSE VIEW-FACTOR FILE: "
+                  << filename << "\n      Its near-field (M2) entries were built by the "
+                     "one-sided estimator retired on\n      2026-08-23, which reads about "
+                     "-22% low on edge/vertex-touching pairs and\n      -3.9% "
+                     "mass-weighted over the near field. This run reproduces THAT physics,"
+                  << "\n      not the current estimator's. Rebuild the matrix to get the "
+                     "corrected near\n      field -- but check the size first: PTM-19 "
+                     "forbids rebuilding a production\n      .vf by accident. ***\n"
+                  << std::endl;
+    }
 
     n_rows_ = nrows;
     n_cols_ = ncols;
@@ -799,6 +824,22 @@ static std::atomic<int> g_subdiv_angle_reject{0};
 static std::atomic<int> g_subdiv_vis_reject{0};
 static std::atomic<int> g_subdiv_accepted{0};
 static std::atomic<int> g_subdiv_weight_zero{0};
+
+// Near-field physical-bound tripwire. A_i F_ij can never exceed min(A_i, A_j)
+// -- F_ij <= 1 and, by reciprocity, F_ji <= 1. A finite-order area quadrature
+// CAN exceed it: as a concave crease closes, the sample pairs nearest the
+// shared edge have r -> 0 with cos_a cos_b -> 1 and the estimate diverges,
+// while the true value approaches 1 from below. Measured on two unit triangles
+// sharing an edge (order 3): F_ij = 0.27 at a 90 degree dihedral against a
+// reference 0.21, 1.07 at 45 degrees, 2.24 at 30 degrees, 19.2 at 10 degrees.
+// The same divergence is present in the H-matrix builder's refined kernel
+// (hmatrix_view_factor.cpp), which uses this quadrature with an adaptive order;
+// its ceiling of 16 only slows the growth. These counters exist so that an
+// entry clamped to the physical bound is REPORTED rather than absorbed by the
+// downstream row-sum renormalization, which would silently rescale the whole
+// row and drive that face's sky view factor to zero.
+static std::atomic<long long> g_nearfield_bound_clamps{0};
+static std::atomic<int> g_nearfield_bound_worst_ratio_ppm{0};  // (g/g_max - 1) in ppm
 
 ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& face_indices) {
     size_t n_subset = face_indices.size();
@@ -1040,6 +1081,8 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
     ViewFactorMatrix F;
     F.buildFromTriplets(n_total, all_rows, all_cols, all_vals);
 
+    reportNearFieldBoundClamps();
+
     if (config_.verbose) {
         std::cout << "View factor matrix: " << F.numRows() << " x " << F.numCols()
                   << ", " << F.numNonZeros() << " non-zeros ("
@@ -1216,67 +1259,92 @@ double ViewFactorCalculator::computeCentroid(int face_i, int face_j) {
     return std::max(0.0, F_ij);
 }
 
-double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int level) {
-    // M2: Single-point to area integration method
-    // Use centroid of face_i, but integrate over subdivided face_j
-    // This is more accurate than M1 for nearby faces and more stable than M3
+double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int order) {
+    // M2: SYMMETRIC double-area sub-centroid quadrature.
     //
-    // F_ij = (1/π) * ∫∫_{A_j} (cos_i * cos_j / r²) dA_j
+    //   A_i F_ij = A_j F_ji = (1/pi) * int_{A_i} int_{A_j} cos_i cos_j / r^2 dA_j dA_i
     //
-    // We approximate this by summing over subdivision points of face_j,
-    // where each point represents an equal area element A_j/n_points.
+    // Both faces are sampled at the centroids of m x m equal-area sub-triangles
+    // (order m = config_.nearfield_quadrature_order), so the accumulated sum is
+    // ONE quantity -- the same double integral -- for both directions, and
+    // reciprocity is an algebraic identity of the estimator rather than
+    // something it approaches in the refinement limit.
+    //
+    // The rule this replaced was one-sided: a point emitter at the centroid of
+    // one face against a closed vertex lattice on the other. Each direction was
+    // then a midpoint rule in a DIFFERENT variable of the same symmetric double
+    // integral, which is why A_i F_ij and A_j F_ji disagreed by up to 46% on a
+    // near pair. Measured against a Richardson double-area reference on
+    // data/meshes/lunar_crater_80N.ply (2026-08-23), the one-sided rule read
+    // -3.9% mass-weighted over near-field pairs, -0.09% on non-touching pairs
+    // and -21.7% on edge/vertex-touching pairs (17.6% of the near-field mass);
+    // the defect was a MAGNITUDE bias, and the non-reciprocity was its symptom.
+    // Post-hoc symmetrization of the old rule fixes nothing (-3.87%). At m = 3
+    // this rule reads +0.32% mass-weighted on the same population, and +1.26%
+    // on the edge/vertex-touching subset that the old rule missed by -21.7%.
+    //
+    // It is NOT uniformly better on every geometry. On two perpendicular unit
+    // squares sharing an edge -- the analytic worst case, an integrable 1/r^2
+    // singularity sitting on the shared edge -- the old rule read -18.1% and
+    // this one reads +18.5% at m = 3, the same magnitude with the sign flipped.
+    // No production-order area quadrature is close there; the error falls only
+    // like 1/m. Arm [T] of test_vf_production bounds it and prints the table.
+    //
+    // KNOWN LIMITATION, unchanged from before: occlusion is a SINGLE
+    // centroid-to-centroid ray. No sample point carries its own visibility, so
+    // a partially occluded near pair is still all-or-nothing.
 
-    std::vector<std::array<double, 3>> points_j;
-    std::vector<double> weights_j;
+    // Canonical ordering. min(i,j) is always the outer loop, so the summation
+    // ORDER -- not merely the exact-arithmetic value -- is the same whichever
+    // direction is asked, and the two directions agree to the last bit before
+    // the final division by the asking face's area.
+    const int fa = std::min(face_i, face_j);
+    const int fb = std::max(face_i, face_j);
 
-    getSubdivisionPoints(face_j, level, points_j, weights_j);
-
-    const auto& c_i = face_centers_[face_i];
-    const auto& n_i = face_normals_[face_i];
-    const auto& n_j = face_normals_[face_j];
-    double A_j = face_areas_[face_j];
-
-    // First check center-to-center visibility
-    if (!isVisible(c_i, face_centers_[face_j])) {
+    // The visibility query is issued in canonical order too. Mutual visibility
+    // is a symmetric geometric relation; the ray-offset arithmetic in
+    // isVisible() is not exactly symmetric in its arguments, and letting that
+    // decide would put a direction-dependent zero back into the estimator.
+    if (!isVisible(face_centers_[fa], face_centers_[fb])) {
         g_subdiv_vis_reject++;
         return 0.0;
     }
 
-    double F_sum = 0.0;
+    SubCentroidSamples pts_a, pts_b;
+    getSubCentroidPoints(fa, order, pts_a);
+    getSubCentroidPoints(fb, order, pts_b);
+
+    const auto& n_a = face_normals_[fa];
+    const auto& n_b = face_normals_[fb];
+
+    double kernel_sum = 0.0;
     int n_valid = 0;
-    int angle_rejects = 0;
 
-    // Integrate over receiving face (face_j)
-    for (size_t pj = 0; pj < points_j.size(); ++pj) {
-        const auto& p_j = points_j[pj];
+    for (int ia = 0; ia < pts_a.count; ++ia) {
+        const auto& p_a = pts_a.p[ia];
+        for (int ib = 0; ib < pts_b.count; ++ib) {
+            const auto& p_b = pts_b.p[ib];
 
-        auto r_vec = subtract(p_j, c_i);
-        double r2 = dot(r_vec, r_vec);
-        if (r2 < 1e-20) continue;
+            const double dx = p_b[0] - p_a[0];
+            const double dy = p_b[1] - p_a[1];
+            const double dz = p_b[2] - p_a[2];
+            const double r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < 1e-20) continue;
 
-        double r = std::sqrt(r2);
-        std::array<double, 3> r_hat = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+            const double inv_r = 1.0 / std::sqrt(r2);
+            // Outward normals: cos_a along +d, cos_b along -d. Swapping the two
+            // faces flips d and exchanges the two cosines, so the product is
+            // invariant -- this is the symmetry the canonical ordering exploits.
+            const double cos_a = (n_a[0] * dx + n_a[1] * dy + n_a[2] * dz) * inv_r;
+            const double cos_b = -(n_b[0] * dx + n_b[1] * dy + n_b[2] * dz) * inv_r;
 
-        // Compute dot products with connecting vector r_hat (pointing from i to j)
-        double dot_i = dot(n_i, r_hat);
-        double dot_j = dot(n_j, r_hat);
+            // Grazing/back-facing cut, same 1e-6 threshold as M1. A rejected
+            // sample pair contributes ZERO; it is not removed from the domain.
+            if (cos_a < 1e-6 || cos_b < 1e-6) continue;
 
-        // With outward normals:
-        //   cos_i = dot_i (positive if face i looks toward point)
-        //   cos_j = -dot_j (positive if face j looks toward face i)
-        double cos_i = dot_i;
-        double cos_j = -dot_j;
-
-        // Skip faces that don't face each other (cos < 0) or nearly-grazing angles
-        if (cos_i < 1e-6 || cos_j < 1e-6) {
-            angle_rejects++;
-            continue;
+            kernel_sum += (cos_a * cos_b) / r2;
+            ++n_valid;
         }
-
-        // Each subdivision point represents equal area A_j / n_points
-        // F contribution = (cos_i * cos_j / r²) * (A_j / n_points) / π
-        F_sum += (cos_i * cos_j) / r2;
-        n_valid++;
     }
 
     if (n_valid == 0) {
@@ -1284,16 +1352,59 @@ double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int leve
         return 0.0;
     }
 
-    // Final formula: F_ij = (A_j / π) * (1/n_points) * sum
-    // where sum = Σ (cos_i * cos_j / r²)
-    double n_points = static_cast<double>(points_j.size());
-    double F_ij = (A_j / M_PI) * F_sum / n_points;
+    // Divide by the TOTAL sample-pair count, never by the survivors. Dividing by
+    // the survivors would condition the estimate on detection -- FC-08's error --
+    // and inflates the near field by +1.42% mass-weighted / +25% on the worst
+    // pair, while the cut itself discards 0.00000% of the coupling mass
+    // (measured 2026-08-23). This divisor is correct; do not "fix" it.
+    const double n_pairs = static_cast<double>(pts_a.count) *
+                           static_cast<double>(pts_b.count);
 
-    // Debug: print first few computed view factors with detailed cosine info
-    if (F_ij > 0) {
+    // g == A_i F_ij == A_j F_ji, bit-identical for both directions.
+    double g = face_areas_[fa] * face_areas_[fb] * kernel_sum / (M_PI * n_pairs);
+
+    // Physical bound. F_ij <= 1 and F_ji <= 1, so A_i F_ij <= min(A_i, A_j).
+    // This is a conservation bound, not a tuning parameter, and min() is
+    // symmetric so the clamp cannot break the reciprocity identity. Exceeding
+    // it means the quadrature has failed on a near-singular concave crease --
+    // it is counted and reported, never absorbed silently.
+    const double g_max = std::min(face_areas_[fa], face_areas_[fb]);
+    if (g > g_max) {
+        const double excess_ppm = 1.0e6 * (g / g_max - 1.0);
+        const int excess = static_cast<int>(std::min(excess_ppm, 2.0e9));
+        int prev = g_nearfield_bound_worst_ratio_ppm.load(std::memory_order_relaxed);
+        while (excess > prev &&
+               !g_nearfield_bound_worst_ratio_ppm.compare_exchange_weak(prev, excess)) {
+        }
+        g_nearfield_bound_clamps++;
+        g = g_max;
+    }
+
+    if (g > 0.0) {
         g_subdiv_accepted++;
     }
-    return std::max(0.0, F_ij);
+    return std::max(0.0, g / face_areas_[face_i]);
+}
+
+// Print the near-field physical-bound tripwire, if it fired. NOT gated on
+// config_.verbose: a clamped view factor is an energy-conservation event, and
+// the whole point of the counter is that it cannot be missed. On stderr, not
+// stdout, because several callers redirect the calculator's stdout to keep
+// their own output greppable (test_vf_production does) and this must survive.
+void ViewFactorCalculator::reportNearFieldBoundClamps() {
+    const long long n = g_nearfield_bound_clamps.exchange(0);
+    const int worst = g_nearfield_bound_worst_ratio_ppm.exchange(0);
+    if (n == 0) return;
+    std::cerr << "\n  *** NEAR-FIELD VIEW-FACTOR BOUND CLAMP: " << n
+              << " pair(s) exceeded A_i F_ij <= min(A_i, A_j) and were clamped."
+              << "\n      Worst overshoot " << (worst / 10000.0) << "% above the bound."
+              << "\n      Cause: the near-field quadrature diverges on a concave crease"
+              << "\n      sharper than roughly 50 degrees (order "
+              << config_.nearfield_quadrature_order << " here). Either the mesh has folded"
+              << "\n      or near-degenerate adjacent facets, or it genuinely has such"
+              << "\n      creases and radiation.nearfield_quadrature_order must be raised."
+              << "\n      The clamped entries are BOUNDED but not accurate. ***\n"
+              << std::endl;
 }
 
 double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
@@ -1314,7 +1425,7 @@ double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
         return computeCentroid(face_i, face_j);
     } else {
         // Close: use subdivision method
-        return computeSubdivision(face_i, face_j, config_.subdivision_level);
+        return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
 }
 
@@ -1332,7 +1443,7 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
 
     if (Ns <= config_.adaptive_ns_threshold) {
         // Close faces: use subdivision method (needs full computation at sample points)
-        return computeSubdivision(face_i, face_j, config_.subdivision_level);
+        return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
 
     // Far faces: use centroid method with precomputed geometry
@@ -1447,7 +1558,7 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
     // Process near neighbors with subdivision method (individual visibility)
     for (size_t idx : near_neighbor_indices) {
         const auto& nd = neighbors[idx];
-        double F_ij = computeSubdivision(face_i, nd.neighbor_idx, config_.subdivision_level);
+        double F_ij = computeSubdivision(face_i, nd.neighbor_idx, config_.nearfield_quadrature_order);
         if (F_ij > config_.visibility_threshold) {
             results.push_back({nd.neighbor_idx, F_ij});
         }
@@ -1566,49 +1677,63 @@ void ViewFactorCalculator::findNeighbors(int face_idx, double radius, std::vecto
     spatial_grid_.query(face_centers_[face_idx], radius, result);
 }
 
-void ViewFactorCalculator::getSubdivisionPoints(int face_idx, int level,
-                                                 std::vector<std::array<double, 3>>& points,
-                                                 std::vector<double>& weights) {
+void ViewFactorCalculator::getSubCentroidPoints(int face_idx, int order,
+                                                 SubCentroidSamples& out) const {
     const auto& face = mesh_->faces[face_idx];
     const auto& v0 = mesh_->vertices[face[0]];
     const auto& v1 = mesh_->vertices[face[1]];
     const auto& v2 = mesh_->vertices[face[2]];
 
-    // Generate barycentric coordinates for subdivision
-    // Level 0: 1 point (centroid)
-    // Level 1: 4 points
-    // Level 2: 16 points, etc.
-
-    int n_per_edge = 1 << level;  // 2^level
-    int n_points = 0;
-
-    // Count total points
-    for (int i = 0; i <= n_per_edge; ++i) {
-        for (int j = 0; j <= n_per_edge - i; ++j) {
-            n_points++;
+    // Split the triangle into m^2 congruent sub-triangles by the standard
+    // barycentric subdivision and take each one's centroid, weight A/m^2:
+    //   row a holds (m - a) "upward" sub-triangles, centroids at
+    //     (u, v) = (a/m + 1/(3m), b/m + 1/(3m)),
+    //   and (m - a - 1) "downward" ones at
+    //     (u, v) = (a/m + 2/(3m), b/m + 2/(3m)).
+    // Sum over a of (m - a) + (m - a - 1) = m^2. Second-order accurate, and
+    // OPEN: no sample lands on an edge or a vertex, so the integrable 1/r^2
+    // singularity of an edge-touching pair is never evaluated at r = 0.
+    //
+    // ptm_thermal_sim refuses an out-of-range order at configuration time, so
+    // the clamp below is a buffer-overflow guard on the fixed-size sample
+    // array, not a policy. It is still reachable by a caller that builds a
+    // RadiationConfig directly (a tool or a test), and a clamp that changes the
+    // physics silently is exactly the failure mode this project keeps paying
+    // for -- so it says so, once.
+    if (order < 1 || order > kMaxNearFieldQuadOrder) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::cerr << "[view-factor] WARNING: nearfield_quadrature_order = " << order
+                      << " is outside 1.." << kMaxNearFieldQuadOrder
+                      << "; CLAMPING. The near-field view factors below are NOT the ones "
+                         "this configuration asked for." << std::endl;
         }
     }
-
-    points.resize(n_points);
-    weights.resize(n_points, 1.0 / n_points);
+    const int m = std::min(std::max(order, 1), kMaxNearFieldQuadOrder);
+    const double inv_m = 1.0 / static_cast<double>(m);
+    const double third = inv_m / 3.0;
 
     int idx = 0;
-    double step = 1.0 / n_per_edge;
-
-    for (int i = 0; i <= n_per_edge; ++i) {
-        double u = i * step;
-        for (int j = 0; j <= n_per_edge - i; ++j) {
-            double v = j * step;
-            double w = 1.0 - u - v;
-
-            points[idx] = {{
-                u * v0[0] + v * v1[0] + w * v2[0],
-                u * v0[1] + v * v1[1] + w * v2[1],
-                u * v0[2] + v * v1[2] + w * v2[2]
-            }};
-            idx++;
+    for (int a = 0; a < m; ++a) {
+        const double u_row = static_cast<double>(a) * inv_m;
+        for (int b = 0; b < m - a; ++b) {
+            const double u = u_row + third;
+            const double v = static_cast<double>(b) * inv_m + third;
+            const double w = 1.0 - u - v;
+            out.p[idx++] = {{u * v0[0] + v * v1[0] + w * v2[0],
+                             u * v0[1] + v * v1[1] + w * v2[1],
+                             u * v0[2] + v * v1[2] + w * v2[2]}};
+        }
+        for (int b = 0; b < m - a - 1; ++b) {
+            const double u = u_row + 2.0 * third;
+            const double v = static_cast<double>(b) * inv_m + 2.0 * third;
+            const double w = 1.0 - u - v;
+            out.p[idx++] = {{u * v0[0] + v * v1[0] + w * v2[0],
+                             u * v0[1] + v * v1[1] + w * v2[1],
+                             u * v0[2] + v * v1[2] + w * v2[2]}};
         }
     }
+    out.count = idx;  // == m * m
 }
 
 // Vector utilities

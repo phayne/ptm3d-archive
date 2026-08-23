@@ -25,7 +25,11 @@ import numpy as np
 
 
 MAGIC_VFM = 0x5646464D
-VERSION_VFM = 1
+# Byte layout is identical across versions; the version is a PHYSICS provenance
+# stamp. v1 = the one-sided near-field (M2) estimator retired 2026-08-23,
+# v2 = the symmetric double-area quadrature. See view_factor.cpp:540.
+VERSION_VFM_MIN = 1
+VERSION_VFM_MAX = 2
 
 
 def read_vfm(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -34,8 +38,12 @@ def read_vfm(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         magic, version = struct.unpack("II", f.read(8))
         if magic != MAGIC_VFM:
             raise SystemExit(f"Bad magic 0x{magic:08X} in {path}")
-        if version != VERSION_VFM:
+        if not VERSION_VFM_MIN <= version <= VERSION_VFM_MAX:
             raise SystemExit(f"Unsupported VFM version {version}")
+        if version < VERSION_VFM_MAX:
+            print(f"NOTE: {path} is VFM v{version} -- its near-field entries come from "
+                  f"the one-sided estimator retired 2026-08-23, not the current one.",
+                  file=sys.stderr)
         nrows, ncols, nnz = struct.unpack("QQQ", f.read(24))
         row_ptr = np.frombuffer(f.read((nrows + 1) * 4), dtype=np.int32)
         col_idx = np.frombuffer(f.read(nnz * 4), dtype=np.int32)

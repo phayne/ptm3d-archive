@@ -605,6 +605,16 @@ struct SimulationConfig {
         int max_neighbors = 500;                  // Hard ceiling per face (reduced from 2000 for better performance)
         int min_neighbors = 20;                   // Minimum neighbors per face
         bool use_cluster_cull = true;             // Conservative octree cluster-pair cull before ranking
+        // Near-field (M2) view-factor quadrature order. Order m samples BOTH
+        // faces of a near pair at the centroids of m x m equal-area
+        // sub-triangles (m^2 points/face, m^4 kernel evaluations/pair), which
+        // makes A_i F_ij == A_j F_ji an algebraic identity. 3 = production
+        // default; 2 is ~2.8x cheaper on the near-field kernel at essentially
+        // the same mass-weighted accuracy. Valid 1..8; out of range is FATAL.
+        // Only the in-engine SPARSE view-factor builder reads this -- the
+        // H-matrix and Monte-Carlo builders have their own kernels, and a run
+        // that LOADS a cached radiation.view_factor_file never evaluates it.
+        int nearfield_quadrature_order = 3;
         // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;
