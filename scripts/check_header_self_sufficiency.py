@@ -112,6 +112,7 @@ FILES = HEADERS + [
     "src/cpp/radiation/test_flux_cube_identity.cpp",
     "src/cpp/radiation/test_vf_production.cpp",
     "src/cpp/radiation/nearfield_quadrature.cpp",
+    "src/cpp/radiation/vf_dump_sparse.cpp",
 ] + GPU_FILES + GPU_REGION_FILES
 
 # symbol pattern -> the header(s) the STANDARD requires. A tuple means any one

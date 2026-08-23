@@ -296,6 +296,59 @@ jobs:
             exit 1
           fi
 
+      # Two independent view-factor implementations, subtracted. The two gates
+      # above and vf-assembler-gate below each score ONE implementation against
+      # closed forms in isolation, which is necessary and not sufficient: FC-08
+      # (offline, 2x far field) and the M2 near-field bias (in-engine, -21.7% on
+      # touching pairs) each survived every in-isolation invariant. This step
+      # runs the in-engine sparse builder and the mc_ref_pp + assemble_vf_haworth
+      # referee on ONE synthetic cap and differences the matrices.
+      #
+      # ubuntu only: it needs numpy, and running the same comparison twice buys
+      # nothing. Settings are MEASURED, not guessed -- 42 s at --jobs 2 on the
+      # development host with --nrays 100000, and at that budget arm [X0] still
+      # finds 179,687 lambda-resolved entries (its floor is 1,000). Do not
+      # reduce --nrays further without re-reading [X0]: at 40,000 rays NOT ONE
+      # entry on this cap reaches lambda = 50 and the per-entry arm goes vacuous.
+      #
+      # BOTH polarities run. --referee-divisor hits reinstates the FC-08 defect
+      # and arm [X6] -- the low-ray-budget arm, the only regime where FC-08
+      # EXISTS -- must go red. Without that second invocation this step would
+      # pass just as happily with the defect present.
+      - name: Cross-agreement -- in-engine builder vs offline referee
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -uo pipefail
+          python -m pip install --quiet numpy
+          cmake --build build --target vf_dump_sparse -j2
+          rc=0
+          python3 scripts/ptm12_diag/test_vf_cross_agreement.py \
+            --jobs 2 --nrays 100000 2>&1 | tee vf_xagree.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_cross_agreement exited $rc"; exit 1; }
+          grep -q '^\[test_vf_cross_agreement\] PASS' vf_xagree.log \
+            || { echo '::error::test_vf_cross_agreement printed no PASS verdict'; exit 1; }
+          grep -E '^\s+\[X[0-9]+[ab]?\]' vf_xagree.log
+
+      - name: Negative control -- the FC-08 assembler defect must FAIL the cross gate
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -uo pipefail
+          rc=0
+          python3 scripts/ptm12_diag/test_vf_cross_agreement.py \
+            --jobs 2 --nrays 100000 --referee-divisor hits \
+            > vf_xagree_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::the cross gate PASSED with the FC-08 divisor defect reinstated. Do not trust the green run above.'
+            tail -40 vf_xagree_control.log
+            exit 1
+          fi
+          grep -q 'NEGATIVE CONTROL' vf_xagree_control.log || {
+            echo '::error::the control run did not announce itself; it may not have been applied.'
+            exit 1
+          }
+          echo "OK: FC-08 divisor rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[X[0-9]+[ab]?\].*FAILED' vf_xagree_control.log
+
       # Anti-tautology. A gate that has never been seen to go red is not a gate.
       # Scale every far-field entry by 2 -- FC-08's exact signature -- and require
       # a nonzero exit. The injection is applied to the assembled matrix inside
