@@ -322,6 +322,30 @@ jobs:
           echo "OK: 2x far-field inflation rejected (exit $rc). Verdicts that fired:"
           grep -E '^\s+\[[A-Z0-9]+\].*FAILED' vf_production_control.log
 
+      # Second anti-tautology, added when the reciprocity tolerances dropped from
+      # 1e-2 / 0.60 to 1e-6 (2026-08-23, symmetric near-field quadrature). Those
+      # limits are now six orders of magnitude tighter than they were, and a
+      # tolerance that tight is worthless if nothing has ever been shown to
+      # exceed it. Perturb ONE entry and require red.
+      - name: Negative control -- a single broken reciprocal pair must FAIL the gate
+        env:
+          PTM_VFGATE_INJECT_RECIP: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build/bin/test_vf_production > vf_production_recip.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production PASSED with one view-factor entry doubled. The reciprocity arms are not detecting; do not trust the green run above.'
+            tail -40 vf_production_recip.log
+            exit 1
+          fi
+          grep -q 'FAULT INJECTION ACTIVE' vf_production_recip.log || {
+            echo '::error::the injected run did not announce itself; the control may not have been applied.'
+            exit 1
+          }
+          echo "OK: single-entry reciprocity break rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[[A-Z0-9]+\].*FAILED' vf_production_recip.log
+
       - name: Build + run spectral-equilibration test
         # The program's exit status is now a real gate (worst max|dT| at the
         # production cadence N=192 steps/day vs the 1 K target). Grep the verdict

@@ -40,9 +40,23 @@
  *       mean of the production row sums over disk 1 IS F_12 by definition, so
  *       the comparison is exact, not a limit.
  *
+ *   [T] TOUCHING PAIR. Two perpendicular unit squares sharing an edge, built as
+ *       2 + 2 triangles and pushed through the same production calculator. The
+ *       aggregate is a closed form (Howell C-14),
+ *           A_1 F_12 = 0.20004378   for l = w = h = 1,
+ *       and it is the WORST case for any quadrature on this kernel: the
+ *       integrand has an integrable 1/r^2 singularity on the shared edge. Arms
+ *       I and D cannot see this -- the cap's near pairs are shallow and the
+ *       disks have no near pairs at all -- and edge/vertex-touching pairs carry
+ *       17.6% of the near-field coupling mass on a real crater mesh.
+ *       Gated as a two-sided BAND on the ratio, not as an accuracy tolerance:
+ *       no production-order area quadrature is within a few percent of this
+ *       closed form (the error falls only like 1/m), so the arm bounds the
+ *       magnitude and pins the SIGN. It prints its own refinement table.
+ *
  *   [R] RECIPROCITY on the PRODUCTION matrix. Here this is NOT a tautology:
  *       `ViewFactorCalculator::computeSubset` computes every (i,j) independently
- *       from the M1/M3 kernel and never symmetrizes. A_i F_ij == A_j F_ji only
+ *       from the M1/M2 kernel and never symmetrizes. A_i F_ij == A_j F_ji only
  *       if the kernel, the areas and the occlusion agree in both directions.
  *
  *   [S] CLOSURE, sum_j F_ij <= 1. Necessary, never sufficient -- FC-08 passed
@@ -84,6 +98,8 @@
  *
  * Usage: test_vf_production [--refine] [--tol-ingersoll PCT]
  *                           [--tol-disk PCT] [--tol-recip PCT]
+ *                           [--tol-touch-lo R] [--tol-touch-hi R]
+ *                           [--quad-order M]
  */
 #include <algorithm>
 #include <array>
@@ -117,6 +133,21 @@ constexpr double PI = 3.14159265358979323846;
 // depth d and rim radius r_rim, uniform over the whole cap.
 double ingersollTerrainVF(double d, double r_rim) {
     return (d * d) / (d * d + r_rim * r_rim);
+}
+
+// Two perpendicular rectangles with a COMMON EDGE of length l; rectangle 1 is
+// l x w, rectangle 2 is l x h. Howell, "A Catalog of Radiation Heat Transfer
+// Configuration Factors", C-14. Exact.
+double perpendicularRectF12(double l, double w, double h) {
+    const double W = w / l;
+    const double H = h / l;
+    const double W2 = W * W, H2 = H * H;
+    const double t = W * std::atan(1.0 / W) + H * std::atan(1.0 / H) -
+                     std::sqrt(H2 + W2) * std::atan(1.0 / std::sqrt(H2 + W2));
+    const double A = (1.0 + W2) * (1.0 + H2) / (1.0 + W2 + H2);
+    const double B = std::pow(W2 * (1.0 + W2 + H2) / ((1.0 + W2) * (W2 + H2)), W2);
+    const double C = std::pow(H2 * (1.0 + H2 + W2) / ((1.0 + H2) * (H2 + W2)), H2);
+    return (t + 0.25 * std::log(A * B * C)) / (PI * W);
 }
 
 // Configuration factor between two coaxial parallel disks (radius r1 -> r2,
@@ -262,6 +293,83 @@ BuiltMesh buildCoaxialDisks(double r1, double r2, double L, int n_rings, int n_a
     return b;
 }
 
+// A CONCAVE WEDGE: two unit right triangles sharing the edge (0,0,0)-(1,0,0) at
+// an arbitrary dihedral angle. As the angle closes the exact A_i F_ij rises
+// toward A_i and never past it, while a finite-order area quadrature diverges:
+// the sample pairs nearest the shared edge have r -> 0 with cos_a cos_b -> 1.
+// Order 3 reads F_ij = 1.07 at 45 degrees and 19.2 at 10 degrees against
+// references 0.49 and 0.84. This geometry exists so the physical-bound tripwire
+// in computeSubdivision is exercised by the gate rather than trusted.
+BuiltMesh buildConcaveWedge(double dihedral_deg) {
+    const double th = dihedral_deg * PI / 180.0;
+    BuiltMesh b;
+    b.mesh = std::make_shared<ptm::Mesh>();
+    auto& V = b.mesh->vertices;
+    auto& F = b.mesh->faces;
+
+    V.push_back({{0.0, 0.0, 0.0}});
+    V.push_back({{1.0, 0.0, 0.0}});
+    V.push_back({{0.0, 1.0, 0.0}});
+    V.push_back({{0.0, std::cos(th), std::sin(th)}});
+
+    F.push_back({{0, 1, 2}});
+    b.group.push_back(0);
+    F.push_back({{0, 3, 1}});
+    b.group.push_back(1);
+
+    finalizeMesh(b, {{0.0, 0.0, 0.0}}, false);
+    // Both normals must point INTO the wedge or the pair never couples.
+    const auto& C = b.mesh->face_centers;
+    for (size_t i = 0; i < 2; ++i) {
+        const size_t o = 1 - i;
+        const std::array<double, 3> to_other = {{C[o][0] - C[i][0], C[o][1] - C[i][1],
+                                                 C[o][2] - C[i][2]}};
+        auto& n = b.mesh->face_normals[i];
+        if (n[0] * to_other[0] + n[1] * to_other[1] + n[2] * to_other[2] < 0.0)
+            for (int k = 0; k < 3; ++k) n[k] = -n[k];
+    }
+    return b;
+}
+
+// Two perpendicular UNIT SQUARES sharing the edge from (0,0,0) to (1,0,0):
+// square 1 in the z = 0 plane facing +z (group 0), square 2 in the y = 0 plane
+// facing +y (group 1). Two triangles each -- the calculator only ever sees
+// triangles, so the closed form has to be reassembled from four directed pairs,
+// which is precisely the situation a real mesh presents.
+BuiltMesh buildTouchingSquares() {
+    BuiltMesh b;
+    b.mesh = std::make_shared<ptm::Mesh>();
+    auto& V = b.mesh->vertices;
+    auto& F = b.mesh->faces;
+
+    V.push_back({{0.0, 0.0, 0.0}});   // 0  shared edge start
+    V.push_back({{1.0, 0.0, 0.0}});   // 1  shared edge end
+    V.push_back({{1.0, 1.0, 0.0}});   // 2  square 1
+    V.push_back({{0.0, 1.0, 0.0}});   // 3  square 1
+    V.push_back({{1.0, 0.0, 1.0}});   // 4  square 2
+    V.push_back({{0.0, 0.0, 1.0}});   // 5  square 2
+
+    F.push_back({{0, 1, 2}});         // square 1, winding gives +z
+    F.push_back({{0, 2, 3}});
+    b.group.push_back(0);
+    b.group.push_back(0);
+
+    F.push_back({{0, 4, 1}});         // square 2, winding gives +y
+    F.push_back({{0, 5, 4}});
+    b.group.push_back(1);
+    b.group.push_back(1);
+
+    finalizeMesh(b, {{0.0, 0.0, 0.0}}, false);
+    // Pin the orientation rather than trusting the winding: square 1 must look
+    // +z and square 2 must look +y, or the two never see each other at all.
+    for (size_t i = 0; i < F.size(); ++i) {
+        const int axis = (b.group[i] == 0) ? 2 : 1;
+        if (b.mesh->face_normals[i][axis] < 0.0)
+            for (int k = 0; k < 3; ++k) b.mesh->face_normals[i][k] = -b.mesh->face_normals[i][k];
+    }
+    return b;
+}
+
 RTCScene makeScene(RTCDevice dev, const ptm::Mesh& m) {
     RTCScene scene = rtcNewScene(dev);
     RTCGeometry g = rtcNewGeometry(dev, RTC_GEOMETRY_TYPE_TRIANGLE);
@@ -349,31 +457,48 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, 
     return touched;
 }
 
-// Perturb exactly ONE entry, chosen deterministically: the far-field two-sided
-// pair carrying the most A_i F_ij mass. Far field on purpose -- that is FC-08's
-// regime and the one whose reciprocity arm is gated at machine precision. Which
-// pair was hit is printed, so the control is auditable rather than "some entry".
+// Perturb exactly ONE entry, chosen deterministically: the two-sided pair
+// carrying the most A_i F_ij mass. FAR FIELD is preferred -- that is FC-08's
+// regime -- but a geometry with no far-field pair at all (arm T: every pair is
+// near field) falls back to the near field rather than injecting nothing.
+// That fallback is the only control the NEAR-field reciprocity arms have, and
+// those are the ones whose tolerance dropped from 0.60 to 1e-6 on 2026-08-23.
+// Which pair was hit, and in which regime, is printed; the caller treats
+// "found nothing" as a hard error, because a control that silently did not
+// perturb anything would report a green run as proof of detection.
 bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
                             double scale) {
     const auto& C = b.mesh->face_centers;
-    double best = 0.0;
-    size_t bi = 0, bj = 0;
-    bool found = false;
-    for (size_t i = 0; i < d.n; ++i) {
-        for (size_t j = 0; j < d.n; ++j) {
-            if (i == j || d.at(i, j) <= 0.0 || d.at(j, i) <= 0.0) continue;
-            const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
-            const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (r / std::sqrt(std::sqrt(b.areas[i] * b.areas[j])) <= ns_threshold) continue;
-            const double mass = b.areas[i] * d.at(i, j);
-            if (mass > best) { best = mass; bi = i; bj = j; found = true; }
+    // pass 0 = far field only, pass 1 = anything.
+    for (int pass = 0; pass < 2; ++pass) {
+        double best = 0.0;
+        size_t bi = 0, bj = 0;
+        bool found = false;
+        bool near = false;
+        for (size_t i = 0; i < d.n; ++i) {
+            for (size_t j = 0; j < d.n; ++j) {
+                if (i == j || d.at(i, j) <= 0.0 || d.at(j, i) <= 0.0) continue;
+                const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1],
+                             dz = C[j][2] - C[i][2];
+                const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const bool is_far =
+                    r / std::sqrt(std::sqrt(b.areas[i] * b.areas[j])) > ns_threshold;
+                if (pass == 0 && !is_far) continue;
+                const double mass = b.areas[i] * d.at(i, j);
+                if (mass > best) {
+                    best = mass; bi = i; bj = j; found = true; near = !is_far;
+                }
+            }
         }
+        if (!found) continue;
+        d.at(bi, bj) *= scale;
+        std::cout << "  injection: perturbed the single "
+                  << (near ? "NEAR-field (M2)" : "far-field (M1)") << " entry F(" << bi
+                  << "," << bj << ") by x" << std::fixed << std::setprecision(4)
+                  << scale << "\n";
+        return true;
     }
-    if (!found) return false;
-    d.at(bi, bj) *= scale;
-    std::cout << "  injection: perturbed the single far-field entry F(" << bi << ","
-              << bj << ") by x" << std::fixed << std::setprecision(4) << scale << "\n";
-    return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,15 +548,36 @@ double areaWeightedRowSum(const DenseVF& d, const BuiltMesh& b, int want) {
     return (den > 0.0) ? num / den : 0.0;
 }
 
+// The UNNORMALIZED coupling out of group `want`: sum over its faces of
+// A_i * sum_j F_ij. For the touching-square pair that quantity IS A_1 F_12, the
+// closed form, with no area normalization to argue about.
+double areaWeightedCoupling(const DenseVF& d, const BuiltMesh& b, int want) {
+    double acc = 0.0;
+    for (size_t i = 0; i < d.n; ++i) {
+        if (b.group[i] != want) continue;
+        double rs = 0.0;
+        for (size_t j = 0; j < d.n; ++j) rs += d.at(i, j);
+        acc += b.areas[i] * rs;
+    }
+    return acc;
+}
+
 // Reciprocity is split by the SAME criterion the calculator itself uses to pick
 // an estimator: Ns = r / sqrt(A_eff) against adaptive_ns_threshold. Above it the
 // pair goes through M1, the centroid kernel A_j cos_i cos_j / (pi r^2), which is
 // ANALYTICALLY reciprocal -- A_i F_ij and A_j F_ji are the same expression -- so
-// any residual there is an occlusion or storage-threshold asymmetry and is gated
-// at machine precision. Below it the pair goes through M2
-// (`computeSubdivision`), a one-sided quadrature that integrates over the
-// EMITTING face only; it is reciprocal only in the limit of infinite
-// subdivision, so its residual is reported and bounded, not required to vanish.
+// any residual there is an occlusion or storage-threshold asymmetry.
+//
+// Below the threshold the pair goes through M2 (`computeSubdivision`). Until
+// 2026-08-23 that was a ONE-SIDED rule: it placed a point emitter at the
+// centroid of one face and integrated over the other, i.e. each direction was a
+// midpoint rule in a DIFFERENT variable of the same symmetric double integral.
+// (An earlier revision of this comment had the two faces the wrong way round --
+// the code integrated over the RECEIVER and treated the EMITTER as a point.
+// Corrected 2026-08-23 by Fermi's review.) Its worst near-field pair read 0.4618
+// on the cap. M2 is now a symmetric double-area sub-centroid quadrature
+// accumulated in canonical min(i,j) order, so BOTH regimes are reciprocal as
+// algebraic identities and both are gated at machine precision.
 struct RecipResult {
     double worst_far = 0.0;
     double worst_near = 0.0;
@@ -503,6 +649,16 @@ void reportReciprocity(const char* label, const RecipResult& rr, double tol_far,
 // the run
 // ---------------------------------------------------------------------------
 
+// 0 = leave the production default (radiation_config.h) alone.
+int g_quad_order_override = 0;
+
+// Set when a requested fault injection could not be applied. Fatal at exit.
+bool g_injection_failed = false;
+
+void applyQuadOrder(radiation::RadiationConfig& cfg) {
+    if (g_quad_order_override > 0) cfg.nearfield_quadrature_order = g_quad_order_override;
+}
+
 radiation::RadiationConfig noTruncationConfig(size_t n_faces) {
     radiation::RadiationConfig cfg;              // production defaults, then:
     cfg.adaptive_neighbors = false;              // == --max-neighbors N on the CLI
@@ -510,6 +666,7 @@ radiation::RadiationConfig noTruncationConfig(size_t n_faces) {
     cfg.search_radius_factor = 1000.0;           // the extent-based radius already
                                                  // covers the mesh; belt and braces
     cfg.verbose = false;
+    applyQuadOrder(cfg);
     return cfg;
 }
 
@@ -540,7 +697,11 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
     }
     if (inj.reciprocity_scale != 1.0) {
         if (!injectReciprocityBreak(d, b, cfg.adaptive_ns_threshold, inj.reciprocity_scale)) {
-            std::cout << "  INJECTION ERROR: no two-sided far-field entry to perturb.\n";
+            // A control that could not perturb anything proves nothing, and a
+            // green exit after it would be read as "the detector works".
+            std::cout << "  INJECTION ERROR: no two-sided entry to perturb on this "
+                         "geometry. The reciprocity control did NOT run here.\n";
+            g_injection_failed = true;
         }
     }
     return d;
@@ -591,20 +752,46 @@ int main(int argc, char** argv) {
                                      // still far below a 2x scale error.
     // Tolerances. Every one is pinned from a measured refinement curve, printed
     // above the verdict it gates; see SESSION-NOTES-2026-08-22-vf-production-gate.md.
-    double tol_perface = 2.0;        // measured worst per-face deviation 1.19% at the
-                                     // default 2,750-face cap; this is the faceting
-                                     // residual of a flat-triangle cap and it SHRINKS
-                                     // with resolution (4.08/2.69/1.73/1.19% at
-                                     // 342/648/1404/2750 faces).
+    double tol_perface = 2.0;        // faceting residual of a flat-triangle cap;
+                                     // SHRINKS with resolution (4.08/2.69/1.73/1.19%
+                                     // at 342/648/1404/2750 faces under the old
+                                     // one-sided M2). The symmetric M2 reads 1.45%
+                                     // at the 2,750-face cap -- WORSE, and expected
+                                     // to be: the old rule's near-field deficit
+                                     // partly canceled the faceting error. 1.38x
+                                     // headroom, NOT re-tuned.
+    // ARM T band. NOT an accuracy tolerance -- see the banner the arm prints.
+    // Measured ratios to the closed form, production calculator, 2026-08-23:
+    //   symmetric double-area   m = 1  1.5166   (degenerate: pure centroid)
+    //                           m = 2  1.2738
+    //                           m = 3  1.1853   <- production default
+    //                           m = 4  1.1400
+    //   old one-sided rule      level 3  0.8192   level 6  0.9487
+    // The edges are chosen by an explicit rule: pass the two production-
+    // sanctioned orders (2 and 3), reject order 1 (no near-field treatment at
+    // all), reject the old one-sided rule at ANY of its levels, and reject a 2x
+    // inflation (2.37). The rule OVER-counts here for a structural reason -- an
+    // open rule samples a positively singular kernel at finite r -- so the lower
+    // edge sits just below the closed form rather than symmetric about it.
+    // A REVIEW NOTE, because the spec for this arm said otherwise: the review
+    // that commissioned it predicted "+1.3% after". That number is the
+    // EDGE/VERTEX-TOUCHING population on lunar_crater_80N.ply (+1.258%), not
+    // this geometry. The review's own reference script (q4_edge.py) prints
+    // +18.530% for the double-area rule at m = 3 on perpendicular unit squares,
+    // and the production calculator reproduces it to six digits.
+    double tol_touch_lo = 0.98, tol_touch_hi = 1.40;
     double tol_recip = 1.0e-6;       // far field: M1 is reciprocal as an identity;
                                      // measured 1.3e-15, nine orders of headroom.
-    double tol_recip_mass = 1.0e-2;  // measured 3.5e-3 on the cap (2.8x headroom).
-    double tol_recip_near = 0.60;    // measured worst near-field pair 0.464. M2
-                                     // integrates over the EMITTER only, so it is
-                                     // reciprocal only in the subdivision limit.
-                                     // This is a REGRESSION bound on a known
-                                     // non-reciprocal quadrature, not a claim that
-                                     // 46% is acceptable -- see the owed ledger row.
+    double tol_recip_mass = 1.0e-6;  // was 1e-2 while M2 was one-sided. The
+                                     // symmetric double-area M2 makes A_iF_ij =
+                                     // A_jF_ji an algebraic identity in BOTH
+                                     // regimes; measured 1.6e-16.
+    double tol_recip_near = 1.0e-6;  // was 0.60, a regression bound on a known
+                                     // non-reciprocal quadrature (worst pair
+                                     // 0.4618). Now measured 6.6e-16: the near
+                                     // field is held to the same machine-precision
+                                     // standard as the far field, so any future
+                                     // one-sided kernel is red on sight.
     double band_lo = 0.90, band_hi = 1.02;
 
     for (int i = 1; i < argc; ++i) {
@@ -616,6 +803,23 @@ int main(int argc, char** argv) {
         else if (a == "--tol-recip-mass" && i + 1 < argc) tol_recip_mass = std::atof(argv[++i]);
         else if (a == "--tol-recip-near" && i + 1 < argc) tol_recip_near = std::atof(argv[++i]);
         else if (a == "--tol-perface" && i + 1 < argc) tol_perface = std::atof(argv[++i]);
+        else if (a == "--tol-touch-lo" && i + 1 < argc) tol_touch_lo = std::atof(argv[++i]);
+        else if (a == "--tol-touch-hi" && i + 1 < argc) tol_touch_hi = std::atof(argv[++i]);
+        else if (a == "--quad-order" && i + 1 < argc) {
+            // strtol, not atoi: atoi maps both "0" and a typo to 0, which is the
+            // "no override" sentinel, so a mistyped order would run at the
+            // default and REPORT itself as the default.
+            char* end = nullptr;
+            const long v = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1 ||
+                v > radiation::kMaxNearFieldQuadOrder) {
+                std::cerr << "--quad-order expects an integer 1.."
+                          << radiation::kMaxNearFieldQuadOrder << ", got '" << argv[i]
+                          << "'\n";
+                return 2;
+            }
+            g_quad_order_override = static_cast<int>(v);
+        }
         else if (a == "--band-lo" && i + 1 < argc) band_lo = std::atof(argv[++i]);
         else if (a == "--band-hi" && i + 1 < argc) band_hi = std::atof(argv[++i]);
         else {
@@ -630,6 +834,17 @@ int main(int argc, char** argv) {
     std::cout << "  test_vf_production -- closed-form gate on the PRODUCTION\n";
     std::cout << "  radiation::ViewFactorCalculator (Embree ray-traced).\n";
     std::cout << "================================================================\n";
+    {
+        const radiation::RadiationConfig probe;
+        const int m = (g_quad_order_override > 0) ? g_quad_order_override
+                                                  : probe.nearfield_quadrature_order;
+        std::cout << "  near-field quadrature order m = " << m << " ("
+                  << (m * m) << " sample points per face, " << (m * m * m * m)
+                  << " kernel evaluations per pair)"
+                  << (g_quad_order_override > 0 ? "   [--quad-order OVERRIDE]"
+                                                : "   [production default]")
+                  << "\n";
+    }
     if (inj.active()) {
         std::cout << "\n";
         std::cout << "  ****************************************************************\n";
@@ -752,6 +967,7 @@ int main(int argc, char** argv) {
             BuiltMesh b = buildCoaxialDisks(r1, r2, L, 8, 24);
             radiation::RadiationConfig cfg;   // untouched production defaults
             cfg.verbose = false;
+            applyQuadOrder(cfg);
             size_t injected = 0;
             DenseVF d = runProductionVF(b, cfg, inj, &injected);
             const double meas = areaWeightedRowSum(d, b, 0);
@@ -775,6 +991,105 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ------------------------------------------------------------------------ ARM T
+    {
+        const double f12 = perpendicularRectF12(1.0, 1.0, 1.0);
+        std::cout << "\n=== ARM T: perpendicular unit squares sharing an edge ===\n";
+        std::cout << "  closed form (Howell C-14): A_1 F_12 = " << std::fixed
+                  << std::setprecision(8) << f12 << "\n";
+        std::cout << "  Built as 2 + 2 triangles, so the aggregate is reassembled from\n"
+                  << "  four DIRECTED near-field pairs -- the shape a real mesh presents.\n"
+                  << "  Arms I and D cannot see this regime: the cap's near pairs are\n"
+                  << "  shallow and the disks have no near pairs at all, yet on a real\n"
+                  << "  crater mesh edge/vertex-touching pairs carry 17.6% of the\n"
+                  << "  near-field coupling mass.\n";
+        std::cout << "\n  READ THIS BEFORE QUOTING THE NUMBER. This arm is a REGRESSION\n"
+                  << "  BOUND and a SIGN detector, not an accuracy certificate. The\n"
+                  << "  integrand has an integrable 1/r^2 singularity ON the shared edge,\n"
+                  << "  so NO production-order area quadrature is close to it: the\n"
+                  << "  symmetric double-area rule's error falls only like 1/m, roughly\n"
+                  << "  +57%/m, and reaching 2% would need m ~ 30, i.e. ~10^6 kernel\n"
+                  << "  evaluations per pair. The refinement table below is printed so\n"
+                  << "  the 1/m law is visible and a change in convergence ORDER shows up\n"
+                  << "  even when the gated ratio does not move.\n";
+
+        struct Row { int m; double meas; };
+        std::vector<Row> table;
+        const radiation::RadiationConfig probe;
+        const int prod_m = (g_quad_order_override > 0) ? g_quad_order_override
+                                                       : probe.nearfield_quadrature_order;
+        std::vector<int> orders = {1, 2, 3, 4};
+        if (std::find(orders.begin(), orders.end(), prod_m) == orders.end())
+            orders.push_back(prod_m);
+
+        DenseVF d_prod;
+        BuiltMesh b = buildTouchingSquares();
+        radiation::RadiationConfig cfg_prod = noTruncationConfig(b.mesh->faces.size());
+        size_t injected = 0;
+        std::cout << "\n";
+        for (int m : orders) {
+            auto cfg = noTruncationConfig(b.mesh->faces.size());
+            cfg.nearfield_quadrature_order = m;
+            size_t inj_here = 0;
+            DenseVF d = runProductionVF(b, cfg, inj, &inj_here);
+            const double meas = areaWeightedCoupling(d, b, 0);
+            table.push_back({m, meas});
+            std::cout << "    m = " << m << " (" << std::setw(4) << (m * m * m * m)
+                      << " evals/pair):  A_1 F_12 = " << std::fixed << std::setprecision(6)
+                      << meas << "   ratio " << std::setprecision(4) << (meas / f12)
+                      << "   err " << std::showpos << std::setprecision(3)
+                      << 100.0 * (meas / f12 - 1.0) << "%" << std::noshowpos
+                      << "   err*m " << std::setprecision(1)
+                      << 100.0 * (meas / f12 - 1.0) * m
+                      << (m == prod_m ? "   <-- gated" : "") << "\n";
+            if (m == prod_m) { d_prod = d; injected = inj_here; }
+        }
+
+        double meas_prod = 0.0;
+        for (const auto& r : table) if (r.m == prod_m) meas_prod = r.meas;
+        const RecipResult rr = reciprocity(d_prod, b, cfg_prod.adaptive_ns_threshold);
+        std::cout << "  " << b.mesh->faces.size() << " faces; " << rr.pairs_near
+                  << " of " << (rr.pairs_near + rr.pairs_far)
+                  << " two-sided pairs are near field (M2)";
+        if (injected) std::cout << "   (injection touched " << injected << " entries)";
+        std::cout << "\n";
+        verdictBand("T1", "touching-pair A_1 F_12 / closed form", meas_prod / f12,
+                    tol_touch_lo, tol_touch_hi, all_ok);
+        reportReciprocity("touching squares", rr, tol_recip, tol_recip_mass,
+                          tol_recip_near, all_ok, "R3a", "R3b", "R3c");
+        const RowStats rs = rowSumStats(d_prod, b.group, -1);
+        verdictBelow("S3", "max row sum (closure, must be <= 1)", rs.max, 1.0, all_ok);
+    }
+
+    // ------------------------------------------------------------------------ ARM W
+    {
+        std::cout << "\n=== ARM W: concave wedge, the physical bound F_ij <= 1 ===\n";
+        std::cout << "  Two unit triangles sharing an edge at a closing dihedral. The\n"
+                  << "  exact A_i F_ij rises toward A_i and never past it; a finite-order\n"
+                  << "  area quadrature DIVERGES, because the sample pairs nearest the\n"
+                  << "  shared edge have r -> 0 with cos_a cos_b -> 1. Unbounded, order 3\n"
+                  << "  reads 1.07 at 45 deg and 19.2 at 10 deg against references 0.49\n"
+                  << "  and 0.84 -- fabricated energy that the downstream row-sum\n"
+                  << "  renormalization would absorb silently, zeroing that face's sky\n"
+                  << "  view factor. computeSubdivision clamps at min(A_i, A_j) and counts\n"
+                  << "  it; this arm is what proves the clamp is there.\n";
+        double worst = 0.0;
+        for (double deg : {90.0, 45.0, 30.0, 10.0}) {
+            BuiltMesh b = buildConcaveWedge(deg);
+            auto cfg = noTruncationConfig(b.mesh->faces.size());
+            size_t injected = 0;
+            DenseVF d = runProductionVF(b, cfg, inj, &injected);
+            double mx = 0.0;
+            for (size_t i = 0; i < d.n; ++i)
+                for (size_t j = 0; j < d.n; ++j) mx = std::max(mx, d.at(i, j));
+            worst = std::max(worst, mx);
+            std::cout << "    dihedral " << std::setw(3) << static_cast<int>(deg)
+                      << " deg:  max F_ij = " << std::fixed << std::setprecision(6) << mx
+                      << "\n";
+        }
+        verdictBelow("W1", "max F_ij over a closing concave wedge", worst, 1.0, all_ok);
+    }
+
     // ------------------------------------------------------------------------
     std::cout << "\n=== NOT COVERED BY THIS PROGRAM ===\n";
     std::cout << "  * the OFFLINE sweep + assembler (mc_ref_pp + assemble_vf_haworth.py):\n"
@@ -785,6 +1100,14 @@ int main(int argc, char** argv) {
     std::cout << "  * the GPU BVH visibility path (benchmark_gpu_visibility): the\n"
               << "    calculator above uses Embree on the CPU in every configuration.\n";
     std::cout << "  * the radiosity SOLVE. This program scores geometry only.\n";
+
+    if (g_injection_failed) {
+        std::cout << "\n[test_vf_production] FAULT INJECTION REQUESTED BUT NOT APPLIED on at\n"
+                  << "[test_vf_production] least one arm (see INJECTION ERROR above). A\n"
+                  << "[test_vf_production] control that perturbed nothing is not a control.\n";
+        std::cerr << "test_vf_production: requested fault injection could not be applied\n";
+        return 3;
+    }
 
     if (inj.active()) {
         std::cout << "\n[test_vf_production] NEGATIVE CONTROL RUN -- verdicts above describe\n"
