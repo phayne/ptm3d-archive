@@ -1,6 +1,9 @@
-# Build directory
-build/
-build_*/
+# Build directories. One pattern for every separator the docs and CI use:
+# `build/`, `build_gpu/`, and `build-gpu/` (the name INSTALL.md and the
+# gpu-portable-isa CI job teach). The previous `build/` + `build_*/` pair
+# missed the hyphen, so `build-gpu/` showed up as untracked in every status.
+# Trailing slash: directories only, so scripts/build_lola_ring.py is untouched.
+build*/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
