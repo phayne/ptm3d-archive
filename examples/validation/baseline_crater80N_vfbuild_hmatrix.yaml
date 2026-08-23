@@ -1,0 +1,80 @@
+# PTM3D validation baseline arm: the H-MATRIX view-factor builder, built FRESH.
+#
+# The companion to baseline_crater80N_vfbuild_sparse.yaml, and the reason it is
+# a SEPARATE arm rather than a variant: PTM3D has two in-engine view-factor
+# builders with two different near-field estimators, and ptm_thermal_sim picks
+# between them by a MEMORY THRESHOLD as well as by this config key. A suite that
+# only ever exercises one of them cannot say anything about a production run
+# that took the other. (Paul's standing priority: one physics across all paths.)
+#
+# The two builders are not expected to produce identical matrices, and this arm
+# does not assert that they do -- test_vf_production's arm [H] scores their
+# agreement directly. What this arm holds is that the H-matrix ROUTE, end to end
+# through a coupled thermal run, stays byte-stable.
+#
+# Differences from the sparse arm, and only these:
+#   use_hmatrix: true / use_aca: true
+#
+# Note what that turns on besides the estimator: ACA low-rank compression at
+# aca_tolerance = 1e-3. Measured on the Ingersoll cap, compression is what makes
+# the H-matrix's far-field reciprocity residual 9.9e-2 instead of 6.5e-14 and
+# its mass-weighted defect 1.5e-3 instead of 1.2e-15. That is inside this arm's
+# bytes by design -- it is what production runs.
+#
+# Confirm from the log that the matrix was BUILT and not loaded:
+#   grep -E 'H-matrix|Loading view factor' <log>
+#
+# Runtime ~30 s on this host at 48 threads. Run from the repository root:
+#   ./build/bin/ptm_thermal_sim \
+#       --config examples/validation/baseline_crater80N_vfbuild_hmatrix.yaml
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h output cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  use_gpu: false
+  use_hmatrix: true              # the OTHER in-engine builder
+  use_aca: true
+  view_factor_file: ''           # LOAD-BEARING: empty means BUILD, never cache
+  nearfield_quadrature_order: 3  # a FLOOR on this path; the builder raises it
+                                 # adaptively on close pairs. See
+                                 # nearfield_quadrature.h.
+  coupling_mode: fixed
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/validation_baseline/crater80N_vfbuild_hmatrix
+  format: binary
+  vtk_mode: thermal
+  write_raw_stats: true
+  skip_time_series: true
+  skip_mesh: true
+advanced:
+  verbose: false
