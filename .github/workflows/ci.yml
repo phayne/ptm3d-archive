@@ -276,6 +276,52 @@ jobs:
             exit 1
           fi
 
+      # The bowl-crater gate above scores an INLINE analytic centroid kernel; it
+      # never calls radiation::ViewFactorCalculator. That is why FC-08 -- a 2x
+      # far-field inflation -- lived for months under a green run of it. This
+      # step scores the production calculator itself against two closed forms
+      # (Ingersoll spherical cap, coaxial parallel disks) and against reciprocity
+      # and row-sum closure. ~3 s on 2 cores.
+      - name: Build + run production view-factor closed-form gate
+        run: |
+          set -uo pipefail
+          cmake --build build --target test_vf_production -j2
+          rc=0
+          ./build/bin/test_vf_production | tee vf_production.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_production exited $rc"; exit 1; }
+          grep -q '^\[test_vf_production\] PASS' vf_production.log \
+            || { echo '::error::test_vf_production printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' vf_production.log; then
+            echo '::error::test_vf_production logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      # Anti-tautology. A gate that has never been seen to go red is not a gate.
+      # Scale every far-field entry by 2 -- FC-08's exact signature -- and require
+      # a nonzero exit. The injection is applied to the assembled matrix inside
+      # the test binary, after the production calculator has returned, so nothing
+      # in the engine is perturbed. Note which verdicts do NOT fire: reciprocity
+      # and closure both still pass on the doubled matrix, which is the whole
+      # reason they could not catch FC-08.
+      - name: Negative control -- a 2x far-field inflation must FAIL the gate
+        env:
+          PTM_VFGATE_INJECT_SCALE: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build/bin/test_vf_production > vf_production_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production PASSED with every far-field view factor doubled. The detector is broken; do not trust the green run above.'
+            tail -40 vf_production_control.log
+            exit 1
+          fi
+          grep -q 'FAULT INJECTION ACTIVE' vf_production_control.log || {
+            echo '::error::the injected run did not announce itself; the control may not have been applied.'
+            exit 1
+          }
+          echo "OK: 2x far-field inflation rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[[A-Z0-9]+\].*FAILED' vf_production_control.log
+
       - name: Build + run spectral-equilibration test
         # The program's exit status is now a real gate (worst max|dT| at the
         # production cadence N=192 steps/day vs the 1 K target). Grep the verdict
@@ -322,6 +368,67 @@ jobs:
           assert 50 < min(tmin) < 110, f"night-side Tmin {min(tmin):.1f} K out of range"
           print(f"OK: Tmax {max(tmax):.1f} K, Tmin {min(tmin):.1f} K over {len(tmax)} faces")
           EOF
+
+  # ==========================================================================
+  # The OFFLINE view-factor pipeline. A different code path from everything
+  # above, and the one FC-08 actually broke.
+  # ==========================================================================
+  # test_vf_production (in build-and-test) scores the IN-ENGINE calculator.
+  # Neither it nor test_bowl_crater ever invokes scripts/ptm12_diag/mc_ref_pp +
+  # assemble_vf_haworth.py, which is the pipeline that built every referee CSR
+  # for Moon3D and AGT -- and which divided the symmetrized pair by the number
+  # of ray directions that HAPPENED TO HIT instead of by 2, inflating far-field
+  # entries by up to exactly 2x for months. Reciprocity and SigmaF <= 1 both
+  # PASS on that matrix; only a closed form catches it, so a closed form is what
+  # this job runs.
+  #
+  # Own job, ubuntu only: it is the longest correctness step in the workflow
+  # (~197 s at --jobs 2 on a Mac Pro; this runner has 4 vCPU) and it needs
+  # nothing from the CMake build.
+  vf-assembler-gate:
+    name: ubuntu offline VF assembler (FC-08 closed form)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # mc_ref_pp is one translation unit against Embree 4; the gate compiles it
+      # itself (pkg-config first, then the usual prefixes) -- no CMake needed.
+      - name: Install dependencies (Embree 4 + numpy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libembree-dev pkg-config
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      # BOTH polarities run on every invocation and both are required: the arms
+      # named A2 and B2 re-run the pre-2026-08-19 estimator through
+      # `--symmetrize-divisor hits` and FAIL if it is NOT detected. So this step
+      # cannot quietly lose its teeth -- if a future change made the defect
+      # invisible, A2/B2 go red, not green.
+      #
+      # The geometry is reduced from the shipped defaults so the job fits CI, and
+      # the reduction was validated by measurement, not assumed: see the SIZING
+      # note in the script's docstring. Do not shrink it further without
+      # re-measuring A2/B2 -- the FC-08 defect is invisible on a coarse mesh.
+      - name: FC-08 closed-form + ray-budget + back-face-cull gate
+        run: |
+          set -uo pipefail
+          rc=0
+          python3 scripts/ptm12_diag/test_vf_assembler_gate.py \
+            --jobs 4 \
+            --disk-nth 90 --disk-k 110 --disk-a0 2.0 \
+            --nrays-closed-form 40000 \
+            --nrays-lo 4000 --nrays-hi 40000 \
+            --nrays-backface 20000 2>&1 | tee vf_assembler.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_assembler_gate exited $rc"; exit 1; }
+          grep -q '^\[vf-assembler-gate\] PASS' vf_assembler.log \
+            || { echo '::error::test_vf_assembler_gate printed no PASS verdict'; exit 1; }
+          grep -E '^\s+\[A[12]\]|^\s+\[B[12]\]|^\s+\[C[12]\]' vf_assembler.log
 
   # ==========================================================================
   # The combination the build-and-test job above CANNOT see.
@@ -517,6 +624,39 @@ jobs:
             echo '::error::test_bowl_crater (GPU=ON) logged a FAILED verdict (lines above).'
             exit 1
           fi
+
+      # Same production view-factor gate as the CPU job, in the GPU=ON portable
+      # configuration. It matters here for a different reason: the calculator's
+      # visibility test uses Embree SIMD ray packets, and this is the build whose
+      # ISA the tinybvh INTERFACE flag used to corrupt. A closed-form check on
+      # the ray-traced path is exactly what an ISA/ABI defect would move.
+      - name: Production view-factor closed-form gate (GPU=ON, portable)
+        run: |
+          set -uo pipefail
+          cmake --build build-gpu --target test_vf_production -j2
+          rc=0
+          ./build-gpu/bin/test_vf_production | tee vf_production_gpu.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_production (GPU=ON) exited $rc"; exit 1; }
+          grep -q '^\[test_vf_production\] PASS' vf_production_gpu.log \
+            || { echo '::error::test_vf_production (GPU=ON) printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' vf_production_gpu.log; then
+            echo '::error::test_vf_production (GPU=ON) logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      - name: Negative control (GPU=ON) -- 2x far-field inflation must FAIL
+        env:
+          PTM_VFGATE_INJECT_SCALE: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build-gpu/bin/test_vf_production > vf_production_gpu_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production (GPU=ON) PASSED with every far-field view factor doubled. The detector is broken.'
+            tail -40 vf_production_gpu_control.log
+            exit 1
+          fi
+          echo "OK: 2x far-field inflation rejected (exit $rc)."
 
       - name: Fetch SPICE kernels (NAIF, Moon core, ~44 MB)
         run: python3 scripts/fetch_kernels.py --bodies moon

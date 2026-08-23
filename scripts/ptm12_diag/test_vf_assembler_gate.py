@@ -5,13 +5,24 @@ Three arms. A and B drive the ACTUAL referee pipeline end to end -- mc_ref_pp sw
 assemble_vf_haworth.py -> CSR -- so a defect anywhere between the ray sampler and the
 written matrix is in scope.
 
-  ARM A  CLOSED FORM.  A 0.01 m^2 horizontal element under a coaxial parallel disk
+  ARM A  CLOSED FORM.  A small horizontal element under a coaxial parallel disk
          (a = 57.735 m at H = 100 m) has the exact answer F = a^2/(a^2 + H^2) =
          0.250000.  The disk is genuinely flat, so tessellating it introduces no
          geometric error; the only approximation is the finite extent of the element,
-         O((e0/H)^2) ~ 2e-6.  The disk is cut into ~99,800 facets so every pair sits at
-         lambda = NRAYS * F_ij of order 1 -- the production regime.  The assembled row 0
-         must reproduce 0.250000 to within --closed-form-tol-pct.
+         O((e0/H)^2) -- 2e-6 at the historical 0.01 m^2, 9e-5 at the CI default of
+         2 m^2, both far below any tolerance here.  The disk is cut into enough facets
+         that every pair sits at lambda = NRAYS * F_ij of order 1 -- the production
+         regime, and the ONLY regime where the FC-08 defect is visible.  The assembled
+         row 0 must reproduce 0.250000 to within --closed-form-tol-pct.
+
+         SIZING (measured 2026-08-22, and the reason --disk-a0 exists).  Arm A's
+         residual is dominated by the REVERSE ray direction, facet -> element, whose
+         expected hit count is NRAYS * nfaces * 0.25 * A0 / A_disk.  Shrinking the disk
+         for speed without raising A0 makes that count collapse and the residual grows:
+         at 19,711 facets and A0 = 0.01 m^2 the shipping estimator read +0.963% / -0.249%
+         / -1.700% at NRAYS = 40k / 80k / 120k -- non-monotone, and over the 1% line.
+         Raising A0 to 2 m^2 at the same cost pins it at +0.074%.  Never reduce the
+         geometry without re-measuring BOTH polarities.
 
   ARM C  BACK-FACE CULL (Paul's ruling, 2026-08-19).  A ray striking the BACK of a
          one-sided facet has reached the underside of opaque terrain: it is blocked, but
@@ -38,11 +49,21 @@ The Ingersoll bowl-crater test is blind here too: it builds its view factors wit
 in-code calculator and never invokes this pipeline.
 
 Requires numpy and Embree (the same Embree mc_ref_pp is built against).
-Runtime on the 48-core Mac Pro: a few minutes.
+
+Runtime, measured 2026-08-22 on the Mac Pro with --jobs 2 (a CI-sized machine):
+  * shipped defaults, arm A alone .................. 1,032 s   NOT CI-affordable
+  * the CI settings below, all three arms .............. 197 s
+The CI settings are the ones in .github/workflows/ci.yml, job vf-assembler-gate:
+  --disk-nth 90 --disk-k 110 --disk-a0 2.0 --nrays-closed-form 40000
+  --nrays-lo 4000 --nrays-hi 40000 --nrays-backface 20000
+Measured there: A1 +0.074% (tol 1%), A2 +28.955% (floor 10%), B1 0.044%
+(tol 0.1%), B2 71.65% (floor 25%), C1/C2 pass.  The shipped defaults give
+A1 +0.583% / A2 +75.155%, reproduced exactly by the 1,032 s run above.
 
 Usage:
   test_vf_assembler_gate.py [--work DIR] [--jobs N] [--mc-ref-pp PATH]
                             [--arm A|B|C|all] [--keep]
+                            [--disk-nth N] [--disk-k N] [--disk-a0 M2]
 """
 import argparse
 import glob
@@ -67,7 +88,7 @@ CRATER_PLY = REPO / "data" / "meshes" / "lunar_crater_80N.ply"
 DISK_H = 100.0
 DISK_A = 57.735026918962575          # a^2/(a^2+H^2) == 0.25 exactly
 DISK_A0 = 0.01                       # m^2, the receiving element
-DISK_NTH = 200                       # azimuthal divisions
+DISK_NTH = 200                       # azimuthal divisions   (--disk-nth)
 DISK_K = 250                         # radial rings  -> 200*250*2 - 200 = 99,800 facets
 CLOSED_FORM = DISK_A ** 2 / (DISK_A ** 2 + DISK_H ** 2)
 
@@ -176,18 +197,50 @@ def find_or_build_mc_ref_pp(explicit, work):
             print(f"  mc_ref_pp: using existing {cand}")
             return str(cand)
     out = work / "mc_ref_pp"
-    sdk = subprocess.run(["/usr/bin/xcrun", "--show-sdk-path"],
-                         capture_output=True, text=True).stdout.strip()
-    cmd = ["/Library/Developer/CommandLineTools/usr/bin/clang++", "-O3", "-std=c++17"]
-    if sdk:
-        cmd += ["-isysroot", sdk]
-    cmd += ["-I/usr/local/include", str(MC_SRC), "-L/usr/local/lib", "-lembree4", "-o", str(out)]
+    # Portable build. The referee is one translation unit against Embree 4, so it
+    # needs no CMake -- but it must not assume the Mac Pro's toolchain, because CI
+    # runs this on Linux too. Compiler: $CXX, else the Xcode CommandLineTools
+    # clang++ where it exists (the /usr/bin/c++ shim on this machine is a stub),
+    # else c++. Include/library roots: pkg-config first, then the usual prefixes.
+    cxx = os.environ.get("CXX")
+    if not cxx:
+        for cand in ("/Library/Developer/CommandLineTools/usr/bin/clang++", "c++"):
+            if cand == "c++" or Path(cand).is_file():
+                cxx = cand
+                break
+    cmd = [cxx, "-O3", "-std=c++17"]
+    if sys.platform == "darwin":
+        sdk = subprocess.run(["/usr/bin/xcrun", "--show-sdk-path"],
+                             capture_output=True, text=True).stdout.strip()
+        if sdk:
+            cmd += ["-isysroot", sdk]
+    pkg_c, pkg_l = [], []
+    for probe, sink in ((["--cflags"], pkg_c), (["--libs"], pkg_l)):
+        r = subprocess.run(["pkg-config"] + probe + ["embree4"], capture_output=True, text=True)
+        if r.returncode == 0:
+            sink.extend(r.stdout.split())
+    if pkg_c:
+        cmd += pkg_c
+    else:
+        for inc in ("/usr/local/include", "/opt/homebrew/include", "/usr/include"):
+            if (Path(inc) / "embree4" / "rtcore.h").is_file():
+                cmd += ["-I" + inc]
+                break
+    cmd += [str(MC_SRC)]
+    if pkg_l:
+        cmd += pkg_l
+    else:
+        for lib in ("/usr/local/lib", "/opt/homebrew/lib"):
+            if Path(lib).is_dir():
+                cmd += ["-L" + lib]
+        cmd += ["-lembree4"]
+    cmd += ["-o", str(out)]
     print("  mc_ref_pp: building --", " ".join(cmd))
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not out.is_file():
-        sys.stderr.write(r.stderr)
+        sys.stderr.write(r.stdout + r.stderr)
         raise SystemExit("FATAL: could not build mc_ref_pp. Install Embree 4 (headers in "
-                         "/usr/local/include/embree4) or pass --mc-ref-pp /path/to/mc_ref_pp.")
+                         "<prefix>/include/embree4) or pass --mc-ref-pp /path/to/mc_ref_pp.")
     return str(out)
 
 
@@ -424,12 +477,35 @@ def arm_c(work, binary, jobs, nrays):
 
 
 def main():
+    global DISK_NTH, DISK_K, DISK_A0
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=None, help="scratch directory (default: a temp dir)")
     ap.add_argument("--jobs", type=int, default=min(20, os.cpu_count() or 4))
     ap.add_argument("--mc-ref-pp", default=None, help="prebuilt referee binary")
     ap.add_argument("--arm", choices=("A", "B", "C", "all"), default="all")
+    # Arm-A tessellation. The controlling variable for the FC-08 defect is
+    # lambda = NRAYS * F_ij, NOT the ray budget alone: a coarse disk with a big
+    # budget puts every pair in the well-sampled regime and hides the bug
+    # completely. So --disk-nth/--disk-k and --nrays-closed-form must be scaled
+    # TOGETHER (roughly, NRAYS proportional to the facet count), and any reduced
+    # setting has to be justified by the DEFECTIVE arm still reading >= the
+    # --closed-form-defect-min-pct floor. The gate enforces that automatically:
+    # arm A2 fails if the teeth have gone.
+    ap.add_argument("--disk-nth", type=int, default=DISK_NTH,
+                    help="azimuthal divisions of the arm-A disk (default %(default)s)")
+    ap.add_argument("--disk-k", type=int, default=DISK_K,
+                    help="radial rings of the arm-A disk (default %(default)s)")
+    # Element area. The closed form F = a^2/(a^2+H^2) is the DIFFERENTIAL-element
+    # result, so this must stay small against H^2 = 1e4 m^2: the error is
+    # O((e0/H)^2), i.e. 2.3e-6 at 0.01 m^2 and 2.3e-4 at 1 m^2, both far under any
+    # tolerance here. It is a knob because it sets how often the REVERSE ray
+    # direction (facet -> element) registers a hit, and that sampling term is what
+    # dominates arm A's residual: expected reverse hits ~ NRAYS * nfaces * 0.25 *
+    # A0 / A_disk, and the residual falls as 1/sqrt of it. Shrinking the disk
+    # without raising A0 makes the residual worse, not better.
+    ap.add_argument("--disk-a0", type=float, default=DISK_A0,
+                    help="area [m^2] of the arm-A receiving element (default %(default)s)")
     ap.add_argument("--nrays-closed-form", type=int, default=200000)
     ap.add_argument("--nrays-lo", type=int, default=4000)
     ap.add_argument("--nrays-backface", type=int, default=20000,
@@ -449,6 +525,8 @@ def main():
     ap.add_argument("--invariance-defect-min-pct", type=float, default=25.0)
     ap.add_argument("--keep", action="store_true", help="keep the scratch directory")
     a = ap.parse_args()
+
+    DISK_NTH, DISK_K, DISK_A0 = a.disk_nth, a.disk_k, a.disk_a0
 
     if not ASSEMBLER.is_file():
         raise SystemExit(f"FATAL: {ASSEMBLER} not found")
@@ -476,6 +554,14 @@ def main():
     print(f"\n=== SUMMARY ({time.time()-t0:.0f}s) ===")
     for k, v in results.items():
         print(f"  {k:<32} {'PASS' if v else 'FAIL'}")
+    # One greppable verdict line, so a CI step can check the log as well as the
+    # exit status: an edit that drops the assertions would exit 0 silently.
+    # Deliberately worded with no "fail" substring on the passing branch --
+    # ptm_r2_acceptance.py once read its own "0 failed" as a failure.
+    if all(results.values()):
+        print("[vf-assembler-gate] PASS: every arm met its threshold in BOTH polarities.")
+    else:
+        print("[vf-assembler-gate] at least one arm did NOT meet its threshold (see above).")
     if a.keep or not we_made_it:
         print(f"  artifacts kept in {work}"
               + ("" if we_made_it else " (pre-existing directory; never auto-removed)"))
