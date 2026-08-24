@@ -320,6 +320,11 @@ public:
     // Honors PTM_HMATRIX_CONTENT_HASH=0, and says so when it does.
     void printContentDigest() const;
 
+    // The bbox-center translation build() applied to its ray origins, which
+    // MUST equal the one the caller applied to the Embree scene vertices.
+    // Exposed for checking, not for use.
+    const std::array<double, 3>& sceneOriginShift() const { return scene_origin_shift_; }
+
     // Thread count block assembly actually ran at, 0 if build() has not run.
     int buildThreads() const { return hmatrix_build_threads_; }
 
@@ -564,6 +569,9 @@ private:
     // thread-count dependent, and a provenance line that omits the thread count
     // cannot be checked against a later run.
     int hmatrix_build_threads_ = 0;
+
+    // Mesh -> scene translation applied to ray origins (see build()).
+    std::array<double, 3> scene_origin_shift_{{0.0, 0.0, 0.0}};
 
     // Out-of-core support
     bool out_of_core_enabled_ = false;

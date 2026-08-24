@@ -2703,6 +2703,12 @@ bool RadiationExchangeManager::initializeScene() {
         0.5 * (bbmin[1] + bbmax[1]),
         0.5 * (bbmin[2] + bbmax[2])
     }};
+    // Remembered, not recomputed downstream. Every builder that fires a ray
+    // into this scene has to translate its origins by exactly this vector, and
+    // "each builder computes the same shift from the same vertices" was the
+    // assumption under which the SPARSE builder spent a month firing every
+    // occlusion ray 1.7e6 m away from the geometry.
+    scene_origin_shift_ = origin_shift;
     std::cout << "  Radiation Embree scene recentered by ("
               << origin_shift[0] << ", " << origin_shift[1] << ", " << origin_shift[2]
               << ") for float32 precision" << std::endl;
@@ -2846,6 +2852,25 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
                   << " MB" << std::endl;
         std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
         hmatrix_view_factors_->printContentDigest();
+        // The builder recomputes the mesh->scene translation from the same
+        // vertices this manager used. Same formula, two copies -- so CHECK,
+        // do not assume. A mismatch means every occlusion ray it fired missed
+        // the geometry, which reads as "nothing is occluded" and not as an
+        // error.
+        {
+            const auto& hs = hmatrix_view_factors_->sceneOriginShift();
+            for (int k = 0; k < 3; ++k) {
+                if (hs[k] != scene_origin_shift_[k]) {
+                    std::cerr << "\nFATAL: the H-matrix builder translated its ray origins by ("
+                              << hs[0] << ", " << hs[1] << ", " << hs[2] << ") but the Embree\n"
+                                 "  scene was recentered by (" << scene_origin_shift_[0] << ", "
+                              << scene_origin_shift_[1] << ", " << scene_origin_shift_[2] << ").\n"
+                                 "  Rays and geometry are in different frames; every visibility "
+                                 "query would return VISIBLE." << std::endl;
+                    return false;
+                }
+            }
+        }
         if (config_.verbose) {
             hmatrix_view_factors_->printStatistics();
         }
@@ -2856,6 +2881,7 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
                                         static_cast<RTCDevice>(device_),
                                         static_cast<RTCScene>(scene_),
                                         config_);
+        calculator.setSceneOriginShift(scene_origin_shift_);
 
         view_factors_ = calculator.computeAll();
         using_hmatrix_ = false;
@@ -3070,6 +3096,25 @@ bool RadiationExchangeManager::prepare(
                   << " MB" << std::endl;
         std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
         hmatrix_view_factors_->printContentDigest();
+        // The builder recomputes the mesh->scene translation from the same
+        // vertices this manager used. Same formula, two copies -- so CHECK,
+        // do not assume. A mismatch means every occlusion ray it fired missed
+        // the geometry, which reads as "nothing is occluded" and not as an
+        // error.
+        {
+            const auto& hs = hmatrix_view_factors_->sceneOriginShift();
+            for (int k = 0; k < 3; ++k) {
+                if (hs[k] != scene_origin_shift_[k]) {
+                    std::cerr << "\nFATAL: the H-matrix builder translated its ray origins by ("
+                              << hs[0] << ", " << hs[1] << ", " << hs[2] << ") but the Embree\n"
+                                 "  scene was recentered by (" << scene_origin_shift_[0] << ", "
+                              << scene_origin_shift_[1] << ", " << scene_origin_shift_[2] << ").\n"
+                                 "  Rays and geometry are in different frames; every visibility "
+                                 "query would return VISIBLE." << std::endl;
+                    return false;
+                }
+            }
+        }
         if (config_.verbose) {
             hmatrix_view_factors_->printStatistics();
         }
@@ -3081,6 +3126,7 @@ bool RadiationExchangeManager::prepare(
                                         static_cast<RTCDevice>(device_),
                                         static_cast<RTCScene>(scene_),
                                         config_);
+        calculator.setSceneOriginShift(scene_origin_shift_);
 
         // Compute for ALL faces so that wall->floor radiation is captured
         view_factors_ = calculator.computeAll();
@@ -3373,6 +3419,7 @@ void RadiationExchangeManager::buildBeamPairs() {
     // uses the same F formula and row-normalization as the radiosity.
     ViewFactorCalculator calc(mesh_, static_cast<RTCDevice>(device_),
                               static_cast<RTCScene>(scene_), config_);
+    calc.setSceneOriginShift(scene_origin_shift_);
     ViewFactorMatrix rows = calc.computeSubset(receivers);  // global row indexing
 
     // Cache per-face mean normals (float) for the run-time beamed pass.

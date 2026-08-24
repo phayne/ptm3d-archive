@@ -885,6 +885,10 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         0.5 * (bbmin[1] + bbmax[1]),
         0.5 * (bbmin[2] + bbmax[2])
     }};
+    // Published so the caller can CHECK it against the shift it actually
+    // applied to the scene, rather than trusting that two copies of the same
+    // formula stay in step. They did not, for the sparse builder, for a month.
+    scene_origin_shift_ = origin_shift;
 
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n_faces; ++i) {
