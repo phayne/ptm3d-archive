@@ -51,6 +51,113 @@ what the engine looked like when someone last cared.
 
 ## 2. The current baselines
 
+### 2.1 The CPU baseline: `postmerge-baseline-2026-08-24` at `51bf168`
+
+Cut after the view-factor accuracy arc (pull requests #118 through #124) landed
+on `main`. It blesses **fifteen arms** at commit **`51bf168`** — the five
+portable CPU arms, the two `vfbuild` arms, and the eight GPU arms — and it
+**supersedes** the two 2026-08-15 tags for those arms without replacing them:
+the tags are untouched, the 2026-08-15 bank stays on disk, and the two
+site-local flagship arms are still 2026-08-15's, unre-run.
+
+```
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu_archnative.json
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json
+```
+
+The CPU arms are banked **twice**, because **`PTM_ARCH_NATIVE` is part of the
+baseline and nobody had recorded it** (section 6). The first manifest is the
+documented onboarding and CI configuration, `PTM_ARCH_NATIVE=OFF`; the second is
+`ON`, the setting the 2026-08-15 builds actually used. They differ from each
+other in five files out of 150 — the float64 `statistics/_raw/*_sum.bin`
+accumulators of the two `vfbuild` arms, at a maximum relative difference of
+1.6e-12. The GPU manifest is `PTM_ENABLE_GPU=ON`, `GPU_BACKEND=OPENCL`,
+`PTM_ARCH_NATIVE=OFF` — the post-#118 documented onboarding combination, whose
+configure step prints `Eigen ABI uniformity: OK`. Every arm ran at
+`OMP_NUM_THREADS=48`, recorded per arm, and the build flags are now recorded per
+binary in the manifest itself rather than in prose.
+
+⚠️ **No git tag has been cut.** The name above is proposed; the manifests bless
+the commit. Cutting the tag is a separate, deliberate act.
+
+Which arms still match `validate-baseline-2026-08-15`, and why the others do not:
+
+| Arm | Against `validate-baseline-2026-08-15` | Cause |
+|---|---|---|
+| `asteroid_bennu_spice_cpu` | 16/16 identical | — |
+| `asteroid_keplerian_cpu` | 16/16 identical | — |
+| `moon_crater80N_coupled_cpu` | 8/22 | pull request #102 |
+| `moon_crater80N_radoff_cpu` | 5/16 | pull request #102 |
+| `europa_diurnal_cpu` | 7/16 | pull request #102 |
+| `moon_crater80N_vfbuild_sparse` | not in that baseline | new config, section 3 |
+| `moon_crater80N_vfbuild_hmatrix` | not in that baseline | new config, section 3 |
+| `moon_crater80N_gputhermal_n{1,2,4}` | not comparable | rebuilt view factors, below |
+| `moon_crater80N_radgpu_n{1,2,4}` | not comparable | rebuilt view factors, below |
+| `moon_crater80N_radgpu_gray_n{1,4}` | not comparable | rebuilt view factors, below |
+
+**The three that moved were moved by `45eefe4` (pull request #102,
+`perf/primary-disk-face-budget`), and by nothing else.** Bisected 2026-08-24 at a
+fixed ISA setting, which is the only way this comparison means anything:
+`ecf635a` and `a6b141a` (#101) are byte-identical on the radiation-off arm, and
+`45eefe4` is byte-identical to `51bf168` on the radiation-off (16/16), coupled
+(22/22) and Europa (16/16) arms. Everything merged after #102 — including the
+entire view-factor arc — moves **zero bytes** on all five portable CPU arms. The
+magnitude on the radiation-off arm is 11 of 16 files, up to 573 of 12,800 faces,
+maximum 0.02846 K on `temperature_max`, confined to the illumination,
+primary-infrared and primary-reflected channels.
+
+This supersedes the earlier working note that the drift was "pre-existing,
+`ecf635a` to `cb1e55d`, cause unidentified". It was pre-existing; the cause is
+now identified.
+
+### The GPU arms were re-run on rebuilt view factors, not re-verified
+
+⛔ **The GPU arms of `validate-baseline-2026-08-15` were not merely stale, they
+were unreproducible**, so nothing in this baseline is a comparison against them.
+The five radiosity arms loaded a `crater80N_sparse.vf` built by the engine sparse
+builder during the zero-occlusion window, containing no occlusion at all
+(section 6). All seven copies of that matrix are quarantined at
+`~/projects/quarantine_zero-occlusion-vf_2026-08-24/`.
+
+Both input matrices were therefore **rebuilt on `main`**, and both live beside
+the manifests with a provenance sidecar:
+
+| Matrix | Consumed by | Format | Content |
+|---|---|---|---|
+| `crater80N_sparse.vf` | `radgpu`, `radgpu_gray` | `VFFM` v2, md5 `b1e3cdc4…` | 1,297,556 non-zeros; 224,412 of 1,521,968 pairs rejected as blocked |
+| `crater80N_hmat.vf` | `gputhermal` | `HMAT` v2, md5 `61454478…` | built twice, identical; supersedes the 2026-08-15 file, which predates the near-field quadrature port |
+
+The H-matrix cache was never contaminated — that builder always recomputed its
+own scene shift — but it was replaced anyway, because it carried the pre-#122
+near-field physics. ⛔ **The `HMAT` format has no physics provenance stamp**: the
+old file and the new one both report `version 2`, so a stale H-matrix cache loads
+silently. Only the sparse `VFFM` format announces v1 against v2. Check the md5.
+
+Two properties were proven rather than inherited from the CPU work:
+
+- **Run-to-run determinism on the GPU.** Every one of the eight arms was run
+  twice; all eight pairs are byte-identical (32/32 on the six two-band arms,
+  26/26 on the two gray arms). The deterministic H-matrix matvec landed on the
+  CPU side of the arc; a CPU proof is not a GPU proof.
+- **`N=1` equals `N=2` equals `N=4`**, on both pools: `gputhermal` 32/32 for all
+  three pairings, `radgpu` 32/32 for all three, `radgpu_gray` 26/26 at N=1
+  against N=4.
+
+**Neither is a fallback tautology**, and that was checked per arm rather than
+assumed: `gputhermal` at N=2 and N=4 prints `Multi-GPU dispatch across 2/4
+device(s)` and enumerates the devices while N=1 does not, and the radiosity arms
+print `[Radiosity] ACTIVE RUNG: single-GPU radiosity` at N=1 against
+`multi-GPU pool, 2/4 device(s)` at N=2 and N=4. The radiosity logs also report
+`nnz = 1297556`, which is the corrected matrix and not the quarantined one.
+
+The gray-mode hazard in section 7 — the single-GPU path clears `warm_start` only
+in two-band mode while the pool clears it unconditionally — again did not
+materialize. It remains real in the code, and there is still no gray-mode arm at
+production spectral radius.
+
+### 2.2 The 2026-08-15 tags
+
 Both tags point at **`ecf635a`** (`Merge pull request #95 from
 phayne/perf/rad-defaults-and-rho-advisory`), which is `origin/main` as of
 2026-08-15 and the first commit carrying the full 2026-08-15 merge set.
@@ -148,8 +255,15 @@ are not comparable to it.** They are new configs, and they run physics that
 changed on purpose: the near-field estimator was one-sided until 2026-08-23 and
 read −21.7 percent on edge/vertex-touching pairs. Their baselines are banked
 separately, at the branch and commit named in their own manifest, with the
-attribution in `notes`. Do not merge them into the 2026-08-15 manifest and do
-not retag it.
+attribution in `notes` — currently `postmerge-baseline-2026-08-24` at `51bf168`
+(section 2.1), which supersedes `vfunify-stage2-2026-08-23` at `fc57d58`. Do not
+merge them into the 2026-08-15 manifest and do not retag it.
+
+Both arms are byte-identical between `fc57d58` and `51bf168` — 32/32 each, at 48
+threads and `PTM_ARCH_NATIVE=OFF`. That was verified rather than assumed, and the
+verification is one command: `git diff fc57d58 51bf168` touches exactly one file,
+`.github/workflows/ci.yml`. "The branch was merged unchanged" is a claim about
+the tree, and a merge commit is where such a claim quietly stops being true.
 
 ### Two arms exist only to keep a gate honest
 
@@ -210,11 +324,27 @@ runs the simulator, so it is safe on a machine with no GPU.
 # Compare two finished run directories directly (N=1 versus N=4, CPU versus GPU)
 python3 scripts/ptm_validate_baseline.py equivalence <run_a> <run_b>
 
-# Compare a set of finished runs against the banked baseline
+# Compare a set of finished runs against the current CPU baseline (section 2.1).
+# Use the manifest whose ISA flag matches the build you are validating.
 python3 scripts/ptm_validate_baseline.py verify \
-    --manifest ~/projects/validate_rebaseline_2026-08-15/bank/baseline_manifest.json \
+    --manifest ~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json \
+    --repo . --binary build/bin/ptm_thermal_sim
+
+# The GPU arms (section 2.1), against a PTM_ENABLE_GPU=ON build
+python3 scripts/ptm_validate_baseline.py verify \
+    --manifest ~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json \
+    --repo . --binary build_gpu/bin/ptm_thermal_sim
+
+# The 2026-08-15 bank, for the flagship arms it still owns (section 2.2)
+python3 scripts/ptm_validate_baseline.py verify \
+    --manifest ~/projects/validate_rebaseline_2026-08-15/bank/baseline_manifest_flagship.json \
     --repo . --binary build/bin/ptm_thermal_sim
 ```
+
+⚠️ `verify` keys a `--binary` by its build **directory** name, so
+`build_gpu/bin/ptm_thermal_sim` and `build/bin/ptm_thermal_sim` are different
+keys. Point it at the build the manifest was cut from, or it reports that it
+checked neither the linked libraries nor the build flags.
 
 `verify` reports **provenance before bytes**. If a config file's bytes have
 changed since the baseline was cut, if the engine commit differs, or if a
@@ -273,6 +403,55 @@ configure step prints the ISA; read them rather than assuming.
 Embree** (`test_bowl_crater.cpp`), so passing it is a do-no-harm check, never a
 discriminating test of an Embree change. The Embree-exercising bowl target is
 `bowl_crater_ptm`.
+
+### `PTM_ARCH_NATIVE` — the flag that cost a month
+
+The 2026-08-15 arms were built with **`PTM_ARCH_NATIVE=ON`**
+(`ptm-rebaseline/build_cpu/CMakeCache.txt`), which turns on AVX2 and AVX-512 code
+generation. Neither the manifest nor this document recorded it. Every later
+comparison was made from a worktree configured `OFF` — the documented onboarding
+combination — and every one of them read a byte difference that nobody could
+attribute.
+
+Measured 2026-08-24. Rebuilding `ecf635a` with `PTM_ARCH_NATIVE=ON` reproduces the
+banked radiation-off arm **16/16 byte-identical**; rebuilding the same commit with
+`OFF` does not. The physical size of the `ON`-versus-`OFF` difference at `ecf635a`
+is **one face, maximum 3.2e-20** — a single denormal in six flux files, no
+temperature file touched. That is the whole of it: enough to break byte-identity,
+far too small to mean anything, and exactly the kind of difference a byte gate is
+supposed to surface rather than absorb.
+
+On `51bf168` the flag is inert on all five portable CPU arms (`OFF` == `ON`,
+22/22 and 16/16 × 4) and moves only the float64 `statistics/_raw/*_sum.bin`
+accumulators on the two `vfbuild` arms — 5 of 32 files, maximum relative
+difference 1.6e-12, summation reassociation under AVX-512. The `_raw` sums are
+the same files the thread-count change moves, for the same reason.
+
+**So record the ISA configuration next to the thread count, and compare only
+across a matched pair.** Both `postmerge-baseline-2026-08-24` manifests name
+their flag; an older manifest that does not name one was almost certainly cut at
+`ON`, and a byte verdict against it from an `OFF` build is unattributable.
+
+### The zero-occlusion view-factor window
+
+Any `.vf` built by the **engine sparse builder** between `adc2aa5` (2026-07-20)
+and `0b41b3b` fired its occlusion rays in the mesh frame into a scene
+`RadiationExchangeManager::initEmbree` had recentered, so **no candidate pair was
+ever rejected as blocked**. On the 12,800-face crater that is 0 of 1,307,376
+pairs and up to −6.52 K on `temperature_max`.
+
+`validate-baseline-2026-08-15`'s six GPU arms load exactly such a matrix, which is
+why they cannot simply be re-verified: their input was wrong, so their bytes bless
+the wrong physics. The seven copies of it are quarantined, not deleted, at
+`~/projects/quarantine_zero-occlusion-vf_2026-08-24/` with a reversal manifest,
+and a corrected replacement sits at
+`~/projects/ada_postmerge_2026-08-24/crater80N_sparse.vf`.
+
+A missing `.vf` is not a hazard here: `ptm_thermal_sim` announces
+`Early View Factor Computation`, builds the matrix, prints its occlusion counts,
+and saves it to the named path (`src/cpp/main/ptm_thermal_sim.cpp`, the block
+guarded on `!vf_file_exists`). The hazard is a `.vf` that exists and is silently
+wrong, which is what version 1 of the sparse format now announces on load.
 
 ### The 2026-08-15 defaults are baked in
 
@@ -427,6 +606,17 @@ Stated explicitly, because the value of a gate is bounded by what it touches:
   independent run of the same recipe at `d279eca` (13.95 K). The failure is a
   property of the recipe, not of the baseline. **Never quote a flagship arm as a
   converged thermal field.**
+- **The two site-local flagship arms.** They were not re-run at `51bf168`, so
+  `validate-baseline-flagship-2026-08-15` stands unre-baselined and its own
+  view factors are unaudited by this work. Production scale — 509,337 faces, and
+  a view-factor spectral radius of 0.776 against the crater's 0.134 — is
+  therefore ungated on current `main`.
+- **`test_bowl_crater` is a smaller gate on a CPU build than on a GPU build, and
+  it does not say so.** It reports `PASS: 12 of 12 verdicts (0 skipped)` when
+  built with `PTM_ENABLE_GPU=OFF` and `PASS: 16 of 16 verdicts (0 skipped)` with
+  `ON`; the four missing verdicts are the GPU-against-CPU radiosity comparison,
+  which is compiled out rather than skipped. `0 skipped` reads as full coverage
+  in both cases. Quote the build configuration alongside the verdict.
 - **The exosphere, camera, and merge-chunks binaries.** Only `ptm_thermal_sim`
   is exercised here.
 - **Illumination on the GPU.** Every arm traces shadow rays on the CPU with
