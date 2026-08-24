@@ -981,14 +981,29 @@ int main(int argc, char** argv) {
     // [H4] worst per-entry near-field disagreement with the sparse builder, in
     // the NO-TRUNCATION control. Not zero, and not a defect: the two builders
     // run the same kernel at a different ORDER on close pairs (sparse fixed at
-    // nearfield_quadrature_order, H-matrix at max(that, ceil(4d/r))). The
+    // nearfield_quadrature_order, H-matrix at max(that, ceil(w d / r))). The
     // measurement is the proof of that attribution -- raise the configured
     // floor toward the adaptive order and the disagreement collapses:
-    //     m = 2  0.2811      m = 3  0.1643      m = 8  0.01373
-    // 0.40 clears the worst production-sanctioned order (m = 2) by 1.4x and the
-    // default (m = 3) by 2.4x. A SECOND copy of the integral, or a lost clamp,
-    // moves this by orders of magnitude, not by 40%.
-    double tol_hmat_agree = 0.40;
+    //     m = 2  0.5614   m = 3  0.4554   m = 4  0.3737   m = 6  0.2548
+    //     m = 8  0.1724
+    //
+    // RE-DERIVED 2026-08-23 when the grazing cut was unified (0.01 on the
+    // H-matrix, 1e-6 on the sparse builder -> 1e-6 on both). The table above
+    // used to read 0.2811 / 0.1643 / 0.01373 at m = 2/3/8, and this bound was
+    // 0.40. It is NOT a widened tolerance hiding a regression: the POPULATION
+    // changed. The H-matrix's 0.01 cut had been deleting 1,584 significant
+    // entries the sparse builder kept, so the old statistic was taken over the
+    // pairs the two builders happened to share. With the cut unified the shared
+    // set is complete (sparse-only 1,584 -> 0) and the AGGREGATE agreement
+    // improves 2.5x (area-weighted mass difference 0.1557% -> 0.0627%); what
+    // rose is the worst SINGLE entry, because the newly shared entries are
+    // extreme-grazing pairs at Ns ~ 0.4 where the order policy bites hardest.
+    // The monotone collapse with m is the proof that it is the order policy and
+    // not a second copy of the kernel.
+    //
+    // 0.80 clears the worst production-sanctioned order (m = 2) by 1.4x, the
+    // same headroom the previous bound had.
+    double tol_hmat_agree = 0.80;
     // [H2b] mass-weighted reciprocity defect in the PRODUCTION configuration.
     // This one is compression, not the kernel: it reads 1.48e-3 with
     // aca_tolerance = 1e-3 and 1.16e-15 with the tolerance driven to 1e-14.

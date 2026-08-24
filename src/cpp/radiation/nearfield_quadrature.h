@@ -232,9 +232,9 @@ inline double nearFieldPairIntegral(const std::array<double, 3>& a0,
             const double cos_a = (n_a[0] * dx + n_a[1] * dy + n_a[2] * dz) * inv_r;
             const double cos_b = -(n_b[0] * dx + n_b[1] * dy + n_b[2] * dz) * inv_r;
 
-            // Grazing/back-facing cut, same 1e-6 threshold as M1. A rejected
+            // Grazing/back-facing cut, the shared kGrazingCosCut. A rejected
             // sample pair contributes ZERO; it is not removed from the domain.
-            if (cos_a < 1e-6 || cos_b < 1e-6) continue;
+            if (cos_a < kGrazingCosCut || cos_b < kGrazingCosCut) continue;
 
             kernel_sum += (cos_a * cos_b) / r2;
             ++n_valid;

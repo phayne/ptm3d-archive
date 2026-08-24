@@ -455,6 +455,12 @@ private:
     // rejected.
     int refinedQuadratureOrder(int face_i, int face_j) const;
 
+    // Fill a candidate's occlusion ray for a pair, issued in CANONICAL order
+    // (lower face index first) so the visibility verdict cannot depend on which
+    // direction asked. RayCandidate is file-local to the .cpp.
+    void setCanonicalVisibilityRay(int face_i, int face_j, double r,
+                                   struct RayCandidate& cand) const;
+
     // The near/far switch, for every entry generator in this builder. `r` is
     // the centroid separation, already computed by every caller.
     bool isNearFieldPair(int face_i, int face_j, double r) const;

@@ -33,6 +33,19 @@ constexpr int kMaxNearFieldQuadOrder = 16;
 constexpr int kMaxConfigNearFieldQuadOrder = 8;
 constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQuadOrder;
 
+// Grazing / back-facing cut on the pair cosines, shared by every in-engine
+// view-factor kernel. A sample or a pair whose cos_i or cos_j falls below this
+// contributes ZERO; it is not removed from the integration domain (dividing by
+// the survivors would condition the estimate on detection -- FC-08's error).
+//
+// 1e-6 is the sparse builder's long-standing value and the one the shared
+// near-field quadrature uses. The H-matrix builder used 0.01 -- ten thousand
+// times larger -- in all four of its entry generators, as a candidate cull
+// before ray tracing, so the two builders disagreed about which pairs EXIST
+// before they could disagree about their values. Unified 2026-08-23; the
+// measured effect is in docs/design/vf-unification.md.
+constexpr double kGrazingCosCut = 1e-6;
+
 // Configuration for radiation exchange computation
 struct RadiationConfig {
     // Master enable/disable

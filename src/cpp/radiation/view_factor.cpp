@@ -1227,14 +1227,23 @@ double ViewFactorCalculator::computeCentroid(int face_i, int face_j) {
     double cos_i = dot_i;       // n_i · r_hat (positive if i faces toward j)
     double cos_j = -dot_j;      // n_j · (-r_hat) (positive if j faces toward i)
 
-    // Skip nearly-grazing angles (avoid numerical issues)
-    if (cos_i < 1e-6 || cos_j < 1e-6) {
+    // Skip nearly-grazing angles (avoid numerical issues). kGrazingCosCut is
+    // shared with the near-field kernel and, since 2026-08-23, with the
+    // H-matrix builder.
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         g_angle_reject++;
         return 0.0;
     }
 
-    // Check visibility using ray tracing
-    if (!isVisible(c_i, c_j)) {
+    // Check visibility using ray tracing, in CANONICAL (min index first) order.
+    // Mutual visibility is a symmetric geometric relation, but isVisible() is
+    // not exactly symmetric in its arguments -- the ray starts at p1, and
+    // Embree's float32 traversal can answer differently from the two ends of
+    // the same segment. Letting that decide puts a direction-dependent ZERO
+    // into an otherwise analytically reciprocal estimator. computeSubdivision
+    // has canonicalized since 2026-08-23; the far field does now too.
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) {
         g_vis_reject++;
         return 0.0;
     }
@@ -1343,12 +1352,13 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
     double cos_j = -geom.dot_nj_rhat;
 
     // Skip faces that don't face each other or nearly-grazing angles
-    if (cos_i < 1e-6 || cos_j < 1e-6) {
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         return 0.0;
     }
 
-    // Check visibility using ray tracing
-    if (!isVisible(face_centers_[face_i], face_centers_[face_j])) {
+    // Check visibility using ray tracing, canonical order (see computeCentroid).
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) {
         return 0.0;
     }
 
@@ -1400,7 +1410,7 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
             double cos_j = -nd.geom.dot_nj_rhat;
 
             // Skip faces that don't face each other (angle filter)
-            if (cos_i >= 1e-6 && cos_j >= 1e-6) {
+            if (cos_i >= kGrazingCosCut && cos_j >= kGrazingCosCut) {
                 far_neighbors.push_back({
                     static_cast<int>(idx), face_j,
                     cos_i, cos_j, nd.geom.r2, face_areas_[face_j]
@@ -1415,11 +1425,12 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
         std::vector<RayCandidate> rays;
         rays.reserve(far_neighbors.size());
 
-        const auto& c_i = face_centers_[face_i];
-
         for (const auto& fn : far_neighbors) {
-            const auto& c_j = face_centers_[fn.face_j];
-            RayCandidate ray = prepareRay(c_i, c_j, fn.idx);
+            // Canonical order (see computeCentroid): the segment is the same
+            // either way, the float32 traversal is not.
+            const int fa = std::min(face_i, fn.face_j);
+            const int fb = std::max(face_i, fn.face_j);
+            RayCandidate ray = prepareRay(face_centers_[fa], face_centers_[fb], fn.idx);
             rays.push_back(ray);
         }
 

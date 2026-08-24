@@ -3205,9 +3205,8 @@ void HMatrixViewFactor::computeViewFactorBlock(
             double cos_i = dot_i;
             double cos_j = -dot_j;
 
-            // Grazing angle rejection
-            static constexpr double MIN_COS_ANGLE = 0.01;
-            if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+            // Grazing angle rejection, the SHARED cut (see computeViewFactorRow).
+            if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
             // Distance-based culling
             double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3224,27 +3223,8 @@ void HMatrixViewFactor::computeViewFactorBlock(
                 cand.estimated_F = computeViewFactorRefined(face_i, face_j);
             }
 
-            std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+            setCanonicalVisibilityRay(face_i, face_j, r, cand);
 
-            double relative_offset = r * 0.001;
-            double absolute_offset = 0.5;
-            double offset = std::max(relative_offset, absolute_offset);
-            offset = std::min(offset, r * 0.1);
-
-            cand.origin = {{
-                c_i[0] + offset * dir[0],
-                c_i[1] + offset * dir[1],
-                c_i[2] + offset * dir[2]
-            }};
-            { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-            double end_margin = std::max(r * 0.001, absolute_offset);
-            end_margin = std::min(end_margin, r * 0.1);
-            cand.tfar = static_cast<float>(r - offset - end_margin);
-
-            if (cand.tfar < 0.1f) {
-                cand.tfar = -1.0f;  // Mark as "skip ray trace, assume visible"
-            }
 
             row_candidates[i].push_back(cand);
         }
@@ -3552,9 +3532,11 @@ void HMatrixViewFactor::computeViewFactorRow(
         double cos_i = dot_i;
         double cos_j = -dot_j;
 
-        // Grazing angle rejection
-        static constexpr double MIN_COS_ANGLE = 0.01;
-        if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+        // Grazing angle rejection, the SHARED cut. It was 0.01 here and 1e-6
+        // on the sparse builder, so this builder deleted pairs the other one
+        // kept -- a disagreement about which entries exist, upstream of any
+        // disagreement about their values.
+        if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3574,27 +3556,8 @@ void HMatrixViewFactor::computeViewFactorRow(
             cand.estimated_F = computeViewFactorRefined(face_i, face_j);
         }
 
-        std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+        setCanonicalVisibilityRay(face_i, face_j, r, cand);
 
-        double relative_offset = r * 0.001;
-        double absolute_offset = 0.5;
-        double offset = std::max(relative_offset, absolute_offset);
-        offset = std::min(offset, r * 0.1);
-
-        cand.origin = {{
-            c_i[0] + offset * dir[0],
-            c_i[1] + offset * dir[1],
-            c_i[2] + offset * dir[2]
-        }};
-        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-        double end_margin = std::max(r * 0.001, absolute_offset);
-        end_margin = std::min(end_margin, r * 0.1);
-        cand.tfar = static_cast<float>(r - offset - end_margin);
-
-        if (cand.tfar < 0.1f) {
-            cand.tfar = -1.0f;  // Skip ray trace, assume visible
-        }
 
         candidates.push_back(cand);
     }
@@ -3673,9 +3636,11 @@ void HMatrixViewFactor::computeViewFactorColumn(
         double cos_i = dot_i;
         double cos_j = -dot_j;
 
-        // Grazing angle rejection
-        static constexpr double MIN_COS_ANGLE = 0.01;
-        if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+        // Grazing angle rejection, the SHARED cut. It was 0.01 here and 1e-6
+        // on the sparse builder, so this builder deleted pairs the other one
+        // kept -- a disagreement about which entries exist, upstream of any
+        // disagreement about their values.
+        if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3695,27 +3660,8 @@ void HMatrixViewFactor::computeViewFactorColumn(
         }
 
         // Ray goes from face_i to face_j
-        std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+        setCanonicalVisibilityRay(face_i, face_j, r, cand);
 
-        double relative_offset = r * 0.001;
-        double absolute_offset = 0.5;
-        double offset = std::max(relative_offset, absolute_offset);
-        offset = std::min(offset, r * 0.1);
-
-        cand.origin = {{
-            c_i[0] + offset * dir[0],
-            c_i[1] + offset * dir[1],
-            c_i[2] + offset * dir[2]
-        }};
-        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-        double end_margin = std::max(r * 0.001, absolute_offset);
-        end_margin = std::min(end_margin, r * 0.1);
-        cand.tfar = static_cast<float>(r - offset - end_margin);
-
-        if (cand.tfar < 0.1f) {
-            cand.tfar = -1.0f;  // Skip ray trace, assume visible
-        }
 
         candidates.push_back(cand);
     }
@@ -4003,10 +3949,9 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     double cos_i = dot_i;     // Already positive
     double cos_j = -dot_j;    // Convert to positive (face j looking toward i)
 
-    // SPATIAL CULLING OPTIMIZATION 2: Grazing angle rejection
-    // Very grazing angles contribute negligible view factors
-    static constexpr double MIN_COS_ANGLE = 0.01;  // ~89.4 degrees
-    if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) {
+    // SPATIAL CULLING OPTIMIZATION 2: Grazing angle rejection, the SHARED cut
+    // (see computeViewFactorRow for why it is no longer 0.01 here).
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         return 0.0;
     }
 
@@ -4019,8 +3964,12 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
         return 0.0;  // Would be below threshold even with perfect visibility
     }
 
-    // Passed all culling tests - now do the expensive visibility check
-    if (!isVisible(c_i, c_j)) return 0.0;
+    // Passed all culling tests - now do the expensive visibility check, in
+    // CANONICAL (min index first) order. Mutual visibility is symmetric;
+    // isVisible() is not exactly symmetric in its arguments, and letting the
+    // float32 traversal decide puts a direction-dependent zero into the matrix.
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) return 0.0;
 
     // M1 (centroid) estimate is a far-field approximation. In the near field
     // (centers closer than a few face-widths) it overshoots, so refine with
@@ -4029,6 +3978,55 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
         return computeViewFactorRefined(face_i, face_j);
     }
     return estimated_F;
+}
+
+// Fill a candidate's occlusion ray for the pair (face_i, face_j), issued in
+// CANONICAL order: always from the LOWER face index to the higher one,
+// whichever way the caller asked.
+//
+// Mutual visibility is a symmetric geometric relation. isVisible() and this ray
+// setup are not exactly symmetric in their arguments -- the origin is offset
+// from p1 and Embree's float32 traversal can answer differently from the two
+// ends of the same segment -- so a non-canonical query lets a rounding
+// difference decide whether F_ij exists while F_ji does not. The offsets
+// themselves are unchanged (0.1 percent of the distance or 0.5 m, whichever is
+// larger, capped at 10 percent of the distance; a segment shorter than 0.1 m
+// after both margins is assumed visible), and are the same arithmetic the
+// sparse builder uses.
+//
+// The optional normal lift (PTM_HMATRIX_RAY_LIFT, default 0 and therefore
+// inert) lifts along the ORIGIN face's normal, which under canonical ordering
+// is the lower-indexed face rather than the asking one.
+void HMatrixViewFactor::setCanonicalVisibilityRay(int face_i, int face_j, double r,
+                                                  RayCandidate& cand) const {
+    const int fa = std::min(face_i, face_j);
+    const int fb = std::max(face_i, face_j);
+    const auto& pa = face_centers_[fa];
+    const auto& pb = face_centers_[fb];
+
+    std::array<double, 3> dir = {{(pb[0] - pa[0]) / r, (pb[1] - pa[1]) / r,
+                                  (pb[2] - pa[2]) / r}};
+
+    const double relative_offset = r * 0.001;
+    const double absolute_offset = 0.5;
+    double offset = std::max(relative_offset, absolute_offset);
+    offset = std::min(offset, r * 0.1);
+
+    cand.origin = {{pa[0] + offset * dir[0], pa[1] + offset * dir[1],
+                    pa[2] + offset * dir[2]}};
+    const double rl = getRayLiftFactor();
+    if (rl > 0.0) {
+        const double nl = rl * std::sqrt(2.0 * face_areas_[fa]);
+        cand.origin[0] += nl * face_normals_[fa][0];
+        cand.origin[1] += nl * face_normals_[fa][1];
+        cand.origin[2] += nl * face_normals_[fa][2];
+    }
+    cand.dir = dir;
+
+    double end_margin = std::max(r * 0.001, absolute_offset);
+    end_margin = std::min(end_margin, r * 0.1);
+    cand.tfar = static_cast<float>(r - offset - end_margin);
+    if (cand.tfar < 0.1f) cand.tfar = -1.0f;  // too close: assume visible
 }
 
 bool HMatrixViewFactor::isNearFieldPair(int fi, int fj, double r) const {
