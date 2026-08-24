@@ -2794,7 +2794,8 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
                                           static_cast<RTCDevice>(device_),
                                           static_cast<RTCScene>(scene_),
                                           config_,
-                                          config_.mc_rays_per_face);
+                                          config_.mc_rays_per_face,
+                                          scene_origin_shift_);
         using_hmatrix_ = false;
         std::cout << "Monte Carlo view factors computed:" << std::endl;
         std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
@@ -3033,7 +3034,8 @@ bool RadiationExchangeManager::prepare(
                                           static_cast<RTCDevice>(device_),
                                           static_cast<RTCScene>(scene_),
                                           config_,
-                                          config_.mc_rays_per_face);
+                                          config_.mc_rays_per_face,
+                                          scene_origin_shift_);
         solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
         using_hmatrix_ = false;
         std::cout << "Monte Carlo view factors computed:" << std::endl;
