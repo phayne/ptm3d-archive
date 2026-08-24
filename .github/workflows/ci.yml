@@ -420,7 +420,22 @@ jobs:
       # Runs the shipped quickstart config exactly as a new user would:
       # fetch the Moon/Mercury SPICE core from NAIF (~44 MB), run from the repo root,
       # then assert the per-face temperature statistics are physically sane.
-      - name: Fetch SPICE kernels (NAIF, Moon/Mercury core, ~44 MB)
+      # Cache the fetched kernels: NAIF has rate-limited/timed out for hosted
+      # runners (28 min of retries on 2026-08-23). fetch_kernels.py skips files
+      # that are already present with the right size and pinned SHA-256, so a
+      # warm restore makes the fetch a fast verify-only pass. Bump -v1 to force
+      # a refetch (e.g. if NAIF revises a kernel).
+      - name: Cache SPICE kernels (Moon/Mercury core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/kernels/lsk
+            data/kernels/pck
+            data/kernels/spk
+            data/kernels/fk
+          key: spice-moon-core-${{ hashFiles('scripts/fetch_kernels.py') }}-v1
+
+      - name: Fetch SPICE kernels (NAIF on cache miss, Moon/Mercury core, ~44 MB)
         # --bodies moon: the bare command would also pull jup365.bsp (1.1 GB)
         # because europa.tm ships in data/kernels/. The smoke test is Moon-only.
         run: python3 scripts/fetch_kernels.py --bodies moon
@@ -735,7 +750,18 @@ jobs:
           fi
           echo "OK: 2x far-field inflation rejected (exit $rc)."
 
-      - name: Fetch SPICE kernels (NAIF, Moon core, ~44 MB)
+      # Same NAIF-outage armor as the CPU job: warm cache -> verify-only fetch.
+      - name: Cache SPICE kernels (Moon core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/kernels/lsk
+            data/kernels/pck
+            data/kernels/spk
+            data/kernels/fk
+          key: spice-moon-core-${{ hashFiles('scripts/fetch_kernels.py') }}-v1
+
+      - name: Fetch SPICE kernels (NAIF on cache miss, Moon core, ~44 MB)
         run: python3 scripts/fetch_kernels.py --bodies moon
 
       # This exact shipped example returned rc=134 with no statistics written
