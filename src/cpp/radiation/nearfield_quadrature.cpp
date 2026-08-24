@@ -45,6 +45,36 @@ bool visibilityRayLegacyRequested() {
     return on;
 }
 
+bool directedStorageFloorRequested() {
+    static const bool on = [] {
+        const char* e = std::getenv("PTM_VF_DIRECTED_FLOOR");
+        const bool want = (e && std::string(e) == "1");
+        if (want) {
+            std::cerr << "[view-factor] WARNING: PTM_VF_DIRECTED_FLOOR=1 -- the storage "
+                         "floor is applied to the DIRECTED F_ij again, so an "
+                         "area-asymmetric pair can be stored one-sided. Control only."
+                      << std::endl;
+        }
+        return want;
+    }();
+    return on;
+}
+
+bool legacyPrecullRequested() {
+    static const bool on = [] {
+        const char* e = std::getenv("PTM_HMATRIX_PRECULL_LEGACY");
+        const bool want = (e && std::string(e) == "1");
+        if (want) {
+            std::cerr << "[view-factor] WARNING: PTM_HMATRIX_PRECULL_LEGACY=1 -- near "
+                         "pairs are pre-culled on their M1 estimate again, which can "
+                         "delete a pair the refined kernel would keep. Control only."
+                      << std::endl;
+        }
+        return want;
+    }();
+    return on;
+}
+
 void reportVisibilityUnresolvable(const char* builder) {
     const long long n = detail::g_visibility_unresolvable.exchange(0);
     if (n == 0) return;

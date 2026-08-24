@@ -970,7 +970,12 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
                 for (int face_j : neighbors) {
                     double F_ij = computeAdaptive(face_i, face_j);
 
-                    if (F_ij > config_.visibility_threshold) {
+                    // Symmetric storage floor: keep or drop is a property of
+                    // the PAIR, not of the direction being asked. See
+                    // radiation::keepPairEntryF.
+                    if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                                  face_areas_[face_j],
+                                                  config_.visibility_threshold)) {
                         local_rows[tid].push_back(face_i);
                         local_cols[tid].push_back(face_j);
                         local_vals[tid].push_back(F_ij);
@@ -1458,7 +1463,9 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
             if (is_visible) {
                 const auto& fn = far_neighbors[r];
                 double F_ij = (fn.A_j / M_PI) * (fn.cos_i * fn.cos_j) / fn.r2;
-                if (F_ij > config_.visibility_threshold) {
+                if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                              face_areas_[fn.face_j],
+                                              config_.visibility_threshold)) {
                     results.push_back({fn.face_j, F_ij});
                 }
             }
@@ -1469,7 +1476,9 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
     for (size_t idx : near_neighbor_indices) {
         const auto& nd = neighbors[idx];
         double F_ij = computeSubdivision(face_i, nd.neighbor_idx, config_.nearfield_quadrature_order);
-        if (F_ij > config_.visibility_threshold) {
+        if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                      face_areas_[nd.neighbor_idx],
+                                      config_.visibility_threshold)) {
             results.push_back({nd.neighbor_idx, F_ij});
         }
     }

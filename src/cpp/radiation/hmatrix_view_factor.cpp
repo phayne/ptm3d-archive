@@ -141,6 +141,11 @@ static std::atomic<double> g_svd_rank_cap_worst_resid{0.0};
 // Largest rank the spectrum asked for, over capped blocks.
 static std::atomic<int> g_svd_rank_cap_worst_want{0};
 
+// Near pairs the M1 pre-cull WOULD have deleted, and which now reach the
+// refined kernel instead. Zero means the change is inert on this mesh -- a
+// measured zero, not an assumed one.
+static std::atomic<size_t> g_precull_near_bypassed{0};
+
 // Near-field EXPOSURE of the ACA cross generators.
 //
 // computeViewFactorRow/Column are the matrix-entry oracles ACA samples to build
@@ -245,6 +250,7 @@ static void resetProfilingCounters() {
     g_svd_compress_calls = 0;
     g_svd_rank_cap_worst_resid = 0.0;
     g_svd_rank_cap_worst_want = 0;
+    g_precull_near_bypassed = 0;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -1683,6 +1689,14 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         }
         std::cout << std::endl;
     }
+
+    // NOT behind verbose. Near pairs whose M1 estimate is below the pre-cull
+    // floor now reach the refined kernel instead of being deleted on the
+    // strength of the estimator the refinement exists to replace. A zero here
+    // is a MEASURED zero -- the change was inert on this mesh -- and a non-zero
+    // is the population that used to be silently missing.
+    std::cout << "  Near pairs that bypassed the M1 pre-cull: "
+              << g_precull_near_bypassed.load() << std::endl;
 
     // NOT behind verbose, and NOT silent. tryCompressToLowRank() clamps its
     // truncation rank at max_svd_rank and returns success even when the
@@ -3202,7 +3216,8 @@ void HMatrixViewFactor::computeViewFactorBlock(
                 if (face_i == face_j) continue;
 
                 double F_ij = computeViewFactor(face_i, face_j);
-                if (F_ij > rad_config_.visibility_threshold) {
+                if (keepPairEntryF(F_ij, face_areas_[face_i], face_areas_[face_j],
+                                   rad_config_.visibility_threshold)) {
                     row_entries[i].push_back({static_cast<int>(j), F_ij});
                 }
             }
@@ -3273,7 +3288,18 @@ void HMatrixViewFactor::computeViewFactorBlock(
 
             // Distance-based culling
             double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
-            if (estimated_F < rad_config_.visibility_threshold * 0.1) continue;
+            // Pre-cull on the pair's strongest direction, and ONLY where M1 is
+            // the answer. In the near field it is not -- it is the estimator
+            // the refinement exists to replace -- and on a concave crease the
+            // centroid-to-centroid line can be grazing while the sub-triangles
+            // see each other perfectly well, so a near-zero M1 says nothing
+            // about the refined value. Near pairs therefore bypass this gate.
+            if (!keepPairEntryF(estimated_F, face_areas_[face_i], A_j,
+                                rad_config_.visibility_threshold * 0.1)) {
+                if (legacyPrecullRequested() ||
+                    !isNearFieldPair(face_i, face_j, std::sqrt(r2))) continue;
+                g_precull_near_bypassed++;
+            }
 
             // Passed all culling - add to batch
             RayCandidate cand;
@@ -3618,7 +3644,13 @@ void HMatrixViewFactor::computeViewFactorRow(
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
-        if (estimated_F < rad_config_.visibility_threshold * 0.1) continue;
+        // See computeViewFactorBlock: near pairs bypass the M1 pre-cull.
+        if (!keepPairEntryF(estimated_F, face_areas_[face_i], A_j,
+                            rad_config_.visibility_threshold * 0.1)) {
+            if (legacyPrecullRequested() ||
+                !isNearFieldPair(face_i, face_j, std::sqrt(r2))) continue;
+            g_precull_near_bypassed++;
+        }
 
         // Passed all culling - add to batch
         RayCandidate cand;
@@ -3723,7 +3755,13 @@ void HMatrixViewFactor::computeViewFactorColumn(
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
-        if (estimated_F < rad_config_.visibility_threshold * 0.1) continue;
+        // See computeViewFactorBlock: near pairs bypass the M1 pre-cull.
+        if (!keepPairEntryF(estimated_F, face_areas_[face_i], A_j,
+                            rad_config_.visibility_threshold * 0.1)) {
+            if (legacyPrecullRequested() ||
+                !isNearFieldPair(face_i, face_j, std::sqrt(r2))) continue;
+            g_precull_near_bypassed++;
+        }
 
         // Passed all culling - add to batch
         RayCandidate cand;
@@ -4040,8 +4078,13 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     // F_ij ~ A_j * cos_i * cos_j / (π * r²)
     // If this is below threshold, skip
     double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
-    if (estimated_F < rad_config_.visibility_threshold * 0.1) {
-        return 0.0;  // Would be below threshold even with perfect visibility
+    // See computeViewFactorBlock: near pairs bypass the M1 pre-cull.
+    if (!keepPairEntryF(estimated_F, face_areas_[face_i], A_j,
+                        rad_config_.visibility_threshold * 0.1)) {
+        if (legacyPrecullRequested() || !isNearFieldPair(face_i, face_j, r)) {
+            return 0.0;  // M1 IS the estimator out here, and it is below the floor
+        }
+        g_precull_near_bypassed++;
     }
 
     // Passed all culling tests - now do the expensive visibility check, in

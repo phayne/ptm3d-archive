@@ -217,6 +217,40 @@ inline VisibilitySegment visibilityRay(const std::array<double, 3>& pa,
     return seg;
 }
 
+// ---------------------------------------------------------------------------
+// The storage floor, on a quantity that does not depend on which way you ask.
+//
+// `visibility_threshold` used to gate the DIRECTED F_ij. F_ij = g / A_i and
+// F_ji = g / A_j for the same g = A_i F_ij, so on an area-asymmetric pair one
+// direction can clear the floor while the other does not, and the matrix keeps
+// the pair ONE-SIDED. A later reciprocity check then reads a defect that is
+// really a storage artifact, and the radiosity gets a matrix that is not
+// symmetric in the exchange it represents.
+//
+// Whether a pair is worth storing is a property of the PAIR. It is decided here
+// on the pair's strongest direction -- keep iff max(F_ij, F_ji) > tau, which is
+// g / min(A_i, A_j) > tau. That can only ADD the weaker direction of a pair the
+// old rule already kept; it never deletes a pair, so it is the safe direction.
+// PTM_VF_DIRECTED_FLOOR=1 restores the retired directed rule, so the A/B that
+// justifies the change is runnable on one binary. Warns; a control, not a
+// production setting.
+bool directedStorageFloorRequested();
+
+inline bool keepPairEntry(double g, double area_i, double area_j, double tau) {
+    if (directedStorageFloorRequested())
+        return (area_i > 0.0) && (g / area_i > tau);
+    const double a = std::min(area_i, area_j);
+    return (a > 0.0) && (g / a > tau);
+}
+
+// Same rule, for a caller holding F_ij rather than g.
+inline bool keepPairEntryF(double F_ij, double area_i, double area_j, double tau) {
+    return keepPairEntry(F_ij * area_i, area_i, area_j, tau);
+}
+
+// PTM_HMATRIX_PRECULL_LEGACY=1 restores the M1 pre-cull on near pairs too.
+bool legacyPrecullRequested();
+
 // Sample points for one face at a given near-field quadrature order; capacity
 // is kMaxNearFieldQuadPoints (radiation_config.h). Deliberately NOT
 // value-initialized: two of these are stack-constructed per near pair and only
