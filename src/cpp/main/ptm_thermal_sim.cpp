@@ -15073,6 +15073,9 @@ int main(int argc, char** argv) {
         prov.mesh_faces        = mesh->faces.size();
         prov.mesh_length_unit  = mesh_length_unit;
         prov.mesh_median_radius = mesh_median_radius;
+#ifdef _OPENMP
+        prov.omp_max_threads = omp_get_max_threads();
+#endif
         ptm::writeRunProvenance(prov);
     }
 

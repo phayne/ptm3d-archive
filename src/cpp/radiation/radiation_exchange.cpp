@@ -2845,6 +2845,7 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
         std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
                   << " MB" << std::endl;
         std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
+        hmatrix_view_factors_->printContentDigest();
         if (config_.verbose) {
             hmatrix_view_factors_->printStatistics();
         }
@@ -3068,6 +3069,7 @@ bool RadiationExchangeManager::prepare(
         std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
                   << " MB" << std::endl;
         std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
+        hmatrix_view_factors_->printContentDigest();
         if (config_.verbose) {
             hmatrix_view_factors_->printStatistics();
         }

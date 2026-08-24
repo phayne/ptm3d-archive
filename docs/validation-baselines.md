@@ -304,6 +304,16 @@ regression.
   it makes the baseline *about something else*.
 - **A different machine.** The GPU arms are pinned to this host's four AMD
   W6800X Duo compute devices. Nothing here claims cross-machine byte-identity.
+- **A different thread count.** Several OpenMP reductions in the solver and in
+  the statistics accumulators sum in thread-partition order, so the same binary
+  on the same config at 8 and at 48 threads writes different bytes. Measured
+  2026-08-23 on `moon_crater80N_vfbuild_sparse`: at 48 threads 32/32 files match
+  the `vfunify-stage1-2026-08-23` manifest; at 8 threads, 31/32 — one file,
+  `statistics/_raw/temperature_sum.bin`, and nothing else changed. Since that
+  date the engine records `omp_max_threads` in `provenance.txt`, `bank` copies
+  it into the manifest, and `verify` reports a thread-count change **before**
+  the byte verdict. An arm banked by an older engine records no thread count and
+  `verify` says so; treat its byte verdict as unattributable until it is re-cut.
 
 ---
 

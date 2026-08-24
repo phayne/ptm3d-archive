@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -262,6 +263,21 @@ bool writeRunProvenance(const RunProvenance& p) {
     // are what lets a future results diff be attributed instead of guessed at.
     kv("embree_library", PTM_BUILD_EMBREE_LIB);
     kv("embree_max_isa", PTM_BUILD_EMBREE_MAX_ISA);
+    // Thread count belongs in the provenance for the same reason Embree does:
+    // it changes the bytes. Several OpenMP reductions in the solver and the
+    // statistics accumulators sum in thread-partition order, so the same
+    // binary on the same config at 8 and at 48 threads writes different
+    // statistics files. A baseline manifest that does not record this compares
+    // two runs that were never comparable.
+    {
+        const char* env_nt = std::getenv("OMP_NUM_THREADS");
+        kv("omp_num_threads_env", env_nt && *env_nt ? env_nt : "(unset)");
+        if (p.omp_max_threads > 0) {
+            out << "omp_max_threads=" << p.omp_max_threads << '\n';
+        } else {
+            kv("omp_max_threads", "unknown (caller did not supply it)");
+        }
+    }
     kv("command_line", joinArgv(p.argv));
 
     kv("body", p.body.empty() ? "unknown" : p.body);

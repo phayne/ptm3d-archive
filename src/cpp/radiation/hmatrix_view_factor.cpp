@@ -121,6 +121,26 @@ static std::atomic<size_t> g_subdiv_leaves_sparse{0};    // Sub-blocks computed 
 static std::atomic<size_t> g_subdiv_leaves_zero{0};      // Sub-blocks genuinely empty
 static std::atomic<size_t> g_subdiv_depth_cap_zero{0};   // LAST-RESORT: leaf still huge at depth cap -> zeroed
 
+// SVD rank cap: how often tryCompressToLowRank() was asked for a tolerance it
+// could not deliver inside max_svd_rank, and returned success anyway.
+//
+// The truncation rank is chosen from the singular-value spectrum against
+// `compression_tolerance`, and then clamped to `max_svd_rank` (50). When the
+// clamp binds, the block does NOT meet the requested tolerance -- and the
+// function still returns true, so the caller stores the approximation and no
+// line of output says the tolerance was abandoned. That silence is the defect;
+// the clamp itself is a legitimate memory bound. These counters turn it into a
+// number, and PTM_HMATRIX_RANK_CAP_FATAL / radiation.hmatrix_rank_cap_fatal
+// turns the number into a stop.
+static std::atomic<size_t> g_svd_rank_capped{0};       // blocks where the cap bound
+static std::atomic<size_t> g_svd_compress_calls{0};    // blocks that reached the rank choice
+// Worst achieved relative residual sigma(rank_cap)/sigma(0) over capped blocks,
+// i.e. the tolerance the builder actually delivered where it promised
+// compression_tolerance. Stored as a double under compare-exchange.
+static std::atomic<double> g_svd_rank_cap_worst_resid{0.0};
+// Largest rank the spectrum asked for, over capped blocks.
+static std::atomic<int> g_svd_rank_cap_worst_want{0};
+
 // Near-field EXPOSURE of the ACA cross generators.
 //
 // computeViewFactorRow/Column are the matrix-entry oracles ACA samples to build
@@ -221,6 +241,10 @@ static void resetProfilingCounters() {
     g_cross_pairs = 0;
     g_cross_near_pairs = 0;
     g_cross_min_r_over_4d = 1.0e300;
+    g_svd_rank_capped = 0;
+    g_svd_compress_calls = 0;
+    g_svd_rank_cap_worst_resid = 0.0;
+    g_svd_rank_cap_worst_want = 0;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -1395,6 +1419,7 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
 
     std::cout << "    Final thread count: " << threads_to_use << std::endl;
     omp_set_num_threads(threads_to_use);
+    hmatrix_build_threads_ = threads_to_use;
     std::cout << std::flush;
 
     // Time estimation for progress reporting
@@ -1652,6 +1677,37 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
             std::cout << " (ACA did not run on this mesh)";
         }
         std::cout << std::endl;
+    }
+
+    // NOT behind verbose, and NOT silent. tryCompressToLowRank() clamps its
+    // truncation rank at max_svd_rank and returns success even when the
+    // requested compression_tolerance was not met. That is a defensible memory
+    // bound and an indefensible silence: a block stored at a tolerance nobody
+    // asked for is a physics decision made by a constant.
+    {
+        const size_t capped = g_svd_rank_capped.load();
+        if (capped > 0) {
+            std::cout << "  WARNING: SVD rank cap BOUND on " << capped << " of "
+                      << g_svd_compress_calls.load() << " compressed blocks: "
+                      << "compression_tolerance = " << config_.compression_tolerance
+                      << " was NOT met there. max_svd_rank = " << config_.max_svd_rank
+                      << ", spectrum asked for up to " << g_svd_rank_cap_worst_want.load()
+                      << "; worst delivered relative residual "
+                      << std::scientific << std::setprecision(3)
+                      << g_svd_rank_cap_worst_resid.load() << std::defaultfloat
+                      << ". This matrix is COARSER than its configured tolerance; "
+                         "set PTM_HMATRIX_RANK_CAP_FATAL=1 to make that a stop "
+                         "instead of a warning." << std::endl;
+            const char* fatal = std::getenv("PTM_HMATRIX_RANK_CAP_FATAL");
+            if (fatal && std::string(fatal) == "1") {
+                std::cerr << "\nFATAL: PTM_HMATRIX_RANK_CAP_FATAL=1 and the SVD rank cap "
+                             "bound on " << capped << " block(s).\n"
+                             "  The H-matrix does not meet its stated compression "
+                             "tolerance, so this run refuses to continue on it."
+                          << std::endl;
+                std::exit(1);
+            }
+        }
     }
 
     if (config_.verbose) {
@@ -3468,9 +3524,24 @@ bool HMatrixViewFactor::tryCompressToLowRank(
 
     if (rank == 0) return false;
 
-    // Cap rank
+    // Cap rank. When the cap binds, the stored block does NOT meet `tolerance`;
+    // record by how much instead of returning a quiet success. sigma(rank_cap)
+    // / sigma(0) is the relative size of the largest singular value thrown
+    // away, which is the tolerance actually delivered.
+    g_svd_compress_calls++;
+    const int rank_wanted = rank;
     rank = std::min(rank, config_.max_svd_rank);
     rank = std::min(rank, static_cast<int>(sigma.size()));
+    if (rank_wanted > rank) {
+        g_svd_rank_capped++;
+        const double resid = (sigma(0) > 0.0) ? sigma(rank) / sigma(0) : 0.0;
+        double prev = g_svd_rank_cap_worst_resid.load(std::memory_order_relaxed);
+        while (resid > prev &&
+               !g_svd_rank_cap_worst_resid.compare_exchange_weak(prev, resid)) {}
+        int prev_want = g_svd_rank_cap_worst_want.load(std::memory_order_relaxed);
+        while (rank_wanted > prev_want &&
+               !g_svd_rank_cap_worst_want.compare_exchange_weak(prev_want, rank_wanted)) {}
+    }
 
     // Check if low-rank is beneficial
     size_t sparse_bytes = sparse.memoryBytes();
@@ -4165,12 +4236,119 @@ bool HMatrixViewFactor::isVisible(const std::array<double, 3>& p1,
     return rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID;
 }
 
+namespace {
+
+// Every global row a root block writes, following hierarchical children.
+// Returns false if a descendant is disk-backed, whose row map lives in a file
+// and is not knowable here.
+bool collectWrittenRows(const radiation::HMatrixBlock& blk, std::vector<int>& out) {
+    if (const auto* hb = std::get_if<radiation::HierarchicalBlock>(&blk.data)) {
+        bool ok = true;
+        for (const auto& child : hb->children) {
+            if (child) ok = collectWrittenRows(*child, out) && ok;
+        }
+        return ok;
+    }
+    if (std::holds_alternative<radiation::DiskBlock>(blk.data)) return false;
+    out.insert(out.end(), blk.row_indices.begin(), blk.row_indices.end());
+    return true;
+}
+
+} // namespace
+
+void HMatrixViewFactor::prepareMatvecSchedule() const {
+    if (matvec_schedule_ != MatvecSchedule::Unknown) return;
+
+    const size_t nb = root_blocks_.size();
+    if (nb == 0 || n_rows_ == 0) {
+        matvec_schedule_ = MatvecSchedule::PerBlock;
+        return;
+    }
+
+    // The negative control for the determinism fix, kept in the shipped binary
+    // so the control is runnable and not a claim about a binary that no longer
+    // exists. Restores the pre-2026-08-23 atomic schedule, whose results move
+    // in the last bits between two runs of the same binary.
+    if (const char* atomic_env = std::getenv("PTM_HMATRIX_MATVEC_ATOMIC")) {
+        if (std::string(atomic_env) == "1") {
+            std::cout << "[hmatrix] WARNING: PTM_HMATRIX_MATVEC_ATOMIC=1 -- matvec uses "
+                         "the legacy atomic schedule. Results are NOT reproducible run "
+                         "to run. This is a control, not a production setting."
+                      << std::endl;
+            matvec_schedule_ = MatvecSchedule::Legacy;
+            return;
+        }
+    }
+
+    // Candidate grouping. The octree/quadtree builder lays root blocks out as a
+    // dense N x N grid, block_idx = i * N + j, and every block in grid row i
+    // writes exactly the rows of tree node i -- so grid rows are the natural
+    // groups. Anything else: try one group per block.
+    const size_t N = static_cast<size_t>(std::llround(std::sqrt(static_cast<double>(nb))));
+    const bool grid = (N * N == nb);
+
+    std::vector<int> owner(n_rows_, -1);
+    std::vector<int> rows;
+    bool disjoint = true;
+    bool complete = true;
+
+    for (size_t b = 0; b < nb && disjoint && complete; ++b) {
+        if (!root_blocks_[b]) continue;
+        rows.clear();
+        complete = collectWrittenRows(*root_blocks_[b], rows);
+        if (!complete) break;
+        const int g = grid ? static_cast<int>(b / N) : static_cast<int>(b);
+        for (int r : rows) {
+            if (r < 0 || static_cast<size_t>(r) >= n_rows_) continue;
+            if (owner[r] < 0) owner[r] = g;
+            else if (owner[r] != g) { disjoint = false; break; }
+        }
+    }
+
+    if (!complete) {
+        std::cout << "[hmatrix] WARNING: matvec falls back to the ATOMIC schedule -- a "
+                     "disk-backed block hides its row map, so row disjointness cannot be "
+                     "verified. Results will vary in the last bits between runs."
+                  << std::endl;
+        matvec_schedule_ = MatvecSchedule::Legacy;
+        return;
+    }
+    if (!disjoint) {
+        std::cout << "[hmatrix] WARNING: matvec falls back to the ATOMIC schedule -- two "
+                     "root blocks write the same row, so no thread can own a row. "
+                     "Results will vary in the last bits between runs."
+                  << std::endl;
+        matvec_schedule_ = MatvecSchedule::Legacy;
+        return;
+    }
+
+    matvec_schedule_ = grid ? MatvecSchedule::RowGroups : MatvecSchedule::PerBlock;
+    matvec_grid_dim_ = grid ? N : 0;
+    std::cout << "[hmatrix] matvec schedule: "
+              << (grid ? "row groups" : "per block")
+              << " (row disjointness verified over " << nb
+              << " root blocks) -- reproducible run to run at any thread count."
+              << std::endl;
+}
+
 void HMatrixViewFactor::matvec(const std::vector<double>& x,
                                 std::vector<double>& y) const {
     y.assign(n_rows_, 0.0);
 
-    // Use mmap path if loaded via mmap
+    // Use mmap path if loaded via mmap. NOT given the deterministic schedule
+    // below: the selection threshold in radiation_exchange.cpp is set to 1e9
+    // faces, so this branch is unreachable in every shipped configuration, and
+    // an untested reordering of a dead production path buys nothing. If it is
+    // ever re-enabled, it needs the same treatment -- its accumulation is the
+    // same non-associative atomic.
     if (mmap_loaded_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cout << "[hmatrix] WARNING: the mmap matvec accumulates through omp "
+                         "atomic; its results are not reproducible run to run."
+                      << std::endl;
+        }
         #pragma omp parallel for schedule(dynamic)
         for (size_t b = 0; b < mmap_root_indices_.size(); ++b) {
             matvecMmapBlock(mmap_root_indices_[b], x.data(), y.data());
@@ -4178,12 +4356,30 @@ void HMatrixViewFactor::matvec(const std::vector<double>& x,
         return;
     }
 
-    // Standard in-memory path
+    prepareMatvecSchedule();
+
+    // Standard in-memory path. Each schedule below reaches a given y[i] from
+    // exactly one thread, in one fixed block order, so the sum is the same
+    // sum every run -- at any thread count, under any scheduling decision the
+    // runtime makes.
+    if (matvec_schedule_ == MatvecSchedule::RowGroups) {
+        const size_t N = matvec_grid_dim_;
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < N; ++i) {
+            for (size_t j = 0; j < N; ++j) {
+                const auto& blk = root_blocks_[i * N + j];
+                if (blk) blk->matvec(x.data(), y.data());
+            }
+        }
+        return;
+    }
+
+    // PerBlock (verified: one block owns each row) and Legacy (unverified) run
+    // the same loop. Only PerBlock is reproducible, and prepareMatvecSchedule()
+    // has already said so for the other case.
     #pragma omp parallel for schedule(dynamic)
     for (size_t b = 0; b < root_blocks_.size(); ++b) {
-        if (root_blocks_[b]) {
-            root_blocks_[b]->matvec(x.data(), y.data());
-        }
+        if (root_blocks_[b]) root_blocks_[b]->matvec(x.data(), y.data());
     }
 }
 
@@ -4254,6 +4450,129 @@ void HMatrixViewFactor::printStatistics() const {
     std::cout << "  Total non-zeros: " << total_nnz_ << std::endl;
     std::cout << "  Memory usage: " << (memoryBytes() / (1024.0 * 1024.0)) << " MB" << std::endl;
     std::cout << "  Compression ratio: " << compressionRatio() << "x" << std::endl;
+}
+
+void HMatrixViewFactor::printContentDigest() const {
+    // Provenance: two builds of the same commit on the same mesh at the same
+    // thread count must print the same digest. This is the only line in the log
+    // that can say so.
+    const char* hash_env = std::getenv("PTM_HMATRIX_CONTENT_HASH");
+    if (hash_env && std::string(hash_env) == "0") {
+        std::cout << "  Content digest: DISABLED by PTM_HMATRIX_CONTENT_HASH=0 "
+                     "(reproducibility of this matrix is unverified)" << std::endl;
+        return;
+    }
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    const uint64_t digest = contentHash();
+    const double secs = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+    if (digest == 0) return;  // contentHash() already said why
+    std::cout << "  Content digest: 0x" << std::hex << std::setw(16)
+              << std::setfill('0') << digest << std::dec << std::setfill(' ')
+              << "  (build threads: " << hmatrix_build_threads_
+              << ", digest " << std::fixed << std::setprecision(2) << secs << " s)"
+              << std::defaultfloat << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic content digest
+// ---------------------------------------------------------------------------
+namespace {
+
+// FNV-1a over raw bytes. Chosen because it is order-sensitive and trivially
+// auditable, not because it is cryptographic: the question this answers is
+// "did the same build produce the same matrix", and any collision-resistant
+// mixing does that.
+inline void hashBytes(uint64_t& h, const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<uint64_t>(b[i]);
+        h *= 1099511628211ULL;
+    }
+}
+
+inline void hashInt(uint64_t& h, int64_t v) { hashBytes(h, &v, sizeof(v)); }
+
+inline void hashDoubles(uint64_t& h, const double* p, size_t n) {
+    hashBytes(h, p, n * sizeof(double));
+}
+
+inline void hashIndices(uint64_t& h, const std::vector<int>& v) {
+    hashInt(h, static_cast<int64_t>(v.size()));
+    if (!v.empty()) hashBytes(h, v.data(), v.size() * sizeof(int));
+}
+
+// Returns false if the block (or a descendant) is disk-backed, in which case
+// the digest is not computable from memory and the caller must say so.
+bool hashBlock(uint64_t& h, const radiation::HMatrixBlock& blk) {
+    hashIndices(h, blk.row_indices);
+    hashIndices(h, blk.col_indices);
+    hashInt(h, static_cast<int64_t>(blk.data.index()));
+
+    if (const auto* z = std::get_if<radiation::ZeroBlock>(&blk.data)) {
+        hashInt(h, z->n_rows); hashInt(h, z->n_cols);
+        return true;
+    }
+    if (const auto* s = std::get_if<radiation::SparseBlock>(&blk.data)) {
+        hashInt(h, s->n_rows); hashInt(h, s->n_cols);
+        hashInt(h, static_cast<int64_t>(s->values.size()));
+        if (!s->values.empty()) hashDoubles(h, s->values.data(), s->values.size());
+        hashIndices(h, s->col_indices);
+        hashIndices(h, s->row_ptrs);
+        return true;
+    }
+    if (const auto* l = std::get_if<radiation::LowRankBlock>(&blk.data)) {
+        hashInt(h, l->n_rows); hashInt(h, l->n_cols); hashInt(h, l->rank);
+        if (l->U.size()) hashDoubles(h, l->U.data(), static_cast<size_t>(l->U.size()));
+        if (l->sigma.size()) hashDoubles(h, l->sigma.data(), static_cast<size_t>(l->sigma.size()));
+        if (l->V.size()) hashDoubles(h, l->V.data(), static_cast<size_t>(l->V.size()));
+        return true;
+    }
+    if (const auto* d = std::get_if<radiation::DenseBlock>(&blk.data)) {
+        hashInt(h, d->n_rows); hashInt(h, d->n_cols);
+        if (d->data.size()) hashDoubles(h, d->data.data(), static_cast<size_t>(d->data.size()));
+        return true;
+    }
+    if (const auto* hb = std::get_if<radiation::HierarchicalBlock>(&blk.data)) {
+        hashInt(h, hb->n_rows); hashInt(h, hb->n_cols);
+        hashIndices(h, hb->row_indices);
+        hashIndices(h, hb->col_indices);
+        hashInt(h, static_cast<int64_t>(hb->children.size()));
+        bool ok = true;
+        for (const auto& child : hb->children) {
+            if (!child) { hashInt(h, -1); continue; }
+            ok = hashBlock(h, *child) && ok;
+        }
+        return ok;
+    }
+    // DiskBlock: the payload lives in a file this walk does not own.
+    return false;
+}
+
+} // namespace
+
+uint64_t HMatrixViewFactor::contentHash() const {
+    if (mmap_loaded_) {
+        std::cout << "[hmatrix] content digest NOT computed: matrix is mmap-loaded, "
+                     "its bytes are the file's. Digest the file instead." << std::endl;
+        return 0;
+    }
+    uint64_t h = 14695981039346656037ULL;  // FNV-1a offset basis
+    hashInt(h, static_cast<int64_t>(n_rows_));
+    hashInt(h, static_cast<int64_t>(n_cols_));
+    hashInt(h, static_cast<int64_t>(root_blocks_.size()));
+    bool complete = true;
+    for (size_t b = 0; b < root_blocks_.size(); ++b) {
+        hashInt(h, static_cast<int64_t>(b));
+        if (!root_blocks_[b]) { hashInt(h, -1); continue; }
+        complete = hashBlock(h, *root_blocks_[b]) && complete;
+    }
+    if (!complete) {
+        std::cout << "[hmatrix] content digest NOT computed: at least one block is "
+                     "disk-backed (out-of-core build)." << std::endl;
+        return 0;
+    }
+    return h;
 }
 
 // Vector utilities

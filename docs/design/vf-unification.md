@@ -363,13 +363,18 @@ arithmetically exact extraction move the last digit: a pure code motion moved
   success *even when the requested tolerance was not met* — on crater80N it produced NEGATIVE
   view factors and a fabricated 17 percent mass difference. Use
   `HMatrixViewFactor::computeDenseReference()` (`:4222`).
-* **The `moon_crater80N_vfbuild_hmatrix` arm is not reproducible run to run.**
-  `statistics/_raw/temperature_sum.bin` differs between two runs of the *same* binary — 481 of
-  12,800 faces, max $|\Delta T_{mean}| = 5.7 \times 10^{-14}$ K, summation-order round-off.
-  Verified twice on two different binaries. That file cannot gate anything until it is fixed.
-  The sparse arm is 32/32 reproducible.
+* ~~**The `moon_crater80N_vfbuild_hmatrix` arm is not reproducible run to run.**~~ **FIXED in
+  stage 2.** The cause was not the build: the assembled matrix's content digest was identical
+  across four runs while the temperatures moved. It was `HMatrixViewFactor::matvec()`, which ran
+  `parallel for schedule(dynamic)` over every root block and accumulated through
+  `#pragma omp atomic`, so the order threads reached a given `y[i]` was not fixed. Root blocks are
+  now grouped by written row — verified disjoint, not assumed — and each group is summed by one
+  thread in fixed block order. Four consecutive runs are byte-identical at 8 and at 48 threads.
 * **`ptm_thermal_sim`'s md5 depends on the worktree path** — it embeds the absolute
   `data/kernels` directory — so the same commit built in two worktrees gives two md5s.
   `test_vf_production` and `test_bowl_crater` do not and reproduce exactly.
-* **Statistics are thread-count dependent.** The same binary at `OMP_NUM_THREADS=16` and at 48
-  gives different `temperature_sum.bin`. The banked manifests record no thread count.
+* **Statistics are thread-count dependent.** The same binary at `OMP_NUM_THREADS=8` and at 48
+  gives different `temperature_sum.bin`, and nothing else. Since stage 2 the engine writes
+  `omp_max_threads` into `provenance.txt`, `ptm_validate_baseline.py bank` records it, and
+  `verify` reports a thread-count change before the byte verdict. Manifests banked before that
+  carry no thread count and `verify` says so rather than comparing silently.
