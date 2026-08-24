@@ -49,7 +49,7 @@
  *
  * Usage:
  *   vf_dump_sparse <mesh.ply> <out.csr> [--quad-order M]
- *                  [--visibility-threshold X] [--ns-threshold X]
+ *                  [--visibility-threshold X] [--window-factor X]
  *                  [--max-neighbors N] [--adaptive-neighbors] [--quiet]
  */
 #include <algorithm>
@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     int max_neighbors = -1;
     bool adaptive = false;
     bool quiet = false;
-    double vis_threshold = -1.0, ns_threshold = -1.0;
+    double vis_threshold = -1.0, window_factor = -1.0;
 
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
@@ -204,7 +204,15 @@ int main(int argc, char** argv) {
         };
         if (a == "--quad-order") quad_order = std::stoi(need("--quad-order"));
         else if (a == "--visibility-threshold") vis_threshold = std::stod(need("--visibility-threshold"));
-        else if (a == "--ns-threshold") ns_threshold = std::stod(need("--ns-threshold"));
+        else if (a == "--window-factor") window_factor = std::stod(need("--window-factor"));
+        // --ns-threshold selected the estimator through a DIFFERENT quantity
+        // (Ns = r / (A_i A_j)^(1/4)). Silently accepting the old number under
+        // the new rule would change the physics without saying so.
+        else if (a == "--ns-threshold")
+            fail("--ns-threshold was removed with adaptive_ns_threshold (2026-08-23). "
+                 "The near/far switch is now r < w (sqrt(A_i) + sqrt(A_j)); use "
+                 "--window-factor w. They are NOT the same number: the old default 5 "
+                 "corresponds to w = 2.5 on an equal-area pair only.");
         else if (a == "--max-neighbors") max_neighbors = std::stoi(need("--max-neighbors"));
         else if (a == "--adaptive-neighbors") adaptive = true;
         else if (a == "--quiet") quiet = true;
@@ -213,7 +221,7 @@ int main(int argc, char** argv) {
     }
     if (pos.size() != 2) {
         std::cerr << "usage: vf_dump_sparse <mesh.ply> <out.csr> [--quad-order M]\n"
-                     "       [--visibility-threshold X] [--ns-threshold X]\n"
+                     "       [--visibility-threshold X] [--window-factor X]\n"
                      "       [--max-neighbors N] [--adaptive-neighbors] [--quiet]\n";
         return 2;
     }
@@ -237,14 +245,14 @@ int main(int argc, char** argv) {
         cfg.nearfield_quadrature_order = quad_order;
     }
     if (vis_threshold >= 0.0) cfg.visibility_threshold = vis_threshold;
-    if (ns_threshold > 0.0) cfg.adaptive_ns_threshold = ns_threshold;
+    if (window_factor >= 0.0) cfg.nearfield_window_factor = window_factor;
 
     if (!quiet) {
         std::cout << "[vf_dump_sparse] " << mesh_path << ": " << n << " faces, "
                   << mesh->vertices.size() << " vertices\n"
                   << "[vf_dump_sparse] nearfield_quadrature_order="
                   << cfg.nearfield_quadrature_order
-                  << "  adaptive_ns_threshold=" << cfg.adaptive_ns_threshold
+                  << "  nearfield_window_factor=" << cfg.nearfield_window_factor
                   << "  visibility_threshold=" << cfg.visibility_threshold
                   << "  adaptive_neighbors=" << (cfg.adaptive_neighbors ? "true" : "false")
                   << "  max_neighbors=" << cfg.max_neighbors << "\n";

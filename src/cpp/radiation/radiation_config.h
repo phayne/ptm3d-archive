@@ -117,7 +117,21 @@ struct RadiationConfig {
     // resolution on both; the H-matrix is never coarser than the sparse path,
     // and on the tightest pairs it is finer.
     int nearfield_quadrature_order = 3;
-    double adaptive_ns_threshold = 5.0;  // Ns threshold: use M2 when r/sqrt(A) < 5
+
+    // The near/far switch, for BOTH in-engine builders:
+    //     near <=> r < nearfield_window_factor * (sqrt(A_i) + sqrt(A_j))
+    // See isNearFieldPair() in nearfield_quadrature.h for the refinement curve
+    // this constant was chosen from. 0 = never refine (pure M1); a very large
+    // value = always refine (pure M2).
+    //
+    // REPLACED adaptive_ns_threshold (default 5), a threshold on the
+    // dimensionless Ns = r / (A_i A_j)^(1/4). Removed rather than renamed: the
+    // two numbers are not the same quantity (a geometric mean of areas against
+    // a sum of lengths), and 5 carried into this field would silently narrow
+    // the window instead of widening it. On an equal-area pair the old rule cut
+    // at Ns = 5 and this one cuts at Ns = 8; on a 100:1 area contrast the old
+    // rule cut where M1 was still 150 percent wrong.
+    double nearfield_window_factor = 4.0;
 
     // Radiosity solver parameters
     int max_iterations = 100;            // Max Jacobi iterations

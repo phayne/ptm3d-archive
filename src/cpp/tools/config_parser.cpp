@@ -614,6 +614,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // Near-field (M2) symmetric double-area quadrature order; sparse
             // in-engine builder only. Range-checked in ptm_thermal_sim.cpp.
             config.radiation.nearfield_quadrature_order = getWithDefault(rad, "nearfield_quadrature_order", config.radiation.nearfield_quadrature_order);
+            // Near/far switch, both in-engine builders. Range-checked in
+            // ptm_thermal_sim.cpp (negative is FATAL).
+            config.radiation.nearfield_window_factor = getWithDefault(rad, "nearfield_window_factor", config.radiation.nearfield_window_factor);
             config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
             config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
             // Anisotropic roughness-beamed emission (Smith 1967); 0 = Lambertian.

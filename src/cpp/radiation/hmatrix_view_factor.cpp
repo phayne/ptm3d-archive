@@ -4032,19 +4032,14 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
 }
 
 bool HMatrixViewFactor::isNearFieldPair(int fi, int fj, double r) const {
-    // The near/far switch for THIS builder, in one place. It was written out
-    // four times -- in computeViewFactor, in computeViewFactorBlock, and
-    // (silently, by omission) NOT in computeViewFactorRow/Column, which is how
-    // the ACA cross generators came to skip the near field entirely.
-    //
-    // r < 4 (sqrt(A_i) + sqrt(A_j)). The length scale is the SUM of the two
-    // face sizes, not their geometric mean: the centroid approximation's error
-    // is governed by the larger of the two solid angles, so a 1 m facet 200 m
-    // from a 100 m facet is a near pair even though sqrt(A_i A_j) says
-    // otherwise. The sparse builder's Ns = r / (A_i A_j)^(1/4) <= 5 uses the
-    // geometric mean and calls that same pair far field. Unifying the two rules
-    // is a separate change; see docs/design/vf-unification.md.
-    return r < 4.0 * (std::sqrt(face_areas_[fi]) + std::sqrt(face_areas_[fj]));
+    // The near/far switch, in one place for this builder and SHARED with the
+    // sparse one (radiation::isNearFieldPair, nearfield_quadrature.h). It used
+    // to be written out four times here -- in computeViewFactor, in
+    // computeViewFactorBlock, and (silently, by omission) NOT in
+    // computeViewFactorRow/Column, which is how the ACA cross generators came
+    // to skip the near field entirely.
+    return radiation::isNearFieldPair(r, face_areas_[fi], face_areas_[fj],
+                                      rad_config_.nearfield_window_factor);
 }
 
 int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
@@ -4069,7 +4064,12 @@ int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
     const double d = std::sqrt(face_areas_[fi]) + std::sqrt(face_areas_[fj]);
     auto rv = subtract(face_centers_[fj], face_centers_[fi]);
     const double r0 = std::sqrt(dot(rv, rv));
-    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(4.0 * d / r0))
+    // The same length scale as the near/far window, so the order is 1 exactly
+    // at the window edge and rises as the pair closes. Tracking the configured
+    // window keeps "widen the window" from silently meaning "refine the newly
+    // included pairs at a different resolution than the ones already inside".
+    const double w = rad_config_.nearfield_window_factor;
+    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(w * d / r0))
                          : radiation::kMaxNearFieldQuadOrder;
     m = std::max(m, rad_config_.nearfield_quadrature_order);
     if (m < 1) m = 1;

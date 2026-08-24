@@ -438,9 +438,10 @@ DenseVF densify(const radiation::ViewFactorMatrix& F) {
 }
 
 // Far field == the regime the ADAPTIVE method sends to the M1 centroid kernel,
-// i.e. Ns = r / sqrt(A_eff) above adaptive_ns_threshold. That is exactly where
-// FC-08's factor of two lived, so the control perturbs the same population.
-size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, double scale) {
+// i.e. OUTSIDE radiation::isNearFieldPair at nearfield_window_factor. That is
+// exactly where FC-08's factor of two lived, so the control perturbs the same
+// population.
+size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double window_factor, double scale) {
     size_t touched = 0;
     const auto& C = b.mesh->face_centers;
     for (size_t i = 0; i < d.n; ++i) {
@@ -449,7 +450,7 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, 
             const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
             const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
             const double A_eff = std::sqrt(b.areas[i] * b.areas[j]);
-            if (r / std::sqrt(A_eff) > ns_threshold) {
+            if (!radiation::isNearFieldPair(r, b.areas[i], b.areas[j], window_factor)) {
                 d.at(i, j) *= scale;
                 ++touched;
             }
@@ -467,7 +468,7 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, 
 // Which pair was hit, and in which regime, is printed; the caller treats
 // "found nothing" as a hard error, because a control that silently did not
 // perturb anything would report a green run as proof of detection.
-bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
+bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double window_factor,
                             double scale) {
     const auto& C = b.mesh->face_centers;
     // pass 0 = far field only, pass 1 = anything.
@@ -483,7 +484,7 @@ bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
                              dz = C[j][2] - C[i][2];
                 const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
                 const bool is_far =
-                    r / std::sqrt(std::sqrt(b.areas[i] * b.areas[j])) > ns_threshold;
+                    !radiation::isNearFieldPair(r, b.areas[i], b.areas[j], window_factor);
                 if (pass == 0 && !is_far) continue;
                 const double mass = b.areas[i] * d.at(i, j);
                 if (mass > best) {
@@ -566,7 +567,7 @@ double areaWeightedCoupling(const DenseVF& d, const BuiltMesh& b, int want) {
 }
 
 // Reciprocity is split by the SAME criterion the calculator itself uses to pick
-// an estimator: Ns = r / sqrt(A_eff) against adaptive_ns_threshold. Above it the
+// an estimator: radiation::isNearFieldPair at nearfield_window_factor. Outside it the
 // pair goes through M1, the centroid kernel A_j cos_i cos_j / (pi r^2), which is
 // ANALYTICALLY reciprocal -- A_i F_ij and A_j F_ji are the same expression -- so
 // any residual there is an occlusion or storage-threshold asymmetry.
@@ -602,7 +603,7 @@ struct RecipResult {
 // (296,297) on the cap, cos_i = cos_j = 0.00000, F = 8.8e-21 against 1.9e-20,
 // sparse builder exactly 0. Pairs cut by the floor are COUNTED and printed, so
 // the cut cannot quietly remove a real one.
-RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshold,
+RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double window_factor,
                         double floor_F = 0.0) {
     RecipResult r;
     const auto& C = b.mesh->face_centers;
@@ -625,7 +626,7 @@ RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshol
             const double rel = std::fabs(a - c) / std::max(a, c);
             absdiff += std::fabs(a - c);
             maxsum += std::max(a, c);
-            if (dist / std::sqrt(A_eff) > ns_threshold) {
+            if (!radiation::isNearFieldPair(dist, b.areas[i], b.areas[j], window_factor)) {
                 ++r.pairs_far;
                 r.worst_far = std::max(r.worst_far, rel);
             } else {
@@ -708,11 +709,11 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
 
     if (injected_entries) *injected_entries = 0;
     if (inj.far_field_scale != 1.0) {
-        const size_t k = injectFarFieldScale(d, b, cfg.adaptive_ns_threshold, inj.far_field_scale);
+        const size_t k = injectFarFieldScale(d, b, cfg.nearfield_window_factor, inj.far_field_scale);
         if (injected_entries) *injected_entries = k;
     }
     if (inj.reciprocity_scale != 1.0) {
-        if (!injectReciprocityBreak(d, b, cfg.adaptive_ns_threshold, inj.reciprocity_scale)) {
+        if (!injectReciprocityBreak(d, b, cfg.nearfield_window_factor, inj.reciprocity_scale)) {
             // A control that could not perturb anything proves nothing, and a
             // green exit after it would be read as "the detector works".
             std::cout << "  INJECTION ERROR: no two-sided entry to perturb on this "
@@ -841,7 +842,7 @@ struct AgreeResult {
 };
 
 AgreeResult agreement(const DenseVF& s, const DenseVF& h, const BuiltMesh& b,
-                      double floor_frac, double ns_threshold) {
+                      double floor_frac, double window_factor) {
     AgreeResult r;
     const auto& C = b.mesh->face_centers;
     double peak = 0.0;
@@ -859,11 +860,13 @@ AgreeResult agreement(const DenseVF& s, const DenseVF& h, const BuiltMesh& b,
             ++r.compared;
             const double rel = std::fabs(a - g) / std::max(a, g);
             const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
-            const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
-                              std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
+            const double rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const double ns = rr / std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
             if (rel > r.worst_rel) { r.worst_rel = rel; r.worst_ns = ns; }
-            if (ns > ns_threshold) r.worst_far = std::max(r.worst_far, rel);
-            else r.worst_near = std::max(r.worst_near, rel);
+            if (radiation::isNearFieldPair(rr, b.areas[i], b.areas[j], window_factor))
+                r.worst_near = std::max(r.worst_near, rel);
+            else
+                r.worst_far = std::max(r.worst_far, rel);
         }
     }
     r.mass_rel = (maxsum > 0.0) ? absdiff / maxsum : 0.0;
@@ -1129,7 +1132,7 @@ int main(int argc, char** argv) {
                         1.0 - f_exact, tol_ingersoll, all_ok);
                 verdictBelow("I3", "worst PER-FACE deviation from f [%]", worst_face,
                              tol_perface, all_ok);
-                const RecipResult rr = reciprocity(d, b, cfg.adaptive_ns_threshold);
+                const RecipResult rr = reciprocity(d, b, cfg.nearfield_window_factor);
                 reportReciprocity("spherical cap", rr, tol_recip, tol_recip_mass,
                                   tol_recip_near, all_ok, "R1a", "R1b", "R1c");
                 verdictBelow("S1", "max row sum (closure, must be <= 1)", rs.max, 1.0, all_ok);
@@ -1171,7 +1174,7 @@ int main(int argc, char** argv) {
             if (li + 1 == levels.size()) {
                 verdict("D1", "disk-pair F_12, no-truncation config", meas, f12,
                         tol_disk, all_ok);
-                const RecipResult rr = reciprocity(d, b, cfg.adaptive_ns_threshold);
+                const RecipResult rr = reciprocity(d, b, cfg.nearfield_window_factor);
                 std::cout << "  NOTE: on this geometry every surviving pair is far field\n"
                           << "  (" << rr.pairs_far << " far vs " << rr.pairs_near
                           << " near), so R2 exercises only the analytically reciprocal M1\n"
@@ -1268,7 +1271,7 @@ int main(int argc, char** argv) {
 
         double meas_prod = 0.0;
         for (const auto& r : table) if (r.m == prod_m) meas_prod = r.meas;
-        const RecipResult rr = reciprocity(d_prod, b, cfg_prod.adaptive_ns_threshold);
+        const RecipResult rr = reciprocity(d_prod, b, cfg_prod.nearfield_window_factor);
         std::cout << "  " << b.mesh->faces.size() << " faces; " << rr.pairs_near
                   << " of " << (rr.pairs_near + rr.pairs_far)
                   << " two-sided pairs are near field (M2)";
@@ -1387,8 +1390,8 @@ int main(int argc, char** argv) {
         // is the non-arbitrary significance cut here: an entry below it does
         // not exist in a production sparse .vf at all.
         const double floor_F = cfg.visibility_threshold;
-        const RecipResult rp = reciprocity(dh, b, cfg.adaptive_ns_threshold, floor_F);
-        const RecipResult rn = reciprocity(dn, b, cfg.adaptive_ns_threshold, floor_F);
+        const RecipResult rp = reciprocity(dh, b, cfg.nearfield_window_factor, floor_F);
+        const RecipResult rn = reciprocity(dn, b, cfg.nearfield_window_factor, floor_F);
         std::cout << "  H-matrix reciprocity, entries >= visibility_threshold ("
                   << std::scientific << std::setprecision(0) << floor_F << std::defaultfloat
                   << "): " << rp.pairs_far << " far-field, "
@@ -1422,9 +1425,9 @@ int main(int argc, char** argv) {
                     if (std::max(dn.at(i, j), dn.at(j, i)) < floor_F) continue;
                     const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1],
                                  dz = C[j][2] - C[i][2];
-                    const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
-                                      std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
-                    if (ns > cfg.adaptive_ns_threshold) continue;
+                    const double rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (!radiation::isNearFieldPair(rr, b.areas[i], b.areas[j],
+                                                    cfg.nearfield_window_factor)) continue;
                     const double rel = std::fabs(a - c) / std::max(a, c);
                     if (rel > worst) { worst = rel; wi = i; wj = j; }
                 }
@@ -1468,8 +1471,8 @@ int main(int argc, char** argv) {
         // centroid cosines against 1e-6), and a different neighbor-selection
         // rule. What the shared kernel buys is that those are all DECLARED
         // differences in the callers, not a second copy of the integral.
-        const AgreeResult ap = agreement(ds, dh, b, 1.0e-3, cfg.adaptive_ns_threshold);
-        const AgreeResult an = agreement(ds, dn, b, 1.0e-3, cfg.adaptive_ns_threshold);
+        const AgreeResult ap = agreement(ds, dh, b, 1.0e-3, cfg.nearfield_window_factor);
+        const AgreeResult an = agreement(ds, dn, b, 1.0e-3, cfg.nearfield_window_factor);
         std::cout << "  sparse vs H-matrix, entries above 1e-3 of the peak:\n"
                   << "    production     " << ap.compared << " compared, " << ap.only_sparse
                   << " sparse-only, " << ap.only_hmat << " H-matrix-only; area-weighted"

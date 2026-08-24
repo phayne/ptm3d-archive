@@ -660,11 +660,11 @@ void runBowlCraterTest(double diameter,
     config.visibility_threshold = 1e-6;
     // Decorative except for visibility_threshold: this test never constructs a
     // ViewFactorCalculator (see below -- it fills F from its own inline analytic
-    // centroid kernel, no Embree), so neither the quadrature order nor the Ns
-    // threshold reaches any code. Kept only so the block still reads as the
-    // configuration the crater would be run under.
+    // centroid kernel, no Embree), so neither the quadrature order nor the
+    // near-field window reaches any code. Kept only so the block still reads as
+    // the configuration the crater would be run under.
     config.nearfield_quadrature_order = 2;
-    config.adaptive_ns_threshold = 30.0;
+    config.nearfield_window_factor = 15.0;   // was adaptive_ns_threshold = 30
 
     // Create view factor calculator (without Embree for this simple test)
     // We'll compute view factors directly since the crater is a simple concave surface

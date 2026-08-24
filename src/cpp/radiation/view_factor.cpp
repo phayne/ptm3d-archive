@@ -1302,8 +1302,10 @@ void ViewFactorCalculator::reportNearFieldBoundClamps() {
 }
 
 double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
-    // Adaptive method selection based on dimensionless separation Ns
-    // Ns = r / sqrt(A) where r is distance and A is face area
+    // Near/far selection through the SHARED rule (nearfield_quadrature.h), the
+    // same one the H-matrix builder uses. Before 2026-08-23 this path used
+    // Ns = r / (A_i A_j)^(1/4) against adaptive_ns_threshold, a geometric mean
+    // that is blind to an area contrast.
 
     const auto& c_i = face_centers_[face_i];
     const auto& c_j = face_centers_[face_j];
@@ -1311,16 +1313,11 @@ double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
     auto r_vec = subtract(c_j, c_i);
     double r = std::sqrt(dot(r_vec, r_vec));
 
-    double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-    double Ns = r / std::sqrt(A_eff);
-
-    if (Ns > config_.adaptive_ns_threshold) {
-        // Far apart: use centroid method
-        return computeCentroid(face_i, face_j);
-    } else {
-        // Close: use subdivision method
+    if (isNearFieldPair(r, face_areas_[face_i], face_areas_[face_j],
+                        config_.nearfield_window_factor)) {
         return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
+    return computeCentroid(face_i, face_j);
 }
 
 double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
@@ -1332,10 +1329,8 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
     // For nearby faces requiring subdivision, we fall back to full computation
     // since subdivision requires computing at multiple sample points.
 
-    double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-    double Ns = geom.r / std::sqrt(A_eff);
-
-    if (Ns <= config_.adaptive_ns_threshold) {
+    if (isNearFieldPair(geom.r, face_areas_[face_i], face_areas_[face_j],
+                        config_.nearfield_window_factor)) {
         // Close faces: use subdivision method (needs full computation at sample points)
         return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
@@ -1375,7 +1370,8 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
 
     results.reserve(neighbors.size());
 
-    // Separate neighbors into far (centroid) and near (subdivision) based on Ns threshold
+    // Separate neighbors into far (centroid) and near (subdivision) by the
+    // shared near-field window (nearfield_quadrature.h).
     struct FarNeighbor {
         int idx;              // Index in neighbors vector
         int face_j;           // Face index
@@ -1394,11 +1390,8 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
         const auto& nd = neighbors[idx];
         int face_j = nd.neighbor_idx;
 
-        // Compute Ns to decide method
-        double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-        double Ns = nd.geom.r / std::sqrt(A_eff);
-
-        if (Ns <= config_.adaptive_ns_threshold) {
+        if (isNearFieldPair(nd.geom.r, face_areas_[face_i], face_areas_[face_j],
+                            config_.nearfield_window_factor)) {
             // Near face: needs subdivision method
             near_neighbor_indices.push_back(idx);
         } else {
