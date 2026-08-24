@@ -1227,14 +1227,23 @@ double ViewFactorCalculator::computeCentroid(int face_i, int face_j) {
     double cos_i = dot_i;       // n_i · r_hat (positive if i faces toward j)
     double cos_j = -dot_j;      // n_j · (-r_hat) (positive if j faces toward i)
 
-    // Skip nearly-grazing angles (avoid numerical issues)
-    if (cos_i < 1e-6 || cos_j < 1e-6) {
+    // Skip nearly-grazing angles (avoid numerical issues). kGrazingCosCut is
+    // shared with the near-field kernel and, since 2026-08-23, with the
+    // H-matrix builder.
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         g_angle_reject++;
         return 0.0;
     }
 
-    // Check visibility using ray tracing
-    if (!isVisible(c_i, c_j)) {
+    // Check visibility using ray tracing, in CANONICAL (min index first) order.
+    // Mutual visibility is a symmetric geometric relation, but isVisible() is
+    // not exactly symmetric in its arguments -- the ray starts at p1, and
+    // Embree's float32 traversal can answer differently from the two ends of
+    // the same segment. Letting that decide puts a direction-dependent ZERO
+    // into an otherwise analytically reciprocal estimator. computeSubdivision
+    // has canonicalized since 2026-08-23; the far field does now too.
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) {
         g_vis_reject++;
         return 0.0;
     }
@@ -1302,8 +1311,10 @@ void ViewFactorCalculator::reportNearFieldBoundClamps() {
 }
 
 double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
-    // Adaptive method selection based on dimensionless separation Ns
-    // Ns = r / sqrt(A) where r is distance and A is face area
+    // Near/far selection through the SHARED rule (nearfield_quadrature.h), the
+    // same one the H-matrix builder uses. Before 2026-08-23 this path used
+    // Ns = r / (A_i A_j)^(1/4) against adaptive_ns_threshold, a geometric mean
+    // that is blind to an area contrast.
 
     const auto& c_i = face_centers_[face_i];
     const auto& c_j = face_centers_[face_j];
@@ -1311,16 +1322,11 @@ double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
     auto r_vec = subtract(c_j, c_i);
     double r = std::sqrt(dot(r_vec, r_vec));
 
-    double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-    double Ns = r / std::sqrt(A_eff);
-
-    if (Ns > config_.adaptive_ns_threshold) {
-        // Far apart: use centroid method
-        return computeCentroid(face_i, face_j);
-    } else {
-        // Close: use subdivision method
+    if (isNearFieldPair(r, face_areas_[face_i], face_areas_[face_j],
+                        config_.nearfield_window_factor)) {
         return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
+    return computeCentroid(face_i, face_j);
 }
 
 double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
@@ -1332,10 +1338,8 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
     // For nearby faces requiring subdivision, we fall back to full computation
     // since subdivision requires computing at multiple sample points.
 
-    double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-    double Ns = geom.r / std::sqrt(A_eff);
-
-    if (Ns <= config_.adaptive_ns_threshold) {
+    if (isNearFieldPair(geom.r, face_areas_[face_i], face_areas_[face_j],
+                        config_.nearfield_window_factor)) {
         // Close faces: use subdivision method (needs full computation at sample points)
         return computeSubdivision(face_i, face_j, config_.nearfield_quadrature_order);
     }
@@ -1348,12 +1352,13 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
     double cos_j = -geom.dot_nj_rhat;
 
     // Skip faces that don't face each other or nearly-grazing angles
-    if (cos_i < 1e-6 || cos_j < 1e-6) {
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         return 0.0;
     }
 
-    // Check visibility using ray tracing
-    if (!isVisible(face_centers_[face_i], face_centers_[face_j])) {
+    // Check visibility using ray tracing, canonical order (see computeCentroid).
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) {
         return 0.0;
     }
 
@@ -1375,7 +1380,8 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
 
     results.reserve(neighbors.size());
 
-    // Separate neighbors into far (centroid) and near (subdivision) based on Ns threshold
+    // Separate neighbors into far (centroid) and near (subdivision) by the
+    // shared near-field window (nearfield_quadrature.h).
     struct FarNeighbor {
         int idx;              // Index in neighbors vector
         int face_j;           // Face index
@@ -1394,11 +1400,8 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
         const auto& nd = neighbors[idx];
         int face_j = nd.neighbor_idx;
 
-        // Compute Ns to decide method
-        double A_eff = std::sqrt(face_areas_[face_i] * face_areas_[face_j]);
-        double Ns = nd.geom.r / std::sqrt(A_eff);
-
-        if (Ns <= config_.adaptive_ns_threshold) {
+        if (isNearFieldPair(nd.geom.r, face_areas_[face_i], face_areas_[face_j],
+                            config_.nearfield_window_factor)) {
             // Near face: needs subdivision method
             near_neighbor_indices.push_back(idx);
         } else {
@@ -1407,7 +1410,7 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
             double cos_j = -nd.geom.dot_nj_rhat;
 
             // Skip faces that don't face each other (angle filter)
-            if (cos_i >= 1e-6 && cos_j >= 1e-6) {
+            if (cos_i >= kGrazingCosCut && cos_j >= kGrazingCosCut) {
                 far_neighbors.push_back({
                     static_cast<int>(idx), face_j,
                     cos_i, cos_j, nd.geom.r2, face_areas_[face_j]
@@ -1422,11 +1425,12 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
         std::vector<RayCandidate> rays;
         rays.reserve(far_neighbors.size());
 
-        const auto& c_i = face_centers_[face_i];
-
         for (const auto& fn : far_neighbors) {
-            const auto& c_j = face_centers_[fn.face_j];
-            RayCandidate ray = prepareRay(c_i, c_j, fn.idx);
+            // Canonical order (see computeCentroid): the segment is the same
+            // either way, the float32 traversal is not.
+            const int fa = std::min(face_i, fn.face_j);
+            const int fb = std::max(face_i, fn.face_j);
+            RayCandidate ray = prepareRay(face_centers_[fa], face_centers_[fb], fn.idx);
             rays.push_back(ray);
         }
 

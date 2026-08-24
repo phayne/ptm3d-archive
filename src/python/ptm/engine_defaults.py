@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-182 keys across 11 sections.
+183 keys across 11 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -146,6 +146,7 @@ ENGINE_DEFAULTS = {
     'radiation.min_neighbors': 20,
     'radiation.min_shadow_fraction': 0.3,
     'radiation.nearfield_quadrature_order': 3,
+    'radiation.nearfield_window_factor': 4.0,
     'radiation.radiance_prune_eps': 0.0,
     'radiation.rms_slope_deg': 0.0,
     'radiation.use_aca': True,

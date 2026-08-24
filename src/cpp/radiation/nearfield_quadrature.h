@@ -18,9 +18,6 @@
 //   * occlusion. The sparse builder issues one canonical centroid-to-centroid
 //     Embree ray inside computeSubdivision; the H-matrix batches its rays in
 //     the block assembler and cannot ask for one here.
-//   * the near/far switch. Sparse: Ns = r/sqrt(sqrt(A_i A_j)) vs
-//     adaptive_ns_threshold (5). H-matrix: r < 4 (sqrt(A_i) + sqrt(A_j)), a
-//     wider window. Unifying those is a separate change with its own evidence.
 //   * bowl_crater_ptm.cpp keeps a THIRD, harness-local replica on purpose: its
 //     KPROBE mode isolates the kernel from the occlusion and pair-set, and it
 //     also carries the RETIRED one-sided rule for attribution. It is documented
@@ -35,6 +32,40 @@
 #include "radiation_config.h"
 
 namespace radiation {
+
+// ---------------------------------------------------------------------------
+// The near/far switch -- ONE rule, both in-engine builders.
+//
+//   near  <=>  r < w (sqrt(A_i) + sqrt(A_j)),   w = nearfield_window_factor
+//
+// r is the centroid separation. The length scale is the SUM of the two face
+// sizes, so the pair is judged by the LARGER of the two solid angles, which is
+// what actually governs the centroid approximation's error.
+//
+// Until 2026-08-23 the two builders used different rules and the sparse one
+// used the GEOMETRIC MEAN: Ns = r / (A_i A_j)^(1/4) <= adaptive_ns_threshold
+// (5). The geometric mean cannot see an area contrast. Measured M1 error
+// against the same quadrature run to convergence (m = 32, ~1.05e6 evaluations
+// per pair; ~/projects/ada_vfunify_2026-08-23/probe/window_curve.py):
+//
+//   A_j/A_i        at the OLD cut (Ns = 5)     at THIS cut (w = 4)
+//   1              Ns 5,      M1 +3.49%        Ns 8,      M1 +1.38%
+//   100            Ns 5,      M1 +16.7%        Ns 12.6,   M1 +2.3%
+//   10000          Ns 5,      M1 +150%         Ns 40,     M1 ~+2%
+//
+// so the old rule handed the far-field estimator pairs it was wrong about by
+// 150 percent on a 100:1 linear size contrast -- the core-plus-ring meshes this
+// project builds are exactly that. The error is one-signed (M1 always
+// OVER-estimates a near pair), so widening the window makes terrain coupling
+// SMALLER, not larger.
+//
+// w = 4 is the H-matrix builder's historical constant, kept because it is the
+// SAFE direction: M2 converges to M1 in the far field, so an over-wide window
+// costs time and never accuracy, while an over-narrow one is a bias. It leaves
+// 1.38% of M1 error at the cut for an equal-area pair.
+inline bool isNearFieldPair(double r, double A_i, double A_j, double window_factor) {
+    return r < window_factor * (std::sqrt(A_i) + std::sqrt(A_j));
+}
 
 // Sample points for one face at a given near-field quadrature order; capacity
 // is kMaxNearFieldQuadPoints (radiation_config.h). Deliberately NOT
@@ -201,9 +232,9 @@ inline double nearFieldPairIntegral(const std::array<double, 3>& a0,
             const double cos_a = (n_a[0] * dx + n_a[1] * dy + n_a[2] * dz) * inv_r;
             const double cos_b = -(n_b[0] * dx + n_b[1] * dy + n_b[2] * dz) * inv_r;
 
-            // Grazing/back-facing cut, same 1e-6 threshold as M1. A rejected
+            // Grazing/back-facing cut, the shared kGrazingCosCut. A rejected
             // sample pair contributes ZERO; it is not removed from the domain.
-            if (cos_a < 1e-6 || cos_b < 1e-6) continue;
+            if (cos_a < kGrazingCosCut || cos_b < kGrazingCosCut) continue;
 
             kernel_sum += (cos_a * cos_b) / r2;
             ++n_valid;

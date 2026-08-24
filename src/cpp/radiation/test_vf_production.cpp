@@ -438,9 +438,10 @@ DenseVF densify(const radiation::ViewFactorMatrix& F) {
 }
 
 // Far field == the regime the ADAPTIVE method sends to the M1 centroid kernel,
-// i.e. Ns = r / sqrt(A_eff) above adaptive_ns_threshold. That is exactly where
-// FC-08's factor of two lived, so the control perturbs the same population.
-size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, double scale) {
+// i.e. OUTSIDE radiation::isNearFieldPair at nearfield_window_factor. That is
+// exactly where FC-08's factor of two lived, so the control perturbs the same
+// population.
+size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double window_factor, double scale) {
     size_t touched = 0;
     const auto& C = b.mesh->face_centers;
     for (size_t i = 0; i < d.n; ++i) {
@@ -449,7 +450,7 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, 
             const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
             const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
             const double A_eff = std::sqrt(b.areas[i] * b.areas[j]);
-            if (r / std::sqrt(A_eff) > ns_threshold) {
+            if (!radiation::isNearFieldPair(r, b.areas[i], b.areas[j], window_factor)) {
                 d.at(i, j) *= scale;
                 ++touched;
             }
@@ -467,7 +468,7 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double ns_threshold, 
 // Which pair was hit, and in which regime, is printed; the caller treats
 // "found nothing" as a hard error, because a control that silently did not
 // perturb anything would report a green run as proof of detection.
-bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
+bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double window_factor,
                             double scale) {
     const auto& C = b.mesh->face_centers;
     // pass 0 = far field only, pass 1 = anything.
@@ -483,7 +484,7 @@ bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
                              dz = C[j][2] - C[i][2];
                 const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
                 const bool is_far =
-                    r / std::sqrt(std::sqrt(b.areas[i] * b.areas[j])) > ns_threshold;
+                    !radiation::isNearFieldPair(r, b.areas[i], b.areas[j], window_factor);
                 if (pass == 0 && !is_far) continue;
                 const double mass = b.areas[i] * d.at(i, j);
                 if (mass > best) {
@@ -506,8 +507,10 @@ bool injectReciprocityBreak(DenseVF& d, const BuiltMesh& b, double ns_threshold,
 // measurement
 // ---------------------------------------------------------------------------
 
-// Verdict printer (defined below with the rest of the reporting helpers).
+// Verdict printers (defined below with the rest of the reporting helpers).
 void verdictBelow(const char* tag, const char* what, double measured, double limit,
+                  bool& all_ok);
+void verdictAbove(const char* tag, const char* what, double measured, double floor_v,
                   bool& all_ok);
 
 struct RowStats {
@@ -564,7 +567,7 @@ double areaWeightedCoupling(const DenseVF& d, const BuiltMesh& b, int want) {
 }
 
 // Reciprocity is split by the SAME criterion the calculator itself uses to pick
-// an estimator: Ns = r / sqrt(A_eff) against adaptive_ns_threshold. Above it the
+// an estimator: radiation::isNearFieldPair at nearfield_window_factor. Outside it the
 // pair goes through M1, the centroid kernel A_j cos_i cos_j / (pi r^2), which is
 // ANALYTICALLY reciprocal -- A_i F_ij and A_j F_ji are the same expression -- so
 // any residual there is an occlusion or storage-threshold asymmetry.
@@ -600,7 +603,7 @@ struct RecipResult {
 // (296,297) on the cap, cos_i = cos_j = 0.00000, F = 8.8e-21 against 1.9e-20,
 // sparse builder exactly 0. Pairs cut by the floor are COUNTED and printed, so
 // the cut cannot quietly remove a real one.
-RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshold,
+RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double window_factor,
                         double floor_F = 0.0) {
     RecipResult r;
     const auto& C = b.mesh->face_centers;
@@ -623,7 +626,7 @@ RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshol
             const double rel = std::fabs(a - c) / std::max(a, c);
             absdiff += std::fabs(a - c);
             maxsum += std::max(a, c);
-            if (dist / std::sqrt(A_eff) > ns_threshold) {
+            if (!radiation::isNearFieldPair(dist, b.areas[i], b.areas[j], window_factor)) {
                 ++r.pairs_far;
                 r.worst_far = std::max(r.worst_far, rel);
             } else {
@@ -706,11 +709,11 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
 
     if (injected_entries) *injected_entries = 0;
     if (inj.far_field_scale != 1.0) {
-        const size_t k = injectFarFieldScale(d, b, cfg.adaptive_ns_threshold, inj.far_field_scale);
+        const size_t k = injectFarFieldScale(d, b, cfg.nearfield_window_factor, inj.far_field_scale);
         if (injected_entries) *injected_entries = k;
     }
     if (inj.reciprocity_scale != 1.0) {
-        if (!injectReciprocityBreak(d, b, cfg.adaptive_ns_threshold, inj.reciprocity_scale)) {
+        if (!injectReciprocityBreak(d, b, cfg.nearfield_window_factor, inj.reciprocity_scale)) {
             // A control that could not perturb anything proves nothing, and a
             // green exit after it would be read as "the detector works".
             std::cout << "  INJECTION ERROR: no two-sided entry to perturb on this "
@@ -732,8 +735,16 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
 // (PTM-19: never rebuild a production .vf). It is also the honest thing to
 // score -- matvec is exactly how the radiosity solver consumes this matrix, so
 // the arm sees the same numbers the solver would.
+// `stress_blocks` shrinks the octree leaf and the ACA floor so that ACA runs on
+// SMALL, closely spaced clusters. It exists because at library defaults the ACA
+// cross generators never meet a near pair at all -- measured on
+// lunar_crater_80N (12,800 faces) the closest pair they evaluate sits at
+// r / 4d = 2.04, and on the cap below they see none. An arm that asserts the
+// cross generators handle a near pair correctly, run at defaults, would be
+// green because it measured NOTHING. See arm [U].
 DenseVF runHMatrixVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
-                     bool no_truncation = false) {
+                     bool no_truncation = false, bool force_dense = false,
+                     size_t* cross_near_pairs = nullptr, bool stress_blocks = false) {
     RTCDevice dev = rtcNewDevice(nullptr);
     RTCScene scene = makeScene(dev, *b.mesh);
     DenseVF d;
@@ -756,7 +767,26 @@ DenseVF runHMatrixVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
             hc.aca_tolerance = 1.0e-14;
             hc.compression_tolerance = 1.0e-14;
         }
+        if (stress_blocks) {
+            hc.min_block_size = 16;
+            hc.aca_min_block_size = 16;
+        }
+        if (force_dense) {
+            // The BLOCK-STRUCTURE-isolation control. min_block_size also sizes
+            // the octree leaf, so making it >= n_faces collapses the whole
+            // matrix onto ONE block, which buildBlock() then computes through
+            // computeViewFactorBlock -- the exact, direct, near-field-refined
+            // generator. Same builder, same kernel, same order rule, same
+            // grazing cull, same occlusion rays; the only thing removed is the
+            // hierarchical decomposition and with it the ACA cross generators.
+            // A difference against this reference is therefore attributable to
+            // the DECOMPOSITION and to nothing else.
+            hc.min_block_size = static_cast<int>(d.n) + 1;
+        }
         H.build(b.mesh, dev, scene, cfg, hc);
+        if (cross_near_pairs) {
+            *cross_near_pairs = radiation::HMatrixViewFactor::crossGeneratorNearPairs();
+        }
         std::vector<double> x(d.n, 0.0), y;
         for (size_t j = 0; j < d.n; ++j) {
             std::fill(x.begin(), x.end(), 0.0);
@@ -764,6 +794,30 @@ DenseVF runHMatrixVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
             H.matvec(x, y);
             for (size_t i = 0; i < d.n; ++i) d.at(i, j) = y[i];
         }
+        std::cout.rdbuf(saved);
+    }
+    rtcReleaseScene(scene);
+    rtcReleaseDevice(dev);
+    return d;
+}
+
+// The H-matrix builder's EXACT matrix: every entry from its dense-block
+// generator, no hierarchical decomposition, no low-rank approximation. This is
+// the reference arm [U] scores the assembled matrix against, so that the only
+// variable between them is the block structure.
+DenseVF exactHMatrixReference(const BuiltMesh& b, const radiation::RadiationConfig& cfg) {
+    RTCDevice dev = rtcNewDevice(nullptr);
+    RTCScene scene = makeScene(dev, *b.mesh);
+    DenseVF d;
+    d.n = b.mesh->faces.size();
+    {
+        std::ostringstream sink;
+        std::streambuf* saved = std::cout.rdbuf(sink.rdbuf());
+        radiation::HMatrixViewFactor H;
+        radiation::HMatrixConfig hc;
+        hc.verbose = false;
+        H.build(b.mesh, dev, scene, cfg, hc);
+        H.computeDenseReference(d.f);
         std::cout.rdbuf(saved);
     }
     rtcReleaseScene(scene);
@@ -788,7 +842,7 @@ struct AgreeResult {
 };
 
 AgreeResult agreement(const DenseVF& s, const DenseVF& h, const BuiltMesh& b,
-                      double floor_frac, double ns_threshold) {
+                      double floor_frac, double window_factor) {
     AgreeResult r;
     const auto& C = b.mesh->face_centers;
     double peak = 0.0;
@@ -806,11 +860,13 @@ AgreeResult agreement(const DenseVF& s, const DenseVF& h, const BuiltMesh& b,
             ++r.compared;
             const double rel = std::fabs(a - g) / std::max(a, g);
             const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
-            const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
-                              std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
+            const double rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const double ns = rr / std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
             if (rel > r.worst_rel) { r.worst_rel = rel; r.worst_ns = ns; }
-            if (ns > ns_threshold) r.worst_far = std::max(r.worst_far, rel);
-            else r.worst_near = std::max(r.worst_near, rel);
+            if (radiation::isNearFieldPair(rr, b.areas[i], b.areas[j], window_factor))
+                r.worst_near = std::max(r.worst_near, rel);
+            else
+                r.worst_far = std::max(r.worst_far, rel);
         }
     }
     r.mass_rel = (maxsum > 0.0) ? absdiff / maxsum : 0.0;
@@ -846,6 +902,17 @@ void verdictBelow(const char* tag, const char* what, double measured, double lim
     std::cout << "  [" << tag << "] " << std::left << std::setw(46) << what
               << std::right << " measured " << std::scientific << std::setprecision(3) << measured
               << "  limit " << limit << "   " << std::defaultfloat
+              << (ok ? "PASS" : "FAILED") << "\n";
+    all_ok = all_ok && ok;
+}
+
+// A FLOOR, for the arms whose failure mode is "this measured nothing".
+void verdictAbove(const char* tag, const char* what, double measured, double floor_v,
+                  bool& all_ok) {
+    const bool ok = (measured >= floor_v);
+    std::cout << "  [" << tag << "] " << std::left << std::setw(46) << what
+              << std::right << " measured " << std::fixed << std::setprecision(0) << measured
+              << "  floor " << floor_v << "   " << std::defaultfloat
               << (ok ? "PASS" : "FAILED") << "\n";
     all_ok = all_ok && ok;
 }
@@ -914,14 +981,29 @@ int main(int argc, char** argv) {
     // [H4] worst per-entry near-field disagreement with the sparse builder, in
     // the NO-TRUNCATION control. Not zero, and not a defect: the two builders
     // run the same kernel at a different ORDER on close pairs (sparse fixed at
-    // nearfield_quadrature_order, H-matrix at max(that, ceil(4d/r))). The
+    // nearfield_quadrature_order, H-matrix at max(that, ceil(w d / r))). The
     // measurement is the proof of that attribution -- raise the configured
     // floor toward the adaptive order and the disagreement collapses:
-    //     m = 2  0.2811      m = 3  0.1643      m = 8  0.01373
-    // 0.40 clears the worst production-sanctioned order (m = 2) by 1.4x and the
-    // default (m = 3) by 2.4x. A SECOND copy of the integral, or a lost clamp,
-    // moves this by orders of magnitude, not by 40%.
-    double tol_hmat_agree = 0.40;
+    //     m = 2  0.5614   m = 3  0.4554   m = 4  0.3737   m = 6  0.2548
+    //     m = 8  0.1724
+    //
+    // RE-DERIVED 2026-08-23 when the grazing cut was unified (0.01 on the
+    // H-matrix, 1e-6 on the sparse builder -> 1e-6 on both). The table above
+    // used to read 0.2811 / 0.1643 / 0.01373 at m = 2/3/8, and this bound was
+    // 0.40. It is NOT a widened tolerance hiding a regression: the POPULATION
+    // changed. The H-matrix's 0.01 cut had been deleting 1,584 significant
+    // entries the sparse builder kept, so the old statistic was taken over the
+    // pairs the two builders happened to share. With the cut unified the shared
+    // set is complete (sparse-only 1,584 -> 0) and the AGGREGATE agreement
+    // improves 2.5x (area-weighted mass difference 0.1557% -> 0.0627%); what
+    // rose is the worst SINGLE entry, because the newly shared entries are
+    // extreme-grazing pairs at Ns ~ 0.4 where the order policy bites hardest.
+    // The monotone collapse with m is the proof that it is the order policy and
+    // not a second copy of the kernel.
+    //
+    // 0.80 clears the worst production-sanctioned order (m = 2) by 1.4x, the
+    // same headroom the previous bound had.
+    double tol_hmat_agree = 0.80;
     // [H2b] mass-weighted reciprocity defect in the PRODUCTION configuration.
     // This one is compression, not the kernel: it reads 1.48e-3 with
     // aca_tolerance = 1e-3 and 1.16e-15 with the tolerance driven to 1e-14.
@@ -931,6 +1013,11 @@ int main(int argc, char** argv) {
     // production configuration: 0.617% measured (0.156% with compression off).
     // 2% is 3.2x.
     double tol_hmat_mass = 2.0e-2;
+    // ARM U tolerances -- the stage-1 unification invariants. Pinned from the
+    // arm's own printout on the same 1,404-face cap, 2026-08-23; see the arm.
+    double min_cross_near_pairs = 100.0;
+    double tol_unify_near = 1.0e-9;
+    double tol_unify_mass = 2.0e-2;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -951,6 +1038,12 @@ int main(int argc, char** argv) {
             tol_hmat_recip_mass = std::atof(argv[++i]);
         else if (a == "--tol-hmat-mass" && i + 1 < argc)
             tol_hmat_mass = std::atof(argv[++i]);
+        else if (a == "--tol-unify-near" && i + 1 < argc)
+            tol_unify_near = std::atof(argv[++i]);
+        else if (a == "--tol-unify-mass" && i + 1 < argc)
+            tol_unify_mass = std::atof(argv[++i]);
+        else if (a == "--min-cross-near" && i + 1 < argc)
+            min_cross_near_pairs = std::atof(argv[++i]);
         else if (a == "--quad-order" && i + 1 < argc) {
             // strtol, not atoi: atoi maps both "0" and a typo to 0, which is the
             // "no override" sentinel, so a mistyped order would run at the
@@ -1054,7 +1147,7 @@ int main(int argc, char** argv) {
                         1.0 - f_exact, tol_ingersoll, all_ok);
                 verdictBelow("I3", "worst PER-FACE deviation from f [%]", worst_face,
                              tol_perface, all_ok);
-                const RecipResult rr = reciprocity(d, b, cfg.adaptive_ns_threshold);
+                const RecipResult rr = reciprocity(d, b, cfg.nearfield_window_factor);
                 reportReciprocity("spherical cap", rr, tol_recip, tol_recip_mass,
                                   tol_recip_near, all_ok, "R1a", "R1b", "R1c");
                 verdictBelow("S1", "max row sum (closure, must be <= 1)", rs.max, 1.0, all_ok);
@@ -1096,7 +1189,7 @@ int main(int argc, char** argv) {
             if (li + 1 == levels.size()) {
                 verdict("D1", "disk-pair F_12, no-truncation config", meas, f12,
                         tol_disk, all_ok);
-                const RecipResult rr = reciprocity(d, b, cfg.adaptive_ns_threshold);
+                const RecipResult rr = reciprocity(d, b, cfg.nearfield_window_factor);
                 std::cout << "  NOTE: on this geometry every surviving pair is far field\n"
                           << "  (" << rr.pairs_far << " far vs " << rr.pairs_near
                           << " near), so R2 exercises only the analytically reciprocal M1\n"
@@ -1193,7 +1286,7 @@ int main(int argc, char** argv) {
 
         double meas_prod = 0.0;
         for (const auto& r : table) if (r.m == prod_m) meas_prod = r.meas;
-        const RecipResult rr = reciprocity(d_prod, b, cfg_prod.adaptive_ns_threshold);
+        const RecipResult rr = reciprocity(d_prod, b, cfg_prod.nearfield_window_factor);
         std::cout << "  " << b.mesh->faces.size() << " faces; " << rr.pairs_near
                   << " of " << (rr.pairs_near + rr.pairs_far)
                   << " two-sided pairs are near field (M2)";
@@ -1312,8 +1405,8 @@ int main(int argc, char** argv) {
         // is the non-arbitrary significance cut here: an entry below it does
         // not exist in a production sparse .vf at all.
         const double floor_F = cfg.visibility_threshold;
-        const RecipResult rp = reciprocity(dh, b, cfg.adaptive_ns_threshold, floor_F);
-        const RecipResult rn = reciprocity(dn, b, cfg.adaptive_ns_threshold, floor_F);
+        const RecipResult rp = reciprocity(dh, b, cfg.nearfield_window_factor, floor_F);
+        const RecipResult rn = reciprocity(dn, b, cfg.nearfield_window_factor, floor_F);
         std::cout << "  H-matrix reciprocity, entries >= visibility_threshold ("
                   << std::scientific << std::setprecision(0) << floor_F << std::defaultfloat
                   << "): " << rp.pairs_far << " far-field, "
@@ -1347,9 +1440,9 @@ int main(int argc, char** argv) {
                     if (std::max(dn.at(i, j), dn.at(j, i)) < floor_F) continue;
                     const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1],
                                  dz = C[j][2] - C[i][2];
-                    const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
-                                      std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
-                    if (ns > cfg.adaptive_ns_threshold) continue;
+                    const double rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (!radiation::isNearFieldPair(rr, b.areas[i], b.areas[j],
+                                                    cfg.nearfield_window_factor)) continue;
                     const double rel = std::fabs(a - c) / std::max(a, c);
                     if (rel > worst) { worst = rel; wi = i; wj = j; }
                 }
@@ -1393,8 +1486,8 @@ int main(int argc, char** argv) {
         // centroid cosines against 1e-6), and a different neighbor-selection
         // rule. What the shared kernel buys is that those are all DECLARED
         // differences in the callers, not a second copy of the integral.
-        const AgreeResult ap = agreement(ds, dh, b, 1.0e-3, cfg.adaptive_ns_threshold);
-        const AgreeResult an = agreement(ds, dn, b, 1.0e-3, cfg.adaptive_ns_threshold);
+        const AgreeResult ap = agreement(ds, dh, b, 1.0e-3, cfg.nearfield_window_factor);
+        const AgreeResult an = agreement(ds, dn, b, 1.0e-3, cfg.nearfield_window_factor);
         std::cout << "  sparse vs H-matrix, entries above 1e-3 of the peak:\n"
                   << "    production     " << ap.compared << " compared, " << ap.only_sparse
                   << " sparse-only, " << ap.only_hmat << " H-matrix-only; area-weighted"
@@ -1435,6 +1528,137 @@ int main(int argc, char** argv) {
         }
         verdictBelow("H5", "H-matrix max F_ij over a closing concave wedge", worst_h,
                      1.0, all_ok);
+    }
+
+    // ------------------------------------------------------------------------
+    // ARM U -- one physics per PAIR, whichever block it lands in.
+    //
+    // Skipped under fault injection for the same reason arm H is: the hooks
+    // perturb the dense matrix runProductionVF returns and never reach this
+    // builder, so a "control" here would silently be a clean run.
+    if (!inj.active()) {
+        std::cout << "\n=== ARM U: same pair, same view factor, whichever BLOCK it lands in ===\n";
+        std::cout << "  The H-matrix has THREE matrix-entry generators, not one:\n"
+                  << "  computeViewFactorBlock (dense/small blocks), and\n"
+                  << "  computeViewFactorRow / computeViewFactorColumn, the cross\n"
+                  << "  generators ACA samples to build a low-rank factorization. The\n"
+                  << "  first refines a close pair with the shared near-field\n"
+                  << "  quadrature; until 2026-08-23 the other two did not, so whether a\n"
+                  << "  pair got the near-field physics depended on where the OCTREE put\n"
+                  << "  it -- not on the pair. This arm compares the production block\n"
+                  << "  decomposition against the same builder collapsed onto a single\n"
+                  << "  exact block (min_block_size >= n_faces), so the decomposition is\n"
+                  << "  the only variable.\n"
+                  << "  NOTE: reciprocity cannot see this. Both cross generators evaluate\n"
+                  << "  the SAME M1 expression, and M1 satisfies A_i F_ij = A_j F_ji as an\n"
+                  << "  algebraic identity, so an all-M1 block is perfectly reciprocal and\n"
+                  << "  perfectly wrong. [H2] reads 4e-14 with the gap wide open.\n";
+
+        BuiltMesh b = buildSphericalCap(0.2, 100.0, 20, 36);
+        auto cfg = noTruncationConfig(b.mesh->faces.size());
+
+        // The reference: the same builder, same kernel, same occlusion rays, no
+        // hierarchical decomposition and no low-rank approximation anywhere.
+        // NOT "build with min_block_size >= n_faces" -- that route still runs
+        // the single block through tryCompressToLowRank(), which caps the rank
+        // at max_svd_rank (50) and reports success even when the requested
+        // tolerance was not met. On crater80N that reference came back with
+        // NEGATIVE view factors and a fabricated 17% mass difference.
+        DenseVF dref = exactHMatrixReference(b, cfg);
+
+        size_t near_exposed = 0, near_exposed_prod = 0;
+        DenseVF dblk = runHMatrixVF(b, cfg, /*no_truncation=*/true, /*force_dense=*/false,
+                                    &near_exposed, /*stress_blocks=*/true);
+        DenseVF dprod = runHMatrixVF(b, cfg, /*no_truncation=*/false, /*force_dense=*/false,
+                                     &near_exposed_prod, /*stress_blocks=*/true);
+        // What the DEFAULT block layout exposes, reported so the stressed
+        // numbers above are never mistaken for production's.
+        size_t near_default = 0;
+        (void)runHMatrixVF(b, cfg, /*no_truncation=*/true, /*force_dense=*/false,
+                           &near_default, /*stress_blocks=*/false);
+        const size_t cross_default = radiation::HMatrixViewFactor::crossGeneratorPairs();
+        const double margin_default = radiation::HMatrixViewFactor::crossGeneratorMinROver4d();
+
+        // The comparison window is the H-MATRIX's own near-field window,
+        // r < 4 (sqrt(A_i) + sqrt(A_j)) -- the one its generators branch on --
+        // not the sparse builder's Ns <= 5. Scoring a builder against a rule it
+        // does not use would put the near/far-window question (a separate,
+        // deliberate difference) inside this verdict.
+        struct BlockAgree {
+            double worst_near = 0.0;
+            double mass_near = 0.0;     // area-weighted sum|a-b| / sum max(a,b)
+            size_t near_compared = 0;
+            size_t near_only_ref = 0;   // present in the reference, absent from the test
+            size_t near_only_test = 0;
+        };
+        const double floor_F = cfg.visibility_threshold;
+        auto compareNear = [&](const DenseVF& ref, const DenseVF& test) {
+            BlockAgree g;
+            const auto& C = b.mesh->face_centers;
+            double absdiff = 0.0, maxsum = 0.0;
+            for (size_t i = 0; i < ref.n; ++i) {
+                for (size_t j = 0; j < ref.n; ++j) {
+                    if (i == j) continue;
+                    const double a = ref.at(i, j), t = test.at(i, j);
+                    if (a < floor_F && t < floor_F) continue;
+                    const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1],
+                                 dz = C[j][2] - C[i][2];
+                    const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    const double d4 = 4.0 * (std::sqrt(b.areas[i]) + std::sqrt(b.areas[j]));
+                    if (r >= d4) continue;                       // far field, not this arm
+                    absdiff += b.areas[i] * std::fabs(a - t);
+                    maxsum += b.areas[i] * std::max(a, t);
+                    if (a == 0.0) { ++g.near_only_test; continue; }
+                    if (t == 0.0) { ++g.near_only_ref; continue; }
+                    ++g.near_compared;
+                    g.worst_near = std::max(g.worst_near, std::fabs(a - t) / std::max(a, t));
+                }
+            }
+            g.mass_near = (maxsum > 0.0) ? absdiff / maxsum : 0.0;
+            return g;
+        };
+
+        const BlockAgree gb = compareNear(dref, dblk);
+        const BlockAgree gp = compareNear(dref, dprod);
+
+        std::cout << "  " << b.mesh->faces.size() << " faces; near-field window r < 4d,"
+                  << " entries >= visibility_threshold\n"
+                  << "    at LIBRARY DEFAULTS the ACA cross generators see " << near_default
+                  << " near pairs here (" << cross_default << " pairs of any kind";
+        if (cross_default > 0) {
+            std::cout << ", closest approach r/4d = " << std::fixed << std::setprecision(3)
+                      << margin_default;
+        } else {
+            std::cout << ", so ACA never runs on this mesh at defaults";
+        }
+        std::cout << ")\n"
+                  << "    -- so this arm runs\n"
+                  << "    a STRESSED block layout (min_block_size 16, aca_min_block_size 16)"
+                  << " to put real near pairs through them\n"
+                  << "    stressed: " << near_exposed << " near pairs (no truncation), "
+                  << near_exposed_prod << " (production tolerances)\n"
+                  << "    vs the single-block reference, NO TRUNCATION: "
+                  << gb.near_compared << " compared, " << gb.near_only_ref
+                  << " reference-only, " << gb.near_only_test << " test-only;"
+                  << " worst " << std::scientific << std::setprecision(3) << gb.worst_near
+                  << ", area-weighted mass " << std::fixed << std::setprecision(4)
+                  << 100.0 * gb.mass_near << "%\n"
+                  << "    vs the single-block reference, PRODUCTION config:  "
+                  << gp.near_compared << " compared, " << gp.near_only_ref
+                  << " reference-only, " << gp.near_only_test << " test-only;"
+                  << " worst " << std::scientific << std::setprecision(3) << gp.worst_near
+                  << ", area-weighted mass " << std::fixed << std::setprecision(4)
+                  << 100.0 * gp.mass_near << "%\n" << std::defaultfloat;
+
+        // [U0] is what stops [U1] from being green because it measured nothing.
+        // The per-entry arm of the cross-agreement gate shipped VACUOUS once
+        // already (no entry reached its resolution threshold, "0 <= 0 PASS").
+        verdictAbove("U0", "near pairs reaching the ACA cross generators",
+                     static_cast<double>(near_exposed), min_cross_near_pairs, all_ok);
+        verdictBelow("U1", "block-decomposition dependence of a near pair, no truncation",
+                     gb.worst_near, tol_unify_near, all_ok);
+        verdictBelow("U2", "block-decomposition dependence, near-field mass, production",
+                     gp.mass_near, tol_unify_mass, all_ok);
     }
 
     // ------------------------------------------------------------------------

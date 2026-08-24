@@ -142,8 +142,47 @@ mass-weighted, $-21.7$% on edge/vertex-touching pairs, against a Richardson doub
 on `data/meshes/lunar_crater_80N.ply`. `subdivision_level` no longer exists: the replacement key
 counts sub-triangles per edge, not lattice refinements, so the two numbers are not interchangeable.
 
-The switch between M1 and M2 is `adaptive_ns_threshold` (default 5.0); `method` may also be pinned
-to `CENTROID` or `SUBDIVISION`.
+**The near/far switch, one rule for both builders.** A pair is near when
+
+$$ r < w \thinspace \left( \sqrt{A_i} + \sqrt{A_j} \right) $$
+
+with $w$ = `nearfield_window_factor` (default 4) and $r$ the centroid separation. `method` may
+still be pinned to `CENTROID` or `SUBDIVISION`.
+
+Before 2026-08-23 the two builders switched on different quantities: the sparse builder on
+$N_s = r / (A_i A_j)^{1/4} \le 5$ and the H-matrix builder on the rule above at $w = 4$. The
+length scale that matters is the SUM of the two face sizes, because the centroid approximation's
+error is set by the LARGER of the two solid angles; a geometric mean cannot see an area contrast at
+all. M1 error against the same quadrature run to convergence ($m = 32$, about $1.05 \times 10^6$
+kernel evaluations per pair):
+
+| $A_j / A_i$ | at the OLD cut ($N_s = 5$) | at THIS cut ($w = 4$) |
+|---|---|---|
+| 1 | $N_s = 5$, M1 $+3.49$ percent | $N_s = 8$, M1 $+1.38$ percent |
+| 100 | $N_s = 5$, M1 $+16.7$ percent | $N_s = 12.6$, M1 $+2.3$ percent |
+| 10000 | $N_s = 5$, M1 $+150$ percent | $N_s = 40$, M1 about $+2$ percent |
+
+so on a 100:1 linear size contrast — a core-plus-ring mesh, which this project builds routinely —
+the old rule handed the far-field estimator pairs it was wrong about by 150 percent. The error is
+one-signed (M1 always OVER-estimates a near pair), so the wider window makes terrain coupling
+smaller, not larger. $w = 4$ is kept because widening is the safe direction: M2 converges to M1 in
+the far field, so an over-wide window costs time and never accuracy.
+
+`adaptive_ns_threshold` was REMOVED, not renamed. Measured on `lunar_crater_80N.ply` with
+`vf_dump_sparse` (12,800 faces, `--max-neighbors 500`, so the estimator is the only variable):
+
+| $w$ | nnz | mean $\sum_j F_{ij}$ | total mass | vs $w = 8$ |
+|---|---|---|---|---|
+| 0 (pure M1) | 904,256 | 0.0047792 | 61.174 | $+1.877$ percent |
+| 2.5 (the old rule on an equal-area pair) | 904,506 | 0.0046940 | 60.083 | $+0.0138$ percent |
+| **4.0 (default)** | 904,385 | 0.0046931 | 60.071 | $+0.0068$ percent |
+| 8.0 | 904,357 | 0.0046926 | 60.065 | — |
+
+Build time is 0.3 s at every setting; the near-field kernel is not what this mesh's VF build costs.
+End to end through the coupled thermal arm `baseline_crater80N_vfbuild_sparse`, the old rule to the
+new one moves 2,562 of 12,800 faces, median $-1.5 \times 10^{-4}$ K and worst $0.019$ K on
+`temperature_max` — cooling, as the sign of the M1 bias requires. The H-matrix arm is unchanged:
+$w = 4$ is the constant it already used.
 
 **One kernel, two builders.** Since 2026-08-23 the M2 integral above lives in exactly one place,
 `src/cpp/radiation/nearfield_quadrature.h`, and both in-engine view-factor builders call it. Before
@@ -160,7 +199,7 @@ The two builders reach the ORDER differently, and `nearfield_quadrature_order` g
 | builder | order on a pair |
 |---|---|
 | sparse (`view_factor.cpp`) | exactly `nearfield_quadrature_order` |
-| H-matrix (`hmatrix_view_factor.cpp`) | `nearfield_quadrature_order` raised to $\lceil 4d/r \rceil$ where that is larger, capped at 16, with $d = \sqrt{A_i} + \sqrt{A_j}$ |
+| H-matrix (`hmatrix_view_factor.cpp`) | `nearfield_quadrature_order` raised to $\lceil w d/r \rceil$ where that is larger, capped at 16, with $d = \sqrt{A_i} + \sqrt{A_j}$ and $w$ = `nearfield_window_factor` |
 
 so the configured value is the ORDER on one path and a FLOOR on the other: raising it refines both,
 and the H-matrix is never coarser than the sparse builder on the same pair. Pinning the H-matrix to
@@ -931,6 +970,7 @@ warns.
 | `min_neighbors` | 20 | Floor on partners per face |
 | `use_cluster_cull` | true | Conservative cluster-level back-face pre-cull |
 | `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8. The exact order on the sparse builder, a FLOOR on the H-matrix builder |
+| `nearfield_window_factor` | 4.0 | The near/far switch for BOTH in-engine builders: a pair is near when $r < w (\sqrt{A_i} + \sqrt{A_j})$. 0 forces M1 everywhere; a very large value forces M2. Replaced the internal `adaptive_ns_threshold` |
 | `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
 | `rms_slope_deg` | 0.0 | Smith beamed emission; 0 = Lambertian |

@@ -615,6 +615,13 @@ struct SimulationConfig {
         // H-matrix and Monte-Carlo builders have their own kernels, and a run
         // that LOADS a cached radiation.view_factor_file never evaluates it.
         int nearfield_quadrature_order = 3;
+        // Near/far switch for BOTH in-engine builders:
+        //     near <=> r < nearfield_window_factor * (sqrt(A_i) + sqrt(A_j)).
+        // 0 = never refine (pure M1); very large = always refine (pure M2).
+        // Replaced the internal adaptive_ns_threshold (a threshold on
+        // Ns = r / (A_i A_j)^(1/4), which is blind to an area contrast) --
+        // NOT a rename: the two are different quantities.
+        double nearfield_window_factor = 4.0;
         // Monte Carlo ray-gather view-factor builder (mc_view_factor.cpp).
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;

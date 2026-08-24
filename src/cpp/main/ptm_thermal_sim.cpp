@@ -13440,6 +13440,7 @@ int main(int argc, char** argv) {
     int rad_max_neighbors_override = -1;         // -1 = use adaptive, >0 = fixed override
     bool rad_use_cluster_cull = true;            // Conservative octree cluster-pair cull before ranking
     int rad_nearfield_quadrature_order = 3;      // M2 symmetric double-area quadrature order (sparse builder)
+    double rad_nearfield_window_factor = 4.0;    // near/far switch, both in-engine builders
     bool rad_force_hmatrix = false;              // Bypass historical H-matrix auto-disable (vestigial)
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
@@ -13482,6 +13483,21 @@ int main(int argc, char** argv) {
     rad_min_neighbors = sim_config.radiation.min_neighbors;
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
     rad_nearfield_quadrature_order = sim_config.radiation.nearfield_quadrature_order;
+    rad_nearfield_window_factor = sim_config.radiation.nearfield_window_factor;
+    if (!(rad_nearfield_window_factor >= 0.0)) {
+        std::cerr << "\nFATAL: radiation.nearfield_window_factor = "
+                  << rad_nearfield_window_factor << " is out of range. It is the w in the\n"
+                  << "       near-field test r < w (sqrt(A_i) + sqrt(A_j)), so it must be\n"
+                  << "       finite and non-negative. 0 forces the M1 centroid estimator on\n"
+                  << "       every pair; the default is 4.\n";
+        return 1;
+    }
+    if (rad_nearfield_window_factor == 0.0) {
+        std::cout << "[config] WARNING: radiation.nearfield_window_factor = 0 disables the\n"
+                  << "[config]          near-field quadrature entirely -- every pair, however\n"
+                  << "[config]          close, is estimated by the M1 centroid formula, which\n"
+                  << "[config]          over-counts a touching pair by tens of percent.\n";
+    }
     if (rad_nearfield_quadrature_order < 1 ||
         rad_nearfield_quadrature_order > radiation::kMaxConfigNearFieldQuadOrder) {
         std::cerr << "\nFATAL: radiation.nearfield_quadrature_order = "
@@ -15286,6 +15302,7 @@ int main(int argc, char** argv) {
             early_rad_config.min_neighbors = rad_min_neighbors;
             early_rad_config.use_cluster_cull = rad_use_cluster_cull;
             early_rad_config.nearfield_quadrature_order = rad_nearfield_quadrature_order;
+            early_rad_config.nearfield_window_factor = rad_nearfield_window_factor;
             early_rad_config.force_hmatrix = rad_force_hmatrix;
             early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
@@ -17597,6 +17614,7 @@ int main(int argc, char** argv) {
             rad_config.min_neighbors = rad_min_neighbors;
             rad_config.use_cluster_cull = rad_use_cluster_cull;
             rad_config.nearfield_quadrature_order = rad_nearfield_quadrature_order;
+            rad_config.nearfield_window_factor = rad_nearfield_window_factor;
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;

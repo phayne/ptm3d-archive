@@ -33,6 +33,19 @@ constexpr int kMaxNearFieldQuadOrder = 16;
 constexpr int kMaxConfigNearFieldQuadOrder = 8;
 constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQuadOrder;
 
+// Grazing / back-facing cut on the pair cosines, shared by every in-engine
+// view-factor kernel. A sample or a pair whose cos_i or cos_j falls below this
+// contributes ZERO; it is not removed from the integration domain (dividing by
+// the survivors would condition the estimate on detection -- FC-08's error).
+//
+// 1e-6 is the sparse builder's long-standing value and the one the shared
+// near-field quadrature uses. The H-matrix builder used 0.01 -- ten thousand
+// times larger -- in all four of its entry generators, as a candidate cull
+// before ray tracing, so the two builders disagreed about which pairs EXIST
+// before they could disagree about their values. Unified 2026-08-23; the
+// measured effect is in docs/design/vf-unification.md.
+constexpr double kGrazingCosCut = 1e-6;
+
 // Configuration for radiation exchange computation
 struct RadiationConfig {
     // Master enable/disable
@@ -117,7 +130,21 @@ struct RadiationConfig {
     // resolution on both; the H-matrix is never coarser than the sparse path,
     // and on the tightest pairs it is finer.
     int nearfield_quadrature_order = 3;
-    double adaptive_ns_threshold = 5.0;  // Ns threshold: use M2 when r/sqrt(A) < 5
+
+    // The near/far switch, for BOTH in-engine builders:
+    //     near <=> r < nearfield_window_factor * (sqrt(A_i) + sqrt(A_j))
+    // See isNearFieldPair() in nearfield_quadrature.h for the refinement curve
+    // this constant was chosen from. 0 = never refine (pure M1); a very large
+    // value = always refine (pure M2).
+    //
+    // REPLACED adaptive_ns_threshold (default 5), a threshold on the
+    // dimensionless Ns = r / (A_i A_j)^(1/4). Removed rather than renamed: the
+    // two numbers are not the same quantity (a geometric mean of areas against
+    // a sum of lengths), and 5 carried into this field would silently narrow
+    // the window instead of widening it. On an equal-area pair the old rule cut
+    // at Ns = 5 and this one cuts at Ns = 8; on a 100:1 area contrast the old
+    // rule cut where M1 was still 150 percent wrong.
+    double nearfield_window_factor = 4.0;
 
     // Radiosity solver parameters
     int max_iterations = 100;            // Max Jacobi iterations

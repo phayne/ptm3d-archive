@@ -225,8 +225,13 @@ bool shadowed(RTCScene scene, const std::array<double, 3>& c,
 // Environment knobs (all optional; defaults reproduce prior behavior):
 //   PTM_BOWL_NRINGS / PTM_BOWL_NAZ / PTM_BOWL_NFLAT  : mesh resolution
 //   PTM_BOWL_VISTHRESH                               : visibility_threshold
-//   PTM_BOWL_NSTHRESH                                : adaptive_ns_threshold
+//   PTM_BOWL_WINDOW                                  : nearfield_window_factor
 //                     (0 => force pure M1/centroid; huge => force pure M2/subdivision)
+//                     Replaced PTM_BOWL_NSTHRESH, which set the RETIRED
+//                     adaptive_ns_threshold. The two are different quantities;
+//                     setting the old name is now a hard error, not a silent
+//                     no-op, because a benchmark that quietly ran the default
+//                     window would be reported as one that ran the requested one.
 //   PTM_BOWL_NOOCCLUSION=1                           : build an EMPTY Embree scene
 //                     (assume-all-visible; ideal for a fully-concave bowl)
 //   PTM_BOWL_RECIP=1                                 : symmetrize A_i F_ij = A_j F_ji
@@ -243,7 +248,7 @@ bool shadowed(RTCScene scene, const std::array<double, 3>& c,
 //                     never be confused with a production "m2" row.
 //   PTM_BOWL_QUADORDER=<m>                           : radiation.nearfield_quadrature_order
 //                     for the production path (default = the shipped value). With
-//                     PTM_BOWL_NSTHRESH=1e12 every pair goes to M2, so vf_seconds
+//                     PTM_BOWL_WINDOW=1e12 every pair goes to M2, so vf_seconds
 //                     then measures the near-field kernel alone.
 //   PTM_BOWL_RESULTS=<path.csv>                       : append one result row (default
 //                     output/bowl_conv/results.csv)
@@ -386,7 +391,15 @@ int main(int argc, char** argv) {
 
     // Measurement-harness knobs (env). Default reproduces prior behavior.
     const double vis_thresh = env_dbl("PTM_BOWL_VISTHRESH", 5e-10);
-    const double ns_thresh = env_dbl("PTM_BOWL_NSTHRESH", 5.0);
+    if (env_c("PTM_BOWL_NSTHRESH")) {
+        std::fprintf(stderr,
+                     "FATAL: PTM_BOWL_NSTHRESH was removed with adaptive_ns_threshold "
+                     "(2026-08-23). The near/far switch is now r < w (sqrt(A_i) + "
+                     "sqrt(A_j)); use PTM_BOWL_WINDOW=w. The old default 5 is w = 2.5 "
+                     "on an equal-area pair, and nothing at all on an unequal one.\n");
+        std::exit(2);
+    }
+    const double window_factor = env_dbl("PTM_BOWL_WINDOW", 4.0);
     const bool no_occ = env_flag("PTM_BOWL_NOOCCLUSION");
     const bool recip = env_flag("PTM_BOWL_RECIP");
     const bool vf_only = env_flag("PTM_BOWL_VFONLY");
@@ -407,7 +420,7 @@ int main(int argc, char** argv) {
         std::ifstream chk(results_path);
         if (!chk.good()) {
             std::ofstream h(results_path, std::ios::app);
-            h << "mode,dd,n_rings,n_az,nf,n_floor,visthresh,nsthresh,occ,recip,kernel,"
+            h << "mode,dd,n_rings,n_az,nf,n_floor,visthresh,windowfactor,occ,recip,kernel,"
                  "analytic,mean_aw,mean,min,max,std,mean_bias_pct,peak_dev_pct,vf_seconds\n";
         }
     }
@@ -448,8 +461,8 @@ int main(int argc, char** argv) {
             cfg.search_radius_factor = 1000.0;
             cfg.method = radiation::RadiationConfig::ViewFactorMethod::CENTROID;
             cfg.adaptive_neighbors = false;
-            cfg.adaptive_ns_threshold = ns_thresh;   // 0 => pure M1; huge => pure M2
-            // Near-field quadrature order. Paired with PTM_BOWL_NSTHRESH=1e12
+            cfg.nearfield_window_factor = window_factor;  // 0 => pure M1; huge => pure M2
+            // Near-field quadrature order. Paired with PTM_BOWL_WINDOW=1e12
             // (every pair goes to M2) this makes vf_seconds a clean measurement
             // of the near-field kernel alone, which is what the order actually
             // costs: m^4 evaluations per directed pair.
@@ -470,7 +483,8 @@ int main(int argc, char** argv) {
                 fsky_face.push_back(1.0 - rs);
                 fsky_area.push_back(b.areas[i]);
             }
-            kernel_label = (ns_thresh <= 0.0) ? "m1" : (ns_thresh >= 1e12 ? "m2" : "adaptive");
+            kernel_label = (window_factor <= 0.0) ? "m1"
+                         : (window_factor >= 1e12 ? "m2" : "adaptive");
         } else {
             // ---- kernel-probe path: floor F_sky directly from geometry, with a
             //      chosen kernel + identical occlusion (isolates the kernel). ----
@@ -578,7 +592,7 @@ int main(int argc, char** argv) {
             r << std::setprecision(10)
               << (kprobe.empty() ? "computeAll" : "kprobe") << "," << dd << ","
               << n_rings << "," << n_az << "," << nf << "," << n_floor << ","
-              << vis_thresh << "," << ns_thresh << "," << (no_occ ? 0 : 1) << ","
+              << vis_thresh << "," << window_factor << "," << (no_occ ? 0 : 1) << ","
               << (recip ? 1 : 0) << "," << kernel_label << "," << fsky_an << ","
               << mean_aw << "," << mean_p << "," << fmin << "," << fmax << "," << sd << ","
               << mean_bias_pct << "," << peak_dev_pct << "," << vf_seconds << "\n";

@@ -121,6 +121,42 @@ static std::atomic<size_t> g_subdiv_leaves_sparse{0};    // Sub-blocks computed 
 static std::atomic<size_t> g_subdiv_leaves_zero{0};      // Sub-blocks genuinely empty
 static std::atomic<size_t> g_subdiv_depth_cap_zero{0};   // LAST-RESORT: leaf still huge at depth cap -> zeroed
 
+// Near-field EXPOSURE of the ACA cross generators.
+//
+// computeViewFactorRow/Column are the matrix-entry oracles ACA samples to build
+// a low-rank factorization. They see the same pairs computeViewFactorBlock sees,
+// so if a pair is close enough that the M1 centroid estimate is wrong, it is
+// wrong here too -- and until 2026-08-23 these two generators were the only VF
+// code in the engine with NO near-field branch at all. Whether a close pair got
+// the M2 quadrature therefore depended on which BLOCK the octree happened to put
+// it in, which is not a physical property of the pair.
+//
+// These counters exist so the exposure is a measured number rather than an
+// argument. A gate that asserts "the cross generators agree with the dense
+// generator on near pairs" is vacuous if the cross generators never saw one --
+// this is what makes that arm non-vacuous.
+// The MARGIN matters as much as the count. On the two meshes measured
+// 2026-08-23 the count is zero -- but "zero" alone does not say whether the
+// admissibility condition misses the near-field window by a factor of 20 or by
+// 5 percent, and the answer decides whether the gap is unreachable or merely
+// unreached. So the closest approach is recorded too, as min r / (w d) with the
+// CONFIGURED window w -- a fixed 4 here would under-report the moment anyone
+// changed nearfield_window_factor.
+static std::atomic<size_t> g_cross_pairs{0};        // pairs surviving culling in row/col
+static std::atomic<size_t> g_cross_near_pairs{0};   // ... of those, inside the near window
+static std::atomic<double> g_cross_min_r_over_4d{1.0e300};
+
+static inline void noteCrossPair(double r, double d4) {
+    ++g_cross_pairs;
+    const double ratio = (d4 > 0.0) ? r / d4 : 1.0e300;
+    if (ratio < 1.0) ++g_cross_near_pairs;
+    double prev = g_cross_min_r_over_4d.load(std::memory_order_relaxed);
+    while (ratio < prev &&
+           !g_cross_min_r_over_4d.compare_exchange_weak(prev, ratio,
+                                                        std::memory_order_relaxed)) {
+    }
+}
+
 // Shared source of truth for the ACA face-count cap (env PTM_HMATRIX_ACA_CAP,
 // default 12000 faces/side; 0 = off). Read once. Used both by buildBlock's
 // admissible pre-zero guard and by buildAdmissibleSubdivided's per-sub-block gate.
@@ -182,6 +218,9 @@ static void resetProfilingCounters() {
     g_subdiv_leaves_sparse = 0;
     g_subdiv_leaves_zero = 0;
     g_subdiv_depth_cap_zero = 0;
+    g_cross_pairs = 0;
+    g_cross_near_pairs = 0;
+    g_cross_min_r_over_4d = 1.0e300;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -226,6 +265,10 @@ static void printProfilingCounters(double total_ms) {
               << ", zero=" << g_subdiv_leaves_zero.load()
               << ", depth-cap-zero=" << g_subdiv_depth_cap_zero.load() << ")" << std::endl;
     std::cout << "    Hierarchical recursions: " << g_hierarchical_recursions.load() << std::endl;
+    std::cout << "    ACA cross-generator pairs: " << g_cross_pairs.load()
+              << " (near field, r < 4d: " << g_cross_near_pairs.load()
+              << "; closest approach r/4d = " << g_cross_min_r_over_4d.load() << ")"
+              << std::endl;
     std::cout << "    Small blocks (in RAM):   " << g_small_blocks_count.load()
               << " (" << (g_small_blocks_bytes.load() / (1024.0 * 1024.0)) << " MB)" << std::endl;
     std::cout << "    Index memory usage:      " << std::fixed << std::setprecision(2)
@@ -1591,6 +1634,25 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     // prints nothing when it did not fire.
     reportNearFieldBoundClamps("H-matrix builder",
                                rad_config_.nearfield_quadrature_order);
+
+    // NOT behind verbose. Which entries of this matrix came through the ACA
+    // cross generators, and how close those pairs got to the near-field window,
+    // is provenance for the physics -- and until 2026-08-23 the cross
+    // generators skipped the near field entirely, so "how close did they get"
+    // was the difference between a latent defect and an active one. It is one
+    // line, and a verbose-gated diagnostic is a diagnostic nobody reads.
+    {
+        const size_t cp = g_cross_pairs.load();
+        std::cout << "  ACA cross-generator entries: " << cp;
+        if (cp > 0) {
+            std::cout << "; near field (r < 4d): " << g_cross_near_pairs.load()
+                      << "; closest approach r/4d = " << std::fixed << std::setprecision(3)
+                      << g_cross_min_r_over_4d.load() << std::defaultfloat;
+        } else {
+            std::cout << " (ACA did not run on this mesh)";
+        }
+        std::cout << std::endl;
+    }
 
     if (config_.verbose) {
         std::cout << "  H-matrix build completed in " << elapsed << " seconds" << std::endl;
@@ -3145,9 +3207,8 @@ void HMatrixViewFactor::computeViewFactorBlock(
             double cos_i = dot_i;
             double cos_j = -dot_j;
 
-            // Grazing angle rejection
-            static constexpr double MIN_COS_ANGLE = 0.01;
-            if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+            // Grazing angle rejection, the SHARED cut (see computeViewFactorRow).
+            if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
             // Distance-based culling
             double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3159,35 +3220,13 @@ void HMatrixViewFactor::computeViewFactorBlock(
             cand.local_col = static_cast<int>(j);
             cand.estimated_F = estimated_F;
             // Refine near-field pairs, where the M1 centroid estimate overshoots
-            // (this is the source of Sum_j F_ij > 1). d = characteristic size.
-            {
-                const double d_size = std::sqrt(face_areas_[face_i]) + std::sqrt(A_j);
-                if (r < 4.0 * d_size) {
-                    cand.estimated_F = computeViewFactorRefined(face_i, face_j);
-                }
+            // (this is the source of Sum_j F_ij > 1).
+            if (isNearFieldPair(face_i, face_j, r)) {
+                cand.estimated_F = computeViewFactorRefined(face_i, face_j);
             }
 
-            std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+            setCanonicalVisibilityRay(face_i, face_j, r, cand);
 
-            double relative_offset = r * 0.001;
-            double absolute_offset = 0.5;
-            double offset = std::max(relative_offset, absolute_offset);
-            offset = std::min(offset, r * 0.1);
-
-            cand.origin = {{
-                c_i[0] + offset * dir[0],
-                c_i[1] + offset * dir[1],
-                c_i[2] + offset * dir[2]
-            }};
-            { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-            double end_margin = std::max(r * 0.001, absolute_offset);
-            end_margin = std::min(end_margin, r * 0.1);
-            cand.tfar = static_cast<float>(r - offset - end_margin);
-
-            if (cand.tfar < 0.1f) {
-                cand.tfar = -1.0f;  // Mark as "skip ray trace, assume visible"
-            }
 
             row_candidates[i].push_back(cand);
         }
@@ -3495,9 +3534,11 @@ void HMatrixViewFactor::computeViewFactorRow(
         double cos_i = dot_i;
         double cos_j = -dot_j;
 
-        // Grazing angle rejection
-        static constexpr double MIN_COS_ANGLE = 0.01;
-        if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+        // Grazing angle rejection, the SHARED cut. It was 0.01 here and 1e-6
+        // on the sparse builder, so this builder deleted pairs the other one
+        // kept -- a disagreement about which entries exist, upstream of any
+        // disagreement about their values.
+        if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3508,28 +3549,18 @@ void HMatrixViewFactor::computeViewFactorRow(
         cand.local_row = local_row;
         cand.local_col = static_cast<int>(j);
         cand.estimated_F = estimated_F;
-
-        std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
-
-        double relative_offset = r * 0.001;
-        double absolute_offset = 0.5;
-        double offset = std::max(relative_offset, absolute_offset);
-        offset = std::min(offset, r * 0.1);
-
-        cand.origin = {{
-            c_i[0] + offset * dir[0],
-            c_i[1] + offset * dir[1],
-            c_i[2] + offset * dir[2]
-        }};
-        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-        double end_margin = std::max(r * 0.001, absolute_offset);
-        end_margin = std::min(end_margin, r * 0.1);
-        cand.tfar = static_cast<float>(r - offset - end_margin);
-
-        if (cand.tfar < 0.1f) {
-            cand.tfar = -1.0f;  // Skip ray trace, assume visible
+        noteCrossPair(r, rad_config_.nearfield_window_factor *
+                            (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        // Same near-field refinement the dense-block generator applies. Without
+        // it, whether a close pair got the M2 quadrature depended on which
+        // BLOCK the octree put it in -- ACA samples the matrix through THIS
+        // function, so a low-rank block was built from unrefined M1 entries.
+        if (isNearFieldPair(face_i, face_j, r)) {
+            cand.estimated_F = computeViewFactorRefined(face_i, face_j);
         }
+
+        setCanonicalVisibilityRay(face_i, face_j, r, cand);
+
 
         candidates.push_back(cand);
     }
@@ -3608,9 +3639,11 @@ void HMatrixViewFactor::computeViewFactorColumn(
         double cos_i = dot_i;
         double cos_j = -dot_j;
 
-        // Grazing angle rejection
-        static constexpr double MIN_COS_ANGLE = 0.01;
-        if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) continue;
+        // Grazing angle rejection, the SHARED cut. It was 0.01 here and 1e-6
+        // on the sparse builder, so this builder deleted pairs the other one
+        // kept -- a disagreement about which entries exist, upstream of any
+        // disagreement about their values.
+        if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) continue;
 
         // Distance-based culling
         double estimated_F = (A_j / M_PI) * (cos_i * cos_j) / r2;
@@ -3621,29 +3654,18 @@ void HMatrixViewFactor::computeViewFactorColumn(
         cand.local_row = static_cast<int>(i);
         cand.local_col = local_col;
         cand.estimated_F = estimated_F;
+        noteCrossPair(r, rad_config_.nearfield_window_factor *
+                            (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        // See computeViewFactorRow: the same near-field refinement, for the same
+        // reason. F_ij is the ROW face's view factor either way, so the call
+        // takes (face_i, face_j) in that order here too.
+        if (isNearFieldPair(face_i, face_j, r)) {
+            cand.estimated_F = computeViewFactorRefined(face_i, face_j);
+        }
 
         // Ray goes from face_i to face_j
-        std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
+        setCanonicalVisibilityRay(face_i, face_j, r, cand);
 
-        double relative_offset = r * 0.001;
-        double absolute_offset = 0.5;
-        double offset = std::max(relative_offset, absolute_offset);
-        offset = std::min(offset, r * 0.1);
-
-        cand.origin = {{
-            c_i[0] + offset * dir[0],
-            c_i[1] + offset * dir[1],
-            c_i[2] + offset * dir[2]
-        }};
-        { double rl_=getRayLiftFactor(); if(rl_>0){ double nl_=rl_*std::sqrt(2.0*face_areas_[face_i]); cand.origin[0]+=nl_*face_normals_[face_i][0]; cand.origin[1]+=nl_*face_normals_[face_i][1]; cand.origin[2]+=nl_*face_normals_[face_i][2]; } } cand.dir = dir;
-
-        double end_margin = std::max(r * 0.001, absolute_offset);
-        end_margin = std::min(end_margin, r * 0.1);
-        cand.tfar = static_cast<float>(r - offset - end_margin);
-
-        if (cand.tfar < 0.1f) {
-            cand.tfar = -1.0f;  // Skip ray trace, assume visible
-        }
 
         candidates.push_back(cand);
     }
@@ -3931,10 +3953,9 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     double cos_i = dot_i;     // Already positive
     double cos_j = -dot_j;    // Convert to positive (face j looking toward i)
 
-    // SPATIAL CULLING OPTIMIZATION 2: Grazing angle rejection
-    // Very grazing angles contribute negligible view factors
-    static constexpr double MIN_COS_ANGLE = 0.01;  // ~89.4 degrees
-    if (cos_i < MIN_COS_ANGLE || cos_j < MIN_COS_ANGLE) {
+    // SPATIAL CULLING OPTIMIZATION 2: Grazing angle rejection, the SHARED cut
+    // (see computeViewFactorRow for why it is no longer 0.01 here).
+    if (cos_i < kGrazingCosCut || cos_j < kGrazingCosCut) {
         return 0.0;
     }
 
@@ -3947,18 +3968,80 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
         return 0.0;  // Would be below threshold even with perfect visibility
     }
 
-    // Passed all culling tests - now do the expensive visibility check
-    if (!isVisible(c_i, c_j)) return 0.0;
+    // Passed all culling tests - now do the expensive visibility check, in
+    // CANONICAL (min index first) order. Mutual visibility is symmetric;
+    // isVisible() is not exactly symmetric in its arguments, and letting the
+    // float32 traversal decide puts a direction-dependent zero into the matrix.
+    if (!isVisible(face_centers_[std::min(face_i, face_j)],
+                   face_centers_[std::max(face_i, face_j)])) return 0.0;
 
     // M1 (centroid) estimate is a far-field approximation. In the near field
     // (centers closer than a few face-widths) it overshoots, so refine with
-    // area-to-area quadrature. d = characteristic face size.
-    const double A_i = face_areas_[face_i];
-    const double d = std::sqrt(A_i) + std::sqrt(A_j);
-    if (r < 4.0 * d) {
+    // area-to-area quadrature.
+    if (isNearFieldPair(face_i, face_j, r)) {
         return computeViewFactorRefined(face_i, face_j);
     }
     return estimated_F;
+}
+
+// Fill a candidate's occlusion ray for the pair (face_i, face_j), issued in
+// CANONICAL order: always from the LOWER face index to the higher one,
+// whichever way the caller asked.
+//
+// Mutual visibility is a symmetric geometric relation. isVisible() and this ray
+// setup are not exactly symmetric in their arguments -- the origin is offset
+// from p1 and Embree's float32 traversal can answer differently from the two
+// ends of the same segment -- so a non-canonical query lets a rounding
+// difference decide whether F_ij exists while F_ji does not. The offsets
+// themselves are unchanged (0.1 percent of the distance or 0.5 m, whichever is
+// larger, capped at 10 percent of the distance; a segment shorter than 0.1 m
+// after both margins is assumed visible), and are the same arithmetic the
+// sparse builder uses.
+//
+// The optional normal lift (PTM_HMATRIX_RAY_LIFT, default 0 and therefore
+// inert) lifts along the ORIGIN face's normal, which under canonical ordering
+// is the lower-indexed face rather than the asking one.
+void HMatrixViewFactor::setCanonicalVisibilityRay(int face_i, int face_j, double r,
+                                                  RayCandidate& cand) const {
+    const int fa = std::min(face_i, face_j);
+    const int fb = std::max(face_i, face_j);
+    const auto& pa = face_centers_[fa];
+    const auto& pb = face_centers_[fb];
+
+    std::array<double, 3> dir = {{(pb[0] - pa[0]) / r, (pb[1] - pa[1]) / r,
+                                  (pb[2] - pa[2]) / r}};
+
+    const double relative_offset = r * 0.001;
+    const double absolute_offset = 0.5;
+    double offset = std::max(relative_offset, absolute_offset);
+    offset = std::min(offset, r * 0.1);
+
+    cand.origin = {{pa[0] + offset * dir[0], pa[1] + offset * dir[1],
+                    pa[2] + offset * dir[2]}};
+    const double rl = getRayLiftFactor();
+    if (rl > 0.0) {
+        const double nl = rl * std::sqrt(2.0 * face_areas_[fa]);
+        cand.origin[0] += nl * face_normals_[fa][0];
+        cand.origin[1] += nl * face_normals_[fa][1];
+        cand.origin[2] += nl * face_normals_[fa][2];
+    }
+    cand.dir = dir;
+
+    double end_margin = std::max(r * 0.001, absolute_offset);
+    end_margin = std::min(end_margin, r * 0.1);
+    cand.tfar = static_cast<float>(r - offset - end_margin);
+    if (cand.tfar < 0.1f) cand.tfar = -1.0f;  // too close: assume visible
+}
+
+bool HMatrixViewFactor::isNearFieldPair(int fi, int fj, double r) const {
+    // The near/far switch, in one place for this builder and SHARED with the
+    // sparse one (radiation::isNearFieldPair, nearfield_quadrature.h). It used
+    // to be written out four times here -- in computeViewFactor, in
+    // computeViewFactorBlock, and (silently, by omission) NOT in
+    // computeViewFactorRow/Column, which is how the ACA cross generators came
+    // to skip the near field entirely.
+    return radiation::isNearFieldPair(r, face_areas_[fi], face_areas_[fj],
+                                      rad_config_.nearfield_window_factor);
 }
 
 int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
@@ -3983,7 +4066,12 @@ int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
     const double d = std::sqrt(face_areas_[fi]) + std::sqrt(face_areas_[fj]);
     auto rv = subtract(face_centers_[fj], face_centers_[fi]);
     const double r0 = std::sqrt(dot(rv, rv));
-    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(4.0 * d / r0))
+    // The same length scale as the near/far window, so the order is 1 exactly
+    // at the window edge and rises as the pair closes. Tracking the configured
+    // window keeps "widen the window" from silently meaning "refine the newly
+    // included pairs at a different resolution than the ones already inside".
+    const double w = rad_config_.nearfield_window_factor;
+    int m = (r0 > 1e-12) ? static_cast<int>(std::ceil(w * d / r0))
                          : radiation::kMaxNearFieldQuadOrder;
     m = std::max(m, rad_config_.nearfield_quadrature_order);
     if (m < 1) m = 1;
@@ -4129,6 +4217,29 @@ double HMatrixViewFactor::compressionRatio() const {
     size_t dense_size = n_rows_ * n_cols_ * sizeof(double);
     size_t actual_size = memoryBytes();
     return static_cast<double>(dense_size) / actual_size;
+}
+
+size_t HMatrixViewFactor::crossGeneratorPairs() { return g_cross_pairs.load(); }
+size_t HMatrixViewFactor::crossGeneratorNearPairs() { return g_cross_near_pairs.load(); }
+double HMatrixViewFactor::crossGeneratorMinROver4d() { return g_cross_min_r_over_4d.load(); }
+
+void HMatrixViewFactor::computeDenseReference(std::vector<double>& out) {
+    const size_t n = n_rows_;
+    out.assign(n * n, 0.0);
+    if (n == 0 || !mesh_) return;
+
+    std::vector<int> all(n);
+    for (size_t i = 0; i < n; ++i) all[i] = static_cast<int>(i);
+
+    SparseBlock sparse;
+    computeViewFactorBlock(all, all, sparse);
+
+    for (int i = 0; i < sparse.n_rows; ++i) {
+        for (int k = sparse.row_ptrs[i]; k < sparse.row_ptrs[i + 1]; ++k) {
+            out[static_cast<size_t>(i) * n + static_cast<size_t>(sparse.col_indices[k])] =
+                sparse.values[k];
+        }
+    }
 }
 
 void HMatrixViewFactor::printStatistics() const {
