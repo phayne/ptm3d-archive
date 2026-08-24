@@ -13483,12 +13483,12 @@ int main(int argc, char** argv) {
     rad_use_cluster_cull = sim_config.radiation.use_cluster_cull;
     rad_nearfield_quadrature_order = sim_config.radiation.nearfield_quadrature_order;
     if (rad_nearfield_quadrature_order < 1 ||
-        rad_nearfield_quadrature_order > radiation::kMaxNearFieldQuadOrder) {
+        rad_nearfield_quadrature_order > radiation::kMaxConfigNearFieldQuadOrder) {
         std::cerr << "\nFATAL: radiation.nearfield_quadrature_order = "
                   << rad_nearfield_quadrature_order << " is out of range. It is the order m of "
                   << "the near-field\n       double-area quadrature (m^2 sample points per face, "
                   << "m^4 kernel evaluations per\n       pair) and must be between 1 and "
-                  << radiation::kMaxNearFieldQuadOrder
+                  << radiation::kMaxConfigNearFieldQuadOrder
                   << ". The production default is 3.\n" << std::endl;
         std::exit(1);
     }

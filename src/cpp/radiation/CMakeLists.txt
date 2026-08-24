@@ -3,6 +3,7 @@
 
 add_library(radiation STATIC
     view_factor.cpp
+    nearfield_quadrature.cpp
     radiation_exchange.cpp
     face_selection.cpp
     hmatrix_view_factor.cpp
@@ -131,6 +132,20 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(bowl_crater_ptm PRIVATE OpenMP::OpenMP_CXX)
 endif()
 set_target_properties(bowl_crater_ptm PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Dump the PRODUCTION sparse view-factor matrix to the offline pipeline's CSR
+# format, so scripts/ptm12_diag/test_vf_cross_agreement.py can difference the
+# in-engine builder against the mc_ref_pp + assemble_vf_haworth.py referee on
+# one mesh. Nothing compared those two answers before 2026-08-23.
+add_executable(vf_dump_sparse vf_dump_sparse.cpp)
+target_link_libraries(vf_dump_sparse PRIVATE radiation mesh_utils ${EMBREE_LIBRARIES})
+target_include_directories(vf_dump_sparse PRIVATE ${EMBREE_INCLUDE_DIRS})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(vf_dump_sparse PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(vf_dump_sparse PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 

@@ -56,6 +56,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADERS = [
     "src/cpp/fluxcubes/flux_cube_format.h",
     "src/cpp/fluxcubes/flux_cube_pass.h",
+    "src/cpp/radiation/nearfield_quadrature.h",
     "src/cpp/radiation/radiosity_reconstruction.h",
 ]
 
@@ -110,6 +111,8 @@ FILES = HEADERS + [
     "src/cpp/fluxcubes/test_flux_cube_pass.cpp",
     "src/cpp/radiation/test_flux_cube_identity.cpp",
     "src/cpp/radiation/test_vf_production.cpp",
+    "src/cpp/radiation/nearfield_quadrature.cpp",
+    "src/cpp/radiation/vf_dump_sparse.cpp",
 ] + GPU_FILES + GPU_REGION_FILES
 
 # symbol pattern -> the header(s) the STANDARD requires. A tuple means any one

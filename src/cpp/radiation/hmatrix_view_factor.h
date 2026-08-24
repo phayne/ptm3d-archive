@@ -13,6 +13,7 @@
 #include <Eigen/Sparse>
 
 #include "radiation_config.h"
+#include "nearfield_quadrature.h"
 #include "../mesh/mesh_utils.h"
 #include "horizon_field.h"
 
@@ -401,9 +402,23 @@ private:
     // approximation (valid only for r >> face size) and overshoots for close
     // or adjacent pairs, which is what makes Sum_j F_ij exceed 1 and the
     // radiosity coupling diverge. This double-integrates over both triangles,
-    // subdividing more finely as the pair gets closer, so the result is
-    // physically bounded (Sum_j F_ij <= 1) with no artificial cap.
+    // subdividing more finely as the pair gets closer.
+    //
+    // Since 2026-08-23 it calls the SHARED estimator in nearfield_quadrature.h,
+    // the same one the sparse builder uses. The old claim here -- "physically
+    // bounded (Sum_j F_ij <= 1) with no artificial cap" -- was FALSE: the
+    // quadrature diverges on a closing concave crease (F_ij = 4.59 at a 10
+    // degree dihedral, 16.75 at 5, even at the adaptive ceiling). The bound is
+    // now enforced by the shared kernel's clamp and reported by its tripwire.
     double computeViewFactorRefined(int face_i, int face_j) const;
+
+    // Quadrature order for computeViewFactorRefined on this pair:
+    // clamp(max(rad_config_.nearfield_quadrature_order, ceil(4 d / r)), 1,
+    // kMaxNearFieldQuadOrder), d = sqrt(A_i) + sqrt(A_j). The configured key is
+    // a FLOOR here, not the value -- see the measurement table at the
+    // definition for why pinning it to the sparse path's fixed order was
+    // rejected.
+    int refinedQuadratureOrder(int face_i, int face_j) const;
 
     // Visibility check
     bool isVisible(const std::array<double, 3>& p1,

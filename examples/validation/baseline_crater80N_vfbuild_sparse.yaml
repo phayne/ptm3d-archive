@@ -1,0 +1,86 @@
+# PTM3D validation baseline arm: the SPARSE view-factor builder, built FRESH.
+#
+# Part of the byte-identity regression suite (docs/validation-baselines.md).
+# This arm exists because, before 2026-08-23, the whole portable suite was
+# STRUCTURALLY INERT to any change in the view-factor estimator:
+#
+#   asteroid_bennu / asteroid_keplerian / europa_diurnal   radiation.enabled: false
+#   moon_crater80N_radoff_cpu                              radiation off
+#   moon_crater80N_coupled_cpu                             LOADS a cached H-matrix .vf
+#   moon_crater80N_radgpu_n{1,2,4} / gputhermal_n{1,2,4}   LOAD a prebuilt .vf
+#
+# The symmetric near-field quadrature fix -- a change that moves sunlit rim
+# faces by up to +13.45 K -- came out 5/5 BYTE-IDENTICAL against that suite.
+# That is a tautology, not do-no-harm evidence. Two things make this arm able
+# to see such a change:
+#
+#   1. view_factor_file: ''  -> the matrix is BUILT on every run, never loaded.
+#      A cached .vf makes any estimator change inert by construction, and the
+#      suite had no arm without one.
+#   2. use_hmatrix / use_aca: false -> the SPARSE builder, the only path that
+#      calls ViewFactorCalculator::computeSubdivision. The H-matrix builder gets
+#      its own arm (baseline_crater80N_vfbuild_hmatrix.yaml); the two run
+#      different estimators, and which one a production run uses has been
+#      decided by a memory threshold.
+#
+# Everything else is held down so the estimator is the only thing that can move
+# the bytes: CPU thermal, CPU radiosity, coupling_mode fixed (a deterministic
+# sweep count -- an early exit could differ between arms and confound a byte
+# diff), no albedo map, no GPU anywhere.
+#
+# Confirm from the log that the matrix was BUILT and not loaded:
+#   grep -E 'Computing view factors|Loading view factor' <log>
+# The first must appear; the second must not.
+#
+# Runtime ~27 s on this host at 48 threads. Run from the repository root:
+#   ./build/bin/ptm_thermal_sim \
+#       --config examples/validation/baseline_crater80N_vfbuild_sparse.yaml
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118                 # ~6 h output cadence over one lunation
+  body: Moon
+mesh:
+  resolution: 3
+  import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: -1.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  use_gpu: false
+  use_hmatrix: false             # sparse builder: reaches computeSubdivision
+  use_aca: false
+  view_factor_file: ''           # LOAD-BEARING: empty means BUILD, never cache
+  nearfield_quadrature_order: 3  # stated, not defaulted -- this arm is ABOUT it
+  coupling_mode: fixed
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+  coupling_flux_threshold: 0.1
+  coupling_face_fraction: 0.01
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/validation_baseline/crater80N_vfbuild_sparse
+  format: binary
+  vtk_mode: thermal
+  write_raw_stats: true
+  skip_time_series: true
+  skip_mesh: true
+advanced:
+  verbose: false

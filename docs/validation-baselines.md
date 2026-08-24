@@ -88,6 +88,8 @@ another's coverage costs wall-clock time and buys nothing.
 | Arm | Config | What only this arm covers |
 |---|---|---|
 | `moon_crater80N_coupled_cpu` | `examples/tutorial04_crater80N_coupled.yaml` | CPU thermal, H-matrix view factors, CPU two-band radiosity, the coupling loop |
+| `moon_crater80N_vfbuild_sparse` | `examples/validation/baseline_crater80N_vfbuild_sparse.yaml` | The SPARSE view-factor builder, matrix BUILT not loaded — the only arm that can see a change to the near-field estimator |
+| `moon_crater80N_vfbuild_hmatrix` | `examples/validation/baseline_crater80N_vfbuild_hmatrix.yaml` | The H-MATRIX builder, matrix BUILT not loaded, including its ACA low-rank compression |
 | `moon_crater80N_radoff_cpu` | `examples/tutorial04_crater80N_radoff.yaml` | Illumination plus CPU thermal with radiation disabled |
 | `moon_crater80N_gputhermal_n{1,2,4}` | `examples/validation/baseline_crater80N_gputhermal.yaml` | GPU persistent-kernel thermal solver, the multi-GPU **thermal** pool, and the two-phase cadence that makes the 2026-08-15 defaults active |
 | `moon_crater80N_radgpu_n{1,2,4}` | `examples/validation/baseline_crater80N_radgpu.yaml` | GPU radiosity solver and the multi-GPU **radiosity** pool (needs a sparse view-factor matrix; the GPU solver refuses an H-matrix) |
@@ -101,6 +103,53 @@ about a change gated to the generic-body path — for such a change "Moon
 byte-identical" is a tautology, because the gate excluded the Moon by
 construction. Commit `5bfbdbe` scrambled the asteroid diurnal field while
 passing the bowl-crater test, lunar byte-identity, and the seam check.
+
+### Two arms exist because the other thirteen are blind to the view factors
+
+Added 2026-08-23 on `fix/hmatrix-symmetric-quadrature`. Every other arm in the
+suite is **structurally inert** to a change in how view factors are computed:
+
+| arm | why it cannot see a view-factor change |
+|---|---|
+| `asteroid_bennu_spice_cpu`, `asteroid_keplerian_cpu`, `europa_diurnal_cpu` | `radiation.enabled: false` |
+| `moon_crater80N_radoff_cpu` | radiation off |
+| `moon_crater80N_coupled_cpu` | LOADS a cached H-matrix `.vf` |
+| `moon_crater80N_radgpu_n{1,2,4}`, `moon_crater80N_gputhermal_n{1,2,4}` | LOAD a prebuilt `.vf` |
+
+This is not hypothetical. The 2026-08-23 symmetric near-field quadrature fix
+moves sunlit crater-rim faces by up to **+13.45 K**, and came out **5/5
+byte-identical** against the CPU arms of this suite. A green suite there was a
+tautology, not do-no-harm evidence, and it would have said exactly the same
+thing about a fix that was wrong.
+
+The two new arms differ from every other one in a single load-bearing way:
+`radiation.view_factor_file: ''`, so the matrix is **built on every run**. One
+takes the sparse builder, one the H-matrix builder, because PTM3D has two
+in-engine view-factor implementations with two different near-field order rules
+and `ptm_thermal_sim` chooses between them by a memory threshold as well as by
+config. An arm covering one says nothing about a run that took the other.
+
+Confirm from the log that the matrix was built, not loaded:
+
+```
+grep -E 'Using sparse view factor matrix|Building H-matrix' <log>   # must appear
+grep -E 'Loading view factor'                              <log>   # must NOT
+```
+
+Sensitivity is verified, not assumed. Flipping
+`radiation.nearfield_quadrature_order` from 3 to 1 — which makes the near field
+a bare M1 centroid estimate — moves **9 of 32 output files** on BOTH arms
+(`temperature_avg/min/max`, `indirect_solar_max`, and their `_raw` counterparts);
+`ptm_validate_baseline.py equivalence` returns `NOT EQUIVALENT`, exit 1. That
+negative control is what makes a green verdict from these arms mean something.
+
+⛔ **These two arms are NOT in `validate-baseline-2026-08-15`, and their bytes
+are not comparable to it.** They are new configs, and they run physics that
+changed on purpose: the near-field estimator was one-sided until 2026-08-23 and
+read −21.7 percent on edge/vertex-touching pairs. Their baselines are banked
+separately, at the branch and commit named in their own manifest, with the
+attribution in `notes`. Do not merge them into the 2026-08-15 manifest and do
+not retag it.
 
 ### Two arms exist only to keep a gate honest
 

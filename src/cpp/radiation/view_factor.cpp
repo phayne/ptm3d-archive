@@ -825,21 +825,9 @@ static std::atomic<int> g_subdiv_vis_reject{0};
 static std::atomic<int> g_subdiv_accepted{0};
 static std::atomic<int> g_subdiv_weight_zero{0};
 
-// Near-field physical-bound tripwire. A_i F_ij can never exceed min(A_i, A_j)
-// -- F_ij <= 1 and, by reciprocity, F_ji <= 1. A finite-order area quadrature
-// CAN exceed it: as a concave crease closes, the sample pairs nearest the
-// shared edge have r -> 0 with cos_a cos_b -> 1 and the estimate diverges,
-// while the true value approaches 1 from below. Measured on two unit triangles
-// sharing an edge (order 3): F_ij = 0.27 at a 90 degree dihedral against a
-// reference 0.21, 1.07 at 45 degrees, 2.24 at 30 degrees, 19.2 at 10 degrees.
-// The same divergence is present in the H-matrix builder's refined kernel
-// (hmatrix_view_factor.cpp), which uses this quadrature with an adaptive order;
-// its ceiling of 16 only slows the growth. These counters exist so that an
-// entry clamped to the physical bound is REPORTED rather than absorbed by the
-// downstream row-sum renormalization, which would silently rescale the whole
-// row and drive that face's sky view factor to zero.
-static std::atomic<long long> g_nearfield_bound_clamps{0};
-static std::atomic<int> g_nearfield_bound_worst_ratio_ppm{0};  // (g/g_max - 1) in ppm
+// The near-field physical-bound tripwire counters now live in
+// nearfield_quadrature.h, next to the clamp that increments them, because the
+// H-matrix builder shares both.
 
 ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& face_indices) {
     size_t n_subset = face_indices.size();
@@ -1260,44 +1248,20 @@ double ViewFactorCalculator::computeCentroid(int face_i, int face_j) {
 }
 
 double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int order) {
-    // M2: SYMMETRIC double-area sub-centroid quadrature.
+    // M2: SYMMETRIC double-area sub-centroid quadrature. The estimator itself
+    // lives in nearfield_quadrature.h and is SHARED with the H-matrix builder
+    // (one function, two callers). Everything this method still owns is the
+    // part that is genuinely sparse-builder-specific: the canonical ordering
+    // and the single occlusion ray.
     //
-    //   A_i F_ij = A_j F_ji = (1/pi) * int_{A_i} int_{A_j} cos_i cos_j / r^2 dA_j dA_i
-    //
-    // Both faces are sampled at the centroids of m x m equal-area sub-triangles
-    // (order m = config_.nearfield_quadrature_order), so the accumulated sum is
-    // ONE quantity -- the same double integral -- for both directions, and
-    // reciprocity is an algebraic identity of the estimator rather than
-    // something it approaches in the refinement limit.
-    //
-    // The rule this replaced was one-sided: a point emitter at the centroid of
-    // one face against a closed vertex lattice on the other. Each direction was
-    // then a midpoint rule in a DIFFERENT variable of the same symmetric double
-    // integral, which is why A_i F_ij and A_j F_ji disagreed by up to 46% on a
-    // near pair. Measured against a Richardson double-area reference on
-    // data/meshes/lunar_crater_80N.ply (2026-08-23), the one-sided rule read
-    // -3.9% mass-weighted over near-field pairs, -0.09% on non-touching pairs
-    // and -21.7% on edge/vertex-touching pairs (17.6% of the near-field mass);
-    // the defect was a MAGNITUDE bias, and the non-reciprocity was its symptom.
-    // Post-hoc symmetrization of the old rule fixes nothing (-3.87%). At m = 3
-    // this rule reads +0.32% mass-weighted on the same population, and +1.26%
-    // on the edge/vertex-touching subset that the old rule missed by -21.7%.
-    //
-    // It is NOT uniformly better on every geometry. On two perpendicular unit
-    // squares sharing an edge -- the analytic worst case, an integrable 1/r^2
-    // singularity sitting on the shared edge -- the old rule read -18.1% and
-    // this one reads +18.5% at m = 3, the same magnitude with the sign flipped.
-    // No production-order area quadrature is close there; the error falls only
-    // like 1/m. Arm [T] of test_vf_production bounds it and prints the table.
-    //
-    // KNOWN LIMITATION, unchanged from before: occlusion is a SINGLE
-    // centroid-to-centroid ray. No sample point carries its own visibility, so
-    // a partially occluded near pair is still all-or-nothing.
+    // KNOWN LIMITATION, unchanged: occlusion is a SINGLE centroid-to-centroid
+    // ray. No sample point carries its own visibility, so a partially occluded
+    // near pair is still all-or-nothing.
 
-    // Canonical ordering. min(i,j) is always the outer loop, so the summation
-    // ORDER -- not merely the exact-arithmetic value -- is the same whichever
-    // direction is asked, and the two directions agree to the last bit before
-    // the final division by the asking face's area.
+    // Canonical ordering. min(i,j) is always the outer loop of the shared
+    // kernel, so the summation ORDER -- not merely the exact-arithmetic value
+    // -- is the same whichever direction is asked, and the two directions agree
+    // to the last bit before the final division by the asking face's area.
     const int fa = std::min(face_i, face_j);
     const int fb = std::max(face_i, face_j);
 
@@ -1310,74 +1274,20 @@ double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int orde
         return 0.0;
     }
 
-    SubCentroidSamples pts_a, pts_b;
-    getSubCentroidPoints(fa, order, pts_a);
-    getSubCentroidPoints(fb, order, pts_b);
+    const auto& tri_a = mesh_->faces[fa];
+    const auto& tri_b = mesh_->faces[fb];
 
-    const auto& n_a = face_normals_[fa];
-    const auto& n_b = face_normals_[fb];
-
-    double kernel_sum = 0.0;
+    // g == A_i F_ij == A_j F_ji, bit-identical for both directions.
     int n_valid = 0;
-
-    for (int ia = 0; ia < pts_a.count; ++ia) {
-        const auto& p_a = pts_a.p[ia];
-        for (int ib = 0; ib < pts_b.count; ++ib) {
-            const auto& p_b = pts_b.p[ib];
-
-            const double dx = p_b[0] - p_a[0];
-            const double dy = p_b[1] - p_a[1];
-            const double dz = p_b[2] - p_a[2];
-            const double r2 = dx * dx + dy * dy + dz * dz;
-            if (r2 < 1e-20) continue;
-
-            const double inv_r = 1.0 / std::sqrt(r2);
-            // Outward normals: cos_a along +d, cos_b along -d. Swapping the two
-            // faces flips d and exchanges the two cosines, so the product is
-            // invariant -- this is the symmetry the canonical ordering exploits.
-            const double cos_a = (n_a[0] * dx + n_a[1] * dy + n_a[2] * dz) * inv_r;
-            const double cos_b = -(n_b[0] * dx + n_b[1] * dy + n_b[2] * dz) * inv_r;
-
-            // Grazing/back-facing cut, same 1e-6 threshold as M1. A rejected
-            // sample pair contributes ZERO; it is not removed from the domain.
-            if (cos_a < 1e-6 || cos_b < 1e-6) continue;
-
-            kernel_sum += (cos_a * cos_b) / r2;
-            ++n_valid;
-        }
-    }
+    const double g = nearFieldPairIntegral(
+        mesh_->vertices[tri_a[0]], mesh_->vertices[tri_a[1]], mesh_->vertices[tri_a[2]],
+        mesh_->vertices[tri_b[0]], mesh_->vertices[tri_b[1]], mesh_->vertices[tri_b[2]],
+        face_normals_[fa], face_normals_[fb],
+        face_areas_[fa], face_areas_[fb], order, &n_valid);
 
     if (n_valid == 0) {
         g_subdiv_weight_zero++;
         return 0.0;
-    }
-
-    // Divide by the TOTAL sample-pair count, never by the survivors. Dividing by
-    // the survivors would condition the estimate on detection -- FC-08's error --
-    // and inflates the near field by +1.42% mass-weighted / +25% on the worst
-    // pair, while the cut itself discards 0.00000% of the coupling mass
-    // (measured 2026-08-23). This divisor is correct; do not "fix" it.
-    const double n_pairs = static_cast<double>(pts_a.count) *
-                           static_cast<double>(pts_b.count);
-
-    // g == A_i F_ij == A_j F_ji, bit-identical for both directions.
-    double g = face_areas_[fa] * face_areas_[fb] * kernel_sum / (M_PI * n_pairs);
-
-    // Physical bound. F_ij <= 1 and F_ji <= 1, so A_i F_ij <= min(A_i, A_j).
-    // This is a conservation bound, not a tuning parameter, and min() is
-    // symmetric so the clamp cannot break the reciprocity identity. Exceeding
-    // it means the quadrature has failed on a near-singular concave crease --
-    // it is counted and reported, never absorbed silently.
-    const double g_max = std::min(face_areas_[fa], face_areas_[fb]);
-    if (g > g_max) {
-        const double excess_ppm = 1.0e6 * (g / g_max - 1.0);
-        const int excess = static_cast<int>(std::min(excess_ppm, 2.0e9));
-        int prev = g_nearfield_bound_worst_ratio_ppm.load(std::memory_order_relaxed);
-        while (excess > prev &&
-               !g_nearfield_bound_worst_ratio_ppm.compare_exchange_weak(prev, excess)) {
-        }
-        g_nearfield_bound_clamps++;
-        g = g_max;
     }
 
     if (g > 0.0) {
@@ -1386,25 +1296,9 @@ double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int orde
     return std::max(0.0, g / face_areas_[face_i]);
 }
 
-// Print the near-field physical-bound tripwire, if it fired. NOT gated on
-// config_.verbose: a clamped view factor is an energy-conservation event, and
-// the whole point of the counter is that it cannot be missed. On stderr, not
-// stdout, because several callers redirect the calculator's stdout to keep
-// their own output greppable (test_vf_production does) and this must survive.
 void ViewFactorCalculator::reportNearFieldBoundClamps() {
-    const long long n = g_nearfield_bound_clamps.exchange(0);
-    const int worst = g_nearfield_bound_worst_ratio_ppm.exchange(0);
-    if (n == 0) return;
-    std::cerr << "\n  *** NEAR-FIELD VIEW-FACTOR BOUND CLAMP: " << n
-              << " pair(s) exceeded A_i F_ij <= min(A_i, A_j) and were clamped."
-              << "\n      Worst overshoot " << (worst / 10000.0) << "% above the bound."
-              << "\n      Cause: the near-field quadrature diverges on a concave crease"
-              << "\n      sharper than roughly 50 degrees (order "
-              << config_.nearfield_quadrature_order << " here). Either the mesh has folded"
-              << "\n      or near-degenerate adjacent facets, or it genuinely has such"
-              << "\n      creases and radiation.nearfield_quadrature_order must be raised."
-              << "\n      The clamped entries are BOUNDED but not accurate. ***\n"
-              << std::endl;
+    radiation::reportNearFieldBoundClamps("sparse builder",
+                                          config_.nearfield_quadrature_order);
 }
 
 double ViewFactorCalculator::computeAdaptive(int face_i, int face_j) {
@@ -1675,65 +1569,6 @@ void ViewFactorCalculator::findNeighbors(int face_idx, double radius, std::vecto
     }
 
     spatial_grid_.query(face_centers_[face_idx], radius, result);
-}
-
-void ViewFactorCalculator::getSubCentroidPoints(int face_idx, int order,
-                                                 SubCentroidSamples& out) const {
-    const auto& face = mesh_->faces[face_idx];
-    const auto& v0 = mesh_->vertices[face[0]];
-    const auto& v1 = mesh_->vertices[face[1]];
-    const auto& v2 = mesh_->vertices[face[2]];
-
-    // Split the triangle into m^2 congruent sub-triangles by the standard
-    // barycentric subdivision and take each one's centroid, weight A/m^2:
-    //   row a holds (m - a) "upward" sub-triangles, centroids at
-    //     (u, v) = (a/m + 1/(3m), b/m + 1/(3m)),
-    //   and (m - a - 1) "downward" ones at
-    //     (u, v) = (a/m + 2/(3m), b/m + 2/(3m)).
-    // Sum over a of (m - a) + (m - a - 1) = m^2. Second-order accurate, and
-    // OPEN: no sample lands on an edge or a vertex, so the integrable 1/r^2
-    // singularity of an edge-touching pair is never evaluated at r = 0.
-    //
-    // ptm_thermal_sim refuses an out-of-range order at configuration time, so
-    // the clamp below is a buffer-overflow guard on the fixed-size sample
-    // array, not a policy. It is still reachable by a caller that builds a
-    // RadiationConfig directly (a tool or a test), and a clamp that changes the
-    // physics silently is exactly the failure mode this project keeps paying
-    // for -- so it says so, once.
-    if (order < 1 || order > kMaxNearFieldQuadOrder) {
-        static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) {
-            std::cerr << "[view-factor] WARNING: nearfield_quadrature_order = " << order
-                      << " is outside 1.." << kMaxNearFieldQuadOrder
-                      << "; CLAMPING. The near-field view factors below are NOT the ones "
-                         "this configuration asked for." << std::endl;
-        }
-    }
-    const int m = std::min(std::max(order, 1), kMaxNearFieldQuadOrder);
-    const double inv_m = 1.0 / static_cast<double>(m);
-    const double third = inv_m / 3.0;
-
-    int idx = 0;
-    for (int a = 0; a < m; ++a) {
-        const double u_row = static_cast<double>(a) * inv_m;
-        for (int b = 0; b < m - a; ++b) {
-            const double u = u_row + third;
-            const double v = static_cast<double>(b) * inv_m + third;
-            const double w = 1.0 - u - v;
-            out.p[idx++] = {{u * v0[0] + v * v1[0] + w * v2[0],
-                             u * v0[1] + v * v1[1] + w * v2[1],
-                             u * v0[2] + v * v1[2] + w * v2[2]}};
-        }
-        for (int b = 0; b < m - a - 1; ++b) {
-            const double u = u_row + 2.0 * third;
-            const double v = static_cast<double>(b) * inv_m + 2.0 * third;
-            const double w = 1.0 - u - v;
-            out.p[idx++] = {{u * v0[0] + v * v1[0] + w * v2[0],
-                             u * v0[1] + v * v1[1] + w * v2[1],
-                             u * v0[2] + v * v1[2] + w * v2[2]}};
-        }
-    }
-    out.count = idx;  // == m * m
 }
 
 // Vector utilities

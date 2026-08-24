@@ -118,6 +118,7 @@
 #include <embree4/rtcore.h>
 
 #include "../mesh/mesh_utils.h"
+#include "hmatrix_view_factor.h"
 #include "radiation_config.h"
 #include "view_factor.h"
 
@@ -586,9 +587,21 @@ struct RecipResult {
     size_t pairs_one_sided = 0;
     double one_sided_weight = 0.0;   // fraction of the A_iF_ij mass that is one-sided
     double defect_mass = 0.0;        // sum|a-c| / sum max(a,c), over two-sided pairs
+    size_t pairs_below_floor = 0;    // skipped by the significance cut, if any
 };
 
-RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshold) {
+// `floor_F` is a SIGNIFICANCE cut on the view factor itself, defaulting to 0
+// (score everything) so the sparse arms are unchanged. It exists for the
+// H-matrix arm: dense and low-rank blocks store every entry they reconstruct,
+// including round-off-scale values on exactly coplanar adjacent facets, whereas
+// the sparse builder drops anything below visibility_threshold and never
+// carries them at all. Scoring the ratio of two 1e-20 numbers produced a
+// "worst near-field pair" of 38 that was entirely noise -- measured pair
+// (296,297) on the cap, cos_i = cos_j = 0.00000, F = 8.8e-21 against 1.9e-20,
+// sparse builder exactly 0. Pairs cut by the floor are COUNTED and printed, so
+// the cut cannot quietly remove a real one.
+RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshold,
+                        double floor_F = 0.0) {
     RecipResult r;
     const auto& C = b.mesh->face_centers;
     double total = 0.0, one = 0.0, absdiff = 0.0, maxsum = 0.0;
@@ -597,6 +610,7 @@ RecipResult reciprocity(const DenseVF& d, const BuiltMesh& b, double ns_threshol
             const double a = b.areas[i] * d.at(i, j);
             const double c = b.areas[j] * d.at(j, i);
             if (a == 0.0 && c == 0.0) continue;
+            if (std::max(d.at(i, j), d.at(j, i)) < floor_F) { ++r.pairs_below_floor; continue; }
             total += std::max(a, c);
             if (a == 0.0 || c == 0.0) {
                 ++r.pairs_one_sided;
@@ -707,6 +721,102 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
     return d;
 }
 
+// The OTHER in-engine builder. Selected in production by radiation.use_hmatrix
+// (ptm_thermal_sim also switches to it automatically once the sparse matrix
+// would not fit), and until 2026-08-23 gated by nothing at all -- which is how
+// its near-field kernel came to be an UNBOUNDED copy of the sparse builder's.
+//
+// HMatrixViewFactor exposes no row accessor, only matvec, so the dense matrix
+// is recovered one COLUMN at a time: y = F e_j gives y_i = F_ij. That is n
+// matvecs, which is only affordable because these meshes are deliberately small
+// (PTM-19: never rebuild a production .vf). It is also the honest thing to
+// score -- matvec is exactly how the radiosity solver consumes this matrix, so
+// the arm sees the same numbers the solver would.
+DenseVF runHMatrixVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
+                     bool no_truncation = false) {
+    RTCDevice dev = rtcNewDevice(nullptr);
+    RTCScene scene = makeScene(dev, *b.mesh);
+    DenseVF d;
+    d.n = b.mesh->faces.size();
+    d.f.assign(d.n * d.n, 0.0);
+    {
+        // The builder prints its block statistics on std::cout even with
+        // verbose off; capture so the verdict lines stay greppable.
+        std::ostringstream sink;
+        std::streambuf* saved = std::cout.rdbuf(sink.rdbuf());
+        radiation::HMatrixViewFactor H;
+        radiation::HMatrixConfig hc;             // library defaults
+        hc.verbose = false;
+        if (no_truncation) {
+            // The kernel-isolation control: drive the low-rank tolerances to
+            // round-off so ACA and SVD keep every mode. The BLOCK STRUCTURE and
+            // every kernel call are unchanged; only the compression is
+            // effectively removed, so a difference between this and the
+            // production configuration is attributable to compression alone.
+            hc.aca_tolerance = 1.0e-14;
+            hc.compression_tolerance = 1.0e-14;
+        }
+        H.build(b.mesh, dev, scene, cfg, hc);
+        std::vector<double> x(d.n, 0.0), y;
+        for (size_t j = 0; j < d.n; ++j) {
+            std::fill(x.begin(), x.end(), 0.0);
+            x[j] = 1.0;
+            H.matvec(x, y);
+            for (size_t i = 0; i < d.n; ++i) d.at(i, j) = y[i];
+        }
+        std::cout.rdbuf(saved);
+    }
+    rtcReleaseScene(scene);
+    rtcReleaseDevice(dev);
+    return d;
+}
+
+// Largest relative disagreement between the two in-engine builders, over the
+// entries that carry the coupling. `floor_frac` of the largest entry is the
+// significance cut: an entry at 1e-12 can disagree by 100% and mean nothing,
+// and including it would make the statistic a report on the culling thresholds
+// rather than on the kernel.
+struct AgreeResult {
+    double worst_rel = 0.0;
+    double worst_near = 0.0;  // worst among pairs the SPARSE builder treats as M2
+    double worst_far = 0.0;
+    size_t compared = 0;
+    size_t only_sparse = 0;   // significant in sparse, absent from H-matrix
+    size_t only_hmat = 0;
+    double mass_rel = 0.0;    // sum|a-h| / sum max(a,h), area-weighted
+    double worst_ns = 0.0;    // Ns of the worst entry, so the regime is visible
+};
+
+AgreeResult agreement(const DenseVF& s, const DenseVF& h, const BuiltMesh& b,
+                      double floor_frac, double ns_threshold) {
+    AgreeResult r;
+    const auto& C = b.mesh->face_centers;
+    double peak = 0.0;
+    for (size_t k = 0; k < s.f.size(); ++k) peak = std::max(peak, std::max(s.f[k], h.f[k]));
+    const double floor_v = floor_frac * peak;
+    double absdiff = 0.0, maxsum = 0.0;
+    for (size_t i = 0; i < s.n; ++i) {
+        for (size_t j = 0; j < s.n; ++j) {
+            const double a = s.at(i, j), g = h.at(i, j);
+            if (a < floor_v && g < floor_v) continue;
+            absdiff += b.areas[i] * std::fabs(a - g);
+            maxsum += b.areas[i] * std::max(a, g);
+            if (a == 0.0) { ++r.only_hmat; continue; }
+            if (g == 0.0) { ++r.only_sparse; continue; }
+            ++r.compared;
+            const double rel = std::fabs(a - g) / std::max(a, g);
+            const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1], dz = C[j][2] - C[i][2];
+            const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
+                              std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
+            if (rel > r.worst_rel) { r.worst_rel = rel; r.worst_ns = ns; }
+            if (ns > ns_threshold) r.worst_far = std::max(r.worst_far, rel);
+            else r.worst_near = std::max(r.worst_near, rel);
+        }
+    }
+    r.mass_rel = (maxsum > 0.0) ? absdiff / maxsum : 0.0;
+    return r;
+}
+
 void verdict(const char* tag, const char* what, double measured, double closed,
              double tol_pct, bool& all_ok) {
     const double err = (closed != 0.0) ? 100.0 * (measured / closed - 1.0) : 0.0;
@@ -793,6 +903,34 @@ int main(int argc, char** argv) {
                                      // standard as the far field, so any future
                                      // one-sided kernel is red on sight.
     double band_lo = 0.90, band_hi = 1.02;
+    // ARM H tolerances. Every one is pinned from a measurement printed by the
+    // arm itself, on the 1,404-face cap, 2026-08-23. They are DRIFT DETECTORS
+    // on the H-matrix builder, not accuracy claims about it.
+    //
+    // Same 1% ruling as [I1]. The H-matrix reads +0.617% here and the sparse
+    // builder reads +0.628% on the SAME mesh, so almost all of it is the cap's
+    // faceting residual, common to both; 1.6x headroom.
+    double tol_hmat_ingersoll = 1.0;
+    // [H4] worst per-entry near-field disagreement with the sparse builder, in
+    // the NO-TRUNCATION control. Not zero, and not a defect: the two builders
+    // run the same kernel at a different ORDER on close pairs (sparse fixed at
+    // nearfield_quadrature_order, H-matrix at max(that, ceil(4d/r))). The
+    // measurement is the proof of that attribution -- raise the configured
+    // floor toward the adaptive order and the disagreement collapses:
+    //     m = 2  0.2811      m = 3  0.1643      m = 8  0.01373
+    // 0.40 clears the worst production-sanctioned order (m = 2) by 1.4x and the
+    // default (m = 3) by 2.4x. A SECOND copy of the integral, or a lost clamp,
+    // moves this by orders of magnitude, not by 40%.
+    double tol_hmat_agree = 0.40;
+    // [H2b] mass-weighted reciprocity defect in the PRODUCTION configuration.
+    // This one is compression, not the kernel: it reads 1.48e-3 with
+    // aca_tolerance = 1e-3 and 1.16e-15 with the tolerance driven to 1e-14.
+    // 1e-2 is ~7x the measurement and catches a 10x compression degradation.
+    double tol_hmat_recip_mass = 1.0e-2;
+    // [H4b] area-weighted mass difference against the sparse builder in the
+    // production configuration: 0.617% measured (0.156% with compression off).
+    // 2% is 3.2x.
+    double tol_hmat_mass = 2.0e-2;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -805,6 +943,14 @@ int main(int argc, char** argv) {
         else if (a == "--tol-perface" && i + 1 < argc) tol_perface = std::atof(argv[++i]);
         else if (a == "--tol-touch-lo" && i + 1 < argc) tol_touch_lo = std::atof(argv[++i]);
         else if (a == "--tol-touch-hi" && i + 1 < argc) tol_touch_hi = std::atof(argv[++i]);
+        else if (a == "--tol-hmat-ingersoll" && i + 1 < argc)
+            tol_hmat_ingersoll = std::atof(argv[++i]);
+        else if (a == "--tol-hmat-agree" && i + 1 < argc)
+            tol_hmat_agree = std::atof(argv[++i]);
+        else if (a == "--tol-hmat-recip-mass" && i + 1 < argc)
+            tol_hmat_recip_mass = std::atof(argv[++i]);
+        else if (a == "--tol-hmat-mass" && i + 1 < argc)
+            tol_hmat_mass = std::atof(argv[++i]);
         else if (a == "--quad-order" && i + 1 < argc) {
             // strtol, not atoi: atoi maps both "0" and a typo to 0, which is the
             // "no override" sentinel, so a mistyped order would run at the
@@ -812,9 +958,9 @@ int main(int argc, char** argv) {
             char* end = nullptr;
             const long v = std::strtol(argv[++i], &end, 10);
             if (end == argv[i] || *end != '\0' || v < 1 ||
-                v > radiation::kMaxNearFieldQuadOrder) {
+                v > radiation::kMaxConfigNearFieldQuadOrder) {
                 std::cerr << "--quad-order expects an integer 1.."
-                          << radiation::kMaxNearFieldQuadOrder << ", got '" << argv[i]
+                          << radiation::kMaxConfigNearFieldQuadOrder << ", got '" << argv[i]
                           << "'\n";
                 return 2;
             }
@@ -1090,13 +1236,222 @@ int main(int argc, char** argv) {
         verdictBelow("W1", "max F_ij over a closing concave wedge", worst, 1.0, all_ok);
     }
 
+    // ------------------------------------------------------------------------ ARM H
+    // The H-matrix builder. Skipped under fault injection: the Injection hooks
+    // perturb a DenseVF produced by runProductionVF, and this arm does not go
+    // through it, so a "control" here would silently be a clean run.
+    if (!inj.active()) {
+        std::cout << "\n=== ARM H: the H-MATRIX builder, same geometry, same closed forms ===\n";
+        std::cout << "  radiation.use_hmatrix selects a SECOND in-engine view-factor\n"
+                  << "  builder, and ptm_thermal_sim also switches to it on its own once\n"
+                  << "  the sparse matrix would not fit in memory -- so which estimator a\n"
+                  << "  production run used has been decided by a memory threshold, with\n"
+                  << "  no gate on the other side of it. Until 2026-08-23 its near-field\n"
+                  << "  kernel was a private copy: already double-area, but with NO\n"
+                  << "  physical bound (F_ij = 4.59 at a 10 degree dihedral, 16.75 at 5),\n"
+                  << "  no canonical ordering, and a grazing cut at exactly 0 instead of\n"
+                  << "  1e-6. It now calls the same radiation::nearFieldPairIntegral() the\n"
+                  << "  sparse builder calls. These arms are what holds that.\n";
+
+        // Same cap as arm [I], one refinement level down (1,404 faces): the
+        // H-matrix is densified with one matvec per column, so the cost is
+        // O(n * nnz) and the finest level would dominate the gate's runtime.
+        BuiltMesh b = buildSphericalCap(0.2, 100.0, 20, 36);
+        auto cfg = noTruncationConfig(b.mesh->faces.size());
+        const double f_closed = ingersollTerrainVF(0.2 * 100.0, 50.0);
+
+        DenseVF ds = runProductionVF(b, cfg, Injection{}, nullptr);
+        DenseVF dh = runHMatrixVF(b, cfg);
+
+        auto meanRowSum = [](const DenseVF& d) {
+            double m = 0.0;
+            for (size_t i = 0; i < d.n; ++i) {
+                double row = 0.0;
+                for (size_t j = 0; j < d.n; ++j) row += d.at(i, j);
+                m += row;
+            }
+            return m / static_cast<double>(d.n);
+        };
+        const double mean_h = meanRowSum(dh);
+        const double mean_s = meanRowSum(ds);
+
+        std::cout << "  " << b.mesh->faces.size() << " faces, densified column by column\n";
+        std::cout << "  the SPARSE builder on this same mesh reads " << std::fixed
+                  << std::setprecision(6) << mean_s << " (" << std::showpos
+                  << std::setprecision(4) << 100.0 * (mean_s / f_closed - 1.0) << "%"
+                  << std::noshowpos << "), so the faceting residual of the cap is common\n"
+                  << "  to both and only the DIFFERENCE below is about the builder\n";
+        verdict("H1", "H-matrix terrain VF, mean over cap faces", mean_h, f_closed,
+                tol_hmat_ingersoll, all_ok);
+
+        // ------------------------------------------------------------------
+        // The kernel and the COMPRESSION are two different questions, and
+        // scoring them together produced a number that looked alarming and
+        // meant nothing. Measured on this cap, production configuration
+        // (aca_tolerance 1e-3): worst near-field reciprocity residual 13.08,
+        // worst significant per-entry disagreement with the sparse builder
+        // 1.62. The offending pair is two ADJACENT, near-coplanar cap facets
+        // with F_ij = 2.2e-5 -- the sparse builder gives both directions
+        // 2.222003e-05 exactly, and the H-matrix reconstructs 5.07e-08 and
+        // 5.05e-09. Those are not M1 (2.81e-05), not M2, and not zero: they are
+        // the low-rank residual left where a rank-truncated block had nothing
+        // to say. So the arm runs the builder TWICE and gates the two questions
+        // apart:
+        //
+        //   NO-TRUNCATION control  (aca/svd tolerance 1e-14) -> the kernel.
+        //       Gated at machine precision. This is what "the two builders now
+        //       share one estimator" has to mean to be worth asserting.
+        //   PRODUCTION config      (library defaults)        -> compression.
+        //       Gated on the AREA-WEIGHTED quantities, which is what the
+        //       radiosity solve actually integrates, and reported per-entry
+        //       without a verdict.
+        // ------------------------------------------------------------------
+        DenseVF dn = runHMatrixVF(b, cfg, /*no_truncation=*/true);
+
+        // visibility_threshold is the sparse builder's own storage floor, so it
+        // is the non-arbitrary significance cut here: an entry below it does
+        // not exist in a production sparse .vf at all.
+        const double floor_F = cfg.visibility_threshold;
+        const RecipResult rp = reciprocity(dh, b, cfg.adaptive_ns_threshold, floor_F);
+        const RecipResult rn = reciprocity(dn, b, cfg.adaptive_ns_threshold, floor_F);
+        std::cout << "  H-matrix reciprocity, entries >= visibility_threshold ("
+                  << std::scientific << std::setprecision(0) << floor_F << std::defaultfloat
+                  << "): " << rp.pairs_far << " far-field, "
+                  << rp.pairs_near << " near-field, " << rp.pairs_one_sided
+                  << " one-sided, " << rp.pairs_below_floor << " below the floor\n"
+                  << "    production  (aca_tolerance 1e-3): worst near " << std::scientific
+                  << std::setprecision(3) << rp.worst_near << ", worst far " << rp.worst_far
+                  << ", mass-weighted defect " << rp.defect_mass << "\n"
+                  << "    no-truncation control:            worst near " << rn.worst_near
+                  << ", worst far " << rn.worst_far
+                  << ", mass-weighted defect " << rn.defect_mass << "\n"
+                  << std::defaultfloat;
+        verdictBelow("H2", "H-matrix near-field reciprocity, no truncation",
+                     rn.worst_near, tol_recip_near, all_ok);
+
+        // Name the offending pair in the NO-TRUNCATION matrix. A_i F_ij and
+        // A_j F_ji leave the shared kernel as ONE number, so a near-field
+        // asymmetry that survives with compression switched off means one of
+        // the two directions never reached that kernel. The M1 column is the
+        // discriminator: a direction that equals its own centroid estimate was
+        // produced by a code path that does not refine.
+        {
+            size_t wi = 0, wj = 0;
+            double worst = -1.0;
+            const auto& C = b.mesh->face_centers;
+            for (size_t i = 0; i < dn.n; ++i) {
+                for (size_t j = i + 1; j < dn.n; ++j) {
+                    const double a = b.areas[i] * dn.at(i, j);
+                    const double c = b.areas[j] * dn.at(j, i);
+                    if (a <= 0.0 || c <= 0.0) continue;
+                    if (std::max(dn.at(i, j), dn.at(j, i)) < floor_F) continue;
+                    const double dx = C[j][0] - C[i][0], dy = C[j][1] - C[i][1],
+                                 dz = C[j][2] - C[i][2];
+                    const double ns = std::sqrt(dx * dx + dy * dy + dz * dz) /
+                                      std::sqrt(std::sqrt(b.areas[i] * b.areas[j]));
+                    if (ns > cfg.adaptive_ns_threshold) continue;
+                    const double rel = std::fabs(a - c) / std::max(a, c);
+                    if (rel > worst) { worst = rel; wi = i; wj = j; }
+                }
+            }
+            if (worst > 0.0) {
+                const auto& n_i = b.mesh->face_normals[wi];
+                const auto& n_j = b.mesh->face_normals[wj];
+                const double dx = C[wj][0] - C[wi][0], dy = C[wj][1] - C[wi][1],
+                             dz = C[wj][2] - C[wi][2];
+                const double r2 = dx * dx + dy * dy + dz * dz;
+                const double r = std::sqrt(r2);
+                const double ci = (n_i[0] * dx + n_i[1] * dy + n_i[2] * dz) / r;
+                const double cj = -(n_j[0] * dx + n_j[1] * dy + n_j[2] * dz) / r;
+                const double d_size = std::sqrt(b.areas[wi]) + std::sqrt(b.areas[wj]);
+                std::cout << "    worst near pair (" << wi << "," << wj << "), Ns = "
+                          << std::fixed << std::setprecision(3)
+                          << r / std::sqrt(std::sqrt(b.areas[wi] * b.areas[wj]))
+                          << ", cos_i " << std::setprecision(5) << ci << ", cos_j " << cj
+                          << ", r/4d " << std::setprecision(3) << r / (4.0 * d_size) << "\n"
+                          << std::scientific << std::setprecision(6)
+                          << "      F_ij  H-mat(no trunc) " << dn.at(wi, wj) << "  sparse "
+                          << ds.at(wi, wj) << "  M1 " << (b.areas[wj] / PI) * ci * cj / r2
+                          << "\n"
+                          << "      F_ji  H-mat(no trunc) " << dn.at(wj, wi) << "  sparse "
+                          << ds.at(wj, wi) << "  M1 " << (b.areas[wi] / PI) * ci * cj / r2
+                          << "\n" << std::defaultfloat;
+            }
+        }
+        verdictBelow("H2b", "H-matrix reciprocity mass defect, production",
+                     rp.defect_mass, tol_hmat_recip_mass, all_ok);
+
+        const RowStats rsh = rowSumStats(dh, b.group, -1);
+        verdictBelow("H3", "H-matrix max row sum (closure, must be <= 1)", rsh.max, 1.0,
+                     all_ok);
+
+        // Cross-agreement with the sparse builder. The two are NOT expected to
+        // agree exactly even without compression: different near/far switches
+        // (Ns <= 5 against r < 4(sqrt(A_i) + sqrt(A_j))), different quadrature
+        // ORDER on close pairs (the H-matrix raises it adaptively above the
+        // configured floor), a different caller-level grazing cull (0.01 on the
+        // centroid cosines against 1e-6), and a different neighbor-selection
+        // rule. What the shared kernel buys is that those are all DECLARED
+        // differences in the callers, not a second copy of the integral.
+        const AgreeResult ap = agreement(ds, dh, b, 1.0e-3, cfg.adaptive_ns_threshold);
+        const AgreeResult an = agreement(ds, dn, b, 1.0e-3, cfg.adaptive_ns_threshold);
+        std::cout << "  sparse vs H-matrix, entries above 1e-3 of the peak:\n"
+                  << "    production     " << ap.compared << " compared, " << ap.only_sparse
+                  << " sparse-only, " << ap.only_hmat << " H-matrix-only; area-weighted"
+                  << " mass difference " << std::fixed << std::setprecision(4)
+                  << 100.0 * ap.mass_rel << "%\n"
+                  << "                   worst near " << std::scientific
+                  << std::setprecision(3) << ap.worst_near << " (at Ns = " << std::fixed
+                  << std::setprecision(2) << ap.worst_ns << "), worst far "
+                  << std::scientific << std::setprecision(3) << ap.worst_far << "\n"
+                  << "    no truncation  " << an.compared << " compared, " << an.only_sparse
+                  << " sparse-only, " << an.only_hmat << " H-matrix-only; area-weighted"
+                  << " mass difference " << std::fixed << std::setprecision(4)
+                  << 100.0 * an.mass_rel << "%\n"
+                  << "                   worst near " << std::scientific
+                  << std::setprecision(3) << an.worst_near << ", worst far "
+                  << an.worst_far << "\n" << std::defaultfloat;
+        verdictBelow("H4", "sparse vs H-matrix worst near entry, no truncation",
+                     an.worst_near, tol_hmat_agree, all_ok);
+        verdictBelow("H4b", "sparse vs H-matrix area-weighted mass, production",
+                     ap.mass_rel, tol_hmat_mass, all_ok);
+
+        // The dihedral probe, on the H-matrix path. Before the port this read
+        // 4.59 at 10 degrees on its own adaptive order; the shared kernel's
+        // min(A_i, A_j) clamp is what bounds it, and the tripwire on stderr is
+        // what makes the clamp audible.
+        double worst_h = 0.0;
+        for (double deg : {90.0, 45.0, 30.0, 10.0}) {
+            BuiltMesh w = buildConcaveWedge(deg);
+            auto wcfg = noTruncationConfig(w.mesh->faces.size());
+            DenseVF dw = runHMatrixVF(w, wcfg);
+            double mx = 0.0;
+            for (size_t i = 0; i < dw.n; ++i)
+                for (size_t j = 0; j < dw.n; ++j) mx = std::max(mx, dw.at(i, j));
+            worst_h = std::max(worst_h, mx);
+            std::cout << "    H-matrix, dihedral " << std::setw(3) << static_cast<int>(deg)
+                      << " deg:  max F_ij = " << std::fixed << std::setprecision(6) << mx
+                      << "\n";
+        }
+        verdictBelow("H5", "H-matrix max F_ij over a closing concave wedge", worst_h,
+                     1.0, all_ok);
+    }
+
     // ------------------------------------------------------------------------
     std::cout << "\n=== NOT COVERED BY THIS PROGRAM ===\n";
     std::cout << "  * the OFFLINE sweep + assembler (mc_ref_pp + assemble_vf_haworth.py):\n"
-              << "    gated separately by scripts/ptm12_diag/test_vf_assembler_gate.py.\n";
-    std::cout << "  * the H-matrix builder (hmatrix_view_factor.cpp) and the Monte-Carlo\n"
-              << "    ray-gather builder (mc_view_factor.cpp): different code paths,\n"
-              << "    selected by use_hmatrix / use_monte_carlo_vf. UNGATED here.\n";
+              << "    gated separately by scripts/ptm12_diag/test_vf_assembler_gate.py,\n"
+              << "    and cross-checked against this builder by\n"
+              << "    scripts/ptm12_diag/test_vf_cross_agreement.py.\n";
+    std::cout << "  * the Monte-Carlo ray-gather builder (mc_view_factor.cpp), selected\n"
+              << "    by use_monte_carlo_vf: still UNGATED.\n";
+    std::cout << "  * the H-matrix builder's FAR field. Arm H gates its near-field\n"
+              << "    kernel, its closure and its agreement with the sparse builder, but\n"
+              << "    its ACA low-rank compression is scored only by the printed\n"
+              << "    far-field reciprocity residual, not by a verdict.\n";
+    std::cout << "  * fault injection does not reach arm H: the hooks perturb the dense\n"
+              << "    matrix runProductionVF returns, so arm H is SKIPPED under\n"
+              << "    PTM_VFGATE_INJECT_*, not silently passed.\n";
     std::cout << "  * the GPU BVH visibility path (benchmark_gpu_visibility): the\n"
               << "    calculator above uses Embree on the CPU in every configuration.\n";
     std::cout << "  * the radiosity SOLVE. This program scores geometry only.\n";

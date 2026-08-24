@@ -271,8 +271,22 @@ def backface_counts(outdir, jobs):
     return det, blk
 
 
-def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=False):
-    """Run the per-partner referee over every face, in `jobs` parallel chunks."""
+def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=False,
+          keps=0.2):
+    """Run the per-partner referee over every face, in `jobs` parallel chunks.
+
+    `keps` is mc_ref_pp's rise-march self-relief threshold, as a fraction of the
+    launch face's edge length: a hit whose out-of-plane rise from the launch
+    face is below it is dismissed as the face's own local relief and the march
+    continues past it. 0.2 is what every caller in this repository passes, and
+    it is defensible on a DEM heightfield. It is NOT free on a smoothly curved
+    surface, where adjacent facets are near-coplanar and there is no self-relief
+    to reject: measured 2026-08-23 on a 648-face spherical cap, the mean terrain
+    view factor reads -5.798 percent against the Ingersoll closed form at
+    keps = 0.2, -0.832 at 0.05, +0.626 at 0.01 and +0.874 at 0.001, and the
+    deficit is INDEPENDENT of ray budget, so it is a filter bias and not noise.
+    Parameterized so test_vf_cross_agreement.py can both avoid it and measure
+    it; the default is unchanged, so every existing caller is unaffected."""
     outdir.mkdir(parents=True, exist_ok=True)
     chunks = np.array_split(np.arange(nfaces), jobs)
     env = dict(os.environ)
@@ -287,7 +301,7 @@ def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=Fals
         fl.write_text("\n".join(str(int(i)) for i in ch) + "\n")
         log = open(outdir / f"log_{k:02d}.txt", "w")
         procs.append((subprocess.Popen(
-            [binary, str(mesh), str(tmax), str(fl), str(nrays), "1e-4", "0.2", "1",
+            [binary, str(mesh), str(tmax), str(fl), str(nrays), "1e-4", str(keps), "1",
              str(outdir / f"pp_{k:02d}.bin")], stdout=log, stderr=subprocess.STDOUT, env=env),
             log, k))
     bad = []
@@ -303,7 +317,8 @@ def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=Fals
     got = sorted(glob.glob(str(outdir / "pp_*.bin")))
     if len(got) != jobs:
         raise SystemExit(f"FATAL: expected {jobs} sweep chunks, found {len(got)}")
-    print(f"  sweep NRAYS={nrays}: {jobs} chunks, {nfaces} faces, {time.time()-t0:.0f}s")
+    print(f"  sweep NRAYS={nrays} keps={keps}: {jobs} chunks, {nfaces} faces, "
+          f"{time.time()-t0:.0f}s")
     return str(outdir / "pp_*.bin")
 
 
