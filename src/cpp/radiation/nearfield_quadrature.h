@@ -28,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <limits>
 
 #include "radiation_config.h"
 
@@ -67,6 +68,155 @@ inline bool isNearFieldPair(double r, double A_i, double A_j, double window_fact
     return r < window_factor * (std::sqrt(A_i) + std::sqrt(A_j));
 }
 
+// ---------------------------------------------------------------------------
+// The occlusion ray -- ONE rule, both in-engine builders.
+//
+// A centroid-to-centroid visibility segment has to start clear of the source
+// facet and stop clear of the target facet, or the ray reports the pair
+// occluded by the two faces it is asking about. Until 2026-08-23 both builders
+// did that with
+//
+//     offset = clamp(max(0.001 r, 0.5 m), .., 0.1 r)   at each end, and
+//     "a segment shorter than 0.1 m after both margins is VISIBLE"
+//
+// which is three absolute lengths in meters in a code base whose facets run
+// from 2.48 mm (the moon3d polar patch) to 80 m (A3GT rings). On a sub-meter
+// mesh the 0.1 m auto-pass swallows the whole segment: EVERY pair closer than
+// about 0.125 m -- fifty facet widths -- skipped the occlusion test entirely
+// and was recorded visible. See [[ptm-shadow-ray-offset-scale-bug]], and note
+// that this is the VIEW-FACTOR path, not the solar-shadow one; the two failed
+// the same way for the same reason and must be fixed separately.
+//
+// The replacement is relative to the geometry, with the constants argued from
+// it rather than tuned:
+//
+//   * The margin's job is to leave the source facet's own footprint. A
+//     triangle's centroid is about 0.3 L from its edges for L = sqrt(2 A), so
+//     any margin up to ~0.25 L moves the origin WITHIN the source facet's own
+//     cell. Nothing can be vaulted there that is not the source facet itself,
+//     which is the one thing the margin exists to skip. That is the ceiling.
+//     kRayMarginFaceFrac = 0.02 sits well under it and still clears the
+//     triangle's float32 footprint on every mesh in this project.
+//
+//   * Embree traverses in float32. If the margin is smaller than the
+//     quantization of the ray origin's own coordinates it does not exist: the
+//     cast to float rounds it away. kRayMarginUlps ulps of the larger endpoint
+//     coordinate is therefore a FLOOR, not a tuning knob. It is what the old
+//     0.5 m actually was -- 4 ulps of a lunar selenocentric coordinate, whose
+//     ulp is 0.125 m -- discovered rather than declared.
+//
+//   * The pair is "touching, assume visible" when the segment left after both
+//     margins is below that same float32 floor, i.e. when float32 cannot
+//     resolve the gap. Not when it is below a tenth of a meter.
+//
+// If the floor exceeds the ceiling the scene cannot be ray-traced in float32 at
+// those coordinates at all, and the caller is told (unresolvable) rather than
+// handed a silently meaningless answer. Recentering the scene is the cure; the
+// engine already does it, `vf_dump_sparse` does not.
+inline constexpr double kRayMarginFaceFrac = 0.02;   // margin as a fraction of sqrt(2A)
+inline constexpr double kRayMarginFaceCap  = 0.25;   // never leave the source facet's cell
+inline constexpr double kRayMarginDistCap  = 0.40;   // and never eat the whole segment
+inline constexpr double kRayMarginUlps     = 8.0;    // float32 quantization floor
+
+// One float32 ulp at the largest coordinate magnitude the ray will touch.
+inline double sceneUlp(const std::array<double, 3>& a,
+                       const std::array<double, 3>& b) {
+    double m = 0.0;
+    for (int k = 0; k < 3; ++k) {
+        m = std::max(m, std::abs(a[k]));
+        m = std::max(m, std::abs(b[k]));
+    }
+    const float f = static_cast<float>(m);
+    const float nx = std::nextafter(f, std::numeric_limits<float>::infinity());
+    const double u = static_cast<double>(nx) - static_cast<double>(f);
+    return (u > 0.0) ? u : static_cast<double>(std::numeric_limits<float>::denorm_min());
+}
+
+struct VisibilitySegment {
+    std::array<double, 3> origin{{0.0, 0.0, 0.0}};  // in SCENE coordinates
+    std::array<double, 3> dir{{1.0, 0.0, 0.0}};
+    double tfar = -1.0;        // < 0 means: do not trace
+    bool auto_visible = false; // segment below the float32 floor: touching
+    bool unresolvable = false; // float32 floor exceeds the facet-cell ceiling
+};
+
+// Build the occlusion segment for a pair, given each end's face AREA and the
+// mesh -> scene translation (zero when the scene is in mesh coordinates).
+// `pa`/`pb` are the two centroids in MESH coordinates; the caller is
+// responsible for passing them in canonical (lower face index first) order, so
+// that the float32 traversal cannot answer differently from the two ends.
+// The pre-2026-08-23 absolute-meter rule, kept so the A/B that justifies the
+// replacement is runnable on ONE binary instead of resting on a build that no
+// longer exists. PTM_VF_RAY_LEGACY=1 selects it; it warns, and it is a control,
+// not a production setting.
+bool visibilityRayLegacyRequested();
+
+inline VisibilitySegment visibilityRayLegacy(const std::array<double, 3>& pa,
+                                             const std::array<double, 3>& pb,
+                                             const std::array<double, 3>& scene_shift) {
+    VisibilitySegment seg;
+    const std::array<double, 3> d = {{pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]}};
+    const double r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (!(r > 0.0)) { seg.auto_visible = true; return seg; }
+    seg.dir = {{d[0] / r, d[1] / r, d[2] / r}};
+
+    const double absolute_offset = 0.5;
+    double offset = std::max(r * 0.001, absolute_offset);
+    offset = std::min(offset, r * 0.1);
+    double end_margin = std::max(r * 0.001, absolute_offset);
+    end_margin = std::min(end_margin, r * 0.1);
+
+    seg.origin = {{pa[0] - scene_shift[0] + offset * seg.dir[0],
+                   pa[1] - scene_shift[1] + offset * seg.dir[1],
+                   pa[2] - scene_shift[2] + offset * seg.dir[2]}};
+    const double tfar = r - offset - end_margin;
+    if (tfar < 0.1) { seg.auto_visible = true; seg.tfar = -1.0; return seg; }
+    seg.tfar = tfar;
+    return seg;
+}
+
+inline VisibilitySegment visibilityRay(const std::array<double, 3>& pa,
+                                       const std::array<double, 3>& pb,
+                                       double area_a, double area_b,
+                                       const std::array<double, 3>& scene_shift) {
+    if (visibilityRayLegacyRequested())
+        return visibilityRayLegacy(pa, pb, scene_shift);
+
+    VisibilitySegment seg;
+
+    const std::array<double, 3> d = {{pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]}};
+    const double r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (!(r > 0.0)) { seg.auto_visible = true; return seg; }
+    seg.dir = {{d[0] / r, d[1] / r, d[2] / r}};
+
+    const std::array<double, 3> sa = {{pa[0] - scene_shift[0], pa[1] - scene_shift[1],
+                                       pa[2] - scene_shift[2]}};
+    const std::array<double, 3> sb = {{pb[0] - scene_shift[0], pb[1] - scene_shift[1],
+                                       pb[2] - scene_shift[2]}};
+    const double floor_len = kRayMarginUlps * sceneUlp(sa, sb);
+
+    auto margin = [&](double area) {
+        const double L = std::sqrt(2.0 * std::max(area, 0.0));
+        const double ceiling = std::min(kRayMarginFaceCap * L, kRayMarginDistCap * r);
+        double m = std::max(kRayMarginFaceFrac * L, floor_len);
+        if (m > ceiling) {
+            if (floor_len > ceiling) seg.unresolvable = true;
+            m = ceiling;
+        }
+        return m;
+    };
+
+    const double ma = margin(area_a);
+    const double mb = margin(area_b);
+
+    seg.origin = {{sa[0] + ma * seg.dir[0], sa[1] + ma * seg.dir[1],
+                   sa[2] + ma * seg.dir[2]}};
+    const double tfar = r - ma - mb;
+    if (tfar <= floor_len) { seg.auto_visible = true; seg.tfar = -1.0; return seg; }
+    seg.tfar = tfar;
+    return seg;
+}
+
 // Sample points for one face at a given near-field quadrature order; capacity
 // is kMaxNearFieldQuadPoints (radiation_config.h). Deliberately NOT
 // value-initialized: two of these are stack-constructed per near pair and only
@@ -94,7 +244,17 @@ namespace detail {
 // factor to zero.
 inline std::atomic<long long> g_nearfield_bound_clamps{0};
 inline std::atomic<int> g_nearfield_bound_worst_ratio_ppm{0};  // (g/g_max - 1) in ppm
+
+// Pairs whose float32 margin floor exceeded the facet-cell ceiling -- the scene
+// coordinates are too large for its facets and no occlusion ray at that pair
+// means anything. Reported, never absorbed.
+inline std::atomic<long long> g_visibility_unresolvable{0};
 }  // namespace detail
+
+// One pair could not be ray-traced in float32 at these scene coordinates.
+inline void noteVisibilityUnresolvable() {
+    detail::g_visibility_unresolvable.fetch_add(1, std::memory_order_relaxed);
+}
 
 // Out-of-line so this header does not pull in <iostream>; see the buffer-
 // capacity clamp guard in subCentroidPoints() below.
@@ -283,5 +443,9 @@ inline double nearFieldPairIntegral(const std::array<double, 3>& a0,
 // and this must survive. `builder` names which VF path fired it, because the
 // counters are process-wide and shared between them.
 void reportNearFieldBoundClamps(const char* builder, int order);
+
+// Report (and reset) the float32-unresolvable pair count. Prints nothing when
+// it did not fire.
+void reportVisibilityUnresolvable(const char* builder);
 
 }  // namespace radiation

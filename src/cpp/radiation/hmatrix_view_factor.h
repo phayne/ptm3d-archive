@@ -494,8 +494,10 @@ private:
     bool isNearFieldPair(int face_i, int face_j, double r) const;
 
     // Visibility check
-    bool isVisible(const std::array<double, 3>& p1,
-                   const std::array<double, 3>& p2) const;
+    // Mutual visibility of two faces, by ONE Embree ray through the shared
+    // scale-aware rule (radiation::visibilityRay). Face INDICES, canonical
+    // order; the margins depend on the two faces' own sizes.
+    bool isVisible(int face_a, int face_b) const;
 
     // Vector utilities
     static std::array<double, 3> subtract(const std::array<double, 3>& a,

@@ -187,12 +187,12 @@ private:
         const std::vector<NeighborData>& neighbors);
 
     // Visibility check using Embree
-    bool isVisible(const std::array<double, 3>& p1, const std::array<double, 3>& p2);
-
-    // Batch visibility check (more efficient)
-    std::vector<bool> checkVisibilityBatch(
-        const std::vector<std::array<double, 3>>& origins,
-        const std::vector<std::array<double, 3>>& targets);
+    // Mutual visibility of two faces, by ONE Embree ray through the shared
+    // scale-aware rule (radiation::visibilityRay). Takes face INDICES, not
+    // points, because the margins are relative to the two faces' own sizes and
+    // a caller holding only centroids cannot supply that. Pass them in
+    // canonical (lower index first) order.
+    bool isVisible(int face_a, int face_b);
 
     // Find potential neighbors within search radius
     std::vector<int> findNeighbors(int face_idx, double radius);

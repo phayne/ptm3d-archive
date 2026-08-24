@@ -1663,6 +1663,7 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     // prints nothing when it did not fire.
     reportNearFieldBoundClamps("H-matrix builder",
                                rad_config_.nearfield_quadrature_order);
+    reportVisibilityUnresolvable("H-matrix builder");
 
     // NOT behind verbose. Which entries of this matrix came through the ACA
     // cross generators, and how close those pairs got to the near-field window,
@@ -4047,8 +4048,7 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
     // CANONICAL (min index first) order. Mutual visibility is symmetric;
     // isVisible() is not exactly symmetric in its arguments, and letting the
     // float32 traversal decide puts a direction-dependent zero into the matrix.
-    if (!isVisible(face_centers_[std::min(face_i, face_j)],
-                   face_centers_[std::max(face_i, face_j)])) return 0.0;
+    if (!isVisible(std::min(face_i, face_j), std::max(face_i, face_j))) return 0.0;
 
     // M1 (centroid) estimate is a far-field approximation. In the near field
     // (centers closer than a few face-widths) it overshoots, so refine with
@@ -4076,23 +4076,21 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
 // The optional normal lift (PTM_HMATRIX_RAY_LIFT, default 0 and therefore
 // inert) lifts along the ORIGIN face's normal, which under canonical ordering
 // is the lower-indexed face rather than the asking one.
-void HMatrixViewFactor::setCanonicalVisibilityRay(int face_i, int face_j, double r,
+void HMatrixViewFactor::setCanonicalVisibilityRay(int face_i, int face_j, double /*r*/,
                                                   RayCandidate& cand) const {
     const int fa = std::min(face_i, face_j);
     const int fb = std::max(face_i, face_j);
-    const auto& pa = face_centers_[fa];
-    const auto& pb = face_centers_[fb];
 
-    std::array<double, 3> dir = {{(pb[0] - pa[0]) / r, (pb[1] - pa[1]) / r,
-                                  (pb[2] - pa[2]) / r}};
+    // face_centers_ are already in SCENE coordinates here (build() subtracts
+    // the bbox-center shift when it fills them), so the shared kernel is handed
+    // a zero shift.
+    const VisibilitySegment seg = visibilityRay(face_centers_[fa], face_centers_[fb],
+                                                face_areas_[fa], face_areas_[fb],
+                                                {{0.0, 0.0, 0.0}});
+    if (seg.unresolvable) noteVisibilityUnresolvable();
 
-    const double relative_offset = r * 0.001;
-    const double absolute_offset = 0.5;
-    double offset = std::max(relative_offset, absolute_offset);
-    offset = std::min(offset, r * 0.1);
-
-    cand.origin = {{pa[0] + offset * dir[0], pa[1] + offset * dir[1],
-                    pa[2] + offset * dir[2]}};
+    cand.origin = seg.origin;
+    cand.dir = seg.dir;
     const double rl = getRayLiftFactor();
     if (rl > 0.0) {
         const double nl = rl * std::sqrt(2.0 * face_areas_[fa]);
@@ -4100,12 +4098,7 @@ void HMatrixViewFactor::setCanonicalVisibilityRay(int face_i, int face_j, double
         cand.origin[1] += nl * face_normals_[fa][1];
         cand.origin[2] += nl * face_normals_[fa][2];
     }
-    cand.dir = dir;
-
-    double end_margin = std::max(r * 0.001, absolute_offset);
-    end_margin = std::min(end_margin, r * 0.1);
-    cand.tfar = static_cast<float>(r - offset - end_margin);
-    if (cand.tfar < 0.1f) cand.tfar = -1.0f;  // too close: assume visible
+    cand.tfar = (seg.tfar < 0.0) ? -1.0f : static_cast<float>(seg.tfar);
 }
 
 bool HMatrixViewFactor::isNearFieldPair(int fi, int fj, double r) const {
@@ -4193,41 +4186,24 @@ double HMatrixViewFactor::computeViewFactorRefined(int fi, int fj) const {
     return g / face_areas_[fi];
 }
 
-bool HMatrixViewFactor::isVisible(const std::array<double, 3>& p1,
-                                   const std::array<double, 3>& p2) const {
-    auto dir = subtract(p2, p1);
-    double dist = length(dir);
-    if (dist < 1e-10) return true;
-
-    dir = {{dir[0] / dist, dir[1] / dist, dir[2] / dist}};
-
-    // Use both relative and absolute offsets (from view_factor.cpp)
-    double relative_offset = dist * 0.001;
-    double absolute_offset = 0.5;
-    double offset = std::max(relative_offset, absolute_offset);
-    offset = std::min(offset, dist * 0.1);
-
-    std::array<double, 3> origin = {{
-        p1[0] + offset * dir[0],
-        p1[1] + offset * dir[1],
-        p1[2] + offset * dir[2]
-    }};
-
-    double end_margin = std::max(dist * 0.001, absolute_offset);
-    end_margin = std::min(end_margin, dist * 0.1);
-    double tfar = dist - offset - end_margin;
-
-    if (tfar < 0.1) return true;
+bool HMatrixViewFactor::isVisible(int face_a, int face_b) const {
+    // ONE rule, shared with the sparse builder: radiation::visibilityRay().
+    // face_centers_ are already in scene coordinates (see build()).
+    const VisibilitySegment seg = visibilityRay(face_centers_[face_a], face_centers_[face_b],
+                                                face_areas_[face_a], face_areas_[face_b],
+                                                {{0.0, 0.0, 0.0}});
+    if (seg.unresolvable) noteVisibilityUnresolvable();
+    if (seg.auto_visible || seg.tfar <= 0.0) return true;
 
     RTCRayHit rayhit;
-    rayhit.ray.org_x = static_cast<float>(origin[0]);
-    rayhit.ray.org_y = static_cast<float>(origin[1]);
-    rayhit.ray.org_z = static_cast<float>(origin[2]);
-    rayhit.ray.dir_x = static_cast<float>(dir[0]);
-    rayhit.ray.dir_y = static_cast<float>(dir[1]);
-    rayhit.ray.dir_z = static_cast<float>(dir[2]);
+    rayhit.ray.org_x = static_cast<float>(seg.origin[0]);
+    rayhit.ray.org_y = static_cast<float>(seg.origin[1]);
+    rayhit.ray.org_z = static_cast<float>(seg.origin[2]);
+    rayhit.ray.dir_x = static_cast<float>(seg.dir[0]);
+    rayhit.ray.dir_y = static_cast<float>(seg.dir[1]);
+    rayhit.ray.dir_z = static_cast<float>(seg.dir[2]);
     rayhit.ray.tnear = 0.0f;
-    rayhit.ray.tfar = static_cast<float>(tfar);
+    rayhit.ray.tfar = static_cast<float>(seg.tfar);
     rayhit.ray.mask = 0xFFFFFFFF;
     rayhit.ray.flags = 0;
     rayhit.ray.time = 0.0f;
