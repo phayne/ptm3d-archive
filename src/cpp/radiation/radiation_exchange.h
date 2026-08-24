@@ -901,6 +901,11 @@ private:
     void* device_ = nullptr;  // RTCDevice
     void* scene_ = nullptr;   // RTCScene
     bool scene_initialized_ = false;
+    // The bbox-center translation applied to scene_'s vertices before the
+    // float32 conversion (initEmbree). Every builder that fires a ray into
+    // scene_ must translate its ray ORIGINS by this; see
+    // ViewFactorCalculator::setSceneOriginShift().
+    std::array<double, 3> scene_origin_shift_{{0.0, 0.0, 0.0}};
 
     // View factor data
     ViewFactorMatrix view_factors_;

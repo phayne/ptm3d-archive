@@ -302,53 +302,27 @@ static void batchedVisibilityTest(
     }
 }
 
-// Prepare ray from two points with appropriate offsets to avoid self-intersection
+// Prepare ray for one pair, through the SHARED scale-aware rule
+// (radiation::visibilityRay, nearfield_quadrature.h). p1/p2 are centroids in
+// MESH coordinates, in canonical order; area1/area2 are their faces' areas.
 static RayCandidate prepareRay(
     const std::array<double, 3>& p1,
     const std::array<double, 3>& p2,
-    int neighbor_idx) {
+    double area1,
+    double area2,
+    int neighbor_idx,
+    const std::array<double, 3>& scene_shift) {
 
     RayCandidate ray;
     ray.neighbor_idx = neighbor_idx;
 
-    // Compute direction
-    std::array<double, 3> dir = {{p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]}};
-    double dist = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+    const radiation::VisibilitySegment seg =
+        radiation::visibilityRay(p1, p2, area1, area2, scene_shift);
+    if (seg.unresolvable) radiation::noteVisibilityUnresolvable();
 
-    if (dist < 1e-10) {
-        // Same point - mark as invalid ray
-        ray.origin = p1;
-        ray.dir = {{1.0, 0.0, 0.0}};
-        ray.tfar = -1.0f;
-        return ray;
-    }
-
-    // Normalize
-    dir[0] /= dist;
-    dir[1] /= dist;
-    dir[2] /= dist;
-
-    // Compute offset (same logic as isVisible)
-    double relative_offset = dist * 0.001;
-    double absolute_offset = 0.5;
-    double offset = std::max(relative_offset, absolute_offset);
-    offset = std::min(offset, dist * 0.1);
-
-    // Compute ray origin with offset
-    ray.origin = {{
-        p1[0] + offset * dir[0],
-        p1[1] + offset * dir[1],
-        p1[2] + offset * dir[2]
-    }};
-    ray.dir = dir;
-
-    // Compute tfar
-    double end_margin = std::max(dist * 0.001, absolute_offset);
-    end_margin = std::min(end_margin, dist * 0.1);
-    double tfar = dist - offset - end_margin;
-
-    ray.tfar = (tfar < 0.1f) ? -1.0f : static_cast<float>(tfar);  // -1 means skip (too close)
-
+    ray.origin = seg.origin;
+    ray.dir = seg.dir;
+    ray.tfar = (seg.tfar < 0.0) ? -1.0f : static_cast<float>(seg.tfar);
     return ray;
 }
 
@@ -825,6 +799,12 @@ static std::atomic<int> g_subdiv_vis_reject{0};
 static std::atomic<int> g_subdiv_accepted{0};
 static std::atomic<int> g_subdiv_weight_zero{0};
 
+// Pairs whose occlusion ray was never traced because the segment left after
+// both margins was shorter than the auto-pass floor -- "assumed visible". On a
+// mesh whose facets are smaller than the margins this is EVERY near pair, and
+// before 2026-08-23 it was reported nowhere.
+static std::atomic<long long> g_ray_autopass{0};
+
 // The near-field physical-bound tripwire counters now live in
 // nearfield_quadrature.h, next to the clamp that increments them, because the
 // H-matrix builder shares both.
@@ -990,7 +970,12 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
                 for (int face_j : neighbors) {
                     double F_ij = computeAdaptive(face_i, face_j);
 
-                    if (F_ij > config_.visibility_threshold) {
+                    // Symmetric storage floor: keep or drop is a property of
+                    // the PAIR, not of the direction being asked. See
+                    // radiation::keepPairEntryF.
+                    if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                                  face_areas_[face_j],
+                                                  config_.visibility_threshold)) {
                         local_rows[tid].push_back(face_i);
                         local_cols[tid].push_back(face_j);
                         local_vals[tid].push_back(F_ij);
@@ -1070,6 +1055,43 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
     F.buildFromTriplets(n_total, all_rows, all_cols, all_vals);
 
     reportNearFieldBoundClamps();
+    radiation::reportVisibilityUnresolvable("sparse builder");
+
+    // NOT behind verbose. How many candidate pairs the occlusion ray actually
+    // rejected is the only evidence in the log that the ray did anything at
+    // all: a ray fired into a scene it is not registered with, or one whose
+    // margins swallow the whole segment, returns "visible" for every pair and
+    // is indistinguishable from a mesh with no occlusion. A zero here on
+    // concave terrain is a defect, not a clean bill of health.
+    {
+        const long long far_rej = g_vis_reject.load();
+        const long long near_rej = g_subdiv_vis_reject.load();
+        const long long far_ok = g_accepted.load();
+        const long long near_ok = g_subdiv_accepted.load();
+        const long long tried = far_rej + near_rej + far_ok + near_ok;
+        const long long autopass = g_ray_autopass.load();
+        std::cout << "  Occlusion: " << (far_rej + near_rej) << " of " << tried
+                  << " candidate pairs rejected as blocked ("
+                  << far_rej << " far, " << near_rej << " near); "
+                  << autopass << " never traced (segment shorter than the margins)";
+        if (tried > 0 && far_rej + near_rej == 0) {
+            std::cout << "\n             WARNING: NOTHING was occluded. On concave terrain "
+                         "that is a defect, not a clean result.";
+        }
+        std::cout << std::endl;
+
+        // Reset unconditionally. These used to be cleared only inside the
+        // verbose block, so a non-verbose run that called computeSubset twice
+        // reported the SECOND build's counts as the sum of both.
+        g_angle_reject = 0;
+        g_vis_reject = 0;
+        g_accepted = 0;
+        g_first_accept_printed = false;
+        g_subdiv_weight_zero = 0;
+        g_subdiv_vis_reject = 0;
+        g_subdiv_accepted = 0;
+        g_ray_autopass = 0;
+    }
 
     if (config_.verbose) {
         std::cout << "View factor matrix: " << F.numRows() << " x " << F.numCols()
@@ -1089,15 +1111,6 @@ ViewFactorMatrix ViewFactorCalculator::computeSubset(const std::vector<int>& fac
         std::cout << "  Rejected (weight_sum=0, all angles bad): " << g_subdiv_weight_zero.load() << std::endl;
         std::cout << "  Rejected by visibility: " << g_subdiv_vis_reject.load() << std::endl;
         std::cout << "  Accepted: " << g_subdiv_accepted.load() << std::endl;
-
-        // Reset for next run
-        g_angle_reject = 0;
-        g_vis_reject = 0;
-        g_accepted = 0;
-        g_first_accept_printed = false;
-        g_subdiv_weight_zero = 0;
-        g_subdiv_vis_reject = 0;
-        g_subdiv_accepted = 0;
 
         // Diagnostic: Check row sum variation (indicates view factor consistency)
         auto row_sums = F.rowSums();
@@ -1242,8 +1255,7 @@ double ViewFactorCalculator::computeCentroid(int face_i, int face_j) {
     // the same segment. Letting that decide puts a direction-dependent ZERO
     // into an otherwise analytically reciprocal estimator. computeSubdivision
     // has canonicalized since 2026-08-23; the far field does now too.
-    if (!isVisible(face_centers_[std::min(face_i, face_j)],
-                   face_centers_[std::max(face_i, face_j)])) {
+    if (!isVisible(std::min(face_i, face_j), std::max(face_i, face_j))) {
         g_vis_reject++;
         return 0.0;
     }
@@ -1278,7 +1290,7 @@ double ViewFactorCalculator::computeSubdivision(int face_i, int face_j, int orde
     // is a symmetric geometric relation; the ray-offset arithmetic in
     // isVisible() is not exactly symmetric in its arguments, and letting that
     // decide would put a direction-dependent zero back into the estimator.
-    if (!isVisible(face_centers_[fa], face_centers_[fb])) {
+    if (!isVisible(fa, fb)) {
         g_subdiv_vis_reject++;
         return 0.0;
     }
@@ -1357,8 +1369,7 @@ double ViewFactorCalculator::computeWithPrecomputed(int face_i, int face_j,
     }
 
     // Check visibility using ray tracing, canonical order (see computeCentroid).
-    if (!isVisible(face_centers_[std::min(face_i, face_j)],
-                   face_centers_[std::max(face_i, face_j)])) {
+    if (!isVisible(std::min(face_i, face_j), std::max(face_i, face_j))) {
         return 0.0;
     }
 
@@ -1430,7 +1441,9 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
             // either way, the float32 traversal is not.
             const int fa = std::min(face_i, fn.face_j);
             const int fb = std::max(face_i, fn.face_j);
-            RayCandidate ray = prepareRay(face_centers_[fa], face_centers_[fb], fn.idx);
+            RayCandidate ray = prepareRay(face_centers_[fa], face_centers_[fb],
+                                          face_areas_[fa], face_areas_[fb], fn.idx,
+                                          scene_origin_shift_);
             rays.push_back(ray);
         }
 
@@ -1441,12 +1454,18 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
         // Compute view factors for visible pairs
         for (size_t r = 0; r < far_neighbors.size(); ++r) {
             // Skip invalid rays (tfar < 0 means too close, treat as visible)
-            bool is_visible = (rays[r].tfar < 0.0f) ? true : visible[r];
+            const bool auto_pass = (rays[r].tfar < 0.0f);
+            bool is_visible = auto_pass ? true : visible[r];
+            if (auto_pass) g_ray_autopass++;
+            else if (!is_visible) g_vis_reject++;
+            else g_accepted++;
 
             if (is_visible) {
                 const auto& fn = far_neighbors[r];
                 double F_ij = (fn.A_j / M_PI) * (fn.cos_i * fn.cos_j) / fn.r2;
-                if (F_ij > config_.visibility_threshold) {
+                if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                              face_areas_[fn.face_j],
+                                              config_.visibility_threshold)) {
                     results.push_back({fn.face_j, F_ij});
                 }
             }
@@ -1457,7 +1476,9 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
     for (size_t idx : near_neighbor_indices) {
         const auto& nd = neighbors[idx];
         double F_ij = computeSubdivision(face_i, nd.neighbor_idx, config_.nearfield_quadrature_order);
-        if (F_ij > config_.visibility_threshold) {
+        if (radiation::keepPairEntryF(F_ij, face_areas_[face_i],
+                                      face_areas_[nd.neighbor_idx],
+                                      config_.visibility_threshold)) {
             results.push_back({nd.neighbor_idx, F_ij});
         }
     }
@@ -1465,54 +1486,27 @@ std::vector<std::pair<int, double>> ViewFactorCalculator::computeViewFactorsBatc
     return results;
 }
 
-bool ViewFactorCalculator::isVisible(const std::array<double, 3>& p1,
-                                     const std::array<double, 3>& p2) {
-    // Ray from p1 toward p2
-    auto dir = subtract(p2, p1);
-    double dist = length(dir);
-    if (dist < 1e-10) return true;  // Same point
+bool ViewFactorCalculator::isVisible(int face_a, int face_b) {
+    // ONE rule, shared with the H-matrix builder: radiation::visibilityRay()
+    // in nearfield_quadrature.h. Scale-relative margins, a float32 floor taken
+    // from the scene's own coordinates, and an auto-pass that fires when the
+    // gap is below that floor rather than below a hard-coded tenth of a meter.
+    const radiation::VisibilitySegment seg = radiation::visibilityRay(
+        face_centers_[face_a], face_centers_[face_b],
+        face_areas_[face_a], face_areas_[face_b], scene_origin_shift_);
 
-    // Normalize direction
-    dir = {{dir[0] / dist, dir[1] / dist, dir[2] / dist}};
+    if (seg.unresolvable) radiation::noteVisibilityUnresolvable();
+    if (seg.auto_visible || seg.tfar <= 0.0) { g_ray_autopass++; return true; }
 
-    // Use BOTH relative and absolute offsets to avoid self-intersection.
-    // The relative offset handles long-distance rays, while the absolute
-    // offset (based on typical face size) handles short-distance rays
-    // where a tiny relative offset might still hit the source face.
-    //
-    // For crater meshes with ~20m face edges, use 0.5m as minimum offset.
-    double relative_offset = dist * 0.001;  // 0.1% of distance
-    double absolute_offset = 0.5;           // 0.5m minimum
-    double offset = std::max(relative_offset, absolute_offset);
-
-    // Clamp offset to at most 10% of distance to avoid overshooting for nearby faces
-    offset = std::min(offset, dist * 0.1);
-
-    std::array<double, 3> origin = {{
-        p1[0] + offset * dir[0],
-        p1[1] + offset * dir[1],
-        p1[2] + offset * dir[2]
-    }};
-
-    // Similarly, stop the ray before reaching p2 with adequate margin
-    double end_margin = std::max(dist * 0.001, absolute_offset);
-    end_margin = std::min(end_margin, dist * 0.1);
-    double tfar = dist - offset - end_margin;
-
-    // If the effective ray length is too short, consider it visible
-    // (faces are essentially touching)
-    if (tfar < 0.1) return true;
-
-    // Create ray
     RTCRayHit rayhit;
-    rayhit.ray.org_x = static_cast<float>(origin[0]);
-    rayhit.ray.org_y = static_cast<float>(origin[1]);
-    rayhit.ray.org_z = static_cast<float>(origin[2]);
-    rayhit.ray.dir_x = static_cast<float>(dir[0]);
-    rayhit.ray.dir_y = static_cast<float>(dir[1]);
-    rayhit.ray.dir_z = static_cast<float>(dir[2]);
+    rayhit.ray.org_x = static_cast<float>(seg.origin[0]);
+    rayhit.ray.org_y = static_cast<float>(seg.origin[1]);
+    rayhit.ray.org_z = static_cast<float>(seg.origin[2]);
+    rayhit.ray.dir_x = static_cast<float>(seg.dir[0]);
+    rayhit.ray.dir_y = static_cast<float>(seg.dir[1]);
+    rayhit.ray.dir_z = static_cast<float>(seg.dir[2]);
     rayhit.ray.tnear = 0.0f;
-    rayhit.ray.tfar = static_cast<float>(tfar);
+    rayhit.ray.tfar = static_cast<float>(seg.tfar);
     rayhit.ray.mask = 0xFFFFFFFF;
     rayhit.ray.flags = 0;
     rayhit.ray.time = 0.0f;
@@ -1520,32 +1514,9 @@ bool ViewFactorCalculator::isVisible(const std::array<double, 3>& p1,
     rayhit.hit.primID = RTC_INVALID_GEOMETRY_ID;
     rayhit.hit.instID[0] = RTC_INVALID_GEOMETRY_ID;
 
-    // Trace ray
     rtcIntersect1(scene_, &rayhit);
 
-    // Visible if no hit (geomID remains invalid)
     return rayhit.hit.geomID == RTC_INVALID_GEOMETRY_ID;
-}
-
-std::vector<bool> ViewFactorCalculator::checkVisibilityBatch(
-    const std::vector<std::array<double, 3>>& origins,
-    const std::vector<std::array<double, 3>>& targets) {
-
-    size_t n = origins.size();
-    std::vector<bool> visible(n, false);
-
-    // Process in batches for cache efficiency
-    constexpr size_t BATCH_SIZE = 64;
-
-    for (size_t start = 0; start < n; start += BATCH_SIZE) {
-        size_t end = std::min(start + BATCH_SIZE, n);
-
-        for (size_t i = start; i < end; ++i) {
-            visible[i] = isVisible(origins[i], targets[i]);
-        }
-    }
-
-    return visible;
 }
 
 std::vector<int> ViewFactorCalculator::findNeighbors(int face_idx, double radius) {

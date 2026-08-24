@@ -1,7 +1,8 @@
 # View-factor unification — design
 
-Status: **stage 1 implemented** (`feat/vf-unification-stage1`), stages 2–4 proposed and
-**awaiting decisions from Paul** (§5). Written 2026-08-23.
+Status: **stages 1 and 2 implemented** (`feat/vf-unification-stage1`, `feat/vf-unification-stage2`).
+Paul ruled on D1–D6 on 2026-08-23; §5 records each ruling and what stage 2 measured or built
+for it. Written 2026-08-23.
 
 Paul's standing top science priority is *one physics across all paths*. For the thermal solver
 that priority produced the divergence map (`SESSION-NOTES-2026-08-11`); this document is the
@@ -255,6 +256,81 @@ physics of a pair.
 
 ---
 
+## 4b. What stage 2 changed, and what it measured
+
+Five commits. Every number below is on `lunar_crater_80N` (12,800 faces, 17.7 m facets) unless
+stated otherwise, at `OMP_NUM_THREADS=48` for the validation arms and 8 for the builder probes.
+
+### 4b.1 The H-matrix matvec is deterministic
+
+`HMatrixViewFactor::matvec()` ran `parallel for schedule(dynamic)` over every root block and
+accumulated into `y` through `#pragma omp atomic`, so the order threads reached a given `y[i]`
+was not fixed and 338 of 12,800 faces moved by one ULP between runs. Root blocks are now grouped
+so no two groups write the same row, disjointness **verified** rather than assumed, each group
+summed by one thread in fixed block order. Four consecutive runs byte-identical at 8 and at 48
+threads; negative control `PTM_HMATRIX_MATVEC_ATOMIC=1` red 3 of 3.
+
+The build was never the problem: a new `contentHash()`, printed on every build with the build
+thread count, read `0xbe50eb778db92c5a` across four runs and across 4, 8 and 48 threads while the
+temperatures moved. That measurement is what separated the two failure modes.
+
+### 4b.2 ⛔ The sparse builder was doing NO occlusion at all
+
+`initEmbree` recenters the scene vertices on the mesh bounding box before the float32 conversion
+(`adc2aa5`, 2026-07-20). `ViewFactorCalculator`'s `face_centers_` stay in the mesh frame, and
+nobody told it. Every occlusion ray started 1.74e6 m from the geometry:
+
+| | pairs rejected as blocked |
+|---|---|
+| engine, before | **0** of 1,307,376 |
+| `vf_dump_sparse` (scene and rays both in the mesh frame) | 1,226,778 of 7,536,236 |
+| engine, after | 224,412 of 1,521,968 |
+
+Effect on `baseline_crater80N_vfbuild_sparse`: 2,626 of 12,800 faces, `temperature_max` median
+−0.0064 K, **worst −6.52 K**, every face cooling. Affects any run that BUILDS a sparse `.vf`
+in-engine on a mesh whose bounding-box center is far from the body center — every DEM patch under
+the 100,000-face H-matrix promotion threshold. `test_vf_production` builds its own scene at mesh
+coordinates and is blind to it by construction.
+
+### 4b.3 One scale-relative occlusion ray (D5)
+
+Same crater at three facet sizes, geometry and absolute coordinates identical:
+
+| facet | rule | rejected as blocked | never traced | nnz |
+|---|---|---|---|---|
+| 17.7 m | retired | 224,412 | 0 | 1,297,556 |
+| 17.7 m | new | 224,412 | 0 | 1,297,556 |
+| 0.177 m | retired | 212,364 | 108 | 1,302,540 |
+| 0.177 m | new | 232,718 | 0 | 1,297,556 |
+| 1.77 mm | retired | **0** | 1,468,252 | 1,307,376 |
+| 1.77 mm | new | 102,635 | 0 | 1,297,556 |
+
+The new rule returns the same nnz at all three scales; the absolute rule cannot. On the 1.77 mm
+copy the temperature effect is 2,626 faces, worst **−7.84 K**. On the 17.7 m gate mesh the two
+rules make the same decision on every pair, because $0.02\sqrt{2A} = 0.500$ m there — the retired
+constant, exactly.
+
+### 4b.4 The Monte-Carlo builder (D2)
+
+Reciprocity by combining the two directions with divisor 2; the near field from the shared
+quadrature over a geometry-enumerated pair set; the sky channel derived rather than accumulated.
+Gate arm **[M]**: closure +1.86 percent against the closed form (the sparse builder reads +2.04
+on the same mesh), reciprocity 3.9e-16, worst near-field entry against the sparse builder
+6.0e-16, 39,180 near pairs present. Negative control `PTM_MC_LEGACY=1`: **M2 and M3 red at 0.90
+and 0.89 while M1 still passes** — the closure test cannot see either defect.
+
+Two further scene-coupling defects surfaced and were fixed: the builder recomputed the
+bounding-box shift itself, and it ignored `mesh->face_normals` in favor of an "away from the
+origin" rule. Given a mesh-frame scene the first produced 33 partners per face instead of 425;
+the second produced an entirely empty matrix. Neither errored.
+
+### 4b.5 The storage floor and the pre-cull (D4)
+
+Both now direction-independent. The floor moves 11 entries and 0.000005 percent of the mass on
+this mesh; 20 near pairs bypass the M1 pre-cull and the arm is byte-identical either way.
+
+---
+
 ## 5. Decision points for Paul
 
 Each of these is a real choice with a cost, not an oversight. Stage 1 deliberately stopped
@@ -279,6 +355,29 @@ The remaining gap is that nobody has measured what the missing near-field treatm
 shipped A3GT/moon3d matrices. That measurement is cheap on the surviving raw sweeps and does
 not require changing the assembler. **Recommend: measure first, decide after.**
 
+**RULED (Paul, 2026-08-23): measure first. MEASURED** — `~/projects/ada_vfstage2_2026-08-23/d1_table.txt`,
+from the surviving raw sweeps, no re-sweep and no rebuild:
+
+| product | faces | facet | near-field mass share | RAW sweep vs engine M2 | estimator bias alone | worst face |
+|---|---|---|---|---|---|---|
+| moon3d fig8-hybrid core | 140,091 | 172 m | 20.34% | −22.50% | **+0.62%** | +0.033 K |
+| A3GT A03MP026 core | 2,397,890 | 2.00 m | 6.33% | −23.95% | **+0.73%** | +0.020 K |
+| A3GT A03N1016 core | 1,798,135 | 2.04 m | 8.67% | −35.78% | **+1.42%** | +0.057 K |
+| A3GT A03SP010 core | 8,746 | 56.8 m | 6.63% | −22.92% | **+1.14%** | +0.014 K |
+
+The raw column and the bias column are different questions. The raw difference conflates the
+estimator's near-field bias (positive) with the sweep's occlusion and its `keps` = 0.2 self-relief
+filter (both negative), and is 30 times the size of either. Separating them by the sweep's ratio to
+its **own** analytic estimator — a point emitter at the centroid against a subdivided receiver,
+which is what a centroid-launched gather estimates with no occlusion — leaves the estimator bias
+alone, and it is under 1.5 percent mass-weighted on every product. By $\sigma T^4$ linearization at
+250 K that is **at most 0.06 K on the worst sampled face and under 0.01 K at the 95th percentile**.
+
+⛔ **The 509k moon3d product's raw sweep does NOT survive.** What survives under
+`~/projects/moon3d/vf/fig8_hybrid_sweep/` is the fig8-hybrid 140k core at 172 m facets. The 509k
+patch is 2.48 mm-faceted, a regime this table does not reach, and §4b.3 shows the occlusion rule
+alone is worth −7.84 K there.
+
 **D2. Should the Monte-Carlo builder get a near-field treatment, or be documented as
 far-field-only?**
 
@@ -289,6 +388,8 @@ partners' MC estimates with the shared quadrature); (c) retire it in favor of th
 the out-of-core path is trusted. (b) is the only one that makes it "one physics", and it is the
 most work. **No recommendation without a measurement of how much near-field mass a 4M-face mesh
 actually carries.**
+
+**RULED (Paul, 2026-08-23): (b), give it the near field. DONE**, see §4b.4 and gate arm [M].
 
 **D3. Is `w = 4` the right window, and should the H-matrix keep its adaptive order?**
 
@@ -311,6 +412,10 @@ near pair whose refined value would clear the floor can be deleted on the streng
 estimate the builder itself considers wrong there. Both are one-line changes with unmeasured
 cost.
 
+**RULED (Paul, 2026-08-23): implement both. DONE**, see §4b.5. Both can only ADD entries; both
+are measured inert on every mesh available here, and the pre-cull's reachable population (20
+pairs on the gate mesh) is now a printed number rather than an argument.
+
 **D5. The 0.5 m absolute ray offset.**
 
 `max(0.001 r, 0.5 m)` capped at `0.1 r`, plus "a segment shorter than 0.1 m after both margins
@@ -319,6 +424,9 @@ wrong on a sub-meter mesh. On the 2.48 mm-facet moon3d patch every near pair ski
 occlusion test entirely. This is [[ptm-shadow-ray-offset-scale-bug]] and it is a *physics* bug,
 not a unification one; it is listed here because any fix must land in the shared
 `visibilityRay()` of §4 rather than in one builder.
+
+**RULED (Paul, 2026-08-23): yes, make it scale-aware. DONE**, see §4b.3. `visibilityRay()` now
+exists, in `nearfield_quadrature.h`, and is the only copy.
 
 **D6. Which production artifacts change, and what re-runs that implies.**
 
@@ -331,6 +439,12 @@ not a unification one; it is listed here because any fix must land in the shared
 | flux-cube `.fcg` caches | nothing | none |
 
 Nothing in stage 1 forces a re-run. Everything in stage 1 changes what a **new** build produces.
+
+**RULED (Paul, 2026-08-23): no re-runs of anything now.** Stage 2 does not change that for cached
+artifacts, but it does change the reading of §4b.2 for any sparse `.vf` BUILT in-engine on a DEM
+patch since 2026-07-20: such a matrix has no occlusion in it. Whether any shipped product came
+from that path is a provenance question, not a code question, and this document does not answer
+it.
 
 ---
 
@@ -363,13 +477,18 @@ arithmetically exact extraction move the last digit: a pure code motion moved
   success *even when the requested tolerance was not met* — on crater80N it produced NEGATIVE
   view factors and a fabricated 17 percent mass difference. Use
   `HMatrixViewFactor::computeDenseReference()` (`:4222`).
-* **The `moon_crater80N_vfbuild_hmatrix` arm is not reproducible run to run.**
-  `statistics/_raw/temperature_sum.bin` differs between two runs of the *same* binary — 481 of
-  12,800 faces, max $|\Delta T_{mean}| = 5.7 \times 10^{-14}$ K, summation-order round-off.
-  Verified twice on two different binaries. That file cannot gate anything until it is fixed.
-  The sparse arm is 32/32 reproducible.
+* ~~**The `moon_crater80N_vfbuild_hmatrix` arm is not reproducible run to run.**~~ **FIXED in
+  stage 2.** The cause was not the build: the assembled matrix's content digest was identical
+  across four runs while the temperatures moved. It was `HMatrixViewFactor::matvec()`, which ran
+  `parallel for schedule(dynamic)` over every root block and accumulated through
+  `#pragma omp atomic`, so the order threads reached a given `y[i]` was not fixed. Root blocks are
+  now grouped by written row — verified disjoint, not assumed — and each group is summed by one
+  thread in fixed block order. Four consecutive runs are byte-identical at 8 and at 48 threads.
 * **`ptm_thermal_sim`'s md5 depends on the worktree path** — it embeds the absolute
   `data/kernels` directory — so the same commit built in two worktrees gives two md5s.
   `test_vf_production` and `test_bowl_crater` do not and reproduce exactly.
-* **Statistics are thread-count dependent.** The same binary at `OMP_NUM_THREADS=16` and at 48
-  gives different `temperature_sum.bin`. The banked manifests record no thread count.
+* **Statistics are thread-count dependent.** The same binary at `OMP_NUM_THREADS=8` and at 48
+  gives different `temperature_sum.bin`, and nothing else. Since stage 2 the engine writes
+  `omp_max_threads` into `provenance.txt`, `ptm_validate_baseline.py bank` records it, and
+  `verify` reports a thread-count change before the byte verdict. Manifests banked before that
+  carry no thread count and `verify` says so rather than comparing silently.

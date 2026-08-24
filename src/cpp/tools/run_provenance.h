@@ -54,6 +54,12 @@ struct RunProvenance {
     std::size_t mesh_faces = 0;
     std::string mesh_length_unit;  // "meters" | "kilometers" | "unknown"
     double      mesh_median_radius = 0.0;  // in the unit above
+    // omp_get_max_threads() as the ENGINE sees it. Filled by the caller, not
+    // read here: this translation unit is compiled into ptm_tools, which does
+    // not link OpenMP, so an omp_get_max_threads() call in this file would
+    // compile out to a confident "1" and put a lie in the provenance. 0 = the
+    // caller did not supply it, and the file says so.
+    int         omp_max_threads = 0;
 };
 
 // Write provenance.txt (and config_used.yaml, when a config was loaded).

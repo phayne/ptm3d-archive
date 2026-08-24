@@ -145,6 +145,27 @@ public:
     // report names which builder is speaking.
     void reportNearFieldBoundClamps();
 
+    // The constant translation that maps MESH coordinates into the coordinates
+    // of the Embree scene this calculator was handed.
+    //
+    // RadiationExchangeManager recenters the scene vertices on the mesh
+    // bounding-box center before the float32 conversion, because at lunar
+    // selenocentric magnitudes (|z| ~ 1.7e6 m) one float32 ulp is 0.125 m and a
+    // meter-scale patch collapses. `face_centers_` here stay in the MESH frame
+    // -- the outward-normal convention is defined against the body center at
+    // the origin and would break if they moved -- so every ray this class fires
+    // must be translated by this shift, and only at the point where the ray is
+    // formed.
+    //
+    // Default zero, for callers whose scene is in the mesh frame
+    // (vf_dump_sparse, test harnesses). Getting this wrong does not produce a
+    // wrong answer, it produces NO answer: the ray starts 1.7e6 m off the
+    // geometry, hits nothing, and every pair reads as mutually visible.
+    void setSceneOriginShift(const std::array<double, 3>& shift) {
+        scene_origin_shift_ = shift;
+    }
+    const std::array<double, 3>& sceneOriginShift() const { return scene_origin_shift_; }
+
     // Get precomputed face data
     const std::vector<std::array<double, 3>>& getFaceCenters() const { return face_centers_; }
     const std::vector<std::array<double, 3>>& getFaceNormals() const { return face_normals_; }
@@ -166,12 +187,12 @@ private:
         const std::vector<NeighborData>& neighbors);
 
     // Visibility check using Embree
-    bool isVisible(const std::array<double, 3>& p1, const std::array<double, 3>& p2);
-
-    // Batch visibility check (more efficient)
-    std::vector<bool> checkVisibilityBatch(
-        const std::vector<std::array<double, 3>>& origins,
-        const std::vector<std::array<double, 3>>& targets);
+    // Mutual visibility of two faces, by ONE Embree ray through the shared
+    // scale-aware rule (radiation::visibilityRay). Takes face INDICES, not
+    // points, because the margins are relative to the two faces' own sizes and
+    // a caller holding only centroids cannot supply that. Pass them in
+    // canonical (lower index first) order.
+    bool isVisible(int face_a, int face_b);
 
     // Find potential neighbors within search radius
     std::vector<int> findNeighbors(int face_idx, double radius);
@@ -217,6 +238,7 @@ private:
     RadiationConfig config_;
 
     // Precomputed face data
+    std::array<double, 3> scene_origin_shift_{{0.0, 0.0, 0.0}};
     std::vector<std::array<double, 3>> face_centers_;
     std::vector<std::array<double, 3>> face_normals_;
     std::vector<double> face_areas_;

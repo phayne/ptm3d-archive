@@ -137,6 +137,27 @@ def engine_sha_from_runs(run_dirs) -> str:
     return next(iter(seen))
 
 
+def run_threads(run_dir: str) -> dict:
+    """The thread count a run actually executed at, from its own provenance.
+
+    Statistics are thread-count dependent: several OpenMP reductions in the
+    solver and in the statistics accumulators sum in thread-partition order, so
+    the same binary on the same config at 8 and at 48 threads writes different
+    bytes. A manifest that does not record this compares two runs that were
+    never comparable, and the byte verdict below would be read as a physics
+    regression.
+    """
+    prov = os.path.join(run_dir, "provenance.txt")
+    out = {}
+    if not os.path.exists(prov):
+        return out
+    for line in open(prov, errors="replace"):
+        for key in ("omp_max_threads", "omp_num_threads_env"):
+            if line.startswith(key + "="):
+                out[key] = line.split("=", 1)[1].strip()
+    return out
+
+
 def git_sha(repo: str) -> str:
     git = "/Library/Developer/CommandLineTools/usr/bin/git"
     git = git if os.path.exists(git) else "git"
@@ -175,9 +196,16 @@ def cmd_bank(args: argparse.Namespace) -> int:
             print(f"ERROR: --arm expects NAME=RUNDIR, got {spec!r}", file=sys.stderr)
             return 2
         name, run_dir = spec.split("=", 1)
+        threads = run_threads(run_dir)
         arms[name] = {"run_dir": os.path.abspath(run_dir),
+                      "threads": threads,
                       "files": digest_run(run_dir)}
-        print(f"  banked {name}: {len(arms[name]['files'])} files")
+        if not threads:
+            print(f"  WARNING: {name} records no thread count (engine older "
+                  f"than the omp_max_threads provenance key). A later verify "
+                  f"cannot tell a thread-count change from a physics change.")
+        print(f"  banked {name}: {len(arms[name]['files'])} files"
+              f"{', ' + threads['omp_max_threads'] + ' threads' if threads.get('omp_max_threads') else ''}")
 
     configs = {}
     for spec in args.config:
@@ -302,6 +330,19 @@ def cmd_verify(args: argparse.Namespace) -> int:
             problems += 1
             continue
         banked = manifest["arms"][name]["files"]
+        banked_threads = manifest["arms"][name].get("threads") or {}
+        now_threads = run_threads(run_dir)
+        b_nt = banked_threads.get("omp_max_threads")
+        n_nt = now_threads.get("omp_max_threads")
+        if b_nt is None or n_nt is None:
+            print(f"PROVENANCE SKIPPED for {name}: thread count unknown "
+                  f"(banked {b_nt!r}, now {n_nt!r}). Byte-identity across an "
+                  f"unknown thread-count change is not evidence about physics.")
+        elif b_nt != n_nt:
+            print(f"PROVENANCE: {name} ran at {n_nt} threads, banked at {b_nt}. "
+                  f"Statistics are thread-count dependent; a byte diff below is "
+                  f"expected and says NOTHING about the change under test. "
+                  f"Re-run at {b_nt} threads before reading the verdict.")
         try:
             now = digest_run(run_dir)
         except FileNotFoundError as exc:

@@ -119,6 +119,7 @@
 
 #include "../mesh/mesh_utils.h"
 #include "hmatrix_view_factor.h"
+#include "mc_view_factor.h"
 #include "radiation_config.h"
 #include "view_factor.h"
 
@@ -742,6 +743,32 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
 // r / 4d = 2.04, and on the cap below they see none. An arm that asserts the
 // cross generators handle a near pair correctly, run at defaults, would be
 // green because it measured NOTHING. See arm [U].
+// The Monte-Carlo ray-gather builder (mc_view_factor.cpp), through the same
+// production-style committed Embree scene the other two use.
+//
+// NOTE the frame: this scene is at MESH coordinates, and computeMonteCarlo
+// recenters its ray origins on the mesh bounding box. On a gate mesh built
+// around the origin that shift is nothing, and the two agree. On a lunar
+// selenocentric patch they would not, which is exactly the class of defect the
+// scene-shift plumbing in ViewFactorCalculator now exists to prevent -- and
+// this gate cannot see it, by construction.
+DenseVF runMonteCarloVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
+                        int rays_per_face) {
+    RTCDevice dev = rtcNewDevice(nullptr);
+    RTCScene scene = makeScene(dev, *b.mesh);
+    radiation::ViewFactorMatrix F;
+    {
+        std::ostringstream sink;
+        std::streambuf* saved = std::cout.rdbuf(sink.rdbuf());
+        F = radiation::computeMonteCarlo(b.mesh, dev, scene, cfg, rays_per_face);
+        std::cout.rdbuf(saved);
+    }
+    DenseVF d = densify(F);
+    rtcReleaseScene(scene);
+    rtcReleaseDevice(dev);
+    return d;
+}
+
 DenseVF runHMatrixVF(const BuiltMesh& b, const radiation::RadiationConfig& cfg,
                      bool no_truncation = false, bool force_dense = false,
                      size_t* cross_near_pairs = nullptr, bool stress_blocks = false) {
@@ -1013,6 +1040,24 @@ int main(int argc, char** argv) {
     // production configuration: 0.617% measured (0.156% with compression off).
     // 2% is 3.2x.
     double tol_hmat_mass = 2.0e-2;
+    // ARM M tolerances -- the Monte-Carlo builder.
+    //
+    // M1 is wider than the sparse arm's closed-form tolerance by the gather's
+    // own sampling error and by the cap's faceting residual, which at 348 faces
+    // is the larger of the two; the arm prints the sparse builder's reading on
+    // the same mesh so the two are separable by eye.
+    double tol_mc_ingersoll = 4.0;
+    // M2 is a ROUND-OFF bound, not a tolerance: after the reciprocity
+    // combination A_i F_ij == A_j F_ji is an algebraic identity of the stored
+    // entries, so anything above accumulated float error is a defect. The
+    // pre-fix builder reads O(1) here.
+    double tol_mc_recip = 1.0e-9;
+    // M3 is the WORST near-field entry against the sparse builder. Both now
+    // call radiation::nearFieldPairIntegral() on the same pair set, so what is
+    // left is the occlusion convention and float error, not estimator drift --
+    // this is a relative residual, and the pre-fix builder reads O(1) on it.
+    double tol_mc_agree_near = 1.0e-6;
+
     // ARM U tolerances -- the stage-1 unification invariants. Pinned from the
     // arm's own printout on the same 1,404-face cap, 2026-08-23; see the arm.
     double min_cross_near_pairs = 100.0;
@@ -1661,14 +1706,100 @@ int main(int argc, char** argv) {
                      gp.mass_near, tol_unify_mass, all_ok);
     }
 
+    // ------------------------------------------------------------------------ ARM M
+    // The Monte-Carlo ray-gather builder. Skipped under fault injection for the
+    // same reason arm H is: the hooks perturb a DenseVF from runProductionVF,
+    // which this arm does not go through, so a "control" here would be a clean
+    // run wearing a control's label.
+    if (!inj.active()) {
+        std::cout << "\n=== ARM M: the MONTE-CARLO ray-gather builder ===\n";
+        std::cout << "  radiation.use_monte_carlo_vf selects a THIRD in-engine builder,\n"
+                  << "  because H-matrix build memory is infeasible above roughly 4M\n"
+                  << "  faces. Until 2026-08-23 it was ungated, it was NOT reciprocal at\n"
+                  << "  any ray budget, and it had no near-field treatment at all: a\n"
+                  << "  touching pair was estimated by the same centroid-launched\n"
+                  << "  hemisphere sampler as a distant one, so it carried exactly the\n"
+                  << "  M1 bias the other two builders removed. It now combines the two\n"
+                  << "  directions of each pair and takes in-window pairs from the shared\n"
+                  << "  quadrature. This arm holds that.\n";
+
+        // A cap small enough that a 200k-ray-per-face gather is seconds, not
+        // minutes, and coarse enough that a real fraction of its coupling mass
+        // is in the near field -- which is the part the fix is about.
+        BuiltMesh b = buildSphericalCap(0.2, 100.0, 12, 20);
+        auto cfg = noTruncationConfig(b.mesh->faces.size());
+        const double f_closed = ingersollTerrainVF(0.2 * 100.0, 50.0);
+        const int rays = 200000;
+
+        DenseVF dm = runMonteCarloVF(b, cfg, rays);
+        DenseVF ds = runProductionVF(b, cfg, Injection{}, nullptr);
+
+        auto meanRowSum = [](const DenseVF& d) {
+            double m = 0.0;
+            for (size_t i = 0; i < d.n; ++i) {
+                double row = 0.0;
+                for (size_t j = 0; j < d.n; ++j) row += d.at(i, j);
+                m += row;
+            }
+            return m / static_cast<double>(d.n);
+        };
+        const double mean_m = meanRowSum(dm);
+        const double mean_s = meanRowSum(ds);
+
+        std::cout << "  " << b.mesh->faces.size() << " faces, " << rays
+                  << " rays/face; the SPARSE builder on this same mesh reads "
+                  << std::fixed << std::setprecision(6) << mean_s << " ("
+                  << std::showpos << std::setprecision(4)
+                  << 100.0 * (mean_s / f_closed - 1.0) << "%" << std::noshowpos
+                  << "), so the cap's faceting residual is common to both\n";
+
+        // [M1] the closed form. Tolerance is wider than the sparse arm's by the
+        // gather's own sampling error, which at this budget is ~1/sqrt(N) per
+        // entry and much smaller on a row sum.
+        verdict("M1", "MC terrain VF, mean over cap faces", mean_m, f_closed,
+                tol_mc_ingersoll, all_ok);
+
+        // [M2] reciprocity. An identity of the OTHER two builders' kernels and,
+        // before this change, false for this one at every budget. Now exact by
+        // construction, so it is gated at round-off and not at a tolerance.
+        const double floor_F = cfg.visibility_threshold;
+        const RecipResult rm = reciprocity(dm, b, cfg.nearfield_window_factor, floor_F);
+        std::cout << "  MC reciprocity, entries >= " << std::scientific
+                  << std::setprecision(0) << floor_F << std::defaultfloat << ": "
+                  << rm.pairs_far << " far, " << rm.pairs_near << " near, "
+                  << rm.pairs_one_sided << " one-sided\n";
+        verdictBelow("M2", "MC reciprocity, worst |A_i F_ij / A_j F_ji - 1|",
+                     std::max(rm.worst_near, rm.worst_far), tol_mc_recip, all_ok);
+
+        // [M3] cross-builder agreement on the NEAR field specifically. This is
+        // the arm the near-field replacement exists for; the far field is
+        // sampling noise and is reported, not gated.
+        const AgreeResult am = agreement(ds, dm, b, 1.0e-3, cfg.nearfield_window_factor);
+        std::cout << "  MC vs SPARSE, entries above 1e-3 of peak: " << am.compared
+                  << " compared, " << am.only_sparse << " sparse-only, " << am.only_hmat
+                  << " MC-only; area-weighted mass disagreement " << std::fixed
+                  << std::setprecision(4) << 100.0 * am.mass_rel << "%, worst near "
+                  << std::scientific << std::setprecision(3) << am.worst_near
+                  << ", worst far " << am.worst_far << std::defaultfloat << "\n";
+        verdictBelow("M3", "MC vs sparse, worst NEAR-field entry disagreement",
+                     am.worst_near, tol_mc_agree_near, all_ok);
+
+        // [M0] the exposure counter. M3 is VACUOUS on a mesh with no near pairs,
+        // and this project has already shipped one silently vacuous arm.
+        verdictAbove("M0", "near-field pairs this mesh actually presents",
+                     static_cast<double>(rm.pairs_near), 100.0, all_ok);
+    }
+
     // ------------------------------------------------------------------------
     std::cout << "\n=== NOT COVERED BY THIS PROGRAM ===\n";
     std::cout << "  * the OFFLINE sweep + assembler (mc_ref_pp + assemble_vf_haworth.py):\n"
               << "    gated separately by scripts/ptm12_diag/test_vf_assembler_gate.py,\n"
               << "    and cross-checked against this builder by\n"
               << "    scripts/ptm12_diag/test_vf_cross_agreement.py.\n";
-    std::cout << "  * the Monte-Carlo ray-gather builder (mc_view_factor.cpp), selected\n"
-              << "    by use_monte_carlo_vf: still UNGATED.\n";
+    std::cout << "  * the Monte-Carlo builder's FAR field. Arm M gates its closure, its\n"
+              << "    reciprocity and its NEAR-field agreement with the sparse builder;\n"
+              << "    the far field is a sampling estimate and is reported, not gated.\n"
+              << "    Nothing here runs it at production scale (>4M faces) either.\n";
     std::cout << "  * the H-matrix builder's FAR field. Arm H gates its near-field\n"
               << "    kernel, its closure and its agreement with the sparse builder, but\n"
               << "    its ACA low-rank compression is scored only by the printed\n"

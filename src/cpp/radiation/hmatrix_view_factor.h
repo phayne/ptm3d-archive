@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <cmath>
 #include <algorithm>
@@ -300,6 +301,33 @@ public:
     // Statistics
     void printStatistics() const;
 
+    // A deterministic 64-bit digest of everything the assembled matrix stores:
+    // block structure, index maps, and every stored double, visited in a fixed
+    // order (root-block index, then child order) that does not depend on which
+    // thread built which block.
+    //
+    // This exists to separate two failure modes that look identical from the
+    // outside. If two runs of the same binary give different results but the
+    // same digest, the BUILD is deterministic and the difference is downstream
+    // (the matvec's reduction order). If the digest itself moves, the matrix is
+    // not the same matrix, and no amount of downstream care will fix it.
+    //
+    // Returns 0 and warns for a disk-backed or mmap-loaded matrix, whose bytes
+    // this walk does not own; a 0 return means "not computed", never "empty".
+    uint64_t contentHash() const;
+
+    // One log line: the digest, the build thread count, and what it cost.
+    // Honors PTM_HMATRIX_CONTENT_HASH=0, and says so when it does.
+    void printContentDigest() const;
+
+    // The bbox-center translation build() applied to its ray origins, which
+    // MUST equal the one the caller applied to the Embree scene vertices.
+    // Exposed for checking, not for use.
+    const std::array<double, 3>& sceneOriginShift() const { return scene_origin_shift_; }
+
+    // Thread count block assembly actually ran at, 0 if build() has not run.
+    int buildThreads() const { return hmatrix_build_threads_; }
+
     // How many pairs the ACA cross generators (computeViewFactorRow/Column)
     // evaluated on the most recent build(), and how many of those fell inside
     // this builder's near-field window. Process-wide, reset by build().
@@ -466,8 +494,10 @@ private:
     bool isNearFieldPair(int face_i, int face_j, double r) const;
 
     // Visibility check
-    bool isVisible(const std::array<double, 3>& p1,
-                   const std::array<double, 3>& p2) const;
+    // Mutual visibility of two faces, by ONE Embree ray through the shared
+    // scale-aware rule (radiation::visibilityRay). Face INDICES, canonical
+    // order; the margins depend on the two faces' own sizes.
+    bool isVisible(int face_a, int face_b) const;
 
     // Vector utilities
     static std::array<double, 3> subtract(const std::array<double, 3>& a,
@@ -536,6 +566,15 @@ private:
     mutable size_t num_disk_blocks_ = 0;
     mutable size_t total_nnz_ = 0;
 
+    // The thread count build() actually used for block assembly. Recorded
+    // because the assembled matrix and every statistic downstream of it are
+    // thread-count dependent, and a provenance line that omits the thread count
+    // cannot be checked against a later run.
+    int hmatrix_build_threads_ = 0;
+
+    // Mesh -> scene translation applied to ray origins (see build()).
+    std::array<double, 3> scene_origin_shift_{{0.0, 0.0, 0.0}};
+
     // Out-of-core support
     bool out_of_core_enabled_ = false;
     std::string out_of_core_file_;
@@ -582,6 +621,29 @@ private:
 
     // Helper to perform matvec using mmap'd data
     void matvecMmapBlock(size_t block_idx, const double* x, double* y) const;
+
+    // ---- Deterministic matvec scheduling -----------------------------------
+    // The flat "parallel for over every root block, accumulate through omp
+    // atomic" schedule this class used to run gives a DIFFERENT answer every
+    // run at the same thread count, because floating-point addition is not
+    // associative and the order threads reach a given y[i] is not fixed. On
+    // the 12,800-face 80 N crater arm that showed up as 338 of 12,800 faces
+    // moving by one ULP -- enough to make the arm unbankable.
+    //
+    // The cure is structural, not a tolerance: root blocks are grouped so that
+    // no two groups write the same row of y, and each group is then processed
+    // by exactly one thread, in fixed block order. Disjointness is VERIFIED,
+    // never assumed; if verification fails the class falls back to the old
+    // schedule and says so out loud.
+    enum class MatvecSchedule {
+        Unknown,      // not yet determined
+        RowGroups,    // root blocks form an N x N grid; group = block row
+        PerBlock,     // every root block owns its rows alone
+        Legacy        // rows are shared across root blocks: atomic, NOT reproducible
+    };
+    mutable MatvecSchedule matvec_schedule_ = MatvecSchedule::Unknown;
+    mutable size_t matvec_grid_dim_ = 0;   // N, when schedule is RowGroups
+    void prepareMatvecSchedule() const;
 
     // Helper to scan a block during mmap loading
     bool scanBlockForMmap(const char* data, size_t file_size, size_t& offset, size_t& out_block_idx);
