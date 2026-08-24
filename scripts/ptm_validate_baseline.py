@@ -9,9 +9,10 @@ Two subcommands:
   bank    Walk a set of finished run directories, digest every output file the
           suite compares, and write a single `baseline_manifest.json` that
           records the digests together with the provenance that makes them
-          meaningful: engine commit, engine binary md5, every dynamic library
-          the engine links (Embree above all), and the md5 of each config that
-          produced an arm.
+          meaningful: engine commit, engine binary md5, the build's own CMake
+          flags (`PTM_ARCH_NATIVE` above all), every dynamic library the engine
+          links (Embree above all), and the md5 of each config that produced an
+          arm.
 
   verify  Re-digest the same run directories and compare against a banked
           manifest. Any digest mismatch is a regression. Any provenance
@@ -76,6 +77,54 @@ def digest_run(run_dir: str, subdir: str = "statistics") -> dict:
             out[rel] = {"md5": md5_file(full), "bytes": os.path.getsize(full)}
     if not out:
         raise FileNotFoundError(f"{root} contains no comparable files")
+    return out
+
+
+def build_flags(binary: str) -> dict:
+    """The CMake cache variables that change the code the compiler generates.
+
+    An engine binary md5 identifies a build but does not EXPLAIN it, and the
+    manifest previously recorded no build configuration at all. That gap cost a
+    month: `validate-baseline-2026-08-15` was cut from a `PTM_ARCH_NATIVE=ON`
+    build (AVX2 + AVX-512), every later worktree configured `OFF`, and the
+    resulting byte differences were read as unexplained physics drift for eight
+    days across four branches. Rebuilding `ecf635a` with `ON` reproduces the
+    banked lunar radiation-off arm 16/16; with `OFF` it does not, and the actual
+    physical difference is one face at 3.2e-20 -- a denormal.
+
+    So the flags are read from the build's own `CMakeCache.txt` rather than
+    asked of the operator: a field that must be remembered is a field that will
+    be forgotten, and this one was.
+
+    Returns `{"_cmake_cache": <path>, "<VAR>": "<value>", ...}`, or a record
+    carrying `_error` when the cache cannot be read. It never returns silently
+    empty -- a missing cache is reported, because "no flags recorded" and "flags
+    recorded as absent" are different claims.
+    """
+    # <build>/bin/ptm_thermal_sim -> <build>/CMakeCache.txt
+    build_dir = os.path.dirname(os.path.dirname(os.path.abspath(binary)))
+    cache = os.path.join(build_dir, "CMakeCache.txt")
+    wanted = ("CMAKE_BUILD_TYPE", "PTM_ARCH_NATIVE", "PTM_ENABLE_GPU",
+              "GPU_BACKEND", "PTM_USE_VTK_READER", "BUILD_SHARED_LIBS",
+              "CMAKE_CXX_COMPILER", "CMAKE_CXX_FLAGS")
+    out = {"_cmake_cache": cache}
+    if not os.path.exists(cache):
+        out["_error"] = ("no CMakeCache.txt beside the binary; build flags are "
+                         "UNRECORDED for this arm")
+        return out
+    try:
+        with open(cache, errors="replace") as fh:
+            for line in fh:
+                name, sep, rest = line.partition(":")
+                if not sep or "=" not in rest:
+                    continue
+                if name in wanted:
+                    out[name] = rest.split("=", 1)[1].strip()
+    except OSError as exc:
+        out["_error"] = f"could not read {cache}: {exc}"
+    missing = [k for k in wanted if k not in out]
+    if missing:
+        out["_absent_from_cache"] = missing
     return out
 
 
@@ -184,7 +233,13 @@ def _binary_records(paths) -> dict:
                 f"two --binary arguments both key to {key!r} "
                 f"({out[key]['path']} and {path}); rename a build directory or "
                 f"the manifest would silently record only one of them")
+        flags = build_flags(path)
+        if "_error" in flags:
+            print(f"  WARNING: {key}: {flags['_error']}. A later verify cannot "
+                  f"tell an ISA/build-configuration change from a physics "
+                  f"change; PTM_ARCH_NATIVE alone moves bytes.")
         out[key] = {"path": path, "md5": md5_file(path),
+                    "build_flags": flags,
                     "libraries": linked_libraries(path)}
     return out
 
@@ -229,7 +284,9 @@ def cmd_bank(args: argparse.Namespace) -> int:
               f"from -- verify it before trusting this manifest.")
 
     manifest = {
-        "schema": "ptm3d-validation-baseline/1",
+        # /2 adds binaries[*].build_flags. `verify` reads /1 manifests and says
+        # so rather than assuming their ISA configuration.
+        "schema": "ptm3d-validation-baseline/2",
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "baseline_tag": args.tag,
         "engine_git_sha": engine_sha,
@@ -298,12 +355,40 @@ def cmd_verify(args: argparse.Namespace) -> int:
         brec = banked_bins.get(key)
         if brec is None:
             print(f"PROVENANCE SKIPPED: --binary {spec} keys to {key!r}, which is "
-                  f"not in the manifest (it has {sorted(banked_bins)}). Its linked "
-                  f"libraries were NOT checked against anything.")
+                  f"not in the manifest (it has {sorted(banked_bins)}). Neither its "
+                  f"linked libraries NOR its build flags were checked against "
+                  f"anything -- and the key is the build DIRECTORY name, so this "
+                  f"fires exactly when you compare two differently-configured "
+                  f"builds, which is when the flags matter most. This build reports "
+                  f"PTM_ARCH_NATIVE="
+                  f"{build_flags(spec).get('PTM_ARCH_NATIVE', 'unknown')}.")
             continue
         if md5_file(spec) != brec.get("md5"):
             print(f"PROVENANCE: engine binary {key} differs -- banked "
                   f"{brec.get('md5')}, now {md5_file(spec)}.")
+
+        # Build configuration, before the bytes. `PTM_ARCH_NATIVE` alone moves
+        # bytes with no source change at all, so a byte verdict taken across it
+        # is answering a different question.
+        was_flags = brec.get("build_flags")
+        now_flags = build_flags(spec)
+        if was_flags is None:
+            print(f"PROVENANCE SKIPPED for binary {key}: this manifest predates "
+                  f"build-flag recording, so the ISA configuration it was cut at "
+                  f"is UNKNOWN. Baselines cut before 2026-08-24 on this machine "
+                  f"were built with PTM_ARCH_NATIVE=ON; the current build reports "
+                  f"{now_flags.get('PTM_ARCH_NATIVE', 'unknown')}. Treat a byte "
+                  f"diff below as unattributable until the baseline is re-cut.")
+        else:
+            for var in sorted(set(was_flags) | set(now_flags)):
+                if var.startswith("_"):
+                    continue
+                if was_flags.get(var) != now_flags.get(var):
+                    print(f"PROVENANCE: build flag {var} differs for {key} -- "
+                          f"banked {was_flags.get(var)!r}, now "
+                          f"{now_flags.get(var)!r}. Generated code differs, so "
+                          f"byte-identity is NOT expected across it.")
+
         libs = linked_libraries(spec)
         for lib, was in brec.get("libraries", {}).items():
             now_lib = libs.get(lib)
