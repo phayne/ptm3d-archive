@@ -121,6 +121,40 @@ static std::atomic<size_t> g_subdiv_leaves_sparse{0};    // Sub-blocks computed 
 static std::atomic<size_t> g_subdiv_leaves_zero{0};      // Sub-blocks genuinely empty
 static std::atomic<size_t> g_subdiv_depth_cap_zero{0};   // LAST-RESORT: leaf still huge at depth cap -> zeroed
 
+// Near-field EXPOSURE of the ACA cross generators.
+//
+// computeViewFactorRow/Column are the matrix-entry oracles ACA samples to build
+// a low-rank factorization. They see the same pairs computeViewFactorBlock sees,
+// so if a pair is close enough that the M1 centroid estimate is wrong, it is
+// wrong here too -- and until 2026-08-23 these two generators were the only VF
+// code in the engine with NO near-field branch at all. Whether a close pair got
+// the M2 quadrature therefore depended on which BLOCK the octree happened to put
+// it in, which is not a physical property of the pair.
+//
+// These counters exist so the exposure is a measured number rather than an
+// argument. A gate that asserts "the cross generators agree with the dense
+// generator on near pairs" is vacuous if the cross generators never saw one --
+// this is what makes that arm non-vacuous.
+// The MARGIN matters as much as the count. On the two meshes measured
+// 2026-08-23 the count is zero -- but "zero" alone does not say whether the
+// admissibility condition misses the near-field window by a factor of 20 or by
+// 5 percent, and the answer decides whether the gap is unreachable or merely
+// unreached. So the closest approach is recorded too, as min r / (4 d).
+static std::atomic<size_t> g_cross_pairs{0};        // pairs surviving culling in row/col
+static std::atomic<size_t> g_cross_near_pairs{0};   // ... of those, r < 4 d (the near window)
+static std::atomic<double> g_cross_min_r_over_4d{1.0e300};
+
+static inline void noteCrossPair(double r, double d4) {
+    ++g_cross_pairs;
+    const double ratio = (d4 > 0.0) ? r / d4 : 1.0e300;
+    if (ratio < 1.0) ++g_cross_near_pairs;
+    double prev = g_cross_min_r_over_4d.load(std::memory_order_relaxed);
+    while (ratio < prev &&
+           !g_cross_min_r_over_4d.compare_exchange_weak(prev, ratio,
+                                                        std::memory_order_relaxed)) {
+    }
+}
+
 // Shared source of truth for the ACA face-count cap (env PTM_HMATRIX_ACA_CAP,
 // default 12000 faces/side; 0 = off). Read once. Used both by buildBlock's
 // admissible pre-zero guard and by buildAdmissibleSubdivided's per-sub-block gate.
@@ -182,6 +216,9 @@ static void resetProfilingCounters() {
     g_subdiv_leaves_sparse = 0;
     g_subdiv_leaves_zero = 0;
     g_subdiv_depth_cap_zero = 0;
+    g_cross_pairs = 0;
+    g_cross_near_pairs = 0;
+    g_cross_min_r_over_4d = 1.0e300;
 }
 
 static void printProfilingCounters(double total_ms) {
@@ -226,6 +263,10 @@ static void printProfilingCounters(double total_ms) {
               << ", zero=" << g_subdiv_leaves_zero.load()
               << ", depth-cap-zero=" << g_subdiv_depth_cap_zero.load() << ")" << std::endl;
     std::cout << "    Hierarchical recursions: " << g_hierarchical_recursions.load() << std::endl;
+    std::cout << "    ACA cross-generator pairs: " << g_cross_pairs.load()
+              << " (near field, r < 4d: " << g_cross_near_pairs.load()
+              << "; closest approach r/4d = " << g_cross_min_r_over_4d.load() << ")"
+              << std::endl;
     std::cout << "    Small blocks (in RAM):   " << g_small_blocks_count.load()
               << " (" << (g_small_blocks_bytes.load() / (1024.0 * 1024.0)) << " MB)" << std::endl;
     std::cout << "    Index memory usage:      " << std::fixed << std::setprecision(2)
@@ -1591,6 +1632,25 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
     // prints nothing when it did not fire.
     reportNearFieldBoundClamps("H-matrix builder",
                                rad_config_.nearfield_quadrature_order);
+
+    // NOT behind verbose. Which entries of this matrix came through the ACA
+    // cross generators, and how close those pairs got to the near-field window,
+    // is provenance for the physics -- and until 2026-08-23 the cross
+    // generators skipped the near field entirely, so "how close did they get"
+    // was the difference between a latent defect and an active one. It is one
+    // line, and a verbose-gated diagnostic is a diagnostic nobody reads.
+    {
+        const size_t cp = g_cross_pairs.load();
+        std::cout << "  ACA cross-generator entries: " << cp;
+        if (cp > 0) {
+            std::cout << "; near field (r < 4d): " << g_cross_near_pairs.load()
+                      << "; closest approach r/4d = " << std::fixed << std::setprecision(3)
+                      << g_cross_min_r_over_4d.load() << std::defaultfloat;
+        } else {
+            std::cout << " (ACA did not run on this mesh)";
+        }
+        std::cout << std::endl;
+    }
 
     if (config_.verbose) {
         std::cout << "  H-matrix build completed in " << elapsed << " seconds" << std::endl;
@@ -3159,12 +3219,9 @@ void HMatrixViewFactor::computeViewFactorBlock(
             cand.local_col = static_cast<int>(j);
             cand.estimated_F = estimated_F;
             // Refine near-field pairs, where the M1 centroid estimate overshoots
-            // (this is the source of Sum_j F_ij > 1). d = characteristic size.
-            {
-                const double d_size = std::sqrt(face_areas_[face_i]) + std::sqrt(A_j);
-                if (r < 4.0 * d_size) {
-                    cand.estimated_F = computeViewFactorRefined(face_i, face_j);
-                }
+            // (this is the source of Sum_j F_ij > 1).
+            if (isNearFieldPair(face_i, face_j, r)) {
+                cand.estimated_F = computeViewFactorRefined(face_i, face_j);
             }
 
             std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
@@ -3508,6 +3565,14 @@ void HMatrixViewFactor::computeViewFactorRow(
         cand.local_row = local_row;
         cand.local_col = static_cast<int>(j);
         cand.estimated_F = estimated_F;
+        noteCrossPair(r, 4.0 * (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        // Same near-field refinement the dense-block generator applies. Without
+        // it, whether a close pair got the M2 quadrature depended on which
+        // BLOCK the octree put it in -- ACA samples the matrix through THIS
+        // function, so a low-rank block was built from unrefined M1 entries.
+        if (isNearFieldPair(face_i, face_j, r)) {
+            cand.estimated_F = computeViewFactorRefined(face_i, face_j);
+        }
 
         std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
 
@@ -3621,6 +3686,13 @@ void HMatrixViewFactor::computeViewFactorColumn(
         cand.local_row = static_cast<int>(i);
         cand.local_col = local_col;
         cand.estimated_F = estimated_F;
+        noteCrossPair(r, 4.0 * (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        // See computeViewFactorRow: the same near-field refinement, for the same
+        // reason. F_ij is the ROW face's view factor either way, so the call
+        // takes (face_i, face_j) in that order here too.
+        if (isNearFieldPair(face_i, face_j, r)) {
+            cand.estimated_F = computeViewFactorRefined(face_i, face_j);
+        }
 
         // Ray goes from face_i to face_j
         std::array<double, 3> dir = {{r_vec[0] / r, r_vec[1] / r, r_vec[2] / r}};
@@ -3952,13 +4024,27 @@ double HMatrixViewFactor::computeViewFactor(int face_i, int face_j) const {
 
     // M1 (centroid) estimate is a far-field approximation. In the near field
     // (centers closer than a few face-widths) it overshoots, so refine with
-    // area-to-area quadrature. d = characteristic face size.
-    const double A_i = face_areas_[face_i];
-    const double d = std::sqrt(A_i) + std::sqrt(A_j);
-    if (r < 4.0 * d) {
+    // area-to-area quadrature.
+    if (isNearFieldPair(face_i, face_j, r)) {
         return computeViewFactorRefined(face_i, face_j);
     }
     return estimated_F;
+}
+
+bool HMatrixViewFactor::isNearFieldPair(int fi, int fj, double r) const {
+    // The near/far switch for THIS builder, in one place. It was written out
+    // four times -- in computeViewFactor, in computeViewFactorBlock, and
+    // (silently, by omission) NOT in computeViewFactorRow/Column, which is how
+    // the ACA cross generators came to skip the near field entirely.
+    //
+    // r < 4 (sqrt(A_i) + sqrt(A_j)). The length scale is the SUM of the two
+    // face sizes, not their geometric mean: the centroid approximation's error
+    // is governed by the larger of the two solid angles, so a 1 m facet 200 m
+    // from a 100 m facet is a near pair even though sqrt(A_i A_j) says
+    // otherwise. The sparse builder's Ns = r / (A_i A_j)^(1/4) <= 5 uses the
+    // geometric mean and calls that same pair far field. Unifying the two rules
+    // is a separate change; see docs/design/vf-unification.md.
+    return r < 4.0 * (std::sqrt(face_areas_[fi]) + std::sqrt(face_areas_[fj]));
 }
 
 int HMatrixViewFactor::refinedQuadratureOrder(int fi, int fj) const {
@@ -4129,6 +4215,29 @@ double HMatrixViewFactor::compressionRatio() const {
     size_t dense_size = n_rows_ * n_cols_ * sizeof(double);
     size_t actual_size = memoryBytes();
     return static_cast<double>(dense_size) / actual_size;
+}
+
+size_t HMatrixViewFactor::crossGeneratorPairs() { return g_cross_pairs.load(); }
+size_t HMatrixViewFactor::crossGeneratorNearPairs() { return g_cross_near_pairs.load(); }
+double HMatrixViewFactor::crossGeneratorMinROver4d() { return g_cross_min_r_over_4d.load(); }
+
+void HMatrixViewFactor::computeDenseReference(std::vector<double>& out) {
+    const size_t n = n_rows_;
+    out.assign(n * n, 0.0);
+    if (n == 0 || !mesh_) return;
+
+    std::vector<int> all(n);
+    for (size_t i = 0; i < n; ++i) all[i] = static_cast<int>(i);
+
+    SparseBlock sparse;
+    computeViewFactorBlock(all, all, sparse);
+
+    for (int i = 0; i < sparse.n_rows; ++i) {
+        for (int k = sparse.row_ptrs[i]; k < sparse.row_ptrs[i + 1]; ++k) {
+            out[static_cast<size_t>(i) * n + static_cast<size_t>(sparse.col_indices[k])] =
+                sparse.values[k];
+        }
+    }
 }
 
 void HMatrixViewFactor::printStatistics() const {

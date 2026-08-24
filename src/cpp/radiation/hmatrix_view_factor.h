@@ -300,6 +300,41 @@ public:
     // Statistics
     void printStatistics() const;
 
+    // How many pairs the ACA cross generators (computeViewFactorRow/Column)
+    // evaluated on the most recent build(), and how many of those fell inside
+    // this builder's near-field window. Process-wide, reset by build().
+    //
+    // These are exposure counters, not verdicts. They exist because an assertion
+    // that the cross generators treat a near pair the same way the dense block
+    // generator does is VACUOUS on a mesh where they never meet one, and this
+    // project has already shipped one silently vacuous gate arm.
+    static size_t crossGeneratorPairs();
+    static size_t crossGeneratorNearPairs();
+    // Closest approach the cross generators reached, as r / (4 d). Below 1 is
+    // inside the near-field window; the value says how much margin there was.
+    static double crossGeneratorMinROver4d();
+
+    // The EXACT matrix this builder would produce with no hierarchical
+    // decomposition and no low-rank approximation anywhere: one call to the
+    // dense-block generator over every (i, j), expanded row-major into `out`
+    // (n_faces^2 doubles). Same kernel, same near/far switch, same grazing
+    // cull, same batched occlusion rays as a production dense block -- the ONLY
+    // thing removed is the block structure. A difference between this and the
+    // assembled matrix is therefore attributable to the decomposition and to
+    // nothing else.
+    //
+    // Must be called after build(), which is what supplies the mesh, the scene
+    // and the RadiationConfig. O(n^2) ray-traced entries and O(n^2) doubles, so
+    // this is for gates and diagnostics on small meshes, not for production.
+    //
+    // NOT equivalent to building with min_block_size >= n_faces: that route
+    // still passes the single block through tryCompressToLowRank(), which caps
+    // the rank at max_svd_rank (default 50) and returns success even when the
+    // requested tolerance was NOT met -- on a 12,800-face mesh that reference
+    // came back with NEGATIVE view factors. Measured 2026-08-23; see
+    // docs/design/vf-unification.md.
+    void computeDenseReference(std::vector<double>& out);
+
     // Save/load compressed matrix
     bool writeBinary(const std::string& filename) const;
     bool readBinary(const std::string& filename);
@@ -419,6 +454,10 @@ private:
     // definition for why pinning it to the sparse path's fixed order was
     // rejected.
     int refinedQuadratureOrder(int face_i, int face_j) const;
+
+    // The near/far switch, for every entry generator in this builder. `r` is
+    // the centroid separation, already computed by every caller.
+    bool isNearFieldPair(int face_i, int face_j, double r) const;
 
     // Visibility check
     bool isVisible(const std::array<double, 3>& p1,
