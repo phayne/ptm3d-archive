@@ -139,9 +139,11 @@ static std::atomic<size_t> g_subdiv_depth_cap_zero{0};   // LAST-RESORT: leaf st
 // 2026-08-23 the count is zero -- but "zero" alone does not say whether the
 // admissibility condition misses the near-field window by a factor of 20 or by
 // 5 percent, and the answer decides whether the gap is unreachable or merely
-// unreached. So the closest approach is recorded too, as min r / (4 d).
+// unreached. So the closest approach is recorded too, as min r / (w d) with the
+// CONFIGURED window w -- a fixed 4 here would under-report the moment anyone
+// changed nearfield_window_factor.
 static std::atomic<size_t> g_cross_pairs{0};        // pairs surviving culling in row/col
-static std::atomic<size_t> g_cross_near_pairs{0};   // ... of those, r < 4 d (the near window)
+static std::atomic<size_t> g_cross_near_pairs{0};   // ... of those, inside the near window
 static std::atomic<double> g_cross_min_r_over_4d{1.0e300};
 
 static inline void noteCrossPair(double r, double d4) {
@@ -3547,7 +3549,8 @@ void HMatrixViewFactor::computeViewFactorRow(
         cand.local_row = local_row;
         cand.local_col = static_cast<int>(j);
         cand.estimated_F = estimated_F;
-        noteCrossPair(r, 4.0 * (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        noteCrossPair(r, rad_config_.nearfield_window_factor *
+                            (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
         // Same near-field refinement the dense-block generator applies. Without
         // it, whether a close pair got the M2 quadrature depended on which
         // BLOCK the octree put it in -- ACA samples the matrix through THIS
@@ -3651,7 +3654,8 @@ void HMatrixViewFactor::computeViewFactorColumn(
         cand.local_row = static_cast<int>(i);
         cand.local_col = local_col;
         cand.estimated_F = estimated_F;
-        noteCrossPair(r, 4.0 * (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
+        noteCrossPair(r, rad_config_.nearfield_window_factor *
+                            (std::sqrt(face_areas_[face_i]) + std::sqrt(A_j)));
         // See computeViewFactorRow: the same near-field refinement, for the same
         // reason. F_ij is the ROW face's view factor either way, so the call
         // takes (face_i, face_j) in that order here too.
