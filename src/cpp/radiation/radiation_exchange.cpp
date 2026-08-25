@@ -2661,7 +2661,11 @@ void RadiationExchangeManager::reportBeamCost() const {
     os << "  [beam-cost] one-time: chi table " << beam_chi_build_s_ << " s, beam-pair build "
        << beam_pair_build_s_ << " s (" << beam_pairs_.size() << " pairs, "
        << sizeof(BeamPair) << " B/pair = " << (bytes / (1024.0 * 1024.0 * 1024.0))
-       << " GiB host)\n"
+       << " GiB host; + " << beam_row_face_.size() << " CSR rows and "
+       << beam_emit_.size() << " emitter records = "
+       << ((static_cast<double>(beam_row_face_.size()) * (sizeof(int) + sizeof(size_t))
+            + static_cast<double>(beam_emit_.size()) * sizeof(BeamEmitStep))
+           / (1024.0 * 1024.0)) << " MiB)\n"
        << "  [beam-cost] per-timestep: " << beam_flux_s_ << " s total over "
        << beam_flux_calls_ << " addBeamedFlux call(s) = " << per_call_ms
        << " ms/call; one-shot Gate-2 audit " << beam_audit_s_ << " s\n"
@@ -3488,8 +3492,67 @@ float RadiationExchangeManager::lookupChi(double cos_sun, double cos_e,
                           cos_sun, cos_e, cos_psi);
 }
 
+// ---------------------------------------------------------------------------
+// Per-emitter, per-timestep hoisting.
+//
+// cos_sun = n_j.s_hat, its chi-table axis, and the emitter's source terms
+// eps_j sigma T_j^4 (and the optional reflected-solar term) depend ONLY on the
+// emitter face and the timestep. The beam pass has ~10^8 pairs over ~10^5 faces,
+// so recomputing them per pair -- which is what the pass did through
+// 2026-08-25 -- repeats each one by a factor of ~10^3. Measured share of the
+// per-pair kernel: chi lookup 0.775 ns of 1.195 ns/pair, the T/emissivity
+// gathers a further 0.120 ns.
+//
+// Every expression below is copied verbatim from the per-pair code it replaces,
+// operand order included, so this is a pure common-subexpression lift: the
+// beamed flux is bit-identical, and that is checked by a byte comparison of the
+// run's outputs, not asserted.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::fillEmitSteps(
+        const std::vector<double>& temperatures,
+        const std::vector<double>& solar_flux,
+        const std::array<double, 3>& sun_dir) const {
+    const size_t nf = beam_normals_.size();
+    beam_emit_.resize(nf);
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+    const size_t n_solar = solar_flux.size();
+    const size_t n_temp = temperatures.size();
+    const size_t n_eps = emissivity_.size();
+    // The per-pair code these records replace indexed temperatures[j] and
+    // emissivity_[j] with NO bounds check, so a short array there was undefined
+    // behavior. Bounds-checking and substituting zero would be safer but silent:
+    // every emitter past the end would contribute exactly zero beamed flux and
+    // nothing in the outputs would distinguish that from a correct run. The
+    // sibling inconsistency in buildBeamPairs() (two different view-factor
+    // matrices in one flux) is fatal for the same reason, so this one is too.
+    if (n_temp < nf || n_eps < nf) {
+        std::cerr << "  [beaming] FATAL: " << nf << " beam faces, but temperatures["
+                  << n_temp << "] / emissivity[" << n_eps << "]. Emitters past the end of "
+                     "either array have no source term, so the beamed correction would be "
+                     "silently incomplete over part of the mesh. Refusing." << std::endl;
+        std::exit(3);
+    }
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < nf; ++f) {
+        const std::array<float, 3>& nj = beam_normals_[f];
+        BeamEmitStep& e = beam_emit_[f];
+        e.cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
+        e.ax = smith::resolveSunAxis(e.cos_sun, chi_ns_);
+        if (!e.ax.active) { e.Ej = 0.0; e.Sj = 0.0; continue; }
+        const double Tj = temperatures[f];
+        e.Ej = emissivity_[f] * SIGMA_SB * Tj * Tj * Tj * Tj;
+        // solar_flux is legitimately allowed to be shorter -- the per-pair code
+        // it replaces carried exactly this `bp.j < solar_flux.size()` test.
+        e.Sj = (beam_solar_ && f < n_solar) ? solar_albedo_beam_ * solar_flux[f] : 0.0;
+    }
+}
+
 void RadiationExchangeManager::buildBeamPairs() {
     beam_pairs_.clear();
+    beam_row_face_.clear();
+    beam_row_off_.clear();
     if (classification_.exchange_face_indices.empty()) return;
 
     // Receivers = the shadowed-floor faces. PTM-98: this is deliberately NOT
@@ -3591,24 +3654,23 @@ void RadiationExchangeManager::buildBeamPairs() {
     const auto& shadow = classification_.shadow_fractions;
     const double thresh = config_.beam_vf_threshold;
 
-    std::vector<int> cols;
-    std::vector<double> vals;
-    for (int i : receivers) {
-        if (vfr) {
-            const auto& rp = vfr->rowPointers();
-            const auto& ci_ = vfr->colIndices();
-            const auto& dv = vfr->values();
-            const int64_t a = rp[i], b = rp[i + 1];
-            cols.assign(ci_.begin() + a, ci_.begin() + b);
-            vals.assign(dv.begin() + a, dv.begin() + b);
-        } else {
-            rows.getRow(i, cols, vals);     // global receiver index
-        }
-        if (cols.empty()) continue;
+    // One receiver's pairs, emitted in ascending column order. Shared verbatim by
+    // the counting pass and the filling pass so the two CANNOT disagree about
+    // which pairs qualify -- a count/fill mismatch here would silently truncate
+    // or pad the pair list.
+    // `cap` bounds the write: emitRow NEVER stores past out[cap-1], but it keeps
+    // counting, so the caller sees n != cap and can refuse. Without the bound a
+    // count/fill disagreement would corrupt the next receiver's slice (or the
+    // heap, on the last row) BEFORE the guard that is supposed to catch it ran.
+    auto emitRow = [&](int i, const std::vector<int>& cols,
+                       const std::vector<double>& vals,
+                       BeamPair* out, size_t cap) -> size_t {
+        if (cols.empty()) return 0;
         double rowsum = 0.0;
         for (double v : vals) rowsum += v;
         double rownorm = 1.0 / std::max(1.0, rowsum);   // matches radiosity vf_row_norm
         const auto& ci = centers[i];
+        size_t n = 0;
         for (size_t m = 0; m < cols.size(); ++m) {
             int j = cols[m];
             if (j < 0 || j >= static_cast<int>(shadow.size())) continue;
@@ -3624,21 +3686,107 @@ void RadiationExchangeManager::buildBeamPairs() {
             const auto& nj = normals[j];
             double cos_e = nj[0] * dirx + nj[1] * diry + nj[2] * dirz;
             if (cos_e <= 0.0) continue;                 // wall not emitting toward floor
-            BeamPair bp;
-            bp.i = i;
-            bp.j = j;
-            bp.Fhat_ij = static_cast<float>(Fhat);
-            bp.cos_e = static_cast<float>(cos_e);
-            bp.dir_ji = { static_cast<float>(dirx),
-                          static_cast<float>(diry),
-                          static_cast<float>(dirz) };
-            beam_pairs_.push_back(bp);
+            if (out && n < cap) {
+                BeamPair& bp = out[n];
+                bp.j = j;
+                bp.Fhat_ij = static_cast<float>(Fhat);
+                bp.cos_e = static_cast<float>(cos_e);
+                bp.dir_ji = { static_cast<float>(dirx),
+                              static_cast<float>(diry),
+                              static_cast<float>(dirz) };
+            }
+            ++n;
         }
+        return n;
+    };
+
+    // Read one receiver's row from whichever matrix is in play.
+    auto loadRow = [&](int i, std::vector<int>& cols, std::vector<double>& vals) {
+        if (vfr) {
+            const auto& rp = vfr->rowPointers();
+            const auto& ci_ = vfr->colIndices();
+            const auto& dv = vfr->values();
+            const int64_t a = rp[i], b = rp[i + 1];
+            cols.assign(ci_.begin() + a, ci_.begin() + b);
+            vals.assign(dv.begin() + a, dv.begin() + b);
+        } else {
+            rows.getRow(i, cols, vals);     // global receiver index
+        }
+    };
+
+    // Count, then fill. The old single pass push_back()-ed into an unreserved
+    // vector, so a 5 GB pair list was grown by repeated realloc-and-copy (a
+    // ~1.5x transient peak on top of the final size) on ONE thread. Counting
+    // first makes the allocation exact and both passes parallel over receivers,
+    // and -- because each receiver writes only its own slice at a prefix-sum
+    // offset -- the resulting order is byte-for-byte the order the serial loop
+    // produced. MEASURED on the r50 chunk: 10.2 s -> see the [beam-cost] line.
+    const size_t nrecv = receivers.size();
+    std::vector<size_t> counts(nrecv, 0);
+    #pragma omp parallel
+    {
+        std::vector<int> cols;
+        std::vector<double> vals;
+        #pragma omp for schedule(guided)
+        for (long r = 0; r < static_cast<long>(nrecv); ++r) {
+            loadRow(receivers[r], cols, vals);
+            counts[r] = emitRow(receivers[r], cols, vals, nullptr, 0);
+        }
+    }
+    std::vector<size_t> offsets(nrecv + 1, 0);
+    for (size_t r = 0; r < nrecv; ++r) offsets[r + 1] = offsets[r] + counts[r];
+    beam_pairs_.resize(offsets[nrecv]);
+    long mismatch_row = -1;                // -1 = none; set once, read after the region
+    #pragma omp parallel
+    {
+        std::vector<int> cols;
+        std::vector<double> vals;
+        #pragma omp for schedule(guided)
+        for (long r = 0; r < static_cast<long>(nrecv); ++r) {
+            if (counts[r] == 0) continue;
+            loadRow(receivers[r], cols, vals);
+            const size_t n = emitRow(receivers[r], cols, vals,
+                                     beam_pairs_.data() + offsets[r], counts[r]);
+            if (n != counts[r]) {
+                // Should not happen -- same predicate, same inputs -- but the two
+                // passes are two separate inlinings of emitRow, and -ffast-math
+                // lets the compiler reassociate the `rowsum` accumulation
+                // differently in each; a 1-ULP rowsum shifts rownorm and can flip
+                // a pair sitting exactly on the Fhat <= threshold boundary. The
+                // write above is capacity-bounded, so this is detected with the
+                // pair list still intact, and made fatal after the region
+                // (exiting from inside a parallel region can deadlock the rest).
+                #pragma omp critical
+                { if (mismatch_row < 0) mismatch_row = r; }
+            }
+        }
+    }
+    if (mismatch_row >= 0) {
+        std::cerr << "  [Smith beaming] FATAL: beam-pair count/fill mismatch on receiver "
+                  << receivers[mismatch_row] << " (expected " << counts[mismatch_row]
+                  << "). The view-factor row changed between the counting and filling "
+                     "passes. Refusing to run on a corrupt pair list.\n";
+        std::exit(3);
+    }
+
+    // CSR row index: receivers that produced at least one pair, in the same
+    // order. addBeamedFlux() walks these rows so it can accumulate a whole
+    // receiver in a register instead of paying an `omp atomic` per pair.
+    beam_row_face_.clear();
+    beam_row_off_.clear();
+    beam_row_face_.reserve(nrecv);
+    beam_row_off_.reserve(nrecv + 1);
+    beam_row_off_.push_back(0);
+    for (size_t r = 0; r < nrecv; ++r) {
+        if (counts[r] == 0) continue;
+        beam_row_face_.push_back(receivers[r]);
+        beam_row_off_.push_back(offsets[r + 1]);
     }
 
     std::cout << "  Smith beamed emission: " << beam_pairs_.size()
               << " wall->floor beam pairs (rms_slope = " << config_.rms_slope_deg
-              << " deg), from " << beam_receivers_.size() << " receivers"
+              << " deg), from " << beam_receivers_.size() << " receivers ("
+              << beam_row_face_.size() << " with pairs)"
               << ", view factors from " << beam_vf_source_ << std::endl;
 }
 
@@ -3724,58 +3872,156 @@ void RadiationExchangeManager::auditBeamViewFactorSource(
 // condition, and it is CHECKED, not assumed.
 // ---------------------------------------------------------------------------
 bool RadiationExchangeManager::auditBeamEnergy(
-        const std::vector<double>& temperatures,
         const std::array<double, 3>& sun_dir) const {
     if (beam_pairs_.empty()) return false;
+    const size_t n = beam_normals_.size();
+    if (beam_emit_.size() != n) {
+        // Cannot happen from addBeamedFlux(), which calls fillEmitSteps() first.
+        // Returning quietly would leave beam_audit_done_ false, so the audit
+        // would re-enter and bail on every timestep and the run would simply end
+        // with no [beam-gate2] line at all -- the one statement of this run's chi
+        // closure and energy admissibility, gone without a word.
+        std::cerr << "  [beam-gate2] ERROR: emitter state is " << beam_emit_.size()
+                  << " long against " << n << " beam faces, so Gate 2 CANNOT RUN. This "
+                     "run makes no statement about its chi closure or its energy "
+                     "admissibility. Do not treat it as gated." << std::endl;
+        return true;   // consume the one shot; the complaint above is the report
+    }
     const float sx = static_cast<float>(sun_dir[0]);
     const float sy = static_cast<float>(sun_dir[1]);
     const float sz = static_cast<float>(sun_dir[2]);
-    const size_t n = beam_normals_.size();
 
-    std::vector<double> Dj(n, 0.0);          // Sum_i F_ji (chi-1) per emitter
-    std::vector<double> chi_v;               // chi over active pairs
-    std::vector<double> wt_v;                // delivered IR flux, the weight
-    chi_v.reserve(beam_pairs_.size() / 4 + 1);
-    wt_v.reserve(beam_pairs_.size() / 4 + 1);
+    // ---- weighted-chi histogram instead of a sorted copy of every active pair.
+    //
+    // This audit used to materialize TWO doubles per active pair (chi and its
+    // weight) and then std::sort an index over them, purely to read three
+    // weighted percentiles. On the r50 chunk that is ~152 M active pairs: 2.4 GB
+    // of transient host memory and a serial sort, MEASURED at 41-43 s per chunk
+    // -- the single largest item in the beaming cost table, and it bought three
+    // diagnostic numbers.
+    //
+    // The gate stays ALWAYS ON (it is the only place this run's chi closure and
+    // energy admissibility are ever stated). What changes is how the percentiles
+    // are obtained: one parallel pass accumulating a weighted histogram of chi,
+    // then percentiles by linear interpolation of the cumulative weight. chi is
+    // hard-bounded to [0, 4] by buildChiTable()'s clamp, so the bin range is
+    // exact rather than assumed, and a chi that genuinely escapes that range is
+    // counted and reported rather than silently folded into an end bin.
+    constexpr int kNBins = 8192;                 // 4/8192 = 4.883e-4 in chi
+    constexpr double kChiMax = 4.0;              // buildChiTable() clamps to [0,4]
+    const double bin_w = kChiMax / kNBins;
 
-    size_t n_active = 0;
-    for (const BeamPair& bp : beam_pairs_) {
-        const std::array<float, 3>& nj = beam_normals_[bp.j];
-        double cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
-        if (cos_sun <= 0.0) continue;
-        double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
-                                             + bp.dir_ji[2] * sz);
-        double chi = lookupChi(cos_sun, static_cast<double>(bp.cos_e), cos_psi);
-        ++n_active;
-        // F_ji from F_ij by reciprocity: A_i F_ij = A_j F_ji.
-        double Aj = (bp.j < static_cast<int>(beam_area_.size())) ? beam_area_[bp.j] : 0.0;
-        double Ai = (bp.i < static_cast<int>(beam_area_.size())) ? beam_area_[bp.i] : 0.0;
-        double Fji = (Aj > 0.0) ? static_cast<double>(bp.Fhat_ij) * Ai / Aj : 0.0;
-        Dj[bp.j] += Fji * (chi - 1.0);
-        double Tj = temperatures[bp.j];
-        double w = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj
-                 * static_cast<double>(bp.Fhat_ij);
-        chi_v.push_back(chi);
-        wt_v.push_back(w);
+    const int nthreads = omp_get_max_threads();
+    // The histogram is per-thread (8192 doubles = 64 KiB each) so the percentiles
+    // stay deterministic. D_j is NOT: it is one shared n-face array written with
+    // `omp atomic`, because per-thread copies of it would be nthreads x n x 8 B --
+    // 0.9 GB on a 2.4 M-face A3GT site at 48 threads, i.e. this audit would have
+    // swapped one multi-GB transient for another. The cost of D_j's summation
+    // order not being fixed is last-bit noise on a diagnostic printed to six
+    // significant figures.
+    std::vector<double> Dj(n, 0.0);
+    std::vector<std::vector<double>> hist_t(nthreads);
+    std::vector<double> wsum_t(nthreads, 0.0), wchi_t(nthreads, 0.0);
+    std::vector<size_t> nact_t(nthreads, 0), nout_t(nthreads, 0);
+    const size_t nrow = beam_row_face_.size();
+    // schedule(static) so the row->thread partition is fixed and the histogram
+    // reduction below is deterministic run to run.
+    #pragma omp parallel
+    {
+        const int t = omp_get_thread_num();
+        std::vector<double>& h_l = hist_t[t];
+        h_l.assign(kNBins, 0.0);
+        double ws = 0.0, wc = 0.0;
+        size_t na = 0, no = 0;
+        #pragma omp for schedule(static)
+        for (long r = 0; r < static_cast<long>(nrow); ++r) {
+            const int i = beam_row_face_[r];
+            const double Ai = (i < static_cast<int>(beam_area_.size())) ? beam_area_[i] : 0.0;
+            for (size_t k = beam_row_off_[r]; k < beam_row_off_[r + 1]; ++k) {
+                const BeamPair& bp = beam_pairs_[k];
+                const BeamEmitStep& e = beam_emit_[bp.j];
+                if (!e.ax.active) continue;
+                const double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                                           + bp.dir_ji[2] * sz);
+                const double chi = smith::evalChiAxis(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                                                      e.ax, e.cos_sun,
+                                                      static_cast<double>(bp.cos_e), cos_psi);
+                ++na;
+                // F_ji from F_ij by reciprocity: A_i F_ij = A_j F_ji.
+                const double Aj = (bp.j < static_cast<int>(beam_area_.size()))
+                                ? beam_area_[bp.j] : 0.0;
+                const double Fji = (Aj > 0.0) ? static_cast<double>(bp.Fhat_ij) * Ai / Aj : 0.0;
+                const double dD = Fji * (chi - 1.0);
+                #pragma omp atomic
+                Dj[bp.j] += dD;
+                const double w = e.Ej * static_cast<double>(bp.Fhat_ij);
+                ws += w;
+                wc += w * chi;
+                // chi == kChiMax exactly is IN range (buildChiTable clamps to it,
+                // and a float result within half an ULP of 4 rounds to exactly
+                // 4.0f -- which is precisely the saturated grazing-Sun regime this
+                // gate exists to police). Only chi > kChiMax is a real escape.
+                int b = static_cast<int>(chi / bin_w);
+                if (b >= kNBins) { if (chi > kChiMax) ++no; b = kNBins - 1; }
+                else if (b < 0)  { ++no; b = 0; }
+                h_l[b] += w;
+            }
+        }
+        wsum_t[t] = ws; wchi_t[t] = wc; nact_t[t] = na; nout_t[t] = no;
+    }
+    std::vector<double> hist(kNBins, 0.0);
+    double wsum = 0.0, wchi = 0.0;
+    size_t n_active = 0, n_outside = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        if (hist_t[t].size() == kNBins) for (int b = 0; b < kNBins; ++b) hist[b] += hist_t[t][b];
+        wsum += wsum_t[t]; wchi += wchi_t[t];
+        n_active += nact_t[t]; n_outside += nout_t[t];
     }
     if (n_active == 0) {
         std::cout << "  [beam-gate2] no pair beamed on this timestep (no sunlit emitter). "
                      "Audit deferred." << std::endl;
         return false;
     }
-
-    // Flux-weighted chi statistics.
-    double wsum = 0.0, wchi = 0.0;
-    for (size_t k = 0; k < chi_v.size(); ++k) { wsum += wt_v[k]; wchi += wt_v[k] * chi_v[k]; }
-    std::vector<size_t> ord(chi_v.size());
-    for (size_t k = 0; k < ord.size(); ++k) ord[k] = k;
-    std::sort(ord.begin(), ord.end(),
-              [&](size_t a, size_t b) { return chi_v[a] < chi_v[b]; });
+    if (n_outside > 0) {
+        std::cerr << "  [beam-gate2] WARNING: " << n_outside << " of " << n_active
+                  << " active pairs read a chi outside the [0, " << kChiMax
+                  << "] range buildChiTable() clamps to. The percentile bins below are "
+                     "saturated for those pairs; the chi table is not what this audit "
+                     "assumes it is." << std::endl;
+    }
+    // Weighted percentile from the cumulative histogram, interpolated inside the
+    // straddling bin. Bin width 4.883e-4 in chi; the interpolation makes the
+    // reported value considerably tighter than that on a smooth distribution.
+    // Every active pair carries weight w = eps_j sigma T_j^4 Fhat, so wsum is 0
+    // only if every sunlit emitter is at T = 0 (or zero emissivity). The old
+    // sorted path then returned the smallest observed chi; falling through to
+    // kChiMax here would print "p95 4" -- indistinguishable from a genuinely
+    // saturated table -- so the weightless case is reported as such instead.
+    const bool have_weight = (wsum > 0.0);
     auto wpct = [&](double f) {
-        double acc = 0.0, target = f * wsum;
-        for (size_t k : ord) { acc += wt_v[k]; if (acc >= target) return chi_v[k]; }
-        return chi_v.empty() ? 1.0 : chi_v[ord.back()];
+        const double target = f * wsum;
+        double acc = 0.0;
+        for (int b = 0; b < kNBins; ++b) {
+            const double next = acc + hist[b];
+            if (next >= target && hist[b] > 0.0) {
+                const double frac = (target - acc) / hist[b];
+                return (b + std::min(1.0, std::max(0.0, frac))) * bin_w;
+            }
+            acc = next;
+        }
+        return kChiMax;
     };
+    std::string pct_text;
+    if (have_weight) {
+        std::ostringstream p;
+        p << std::defaultfloat << std::setprecision(6)
+          << "p05 " << wpct(0.05) << ", p50 " << wpct(0.50) << ", p95 " << wpct(0.95)
+          << "; percentiles from a " << kNBins << "-bin weighted histogram, bin " << bin_w;
+        pct_text = p.str();
+    } else {
+        pct_text = "p05/p50/p95 NOT AVAILABLE -- the total flux weight over the active "
+                   "pairs is zero, so there is no distribution to take percentiles of";
+    }
 
     // Per-emitter energy admissibility.
     size_t n_emit = 0, n_violate = 0;
@@ -3800,9 +4046,8 @@ bool RadiationExchangeManager::auditBeamEnergy(
     os << "  [beam-gate2] chi over the pairs that actually beam ("
        << n_active << " of " << beam_pairs_.size() << " pairs, w = "
        << config_.rms_slope_deg << " deg):\n"
-       << "  [beam-gate2]   flux-weighted mean chi = " << (wsum > 0 ? wchi / wsum : 1.0)
-       << "  (p05 " << wpct(0.05) << ", p50 " << wpct(0.50)
-       << ", p95 " << wpct(0.95) << ")\n"
+       << "  [beam-gate2]   flux-weighted mean chi = " << (have_weight ? wchi / wsum : 1.0)
+       << "  (" << pct_text << ")\n"
        << "  [beam-gate2] per-emitter beamed excess D_j = Sum_i F_ji (chi-1), i.e. the "
           "fraction of the wall's OWN eps*sigma*T^4 A_j taken from its sky share:\n"
        << "  [beam-gate2]   " << n_emit << " emitters; mean D_j = "
@@ -3867,17 +4112,21 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
     const float sy = static_cast<float>(sun_dir[1]);
     const float sz = static_cast<float>(sun_dir[2]);
 
-    // Gate 2, once per run, on the first timestep that actually beams. Costs one
-    // extra serial pass over the pair list; it is the only place the chi closure
-    // and the energy admissibility of this run are ever stated. Timed separately
-    // so it is not charged to the per-timestep pass.
+    // Everything that depends on the emitter and the timestep but NOT on the
+    // pair, computed once per face. Must precede the Gate-2 audit, which reads
+    // the same records so the audit and the pass cannot see different emitters.
+    fillEmitSteps(temperatures, solar_flux, sun_dir);
+
+    // Gate 2, once per run, on the first timestep that actually beams. It is the
+    // only place the chi closure and the energy admissibility of this run are
+    // ever stated. Timed separately so it is not charged to the per-timestep pass.
     double audit_s = 0.0;
     if (!beam_audit_done_) {
         // Only counts as done once a timestep actually had a sunlit emitter:
         // otherwise the one shot would be spent on a nighttime step and the run
         // would report nothing.
         const auto ta = clk::now();
-        beam_audit_done_ = auditBeamEnergy(temperatures, sun_dir);
+        beam_audit_done_ = auditBeamEnergy(sun_dir);
         audit_s = std::chrono::duration<double>(clk::now() - ta).count();
         beam_audit_s_ += audit_s;
     }
@@ -3906,7 +4155,7 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
             pre[k] = flux[beam_receivers_[k]];
         }
         // Only PTM_BEAM_SOLAR puts anything in the visible band; the default
-        // IR-only pass needs no second accumulator and pays no second atomic.
+        // IR-only pass needs no second accumulator and no second n-face array.
         if (beam_solar_ && band_vis && band_vis->size() == flux.size()) {
             dvis.assign(flux.size(), 0.0);
         }
@@ -3914,41 +4163,58 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
     const bool split_solar = !dvis.empty();
 
     // Accumulate the signed (chi-1) corrections, then apply once per receiver so
-    // the result stays non-negative (absorbed flux). OpenMP-safe via atomic add
-    // on the receiver bucket would race the final clamp, so reduce into a local.
-    const size_t np = beam_pairs_.size();
-    #pragma omp parallel for schedule(static)
-    for (size_t k = 0; k < np; ++k) {
-        const BeamPair& bp = beam_pairs_[k];
-        const std::array<float, 3>& nj = beam_normals_[bp.j];
-        double cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
-        if (cos_sun <= 0.0) continue;   // wall mean in shadow this timestep -> no beaming
-        double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
-                                             + bp.dir_ji[2] * sz);
-        double chi = lookupChi(cos_sun, static_cast<double>(bp.cos_e), cos_psi);
-        double delta = chi - 1.0;
-        if (delta == 0.0) continue;
-        double Tj = temperatures[bp.j];
-        double Ej = emissivity_[bp.j] * SIGMA_SB * Tj * Tj * Tj * Tj;   // thermal IR source
-        // Solar opposition beaming (PTM_BEAM_SOLAR): the reflected-solar source
-        // (albedo * incident sunlight) leaving the sunlit wall has the same m.s facet
-        // structure as its IR emission, so the floor (backscatter) gets the same chi
-        // enhancement. Absorbed at the floor with eps_i (consistent with the radiosity's
-        // solar handling). Off by default => byte-identical IR-only beaming.
-        double Sj = 0.0;
-        if (beam_solar_ && bp.j < static_cast<int>(solar_flux.size())) {
-            Sj = solar_albedo_beam_ * solar_flux[bp.j];
+    // the result stays non-negative (absorbed flux).
+    //
+    // RECEIVER-MAJOR. buildBeamPairs() emits pairs receiver-major, so the pairs
+    // of one receiver are a contiguous CSR row: the whole row can be summed in a
+    // register and stored once, instead of one `omp atomic` per pair. The
+    // register is SEEDED FROM flux[i] and stored back, so the intended sequence
+    // of double additions applied to flux[i] is exactly the sequence the atomic
+    // path applied -- same values, same order. MEASURED: 35/35 output files
+    // byte-identical on the r50 beaming smoke, and 35/35 on the Lambertian one.
+    //
+    // ⚠️ That byte-identity is MEASURED ON THIS TOOLCHAIN, not guaranteed by the
+    // construction. The old `omp atomic` forced each addition onto memory in
+    // program order; this is a plain scalar reduction in a countable loop, which
+    // -ffast-math (CMakeLists.txt ~259) lets the compiler split into partial sums
+    // and a horizontal add. A compiler or flag change can therefore move the low
+    // bits with nothing in the suite objecting -- re-run the beaming-ON byte
+    // comparison after any toolchain bump, do not assume it.
+    //
+    // MEASURED cost of the atomic on the r50 chunk: 0.070 of 1.195 ns/pair.
+    //
+    // Solar opposition beaming (PTM_BEAM_SOLAR): the reflected-solar source
+    // (albedo * incident sunlight) leaving the sunlit wall has the same m.s facet
+    // structure as its IR emission, so the floor (backscatter) gets the same chi
+    // enhancement. Absorbed at the floor with eps_i (consistent with the radiosity's
+    // solar handling). Off by default => byte-identical IR-only beaming.
+    const size_t nrow = beam_row_face_.size();
+    #pragma omp parallel for schedule(guided)
+    for (long r = 0; r < static_cast<long>(nrow); ++r) {
+        const int i = beam_row_face_[r];
+        const double eps_i = emissivity_[i];
+        double acc = flux[i];
+        double acc_vis = split_solar ? dvis[i] : 0.0;
+        for (size_t k = beam_row_off_[r]; k < beam_row_off_[r + 1]; ++k) {
+            const BeamPair& bp = beam_pairs_[k];
+            const BeamEmitStep& e = beam_emit_[bp.j];
+            if (!e.ax.active) continue;   // wall mean in shadow this timestep -> no beaming
+            double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                                 + bp.dir_ji[2] * sz);
+            double chi = smith::evalChiAxis(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                                            e.ax, e.cos_sun,
+                                            static_cast<double>(bp.cos_e), cos_psi);
+            double delta = chi - 1.0;
+            if (delta == 0.0) continue;
+            acc += eps_i * (e.Ej + e.Sj) * static_cast<double>(bp.Fhat_ij) * delta;
+            if (split_solar) {
+                // The reflected-solar half of the same delta, so it can be booked
+                // to the VISIBLE band rather than to thermal IR.
+                acc_vis += eps_i * e.Sj * static_cast<double>(bp.Fhat_ij) * delta;
+            }
         }
-        double dq = emissivity_[bp.i] * (Ej + Sj) * static_cast<double>(bp.Fhat_ij) * delta;
-        #pragma omp atomic
-        flux[bp.i] += dq;
-        if (split_solar) {
-            // The reflected-solar half of the same delta, so it can be booked to
-            // the VISIBLE band rather than to thermal IR.
-            double dq_vis = emissivity_[bp.i] * Sj * static_cast<double>(bp.Fhat_ij) * delta;
-            #pragma omp atomic
-            dvis[bp.i] += dq_vis;
-        }
+        flux[i] = acc;
+        if (split_solar) dvis[i] = acc_vis;
     }
 
     // Keep absorbed indirect flux non-negative on the receiver set. PTM-98: the

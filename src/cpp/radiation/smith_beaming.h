@@ -164,20 +164,57 @@ inline std::vector<float> buildChiTable(double w_rad, int ns, int ne, int nphi) 
     return table;
 }
 
-// Trilinear lookup into a table from buildChiTable(). Signature unchanged: the
-// caller still supplies cos_psi = d.s_hat, and the azimuth cosine the table is
-// indexed on is derived here. Returns 1.0 outside the active domain
+// The cos_sun axis of the chi lookup, pre-resolved.
+//
+// WHY THIS EXISTS (perf/beaming-overhead, 2026-08-25): cos_sun = n_j . s_hat
+// depends only on the EMITTER and on the timestep's Sun direction -- never on
+// which receiver the pair points at. In the production beam pass every emitter
+// appears in hundreds to thousands of pairs, so evalChi() was recomputing one
+// sqrt, one multiply-add and the whole cos_sun index/weight triple once per PAIR
+// instead of once per FACE. MEASURED on the r50 beam pass (193.6 M pairs, 48
+// threads): the chi lookup was 0.775 ns of the kernel's 1.195 ns/pair (65% of
+// it), and hoisting this axis out of the pair loop took the whole kernel to
+// 1.001 ns/pair.
+//
+// The fields are exactly the quantities evalChi() used to compute inline, with
+// the same expressions in the same order, so the hoisted path is bit-identical
+// to the per-pair one -- verified, not assumed (see the beaming gates).
+struct SunAxis {
+    double sin_sun;   // sqrt(max(0, 1 - cos_sun^2))
+    double ds;        // trilinear weight on the cos_sun axis
+    int    is0, is1;  // bracketing chi-table slabs
+    bool   active;    // cos_sun > 0; false => chi is identically 1
+};
+
+inline SunAxis resolveSunAxis(double cos_sun, int ns) {
+    SunAxis ax{};
+    ax.active = (cos_sun > 0.0);
+    if (!ax.active) { ax.sin_sun = 0.0; ax.ds = 0.0; ax.is0 = ax.is1 = 0; return ax; }
+    ax.sin_sun = std::sqrt(std::max(0.0, 1.0 - cos_sun * cos_sun));
+    double fs = cos_sun * ns - 0.5;
+    fs = std::min(static_cast<double>(ns - 1), std::max(0.0, fs));
+    ax.is0 = static_cast<int>(fs);
+    ax.is1 = std::min(ax.is0 + 1, ns - 1);
+    ax.ds  = fs - ax.is0;
+    return ax;
+}
+
+// Trilinear lookup with the cos_sun axis already resolved by the caller. This is
+// THE implementation; evalChi() below is a thin wrapper that resolves the axis
+// first, so the hoisted production path and the reference path cannot drift
+// apart. The caller still supplies cos_psi = d.s_hat, and the azimuth cosine the
+// table is indexed on is derived here. Returns 1.0 outside the active domain
 // (cos_sun <= 0, cos_e <= 0) and for a geometrically UNREACHABLE (cos_sun,
 // cos_e, cos_psi) triple (|cos_phi| > 1), which is what the exact expression
 // does too. The degenerate slabs sin_sun -> 0 / sin_e -> 0 are azimuth-
 // independent, so any cos_phi reads the same value; 0 is used.
-inline float evalChi(const std::vector<float>& table, int ns, int ne, int nphi,
-                     double cos_sun, double cos_e, double cos_psi) {
+inline float evalChiAxis(const std::vector<float>& table, int ns, int ne, int nphi,
+                         const SunAxis& ax, double cos_sun, double cos_e,
+                         double cos_psi) {
     if (table.empty()) return 1.0f;
-    if (cos_sun <= 0.0 || cos_e <= 0.0) return 1.0f;
-    const double sin_sun = std::sqrt(std::max(0.0, 1.0 - cos_sun * cos_sun));
+    if (!ax.active || cos_e <= 0.0) return 1.0f;
     const double sin_e   = std::sqrt(std::max(0.0, 1.0 - cos_e * cos_e));
-    const double denom = sin_sun * sin_e;
+    const double denom = ax.sin_sun * sin_e;
     double cphi = 0.0;
     if (denom > 1e-9) {
         cphi = (cos_psi - cos_sun * cos_e) / denom;
@@ -195,28 +232,36 @@ inline float evalChi(const std::vector<float>& table, int ns, int ne, int nphi,
         if (cphi < -1.0 - kReach || cphi > 1.0 + kReach) return 1.0f;
         cphi = std::min(1.0, std::max(-1.0, cphi));
     }
-    double fs = cos_sun * ns - 0.5;
     double fe = cos_e * ne - 0.5;
     double fp = (cphi + 1.0) * 0.5 * nphi - 0.5;
     auto clampf = [](double f, int n) {
         return std::min(static_cast<double>(n - 1), std::max(0.0, f));
     };
-    fs = clampf(fs, ns); fe = clampf(fe, ne); fp = clampf(fp, nphi);
-    int is0 = static_cast<int>(fs), ie0 = static_cast<int>(fe), ip0 = static_cast<int>(fp);
-    int is1 = std::min(is0 + 1, ns - 1);
+    fe = clampf(fe, ne); fp = clampf(fp, nphi);
+    int ie0 = static_cast<int>(fe), ip0 = static_cast<int>(fp);
     int ie1 = std::min(ie0 + 1, ne - 1);
     int ip1 = std::min(ip0 + 1, nphi - 1);
-    double ds = fs - is0, de = fe - ie0, dp = fp - ip0;
+    double de = fe - ie0, dp = fp - ip0;
     auto at = [&](int a, int b, int c) -> double {
         return table[(static_cast<size_t>(a) * ne + b) * nphi + c];
     };
-    double c00 = at(is0, ie0, ip0) * (1 - dp) + at(is0, ie0, ip1) * dp;
-    double c01 = at(is0, ie1, ip0) * (1 - dp) + at(is0, ie1, ip1) * dp;
-    double c10 = at(is1, ie0, ip0) * (1 - dp) + at(is1, ie0, ip1) * dp;
-    double c11 = at(is1, ie1, ip0) * (1 - dp) + at(is1, ie1, ip1) * dp;
+    double c00 = at(ax.is0, ie0, ip0) * (1 - dp) + at(ax.is0, ie0, ip1) * dp;
+    double c01 = at(ax.is0, ie1, ip0) * (1 - dp) + at(ax.is0, ie1, ip1) * dp;
+    double c10 = at(ax.is1, ie0, ip0) * (1 - dp) + at(ax.is1, ie0, ip1) * dp;
+    double c11 = at(ax.is1, ie1, ip0) * (1 - dp) + at(ax.is1, ie1, ip1) * dp;
     double c0 = c00 * (1 - de) + c01 * de;
     double c1 = c10 * (1 - de) + c11 * de;
-    return static_cast<float>(c0 * (1 - ds) + c1 * ds);
+    return static_cast<float>(c0 * (1 - ax.ds) + c1 * ax.ds);
+}
+
+// Trilinear lookup into a table from buildChiTable(). Unchanged signature and
+// unchanged result: it resolves the cos_sun axis and defers to evalChiAxis().
+inline float evalChi(const std::vector<float>& table, int ns, int ne, int nphi,
+                     double cos_sun, double cos_e, double cos_psi) {
+    if (table.empty()) return 1.0f;
+    if (cos_sun <= 0.0 || cos_e <= 0.0) return 1.0f;
+    return evalChiAxis(table, ns, ne, nphi, resolveSunAxis(cos_sun, ns),
+                       cos_sun, cos_e, cos_psi);
 }
 
 } // namespace smith

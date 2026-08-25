@@ -9,6 +9,7 @@
 #include "radiation_config.h"
 #include "view_factor.h"
 #include "hmatrix_view_factor.h"
+#include "smith_beaming.h"     // smith::SunAxis, carried per emitter in BeamEmitStep
 #include "../mesh/mesh_utils.h"
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann (the single definition)
 
@@ -736,12 +737,31 @@ private:
 // angularly: hot Sun-facing micro-facets beam IR preferentially toward the Sun,
 // which at the lunar pole (grazing Sun, wall sloped toward floor) enhances
 // wall->floor IR. See addBeamedFlux().
+// The RECEIVER index i is NOT stored: buildBeamPairs() emits pairs
+// receiver-major, so i is implied by the row (beam_row_face_/beam_row_off_) the
+// pair sits in -- CSR, not coordinate list. That is 4 of the old 28 bytes back
+// (28 -> 24 B/pair, -14.3%), and it is what lets addBeamedFlux() accumulate a
+// whole receiver in one register instead of paying an `omp atomic` per pair.
 struct BeamPair {
-    int i;                       // receiver face (shadowed floor)
     int j;                       // emitter face (sunlit wall)
     float Fhat_ij;               // renormalized VF weight (matches radiosity)
     float cos_e;                 // emission-angle cosine n_j . dir_ji (fixed)
     std::array<float, 3> dir_ji; // unit emitter->receiver direction (body frame)
+};
+
+// Per-EMITTER, per-timestep quantities the beamed pass would otherwise recompute
+// once per pair. Rebuilt each addBeamedFlux() call by one parallel pass over the
+// faces (~10^5) instead of the pairs (~10^8). One record (56 B here -- SunAxis
+// pads to 32 because of its trailing bool) replaces three separate per-pair
+// gathers into temperatures[j], emissivity_[j] and beam_normals_[j]. Every field
+// is the SAME expression the per-pair code used, so hoisting them changes no
+// number; the exact size is printed in the [beam-cost] memory line rather than
+// asserted here, since it is layout- and platform-dependent.
+struct BeamEmitStep {
+    double Ej;              // eps_j * SIGMA_SB * T_j^4        (thermal-IR source)
+    double Sj;              // solar_albedo_beam_ * solar_flux[j] (PTM_BEAM_SOLAR; else 0)
+    smith::SunAxis ax;      // the resolved cos_sun axis of the chi lookup
+    double cos_sun;         // n_j . s_hat, widened from the float dot exactly as before
 };
 
 // Main radiation exchange manager
@@ -1010,6 +1030,16 @@ private:
     bool beam_solar_ = false;
     double solar_albedo_beam_ = 0.0;
     std::vector<BeamPair> beam_pairs_;             // sunlit-wall -> shadowed-floor
+    // CSR row structure over beam_pairs_. beam_row_face_[r] is the receiver face
+    // of row r; its pairs are beam_pairs_[beam_row_off_[r] .. beam_row_off_[r+1]).
+    // Only receivers that actually produced pairs get a row, so this is shorter
+    // than beam_receivers_.
+    std::vector<int> beam_row_face_;
+    std::vector<size_t> beam_row_off_;             // size = beam_row_face_.size() + 1
+    // Per-emitter per-timestep scratch, rebuilt at the top of addBeamedFlux().
+    // A member (not a local) so the allocation happens once per run, not once
+    // per timestep. mutable for the same reason as the timing counters.
+    mutable std::vector<BeamEmitStep> beam_emit_;
     std::vector<std::array<float, 3>> beam_normals_; // per-face mean normals (float)
     // Directional emission factor chi(cos_sun, cos_e, cos_psi) on a regular grid.
     // cos_sun = n_j.s_hat in [0,1]; cos_e = n_j.dir_ji in [0,1]; cos_psi = dir_ji.s_hat in [-1,1].
@@ -1078,8 +1108,11 @@ private:
     // counted and reported loudly; they are never silently clamped.
     // Returns false when no pair beamed on this timestep (no sunlit emitter), so
     // the caller can keep its one shot for a step that has something to report.
-    bool auditBeamEnergy(const std::vector<double>& temperatures,
-                         const std::array<double, 3>& sun_dir) const;
+    // Reads the emitter's T^4 source from beam_emit_, so fillEmitSteps() must
+    // have run for THIS timestep first -- which is why it no longer takes the
+    // temperature vector: there is one emitter state and both the audit and the
+    // beamed pass read it, rather than each deriving its own.
+    bool auditBeamEnergy(const std::array<double, 3>& sun_dir) const;
     // Gate 1 (matrix identity). With PTM_BEAM_VF_AUDIT=N, build in-engine view
     // factors for N sampled receivers and print their row sums beside the row
     // sums of the matrix the beam pass actually used. Diagnostic only.
@@ -1110,6 +1143,14 @@ private:
     void configureSolarBeaming();
     // Trilinear lookup into chi_table_; returns 1.0 outside the active domain.
     float lookupChi(double cos_sun, double cos_e, double cos_psi) const;
+    // Fill beam_emit_ for this timestep's Sun direction: one parallel pass over
+    // the FACES, replacing the per-pair recomputation of cos_sun, the chi
+    // cos_sun axis, and the emitter's IR/solar source terms. Same expressions,
+    // so the beamed flux is unchanged. Shared by addBeamedFlux() and the Gate-2
+    // audit so the two cannot read different emitter state.
+    void fillEmitSteps(const std::vector<double>& temperatures,
+                       const std::vector<double>& solar_flux,
+                       const std::array<double, 3>& sun_dir) const;
 };
 
 } // namespace radiation
