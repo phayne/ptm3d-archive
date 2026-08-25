@@ -1033,8 +1033,41 @@ private:
     // that actually beams.
     mutable bool beam_audit_done_ = false;
 
+    // --- what beaming costs (Paul, 2026-08-25: quantify before it is standard) -
+    // One-time setup, split so the chi table (fixed, sub-second) is not confused
+    // with the pair build (O(nnz of the receiver rows), the part that scales).
+    double beam_chi_build_s_ = 0.0;
+    double beam_pair_build_s_ = 0.0;
+    // Per-timestep pass, accumulated. mutable for the same reason as the audit
+    // flag: addBeamedFlux() is const. Not thread-safe by construction and does
+    // not need to be -- addBeamedFlux is called from the serial timestep loop and
+    // parallelizes only inside itself.
+    mutable double beam_flux_s_ = 0.0;
+    mutable long long beam_flux_calls_ = 0;
+    // Gate-2 costs one extra serial pass over the pair list, once per run; it is
+    // reported separately so it is never mistaken for per-timestep overhead.
+    mutable double beam_audit_s_ = 0.0;
+    // One-shot complaint when beaming is live, the run exports bands, and the
+    // band arrays were not in a state addBeamedFlux() could write. Silence there
+    // is exactly the BEAM-05 defect.
+    mutable bool beam_band_gap_warned_ = false;
+    // One-shot notice that the non-negativity clamp fired on a receiver, i.e.
+    // the beamed correction over-subtracted somewhere. Rare, and worth knowing.
+    mutable bool beam_clamp_warned_ = false;
+    // Printed once, from the destructor, so a run cannot end without saying it.
+    void reportBeamCost() const;
+
+    // THE SWITCH, in one place. Both the config flag and a usable slope are
+    // required; nothing in this class reads rms_slope_deg as a switch any more.
+    bool beamingRequested() const {
+        return config_.beaming && config_.rms_slope_deg > 0.0;
+    }
+    // Build the chi table, the beam-pair list and the solar-beaming settings, and
+    // print the one-line ACTIVE banner. Called from BOTH prepare() exits (loaded
+    // view factors, and freshly computed ones) so the two cannot drift apart.
+    void activateBeaming();
     // Build the chi lookup table by Gaussian quadrature over the Smith facet-
-    // slope distribution (called once in prepare() when rms_slope_deg > 0).
+    // slope distribution (called once from activateBeaming()).
     void buildChiTable();
     // Gate 2 (energy conservation + chi closure). For one timestep, report the
     // flux-weighted mean/median/p95 chi over the pairs that actually beam, and
@@ -1058,10 +1091,19 @@ private:
     void buildBeamPairs();
     // Add the per-timestep beamed correction: for each pair,
     //   flux[i] += eps_i * eps_j * sigma * T_j^4 * Fhat_ij * (chi - 1).
+    //
+    // BEAM-05. band_ir / band_vis are the per-band absorbed-indirect arrays the
+    // run exports (indirect_ir / indirect_solar). When they are supplied, the
+    // same delta this pass adds to the total is booked into them -- the thermal-IR
+    // source to the IR band, the reflected-solar source (PTM_BEAM_SOLAR, off by
+    // default) to the visible band -- so the exported bands keep summing to the
+    // exported total. Pass nullptr on a gray run, where there is no split.
     void addBeamedFlux(const std::vector<double>& temperatures,
                        const std::vector<double>& solar_flux,
                        const std::array<double, 3>& sun_dir,
-                       std::vector<double>& flux) const;
+                       std::vector<double>& flux,
+                       std::vector<double>* band_ir = nullptr,
+                       std::vector<double>* band_vis = nullptr) const;
     // Read PTM_BEAM_SOLAR / PTM_SOLAR_ALBEDO to enable beaming the reflected-solar
     // source toward the floor (opposition), in addition to thermal IR. Called from
     // prepare() when beaming is active.

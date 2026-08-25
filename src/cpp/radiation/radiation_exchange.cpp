@@ -2636,7 +2636,38 @@ RadiationExchangeManager::RadiationExchangeManager(
 }
 
 RadiationExchangeManager::~RadiationExchangeManager() {
+    reportBeamCost();
     cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// What beaming cost this run, in seconds and in bytes.
+//
+// Paul's condition for making beaming standard on lunar polar configs was that
+// the computational cost be quantified first. A cost that is only ever measured
+// by differencing two whole runs is a cost nobody re-measures on a new mesh, so
+// the engine reports its own: the one-time chi table + pair build, the summed
+// per-timestep pass with its call count, and the pair-list footprint (the term
+// that scales with mesh size and decides whether beaming fits in host RAM).
+// Printed from the destructor so no exit path can skip it.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::reportBeamCost() const {
+    if (beam_pairs_.empty() && beam_flux_calls_ == 0 && beam_pair_build_s_ == 0.0) return;
+    const double bytes = static_cast<double>(beam_pairs_.size()) * sizeof(BeamPair);
+    const double per_call_ms = beam_flux_calls_
+        ? 1000.0 * beam_flux_s_ / static_cast<double>(beam_flux_calls_) : 0.0;
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  [beam-cost] one-time: chi table " << beam_chi_build_s_ << " s, beam-pair build "
+       << beam_pair_build_s_ << " s (" << beam_pairs_.size() << " pairs, "
+       << sizeof(BeamPair) << " B/pair = " << (bytes / (1024.0 * 1024.0 * 1024.0))
+       << " GiB host)\n"
+       << "  [beam-cost] per-timestep: " << beam_flux_s_ << " s total over "
+       << beam_flux_calls_ << " addBeamedFlux call(s) = " << per_call_ms
+       << " ms/call; one-shot Gate-2 audit " << beam_audit_s_ << " s\n"
+       << "  [beam-cost] beaming total (setup + passes + audit) = "
+       << (beam_chi_build_s_ + beam_pair_build_s_ + beam_flux_s_ + beam_audit_s_) << " s";
+    std::cout << os.str() << std::endl;
 }
 
 void RadiationExchangeManager::cleanup() {
@@ -2929,10 +2960,22 @@ bool RadiationExchangeManager::prepare(
     FaceSelector selector(mesh_, config_);
     classification_ = selector.classify(illumination_series);
 
+    // TRIPWIRE, not the user-facing message. ptm_thermal_sim zeroes the slope
+    // when the switch is off and announces it there, so this branch is
+    // unreachable from the shipped binary -- and that is the point: it fires only
+    // if some other caller builds a RadiationConfig with a slope and no switch,
+    // which is the one way a beaming run could happen without anyone asking.
+    if (config_.rms_slope_deg > 0.0 && !config_.beaming) {
+        std::cerr << "  [beaming] TRIPWIRE: this RadiationConfig carries rms_slope_deg = "
+                  << config_.rms_slope_deg << " deg with beaming = false. The slope is INERT "
+                     "(Lambertian emission). If you expected beaming, the caller that built "
+                     "this config set the knob and not the switch." << std::endl;
+    }
+
     // PTM-101: the beamed-emission receiver/emitter sets are still shadow-fraction
     // based and therefore window-dependent, even though the exchange set no longer
-    // is. Beaming is off by default (rms_slope_deg == 0); say so when it is on.
-    if (config_.rms_slope_deg > 0.0) {
+    // is. Beaming is off by default; say so when it is on.
+    if (beamingRequested()) {
         std::cout << "  WARNING [PTM-101] rms_slope_deg=" << config_.rms_slope_deg
                   << " > 0: the Smith beamed-emission receiver and emitter sets are"
                      " selected from shadow fractions measured over THIS window, so a"
@@ -2988,13 +3031,7 @@ bool RadiationExchangeManager::prepare(
         solver_->initGPU();
 
         is_active_ = true;
-        if (config_.rms_slope_deg > 0.0) {
-            chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
-            buildChiTable();
-            buildBeamPairs();
-            beam_active_ = !beam_pairs_.empty();
-            configureSolarBeaming();
-        }
+        activateBeaming();
         return true;
     }
 
@@ -3154,17 +3191,52 @@ bool RadiationExchangeManager::prepare(
     solver_->initGPU();
 
     is_active_ = true;
-
-    // Smith (1967) anisotropic beamed-emission setup (only when rms_slope_deg>0).
-    if (config_.rms_slope_deg > 0.0) {
-        chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
-        buildChiTable();
-        buildBeamPairs();
-        beam_active_ = !beam_pairs_.empty();
-        configureSolarBeaming();
-    }
+    activateBeaming();
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Smith (1967) anisotropic beamed-emission setup. ONE definition, reached from
+// both prepare() exits (pre-loaded view factors, and freshly computed ones): the
+// two used to carry duplicate copies of this block, which is how a switch grows
+// a path that honors it and a path that does not.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::activateBeaming() {
+    if (!beamingRequested()) return;
+    using clk = std::chrono::steady_clock;
+    chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+    auto t0 = clk::now();
+    buildChiTable();
+    auto t1 = clk::now();
+    buildBeamPairs();
+    auto t2 = clk::now();
+    beam_chi_build_s_ = std::chrono::duration<double>(t1 - t0).count();
+    beam_pair_build_s_ = std::chrono::duration<double>(t2 - t1).count();
+    beam_active_ = !beam_pairs_.empty();
+    configureSolarBeaming();
+
+    // The banner. Beaming moves polar floor temperatures by several kelvin, so a
+    // reader of the log has to be able to see -- in one line, without knowing the
+    // key exists -- that this run is not Lambertian.
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  ============================================================\n"
+       << "  [beaming] ACTIVE: Smith (1967) anisotropic thermal emission, "
+       << "radiation.rms_slope_deg = " << config_.rms_slope_deg << " deg"
+       << " (w = " << chi_w_rad_ << " rad); chi table " << chi_ns_ << " x " << chi_ne_
+       << " x " << chi_npsi_ << " on (cos_sun, cos_e, cos_phi); "
+       << beam_pairs_.size() << " wall->floor pairs. Literature w range 20-37 deg "
+          "(Jhoti 2024 Table 1 / Rubanenko 2020 / Bandfield 2015); "
+          "see docs/radiation-exchange.md section 8.\n"
+       << "  ============================================================";
+    std::cout << os.str() << std::endl;
+    if (!beam_active_) {
+        std::cerr << "  [beaming] WARNING: beaming: true but NO wall->floor beam pair "
+                     "survived the shadow/geometry filters -- this run is Lambertian in "
+                     "practice. Check min_shadow_fraction and the illumination window."
+                  << std::endl;
+    }
 }
 
 bool RadiationExchangeManager::hasGPUPool() const {
@@ -3283,12 +3355,25 @@ RadiationExchangeManager::computeIndirectFluxBatch(
             writeBackFlux(ir_raw[k],  indirect_ir_batch_[k]);
             writeBackFlux(vis_raw[k], indirect_vis_batch_[k]);
         }
-        // Smith beamed-emission correction (per timestep, Sun-dependent).
+        // Smith beamed-emission correction (per timestep, Sun-dependent). BEAM-05:
+        // the same delta is booked into the per-band arrays that were just written
+        // back, so the bands this run exports still sum to the total it couples.
         if (do_beam) {
             const auto& s = sun_dirs[k];
             if (s[0] != 0.0 || s[1] != 0.0 || s[2] != 0.0) {
+                // Not just "the arrays are the right size": they are pre-sized by
+                // assign() and only FILLED when this step's raw band vectors were
+                // non-empty (the writeBackFlux guard above). Booking the beamed
+                // delta into an unfilled band would export a band that is nothing
+                // but the correction.
+                const bool bands = have_band_batch
+                    && !ir_raw[k].empty() && !vis_raw[k].empty()
+                    && indirect_ir_batch_[k].size() == indirect_per_timestep[k].size()
+                    && indirect_vis_batch_[k].size() == indirect_per_timestep[k].size();
                 addBeamedFlux(temperatures_per_timestep[k], solar_flux_per_timestep[k],
-                              s, indirect_per_timestep[k]);
+                              s, indirect_per_timestep[k],
+                              bands ? &indirect_ir_batch_[k] : nullptr,
+                              bands ? &indirect_vis_batch_[k] : nullptr);
             }
         }
     }
@@ -3351,9 +3436,15 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
 
     // Smith (1967) anisotropic beamed-emission correction (Sun-dependent).
     // Redistributes each sunlit wall's fixed total emission toward the floor.
+    // BEAM-05: the delta is booked into the per-band arrays filled just above, so
+    // indirect_solar + indirect_ir keeps equaling the total the BC integrates.
     const bool sun_valid = (sun_dir[0] != 0.0 || sun_dir[1] != 0.0 || sun_dir[2] != 0.0);
     if (beam_active_ && sun_valid) {
-        addBeamedFlux(temperatures, solar_flux, sun_dir, indirect_flux_);
+        const bool bands = indirect_flux_ir_.size() == indirect_flux_.size()
+                        && indirect_flux_vis_.size() == indirect_flux_.size();
+        addBeamedFlux(temperatures, solar_flux, sun_dir, indirect_flux_,
+                      bands ? &indirect_flux_ir_ : nullptr,
+                      bands ? &indirect_flux_vis_ : nullptr);
     }
 
     // Update statistics (after beaming so they reflect the corrected flux)
@@ -3759,7 +3850,9 @@ void RadiationExchangeManager::configureSolarBeaming() {
 void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperatures,
                                              const std::vector<double>& solar_flux,
                                              const std::array<double, 3>& sun_dir,
-                                             std::vector<double>& flux) const {
+                                             std::vector<double>& flux,
+                                             std::vector<double>* band_ir,
+                                             std::vector<double>* band_vis) const {
     // This is the ISOTHERMAL Smith-chi radiosity beaming. The anisothermal
     // sub-facet hook (radiation/anisothermal_beaming.h aniso::enhancementBol) is
     // DESIGNED but NOT wired here. HARD PREREQUISITE before wiring it (Fermi,
@@ -3768,19 +3861,57 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
     // energy leak -- REQUIRED for energy balance. Do NOT re-fold E with chi's
     // (m.s)(m.d) weight (Fermi: worse, +85% at grazing). See enhancementBol.
     if (beam_pairs_.empty()) return;
+    using clk = std::chrono::steady_clock;
+    const auto t_enter = clk::now();
     const float sx = static_cast<float>(sun_dir[0]);
     const float sy = static_cast<float>(sun_dir[1]);
     const float sz = static_cast<float>(sun_dir[2]);
 
     // Gate 2, once per run, on the first timestep that actually beams. Costs one
     // extra serial pass over the pair list; it is the only place the chi closure
-    // and the energy admissibility of this run are ever stated.
+    // and the energy admissibility of this run are ever stated. Timed separately
+    // so it is not charged to the per-timestep pass.
+    double audit_s = 0.0;
     if (!beam_audit_done_) {
         // Only counts as done once a timestep actually had a sunlit emitter:
         // otherwise the one shot would be spent on a nighttime step and the run
         // would report nothing.
+        const auto ta = clk::now();
         beam_audit_done_ = auditBeamEnergy(temperatures, sun_dir);
+        audit_s = std::chrono::duration<double>(clk::now() - ta).count();
+        beam_audit_s_ += audit_s;
     }
+
+    // BEAM-05. The beamed delta is a real term in the flux the thermal BC
+    // integrates, so it belongs in the band split too -- otherwise the two
+    // exported bands stop adding up to the total they claim to decompose (33%
+    // relative on the r50 beaming smoke, measured 2026-08-25). The receivers'
+    // pre-beaming flux is snapshotted here and the delta is read back off the
+    // total AFTER the non-negativity clamp below, so the clamp is accounted for
+    // by construction instead of modeled.
+    const bool track_bands = (band_ir != nullptr && band_ir->size() == flux.size());
+    if (band_ir && !track_bands && !beam_band_gap_warned_) {
+        beam_band_gap_warned_ = true;
+        std::cerr << "  [beaming] WARNING (BEAM-05): asked to book the beamed delta into the "
+                     "per-band absorbed flux, but the IR band array is " << band_ir->size()
+                  << " long against a " << flux.size() << "-face total. The bands for this "
+                     "step will NOT sum to the total; do not read them as a decomposition."
+                  << std::endl;
+    }
+    std::vector<double> pre;                 // receivers' flux before this pass
+    std::vector<double> dvis;                // reflected-solar part of the delta only
+    if (track_bands) {
+        pre.resize(beam_receivers_.size());
+        for (size_t k = 0; k < beam_receivers_.size(); ++k) {
+            pre[k] = flux[beam_receivers_[k]];
+        }
+        // Only PTM_BEAM_SOLAR puts anything in the visible band; the default
+        // IR-only pass needs no second accumulator and pays no second atomic.
+        if (beam_solar_ && band_vis && band_vis->size() == flux.size()) {
+            dvis.assign(flux.size(), 0.0);
+        }
+    }
+    const bool split_solar = !dvis.empty();
 
     // Accumulate the signed (chi-1) corrections, then apply once per receiver so
     // the result stays non-negative (absorbed flux). OpenMP-safe via atomic add
@@ -3811,15 +3942,60 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
         double dq = emissivity_[bp.i] * (Ej + Sj) * static_cast<double>(bp.Fhat_ij) * delta;
         #pragma omp atomic
         flux[bp.i] += dq;
+        if (split_solar) {
+            // The reflected-solar half of the same delta, so it can be booked to
+            // the VISIBLE band rather than to thermal IR.
+            double dq_vis = emissivity_[bp.i] * Sj * static_cast<double>(bp.Fhat_ij) * delta;
+            #pragma omp atomic
+            dvis[bp.i] += dq_vis;
+        }
     }
 
     // Keep absorbed indirect flux non-negative on the receiver set. PTM-98: the
     // beam receiver list, not the (now all-faces) exchange list — only receivers
     // can be driven negative by the beamed correction, and clamping the rest
     // would silently touch faces this pass never wrote.
-    for (int i : beam_receivers_) {
-        if (flux[i] < 0.0) flux[i] = 0.0;
+    size_t n_clamped = 0;
+    for (size_t k = 0; k < beam_receivers_.size(); ++k) {
+        const int i = beam_receivers_[k];
+        const double raw = flux[i];
+        if (raw < 0.0) {
+            flux[i] = 0.0;
+            ++n_clamped;
+            // BEAM-05 + non-negativity together. The total is now exactly 0, and
+            // both bands are absorbed fluxes that must stay >= 0, so the only
+            // split that is both closed and physical is 0 + 0. Booking the
+            // signed delta here instead would set band_ir = -band_vis: closed,
+            // but a negative absorbed IR flux in the exported product.
+            if (track_bands) {
+                (*band_ir)[i] = 0.0;
+                if (band_vis && band_vis->size() == flux.size()) (*band_vis)[i] = 0.0;
+            }
+            continue;
+        }
+        if (!track_bands) continue;
+        // BEAM-05 book-keeping on the unclamped receivers: the delta this pass
+        // applied to the total, split into the band it came from, so
+        // band_ir + band_vis moves by exactly the same amount the total did.
+        const double d_app = raw - pre[k];
+        if (d_app == 0.0) continue;
+        const double d_vis = split_solar ? dvis[i] : 0.0;
+        (*band_ir)[i] += d_app - d_vis;
+        if (split_solar) (*band_vis)[i] += d_vis;
     }
+    if (n_clamped && !beam_clamp_warned_) {
+        beam_clamp_warned_ = true;
+        std::cerr << "  [beaming] NOTE: the non-negativity clamp fired on " << n_clamped
+                  << " of " << beam_receivers_.size() << " receiver(s) this timestep -- the "
+                     "beamed correction drove their absorbed indirect flux below zero. Those "
+                     "faces are set to 0 in the total AND in both bands (an absorbed flux "
+                     "cannot be negative), so the split stays closed. Reported once per run."
+                  << std::endl;
+    }
+
+    // Charge this call to the per-timestep budget, less the one-shot audit.
+    beam_flux_s_ += std::chrono::duration<double>(clk::now() - t_enter).count() - audit_s;
+    ++beam_flux_calls_;
 }
 
 void RadiationExchangeManager::setEmissivity(double emissivity) {

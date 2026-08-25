@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-183 keys across 11 sections.
+184 keys across 11 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -125,6 +125,7 @@ ENGINE_DEFAULTS = {
     'radiation.adaptive_neighbors': True,
     'radiation.band_separated': True,
     'radiation.beam_vf_threshold': 1e-07,
+    'radiation.beaming': False,
     'radiation.captured_energy_target': 0.95,
     'radiation.coupling_face_fraction': 0.01,
     'radiation.coupling_flux_threshold': 0.1,
