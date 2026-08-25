@@ -60,7 +60,8 @@ struct RadiationConfig {
     double convergence_tolerance = 0.01;
     int    convergence_check_interval = 0;  // GPU only; 0 = auto, sized per matrix
     bool   use_gpu              = false;
-    double rms_slope_deg        = 0.0;    // 0 = Lambertian emission
+    bool   beaming              = false;  // Smith beamed emission: THE SWITCH
+    double rms_slope_deg        = 0.0;    // RMS sub-facet slope w [deg]: THE KNOB
     /* ... */
 };
 }

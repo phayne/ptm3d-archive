@@ -626,7 +626,18 @@ struct SimulationConfig {
         bool use_monte_carlo_vf = false;
         int mc_rays_per_face = 100000;
         // Anisotropic (roughness-beamed) thermal emission, Smith 1967.
-        // 0 (default) = Lambertian, byte-identical. RMS micro-slope [deg].
+        // THE SWITCH. false (default) = pure Lambertian emission, byte-identical
+        // to every pre-2026-08-25 run. true REQUIRES rms_slope_deg > 0 (the
+        // knob); the engine refuses to start on beaming: true with no slope.
+        // Standard for lunar polar SITE and REGIONAL configs (facets >> the ~mm-cm
+        // thermal-isolation scale). OFF on sub-cm meshes, which already resolve the
+        // roughness this parameterizes -- Paul, 2026-08-25. See
+        // docs/radiation-exchange.md section 8.
+        bool beaming = false;
+        // THE KNOB. RMS micro-slope w [deg] of the sub-facet slope distribution.
+        // Literature range 20-37 deg; 32.5 is the Jhoti et al. Table 1 lunar
+        // highlands value used for the validated polar result. Inert unless
+        // beaming: true. 0 (default) = Lambertian.
         double rms_slope_deg = 0.0;
         double beam_vf_threshold = 1e-7;
         // Radiance-weighted view-factor pruning threshold [W/m^2], applied at VF

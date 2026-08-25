@@ -445,6 +445,27 @@ public:
     // PTM_RAD_EMISSIVITY override. reflectivity_ is exactly 1 - this.
     const std::vector<double>& operativeEmissivity() const { return emissivity_; }
 
+    // ---- PTM_HMATRIX_VF_REPLACE state, for callers that must not build their
+    // own view factors while an external referee CSR is driving the radiosity.
+    //
+    // The reason this is exposed at all: RadiationExchangeManager::buildBeamPairs()
+    // used to call ViewFactorCalculator::computeSubset() unconditionally, so on a
+    // VF_REPLACE run the base radiosity solved the referee matrix while the Smith
+    // beamed-emission delta was computed from a DIFFERENT, in-engine matrix. Two
+    // matrices in one physical answer is the FC-08 / VF-unification-stage-2 error
+    // class; the beam pass now reads these instead.
+    bool vfReplaceActive() const { return vf_replace_cpu_route_; }
+    const std::string& vfReplacePath() const { return vf_replace_path_; }
+    // The replacement CSR itself, or nullptr when a replacement IS installed but
+    // is no longer directly row-addressable (PTM_HMATRIX_ROWFIX wraps F_op_ in a
+    // CorrectedRowFixOperator, whose congruence has no sparse rows). Callers must
+    // treat `vfReplaceActive() && !vfReplaceRows()` as an error, not as "absent".
+    // Non-owning: initCommon() installs this operator and never destroys it.
+    const SparseVFOperator* vfReplaceRows() const {
+        if (!vf_replace_cpu_route_) return nullptr;
+        return dynamic_cast<const SparseVFOperator*>(F_op_.get());
+    }
+
 private:
     // Initialize common data
     void initCommon(const std::vector<double>& emissivity,
@@ -996,18 +1017,93 @@ private:
     std::vector<float> chi_table_;
     int chi_ns_ = 0, chi_ne_ = 0, chi_npsi_ = 0;
 
+    // Face areas and per-emitter sky view factor F_sky,j = 1 - Sum_i F_ji, both
+    // over the SAME matrix buildBeamPairs() sourced its rows from. Populated only
+    // when beaming is active. beam_fsky_ is empty when the source matrix cannot
+    // supply full row sums (the in-engine subset path computes receiver rows
+    // only), and the energy-admissibility audit then reports that it could not
+    // run rather than passing silently.
+    std::vector<double> beam_area_;
+    std::vector<double> beam_fsky_;
+    // Name of the matrix the beam pairs were built from, for the banner and for
+    // the audit line. "" until buildBeamPairs() runs.
+    std::string beam_vf_source_;
+    // One-shot Gate-2 audit (flux-weighted mean chi + per-emitter energy debit).
+    // mutable because addBeamedFlux() is const and fires it on the first timestep
+    // that actually beams.
+    mutable bool beam_audit_done_ = false;
+
+    // --- what beaming costs (Paul, 2026-08-25: quantify before it is standard) -
+    // One-time setup, split so the chi table (fixed, sub-second) is not confused
+    // with the pair build (O(nnz of the receiver rows), the part that scales).
+    double beam_chi_build_s_ = 0.0;
+    double beam_pair_build_s_ = 0.0;
+    // Per-timestep pass, accumulated. mutable for the same reason as the audit
+    // flag: addBeamedFlux() is const. Not thread-safe by construction and does
+    // not need to be -- addBeamedFlux is called from the serial timestep loop and
+    // parallelizes only inside itself.
+    mutable double beam_flux_s_ = 0.0;
+    mutable long long beam_flux_calls_ = 0;
+    // Gate-2 costs one extra serial pass over the pair list, once per run; it is
+    // reported separately so it is never mistaken for per-timestep overhead.
+    mutable double beam_audit_s_ = 0.0;
+    // One-shot complaint when beaming is live, the run exports bands, and the
+    // band arrays were not in a state addBeamedFlux() could write. Silence there
+    // is exactly the BEAM-05 defect.
+    mutable bool beam_band_gap_warned_ = false;
+    // One-shot notice that the non-negativity clamp fired on a receiver, i.e.
+    // the beamed correction over-subtracted somewhere. Rare, and worth knowing.
+    mutable bool beam_clamp_warned_ = false;
+    // Printed once, from the destructor, so a run cannot end without saying it.
+    void reportBeamCost() const;
+
+    // THE SWITCH, in one place. Both the config flag and a usable slope are
+    // required; nothing in this class reads rms_slope_deg as a switch any more.
+    bool beamingRequested() const {
+        return config_.beaming && config_.rms_slope_deg > 0.0;
+    }
+    // Build the chi table, the beam-pair list and the solar-beaming settings, and
+    // print the one-line ACTIVE banner. Called from BOTH prepare() exits (loaded
+    // view factors, and freshly computed ones) so the two cannot drift apart.
+    void activateBeaming();
     // Build the chi lookup table by Gaussian quadrature over the Smith facet-
-    // slope distribution (called once in prepare() when rms_slope_deg > 0).
+    // slope distribution (called once from activateBeaming()).
     void buildChiTable();
+    // Gate 2 (energy conservation + chi closure). For one timestep, report the
+    // flux-weighted mean/median/p95 chi over the pairs that actually beam, and
+    // the per-emitter beamed excess D_j = Sum_i F_ji (chi_ji - 1) as a fraction
+    // of that emitter's own emitted power. Beaming REDISTRIBUTES a wall's fixed
+    // eps*sigma*T^4: the excess delivered to the floor is taken from the wall's
+    // sky share, so D_j <= F_sky,j is the admissibility condition. Violations are
+    // counted and reported loudly; they are never silently clamped.
+    // Returns false when no pair beamed on this timestep (no sunlit emitter), so
+    // the caller can keep its one shot for a step that has something to report.
+    bool auditBeamEnergy(const std::vector<double>& temperatures,
+                         const std::array<double, 3>& sun_dir) const;
+    // Gate 1 (matrix identity). With PTM_BEAM_VF_AUDIT=N, build in-engine view
+    // factors for N sampled receivers and print their row sums beside the row
+    // sums of the matrix the beam pass actually used. Diagnostic only.
+    void auditBeamViewFactorSource(ViewFactorCalculator& calc,
+                                   const std::vector<int>& receivers,
+                                   const SparseVFOperator* vfr) const;
     // Build the pruned sunlit-wall -> shadowed-floor beam-pair list (geometry +
     // Embree visibility), renormalized to match the radiosity VF weights.
     void buildBeamPairs();
     // Add the per-timestep beamed correction: for each pair,
     //   flux[i] += eps_i * eps_j * sigma * T_j^4 * Fhat_ij * (chi - 1).
+    //
+    // BEAM-05. band_ir / band_vis are the per-band absorbed-indirect arrays the
+    // run exports (indirect_ir / indirect_solar). When they are supplied, the
+    // same delta this pass adds to the total is booked into them -- the thermal-IR
+    // source to the IR band, the reflected-solar source (PTM_BEAM_SOLAR, off by
+    // default) to the visible band -- so the exported bands keep summing to the
+    // exported total. Pass nullptr on a gray run, where there is no split.
     void addBeamedFlux(const std::vector<double>& temperatures,
                        const std::vector<double>& solar_flux,
                        const std::array<double, 3>& sun_dir,
-                       std::vector<double>& flux) const;
+                       std::vector<double>& flux,
+                       std::vector<double>* band_ir = nullptr,
+                       std::vector<double>* band_vis = nullptr) const;
     // Read PTM_BEAM_SOLAR / PTM_SOLAR_ALBEDO to enable beaming the reflected-solar
     // source toward the floor (opposition), in addition to thermal IR. Called from
     // prepare() when beaming is active.

@@ -619,9 +619,23 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.nearfield_window_factor = getWithDefault(rad, "nearfield_window_factor", config.radiation.nearfield_window_factor);
             config.radiation.use_monte_carlo_vf = getWithDefault(rad, "use_monte_carlo_vf", config.radiation.use_monte_carlo_vf);
             config.radiation.mc_rays_per_face = getWithDefault(rad, "mc_rays_per_face", config.radiation.mc_rays_per_face);
-            // Anisotropic roughness-beamed emission (Smith 1967); 0 = Lambertian.
+            // Anisotropic roughness-beamed emission (Smith 1967). The switch is
+            // radiation.beaming; radiation.rms_slope_deg is the knob it needs.
+            config.radiation.beaming = getWithDefault(rad, "beaming", config.radiation.beaming);
             config.radiation.rms_slope_deg = getWithDefault(rad, "rms_slope_deg", config.radiation.rms_slope_deg);
             config.radiation.beam_vf_threshold = getWithDefault(rad, "beam_vf_threshold", config.radiation.beam_vf_threshold);
+            // LEGACY BRIDGE. Before 2026-08-25 the only switch was
+            // "rms_slope_deg > 0". A config written then has no beaming key, and
+            // silently demoting it to Lambertian would change that run's physics
+            // with nothing said. Honor the old switch, and say so.
+            if (!rad["beaming"] && config.radiation.rms_slope_deg > 0.0) {
+                config.radiation.beaming = true;
+                std::cerr << "[config] NOTE: radiation.rms_slope_deg = "
+                          << config.radiation.rms_slope_deg << " > 0 with no radiation.beaming "
+                             "key. This is the pre-2026-08-25 implicit switch, so beaming is "
+                             "ON for this run. Add 'beaming: true' to the config to state the "
+                             "intent explicitly." << std::endl;
+            }
             // Radiance-weighted VF pruning epsilon [W/m^2] (assembly-time; 0 = off).
             // Distinct from visibility_threshold. The runners propagate it to the
             // assembler via PTM_RADIANCE_PRUNE_EPS; the sim only logs it.

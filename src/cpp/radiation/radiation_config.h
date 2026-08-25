@@ -217,8 +217,10 @@ struct RadiationConfig {
     // Anisotropic (roughness-beamed) thermal emission (Smith 1967).
     // Sun-facing rough micro-facets beam thermal IR toward the Sun; for polar
     // craters this enhances wall->floor IR (sun-dependent, amplifies the seasonal
-    // cycle). rms_slope_deg = 0 (default) => pure Lambertian, byte-identical.
-    double rms_slope_deg = 0.0;          // RMS micro-slope [deg]; 0 = OFF (Lambertian)
+    // cycle). BOTH must be set for the pass to run: `beaming` is the switch,
+    // `rms_slope_deg` the knob. Either off => pure Lambertian, byte-identical.
+    bool beaming = false;                // Master switch (YAML radiation.beaming)
+    double rms_slope_deg = 0.0;          // RMS micro-slope w [deg]; literature 20-37
     double beam_vf_threshold = 1e-7;     // Min renormalized VF to keep a beam pair
 
     // Radiance-weighted view-factor pruning epsilon [W/m^2]. Applied at VF

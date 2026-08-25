@@ -6,7 +6,7 @@ two-band radiosity coupling, and its illumination-only companion.
 
 | File | Radiation | Purpose |
 |---|---|---|
-| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default) | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
+| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default); `radiation.beaming: false` **explicitly, and it must stay off — see below** | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
 | `moon3d_native_yearlong_radoff.yaml` | `radiation.enabled: false` | The no-coupling comparison pair. Identical in every other value. |
 
 Both are derived from `examples/moon3d_500k_clean.yaml` (2026-07-12): only the mesh,
@@ -22,6 +22,36 @@ lost and had to be re-run. Tracking them is the fix.
 
 Sanitizing them changed **only path-valued keys** — every physical, numerical and
 scheduling value is byte-for-byte what the campaign ran.
+
+## ⛔ 2026-08-25: beaming stays OFF on this mesh, and it is a physics rule
+
+`moon3d_native_yearlong_coupled.yaml` carries an explicit `radiation.beaming: false`.
+That is not a leftover default — it is the answer to a question this directory will keep
+being asked, now that Smith (1967) beamed emission is standard on lunar polar **site**
+configs.
+
+Beaming is a **sub-facet** model. `chi` stands in for roughness the mesh does not
+resolve, at the scale where surface elements become thermally isolated from one another —
+millimeters to centimeters on lunar regolith. **This mesh's facets are ~2 mm**: 509,337
+faces over 1.96 m² of total area, a simulated crater about 1.6 m across. It already
+resolves the structure `chi` is a stand-in for.
+
+> **Paul's ruling, 2026-08-25.** "The Moon3D mesh resolution is comparable to the
+> roughness scale (millimeters to centimeters) that the beaming is intended to capture,
+> so the beaming should be OFF for small local meshes like this."
+
+Turning it on here would count the same physics twice. Beaming belongs on **site and
+regional** meshes — meters and up (`sunlit_radcore_r50` at 237 m, `haworth_radcore_r32c`
+at 181 m, an A3GT 3 km core at 3.46 m). The criterion, the measured facet scales, and
+the validated result are in
+[`docs/radiation-exchange.md` §8.4](../../docs/radiation-exchange.md).
+
+Because beaming is off, **every physical, numerical and scheduling value here still
+matches the campaign that produced the shipped `moon3d_native_yearlong` dataset** and its
+annual T_max map, cold-trap area and volatile-stability figures.
+
+`moon3d_native_yearlong_radoff.yaml` needs no such key: it has `radiation.enabled: false`,
+so beaming has nothing to act on there.
 
 ## The three site-local inputs you must supply
 

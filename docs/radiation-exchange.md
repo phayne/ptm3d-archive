@@ -930,7 +930,9 @@ deep column, +10.2 K in the window-mean surface temperature of a permanently sha
 
 ## 8. Anisotropic beamed emission
 
-By default every face emits as a Lambertian surface. Setting `rms_slope_deg` above 0 enables the
+### 8.1 The model
+
+By default every face emits as a Lambertian surface. `radiation.beaming: true` enables the
 Smith (1967) statistical-roughness model: a surface with a Gaussian micro-slope distribution of
 RMS slope $w$ beams thermal IR preferentially toward the Sun, because its Sun-facing micro-facets
 are the hot ones. The model supplies a directional factor
@@ -939,14 +941,210 @@ $$\chi(\cos\theta_{\text{sun}}, \cos\theta_e, \cos\psi; w) = \frac{\text{rough-s
 
 normalized so that its $\cos\theta_e$-weighted hemispherical mean is exactly 1 — pure angular
 redistribution, with the face still emitting $\varepsilon\sigma T^4$ in total. $\chi \to 1$
-everywhere as $w \to 0$, so `rms_slope_deg: 0` is the Lambertian case exactly. For polar craters
-the effect redistributes wall emission toward the floor in a Sun-direction-dependent way.
+everywhere as $w \to 0$, so a vanishing slope is the Lambertian case exactly. For polar craters
+the effect redistributes sunlit-wall emission toward the shadowed floor in a Sun-direction-dependent
+way, which is the reason the feature exists.
+
+The correction is applied per timestep, after the radiosity solve, over a pruned
+sunlit-wall $\to$ shadowed-floor pair list built once per run from the **same** view-factor matrix
+the radiosity solves (including an external matrix installed by `PTM_HMATRIX_VF_REPLACE`; the run
+refuses to start rather than mix two matrices). It is booked into the thermal-IR band, so
+`indirect_solar + indirect_ir` keeps equaling the coupled total; the engine measures that identity
+on every two-band run and warns if it fails.
+
+### 8.2 The switch and the knob
+
+Two keys, and both are required:
+
+| Key | Default | Role |
+|---|---|---|
+| `radiation.beaming` | `false` | **The switch.** Nothing beams unless this is `true`. |
+| `radiation.rms_slope_deg` | `0.0` | **The knob.** RMS sub-facet slope $w$, in degrees. |
+
+- `beaming: true` with `rms_slope_deg` unset or $\le 0$ is **fatal at startup**, not a silent
+  fallback to Lambertian.
+- `beaming: false` with a nonzero `rms_slope_deg` runs Lambertian and says so in one line. Leaving
+  the slope in a file as documentation of the value to re-enable is a supported pattern.
+- A config written before 2026-08-25 has no `beaming` key at all, and `rms_slope_deg > 0` was then
+  the only switch. Such a config still beams — the parser honors the old switch and prints a
+  `[config] NOTE` asking for the explicit key. That bridge exists so no pre-existing run silently
+  changes physics; do not rely on it in new configs.
+
 `beam_vf_threshold` (default $10^{-7}$) sets the smallest renormalized view factor kept as a beam
 pair.
 
-Beaming is off by default. When it is on, its emitter and receiver sets are still selected from
-window-scoped shadow fractions and therefore remain dependent on the chunk decomposition; the run
-warns.
+### 8.3 Choosing $w$: literature values
+
+$w$ is a real surface property, not a tuning parameter. Published RMS sub-facet slopes for lunar
+regolith span roughly **20–37°**:
+
+| $w$ | Source |
+|---|---|
+| **32.5°** | Jhoti et al. (2024), Table 1 — lunar highlands. **The value used for the validated polar result below, and the recommended default.** |
+| ~20° | Bandfield et al. (2015) — Diviner-derived global regolith roughness. |
+| ~37° | Rubanenko et al. (2020) — steep-slope end of the published range. |
+
+The polar result in §8.5 was obtained at the literature value 32.5° with **no tuning**.
+
+### 8.4 When beaming applies: the mesh-scale criterion
+
+**Beaming is a SUB-facet model.** $\chi$ exists to represent roughness the mesh does not resolve:
+sub-facet elements that are thermally isolated from one another, so the Sun-facing ones run hot and
+the shaded ones run cold within what the model treats as a single isothermal facet. That
+isolation sets in at **millimeters to centimeters** on lunar regolith — the scale the published
+RMS-slope values of §8.3 characterize.
+
+> **Paul's ruling, 2026-08-25.** "The Moon3D mesh resolution is comparable to the roughness scale
+> (millimeters to centimeters) that the beaming is intended to capture, so the beaming should be
+> OFF for small local meshes like this."
+
+So the criterion is not "is this a lunar polar site?" — it is a comparison of two lengths:
+
+> **Turn beaming ON only when the facet scale is much larger than the thermal-isolation scale
+> (~mm–cm). At or below that scale the mesh already resolves the anisothermality explicitly, and
+> beaming would double-count it.**
+
+Facet scale here is $\sqrt{\bar{A}}$, the square root of the mean face area — measured from each
+mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), not estimated:
+
+| Mesh | faces | total area | $\sqrt{\bar{A}}$ | beaming |
+|---|---|---|---|---|
+| `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** — 5 orders above the roughness scale |
+| `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
+| A3GT `A03MP026` 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
+| `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** — the mesh *is* at the roughness scale |
+
+The 509k `moon3d` mesh is a simulated crater roughly **1.6 m across** whose facets are ~2 mm. It
+resolves exactly the sub-facet structure $\chi$ is a stand-in for. Beaming there is not a
+refinement, it is the same physics counted twice.
+
+Site and regional meshes — meters and up — are the case beaming was built and validated for.
+
+**Configs.** New site/regional lunar polar production configs should carry
+
+```yaml
+radiation:
+  beaming: true
+  rms_slope_deg: 32.5      # Jhoti et al. (2024) Table 1, lunar highlands
+```
+
+Deliberately **not** switched on, and why:
+
+- `examples/moon3d_native_yearlong/*.yaml` — the 509k mesh in the table above. Sub-cm facets;
+  beaming would double-count the roughness the mesh already carries (Paul, 2026-08-25).
+- `examples/validation/baseline_crater80N_*.yaml` — these are the byte-identical regression
+  baselines (`scripts/ptm_validate_baseline.py`). Turning beaming on there would move the
+  baselines, which is the one thing they exist not to do.
+- `examples/tutorial04_crater80N_*.yaml` — teaching configs whose printed numbers are quoted in
+  the tutorial text.
+- Europa and asteroid configs — the model is parameterized on lunar regolith roughness and the
+  polar-crater geometry it was validated on. Nothing here supports carrying $w = 32.5°$ to an icy
+  or small-body surface.
+
+### 8.5 What it does to the answer (validated, `sunlit_radcore_r50`)
+
+Measured 2026-08-24 on the 140,091-face lunar polar hybrid mesh at $w = 32.5°$, referee v4 CSR,
+scored against Williams et al. (2019) Diviner, 5 coupling sweeps, summer maximum:
+
+| Stratum | bias before → after | RMSE before → after |
+|---|---|---|
+| deep cold, < 110 K | **−7.31 → +1.36 K** | 31.40 → 28.98 K |
+| PSR, < 200 K | +0.89 → +7.06 K | 41.12 → 39.44 K |
+| margin, 110–200 K | +11.59 → +14.49 K | 51.10 → 49.90 K |
+| sunlit, ≥ 200 K | +8.75 → +8.78 K | 21.36 → 21.23 K |
+
+The deep-cold cold bias is essentially closed and the sunlit population is untouched (+0.04 K).
+
+**Read the whole table before adopting it. Beaming is a warming term everywhere, so it helps only
+where the model was cold, and it is a *net cost* on the three strata that were already warm:**
+
+| Stratum | bias change | verdict |
+|---|---|---|
+| deep cold, < 100 K (summer) | −7.31 → +1.36 K | **improved**, the reason to adopt it |
+| **PSR, < 200 K (summer)** | **+0.89 → +7.06 K** | **degraded by 6.2 K** — the largest single regression in the table |
+| margin, 110–200 K (summer) | +11.59 → +14.49 K | degraded by 2.9 K |
+| deep column, winter | +14.41 → +17.56 K | degraded by 3.1 K |
+| sunlit, ≥ 200 K | +8.75 → +8.78 K | unchanged |
+
+RMSE nevertheless falls in every stratum in the first table because the distribution tightens even
+where the mean bias worsens; do not read "RMSE improves" as "the answer got better everywhere",
+and note that the winter and margin *means* rise (winter_mean 4.89 → 5.35 K).
+
+**Known open items that beaming does NOT address (parked by Paul, 2026-08-25):** the winter and
+margin warm biases above. Beaming is not a fix for those and was never claimed to be; they remain
+open and are not to be reopened without Paul's word.
+
+### 8.6 What it costs
+
+Measured on the same mesh; see §8.7 for the numbers and how to re-measure them on a new mesh.
+The short version: **beaming costs about +22% wall time and ~5–6.5 GiB of host RAM on a
+140k-face lunar polar site mesh**, and the RAM term is the one that scales dangerously — it grows
+with the view-factor matrix's nonzero count, not with the face count.
+
+### 8.7 Cost table
+
+Every number below is measured, not modeled. The engine prints its own `[beam-cost]` block at the
+end of any run with beaming on, so this is re-measurable on any mesh without differencing two runs.
+
+**Production wall time** — four `sunlit_radcore_r50` arms, 140,091 faces, 573.0 M-nonzero referee
+CSR, 2 chunks each (2026-08-24):
+
+| Arm pair (identical except beaming) | off | on | delta |
+|---|---|---|---|
+| `max_coupling_iterations: 5` | 1743.9 s | 2128.0 s | +384.0 s (**+22.0%**) |
+| `max_coupling_iterations: 16` | 1738.9 s | 2125.9 s | +387.1 s (**+22.3%**) |
+
+**Where the time goes** — engine-instrumented, r50 smoke, same mesh and CSR, 193.6 M beam pairs,
+16 beamed timesteps (2026-08-25). The accounted total is 97.7% of the measured 56.0 s wall-time
+delta between the beaming-on and beaming-off smokes, so the instrumentation is not missing a term:
+
+| Item | Cost | Scales with |
+|---|---|---|
+| $\chi$ table build | 0.05 s, once | nothing (fixed 48 × 48 × 65 grid) |
+| beam-pair build | 9.84 s, once per chunk | pairs (~51 ns/pair) |
+| Gate-2 energy audit | 41.2 s, once per chunk | active pairs (a sort over them) |
+| per-timestep `addBeamedFlux` | 225 ms/call × 16 = 3.6 s | pairs (~1.16 ns/pair/call, 48 threads) |
+
+The Gate-2 audit dominates a *short* run and is negligible in a long one: it is one shot per chunk
+against however many beamed timesteps the run has (1380 on the production science chunk above).
+
+**Memory** — the pair list is `28 B/pair` (`BeamPair`: two `int`, two `float`, a `float[3]`), plus a
+transient `2 × 8 B` per active pair inside the one-shot Gate-2 audit:
+
+| Mesh class | faces | CSR nnz | beam pairs | pair list | Gate-2 transient |
+|---|---|---|---|---|---|
+| `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **5.05–6.45 GiB** | ~2.4 GB |
+| `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 5.0–6.4 GiB (est.) | ~2.4 GB |
+| A3GT 3 km site (A03MP026) | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **21.9–27.9 GiB (est.)** | ~8 GB |
+
+The estimates apply the **measured** r50 retention band — 33.8–43.2% of the CSR's nonzeros survive
+the receiver/emitter/geometry filters — to each mesh's own nonzero count. They are estimates, not
+measurements: the retention depends on the shadow topology of the specific site and window, and
+the receiver set is itself window-scoped (§8.8). The absolute ceiling is 100% retention, i.e.
+28 B × nnz: **64.8 GiB** for the A3GT site.
+
+The 509k `moon3d` mesh is deliberately absent from this table: beaming does not apply there at all
+(§8.4), so its cost is not a number anyone should be planning against.
+
+⚠️ **Beaming on a multi-million-face site is not a free flip.** Extrapolating the measured
+per-pair rate, an A3GT-class site would add of order 1 s per beamed timestep on top of a ~1 GB/s
+pair build and >20 GiB of resident host memory. Measure it on the target mesh — with a short run
+and the `[beam-cost]` line — before committing a campaign to it.
+
+### 8.8 Caveats
+
+- **Chunk dependence (PTM-101).** The emitter and receiver sets are selected from shadow fractions
+  measured over *this window*, so a beaming run remains dependent on the chunk decomposition even
+  though the radiation-exchange set (PTM-98) no longer is. Measured on r50: 126,787 receivers /
+  247.4 M pairs in chunk 000 against 128,794 / 242.5 M in chunk 001. The run warns. Remedy: run
+  beaming single-shot, or state the chunk decomposition with the result.
+- **`test_bowl_crater` does not cover it.** The Ingersoll gate constructs `RadiositySolver`
+  directly and never touches `RadiationExchangeManager`, so `buildBeamPairs` / `addBeamedFlux` are
+  architecturally unreachable from it. Its green is not evidence about beaming.
+- **The isothermal model only.** This is the isothermal Smith-$\chi$ radiosity beaming. The
+  anisothermal sub-facet model (`radiation/anisothermal_beaming.h`) is designed but deliberately
+  not wired: it needs a per-$\cos\theta_{\text{sun}}$ closure table first, or it leaks ~+9% of the
+  energy at grazing incidence.
 
 ## 9. Configuration reference
 
@@ -973,7 +1171,8 @@ warns.
 | `nearfield_window_factor` | 4.0 | The near/far switch for BOTH in-engine builders: a pair is near when $r < w (\sqrt{A_i} + \sqrt{A_j})$. 0 forces M1 everywhere; a very large value forces M2. Replaced the internal `adaptive_ns_threshold` |
 | `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
-| `rms_slope_deg` | 0.0 | Smith beamed emission; 0 = Lambertian |
+| `beaming` | false | **The Smith beamed-emission switch** (§8). `true` requires `rms_slope_deg > 0` or the run refuses to start. Standard for lunar polar SITE/REGIONAL configs; OFF on sub-cm meshes (§8.4) |
+| `rms_slope_deg` | 0.0 | RMS sub-facet slope $w$ in degrees, the beaming knob (§8.3). Literature 20–37°; 32.5° is the validated lunar polar value. Inert unless `beaming: true` |
 | `beam_vf_threshold` | 1e-7 | Smallest renormalized view factor kept as a beam pair |
 | `radiance_prune_eps` | 0.0 | Radiance-weighted pruning threshold, applied at assembly (§11) |
 | `max_coupling_iterations` | 16 | Picard iteration cap |
@@ -1167,6 +1366,17 @@ IlluminationModel
   this module (`test_bowl_crater`).
 - Smith, B. G. (1967). Lunar surface roughness: shadowing and thermal emission. *Journal of
   Geophysical Research*, 72, 4059-4067. Anisotropic beamed emission (§8).
+- Bandfield, J. L., Hayne, P. O., Williams, J.-P., Greenhagen, B. T., & Paige, D. A. (2015). Lunar
+  surface roughness derived from LRO Diviner Radiometer observations. *Icarus*, 248, 357-372.
+  RMS sub-facet slope ~20°, the low end of the range in §8.3.
+- Rubanenko, L., Mazarico, E., Neumann, G. A., & Paige, D. A. (2020). Ice in micro cold traps on
+  Mercury: implications for age and origin. *Journal of Geophysical Research: Planets*, 125,
+  e2020JE006494. Steep-slope end of the RMS sub-facet slope range in §8.3.
+- Jhoti, E., Paige, D. A., et al. (2024). Lunar roughness and its effect on emission phase
+  functions. Table 1 gives the lunar highlands RMS sub-facet slope $w = 32.5°$ used as the
+  recommended default in §8.3. Author code archived at doi:10.5281/zenodo.18168035.
+- Williams, J.-P., Paige, D. A., et al. (2019). Seasonal polar temperatures on the Moon. *Journal
+  of Geophysical Research: Planets*, 124, 2505-2521. The Diviner comparison scored in §8.5.
 - Hayne, P. O., et al. (2017). Global regolith thermophysical properties of the Moon from the
   Diviner Lunar Radiometer Experiment. *Journal of Geophysical Research: Planets*, 122, 2371-2400.
   Incidence-angle-dependent albedo.

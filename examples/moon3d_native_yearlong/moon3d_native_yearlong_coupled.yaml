@@ -108,6 +108,26 @@ radiation:
   captured_energy_target: 0.95
   max_neighbors: 500
   min_neighbors: 20
+  # ---- Smith (1967) beamed thermal emission: OFF, and it must stay off ----
+  # ⛔ NOT because this is not a lunar polar crater -- it is -- but because of
+  # the MESH SCALE. Beaming is a SUB-facet model: chi stands in for roughness
+  # the mesh does not resolve, at the scale where surface elements become
+  # thermally isolated from one another (millimeters to centimeters on lunar
+  # regolith). This mesh's facets are ~2 mm (509,337 faces over 1.96 m^2 total
+  # area -- a simulated crater ~1.6 m across), i.e. AT that scale. It already
+  # resolves the anisothermality chi is a stand-in for.
+  #
+  #   Paul's ruling, 2026-08-25: "The Moon3D mesh resolution is comparable to
+  #   the roughness scale (millimeters to centimeters) that the beaming is
+  #   intended to capture, so the beaming should be OFF for small local meshes
+  #   like this."
+  #
+  # Turning it on here would count the same physics twice. Beaming belongs on
+  # SITE and REGIONAL meshes -- meters and up (sunlit_radcore_r50 at 237 m,
+  # haworth_radcore_r32c at 181 m, an A3GT 3 km core at 3.5 m).
+  # See docs/radiation-exchange.md section 8.4 for the criterion and the
+  # measured facet scales.
+  beaming: false
 illumination:
   include_primary_reflection: true
   use_batch_processing: true

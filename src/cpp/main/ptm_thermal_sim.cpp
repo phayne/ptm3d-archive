@@ -12247,6 +12247,66 @@ bool writeStatisticsBinary(
 }
 
 // ---------------------------------------------------------------------------
+// BEAM-05 tripwire: do the two exported bands still add up to the exported total?
+//
+// indirect_solar + indirect_ir is supposed to equal indirect_flux_series -- the
+// value actually coupled into the thermal BC and dumped by PTM_DUMP_QIND_SERIES.
+// That identity is the whole reason the bands are exported in ABSORBED units, and
+// nothing checked it. The Smith beamed correction broke it silently: the beamed
+// delta landed in the total and in neither band, so a beaming run shipped bands
+// that summed to LESS than the flux the solver used, with no complaint anywhere.
+//
+// Measured, not assumed, on every two-band run. Returns the max |vis+ir-total|
+// over the whole series; warns loudly past a relative tolerance.
+// ---------------------------------------------------------------------------
+static double reportIndirectBandClosure(
+    const std::vector<std::vector<double>>& indirect_flux_series,
+    const std::vector<std::vector<double>>& indirect_solar_series,
+    const std::vector<std::vector<double>>& indirect_ir_series)
+{
+    const size_t F = indirect_flux_series.size();
+    if (F == 0 || indirect_solar_series.size() != F || indirect_ir_series.size() != F) {
+        std::cerr << "[indirect-bands] closure NOT CHECKED: series sizes disagree ("
+                  << F << "/" << indirect_solar_series.size() << "/"
+                  << indirect_ir_series.size() << ").\n";
+        return -1.0;
+    }
+    double max_abs = 0.0;      // max |vis + ir - total|            [W/m^2]
+    double max_tot = 0.0;      // max |total|, the scale to judge it against
+    long long n_cmp = 0;
+    #pragma omp parallel for schedule(static) reduction(max:max_abs,max_tot) reduction(+:n_cmp)
+    for (long long f = 0; f < static_cast<long long>(F); ++f) {
+        const auto& tt = indirect_flux_series[f];
+        const auto& vv = indirect_solar_series[f];
+        const auto& ii = indirect_ir_series[f];
+        const size_t n = std::min(tt.size(), std::min(vv.size(), ii.size()));
+        for (size_t t = 0; t < n; ++t) {
+            const double r = std::fabs(vv[t] + ii[t] - tt[t]);
+            if (r > max_abs) max_abs = r;
+            const double a = std::fabs(tt[t]);
+            if (a > max_tot) max_tot = a;
+            ++n_cmp;
+        }
+    }
+    const double rel = (max_tot > 0.0) ? max_abs / max_tot : 0.0;
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6)
+       << "[indirect-bands] closure check (indirect_solar + indirect_ir - indirect_flux): "
+       << "max |residual| = " << max_abs << " W/m^2 over " << n_cmp
+       << " face-steps, max |total| = " << max_tot << " W/m^2, relative = " << rel;
+    std::cout << os.str() << std::endl;
+    // 1e-6 relative is far above float32/summation noise and far below any real
+    // missing term; the beamed-delta defect showed up here at ~3e-1 relative.
+    if (rel > 1e-6) {
+        std::cerr << "[indirect-bands] WARNING: the exported bands do NOT sum to the "
+                     "exported total (relative residual " << rel << " > 1e-6). A term in "
+                     "the coupled indirect flux is missing from the band split; do NOT "
+                     "use indirect_solar/indirect_ir as a decomposition of this run.\n";
+    }
+    return max_abs;
+}
+
+// ---------------------------------------------------------------------------
 // Band-separated INDIRECT flux outputs (Paul's product, 2026-07-17 — Ada).
 //
 // Writes the two indirect radiosity bands as per-timestep frames + statistics,
@@ -12262,8 +12322,9 @@ bool writeStatisticsBinary(
 // indirect_flux_series — the value coupled into the thermal BC and dumped by
 // PTM_DUMP_QIND_SERIES ('QIDT'). Converting to incident would require a fragile
 // per-face division by (1-A_i) and ε_i that also breaks that sum-equality
-// cross-check. (No Smith beaming here — with rms_slope_deg > 0 the beamed IR
-// correction is added to the total but not the split, so vis+ir < total then.)
+// cross-check. The sum-equality holds with Smith beaming on too (BEAM-05, fixed
+// 2026-08-25): the beamed IR correction is booked into indirect_ir alongside the
+// total. reportIndirectBandClosure() below measures it on every run.
 //
 //   *_series : [face][ABSOLUTE step] absorbed band flux (exactly as coupled).
 //   frames   : output window [eq_steps, eq_steps+out_steps) -> _0000.._{out-1}.bin
@@ -13445,7 +13506,11 @@ int main(int argc, char** argv) {
     bool rad_use_monte_carlo_vf = false;         // Monte Carlo ray-gather view factors
     int  rad_mc_rays_per_face = 100000;          // Rays per source face for MC method
 
-    // Anisotropic (roughness-beamed) thermal emission (Smith 1967). 0 = OFF.
+    // Anisotropic (roughness-beamed) thermal emission (Smith 1967).
+    // rad_beaming is the switch, rad_rms_slope_deg the knob; when the switch is
+    // off the knob is forced to 0 below, so every downstream `> 0` test is a test
+    // of BOTH and no code path can honor one without the other.
+    bool rad_beaming = false;                    // radiation.beaming
     double rad_rms_slope_deg = 0.0;              // RMS micro-slope [deg]
     double rad_beam_vf_threshold = 1e-7;         // Min renormalized VF to keep a beam pair
     double rad_radiance_prune_eps = 0.0;         // Radiance-prune eps [W/m^2] (assembly-time; 0 = off)
@@ -13518,7 +13583,32 @@ int main(int argc, char** argv) {
     }
     rad_use_monte_carlo_vf = sim_config.radiation.use_monte_carlo_vf;
     rad_mc_rays_per_face = sim_config.radiation.mc_rays_per_face;
+    rad_beaming = sim_config.radiation.beaming;
     rad_rms_slope_deg = sim_config.radiation.rms_slope_deg;
+    // The switch needs the knob. Refusing here is the point: a config that asks
+    // for beaming and supplies no roughness would otherwise run Lambertian and
+    // report nothing, and its author would read the output as a beaming result.
+    if (rad_beaming && !(rad_rms_slope_deg > 0.0)) {
+        std::cerr << "[config] FATAL: radiation.beaming = true requires "
+                     "radiation.rms_slope_deg > 0 (got " << rad_rms_slope_deg << ").\n"
+                     "         rms_slope_deg is the RMS sub-facet slope w in DEGREES. "
+                     "Literature range 20-37 deg:\n"
+                     "           32.5  Jhoti et al. (2024) Table 1, lunar highlands "
+                     "(the validated polar value)\n"
+                     "           ~20   Bandfield et al. (2015), Diviner global regolith fit\n"
+                     "           ~37   Rubanenko et al. (2020), steep-slope end of the range\n"
+                     "         Set a value in that range, or remove 'beaming: true'."
+                  << std::endl;
+        return 1;
+    }
+    // Switch off => knob forced inert, so nothing downstream can act on a
+    // leftover slope. Announced, never silent.
+    if (!rad_beaming && rad_rms_slope_deg > 0.0) {
+        std::cout << "[config] radiation.beaming = false: radiation.rms_slope_deg = "
+                  << rad_rms_slope_deg << " deg is INERT this run (Lambertian emission)."
+                  << std::endl;
+        rad_rms_slope_deg = 0.0;
+    }
     rad_beam_vf_threshold = sim_config.radiation.beam_vf_threshold;
     rad_radiance_prune_eps = sim_config.radiation.radiance_prune_eps;
     // Multi-GPU radiosity (only consulted if rad_use_gpu == true).
@@ -15309,6 +15399,7 @@ int main(int argc, char** argv) {
             early_rad_config.force_hmatrix = rad_force_hmatrix;
             early_rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             early_rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            early_rad_config.beaming = rad_beaming;
             early_rad_config.rms_slope_deg = rad_rms_slope_deg;
             early_rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             early_rad_config.radiance_prune_eps = rad_radiance_prune_eps;
@@ -16461,8 +16552,10 @@ int main(int argc, char** argv) {
     // held in indirect_flux_series, captured per timestep from the two-band
     // solve. Same [face][ABSOLUTE step] layout as indirect_flux_series; left
     // empty for gray / radoff runs (so those runs' outputs stay byte-identical).
-    // With no Smith beaming, indirect_solar_series + indirect_ir_series ==
-    // indirect_flux_series exactly (== the PTM_DUMP_QIND_SERIES 'QIDT' total).
+    // indirect_solar_series + indirect_ir_series == indirect_flux_series (== the
+    // PTM_DUMP_QIND_SERIES 'QIDT' total), with or without Smith beaming; the
+    // beamed delta goes to the IR band (BEAM-05). Checked, not assumed, by
+    // reportIndirectBandClosure() before the bands are written.
     std::vector<std::vector<double>> indirect_solar_series;  // (1-A)·Σ F·B_vis
     std::vector<std::vector<double>> indirect_ir_series;     //   ε·Σ F·B_ir
 
@@ -17621,6 +17714,7 @@ int main(int argc, char** argv) {
             rad_config.force_hmatrix = rad_force_hmatrix;
             rad_config.use_monte_carlo_vf = rad_use_monte_carlo_vf;
             rad_config.mc_rays_per_face = rad_mc_rays_per_face;
+            rad_config.beaming = rad_beaming;
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             rad_config.radiance_prune_eps = rad_radiance_prune_eps;
@@ -21219,6 +21313,10 @@ int main(int argc, char** argv) {
     if (output_format == "binary" && run_thermal_mesh
             && !indirect_solar_series.empty()) {
         if (indirect_bands_available && !indirect_bands_batch_gap) {
+            // BEAM-05 tripwire, before anything is written: the bands are only
+            // meaningful as a decomposition if they add up to the total.
+            reportIndirectBandClosure(indirect_flux_series,
+                                      indirect_solar_series, indirect_ir_series);
             const bool write_frames = !sim_config.output.skip_time_series;
             bool ib_ok = writeIndirectBandOutputs(
                 output_dir, mesh,
