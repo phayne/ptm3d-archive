@@ -423,6 +423,64 @@ def test_validate_never_raises_on_a_scalar_the_engine_accepts():
             assert isinstance(ok, bool) and isinstance(messages, list)
 
 
+def test_validate_catches_the_two_martinez_engine_refusals():
+    """The combo can reach two engine startup FATALs; validate() must too.
+
+    Same shape as the beaming/rms_slope_deg pair: the GUI offers the control,
+    so the refusal has to sit next to it rather than arrive as an exit 1 after
+    pre-flight has already passed.
+    """
+    manager = _manager()
+    manager.set_value("thermophysical.conductivity_model", "martinez2021")
+    manager.set_value("thermophysical.constant_thermal_inertia", 55.0)
+    ok, messages = manager.validate()
+    assert not ok and any("contradictory" in m for m in messages), messages
+
+    # Eq. 10's solid coefficient is negative below 1003.52 kg/m^3, and on a
+    # built-in body the density rows have no engine override path -- so Europa
+    # (500/700) cannot be made valid from the GUI at all.
+    manager = _manager()
+    manager.set_value("simulation.body", "Europa")
+    manager.set_value("thermophysical.conductivity_model", "martinez2021")
+    manager.set_value("thermophysical.rhos", 500.0)
+    manager.set_value("thermophysical.rhod", 700.0)
+    ok, messages = manager.validate()
+    assert not ok and any("1003.52" in m for m in messages), messages
+
+    # An alias spelling must reach the same rule.
+    manager.set_value("thermophysical.conductivity_model", "Martinez")
+    ok, _messages = manager.validate()
+    assert not ok, "the alias spelling escaped the density rule"
+
+    # hayne2017 at the same densities is fine.
+    manager.set_value("thermophysical.conductivity_model", "hayne2017")
+    ok, messages = manager.validate()
+    assert ok, messages
+
+
+def test_beaming_with_radiation_off_is_reported_inert():
+    """The engine reads beaming only on the radiation path.
+
+    With radiation.enabled false -- the GUI's own default -- the run is
+    Lambertian and says nothing about Smith at all, which is exactly the
+    misreading the engine's own FATAL comment warns about.
+    """
+    from gui_core.preflight import PreflightReport
+
+    manager = _manager()
+    manager.set_value("radiation.enabled", False)
+    manager.set_value("radiation.beaming", True)
+    manager.set_value("radiation.rms_slope_deg", 32.5)
+    # Not an error -- the engine runs it -- but it must not pass in silence.
+    ok, _messages = manager.validate()
+    assert ok, "an inert beaming flag should not block the launch"
+
+    source = (REPO_ROOT / "gui" / "gui_core" / "preflight.py").read_text()
+    assert 'rad.get("beaming", False) and not rad.get("enabled", False)' in source, (
+        "run_preflight no longer warns about beaming with radiation off")
+    assert isinstance(PreflightReport().warnings, list)
+
+
 def test_the_enum_alias_tables_match_the_engine_s_parsers():
     """The engine normalizes and accepts synonyms; a plain findText does not.
 
@@ -530,6 +588,8 @@ TESTS = [
     test_a_quoted_rms_slope_does_not_break_the_load,
     test_the_basal_heat_flow_control_is_not_gated_on_the_body,
     test_validate_refuses_beaming_without_a_slope,
+    test_validate_catches_the_two_martinez_engine_refusals,
+    test_beaming_with_radiation_off_is_reported_inert,
     test_the_enum_alias_tables_match_the_engine_s_parsers,
     test_validate_catches_the_mesh_placement_traps,
     test_validate_never_raises_on_a_scalar_the_engine_accepts,

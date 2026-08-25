@@ -12,6 +12,20 @@ from ptm.engine_defaults import ENGINE_DEFAULTS
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
 
 
+#: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
+#: config that puts a scalar where one of these belongs has it dropped, which is
+#: what yaml-cpp does with a scalar section node under `if (root["radiation"])`.
+#: Derived from the default config's own shape below, so it cannot fall behind.
+_SECTION_KEYS = set()
+
+
+def _collect_section_keys(node, prefix=""):
+    for key, value in node.items():
+        if isinstance(value, dict):
+            _SECTION_KEYS.add(f"{prefix}{key}")
+            _collect_section_keys(value, f"{prefix}{key}.")
+
+
 def _sync_with_engine_defaults(shape, overrides, prefix=""):
     """Replace every value in `shape` that is an engine key with the engine's own.
 
@@ -513,15 +527,29 @@ class ConfigManager:
         # scalar node reads the section as absent -- so the GUI and the engine
         # now agree about what such a file means.
         if isinstance(loaded, dict):
-            bad = [k for k, v in loaded.items() if not isinstance(v, dict)]
-            for key in bad:
-                if loaded[key] is not None:
-                    import logging
-                    logging.warning(
-                        "[config] section %r is %r, not a mapping; ignoring it "
-                        "(the engine reads a scalar section as absent too).",
-                        key, loaded[key])
-                del loaded[key]
+            # RECURSIVE, because generic_body's orbit/spin/shape are sections
+            # too: `generic_body: {orbit: abc}` reached .get on a str and
+            # aborted the window from BodyDefinitionTab.load_from_config.
+            # Depth-1 sanitizing covered the top-level sections only.
+            def _drop_non_mappings(node, prefix=""):
+                for key in [k for k, v in node.items() if not isinstance(v, dict)]:
+                    dotted = f"{prefix}{key}"
+                    # A leaf VALUE is fine; only a key that this schema says is
+                    # a section gets dropped.
+                    if dotted not in _SECTION_KEYS:
+                        continue
+                    if node[key] is not None:
+                        import logging
+                        logging.warning(
+                            "[config] section %r is %r, not a mapping; "
+                            "ignoring it (the engine reads a scalar section as "
+                            "absent too).", dotted, node[key])
+                    del node[key]
+                for key, value in node.items():
+                    if isinstance(value, dict):
+                        _drop_non_mappings(value, f"{prefix}{key}.")
+
+            _drop_non_mappings(loaded)
         elif loaded is not None:
             raise ValueError(
                 f"{filename} does not contain a YAML mapping at the top level "
@@ -978,6 +1006,42 @@ class ConfigManager:
                 "enabled. Literature range 20-37 degrees; 32.5 is the "
                 "validated lunar polar value (Jhoti et al. 2024).")
 
+        # conductivity_model: martinez2021 has TWO engine-side FATALs that a
+        # GUI user can reach with the new combo and never see coming. Same shape
+        # as the beaming/slope pair above: the control exists, so the refusal
+        # has to exist next to it.
+        thermo = self.config.get("thermophysical")
+        thermo = thermo if isinstance(thermo, dict) else {}
+        model = str(thermo.get("conductivity_model", "hayne2017") or "")
+        is_martinez = "".join(
+            c for c in model.lower() if c not in "_- ").startswith("martinez")
+        if is_martinez:
+            c_ti = self._as_number(thermo.get("constant_thermal_inertia", -1.0),
+                                   -1.0)
+            if c_ti > 0:
+                errors.append(
+                    "Thermophysical: constant_thermal_inertia "
+                    f"({c_ti} SI) and conductivity_model martinez2021 are "
+                    "mutually contradictory -- constant TI derives cp from ks, "
+                    "and under Martinez the conductivity is not ks but Eq. 10, "
+                    "a function of temperature. The engine refuses this pair at "
+                    "startup (ptm_thermal_sim.cpp:16723).")
+            # Eq. 10's solid coefficient goes NEGATIVE below 1003.52 kg/m^3,
+            # so the engine refuses the run. On a built-in body the density
+            # rows are disabled (no override path), which means Europa
+            # (rho 500/700) cannot be made valid from this GUI at all -- say so
+            # here rather than let the launch fail after pre-flight.
+            rho_lo = min(self._as_number(thermo.get("rhos", 0.0), 0.0),
+                         self._as_number(thermo.get("rhod", 0.0), 0.0))
+            if 0 < rho_lo < 1003.52:
+                errors.append(
+                    f"Thermophysical: conductivity_model martinez2021 is "
+                    f"invalid at density {rho_lo:g} kg/m^3 -- Eq. 10 gives a "
+                    f"NEGATIVE conductivity below 1003.52. The engine refuses "
+                    f"this at startup. Raise the densities, or use hayne2017. "
+                    f"(On a built-in body the density rows have no engine "
+                    f"override path, so hayne2017 is the only option there.)")
+
         # The engine gates the mesh rotation on `latitude_override > -900` and
         # range-checks nothing, so -95 is fed straight to rotateMeshToLatLon,
         # where cos(lat) < 0 mirrors the target through the pole: the mesh lands
@@ -1054,3 +1118,4 @@ if _unknown_overrides:
 
 _sync_with_engine_defaults(ConfigManager.DEFAULT_CONFIG,
                            ConfigManager.GUI_DEFAULT_OVERRIDES)
+_collect_section_keys(ConfigManager.DEFAULT_CONFIG)

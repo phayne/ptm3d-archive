@@ -2188,6 +2188,10 @@ class RadiationTab(BaseConfigTab):
 
         self.widgets["radiation.beaming"].toggled.connect(
             self._on_beaming_toggled)
+        # Beaming is inert with radiation off, so the switch's own gate depends
+        # on that checkbox too.
+        self.widgets["radiation.enabled"].toggled.connect(
+            lambda _v: self._update_beaming_gating())
 
         # --- Thermal-Radiation Coupling (collapsed) ---
         coupling_section = CollapsibleSection("Thermal-Radiation Coupling", collapsed=True)
@@ -2390,6 +2394,32 @@ class RadiationTab(BaseConfigTab):
         policy = self._beaming_policy()
         switch = self.widgets["radiation.beaming"]
         knob = self.widgets["radiation.rms_slope_deg"]
+
+        # Beaming is INERT with radiation exchange off -- which is the GUI's own
+        # default. The engine copies beaming/rms_slope_deg into the radiation
+        # config only inside its radiation-enabled blocks
+        # (ptm_thermal_sim.cpp:15402, :17717), so the run prints nothing about
+        # Smith at all and the operator reads a Lambertian result as a beaming
+        # one. That is the failure the engine's own FATAL comment names. Reported
+        # here, in the tab, the same way "Face Fraction (legacy mode only)" is
+        # gated on coupling_mode.
+        if not self.config_manager.get_value("radiation.enabled", False):
+            switch.setEnabled(False)
+            knob.setEnabled(False)
+            self.beaming_ack.setVisible(False)
+            self.beaming_note.setStyleSheet(
+                "color: #FFB74D; font-size: 10px; padding: 4px;")
+            self.beaming_note.setText(
+                "Radiation exchange is OFF, so beaming is inert: the engine "
+                "reads these two keys only on the radiation path and the run "
+                "would say nothing about Smith at all. Enable Radiation "
+                "Exchange above to use it."
+                + (f"\n{policy.reason}" if switch.isChecked() else ""))
+            if switch.isChecked():
+                logging.warning(
+                    "[beaming] radiation.beaming is ON but radiation.enabled is "
+                    "off; the engine will ignore it entirely.")
+            return
 
         # Reset the acknowledgment whenever the thing being acknowledged
         # changes. Hiding it while leaving it CHECKED carried a tick made for

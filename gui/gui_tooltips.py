@@ -552,7 +552,13 @@ def get_synodic_period_days(config_manager, body_name=None):
     if clean_name in BODY_SYNODIC_PERIODS:
         return BODY_SYNODIC_PERIODS[clean_name]
 
-    return config_manager.get_value("simulation.duration_days", 3.55)
+    # The last resort returns the RAW config scalar, which then becomes
+    # _current_synodic_days on two tabs and is multiplied and compared there.
+    # Coerced for the same reason as everything else in this module: an
+    # uncached body (Custom, an uncached [H] ...) plus a quoted or
+    # exponent-spelled duration was a process abort.
+    return _as_number(
+        config_manager.get_value("simulation.duration_days", 3.55), 3.55)
 
 
 # Orbital period (year) in Earth days for built-in bodies.

@@ -894,7 +894,14 @@ def run_preflight(config, find_executable, project_root=None):
     # changing someone's physics is the failure this stage exists to remove --
     # so the launch is where it has to be asked. Same shape as the PTM-19
     # view-factor guard: a warning with an explicit override.
-    if rad.get("beaming", False):
+    if rad.get("beaming", False) and not rad.get("enabled", False):
+        # Inert, and the run would say nothing about it. Warn rather than let
+        # a Lambertian result be read as a beaming one.
+        report.warnings.append(
+            "beaming: radiation.beaming is ON but radiation.enabled is off, so "
+            "the engine ignores it entirely -- it reads that key only on the "
+            "radiation path. This run will be Lambertian and will not say so.")
+    elif rad.get("beaming", False):
         try:
             from gui_core.facet_scale import beaming_policy
             policy = beaming_policy(config, project_root)
