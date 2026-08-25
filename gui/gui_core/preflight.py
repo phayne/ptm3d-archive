@@ -576,22 +576,47 @@ def check_env_completeness(env, required=None):
     return problems
 
 
+def engine_env_plan(config):
+    """Decide WHICH variables a config asks for. Returns (table, source).
+
+    A config that carries an ``engine_env:`` mapping is taken at its word: the
+    block IS the environment, so ``engine_env: {}`` means "no fix flags" and a
+    block naming one variable does not silently gain the other four. A config
+    with no ``engine_env:`` key at all has not expressed an opinion, and gets
+    the recommended-ON set.
+
+    Before this distinction existed, ``load_from_yaml`` merged the loaded file
+    into DEFAULT_CONFIG, so every config came back carrying the recommended set
+    whatever it said -- there was no way to write "this run wants nothing".
+    A block that omits a recommended variable still gets a preflight warning
+    from ``check_env_completeness``; honoring it is not the same as endorsing it.
+    """
+    if not isinstance(config, dict) or "engine_env" not in config:
+        return dict(RECOMMENDED_ENGINE_ENV), "recommended-ON default set"
+    block = config.get("engine_env")
+    if not isinstance(block, dict):
+        # `engine_env:` with no mapping under it. Do not read a truncated file
+        # as a request for an empty environment; say so and use the default.
+        return (dict(RECOMMENDED_ENGINE_ENV),
+                "engine_env: present but not a mapping -- ignored, "
+                "recommended-ON default set applied")
+    table = {}
+    for k, v in block.items():
+        k = str(k).strip()
+        if not k:
+            continue
+        if v is None or str(v).strip() == "":
+            continue  # blank value = do not set
+        table[k] = str(v).strip()
+    return table, "engine_env: block in the config"
+
+
 def build_engine_env(config, base_env=None):
-    """Compose the subprocess environment: inherited env + recommended-ON
-    set + the user's Engine Flags table (config['engine_env']), which wins.
+    """Compose the subprocess environment: inherited env + whatever
+    ``engine_env_plan`` decides this config asks for.
     Returns (env, applied) where applied lists 'KEY=VAL' lines actually set."""
     env = dict(base_env if base_env is not None else os.environ)
-    table = dict(RECOMMENDED_ENGINE_ENV)
-    user_table = config.get("engine_env", {}) if isinstance(config, dict) else {}
-    if isinstance(user_table, dict):
-        for k, v in user_table.items():
-            k = str(k).strip()
-            if not k:
-                continue
-            if v is None or str(v).strip() == "":
-                table.pop(k, None)  # blank value = do not set / unset default
-            else:
-                table[k] = str(v).strip()
+    table, _source = engine_env_plan(config)
     applied = []
     for k in sorted(table):
         env[k] = table[k]
@@ -795,13 +820,16 @@ def run_preflight(config, find_executable, project_root=None):
 
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
+    _table, env_source = engine_env_plan(config)
     problems = check_env_completeness(env)
     if problems:
-        # build_engine_env always applies the recommended set, so problems
-        # here mean the user's Engine Flags table removed/changed one.
+        # A problem here means this config's own engine_env: block dropped or
+        # changed a recommended variable. Honoring the block is the point; not
+        # saying so would be the old silence.
         for p in problems:
             report.warnings.append(f"engine env: {p}")
-    report.info.append("engine env: " + " ".join(applied))
+    report.info.append(f"engine env source: {env_source}")
+    report.info.append("engine env: " + (" ".join(applied) or "(none)"))
     # A physics change is not a footnote. Warn, not info, so the console
     # classifier colors it and a colleague comparing against an older GUI run
     # of the same config is told why the numbers moved.

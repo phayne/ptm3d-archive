@@ -51,6 +51,25 @@ ENVIRONMENT_DOC = REPO_ROOT / "docs" / "ENVIRONMENT.md"
 RISE_EPS_GATED = ("PTM_ILLUM_RISE_KEPS", "PTM_ILLUM_RISE_HABS")
 
 
+class Skipped(Exception):
+    """A check that could not run here, as distinct from one that failed.
+
+    Only the ConfigManager check raises it, and only for a missing PyQt6:
+    ``gui_core`` pulls Qt in at package import, so without it that one check is
+    unrunnable, not failing. Everything else here reaches ``preflight``
+    directly, which imports Qt lazily.
+    """
+
+
+def _skip(reason):
+    """Skip the current check. Uses pytest's own mechanism when under pytest."""
+    try:
+        import pytest
+    except ImportError:
+        raise Skipped(reason) from None
+    pytest.skip(reason)
+
+
 def documented_recommended_on():
     """Parse the ``[recommended-ON]`` set out of docs/ENVIRONMENT.md.
 
@@ -128,6 +147,98 @@ def test_rise_eps_gated_variables_are_never_orphaned():
             f"the 2026-07-29..2026-08-25 defect.")
 
 
+def test_a_config_can_decline_the_flags():
+    """An ``engine_env:`` block is honored exactly, including an empty one.
+
+    ``load_from_yaml`` used to merge the loaded file INTO a DEFAULT_CONFIG whose
+    ``engine_env`` is the recommended set, so ``engine_env: {}`` -- the
+    documented way to say "no fix flags" -- came back carrying all of them, and
+    a block naming one variable silently gained the rest. There was no way to
+    write "this run wants nothing."
+    """
+    env, applied = build_engine_env({"engine_env": {}}, base_env={})
+    leaked = sorted(k for k in env if k.startswith("PTM_"))
+    assert not leaked, (
+        f"a config carrying an empty engine_env: block still got {leaked}; "
+        f"'no fix flags' has to be expressible")
+    assert applied == [], f"applied should be empty, got {applied}"
+
+    env, _ = build_engine_env(
+        {"engine_env": {"PTM_ILLUM_TRUE_NORMALS": "0"}}, base_env={})
+    assert env.get("PTM_ILLUM_TRUE_NORMALS") == "0"
+    assert "PTM_ILLUM_RISE_EPS" not in env, (
+        "a config that named one variable was silently given the rest of the "
+        "recommended set; an explicit block must mean exactly what it says")
+
+    # No block at all is "I did not think about this": apply the set.
+    env, _ = build_engine_env({}, base_env={})
+    assert env.get("PTM_ILLUM_RISE_EPS") == "1"
+
+    # A blank value inside a block still means "do not set".
+    env, _ = build_engine_env(
+        {"engine_env": {"PTM_ILLUM_RISE_EPS": "1", "PTM_ILLUM_SEAL_HOLES": ""}},
+        base_env={})
+    assert env.get("PTM_ILLUM_RISE_EPS") == "1"
+    assert "PTM_ILLUM_SEAL_HOLES" not in env
+
+
+def test_declining_the_flags_is_reported_not_silent():
+    """Honoring a reduced block still warns that it is reduced."""
+    from gui_core.preflight import check_env_completeness, engine_env_plan
+
+    env, _ = build_engine_env({"engine_env": {}}, base_env={})
+    problems = check_env_completeness(env)
+    assert problems, (
+        "an engine_env: {} run got no completeness warning at all; honoring a "
+        "block is not the same as endorsing it")
+
+    _table, source = engine_env_plan({"engine_env": {}})
+    assert "engine_env" in source, source
+    _table, source = engine_env_plan({})
+    assert "recommended" in source, source
+    # A truncated `engine_env:` must not be read as a request for nothing.
+    table, source = engine_env_plan({"engine_env": None})
+    assert table == dict(RECOMMENDED_ENGINE_ENV), table
+    assert "not a mapping" in source, source
+
+
+def test_loading_a_config_does_not_re_add_the_flags():
+    """ConfigManager keeps the file's own block instead of merging the default.
+
+    Skipped, not failed, where PyQt6 is missing: ``gui_core`` imports Qt at
+    package import even though ``preflight`` itself does not.
+    """
+    import tempfile
+
+    try:
+        from gui_core.config_manager import ConfigManager
+    except ImportError as exc:
+        _skip(f"the GUI's config manager is unavailable here ({exc}); "
+              f"install PyQt6 to run this check")
+
+    def loaded_env(text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+            fh.write(text)
+            path = fh.name
+        manager = ConfigManager()
+        manager.load_from_yaml(path)
+        Path(path).unlink()
+        return manager.get_value("engine_env")
+
+    assert loaded_env("simulation:\n  body: Moon\nengine_env: {}\n") == {}, (
+        "a config declaring an empty engine_env: block came back carrying the "
+        "recommended set; there is then no way to write 'no fix flags'")
+
+    one = loaded_env("simulation:\n  body: Moon\n"
+                     "engine_env:\n  PTM_ILLUM_TRUE_NORMALS: '0'\n")
+    assert one == {"PTM_ILLUM_TRUE_NORMALS": "0"}, (
+        f"a block naming one variable silently gained the others: {one}")
+
+    # No block at all keeps the recommended default.
+    none = loaded_env("simulation:\n  body: Moon\n")
+    assert none == dict(RECOMMENDED_ENGINE_ENV), none
+
+
 def test_the_physics_change_is_announced():
     """The banner names the variables and says temperatures move."""
     for token in ("PTM_ILLUM_RISE_EPS", "PTM_ILLUM_RISE_KEPS",
@@ -140,28 +251,47 @@ TESTS = [
     test_injected_variables_match_the_documentation,
     test_every_omission_is_on_the_record,
     test_rise_eps_gated_variables_are_never_orphaned,
+    test_a_config_can_decline_the_flags,
+    test_declining_the_flags_is_reported_not_silent,
+    test_loading_a_config_does_not_re_add_the_flags,
     test_the_physics_change_is_announced,
 ]
 
 
 def main():
     failures = 0
+    skipped = 0
     for test in TESTS:
         try:
             test()
         except AssertionError as exc:
             failures += 1
             print(f"FAIL {test.__name__}\n     {exc}")
+        except BaseException as exc:                   # noqa: BLE001
+            # pytest.skip raises its own Skipped, which derives from
+            # BaseException; match on the name and let anything else through.
+            if type(exc).__name__ != "Skipped":
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failures += 1
+                print(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+            else:
+                skipped += 1
+                print(f"SKIP {test.__name__}\n     {exc}")
         else:
             print(f"PASS {test.__name__}")
     total = len(TESTS)
-    print(f"\n[test_gui_engine_env] {total - failures}/{total} passed, "
+    tally = f"{total - failures - skipped}/{total} passed"
+    if skipped:
+        tally += f", {skipped} skipped"
+    print(f"\n[test_gui_engine_env] {tally}, "
           f"{len(RECOMMENDED_ENGINE_ENV)} variable(s) injected, "
           f"{len(DELIBERATELY_NOT_INJECTED)} deliberately omitted")
     if failures:
         print("[test_gui_engine_env] FAIL")
         return 1
-    print("[test_gui_engine_env] PASS")
+    print("[test_gui_engine_env] PASS"
+          + (f" ({skipped} skipped)" if skipped else ""))
     return 0
 
 

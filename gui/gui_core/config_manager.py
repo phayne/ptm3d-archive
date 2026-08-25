@@ -372,6 +372,19 @@ class ConfigManager:
 
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
 
+        # engine_env is REPLACED, not merged. A config that carries the block
+        # is taken at its word -- `engine_env: {}` means "no fix flags", and a
+        # block naming one variable does not silently gain the rest. Merging
+        # made both of those impossible to write: every loaded config came back
+        # carrying the recommended set whatever it said. A config with no
+        # engine_env key at all has expressed no opinion and keeps the default.
+        # gui_core.preflight.engine_env_plan applies the same rule at launch.
+        # A non-mapping `engine_env:` (a truncated file) keeps the default set
+        # instead, which is what engine_env_plan does at launch -- the two must
+        # not disagree about what the same file means.
+        if isinstance(loaded, dict) and isinstance(loaded.get("engine_env"), dict):
+            self.config["engine_env"] = dict(loaded["engine_env"])
+
         # Derive synthetic GUI fields property_map_mode / property_map_kind
         # from the underlying YAML keys (so the GUI radio reflects the file).
         therm = self.config.get("thermal", {})
