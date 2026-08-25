@@ -1,8 +1,36 @@
 # PTM3D GUI — update plan (functionality and usability)
 
-Status: **plan only. Nothing here is implemented.** Written 2026-08-25 against `main` at
-`ddaeb3b` (PR #128, the Smith-beaming merge). Every number below was measured on that tree,
+Status: **Stage 1 is implemented** on `feat/gui-stage1-correctness` (2026-08-25, prepare-only).
+Stages 2 and 3 are still plan only. Written 2026-08-25 against `main` at
+`ddaeb3b` (PR #128, the Smith-beaming merge); the Stage-1 work rebased onto `cf7d97c`, which
+changed nothing in `gui/` or the config surface. Every number below was measured on that tree,
 not estimated; §1.1 lists the probes and how to rerun them.
+
+> **What Stage 1 shipped, and the three places it deviates from this document.**
+> All fourteen items landed, plus the GUI-PRESET-1 disposition. Decisions used: DP-1(a)
+> read-only open, DP-2 the corrected environment set, DP-3 defaults generated from
+> `ptm.engine_defaults`, DP-4 the facet-scale rule (GUI-side only; the engine-side guard stays
+> `ENG-BEAM-SCALE-1`). DP-5 through DP-9 were not touched.
+>
+> 1. **§2.3 says eleven orphan keys; there are ten.**
+>    `thermophysical.constant_thermal_inertia` is annotated in that list as handler-wired and is
+>    not an orphan. Eight were deleted, two got controls.
+> 2. **§4.4's sampling threshold moved from 5,000,000 faces to 200,000.** Summing all 2,397,890
+>    faces of the A3GT `A03MP026` core took 9.9 s in the reader, on the GUI thread, per field
+>    change; sampling 5,000 takes 0.6 s and lands within 0.6% of the documented 3.46 m.
+> 3. **§4.4's criterion is now the FINE END of the mesh, not `sqrt(mean face area)`.** The mean
+>    is dominated by the largest facets: 99% of facets at 1 mm plus 1% at 1 m reports 10 cm and
+>    passes a rule written to refuse millimeter facets with margin — and A3GT v2 meshes really
+>    are multi-resolution (`scripts/a3gt_v2_extended_mesh.py`). Measured `sqrt(mean)` against
+>    `sqrt(5th percentile)`: `sunlit_radcore_r50` 234 m / 169 m, A3GT core 3.47 m / 0.708 m,
+>    A3GT ring 146 m / 25.1 m. The gate is the 5th percentile; the reported headline stays the
+>    mean so it still matches §8.4's table. The A3GT core therefore moves from *allow* to the
+>    acknowledgment tier, which is the honest reading of 5% of its facets being sub-meter.
+>
+> Also corrected while implementing: `docs/KNOWN_LIMITATIONS.md` §4 said
+> `thermal.geothermal_heat_flow` is discarded on built-in bodies, and it has been FIXED since
+> `2e06a70`. Re-measured — Moon ico3, Qb −1 vs 0.05 W/m², max |ΔT_min| = 0.8421 K. Trusting the
+> stale doc cost one wrong commit, reverted the same day.
 
 The GUI was last changed substantively on **2026-08-09** (`b4a4d73`, an American-English
 sweep). The only later commit touching `gui/` is `2a0ac1f` (2026-08-21), which changed
@@ -451,10 +479,15 @@ src/python/tests/test_config_parity.py` green (its GUI arm is the parity gate) a
 byte-comparison of a saved config before and after, which is the invariant the 2026-08-02 work
 established and should not be dropped.
 
-### Stage 1 — correctness
+### Stage 1 — correctness — **IMPLEMENTED**
 
 Ships the defects and the science keys. No layout change, so it can land while the UI design is
 still being argued about.
+
+Implemented 2026-08-25 on `feat/gui-stage1-correctness`; see the status note at the top of this
+document for the three deviations. Six new test files carry the invariants
+(`test_gui_engine_env`, `test_gui_run_is_read_only`, `test_gui_defaults_follow_engine`,
+`test_gui_stage1_keys`, `test_gui_beaming_scale_rule`, `test_gui_scalar_spellings`).
 
 | # | Item | Effort | Description |
 |---|---|---|---|
