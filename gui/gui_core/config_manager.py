@@ -397,6 +397,36 @@ class ConfigManager:
     # sets, and a preset that would violate the beaming facet-scale rule
     # refusing with the reason.
 
+    #: Property-map combo labels, and the label-or-index decoder. Class-level
+    #: because ThermalTab.load_from_config needs the SAME mapping: the combo's
+    #: writeback stores the label text, so a second load_from_config() without
+    #: an intervening load_from_yaml() handed `int()` a sentence and aborted the
+    #: application. Two copies of this decoder is how that happened.
+    _MODE_LABELS = {
+        "None (uniform body H)": 0,
+        "Bundled icosphere default for body": 1,
+        "Custom file": 2,
+    }
+    _KIND_LABELS = {
+        "H-parameter (m)": 0,
+        "Thermal inertia (J m^-2 K^-1 s^-1/2)": 1,
+    }
+
+    @staticmethod
+    def _to_index(raw, label_map):
+        """Combo label text, a numeric string, or an int -> index. Never raises."""
+        if isinstance(raw, str):
+            if raw in label_map:
+                return label_map[raw]
+            try:                       # numeric string fallback (e.g. "1")
+                return int(raw)
+            except (ValueError, TypeError):
+                return 0
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return 0
+
     # Properties with an engine-side *_override key for BUILT-IN bodies
     # (config_parser.cpp "Parse Thermophysical section"; the other
     # thermophysical scalars have no override path outside generic_body).
@@ -429,7 +459,8 @@ class ConfigManager:
         gb = self.config.get("generic_body", {}) or {}
         return bool(
             gb.get("config_file") or gb.get("name")
-            or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+            or self._as_number(
+                (gb.get("orbit") or {}).get("semi_major_axis_au", -1.0), -1.0) > 0
         )
 
     def get_config(self):
@@ -474,9 +505,22 @@ class ConfigManager:
         # because it is the same crash class as the rest of this branch and the
         # fix is one line at the boundary. Dropping the key is exactly what the
         # engine does with it.
+        # Generalized from the None case: ANY non-mapping top-level value is
+        # dropped, because every section in this schema is a mapping. A bare
+        # `radiation:` (None), a `mesh: ico6` (str) or a `thermal:` followed by
+        # a list all used to reach `.get(...)` on a non-dict and abort. Dropping
+        # is what yaml-cpp effectively does -- `if (root["radiation"])` on a
+        # scalar node reads the section as absent -- so the GUI and the engine
+        # now agree about what such a file means.
         if isinstance(loaded, dict):
-            empty = [k for k, v in loaded.items() if v is None]
-            for key in empty:
+            bad = [k for k, v in loaded.items() if not isinstance(v, dict)]
+            for key in bad:
+                if loaded[key] is not None:
+                    import logging
+                    logging.warning(
+                        "[config] section %r is %r, not a mapping; ignoring it "
+                        "(the engine reads a scalar section as absent too).",
+                        key, loaded[key])
                 del loaded[key]
         elif loaded is not None:
             raise ValueError(
@@ -525,7 +569,8 @@ class ConfigManager:
 
         # Derive synthetic GUI fields property_map_mode / property_map_kind
         # from the underlying YAML keys (so the GUI radio reflects the file).
-        therm = self.config.get("thermal", {})
+        therm = self.config.get("thermal")
+        therm = therm if isinstance(therm, dict) else {}
         h_path  = therm.get("h_parameter_map", "")
         ti_path = therm.get("thermal_inertia_map", "")
         use_def = therm.get("use_default_property_map", False)
@@ -551,7 +596,8 @@ class ConfigManager:
         # only canonical built-in references select Built-in. No behavior
         # change for old configs.
         loaded_mesh = (loaded or {}).get("mesh", {}) or {}
-        mesh_cfg = self.config.get("mesh", {})
+        mesh_cfg = self.config.get("mesh")
+        mesh_cfg = mesh_cfg if isinstance(mesh_cfg, dict) else {}
         topo_dir = str(loaded_mesh.get("topo_directory", "") or "")
         if "topo_directory" not in loaded_mesh or \
                 topo_dir.rstrip("/") in ("", "data/topo"):
@@ -729,7 +775,8 @@ class ConfigManager:
                 gb = v if isinstance(v, dict) else {}
                 has_data = (
                     gb.get("config_file") or gb.get("name")
-                    or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+                    or self._as_number(
+                (gb.get("orbit") or {}).get("semi_major_axis_au", -1.0), -1.0) > 0
                 )
                 if has_data:
                     cleaned = self._strip_sentinels(_dc(gb))
@@ -769,28 +816,9 @@ class ConfigManager:
         # The GUI's QComboBox writeback stores the *label text* (see
         # add_combo_field's currentTextChanged binding), so map labels back
         # to indices defensively.
-        _MODE_LABELS = {
-            "None (uniform body H)": 0,
-            "Bundled icosphere default for body": 1,
-            "Custom file": 2,
-        }
-        _KIND_LABELS = {
-            "H-parameter (m)": 0,
-            "Thermal inertia (J m^-2 K^-1 s^-1/2)": 1,
-        }
-        def _to_index(raw, label_map):
-            if isinstance(raw, str):
-                if raw in label_map:
-                    return label_map[raw]
-                # numeric string fallback (e.g. "1")
-                try:
-                    return int(raw)
-                except (ValueError, TypeError):
-                    return 0
-            try:
-                return int(raw)
-            except (ValueError, TypeError):
-                return 0
+        _MODE_LABELS = self._MODE_LABELS
+        _KIND_LABELS = self._KIND_LABELS
+        _to_index = self._to_index
         if "thermal" in out:
             therm = _dc(out["thermal"])
             mode = _to_index(therm.pop("property_map_mode", 0), _MODE_LABELS)
@@ -819,7 +847,9 @@ class ConfigManager:
             out["thermal"] = therm
 
         # Sanitize simulation.body
-        body = out.get("simulation", {}).get("body", "")
+        # str(): a scalar that is not a string still has to be written, not
+        # crash the save. yaml.safe_load can hand back a float here.
+        body = str(out.get("simulation", {}).get("body", "") or "")
         if body.startswith("[H] "):
             out["simulation"] = _dc(out["simulation"])
             out["simulation"]["body"] = body[4:]
@@ -897,28 +927,32 @@ class ConfigManager:
         num = self._as_number
 
         # Simulation parameters
-        sim = self.config.get("simulation", {})
+        sim = self.config.get("simulation")
+        sim = sim if isinstance(sim, dict) else {}
         if num(sim.get("duration_days"), 0.0) <= 0:
             errors.append("Duration must be positive")
         if num(sim.get("timesteps"), 0.0) <= 0:
             errors.append("Timesteps must be positive")
 
         # Mesh parameters
-        mesh_cfg = self.config.get("mesh", {})
+        mesh_cfg = self.config.get("mesh")
+        mesh_cfg = mesh_cfg if isinstance(mesh_cfg, dict) else {}
         if num(mesh_cfg.get("resolution"), 0.0) < 1:
             errors.append("Mesh resolution must be >= 1")
         if num(mesh_cfg.get("scale_factor"), 0.0) <= 0:
             errors.append("Mesh scale factor must be positive")
 
         # Thermal parameters
-        therm = self.config.get("thermal", {})
+        therm = self.config.get("thermal")
+        therm = therm if isinstance(therm, dict) else {}
         if num(therm.get("threads"), 0.0) < 0:
             errors.append("Thermal threads cannot be negative")
         if num(therm.get("equilibration_orbits"), 0.0) < 0:
             errors.append("Equilibration cycles cannot be negative")
 
         # Radiation parameters
-        rad = self.config.get("radiation", {})
+        rad = self.config.get("radiation")
+        rad = rad if isinstance(rad, dict) else {}
         if rad.get("enabled", False):
             if not 0 <= num(rad.get("min_shadow_fraction"), 0.0) <= 1:
                 errors.append("Radiation: min_shadow_fraction must be between 0 and 1")
@@ -949,7 +983,8 @@ class ConfigManager:
         # where cos(lat) < 0 mirrors the target through the pole: the mesh lands
         # at +85 and longitude+180, silently, somewhere other than the field
         # says. -999 stays the documented "leave it alone" sentinel.
-        mesh = self.config.get("mesh", {})
+        mesh = self.config.get("mesh")
+        mesh = mesh if isinstance(mesh, dict) else {}
         lat = self._as_number(mesh.get("latitude_override", -999.0), -999.0)
         if lat > -900.0 and not (-90.0 <= lat <= 90.0):
             errors.append(
@@ -967,13 +1002,19 @@ class ConfigManager:
                 "on latitude, so this longitude will be ignored. Set a "
                 "latitude, or clear the longitude to -999.")
 
-        # Output validation
+        # Output validation. .get(), not [...]: the only unguarded subscript
+        # left in this function, and `output: binary` (a scalar section) made it
+        # raise "string indices must be integers" out of the Run slot.
+        # load_from_yaml drops non-mapping sections now, but validate() is
+        # public and is also reached from configs this manager did not load.
+        out_cfg = self.config.get("output")
+        out_cfg = out_cfg if isinstance(out_cfg, dict) else {}
         valid_formats = ["binary", "vtk"]
-        if self.config["output"]["format"] not in valid_formats:
+        if out_cfg.get("format") not in valid_formats:
             errors.append(f"Output format must be one of: {', '.join(valid_formats)}")
 
         valid_vtk_modes = ["thermal", "complete", "both"]
-        if self.config["output"]["vtk_mode"] not in valid_vtk_modes:
+        if out_cfg.get("vtk_mode") not in valid_vtk_modes:
             errors.append(f"VTK mode must be one of: {', '.join(valid_vtk_modes)}")
 
         # GPU warnings

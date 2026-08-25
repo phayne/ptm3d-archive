@@ -352,6 +352,47 @@ class BaseConfigTab(QWidget):
         self.config_manager.set_value(key, value)
         self.value_changed.emit()
 
+    def set_bool(self, key, value):
+        """Load a boolean into its checkbox, tolerating YAML's spellings.
+
+        `beaming: 'true'` -- a QUOTED boolean -- is a str after
+        yaml.safe_load, and yaml-cpp's `as<bool>` accepts it, so the engine runs
+        that config. `setChecked(str)` raises, out of load_from_config, which is
+        an application abort. The sibling of set_numeric for the same reason.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        if isinstance(value, bool):
+            widget.setChecked(value)
+            return
+        text = str(value).strip().lower()
+        # The set yaml-cpp's bool decoder accepts.
+        if text in ("true", "yes", "on", "1"):
+            widget.setChecked(True)
+        elif text in ("false", "no", "off", "0", "", "none"):
+            widget.setChecked(False)
+        else:
+            logging.warning(
+                "[config] %s = %r is not a boolean; leaving the control at %r",
+                key, value, widget.isChecked())
+            return
+        self.config_manager.set_value(key, widget.isChecked())
+
+    def set_text(self, key, value):
+        """Load a string into its line edit. A non-string is shown, not thrown."""
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        if value is None:
+            widget.setText("")
+            return
+        if not isinstance(value, str):
+            logging.warning(
+                "[config] %s = %r is not a string; showing its text form",
+                key, value)
+        widget.setText(str(value))
+
     def set_enum(self, key, value, aliases):
         """Select a combo entry, tolerating the engine's own aliases.
 
@@ -877,6 +918,7 @@ class SimulationTab(BaseConfigTab):
             return
 
         # Check if this is a HORIZONS body (prefixed with [H])
+        text = str(text or "")
         is_horizons = text.startswith("[H] ")
         is_custom = (text == "Custom")
         self.generic_body_label.setVisible(is_horizons or is_custom)
@@ -973,7 +1015,7 @@ class SimulationTab(BaseConfigTab):
 
         self._syncing = True
         try:
-            self.widgets["simulation.start_time"].setText(sim["start_time"])
+            self.set_text("simulation.start_time", sim["start_time"])
 
             # Update synodic period for the loaded body
             self._current_synodic_days = self._get_synodic_period_days(
@@ -992,8 +1034,9 @@ class SimulationTab(BaseConfigTab):
 
             self.set_numeric("simulation.timesteps", sim["timesteps"])
 
-            # Body combo
-            body_name = sim["body"]
+            # Body combo. str(): findText refuses a non-string argument, and
+            # simulation.body is whatever yaml.safe_load made of it.
+            body_name = str(sim.get("body", "") or "")
             combo = self.widgets["simulation.body"]
             idx = combo.findText(body_name)
             if idx >= 0:
@@ -1002,8 +1045,9 @@ class SimulationTab(BaseConfigTab):
                 combo.blockSignals(False)
             else:
                 # Body not found directly — check if it's a HORIZONS body
-                config_path = config.get("generic_body", {}).get("config_file", "")
+                config_path = (config.get("generic_body") or {}).get("config_file", "")
 
+                body_name = str(body_name or "")
                 if body_name.startswith("[H] "):
                     self.add_horizons_body(body_name[4:], config_path)
                 else:
@@ -1208,7 +1252,7 @@ class MeshTab(BaseConfigTab):
 
     def _on_import_file_changed(self, text):
         """Disable global mesh options when a custom mesh file is specified."""
-        has_custom = bool(text.strip())
+        has_custom = bool(str(text or "").strip())
         self.widgets["mesh.resolution"].setEnabled(not has_custom)
         self.widgets["mesh.use_topographic"].setEnabled(not has_custom)
         if has_custom:
@@ -1225,6 +1269,7 @@ class MeshTab(BaseConfigTab):
 
     def _current_body(self):
         body = self.config_manager.get_value("simulation.body", "") or ""
+        body = str(body or "")
         return body[4:] if body.startswith("[H] ") else body
 
     def _project_root(self):
@@ -1238,7 +1283,7 @@ class MeshTab(BaseConfigTab):
         if source == "builtin":
             # Canonical relative reference; the engine resolves it through
             # its PTM_DATA_ROOT contract (portable saved configs).
-            self.widgets["mesh.topo_directory"].setText("data/topo")
+            self.set_text("mesh.topo_directory", "data/topo")
         self._apply_topo_source_enabled()
         self.refresh_builtin_topo()
         self.value_changed.emit()
@@ -1303,12 +1348,12 @@ class MeshTab(BaseConfigTab):
         self._loading = True
         try:
             self.set_numeric("mesh.resolution", mesh["resolution"])
-            self.widgets["mesh.use_topographic"].setChecked(
+            self.set_bool("mesh.use_topographic", 
                 mesh.get("use_topographic", False))
-            self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
-            self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
+            self.set_text("mesh.topo_directory", mesh.get("topo_directory", ""))
+            self.set_text("mesh.import_file", mesh.get("import_file", ""))
             self.set_numeric("mesh.scale_factor", mesh.get("scale_factor", 1.0))
-            self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
+            self.set_text("mesh.occluder_file", mesh.get("occluder_file", ""))
             self.set_numeric("mesh.latitude_override",
                              mesh.get("latitude_override", -999.0))
             self.set_numeric("mesh.longitude_override",
@@ -1953,17 +1998,22 @@ class ThermalTab(BaseConfigTab):
     def _sync_eq_cadence_from_config(self):
         """Set combo + spin to reflect stored values (called from load_from_config)."""
         thermal = self.config_manager.get_config().get("thermal", {})
-        explicit = thermal.get("equilibration_steps_per_day", -1.0)
-        samples = thermal.get("equilibration_samples_per_diurnal_cycle", -1.0)
+        # Coerced: yaml.safe_load returns str for `-1e0`, `5e3` and a quoted
+        # `'120'` -- and '120' is the GUI's OWN default for the samples key, so
+        # a config carrying it quoted aborted the window here.
+        explicit = ConfigManager._as_number(
+            thermal.get("equilibration_steps_per_day", -1.0), -1.0)
+        samples = ConfigManager._as_number(
+            thermal.get("equilibration_samples_per_diurnal_cycle", -1.0), -1.0)
 
         self.eq_cadence_combo.blockSignals(True)
         self.eq_cadence_spin.blockSignals(True)
         try:
-            if explicit is not None and explicit > 0.0:
+            if explicit > 0.0:
                 self.eq_cadence_combo.setCurrentIndex(self._EQ_MODE_CUSTOM)
                 self.eq_cadence_spin.setValue(float(explicit))
                 self.eq_cadence_spin.setEnabled(True)
-            elif samples is not None and samples > 0.0:
+            elif samples > 0.0:
                 # Snap to known tiers; otherwise use Balanced as closest default
                 tier_idx = self._EQ_MODE_BALANCED
                 for idx_k, s_k in self._EQ_ACCURACY_SAMPLES.items():
@@ -1990,7 +2040,7 @@ class ThermalTab(BaseConfigTab):
 
         self._syncing = True
         try:
-            self.widgets["thermal.run_thermal_mesh"].setChecked(thermal["run_thermal_mesh"])
+            self.set_bool("thermal.run_thermal_mesh", thermal["run_thermal_mesh"])
             self.set_numeric("thermal.threads", thermal["threads"])
 
             # Update synodic and orbital periods for current body
@@ -2004,10 +2054,10 @@ class ThermalTab(BaseConfigTab):
             self.eq_spin.setValue(display_val)
             self.eq_spin.blockSignals(False)
 
-            self.widgets["thermal.compute_statistics"].setChecked(thermal["compute_statistics"])
-            self.widgets["thermal.use_gpu"].setChecked(thermal.get("use_gpu", False))
-            self.widgets["thermal.enable_shadow_flux"].setChecked(
-                thermal.get("enable_shadow_flux", False))
+            self.set_bool("thermal.compute_statistics", thermal["compute_statistics"])
+            self.set_bool("thermal.use_gpu", thermal.get("use_gpu", False))
+            self.set_bool("thermal.enable_shadow_flux",
+                          thermal.get("enable_shadow_flux", False))
             self.set_numeric("thermal.geothermal_heat_flow",
                              thermal.get("geothermal_heat_flow", -1.0))
 
@@ -2019,20 +2069,30 @@ class ThermalTab(BaseConfigTab):
                           SEED_ANCHOR_ALIASES)
             self.set_numeric("thermal.analytic_seed_cycles",
                              thermal.get("analytic_seed_cycles", -1.0))
-            self.widgets["thermal.seed_anchor_refuse_two_timescale"].setChecked(
-                thermal.get("seed_anchor_refuse_two_timescale", False))
-            self.widgets["thermal.initial_state_file"].setText(
-                thermal.get("initial_state_file", ""))
-            self.widgets["thermal.final_state_file"].setText(
-                thermal.get("final_state_file", ""))
+            self.set_bool("thermal.seed_anchor_refuse_two_timescale",
+                          thermal.get("seed_anchor_refuse_two_timescale", False))
+            self.set_text("thermal.initial_state_file",
+                          thermal.get("initial_state_file", ""))
+            self.set_text("thermal.final_state_file",
+                          thermal.get("final_state_file", ""))
 
             self.set_numeric("thermal.integration_days", thermal["integration_days"])
             self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
             # Property maps (synthetic mode/kind drive the UI; underlying
             # YAML keys are managed by ConfigManager at save/load time).
-            mode = int(thermal.get("property_map_mode", 0))
-            kind = int(thermal.get("property_map_kind", 0))
+            # The combo's writeback stores the LABEL TEXT, so a second
+            # load_from_config() without an intervening load_from_yaml() saw
+            # "Bundled icosphere default for body" and int() raised -- an abort.
+            # The dashboard's mesh chain does exactly that sequence
+            # (thermal_adapter.set_input -> load_from_config). ConfigManager
+            # already defends the same value with _to_index at save time; this
+            # call site did not.
+            from gui_core.config_manager import ConfigManager as _CM
+            mode = _CM._to_index(thermal.get("property_map_mode", 0),
+                                 _CM._MODE_LABELS)
+            kind = _CM._to_index(thermal.get("property_map_kind", 0),
+                                 _CM._KIND_LABELS)
             if "thermal.property_map_mode" in self.widgets:
                 self.widgets["thermal.property_map_mode"].setCurrentIndex(mode)
             if "thermal.property_map_kind" in self.widgets:
@@ -2041,9 +2101,9 @@ class ThermalTab(BaseConfigTab):
             # field (file picker). When kind=H-parameter, the same widget is
             # interpreted as an h_parameter_map path at save-time.
             custom_path = thermal.get("thermal_inertia_map", "") or thermal.get("h_parameter_map", "")
-            self.widgets["thermal.thermal_inertia_map"].setText(custom_path)
+            self.set_text("thermal.thermal_inertia_map", custom_path)
             if "thermal.property_maps_directory" in self.widgets:
-                self.widgets["thermal.property_maps_directory"].setText(
+                self.set_text("thermal.property_maps_directory", 
                     thermal.get("property_maps_directory", "data/property_maps")
                 )
             # Sync enable state to mode
@@ -2486,12 +2546,12 @@ class RadiationTab(BaseConfigTab):
         config = self.config_manager.get_config()
         rad = config.get("radiation", {})
 
-        self.widgets["radiation.enabled"].setChecked(rad.get("enabled", False))
-        self.widgets["radiation.verbose"].setChecked(rad.get("verbose", False))
+        self.set_bool("radiation.enabled", rad.get("enabled", False))
+        self.set_bool("radiation.verbose", rad.get("verbose", False))
         # The fallbacks here track the engine's own defaults (they only fire for
         # a config missing the key entirely). use_gpu was True and
         # max_coupling_iterations 10 while the engine said False and 16.
-        self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", False))
+        self.set_bool("radiation.use_gpu", rad.get("use_gpu", False))
         self.set_numeric("radiation.min_shadow_fraction", rad.get("min_shadow_fraction", 0.3))
         self.set_enum("radiation.coupling_mode",
                       rad.get("coupling_mode", "bounded"),
@@ -2500,20 +2560,20 @@ class RadiationTab(BaseConfigTab):
         self.set_numeric("radiation.coupling_temp_threshold", rad.get("coupling_temp_threshold", 0.5))
         self.set_numeric("radiation.coupling_flux_threshold", rad.get("coupling_flux_threshold", 0.1))
         self.set_numeric("radiation.coupling_face_fraction", rad.get("coupling_face_fraction", 0.01))
-        self.widgets["radiation.view_factor_file"].setText(rad.get("view_factor_file", ""))
-        self.widgets["radiation.use_hmatrix"].setChecked(rad.get("use_hmatrix", False))
-        self.widgets["radiation.use_aca"].setChecked(rad.get("use_aca", True))
+        self.set_text("radiation.view_factor_file", rad.get("view_factor_file", ""))
+        self.set_bool("radiation.use_hmatrix", rad.get("use_hmatrix", False))
+        self.set_bool("radiation.use_aca", rad.get("use_aca", True))
         self.set_numeric("radiation.aca_tolerance", rad.get("aca_tolerance", 0.001))
         self.set_numeric("radiation.aca_max_rank", rad.get("aca_max_rank", 50))
         self.set_numeric("radiation.hmatrix_threads", rad.get("hmatrix_threads", 0))
         self.set_numeric("radiation.nearfield_quadrature_order",
                          rad.get("nearfield_quadrature_order", 3))
-        self.widgets["radiation.use_monte_carlo_vf"].setChecked(
-            rad.get("use_monte_carlo_vf", False))
+        self.set_bool("radiation.use_monte_carlo_vf",
+                      rad.get("use_monte_carlo_vf", False))
         self.set_numeric("radiation.mc_rays_per_face",
                          rad.get("mc_rays_per_face", 100000))
         # Sparse view factors
-        self.widgets["radiation.adaptive_neighbors"].setChecked(rad.get("adaptive_neighbors", True))
+        self.set_bool("radiation.adaptive_neighbors", rad.get("adaptive_neighbors", True))
         self.set_numeric("radiation.captured_energy_target", rad.get("captured_energy_target", 0.95))
         self.set_numeric("radiation.max_neighbors", rad.get("max_neighbors", 500))
         self.set_numeric("radiation.min_neighbors", rad.get("min_neighbors", 20))
@@ -2522,7 +2582,7 @@ class RadiationTab(BaseConfigTab):
         # disagrees with is kept and said loudly.
         self.set_numeric("radiation.rms_slope_deg", rad.get("rms_slope_deg", 0.0))
         self.widgets["radiation.beaming"].blockSignals(True)
-        self.widgets["radiation.beaming"].setChecked(rad.get("beaming", False))
+        self.set_bool("radiation.beaming", rad.get("beaming", False))
         self.widgets["radiation.beaming"].blockSignals(False)
         self._legacy_beaming_note()
         self._update_hmatrix_suboptions()
@@ -2553,7 +2613,7 @@ class RadiationTab(BaseConfigTab):
         # beaming off would silently get it back.
         self.config_manager.legacy_implicit_beaming = None
         self.widgets["radiation.beaming"].blockSignals(True)
-        self.widgets["radiation.beaming"].setChecked(True)
+        self.set_bool("radiation.beaming", True)
         self.widgets["radiation.beaming"].blockSignals(False)
         self.config_manager.set_value("radiation.beaming", True)
         logging.warning(
@@ -3029,6 +3089,9 @@ class ThermophysicalTab(BaseConfigTab):
             config = self.config_manager.get_config()
             body_name = config.get("simulation", {}).get("body", "Moon")
 
+        # str(): simulation.body can be any scalar after yaml.safe_load, and
+        # .startswith on a float raises out of load_from_config -- an abort.
+        body_name = str(body_name or "")
         # Strip [H] prefix for HORIZONS bodies
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
 
@@ -3113,8 +3176,11 @@ class ThermophysicalTab(BaseConfigTab):
                 # and its widget caps at 1.0 m.
                 self.set_numeric(value_key, thermo.get(value_attr, 0.0))
             if default_key in self.widgets:
-                use_default = thermo.get(default_attr, True)
-                self.widgets[default_key].setChecked(use_default)
+                # set_bool, not setChecked: a quoted `use_default_H: 'true'` is
+                # a str after yaml.safe_load, the engine's as<bool> accepts it,
+                # and setChecked(str) raises out of load_from_config.
+                self.set_bool(default_key, thermo.get(default_attr, True))
+                use_default = self.widgets[default_key].isChecked()
                 self.widgets[value_key].setEnabled(not use_default)
 
         # Seed body defaults first (this re-applies the body's default
@@ -3161,7 +3227,8 @@ class ThermophysicalTab(BaseConfigTab):
                 return None
             # Get rAU from orbit section if available
             orbit = body_config.get("generic_body", {}).get("orbit", {})
-            rAU = orbit.get("semi_major_axis_au", 2.5)
+            rAU = ConfigManager._as_number(
+                orbit.get("semi_major_axis_au", 2.5), 2.5)
             if rAU <= 0:
                 rAU = 2.5
             return {
@@ -3188,7 +3255,7 @@ class ThermophysicalTab(BaseConfigTab):
     def _get_current_body_defaults(self):
         """Return the BODY_DEFAULTS dict for the currently selected body."""
         config = self.config_manager.get_config()
-        body_name = config.get("simulation", {}).get("body", "Moon")
+        body_name = str(config.get("simulation", {}).get("body", "Moon") or "")
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
         if body_name.startswith("[H] "):
             hd = self._load_horizons_defaults(clean_name)
@@ -3232,8 +3299,9 @@ class ThermophysicalTab(BaseConfigTab):
         cpCoeff = defaults.get("cpCoeff", [])
 
         # Try to get rAU from generic_body config (overrides body defaults)
-        config_rAU = self.config_manager.get_value(
-            "generic_body.orbit.semi_major_axis_au", -1.0)
+        config_rAU = ConfigManager._as_number(
+            self.config_manager.get_value(
+                "generic_body.orbit.semi_major_axis_au", -1.0), -1.0)
         if config_rAU > 0:
             rAU = config_rAU
 
@@ -3752,6 +3820,7 @@ class BodyDefinitionTab(BaseConfigTab):
 
     def on_body_changed(self, body_name):
         """Update banner and field state when body selection changes."""
+        body_name = str(body_name or "")
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
         is_builtin = clean_name in self.BUILTIN_BODIES
         is_horizons = body_name.startswith("[H] ")
@@ -3877,11 +3946,13 @@ class BodyDefinitionTab(BaseConfigTab):
             return
         widget = self.widgets[key]
         widget.blockSignals(True)
-        if isinstance(widget, QDoubleSpinBox):
-            # Clamp to widget range
-            v = float(value) if value is not None else widget.minimum()
+        if isinstance(widget, (QDoubleSpinBox, QSpinBox)):
+            # Clamp to widget range. float() is not enough on its own: NaN and
+            # the infinities pass it, and int(nan)/int(inf) then raise out of
+            # load_from_config, which is a process abort.
+            v = ConfigManager._as_number(value, widget.minimum())
             v = max(widget.minimum(), min(widget.maximum(), v))
-            widget.setValue(v)
+            widget.setValue(type(widget.value())(v))
         elif isinstance(widget, QLineEdit):
             widget.setText(str(value) if value else "")
         elif isinstance(widget, QComboBox):
@@ -3924,7 +3995,9 @@ class BodyDefinitionTab(BaseConfigTab):
         orbit = gb.get("orbit", {})
         for field in ["semi_major_axis_au", "eccentricity", "inclination_deg",
                        "lon_ascending_node_deg", "arg_perihelion_deg", "mean_anomaly_deg"]:
-            val = orbit.get(field, -1.0)
+            # Coerced: a quoted or exponent-spelled number loads as str and
+            # the bare `>=` raised out of load_from_config -- an abort.
+            val = ConfigManager._as_number(orbit.get(field, -1.0), -1.0)
             self._set_widget_value(f"generic_body.orbit.{field}",
                                    val if val >= 0 else 0.0)
         self._set_widget_value("generic_body.orbit.epoch",
@@ -3933,7 +4006,7 @@ class BodyDefinitionTab(BaseConfigTab):
         # Spin
         spin = gb.get("spin", {})
         for field in ["period_hours", "pole_ra_deg", "pole_dec_deg", "prime_meridian_deg"]:
-            val = spin.get(field, -1.0)
+            val = ConfigManager._as_number(spin.get(field, -1.0), -1.0)
             self._set_widget_value(f"generic_body.spin.{field}",
                                    val if val >= 0 else 0.0)
 
@@ -4064,6 +4137,7 @@ class IlluminationTab(BaseConfigTab):
 
     def _current_body(self):
         body = self.config_manager.get_value("simulation.body", "") or ""
+        body = str(body or "")
         return body[4:] if body.startswith("[H] ") else body
 
     def _project_root(self):
@@ -4159,11 +4233,11 @@ class IlluminationTab(BaseConfigTab):
         config = self.config_manager.get_config()
         illum = config["illumination"]
 
-        self.widgets["illumination.include_primary_reflection"].setChecked(illum["include_primary_reflection"])
-        self.widgets["illumination.use_batch_processing"].setChecked(illum["use_batch_processing"])
-        self.widgets["illumination.albedo_map"].setText(illum["albedo_map"])
-        self.widgets["illumination.albedo_maps_directory"].setText(illum["albedo_maps_directory"])
-        self.widgets["illumination.positions_file"].setText(illum["positions_file"])
+        self.set_bool("illumination.include_primary_reflection", illum["include_primary_reflection"])
+        self.set_bool("illumination.use_batch_processing", illum["use_batch_processing"])
+        self.set_text("illumination.albedo_map", illum["albedo_map"])
+        self.set_text("illumination.albedo_maps_directory", illum["albedo_maps_directory"])
+        self.set_text("illumination.positions_file", illum["positions_file"])
 
         source = illum.get("albedo_source", "builtin")
         for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
@@ -4236,20 +4310,22 @@ class OutputTab(BaseConfigTab):
         config = self.config_manager.get_config()
         out = config["output"]
 
-        self.widgets["output.directory"].setText(out["directory"])
+        self.set_text("output.directory", out["directory"])
 
-        idx = self.widgets["output.format"].findText(out["format"])
+        # str(): findText refuses a non-string, out of load_from_config.
+        idx = self.widgets["output.format"].findText(str(out.get("format", "")))
         if idx >= 0:
             self.widgets["output.format"].setCurrentIndex(idx)
 
-        idx = self.widgets["output.vtk_mode"].findText(out["vtk_mode"])
+        idx = self.widgets["output.vtk_mode"].findText(
+            str(out.get("vtk_mode", "")))
         if idx >= 0:
             self.widgets["output.vtk_mode"].setCurrentIndex(idx)
 
-        self.widgets["output.include_primary_ir"].setChecked(out.get("include_primary_ir", False))
-        self.widgets["output.locations_file"].setText(out.get("locations_file", ""))
-        self.widgets["output.depths_file"].setText(out.get("depths_file", ""))
-        self.widgets["output.series_output"].setText(out.get("series_output", ""))
+        self.set_bool("output.include_primary_ir", out.get("include_primary_ir", False))
+        self.set_text("output.locations_file", out.get("locations_file", ""))
+        self.set_text("output.depths_file", out.get("depths_file", ""))
+        self.set_text("output.series_output", out.get("series_output", ""))
 
 
 class EngineFlagsTab(BaseConfigTab):

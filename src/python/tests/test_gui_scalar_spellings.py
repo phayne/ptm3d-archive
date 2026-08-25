@@ -38,24 +38,37 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
 
-#: Spellings yaml.safe_load hands back as something other than int/float.
+#: Spellings yaml.safe_load hands back as something other than the type the
+#: key wants -- every one of which the ENGINE parses without complaint.
+#: `-1e0`, `5e3` and `1e5` are str (PyYAML's float resolver wants a decimal
+#: point or a signed exponent); `~` is None; `.nan`/`.inf`/`-.inf` are floats
+#: that int() refuses; `'true'` is a str that yaml-cpp's as<bool> accepts.
 SPELLINGS = ("-1e0", "5e3", "1e5", '"20"', "~",
-             ".nan", ".inf", "-.inf")
+             ".nan", ".inf", "-.inf", "'true'", "'no'", "[]")
 
-#: Every numeric key the GUI reads back into a widget or compares.
-NUMERIC_KEYS = {
-    "simulation": ("duration_days", "timesteps"),
-    "mesh": ("resolution", "scale_factor", "latitude_override",
-             "longitude_override"),
-    "thermal": ("threads", "equilibration_orbits", "geothermal_heat_flow",
-                "analytic_seed_cycles", "integration_days", "integration_steps"),
-    "radiation": ("min_shadow_fraction", "max_coupling_iterations",
-                  "coupling_temp_threshold", "coupling_flux_threshold",
-                  "coupling_face_fraction", "aca_tolerance", "aca_max_rank",
-                  "hmatrix_threads", "captured_energy_target", "max_neighbors",
-                  "min_neighbors", "rms_slope_deg",
-                  "nearfield_quadrature_order", "mc_rays_per_face"),
-}
+
+def _leaf_keys():
+    """Every leaf key of the GUI's own DEFAULT_CONFIG, as (section, dotted-rest).
+
+    DERIVED, not enumerated. A hand-written key list is how this test reported
+    "130 of 130 clean" while `thermal.equilibration_samples_per_diurnal_cycle`
+    -- whose GUI default is 120 -- still aborted the window when a config
+    quoted it. The set of keys to check is exactly the set the GUI reads.
+    """
+    from gui_core.config_manager import ConfigManager
+
+    out = []
+
+    def walk(node, prefix):
+        for key, value in node.items():
+            dotted = f"{prefix}{key}"
+            if isinstance(value, dict):
+                walk(value, dotted + ".")
+            else:
+                out.append(dotted)
+
+    walk(ConfigManager.DEFAULT_CONFIG, "")
+    return out
 
 
 class Skipped(Exception):
@@ -109,35 +122,52 @@ def test_no_scalar_spelling_can_abort_the_gui():
     with tempfile.TemporaryDirectory() as scratch:
         ConfigManager, ConfigurationPanel = _panel_stack(scratch)
         path = Path(scratch) / "spelling.yaml"
+        out_path = Path(scratch) / "out.yaml"
         failures = []
         checked = 0
+        keys = _leaf_keys()
+        assert len(keys) > 80, (
+            f"only {len(keys)} leaf keys found in DEFAULT_CONFIG; the "
+            f"derivation is broken and this test would pass vacuously")
+
+        # ONE manager and ONE panel, reused. Rebuilding a ConfigurationPanel per
+        # case costs ~0.4 s and turns this into a nine-minute gate, which is a
+        # gate nobody runs. Reuse is also the harsher test: the widgets carry
+        # state from the previous case, which is exactly how the property-map
+        # combo's label-text writeback aborted a SECOND load_from_config().
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
 
         for spelling in SPELLINGS:
-            for section, keys in NUMERIC_KEYS.items():
-                for key in keys:
-                    doc = {"simulation": {"body": "Moon"},
-                           "radiation": {"enabled": True, "beaming": True}}
-                    doc.setdefault(section, {})
-                    doc[section][key] = yaml.safe_load(spelling)
-                    path.write_text(yaml.dump(doc, default_flow_style=False))
-                    checked += 1
-                    try:
-                        manager = ConfigManager()
-                        manager.load_from_yaml(str(path))
-                        panel = ConfigurationPanel(manager)
-                        for tab in panel.tabs.values():
-                            tab.load_from_config()
-                        manager.validate()
-                        manager.save_to_yaml(str(Path(scratch) / "out.yaml"))
-                    except Exception as exc:               # noqa: BLE001
-                        failures.append(
-                            f"{section}.{key} = {spelling}: "
-                            f"{type(exc).__name__}: {exc}")
+            parsed = yaml.safe_load(spelling)
+            for dotted in keys:
+                doc = {"simulation": {"body": "Moon"},
+                       "radiation": {"enabled": True, "beaming": True}}
+                node = doc
+                parts = dotted.split(".")
+                for part in parts[:-1]:
+                    node = node.setdefault(part, {})
+                node[parts[-1]] = parsed
+                path.write_text(yaml.dump(doc, default_flow_style=False))
+                checked += 1
+                try:
+                    manager.load_from_yaml(str(path))
+                    for tab in panel.tabs.values():
+                        tab.load_from_config()
+                    # A SECOND pass: the combo writebacks store label text, so
+                    # the second load is a different input than the first.
+                    for tab in panel.tabs.values():
+                        tab.load_from_config()
+                    manager.validate()
+                    manager.save_to_yaml(str(out_path))
+                except Exception as exc:                   # noqa: BLE001
+                    failures.append(
+                        f"{dotted} = {spelling}: {type(exc).__name__}: {exc}")
 
         assert not failures, (
             f"{len(failures)} of {checked} loads raised. Each one is an "
             f"application abort (PyQt6 qFatal, exit 134), not an error "
-            f"message:\n  " + "\n  ".join(failures[:12]))
+            f"message:\n  " + "\n  ".join(failures[:15]))
 
 
 TESTS = [test_no_scalar_spelling_can_abort_the_gui]
@@ -166,8 +196,7 @@ def main():
     tally = f"{total - failures - skipped}/{total} passed"
     if skipped:
         tally += f", {skipped} skipped"
-    n = len(SPELLINGS) * sum(len(v) for v in NUMERIC_KEYS.values())
-    print(f"\n[test_gui_scalar_spellings] {tally}, {n} config loads")
+    print(f"\n[test_gui_scalar_spellings] {tally}")
     if failures:
         print("[test_gui_scalar_spellings] FAIL")
         return 1
