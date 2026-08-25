@@ -7,7 +7,37 @@ import yaml
 from copy import deepcopy
 from pathlib import Path
 
+from ptm.engine_defaults import ENGINE_DEFAULTS
+
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+
+
+def _sync_with_engine_defaults(shape, overrides, prefix=""):
+    """Replace every value in `shape` that is an engine key with the engine's own.
+
+    `shape` declares WHICH keys the GUI exposes (and carries the GUI-synthetic
+    ones the engine never reads); `ptm.engine_defaults.ENGINE_DEFAULTS` is the
+    generated, test-pinned table of what the engine actually defaults to. Taking
+    the values from there rather than retyping them is what makes the next
+    engine-side change a test failure instead of a GUI that quietly believes an
+    old number. `radiation.max_coupling_iterations` sat at 10 for weeks after the
+    engine raised it to 16 exactly this way.
+
+    Keys in `overrides` keep the GUI's value; every other key that the engine
+    does not read is left as written (GUI-synthetic and display-only fields).
+    Mutates and returns `shape`.
+    """
+    for key, value in shape.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, dict):
+            _sync_with_engine_defaults(value, overrides, dotted + ".")
+        elif dotted in ENGINE_DEFAULTS and dotted not in overrides:
+            engine_value = ENGINE_DEFAULTS[dotted]
+            # A key read without a literal default (a sequence) has None here;
+            # that is "no default in the parser", not "defaults to null".
+            if engine_value is not None:
+                shape[key] = engine_value
+    return shape
 
 
 def detect_hardware_capabilities():
@@ -87,6 +117,41 @@ def detect_hardware_capabilities():
 
 class ConfigManager:
     """Manages PTM3D simulation configuration"""
+
+    #: Every dotted key here keeps the GUI's value; every OTHER key in
+    #: DEFAULT_CONFIG that the engine reads takes the engine's own default from
+    #: ptm.engine_defaults (see _sync_with_engine_defaults). So a divergence is
+    #: either on this list with a reason, or it does not exist.
+    #:
+    #: src/python/tests/test_gui_defaults_follow_engine.py pins the list: an
+    #: entry that no longer differs from the engine, or one naming a key the
+    #: engine does not read, fails there.
+    GUI_DEFAULT_OVERRIDES = {
+        "simulation.body":
+            "Moon is the best-validated built-in body (Diviner) and the least "
+            "surprising starting point; the engine's own default is Europa. "
+            "Paul's D1 ruling, 2026-08-02.",
+        "simulation.duration_days":
+            "One lunar synodic period, to match the default body. The Simulation "
+            "tab re-sets this whenever the body changes.",
+        "simulation.timesteps":
+            "144 steps over one synodic period; the engine's 72 is for its own "
+            "3.55-day Europa default.",
+        "thermal.run_thermal_mesh":
+            "The GUI is a thermal application: a new project runs the thermal "
+            "model. The engine defaults it off because illumination-only runs "
+            "are a normal CLI use.",
+        "thermal.equilibration_samples_per_diurnal_cycle":
+            "120 = the 'Balanced' accuracy tier the cadence selector presents "
+            "(~4 K max on the Moon ico3 reference). The engine's -1 is 'legacy, "
+            "match output cadence', which the tier list offers explicitly.",
+        "mesh.topo_directory":
+            "The built-in dataset contract: data/topo, resolved through "
+            "PTM_DATA_ROOT. The engine's '' means 'no built-in topography'.",
+        "generic_body.shape.type":
+            "A new custom body starts spherical, which is what the Body "
+            "Definition tab's first field offers.",
+    }
 
     DEFAULT_CONFIG = {
         "simulation": {
@@ -186,12 +251,15 @@ class ConfigManager:
             "constant_thermal_inertia": -1.0  # >0: constant TI (chi=0, cp=const); -1: disabled
         },
         "radiation": {
+            # Values below that the engine reads are REPLACED by the engine's
+            # own defaults at class-definition time; what is written here is the
+            # key list, not the numbers. See GUI_DEFAULT_OVERRIDES.
             "enabled": False,
             "min_shadow_fraction": 0.3,
             "verbose": False,
-            "use_gpu": True,
+            "use_gpu": False,
             "view_factor_file": "",
-            "max_coupling_iterations": 10,
+            "max_coupling_iterations": 16,
             "coupling_temp_threshold": 0.5,
             "coupling_flux_threshold": 0.1,
             "coupling_face_fraction": 0.01,
@@ -776,3 +844,18 @@ class ConfigManager:
                 result[key] = value
 
         return result
+
+
+# A typo in GUI_DEFAULT_OVERRIDES would silently do nothing -- the key would
+# simply never match, and the GUI would go on taking the engine's value while
+# the table claimed otherwise. Refuse at import instead; the GUI-imports step in
+# CI runs this.
+_unknown_overrides = sorted(
+    k for k in ConfigManager.GUI_DEFAULT_OVERRIDES if k not in ENGINE_DEFAULTS)
+if _unknown_overrides:
+    raise ValueError(
+        "ConfigManager.GUI_DEFAULT_OVERRIDES names key(s) the engine does not "
+        f"read, so the override could never apply: {_unknown_overrides}")
+
+_sync_with_engine_defaults(ConfigManager.DEFAULT_CONFIG,
+                           ConfigManager.GUI_DEFAULT_OVERRIDES)

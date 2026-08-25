@@ -1804,9 +1804,12 @@ class RadiationTab(BaseConfigTab):
 
         self.widgets["radiation.enabled"].setChecked(rad.get("enabled", False))
         self.widgets["radiation.verbose"].setChecked(rad.get("verbose", False))
-        self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", True))
+        # The fallbacks here track the engine's own defaults (they only fire for
+        # a config missing the key entirely). use_gpu was True and
+        # max_coupling_iterations 10 while the engine said False and 16.
+        self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", False))
         self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
-        self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 10))
+        self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 16))
         self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 0.5))
         self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
         self.widgets["radiation.coupling_face_fraction"].setValue(rad.get("coupling_face_fraction", 0.01))
