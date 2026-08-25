@@ -76,11 +76,32 @@ inline double integral(const double s[3], const double d[3], double w,
 }
 
 // Flat, energy-normalized chi table on a regular grid:
-//   index(is,ie,ipsi) = (is*ne + ie)*npsi + ipsi
+//   index(is,ie,iphi) = (is*ne + ie)*nphi + iphi
 // cos_sun cell centers (is+0.5)/ns in (0,1); cos_e cell centers (ie+0.5)/ne in
-// (0,1); cos_psi cell centers -1 + 2(ipsi+0.5)/npsi in (-1,1).
-inline std::vector<float> buildChiTable(double w_rad, int ns, int ne, int npsi) {
-    std::vector<float> table(static_cast<size_t>(ns) * ne * npsi, 1.0f);
+// (0,1); AZIMUTH cosine cos_phi cell centers -1 + 2(iphi+0.5)/nphi in (-1,1).
+//
+// ⛔ THE THIRD AXIS IS cos_phi, NOT cos_psi (changed 2026-08-24). chi is a
+// function of (theta_sun, theta_e, phi), and cos_psi = d.s_hat is a DERIVED
+// quantity: cos_psi = cos_sun cos_e + sin_sun sin_e cos_phi. On a regular
+// (cos_sun, cos_e, cos_psi) grid most cells are geometrically UNREACHABLE
+// (|cos_phi| > 1) and were filled with chi = 1, so every trilinear stencil
+// straddling that curved boundary was dragged toward 1 -- and at the lunar pole
+// the wall->floor flux sits right ON the boundary (near-zero phase, cos_phi ~ +1),
+// which is where chi is largest and varies fastest.
+//
+// MEASURED on the real flux-weighted wall->floor pair distribution (Fermi's
+// calc10_pairs.npy, 5.3M pairs, w = 32.5 deg): exact flux-weighted mean chi
+// 1.657; the old cos_psi-indexed 24x24x33 table read 1.595 (-3.8%, p95 pointwise
+// error 24%), and refining that grid to 64x128x129 only reached 1.617 -- the bias
+// is the parametrization, not the resolution. Re-indexed on cos_phi at the SAME
+// 24x24x33 the error drops to -0.33% (p95 1.6%), and at 48x48x65 to -0.12%
+// (p95 1.2%). Reproduce with scripts/chi_table_resolution.py (its --pairs input is
+// a measurement, not a repo artifact; the script says so and refuses to invent one).
+//
+// The evalChi() signature is unchanged: it still takes cos_psi and does the
+// conversion, so no caller has to know this.
+inline std::vector<float> buildChiTable(double w_rad, int ns, int ne, int nphi) {
+    std::vector<float> table(static_cast<size_t>(ns) * ne * nphi, 1.0f);
     const double w = w_rad;
 
     // Gaussian-slope quadrature (unit Gaussian in u = p/w), normalized to sum 1.
@@ -126,22 +147,16 @@ inline std::vector<float> buildChiTable(double w_rad, int ns, int ne, int npsi) 
             double cos_e = (ie + 0.5) / ne;
             double sin_e = std::sqrt(std::max(0.0, 1.0 - cos_e * cos_e));
             double g1 = G1(cos_e, w);
-            for (int ipsi = 0; ipsi < npsi; ++ipsi) {
-                double cos_psi = -1.0 + 2.0 * (ipsi + 0.5) / npsi;
-                double chi = 1.0;
-                double denom = sin_sun * sin_e;
-                if (denom > 1e-9) {
-                    double cphi = (cos_psi - cos_sun * cos_e) / denom;
-                    if (cphi >= -1.0 && cphi <= 1.0) {
-                        double sphi = std::sqrt(std::max(0.0, 1.0 - cphi * cphi));
-                        double d[3] = { sin_e * cphi, sin_e * sphi, cos_e };
-                        double I = integral(s, d, w, nodes, gw);
-                        chi = M_PI * g1 * I / (cos_e * Z);
-                    }
-                }
+            for (int iphi = 0; iphi < nphi; ++iphi) {
+                // Every cell is reachable now: cos_phi spans its own full range.
+                double cphi = -1.0 + 2.0 * (iphi + 0.5) / nphi;
+                double sphi = std::sqrt(std::max(0.0, 1.0 - cphi * cphi));
+                double d[3] = { sin_e * cphi, sin_e * sphi, cos_e };
+                double I = integral(s, d, w, nodes, gw);
+                double chi = M_PI * g1 * I / (cos_e * Z);
                 if (!std::isfinite(chi)) chi = 1.0;
                 chi = std::min(4.0, std::max(0.0, chi));
-                size_t idx = (static_cast<size_t>(is) * ne + ie) * npsi + ipsi;
+                size_t idx = (static_cast<size_t>(is) * ne + ie) * nphi + iphi;
                 table[idx] = static_cast<float>(chi);
             }
         }
@@ -149,26 +164,51 @@ inline std::vector<float> buildChiTable(double w_rad, int ns, int ne, int npsi) 
     return table;
 }
 
-// Trilinear lookup into a table from buildChiTable(). Returns 1.0 outside the
-// active domain (cos_sun <= 0 or cos_e <= 0).
-inline float evalChi(const std::vector<float>& table, int ns, int ne, int npsi,
+// Trilinear lookup into a table from buildChiTable(). Signature unchanged: the
+// caller still supplies cos_psi = d.s_hat, and the azimuth cosine the table is
+// indexed on is derived here. Returns 1.0 outside the active domain
+// (cos_sun <= 0, cos_e <= 0) and for a geometrically UNREACHABLE (cos_sun,
+// cos_e, cos_psi) triple (|cos_phi| > 1), which is what the exact expression
+// does too. The degenerate slabs sin_sun -> 0 / sin_e -> 0 are azimuth-
+// independent, so any cos_phi reads the same value; 0 is used.
+inline float evalChi(const std::vector<float>& table, int ns, int ne, int nphi,
                      double cos_sun, double cos_e, double cos_psi) {
     if (table.empty()) return 1.0f;
     if (cos_sun <= 0.0 || cos_e <= 0.0) return 1.0f;
+    const double sin_sun = std::sqrt(std::max(0.0, 1.0 - cos_sun * cos_sun));
+    const double sin_e   = std::sqrt(std::max(0.0, 1.0 - cos_e * cos_e));
+    const double denom = sin_sun * sin_e;
+    double cphi = 0.0;
+    if (denom > 1e-9) {
+        cphi = (cos_psi - cos_sun * cos_e) / denom;
+        // ⛔ CLAMP AT THE BOUNDARY, DO NOT REJECT THERE. |cos_phi| = 1 is the
+        // principal plane -- the azimuth that carries essentially all of the
+        // grazing-Sun wall->floor flux -- and a caller that forms cos_psi from
+        // its own sin_sun/sin_e lands there at 1 +/- a few ulp. Rejecting on a
+        // bare `> 1.0` sends exactly that geometry to chi = 1, i.e. beaming
+        // silently OFF where it matters most; it cost one build to find, under
+        // -O3 without -ffast-math (with -ffast-math the reassociation happened to
+        // land on the other side, so the failure was not even reproducible
+        // across optimization settings). Reject only genuinely unreachable
+        // triples, which no geometric caller can produce.
+        constexpr double kReach = 1e-6;
+        if (cphi < -1.0 - kReach || cphi > 1.0 + kReach) return 1.0f;
+        cphi = std::min(1.0, std::max(-1.0, cphi));
+    }
     double fs = cos_sun * ns - 0.5;
     double fe = cos_e * ne - 0.5;
-    double fp = (cos_psi + 1.0) * 0.5 * npsi - 0.5;
+    double fp = (cphi + 1.0) * 0.5 * nphi - 0.5;
     auto clampf = [](double f, int n) {
         return std::min(static_cast<double>(n - 1), std::max(0.0, f));
     };
-    fs = clampf(fs, ns); fe = clampf(fe, ne); fp = clampf(fp, npsi);
+    fs = clampf(fs, ns); fe = clampf(fe, ne); fp = clampf(fp, nphi);
     int is0 = static_cast<int>(fs), ie0 = static_cast<int>(fe), ip0 = static_cast<int>(fp);
     int is1 = std::min(is0 + 1, ns - 1);
     int ie1 = std::min(ie0 + 1, ne - 1);
-    int ip1 = std::min(ip0 + 1, npsi - 1);
+    int ip1 = std::min(ip0 + 1, nphi - 1);
     double ds = fs - is0, de = fe - ie0, dp = fp - ip0;
     auto at = [&](int a, int b, int c) -> double {
-        return table[(static_cast<size_t>(a) * ne + b) * npsi + c];
+        return table[(static_cast<size_t>(a) * ne + b) * nphi + c];
     };
     double c00 = at(is0, ie0, ip0) * (1 - dp) + at(is0, ie0, ip1) * dp;
     double c01 = at(is0, ie1, ip0) * (1 - dp) + at(is0, ie1, ip1) * dp;

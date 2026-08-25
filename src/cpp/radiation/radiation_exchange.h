@@ -445,6 +445,27 @@ public:
     // PTM_RAD_EMISSIVITY override. reflectivity_ is exactly 1 - this.
     const std::vector<double>& operativeEmissivity() const { return emissivity_; }
 
+    // ---- PTM_HMATRIX_VF_REPLACE state, for callers that must not build their
+    // own view factors while an external referee CSR is driving the radiosity.
+    //
+    // The reason this is exposed at all: RadiationExchangeManager::buildBeamPairs()
+    // used to call ViewFactorCalculator::computeSubset() unconditionally, so on a
+    // VF_REPLACE run the base radiosity solved the referee matrix while the Smith
+    // beamed-emission delta was computed from a DIFFERENT, in-engine matrix. Two
+    // matrices in one physical answer is the FC-08 / VF-unification-stage-2 error
+    // class; the beam pass now reads these instead.
+    bool vfReplaceActive() const { return vf_replace_cpu_route_; }
+    const std::string& vfReplacePath() const { return vf_replace_path_; }
+    // The replacement CSR itself, or nullptr when a replacement IS installed but
+    // is no longer directly row-addressable (PTM_HMATRIX_ROWFIX wraps F_op_ in a
+    // CorrectedRowFixOperator, whose congruence has no sparse rows). Callers must
+    // treat `vfReplaceActive() && !vfReplaceRows()` as an error, not as "absent".
+    // Non-owning: initCommon() installs this operator and never destroys it.
+    const SparseVFOperator* vfReplaceRows() const {
+        if (!vf_replace_cpu_route_) return nullptr;
+        return dynamic_cast<const SparseVFOperator*>(F_op_.get());
+    }
+
 private:
     // Initialize common data
     void initCommon(const std::vector<double>& emissivity,
@@ -996,9 +1017,42 @@ private:
     std::vector<float> chi_table_;
     int chi_ns_ = 0, chi_ne_ = 0, chi_npsi_ = 0;
 
+    // Face areas and per-emitter sky view factor F_sky,j = 1 - Sum_i F_ji, both
+    // over the SAME matrix buildBeamPairs() sourced its rows from. Populated only
+    // when beaming is active. beam_fsky_ is empty when the source matrix cannot
+    // supply full row sums (the in-engine subset path computes receiver rows
+    // only), and the energy-admissibility audit then reports that it could not
+    // run rather than passing silently.
+    std::vector<double> beam_area_;
+    std::vector<double> beam_fsky_;
+    // Name of the matrix the beam pairs were built from, for the banner and for
+    // the audit line. "" until buildBeamPairs() runs.
+    std::string beam_vf_source_;
+    // One-shot Gate-2 audit (flux-weighted mean chi + per-emitter energy debit).
+    // mutable because addBeamedFlux() is const and fires it on the first timestep
+    // that actually beams.
+    mutable bool beam_audit_done_ = false;
+
     // Build the chi lookup table by Gaussian quadrature over the Smith facet-
     // slope distribution (called once in prepare() when rms_slope_deg > 0).
     void buildChiTable();
+    // Gate 2 (energy conservation + chi closure). For one timestep, report the
+    // flux-weighted mean/median/p95 chi over the pairs that actually beam, and
+    // the per-emitter beamed excess D_j = Sum_i F_ji (chi_ji - 1) as a fraction
+    // of that emitter's own emitted power. Beaming REDISTRIBUTES a wall's fixed
+    // eps*sigma*T^4: the excess delivered to the floor is taken from the wall's
+    // sky share, so D_j <= F_sky,j is the admissibility condition. Violations are
+    // counted and reported loudly; they are never silently clamped.
+    // Returns false when no pair beamed on this timestep (no sunlit emitter), so
+    // the caller can keep its one shot for a step that has something to report.
+    bool auditBeamEnergy(const std::vector<double>& temperatures,
+                         const std::array<double, 3>& sun_dir) const;
+    // Gate 1 (matrix identity). With PTM_BEAM_VF_AUDIT=N, build in-engine view
+    // factors for N sampled receivers and print their row sums beside the row
+    // sums of the matrix the beam pass actually used. Diagnostic only.
+    void auditBeamViewFactorSource(ViewFactorCalculator& calc,
+                                   const std::vector<int>& receivers,
+                                   const SparseVFOperator* vfr) const;
     // Build the pruned sunlit-wall -> shadowed-floor beam-pair list (geometry +
     // Embree visibility), renormalized to match the radiosity VF weights.
     void buildBeamPairs();
