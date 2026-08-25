@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor
 
+from gui_core.config_manager import ConfigManager
+
 logger = logging.getLogger(__name__)
 
 # Import tooltips - use try/except for robustness
@@ -420,7 +422,15 @@ class BaseConfigTab(QWidget):
             widget.blockSignals(False)
             self.config_manager.set_value(key, value)
             return
-        widget.setValue(type(widget.value())(number))
+        coerced = type(widget.value())(number)
+        widget.setValue(coerced)
+        # Write the COERCED value back explicitly. Relying on setValue's
+        # valueChanged signal leaves a string in the config whenever the number
+        # happens to equal the widget's current value (no change, no signal) --
+        # and YAML resolves ordinary spellings like `-1e0` and `5e3` as str.
+        # Every later `<` or `<=` on that key then raises TypeError, which out
+        # of a Qt slot is an application abort.
+        self.config_manager.set_value(key, coerced)
 
     def load_from_config(self):
         """Load values from config manager - implemented by subclasses"""
@@ -572,8 +582,13 @@ class SimulationTab(BaseConfigTab):
 
     def _sync_step_size_from_config(self):
         """Initialize step size display from current config values."""
-        days = self.config_manager.get_value("simulation.duration_days", 3.55)
-        n_steps = self.config_manager.get_value("simulation.timesteps", 144)
+        # Coerced, because a YAML `5e3` or a quoted number loads as str and a
+        # bare `>` here raises out of init_ui -- which in the GUI is a process
+        # abort, not a message.
+        days = ConfigManager._as_number(
+            self.config_manager.get_value("simulation.duration_days", 3.55), 0.0)
+        n_steps = ConfigManager._as_number(
+            self.config_manager.get_value("simulation.timesteps", 144), 0.0)
         if n_steps > 0 and days > 0:
             step_sec = (days * 86400.0) / n_steps
             self.step_size_spin.blockSignals(True)
@@ -954,14 +969,17 @@ class SimulationTab(BaseConfigTab):
                 sim.get("body", "Moon")
             )
 
-            # Set duration spinbox in current display units (use saved value, not synodic default)
-            days = sim["duration_days"]
+            # Set duration spinbox in current display units (use saved value,
+            # not synodic default). Coerced: YAML resolves `5e3` and a quoted
+            # number as str, and setValue(str) raises out of load_from_config,
+            # which in the GUI is a process abort rather than a message.
+            days = ConfigManager._as_number(sim["duration_days"], 0.0)
             display_val = self._days_to_display(days)
             self.duration_spin.blockSignals(True)
             self.duration_spin.setValue(display_val)
             self.duration_spin.blockSignals(False)
 
-            self.widgets["simulation.timesteps"].setValue(sim["timesteps"])
+            self.set_numeric("simulation.timesteps", sim["timesteps"])
 
             # Body combo
             body_name = sim["body"]
@@ -1224,7 +1242,7 @@ class MeshTab(BaseConfigTab):
         mode toggle."""
         from gui_core import datasets
         body = self._current_body()
-        res = self.widgets["mesh.resolution"].value()
+        res = int(self.widgets["mesh.resolution"].value())
         root = self._project_root()
         status = datasets.topo_status(body, res, root)
         supported = status.state != datasets.STATE_UNSUPPORTED
@@ -1273,12 +1291,12 @@ class MeshTab(BaseConfigTab):
 
         self._loading = True
         try:
-            self.widgets["mesh.resolution"].setValue(mesh["resolution"])
+            self.set_numeric("mesh.resolution", mesh["resolution"])
             self.widgets["mesh.use_topographic"].setChecked(
                 mesh.get("use_topographic", False))
             self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
             self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
-            self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
+            self.set_numeric("mesh.scale_factor", mesh.get("scale_factor", 1.0))
             self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
             self.set_numeric("mesh.latitude_override",
                              mesh.get("latitude_override", -999.0))
@@ -1670,8 +1688,20 @@ class ThermalTab(BaseConfigTab):
         body, and -- worse -- told the user a value the engine WOULD apply was
         going to be ignored.
         """
-        value = self.config_manager.get_value("thermal.geothermal_heat_flow", -1.0)
-        if value is None or value <= 0:
+        # Coerce before comparing. set_numeric can leave a raw scalar in the
+        # config (out of range, deliberately), and YAML resolves `-1e0`/`5e3`
+        # as str, so a bare `<=` here aborted the application from
+        # load_from_config -- the branch's own headline crash class,
+        # reintroduced in a function the branch added.
+        raw = self.config_manager.get_value("thermal.geothermal_heat_flow", -1.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            self.qb_note.setText(
+                f"Geothermal Q_b = {raw!r} is not a number. The engine will "
+                f"read it as 0 and use the body default.")
+            return
+        if value <= 0:
             self.qb_note.setText("")
             return
         self.qb_note.setText(
@@ -1729,6 +1759,8 @@ class ThermalTab(BaseConfigTab):
     def _eq_orbits_to_display(self, orbits):
         """Convert equilibration orbits (synodic cycles) to the selected display unit."""
         unit = self.eq_unit_combo.currentText()
+        # `orbits` comes straight from the config, where it can be a str.
+        orbits = ConfigManager._as_number(orbits, 0.0)
         days = orbits * self._current_synodic_days
         if unit == "days":
             return days
@@ -1948,7 +1980,7 @@ class ThermalTab(BaseConfigTab):
         self._syncing = True
         try:
             self.widgets["thermal.run_thermal_mesh"].setChecked(thermal["run_thermal_mesh"])
-            self.widgets["thermal.threads"].setValue(thermal["threads"])
+            self.set_numeric("thermal.threads", thermal["threads"])
 
             # Update synodic and orbital periods for current body
             self._current_synodic_days = get_synodic_period_days(self.config_manager)
@@ -1983,8 +2015,8 @@ class ThermalTab(BaseConfigTab):
             self.widgets["thermal.final_state_file"].setText(
                 thermal.get("final_state_file", ""))
 
-            self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
-            self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
+            self.set_numeric("thermal.integration_days", thermal["integration_days"])
+            self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
             # Property maps (synthetic mode/kind drive the UI; underlying
             # YAML keys are managed by ConfigManager at save/load time).
@@ -2449,20 +2481,20 @@ class RadiationTab(BaseConfigTab):
         # a config missing the key entirely). use_gpu was True and
         # max_coupling_iterations 10 while the engine said False and 16.
         self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", False))
-        self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
+        self.set_numeric("radiation.min_shadow_fraction", rad.get("min_shadow_fraction", 0.3))
         self.set_enum("radiation.coupling_mode",
                       rad.get("coupling_mode", "bounded"),
                       COUPLING_MODE_ALIASES)
-        self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 16))
-        self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 0.5))
-        self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
-        self.widgets["radiation.coupling_face_fraction"].setValue(rad.get("coupling_face_fraction", 0.01))
+        self.set_numeric("radiation.max_coupling_iterations", rad.get("max_coupling_iterations", 16))
+        self.set_numeric("radiation.coupling_temp_threshold", rad.get("coupling_temp_threshold", 0.5))
+        self.set_numeric("radiation.coupling_flux_threshold", rad.get("coupling_flux_threshold", 0.1))
+        self.set_numeric("radiation.coupling_face_fraction", rad.get("coupling_face_fraction", 0.01))
         self.widgets["radiation.view_factor_file"].setText(rad.get("view_factor_file", ""))
         self.widgets["radiation.use_hmatrix"].setChecked(rad.get("use_hmatrix", False))
         self.widgets["radiation.use_aca"].setChecked(rad.get("use_aca", True))
-        self.widgets["radiation.aca_tolerance"].setValue(rad.get("aca_tolerance", 0.001))
-        self.widgets["radiation.aca_max_rank"].setValue(rad.get("aca_max_rank", 50))
-        self.widgets["radiation.hmatrix_threads"].setValue(rad.get("hmatrix_threads", 0))
+        self.set_numeric("radiation.aca_tolerance", rad.get("aca_tolerance", 0.001))
+        self.set_numeric("radiation.aca_max_rank", rad.get("aca_max_rank", 50))
+        self.set_numeric("radiation.hmatrix_threads", rad.get("hmatrix_threads", 0))
         self.set_numeric("radiation.nearfield_quadrature_order",
                          rad.get("nearfield_quadrature_order", 3))
         self.widgets["radiation.use_monte_carlo_vf"].setChecked(
@@ -2471,9 +2503,9 @@ class RadiationTab(BaseConfigTab):
                          rad.get("mc_rays_per_face", 100000))
         # Sparse view factors
         self.widgets["radiation.adaptive_neighbors"].setChecked(rad.get("adaptive_neighbors", True))
-        self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
-        self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
-        self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        self.set_numeric("radiation.captured_energy_target", rad.get("captured_energy_target", 0.95))
+        self.set_numeric("radiation.max_neighbors", rad.get("max_neighbors", 500))
+        self.set_numeric("radiation.min_neighbors", rad.get("min_neighbors", 20))
         # Beaming: honor what the file said. The rule then decides whether it
         # may be turned ON from here -- it never turns one OFF; a setting it
         # disagrees with is kept and said loudly.
@@ -4065,7 +4097,8 @@ class IlluminationTab(BaseConfigTab):
         resolution-aware)."""
         from gui_core import datasets
         body = self._current_body()
-        res = self.config_manager.get_value("mesh.resolution", 5)
+        res = int(ConfigManager._as_number(
+            self.config_manager.get_value("mesh.resolution", 5), 5))
         root = self._project_root()
         status = datasets.albedo_status(body, res, root)
         supported = status.state != datasets.STATE_UNSUPPORTED

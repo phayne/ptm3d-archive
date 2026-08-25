@@ -500,7 +500,13 @@ def facet_scale(config, project_root=None):
         if not mean_area or mean_area <= 0:
             return FacetScale(n_faces=n_faces,
                               detail=f"{path.name} has zero mean face area")
-        scale = float(mesh.get("scale_factor", 1.0) or 1.0)
+        try:
+            scale = float(mesh.get("scale_factor", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return FacetScale(
+                n_faces=n_faces,
+                detail=f"mesh.scale_factor is "
+                       f"{mesh.get('scale_factor')!r}, not a number")
         detail = "assuming the PLY is in meters"
         source = "ply"
         if sampled < (n_faces or 0):
