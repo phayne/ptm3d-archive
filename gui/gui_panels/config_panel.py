@@ -285,6 +285,9 @@ class BaseConfigTab(QWidget):
             "illumination.albedo_map": "data/albedo_maps",
             "illumination.albedo_maps_directory": "data/albedo_maps",
             "thermal.thermal_inertia_map": "data/thermal_inertia",
+            "thermal.initial_state_file": "output",
+            "thermal.final_state_file": "output",
+            "mesh.occluder_file": "data/meshes",
             "radiation.view_factor_file": "output",
             "output.directory": "output",
         }
@@ -1251,6 +1254,90 @@ class ThermalTab(BaseConfigTab):
         layout.addWidget(gpu_group)
 
 
+        # --- Initial condition -------------------------------------------
+        # spinup_seed selects the initial condition; `legacy` exists to
+        # reproduce a pre-2026-08-11 baseline digit-for-digit. The GUI used to
+        # defeat that on the GPU path by injecting PTM_EQ_PERFACE_FLUX into
+        # every run (PTM-276); it no longer injects it, so `legacy` here means
+        # what it says.
+        seed_group = QGroupBox("Initial Condition")
+        seed_layout = QGridLayout()
+        seed_layout.setColumnStretch(1, 1)
+
+        self.add_combo_field(seed_layout, 0, "Spin-up Seed:", "thermal.spinup_seed",
+                             ["physical", "legacy"],
+                             "physical (default): each face starts from its own "
+                             "conductive steady profile, so a permanently "
+                             "shadowed column starts on the geothermal floor.\n"
+                             "legacy: the pre-2026-08-11 seed plus the analytic "
+                             "clear-sky pre-conditioner -- exactly what produced "
+                             "results in this repository before that date. Use "
+                             "it to reproduce an old baseline.")
+        self.add_combo_field(seed_layout, 1, "Seed Anchor:", "thermal.seed_anchor",
+                             ["lumped", "warm"],
+                             "Which surface anchor the shared seed hangs its "
+                             "conductive profile from. Only read under "
+                             "spinup_seed: physical.\n"
+                             "lumped (default): anchors at the cycle mean.\n"
+                             "warm: the fourth-moment anchor, which by Jensen is "
+                             ">= the mean -- +45 K on the lit population of the "
+                             "shipped lunar 80N crater. Byte-identical to the "
+                             "pre-2026-08-12 seed.")
+        self.add_double_field(seed_layout, 2, "Analytic Seed Cycles:",
+                              "thermal.analytic_seed_cycles", -1.0, 100.0, 1,
+                              "Diurnal cycles of clear-sky pre-conditioning "
+                              "before the real forcing. It is a FORCING, not a "
+                              "seed: no topography, no shadowing, no IR, no "
+                              "indirect flux, and the GPU has no analog. "
+                              "-1 = follow the spin-up seed; 0 = off.")
+        self.add_bool_field(seed_layout, 3, "Refuse Two-Timescale Faces",
+                            "thermal.seed_anchor_refuse_two_timescale",
+                            "Strict refusal when a face carries diurnal AND "
+                            "seasonal power, which one lumped conductance "
+                            "cannot cover. Off by default because refusing "
+                            "substitutes the warm anchor, and that is the "
+                            "estimator with the +45 K bias.")
+
+        self.seed_note = QLabel("")
+        self.seed_note.setWordWrap(True)
+        self.seed_note.setStyleSheet("color: gray; font-size: 10px;")
+        seed_layout.addWidget(self.seed_note, 4, 0, 1, 2)
+        self.widgets["thermal.spinup_seed"].currentTextChanged.connect(
+            self._update_seed_gating)
+
+        seed_group.setLayout(seed_layout)
+        layout.addWidget(seed_group)
+
+        # --- Run state (warm start / chunk handoff) ------------------------
+        state_group = QGroupBox("Run State")
+        state_layout = QGridLayout()
+        state_layout.setColumnStretch(1, 1)
+
+        self.add_file_field(state_layout, 0, "Initial State File:",
+                            "thermal.initial_state_file",
+                            "State Files (*.bin *.state);;All Files (*)",
+                            "Per-face T(z) profile to start from. This is the "
+                            "warm start: the run continues an earlier one "
+                            "instead of re-equilibrating.")
+        self.add_file_field(state_layout, 1, "Final State File:",
+                            "thermal.final_state_file",
+                            "State Files (*.bin *.state);;All Files (*)",
+                            "Where to dump the per-face T(z) profile at the end. "
+                            "The state written is the one at the LAST exported "
+                            "step, which is what the next chunk must resume from.")
+
+        state_note = QLabel(
+            "A run launched from this window is still a single engine process: "
+            "it does not go through the chunked runner, so it has no automatic "
+            "cool-down, stall abort or resume. These two fields are the manual "
+            "handoff.")
+        state_note.setWordWrap(True)
+        state_note.setStyleSheet("color: gray; font-size: 10px;")
+        state_layout.addWidget(state_note, 2, 0, 1, 2)
+
+        state_group.setLayout(state_layout)
+        layout.addWidget(state_group)
+
         # Integration Window (advanced)
         integ_group = QGroupBox("Integration Window")
         integ_layout = QGridLayout()
@@ -1338,6 +1425,28 @@ class ThermalTab(BaseConfigTab):
 
         layout.addStretch()
         self.create_scroll_area(content)
+
+        self._update_seed_gating()
+
+    # ── Initial-condition handler ────────────────────────────────────
+
+    def _update_seed_gating(self, _mode=None):
+        """seed_anchor is only read under spinup_seed: physical."""
+        physical = self.widgets["thermal.spinup_seed"].currentText() == "physical"
+        for key in ("thermal.seed_anchor",
+                    "thermal.seed_anchor_refuse_two_timescale"):
+            w = self.widgets.get(key)
+            if w is not None:
+                w.setEnabled(physical)
+        if physical:
+            self.seed_note.setText(
+                "physical: each face starts from its own conductive steady "
+                "profile. Seed Anchor applies.")
+        else:
+            self.seed_note.setText(
+                "legacy: reproduces a pre-2026-08-11 baseline. Seed Anchor is "
+                "not read in this mode, and the analytic pre-conditioner runs "
+                "unless Analytic Seed Cycles says otherwise.")
 
     # ── Property-map mode handler ────────────────────────────────────
 
@@ -1605,6 +1714,21 @@ class ThermalTab(BaseConfigTab):
             self.widgets["thermal.geothermal_heat_flow"].setValue(
                 thermal.get("geothermal_heat_flow", -1.0))
 
+            for key, default in (("thermal.spinup_seed", "physical"),
+                                 ("thermal.seed_anchor", "lumped")):
+                widget = self.widgets[key]
+                idx = widget.findText(thermal.get(key.split(".", 1)[1], default))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+            self.widgets["thermal.analytic_seed_cycles"].setValue(
+                thermal.get("analytic_seed_cycles", -1.0))
+            self.widgets["thermal.seed_anchor_refuse_two_timescale"].setChecked(
+                thermal.get("seed_anchor_refuse_two_timescale", False))
+            self.widgets["thermal.initial_state_file"].setText(
+                thermal.get("initial_state_file", ""))
+            self.widgets["thermal.final_state_file"].setText(
+                thermal.get("final_state_file", ""))
+
             self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
             self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
 
@@ -1633,6 +1757,7 @@ class ThermalTab(BaseConfigTab):
         # Sync equilibration-cadence widgets from config (must run OUTSIDE _syncing
         # because the combo/spin have their own block-signals guards).
         self._sync_eq_cadence_from_config()
+        self._update_seed_gating()
 
 
 class RadiationTab(BaseConfigTab):

@@ -159,6 +159,88 @@ def test_nearfield_quadrature_order_and_mc_builder_are_writable():
     assert back.get_value("radiation.mc_rays_per_face") == 250000
 
 
+def test_the_initial_condition_group_is_writable():
+    """spinup_seed and its two companions reach the YAML and come back."""
+    manager = _manager()
+    for key in ("thermal.spinup_seed", "thermal.seed_anchor",
+                "thermal.analytic_seed_cycles",
+                "thermal.seed_anchor_refuse_two_timescale"):
+        assert manager.get_value(key) == ENGINE_DEFAULTS[key], key
+
+    manager.set_value("thermal.spinup_seed", "legacy")
+    manager.set_value("thermal.seed_anchor", "warm")
+    manager.set_value("thermal.analytic_seed_cycles", 24.0)
+    manager.set_value("thermal.seed_anchor_refuse_two_timescale", True)
+
+    written = manager._config_for_yaml()["thermal"]
+    assert written["spinup_seed"] == "legacy", written
+    assert written["seed_anchor"] == "warm", written
+    assert written["analytic_seed_cycles"] == 24.0, written
+    assert written["seed_anchor_refuse_two_timescale"] is True, written
+
+    back = _round_trip(manager)
+    assert back.get_value("thermal.spinup_seed") == "legacy"
+    assert back.get_value("thermal.seed_anchor") == "warm"
+    assert back.get_value("thermal.analytic_seed_cycles") == 24.0
+
+
+def test_spinup_seed_legacy_is_no_longer_defeated_by_the_injected_environment():
+    """The pair that makes `legacy` mean what it says (PTM-276).
+
+    `spinup_seed: legacy` exists to reproduce a pre-fix baseline
+    digit-for-digit. On the GPU path with that seed, an injected
+    PTM_EQ_PERFACE_FLUX=1 switches the seed from the first-10-step instantaneous
+    flux to the per-face time mean -- the GUI was the one caller that could
+    defeat the setting without the user having asked for anything. Exposing the
+    control and dropping the injection have to hold together.
+    """
+    from gui_core.preflight import build_engine_env
+
+    manager = _manager()
+    manager.set_value("thermal.spinup_seed", "legacy")
+    config = manager.get_config()
+    env, _applied = build_engine_env(config, base_env={})
+    assert "PTM_EQ_PERFACE_FLUX" not in env, (
+        "the GUI still injects PTM_EQ_PERFACE_FLUX into a run that asked for "
+        "spinup_seed: legacy, which is exactly what that seed exists to avoid")
+
+
+def test_the_state_files_are_writable():
+    """Warm start and chunk handoff -- without these a GUI run cannot resume."""
+    manager = _manager()
+    manager.set_value("thermal.initial_state_file", "output/prev/final_state.bin")
+    manager.set_value("thermal.final_state_file", "output/here/final_state.bin")
+    written = manager._config_for_yaml()["thermal"]
+    assert written["initial_state_file"] == "output/prev/final_state.bin", written
+    assert written["final_state_file"] == "output/here/final_state.bin", written
+
+    back = _round_trip(manager)
+    assert back.get_value("thermal.initial_state_file") == \
+        "output/prev/final_state.bin"
+    assert back.get_value("thermal.final_state_file") == \
+        "output/here/final_state.bin"
+
+
+def test_both_state_paths_are_absolutized_for_the_run_yaml():
+    """The run YAML is written elsewhere, so relative paths must be resolved.
+
+    initial_state_file is checked for existence too (it is in _FILE_FIELDS);
+    final_state_file is an output path, so it is absolutized but not checked.
+    """
+    from gui_core.preflight import absolutize_config_paths
+
+    manager = _manager()
+    manager.set_value("thermal.initial_state_file", "output/prev/final_state.bin")
+    manager.set_value("thermal.final_state_file", "output/here/final_state.bin")
+    resolved = absolutize_config_paths(manager._config_for_yaml(), REPO_ROOT)
+    for key in ("initial_state_file", "final_state_file"):
+        value = resolved["thermal"][key]
+        assert Path(value).is_absolute(), (
+            f"thermal.{key} stayed relative ({value!r}); the run YAML lives "
+            f"beside the output directory, so the engine would resolve it "
+            f"against the wrong place")
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -167,6 +249,10 @@ TESTS = [
     test_the_default_conductivity_model_is_the_engine_s,
     test_coupling_mode_is_writable_and_round_trips,
     test_nearfield_quadrature_order_and_mc_builder_are_writable,
+    test_the_initial_condition_group_is_writable,
+    test_spinup_seed_legacy_is_no_longer_defeated_by_the_injected_environment,
+    test_the_state_files_are_writable,
+    test_both_state_paths_are_absolutized_for_the_run_yaml,
 ]
 
 

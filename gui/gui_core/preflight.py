@@ -635,6 +635,9 @@ def absolutize_config_paths(config, project_root):
     cfg = deepcopy(config)
     path_fields = _FILE_FIELDS + _DATA_DIR_FIELDS + [
         "radiation.view_factor_file",
+        # An OUTPUT path, so it is absolutized but not existence-checked: it is
+        # the file this run will write, not one it must find.
+        "thermal.final_state_file",
         "output.directory",
     ]
     data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)

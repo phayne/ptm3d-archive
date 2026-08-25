@@ -215,7 +215,18 @@ class ConfigManager:
             "enable_shadow_flux": False,
             "integration_days": -1.0,
             "integration_steps": -1,
-            "geothermal_heat_flow": -1.0  # W/m², -1 = use planet default
+            "geothermal_heat_flow": -1.0,  # W/m², -1 = use planet default
+            # Initial condition. spinup_seed: physical | legacy; seed_anchor:
+            # lumped | warm (only reachable under physical);
+            # analytic_seed_cycles -1 = follow spinup_seed.
+            "spinup_seed": "physical",
+            "seed_anchor": "lumped",
+            "analytic_seed_cycles": -1.0,
+            "seed_anchor_refuse_two_timescale": False,
+            # Warm start and chunk handoff. Without these a GUI run cannot
+            # resume, which is the whole long-run workflow.
+            "initial_state_file": "",
+            "final_state_file": ""
         },
         "thermophysical": {
             # Surface properties
