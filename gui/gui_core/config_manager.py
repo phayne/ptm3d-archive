@@ -856,6 +856,18 @@ class ConfigManager:
                 errors.append("Radiation: coupling_temp_threshold must be positive")
             if rad.get("aca_tolerance", 0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
+            # The switch needs the knob. The engine treats this pair as FATAL at
+            # startup (ptm_thermal_sim.cpp:13591), so without a check here the
+            # GUI happily launches a run that dies before it does any work: the
+            # tab seeds 32.5 when the switch is flipped on, but the slope can be
+            # stepped back to 0 afterwards, and a config can arrive with the
+            # pair already broken.
+            if rad.get("beaming", False) and not (rad.get("rms_slope_deg", 0.0) > 0):
+                errors.append(
+                    "Radiation: beaming is on but rms_slope_deg is "
+                    f"{rad.get('rms_slope_deg', 0.0)}. The engine refuses this "
+                    "pair at startup. Literature range 20-37 degrees; 32.5 is "
+                    "the validated lunar polar value (Jhoti et al. 2024).")
 
         # Output validation
         valid_formats = ["binary", "vtk"]

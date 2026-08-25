@@ -722,7 +722,8 @@ class PTM3DMainWindow(QMainWindow):
             # made "WARNING: engine environment changed ..." look like a note.
             if line.startswith(("ERROR:", "DATALESS:")):
                 self.console_panel.append_error(f"[preflight] {line}")
-            elif line.startswith(("WARNING:", "CLOUD:", "VF-GUARD:")):
+            elif line.startswith(("WARNING:", "CLOUD:", "VF-GUARD:",
+                                  "BEAM-GUARD:")):
                 self.console_panel.append_warning(f"[preflight] {line}")
             else:
                 self.console_panel.append_info(f"[preflight] {line}")

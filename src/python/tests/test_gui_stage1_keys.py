@@ -387,6 +387,27 @@ def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
         "fixed; a stale limitation is what disabled this control once already")
 
 
+def test_validate_refuses_beaming_without_a_slope():
+    """`beaming: true` with `rms_slope_deg: 0` is FATAL at engine startup.
+
+    run_simulation calls validate() first, so without this the GUI cheerfully
+    launches a run that dies before doing any work. The tab seeds 32.5 when the
+    switch is flipped on, but the slope can be stepped back to zero afterwards
+    and a config can arrive with the pair already broken.
+    """
+    manager = _manager()
+    manager.set_value("radiation.enabled", True)
+    manager.set_value("radiation.beaming", True)
+    manager.set_value("radiation.rms_slope_deg", 0.0)
+    ok, messages = manager.validate()
+    assert not ok, "validate() accepted the pair the engine refuses at startup"
+    assert any("rms_slope_deg" in m for m in messages), messages
+
+    manager.set_value("radiation.rms_slope_deg", 32.5)
+    ok, messages = manager.validate()
+    assert ok, messages
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -406,6 +427,7 @@ TESTS = [
     test_the_pre_2026_08_25_implicit_beaming_switch_survives_a_load,
     test_a_quoted_rms_slope_does_not_break_the_load,
     test_the_basal_heat_flow_control_is_not_gated_on_the_body,
+    test_validate_refuses_beaming_without_a_slope,
 ]
 
 

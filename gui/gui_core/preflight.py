@@ -148,6 +148,7 @@ class PreflightReport:
     warnings: list = field(default_factory=list)     # non-blocking
     info: list = field(default_factory=list)         # console notes (exe hash etc.)
     vf_rebuild_warning: str = ""                     # PTM-19 guard text, if triggered
+    beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
     executable: Path = None
     project_root: Path = None
@@ -166,6 +167,8 @@ class PreflightReport:
             out.append(f"CLOUD: {f_}: {p}")
         if self.vf_rebuild_warning:
             out.append(f"VF-GUARD: {self.vf_rebuild_warning}")
+        if self.beaming_warning:
+            out.append(f"BEAM-GUARD: {self.beaming_warning}")
         if self.vf_cost_line:
             out.append(f"VF-COST: {self.vf_cost_line}")
         for w in self.warnings:
@@ -848,6 +851,33 @@ def run_preflight(config, find_executable, project_root=None):
             report.info.extend(est.lines)
             report.warnings.extend(est.warnings)
 
+    # -- Beaming facet-scale guard -------------------------------------------
+    # The configuration tab shows the rule, but a label on a tab is not a gate:
+    # a user can enable beaming on a lunar icosphere and then import a
+    # millimeter-scale mesh, and nothing outside that tab would ever mention it
+    # again. The tab deliberately does NOT rewrite the setting -- silently
+    # changing someone's physics is the failure this stage exists to remove --
+    # so the launch is where it has to be asked. Same shape as the PTM-19
+    # view-factor guard: a warning with an explicit override.
+    if rad.get("beaming", False):
+        try:
+            from gui_core.facet_scale import beaming_policy
+            policy = beaming_policy(config, project_root)
+            if not policy.allowed:
+                report.beaming_warning = (
+                    "radiation.beaming is ON and this mesh does not meet the "
+                    "facet-scale rule, so the sub-facet roughness model would "
+                    "be applied on top of roughness the mesh already resolves "
+                    "(double-counting). " + policy.reason)
+            elif policy.needs_acknowledgment:
+                report.warnings.append("beaming: " + policy.reason)
+            else:
+                report.info.append("beaming: " + policy.reason)
+        except Exception as e:                       # advisory, never a crash
+            report.warnings.append(
+                f"beaming: the facet-scale rule could not be evaluated ({e}); "
+                f"confirm this mesh is far coarser than the roughness scale.")
+
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
     _table, env_source = engine_env_plan(config)
@@ -904,6 +934,24 @@ def confirm_preflight(parent, report):
         msg.setInformativeText("\n".join(lines))
         msg.exec()
         return False
+
+    if report.beaming_warning:
+        msg = QMessageBox(parent)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Beaming on a fine mesh")
+        msg.setText(report.beaming_warning)
+        msg.setInformativeText(
+            "The configuration is left exactly as you set it either way -- "
+            "nothing here rewrites your physics. Cancel to turn beaming off on "
+            "the Radiation page, or confirm to run as configured.")
+        override = QCheckBox("Run anyway -- this mesh does not resolve "
+                             "sub-facet slopes")
+        msg.setCheckBox(override)
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok |
+                               QMessageBox.StandardButton.Cancel)
+        msg.exec()
+        if not override.isChecked():
+            return False
 
     if report.cloud_paths:
         msg = QMessageBox(parent)

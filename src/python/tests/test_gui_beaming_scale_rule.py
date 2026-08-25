@@ -262,6 +262,44 @@ def test_an_unreadable_mesh_refuses_rather_than_guesses():
             assert policy.reason, f"{name} refused with no reason"
 
 
+def test_a_non_lunar_body_is_refused_without_reading_the_mesh():
+    """The body check must come first: measuring decodes every PLY vertex.
+
+    beaming_policy runs from mesh.import_file's per-keystroke textChanged, so a
+    Europa project with a large imported mesh was paying a multi-million-vertex
+    decode on the GUI thread for an answer that is "no" on body grounds anyway.
+    """
+    policy = beaming_policy(_config(Path("/nonexistent/huge.ply"), body="Europa"))
+    assert not policy.allowed
+    assert policy.scale is not None and policy.scale.meters is None
+    assert "wrong body" in policy.scale.detail, policy.scale.detail
+
+
+def test_the_launch_guard_fires_on_a_refused_mesh():
+    """The tab shows the rule; the LAUNCH is where it has to be asked.
+
+    The tab deliberately never rewrites `radiation.beaming`, so without a
+    preflight guard the only disclosure was a label on a tab the user may not
+    be looking at.
+    """
+    from gui_core.preflight import PreflightReport
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "fine.ply"
+        _write_grid_ply(path, edge_m=0.00277)
+        config = _config(path)
+        config["radiation"] = {"enabled": True, "beaming": True,
+                               "rms_slope_deg": 32.5}
+        policy = beaming_policy(config)
+        assert not policy.allowed
+
+    # The report field and its summary tag exist and are routed as a warning.
+    report = PreflightReport()
+    report.beaming_warning = "test"
+    lines = report.summary_lines()
+    assert any(ln.startswith("BEAM-GUARD:") for ln in lines), lines
+
+
 TESTS = [
     test_the_measured_scale_matches_the_geometry,
     test_the_scale_factor_is_applied,
@@ -274,6 +312,8 @@ TESTS = [
     test_a_face_element_with_trailing_colors_is_read_correctly,
     test_a_second_list_on_the_face_element_is_refused,
     test_an_unreadable_mesh_refuses_rather_than_guesses,
+    test_a_non_lunar_body_is_refused_without_reading_the_mesh,
+    test_the_launch_guard_fires_on_a_refused_mesh,
 ]
 
 

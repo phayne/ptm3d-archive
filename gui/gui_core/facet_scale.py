@@ -468,17 +468,23 @@ def facet_scale(config, project_root=None):
 def beaming_policy(config, project_root=None):
     """Whether the GUI may offer `radiation.beaming`, and what to tell the user."""
     body = _clean_body(config)
-    scale = facet_scale(config, project_root)
 
+    # Body first, and only then the mesh. Measuring the facet scale decodes
+    # every vertex of the PLY, and this runs from mesh.import_file's
+    # per-keystroke textChanged; a Europa or asteroid project with a large
+    # imported mesh was paying a multi-million-vertex decode on the GUI thread
+    # for an answer that is "no" on body grounds regardless.
     if body not in BEAMING_BODIES:
         return BeamingPolicy(
-            allowed=False, scale=scale,
+            allowed=False, scale=FacetScale(detail="not measured: wrong body"),
             reason=(f"Beaming is offered for {', '.join(BEAMING_BODIES)} only. "
                     f"The Smith slope distribution is calibrated on lunar "
                     f"regolith (w = 32.5 deg, Jhoti et al. 2024), and "
                     f"docs/radiation-exchange.md section 8.4 declines to carry "
                     f"it to icy or small bodies. Selected body: "
                     f"{body or 'none'}."))
+
+    scale = facet_scale(config, project_root)
 
     if scale.meters is None:
         return BeamingPolicy(

@@ -320,6 +320,39 @@ class BaseConfigTab(QWidget):
         self.config_manager.set_value(key, value)
         self.value_changed.emit()
 
+    def set_numeric(self, key, value):
+        """Load a numeric value into its widget, WARNING if the range clamps it.
+
+        QSpinBox/QDoubleSpinBox.setValue clamps silently and still emits
+        valueChanged, so loading a config whose value falls outside a widget's
+        range both displayed AND wrote back the clamped number: the run then
+        used a value the file never asked for, with nothing said. The one that
+        matters most is thermal.geothermal_heat_flow, where an out-of-band value
+        is a plausible thing for a sensitivity study to carry.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            logging.warning("[config] %s = %r is not a number; leaving the "
+                            "control at its current value", key, value)
+            return
+        low, high = widget.minimum(), widget.maximum()
+        if number < low or number > high:
+            logging.warning(
+                "[config] %s = %s is outside the range this control offers "
+                "(%s to %s). The control shows the clamped value, and the "
+                "configuration KEEPS %s -- edit the field to change it.",
+                key, value, low, high, value)
+            widget.blockSignals(True)
+            widget.setValue(type(widget.value())(min(max(number, low), high)))
+            widget.blockSignals(False)
+            self.config_manager.set_value(key, value)
+            return
+        widget.setValue(type(widget.value())(number))
+
     def load_from_config(self):
         """Load values from config manager - implemented by subclasses"""
         raise NotImplementedError
@@ -1003,8 +1036,11 @@ class MeshTab(BaseConfigTab):
         self.placement_note.setWordWrap(True)
         self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
         custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
-        self.widgets["mesh.latitude_override"].valueChanged.connect(
-            lambda _v: self._update_placement_gating())
+        # BOTH, because the note quotes both numbers: connected to latitude
+        # only, it went on stating the old longitude for the run about to start.
+        for _k in ("mesh.latitude_override", "mesh.longitude_override"):
+            self.widgets[_k].valueChanged.connect(
+                lambda _v: self._update_placement_gating())
 
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)
@@ -1134,10 +1170,10 @@ class MeshTab(BaseConfigTab):
         self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
         self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
         self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
-        self.widgets["mesh.latitude_override"].setValue(
-            mesh.get("latitude_override", -999.0))
-        self.widgets["mesh.longitude_override"].setValue(
-            mesh.get("longitude_override", -999.0))
+        self.set_numeric("mesh.latitude_override",
+                         mesh.get("latitude_override", -999.0))
+        self.set_numeric("mesh.longitude_override",
+                         mesh.get("longitude_override", -999.0))
         self._update_placement_gating()
 
         source = mesh.get("topo_source", "builtin")
@@ -1220,7 +1256,12 @@ class ThermalTab(BaseConfigTab):
                             "thermal.enable_shadow_flux",
                             info_key="thermal.enable_shadow_flux")
         self.add_double_field(control_layout, 5, "Geothermal Q_b (W/m²):",
-                              "thermal.geothermal_heat_flow", -1.0, 10.0, 4,
+                              # 1000 W/m^2, not 10: the falsifier fixture uses
+                              # 5.0 and a sensitivity study can go far higher.
+                              # An out-of-range load warns and keeps the config
+                              # value (set_numeric), but a range that refuses
+                              # plausible science is a range set too tight.
+                              "thermal.geothermal_heat_flow", -1.0, 1000.0, 4,
                               "Bottom-boundary heat flux. -1 = the body's own "
                               "default.\n"
                               "Live on every body since PTM-161 was fixed "
@@ -1811,8 +1852,8 @@ class ThermalTab(BaseConfigTab):
             self.widgets["thermal.use_gpu"].setChecked(thermal.get("use_gpu", False))
             self.widgets["thermal.enable_shadow_flux"].setChecked(
                 thermal.get("enable_shadow_flux", False))
-            self.widgets["thermal.geothermal_heat_flow"].setValue(
-                thermal.get("geothermal_heat_flow", -1.0))
+            self.set_numeric("thermal.geothermal_heat_flow",
+                             thermal.get("geothermal_heat_flow", -1.0))
 
             for key, default in (("thermal.spinup_seed", "physical"),
                                  ("thermal.seed_anchor", "lumped")):
@@ -1820,8 +1861,8 @@ class ThermalTab(BaseConfigTab):
                 idx = widget.findText(thermal.get(key.split(".", 1)[1], default))
                 if idx >= 0:
                     widget.setCurrentIndex(idx)
-            self.widgets["thermal.analytic_seed_cycles"].setValue(
-                thermal.get("analytic_seed_cycles", -1.0))
+            self.set_numeric("thermal.analytic_seed_cycles",
+                             thermal.get("analytic_seed_cycles", -1.0))
             self.widgets["thermal.seed_anchor_refuse_two_timescale"].setChecked(
                 thermal.get("seed_anchor_refuse_two_timescale", False))
             self.widgets["thermal.initial_state_file"].setText(
@@ -2134,6 +2175,19 @@ class RadiationTab(BaseConfigTab):
         switch = self.widgets["radiation.beaming"]
         knob = self.widgets["radiation.rms_slope_deg"]
 
+        # Reset the acknowledgment whenever the thing being acknowledged
+        # changes. Hiding it while leaving it CHECKED carried a tick made for
+        # one mesh over to the next one, so a second warn-tier mesh could be
+        # enabled without the user ever seeing its facet scale -- which is the
+        # entire content of that tier.
+        scale_id = (policy.scale.source if policy.scale else None,
+                    None if not policy.scale or policy.scale.meters is None
+                    else round(policy.scale.meters, 6))
+        if scale_id != getattr(self, "_beaming_ack_scale", None):
+            self.beaming_ack.blockSignals(True)
+            self.beaming_ack.setChecked(False)
+            self.beaming_ack.blockSignals(False)
+            self._beaming_ack_scale = scale_id
         self.beaming_ack.setVisible(policy.needs_acknowledgment)
         ack_ok = (not policy.needs_acknowledgment) or self.beaming_ack.isChecked()
         may_turn_on = policy.allowed and ack_ok
@@ -2297,12 +2351,12 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.aca_tolerance"].setValue(rad.get("aca_tolerance", 0.001))
         self.widgets["radiation.aca_max_rank"].setValue(rad.get("aca_max_rank", 50))
         self.widgets["radiation.hmatrix_threads"].setValue(rad.get("hmatrix_threads", 0))
-        self.widgets["radiation.nearfield_quadrature_order"].setValue(
-            rad.get("nearfield_quadrature_order", 3))
+        self.set_numeric("radiation.nearfield_quadrature_order",
+                         rad.get("nearfield_quadrature_order", 3))
         self.widgets["radiation.use_monte_carlo_vf"].setChecked(
             rad.get("use_monte_carlo_vf", False))
-        self.widgets["radiation.mc_rays_per_face"].setValue(
-            rad.get("mc_rays_per_face", 100000))
+        self.set_numeric("radiation.mc_rays_per_face",
+                         rad.get("mc_rays_per_face", 100000))
         # Sparse view factors
         self.widgets["radiation.adaptive_neighbors"].setChecked(rad.get("adaptive_neighbors", True))
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
@@ -2311,8 +2365,7 @@ class RadiationTab(BaseConfigTab):
         # Beaming: honor what the file said. The rule then decides whether it
         # may be turned ON from here -- it never turns one OFF; a setting it
         # disagrees with is kept and said loudly.
-        self.widgets["radiation.rms_slope_deg"].setValue(
-            rad.get("rms_slope_deg", 0.0))
+        self.set_numeric("radiation.rms_slope_deg", rad.get("rms_slope_deg", 0.0))
         self.widgets["radiation.beaming"].blockSignals(True)
         self.widgets["radiation.beaming"].setChecked(rad.get("beaming", False))
         self.widgets["radiation.beaming"].blockSignals(False)
@@ -2338,6 +2391,12 @@ class RadiationTab(BaseConfigTab):
         slope = getattr(self.config_manager, "legacy_implicit_beaming", None)
         if slope is None:
             return
+        # Consume it. It survived only until now: leaving it set meant every
+        # LATER load_from_config() on the same manager re-forced beaming on --
+        # and the dashboard's thermal adapter calls that on every chained mesh
+        # handoff, so a user who read this warning and deliberately switched
+        # beaming off would silently get it back.
+        self.config_manager.legacy_implicit_beaming = None
         self.widgets["radiation.beaming"].blockSignals(True)
         self.widgets["radiation.beaming"].setChecked(True)
         self.widgets["radiation.beaming"].blockSignals(False)
@@ -4137,6 +4196,7 @@ class EngineFlagsTab(BaseConfigTab):
 
     def _write_back(self):
         self.config_manager.set_value("engine_env", self._collect_rows())
+        self._refresh_declined_note()
         self.value_changed.emit()
 
     def _on_cell_changed(self, _row, _col):
@@ -4161,6 +4221,17 @@ class EngineFlagsTab(BaseConfigTab):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
         self._set_rows(dict(RECOMMENDED_ENGINE_ENV))
         self._write_back()
+        self._refresh_declined_note()
+
+    def _refresh_declined_note(self):
+        """Show the 'declines every flag' note exactly when it is true.
+
+        It used to be set only in load_from_config, so Restore Recommended left
+        it on screen -- the button the note tells you to press -- and deleting
+        every row wrote an empty block without ever showing it.
+        """
+        env = self.config_manager.get_value("engine_env", None)
+        self._declined_note.setVisible(isinstance(env, dict) and not env)
 
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
@@ -4174,7 +4245,7 @@ class EngineFlagsTab(BaseConfigTab):
         if not isinstance(env, dict):
             env = dict(RECOMMENDED_ENGINE_ENV)
         self._set_rows(env)
-        self._declined_note.setVisible(not env)
+        self._refresh_declined_note()
 
 
 class ConfigurationPanel(QWidget):
