@@ -972,6 +972,24 @@ class MeshTab(BaseConfigTab):
         self.add_double_field(custom_layout, 1, "Scale Factor:", "mesh.scale_factor",
                               0.001, 1000.0, 3, "Scaling factor for imported mesh",
                               info_key="mesh.scale_factor")
+        # The core-plus-ring architecture was CLI-only: every A3GT-class site
+        # run needs an occluder, and the GUI had no field for it.
+        self.add_file_field(custom_layout, 2, "Occluder File:", "mesh.occluder_file",
+                            "Mesh Files (*.ply *.obj *.vtk);;All Files (*)",
+                            "Coarse occluder-only mesh (the ring around a "
+                            "high-resolution core). It enters the illumination "
+                            "shadow-ray BVH only -- never thermally solved, "
+                            "radiosity-coupled or written out. See "
+                            "docs/extended-occluder-architecture.md.")
+        # Without these an imported DEM sits wherever its own frame put it.
+        self.add_double_field(custom_layout, 3, "Latitude Override (deg):",
+                              "mesh.latitude_override", -999.0, 90.0, 4,
+                              "Place the imported mesh at this latitude. "
+                              "-999 = leave the mesh in its own frame.")
+        self.add_double_field(custom_layout, 4, "Longitude Override (deg):",
+                              "mesh.longitude_override", -999.0, 360.0, 4,
+                              "Place the imported mesh at this longitude. "
+                              "-999 = leave the mesh in its own frame.")
 
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)
@@ -1081,6 +1099,11 @@ class MeshTab(BaseConfigTab):
         self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
         self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
         self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
+        self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
+        self.widgets["mesh.latitude_override"].setValue(
+            mesh.get("latitude_override", -999.0))
+        self.widgets["mesh.longitude_override"].setValue(
+            mesh.get("longitude_override", -999.0))
 
         source = mesh.get("topo_source", "builtin")
         self.topo_builtin_radio.blockSignals(True)

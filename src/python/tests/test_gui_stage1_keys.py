@@ -241,6 +241,46 @@ def test_both_state_paths_are_absolutized_for_the_run_yaml():
             f"against the wrong place")
 
 
+def test_the_mesh_placement_keys_are_writable():
+    """occluder_file plus the two placement overrides."""
+    manager = _manager()
+    for key in ("mesh.occluder_file", "mesh.latitude_override",
+                "mesh.longitude_override"):
+        assert manager.get_value(key) == ENGINE_DEFAULTS[key], key
+
+    manager.set_value("mesh.import_file", "data/meshes/core.ply")
+    manager.set_value("mesh.occluder_file", "data/meshes/ring.ply")
+    manager.set_value("mesh.latitude_override", -84.223)
+    manager.set_value("mesh.longitude_override", 33.502)
+
+    written = manager._config_for_yaml()["mesh"]
+    assert written["occluder_file"] == "data/meshes/ring.ply", written
+    assert written["latitude_override"] == -84.223, written
+    assert written["longitude_override"] == 33.502, written
+
+    back = _round_trip(manager)
+    assert back.get_value("mesh.occluder_file") == "data/meshes/ring.ply"
+    assert back.get_value("mesh.latitude_override") == -84.223
+
+
+def test_the_occluder_is_preflight_checked_like_the_core_mesh():
+    """It is read at BVH build time, so a cloud placeholder hangs the run."""
+    from gui_core import preflight
+    assert "mesh.occluder_file" in preflight._FILE_FIELDS, (
+        "mesh.occluder_file is not in preflight's file-field list, so it gets "
+        "no existence, dataless or cloud-path check -- unlike mesh.import_file, "
+        "which the engine reads the same way")
+
+
+def test_the_occluder_path_is_absolutized_for_the_run_yaml():
+    from gui_core.preflight import absolutize_config_paths
+
+    manager = _manager()
+    manager.set_value("mesh.occluder_file", "data/meshes/ring.ply")
+    resolved = absolutize_config_paths(manager._config_for_yaml(), REPO_ROOT)
+    assert Path(resolved["mesh"]["occluder_file"]).is_absolute()
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -253,6 +293,9 @@ TESTS = [
     test_spinup_seed_legacy_is_no_longer_defeated_by_the_injected_environment,
     test_the_state_files_are_writable,
     test_both_state_paths_are_absolutized_for_the_run_yaml,
+    test_the_mesh_placement_keys_are_writable,
+    test_the_occluder_is_preflight_checked_like_the_core_mesh,
+    test_the_occluder_path_is_absolutized_for_the_run_yaml,
 ]
 
 

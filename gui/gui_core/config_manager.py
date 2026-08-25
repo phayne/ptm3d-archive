@@ -171,6 +171,15 @@ class ConfigManager:
         "mesh": {
             "resolution": 5,
             "import_file": "",
+            # Coarse occluder-only mesh (the ring of the core-plus-ring
+            # architecture). Added to the illumination shadow-ray BVH only --
+            # never thermally solved, radiosity-coupled or output.
+            # docs/extended-occluder-architecture.md.
+            "occluder_file": "",
+            # Where an imported mesh sits on the body. -999 = leave it in its
+            # own frame (the engine's "unset" sentinel).
+            "latitude_override": -999.0,
+            "longitude_override": -999.0,
             "scale_factor": 1.0,
             "use_topographic": False,
             # Built-in topography ships under data/topo (engine appends

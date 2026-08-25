@@ -107,6 +107,10 @@ CLOUD_PATH_MARKERS = ("/Library/CloudStorage/",)
 # Config fields that hold a single file path: (dotted key, required-if callable)
 _FILE_FIELDS = [
     "mesh.import_file",
+    # The occluder gets the same existence, dataless and cloud checks as the
+    # core mesh: it is read at BVH build time, so an evicted cloud placeholder
+    # here hangs the run in exactly the same way.
+    "mesh.occluder_file",
     "illumination.albedo_map",
     "illumination.positions_file",
     "thermal.thermal_inertia_map",
