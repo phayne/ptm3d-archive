@@ -335,6 +335,58 @@ def test_the_pre_2026_08_25_implicit_beaming_switch_survives_a_load():
         assert manager.get_value("radiation.beaming") is False
 
 
+def test_a_quoted_rms_slope_does_not_break_the_load():
+    """`rms_slope_deg: "20"` is a str after yaml.safe_load.
+
+    The engine's getWithDefault<double> parses it without complaint, so a bare
+    comparison in the implicit-beaming detection turned a loadable config into
+    "Failed to load project".
+    """
+    manager_cls = type(_manager())
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "quoted.yaml"
+        path.write_text('simulation:\n  body: Moon\nradiation:\n'
+                        '  enabled: true\n  rms_slope_deg: "20"\n')
+        manager = manager_cls()
+        manager.load_from_yaml(str(path))       # must not raise
+        assert manager.legacy_implicit_beaming == 20.0
+        assert manager.get_value("radiation.beaming") is True
+
+        path.write_text('simulation:\n  body: Moon\nradiation:\n'
+                        '  rms_slope_deg: not-a-number\n')
+        manager = manager_cls()
+        manager.load_from_yaml(str(path))       # must not raise either
+        assert manager.legacy_implicit_beaming is None
+
+
+def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
+    """PTM-161 is FIXED in this tree; the key is live on every body.
+
+    It was briefly disabled on built-in bodies on the strength of
+    docs/KNOWN_LIMITATIONS.md section 4, which still described the pre-2e06a70
+    behavior. Re-measured on the current engine: Moon ico3, 48 steps, Qb -1 vs
+    0.05 W/m^2 gives max |dT_min| = 0.8421 K and the run prints
+    "[Thermo override] applied at solver: Qb 0.018 -> 0.05 W/m^2".
+    """
+    manager = _manager()
+    manager.set_value("simulation.body", "Moon")
+    manager.set_value("thermal.geothermal_heat_flow", 0.05)
+    written = manager._config_for_yaml()["thermal"]
+    assert written["geothermal_heat_flow"] == 0.05, written
+
+    source = (REPO_ROOT / "src" / "cpp" / "main" / "ptm_thermal_sim.cpp").read_text()
+    assert "ovr_Qb" in source, (
+        "the engine no longer forwards geothermal_heat_flow as ovr_Qb; if "
+        "PTM-161 has regressed, the GUI control and the docs both need to say "
+        "so again")
+
+    limits = (REPO_ROOT / "docs" / "KNOWN_LIMITATIONS.md").read_text()
+    section = limits.split("## 4.", 1)[1].split("\n## ", 1)[0]
+    assert "FIXED" in section, (
+        "KNOWN_LIMITATIONS.md section 4 no longer records that PTM-161 is "
+        "fixed; a stale limitation is what disabled this control once already")
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -352,6 +404,8 @@ TESTS = [
     test_the_occluder_path_is_absolutized_for_the_run_yaml,
     test_the_beaming_pair_is_writable_and_never_half_set,
     test_the_pre_2026_08_25_implicit_beaming_switch_survives_a_load,
+    test_a_quoted_rms_slope_does_not_break_the_load,
+    test_the_basal_heat_flow_control_is_not_gated_on_the_body,
 ]
 
 

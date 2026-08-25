@@ -474,10 +474,17 @@ class ConfigManager:
         # `beaming: false`, silently demoting that run to Lambertian.
         loaded_rad = ((loaded or {}).get("radiation", {}) or {}) \
             if isinstance(loaded, dict) else {}
+        try:
+            # A QUOTED value (rms_slope_deg: "20") comes back as str, which the
+            # engine's getWithDefault<double> parses without complaint. A bare
+            # comparison raised TypeError here and turned a loadable config into
+            # "Failed to load project".
+            loaded_slope = float(loaded_rad.get("rms_slope_deg") or 0.0)
+        except (TypeError, ValueError):
+            loaded_slope = 0.0
         self.legacy_implicit_beaming = (
-            loaded_rad.get("rms_slope_deg")
-            if "beaming" not in loaded_rad
-            and (loaded_rad.get("rms_slope_deg") or 0.0) > 0.0
+            loaded_slope
+            if "beaming" not in loaded_rad and loaded_slope > 0.0
             else None)
 
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})

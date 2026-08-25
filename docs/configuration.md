@@ -138,7 +138,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `h_parameter_map` | string | `""` | Per-face `float32` H-parameter map (mutually exclusive with the above) |
 | `use_default_property_map` | bool | false | Auto-discover the bundled property map for the body |
 | `property_maps_directory` | string | `"data/property_maps"` | Where to look for property maps |
-| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default). **Discarded on built-in bodies** on both backends, while the log announces it — use `heat_flow_mask_file`, or `generic_body.surface.Qb` on a generic body. See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 4 |
+| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default). Live on **every** body since PTM-161 was fixed (`2e06a70`): forwarded to the solvers as `ovr_Qb`, announced as `[Thermo override] applied at solver: Qb …`, and a positive value arms the property-override tripwire that aborts the run if it fails to reach one. It was silently discarded on built-in bodies before that commit — [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 4 has the old behavior and the re-measurement |
 | `heat_flow_mask_file` | string | `""` | Face-index file for locally elevated basal flux |
 | `heat_flow_mask_value` | float | 1.0 | Basal flux on the masked faces (W m<sup>-2</sup>) |
 | `integration_days` | float | -1.0 | Statistics-integration window (-1 = the output window) |

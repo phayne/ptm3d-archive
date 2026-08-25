@@ -181,39 +181,70 @@ def test_a_lunar_icosphere_is_allowed_and_costs_no_file_read():
         assert policy.scale.n_faces == 20 * (4 ** res)
 
 
-def test_a_face_element_with_extra_properties_is_refused_not_misread():
-    """A meshlab-style face element carries colors after the index list.
+def _write_colored_ply(path, edge_m):
+    """A meshlab-style face element: index list, then per-face RGB."""
+    verts = [(0.0, 0.0, 0.0), (edge_m, 0.0, 0.0), (0.0, edge_m, 0.0),
+             (edge_m, edge_m, 0.0)]
+    faces = [(0, 1, 2), (1, 3, 2)]
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"element vertex {len(verts)}\n"
+              "property float x\nproperty float y\nproperty float z\n"
+              f"element face {len(faces)}\n"
+              "property list uchar int vertex_indices\n"
+              "property uchar red\nproperty uchar green\n"
+              "property uchar blue\nend_header\n")
+    with open(path, "wb") as fh:
+        fh.write(header.encode("ascii"))
+        for v in verts:
+            fh.write(struct.pack("<fff", *v))
+        for f in faces:
+            fh.write(struct.pack("<Biii", 3, *f) + bytes([255, 0, 0]))
+    return edge_m / math.sqrt(2.0)
 
-    Reading only the index list leaves the stream misaligned, and a misread
-    record that happens to decode `n == 3` yields a WRONG mean area silently --
+
+def test_a_face_element_with_trailing_colors_is_read_correctly():
+    """The engine reads this layout, so refusing it would refuse a valid mesh.
+
+    ``mesh_utils.cpp`` locates the ``vertex_indices`` property by name and skips
+    the rest, so a MeshLab color export runs fine. What must not happen is
+    reading only the index list and leaving the stream misaligned: a misread
+    record that happens to decode ``n == 3`` yields a WRONG mean area silently,
     which could report a mesh as coarser than it is and allow beaming on one the
-    rule exists to refuse. Refusing the layout is the only safe answer.
+    rule exists to refuse.
     """
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "colored.ply"
-        verts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
-                 (1.0, 1.0, 0.0)]
-        faces = [(0, 1, 2), (1, 3, 2)]
+        expected = _write_colored_ply(path, edge_m=4.0)
+        scale = facet_scale(_config(path))
+        assert scale.meters is not None, scale.detail
+        assert abs(scale.meters - expected) / expected < 1e-4, (
+            f"per-face colors threw the reader off: measured {scale.meters}, "
+            f"expected {expected}")
+        assert scale.n_faces == 2
+
+
+def test_a_second_list_on_the_face_element_is_refused():
+    """An unknown-length trailing list cannot be skipped; refuse, do not guess."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "twolists.ply"
+        verts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)]
         header = ("ply\nformat binary_little_endian 1.0\n"
                   f"element vertex {len(verts)}\n"
                   "property float x\nproperty float y\nproperty float z\n"
-                  f"element face {len(faces)}\n"
+                  "element face 1\n"
                   "property list uchar int vertex_indices\n"
-                  "property uchar red\nproperty uchar green\n"
-                  "property uchar blue\nend_header\n")
+                  "property list uchar float texcoord\nend_header\n")
         with open(path, "wb") as fh:
             fh.write(header.encode("ascii"))
             for v in verts:
                 fh.write(struct.pack("<fff", *v))
-            for f in faces:
-                fh.write(struct.pack("<Biii", 3, *f) + bytes([255, 0, 0]))
-
+            fh.write(struct.pack("<Biii", 3, 0, 1, 2))
+            fh.write(struct.pack("<B", 6) + struct.pack("<6f", *([0.0] * 6)))
         scale = facet_scale(_config(path))
         assert scale.meters is None, (
-            f"a face element with trailing color properties was read as "
-            f"{scale.meters} m instead of being refused; a misaligned read can "
-            f"report a mesh as coarser than it is")
-        assert "layout" in scale.detail or "properties" in scale.detail, scale.detail
+            f"a second per-face list was read as {scale.meters} m; the offsets "
+            f"cannot be known without decoding it")
+        assert "layout" in scale.detail, scale.detail
         assert not beaming_policy(_config(path)).allowed
 
 
@@ -240,7 +271,8 @@ TESTS = [
     test_the_boundaries_are_where_the_decision_says,
     test_non_lunar_bodies_are_refused_whatever_the_scale,
     test_a_lunar_icosphere_is_allowed_and_costs_no_file_read,
-    test_a_face_element_with_extra_properties_is_refused_not_misread,
+    test_a_face_element_with_trailing_colors_is_read_correctly,
+    test_a_second_list_on_the_face_element_is_refused,
     test_an_unreadable_mesh_refuses_rather_than_guesses,
 ]
 

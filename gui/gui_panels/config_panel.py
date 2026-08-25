@@ -982,14 +982,29 @@ class MeshTab(BaseConfigTab):
                             "radiosity-coupled or written out. See "
                             "docs/extended-occluder-architecture.md.")
         # Without these an imported DEM sits wherever its own frame put it.
+        # LATITUDE IS THE GATE: ptm_thermal_sim.cpp:15317 rotates only when
+        # latitude_override > -900, and longitude is read inside that branch.
+        # Longitude alone therefore does nothing at all, which is why the
+        # longitude field is disabled until a latitude is set rather than left
+        # editable with a tooltip nobody reads.
         self.add_double_field(custom_layout, 3, "Latitude Override (deg):",
                               "mesh.latitude_override", -999.0, 90.0, 4,
                               "Place the imported mesh at this latitude. "
-                              "-999 = leave the mesh in its own frame.")
+                              "-999 = leave the mesh in its own frame. This is "
+                              "the switch for BOTH overrides: the engine "
+                              "rotates only when a latitude is given.")
         self.add_double_field(custom_layout, 4, "Longitude Override (deg):",
                               "mesh.longitude_override", -999.0, 360.0, 4,
-                              "Place the imported mesh at this longitude. "
-                              "-999 = leave the mesh in its own frame.")
+                              "Place the imported mesh at this longitude. Read "
+                              "only when a latitude override is also set -- the "
+                              "engine gates the whole rotation on latitude, so "
+                              "a longitude on its own is silently ignored.")
+        self.placement_note = QLabel("")
+        self.placement_note.setWordWrap(True)
+        self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
+        custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
+        self.widgets["mesh.latitude_override"].valueChanged.connect(
+            lambda _v: self._update_placement_gating())
 
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)
@@ -999,6 +1014,25 @@ class MeshTab(BaseConfigTab):
 
         layout.addStretch()
         self.create_scroll_area(content)
+
+        self._update_placement_gating()
+
+    def _update_placement_gating(self):
+        """Longitude is inert without a latitude, so do not offer it alone."""
+        lat = self.widgets["mesh.latitude_override"].value()
+        placing = lat > -900.0
+        self.widgets["mesh.longitude_override"].setEnabled(placing)
+        if placing:
+            lon = self.widgets["mesh.longitude_override"].value()
+            lon_text = "the mesh's own longitude" if lon <= -900.0 \
+                else f"{lon} deg"
+            self.placement_note.setText(
+                f"The mesh will be rotated to {lat} deg latitude, {lon_text}.")
+        else:
+            self.placement_note.setText(
+                "No latitude override: the mesh stays in its own frame and the "
+                "longitude override is not read (the engine gates the rotation "
+                "on latitude).")
 
     def _on_import_file_changed(self, text):
         """Disable global mesh options when a custom mesh file is specified."""
@@ -1104,6 +1138,7 @@ class MeshTab(BaseConfigTab):
             mesh.get("latitude_override", -999.0))
         self.widgets["mesh.longitude_override"].setValue(
             mesh.get("longitude_override", -999.0))
+        self._update_placement_gating()
 
         source = mesh.get("topo_source", "builtin")
         self.topo_builtin_radio.blockSignals(True)
@@ -1188,21 +1223,23 @@ class ThermalTab(BaseConfigTab):
                               "thermal.geothermal_heat_flow", -1.0, 10.0, 4,
                               "Bottom-boundary heat flux. -1 = the body's own "
                               "default.\n"
-                              "DISCARDED ON BUILT-IN BODIES (Moon, Europa, "
-                              "Mercury): the engine parses it, announces "
-                              "'Overriding planet geothermal heat flow', and "
-                              "throws it away, because every mesh solver "
-                              "rebuilds its planet from the body name. "
-                              "KNOWN_LIMITATIONS.md section 4. Use "
-                              "thermal.heat_flow_mask_file, or a custom body's "
-                              "generic_body.surface.Qb.")
-        # A control that does nothing on the default body is worse than no
-        # control. Gray it out there and say why, rather than let a value be
-        # typed, saved, announced by the engine, and discarded.
+                              "Live on every body since PTM-161 was fixed "
+                              "(commit 2e06a70): the value is forwarded to the "
+                              "solvers as ovr_Qb and the run prints "
+                              "'[Thermo override] applied at solver: Qb ...'. "
+                              "A positive value also arms the property-override "
+                              "tripwire, which aborts the run if the override "
+                              "does not reach a solver.")
+        # Measured on this tree rather than taken from KNOWN_LIMITATIONS.md
+        # section 4, which still says "Status: Open": Moon ico3, 48 steps,
+        # Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K over 1280 faces. It is
+        # live, and the docs are stale.
         self.qb_note = QLabel("")
         self.qb_note.setWordWrap(True)
-        self.qb_note.setStyleSheet("color: #FFB74D; font-size: 10px;")
+        self.qb_note.setStyleSheet("color: gray; font-size: 10px;")
         control_layout.addWidget(self.qb_note, 6, 0, 1, 2)
+        self.widgets["thermal.geothermal_heat_flow"].valueChanged.connect(
+            lambda _v: self._update_qb_gating())
 
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
@@ -1463,30 +1500,32 @@ class ThermalTab(BaseConfigTab):
         self._update_seed_gating()
         self._update_qb_gating()
 
-    # ── Basal heat flow: live only on a generic body ─────────────────
+    # ── Basal heat flow ──────────────────────────────────────────────
 
     def _update_qb_gating(self):
-        """thermal.geothermal_heat_flow is discarded on a built-in body."""
-        generic = getattr(self.config_manager, "generic_body_active",
-                          lambda: False)()
-        widget = self.widgets.get("thermal.geothermal_heat_flow")
-        if widget is not None:
-            widget.setEnabled(generic)
-        if generic:
+        """Say what a positive basal heat flow does. It is live on every body.
+
+        This control was briefly disabled on built-in bodies on the strength of
+        docs/KNOWN_LIMITATIONS.md section 4, which describes the value being
+        parsed, announced and then discarded. That was PTM-161, and PTM-161 was
+        fixed by commit 2e06a70 -- an ancestor of this branch. Measured here to
+        settle it rather than trusting either document: Moon ico3, 48 steps,
+        Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K, and the run prints
+        '[Thermo override] applied at solver: Qb 0.018 -> 0.05 W/m^2'.
+        Disabling it made a working knob unreachable on the GUI's own default
+        body, and -- worse -- told the user a value the engine WOULD apply was
+        going to be ignored.
+        """
+        value = self.config_manager.get_value("thermal.geothermal_heat_flow", -1.0)
+        if value is None or value <= 0:
             self.qb_note.setText("")
-        else:
-            self.qb_note.setText(
-                "Basal heat flow is DISCARDED on a built-in body: the engine "
-                "announces the override and then rebuilds its planet from the "
-                "body name, so the compiled default is what integrates "
-                "(KNOWN_LIMITATIONS.md section 4). Use a heat-flow mask, or a "
-                "custom body's surface Qb.")
-            if self.config_manager.get_value(
-                    "thermal.geothermal_heat_flow", -1.0) > 0:
-                logging.warning(
-                    "[thermal] geothermal_heat_flow is set on a built-in body "
-                    "and will be discarded by the engine "
-                    "(KNOWN_LIMITATIONS.md section 4).")
+            return
+        self.qb_note.setText(
+            f"Q_b = {value} W/m² overrides the body default. This is a property "
+            f"OVERRIDE: it is forwarded to the solvers as ovr_Qb, announced in "
+            f"the log, and arms the tripwire that aborts the run if it fails to "
+            f"reach one. It also sets the deep floor, T_geo = "
+            f"(Q_b/(eps*sigma))^0.25.")
 
     # ── Initial-condition handler ────────────────────────────────────
 
@@ -1627,7 +1666,6 @@ class ThermalTab(BaseConfigTab):
             self._syncing = False
         # Refresh the cadence readout text for the new body
         self._update_eq_cadence_readout()
-        # Built-in vs generic decides whether basal heat flow is live at all.
         self._update_qb_gating()
 
     # ── Equilibration cadence handlers ────────────────────────────────
@@ -2107,7 +2145,8 @@ class RadiationTab(BaseConfigTab):
         knob.setEnabled(already_on)
 
         text = policy.reason
-        if already_on and not may_turn_on:
+        if already_on and not policy.allowed:
+            # The rule REFUSES this mesh or body, and beaming is on anyway.
             text = ("BEAMING IS ON AND THIS MESH DOES NOT MEET THE RULE. It "
                     "has been left as the configuration set it -- nothing here "
                     "rewrites your physics -- but check it before trusting the "
@@ -2115,6 +2154,15 @@ class RadiationTab(BaseConfigTab):
             logging.warning("[beaming] radiation.beaming is ON and the "
                             "facet-scale rule declines: %s", policy.reason)
             color = "#E57373"
+        elif already_on and policy.needs_acknowledgment and not ack_ok:
+            # The rule ALLOWS this mesh; it only wants the number acknowledged.
+            # Saying "does not meet the rule" here contradicts the reason text
+            # printed immediately below it, and every 5 cm to 1 m production
+            # mesh would raise a red alarm on open.
+            text = ("Beaming is on and this mesh is in the band where some "
+                    "roughness may already be resolved. Confirm below.\n"
+                    + policy.reason)
+            color = "#FFB74D"
         elif not policy.allowed:
             color = "#E57373"
         elif policy.needs_acknowledgment:
@@ -2260,8 +2308,9 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
-        # Beaming: honor what the file said, then let the rule have the last
-        # word (the switch is turned back off, loudly, if the mesh forbids it).
+        # Beaming: honor what the file said. The rule then decides whether it
+        # may be turned ON from here -- it never turns one OFF; a setting it
+        # disagrees with is kept and said loudly.
         self.widgets["radiation.rms_slope_deg"].setValue(
             rad.get("rms_slope_deg", 0.0))
         self.widgets["radiation.beaming"].blockSignals(True)
@@ -2694,9 +2743,11 @@ class ThermophysicalTab(BaseConfigTab):
     def _update_builtin_support(self):
         """Enable/disable rows according to what the ENGINE can honor.
 
-        Built-in body: only albedo/emissivity/ks/kd reach the engine (via
-        *_override keys written at save time); the other six rows are forced
-        back to 'Use Default' and disabled so no input dies silently.
+        Built-in body: only the BUILTIN_OVERRIDABLE properties reach the engine
+        (via *_override keys written at save time); the BUILTIN_UNSUPPORTED rows
+        are forced back to 'Use Default' and disabled so no input dies silently.
+        Both tuples are the single source for this rule and for the strings it
+        shows, so neither can drift from the other.
         Custom/HORIZONS body: everything is enabled (values are written to
         generic_body.surface, which the engine reads)."""
         generic = getattr(self.config_manager, "generic_body_active",
@@ -4019,6 +4070,19 @@ class EngineFlagsTab(BaseConfigTab):
         info.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
         layout.addWidget(info)
 
+        # Shown only when the loaded config carries an EMPTY engine_env: block.
+        # An empty table would otherwise look like a bug rather than a decision.
+        self._declined_note = QLabel(
+            "This configuration carries an empty engine_env: block — it "
+            "declines every recommended flag, and the launch will also REMOVE "
+            "any of them exported by your shell. Use Restore Recommended to "
+            "take the default set instead.")
+        self._declined_note.setWordWrap(True)
+        self._declined_note.setStyleSheet(
+            "color: #FFB74D; font-size: 10px; padding: 5px;")
+        self._declined_note.setVisible(False)
+        layout.addWidget(self._declined_note)
+
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Variable", "Value"])
         self.table.horizontalHeader().setSectionResizeMode(
@@ -4101,9 +4165,16 @@ class EngineFlagsTab(BaseConfigTab):
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
         env = self.config_manager.get_value("engine_env", None)
-        if not isinstance(env, dict) or not env:
+        # An EMPTY dict is a real state -- "this config declines the flags" --
+        # and must be shown as empty. Treating it as "nothing here, show the
+        # defaults" displayed all five as if they would be applied (the launch
+        # in fact REMOVES them), and the first edit to any cell wrote the whole
+        # displayed set back into the config, silently re-injecting exactly what
+        # the config had declined.
+        if not isinstance(env, dict):
             env = dict(RECOMMENDED_ENGINE_ENV)
         self._set_rows(env)
+        self._declined_note.setVisible(not env)
 
 
 class ConfigurationPanel(QWidget):
@@ -4262,19 +4333,28 @@ class ConfigurationPanel(QWidget):
             res_widget.valueChanged.connect(
                 lambda _v: self.tabs["radiation"].on_mesh_changed())
 
-        # Importing or clearing a mesh changes the facet scale outright.
-        for key in ("mesh.import_file", "mesh.scale_factor"):
+        # Importing, rescaling or clearing a mesh changes the facet scale.
+        #
+        # Pick the signal that fires AFTER the config is written, not merely the
+        # first one that exists. A QDoubleSpinBox has BOTH textChanged and
+        # valueChanged in Qt6 and emits textChanged FIRST, while add_double_field
+        # writes the config on valueChanged -- so a `textChanged or valueChanged`
+        # lookup re-evaluated the rule against the previous scale factor and
+        # nothing ran afterward. Measured: [('textChanged', '2.500'),
+        # ('valueChanged', 2.5)].
+        for key in ("mesh.import_file", "mesh.scale_factor",
+                    "mesh.use_topographic"):
             widget = self.tabs["mesh"].widgets.get(key)
             if widget is None:
                 continue
-            signal = getattr(widget, "textChanged", None) or \
-                getattr(widget, "valueChanged", None)
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                signal = widget.valueChanged
+            elif isinstance(widget, QCheckBox):
+                signal = widget.toggled
+            else:
+                signal = getattr(widget, "textChanged", None)
             if signal is not None:
                 signal.connect(lambda _v: self.tabs["radiation"].on_mesh_changed())
-        topo = self.tabs["mesh"].widgets.get("mesh.use_topographic")
-        if topo is not None:
-            topo.toggled.connect(
-                lambda _v: self.tabs["radiation"].on_mesh_changed())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:

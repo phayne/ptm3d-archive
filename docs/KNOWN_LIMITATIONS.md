@@ -294,15 +294,31 @@ implemented, and the two measurements of the GPU-side magnitude have not been re
 
 ---
 
-## 4. `thermal.geothermal_heat_flow` is discarded on built-in bodies
+## 4. `thermal.geothermal_heat_flow` was discarded on built-in bodies — FIXED
 
-**What it is.** On a built-in body (Moon, Europa, Mercury) the value is parsed, applied to the
+> **Status: FIXED** by commit `2e06a70`, "Forward geothermal_heat_flow to the solvers
+> (PTM-161)". This section is kept for anyone reading a run that predates that commit, and
+> because the section number is cited from elsewhere. **Everything below describes the old
+> behavior.**
+>
+> **Re-measured on the current tree (2026-08-25).** Moon ico3, 48 output steps, CPU,
+> `geothermal_heat_flow` at the default versus `0.05 W/m²`: `statistics/temperature_min.bin` is
+> **not** byte-identical, max `|ΔT_min| = 0.8421 K` over 1,280 faces, and the run prints
+> `[Thermo override] applied at solver: Qb 0.018 -> 0.05 W/m²`. The value is forwarded as
+> `ovr_Qb` (`ptm_thermal_sim.cpp:3849`, `:16906`) and a positive value arms the same
+> property-override tripwire as `ks_override` and the rest, which aborts the run if the override
+> fails to reach a solver.
+>
+> This section said "Status: Open" for long enough that the GUI disabled the control on the
+> strength of it (2026-08-25, reverted the same day). A stale limitation is a limitation.
+
+**What it was.** On a built-in body (Moon, Europa, Mercury) the value was parsed, applied to the
 main-scope planet object, and announced —
 `Overriding planet geothermal heat flow: …` — and then thrown away, because every mesh solver
-rebuilds its own planet from the body name. This is true on **both** backends and at every solver
-entry point, not only on the GPU. The Moon therefore always integrates its compiled
-default `Q_b = 0.018 W/m²` (Langseth et al. 1976) whatever the config asks for and whatever the
-banner says.
+rebuilt its own planet from the body name. This was true on **both** backends and at every solver
+entry point, not only on the GPU. The Moon therefore always integrated its compiled
+default `Q_b = 0.018 W/m²` (Langseth et al. 1976) whatever the config asked for and whatever the
+banner said.
 
 **Who is affected.** Anyone varying the basal heat flow on a built-in body — geothermal
 sensitivity studies, deep-column and ice-table work, and anything that depends on the floor of section 2,
@@ -321,11 +337,11 @@ fixture: it records the number to expect now and the number that must appear onc
 forwarded.
 
 **Note on the related fix.** The property-override class was repaired for `ks_override`,
-`kd_override`, `emissivity_override`, `albedo_override` and `constant_thermal_inertia`, which now
+`kd_override`, `emissivity_override`, `albedo_override` and `constant_thermal_inertia`, which
 apply on all bodies and abort the run if they cannot be applied. `geothermal_heat_flow` was left
-out of that repair. It is the one member of the class still open.
+out of that first repair and joined the class in `2e06a70`.
 
-**Status.** Open.
+**Status.** FIXED (`2e06a70`); re-measured 2026-08-25, see the note at the top of this section.
 
 ---
 

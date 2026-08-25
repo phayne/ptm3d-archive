@@ -267,17 +267,33 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
     lists = [p for p in properties if p[0] == "list"]
     if not lists:
         raise ValueError("PLY face element carries no vertex-index list")
-    # A meshlab-style face element can carry trailing scalars (red/green/blue)
-    # or a second list after the index list. Reading only the index list would
-    # then leave the stream misaligned, and a misread record that happens to
-    # decode n == 3 yields a WRONG mean area silently -- which could allow
-    # beaming on a mesh the rule exists to refuse. Refuse the layout instead.
-    if properties.index(lists[0]) != 0 or len(properties) != 1:
+    # A meshlab-style face element carries trailing scalars (red/green/blue)
+    # after the index list. The engine's own reader handles that
+    # (mesh_utils.cpp locates the vertex_indices property by name and skips the
+    # rest), so refusing it here would refuse beaming on a mesh that runs fine,
+    # for a reason about this reader rather than about the mesh. What must NOT
+    # happen is reading only the index list and leaving the stream misaligned:
+    # a misread record that happens to decode n == 3 yields a WRONG mean area
+    # silently, which could report a mesh as coarser than it is and allow
+    # beaming on one the rule exists to refuse.
+    #
+    # So: the index list must come FIRST (an unknown-length list ahead of it
+    # cannot be skipped without decoding it, and no PTM3D-relevant exporter
+    # writes one), and everything after it must be fixed-width scalars.
+    index_prop = lists[0]
+    if properties.index(index_prop) != 0:
         raise ValueError(
-            "PLY face element carries properties beside the vertex-index list "
+            "PLY face element puts a property before the vertex-index list "
             f"({[p[-1] for p in properties]}); this reader cannot compute face "
             f"areas from that layout")
-    _kind, count_type, item_type, _name = lists[0]
+    trailing = properties[1:]
+    if any(p[0] != "scalar" for p in trailing):
+        raise ValueError(
+            "PLY face element carries a second list after the vertex-index "
+            f"list ({[p[-1] for p in properties]}); this reader cannot compute "
+            f"face areas from that layout")
+    trailing_bytes = sum(_PLY_SCALAR[p[1]][1] for p in trailing)
+    _kind, count_type, item_type, _name = index_prop
     ccode, cwidth = _PLY_SCALAR[count_type]
     icode, iwidth = _PLY_SCALAR[item_type]
     stride, _expected = _sample_stride(n_faces)
@@ -285,7 +301,8 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
 
     if stride > 1:
         seeked = _seek_sampled_triangles(fh, n_faces, stride, block_start,
-                                         ccode, cwidth, icode, iwidth, vertices)
+                                         ccode, cwidth, icode, iwidth,
+                                         trailing_bytes, vertices)
         if seeked is not None:
             return seeked
         # Not a uniform triangle block. Fall back to streaming rather than
@@ -302,6 +319,8 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
         body = fh.read(iwidth * n)
         if len(body) < iwidth * n:
             raise ValueError("PLY face block is truncated")
+        if trailing_bytes and len(fh.read(trailing_bytes)) < trailing_bytes:
+            raise ValueError("PLY face block is truncated")
         if f % stride:
             continue
         idx = struct.unpack("<" + icode * n, body)
@@ -317,7 +336,8 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
 
 
 def _seek_sampled_triangles(fh, n_faces, stride, block_start,
-                            ccode, cwidth, icode, iwidth, vertices):
+                            ccode, cwidth, icode, iwidth, trailing_bytes,
+                            vertices):
     """Sample by seeking, valid only if every face record is a triangle.
 
     Returns (mean_area, n_faces, n_sampled), or None when the block is not a
@@ -325,7 +345,7 @@ def _seek_sampled_triangles(fh, n_faces, stride, block_start,
     record it touches is re-checked for n == 3, so a mixed-arity block is
     detected rather than silently misread at the wrong offsets.
     """
-    record = cwidth + 3 * iwidth
+    record = cwidth + 3 * iwidth + trailing_bytes
     fh.seek(0, 2)
     if fh.tell() - block_start < n_faces * record:
         return None
@@ -339,7 +359,7 @@ def _seek_sampled_triangles(fh, n_faces, stride, block_start,
         raw = fh.read(record)
         if len(raw) < record or unpack_head(raw[:cwidth])[0] != 3:
             return None
-        a, b, c = unpack_idx(raw[cwidth:])
+        a, b, c = unpack_idx(raw[cwidth:cwidth + 3 * iwidth])
         total += _triangle_area(vertices[a], vertices[b], vertices[c])
         used += 1
     if not used:
@@ -365,6 +385,9 @@ def _ply_mean_face_area_ascii(fh, elements):
                 row = fh.readline().split()
                 if f % stride:
                     continue
+                # Trailing per-face properties (colors) follow the index list
+                # on the same line; slicing to 1+n ignores them, which is
+                # correct here because an ASCII record is line-delimited.
                 n = int(row[0])
                 idx = [int(v) for v in row[1:1 + n]]
                 for k in range(1, n - 1):
