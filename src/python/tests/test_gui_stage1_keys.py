@@ -130,12 +130,43 @@ def test_the_default_conductivity_model_is_the_engine_s():
         ENGINE_DEFAULTS["thermophysical.conductivity_model"]
 
 
+def test_coupling_mode_is_writable_and_round_trips():
+    """PTM-102. The mode was unreachable while the field it gates was visible."""
+    manager = _manager()
+    assert manager.get_value("radiation.coupling_mode") == \
+        ENGINE_DEFAULTS["radiation.coupling_mode"]
+    for mode in ("bounded", "fixed", "legacy"):
+        manager.set_value("radiation.coupling_mode", mode)
+        written = manager._config_for_yaml()["radiation"]
+        assert written.get("coupling_mode") == mode, written
+        assert _round_trip(manager).get_value("radiation.coupling_mode") == mode
+
+
+def test_nearfield_quadrature_order_and_mc_builder_are_writable():
+    manager = _manager()
+    for key, value in (("radiation.nearfield_quadrature_order", 1),
+                       ("radiation.use_monte_carlo_vf", True),
+                       ("radiation.mc_rays_per_face", 250000)):
+        manager.set_value(key, value)
+    written = manager._config_for_yaml()["radiation"]
+    assert written["nearfield_quadrature_order"] == 1, written
+    assert written["use_monte_carlo_vf"] is True, written
+    assert written["mc_rays_per_face"] == 250000, written
+
+    back = _round_trip(manager)
+    assert back.get_value("radiation.nearfield_quadrature_order") == 1
+    assert back.get_value("radiation.use_monte_carlo_vf") is True
+    assert back.get_value("radiation.mc_rays_per_face") == 250000
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
     test_H_is_in_the_engine_override_set,
     test_conductivity_model_is_written_and_round_trips,
     test_the_default_conductivity_model_is_the_engine_s,
+    test_coupling_mode_is_writable_and_round_trips,
+    test_nearfield_quadrature_order_and_mc_builder_are_writable,
 ]
 
 

@@ -1671,16 +1671,30 @@ class RadiationTab(BaseConfigTab):
         coupling_layout = QGridLayout(coupling_widget)
         coupling_layout.setColumnStretch(1, 1)
 
-        self.add_int_field(coupling_layout, 0, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
+        # PTM-102. The mode was unreachable while the field it gates was
+        # visible, so a user could set a "Face Fraction (legacy mode only)"
+        # that the engine then announced it was ignoring.
+        self.add_combo_field(coupling_layout, 0, "Coupling Mode:",
+                             "radiation.coupling_mode",
+                             ["bounded", "fixed", "legacy"],
+                             "How the thermal-radiation coupling loop decides "
+                             "it is done (PTM-89).\n"
+                             "bounded (default): absolute selection threshold, "
+                             "no face-fraction exit.\n"
+                             "fixed: as bounded, plus a fixed iteration count.\n"
+                             "legacy: the pre-PTM-89 behavior, for reproducing "
+                             "published runs. It is the only mode that reads "
+                             "Face Fraction.")
+        self.add_int_field(coupling_layout, 1, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
                            1, 50, "Maximum thermal-radiation coupling iterations",
                            info_key="radiation.max_coupling_iterations")
-        self.add_double_field(coupling_layout, 1, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
+        self.add_double_field(coupling_layout, 2, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
                               0.1, 10.0, 1, "Temperature convergence threshold",
                               info_key="radiation.coupling_temp_threshold")
-        self.add_double_field(coupling_layout, 2, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
+        self.add_double_field(coupling_layout, 3, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
                               0.01, 10.0, 2, "Flux change threshold",
                               info_key="radiation.coupling_flux_threshold")
-        self.add_double_field(coupling_layout, 3, "Face Fraction (legacy mode only):",
+        self.add_double_field(coupling_layout, 4, "Face Fraction (legacy mode only):",
                               "radiation.coupling_face_fraction",
                               0.001, 0.1, 3,
                               "Fraction of faces still changing to stop. IGNORED unless "
@@ -1688,6 +1702,15 @@ class RadiationTab(BaseConfigTab):
                               "no error bound and made a coupled run's answer depend on how "
                               "the window was chunked (PTM-89). The engine prints a warning "
                               "if you change it without also setting coupling_mode: legacy.")
+
+        # A label that says "legacy mode only" next to an always-editable field
+        # is a label that lies. Gate it on the mode it names.
+        self.coupling_mode_note = QLabel("")
+        self.coupling_mode_note.setWordWrap(True)
+        self.coupling_mode_note.setStyleSheet("color: gray; font-size: 10px;")
+        coupling_layout.addWidget(self.coupling_mode_note, 5, 0, 1, 2)
+        self.widgets["radiation.coupling_mode"].currentTextChanged.connect(
+            self._update_coupling_mode_gating)
 
         coupling_section.add_widget(coupling_widget)
         layout.addWidget(coupling_section)
@@ -1715,6 +1738,36 @@ class RadiationTab(BaseConfigTab):
                            1, 200, "Maximum rank before falling back to sparse")
         self.add_int_field(vf_layout, 5, "H-Matrix Threads:", "radiation.hmatrix_threads",
                            0, 128, "Threads for H-matrix construction (0 = auto)")
+
+        # Which view-factor builder, and how accurately it integrates the near
+        # field. Both change the numbers a coupled run produces.
+        self.add_int_field(vf_layout, 6, "Near-Field Quadrature Order:",
+                           "radiation.nearfield_quadrature_order", 1, 8,
+                           "Order of the symmetric double-area quadrature used "
+                           "for near-field pairs. 3 is the default and the "
+                           "validated production value; order 1 is the centroid "
+                           "estimator with no near-field treatment at all and "
+                           "reads +51.7% on the touching-pair closed form "
+                           "(order 3 reads +18.5%). The engine calls order 1 "
+                           "\"a diagnostic setting, not a production one\".")
+        self.add_bool_field(vf_layout, 7, "Build View Factors by Monte Carlo",
+                            "radiation.use_monte_carlo_vf",
+                            "Select the Monte Carlo view-factor builder instead "
+                            "of the analytic/H-matrix path. A different builder "
+                            "is a different answer, not just a different speed.")
+        self.add_int_field(vf_layout, 8, "Monte Carlo Rays per Face:",
+                           "radiation.mc_rays_per_face", 1000, 10000000,
+                           "Rays cast per face by the Monte Carlo builder. "
+                           "Used only when that builder is selected.")
+
+        self.quadrature_note = QLabel("")
+        self.quadrature_note.setWordWrap(True)
+        self.quadrature_note.setStyleSheet("color: gray; font-size: 10px;")
+        vf_layout.addWidget(self.quadrature_note, 9, 0, 1, 2)
+        self.widgets["radiation.nearfield_quadrature_order"].valueChanged.connect(
+            self._update_vf_builder_gating)
+        self.widgets["radiation.use_monte_carlo_vf"].toggled.connect(
+            self._update_vf_builder_gating)
 
         vf_section.add_widget(vf_widget)
         layout.addWidget(vf_section)
@@ -1765,10 +1818,53 @@ class RadiationTab(BaseConfigTab):
         self.create_scroll_area(content)
 
         self._update_hmatrix_suboptions()
+        self._update_coupling_mode_gating()
+        self._update_vf_builder_gating()
 
         # Recompute the estimate whenever a radiation field changes.
         self.value_changed.connect(self.update_vf_estimate)
         self.update_vf_estimate()
+
+    def _update_coupling_mode_gating(self, _mode=None):
+        """Face Fraction is editable only in the mode whose name it carries."""
+        mode = self.widgets["radiation.coupling_mode"].currentText()
+        legacy = (mode == "legacy")
+        ff = self.widgets.get("radiation.coupling_face_fraction")
+        if ff is not None:
+            ff.setEnabled(legacy)
+        if legacy:
+            self.coupling_mode_note.setText(
+                "legacy re-introduces PTM-89: the face-fraction exit has no "
+                "error bound, so a coupled run's answer depends on how the "
+                "window was chunked. Use it to reproduce a published run.")
+        elif mode == "fixed":
+            self.coupling_mode_note.setText(
+                "fixed runs exactly Max Coupling Iterations passes; Face "
+                "Fraction is not read.")
+        else:
+            self.coupling_mode_note.setText(
+                "bounded is the PTM-89 fix and the engine default; Face "
+                "Fraction is not read.")
+
+    def _update_vf_builder_gating(self, _value=None):
+        """Warn on quadrature order 1, and gate the Monte Carlo ray count."""
+        order = self.widgets["radiation.nearfield_quadrature_order"].value()
+        mc = self.widgets["radiation.use_monte_carlo_vf"].isChecked()
+        rays = self.widgets.get("radiation.mc_rays_per_face")
+        if rays is not None:
+            rays.setEnabled(mc)
+        if order == 1:
+            # The engine's own wording, so the two do not drift apart.
+            self.quadrature_note.setText(
+                "Order 1 is the centroid estimator: no near-field treatment at "
+                "all. On the touching-pair closed form it reads +51.7% (order 3 "
+                "reads +18.5%). This is a diagnostic setting, not a production "
+                "one.")
+        elif order < 3:
+            self.quadrature_note.setText(
+                f"Order {order} is below the validated production value of 3.")
+        else:
+            self.quadrature_note.setText("")
 
     def _update_hmatrix_suboptions(self, _checked=None):
         """Enable the H-matrix compression sub-fields only when H-matrix is on."""
@@ -1828,6 +1924,10 @@ class RadiationTab(BaseConfigTab):
         # max_coupling_iterations 10 while the engine said False and 16.
         self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", False))
         self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
+        idx = self.widgets["radiation.coupling_mode"].findText(
+            rad.get("coupling_mode", "bounded"))
+        if idx >= 0:
+            self.widgets["radiation.coupling_mode"].setCurrentIndex(idx)
         self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 16))
         self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 0.5))
         self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
@@ -1838,12 +1938,20 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.aca_tolerance"].setValue(rad.get("aca_tolerance", 0.001))
         self.widgets["radiation.aca_max_rank"].setValue(rad.get("aca_max_rank", 50))
         self.widgets["radiation.hmatrix_threads"].setValue(rad.get("hmatrix_threads", 0))
+        self.widgets["radiation.nearfield_quadrature_order"].setValue(
+            rad.get("nearfield_quadrature_order", 3))
+        self.widgets["radiation.use_monte_carlo_vf"].setChecked(
+            rad.get("use_monte_carlo_vf", False))
+        self.widgets["radiation.mc_rays_per_face"].setValue(
+            rad.get("mc_rays_per_face", 100000))
         # Sparse view factors
         self.widgets["radiation.adaptive_neighbors"].setChecked(rad.get("adaptive_neighbors", True))
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
         self._update_hmatrix_suboptions()
+        self._update_coupling_mode_gating()
+        self._update_vf_builder_gating()
         self.update_vf_estimate()
 
 

@@ -264,10 +264,19 @@ class ConfigManager:
             "verbose": False,
             "use_gpu": False,
             "view_factor_file": "",
+            # PTM-102: bounded (default) | fixed | legacy. coupling_face_fraction
+            # is consulted ONLY under legacy; the engine says so at runtime.
+            "coupling_mode": "bounded",
             "max_coupling_iterations": 16,
             "coupling_temp_threshold": 0.5,
             "coupling_flux_threshold": 0.1,
             "coupling_face_fraction": 0.01,
+            # Near-field view-factor quadrature order and the builder choice.
+            # Order 1 is the M1 centroid estimator (+51.7% on the touching-pair
+            # closed form); the engine calls it a diagnostic setting.
+            "nearfield_quadrature_order": 3,
+            "use_monte_carlo_vf": False,
+            "mc_rays_per_face": 100000,
             "use_hmatrix": False,
             "use_aca": True,
             "aca_tolerance": 0.001,
