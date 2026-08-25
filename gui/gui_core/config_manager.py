@@ -344,48 +344,20 @@ class ConfigManager:
         }
     }
 
-    PRESETS = {
-        # Generic (body-agnostic) presets: they layer on top of the default
-        # body, so a "quick" or "highres" run follows whatever body is the
-        # current default (Moon) rather than hardcoding one. Renamed from the
-        # old europa_quick / europa_highres.
-        "quick": {
-            "simulation": {"duration_days": 0.5, "timesteps": 24},
-            "mesh": {"resolution": 4},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/quick_test", "vtk_mode": "thermal"}
-        },
-        "highres": {
-            "simulation": {"duration_days": 3.55, "timesteps": 144},
-            "mesh": {"resolution": 7},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/highres"},
-            "advanced": {"verbose": True}
-        },
-        "moon_thermal": {
-            "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 708},
-            "mesh": {"resolution": 6},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/moon_thermal"}
-        },
-        "crater_radex": {
-            "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 96},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "radiation": {
-                "enabled": True, "verbose": True, "use_gpu": True,
-                "min_shadow_fraction": 0.3, "max_coupling_iterations": 10
-            },
-            "output": {"directory": "output/crater_radex"}
-        },
-        "gpu_accelerated": {
-            # NOTE: no use_gpu_illumination key -- that was a dead key nothing
-            # consumed (illumination GPU is illumination.use_gpu in the engine
-            # YAML, and CPU illumination is both correct and faster on the
-            # reference Mac Pro for lunar workloads).
-            "thermal": {"use_gpu": True},
-            "radiation": {"enabled": True, "use_gpu": True}
-        }
-    }
+    # There is no preset table here on purpose (GUI-PRESET-1). The five that
+    # used to live at this spot -- quick, highres, moon_thermal, crater_radex,
+    # gpu_accelerated -- were unreachable: `grep -rn load_preset gui/` returned
+    # only the definition, and no menu, button or dialog ever called it. They
+    # also carried values the rest of this file had moved past
+    # (max_coupling_iterations 10, radiation.use_gpu true, an `advanced:`
+    # section that no longer exists), and `gpu_accelerated` flipped
+    # thermal.use_gpu to true -- one of the two candidate explanations for the
+    # 2026-08-14 flip that has never been reproduced.
+    #
+    # docs/design/gui-update-plan.md item 2.3 designs the replacement: a
+    # reachable list built from section 4.4, each preset stating which keys it
+    # sets, and a preset that would violate the beaming facet-scale rule
+    # refusing with the reason.
 
     # Properties with an engine-side *_override key for BUILT-IN bodies
     # (config_parser.cpp reads albedo/emissivity/ks/kd_override; the other
@@ -826,15 +798,6 @@ class ConfigManager:
 
         all_messages = errors + warnings
         return (len(errors) == 0, all_messages)
-
-    def load_preset(self, preset_name):
-        """Load a preset configuration"""
-        if preset_name not in self.PRESETS:
-            raise ValueError(f"Unknown preset: {preset_name}")
-
-        preset = self.PRESETS[preset_name]
-        self.reset_to_defaults()
-        self.config = self._deep_merge(self.config, preset)
 
     def _deep_merge(self, base, update):
         """Deep merge two dictionaries"""

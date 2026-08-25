@@ -29,8 +29,12 @@ local disk, not in a cloud-synced folder.
 ### 1. Simulation Configuration
 - **Tabbed Interface**: Organized parameter settings for Simulation, Mesh, Thermal, Radiation, Illumination, and Output
 - **YAML Preview**: Live preview of configuration as you edit
-- **Presets**: Quick-start configurations for common scenarios
 - **Validation**: Real-time configuration validation before running
+
+There are **no presets**. This list advertised them for months while
+`ConfigManager.PRESETS` was unreachable code -- no menu, no button, no dialog
+ever loaded one. The table has been removed; a reachable replacement is
+designed in `docs/design/gui-update-plan.md` (item 2.3).
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
