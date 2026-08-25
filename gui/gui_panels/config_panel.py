@@ -1114,9 +1114,14 @@ class MeshTab(BaseConfigTab):
         custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
         # BOTH, because the note quotes both numbers: connected to latitude
         # only, it went on stating the old longitude for the run about to start.
+        # set_numeric() calls setValue during load_from_config, which emits
+        # valueChanged, so the signal alone cannot tell a user edit from a load.
+        # _loading does.
+        self._loading = False
         for _k in ("mesh.latitude_override", "mesh.longitude_override"):
             self.widgets[_k].valueChanged.connect(
-                lambda _v: self._update_placement_gating())
+                lambda _v: self._update_placement_gating(
+                    user_edit=not self._loading))
 
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)
@@ -1129,12 +1134,20 @@ class MeshTab(BaseConfigTab):
 
         self._update_placement_gating()
 
-    def _update_placement_gating(self):
-        """Longitude is inert without a latitude, so do not offer it alone."""
+    def _update_placement_gating(self, user_edit=False):
+        """Longitude is inert without a latitude, so do not offer it alone.
+
+        `user_edit` is what separates "the user just cleared the latitude" from
+        "a project was opened". Only the first resets a stale longitude: doing
+        it on load DISCARDED a saved longitude_override the moment the file was
+        opened, which is a silent edit to the user's configuration and the exact
+        thing read-only open exists to prevent. On load the value is kept, the
+        field is disabled, and validate() warns that the engine will ignore it.
+        """
         lat = self.widgets["mesh.latitude_override"].value()
         placing = lat > -900.0
         lon_widget = self.widgets["mesh.longitude_override"]
-        if not placing and lon_widget.value() > -900.0:
+        if user_edit and not placing and lon_widget.value() > -900.0:
             # Clearing the latitude leaves a longitude the engine will ignore,
             # in a field about to be disabled -- so the value could not be
             # reached to remove it. Reset it here, and say so rather than
@@ -1258,16 +1271,22 @@ class MeshTab(BaseConfigTab):
         config = self.config_manager.get_config()
         mesh = config["mesh"]
 
-        self.widgets["mesh.resolution"].setValue(mesh["resolution"])
-        self.widgets["mesh.use_topographic"].setChecked(mesh.get("use_topographic", False))
-        self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
-        self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
-        self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
-        self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
-        self.set_numeric("mesh.latitude_override",
-                         mesh.get("latitude_override", -999.0))
-        self.set_numeric("mesh.longitude_override",
-                         mesh.get("longitude_override", -999.0))
+        self._loading = True
+        try:
+            self.widgets["mesh.resolution"].setValue(mesh["resolution"])
+            self.widgets["mesh.use_topographic"].setChecked(
+                mesh.get("use_topographic", False))
+            self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
+            self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
+            self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
+            self.widgets["mesh.occluder_file"].setText(mesh.get("occluder_file", ""))
+            self.set_numeric("mesh.latitude_override",
+                             mesh.get("latitude_override", -999.0))
+            self.set_numeric("mesh.longitude_override",
+                             mesh.get("longitude_override", -999.0))
+        finally:
+            self._loading = False
+        # Not a user edit: a saved longitude is kept, not discarded on open.
         self._update_placement_gating()
 
         source = mesh.get("topo_source", "builtin")

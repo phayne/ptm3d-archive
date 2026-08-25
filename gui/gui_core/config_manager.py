@@ -581,6 +581,24 @@ class ConfigManager:
                     # infer that the user set a custom value (backwards compat)
                     self.config["thermophysical"][flag_name] = False
 
+            # H joined ENGINE_OVERRIDE_KEYS on 2026-08-25, which turns a plain
+            # `thermophysical: {H: ...}` -- inert on a built-in body before that
+            # date, and DROPPED by this writer -- into a live `H_override` the
+            # engine applies by setting planet.H. That is the point of the
+            # change, and it is still a change to an existing config's physics,
+            # so it is announced rather than discovered later.
+            if "H" in loaded_thermo and "H_override" not in loaded_thermo \
+                    and not self.generic_body_active():
+                import logging
+                logging.warning(
+                    "[thermophysical] this config carries thermophysical.H = "
+                    "%s with no H_override. On a built-in body that value used "
+                    "to be ignored; the GUI now writes it as "
+                    "thermophysical.H_override, which the engine APPLIES. The "
+                    "run's regolith scale height changes from the body default "
+                    "to this value. Set 'Use Default' on the H row to keep the "
+                    "old behavior.", loaded_thermo["H"])
+
             # Round-trip the engine override keys (what save now writes for
             # built-in bodies): albedo_override: 0.3 -> albedo=0.3 with
             # use_default_albedo=False so the UI shows the custom value.
@@ -844,34 +862,45 @@ class ConfigManager:
         errors = []
         warnings = []
 
+        # EVERY numeric comparison below goes through _as_number. A quoted YAML
+        # scalar loads without complaint (the engine's getWithDefault<double>
+        # parses it), and a bare `>` on a str or None raises TypeError out of a
+        # Qt slot, which is an application abort -- exit 134. Applying the
+        # coercion to only the new checks left seven of the old ones live; a
+        # crash-class fix has to cover the function, not the diff.
+        num = self._as_number
+
         # Simulation parameters
-        if self.config["simulation"]["duration_days"] <= 0:
+        sim = self.config.get("simulation", {})
+        if num(sim.get("duration_days"), 0.0) <= 0:
             errors.append("Duration must be positive")
-        if self.config["simulation"]["timesteps"] <= 0:
+        if num(sim.get("timesteps"), 0.0) <= 0:
             errors.append("Timesteps must be positive")
 
         # Mesh parameters
-        if self.config["mesh"]["resolution"] < 1:
+        mesh_cfg = self.config.get("mesh", {})
+        if num(mesh_cfg.get("resolution"), 0.0) < 1:
             errors.append("Mesh resolution must be >= 1")
-        if self.config["mesh"]["scale_factor"] <= 0:
+        if num(mesh_cfg.get("scale_factor"), 0.0) <= 0:
             errors.append("Mesh scale factor must be positive")
 
         # Thermal parameters
-        if self.config["thermal"]["threads"] < 0:
+        therm = self.config.get("thermal", {})
+        if num(therm.get("threads"), 0.0) < 0:
             errors.append("Thermal threads cannot be negative")
-        if self.config["thermal"]["equilibration_orbits"] < 0:
+        if num(therm.get("equilibration_orbits"), 0.0) < 0:
             errors.append("Equilibration cycles cannot be negative")
 
         # Radiation parameters
         rad = self.config.get("radiation", {})
         if rad.get("enabled", False):
-            if not (0 <= rad.get("min_shadow_fraction", 0) <= 1):
+            if not 0 <= num(rad.get("min_shadow_fraction"), 0.0) <= 1:
                 errors.append("Radiation: min_shadow_fraction must be between 0 and 1")
-            if rad.get("max_coupling_iterations", 0) < 1:
+            if num(rad.get("max_coupling_iterations"), 0.0) < 1:
                 errors.append("Radiation: max_coupling_iterations must be at least 1")
-            if rad.get("coupling_temp_threshold", 0) <= 0:
+            if num(rad.get("coupling_temp_threshold"), 0.0) <= 0:
                 errors.append("Radiation: coupling_temp_threshold must be positive")
-            if rad.get("aca_tolerance", 0) <= 0:
+            if num(rad.get("aca_tolerance"), 0.0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
 
         # The switch needs the knob. OUTSIDE the `enabled` branch on purpose:

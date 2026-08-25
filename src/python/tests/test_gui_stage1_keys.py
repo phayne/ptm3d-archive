@@ -387,6 +387,42 @@ def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
         "fixed; a stale limitation is what disabled this control once already")
 
 
+def test_validate_never_raises_on_a_scalar_the_engine_accepts():
+    """An exception out of validate() is an APPLICATION ABORT, not an error.
+
+    yaml.safe_load returns a str for a quoted number and None for a bare
+    `key:`; the engine's getWithDefault<double> parses both. validate() is
+    called unguarded from Qt slots (Run, Validate Configuration), PyQt6 qFatals
+    on an exception escaping one, and there is no excepthook -- measured exit
+    134, SIGABRT, taking any unsaved edits with it. Every numeric comparison in
+    the function has to survive both spellings, not just the newest ones.
+    """
+    numeric_keys = [
+        "simulation.duration_days", "simulation.timesteps",
+        "mesh.resolution", "mesh.scale_factor",
+        "mesh.latitude_override", "mesh.longitude_override",
+        "thermal.threads", "thermal.equilibration_orbits",
+        "thermal.geothermal_heat_flow",
+        "radiation.min_shadow_fraction", "radiation.max_coupling_iterations",
+        "radiation.coupling_temp_threshold", "radiation.aca_tolerance",
+        "radiation.rms_slope_deg",
+    ]
+    for key in numeric_keys:
+        for bad in ('"20"', None):
+            manager = _manager()
+            manager.set_value("radiation.enabled", True)
+            manager.set_value("radiation.beaming", True)
+            manager.set_value(key, bad if bad is None else "20")
+            try:
+                ok, messages = manager.validate()
+            except Exception as exc:                       # noqa: BLE001
+                raise AssertionError(
+                    f"validate() raised {type(exc).__name__} for {key} = "
+                    f"{bad!r}: in the GUI this is a SIGABRT, not a message"
+                ) from exc
+            assert isinstance(ok, bool) and isinstance(messages, list)
+
+
 def test_the_enum_alias_tables_match_the_engine_s_parsers():
     """The engine normalizes and accepts synonyms; a plain findText does not.
 
@@ -496,6 +532,7 @@ TESTS = [
     test_validate_refuses_beaming_without_a_slope,
     test_the_enum_alias_tables_match_the_engine_s_parsers,
     test_validate_catches_the_mesh_placement_traps,
+    test_validate_never_raises_on_a_scalar_the_engine_accepts,
 ]
 
 

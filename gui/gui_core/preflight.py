@@ -631,11 +631,25 @@ def engine_env_plan(config):
 #: The seed anchor is the sharpest: `warm` reads +45 K on the lit population of
 #: the shipped lunar 80N crater, and an exported PTM_SEED_ANCHOR would apply it
 #: while the Thermal tab said `lumped`.
+#:   PTM_HMATRIX_THREADS      hmatrix_view_factor.cpp:1421  radiation.hmatrix_threads
+#:                            ("Env override (highest priority)" in its own
+#:                            comment; the GUI has had a control for this key
+#:                            since before this branch, and EngineFlagsTab's
+#:                            docstring names this variable as THE example extra
+#:                            flag, so users do have it exported)
+#:
+#: NOT managed, deliberately: PTM_RAD_EMISSIVITY and PTM_SOLAR_ALBEDO
+#: (radiation_exchange.cpp:208, :235). Neither overrides a config key the GUI
+#: writes -- they force a radiosity-internal quantity that has no config
+#: equivalent -- and both announce themselves; PTM_RAD_EMISSIVITY additionally
+#: makes the engine's own [kirchhoff] check FAIL the run. Removing a variable
+#: nobody's control claims to own would be overreach.
 CONFIG_OVERRIDING_ENGINE_ENV = (
     "PTM_SPINUP_SEED",
     "PTM_SEED_ANCHOR",
     "PTM_ANALYTIC_SEED_CYCLES",
     "PTM_COUPLING_MODE",
+    "PTM_HMATRIX_THREADS",
 )
 
 #: The variables this module OWNS: it sets them when the plan asks for them and
