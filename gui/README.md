@@ -235,10 +235,11 @@ repository `.gitattributes` `export-ignore` rules:
 git archive --format=tar.gz -o ptm3d.tar.gz HEAD
 ```
 
-This excludes per-developer settings (`.claude/`, `gui/.claude/`) and the
-Paul-only tools staged under `gui/_private_tools/` (batch runs, exosphere,
-viewshed). A raw `tar`/`cp -r` of the working tree does **not** honor those
-rules and would leak the excluded paths — use `git archive`.
+This excludes per-developer settings (`.claude/`, `gui/.claude/`). A raw
+`tar`/`cp -r` of the working tree does **not** honor those rules and would leak
+the excluded paths — use `git archive`. The Paul-only tools (batch runs,
+exosphere, viewshed) are no longer staged in this repository at all: they were
+deleted on 2026-08-03 (commit `2b5df5b`), so there is nothing left to exclude.
 
 Some input datasets (SPICE kernels, DEMs, view factors) are large and are not
 bundled; see the top-level data/distribution docs. If the GUI is run against a
