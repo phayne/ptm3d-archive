@@ -818,6 +818,23 @@ class ConfigManager:
         """Generate YAML string for preview"""
         return yaml.dump(self._config_for_yaml(), default_flow_style=False, sort_keys=False)
 
+    @staticmethod
+    def _as_number(value, fallback):
+        """Coerce a YAML scalar for comparison, never raising.
+
+        yaml.safe_load returns a str for a QUOTED number and None for a bare
+        `key:`, both of which the engine's getWithDefault<double> handles. A
+        bare `>` on either raises TypeError -- and validate() is called
+        unguarded from a Qt slot, where an escaping exception makes PyQt6
+        qFatal and takes the whole application down with any unsaved edits.
+        Measured: exit 134, SIGABRT. The same spelling was already fixed one
+        layer up in load_from_yaml; it has to follow the value here too.
+        """
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
     def validate(self):
         """Validate the current configuration.
 
@@ -863,10 +880,11 @@ class ConfigManager:
         # Beaming group on the tab is not gated on radiation.enabled either. So
         # a user can leave radiation off -- the GUI default -- tick beaming,
         # step the slope back to zero, and launch a run that dies at startup.
-        if rad.get("beaming", False) and not (rad.get("rms_slope_deg", 0.0) > 0):
+        slope = self._as_number(rad.get("rms_slope_deg", 0.0), 0.0)
+        if rad.get("beaming", False) and not slope > 0:
             errors.append(
                 "Radiation: beaming is on but rms_slope_deg is "
-                f"{rad.get('rms_slope_deg', 0.0)}. The engine refuses this "
+                f"{rad.get('rms_slope_deg', 0.0)!r}. The engine refuses this "
                 "pair at startup, whether or not radiation exchange is "
                 "enabled. Literature range 20-37 degrees; 32.5 is the "
                 "validated lunar polar value (Jhoti et al. 2024).")
@@ -877,18 +895,22 @@ class ConfigManager:
         # at +85 and longitude+180, silently, somewhere other than the field
         # says. -999 stays the documented "leave it alone" sentinel.
         mesh = self.config.get("mesh", {})
-        lat = mesh.get("latitude_override", -999.0)
+        lat = self._as_number(mesh.get("latitude_override", -999.0), -999.0)
         if lat > -900.0 and not (-90.0 <= lat <= 90.0):
             errors.append(
                 f"Mesh: latitude_override {lat} is outside [-90, 90]. The "
                 "engine does not range-check it and would mirror the mesh "
                 "through the pole. Use -999 to leave the mesh in its own frame.")
-        lon = mesh.get("longitude_override", -999.0)
+        lon = self._as_number(mesh.get("longitude_override", -999.0), -999.0)
         if lon > -900.0 and lat <= -900.0:
-            errors.append(
-                "Mesh: longitude_override is set but latitude_override is not. "
-                "The engine gates the whole rotation on latitude, so the "
-                "longitude would be silently ignored.")
+            # A WARNING, not an error: the Mesh tab disables the longitude
+            # field once the latitude gate closes, so a hard error here locked
+            # the launch behind a control the user could no longer reach.
+            warnings.append(
+                "Warning: mesh.longitude_override is set but "
+                "latitude_override is not. The engine gates the whole rotation "
+                "on latitude, so this longitude will be ignored. Set a "
+                "latitude, or clear the longitude to -999.")
 
         # Output validation
         valid_formats = ["binary", "vtk"]

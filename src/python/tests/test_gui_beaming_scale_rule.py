@@ -245,11 +245,18 @@ def test_a_second_list_on_the_face_element_is_refused():
             f"a second per-face list was read as {scale.meters} m; the offsets "
             f"cannot be known without decoding it")
         assert "layout" in scale.detail, scale.detail
-        assert not beaming_policy(_config(path)).allowed
+        # Unmeasurable is the ACKNOWLEDGMENT tier, not a refusal: see
+        # test_an_unmeasurable_mesh_asks_rather_than_guessing_or_refusing.
+        assert beaming_policy(_config(path)).needs_acknowledgment
 
 
-def test_an_unreadable_mesh_refuses_rather_than_guesses():
-    """Refusing is the safe direction, and it has to say why."""
+def test_an_unmeasurable_mesh_asks_rather_than_guessing_or_refusing():
+    """"I could not read this" is not "this mesh is too fine".
+
+    Conflating the two locked beaming out of every format this reader does not
+    parse -- including .vtk, which the engine loads. What it must never do is
+    invent a number: the scale stays None and the user is asked, on the record.
+    """
     for name, payload in (("missing.ply", None),
                           ("nope.vtk", b"# vtk DataFile Version 5.1\n"),
                           ("broken.ply", b"ply\nformat ascii 1.0\n")):
@@ -258,8 +265,71 @@ def test_an_unreadable_mesh_refuses_rather_than_guesses():
             if payload is not None:
                 path.write_bytes(payload)
             policy = beaming_policy(_config(path))
-            assert not policy.allowed, f"{name}: {policy.reason}"
-            assert policy.reason, f"{name} refused with no reason"
+            assert policy.scale.meters is None, (
+                f"{name}: a facet scale of {policy.scale.meters} was invented "
+                f"for a mesh that could not be read")
+            assert policy.needs_acknowledgment, f"{name}: {policy.reason}"
+            assert "not the same as the mesh being too fine" in policy.reason, (
+                f"{name}: {policy.reason}")
+
+
+def test_an_obj_mesh_is_measured_not_refused():
+    """The engine loads OBJ and the Mesh tab offers it in its file filter."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "lunar.obj"
+        edge = 4.0
+        path.write_text(
+            f"# probe\nv 0 0 0\nv {edge} 0 0\nv 0 {edge} 0\nv {edge} {edge} 0\n"
+            "f 1 2 3\nf 2 4 3\n")
+        scale = facet_scale(_config(path))
+        expected = edge / math.sqrt(2.0)
+        assert scale.meters is not None, scale.detail
+        assert abs(scale.meters - expected) / expected < 1e-4, scale.meters
+        assert scale.n_faces == 2, scale.n_faces
+        assert beaming_policy(_config(path)).allowed
+
+
+def test_a_cloud_placeholder_is_not_opened():
+    """stat() never hydrates; open() does, on the GUI thread, per keystroke.
+
+    This runs from mesh.import_file's textChanged before any pre-flight, so an
+    evicted OneDrive mesh would hang the window on a synchronous download.
+    """
+    from gui_core import facet_scale as fs_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "evicted.ply"
+        _write_grid_ply(path, edge_m=4.0)
+        opened = []
+        real_open = fs_mod.open if hasattr(fs_mod, "open") else open
+
+        import builtins
+        original = builtins.open
+
+        def watched(file, *a, **k):
+            opened.append(str(file))
+            return original(file, *a, **k)
+
+        # Pretend the file is a dataless placeholder.
+        original_is_dataless = None
+        import gui_core.preflight as pf
+        original_is_dataless = pf.is_dataless
+        pf.is_dataless = lambda p: str(p) == str(path)
+        builtins.open = watched
+        try:
+            fs_mod._AREA_CACHE.clear()
+            scale = facet_scale(_config(path))
+        finally:
+            builtins.open = original
+            pf.is_dataless = original_is_dataless
+            fs_mod._AREA_CACHE.clear()
+
+        assert scale.meters is None, "a dataless mesh was read anyway"
+        assert "placeholder" in scale.detail, scale.detail
+        assert str(path) not in opened, (
+            f"the placeholder was opened, which is what triggers hydration: "
+            f"{opened}")
+        assert real_open is not None  # silence the unused-name lint
 
 
 def test_a_topographic_lunar_mesh_is_measurable():
@@ -334,7 +404,9 @@ TESTS = [
     test_a_lunar_icosphere_is_allowed_and_costs_no_file_read,
     test_a_face_element_with_trailing_colors_is_read_correctly,
     test_a_second_list_on_the_face_element_is_refused,
-    test_an_unreadable_mesh_refuses_rather_than_guesses,
+    test_an_unmeasurable_mesh_asks_rather_than_guessing_or_refusing,
+    test_an_obj_mesh_is_measured_not_refused,
+    test_a_cloud_placeholder_is_not_opened,
     test_a_topographic_lunar_mesh_is_measurable,
     test_a_non_lunar_body_is_refused_without_reading_the_mesh,
     test_the_launch_guard_fires_on_a_refused_mesh,

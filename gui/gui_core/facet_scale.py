@@ -173,13 +173,50 @@ _AREA_CACHE = {}
 _AREA_CACHE_MAX = 8
 
 
+def _obj_mean_face_area(path):
+    """(mean triangle area, n_faces, n_sampled) for a Wavefront OBJ.
+
+    The engine loads OBJ (mesh_utils.cpp:1264) and the Mesh tab's file filter
+    offers it, so refusing it here made beaming permanently unreachable for a
+    legitimate coarse lunar OBJ. The format is line-oriented: `v x y z` and
+    `f a b c` with 1-based indices, optionally `f a/vt/vn ...`.
+    """
+    verts = []
+    total = 0.0
+    used = 0
+    n_faces = 0
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("v "):
+                parts = line.split()
+                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                n_faces += 1
+                idx = []
+                for token in line.split()[1:]:
+                    raw = token.split("/")[0]
+                    i = int(raw)
+                    # OBJ indices are 1-based; a negative one counts back from
+                    # the end of the vertex list seen SO FAR.
+                    idx.append(i - 1 if i > 0 else len(verts) + i)
+                for k in range(1, len(idx) - 1):
+                    total += _triangle_area(verts[idx[0]], verts[idx[k]],
+                                            verts[idx[k + 1]])
+                used += 1
+    if not used:
+        raise ValueError("OBJ file declares no face")
+    return total / used, n_faces, used
+
+
 def _ply_mean_face_area(path):
     """(mean triangle area in the mesh's own units, n_faces, n_sampled)."""
     stat = Path(path).stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     if key in _AREA_CACHE:
         return _AREA_CACHE[key]
-    result = _ply_mean_face_area_uncached(path)
+    result = (_obj_mean_face_area(path)
+              if str(path).lower().endswith(".obj")
+              else _ply_mean_face_area_uncached(path))
     if len(_AREA_CACHE) >= _AREA_CACHE_MAX:
         _AREA_CACHE.clear()
     _AREA_CACHE[key] = result
@@ -424,9 +461,24 @@ def facet_scale(config, project_root=None):
                 path = Path(project_root) / path
         if not path.exists():
             return FacetScale(detail=f"{path} does not exist")
-        if not path.name.lower().endswith(".ply"):
+        # This runs from mesh.import_file's per-keystroke textChanged, on the
+        # GUI thread, BEFORE any pre-flight. Opening an evicted OneDrive
+        # placeholder here triggers a synchronous hydration of a
+        # multi-tens-of-megabyte file and hangs the window -- the exact hazard
+        # preflight guards every other mesh path against. stat() alone never
+        # hydrates, so the check itself is free.
+        try:
+            from gui_core.preflight import is_dataless
+            if is_dataless(path):
+                return FacetScale(
+                    detail=f"{path.name} is a cloud placeholder (dataless); "
+                           f"reading it here would hang the window")
+        except ImportError:
+            pass
+        if not path.name.lower().endswith((".ply", ".obj")):
             return FacetScale(
-                detail=f"{path.name} is not a PLY; only PLY geometry is read here")
+                detail=f"{path.name} is neither PLY nor OBJ; only those two "
+                       f"geometry formats are read here")
         try:
             mean_area, n_faces, sampled = _ply_mean_face_area(path)
         except (OSError, ValueError, IndexError, KeyError, struct.error) as exc:
@@ -497,11 +549,21 @@ def beaming_policy(config, project_root=None):
     scale = facet_scale(config, project_root)
 
     if scale.meters is None:
+        # NOT a refusal. "This mesh is at the roughness scale" and "I could not
+        # read this mesh" are different statements, and the module docstring
+        # says so; treating them alike locked beaming out of every format this
+        # reader does not parse, including ones the engine loads happily. Ask
+        # instead: the acknowledgment tier is exactly "you decide, on the
+        # record".
         return BeamingPolicy(
-            allowed=False, scale=scale,
-            reason=("The facet scale could not be measured, and beaming on a "
-                    "mesh already at the roughness scale double-counts "
-                    f"roughness. {scale.detail}."))
+            allowed=True, needs_acknowledgment=True, scale=scale,
+            reason=("The facet scale could not be MEASURED here, which is not "
+                    "the same as the mesh being too fine -- this reader parses "
+                    "PLY and OBJ geometry and derives icosphere and "
+                    "topographic meshes from the resolution. "
+                    f"{scale.detail.capitalize()}. Confirm yourself that this "
+                    f"mesh's facets are far larger than the roughness scale "
+                    f"(millimeters to centimeters) before enabling beaming."))
 
     if scale.meters < FACET_SCALE_DISABLE_BELOW_M:
         return BeamingPolicy(

@@ -1133,7 +1133,18 @@ class MeshTab(BaseConfigTab):
         """Longitude is inert without a latitude, so do not offer it alone."""
         lat = self.widgets["mesh.latitude_override"].value()
         placing = lat > -900.0
-        self.widgets["mesh.longitude_override"].setEnabled(placing)
+        lon_widget = self.widgets["mesh.longitude_override"]
+        if not placing and lon_widget.value() > -900.0:
+            # Clearing the latitude leaves a longitude the engine will ignore,
+            # in a field about to be disabled -- so the value could not be
+            # reached to remove it. Reset it here, and say so rather than
+            # dropping a number the user typed without a word.
+            logging.warning(
+                "[mesh] latitude_override was cleared, so longitude_override "
+                "= %s has been reset to -999: the engine gates the rotation on "
+                "latitude and would have ignored it.", lon_widget.value())
+            lon_widget.setValue(-999.0)
+        lon_widget.setEnabled(placing)
         if placing and not (-90.0 <= lat <= 90.0):
             # The engine would mirror the mesh through the pole rather than
             # refuse. Say so here; validate() blocks the launch.
@@ -4315,8 +4326,14 @@ class EngineFlagsTab(BaseConfigTab):
         it on screen -- the button the note tells you to press -- and deleting
         every row wrote an empty block without ever showing it.
         """
-        env = self.config_manager.get_value("engine_env", None)
-        self._declined_note.setVisible(isinstance(env, dict) and not env)
+        # Key it on the PLAN, not on the raw block. engine_env_plan drops
+        # blank-valued entries, so a table whose five value cells were cleared
+        # is just as much a decline as an empty one -- and looked populated,
+        # with the note hidden and nothing saying the launch would strip those
+        # variables out of the inherited environment.
+        from gui_core.preflight import engine_env_plan
+        table, _source = engine_env_plan(self.config_manager.get_config())
+        self._declined_note.setVisible(not table)
 
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV

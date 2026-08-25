@@ -436,12 +436,17 @@ def test_validate_catches_the_mesh_placement_traps():
     ok, messages = manager.validate()
     assert not ok and any("latitude_override" in m for m in messages), messages
 
+    # A longitude with no latitude WARNS but does not block. It used to be a
+    # hard error, which locked the launch behind a field the Mesh tab disables
+    # as soon as the latitude gate closes -- the user could not reach the
+    # control that would clear it. The tab now resets the stale longitude and
+    # says so; this is the backstop for a config that arrives that way.
     manager.set_value("mesh.latitude_override", -999.0)
     manager.set_value("mesh.longitude_override", 30.0)
     ok, messages = manager.validate()
-    assert not ok and any("longitude_override" in m for m in messages), (
-        "a longitude with no latitude is silently ignored by the engine and "
-        f"was accepted here: {messages}")
+    assert ok, f"a longitude with no latitude must not block the launch: {messages}"
+    assert any("longitude_override" in m for m in messages), (
+        f"...but it must still be said: {messages}")
 
     manager.set_value("mesh.latitude_override", -84.223)
     ok, messages = manager.validate()
