@@ -856,18 +856,39 @@ class ConfigManager:
                 errors.append("Radiation: coupling_temp_threshold must be positive")
             if rad.get("aca_tolerance", 0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
-            # The switch needs the knob. The engine treats this pair as FATAL at
-            # startup (ptm_thermal_sim.cpp:13591), so without a check here the
-            # GUI happily launches a run that dies before it does any work: the
-            # tab seeds 32.5 when the switch is flipped on, but the slope can be
-            # stepped back to 0 afterwards, and a config can arrive with the
-            # pair already broken.
-            if rad.get("beaming", False) and not (rad.get("rms_slope_deg", 0.0) > 0):
-                errors.append(
-                    "Radiation: beaming is on but rms_slope_deg is "
-                    f"{rad.get('rms_slope_deg', 0.0)}. The engine refuses this "
-                    "pair at startup. Literature range 20-37 degrees; 32.5 is "
-                    "the validated lunar polar value (Jhoti et al. 2024).")
+
+        # The switch needs the knob. OUTSIDE the `enabled` branch on purpose:
+        # the engine's check is unconditional (ptm_thermal_sim.cpp:13591 sits in
+        # plain config application, not behind the radiation gate), and the
+        # Beaming group on the tab is not gated on radiation.enabled either. So
+        # a user can leave radiation off -- the GUI default -- tick beaming,
+        # step the slope back to zero, and launch a run that dies at startup.
+        if rad.get("beaming", False) and not (rad.get("rms_slope_deg", 0.0) > 0):
+            errors.append(
+                "Radiation: beaming is on but rms_slope_deg is "
+                f"{rad.get('rms_slope_deg', 0.0)}. The engine refuses this "
+                "pair at startup, whether or not radiation exchange is "
+                "enabled. Literature range 20-37 degrees; 32.5 is the "
+                "validated lunar polar value (Jhoti et al. 2024).")
+
+        # The engine gates the mesh rotation on `latitude_override > -900` and
+        # range-checks nothing, so -95 is fed straight to rotateMeshToLatLon,
+        # where cos(lat) < 0 mirrors the target through the pole: the mesh lands
+        # at +85 and longitude+180, silently, somewhere other than the field
+        # says. -999 stays the documented "leave it alone" sentinel.
+        mesh = self.config.get("mesh", {})
+        lat = mesh.get("latitude_override", -999.0)
+        if lat > -900.0 and not (-90.0 <= lat <= 90.0):
+            errors.append(
+                f"Mesh: latitude_override {lat} is outside [-90, 90]. The "
+                "engine does not range-check it and would mirror the mesh "
+                "through the pole. Use -999 to leave the mesh in its own frame.")
+        lon = mesh.get("longitude_override", -999.0)
+        if lon > -900.0 and lat <= -900.0:
+            errors.append(
+                "Mesh: longitude_override is set but latitude_override is not. "
+                "The engine gates the whole rotation on latitude, so the "
+                "longitude would be silently ignored.")
 
         # Output validation
         valid_formats = ["binary", "vtk"]

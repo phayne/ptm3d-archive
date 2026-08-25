@@ -443,12 +443,8 @@ def facet_scale(config, project_root=None):
         return FacetScale(meters=math.sqrt(mean_area) * abs(scale),
                           n_faces=n_faces, source=source, detail=detail)
 
-    if mesh.get("use_topographic", False):
-        return FacetScale(
-            detail="a topographic tile's face count is not derivable from the "
-                   "config alone")
-
     body = _clean_body(config)
+    topographic = bool(mesh.get("use_topographic", False))
     radius = _BODY_RADII_M.get(body)
     if radius is None:
         return FacetScale(detail=f"no reference radius for body {body!r}")
@@ -460,6 +456,20 @@ def facet_scale(config, project_root=None):
         return FacetScale(detail=f"mesh.resolution {res} is out of range")
     n_faces = 20 * (4 ** res)
     total_area = 4.0 * math.pi * radius * radius
+    if topographic:
+        # A topographic run loads data/topo/<body>/topo_<body>_ico<N>.bin,
+        # which is an ico-N mesh: MEASURED on this tree, ico4 -> 5,120 faces and
+        # ico5 -> 20,480, both exactly 20*4^N (the engine's own
+        # "topographic mesh with ... faces" line). The count is therefore the
+        # same as the smooth branch. The displacement adds a little SURFACE
+        # AREA, so the true facet scale is marginally smaller than this
+        # estimate -- irrelevant against a 5 cm threshold when a lunar ico6
+        # facet is 21 km, and said rather than assumed.
+        return FacetScale(
+            meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
+            source="icosphere-topographic",
+            detail=f"{body} topography grid, resolution {res}; area from the "
+                   f"smooth sphere, so the true scale is slightly smaller")
     return FacetScale(meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
                       source="icosphere",
                       detail=f"{body} sphere, resolution {res}")

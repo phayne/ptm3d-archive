@@ -262,6 +262,29 @@ def test_an_unreadable_mesh_refuses_rather_than_guesses():
             assert policy.reason, f"{name} refused with no reason"
 
 
+def test_a_topographic_lunar_mesh_is_measurable():
+    """The standard lunar production configuration must not be refused.
+
+    A topographic run loads ``data/topo/<body>/topo_<body>_ico<N>.bin``, which
+    is an ico-N mesh. MEASURED on this tree with the engine's own
+    "topographic mesh with ... faces" line: ico4 -> 5,120 faces and
+    ico5 -> 20,480, both exactly ``20*4^N``. Reporting it unmeasurable disabled
+    the beaming switch and raised the launch guard on every run of a mesh whose
+    facets are tens of kilometers across.
+    """
+    for res in (4, 5, 6):
+        config = _config(resolution=res)
+        config["mesh"]["use_topographic"] = True
+        scale = facet_scale(config)
+        assert scale.meters is not None, scale.detail
+        assert scale.n_faces == 20 * (4 ** res), scale.n_faces
+        assert scale.source == "icosphere-topographic", scale.source
+        # The displacement adds surface area, so this is an upper bound; the
+        # detail has to say so rather than present it as exact.
+        assert "slightly smaller" in scale.detail, scale.detail
+        assert beaming_policy(config).allowed
+
+
 def test_a_non_lunar_body_is_refused_without_reading_the_mesh():
     """The body check must come first: measuring decodes every PLY vertex.
 
@@ -312,6 +335,7 @@ TESTS = [
     test_a_face_element_with_trailing_colors_is_read_correctly,
     test_a_second_list_on_the_face_element_is_refused,
     test_an_unreadable_mesh_refuses_rather_than_guesses,
+    test_a_topographic_lunar_mesh_is_measurable,
     test_a_non_lunar_body_is_refused_without_reading_the_mesh,
     test_the_launch_guard_fires_on_a_refused_mesh,
 ]

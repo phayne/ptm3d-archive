@@ -281,6 +281,38 @@ def test_a_shell_export_cannot_re_enable_the_dropped_variable():
         assert name in MANAGED_ENGINE_ENV, name
 
 
+def test_a_shell_export_cannot_override_a_control_the_gui_now_offers():
+    """The same failure class, for the keys Stage 1 exposed.
+
+    PTM_SPINUP_SEED, PTM_SEED_ANCHOR, PTM_ANALYTIC_SEED_CYCLES and
+    PTM_COUPLING_MODE each beat the config key the GUI now writes. An exported
+    PTM_SEED_ANCHOR=warm would apply the +45 K anchor while the Thermal tab
+    displayed `lumped`.
+    """
+    from gui_core.preflight import (CONFIG_OVERRIDING_ENGINE_ENV,
+                                    MANAGED_ENGINE_ENV)
+
+    inherited = {name: "warm" for name in CONFIG_OVERRIDING_ENGINE_ENV}
+    inherited["SHELL"] = "/bin/tcsh"
+    env, applied = build_engine_env({}, base_env=inherited)
+    survived = sorted(n for n in CONFIG_OVERRIDING_ENGINE_ENV if n in env)
+    assert not survived, (
+        f"{survived} reached the engine and would override the control the "
+        f"user set on the tab")
+    assert env["SHELL"] == "/bin/tcsh"
+    for name in CONFIG_OVERRIDING_ENGINE_ENV:
+        assert name in MANAGED_ENGINE_ENV, name
+        assert any(name in line and "removed" in line for line in applied), (
+            f"{name} was removed without saying so")
+
+    # A config that names one explicitly still gets it: the block is the plan.
+    env, _ = build_engine_env(
+        {"engine_env": {"PTM_SEED_ANCHOR": "warm"}},
+        base_env={"PTM_SPINUP_SEED": "legacy"})
+    assert env["PTM_SEED_ANCHOR"] == "warm"
+    assert "PTM_SPINUP_SEED" not in env
+
+
 def test_the_physics_change_is_announced():
     """The banner names the variables and says temperatures move."""
     for token in ("PTM_ILLUM_RISE_EPS", "PTM_ILLUM_RISE_KEPS",
@@ -297,6 +329,7 @@ TESTS = [
     test_declining_the_flags_is_reported_not_silent,
     test_loading_a_config_does_not_re_add_the_flags,
     test_a_shell_export_cannot_re_enable_the_dropped_variable,
+    test_a_shell_export_cannot_override_a_control_the_gui_now_offers,
     test_the_physics_change_is_announced,
 ]
 

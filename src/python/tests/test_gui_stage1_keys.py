@@ -387,6 +387,67 @@ def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
         "fixed; a stale limitation is what disabled this control once already")
 
 
+def test_the_enum_alias_tables_match_the_engine_s_parsers():
+    """The engine normalizes and accepts synonyms; a plain findText does not.
+
+    A config saying `spinup_seed: historical` or `Legacy` left the combo showing
+    "physical" while the engine ran the legacy seed -- a control that reports a
+    value other than the one that runs.
+    """
+    try:
+        from gui_panels.config_panel import (CONDUCTIVITY_MODEL_ALIASES,
+                                             COUPLING_MODE_ALIASES,
+                                             SEED_ANCHOR_ALIASES,
+                                             SPINUP_SEED_ALIASES)
+    except ImportError as exc:
+        _skip(f"the GUI panels are unavailable here ({exc}); "
+              f"install PyQt6 and PyVista to run this check")
+
+    # Spellings taken from eq_seed.cpp and conductivity_model.h.
+    for aliases, cases in (
+            (SPINUP_SEED_ALIASES,
+             {"physical": "physical", "default": "physical",
+              "perface": "physical", "legacy": "legacy",
+              "historical": "legacy"}),
+            (SEED_ANCHOR_ALIASES,
+             {"lumped": "lumped", "default": "lumped", "derived": "lumped",
+              "warm": "warm", "warmbracket": "warm", "t4": "warm",
+              "legacy": "warm"}),
+            (CONDUCTIVITY_MODEL_ALIASES,
+             {"hayne": "hayne2017", "hayne2017": "hayne2017",
+              "default": "hayne2017", "martinez": "martinez2021",
+              "martinez2021": "martinez2021",
+              "martinezsiegler2021": "martinez2021"})):
+        for spelling, canonical in cases.items():
+            assert aliases.get(spelling) == canonical, (
+                f"{spelling!r} should normalize to {canonical!r}, got "
+                f"{aliases.get(spelling)!r}")
+
+    # coupling_mode is compared EXACTLY by the engine and a mismatch is a
+    # startup FATAL, so the GUI must not invent aliases it would reject.
+    assert set(COUPLING_MODE_ALIASES) == {"bounded", "fixed", "legacy"}
+    assert set(COUPLING_MODE_ALIASES.values()) == {"bounded", "fixed", "legacy"}
+
+
+def test_validate_catches_the_mesh_placement_traps():
+    """The engine range-checks neither override and gates both on latitude."""
+    manager = _manager()
+    manager.set_value("mesh.latitude_override", -95.0)
+    ok, messages = manager.validate()
+    assert not ok and any("latitude_override" in m for m in messages), messages
+
+    manager.set_value("mesh.latitude_override", -999.0)
+    manager.set_value("mesh.longitude_override", 30.0)
+    ok, messages = manager.validate()
+    assert not ok and any("longitude_override" in m for m in messages), (
+        "a longitude with no latitude is silently ignored by the engine and "
+        f"was accepted here: {messages}")
+
+    manager.set_value("mesh.latitude_override", -84.223)
+    ok, messages = manager.validate()
+    assert ok, messages
+
+
 def test_validate_refuses_beaming_without_a_slope():
     """`beaming: true` with `rms_slope_deg: 0` is FATAL at engine startup.
 
@@ -428,6 +489,8 @@ TESTS = [
     test_a_quoted_rms_slope_does_not_break_the_load,
     test_the_basal_heat_flow_control_is_not_gated_on_the_body,
     test_validate_refuses_beaming_without_a_slope,
+    test_the_enum_alias_tables_match_the_engine_s_parsers,
+    test_validate_catches_the_mesh_placement_traps,
 ]
 
 

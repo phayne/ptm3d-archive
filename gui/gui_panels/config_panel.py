@@ -110,6 +110,36 @@ class CollapsibleSection(QWidget):
         self.content_layout.addLayout(layout)
 
 
+# Alias tables for the enum keys the GUI exposes as combo boxes. The engine
+# normalizes each string (lowercase, `_`/`-`/space stripped) and accepts
+# synonyms, so a plain findText silently displays the WRONG value for a config
+# that used one -- e.g. `spinup_seed: historical` showing as "physical" while
+# the engine runs the legacy seed. Keys here are the normalized spellings.
+#   src/cpp/thermal/eq_seed.cpp parseEqSeedMode / parseEqSeedAnchor
+#   src/cpp/thermal/conductivity_model.h parseConductivityModel
+#   src/cpp/main/ptm_thermal_sim.cpp:14151 (coupling_mode -- exact, no aliases)
+SPINUP_SEED_ALIASES = {
+    "": "physical", "physical": "physical", "default": "physical",
+    "perface": "physical",
+    "legacy": "legacy", "historical": "legacy",
+}
+SEED_ANCHOR_ALIASES = {
+    "": "lumped", "lumped": "lumped", "default": "lumped", "derived": "lumped",
+    "warm": "warm", "warmbracket": "warm", "t4": "warm", "legacy": "warm",
+}
+CONDUCTIVITY_MODEL_ALIASES = {
+    "": "hayne2017", "hayne": "hayne2017", "hayne2017": "hayne2017",
+    "default": "hayne2017",
+    "martinez": "martinez2021", "martinez2021": "martinez2021",
+    "martinezsiegler2021": "martinez2021",
+}
+# The engine compares this one EXACTLY and makes a mismatch a startup FATAL,
+# so the GUI must not invent aliases the engine would reject.
+COUPLING_MODE_ALIASES = {
+    "bounded": "bounded", "fixed": "fixed", "legacy": "legacy",
+}
+
+
 class BaseConfigTab(QWidget):
     """Base class for configuration tabs"""
 
@@ -319,6 +349,45 @@ class BaseConfigTab(QWidget):
         """Handle widget value changes"""
         self.config_manager.set_value(key, value)
         self.value_changed.emit()
+
+    def set_enum(self, key, value, aliases):
+        """Select a combo entry, tolerating the engine's own aliases.
+
+        The engine normalizes these strings -- lowercase, `_`/`-`/space
+        stripped -- and accepts synonyms: `historical` is `legacy`,
+        `perface`/`default` are `physical`, `derived` is `lumped`, `martinez` is
+        `martinez2021`. A plain ``findText`` misses every one of them, and
+        `if idx >= 0` then leaves the combo showing a DIFFERENT value than the
+        one that will run: a config saying `spinup_seed: historical` displayed
+        "physical" while the engine used the legacy seed.
+
+        `aliases` maps a normalized spelling to the combo entry it means.
+        An unrecognized value is left in the config (the engine will diagnose
+        it, and it is not this panel's job to silently rewrite one) and warned
+        about, never quietly displayed as something else.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        normalized = "".join(
+            c for c in str(value).lower() if c not in "_- ")
+        canonical = aliases.get(normalized)
+        if canonical is None:
+            logging.warning(
+                "[config] %s = %r is not a value this control offers (%s). The "
+                "configuration keeps it and the engine will decide; the control "
+                "is showing %r, which is NOT what will run.",
+                key, value, "/".join(aliases.values() and
+                                     sorted(set(aliases.values()))),
+                widget.currentText())
+            return
+        idx = widget.findText(canonical)
+        if idx >= 0:
+            widget.setCurrentIndex(idx)
+        if str(value) != canonical:
+            # Normalize the stored value too, so the saved YAML says what the
+            # control shows. Only ever an alias-for-alias substitution.
+            self.config_manager.set_value(key, canonical)
 
     def set_numeric(self, key, value):
         """Load a numeric value into its widget, WARNING if the range clamps it.
@@ -1032,6 +1101,13 @@ class MeshTab(BaseConfigTab):
                               "only when a latitude override is also set -- the "
                               "engine gates the whole rotation on latitude, so "
                               "a longitude on its own is silently ignored.")
+        # The engine range-checks NOTHING: its only gate is
+        # latitude_override > -900, so -95 reaches rotateMeshToLatLon with
+        # cos(lat) < 0 and mirrors the mesh through the pole to +85 at
+        # longitude+180. The spin box therefore steps only over the valid band,
+        # with -999 as the documented sentinel just below it; a config carrying
+        # a value in the dead zone is caught by ConfigManager.validate().
+        self.widgets["mesh.latitude_override"].setSingleStep(1.0)
         self.placement_note = QLabel("")
         self.placement_note.setWordWrap(True)
         self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
@@ -1058,7 +1134,14 @@ class MeshTab(BaseConfigTab):
         lat = self.widgets["mesh.latitude_override"].value()
         placing = lat > -900.0
         self.widgets["mesh.longitude_override"].setEnabled(placing)
-        if placing:
+        if placing and not (-90.0 <= lat <= 90.0):
+            # The engine would mirror the mesh through the pole rather than
+            # refuse. Say so here; validate() blocks the launch.
+            self.placement_note.setText(
+                f"Latitude {lat} is outside [-90, 90]. The engine does not "
+                f"range-check it and would mirror the mesh through the pole. "
+                f"Use -999 to leave the mesh in its own frame.")
+        elif placing:
             lon = self.widgets["mesh.longitude_override"].value()
             lon_text = "the mesh's own longitude" if lon <= -900.0 \
                 else f"{lon} deg"
@@ -1855,12 +1938,12 @@ class ThermalTab(BaseConfigTab):
             self.set_numeric("thermal.geothermal_heat_flow",
                              thermal.get("geothermal_heat_flow", -1.0))
 
-            for key, default in (("thermal.spinup_seed", "physical"),
-                                 ("thermal.seed_anchor", "lumped")):
-                widget = self.widgets[key]
-                idx = widget.findText(thermal.get(key.split(".", 1)[1], default))
-                if idx >= 0:
-                    widget.setCurrentIndex(idx)
+            self.set_enum("thermal.spinup_seed",
+                          thermal.get("spinup_seed", "physical"),
+                          SPINUP_SEED_ALIASES)
+            self.set_enum("thermal.seed_anchor",
+                          thermal.get("seed_anchor", "lumped"),
+                          SEED_ANCHOR_ALIASES)
             self.set_numeric("thermal.analytic_seed_cycles",
                              thermal.get("analytic_seed_cycles", -1.0))
             self.widgets["thermal.seed_anchor_refuse_two_timescale"].setChecked(
@@ -2337,10 +2420,9 @@ class RadiationTab(BaseConfigTab):
         # max_coupling_iterations 10 while the engine said False and 16.
         self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", False))
         self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
-        idx = self.widgets["radiation.coupling_mode"].findText(
-            rad.get("coupling_mode", "bounded"))
-        if idx >= 0:
-            self.widgets["radiation.coupling_mode"].setCurrentIndex(idx)
+        self.set_enum("radiation.coupling_mode",
+                      rad.get("coupling_mode", "bounded"),
+                      COUPLING_MODE_ALIASES)
         self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 16))
         self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 0.5))
         self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
@@ -2951,7 +3033,12 @@ class ThermophysicalTab(BaseConfigTab):
 
         for value_key, default_key, value_attr, default_attr in properties:
             if value_key in self.widgets:
-                self.widgets[value_key].setValue(thermo.get(value_attr, 0.0))
+                # set_numeric, not setValue: a spin box clamps SILENTLY and
+                # still emits valueChanged, so an out-of-range config value was
+                # written back clamped. H is the one that matters now -- moving
+                # it into BUILTIN_OVERRIDABLE made it a live engine override,
+                # and its widget caps at 1.0 m.
+                self.set_numeric(value_key, thermo.get(value_attr, 0.0))
             if default_key in self.widgets:
                 use_default = thermo.get(default_attr, True)
                 self.widgets[default_key].setChecked(use_default)
@@ -2973,11 +3060,9 @@ class ThermophysicalTab(BaseConfigTab):
 
         # Conductivity model is a plain string key, not a body default: it is
         # not touched by update_to_body_defaults and needs no re-apply dance.
-        cm_widget = self.widgets.get("thermophysical.conductivity_model")
-        if cm_widget is not None:
-            idx = cm_widget.findText(thermo.get("conductivity_model", "hayne2017"))
-            if idx >= 0:
-                cm_widget.setCurrentIndex(idx)
+        self.set_enum("thermophysical.conductivity_model",
+                      thermo.get("conductivity_model", "hayne2017"),
+                      CONDUCTIVITY_MODEL_ALIASES)
 
         self._update_builtin_support()
 

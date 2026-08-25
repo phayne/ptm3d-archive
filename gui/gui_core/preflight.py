@@ -618,11 +618,32 @@ def engine_env_plan(config):
     return table, "engine_env: block in the config"
 
 
+#: Environment variables that OVERRIDE a config key the GUI now writes. An
+#: inherited one silently beats the control the user just set, which is the
+#: exact failure PTM_EQ_PERFACE_FLUX was dropped for -- so they are managed too,
+#: and removed unless a config's engine_env: block asks for them by name.
+#:
+#:   PTM_SPINUP_SEED          ptm_thermal_sim.cpp:15688  thermal.spinup_seed
+#:   PTM_SEED_ANCHOR          :15713                     thermal.seed_anchor
+#:   PTM_ANALYTIC_SEED_CYCLES :15731                     thermal.analytic_seed_cycles
+#:   PTM_COUPLING_MODE        :14143                     radiation.coupling_mode
+#:
+#: The seed anchor is the sharpest: `warm` reads +45 K on the lit population of
+#: the shipped lunar 80N crater, and an exported PTM_SEED_ANCHOR would apply it
+#: while the Thermal tab said `lumped`.
+CONFIG_OVERRIDING_ENGINE_ENV = (
+    "PTM_SPINUP_SEED",
+    "PTM_SEED_ANCHOR",
+    "PTM_ANALYTIC_SEED_CYCLES",
+    "PTM_COUPLING_MODE",
+)
+
 #: The variables this module OWNS: it sets them when the plan asks for them and
 #: REMOVES them when the plan does not. Nothing outside this set is ever taken
 #: out of the inherited environment.
 MANAGED_ENGINE_ENV = tuple(sorted(
-    set(RECOMMENDED_ENGINE_ENV) | set(DELIBERATELY_NOT_INJECTED)))
+    set(RECOMMENDED_ENGINE_ENV) | set(DELIBERATELY_NOT_INJECTED)
+    | set(CONFIG_OVERRIDING_ENGINE_ENV)))
 
 
 def build_engine_env(config, base_env=None):
@@ -949,8 +970,14 @@ def confirm_preflight(parent, report):
         msg.setCheckBox(override)
         msg.setStandardButtons(QMessageBox.StandardButton.Ok |
                                QMessageBox.StandardButton.Cancel)
-        msg.exec()
-        if not override.isChecked():
+        # BOTH the button and the box. The two older dialogs below consult only
+        # the checkbox, so Cancel with the box ticked launches anyway -- which
+        # is survivable there because they do not mention the buttons, but this
+        # one's own text tells the user to press Cancel. (The same bug in the
+        # cloud-path and view-factor dialogs is pre-existing and out of scope
+        # for this branch; it is owed as a ledger row.)
+        clicked = msg.exec()
+        if clicked != QMessageBox.StandardButton.Ok or not override.isChecked():
             return False
 
     if report.cloud_paths:
