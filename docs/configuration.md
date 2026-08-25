@@ -430,7 +430,7 @@ command line wins. The full key list, with the physics behind each, is in
 | `coupling_mode` | string | `bounded` | `bounded`, `fixed` or `legacy` |
 | `max_coupling_iterations` | int | 16 | Picard iteration cap (raised from 10 on 2026-08-15; see radiation-exchange.md §7.5) |
 | `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) |
-| `beaming` | bool | false | Smith (1967) anisotropic beamed thermal emission. **Standard for lunar polar configurations** — see below |
+| `beaming` | bool | false | Smith (1967) anisotropic beamed thermal emission. **Standard for lunar polar SITE/REGIONAL configurations**; OFF on sub-cm meshes — see below |
 | `rms_slope_deg` | float | 0.0 | RMS sub-facet slope $w$ in degrees; the beaming knob. Inert unless `beaming: true` |
 | `use_gpu` | bool | false | OpenCL radiosity solver |
 | `verbose` | bool | false | Detailed radiation progress |
@@ -462,8 +462,29 @@ radiation:
 20–37°: 32.5° (Jhoti et al. 2024, Table 1 — lunar highlands; the validated polar value and the
 recommended default), ~20° (Bandfield et al. 2015, Diviner global), ~37° (Rubanenko et al. 2020).
 
-**Policy.** Paul's ruling of 2026-08-25: beaming is **standard for lunar polar configurations**. It
-is deliberately *not* enabled in `examples/validation/baseline_crater80N_*.yaml` (those are the
+**When it applies — compare two lengths, not two mission names.** Beaming is a *sub-facet* model:
+it stands in for roughness the mesh does not resolve, at the scale where surface elements become
+thermally isolated from one another — **millimeters to centimeters** on lunar regolith. Paul's
+ruling of 2026-08-25:
+
+> "The Moon3D mesh resolution is comparable to the roughness scale (millimeters to centimeters)
+> that the beaming is intended to capture, so the beaming should be OFF for small local meshes
+> like this."
+
+So the rule is: **turn beaming ON only when the facet scale is much larger than ~cm.** At or below
+that scale the mesh already resolves the anisothermality and beaming double-counts it. Measured
+facet scales, $\sqrt{\text{mean face area}}$:
+
+| Mesh | $\sqrt{\bar{A}}$ | beaming |
+|---|---|---|
+| `sunlit_radcore_r50` (50 km core, 140k faces) | 237 m | **ON** |
+| `haworth_radcore_r32c` (32 km core, 100k faces) | 181 m | **ON** |
+| A3GT `A03MP026` (3 km core, 2.4 M faces) | 3.46 m | **ON** |
+| `moon3d` 509k (a ~1.6 m simulated crater) | 1.96 mm | **OFF** |
+
+**Policy.** Beaming is standard for **site and regional** lunar polar configurations — meters and
+up. It is deliberately *not* enabled in `examples/moon3d_native_yearlong/*.yaml` (sub-cm facets,
+per the ruling above), in `examples/validation/baseline_crater80N_*.yaml` (those are the
 byte-identical regression baselines) or in the `tutorial04_crater80N_*` teaching configs, and it
 must not be carried to Europa or asteroid configs — $w = 32.5°$ is a lunar regolith number
 validated on lunar polar-crater geometry.

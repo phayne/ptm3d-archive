@@ -986,10 +986,41 @@ regolith span roughly **20–37°**:
 
 The polar result in §8.5 was obtained at the literature value 32.5° with **no tuning**.
 
-### 8.4 Policy: standard for lunar polar configs
+### 8.4 When beaming applies: the mesh-scale criterion
 
-Paul's ruling, 2026-08-25: **beaming is standard for lunar polar configurations.** New lunar polar
-production configs should carry
+**Beaming is a SUB-facet model.** $\chi$ exists to represent roughness the mesh does not resolve:
+sub-facet elements that are thermally isolated from one another, so the Sun-facing ones run hot and
+the shaded ones run cold within what the model treats as a single isothermal facet. That
+isolation sets in at **millimeters to centimeters** on lunar regolith — the scale the published
+RMS-slope values of §8.3 characterize.
+
+> **Paul's ruling, 2026-08-25.** "The Moon3D mesh resolution is comparable to the roughness scale
+> (millimeters to centimeters) that the beaming is intended to capture, so the beaming should be
+> OFF for small local meshes like this."
+
+So the criterion is not "is this a lunar polar site?" — it is a comparison of two lengths:
+
+> **Turn beaming ON only when the facet scale is much larger than the thermal-isolation scale
+> (~mm–cm). At or below that scale the mesh already resolves the anisothermality explicitly, and
+> beaming would double-count it.**
+
+Facet scale here is $\sqrt{\bar{A}}$, the square root of the mean face area — measured from each
+mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), not estimated:
+
+| Mesh | faces | total area | $\sqrt{\bar{A}}$ | beaming |
+|---|---|---|---|---|
+| `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** — 5 orders above the roughness scale |
+| `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
+| A3GT `A03MP026` 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
+| `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** — the mesh *is* at the roughness scale |
+
+The 509k `moon3d` mesh is a simulated crater roughly **1.6 m across** whose facets are ~2 mm. It
+resolves exactly the sub-facet structure $\chi$ is a stand-in for. Beaming there is not a
+refinement, it is the same physics counted twice.
+
+Site and regional meshes — meters and up — are the case beaming was built and validated for.
+
+**Configs.** New site/regional lunar polar production configs should carry
 
 ```yaml
 radiation:
@@ -999,6 +1030,8 @@ radiation:
 
 Deliberately **not** switched on, and why:
 
+- `examples/moon3d_native_yearlong/*.yaml` — the 509k mesh in the table above. Sub-cm facets;
+  beaming would double-count the roughness the mesh already carries (Paul, 2026-08-25).
 - `examples/validation/baseline_crater80N_*.yaml` — these are the byte-identical regression
   baselines (`scripts/ptm_validate_baseline.py`). Turning beaming on there would move the
   baselines, which is the one thing they exist not to do.
@@ -1045,7 +1078,8 @@ open and are not to be reopened without Paul's word.
 
 Measured on the same mesh; see §8.7 for the numbers and how to re-measure them on a new mesh.
 The short version: **beaming costs about +22% wall time and ~5–6.5 GiB of host RAM on a
-140k-face lunar polar mesh**, and the RAM term is the one that scales dangerously.
+140k-face lunar polar site mesh**, and the RAM term is the one that scales dangerously — it grows
+with the view-factor matrix's nonzero count, not with the face count.
 
 ### 8.7 Cost table
 
@@ -1080,14 +1114,17 @@ transient `2 × 8 B` per active pair inside the one-shot Gate-2 audit:
 | Mesh class | faces | CSR nnz | beam pairs | pair list | Gate-2 transient |
 |---|---|---|---|---|---|
 | `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **5.05–6.45 GiB** | ~2.4 GB |
-| moon3d 509k flagship | 509,337 | 745.3 M | 252–320 M (est.) | 6.6–8.4 GiB (est.) | ~3 GB |
+| `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 5.0–6.4 GiB (est.) | ~2.4 GB |
 | A3GT 3 km site (A03MP026) | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **21.9–27.9 GiB (est.)** | ~8 GB |
 
 The estimates apply the **measured** r50 retention band — 33.8–43.2% of the CSR's nonzeros survive
 the receiver/emitter/geometry filters — to each mesh's own nonzero count. They are estimates, not
 measurements: the retention depends on the shadow topology of the specific site and window, and
 the receiver set is itself window-scoped (§8.8). The absolute ceiling is 100% retention, i.e.
-28 B × nnz: 19.4 GiB for moon3d 509k and **64.8 GiB** for the A3GT site.
+28 B × nnz: **64.8 GiB** for the A3GT site.
+
+The 509k `moon3d` mesh is deliberately absent from this table: beaming does not apply there at all
+(§8.4), so its cost is not a number anyone should be planning against.
 
 ⚠️ **Beaming on a multi-million-face site is not a free flip.** Extrapolating the measured
 per-pair rate, an A3GT-class site would add of order 1 s per beamed timestep on top of a ~1 GB/s
@@ -1134,7 +1171,7 @@ and the `[beam-cost]` line — before committing a campaign to it.
 | `nearfield_window_factor` | 4.0 | The near/far switch for BOTH in-engine builders: a pair is near when $r < w (\sqrt{A_i} + \sqrt{A_j})$. 0 forces M1 everywhere; a very large value forces M2. Replaced the internal `adaptive_ns_threshold` |
 | `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
-| `beaming` | false | **The Smith beamed-emission switch** (§8). `true` requires `rms_slope_deg > 0` or the run refuses to start. Standard for lunar polar configs |
+| `beaming` | false | **The Smith beamed-emission switch** (§8). `true` requires `rms_slope_deg > 0` or the run refuses to start. Standard for lunar polar SITE/REGIONAL configs; OFF on sub-cm meshes (§8.4) |
 | `rms_slope_deg` | 0.0 | RMS sub-facet slope $w$ in degrees, the beaming knob (§8.3). Literature 20–37°; 32.5° is the validated lunar polar value. Inert unless `beaming: true` |
 | `beam_vf_threshold` | 1e-7 | Smallest renormalized view factor kept as a beam pair |
 | `radiance_prune_eps` | 0.0 | Radiance-weighted pruning threshold, applied at assembly (§11) |

@@ -6,7 +6,7 @@ two-band radiosity coupling, and its illumination-only companion.
 
 | File | Radiation | Purpose |
 |---|---|---|
-| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default) **+ `beaming: true` since 2026-08-25 — see the warning below** | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
+| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default); `radiation.beaming: false` **explicitly, and it must stay off — see below** | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
 | `moon3d_native_yearlong_radoff.yaml` | `radiation.enabled: false` | The no-coupling comparison pair. Identical in every other value. |
 
 Both are derived from `examples/moon3d_500k_clean.yaml` (2026-07-12): only the mesh,
@@ -23,36 +23,35 @@ lost and had to be re-run. Tracking them is the fix.
 Sanitizing them changed **only path-valued keys** — every physical, numerical and
 scheduling value is byte-for-byte what the campaign ran.
 
-## ⚠️ 2026-08-25: the coupled config no longer reproduces the shipped dataset
+## ⛔ 2026-08-25: beaming stays OFF on this mesh, and it is a physics rule
 
-`moon3d_native_yearlong_coupled.yaml` now sets
+`moon3d_native_yearlong_coupled.yaml` carries an explicit `radiation.beaming: false`.
+That is not a leftover default — it is the answer to a question this directory will keep
+being asked, now that Smith (1967) beamed emission is standard on lunar polar **site**
+configs.
 
-```yaml
-radiation:
-  beaming: true
-  rms_slope_deg: 32.5
-```
+Beaming is a **sub-facet** model. `chi` stands in for roughness the mesh does not
+resolve, at the scale where surface elements become thermally isolated from one another —
+millimeters to centimeters on lunar regolith. **This mesh's facets are ~2 mm**: 509,337
+faces over 1.96 m² of total area, a simulated crater about 1.6 m across. It already
+resolves the structure `chi` is a stand-in for.
 
-Smith (1967) beamed thermal emission became **standard for lunar polar configurations**
-on 2026-08-25 (Paul's ruling; physics, literature values, validated result and cost
-table in [`docs/radiation-exchange.md` §8](../../docs/radiation-exchange.md)). It is a
-real change to the answer, not a formatting change: on the validated r50 polar mesh it
-moves the deep-cold summer-max bias from −7.31 K to +1.36 K, and it *worsens* the
-already-warm PSR, margin and winter strata (see §8.5 — read the whole table).
+> **Paul's ruling, 2026-08-25.** "The Moon3D mesh resolution is comparable to the
+> roughness scale (millimeters to centimeters) that the beaming is intended to capture,
+> so the beaming should be OFF for small local meshes like this."
 
-**This is the ONLY value in this directory that no longer matches the campaign that
-produced the shipped `moon3d_native_yearlong` dataset** and its annual T_max map,
-cold-trap area and volatile-stability figures, all of which were run with Lambertian
-emission before this date.
+Turning it on here would count the same physics twice. Beaming belongs on **site and
+regional** meshes — meters and up (`sunlit_radcore_r50` at 237 m, `haworth_radcore_r32c`
+at 181 m, an A3GT 3 km core at 3.46 m). The criterion, the measured facet scales, and
+the validated result are in
+[`docs/radiation-exchange.md` §8.4](../../docs/radiation-exchange.md).
 
-- **To reproduce the shipped dataset and its figures, set `beaming: false`.** The slope
-  below it then goes inert and the run says so in one line.
-- To run new science, leave it as shipped and expect **~+22% wall time and several GiB
-  of extra host RAM** (§8.7), plus a chunk-decomposition dependence the engine warns
-  about (PTM-101, §8.8).
+Because beaming is off, **every physical, numerical and scheduling value here still
+matches the campaign that produced the shipped `moon3d_native_yearlong` dataset** and its
+annual T_max map, cold-trap area and volatile-stability figures.
 
-`moon3d_native_yearlong_radoff.yaml` is untouched: it has `radiation.enabled: false`, so
-beaming has nothing to act on there.
+`moon3d_native_yearlong_radoff.yaml` needs no such key: it has `radiation.enabled: false`,
+so beaming has nothing to act on there.
 
 ## The three site-local inputs you must supply
 

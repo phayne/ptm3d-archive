@@ -629,7 +629,9 @@ struct SimulationConfig {
         // THE SWITCH. false (default) = pure Lambertian emission, byte-identical
         // to every pre-2026-08-25 run. true REQUIRES rms_slope_deg > 0 (the
         // knob); the engine refuses to start on beaming: true with no slope.
-        // Standard for lunar polar configs (Paul, 2026-08-25); see
+        // Standard for lunar polar SITE and REGIONAL configs (facets >> the ~mm-cm
+        // thermal-isolation scale). OFF on sub-cm meshes, which already resolve the
+        // roughness this parameterizes -- Paul, 2026-08-25. See
         // docs/radiation-exchange.md section 8.
         bool beaming = false;
         // THE KNOB. RMS micro-slope w [deg] of the sub-facet slope distribution.
