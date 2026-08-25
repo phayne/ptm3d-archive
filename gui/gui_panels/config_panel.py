@@ -1813,6 +1813,47 @@ class RadiationTab(BaseConfigTab):
         enable_group.setLayout(enable_layout)
         layout.addWidget(enable_group)
 
+        # --- Sub-facet roughness (Smith 1967 beaming) ---------------------
+        # The engine enforces only "beaming: true requires rms_slope_deg > 0"
+        # and NOTHING about the scale of the mesh it is applied to. So this
+        # control pair is the only thing between a user and double-counted
+        # roughness; the rule lives in gui_core.facet_scale.
+        beam_group = QGroupBox("Sub-Facet Roughness (Beaming)")
+        beam_layout = QGridLayout()
+        beam_layout.setColumnStretch(1, 1)
+
+        self.add_bool_field(beam_layout, 0, "Enable Beaming", "radiation.beaming",
+                            "Smith (1967) anisotropic roughness-beamed emission. "
+                            "Only valid when the mesh facets are much LARGER "
+                            "than the roughness scale -- otherwise the mesh "
+                            "already resolves the roughness and this counts it "
+                            "twice.")
+        self.add_double_field(beam_layout, 1, "RMS Slope w (deg):",
+                              "radiation.rms_slope_deg", 0.0, 60.0, 2,
+                              "RMS sub-facet slope in DEGREES. Literature range "
+                              "20-37: 32.5 Jhoti et al. (2024) lunar highlands "
+                              "(the validated polar value), ~20 Bandfield et al. "
+                              "(2015) global regolith fit, ~37 Rubanenko et al. "
+                              "(2020). beaming: true with w = 0 is fatal at "
+                              "engine startup.")
+
+        self.beaming_note = QLabel("")
+        self.beaming_note.setWordWrap(True)
+        self.beaming_note.setStyleSheet("font-size: 10px; padding: 4px;")
+        beam_layout.addWidget(self.beaming_note, 2, 0, 1, 2)
+
+        self.beaming_ack = QCheckBox(
+            "I confirm this mesh does not already resolve sub-facet slopes")
+        self.beaming_ack.setVisible(False)
+        self.beaming_ack.toggled.connect(self._update_beaming_gating)
+        beam_layout.addWidget(self.beaming_ack, 3, 0, 1, 2)
+
+        beam_group.setLayout(beam_layout)
+        layout.addWidget(beam_group)
+
+        self.widgets["radiation.beaming"].toggled.connect(
+            self._on_beaming_toggled)
+
         # --- Thermal-Radiation Coupling (collapsed) ---
         coupling_section = CollapsibleSection("Thermal-Radiation Coupling", collapsed=True)
         coupling_widget = QWidget()
@@ -1968,10 +2009,62 @@ class RadiationTab(BaseConfigTab):
         self._update_hmatrix_suboptions()
         self._update_coupling_mode_gating()
         self._update_vf_builder_gating()
+        self._update_beaming_gating()
 
         # Recompute the estimate whenever a radiation field changes.
         self.value_changed.connect(self.update_vf_estimate)
         self.update_vf_estimate()
+
+    # ── Beaming facet-scale rule (DP-4) ──────────────────────────────
+
+    def _beaming_policy(self):
+        from gui_core.facet_scale import beaming_policy
+        try:
+            return beaming_policy(self.config_manager.get_config(),
+                                  self._project_root())
+        except Exception as exc:                 # never break the tab
+            from gui_core.facet_scale import BeamingPolicy
+            return BeamingPolicy(
+                allowed=False,
+                reason=f"The facet-scale check could not run ({exc}), so "
+                       f"beaming is not offered. Refusing is the safe "
+                       f"direction: a mesh at the roughness scale would "
+                       f"double-count it.")
+
+    def _on_beaming_toggled(self, checked):
+        """Turning the switch on with no slope is fatal at engine startup."""
+        if checked:
+            knob = self.widgets["radiation.rms_slope_deg"]
+            if knob.value() <= 0.0:
+                # 32.5 deg = Jhoti et al. (2024) lunar highlands, the validated
+                # polar value. Announced in the note, never silent.
+                knob.setValue(32.5)
+        self._update_beaming_gating()
+
+    def _update_beaming_gating(self, _checked=None):
+        """Apply the facet-scale and body rules to the beaming control pair."""
+        policy = self._beaming_policy()
+        switch = self.widgets["radiation.beaming"]
+        knob = self.widgets["radiation.rms_slope_deg"]
+
+        self.beaming_ack.setVisible(policy.needs_acknowledgment)
+        ack_ok = (not policy.needs_acknowledgment) or self.beaming_ack.isChecked()
+        may_enable = policy.allowed and ack_ok
+
+        if not may_enable and switch.isChecked():
+            # Refusing has to actually refuse. Turn it off and say why.
+            switch.blockSignals(True)
+            switch.setChecked(False)
+            switch.blockSignals(False)
+            self.config_manager.set_value("radiation.beaming", False)
+        switch.setEnabled(may_enable)
+        knob.setEnabled(may_enable and switch.isChecked())
+
+        color = "#81C784" if policy.allowed and not policy.needs_acknowledgment \
+            else "#FFB74D" if policy.allowed else "#E57373"
+        self.beaming_note.setStyleSheet(
+            f"color: {color}; font-size: 10px; padding: 4px;")
+        self.beaming_note.setText(policy.reason)
 
     def _update_coupling_mode_gating(self, _mode=None):
         """Face Fraction is editable only in the mode whose name it carries."""
@@ -2058,8 +2151,9 @@ class RadiationTab(BaseConfigTab):
         self.vf_estimate_label.setText(text)
 
     def on_body_changed(self, _body_name=None):
-        """Body change affects the mesh face count -> refresh the estimate."""
+        """Body change affects the mesh face count and the beaming rule."""
         self.update_vf_estimate()
+        self._update_beaming_gating()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -2097,10 +2191,40 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
         self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
         self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        # Beaming: honor what the file said, then let the rule have the last
+        # word (the switch is turned back off, loudly, if the mesh forbids it).
+        self.widgets["radiation.rms_slope_deg"].setValue(
+            rad.get("rms_slope_deg", 0.0))
+        self.widgets["radiation.beaming"].blockSignals(True)
+        self.widgets["radiation.beaming"].setChecked(rad.get("beaming", False))
+        self.widgets["radiation.beaming"].blockSignals(False)
+        self._legacy_beaming_note(rad)
         self._update_hmatrix_suboptions()
         self._update_coupling_mode_gating()
         self._update_vf_builder_gating()
+        self._update_beaming_gating()
         self.update_vf_estimate()
+
+    def _legacy_beaming_note(self, rad):
+        """A pre-2026-08-25 config had no `beaming` key; the switch was implied.
+
+        config_parser.cpp honors that bridge and prints a NOTE. The GUI writes
+        the key explicitly, so a config loaded here and saved again would carry
+        `beaming: false` and silently demote the run to Lambertian unless the
+        implied switch is surfaced now.
+        """
+        implied = ("beaming" not in rad) and (rad.get("rms_slope_deg", 0.0) > 0.0)
+        if not implied:
+            return
+        self.widgets["radiation.beaming"].blockSignals(True)
+        self.widgets["radiation.beaming"].setChecked(True)
+        self.widgets["radiation.beaming"].blockSignals(False)
+        self.config_manager.set_value("radiation.beaming", True)
+        logging.warning(
+            "[beaming] this config has rms_slope_deg = %s and no 'beaming' key: "
+            "the pre-2026-08-25 implicit switch. Beaming has been turned ON to "
+            "match what the engine would do, and will be written explicitly on "
+            "the next save.", rad.get("rms_slope_deg"))
 
 
 class ThermophysicalTab(BaseConfigTab):

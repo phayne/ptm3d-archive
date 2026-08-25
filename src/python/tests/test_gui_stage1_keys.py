@@ -281,6 +281,23 @@ def test_the_occluder_path_is_absolutized_for_the_run_yaml():
     assert Path(resolved["mesh"]["occluder_file"]).is_absolute()
 
 
+def test_the_beaming_pair_is_writable_and_never_half_set():
+    """beaming: true with rms_slope_deg == 0 is FATAL at engine startup."""
+    manager = _manager()
+    assert manager.get_value("radiation.beaming") is False
+    assert manager.get_value("radiation.rms_slope_deg") == 0.0
+
+    manager.set_value("radiation.beaming", True)
+    manager.set_value("radiation.rms_slope_deg", 32.5)
+    written = manager._config_for_yaml()["radiation"]
+    assert written["beaming"] is True, written
+    assert written["rms_slope_deg"] == 32.5, written
+
+    back = _round_trip(manager)
+    assert back.get_value("radiation.beaming") is True
+    assert back.get_value("radiation.rms_slope_deg") == 32.5
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -296,6 +313,7 @@ TESTS = [
     test_the_mesh_placement_keys_are_writable,
     test_the_occluder_is_preflight_checked_like_the_core_mesh,
     test_the_occluder_path_is_absolutized_for_the_run_yaml,
+    test_the_beaming_pair_is_writable_and_never_half_set,
 ]
 
 

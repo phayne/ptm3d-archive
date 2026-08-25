@@ -284,6 +284,12 @@ class ConfigManager:
             "verbose": False,
             "use_gpu": False,
             "view_factor_file": "",
+            # Smith (1967) sub-facet roughness. The switch needs the knob:
+            # beaming: true with rms_slope_deg == 0 is FATAL at startup. The
+            # GUI additionally applies the facet-scale rule of
+            # docs/radiation-exchange.md 8.4 -- see gui_core.facet_scale.
+            "beaming": False,
+            "rms_slope_deg": 0.0,
             # PTM-102: bounded (default) | fixed | legacy. coupling_face_fraction
             # is consulted ONLY under legacy; the engine says so at runtime.
             "coupling_mode": "bounded",
