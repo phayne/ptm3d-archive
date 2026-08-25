@@ -108,6 +108,25 @@ radiation:
   captured_energy_target: 0.95
   max_neighbors: 500
   min_neighbors: 20
+  # ---- Smith (1967) beamed thermal emission ------------------------------
+  # STANDARD for lunar polar configurations (Paul, 2026-08-25). Sunlit crater
+  # walls beam IR toward the Sun, which at the pole lands on the shadowed
+  # floor: on the validated r50 polar mesh this moves the deep-cold summer-max
+  # bias from -7.31 K to +1.36 K and leaves the sunlit population unchanged
+  # (+0.04 K). See docs/radiation-exchange.md section 8.
+  #
+  # 32.5 is Jhoti et al. (2024) Table 1's lunar highlands RMS sub-facet slope,
+  # NOT a tuned value; the published range is 20-37 deg.
+  #
+  # ⚠️ THIS CHANGES THE ANSWER relative to the shipped moon3d_native_yearlong
+  # dataset and its figures, which were produced before 2026-08-25 with
+  # Lambertian emission. To reproduce that dataset from this template, set
+  # `beaming: false` (the slope below is then inert and the run says so).
+  # ⚠️ COST: ~+22% wall time and ~7-8 GiB of extra host RAM at this mesh's
+  # scale, and it makes the run chunk-decomposition dependent (PTM-101); the
+  # engine warns. Both are quantified in docs/radiation-exchange.md section 8.7.
+  beaming: true
+  rms_slope_deg: 32.5
 illumination:
   include_primary_reflection: true
   use_batch_processing: true

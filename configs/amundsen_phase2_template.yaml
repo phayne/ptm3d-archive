@@ -64,6 +64,24 @@ radiation:
   captured_energy_target: 0.95
   max_neighbors: 500
   min_neighbors: 20
+  # ---- Smith (1967) beamed thermal emission ------------------------------
+  # Amundsen is a lunar polar crater, and beaming is standard for lunar polar
+  # configurations (Paul, 2026-08-25). It is left OFF here pending Paul's word:
+  # this template drives a campaign whose earlier lunations were run Lambertian
+  # and whose radiation-on reruns are on hold. To enable, UNCOMMENT BOTH lines.
+  #
+  # ⚠️ Both keys stay COMMENTED OUT rather than written as `beaming: false` +
+  # a slope. On a binary older than 2026-08-25 there is no `beaming` key at all
+  # and `rms_slope_deg > 0` IS the switch, so a committed nonzero slope would
+  # silently turn beaming ON there while this file appears to say it is off.
+  #
+  # ⚠️ Cost on THIS template is unmeasured. It runs CPU radiosity
+  # (use_gpu: false) with min_shadow_fraction 0.3, so its receiver set is wider
+  # than the 0.8 case the +22% figure was measured on. Measure with a short run
+  # and read the engine's [beam-cost] line before committing a campaign.
+  # See docs/radiation-exchange.md section 8.
+  # beaming: true
+  # rms_slope_deg: 32.5      # Jhoti et al. (2024) Table 1, lunar highlands
 illumination:
   include_primary_reflection: true
   use_batch_processing: true

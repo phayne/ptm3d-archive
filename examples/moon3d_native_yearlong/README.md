@@ -6,7 +6,7 @@ two-band radiosity coupling, and its illumination-only companion.
 
 | File | Radiation | Purpose |
 |---|---|---|
-| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default) | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
+| `moon3d_native_yearlong_coupled.yaml` | `radiation.enabled: true` (band-separated radiosity, compiled default) **+ `beaming: true` since 2026-08-25 — see the warning below** | The science run. Produces the annual T_max map, cold-trap area, and volatile-stability figures. |
 | `moon3d_native_yearlong_radoff.yaml` | `radiation.enabled: false` | The no-coupling comparison pair. Identical in every other value. |
 
 Both are derived from `examples/moon3d_500k_clean.yaml` (2026-07-12): only the mesh,
@@ -22,6 +22,37 @@ lost and had to be re-run. Tracking them is the fix.
 
 Sanitizing them changed **only path-valued keys** — every physical, numerical and
 scheduling value is byte-for-byte what the campaign ran.
+
+## ⚠️ 2026-08-25: the coupled config no longer reproduces the shipped dataset
+
+`moon3d_native_yearlong_coupled.yaml` now sets
+
+```yaml
+radiation:
+  beaming: true
+  rms_slope_deg: 32.5
+```
+
+Smith (1967) beamed thermal emission became **standard for lunar polar configurations**
+on 2026-08-25 (Paul's ruling; physics, literature values, validated result and cost
+table in [`docs/radiation-exchange.md` §8](../../docs/radiation-exchange.md)). It is a
+real change to the answer, not a formatting change: on the validated r50 polar mesh it
+moves the deep-cold summer-max bias from −7.31 K to +1.36 K, and it *worsens* the
+already-warm PSR, margin and winter strata (see §8.5 — read the whole table).
+
+**This is the ONLY value in this directory that no longer matches the campaign that
+produced the shipped `moon3d_native_yearlong` dataset** and its annual T_max map,
+cold-trap area and volatile-stability figures, all of which were run with Lambertian
+emission before this date.
+
+- **To reproduce the shipped dataset and its figures, set `beaming: false`.** The slope
+  below it then goes inert and the run says so in one line.
+- To run new science, leave it as shipped and expect **~+22% wall time and several GiB
+  of extra host RAM** (§8.7), plus a chunk-decomposition dependence the engine warns
+  about (PTM-101, §8.8).
+
+`moon3d_native_yearlong_radoff.yaml` is untouched: it has `radiation.enabled: false`, so
+beaming has nothing to act on there.
 
 ## The three site-local inputs you must supply
 
