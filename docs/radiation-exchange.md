@@ -1077,59 +1077,135 @@ open and are not to be reopened without Paul's word.
 ### 8.6 What it costs
 
 Measured on the same mesh; see §8.7 for the numbers and how to re-measure them on a new mesh.
-The short version: **beaming costs about +22% wall time and ~5–6.5 GiB of host RAM on a
+The short version: **beaming costs about +10% wall time and ~5.4–5.5 GiB of host RAM on a
 140k-face lunar polar site mesh**, and the RAM term is the one that scales dangerously — it grows
 with the view-factor matrix's nonzero count, not with the face count.
+
+(It cost +22% and 6.3–6.5 GiB as first shipped on 2026-08-24. The efficiency work of 2026-08-25
+recovered 53% of the wall-time overhead and 14% of the memory **at byte-identical output** — 2642
+of 2642 production files unchanged. §8.7 carries both columns, because the "before" numbers are
+what every pre-2026-08-25 beaming run actually paid.)
 
 ### 8.7 Cost table
 
 Every number below is measured, not modeled. The engine prints its own `[beam-cost]` block at the
 end of any run with beaming on, so this is re-measurable on any mesh without differencing two runs.
 
-**Production wall time** — four `sunlit_radcore_r50` arms, 140,091 faces, 573.0 M-nonzero referee
-CSR, 2 chunks each (2026-08-24):
+**Production wall time** — `sunlit_radcore_r50` arms, 140,091 faces, 573.0 M-nonzero referee CSR,
+2 chunks each, same driver / CSR / environment / batch size throughout:
 
 | Arm pair (identical except beaming) | off | on | delta |
 |---|---|---|---|
-| `max_coupling_iterations: 5` | 1743.9 s | 2128.0 s | +384.0 s (**+22.0%**) |
-| `max_coupling_iterations: 16` | 1738.9 s | 2125.9 s | +387.1 s (**+22.3%**) |
+| `max_coupling_iterations: 5` (2026-08-24) | 1743.9 s | 2128.0 s | +384.0 s (**+22.0%**) |
+| `max_coupling_iterations: 16` (2026-08-24) | 1738.9 s | 2125.9 s | +387.1 s (**+22.3%**) |
+| `max_coupling_iterations: 5`, before the efficiency work (2026-08-25) | 1746 s | 2140 s | +394 s (**+22.6%**) |
+| `max_coupling_iterations: 5`, **after** (2026-08-25) | 1746 s | **1930 s** | **+184 s (+10.5%)** |
+
+The last two rows are the same recipe on the same machine minutes apart, so they are directly
+comparable: **210 s of the 394 s beaming overhead recovered, 53%**, and the two beaming arms
+produce **byte-identical output — 2642 of 2642 files** across both chunks. Engine-reported
+`[beam-cost]` accounts for 390.0 s of the 394 s "before" overhead (99.0%) and 176.9 s of the 184 s
+"after" overhead (96.2%), so the table below is not missing a term.
+
+| Production term (2 chunks, 1115 beamed timesteps) | before | after | factor |
+|---|---|---|---|
+| beam-pair build | 23.73 s | **5.76 s** | 4.12× |
+| Gate-2 energy audit | 85.77 s | **0.64 s** | 134× |
+| per-timestep `addBeamedFlux` | 248.5 / 251.7 ms/call | **153.8 / 152.8 ms/call** | 1.62× |
+| pair-list memory (per chunk) | 6.45 / 6.32 GiB | **5.53 / 5.42 GiB** | −14.3% |
 
 **Where the time goes** — engine-instrumented, r50 smoke, same mesh and CSR, 193.6 M beam pairs,
-16 beamed timesteps (2026-08-25). The accounted total is 97.7% of the measured 56.0 s wall-time
-delta between the beaming-on and beaming-off smokes, so the instrumentation is not missing a term:
+16 beamed timesteps. Both columns are measured on the *same* smoke config and binary pair
+(2026-08-25); the "before" column is the code as it stood on 2026-08-24, the "after" column is the
+same code with the efficiency work below applied. The two produce **byte-identical output**
+(35/35 files, beaming on; 35/35 beaming off), so this is the same physics at a different price:
 
-| Item | Cost | Scales with |
-|---|---|---|
-| $\chi$ table build | 0.05 s, once | nothing (fixed 48 × 48 × 65 grid) |
-| beam-pair build | 9.84 s, once per chunk | pairs (~51 ns/pair) |
-| Gate-2 energy audit | 41.2 s, once per chunk | active pairs (a sort over them) |
-| per-timestep `addBeamedFlux` | 225 ms/call × 16 = 3.6 s | pairs (~1.16 ns/pair/call, 48 threads) |
+| Item | Before | After | Scales with |
+|---|---|---|---|
+| $\chi$ table build | 0.049 s, once | 0.049 s, once | nothing (fixed 48 × 48 × 65 grid) |
+| beam-pair build | 10.53 s, once per chunk | **2.34 s** (4.5×) | pairs (54 → 12 ns/pair) |
+| Gate-2 energy audit | 43.88 s, once per chunk | **0.31 s** (141×) | active pairs |
+| per-timestep `addBeamedFlux` | 235.7 ms/call | **155.7 ms/call** (1.51×) | pairs (1.22 → 0.80 ns/pair/call, 48 threads) |
+| beaming total, this smoke | 58.22 s | **5.19 s** | |
 
-The Gate-2 audit dominates a *short* run and is negligible in a long one: it is one shot per chunk
-against however many beamed timesteps the run has (1380 on the production science chunk above).
+Three things changed, and none of them changes a number:
 
-**Memory** — the pair list is `28 B/pair` (`BeamPair`: two `int`, two `float`, a `float[3]`), plus a
-transient `2 × 8 B` per active pair inside the one-shot Gate-2 audit:
+1. **The per-emitter quantities are hoisted out of the pair loop.** $\cos\theta_\odot$, its
+   $\chi$-table axis, and the emitter's $\varepsilon_j\sigma T_j^4$ source depend on the *emitter*
+   and the timestep, not on which receiver the pair points at — and there are ~10³ pairs per
+   emitter. They are now computed once per face per timestep. Measured: the $\chi$ lookup was
+   0.775 ns of the 1.195 ns/pair kernel, and this took the whole kernel to 1.00 ns/pair.
+2. **The pair list is CSR, not a coordinate list.** `buildBeamPairs` already emitted pairs
+   receiver-major, so the receiver index was redundant: dropping it takes `BeamPair` from 28 B to
+   24 B and lets a whole receiver be summed in a register instead of one `omp atomic` per pair
+   (measured: the atomic was 0.070 ns/pair).
+3. **The Gate-2 audit no longer sorts.** It used to materialize two doubles per active pair and
+   `std::sort` an index over them, on one thread, to read three weighted percentiles — 2.4 GB and
+   ~43 s. It now accumulates a weighted histogram of $\chi$ in one parallel pass and interpolates
+   the percentiles from the cumulative weight. **The gate is still always on** (it is the only
+   place a run states its $\chi$ closure and its energy admissibility); it agrees with the sorted
+   version to six significant figures on the mean, on $D_j$, and on the admissibility ratio, and
+   to 5 × 10⁻⁶ on the p05.
 
-| Mesh class | faces | CSR nnz | beam pairs | pair list | Gate-2 transient |
+The pair build and the Gate-2 audit are one shot per *chunk*; the per-timestep pass runs once per
+beamed timestep (1380 on the production science chunk above), so on a long run the per-timestep
+term is what matters and on a short one the setup is.
+
+**Memory** — the pair list is `24 B/pair` (`BeamPair`: one `int`, two `float`, a `float[3]`; the
+receiver comes from the CSR row). The Gate-2 audit's transient is now a per-thread histogram plus
+one shared $D_j$ array rather than a copy of every active pair:
+
+| Mesh class | faces | CSR nnz | beam pairs | pair list (24 B) | Gate-2 transient |
 |---|---|---|---|---|---|
-| `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **5.05–6.45 GiB** | ~2.4 GB |
-| `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 5.0–6.4 GiB (est.) | ~2.4 GB |
-| A3GT 3 km site (A03MP026) | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **21.9–27.9 GiB (est.)** | ~8 GB |
+| `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **4.33–5.53 GiB** | ~4 MB |
+| `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 4.3–5.5 GiB (est.) | ~4 MB |
+| A3GT 3 km site (A03MP026) | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
 
-The estimates apply the **measured** r50 retention band — 33.8–43.2% of the CSR's nonzeros survive
-the receiver/emitter/geometry filters — to each mesh's own nonzero count. They are estimates, not
-measurements: the retention depends on the shadow topology of the specific site and window, and
-the receiver set is itself window-scoped (§8.8). The absolute ceiling is 100% retention, i.e.
-28 B × nnz: **64.8 GiB** for the A3GT site.
+(For comparison, the 2026-08-24 code needed 5.05–6.45 GiB and 21.9–27.9 GiB in the pair-list
+column, and a ~2.4 GB / ~8 GB Gate-2 transient on top.) The estimates apply the **measured** r50
+retention band — 33.8–43.2% of the CSR's nonzeros survive the receiver/emitter/geometry filters —
+to each mesh's own nonzero count. They are estimates, not measurements: the retention depends on
+the shadow topology of the specific site and window, and the receiver set is itself window-scoped
+(§8.8). The absolute ceiling is 100% retention, i.e. 24 B × nnz: **55.6 GiB** for the A3GT site.
+
+The pair build also no longer grows an unreserved vector by repeated realloc-and-copy: it counts
+first, allocates exactly, and fills in parallel, which removes a transient peak of roughly half the
+pair list again (~2.5 GiB at r50, ~10 GiB at A3GT scale) on top of the list itself.
+
+**What is left, and why it was not taken.** The remaining per-timestep cost is dominated by the
+$\chi$ trilinear lookup itself. Three further reductions were implemented and measured on the real
+r50 pair list, and all three were declined because **none of them is bit-identical** — each would
+move every beaming baseline by a few parts in 10⁹, for a fraction of the gain the changes above
+already delivered:
+
+| Candidate | Kernel | vs. the shipped kernel | Why not |
+|---|---|---|---|
+| store $1/\sin\theta_e$ per pair (removes a `sqrt` and a divide) | 0.691 ns/pair | 1.19× faster | not bit-identical; and it costs 4 B/pair back |
+| compute $\cos\phi$ in the emitter's tangent frame instead of from $\cos\psi$ | 0.675 ns/pair | 1.22× | not bit-identical (better conditioned, but different) |
+| both, on a packed 20 B/pair record | 0.640 ns/pair | 1.28×, and −17% memory | not bit-identical |
+
+(The shipped kernel measures 0.821 ns/pair on the same benchmark.) Compiling the $\chi$ kernel with
+AVX2/FMA is worth a further **1.35×** on the lookup in isolation, but `PTM_ARCH_NATIVE=OFF` — the
+documented portable build — deliberately forces AVX off for every target, `radiation_exchange.cpp`
+reaches `<Eigen/Dense>` through its own header (so a per-file `-mavx2` there is the Eigen ABI split
+that had to be fixed once already), and FMA contraction is not bit-identical either. It would need
+its own Eigen-free translation unit plus runtime ISA dispatch.
+
+Moving the pass to the GPU is **not** indicated by the measurements: the kernel is not
+bandwidth-bound (a pure stream over the pair list runs at 123 GB/s, essentially this machine's DRAM
+ceiling, and accounts for only 19% of the kernel), it would be a second physics path for a term
+that must stay bit-comparable with the CPU, and it would put a new long kernel inside the
+per-timestep loop that already carries the GPU-wedge mitigations.
 
 The 509k `moon3d` mesh is deliberately absent from this table: beaming does not apply there at all
 (§8.4), so its cost is not a number anyone should be planning against.
 
-⚠️ **Beaming on a multi-million-face site is not a free flip.** Extrapolating the measured
-per-pair rate, an A3GT-class site would add of order 1 s per beamed timestep on top of a ~1 GB/s
-pair build and >20 GiB of resident host memory. Measure it on the target mesh — with a short run
-and the `[beam-cost]` line — before committing a campaign to it.
+⚠️ **Beaming on a multi-million-face site is still not a free flip.** Extrapolating the measured
+per-pair rate, an A3GT-class site would add of order 0.6 s per beamed timestep and hold ~19–24 GiB
+of resident host memory. Measure it on the target mesh — with a short run and the `[beam-cost]`
+line — before committing a campaign to it. The efficiency work moved the wall-time term
+substantially and the memory term only 14%; memory remains the constraint that decides whether
+beaming fits on a given mesh at all.
 
 ### 8.8 Caveats
 
