@@ -465,6 +465,25 @@ class ConfigManager:
         with open(filename, 'r') as f:
             loaded = yaml.safe_load(f)
 
+        # A bare section header (`radiation:` with nothing under it) parses as
+        # None, and _deep_merge then puts None where a dict belongs, so every
+        # later `rad.get(...)` or `mesh[...]` raises out of a Qt slot -- an
+        # application abort. yaml-cpp treats a Null node as falsy under
+        # `if (root["radiation"])`, so the engine runs these files happily and
+        # only the GUI died. Pre-existing (identical on cf7d97c); fixed here
+        # because it is the same crash class as the rest of this branch and the
+        # fix is one line at the boundary. Dropping the key is exactly what the
+        # engine does with it.
+        if isinstance(loaded, dict):
+            empty = [k for k, v in loaded.items() if v is None]
+            for key in empty:
+                del loaded[key]
+        elif loaded is not None:
+            raise ValueError(
+                f"{filename} does not contain a YAML mapping at the top level "
+                f"(found {type(loaded).__name__}); PTM3D configs are mappings "
+                f"of sections.")
+
         # Record the pre-2026-08-25 IMPLICIT beaming switch before merging.
         # config_parser.cpp:631 turns beaming ON for a config with a positive
         # rms_slope_deg and no `beaming` key, and says so. Once merged with
@@ -849,9 +868,16 @@ class ConfigManager:
         layer up in load_from_yaml; it has to follow the value here too.
         """
         try:
-            return float(value)
+            number = float(value)
         except (TypeError, ValueError):
             return fallback
+        # NaN and the infinities pass float() and then poison everything
+        # downstream: `int(inf)` raises OverflowError, `int(nan)` ValueError,
+        # and every comparison against NaN is False. YAML spells them `.nan`,
+        # `.inf`, `-.inf`. Treat them as "no usable number".
+        if number != number or number in (float("inf"), float("-inf")):
+            return fallback
+        return number
 
     def validate(self):
         """Validate the current configuration.

@@ -75,18 +75,42 @@ _BODY_RADII_M = {
 
 @dataclass
 class FacetScale:
-    """sqrt(mean face area), with how it was obtained."""
+    """sqrt(face area), as a headline mean AND a fine-end percentile.
+
+    ``meters`` is sqrt(MEAN area) -- the number docs/radiation-exchange.md 8.4
+    tabulates, kept so the two agree. ``fine_meters`` is sqrt(the 5th-percentile
+    area), and it is what the rule is applied to.
+
+    The mean alone fails open on a MULTI-RESOLUTION mesh, which is not a
+    contrived case: `scripts/a3gt_v2_extended_mesh.py` builds the production
+    A3GT v2 mesh as one PLY whose resolution falls off from the center, and
+    measured on the real A03MP026 3 km core the mean is 3.47 m while the 5th
+    percentile is 0.71 m -- a factor of 4.9. Construct the extreme and the mean
+    hides it completely: 99% of facets at 1 mm plus 1% at 1 m reports 70.7 cm,
+    passing a rule written to refuse millimeter facets with margin.
+
+    Beaming double-counts on the facets that ALREADY resolve the roughness, so
+    the question is whether a meaningful fraction of the mesh sits at that
+    scale, not what the average is.
+    """
     meters: float = None          # None = not determinable
+    fine_meters: float = None     # sqrt(5th-percentile area); the gate
     n_faces: int = None
-    source: str = "unknown"       # icosphere | ply | ply-sampled | unknown
+    source: str = "unknown"       # icosphere | ply | ply-sampled | obj | unknown
     detail: str = ""
 
     def describe(self):
         if self.meters is None:
             return f"facet scale unknown ({self.detail})"
+        spread = ""
+        if self.fine_meters is not None and \
+                self.fine_meters < 0.9 * self.meters:
+            spread = (f", but the finest 5% are "
+                      f"{_fmt_length(self.fine_meters)} -- this mesh is "
+                      f"multi-resolution")
         return (f"facet scale {_fmt_length(self.meters)} "
                 f"({self.n_faces:,} faces, {self.source}"
-                + (f"; {self.detail}" if self.detail else "") + ")")
+                + (f"; {self.detail}" if self.detail else "") + ")" + spread)
 
 
 @dataclass
@@ -106,6 +130,15 @@ def _fmt_length(m):
     if m < 1000.0:
         return f"{m:.3g} m"
     return f"{m / 1000.0:.4g} km"
+
+
+def _percentile(values, q):
+    """Nearest-rank percentile of `values`. Small samples, so no numpy."""
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    i = int(q * (len(ordered) - 1))
+    return ordered[max(0, min(len(ordered) - 1, i))]
 
 
 def _clean_body(config):
@@ -173,25 +206,30 @@ _AREA_CACHE = {}
 _AREA_CACHE_MAX = 8
 
 
-def _obj_mean_face_area(path):
-    """(mean triangle area, n_faces, n_sampled) for a Wavefront OBJ.
+def _obj_face_areas(path):
+    """(sampled per-face areas, n_faces, n_sampled) for a Wavefront OBJ.
 
     The engine loads OBJ (mesh_utils.cpp:1264) and the Mesh tab's file filter
     offers it, so refusing it here made beaming permanently unreachable for a
     legitimate coarse lunar OBJ. The format is line-oriented: `v x y z` and
     `f a b c` with 1-based indices, optionally `f a/vt/vn ...`.
 
-    OBJ is line-oriented and has no header face count, so the file is walked
-    once; but the AREA arithmetic obeys the same sampling cap as the PLY reader.
-    Summing every face of a 1.2M-face OBJ took 3.81 s on the GUI thread against
-    0.13 s for the equivalent sampled PLY, and this runs from
-    ``mesh.import_file``'s per-keystroke ``textChanged``.
+    RESERVOIR sampling, not "sum the first N then stride". OBJ has no header
+    face count, so a stride cannot be chosen up front -- and taking the first
+    200,000 faces exhaustively is a BIASED sample of a mesh whose resolution
+    varies with position, which every A3GT-class mesh's does. Measured on
+    byte-identical geometry written to both formats (245,000 faces at 1 mm then
+    5,000 at 1 m): the prefix-then-stride reader reported 2.49 cm and REFUSED
+    while the PLY path reported 14.1 cm and allowed -- a 5.7x disagreement that
+    flipped the launch gate on file extension alone. A reservoir is uniform over
+    the whole file in one pass.
     """
+    import random
+
     verts = []
-    areas_total = 0.0
-    used = 0
+    reservoir = []
     n_faces = 0
-    stride = 1
+    rng = random.Random(20260825)          # deterministic: same file, same answer
     with open(path, "r", errors="replace") as fh:
         for line in fh:
             if line.startswith("v "):
@@ -199,36 +237,34 @@ def _obj_mean_face_area(path):
                 verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
             elif line.startswith("f "):
                 n_faces += 1
-                if n_faces > _AREA_SAMPLE_ABOVE and stride == 1:
-                    # Past the cap: switch to sampling. What has been summed so
-                    # far stays valid -- it is a mean over the faces used, and
-                    # `used` counts exactly those.
-                    stride = max(1, _AREA_SAMPLE_ABOVE // _AREA_SAMPLE_COUNT)
-                if (n_faces - 1) % stride:
-                    continue
                 idx = []
                 for token in line.split()[1:]:
-                    raw = token.split("/")[0]
-                    i = int(raw)
+                    i = int(token.split("/")[0])
                     # OBJ indices are 1-based; a negative one counts back from
                     # the end of the vertex list seen SO FAR.
                     idx.append(i - 1 if i > 0 else len(verts) + i)
+                area = 0.0
                 for k in range(1, len(idx) - 1):
-                    areas_total += _triangle_area(verts[idx[0]], verts[idx[k]],
-                                                  verts[idx[k + 1]])
-                used += 1
-    if not used:
+                    area += _triangle_area(verts[idx[0]], verts[idx[k]],
+                                           verts[idx[k + 1]])
+                if len(reservoir) < _AREA_SAMPLE_COUNT:
+                    reservoir.append(area)
+                else:
+                    j = rng.randrange(n_faces)
+                    if j < _AREA_SAMPLE_COUNT:
+                        reservoir[j] = area
+    if not reservoir:
         raise ValueError("OBJ file declares no face")
-    return areas_total / used, n_faces, used
+    return reservoir, n_faces, len(reservoir)
 
 
 def _ply_mean_face_area(path):
-    """(mean triangle area in the mesh's own units, n_faces, n_sampled)."""
+    """(sampled per-face areas in the mesh's own units, n_faces, n_sampled)."""
     stat = Path(path).stat()
     key = (str(path), stat.st_mtime_ns, stat.st_size)
     if key in _AREA_CACHE:
         return _AREA_CACHE[key]
-    result = (_obj_mean_face_area(path)
+    result = (_obj_face_areas(path)
               if str(path).lower().endswith(".obj")
               else _ply_mean_face_area_uncached(path))
     if len(_AREA_CACHE) >= _AREA_CACHE_MAX:
@@ -360,8 +396,7 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
         # reporting an area computed from records at the wrong offsets.
         fh.seek(block_start)
 
-    total = 0.0
-    used = 0
+    areas = []
     for f in range(n_faces):
         head = fh.read(cwidth)
         if len(head) < cwidth:
@@ -377,13 +412,14 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
         idx = struct.unpack("<" + icode * n, body)
         # A polygon of n vertices is a fan of n-2 triangles; PTM3D meshes are
         # triangulated, so this is n == 3 in practice.
+        area = 0.0
         for k in range(1, n - 1):
-            total += _triangle_area(vertices[idx[0]], vertices[idx[k]],
-                                    vertices[idx[k + 1]])
-        used += 1
-    if not used:
+            area += _triangle_area(vertices[idx[0]], vertices[idx[k]],
+                                   vertices[idx[k + 1]])
+        areas.append(area)
+    if not areas:
         raise ValueError("PLY face block yielded no usable triangle")
-    return total / used, n_faces, used
+    return areas, n_faces, len(areas)
 
 
 def _seek_sampled_triangles(fh, n_faces, stride, block_start,
@@ -403,25 +439,22 @@ def _seek_sampled_triangles(fh, n_faces, stride, block_start,
     unpack_head = struct.Struct("<" + ccode).unpack
     unpack_idx = struct.Struct("<" + icode * 3).unpack
 
-    total = 0.0
-    used = 0
+    areas = []
     for f in range(0, n_faces, stride):
         fh.seek(block_start + f * record)
         raw = fh.read(record)
         if len(raw) < record or unpack_head(raw[:cwidth])[0] != 3:
             return None
         a, b, c = unpack_idx(raw[cwidth:cwidth + 3 * iwidth])
-        total += _triangle_area(vertices[a], vertices[b], vertices[c])
-        used += 1
-    if not used:
+        areas.append(_triangle_area(vertices[a], vertices[b], vertices[c]))
+    if not areas:
         return None
-    return total / used, n_faces, used
+    return areas, n_faces, len(areas)
 
 
 def _ply_mean_face_area_ascii(fh, elements):
     vertices = []
-    total = 0.0
-    used = 0
+    areas = []
     n_faces = 0
     for name, count, properties in elements:
         if name == "vertex":
@@ -441,16 +474,17 @@ def _ply_mean_face_area_ascii(fh, elements):
                 # correct here because an ASCII record is line-delimited.
                 n = int(row[0])
                 idx = [int(v) for v in row[1:1 + n]]
+                area = 0.0
                 for k in range(1, n - 1):
-                    total += _triangle_area(vertices[idx[0]], vertices[idx[k]],
-                                            vertices[idx[k + 1]])
-                used += 1
+                    area += _triangle_area(vertices[idx[0]], vertices[idx[k]],
+                                           vertices[idx[k + 1]])
+                areas.append(area)
         else:
             for _ in range(count):
                 fh.readline()
-    if not used:
+    if not areas:
         raise ValueError("PLY face block yielded no usable triangle")
-    return total / used, n_faces, used
+    return areas, n_faces, len(areas)
 
 
 # --------------------------------------------------------------------------
@@ -493,10 +527,12 @@ def facet_scale(config, project_root=None):
             return FacetScale(
                 detail=f"{path.name} is neither PLY nor OBJ; only those two "
                        f"geometry formats are read here")
+        is_obj = path.name.lower().endswith(".obj")
         try:
-            mean_area, n_faces, sampled = _ply_mean_face_area(path)
+            areas, n_faces, sampled = _ply_mean_face_area(path)
         except (OSError, ValueError, IndexError, KeyError, struct.error) as exc:
             return FacetScale(detail=f"could not read {path.name}: {exc}")
+        mean_area = sum(areas) / len(areas) if areas else 0.0
         if not mean_area or mean_area <= 0:
             return FacetScale(n_faces=n_faces,
                               detail=f"{path.name} has zero mean face area")
@@ -507,12 +543,15 @@ def facet_scale(config, project_root=None):
                 n_faces=n_faces,
                 detail=f"mesh.scale_factor is "
                        f"{mesh.get('scale_factor')!r}, not a number")
-        detail = "assuming the PLY is in meters"
-        source = "ply"
+        fmt_name = "OBJ" if is_obj else "PLY"
+        detail = f"assuming the {fmt_name} is in meters"
+        source = "obj" if is_obj else "ply"
         if sampled < (n_faces or 0):
-            source = "ply-sampled"
+            source += "-sampled"
             detail = f"sampled {sampled:,} of {n_faces:,} faces; " + detail
         return FacetScale(meters=math.sqrt(mean_area) * abs(scale),
+                          fine_meters=math.sqrt(_percentile(areas, 0.05))
+                          * abs(scale),
                           n_faces=n_faces, source=source, detail=detail)
 
     body = _clean_body(config)
@@ -538,12 +577,14 @@ def facet_scale(config, project_root=None):
         # estimate -- irrelevant against a 5 cm threshold when a lunar ico6
         # facet is 21 km, and said rather than assumed.
         return FacetScale(
-            meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
+            meters=math.sqrt(total_area / n_faces),
+            fine_meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
             source="icosphere-topographic",
             detail=f"{body} topography grid, resolution {res}; area from the "
                    f"smooth sphere, so the true scale is slightly smaller")
-    return FacetScale(meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
-                      source="icosphere",
+    return FacetScale(meters=math.sqrt(total_area / n_faces),
+                      fine_meters=math.sqrt(total_area / n_faces),
+                      n_faces=n_faces, source="icosphere",
                       detail=f"{body} sphere, resolution {res}")
 
 
@@ -585,16 +626,33 @@ def beaming_policy(config, project_root=None):
                     f"mesh's facets are far larger than the roughness scale "
                     f"(millimeters to centimeters) before enabling beaming."))
 
-    if scale.meters < FACET_SCALE_DISABLE_BELOW_M:
+    # The GATE is the FINE END, not the mean. sqrt(mean area) is dominated by
+    # the largest facets, so a mesh that is 99% millimeter-scale with a coarse
+    # minority reports 70.7 cm and sails through a rule written to refuse
+    # millimeter facets with margin. Beaming double-counts on the facets that
+    # already resolve the roughness, so what matters is whether a meaningful
+    # fraction of the mesh sits at that scale.
+    #
+    # Measured on the real meshes, sqrt(mean) vs sqrt(5th percentile):
+    #   sunlit_radcore_r50   234 m  /  169 m   (ratio 1.4, near-uniform)
+    #   A3GT A03MP026 core  3.47 m  / 0.708 m  (ratio 4.9, multi-resolution)
+    #   A3GT ring            146 m  / 25.1 m   (ratio 5.8, by construction)
+    # None has a millimeter-scale subpopulation, so no validated mesh is newly
+    # refused; the A3GT core moves from allow to the acknowledgment tier, which
+    # is the honest reading of 5% of its facets being sub-meter.
+    fine = scale.fine_meters if scale.fine_meters is not None else scale.meters
+
+    if fine < FACET_SCALE_DISABLE_BELOW_M:
         return BeamingPolicy(
             allowed=False, scale=scale,
-            reason=(f"{scale.describe()}. That is at or near the roughness "
-                    f"scale itself, so this mesh already resolves the roughness "
-                    f"geometrically; a sub-facet model on top would count it "
-                    f"twice. The limit is "
-                    f"{_fmt_length(FACET_SCALE_DISABLE_BELOW_M)}."))
+            reason=(f"{scale.describe()}. The finest facets are at or near the "
+                    f"roughness scale itself, so this mesh already resolves the "
+                    f"roughness geometrically there; a sub-facet model on top "
+                    f"would count it twice. The limit is "
+                    f"{_fmt_length(FACET_SCALE_DISABLE_BELOW_M)} and the "
+                    f"finest 5% of this mesh are {_fmt_length(fine)}."))
 
-    if scale.meters < FACET_SCALE_WARN_BELOW_M:
+    if fine < FACET_SCALE_WARN_BELOW_M or scale.meters < FACET_SCALE_WARN_BELOW_M:
         return BeamingPolicy(
             allowed=True, needs_acknowledgment=True, scale=scale,
             reason=(f"{scale.describe()}. Between "

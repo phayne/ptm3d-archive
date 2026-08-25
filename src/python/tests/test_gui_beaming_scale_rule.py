@@ -332,6 +332,103 @@ def test_a_cloud_placeholder_is_not_opened():
         assert real_open is not None  # silence the unused-name lint
 
 
+def test_a_multi_resolution_mesh_is_refused_on_its_FINE_end():
+    """sqrt(MEAN area) hides a fine subpopulation; the gate must not.
+
+    99% of facets at 1 mm plus 1% at 1 m has a mean-area scale of 10 cm, which
+    sails past a rule written to refuse millimeter facets with margin. This is
+    not contrived: scripts/a3gt_v2_extended_mesh.py builds the production A3GT
+    v2 mesh as one PLY whose resolution falls off from the center, and the real
+    A03MP026 3 km core measures 3.47 m mean against 0.71 m at the 5th
+    percentile.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "multi.ply"
+        verts, faces = [], []
+
+        def tri(x, y, leg):
+            b = len(verts)
+            verts.extend([(x, y, 0.0), (x + leg, y, 0.0), (x, y + leg, 0.0)])
+            faces.append((b, b + 1, b + 2))
+
+        for i in range(9900):                       # 99% at 1 mm
+            tri(i * 0.01, 0.0, 0.001 * math.sqrt(2.0))
+        for i in range(100):                        # 1% at 1 m
+            tri(i * 10.0, 100.0, 1.0 * math.sqrt(2.0))
+
+        with open(path, "wb") as fh:
+            fh.write((f"ply\nformat binary_little_endian 1.0\n"
+                      f"element vertex {len(verts)}\nproperty float x\n"
+                      f"property float y\nproperty float z\n"
+                      f"element face {len(faces)}\n"
+                      f"property list uchar int vertex_indices\n"
+                      f"end_header\n").encode("ascii"))
+            for v in verts:
+                fh.write(struct.pack("<fff", *v))
+            for f in faces:
+                fh.write(struct.pack("<Biii", 3, *f))
+
+        scale = facet_scale(_config(path))
+        assert scale.meters > FACET_SCALE_DISABLE_BELOW_M, (
+            f"the mean-area scale is {scale.meters}, which would make this "
+            f"test pass for the wrong reason")
+        assert scale.fine_meters < FACET_SCALE_DISABLE_BELOW_M, scale.fine_meters
+        policy = beaming_policy(_config(path))
+        assert not policy.allowed, (
+            f"a mesh that is 99% millimeter facets was allowed on the strength "
+            f"of its mean: {policy.reason}")
+        assert "finest" in policy.reason, policy.reason
+
+
+def test_ply_and_obj_agree_on_the_same_geometry():
+    """The gate must not turn on the file extension.
+
+    The first OBJ reader summed the first 200,000 faces exhaustively and only
+    then strided, which is a biased sample of a mesh whose resolution varies
+    with position. On byte-identical geometry it disagreed with the PLY path by
+    5.7x and flipped the launch gate.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        verts, faces = [], []
+
+        def tri(x, y, leg):
+            b = len(verts)
+            verts.extend([(x, y, 0.0), (x + leg, y, 0.0), (x, y + leg, 0.0)])
+            faces.append((b, b + 1, b + 2))
+
+        for i in range(4000):
+            tri(i * 0.01, 0.0, 0.05 * math.sqrt(2.0))
+        for i in range(1000):
+            tri(i * 10.0, 100.0, 2.0 * math.sqrt(2.0))
+
+        ply = Path(tmp) / "same.ply"
+        with open(ply, "wb") as fh:
+            fh.write((f"ply\nformat binary_little_endian 1.0\n"
+                      f"element vertex {len(verts)}\nproperty float x\n"
+                      f"property float y\nproperty float z\n"
+                      f"element face {len(faces)}\n"
+                      f"property list uchar int vertex_indices\n"
+                      f"end_header\n").encode("ascii"))
+            for v in verts:
+                fh.write(struct.pack("<fff", *v))
+            for f in faces:
+                fh.write(struct.pack("<Biii", 3, *f))
+        obj = Path(tmp) / "same.obj"
+        with open(obj, "w") as fh:
+            for v in verts:
+                fh.write(f"v {v[0]} {v[1]} {v[2]}\n")
+            for f in faces:
+                fh.write(f"f {f[0] + 1} {f[1] + 1} {f[2] + 1}\n")
+
+        a, b = facet_scale(_config(ply)), facet_scale(_config(obj))
+        ratio = max(a.meters, b.meters) / min(a.meters, b.meters)
+        assert ratio < 1.25, (
+            f"PLY reports {a.meters} m and OBJ {b.meters} m for the same "
+            f"geometry ({ratio:.2f}x); the gate would turn on the extension")
+        assert beaming_policy(_config(ply)).allowed == \
+            beaming_policy(_config(obj)).allowed
+
+
 def test_a_topographic_lunar_mesh_is_measurable():
     """The standard lunar production configuration must not be refused.
 
@@ -407,6 +504,8 @@ TESTS = [
     test_an_unmeasurable_mesh_asks_rather_than_guessing_or_refusing,
     test_an_obj_mesh_is_measured_not_refused,
     test_a_cloud_placeholder_is_not_opened,
+    test_a_multi_resolution_mesh_is_refused_on_its_FINE_end,
+    test_ply_and_obj_agree_on_the_same_geometry,
     test_a_topographic_lunar_mesh_is_measurable,
     test_a_non_lunar_body_is_refused_without_reading_the_mesh,
     test_the_launch_guard_fires_on_a_refused_mesh,

@@ -410,6 +410,14 @@ class BaseConfigTab(QWidget):
             logging.warning("[config] %s = %r is not a number; leaving the "
                             "control at its current value", key, value)
             return
+        # NaN and the infinities ARE floats, so float() accepts them -- and
+        # `int(nan)` raises ValueError while `int(inf)` raises OverflowError,
+        # out of load_from_config, which is a process abort. YAML spells them
+        # `.nan`, `.inf`, `-.inf`; the engine's std::stod reads them too.
+        if number != number or number in (float("inf"), float("-inf")):
+            logging.warning("[config] %s = %r is not a finite number; leaving "
+                            "the control at its current value", key, value)
+            return
         low, high = widget.minimum(), widget.maximum()
         if number < low or number > high:
             logging.warning(
@@ -725,11 +733,14 @@ class SimulationTab(BaseConfigTab):
             days = self.config_manager.get_value("simulation.duration_days", 3.55)
             try:
                 start_dt = datetime.fromisoformat(start_str)
-                end_dt = start_dt + timedelta(days=days)
+                # OverflowError: timedelta(days=inf) and a duration far past
+                # datetime.MAX both raise, and this runs from
+                # load_from_config -- an abort, not a message.
+                end_dt = start_dt + timedelta(days=ConfigManager._as_number(days, 0.0))
                 self.end_time_edit.blockSignals(True)
                 self.end_time_edit.setText(end_dt.strftime("%Y-%m-%dT%H:%M:%S"))
                 self.end_time_edit.blockSignals(False)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 self.end_time_edit.blockSignals(True)
                 self.end_time_edit.setText("")
                 self.end_time_edit.blockSignals(False)

@@ -39,7 +39,8 @@ sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
 
 #: Spellings yaml.safe_load hands back as something other than int/float.
-SPELLINGS = ("-1e0", "5e3", "1e5", '"20"', "~")
+SPELLINGS = ("-1e0", "5e3", "1e5", '"20"', "~",
+             ".nan", ".inf", "-.inf")
 
 #: Every numeric key the GUI reads back into a widget or compares.
 NUMERIC_KEYS = {
