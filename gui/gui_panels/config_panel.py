@@ -1853,18 +1853,23 @@ class ThermophysicalTab(BaseConfigTab):
     Engine reality check (config_parser.cpp, "Parse Thermophysical
     section"): for BUILT-IN bodies the engine ignores plain scalar keys in
     the thermophysical YAML section and honors only the *_override keys --
-    which exist for albedo, emissivity, ks and kd. The remaining properties
-    (H, rhos, rhod, cp0, Qb, chi) can only be customized through
+    which exist for albedo, emissivity, ks, kd and H. The remaining properties
+    (rhos, rhod, cp0, Qb, chi) can only be customized through
     generic_body.surface, i.e. with a Custom/HORIZONS body. This tab
-    therefore DISABLES those six rows when a built-in body is selected
+    therefore DISABLES those five rows when a built-in body is selected
     instead of silently accepting values the engine would never see (the
     old behavior wrote dead placeholders like `cp0: 800.0`).
     """
 
-    # Properties with an engine *_override path for built-in bodies
-    BUILTIN_OVERRIDABLE = ("albedo", "emissivity", "ks", "kd")
+    # Properties with an engine *_override path for built-in bodies.
+    # H moved here on 2026-08-25: the engine has read thermophysical.H_override
+    # all along (config_parser.cpp:759, applied at ptm_thermal_sim.cpp:14778,
+    # which sets planet.H and therefore works on a built-in body). This tab
+    # nevertheless disabled the H row on every built-in body, so the regolith
+    # scale height -- arguably THE lunar thermal parameter -- was unreachable.
+    BUILTIN_OVERRIDABLE = ("albedo", "emissivity", "ks", "kd", "H")
     # Properties with NO engine path for built-in bodies
-    BUILTIN_UNSUPPORTED = ("H", "rhos", "rhod", "cp0", "Qb", "chi")
+    BUILTIN_UNSUPPORTED = ("rhos", "rhod", "cp0", "Qb", "chi")
 
     # Default properties by body (matches planetary_properties.h)
     BODY_DEFAULTS = {
@@ -2055,6 +2060,19 @@ class ThermophysicalTab(BaseConfigTab):
                                        "thermophysical.use_default_rhod", 100.0, 5000.0, 1,
                                        "Deep bulk density (at depth >> H)",
                                        info_key="thermophysical.rhod")
+
+        # Which k(T, rho) law the solver uses. The engine validates the string
+        # and names the valid values (config_parser.cpp: hayne2017 |
+        # martinez2021), so an unknown one is caught there, not guessed at.
+        self.add_combo_field(cond_layout, 6, "Conductivity Model:",
+                             "thermophysical.conductivity_model",
+                             ["hayne2017", "martinez2021"],
+                             "Temperature-dependent conductivity law.\n"
+                             "hayne2017: k = kc x [1 + chi (T/350)^3], the "
+                             "lunar-calibrated default.\n"
+                             "martinez2021: the Martinez et al. (2021) "
+                             "formulation, which depends on density as well as "
+                             "temperature.")
 
         cond_section.add_widget(cond_widget)
         layout.addWidget(cond_section)
@@ -2389,6 +2407,14 @@ class ThermophysicalTab(BaseConfigTab):
             self._set_incidence_model(saved_ica)
             self.config_manager.set_value(
                 "thermophysical.incidence_angle_albedo", saved_ica)
+
+        # Conductivity model is a plain string key, not a body default: it is
+        # not touched by update_to_body_defaults and needs no re-apply dance.
+        cm_widget = self.widgets.get("thermophysical.conductivity_model")
+        if cm_widget is not None:
+            idx = cm_widget.findText(thermo.get("conductivity_model", "hayne2017"))
+            if idx >= 0:
+                cm_widget.setCurrentIndex(idx)
 
         self._update_builtin_support()
 

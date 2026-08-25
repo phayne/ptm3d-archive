@@ -228,6 +228,9 @@ class ConfigManager:
             # directional model (opt-in). Maps to engine key incidence_angle_albedo
             # (config_parser.cpp: false->Hayne/constant, true->Hapke).
             "incidence_angle_albedo": False,
+            # Temperature-dependent conductivity law: hayne2017 | martinez2021
+            # (config_parser.cpp validates the string and names both).
+            "conductivity_model": "hayne2017",
             # Thermal conductivity
             "use_default_ks": True,
             "ks": 7.4e-4,  # Surface conductivity (W/m/K)
@@ -360,9 +363,16 @@ class ConfigManager:
     # refusing with the reason.
 
     # Properties with an engine-side *_override key for BUILT-IN bodies
-    # (config_parser.cpp reads albedo/emissivity/ks/kd_override; the other
+    # (config_parser.cpp "Parse Thermophysical section"; the other
     # thermophysical scalars have no override path outside generic_body).
-    ENGINE_OVERRIDE_KEYS = ("albedo", "emissivity", "ks", "kd")
+    #
+    # H was missing from this tuple until 2026-08-25 even though the engine has
+    # read thermophysical.H_override the whole time (config_parser.cpp:759,
+    # applied at ptm_thermal_sim.cpp:14778 by setting planet.H directly, so it
+    # works on a built-in body). The regolith density scale height is arguably
+    # THE lunar thermal parameter, and a colleague could not change it on the
+    # Moon from this GUI at all.
+    ENGINE_OVERRIDE_KEYS = ("albedo", "emissivity", "ks", "kd", "H")
 
     def __init__(self):
         self.config = deepcopy(self.DEFAULT_CONFIG)
@@ -595,6 +605,8 @@ class ConfigManager:
                     "use_default_albedo": thermo.get("use_default_albedo", True),
                     "incidence_angle_albedo": thermo.get(
                         "incidence_angle_albedo", False),
+                    "conductivity_model": thermo.get(
+                        "conductivity_model", "hayne2017"),
                     "constant_thermal_inertia": thermo.get(
                         "constant_thermal_inertia", -1.0),
                 }
@@ -603,7 +615,7 @@ class ConfigManager:
                         val = thermo.get(key)
                         if val is not None:
                             cleaned[f"{key}_override"] = val
-                # The remaining properties (H, rhos, rhod, cp0, Qb, chi) have
+                # The remaining properties (rhos, rhod, cp0, Qb, chi) have
                 # NO engine override path for built-in bodies; the UI disables
                 # them (see ThermophysicalTab) so nothing is silently dropped
                 # here.
