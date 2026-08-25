@@ -715,7 +715,15 @@ class PTM3DMainWindow(QMainWindow):
         # diagnosis (e.g. an OneDrive topo_directory of evicted files).
         report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
         for line in report.summary_lines():
-            self.console_panel.append_info(f"[preflight] {line}")
+            # summary_lines() already tags severity; route it so a warning is
+            # colored as one. Everything went through append_info before, which
+            # made "WARNING: engine environment changed ..." look like a note.
+            if line.startswith(("ERROR:", "DATALESS:")):
+                self.console_panel.append_error(f"[preflight] {line}")
+            elif line.startswith(("WARNING:", "CLOUD:", "VF-GUARD:")):
+                self.console_panel.append_warning(f"[preflight] {line}")
+            else:
+                self.console_panel.append_info(f"[preflight] {line}")
         if not confirm_preflight(self, report):
             self.console_panel.append_warning("Launch canceled by pre-flight check")
             return

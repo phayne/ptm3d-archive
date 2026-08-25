@@ -46,20 +46,61 @@ from pathlib import Path
 #
 #   PTM_ILLUM_TRUE_NORMALS=1  flipped-normal overhang shadowing fix (PTM-13
 #                             Phase-2, commit dd09cb8; Fermi gate PASS)
+#   PTM_ILLUM_RISE_EPS=1      enables the rise-epsilon grazing-incidence path
+#                             (traceOccludedRiseEps). It is the GATE: without
+#                             it, RISE_KEPS and RISE_HABS below are never read
+#                             (illumination_model.cpp:616, :1419).
+#   PTM_ILLUM_RISE_KEPS=0.2   the rise-epsilon scale factor validated with it
 #   PTM_ILLUM_RISE_HABS=0     grazing rise-floor leak fix: h_abs = 0 kills
 #                             100% of leaks with zero shadow acne (same gate)
 #   PTM_ILLUM_SEAL_HOLES=1    PTM-18 interior mesh-hole penumbra flash fix
-#   PTM_EQ_PERFACE_FLUX=1     per-face flux equilibration
+#
+# This is the [recommended-ON] set of docs/ENVIRONMENT.md MINUS one variable:
+#
+#   PTM_EQ_PERFACE_FLUX       deliberately NOT injected (PTM-276). On the CPU
+#                             path the engine itself reports it has "NO effect
+#                             on this run"; on the GPU path with
+#                             thermal.spinup_seed: legacy it is LIVE and
+#                             silently overrides the one setting whose whole
+#                             purpose is digit-for-digit reproduction of a
+#                             pre-fix baseline. A config that wants it can
+#                             still ask, in its own engine_env: block.
+#
+# ENV_SET_CHANGED_PHYSICS below records that this table changed on 2026-08-25
+# and that GUI-run physics moved with it.
 #
 # Unknown variables are ignored by older engine builds, so this set is safe
 # to inject unconditionally.
 # --------------------------------------------------------------------------
 RECOMMENDED_ENGINE_ENV = {
     "PTM_ILLUM_TRUE_NORMALS": "1",
+    "PTM_ILLUM_RISE_EPS": "1",
+    "PTM_ILLUM_RISE_KEPS": "0.2",
     "PTM_ILLUM_RISE_HABS": "0",
     "PTM_ILLUM_SEAL_HOLES": "1",
-    "PTM_EQ_PERFACE_FLUX": "1",
 }
+
+#: Variables in the docs/ENVIRONMENT.md [recommended-ON] set that the GUI does
+#: NOT inject, each with the reason. Pinned by
+#: ``src/python/tests/test_gui_engine_env.py``: a variable may be left out only
+#: by appearing here, so the omission is a decision on the record rather than a
+#: table that quietly fell behind the documentation.
+DELIBERATELY_NOT_INJECTED = {
+    "PTM_EQ_PERFACE_FLUX":
+        "PTM-276: inert on CPU (the engine says so), and on GPU it overrides "
+        "an explicit thermal.spinup_seed: legacy. Ask for it per config.",
+}
+
+#: One-line banner for the console: injecting the rise-epsilon gate changed the
+#: physics of every GUI run relative to every GUI run before 2026-08-25.
+ENV_SET_CHANGED_PHYSICS = (
+    "engine environment changed 2026-08-25: PTM_ILLUM_RISE_EPS=1 and "
+    "PTM_ILLUM_RISE_KEPS=0.2 are now injected, so the validated grazing-leak "
+    "fix APPLIES. Every GUI run before this date silently ran without it "
+    "(PTM_ILLUM_RISE_HABS alone is inert). Illumination -- and therefore "
+    "temperatures -- differ from earlier GUI runs of the same config. "
+    "PTM_EQ_PERFACE_FLUX is no longer injected (PTM-276)."
+)
 
 CLOUD_PATH_MARKERS = ("/Library/CloudStorage/",)
 
@@ -761,6 +802,11 @@ def run_preflight(config, find_executable, project_root=None):
         for p in problems:
             report.warnings.append(f"engine env: {p}")
     report.info.append("engine env: " + " ".join(applied))
+    # A physics change is not a footnote. Warn, not info, so the console
+    # classifier colors it and a colleague comparing against an older GUI run
+    # of the same config is told why the numbers moved.
+    if env.get("PTM_ILLUM_RISE_EPS") == "1":
+        report.warnings.append(ENV_SET_CHANGED_PHYSICS)
 
     return report
 
