@@ -207,12 +207,14 @@ class ConfigManager:
             "h_parameter_map": "",
             "use_default_property_map": False,
             "property_maps_directory": "data/property_maps",
+            # Both of these now have controls on the Thermal tab. The rest of
+            # the old orphan set (crater_dd_ratio, integration_offset_days,
+            # integration_offset_steps) is gone: written into every saved YAML
+            # at the engine's own default, with no widget and no handler, so
+            # they read as settings and were not.
             "enable_shadow_flux": False,
-            "crater_dd_ratio": 8.0,
             "integration_days": -1.0,
             "integration_steps": -1,
-            "integration_offset_days": 0.0,
-            "integration_offset_steps": 0,
             "geothermal_heat_flow": -1.0  # W/m², -1 = use planet default
         },
         "thermophysical": {
@@ -286,21 +288,22 @@ class ConfigManager:
             "positions_file": ""
         },
         "output": {
+            # thermal_vtk_file, complete_vtk_file and location_data were
+            # written into every saved YAML at '' with no control anywhere.
+            # output.vtk_mode already selects which VTK products a run writes;
+            # the explicit filename keys are a CLI concern.
             "directory": "output",
             "format": "binary",
             "vtk_mode": "both",
             "include_primary_ir": False,
-            "thermal_vtk_file": "",
-            "complete_vtk_file": "",
             "locations_file": "",
             "depths_file": "",
-            "series_output": "",
-            "location_data": ""
+            "series_output": ""
         },
-        "advanced": {
-            "verbose": False,
-            "default_visible_albedo": -1.0
-        },
+        # The `advanced:` section held exactly two keys (verbose,
+        # default_visible_albedo), both at the engine's default, both with no
+        # control. Dropping the section changes no run: the engine reads it
+        # under `if (root["advanced"])` and falls back to the same values.
         # Engine environment flags (PTM_*) passed to ptm_thermal_sim.
         # Prefilled with the recommended-ON physics fix set; edited via the
         # Engine Flags tab. A blank value means "do not set". The C++ YAML

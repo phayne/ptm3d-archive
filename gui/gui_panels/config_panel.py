@@ -1152,6 +1152,21 @@ class ThermalTab(BaseConfigTab):
                             "Calculate min/max/mean temperature statistics",
                             info_key="thermal.compute_statistics")
 
+        # Both of these were written into every saved config with no control
+        # at all. enable_shadow_flux is a physics switch; geothermal_heat_flow
+        # is the per-run bottom boundary condition.
+        self.add_bool_field(control_layout, 4, "Enable Shadow Flux",
+                            "thermal.enable_shadow_flux",
+                            info_key="thermal.enable_shadow_flux")
+        self.add_double_field(control_layout, 5, "Geothermal Q_b (W/m²):",
+                              "thermal.geothermal_heat_flow", -1.0, 10.0, 4,
+                              "Bottom-boundary heat flux. -1 = the body's own "
+                              "default. A positive value is a property "
+                              "OVERRIDE: the engine reports it alongside the "
+                              "thermophysical overrides and arms the same "
+                              "forwarding tripwire.",
+                              info_key="thermal.geothermal_heat_flow")
+
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
 
@@ -1585,6 +1600,10 @@ class ThermalTab(BaseConfigTab):
 
             self.widgets["thermal.compute_statistics"].setChecked(thermal["compute_statistics"])
             self.widgets["thermal.use_gpu"].setChecked(thermal.get("use_gpu", False))
+            self.widgets["thermal.enable_shadow_flux"].setChecked(
+                thermal.get("enable_shadow_flux", False))
+            self.widgets["thermal.geothermal_heat_flow"].setValue(
+                thermal.get("geothermal_heat_flow", -1.0))
 
             self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
             self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
