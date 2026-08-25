@@ -2082,29 +2082,58 @@ class RadiationTab(BaseConfigTab):
         self._update_beaming_gating()
 
     def _update_beaming_gating(self, _checked=None):
-        """Apply the facet-scale and body rules to the beaming control pair."""
+        """Apply the facet-scale and body rules to the beaming control pair.
+
+        The rule governs whether beaming may be turned ON here. It does NOT
+        silently turn OFF a config that arrived with it on: rewriting someone's
+        physics behind their back is the failure mode this whole stage exists to
+        remove, and the rule can decline for reasons that are not "the mesh is
+        too fine" -- a topographic mesh, a non-PLY import, an unreadable path.
+        An inherited setting the rule disagrees with is kept, said loudly, and
+        left switchable so the user can act on it.
+        """
         policy = self._beaming_policy()
         switch = self.widgets["radiation.beaming"]
         knob = self.widgets["radiation.rms_slope_deg"]
 
         self.beaming_ack.setVisible(policy.needs_acknowledgment)
         ack_ok = (not policy.needs_acknowledgment) or self.beaming_ack.isChecked()
-        may_enable = policy.allowed and ack_ok
+        may_turn_on = policy.allowed and ack_ok
+        already_on = switch.isChecked()
 
-        if not may_enable and switch.isChecked():
-            # Refusing has to actually refuse. Turn it off and say why.
-            switch.blockSignals(True)
-            switch.setChecked(False)
-            switch.blockSignals(False)
-            self.config_manager.set_value("radiation.beaming", False)
-        switch.setEnabled(may_enable)
-        knob.setEnabled(may_enable and switch.isChecked())
+        # Enabled when the rule permits it, or when it is already on so the
+        # user can still turn it off.
+        switch.setEnabled(may_turn_on or already_on)
+        knob.setEnabled(already_on)
 
-        color = "#81C784" if policy.allowed and not policy.needs_acknowledgment \
-            else "#FFB74D" if policy.allowed else "#E57373"
+        text = policy.reason
+        if already_on and not may_turn_on:
+            text = ("BEAMING IS ON AND THIS MESH DOES NOT MEET THE RULE. It "
+                    "has been left as the configuration set it -- nothing here "
+                    "rewrites your physics -- but check it before trusting the "
+                    "run.\n" + policy.reason)
+            logging.warning("[beaming] radiation.beaming is ON and the "
+                            "facet-scale rule declines: %s", policy.reason)
+            color = "#E57373"
+        elif not policy.allowed:
+            color = "#E57373"
+        elif policy.needs_acknowledgment:
+            color = "#FFB74D"
+        else:
+            color = "#81C784"
         self.beaming_note.setStyleSheet(
             f"color: {color}; font-size: 10px; padding: 4px;")
-        self.beaming_note.setText(policy.reason)
+        self.beaming_note.setText(text)
+
+    def on_mesh_changed(self):
+        """The mesh decides the facet scale, so it decides the beaming rule.
+
+        Without this the rule failed OPEN: enable beaming on a lunar icosphere,
+        then import a millimeter-scale mesh on the Mesh tab, and `beaming: true`
+        went to the engine on exactly the mesh the rule exists to refuse.
+        """
+        self._update_beaming_gating()
+        self.update_vf_estimate()
 
     def _update_coupling_mode_gating(self, _mode=None):
         """Face Fraction is editable only in the mode whose name it carries."""
@@ -2238,23 +2267,27 @@ class RadiationTab(BaseConfigTab):
         self.widgets["radiation.beaming"].blockSignals(True)
         self.widgets["radiation.beaming"].setChecked(rad.get("beaming", False))
         self.widgets["radiation.beaming"].blockSignals(False)
-        self._legacy_beaming_note(rad)
+        self._legacy_beaming_note()
         self._update_hmatrix_suboptions()
         self._update_coupling_mode_gating()
         self._update_vf_builder_gating()
         self._update_beaming_gating()
         self.update_vf_estimate()
 
-    def _legacy_beaming_note(self, rad):
+    def _legacy_beaming_note(self):
         """A pre-2026-08-25 config had no `beaming` key; the switch was implied.
 
-        config_parser.cpp honors that bridge and prints a NOTE. The GUI writes
-        the key explicitly, so a config loaded here and saved again would carry
-        `beaming: false` and silently demote the run to Lambertian unless the
-        implied switch is surfaced now.
+        config_parser.cpp:631 honors that bridge and prints a NOTE. The GUI
+        writes the key explicitly, so such a config loaded here and run would
+        carry `beaming: false` and silently demote the run to Lambertian.
+
+        The detection CANNOT be done from `self.config_manager.get_config()`:
+        the merge with DEFAULT_CONFIG always supplies `beaming`, so "the file
+        did not mention it" is information only ConfigManager.load_from_yaml
+        has. It records it on `legacy_implicit_beaming`; this reads that.
         """
-        implied = ("beaming" not in rad) and (rad.get("rms_slope_deg", 0.0) > 0.0)
-        if not implied:
+        slope = getattr(self.config_manager, "legacy_implicit_beaming", None)
+        if slope is None:
             return
         self.widgets["radiation.beaming"].blockSignals(True)
         self.widgets["radiation.beaming"].setChecked(True)
@@ -2264,7 +2297,7 @@ class RadiationTab(BaseConfigTab):
             "[beaming] this config has rms_slope_deg = %s and no 'beaming' key: "
             "the pre-2026-08-25 implicit switch. Beaming has been turned ON to "
             "match what the engine would do, and will be written explicitly on "
-            "the next save.", rad.get("rms_slope_deg"))
+            "the next save.", slope)
 
 
 class ThermophysicalTab(BaseConfigTab):
@@ -2670,9 +2703,9 @@ class ThermophysicalTab(BaseConfigTab):
                           lambda: False)()
         unsupported_tip = (
             "Not customizable for built-in bodies: the engine has no "
-            "override key for this property (config_parser.cpp reads only "
-            "albedo/emissivity/ks/kd overrides). Use a Custom or HORIZONS "
-            "body to set it via generic_body.surface.")
+            "override key for this property (config_parser.cpp reads "
+            + "/".join(self.BUILTIN_OVERRIDABLE) + " overrides only). Use a "
+            "Custom or HORIZONS body to set it via generic_body.surface.")
         for attr in self.BUILTIN_UNSUPPORTED:
             vkey = f"thermophysical.{attr}"
             dkey = f"thermophysical.use_default_{attr}"
@@ -2705,10 +2738,10 @@ class ThermophysicalTab(BaseConfigTab):
             else:
                 self.info_label.setText(
                     "Properties shown are defaults for the selected body. "
-                    "For built-in bodies the engine accepts custom values "
-                    "for Bond albedo, emissivity, ks and kd only (saved as "
-                    "*_override keys); the grayed-out properties require a "
-                    "Custom or HORIZONS body.")
+                    "For built-in bodies the engine accepts custom values for "
+                    + ", ".join(self.BUILTIN_OVERRIDABLE)
+                    + " only (saved as *_override keys); the grayed-out "
+                    "properties require a Custom or HORIZONS body.")
 
     def _on_incidence_model_changed(self, _idx):
         """Selector changed -> write the Hayne/Hapke boolean to config."""
@@ -4223,9 +4256,25 @@ class ConfigurationPanel(QWidget):
                 lambda _v: self.tabs["mesh"].refresh_builtin_topo())
             res_widget.valueChanged.connect(
                 lambda _v: self.tabs["illumination"].refresh_builtin_albedo())
-            # Mesh resolution changes the face count -> refresh the VF estimate.
+            # Mesh resolution changes the face count -> refresh the VF estimate
+            # AND re-evaluate the beaming facet-scale rule, which is a property
+            # of the mesh. Without the second the rule fails open.
             res_widget.valueChanged.connect(
-                lambda _v: self.tabs["radiation"].update_vf_estimate())
+                lambda _v: self.tabs["radiation"].on_mesh_changed())
+
+        # Importing or clearing a mesh changes the facet scale outright.
+        for key in ("mesh.import_file", "mesh.scale_factor"):
+            widget = self.tabs["mesh"].widgets.get(key)
+            if widget is None:
+                continue
+            signal = getattr(widget, "textChanged", None) or \
+                getattr(widget, "valueChanged", None)
+            if signal is not None:
+                signal.connect(lambda _v: self.tabs["radiation"].on_mesh_changed())
+        topo = self.tabs["mesh"].widgets.get("mesh.use_topographic")
+        if topo is not None:
+            topo.toggled.connect(
+                lambda _v: self.tabs["radiation"].on_mesh_changed())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:

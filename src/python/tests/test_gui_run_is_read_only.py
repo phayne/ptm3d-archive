@@ -103,6 +103,52 @@ def test_run_simulation_writes_a_run_yaml_beside_the_output():
         "read-only open is not the same as launching with no config")
 
 
+def test_the_run_yaml_is_written_only_after_the_preflight_gate():
+    """A blocked or canceled launch must not leave a config.yaml behind.
+
+    The tutorial tells the user this file "is the exact configuration that ran",
+    which is false if it is written before the gate: a dataless-file block or a
+    cancel overwrites the previous run's record with a run that never happened.
+    """
+    _cls, fn = _run_simulation_node()
+    save = confirm = None
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) \
+            else getattr(node.func, "id", "")
+        if name == "save_run_yaml":
+            save = node.lineno
+        elif name == "confirm_preflight":
+            confirm = node.lineno
+    assert save is not None and confirm is not None, (save, confirm)
+    assert save > confirm, (
+        f"save_run_yaml runs at {GUI_MAIN.name}:{save}, before the "
+        f"confirm_preflight gate at :{confirm}")
+
+
+def test_the_console_is_not_cleared_after_the_preflight_output():
+    """The physics-change banner has to survive to the screen.
+
+    The environment fix is disclosed through a `[preflight] WARNING:` console
+    line. A `console_panel.clear()` after the preflight loop erased it, along
+    with the cloud-path and view-factor advisories, the instant the run started.
+    """
+    _cls, fn = _run_simulation_node()
+    clears = [n.lineno for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "clear"]
+    preflight = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "run_preflight"]
+    assert preflight, "run_simulation no longer runs the pre-flight at all"
+    late = [c for c in clears if c > preflight[0]]
+    assert not late, (
+        f"console_panel.clear() at {GUI_MAIN.name}:{late} runs after "
+        f"run_preflight at :{preflight[0]}, erasing every [preflight] line "
+        f"including the engine-environment banner")
+
+
 def test_loading_a_shipped_example_does_not_mutate_it():
     """Load -> write the run YAML elsewhere -> the example is untouched.
 
@@ -135,6 +181,8 @@ def test_loading_a_shipped_example_does_not_mutate_it():
 TESTS = [
     test_run_simulation_never_writes_the_project_file,
     test_run_simulation_writes_a_run_yaml_beside_the_output,
+    test_the_run_yaml_is_written_only_after_the_preflight_gate,
+    test_the_console_is_not_cleared_after_the_preflight_output,
     test_loading_a_shipped_example_does_not_mutate_it,
 ]
 

@@ -298,6 +298,43 @@ def test_the_beaming_pair_is_writable_and_never_half_set():
     assert back.get_value("radiation.rms_slope_deg") == 32.5
 
 
+def test_the_pre_2026_08_25_implicit_beaming_switch_survives_a_load():
+    """A config with a slope and no `beaming` key must not be demoted.
+
+    config_parser.cpp:631 turns beaming ON for such a config and says so. The
+    GUI writes `beaming` explicitly, so unless the implicit switch is detected
+    at load, the run YAML carries `beaming: false` and silently demotes a
+    validated beaming run to Lambertian.
+
+    The detection cannot be done from the merged config -- DEFAULT_CONFIG always
+    supplies `beaming` -- which is exactly how the first attempt at this check
+    came out dead. It is recorded by load_from_yaml.
+    """
+    manager_cls = type(_manager())
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy.yaml"
+        path.write_text("simulation:\n  body: Moon\n"
+                        "radiation:\n  enabled: true\n  rms_slope_deg: 32.5\n")
+        manager = manager_cls()
+        manager.load_from_yaml(str(path))
+        assert manager.legacy_implicit_beaming == 32.5, (
+            f"the implicit switch was not detected "
+            f"({manager.legacy_implicit_beaming!r})")
+        assert manager.get_value("radiation.beaming") is True
+        assert manager._config_for_yaml()["radiation"]["beaming"] is True, (
+            "the run YAML would hand the engine beaming: false for a config "
+            "the engine itself would run with beaming ON")
+
+        # An explicit `beaming: false` next to a slope is NOT the implicit
+        # switch, and must be left alone.
+        path.write_text("simulation:\n  body: Moon\nradiation:\n"
+                        "  enabled: true\n  beaming: false\n  rms_slope_deg: 32.5\n")
+        manager = manager_cls()
+        manager.load_from_yaml(str(path))
+        assert manager.legacy_implicit_beaming is None
+        assert manager.get_value("radiation.beaming") is False
+
+
 TESTS = [
     test_H_override_is_written_on_a_builtin_body,
     test_H_override_survives_a_round_trip,
@@ -314,6 +351,7 @@ TESTS = [
     test_the_occluder_is_preflight_checked_like_the_core_mesh,
     test_the_occluder_path_is_absolutized_for_the_run_yaml,
     test_the_beaming_pair_is_writable_and_never_half_set,
+    test_the_pre_2026_08_25_implicit_beaming_switch_survives_a_load,
 ]
 
 

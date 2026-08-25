@@ -163,6 +163,22 @@ def test_a_config_can_decline_the_flags():
         f"'no fix flags' has to be expressible")
     assert applied == [], f"applied should be empty, got {applied}"
 
+    # Declining has to survive a shell that already exports the variable.
+    # Setting-only would leave the child running with it while this function
+    # reported an empty environment -- the PTM-276 hole, from the other side.
+    inherited = {"PTM_EQ_PERFACE_FLUX": "1", "PTM_ILLUM_RISE_EPS": "1",
+                 "PATH": "/usr/bin"}
+    env, applied = build_engine_env({"engine_env": {}}, base_env=inherited)
+    leaked = sorted(k for k in env if k.startswith("PTM_"))
+    assert not leaked, (
+        f"an inherited {leaked} survived an engine_env: {{}} decline; the "
+        f"launching shell must not be able to re-enable a flag the config "
+        f"declined")
+    assert env["PATH"] == "/usr/bin", (
+        "the environment outside the managed variables must be left alone")
+    assert any("removed" in line for line in applied), (
+        f"the removal was not disclosed: applied={applied}")
+
     env, _ = build_engine_env(
         {"engine_env": {"PTM_ILLUM_TRUE_NORMALS": "0"}}, base_env={})
     assert env.get("PTM_ILLUM_TRUE_NORMALS") == "0"
@@ -239,6 +255,32 @@ def test_loading_a_config_does_not_re_add_the_flags():
     assert none == dict(RECOMMENDED_ENGINE_ENV), none
 
 
+def test_a_shell_export_cannot_re_enable_the_dropped_variable():
+    """PTM-276 from the other side, in the default (no engine_env:) case.
+
+    The GUI stopped injecting PTM_EQ_PERFACE_FLUX. That is worth nothing if a
+    user who once exported it in their shell still hands it to every GUI run,
+    where on the GPU path it overrides an explicit thermal.spinup_seed: legacy.
+    """
+    from gui_core.preflight import MANAGED_ENGINE_ENV
+
+    env, applied = build_engine_env(
+        {}, base_env={"PTM_EQ_PERFACE_FLUX": "1", "HOME": "/tmp"})
+    assert "PTM_EQ_PERFACE_FLUX" not in env, (
+        "an exported PTM_EQ_PERFACE_FLUX reached the engine even though the "
+        "GUI deliberately does not inject it")
+    assert env["HOME"] == "/tmp", "unmanaged variables must be untouched"
+    assert any("PTM_EQ_PERFACE_FLUX" in line and "removed" in line
+               for line in applied), applied
+
+    for name in DELIBERATELY_NOT_INJECTED:
+        assert name in MANAGED_ENGINE_ENV, (
+            f"{name} is declared not-injected but is not managed, so an "
+            f"inherited copy would still reach the engine")
+    for name in RECOMMENDED_ENGINE_ENV:
+        assert name in MANAGED_ENGINE_ENV, name
+
+
 def test_the_physics_change_is_announced():
     """The banner names the variables and says temperatures move."""
     for token in ("PTM_ILLUM_RISE_EPS", "PTM_ILLUM_RISE_KEPS",
@@ -254,6 +296,7 @@ TESTS = [
     test_a_config_can_decline_the_flags,
     test_declining_the_flags_is_reported_not_silent,
     test_loading_a_config_does_not_re_add_the_flags,
+    test_a_shell_export_cannot_re_enable_the_dropped_variable,
     test_the_physics_change_is_announced,
 ]
 

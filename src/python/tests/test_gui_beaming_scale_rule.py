@@ -181,6 +181,42 @@ def test_a_lunar_icosphere_is_allowed_and_costs_no_file_read():
         assert policy.scale.n_faces == 20 * (4 ** res)
 
 
+def test_a_face_element_with_extra_properties_is_refused_not_misread():
+    """A meshlab-style face element carries colors after the index list.
+
+    Reading only the index list leaves the stream misaligned, and a misread
+    record that happens to decode `n == 3` yields a WRONG mean area silently --
+    which could report a mesh as coarser than it is and allow beaming on one the
+    rule exists to refuse. Refusing the layout is the only safe answer.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "colored.ply"
+        verts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+                 (1.0, 1.0, 0.0)]
+        faces = [(0, 1, 2), (1, 3, 2)]
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"element vertex {len(verts)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  f"element face {len(faces)}\n"
+                  "property list uchar int vertex_indices\n"
+                  "property uchar red\nproperty uchar green\n"
+                  "property uchar blue\nend_header\n")
+        with open(path, "wb") as fh:
+            fh.write(header.encode("ascii"))
+            for v in verts:
+                fh.write(struct.pack("<fff", *v))
+            for f in faces:
+                fh.write(struct.pack("<Biii", 3, *f) + bytes([255, 0, 0]))
+
+        scale = facet_scale(_config(path))
+        assert scale.meters is None, (
+            f"a face element with trailing color properties was read as "
+            f"{scale.meters} m instead of being refused; a misaligned read can "
+            f"report a mesh as coarser than it is")
+        assert "layout" in scale.detail or "properties" in scale.detail, scale.detail
+        assert not beaming_policy(_config(path)).allowed
+
+
 def test_an_unreadable_mesh_refuses_rather_than_guesses():
     """Refusing is the safe direction, and it has to say why."""
     for name, payload in (("missing.ply", None),
@@ -204,6 +240,7 @@ TESTS = [
     test_the_boundaries_are_where_the_decision_says,
     test_non_lunar_bodies_are_refused_whatever_the_scale,
     test_a_lunar_icosphere_is_allowed_and_costs_no_file_read,
+    test_a_face_element_with_extra_properties_is_refused_not_misread,
     test_an_unreadable_mesh_refuses_rather_than_guesses,
 ]
 

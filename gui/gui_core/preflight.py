@@ -615,16 +615,39 @@ def engine_env_plan(config):
     return table, "engine_env: block in the config"
 
 
+#: The variables this module OWNS: it sets them when the plan asks for them and
+#: REMOVES them when the plan does not. Nothing outside this set is ever taken
+#: out of the inherited environment.
+MANAGED_ENGINE_ENV = tuple(sorted(
+    set(RECOMMENDED_ENGINE_ENV) | set(DELIBERATELY_NOT_INJECTED)))
+
+
 def build_engine_env(config, base_env=None):
-    """Compose the subprocess environment: inherited env + whatever
-    ``engine_env_plan`` decides this config asks for.
-    Returns (env, applied) where applied lists 'KEY=VAL' lines actually set."""
+    """Compose the subprocess environment: inherited env, then the managed
+    variables forced to exactly what ``engine_env_plan`` says.
+
+    Setting is not enough. The launching shell may already export
+    ``PTM_EQ_PERFACE_FLUX=1``, and merely declining to add it would leave the
+    child running with it -- so a config that says "no fix flags", or a
+    ``thermal.spinup_seed: legacy`` run that must not be overridden (PTM-276),
+    would silently get it anyway while this function reported an empty
+    environment. Managed variables the plan omits are therefore REMOVED from the
+    inherited environment, and the removal is reported.
+
+    Returns (env, applied); `applied` lists what was set AND what was removed,
+    because a run's disclosure has to describe the environment the engine
+    actually sees.
+    """
     env = dict(base_env if base_env is not None else os.environ)
     table, _source = engine_env_plan(config)
     applied = []
     for k in sorted(table):
         env[k] = table[k]
         applied.append(f"{k}={table[k]}")
+    for k in MANAGED_ENGINE_ENV:
+        if k not in table and k in env:
+            inherited = env.pop(k)
+            applied.append(f"{k}=(removed; inherited {inherited!r})")
     env["PYTHON_EXECUTABLE"] = sys.executable
     return env, applied
 

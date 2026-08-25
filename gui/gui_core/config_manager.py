@@ -411,6 +411,17 @@ class ConfigManager:
 
     def __init__(self):
         self.config = deepcopy(self.DEFAULT_CONFIG)
+        #: rms_slope_deg of a loaded config that used the pre-2026-08-25
+        #: IMPLICIT beaming switch (a positive slope and no `beaming` key), or
+        #: None. It cannot be recovered from `self.config` afterward: the merge
+        #: with DEFAULT_CONFIG always supplies `beaming`, so "the file did not
+        #: mention it" is information only `load_from_yaml` ever has.
+        self.legacy_implicit_beaming = None
+
+    def reset_to_defaults(self):
+        """Reset configuration to defaults"""
+        self.config = deepcopy(self.DEFAULT_CONFIG)
+        self.legacy_implicit_beaming = None
 
     def generic_body_active(self):
         """True when the config carries real generic-body data (the engine
@@ -449,16 +460,29 @@ class ConfigManager:
         except (KeyError, TypeError):
             return default
 
-    def reset_to_defaults(self):
-        """Reset configuration to defaults"""
-        self.config = deepcopy(self.DEFAULT_CONFIG)
-
     def load_from_yaml(self, filename):
         """Load configuration from YAML file"""
         with open(filename, 'r') as f:
             loaded = yaml.safe_load(f)
 
+        # Record the pre-2026-08-25 IMPLICIT beaming switch before merging.
+        # config_parser.cpp:631 turns beaming ON for a config with a positive
+        # rms_slope_deg and no `beaming` key, and says so. Once merged with
+        # DEFAULT_CONFIG the key is always present, so this is the only moment
+        # the distinction exists -- and it matters, because the GUI writes
+        # `beaming` explicitly and would otherwise hand the engine
+        # `beaming: false`, silently demoting that run to Lambertian.
+        loaded_rad = ((loaded or {}).get("radiation", {}) or {}) \
+            if isinstance(loaded, dict) else {}
+        self.legacy_implicit_beaming = (
+            loaded_rad.get("rms_slope_deg")
+            if "beaming" not in loaded_rad
+            and (loaded_rad.get("rms_slope_deg") or 0.0) > 0.0
+            else None)
+
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
+        if self.legacy_implicit_beaming is not None:
+            self.config["radiation"]["beaming"] = True
 
         # engine_env is REPLACED, not merged. A config that carries the block
         # is taken at its word -- `engine_env: {}` means "no fix flags", and a

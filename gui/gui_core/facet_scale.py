@@ -267,6 +267,16 @@ def _accumulate_binary_faces(fh, n_faces, properties, vertices):
     lists = [p for p in properties if p[0] == "list"]
     if not lists:
         raise ValueError("PLY face element carries no vertex-index list")
+    # A meshlab-style face element can carry trailing scalars (red/green/blue)
+    # or a second list after the index list. Reading only the index list would
+    # then leave the stream misaligned, and a misread record that happens to
+    # decode n == 3 yields a WRONG mean area silently -- which could allow
+    # beaming on a mesh the rule exists to refuse. Refuse the layout instead.
+    if properties.index(lists[0]) != 0 or len(properties) != 1:
+        raise ValueError(
+            "PLY face element carries properties beside the vertex-index list "
+            f"({[p[-1] for p in properties]}); this reader cannot compute face "
+            f"areas from that layout")
     _kind, count_type, item_type, _name = lists[0]
     ccode, cwidth = _PLY_SCALAR[count_type]
     icode, iwidth = _PLY_SCALAR[item_type]
@@ -377,9 +387,18 @@ def facet_scale(config, project_root=None):
     import_file = str(mesh.get("import_file", "") or "")
 
     if import_file:
-        path = Path(import_file)
-        if project_root and not path.is_absolute():
-            path = Path(project_root) / path
+        # Resolve exactly the way preflight (and therefore the run YAML) does,
+        # so a relative `data/...` reference under PTM_DATA_ROOT is found here
+        # too. A bare `project_root / path` reported "does not exist" for the
+        # documented deployment, and the policy then refused for the wrong
+        # reason.
+        try:
+            from gui_core.preflight import resolve_data_path
+            path = Path(resolve_data_path(import_file, project_root))
+        except Exception:
+            path = Path(import_file)
+            if project_root and not path.is_absolute():
+                path = Path(project_root) / path
         if not path.exists():
             return FacetScale(detail=f"{path} does not exist")
         if not path.name.lower().endswith(".ply"):
