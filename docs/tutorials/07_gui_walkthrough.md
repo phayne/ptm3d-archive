@@ -220,10 +220,16 @@ through the GUI.
    sanity check on ranges and required fields.
 7. Press **Run** (or `F5`).
 
-Saving first is not required: if a project file is open the GUI saves and runs
-it; otherwise it writes an engine-facing `config.yaml` (all paths absolutized)
-into the output directory and runs that (`gui/ptm3d_gui.py:679-709`). The
-console reports which file it ran.
+Saving first is not required, and **Run never writes the file you opened**. It
+always writes an engine-facing `config.yaml` (all paths absolutized) into the
+output directory and runs that; your project file changes only when you press
+Save or Save As. The console reports both paths — the one the engine read, and
+the project file it left alone.
+
+> Changed on 2026-08-25. Run used to call Save first whenever a project file
+> was open, which rewrote the author's own file: on the two shipped examples
+> that erased 10 and 19 comments and added 33 and 42 keys. A config is a
+> scientific record, so opening is now read-only.
 
 ### The pre-flight check
 
@@ -238,8 +244,26 @@ The lines report:
   quick check that a rebuild took effect;
 - **where the output goes**, and how much disk is free there;
 - **which engine environment flags** are being applied — by default the
-  recommended physics-fix set (`PTM_EQ_PERFACE_FLUX=1`, `PTM_ILLUM_RISE_HABS=0`,
-  `PTM_ILLUM_SEAL_HOLES=1`, `PTM_ILLUM_TRUE_NORMALS=1`).
+  recommended illumination-fix set (`PTM_ILLUM_TRUE_NORMALS=1`,
+  `PTM_ILLUM_RISE_EPS=1`, `PTM_ILLUM_RISE_KEPS=0.2`, `PTM_ILLUM_RISE_HABS=0`,
+  `PTM_ILLUM_SEAL_HOLES=1`) — and **which source** they came from: the
+  recommended set, or an `engine_env:` block in the config, which is honored
+  exactly as written.
+
+> **This set changed on 2026-08-25, and it changes what GUI runs compute.**
+> Until then the GUI set `PTM_ILLUM_RISE_HABS=0` without setting
+> `PTM_ILLUM_RISE_EPS=1`, which is the gate that makes the engine read it at
+> all. The validated grazing-incidence leak fix was therefore **not applied to
+> any GUI run between 2026-07-29 and 2026-08-25**, while the GUI's own comment
+> and this page both said it was. Adding the gate and its scale factor turns
+> the fix on, so illumination — and therefore temperatures — differ from
+> earlier GUI runs of the same config.
+>
+> `PTM_EQ_PERFACE_FLUX` is deliberately **no longer injected** (PTM-276). The
+> engine reports it has no effect on the CPU path, and on the GPU path with
+> `thermal.spinup_seed: legacy` it silently overrides the one setting whose
+> whole purpose is reproducing a pre-fix baseline digit-for-digit. A config
+> that wants it can ask for it in its own `engine_env:` block.
 
 Pre-flight *blocks* the launch on missing/unreadable files and on "dataless"
 cloud placeholders (files evicted to the cloud; reading one hangs the engine
@@ -352,10 +376,19 @@ binaries yourself, see
 
 `Ctrl+S` writes the configuration as YAML — the same schema the command-line
 engine reads, so a GUI project *is* a config file and vice versa. `Ctrl+O`
-reopens one, **File > Open Recent** keeps the last ten. A run's auto-saved
+reopens one, **File > Open Recent** keeps the last ten. Every run's
 `config.yaml` (in the output directory, with absolutized paths) is the exact
 configuration that ran, which makes it the right thing to archive next to the
 results.
+
+Two things worth knowing about what a save writes:
+
+- **Comments are not preserved.** The GUI serializes its own dictionary, so a
+  hand-written config that you open and then Save comes back without its
+  comments. This is why Run no longer saves for you. A comment-preserving round
+  trip is planned (`docs/design/gui-update-plan.md`, DP-1(b)).
+- **An `engine_env:` block is honored exactly as written**, including an empty
+  one. Only a config with no `engine_env:` key at all gets the recommended set.
 
 ---
 

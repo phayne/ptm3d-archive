@@ -156,6 +156,10 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `compute_ice_stability` | bool | false | Compute the subsurface ice-stability depth |
 | `enable_shadow_flux` | bool | false | Sub-grid crater shadowing correction |
 | `crater_dd_ratio` | float | 8.0 | Diameter-to-depth ratio for that correction |
+| `spinup_seed` | string | `physical` | The initial condition. `physical` seeds every face from its own cycle-mean conductive steady profile, so a permanently shadowed column starts on the geothermal floor rather than 42–47 K above it. `legacy` restores each path's pre-2026-08-11 seed **and** the analytic pre-conditioner, i.e. exactly what produced every result in this repository before that date — use it to reproduce an old baseline. An unrecognized name is fatal at startup, never a silent fallback |
+| `seed_anchor` | string | `lumped` | Which surface anchor the shared seed hangs its conductive profile from. Read **only** under `spinup_seed: physical`. `lumped` anchors at the cycle mean; `warm` uses the fourth-moment anchor, which by Jensen is ≥ the mean (+45 K on the lit population of the shipped lunar 80N crater) and is byte-identical to the pre-2026-08-12 seed |
+| `seed_anchor_refuse_two_timescale` | bool | false | Refuse the lumped anchor on a face carrying both diurnal and seasonal power, where one conductance cannot cover both. Off by default because refusing substitutes `warm`, the estimator with the +45 K bias. Detection and reporting are always on regardless |
+| `analytic_seed_cycles` | float | -1.0 | Diurnal cycles of the CPU analytic clear-sky pre-conditioner: `cos(lat)·cos(h)` insolation with no topography, no shadowing, no IR and no indirect flux. It is a **forcing, not a seed**, it is not counted by `equilibration_orbits`, and the GPU has no analog. -1 follows `spinup_seed` (physical → 0, legacy → the historic count: Moon 24, Europa 2, Mercury 4); 0 is off; a positive value is used exactly and announced |
 | `debug` | bool | false | Verbose per-layer output for one equatorial face |
 
 The checkpoint files are used by the chunked-run workflow
@@ -427,6 +431,8 @@ command line wins. The full key list, with the physics behind each, is in
 | `view_factor_file` | string | `""` | Save/load path for the view-factor matrix; a relative path resolves against the configuration file's directory |
 | `use_hmatrix` | bool | false | Hierarchical-matrix compression for large meshes |
 | `use_monte_carlo_vf` | bool | false | Monte Carlo ray-gather view-factor builder |
+| `mc_rays_per_face` | int | 100000 | Rays cast per face by that builder; read only when it is selected |
+| `nearfield_quadrature_order` | int | 3 | Order of the symmetric double-area quadrature for near-field pairs. 3 is the validated production value. Order 1 is the centroid estimator with no near-field treatment at all and reads **+51.7 %** on the touching-pair closed form (order 3 reads +18.5 %); the engine calls it "a diagnostic setting, not a production one" and says so at startup |
 | `coupling_mode` | string | `bounded` | `bounded`, `fixed` or `legacy` |
 | `max_coupling_iterations` | int | 16 | Picard iteration cap (raised from 10 on 2026-08-15; see radiation-exchange.md §7.5) |
 | `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) |
@@ -497,6 +503,33 @@ run with beaming on prints its own `[beam-cost]` breakdown.
 **Two caveats worth knowing before you turn it on.** Beaming makes a run
 chunk-decomposition dependent (its emitter/receiver sets are window-scoped, PTM-101 — the run
 warns), and it does **not** address the known winter/margin warm biases; those are open and parked.
+
+## flux_cubes
+
+A passive probe that samples the flux field at fixed points in space. The block
+is **top level**, not nested under `output:` — deliberately, so it cannot be
+reached by the body-defaults machinery that makes `thermophysical:` decorative
+on a built-in body (PTM-67). The physics, the geometry cache, the ray budget and
+the outputs are all in [flux-cubes.md](flux-cubes.md); this table is the key
+list.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | false | Run the flux-cube pass. Turning it on must be byte-neutral to every mesh field |
+| `cache_file` | string | `""` | Geometry cache built by `ptm_flux_cube_geom`. **Required** when enabled |
+| `locations` | list[map] | — | Named locations (`name`, `lat_deg`, `lon_deg`, optional `height_m`, `edge_m`). The parser's only sequence of maps, so its per-entry fields have no dotted keys |
+| `write_binary` | bool | true | Write `flux_cubes/flux_cubes.fcb` |
+| `write_csv` | bool | true | Write `flux_cubes/csv/cube_XXXXX.csv` |
+| `write_csv_max_cubes` | int | 0 | Cap the CSV fan-out on a long window (0 = every cube). Never drops a named location |
+| `shadow_probe_rays` | int | 5 | 1 = cube center only; 5 = center plus four rim points |
+
+The geometry keys (`spacing_m`, `height_factor`, `n_rays`, …) are **accepted and
+reported inert**: they live in the cache header, and honoring a YAML copy would
+create two sources of truth for one number. `warnUnreadFluxCubeKeys()` names any
+key the parser does not consume.
+
+**CLI-only for now.** There is no GUI surface for this section; whether to build
+one is decision DP-7 in [design/gui-update-plan.md](design/gui-update-plan.md).
 
 ## gpu
 
