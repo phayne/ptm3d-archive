@@ -1187,11 +1187,22 @@ class ThermalTab(BaseConfigTab):
         self.add_double_field(control_layout, 5, "Geothermal Q_b (W/m²):",
                               "thermal.geothermal_heat_flow", -1.0, 10.0, 4,
                               "Bottom-boundary heat flux. -1 = the body's own "
-                              "default. A positive value is a property "
-                              "OVERRIDE: the engine reports it alongside the "
-                              "thermophysical overrides and arms the same "
-                              "forwarding tripwire.",
-                              info_key="thermal.geothermal_heat_flow")
+                              "default.\n"
+                              "DISCARDED ON BUILT-IN BODIES (Moon, Europa, "
+                              "Mercury): the engine parses it, announces "
+                              "'Overriding planet geothermal heat flow', and "
+                              "throws it away, because every mesh solver "
+                              "rebuilds its planet from the body name. "
+                              "KNOWN_LIMITATIONS.md section 4. Use "
+                              "thermal.heat_flow_mask_file, or a custom body's "
+                              "generic_body.surface.Qb.")
+        # A control that does nothing on the default body is worse than no
+        # control. Gray it out there and say why, rather than let a value be
+        # typed, saved, announced by the engine, and discarded.
+        self.qb_note = QLabel("")
+        self.qb_note.setWordWrap(True)
+        self.qb_note.setStyleSheet("color: #FFB74D; font-size: 10px;")
+        control_layout.addWidget(self.qb_note, 6, 0, 1, 2)
 
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
@@ -1450,6 +1461,32 @@ class ThermalTab(BaseConfigTab):
         self.create_scroll_area(content)
 
         self._update_seed_gating()
+        self._update_qb_gating()
+
+    # ── Basal heat flow: live only on a generic body ─────────────────
+
+    def _update_qb_gating(self):
+        """thermal.geothermal_heat_flow is discarded on a built-in body."""
+        generic = getattr(self.config_manager, "generic_body_active",
+                          lambda: False)()
+        widget = self.widgets.get("thermal.geothermal_heat_flow")
+        if widget is not None:
+            widget.setEnabled(generic)
+        if generic:
+            self.qb_note.setText("")
+        else:
+            self.qb_note.setText(
+                "Basal heat flow is DISCARDED on a built-in body: the engine "
+                "announces the override and then rebuilds its planet from the "
+                "body name, so the compiled default is what integrates "
+                "(KNOWN_LIMITATIONS.md section 4). Use a heat-flow mask, or a "
+                "custom body's surface Qb.")
+            if self.config_manager.get_value(
+                    "thermal.geothermal_heat_flow", -1.0) > 0:
+                logging.warning(
+                    "[thermal] geothermal_heat_flow is set on a built-in body "
+                    "and will be discarded by the engine "
+                    "(KNOWN_LIMITATIONS.md section 4).")
 
     # ── Initial-condition handler ────────────────────────────────────
 
@@ -1590,6 +1627,8 @@ class ThermalTab(BaseConfigTab):
             self._syncing = False
         # Refresh the cadence readout text for the new body
         self._update_eq_cadence_readout()
+        # Built-in vs generic decides whether basal heat flow is live at all.
+        self._update_qb_gating()
 
     # ── Equilibration cadence handlers ────────────────────────────────
 
@@ -1781,6 +1820,7 @@ class ThermalTab(BaseConfigTab):
         # because the combo/spin have their own block-signals guards).
         self._sync_eq_cadence_from_config()
         self._update_seed_gating()
+        self._update_qb_gating()
 
 
 class RadiationTab(BaseConfigTab):

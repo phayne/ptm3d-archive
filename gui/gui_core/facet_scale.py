@@ -59,7 +59,7 @@ BEAMING_BODIES = ("Moon",)
 _AREA_SAMPLE_ABOVE = 200_000
 _AREA_SAMPLE_COUNT = 5_000
 
-#: Volumetric mean radii, metres. Same numbers as ptm.results.BODY_RADII;
+#: Volumetric mean radii, meters. Same numbers as ptm.results.BODY_RADII;
 #: duplicated rather than imported so this module stays importable from a
 #: checkout where the ptm package has not been bootstrapped yet.
 _BODY_RADII_M = {
