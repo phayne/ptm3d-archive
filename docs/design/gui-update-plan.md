@@ -1,7 +1,8 @@
 # PTM3D GUI — update plan (functionality and usability)
 
-Status: **Stage 1 is implemented** on `feat/gui-stage1-correctness` (2026-08-25, prepare-only).
-Stages 2 and 3 are still plan only. Written 2026-08-25 against `main` at
+Status: **Stages 1 and 2 are implemented** — Stage 1 merged as PR #131, Stage 2 on
+`feat/gui-stage2-usability` (2026-08-25, prepare-only). Stage 3 is still plan only.
+Written 2026-08-25 against `main` at
 `ddaeb3b` (PR #128, the Smith-beaming merge); the Stage-1 work rebased onto `cf7d97c`, which
 changed nothing in `gui/` or the config surface. Every number below was measured on that tree,
 not estimated; §1.1 lists the probes and how to rerun them.
@@ -508,7 +509,52 @@ document for the three deviations. Six new test files carry the invariants
 
 **Stage 1 total: 2 M, 12 S.**
 
-### Stage 2 — usability
+### Stage 2 — usability — **IMPLEMENTED**
+
+Implemented 2026-08-25 on `feat/gui-stage2-usability`, stacked on `main` at `faa5bb8`
+(the Stage-1 merge). Decisions used: **DP-1(b)** comment-preserving round trip via
+`ruamel.yaml`, **DP-5** the five presets including "Reproduce a published baseline",
+**DP-6** an engine-side `--validate-config`, **DP-8** the `gpu:` guardrails exposed
+read-mostly, **DP-9** field-level Basic/Advanced. DP-2, DP-3 and DP-4 were settled in
+Stage 1; **DP-7 (`flux_cubes:`) remains open** and is untouched.
+
+Five new test files carry the invariants (`test_gui_comment_roundtrip`,
+`test_gui_field_tiers`, `test_gui_stage2_keys`, `test_gui_presets`,
+`test_gui_engine_validator`) plus one engine test (`test_engine_validate_config`).
+
+> **Where Stage 2 deviates from this document.**
+>
+> 1. **DP-6 was cheap, so the engine hook was built.** `--validate-config` is 74 lines
+>    in `main()`, none of them in a solver path: it exits after every check that is
+>    knowable from the configuration alone and before generic-body construction, mesh
+>    load, SPICE and view factors. It prints its own scope boundary, because `rc = 0`
+>    means *well formed*, not *this run will complete*.
+> 2. **§4.4's "Reproduce a published baseline" carries no table of baselines.** The
+>    open question in DP-5 was *which* baselines it should carry; the answer is none.
+>    It reads the run's own `config_used.yaml` and `provenance.txt`, so it cannot be
+>    out of date, and it compares the engine md5 — a reproduction on a different
+>    binary is not a reproduction.
+> 3. **§2.4's `gpu:` problem is solved in the WRITER, not only by DP-1(b).** The
+>    round trip protects the project file, but `save_run_yaml` — the full dump a RUN
+>    reads — would still have written `min_vram_margin_gib` into every config. So the
+>    `gpu:` section is written selectively: a key equal to the engine default is
+>    omitted, and the floor is written only when the user ticks *"enforce on every
+>    platform"*, which turns the presence semantics into a control.
+> 4. **Item 2.6 gained a disclosure the plan did not anticipate, and did NOT gain the
+>    results-browser view.** Measured: `ice_depth.bin` exists only on the GPU thermal
+>    solver — the accumulator is handed to
+>    `runThermalModelsForAllFaces_GPU_Persistent` and nothing else
+>    (`ptm_thermal_sim.cpp:17320`). On the CPU path the run completes, warns, and
+>    writes no product. The control and `validate()` both say so. The `ice_depth.bin`
+>    viewer in the results browser is **not implemented** and moves to Stage 3.
+> 5. **A tenth nav entry.** The `gpu:` guardrails got their own page rather than
+>    being folded into an existing tab; the per-solver device controls stayed with
+>    their solvers. §4.3 assumed nine.
+> 6. **§3's D9 was already stale.** `docs/configuration.md` now mentions
+>    `nearfield_quadrature_order`, `spinup_seed` and `flux_cubes`; item 2.10 became
+>    the `--validate-config` section plus a rewrite of the tutorial's sections 3, 6
+>    and 7. The tutorial's claim that *"the GUI has no control for `coupling_mode`"*
+>    had survived Stage 1 and is corrected here.
 
 | # | Item | Effort | Description |
 |---|---|---|---|
@@ -523,7 +569,8 @@ document for the three deviations. Six new test files carry the invariants
 | 2.9 | Depth grid, read-only | **S** | Show `thermal_b`, `thermal_m`, `thermal_n` and the derived skin-depth count. Display only; the standing instruction not to retune `thermal_b` stays. |
 | 2.10 | `docs/configuration.md` rows for the newly exposed keys (**D9**) | **S** | |
 
-**Stage 2 total: 1 L, 5 M, 4 S.**
+**Stage 2 total: 1 L, 5 M, 4 S.** All ten implemented, with the six deviations noted
+above. Item 2.6's `ice_depth.bin` viewer moves to Stage 3.
 
 ### Stage 3 — monitoring and integration
 
@@ -618,9 +665,18 @@ double-counted roughness.
 **DP-5 — the preset list.** Approve, cut or extend the five in §4.4. In particular, is
 "Reproduce a published baseline" worth building, and which baselines should it carry?
 
+  *Resolved in Stage 2: all five built. "Reproduce a published baseline" carries NO
+  baselines — it reads the run's own `config_used.yaml` and `provenance.txt`, which
+  cannot go stale and cannot be remembered wrong.*
+
 **DP-6 — validate against the engine?** Item 2.4 wants to hand a config to `ptm_thermal_sim` and
 report its validation text verbatim, so the GUI stops maintaining a second, weaker copy of the
 rules. Is there a supported parse-and-exit mode, and if not, is adding one acceptable?
+
+  *Resolved in Stage 2: there was none, and adding one cost 74 lines in `main()` with
+  no solver path touched — `--validate-config`. It was worth it immediately: the first
+  draft of the GUI's own `eq_indirect_source` check invented a valid set that would have
+  refused `converged`, the one non-default value the engine accepts.*
 
 **DP-7 — `flux_cubes:` in the GUI, or CLI-only?** Seven keys and an output product with no GUI
 surface and no `docs/configuration.md` entry.
@@ -630,9 +686,20 @@ them" is only safe under DP-1(b). The alternative is a single "GPU safety" selec
 `placement_policy` and `thin_margin_policy` and deliberately never writes
 `min_vram_margin_gib`.
 
+  *Resolved in Stage 2: exposed READ-MOSTLY on their own page, with the editable
+  controls behind Advanced — and the writer made selective, so a default config carries
+  no `gpu:` section at all. `min_vram_margin_gib` is written only behind an explicit
+  "enforce on every platform" control, which is that key's presence semantics turned
+  into something a user can see.*
+
 **DP-9 — the tier boundary.** Approve moving Basic/Advanced from whole tabs to fields (item 2.1).
 The consequence is that Radiation and Illumination stop being hidden, which is a visible change
 to the first-run experience.
+
+  *Resolved in Stage 2: moved. Measured split 71 Basic controls / 74 Advanced across 13
+  sections; the only nav row still hidden is Body, and its gate is relevance (a custom
+  body), not tier. The written configuration is byte-identical with the toggle off, on,
+  and off again.*
 
 ---
 

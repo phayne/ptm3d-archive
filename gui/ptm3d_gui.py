@@ -26,7 +26,8 @@ from PyQt6.QtGui import QAction, QIcon, QFont, QKeySequence, QPalette, QColor
 from gui_core.config_manager import ConfigManager
 from gui_core.styles import ModernStyle
 from gui_core.simulation_runner import SimulationRunner, SimulationThread, CameraSimThread
-from gui_core.preflight import run_preflight, confirm_preflight
+from gui_core.preflight import (run_preflight, confirm_preflight,
+                                engine_validate_config)
 
 # Panels
 from gui_panels.config_panel import ConfigurationPanel
@@ -285,7 +286,7 @@ class PTM3DMainWindow(QMainWindow):
 
         sim_menu.addSeparator()
 
-        validate_action = QAction("&Validate Configuration", self)
+        validate_action = QAction("&Check Configuration", self)
         validate_action.setShortcut(QKeySequence("Ctrl+T"))
         validate_action.triggered.connect(self.validate_config)
         sim_menu.addAction(validate_action)
@@ -935,25 +936,58 @@ class PTM3DMainWindow(QMainWindow):
         self.sim_status.setStyleSheet(f"background-color: {color}; color: white; border-radius: 3px; padding: 2px 5px;")
 
     def validate_config(self):
-        """Validate current configuration"""
-        is_valid, messages = self.config_manager.validate()
+        """Check the configuration -- the GUI's rules AND the engine's own.
 
-        if is_valid:
-            if messages:  # Warnings only
-                QMessageBox.information(
-                    self, "Validation Passed",
-                    "Configuration is valid with warnings:\n\n" + "\n".join(f"• {m}" for m in messages)
-                )
+        Item 2.4 / DP-6. The GUI kept a second, weaker copy of the engine's
+        rules, and the two have already disagreed in this session: a draft
+        eq_indirect_source check invented a valid set that would have refused
+        the one non-default value the engine accepts. So the engine is asked
+        directly (`ptm_thermal_sim --validate-config`) and its words are
+        reported verbatim.
+
+        An engine that cannot be asked is reported as NOT CHECKED, never as
+        checked-and-fine.
+        """
+        is_valid, messages = self.config_manager.validate()
+        gui_part = (
+            ("Errors:\n" if not is_valid else "Warnings:\n")
+            + "\n".join(f"  • {m}" for m in messages)
+            if messages else "The GUI's own checks found nothing.")
+
+        exe = SimulationRunner.find_ptm_executable()
+        status, engine_text = engine_validate_config(
+            self.config_manager.get_config(), exe)
+
+        engine_part = {
+            "accepted": "The engine ACCEPTED this configuration:",
+            "refused": "The engine REFUSED this configuration:",
+            "unavailable": "The engine was NOT asked:",
+        }[status] + "\n" + (engine_text.strip() or "(no output)")
+
+        # The console keeps the full engine text; the dialog stays readable.
+        self.console_panel.append_header("Check Configuration")
+        for line in gui_part.splitlines():
+            self.console_panel.append_info(f"[check] {line}")
+        for line in engine_part.splitlines():
+            if status == "refused":
+                self.console_panel.append_error(f"[check] {line}")
+            elif status == "unavailable":
+                self.console_panel.append_warning(f"[check] {line}")
             else:
-                QMessageBox.information(
-                    self, "Validation Passed",
-                    "Configuration is valid and ready to run."
-                )
+                self.console_panel.append_info(f"[check] {line}")
+
+        def _clip(text, limit=2400):
+            return text if len(text) <= limit else (
+                text[:limit] + "\n… (full text in the console)")
+
+        body = _clip(gui_part + "\n\n" + engine_part)
+        if not is_valid or status == "refused":
+            QMessageBox.warning(self, "Check Configuration", body)
+        elif status == "unavailable":
+            QMessageBox.warning(self, "Check Configuration — not fully checked",
+                                body)
         else:
-            QMessageBox.warning(
-                self, "Validation Failed",
-                "Configuration has errors:\n\n" + "\n".join(f"• {m}" for m in messages)
-            )
+            QMessageBox.information(self, "Check Configuration", body)
 
     # === View Operations ===
 

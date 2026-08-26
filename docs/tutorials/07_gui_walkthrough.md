@@ -26,7 +26,10 @@ cd gui/
 pip install -r requirements.txt
 ```
 
-Required: `PyQt6`, `numpy`, `PyYAML`. Optional but strongly recommended:
+Required: `PyQt6`, `numpy`, `PyYAML`, `ruamel.yaml`. The last one is what lets
+Save edit your project file in place instead of flattening it; without it the
+GUI still runs but every save loses the file's comments, and it tells you so
+before the first one. Optional but strongly recommended:
 `pyvista` + `pyvistaqt` (the 3D view) and `matplotlib` (the 2D plots). The
 launcher checks these and reports which are missing (`gui/run_gui.py:42-90`):
 
@@ -90,16 +93,48 @@ console, and **View > Reset Layout** puts everything back.
 > visible.
 
 Keyboard shortcuts: `F5` run, `Shift+F5` stop, `Ctrl+T`
-validate configuration, `Ctrl+S` save project, `Ctrl+L` load a results
-directory, `F6` refresh the 3D view, `Home` reset the camera.
+check configuration (the GUI's checks plus the engine's own), `Ctrl+S` save
+project, `Ctrl+L` load a results directory, `F6` refresh the 3D view, `Home`
+reset the camera.
 
 ---
 
-## 3. Basic mode — the five pages you need
+## 3. Starting from a task
 
-The configuration panel opens in **Basic** mode: five pages, which is everything
-a standard thermal run needs. The **Advanced options** checkbox above the nav
-rail reveals the rest (section 7).
+The first page in the nav rail is **Start**: five task cards, each of which
+sets a coherent group of keys and then *states exactly which ones it set and
+which it refused*. Nothing is applied until you press a card's button.
+
+| Card | What it sets up |
+|---|---|
+| Global lunar diurnal | The whole Moon, one synodic period, radiation off. The standard first run. |
+| Lunar polar crater with self-heating | Imported core mesh plus its occluder ring, radiation on in bounded coupling, and Smith (1967) roughness at w = 32.5° **if the mesh is coarse enough to carry it**. |
+| Europa diurnal | Europa, one synodic period, built-in albedo map. |
+| Asteroid or other custom body | A generic HORIZONS-driven body, no primary reflection, no albedo map. |
+| Reproduce a published baseline | Loads a finished run's own `config_used.yaml` and tells you whether your binary is the one that produced it. |
+
+The crater card is the one worth understanding. The engine enforces only that
+`radiation.beaming: true` carries a positive `rms_slope_deg` and *nothing at all
+about the scale of the mesh it is applied to* — so a mesh whose facets already
+resolve the roughness would have it counted twice, silently. The card therefore
+measures the facet scale of the mesh you gave it and **refuses to tick the
+switch**, with the measured number in the message, when the mesh is at or near
+the millimeter-to-centimeter roughness band. It still sets up the rest of the
+crater run.
+
+"Reproduce a published baseline" deliberately carries no table of remembered
+baselines. It reads the run's own record, so it cannot be out of date: the
+configuration comes from `config_used.yaml` — including that run's `engine_env:`
+block, spin-up seed and beaming setting — and `provenance.txt` supplies the
+engine md5 it ran on, which is compared with yours. A reproduction on a
+different binary is not a reproduction, and the md5 is the only thing that
+settles it.
+
+## 3a. The pages you need
+
+The configuration panel opens in **Basic** mode. Every page is present; each one
+shows its common fields and keeps its expert groups collapsed until you tick
+**Advanced options** (section 7).
 
 ### Simulation
 
@@ -381,28 +416,74 @@ reopens one, **File > Open Recent** keeps the last ten. Every run's
 configuration that ran, which makes it the right thing to archive next to the
 results.
 
-Two things worth knowing about what a save writes:
+Three things worth knowing about what a save writes:
 
-- **Comments are not preserved.** The GUI serializes its own dictionary, so a
-  hand-written config that you open and then Save comes back without its
-  comments. This is why Run no longer saves for you. A comment-preserving round
-  trip is planned (`docs/design/gui-update-plan.md`, DP-1(b)).
+- **Save edits your file in place.** It rewrites only the keys whose values you
+  changed, so comments, ordering, blank lines and quoting all survive, and a
+  key your file never mentioned stays unmentioned. Measured on the two shipped
+  commented examples: open-then-save with no edits is byte-identical, and
+  changing one field changes exactly two lines — the old and new spelling of
+  that field, keeping its own trailing comment. The console says how many keys
+  were rewritten after every save.
+  This needs `ruamel.yaml`, which `gui/requirements.txt` requires. Without it
+  the GUI falls back to the old flattening writer and *says so* — in the
+  console, in the status bar, and in a dialog you can cancel.
+- **The YAML Preview pane is not what Save writes.** It is the fully expanded,
+  engine-facing configuration a *run* is handed, which lands beside the output
+  directory as `config.yaml`.
 - **An `engine_env:` block is honored exactly as written**, including an empty
   one. Only a config with no `engine_env:` key at all gets the recommended set.
+
+### Checking a configuration
+
+**Simulation > Check Configuration** (`Ctrl+T`) runs the GUI's own checks *and*
+hands the configuration to `ptm_thermal_sim --validate-config`, which parses it,
+applies every startup check that does not need the mesh or SPICE, and exits
+without simulating. The engine's own message is shown verbatim, so the GUI is
+no longer maintaining a second, weaker copy of the rules.
+
+If the engine cannot be asked — no binary, a binary too old to carry the flag,
+or a timeout — the result says **NOT CHECKED**. It never reports "could not
+ask" as "fine". And `rc = 0` there means the configuration is well formed, not
+that the run will complete: mesh units, SPICE kernels, property-map face counts
+and the `martinez2021` density guard are all checked later, and the engine's
+own banner names them.
 
 ---
 
 ## 7. Advanced mode
 
-Tick **Advanced options** above the nav rail. Four more pages appear —
-Illumination, Radiation, Engine Flags, HORIZONS — plus **Body** when a custom or
-HORIZONS body is active (it is meaningless for a built-in body, so it stays
-hidden).
+**The Basic/Advanced boundary is drawn by field, not by page.** Every page —
+Simulation, Mesh, Properties, Thermal, Output, Illumination, Radiation, GPU,
+Engine Flags and HORIZONS — is in the nav rail in both tiers. **Body** is the
+one exception, and its gate is relevance rather than tier: it describes a
+custom or HORIZONS body, and there is nothing for it to describe on a built-in
+one.
+
+Tick **Advanced options** above the nav rail and each page grows a collapsed
+expert section:
+
+| Page | Advanced section |
+|---|---|
+| Mesh | Mesh Placement and Occluder |
+| Thermal | Advanced thermal (cadence, convergence, integration window, property maps, depth grid) · Initial Condition and Run State · Ice Stability · GPU Dispatch and Wedge Mitigations |
+| Properties | Heat Capacity and Internal Heat |
+| Radiation | Thermal-Radiation Coupling · View Factor Options · Sparse View Factors · Radiosity GPU Dispatch |
+| Illumination | Advanced illumination (ray tracing, precomputed positions, BVH cache, illumination GPU) |
+| GPU | Change the GPU safety policy |
+| Engine Flags | Edit engine flags |
+
+Measured split: 71 bound controls in Basic, 74 behind Advanced.
 
 ![Advanced nav rail](images/gui/06_advanced_nav_rail.png)
 
-This is purely a visibility filter. Hidden pages still load and save; toggling
-it changes nothing in your YAML.
+This is purely a visibility filter. Every control exists in both tiers and
+still loads and saves; the configuration that would be written is
+byte-identical with the toggle off, on, and off again.
+
+Radiation and Illumination used to be hidden wholesale, which meant the Basic
+tier could not express a crater run at all — and this model exists mostly to run
+craters. That is the change you will notice first.
 
 ### Illumination
 
@@ -433,15 +514,14 @@ view-factor file/H-matrix/ACA options, and the sparse-view-factor settings for
 meshes above ~1M faces.
 
 **Coupling controls.** The engine's default coupling mode is `bounded`
-(`src/cpp/tools/config_parser.h:315`). In that mode the **Face Fraction**
-control has no effect — it applies only in `legacy` mode, hence its label
-**"Face Fraction (legacy mode only)"** (`gui/gui_panels/config_panel.py:1664-1671`);
-the face-fraction exit criterion has no error bound, so `bounded` and `fixed`
-modes ignore it. The GUI has no control for `coupling_mode` itself: to run
-`legacy` (or `fixed`), add `radiation.coupling_mode: legacy` to the YAML by
-hand, or pass `--rad-coupling-mode` on the command line. If Face Fraction is
-changed without setting `coupling_mode: legacy`, the engine prints a console
-warning:
+(`src/cpp/tools/config_parser.h:315`). **Coupling Mode** is now a three-way
+selector in the Thermal-Radiation Coupling section (`bounded` / `fixed` /
+`legacy`), and the **Face Fraction** field below it is gated on it: the
+face-fraction exit criterion has no error bound, so `bounded` and `fixed`
+ignore it, and the field is disabled unless `legacy` is selected. Before that
+gate existed, a field labeled "legacy mode only" sat editable next to a mode
+nobody could choose. If Face Fraction is changed without setting
+`coupling_mode: legacy`, the engine prints a console warning:
 
   ```
   WARNING [PTM-89]: radiation.coupling_face_fraction=0.02 is IGNORED in
@@ -475,13 +555,54 @@ If radiation is off, the box reads
 
 The engine gates several physics fixes behind `PTM_*` environment variables so
 that old runs stay byte-identical. The GUI applies the recommended-ON set by
-default; this table lets you override a value, add a flag, or blank one out
-(blank = not set). **Restore Recommended** puts the default set back. The set
-is stored in the project YAML under `engine_env:`, so a saved project records
-exactly what its run had set, and the engine reads the same block at startup.
+default.
+
+**The page leads with a read-only summary of exactly what the launch will
+export** — computed from the same planner the launch uses, so the two cannot
+disagree — and the editable table is behind **Advanced options**. That summary
+is in the Basic tier on purpose: the whole page used to be Advanced-only, which
+is where an inert `PTM_ILLUM_RISE_HABS` sat unnoticed for a month while the
+GUI's own comment said the fix was applied. A disclosure nobody can reach is
+not a disclosure.
+
+The table lets you override a value, add a flag, or blank one out (blank = not
+set). **Restore Recommended** puts the default set back. The set is stored in
+the project YAML under `engine_env:`, so a saved project records exactly what
+its run had set, and the engine reads the same block at startup.
 
 Change these only deliberately — for example, to reproduce an old run that
-predates a fix.
+predates a fix. The "Reproduce a published baseline" card on the Start page is
+the safer route: it takes the block from the baseline's own record.
+
+### GPU
+
+The **GPU** page is the cross-cutting safety policy — whether a GPU rung is
+allowed at all and which dies each pool may use. It is deliberately
+**read-mostly**: it leads with the *effective* value of each guardrail and
+where that value came from, plus this host's calibration profile, and the
+editable controls are behind **Advanced options**.
+
+The distinction the page exists to carry: `gpu.min_vram_margin_gib = 2.0` as
+the engine's own default is enforced on macOS + AMD and advisory elsewhere,
+while the **same number written into your config** is enforced on every
+platform (`src/cpp/tools/config_parser.h:826` — the engine reads the key's
+*presence* as the request). Two identical numbers, two different behaviors, and
+nothing in a YAML file shows you which one you have.
+
+Because of that, the GUI writes this section **selectively** — the only section
+it does. A guardrail equal to the engine's default is not written at all, so a
+config the GUI touched does not silently change GPU policy on someone else's
+machine, and the floor is written only when you tick **"Enforce the VRAM floor
+on EVERY platform"**. A default GUI config carries no `gpu:` section.
+
+Per-solver device and batch controls (`gpu_devices`, `gpu_device_ids`,
+`gpu_batch_size`, `gpu_inter_batch_pause_ms`) live in the Advanced sections of
+the Thermal, Radiation and Illumination pages — they are the first-class wedge
+mitigations on this hardware, where a hard wedge needs a reboot.
+
+`Illumination > Use GPU for Illumination` is off by default and that is a
+recommendation, not an oversight: the CPU illumination path here is both
+correct and faster. The control exists so the choice is visible.
 
 ### Body / HORIZONS
 

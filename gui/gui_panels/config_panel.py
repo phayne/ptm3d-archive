@@ -5035,6 +5035,178 @@ class EngineFlagsTab(BaseConfigTab):
         self._refresh_declined_note()
 
 
+class TaskCardsTab(BaseConfigTab):
+    """Task cards in front of the section tabs (items 2.2 and 2.3 / DP-5).
+
+    The nine section tabs are the complete reference view and stay that way.
+    What was missing is a way in: "polar crater with self-heating" is a task,
+    ``radiation.captured_energy_target`` is not, and a colleague opening this
+    window had no path from the first to the second.
+
+    Each card states exactly which keys it sets and which it REFUSED, because
+    a form that silently rewrites half a configuration is the same defect as
+    the save path Stage 1 fixed. In particular a card that wants beaming runs
+    the facet-scale rule on the config it just built and refuses with the
+    measured facet scale, rather than ticking the switch and hoping -- the
+    engine has no facet-scale guard of its own, so this is the only one.
+
+    This also retires GUI-PRESET-1: ``gui/README.md`` advertised presets that
+    ``grep -rn load_preset gui/`` showed nothing ever called.
+    """
+
+    preset_applied = pyqtSignal(str)
+
+    def init_ui(self):
+        from gui_core.presets import PRESETS
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        intro = QLabel(
+            "Start from a task, then refine it on the tabs. Every card says "
+            "which keys it sets and which it refuses to set, and nothing here "
+            "is applied until you press its button. The tabs remain the "
+            "complete view of the configuration.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #64b5f6; font-size: 11px; padding: 5px;")
+        layout.addWidget(intro)
+
+        self._reports = {}
+        for preset in PRESETS:
+            group = QGroupBox(preset.title)
+            card = QVBoxLayout()
+
+            body = QLabel(preset.summary)
+            body.setWordWrap(True)
+            body.setStyleSheet("font-size: 11px;")
+            card.addWidget(body)
+
+            if preset.sets:
+                keys = QLabel("Sets: " + ", ".join(sorted(preset.sets)))
+                keys.setWordWrap(True)
+                keys.setStyleSheet("color: gray; font-size: 10px;")
+                card.addWidget(keys)
+            if preset.beaming == "on":
+                note = QLabel(
+                    f"Beaming: requested at w = 32.5 deg, subject to the "
+                    f"facet-scale rule. If the mesh is at or near the "
+                    f"roughness scale the card refuses and says the measured "
+                    f"scale.")
+            else:
+                note = QLabel("Beaming: off. " + preset.beaming_note)
+            note.setWordWrap(True)
+            note.setStyleSheet("color: gray; font-size: 10px;")
+            card.addWidget(note)
+
+            row = QHBoxLayout()
+            button = QPushButton(
+                "Choose a run directory…"
+                if preset.key == "reproduce_baseline" else "Apply")
+            button.clicked.connect(
+                lambda _checked=False, k=preset.key: self._on_apply(k))
+            row.addWidget(button)
+            row.addStretch()
+            card.addLayout(row)
+
+            report = QLabel("")
+            report.setWordWrap(True)
+            report.setTextFormat(Qt.TextFormat.PlainText)
+            report.setStyleSheet(
+                "font-size: 10px; padding: 4px; border: 1px solid #444; "
+                "border-radius: 4px;")
+            report.setVisible(False)
+            card.addWidget(report)
+            self._reports[preset.key] = report
+
+            group.setLayout(card)
+            layout.addWidget(group)
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+
+    def _project_root(self):
+        from pathlib import Path
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            return find_project_root(SimulationRunner.find_ptm_executable())
+        except Exception:
+            return Path.cwd()
+
+    def _on_apply(self, key):
+        if key == "reproduce_baseline":
+            directory = QFileDialog.getExistingDirectory(
+                self, "Select the baseline run's output directory", "",
+                QFileDialog.Option.ShowDirsOnly)
+            if not directory:
+                return
+            self.apply_baseline(directory)
+            return
+        self.apply_preset(key)
+
+    def apply_preset(self, key):
+        """Apply a preset by key and return its PresetResult (also shown)."""
+        from gui_core.presets import PRESETS_BY_KEY, apply_preset
+        preset = PRESETS_BY_KEY[key]
+        result = apply_preset(self.config_manager, preset, self._project_root())
+        self._show(key, "\n".join(result.summary_lines()))
+        self.preset_applied.emit(key)
+        self.value_changed.emit()
+        return result
+
+    def apply_baseline(self, run_dir):
+        """Load a finished run's own config_used.yaml, and say what ran it."""
+        from gui_core.presets import read_baseline, compare_binary
+        from gui_core.preflight import executable_fingerprint
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            _config, provenance, config_path = read_baseline(run_dir)
+        except Exception as exc:
+            self._show("reproduce_baseline", f"Cannot use this directory: {exc}")
+            return None
+        try:
+            self.config_manager.load_from_yaml(str(config_path))
+        except Exception as exc:
+            self._show("reproduce_baseline",
+                       f"{config_path} could not be loaded: {exc}")
+            return None
+        try:
+            exe = SimulationRunner.find_ptm_executable()
+            current = executable_fingerprint(exe)[1] if exe else ""
+        except Exception:
+            current = ""
+        lines = [f"Loaded {config_path}", compare_binary(provenance, current)]
+        for name in ("engine_git_sha", "run_started_utc", "body", "mesh_faces"):
+            if name in provenance:
+                lines.append(f"    {name} = {provenance[name]}")
+        lines.append(
+            "The environment block, spin-up seed and every other key now come "
+            "from the baseline's own record, not from this GUI's defaults.")
+        self._show("reproduce_baseline", "\n".join(lines))
+        self.preset_applied.emit("reproduce_baseline")
+        self.value_changed.emit()
+        return provenance
+
+    def _show(self, key, text):
+        report = self._reports.get(key)
+        if report is None:
+            return
+        report.setText(text)
+        report.setVisible(True)
+
+    def report_text(self, key):
+        """What the card is currently showing (for probes and tests)."""
+        report = self._reports.get(key)
+        return report.text() if report is not None else ""
+
+    def load_from_config(self):
+        # Nothing to load: the cards write, they do not mirror.
+        pass
+
+
 class GpuPolicyTab(BaseConfigTab):
     """The `gpu:` safety guardrails -- READ-MOSTLY (item 2.5 / DP-8).
 
@@ -5221,6 +5393,7 @@ class ConfigurationPanel(QWidget):
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Create and add tabs
+        self.tabs["start"] = TaskCardsTab(self.config_manager)
         self.tabs["simulation"] = SimulationTab(self.config_manager)
         self.tabs["mesh"] = MeshTab(self.config_manager)
         self.tabs["thermal"] = ThermalTab(self.config_manager)
@@ -5259,6 +5432,7 @@ class ConfigurationPanel(QWidget):
         # Still a pure visibility filter: every widget exists in both tiers, so
         # nothing about the saved YAML depends on the toggle.
         tab_order = [
+            ("start", "Start"),
             ("simulation", "Simulation"),
             ("mesh", "Mesh"),
             ("thermophysical", "Properties"),
@@ -5326,6 +5500,13 @@ class ConfigurationPanel(QWidget):
         # Connect tab change signals
         for tab in self.tabs.values():
             tab.value_changed.connect(self.on_value_changed)
+
+        # A task card rewrites a coherent GROUP of keys, so every tab has to
+        # re-read the configuration afterward -- otherwise the card's changes
+        # are in the config and not on screen, and the next widget event writes
+        # the stale on-screen value back over them.
+        self.tabs["start"].preset_applied.connect(
+            lambda _key: self.load_from_config())
 
         # Connect body selection to thermophysical and body definition tabs
         if "simulation.body" in self.tabs["simulation"].widgets:

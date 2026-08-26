@@ -731,6 +731,93 @@ def absolutize_config_paths(config, project_root):
     return cfg
 
 
+#: Wall-clock ceiling for the engine's own config check. It parses and exits,
+#: so a second is generous; the timeout exists because a hung subprocess on the
+#: GUI thread is worse than no answer.
+VALIDATE_TIMEOUT_S = 60.0
+
+
+def engine_validate_config(config, executable, project_root=None, env=None):
+    """Hand `config` to the engine's own parser and report what IT says.
+
+    Item 2.4 / DP-6. ``ConfigManager.validate`` is a second, weaker copy of the
+    engine's rules, and the two have already disagreed: the first draft of the
+    ``eq_indirect_source`` check invented a valid set (``auto|none|file|
+    internal``) that would have refused ``converged``, the one non-default value
+    the engine accepts. The fix is to stop keeping a second copy of the answer.
+
+    Returns ``(status, text)`` where status is:
+      ``"accepted"``     rc 0 -- well formed as far as this mode can tell
+      ``"refused"``      rc 1 -- the engine will not run it, and `text` says why
+      ``"unavailable"``  no binary, no ``--validate-config`` support, or the
+                         call failed. NEVER silently treated as acceptance.
+
+    The YAML is written to a temporary file with every path absolutized, so it
+    resolves exactly as the run YAML would; the temporary file is removed
+    afterward, whatever happens.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import yaml as _yaml
+
+    if not executable:
+        return ("unavailable",
+                "No ptm_thermal_sim was found, so the engine's own checks "
+                "could not be run. Only the GUI's checks applied. Build it "
+                "with: cmake --build build --target ptm_thermal_sim")
+    executable = Path(executable)
+    if not executable.exists():
+        return ("unavailable",
+                f"{executable} does not exist, so the engine's own checks "
+                f"could not be run. Only the GUI's checks applied.")
+
+    root = Path(project_root) if project_root else find_project_root(executable)
+    tmpdir = tempfile.mkdtemp(prefix="ptm3d_validate_")
+    try:
+        path = Path(tmpdir) / "config.yaml"
+        with open(path, "w") as handle:
+            _yaml.dump(absolutize_config_paths(config, root), handle,
+                       default_flow_style=False, sort_keys=False)
+        # build_engine_env returns (env, applied). The SAME environment the
+        # launch would apply: validating under a different one answers a
+        # different question, and PTM_ILLUM_RISE_EPS is exactly the variable
+        # that turned out to matter.
+        child_env, _applied = build_engine_env(config, env)
+        try:
+            proc = subprocess.run(
+                [str(executable), "--config", str(path), "--validate-config"],
+                capture_output=True, text=True, cwd=str(root),
+                env=child_env,
+                timeout=VALIDATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return ("unavailable",
+                    f"The engine did not answer within {VALIDATE_TIMEOUT_S:.0f} s. "
+                    f"--validate-config parses and exits, so this is not a slow "
+                    f"config -- treat it as 'not checked', not as 'accepted'.")
+        except Exception as exc:                       # noqa: BLE001
+            return ("unavailable",
+                    f"The engine's config check could not be run ({exc}). Only "
+                    f"the GUI's checks applied.")
+
+        text = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0 and "[validate-config]" in text:
+            return ("accepted", text)
+        if proc.returncode == 0:
+            # rc 0 with no banner means this binary predates --validate-config
+            # and ignored the unknown flag. It did NOT validate anything, and
+            # reporting success here would be the exact silence this whole
+            # stage is about.
+            return ("unavailable",
+                    "This ptm_thermal_sim does not support --validate-config "
+                    "(it exited 0 without the [validate-config] banner), so "
+                    "nothing was checked by the engine. Rebuild from a tree "
+                    "that carries the flag, or rely on the GUI's own checks.")
+        return ("refused", text)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def run_preflight(config, find_executable, project_root=None):
     """Run all pre-flight checks. `find_executable` is a callable returning
     the engine binary path or None (SimulationRunner.find_ptm_executable).

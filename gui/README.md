@@ -27,14 +27,26 @@ local disk, not in a cloud-synced folder.
 ## Features
 
 ### 1. Simulation Configuration
-- **Tabbed Interface**: Organized parameter settings for Simulation, Mesh, Thermal, Radiation, Illumination, and Output
-- **YAML Preview**: Live preview of configuration as you edit
-- **Validation**: Real-time configuration validation before running
+- **Start page**: five task cards — global lunar diurnal, lunar polar crater
+  with self-heating, Europa diurnal, asteroid or other custom body, and
+  "reproduce a published baseline". Each one states the exact keys it set and
+  any it refused, and nothing is applied until you press its button.
+- **Tabbed Interface**: the complete reference view — Simulation, Mesh,
+  Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine
+  Flags. Every tab is always visible; "Advanced options" reveals the expert
+  groups *inside* each tab rather than hiding whole tabs.
+- **YAML Preview**: the engine-facing configuration a run writes. Save does
+  not write this: it edits your project file in place, changing only the keys
+  you changed and preserving its comments (needs `ruamel.yaml`, which
+  `requirements.txt` requires).
+- **Validation**: the GUI's own checks, plus *Simulation → Check
+  Configuration*, which hands the config to `ptm_thermal_sim
+  --validate-config` and reports the engine's own words.
 
-There are **no presets**. This list advertised them for months while
-`ConfigManager.PRESETS` was unreachable code -- no menu, no button, no dialog
-ever loaded one. The table has been removed; a reachable replacement is
-designed in `docs/design/gui-update-plan.md` (item 2.3).
+The presets were unreachable code for months — `ConfigManager.PRESETS` had no
+menu, no button and no dialog — and this list advertised them anyway. The old
+table was deleted rather than papered over; the Start page above is the
+replacement, designed in `docs/design/gui-update-plan.md` (items 2.2, 2.3).
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
