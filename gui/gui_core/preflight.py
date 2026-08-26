@@ -136,6 +136,23 @@ _DATA_PATH_NO_EXISTENCE_CHECK = [
     "illumination.bvh_cache_file",
 ]
 
+#: Values that are SENTINELS, not paths, and must survive absolutization
+#: untouched. config_parser.h:435 and illumination_model.cpp:781/795 document
+#: `bvh_cache_file: "off"` as "disable the BVH cache"; the engine's
+#: resolveDataPath returns it verbatim (not absolute, not `data/`, does not
+#: exist). Absolutizing it produced "<project_root>/off", which would ENABLE
+#: caching into a file literally named `off` -- the opposite of what was asked.
+#: Reproduced.
+_PATH_SENTINELS = {
+    "illumination.bvh_cache_file": {"off"},
+}
+
+
+def is_path_sentinel(dotted, value):
+    """True when `value` is a documented sentinel for `dotted`, not a path."""
+    return str(value).strip().lower() in _PATH_SENTINELS.get(dotted, ())
+
+
 #: EXACTLY the keys the engine resolves through resolveDataPath
 #: (config_parser.cpp, the "Apply the PTM_DATA_ROOT resolution contract" block).
 #: Transcribed from that list, not inferred from "it looks like a path".
@@ -162,6 +179,12 @@ _ENGINE_DATA_ROOT_FIELDS = [
     "output.locations_file",
     "output.depths_file",
     "generic_body.spice_metakernel",
+    # The engine's key is generic_body.mesh_file (config_parser.cpp:881); the
+    # GUI writes the same value at generic_body.shape.mesh_file. Listed under
+    # BOTH spellings so this table stays literally exact against that block,
+    # whichever one a future writer emits.
+    "generic_body.mesh_file",
+    "generic_body.shape.mesh_file",
 ]
 
 # Config fields that hold a directory that will be READ during the run.
@@ -756,6 +779,8 @@ def absolutize_config_paths(config, project_root):
         val = get_config_value(cfg, dotted)
         if not val:
             continue
+        if is_path_sentinel(dotted, val):
+            continue
         parts = dotted.split(".")
         parent = cfg
         for k in parts[:-1]:
@@ -951,7 +976,17 @@ def run_preflight(config, find_executable, project_root=None):
         val = get_config_value(config, dotted)
         if not val:
             continue
-        p = resolve_data_path(val, project_root)
+        if is_path_sentinel(dotted, val):
+            continue
+        # The SAME resolver absolutize_config_paths uses for this key. They
+        # disagreed: the pre-flight stat'd $PTM_DATA_ROOT/... for four keys the
+        # engine reads relative to the working directory, so a launch could be
+        # blocked for a file that exists, or waved through for one that does
+        # not -- and for thermal.eq_indirect_flux_file that changes the deep
+        # answer rather than merely failing.
+        resolver = (resolve_data_path if dotted in _ENGINE_DATA_ROOT_FIELDS
+                    else resolve_path)
+        p = resolver(val, project_root)
         if not p.exists():
             report.errors.append(f"{dotted}: file not found: {p}")
             continue

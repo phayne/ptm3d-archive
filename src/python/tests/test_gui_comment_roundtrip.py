@@ -418,6 +418,63 @@ def test_one_edit_touches_only_that_key_across_every_config():
         + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
 
 
+def test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save():
+    """The gpu: writer had its own equality rule, and it removed a line.
+
+    A file spelling `placement_margin_gib: 4` (int) put 4 into the loaded view;
+    the panel's set_numeric coerced it to 4.0; that now equals the engine's 4.0
+    default, so the selective gpu writer dropped it -- and plan_edits
+    classified the disappearance as a REMOVAL. Reproduced end to end through a
+    real ConfigurationPanel: an open-and-Save with zero edits deleted the line
+    from the user's file. No shipped examples/ config carries a gpu: section,
+    which is why the corpus sweep did not see it.
+    """
+    _require_ruamel()
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import PyQt6
+    except ImportError as exc:                     # pragma: no cover
+        raise Skip(f"PyQt6 is unavailable here ({exc})")
+    plug = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+    os.environ.setdefault("QT_PLUGIN_PATH", str(plug))
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plug / "platforms"))
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QSettings
+
+    with tempfile.TemporaryDirectory() as scratch:
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        for scope in (QSettings.Scope.UserScope, QSettings.Scope.SystemScope):
+            QSettings.setPath(QSettings.Format.IniFormat, scope, scratch)
+        from gui_core.config_manager import ConfigManager
+        from gui_panels.config_panel import ConfigurationPanel
+        global _APP
+        _APP = QApplication.instance() or QApplication([])
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
+
+        work = Path(scratch) / "gpu_int.yaml"
+        work.write_text(
+            "# keep me\nsimulation:\n  body: Moon\n"
+            "gpu:\n"
+            "  placement_margin_gib: 4       # int, numerically the default\n"
+            "  min_vram_margin_gib: 2\n")
+        before = work.read_text()
+        manager.load_from_yaml(str(work))
+        panel.load_from_config()
+        assert manager.plan_save_edits() == ({}, []), (
+            f"an edit-free open plans {manager.plan_save_edits()}")
+        manager.save_to_yaml(str(work))
+        after = work.read_text()
+        assert after == before, (
+            "an edit-free open+Save changed a gpu: line:\n"
+            + "\n".join(_changed_lines(before, after)))
+        assert "placement_margin_gib" in after, (
+            "the line was deleted from the user's file")
+        # ...and the explicit floor the file asked for is still explicit.
+        assert manager.get_value("gpu.margin_explicit") is True
+
+
 def test_an_int_spelled_double_is_not_rewritten():
     """`scale_factor: 1` must stay `1`, not become `1.0`.
 
@@ -521,6 +578,7 @@ TESTS = [
     test_opening_a_config_in_the_PANEL_plans_no_edits,
     test_no_edit_save_is_byte_identical_on_EVERY_shipped_config,
     test_one_edit_touches_only_that_key_across_every_config,
+    test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save,
     test_an_int_spelled_double_is_not_rewritten,
     test_save_says_which_file_it_actually_rewrote,
     test_plan_save_edits_reports_exactly_what_would_change,

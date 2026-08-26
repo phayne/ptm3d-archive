@@ -418,7 +418,66 @@ def test_only_the_engines_own_data_root_keys_follow_that_contract():
             f"does not: {sorted(missing)}")
 
 
+def test_the_bvh_off_sentinel_survives_absolutization():
+    """`bvh_cache_file: "off"` DISABLES the cache; it is not a path.
+
+    config_parser.h:435 and illumination_model.cpp:781/795 document it, and the
+    engine's resolveDataPath returns it verbatim. The GUI turned it into
+    "<project_root>/off", which would ENABLE caching into a file named `off` --
+    the opposite of what was asked, in the run YAML the engine actually reads.
+    """
+    preflight = _preflight()
+    out = preflight.absolutize_config_paths(
+        {"illumination": {"bvh_cache_file": "off"}}, "/proj")
+    assert out["illumination"]["bvh_cache_file"] == "off", (
+        f"the disable sentinel became {out['illumination']['bvh_cache_file']!r}")
+    for spelling in ("off", "OFF", " Off "):
+        assert preflight.is_path_sentinel("illumination.bvh_cache_file",
+                                          spelling)
+    assert not preflight.is_path_sentinel("illumination.bvh_cache_file",
+                                          "data/site.bvh")
+    assert not preflight.is_path_sentinel("mesh.import_file", "off"), (
+        "the sentinel leaked to a key that has no such contract")
+
+
+def test_the_preflight_and_the_run_yaml_resolve_a_path_the_same_way():
+    """They disagreed, and the disagreement was silent in both directions.
+
+    With PTM_DATA_ROOT set, the pre-flight stat'd $PTM_DATA_ROOT/... for four
+    keys the engine reads relative to the working directory: a launch could be
+    blocked for a file that exists, or waved through for one that does not.
+    """
+    import os
+    preflight = _preflight()
+    cases = [
+        ("thermal.eq_indirect_flux_file", "thermal", "eq_indirect_flux_file"),
+        ("thermal.initial_state_file", "thermal", "initial_state_file"),
+        ("illumination.positions_file", "illumination", "positions_file"),
+        ("mesh.import_file", "mesh", "import_file"),
+    ]
+    previous = os.environ.get("PTM_DATA_ROOT")
+    os.environ["PTM_DATA_ROOT"] = "/DATA"
+    try:
+        for dotted, section, leaf in cases:
+            config = {section: {leaf: "data/thing.bin"}}
+            written = preflight.absolutize_config_paths(config, "/proj")
+            resolver = (preflight.resolve_data_path
+                        if dotted in preflight._ENGINE_DATA_ROOT_FIELDS
+                        else preflight.resolve_path)
+            checked = str(resolver("data/thing.bin", "/proj"))
+            assert written[section][leaf] == checked, (
+                f"{dotted}: the run YAML says {written[section][leaf]}, the "
+                f"pre-flight would check {checked}")
+    finally:
+        if previous is None:
+            os.environ.pop("PTM_DATA_ROOT", None)
+        else:
+            os.environ["PTM_DATA_ROOT"] = previous
+
+
 TESTS = [
+    test_the_bvh_off_sentinel_survives_absolutization,
+    test_the_preflight_and_the_run_yaml_resolve_a_path_the_same_way,
     test_only_the_engines_own_data_root_keys_follow_that_contract,
     test_the_document_checked_is_the_document_that_will_run,
     test_a_crashing_engine_is_not_a_config_refusal,

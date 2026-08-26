@@ -901,7 +901,14 @@ class ConfigManager:
             if key == "min_vram_margin_gib" and explicit:
                 out[key] = value
                 continue
-            if value != engine_value or type(value) is not type(engine_value):
+            # The SAME equality rule plan_edits uses. A strict type test made
+            # an EDIT-FREE open+Save DELETE a line: a file spelling
+            # `placement_margin_gib: 4` (int) put 4 into the loaded view, the
+            # panel's set_numeric coerced it to 4.0, that now equals the
+            # engine's 4.0 default, the key dropped out of the written view --
+            # and plan_edits classified it as a REMOVAL. Reproduced end to end
+            # through a real ConfigurationPanel.
+            if not yaml_roundtrip.values_equal(engine_value, value):
                 out[key] = value
         return out
 
