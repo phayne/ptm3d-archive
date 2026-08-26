@@ -1,6 +1,7 @@
 #include "eq_seed.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdlib>
@@ -819,14 +820,36 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
     return r;
 }
 
+double analyticSeedCyclesFromPeriods(double planet_day_s, double planet_year_s,
+                                     int nyearseq) {
+    if (!(planet_day_s > 0.0) || nyearseq <= 0) return 0.0;
+    const double raw = static_cast<double>(nyearseq) *
+                       std::round(planet_year_s / planet_day_s);
+    if (raw >= 1.0) return raw;
+    // year < day/2 -> round() gives 0 and the pre-conditioner would be silently
+    // switched off. One whole diurnal cycle is the shortest length for which
+    // "integrate the analytic clear-sky forcing" means anything, and it is said
+    // out loud rather than substituted quietly. Reachable today only for
+    // Mercury (2 years = 1 solar day) under thermal.spinup_seed: legacy.
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) {
+        std::cerr << "[eq-seed] NOTE: nyearseq=" << nyearseq << " x round(year/day) = "
+                  << raw << " for a body whose solar day (" << (planet_day_s / 86400.0)
+                  << " d) is longer than its year (" << (planet_year_s / 86400.0)
+                  << " d). The legacy analytic pre-conditioner is run for ONE whole "
+                     "diurnal cycle instead of zero; set thermal.analytic_seed_cycles "
+                     "explicitly to choose a different length." << std::endl;
+    }
+    return 1.0;
+}
+
 double analyticSeedCycles(EqSeedMode mode, double explicit_cycles,
                           double planet_day_s, double planet_year_s,
                           int nyearseq) {
     if (explicit_cycles >= 0.0) return explicit_cycles;
     if (mode == EqSeedMode::Physical) return 0.0;
     if (!(planet_day_s > 0.0)) return 0.0;
-    return static_cast<double>(nyearseq) *
-           std::round(planet_year_s / planet_day_s);
+    return analyticSeedCyclesFromPeriods(planet_day_s, planet_year_s, nyearseq);
 }
 
 // ---------------------------------------------------------------------------

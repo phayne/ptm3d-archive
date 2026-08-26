@@ -454,10 +454,29 @@ double eqSeedGammaEff(const EqSeedInput& in, const EqSeedForcing& fc,
                       double omega, double T_ref);
 
 // ---------------------------------------------------------------------------
+// nyearseq * round(year / solar_day), floored at one whole diurnal cycle.
+// Moon 24, Europa 2, Mercury 2, an asteroid ~10^4.
+//
+// THE FLOOR IS NOT COSMETIC. round(year/day) is 0 for any body whose solar day
+// exceeds twice its year, and Mercury is exactly that body once its day is the
+// true 175.938-day SOLAR day rather than the 58.646-day sidereal rotation
+// (2 Mercury years = 1 Mercury solar day, so year/day = 0.5). Without the
+// floor, fixing ENG-MERCURY-SOLAR-DAY would have silently turned the legacy
+// analytic pre-conditioner OFF for Mercury -- a spin-up of zero cycles
+// reported as a spin-up. Inert for every other body and every shipped config:
+// Moon, Europa and every generic body already return >= 1.
+//
+// Shared so that ptm_thermal_sim's cpuAnalyticSeedCycles (which sizes the SIMD
+// equilibrator and the pre-flight banner) and analyticSeedCycles below cannot
+// drift apart.
+double analyticSeedCyclesFromPeriods(double planet_day_s, double planet_year_s,
+                                     int nyearseq);
+
+// ---------------------------------------------------------------------------
 // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
 //
 //   mode == Physical  -> 0 unless explicitly requested
-//   mode == Legacy    -> nyearseq * round(year/day)   (Moon 24, Europa 2)
+//   mode == Legacy    -> analyticSeedCyclesFromPeriods()   (Moon 24, Europa 2)
 //
 // `explicit_cycles` is the resolved thermal.analytic_seed_cycles: < 0 means
 // "unset, follow the mode", >= 0 means "use exactly this many". A caller that

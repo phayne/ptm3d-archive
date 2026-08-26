@@ -35,7 +35,18 @@ enum class PlanetaryBody {
 // Structure to hold all thermophysical properties
 struct ThermophysicalProperties {
     // Orbital and rotational parameters
-    double day;           // Rotation period (seconds)
+    //
+    // `day` is the SOLAR (synodic) day in seconds -- sunrise to sunrise -- NOT
+    // the sidereal rotation period. Everything downstream treats it as the
+    // period of the solar forcing: the hour angle (thermal_model.cpp
+    // surfFlux), the diurnal skin depth and hence the depth grid
+    // (skinDepth(planet.day, ...)), the timestep (getTimeStep), the
+    // equilibration block length (ptm_thermal_sim `equilibration_days`), the
+    // spectral equilibrator's `cycle_s`, and the output cadence. On a
+    // synchronous rotator (Europa) and on the Moon the distinction is either
+    // nil or already folded in; on Mercury it is a factor of three, and
+    // getting it wrong there was BUGS.md ENG-MERCURY-SOLAR-DAY.
+    double day;           // Solar (synodic) day (seconds)
     double year;          // Orbital period (seconds)
     double rAU;           // Distance from Sun (AU)
     double S;             // Solar constant at orbit (W/m²)
@@ -255,10 +266,49 @@ private:
     // Mercury properties
     static ThermophysicalProperties getMercuryProperties() {
         ThermophysicalProperties props;
-        
+
         // Orbital parameters
-        props.day = 58.646 * 24 * 3600;  // Mercury day in seconds
-        props.year = 87.969 * 24 * 3600; // Mercury year in seconds
+        //
+        // ⚠️ `day` is the SOLAR (synodic) day -- sunrise to sunrise -- on every
+        // body in this file, because that is the period the thermal model is
+        // forced at: it sets the hour angle, the diurnal skin depth, the
+        // timestep, the equilibration block length and the output cadence
+        // (thermal_model.cpp: surfFlux/getTimeStep/skinDepth, ptm_thermal_sim
+        // equilibration_days). Mercury is the one body where that differs from
+        // the rotation period, and until 2026-08-26 this line carried the
+        // SIDEREAL rotation, 58.646 d, while the banner printed it as
+        // "Synodic day (solar day)". Every derived quantity was therefore a
+        // third of its true length: `thermal.equilibration_orbits: 50` bought
+        // 50 sidereal rotations of spin-up rather than 50 solar days, and the
+        // diurnal skin depth was sqrt(3) = 1.73x too shallow.
+        //
+        // Mercury is in a 3:2 spin-orbit resonance, so the solar day is
+        //   P_solar = 1 / |1/P_sidereal - 1/P_orbital| = 3 * P_sidereal
+        //           = 175.938 d  = exactly two Mercury years.
+        // Written as the product below rather than as one opaque literal so
+        // that the resonance is visible in the source, and cross-checked
+        // against the two periods by the static_assert underneath so the three
+        // numbers cannot drift apart. Same expression as
+        // orbital/generic_body.h's synodic-day derivation.
+        //
+        // ⛔ THIS CHANGES MERCURY PHYSICS. No shipped config, tutorial or
+        // dataset selects Mercury (0 of 78 run configs, `ALBEDO_BODIES` and
+        // `TOPO_BODIES` exclude it), so the blast radius is the tutorial and
+        // testing surface only -- but a Mercury run on this binary is not
+        // comparable with one from before. BUGS.md ENG-MERCURY-SOLAR-DAY.
+        constexpr double kMercurySiderealRotationDays = 58.646;
+        constexpr double kMercuryOrbitalPeriodDays    = 87.969;
+        constexpr double kMercurySolarDayDays         = 3.0 * kMercurySiderealRotationDays;
+        static_assert(
+            kMercurySolarDayDays * (1.0 / kMercurySiderealRotationDays
+                                    - 1.0 / kMercuryOrbitalPeriodDays) > 0.9999 &&
+            kMercurySolarDayDays * (1.0 / kMercurySiderealRotationDays
+                                    - 1.0 / kMercuryOrbitalPeriodDays) < 1.0001,
+            "Mercury's solar day must equal 1/(1/P_sidereal - 1/P_orbital); "
+            "one of the three periods was edited without the others");
+
+        props.day = kMercurySolarDayDays * 24 * 3600;   // solar day, 175.938 d
+        props.year = kMercuryOrbitalPeriodDays * 24 * 3600; // Mercury year in seconds
         props.rAU = 0.387;               // Average distance from Sun in AU
         props.S = 9126.6;                // Solar constant at Mercury's orbit
         

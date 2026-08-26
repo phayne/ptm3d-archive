@@ -485,6 +485,21 @@ that the value you set is the value that was echoed.
   every asteroid config in `examples/` — is unaffected: `generic_body:` supplies the properties, and
   that is the supported route.
 
+- **Mercury's `day` was the sidereal rotation, not the solar day, and this is a physics change.**
+  `props.day` is the period the thermal model is forced at: it sets the hour angle, the diurnal
+  skin depth and hence the depth grid, the timestep, the equilibration block length and the output
+  cadence. Mercury's entry carried the **sidereal** 58.646 d while the banner printed it as
+  `Synodic day (solar day)`. Mercury is in a 3:2 spin-orbit resonance, so its solar day is
+  `1/|1/P_sid − 1/P_orb|` = **175.938 d**, three times longer. Every derived quantity was therefore
+  a third of its true length — `thermal.equilibration_orbits: N` bought N sidereal rotations of
+  spin-up, and the diurnal skin depth was √3 = 1.73× too shallow. Fixed 2026-08-26. Measured on an
+  ico2 4-step probe: banner and `Total equilibration period` 58.65 d → 175.94 d; `temperature_max`
+  mean 283.80 K → 324.46 K and minimum 24.82 K → 133.40 K on the CPU SIMD batch path. **A Mercury
+  run on this binary is not comparable with one from before.** No shipped configuration, tutorial
+  or dataset selects Mercury (0 of 78 run configs; the albedo and topography datasets cover Moon and
+  Europa only), so the blast radius is the tutorial and testing surface. Moon and Europa are
+  untouched and byte-identical.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,

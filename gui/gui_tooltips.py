@@ -1751,11 +1751,27 @@ def get_body_defaults(body_name):
 
 
 # Synodic day (solar day) in Earth days for built-in bodies.
-# These are sunrise-to-sunrise periods matching the C++ thermal model (thermo.day).
+#
+# For the three bodies the engine IMPLEMENTS these match the C++ thermal model's
+# `props.day` exactly, and src/python/tests/test_body_capabilities.py fails if
+# they stop matching. That test exists because this table's previous comment
+# made the same claim and it was FALSE for Mercury: this table said 175.942 d
+# while the engine carried the SIDEREAL 58.646 d and printed it as the solar
+# day. Both are now the derived 175.938 d = 3 x the sidereal period
+# (BUGS.md ENG-MERCURY-SOLAR-DAY).
+#
+# The last four are NOT engine values and cannot be: the engine implements no
+# properties for those bodies and REFUSES them at config parse
+# (ENG-BODY-UNBACKED-RUN). They are kept only so the duration widget can still
+# convert units for a config someone typed by hand; they describe the real
+# solar system, not this simulator. Phase B of the body-first work removes them
+# from the dropdown, at which point they should leave this table too.
 BODY_SYNODIC_PERIODS = {
+    # --- implemented by the engine; pinned to props.day by the parity test ---
     "Europa": 3.55,         # Synchronous rotation
     "Moon": 29.530588,      # Synodic lunar day
-    "Mercury": 175.942,     # Solar day (2/3 orbital period)
+    "Mercury": 175.938,     # Solar day = 3 x the 58.646 d sidereal rotation
+    # --- NOT implemented: the engine refuses these body names ---
     "Enceladus": 1.370218,  # Synchronous rotation
     "Titan": 15.945,        # Synchronous rotation
     "Mars": 1.02749,        # Martian sol

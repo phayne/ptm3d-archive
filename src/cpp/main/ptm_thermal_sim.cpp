@@ -1959,23 +1959,27 @@ public:
 static constexpr int kCpuAnalyticSeedYears = 2;
 
 // Length of the CPU paths' analytic clear-sky pre-conditioner, in diurnal
-// cycles, for a body with a real seasonal year (Moon 24, Europa 2, Mercury 4).
+// cycles, for a body with a real seasonal year (Moon 24, Europa 2, Mercury 2).
 // SINGLE SOURCE: the SIMD equilibrator sizes its seed with this and the
 // pre-flight banner reports it with this, so the reported length cannot drift
 // away from the integrated one. Generic bodies do NOT use it on the SIMD path
 // (an asteroid's year is ~10^4 rotations); see the "using_generic_body" branch
 // in runThermalModelsForAllFacesBatchSoA.
+//
+// Must stay identical to thermal::analyticSeedCycles (eq_seed.cpp), including
+// the floor below.
 static double cpuAnalyticSeedCycles(const thermal::Planet& planet, int nyearseq) {
     if (!(planet.day > 0.0)) return 0.0;
-    return static_cast<double>(nyearseq) * std::round(planet.year / planet.day);
+    return thermal::analyticSeedCyclesFromPeriods(planet.day, planet.year, nyearseq);
 }
 
 double getSynodicDayFromPlanet(const thermal::Planet& planet) {
-    // The planet object stores the rotational period in seconds in the 'day' field
-    double rotation_period_seconds = planet.day;
-    double rotation_period_days = rotation_period_seconds / (24.0 * 3600.0);
-    
-    return rotation_period_days;
+    // planet.day is the SOLAR (synodic) day in seconds -- see the field comment
+    // in planetary_properties.h. This is the one place the banner and the
+    // equilibration window get their "Earth days per diurnal cycle" from, so
+    // reading it as anything else (a sidereal rotation, say) propagates
+    // everywhere at once.
+    return planet.day / (24.0 * 3600.0);
 }
 
 std::vector<double> importAlbedoMapFromFile(const std::string& filename) {
@@ -6318,7 +6322,8 @@ bool addThermalDataToVTK(
 // clear-sky pre-conditioner before the real forcing — Model::fastEquilibrate
 // (scalar) and its mirror in the SIMD batch path — of
 // `NYEARSEQ * round(planet.year / planet.day)` diurnal cycles: 24 on the Moon,
-// 2 on Europa, 4 on Mercury, with NYEARSEQ hard-wired to 2 in main(). It is
+// 2 on Europa, 2 on Mercury (see analyticSeedCyclesFromPeriods for the floor
+// that keeps it from being 0 there), with NYEARSEQ hard-wired to 2 in main(). It is
 // not user-configurable, it is not counted by equilibration_orbits, and the
 // GPU path has no equivalent. So "configured == integrated" is exact on the
 // GPU and is "configured == integrated real-forcing spin-up, plus a fixed
