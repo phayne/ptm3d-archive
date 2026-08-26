@@ -553,6 +553,11 @@ class ConfigManager:
         #: than assuming; "Comments and layout preserved" over someone else's
         #: file was a false claim.
         self.last_save_mode = None
+        #: Lines the last save reformatted that carry no key the user edited.
+        #: Empty on every shipped config; non-empty is a layout the writer
+        #: could not reproduce, and it is REPORTED rather than left to be
+        #: noticed in a later diff.
+        self.last_save_layout_changes = []
         #: True once the user has been told that this session's saves cannot
         #: preserve comments (ruamel.yaml missing). The GUI shows it once as a
         #: dialog and every time in the console; it is never silent.
@@ -1257,6 +1262,22 @@ class ConfigManager:
                 return self.last_save_mode
             doc.apply(updates, removals)
             text = doc.dump()
+            # ANY line that changed and is not one of the edited keys is a
+            # LAYOUT change, not an edit -- ruamel reflowing something. The
+            # first-sequence indentation heuristic covers the common case and
+            # cannot cover a document that MIXES sequence shapes, so rather
+            # than hope, measure and report. Silence about a rewrite of lines
+            # nobody edited is the whole failure mode this module exists to
+            # remove.
+            self.last_save_layout_changes = yaml_roundtrip.layout_only_changes(
+                doc.text, text, set(updates) | set(removals))
+            if self.last_save_layout_changes:
+                logger.warning(
+                    "[config] saving %s reformatted %d line(s) that carry no "
+                    "key you edited (YAML layout the writer could not "
+                    "reproduce exactly): %s", filename,
+                    len(self.last_save_layout_changes),
+                    " | ".join(self.last_save_layout_changes[:4]))
             with open(filename, 'w') as f:
                 f.write(text)
         else:

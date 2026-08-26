@@ -462,11 +462,27 @@ class BaseConfigTab(QWidget):
             return
         idx = widget.findText(canonical)
         if idx >= 0:
+            # blockSignals: setCurrentIndex fires currentTextChanged, which is
+            # add_combo_field's writeback -- so merely DISPLAYING a config
+            # wrote the canonical spelling into it, which is the same
+            # edit-free-save rewrite this method stopped doing explicitly one
+            # line below. A load is not an edit.
+            widget.blockSignals(True)
             widget.setCurrentIndex(idx)
+            widget.blockSignals(False)
         if str(value) != canonical:
-            # Normalize the stored value too, so the saved YAML says what the
-            # control shows. Only ever an alias-for-alias substitution.
-            self.config_manager.set_value(key, canonical)
+            # The CONTROL shows the canonical spelling; the CONFIG keeps the
+            # file's. The engine normalizes these the same way the combo does
+            # (`historical` is `legacy`, `martinez` is `martinez2021`, `Auto` is
+            # `auto`), so both spellings run identically -- and rewriting the
+            # stored value made an edit-free open+Save change the user's file,
+            # because _loaded_engine_view is snapshotted before the tabs run.
+            # A user edit still writes the canonical form, through the combo's
+            # own currentTextChanged.
+            logging.info(
+                "[config] %s = %r is displayed as %r; the engine reads them "
+                "identically and the file keeps its own spelling.",
+                key, value, canonical)
 
     def set_numeric(self, key, value):
         """Load a numeric value into its widget, WARNING if the range clamps it.
@@ -4581,7 +4597,12 @@ class IlluminationTab(BaseConfigTab):
                             "Where to cache the shadow-ray acceleration "
                             "structure. Reusing it is a large saving on a "
                             "repeat run of the same mesh; it is rebuilt when "
-                            "the geometry no longer matches.")
+                            "the geometry no longer matches.\n"
+                            "Blank = the engine derives one under the output "
+                            "directory. The exact lowercase word 'off' "
+                            "disables caching -- the engine compares that "
+                            "string literally, so 'OFF' is a FILENAME, not "
+                            "the switch.")
         pos_group.setLayout(pos_layout)
         adv_illum.add_widget(pos_group)
 

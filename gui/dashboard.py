@@ -362,8 +362,31 @@ class UnifiedDashboard(QMainWindow):
             if idx < len(modules):
                 cm = modules[idx].config_manager()
                 if cm and hasattr(cm, 'save_to_yaml'):
-                    cm.save_to_yaml(filepath)
-                    self.console_panel.append_success(f"Saved: {filepath}")
+                    # The SECOND entry point into ConfigManager, and it was not
+                    # migrated with the first. It reported "Saved" for a save
+                    # that wrote nothing ("unchanged"), and it never consulted
+                    # comment_preservation_status(), so with ruamel.yaml absent
+                    # the dashboard silently flattened the user's file -- the
+                    # exact defect this branch exists to remove, still live on
+                    # the other door.
+                    preserved, status = (
+                        cm.comment_preservation_status()
+                        if hasattr(cm, "comment_preservation_status")
+                        else (True, ""))
+                    mode = cm.save_to_yaml(filepath)
+                    if mode == "unchanged":
+                        self.console_panel.append_info(
+                            f"Nothing to write: {filepath} already matches "
+                            f"this configuration and was left untouched.")
+                    elif mode == "replaced_other_file":
+                        self.console_panel.append_warning(
+                            f"Saved over {filepath}, which already existed. "
+                            f"Its own comments and any keys this "
+                            f"configuration does not carry are gone.")
+                    else:
+                        self.console_panel.append_success(f"Saved: {filepath}")
+                    if not preserved and status:
+                        self.console_panel.append_warning(status)
 
     def _on_about(self):
         QMessageBox.about(

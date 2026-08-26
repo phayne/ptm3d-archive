@@ -431,9 +431,15 @@ def test_the_bvh_off_sentinel_survives_absolutization():
         {"illumination": {"bvh_cache_file": "off"}}, "/proj")
     assert out["illumination"]["bvh_cache_file"] == "off", (
         f"the disable sentinel became {out['illumination']['bvh_cache_file']!r}")
-    for spelling in ("off", "OFF", " Off "):
-        assert preflight.is_path_sentinel("illumination.bvh_cache_file",
-                                          spelling)
+    assert preflight.is_path_sentinel("illumination.bvh_cache_file", "off")
+    # EXACT, because the engine's test is exact (`bvh_cache_file_ != "off"`).
+    # Matching case-insensitively would make the GUI call "OFF" disabled while
+    # the engine treated it as a relative path and wrote a cache to <repo>/OFF
+    # -- the disclosure and the run disagreeing about the same file. So "OFF"
+    # is a PATH here, exactly as it is to the engine.
+    for other in ("OFF", " off ", "Off"):
+        assert not preflight.is_path_sentinel(
+            "illumination.bvh_cache_file", other), other
     assert not preflight.is_path_sentinel("illumination.bvh_cache_file",
                                           "data/site.bvh")
     assert not preflight.is_path_sentinel("mesh.import_file", "off"), (

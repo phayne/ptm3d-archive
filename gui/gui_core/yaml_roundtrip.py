@@ -233,6 +233,29 @@ def values_equal(a, b):
     return type(a) is type(b) and a == b
 
 
+def layout_only_changes(before, after, edited_keys):
+    """Changed lines that mention none of `edited_keys` -- i.e. pure reflow.
+
+    `detect_sequence_indent` copies the FIRST block sequence's shape, which is
+    all ruamel offers: there is no per-node indentation. A document that mixes
+    shapes will have the non-matching ones reflowed. That is a real limitation,
+    so it is measured and reported instead of assumed away.
+    """
+    import difflib
+    # Every segment, not just the leaf: writing `simulation.timesteps` into a
+    # file that had no `simulation:` legitimately adds that header, and calling
+    # the header a reflow would cry wolf on a line the edit really did create.
+    leaves = set()
+    for key in edited_keys:
+        leaves.update(key.split("."))
+    changed = [
+        line for line in difflib.unified_diff(
+            before.splitlines(), after.splitlines(), lineterm="", n=0)
+        if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+    return [line for line in changed
+            if not any(leaf in line for leaf in leaves)]
+
+
 def plan_edits(loaded_view, current_view, file_keys):
     """Decide what a save has to change, and nothing more.
 

@@ -610,7 +610,11 @@ class PTM3DMainWindow(QMainWindow):
             self.add_recent_file(filename)
             self.status_label.setText(f"Saved: {Path(filename).name}")
             self.console_panel.append_info(f"Project saved: {filename}")
-            if edits is not None:
+            # NOT in replaced_other_file mode: there the target was replaced
+            # wholesale by a different file's document, so "Rewrote 2 key(s)"
+            # materially understates it and contradicts the warning printed
+            # immediately below.
+            if edits is not None and mode != "replaced_other_file":
                 updates, removals = edits
                 touched = sorted(list(updates) + list(removals))
                 self.console_panel.append_info(
@@ -637,6 +641,13 @@ class PTM3DMainWindow(QMainWindow):
                     f"carried that this project does not are gone.")
             else:
                 self.console_panel.append_warning(status)
+            reflowed = getattr(self.config_manager,
+                               "last_save_layout_changes", [])
+            if reflowed:
+                self.console_panel.append_warning(
+                    "%d line(s) were reformatted that carry no key you edited "
+                    "(a YAML layout the writer could not reproduce exactly): %s"
+                    % (len(reflowed), " | ".join(reflowed[:4])))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project:\n{str(e)}")
 

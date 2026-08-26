@@ -418,6 +418,123 @@ def test_one_edit_touches_only_that_key_across_every_config():
         + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
 
 
+def test_a_reflow_the_writer_cannot_avoid_is_REPORTED():
+    """detect_sequence_indent copies the FIRST sequence's shape, which is all
+    ruamel offers -- there is no per-node indentation. A document that MIXES
+    shapes will have the non-matching ones reflowed on a save with edits.
+
+    That is a real limitation, so it is measured and reported rather than
+    assumed away: any changed line mentioning none of the edited keys' path
+    segments is a layout change, and the console says so.
+    """
+    _require_ruamel()
+    with tempfile.TemporaryDirectory() as tmp:
+        # Two block sequences at DIFFERENT indentations.
+        mixed = Path(tmp) / "mixed.yaml"
+        mixed.write_text(
+            "a_list:\n  - one\n  - two\n"
+            "simulation:\n  timesteps: 5\n"
+            "b_list:\n- three\n- four\n")
+        manager = _manager()
+        manager.load_from_yaml(str(mixed))
+        manager.set_value("simulation.timesteps", 7)
+        manager.save_to_yaml(str(mixed))
+        assert manager.last_save_layout_changes, (
+            "a sequence at a shape the writer cannot reproduce was reflowed "
+            "with nothing said")
+        assert any("three" in ln for ln in manager.last_save_layout_changes), (
+            manager.last_save_layout_changes)
+
+    # ...and it does NOT cry wolf on the section header an edit really created.
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = Path(tmp) / "plain.yaml"
+        plain.write_text("mesh:\n  resolution: 4\n")
+        manager = _manager()
+        manager.load_from_yaml(str(plain))
+        manager.set_value("simulation.timesteps", 7)
+        manager.save_to_yaml(str(plain))
+        assert manager.last_save_layout_changes == [], (
+            f"the `simulation:` header the edit created was reported as a "
+            f"reflow: {manager.last_save_layout_changes}")
+
+
+def test_no_shipped_config_is_reflowed_by_an_edit():
+    """The corpus answer to the limitation above: 0 of 77."""
+    _require_ruamel()
+    targets = (sorted((REPO_ROOT / "configs").rglob("*.yaml"))
+               + sorted((REPO_ROOT / "examples").glob("*.yaml")))
+    offenders = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for src in targets:
+            work = Path(tmp) / src.name
+            shutil.copyfile(src, work)
+            manager = _manager()
+            manager.load_from_yaml(str(work))
+            manager.set_value("simulation.timesteps", 999)
+            manager.save_to_yaml(str(work))
+            if manager.last_save_layout_changes:
+                offenders[src.name] = manager.last_save_layout_changes[:4]
+    assert not offenders, offenders
+
+
+def test_a_recognized_alias_keeps_the_files_own_spelling():
+    """Normalizing the STORED value made an edit-free save rewrite the file.
+
+    `spinup_seed: historical` is `legacy`, `conductivity_model: martinez` is
+    `martinez2021` -- the engine normalizes them the same way the combo does,
+    so both spellings run identically. set_enum used to write the canonical
+    form back into the config, and since _loaded_engine_view is snapshotted
+    before the tabs run, plan_edits saw a user edit. No shipped config uses an
+    alias, which is why the corpus sweep could not catch it.
+    """
+    _require_ruamel()
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import PyQt6
+    except ImportError as exc:                     # pragma: no cover
+        raise Skip(f"PyQt6 is unavailable here ({exc})")
+    plug = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+    os.environ.setdefault("QT_PLUGIN_PATH", str(plug))
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plug / "platforms"))
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QSettings
+
+    with tempfile.TemporaryDirectory() as scratch:
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        for scope in (QSettings.Scope.UserScope, QSettings.Scope.SystemScope):
+            QSettings.setPath(QSettings.Format.IniFormat, scope, scratch)
+        from gui_core.config_manager import ConfigManager
+        from gui_panels.config_panel import ConfigurationPanel
+        global _APP
+        _APP = QApplication.instance() or QApplication([])
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
+
+        work = Path(scratch) / "aliases.yaml"
+        work.write_text(
+            "# keep me\nsimulation:\n  body: Moon\n"
+            "thermal:\n"
+            "  spinup_seed: historical\n"
+            "  seed_anchor: derived\n"
+            "thermophysical:\n"
+            "  conductivity_model: martinez\n")
+        before = work.read_text()
+        manager.load_from_yaml(str(work))
+        panel.load_from_config()
+        assert manager.plan_save_edits() == ({}, []), (
+            f"an alias spelling plans an edit: {manager.plan_save_edits()}")
+        manager.save_to_yaml(str(work))
+        assert work.read_text() == before, (
+            "opening a config that uses documented alias spellings and saving "
+            "with no edits rewrote it:\n"
+            + "\n".join(_changed_lines(before, work.read_text())))
+        # ...and the CONTROLS still show the canonical spelling.
+        thermal = panel.tabs["thermal"]
+        assert thermal.widgets["thermal.spinup_seed"].currentText() == "legacy"
+        assert thermal.widgets["thermal.seed_anchor"].currentText() == "lumped"
+
+
 def test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save():
     """The gpu: writer had its own equality rule, and it removed a line.
 
@@ -578,6 +695,9 @@ TESTS = [
     test_opening_a_config_in_the_PANEL_plans_no_edits,
     test_no_edit_save_is_byte_identical_on_EVERY_shipped_config,
     test_one_edit_touches_only_that_key_across_every_config,
+    test_a_reflow_the_writer_cannot_avoid_is_REPORTED,
+    test_no_shipped_config_is_reflowed_by_an_edit,
+    test_a_recognized_alias_keeps_the_files_own_spelling,
     test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save,
     test_an_int_spelled_double_is_not_rewritten,
     test_save_says_which_file_it_actually_rewrote,

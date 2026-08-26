@@ -149,8 +149,15 @@ _PATH_SENTINELS = {
 
 
 def is_path_sentinel(dotted, value):
-    """True when `value` is a documented sentinel for `dotted`, not a path."""
-    return str(value).strip().lower() in _PATH_SENTINELS.get(dotted, ())
+    """True when `value` is a documented sentinel for `dotted`, not a path.
+
+    EXACT, because the engine's test is exact: `bvh_cache_file_ != "off"`
+    (illumination_model.cpp:781, :795). A case-insensitive match here would
+    make the GUI skip `"OFF"` as "caching disabled" while the engine read it as
+    a relative path and wrote a cache to <repo>/OFF -- the disclosure and the
+    run disagreeing about the same file.
+    """
+    return str(value) in _PATH_SENTINELS.get(dotted, ())
 
 
 #: EXACTLY the keys the engine resolves through resolveDataPath
