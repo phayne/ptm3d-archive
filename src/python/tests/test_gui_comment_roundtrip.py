@@ -484,6 +484,29 @@ def test_layout_detection_matches_a_KEY_not_a_substring():
         {"simulation.timesteps"}) == []
 
 
+def test_comments_deleted_with_their_key_are_not_called_a_reflow():
+    """Clearing a custom body deletes generic_body.orbit.* and the comments
+    above them. Reporting those as "reformatted, carrying no key you edited"
+    is the guard rail crying wolf on a correct deletion. Reproduced on
+    examples/quickstart_asteroid_diurnal.yaml: 5 lines, four of them comments.
+    """
+    _require_ruamel()
+    from gui_core.yaml_roundtrip import layout_only_changes
+    before = ("thermal:\n  threads: 4\n"
+              "generic_body:\n"
+              "  # the orbit, from HORIZONS\n"
+              "  orbit:\n    eccentricity: 0.2\n")
+    after = "thermal:\n  threads: 8\n"
+    reported = layout_only_changes(
+        before, after, {"thermal.threads", "generic_body.orbit.eccentricity"})
+    assert not any(ln.lstrip("-+").strip().startswith("#")
+                   for ln in reported), (
+        f"a comment deleted with its key was reported as a reflow: {reported}")
+    # An ADDED comment is a real surprise and still reported.
+    assert layout_only_changes(
+        "a: 1\n", "a: 1\n# where did this come from\n", {"a"})
+
+
 def test_a_second_save_does_not_repeat_the_first_saves_warning():
     _require_ruamel()
     with tempfile.TemporaryDirectory() as tmp:
@@ -741,6 +764,7 @@ TESTS = [
     test_one_edit_touches_only_that_key_across_every_config,
     test_a_reflow_the_writer_cannot_avoid_is_REPORTED,
     test_layout_detection_matches_a_KEY_not_a_substring,
+    test_comments_deleted_with_their_key_are_not_called_a_reflow,
     test_a_second_save_does_not_repeat_the_first_saves_warning,
     test_no_shipped_config_is_reflowed_by_an_edit,
     test_a_recognized_alias_keeps_the_files_own_spelling,

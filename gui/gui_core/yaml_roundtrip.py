@@ -265,8 +265,22 @@ def layout_only_changes(before, after, edited_keys):
             before.splitlines(), after.splitlines(), lineterm="", n=0)
         if line[:1] in "+-" and not line.startswith(("+++", "---"))]
     if pattern is None:
-        return changed
-    return [line for line in changed if not pattern.match(line)]
+        changed = list(changed)
+    else:
+        changed = [line for line in changed if not pattern.match(line)]
+    # A REMOVED comment or blank line is a consequence of removing the key it
+    # annotated, not a reflow. Clearing a custom body deletes
+    # generic_body.orbit.* and the comments above them, and reporting those as
+    # "reformatted, carrying no key you edited" is the guard rail crying wolf
+    # on a correct deletion. An ADDED comment would be a real surprise and is
+    # still reported.
+    def _is_removed_annotation(line):
+        if not line.startswith("-"):
+            return False
+        body = line[1:].strip()
+        return body == "" or body.startswith("#")
+
+    return [line for line in changed if not _is_removed_annotation(line)]
 
 
 def plan_edits(loaded_view, current_view, file_keys):

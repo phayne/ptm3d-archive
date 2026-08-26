@@ -4671,6 +4671,11 @@ class IlluminationTab(BaseConfigTab):
                                 "illumination.gpu_inter_batch_pause_ms"]
         self.widgets["illumination.use_gpu"].toggled.connect(
             self._update_illum_gpu_gating)
+        # Clearing the unparseable text has to release the field back to the
+        # GPU switch; otherwise "stays editable while stuck" becomes "stays
+        # editable forever".
+        self.widgets["illumination.gpu_device_ids"].textChanged.connect(
+            lambda _t: self._update_illum_gpu_gating())
 
         layout.addWidget(adv_illum)
 
@@ -4797,8 +4802,17 @@ class IlluminationTab(BaseConfigTab):
         on = bool(widget.isChecked()) if widget is not None else False
         for key in getattr(self, "_illum_gpu_keys", []):
             dependent = self.widgets.get(key)
-            if dependent is not None:
-                dependent.setEnabled(on)
+            if dependent is None:
+                continue
+            # A field holding a value that cannot be parsed stays EDITABLE even
+            # when its section's GPU path is off, so the user can always clear
+            # it. validate() no longer blocks on it either, but a config that
+            # carries unparseable text should not become unfixable from the
+            # panel that put it there.
+            stuck = (key.endswith("gpu_device_ids")
+                     and ConfigManager.parse_device_ids(
+                         self.config_manager.get_value(key, [])) is None)
+            dependent.setEnabled(on or stuck)
 
     def load_from_config(self):
         config = self.config_manager.get_config()

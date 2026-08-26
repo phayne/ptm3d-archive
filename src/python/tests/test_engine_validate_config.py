@@ -114,6 +114,39 @@ def test_it_discloses_what_it_did_not_check():
         for phrase in ("mesh", "SPICE", "martinez2021"):
             assert phrase in proc.stdout, (
                 f"the scope note no longer names {phrase!r}")
+        # These two need nothing but the config and are still NOT checked --
+        # they live below this exit inside a block that also reads their
+        # environment overrides, and hoisting them would mean a second copy of
+        # the rule. So the banner has to say so, or the block's own claim to
+        # check "everything knowable from the configuration alone" is false.
+        # Verified against the binary: thermal.eq_indirect_passes: 0 is
+        # ACCEPTED here and FATAL in a real run.
+        for phrase in ("eq_indirect_source", "eq_indirect_passes"):
+            assert phrase in proc.stdout, (
+                f"the scope note does not admit that {phrase} is unchecked; "
+                f"a caller would read ACCEPTED for a config the engine "
+                f"refuses at startup")
+
+
+def test_the_two_config_only_checks_below_the_exit_are_named_not_hidden():
+    """The honest half of the scope boundary.
+
+    `thermal.eq_indirect_passes: 0` is a startup FATAL that needs nothing but
+    the config, and this mode accepts it -- because the check lives below the
+    exit, inside a block that also reads PTM_EQ_INDIRECT_PASSES. Measured both
+    ways. The mode is allowed not to check it; it is not allowed to be quiet
+    about not checking it, and the GUI carries its own copy of both rules.
+    """
+    exe = _engine()
+    with tempfile.TemporaryDirectory() as tmp:
+        config, _ = _write(tmp, "eqpasses", "thermal:\n  eq_indirect_passes: 0\n")
+        proc, _ = _run(exe, config)
+        assert proc.returncode == 0, (
+            "this asserts the CURRENT boundary; if the exit moved below the "
+            "check, update the banner and this test together")
+        assert "eq_indirect_passes" in proc.stdout, (
+            "accepted a config the engine refuses at startup WITHOUT naming "
+            "the key in the not-checked list")
 
 
 def test_engine_refusals_are_reproduced_verbatim():
@@ -204,6 +237,7 @@ def test_nothing_is_simulated_and_nothing_is_written():
 TESTS = [
     test_a_valid_config_is_accepted,
     test_it_discloses_what_it_did_not_check,
+    test_the_two_config_only_checks_below_the_exit_are_named_not_hidden,
     test_engine_refusals_are_reproduced_verbatim,
     test_malformed_yaml_is_refused_not_defaulted,
     test_it_needs_a_config_to_validate,

@@ -217,6 +217,9 @@ def test_an_empty_device_list_is_not_written():
 
 def test_a_malformed_device_list_is_refused_not_ignored():
     manager = _manager()
+    # Only meaningful when that section's GPU path is on: the key is read only
+    # then, and the illumination field is disabled while it is off.
+    manager.set_value("radiation.use_gpu", True)
     manager.set_value("radiation.gpu_device_ids", "zero, one")
     valid, messages = manager.validate()
     assert not valid, (
@@ -351,6 +354,60 @@ def test_the_gpu_enums_are_case_insensitive_like_the_engine():
         manager.set_value("gpu.hard_min_vram_margin_gib", 0.25)
         valid, messages = manager.validate()
         assert valid, f"thin_margin_policy {value!r} refused: {messages}"
+
+
+def test_a_disabled_device_list_does_not_block_the_launch():
+    """And a field holding unparseable text stays editable.
+
+    IlluminationTab disables the device-ID field while illumination.use_gpu is
+    off, and validate() refused unconditionally -- so ticking the box, typing
+    `abc` and unticking it blocked Run with an error naming a field the user
+    could no longer edit, for a key the run would never read. Reproduced.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        tab = panel.tabs["illumination"]
+        tab.widgets["illumination.use_gpu"].setChecked(True)
+        tab.widgets["illumination.gpu_device_ids"].setText("abc")
+        valid, messages = manager.validate()
+        assert not valid, "an unparseable list is refused while the GPU is ON"
+
+        tab.widgets["illumination.use_gpu"].setChecked(False)
+        valid, messages = manager.validate()
+        assert valid, (
+            f"the launch is blocked over a key this run will not read: "
+            f"{messages}")
+        assert tab.widgets["illumination.gpu_device_ids"].isEnabled(), (
+            "the field holding the unparseable text is disabled, so the user "
+            "cannot clear it")
+
+        tab.widgets["illumination.gpu_device_ids"].setText("")
+        assert not tab.widgets["illumination.gpu_device_ids"].isEnabled(), (
+            "once cleared it follows the GPU switch again")
+
+
+def test_an_unreadable_machine_profile_does_not_abort_the_panel():
+    """refresh_effective runs in init_ui, so an AttributeError there takes the
+    WHOLE ConfigurationPanel down, not one tab."""
+    import os
+    from gui_core.config_manager import ConfigManager
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = Path(tmp) / "machine_profile.json"
+        previous = os.environ.get("PTM_MACHINE_PROFILE")
+        os.environ["PTM_MACHINE_PROFILE"] = str(bad)
+        try:
+            for content in ("[1, 2, 3]", '"a string"', "not json at all", "17"):
+                bad.write_text(content)
+                profile, why = ConfigManager.machine_profile()
+                assert profile is None, (
+                    f"machine_profile returned a {type(profile).__name__} for "
+                    f"{content!r}; the caller does profile.get(...)")
+                assert why and str(bad) in why, why
+        finally:
+            if previous is None:
+                os.environ.pop("PTM_MACHINE_PROFILE", None)
+            else:
+                os.environ["PTM_MACHINE_PROFILE"] = previous
 
 
 def test_the_gpu_policy_enums_are_the_engines_own():
@@ -584,6 +641,8 @@ TESTS = [
     test_the_forced_explicit_tick_is_reversible,
     test_an_engine_rejected_enum_is_shown_and_repairable,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
+    test_a_disabled_device_list_does_not_block_the_launch,
+    test_an_unreadable_machine_profile_does_not_abort_the_panel,
     test_the_gpu_policy_enums_are_the_engines_own,
     test_the_hard_floor_rule_is_the_engines_rule,
     test_eq_indirect_source_matches_the_engines_valid_set,

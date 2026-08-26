@@ -14452,9 +14452,22 @@ int main(int argc, char** argv) {
                   << "[validate-config]            property-map face counts, the "
                      "martinez2021 density guard, view\n"
                   << "[validate-config]            factors, and the spin-up seed "
-                     "strings. rc=0 means the configuration\n"
-                  << "[validate-config]            is well formed, NOT that the "
-                     "run will complete." << std::endl;
+                     "strings.\n"
+                  << "[validate-config]            ALSO NOT checked, and these "
+                     "need nothing but the config -- they\n"
+                  << "[validate-config]            simply live below this exit, "
+                     "inside a block that also reads their\n"
+                  << "[validate-config]            environment overrides: "
+                     "thermal.eq_indirect_source (valid: auto |\n"
+                  << "[validate-config]            converged | off) and "
+                     "thermal.eq_indirect_passes (must be >= 1).\n"
+                  << "[validate-config]            Moving them up would mean a "
+                     "second copy of those rules, which is\n"
+                  << "[validate-config]            worse; the GUI checks both "
+                     "itself.\n"
+                  << "[validate-config]            rc=0 means the configuration "
+                     "is well formed, NOT that the run\n"
+                  << "[validate-config]            will complete." << std::endl;
         return 0;
     }
 

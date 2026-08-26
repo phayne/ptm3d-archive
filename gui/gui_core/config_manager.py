@@ -963,7 +963,17 @@ class ConfigManager:
             return None, "no PTM_MACHINE_PROFILE and no HOME to resolve one"
         try:
             with open(path) as handle:
-                return json.load(handle), path
+                profile = json.load(handle)
+            if not isinstance(profile, dict):
+                # A JSON array or scalar sailed past the except clause and was
+                # returned as the profile; the caller then did profile.get(...)
+                # -> AttributeError, out of GpuPolicyTab.init_ui, which aborts
+                # construction of the WHOLE ConfigurationPanel rather than one
+                # tab.
+                return None, (f"{path} is a JSON {type(profile).__name__}, not "
+                              f"an object; regenerate it with "
+                              f"ptm_thermal_sim --calibrate-gpu")
+            return profile, path
         except FileNotFoundError:
             return None, (
                 f"{path} does not exist. The engine will use CONSERVATIVE "
@@ -1478,6 +1488,13 @@ class ConfigManager:
             node = self.config.get(section)
             node = node if isinstance(node, dict) else {}
             if "gpu_device_ids" not in node:
+                continue
+            # Only when that section's GPU path is actually on. The
+            # illumination field is DISABLED while illumination.use_gpu is off,
+            # so an unconditional error blocked the launch over a field the
+            # user could no longer edit, for a key the run would never read.
+            # Reproduced: tick the box, type `abc`, untick it.
+            if not node.get("use_gpu", False):
                 continue
             parsed = self.parse_device_ids(node.get("gpu_device_ids"))
             if parsed is None:
