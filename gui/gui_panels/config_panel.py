@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor
 
 from gui_core.config_manager import ConfigManager
+from ptm.engine_defaults import ENGINE_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,43 @@ CONDUCTIVITY_MODEL_ALIASES = {
 COUPLING_MODE_ALIASES = {
     "bounded": "bounded", "fixed": "fixed", "legacy": "legacy",
 }
+# Compared BYTE-EXACTLY: ptm_thermal_sim.cpp:16534 refuses anything outside
+# auto | converged | off -- it does not normalize case or punctuation, unlike
+# spinup_seed/conductivity_model (normalizeKey) or the gpu policies (toLower).
+# So this table is passed to set_enum with exact=True and carries no synonyms
+# at all: `Auto` and `''` are values the ENGINE rejects, and displaying them as
+# `auto` would show a run that will not happen.
+# (The first draft of the matching check in ConfigManager.validate guessed
+# "auto|none|file|internal" and would have refused `converged`, the one
+# non-default value that works.)
+EQ_INDIRECT_SOURCE_ALIASES = {
+    "auto": "auto", "converged": "converged", "off": "off",
+}
+# output.format and output.vtk_mode: the engine compares them exactly in an
+# if/else chain and REFUSES NOTHING -- ConfigParser::validate() is dead code
+# (ptm_thermal_sim.cpp:17063 says so), so an unrecognized value simply falls
+# through and the run writes no output. `none` is a real value, used by five
+# shipped configs.
+OUTPUT_FORMAT_ALIASES = {
+    "binary": "binary", "vtk": "vtk", "none": "none",
+}
+OUTPUT_VTK_MODE_ALIASES = {
+    "thermal": "thermal", "complete": "complete", "both": "both",
+    "none": "none",
+}
+# gpu.placement_policy and gpu.thin_margin_policy: exact, startup FATAL on a
+# mismatch (ptm_thermal_sim.cpp:14296, :14318).
+# No "" entry: the engine FATALs on an empty policy (ptm_thermal_sim.cpp:14327),
+# and mapping it to a valid label displayed `auto` for a config validate()
+# correctly refuses -- with no way to repair it from the combo, because
+# selecting the item already shown fires no signal. An empty value now surfaces
+# as its own foreign entry, which the user can replace.
+GPU_PLACEMENT_ALIASES = {
+    "auto": "auto", "shared": "shared", "disjoint": "disjoint",
+}
+GPU_THIN_MARGIN_ALIASES = {
+    "separate": "separate", "refuse": "refuse",
+}
 
 
 class BaseConfigTab(QWidget):
@@ -151,7 +189,26 @@ class BaseConfigTab(QWidget):
         super().__init__()
         self.config_manager = config_manager
         self.widgets = {}
+        #: Sections this tab declares Advanced-tier (item 2.1 / DP-9). The
+        #: Basic/Advanced boundary used to be drawn by TAB, which meant the
+        #: Basic tier could not express a crater run at all: Radiation and
+        #: Illumination were hidden wholesale. It is now drawn by FIELD -- every
+        #: tab shows its Basic fields inline and hides these until the user asks
+        #: for them. Purely a visibility filter: every widget still exists, and
+        #: nothing about the saved YAML depends on it.
+        self.advanced_sections = []
         self.init_ui()
+
+    def advanced_section(self, title, collapsed=True):
+        """A CollapsibleSection registered as Advanced-tier for this tab."""
+        section = CollapsibleSection(title, collapsed=collapsed)
+        self.advanced_sections.append(section)
+        return section
+
+    def set_advanced_visible(self, visible):
+        """Show or hide every Advanced-tier section on this tab."""
+        for section in self.advanced_sections:
+            section.setVisible(bool(visible))
 
     def init_ui(self):
         """Initialize UI - implemented by subclasses"""
@@ -393,7 +450,7 @@ class BaseConfigTab(QWidget):
                 key, value)
         widget.setText(str(value))
 
-    def set_enum(self, key, value, aliases):
+    def set_enum(self, key, value, aliases, exact=False):
         """Select a combo entry, tolerating the engine's own aliases.
 
         The engine normalizes these strings -- lowercase, `_`/`-`/space
@@ -412,25 +469,71 @@ class BaseConfigTab(QWidget):
         widget = self.widgets.get(key)
         if widget is None:
             return
-        normalized = "".join(
-            c for c in str(value).lower() if c not in "_- ")
-        canonical = aliases.get(normalized)
+        # Drop any foreign entry a previous load added (see below).
+        foreign = getattr(self, "_foreign_enum_items", {}).get(key)
+        if foreign is not None:
+            idx = widget.findText(foreign)
+            if idx >= 0:
+                widget.blockSignals(True)
+                widget.removeItem(idx)
+                widget.blockSignals(False)
+            self._foreign_enum_items.pop(key, None)
+
+        if exact:
+            # Some engine keys are compared BYTE-EXACTLY, not normalized:
+            # thermal.eq_indirect_source (ptm_thermal_sim.cpp:16534) refuses
+            # `Auto`. Normalizing the lookup here would display `auto` for a
+            # value the engine will reject, and -- now that the stored value is
+            # not rewritten -- the user could not even fix it from the combo,
+            # because selecting the item already showing fires no signal.
+            canonical = aliases.get(str(value))
+        else:
+            normalized = "".join(
+                c for c in str(value).lower() if c not in "_- ")
+            canonical = aliases.get(normalized)
         if canonical is None:
             logging.warning(
                 "[config] %s = %r is not a value this control offers (%s). The "
                 "configuration keeps it and the engine will decide; the control "
-                "is showing %r, which is NOT what will run.",
+                "shows it as an extra entry so you can see what will run and "
+                "replace it.",
                 key, value, "/".join(aliases.values() and
-                                     sorted(set(aliases.values()))),
-                widget.currentText())
+                                     sorted(set(aliases.values()))))
+            # Show the real value as a selectable entry rather than a
+            # different value's label. Picking a valid one then fires
+            # currentTextChanged and repairs the config.
+            label = str(value)
+            widget.blockSignals(True)
+            widget.addItem(label)
+            widget.setCurrentIndex(widget.findText(label))
+            widget.blockSignals(False)
+            if not hasattr(self, "_foreign_enum_items"):
+                self._foreign_enum_items = {}
+            self._foreign_enum_items[key] = label
             return
         idx = widget.findText(canonical)
         if idx >= 0:
+            # blockSignals: setCurrentIndex fires currentTextChanged, which is
+            # add_combo_field's writeback -- so merely DISPLAYING a config
+            # wrote the canonical spelling into it, which is the same
+            # edit-free-save rewrite this method stopped doing explicitly one
+            # line below. A load is not an edit.
+            widget.blockSignals(True)
             widget.setCurrentIndex(idx)
+            widget.blockSignals(False)
         if str(value) != canonical:
-            # Normalize the stored value too, so the saved YAML says what the
-            # control shows. Only ever an alias-for-alias substitution.
-            self.config_manager.set_value(key, canonical)
+            # The CONTROL shows the canonical spelling; the CONFIG keeps the
+            # file's. The engine normalizes these the same way the combo does
+            # (`historical` is `legacy`, `martinez` is `martinez2021`, `Auto` is
+            # `auto`), so both spellings run identically -- and rewriting the
+            # stored value made an edit-free open+Save change the user's file,
+            # because _loaded_engine_view is snapshotted before the tabs run.
+            # A user edit still writes the canonical form, through the combo's
+            # own currentTextChanged.
+            logging.info(
+                "[config] %s = %r is displayed as %r; the engine reads them "
+                "identically and the file keeps its own spelling.",
+                key, value, canonical)
 
     def set_numeric(self, key, value):
         """Load a numeric value into its widget, WARNING if the range clamps it.
@@ -480,6 +583,58 @@ class BaseConfigTab(QWidget):
         # Every later `<` or `<=` on that key then raises TypeError, which out
         # of a Qt slot is an application abort.
         self.config_manager.set_value(key, coerced)
+
+    # ── GPU device lists ─────────────────────────────────────────────
+    # The engine reads `gpu_device_ids` ONLY when it is a YAML sequence
+    # (config_parser.cpp gates on IsSequence()), so a malformed value is not
+    # rejected -- it is ignored, and the run silently uses a different device
+    # set than the panel shows. The field therefore parses on every keystroke
+    # and says out loud when it cannot.
+
+    def add_device_ids_field(self, layout, row, label_text, key, tooltip=""):
+        """A '0,1' text field bound to a YAML sequence of device indices."""
+        label = QLabel(label_text)
+        label.setToolTip(tooltip)
+        layout.addWidget(label, row, 0)
+
+        widget = QLineEdit()
+        widget.setPlaceholderText("blank = select by count; e.g. 0,1")
+        widget.setToolTip(tooltip)
+        note = QLabel("")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #EF9A9A; font-size: 10px;")
+        note.setVisible(False)
+
+        def _changed():
+            parsed = ConfigManager.parse_device_ids(widget.text())
+            if parsed is None:
+                # Store the RAW text, not a silent []. validate() refuses it,
+                # and the launch is blocked while the field is still on screen.
+                note.setText(
+                    "Not a list of device indices. The engine reads this key "
+                    "only as a YAML sequence, so it would be ignored and the "
+                    "run would use a different device set than shown.")
+                note.setVisible(True)
+                self.config_manager.set_value(key, widget.text())
+            else:
+                note.setVisible(False)
+                self.config_manager.set_value(key, parsed)
+            self.value_changed.emit()
+
+        widget.textChanged.connect(_changed)
+        layout.addWidget(widget, row, 1)
+        layout.addWidget(note, row + 1, 0, 1, 2)
+        self.widgets[key] = widget
+        self._device_id_notes = getattr(self, "_device_id_notes", {})
+        self._device_id_notes[key] = note
+        return widget
+
+    def set_device_ids(self, key, value):
+        """Load a device list into its text field, tolerating any spelling."""
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        widget.setText(ConfigManager.format_device_ids(value))
 
     def load_from_config(self):
         """Load values from config manager - implemented by subclasses"""
@@ -1147,9 +1302,22 @@ class MeshTab(BaseConfigTab):
         self.add_double_field(custom_layout, 1, "Scale Factor:", "mesh.scale_factor",
                               0.001, 1000.0, 3, "Scaling factor for imported mesh",
                               info_key="mesh.scale_factor")
+
+        custom_group.setLayout(custom_layout)
+        layout.addWidget(custom_group)
+
+        # --- Placement and occluder (Advanced) ----------------------------
+        # The core-plus-ring architecture and the mesh placement overrides are
+        # what a site run needs and a global run never touches, so they sit
+        # behind the Advanced disclosure rather than in a hidden tab.
+        place_section = self.advanced_section("Mesh Placement and Occluder")
+        place_group = QGroupBox("Placement and Occluder")
+        place_layout = QGridLayout()
+        place_layout.setColumnStretch(1, 1)
+
         # The core-plus-ring architecture was CLI-only: every A3GT-class site
         # run needs an occluder, and the GUI had no field for it.
-        self.add_file_field(custom_layout, 2, "Occluder File:", "mesh.occluder_file",
+        self.add_file_field(place_layout, 0, "Occluder File:", "mesh.occluder_file",
                             "Mesh Files (*.ply *.obj *.vtk);;All Files (*)",
                             "Coarse occluder-only mesh (the ring around a "
                             "high-resolution core). It enters the illumination "
@@ -1162,13 +1330,13 @@ class MeshTab(BaseConfigTab):
         # Longitude alone therefore does nothing at all, which is why the
         # longitude field is disabled until a latitude is set rather than left
         # editable with a tooltip nobody reads.
-        self.add_double_field(custom_layout, 3, "Latitude Override (deg):",
+        self.add_double_field(place_layout, 1, "Latitude Override (deg):",
                               "mesh.latitude_override", -999.0, 90.0, 4,
                               "Place the imported mesh at this latitude. "
                               "-999 = leave the mesh in its own frame. This is "
                               "the switch for BOTH overrides: the engine "
                               "rotates only when a latitude is given.")
-        self.add_double_field(custom_layout, 4, "Longitude Override (deg):",
+        self.add_double_field(place_layout, 2, "Longitude Override (deg):",
                               "mesh.longitude_override", -999.0, 360.0, 4,
                               "Place the imported mesh at this longitude. Read "
                               "only when a latitude override is also set -- the "
@@ -1184,7 +1352,7 @@ class MeshTab(BaseConfigTab):
         self.placement_note = QLabel("")
         self.placement_note.setWordWrap(True)
         self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
-        custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
+        place_layout.addWidget(self.placement_note, 3, 0, 1, 2)
         # BOTH, because the note quotes both numbers: connected to latitude
         # only, it went on stating the old longitude for the run about to start.
         # set_numeric() calls setValue during load_from_config, which emits
@@ -1196,8 +1364,9 @@ class MeshTab(BaseConfigTab):
                 lambda _v: self._update_placement_gating(
                     user_edit=not self._loading))
 
-        custom_group.setLayout(custom_layout)
-        layout.addWidget(custom_group)
+        place_group.setLayout(place_layout)
+        place_section.add_widget(place_group)
+        layout.addWidget(place_section)
 
         # Gray out global mesh options when a custom mesh is selected
         self.widgets["mesh.import_file"].textChanged.connect(self._on_import_file_changed)
@@ -1552,6 +1721,173 @@ class ThermalTab(BaseConfigTab):
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
 
+        # --- GPU dispatch (item 2.8), Advanced ----------------------------
+        # These are the wedge mitigations, not tuning: on this hardware a
+        # kernel hang can take the machine down, and batch size plus the
+        # inter-batch pause are what the 2026-08-20/21 forensics landed on.
+        gpu_disp_group = QGroupBox("Thermal GPU Dispatch")
+        gd = QGridLayout()
+        gd.setColumnStretch(1, 1)
+        self.add_int_field(gd, 0, "GPU Count:", "thermal.gpu_devices", 0, 16,
+                           "How many enumerated GPUs the thermal pool may use. "
+                           "1 = the first available (default); 0 = every one. "
+                           "Ignored when a device list is given below.")
+        self.add_device_ids_field(
+            gd, 1, "GPU Device IDs:", "thermal.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set. "
+            "Run ptm_thermal_sim --list-gpu-devices to see the indices.")
+        self.add_int_field(gd, 3, "Batch Size:", "thermal.gpu_batch_size",
+                           0, 1000000,
+                           "Faces per dispatch. 0 = the engine's own cap "
+                           "(6 GB / 500 K faces), or the calibrated value from "
+                           "the machine profile. Lower it to shorten each "
+                           "kernel, which is the first mitigation for a "
+                           "watchdog reset.")
+        self.add_int_field(gd, 4, "Inter-batch Pause (ms):",
+                           "thermal.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between dispatches. 0 = none. A nonzero "
+                           "pause lets the macOS+AMD driver's watchdog see the "
+                           "device as responsive between batches.")
+        self.add_bool_field(gd, 5, "Auto-calibrate GPU dispatch limits",
+                            "thermal.auto_calibrate_gpu",
+                            "Measure this host's safe dispatch ceiling on the "
+                            "first GPU run and cache it in the machine "
+                            "profile. Turning this OFF makes the engine fall "
+                            "back to CONSERVATIVE defaults and say so.")
+        gpu_disp_group.setLayout(gd)
+
+        # --- Equilibration convergence (item 2.7) -------------------------
+        eqconv_group = QGroupBox("Equilibration Convergence")
+        eq_c = QGridLayout()
+        eq_c.setColumnStretch(1, 1)
+        self.add_double_field(eq_c, 0, "Target Accuracy (K):",
+                              "thermal.equilibration_target_K", 0.0001, 50.0, 4,
+                              "The accuracy the spin-up estimate targets, and "
+                              "the bar the convergence certificate is scored "
+                              "against. This is the criterion; the cycle count "
+                              "above is only the budget.")
+        self.add_bool_field(eq_c, 1, "Stop on Convergence Certificate",
+                            "thermal.equilibration_stop_on_certificate",
+                            "Exit equilibration when the certificate reaches "
+                            "the target accuracy instead of at a fixed cycle "
+                            "count. Off by default: the certificate is an "
+                            "estimate, and a fixed budget is reproducible.")
+        self.add_int_field(eq_c, 2, "Equilibration Cycles (override):",
+                           "thermal.equilibration_cycles", -1, 100000,
+                           "Integrated equilibration cycle count. -1 = follow "
+                           "the Equilibration field above.")
+        self.add_int_field(eq_c, 3, "Indirect-flux Passes:",
+                           "thermal.eq_indirect_passes", 1, 20,
+                           "Passes of the equilibration-phase indirect-flux "
+                           "estimate. Its default moved this summer (PR #78). "
+                           "The engine refuses 0.")
+        self.add_combo_field(eq_c, 4, "Indirect-flux Source:",
+                             "thermal.eq_indirect_source",
+                             ["auto", "converged", "off"],
+                             "Where the equilibration-phase indirect flux comes "
+                             "from.\n"
+                             "auto (default): the engine estimates it inside "
+                             "the radiation-coupling block.\n"
+                             "converged: use the converged coupled solution.\n"
+                             "off: the pre-2026-08 behavior -- a face whose "
+                             "whole forcing is neighbor infrared equilibrates "
+                             "to the bare geothermal floor.")
+        self.add_file_field(eq_c, 5, "Indirect-flux File:",
+                            "thermal.eq_indirect_flux_file",
+                            "QIND Files (*.bin);;All Files (*)",
+                            "An explicit 'QIND' file from a prior pass-1 run. "
+                            "Always wins over the source setting when given.")
+        eqconv_group.setLayout(eq_c)
+
+        # --- Ice stability (item 2.6) -------------------------------------
+        ice_group = QGroupBox("Ice Stability (ice_depth.bin)")
+        ice_l = QGridLayout()
+        ice_l.setColumnStretch(1, 1)
+        self.add_bool_field(ice_l, 0, "Compute Ice Stability Depth",
+                            "thermal.compute_ice_stability",
+                            "Solve for the depth at which water ice survives "
+                            "geologic time, per face, and write ice_depth.bin "
+                            "beside the temperature output.")
+        self.add_double_field(ice_l, 1, "Survival Flux J0 (kg m^-2 s^-1):",
+                              "thermal.ice_stability.flux_threshold_kgm2s",
+                              1e-20, 1e-6, 20,
+                              "The sublimation rate below which ice is called "
+                              "stable. The default 3e-14 is about 1 mm per "
+                              "billion years.")
+        self.add_double_field(ice_l, 2, "Grain Hop Length (um):",
+                              "thermal.ice_stability.grain_hop_length_um",
+                              0.001, 100000.0, 3,
+                              "Diffusive path length scale through the "
+                              "regolith pore space.")
+        self.add_double_field(ice_l, 3, "Sublimation Enthalpy (kJ/mol):",
+                              "thermal.ice_stability.sublimation_enthalpy_kJmol",
+                              1.0, 200.0, 3,
+                              "Latent heat of sublimation used in the vapor "
+                              "pressure law.")
+        self.add_double_field(ice_l, 4, "Geothermal Gradient (K/m):",
+                              "thermal.ice_stability.geothermal_gradient_K_per_m",
+                              0.0, 10.0, 6,
+                              "Added below the modeled column. 0 = isothermal "
+                              "below the deepest node.")
+        self.add_int_field(ice_l, 5, "Depth Subsamples:",
+                           "thermal.ice_stability.n_depth_subsamples",
+                           -1, 100000,
+                           "Subsamples between depth nodes when locating the "
+                           "stability horizon. -1 = the engine's own choice.")
+        self.ice_note = QLabel("")
+        self.ice_note.setWordWrap(True)
+        self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+        ice_l.addWidget(self.ice_note, 6, 0, 1, 2)
+        ice_group.setLayout(ice_l)
+        self._ice_dependent_keys = [
+            "thermal.ice_stability.flux_threshold_kgm2s",
+            "thermal.ice_stability.grain_hop_length_um",
+            "thermal.ice_stability.sublimation_enthalpy_kJmol",
+            "thermal.ice_stability.geothermal_gradient_K_per_m",
+            "thermal.ice_stability.n_depth_subsamples",
+        ]
+
+        # --- Depth grid (item 2.9): READ-ONLY -----------------------------
+        # Standing instruction: do not retune thermal_b. Showing the grid a run
+        # used is worth a lot; offering to change it is not.
+        grid_group = QGroupBox("Depth Grid (read-only)")
+        grid_l = QGridLayout()
+        grid_l.setColumnStretch(1, 1)
+        # INT fields, because grid_b/m/n are `int` in the engine
+        # (config_parser.h:214-216) and ptm.engine_defaults records them as
+        # ints. Bound as doubles they were written back as 15.0/10.0/15.0 by
+        # set_numeric's `coerced = type(widget.value())(number)`, which made
+        # plan_edits' type clause fire and INJECTED three keys into every saved
+        # config -- for controls nobody can edit, contradicting the round
+        # trip's own promise. Reproduced on
+        # examples/tutorial04_crater80N_coupled.yaml before this changed.
+        self.add_int_field(grid_l, 0, "Column Depth b (skin depths):",
+                           "thermal.thermal_b", 0, 1000,
+                           "Bottom of the modeled column, in diurnal skin "
+                           "depths. Displayed, not offered: retuning it "
+                           "without also raising the equilibration cycle "
+                           "count makes the DEEP answer worse before it "
+                           "gets better.")
+        self.add_int_field(grid_l, 1, "Nodes per Skin Depth m:",
+                           "thermal.thermal_m", 0, 1000,
+                           "Vertical resolution near the surface.")
+        self.add_int_field(grid_l, 2, "Grid Parameter n:",
+                           "thermal.thermal_n", 0, 1000,
+                           "Geometric growth control for the layer "
+                           "thicknesses.")
+        for _k in ("thermal.thermal_b", "thermal.thermal_m", "thermal.thermal_n"):
+            self.widgets[_k].setReadOnly(True)
+            self.widgets[_k].setButtonSymbols(
+                QSpinBox.ButtonSymbols.NoButtons)
+        grid_note = QLabel(
+            "Read-only by standing instruction. A config that carries "
+            "different values shows them here; edit the YAML directly if you "
+            "have a reason, and raise thermal.equilibration_orbits with it.")
+        grid_note.setWordWrap(True)
+        grid_note.setStyleSheet("color: gray; font-size: 10px;")
+        grid_l.addWidget(grid_note, 3, 0, 1, 2)
+        grid_group.setLayout(grid_l)
+
 
         # --- Initial condition -------------------------------------------
         # spinup_seed selects the initial condition; `legacy` exists to
@@ -1605,7 +1941,6 @@ class ThermalTab(BaseConfigTab):
             self._update_seed_gating)
 
         seed_group.setLayout(seed_layout)
-        layout.addWidget(seed_group)
 
         # --- Run state (warm start / chunk handoff) ------------------------
         state_group = QGroupBox("Run State")
@@ -1635,7 +1970,14 @@ class ThermalTab(BaseConfigTab):
         state_layout.addWidget(state_note, 2, 0, 1, 2)
 
         state_group.setLayout(state_layout)
-        layout.addWidget(state_group)
+
+        # Initial condition and run state are reproduction/continuation
+        # machinery: a first run never touches them, and a baseline
+        # reproduction needs both. One Advanced disclosure, not a hidden tab.
+        adv_run = self.advanced_section("Initial Condition and Run State")
+        adv_run.add_widget(seed_group)
+        adv_run.add_widget(state_group)
+        layout.addWidget(adv_run)
 
         # Integration Window (advanced)
         integ_group = QGroupBox("Integration Window")
@@ -1706,11 +2048,28 @@ class ThermalTab(BaseConfigTab):
         # Collect the expert thermal knobs (equilibration cadence, integration
         # window, property maps) under one collapsed section so the Thermal tab
         # leads with the common controls.
-        adv_thermal = CollapsibleSection("Advanced thermal", collapsed=True)
+        adv_thermal = self.advanced_section("Advanced thermal")
         adv_thermal.add_widget(cad_group)
+        adv_thermal.add_widget(eqconv_group)
         adv_thermal.add_widget(integ_group)
         adv_thermal.add_widget(maps_group)
+        adv_thermal.add_widget(grid_group)
         layout.addWidget(adv_thermal)
+
+        adv_ice = self.advanced_section("Ice Stability")
+        adv_ice.add_widget(ice_group)
+        layout.addWidget(adv_ice)
+
+        adv_gpu = self.advanced_section("GPU Dispatch and Wedge Mitigations")
+        adv_gpu.add_widget(gpu_disp_group)
+        layout.addWidget(adv_gpu)
+
+        self.widgets["thermal.compute_ice_stability"].toggled.connect(
+            self._update_ice_gating)
+        # The note depends on the GPU box too: the product only exists on that
+        # solver path.
+        self.widgets["thermal.use_gpu"].toggled.connect(
+            lambda _v: self._update_ice_gating())
 
         # Wire enable/disable based on mode
         self.widgets["thermal.property_map_mode"].currentIndexChanged.connect(
@@ -1727,6 +2086,52 @@ class ThermalTab(BaseConfigTab):
 
         self._update_seed_gating()
         self._update_qb_gating()
+        self._update_ice_gating()
+
+    # ── Ice stability ────────────────────────────────────────────────
+
+    def _update_ice_gating(self, _checked=None):
+        """The ice parameters are inert unless the product is being computed.
+
+        Same shape as every other gate on this panel: a field that the run will
+        not read is disabled and says so, rather than sitting editable next to
+        one that is live.
+        """
+        on = self.widgets["thermal.compute_ice_stability"].isChecked()
+        for key in getattr(self, "_ice_dependent_keys", []):
+            widget = self.widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(on)
+        gpu_widget = self.widgets.get("thermal.use_gpu")
+        gpu_on = bool(gpu_widget.isChecked()) if gpu_widget is not None else False
+        if not on:
+            self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+            self.ice_note.setText(
+                "Off: no ice_depth.bin is written, and the parameters below "
+                "are inert.")
+        elif gpu_on:
+            self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+            self.ice_note.setText(
+                "The run writes statistics/ice_depth.bin (one float32 per "
+                "face: the depth in meters at which ice survives, or a "
+                "sentinel where none does).")
+        else:
+            # MEASURED, not inferred (2026-08-25, Moon ico2, this binary): the
+            # accumulator pointer is handed only to
+            # runThermalModelsForAllFaces_GPU_Persistent
+            # (ptm_thermal_sim.cpp:17320). The CPU SIMD-batch and CPU scalar
+            # paths never receive it, so the engine prints "[Ice stability]
+            # WARNING: requested but accumulator not ready" and writes NOTHING.
+            # A user who ticks this box on the CPU path gets a normal-looking
+            # run and no product. Owed as ENG-ICE-CPU-1.
+            self.ice_note.setStyleSheet("color: #FFB74D; font-size: 10px;")
+            self.ice_note.setText(
+                "This product needs the GPU thermal solver. Measured on this "
+                "binary: only runThermalModelsForAllFaces_GPU_Persistent fills "
+                "the accumulator, so with 'Use GPU for Thermal Solver' OFF the "
+                "run completes normally, prints '[Ice stability] WARNING: "
+                "requested but accumulator not ready', and writes no "
+                "ice_depth.bin. Tick the GPU box above, or expect no product.")
 
     # ── Basal heat flow ──────────────────────────────────────────────
 
@@ -2079,6 +2484,54 @@ class ThermalTab(BaseConfigTab):
             self.set_numeric("thermal.integration_days", thermal["integration_days"])
             self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
+            # Equilibration convergence (item 2.7)
+            self.set_numeric("thermal.equilibration_target_K",
+                             thermal.get("equilibration_target_K", 0.1))
+            self.set_bool("thermal.equilibration_stop_on_certificate",
+                          thermal.get("equilibration_stop_on_certificate", False))
+            self.set_numeric("thermal.equilibration_cycles",
+                             thermal.get("equilibration_cycles", -1))
+            self.set_numeric("thermal.eq_indirect_passes",
+                             thermal.get("eq_indirect_passes", 1))
+            self.set_enum("thermal.eq_indirect_source",
+                          thermal.get("eq_indirect_source", "auto"),
+                          EQ_INDIRECT_SOURCE_ALIASES, exact=True)
+            self.set_text("thermal.eq_indirect_flux_file",
+                          thermal.get("eq_indirect_flux_file", ""))
+
+            # Depth grid (item 2.9, read-only display)
+            self.set_numeric("thermal.thermal_b", thermal.get("thermal_b", 15))
+            self.set_numeric("thermal.thermal_m", thermal.get("thermal_m", 10))
+            self.set_numeric("thermal.thermal_n", thermal.get("thermal_n", 15))
+
+            # Ice stability (item 2.6)
+            self.set_bool("thermal.compute_ice_stability",
+                          thermal.get("compute_ice_stability", False))
+            ice = thermal.get("ice_stability")
+            ice = ice if isinstance(ice, dict) else {}
+            self.set_numeric("thermal.ice_stability.flux_threshold_kgm2s",
+                             ice.get("flux_threshold_kgm2s", 3e-14))
+            self.set_numeric("thermal.ice_stability.grain_hop_length_um",
+                             ice.get("grain_hop_length_um", 75.0))
+            self.set_numeric("thermal.ice_stability.sublimation_enthalpy_kJmol",
+                             ice.get("sublimation_enthalpy_kJmol", 51.058))
+            self.set_numeric(
+                "thermal.ice_stability.geothermal_gradient_K_per_m",
+                ice.get("geothermal_gradient_K_per_m", 0.0))
+            self.set_numeric("thermal.ice_stability.n_depth_subsamples",
+                             ice.get("n_depth_subsamples", -1))
+
+            # GPU dispatch (item 2.8)
+            self.set_numeric("thermal.gpu_devices", thermal.get("gpu_devices", 1))
+            self.set_device_ids("thermal.gpu_device_ids",
+                                thermal.get("gpu_device_ids", []))
+            self.set_numeric("thermal.gpu_batch_size",
+                             thermal.get("gpu_batch_size", 0))
+            self.set_numeric("thermal.gpu_inter_batch_pause_ms",
+                             thermal.get("gpu_inter_batch_pause_ms", 0))
+            self.set_bool("thermal.auto_calibrate_gpu",
+                          thermal.get("auto_calibrate_gpu", True))
+
             # Property maps (synthetic mode/kind drive the UI; underlying
             # YAML keys are managed by ConfigManager at save/load time).
             # The combo's writeback stores the LABEL TEXT, so a second
@@ -2116,6 +2569,7 @@ class ThermalTab(BaseConfigTab):
         self._sync_eq_cadence_from_config()
         self._update_seed_gating()
         self._update_qb_gating()
+        self._update_ice_gating()
 
 
 class RadiationTab(BaseConfigTab):
@@ -2194,7 +2648,7 @@ class RadiationTab(BaseConfigTab):
             lambda _v: self._update_beaming_gating())
 
         # --- Thermal-Radiation Coupling (collapsed) ---
-        coupling_section = CollapsibleSection("Thermal-Radiation Coupling", collapsed=True)
+        coupling_section = self.advanced_section("Thermal-Radiation Coupling")
         coupling_widget = QWidget()
         coupling_layout = QGridLayout(coupling_widget)
         coupling_layout.setColumnStretch(1, 1)
@@ -2244,7 +2698,7 @@ class RadiationTab(BaseConfigTab):
         layout.addWidget(coupling_section)
 
         # --- View Factor Options (collapsed, merges caching + compression) ---
-        vf_section = CollapsibleSection("View Factor Options", collapsed=True)
+        vf_section = self.advanced_section("View Factor Options")
         vf_widget = QWidget()
         vf_layout = QGridLayout(vf_widget)
         vf_layout.setColumnStretch(1, 1)
@@ -2301,7 +2755,7 @@ class RadiationTab(BaseConfigTab):
         layout.addWidget(vf_section)
 
         # --- Sparse View Factors (collapsed) ---
-        sparse_section = CollapsibleSection("Sparse View Factors (>1M Faces)", collapsed=True)
+        sparse_section = self.advanced_section("Sparse View Factors (>1M Faces)")
         sparse_widget = QWidget()
         sparse_layout = QGridLayout(sparse_widget)
         sparse_layout.setColumnStretch(1, 1)
@@ -2321,6 +2775,32 @@ class RadiationTab(BaseConfigTab):
 
         sparse_section.add_widget(sparse_widget)
         layout.addWidget(sparse_section)
+
+        # --- Radiosity GPU dispatch (item 2.8) ----------------------------
+        gpu_section = self.advanced_section("Radiosity GPU Dispatch")
+        gpu_widget = QWidget()
+        gpu_layout = QGridLayout(gpu_widget)
+        gpu_layout.setColumnStretch(1, 1)
+        self.add_int_field(gpu_layout, 0, "GPU Count:", "radiation.gpu_devices",
+                           0, 16,
+                           "How many enumerated GPUs the radiosity pool may "
+                           "use. 1 = the first available; 0 = every one. "
+                           "Ignored when a device list is given.")
+        self.add_device_ids_field(
+            gpu_layout, 1, "GPU Device IDs:", "radiation.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+        self.add_int_field(gpu_layout, 3, "Row-chunk Batch Size:",
+                           "radiation.gpu_batch_size", 0, 10000000,
+                           "Rows per radiosity dispatch. 0 = the engine's own "
+                           "choice. A single OpenCL buffer cannot exceed 2^31 "
+                           "bytes, which is why large matrices are chunked at "
+                           "all.")
+        self.add_int_field(gpu_layout, 4, "Inter-batch Pause (ms):",
+                           "radiation.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between radiosity dispatches. A first-class "
+                           "wedge mitigation on macOS + AMD.")
+        gpu_section.add_widget(gpu_widget)
+        layout.addWidget(gpu_section)
 
         # Advisory pre-run cost estimate (disk + solve time), updated live as
         # radiation / mesh / body fields change. Order-of-magnitude only.
@@ -2583,9 +3063,16 @@ class RadiationTab(BaseConfigTab):
         # max_coupling_iterations 10 while the engine said False and 16.
         self.set_bool("radiation.use_gpu", rad.get("use_gpu", False))
         self.set_numeric("radiation.min_shadow_fraction", rad.get("min_shadow_fraction", 0.3))
+        # exact=True: ptm_thermal_sim.cpp:14184 FATALs on any spelling other
+        # than bounded|fixed|legacy -- no normalizeKey, no toLower, unlike
+        # spinup_seed/conductivity_model/the gpu policies. When set_enum
+        # stopped rewriting the stored value, `coupling_mode: Bounded` began
+        # DISPLAYING as `bounded` while the run YAML carried `Bounded` and the
+        # engine died at startup. Reproduced. Now it surfaces as its own entry
+        # and validate() refuses it.
         self.set_enum("radiation.coupling_mode",
                       rad.get("coupling_mode", "bounded"),
-                      COUPLING_MODE_ALIASES)
+                      COUPLING_MODE_ALIASES, exact=True)
         self.set_numeric("radiation.max_coupling_iterations", rad.get("max_coupling_iterations", 16))
         self.set_numeric("radiation.coupling_temp_threshold", rad.get("coupling_temp_threshold", 0.5))
         self.set_numeric("radiation.coupling_flux_threshold", rad.get("coupling_flux_threshold", 0.1))
@@ -2607,6 +3094,13 @@ class RadiationTab(BaseConfigTab):
         self.set_numeric("radiation.captured_energy_target", rad.get("captured_energy_target", 0.95))
         self.set_numeric("radiation.max_neighbors", rad.get("max_neighbors", 500))
         self.set_numeric("radiation.min_neighbors", rad.get("min_neighbors", 20))
+        # Radiosity GPU dispatch (item 2.8)
+        self.set_numeric("radiation.gpu_devices", rad.get("gpu_devices", 1))
+        self.set_device_ids("radiation.gpu_device_ids",
+                            rad.get("gpu_device_ids", []))
+        self.set_numeric("radiation.gpu_batch_size", rad.get("gpu_batch_size", 0))
+        self.set_numeric("radiation.gpu_inter_batch_pause_ms",
+                         rad.get("gpu_inter_batch_pause_ms", 0))
         # Beaming: honor what the file said. The rule then decides whether it
         # may be turned ON from here -- it never turns one OFF; a setting it
         # disagrees with is kept and said loudly.
@@ -2927,7 +3421,7 @@ class ThermophysicalTab(BaseConfigTab):
         layout.addWidget(ti_section)
 
         # --- Heat Capacity & Internal Heat (collapsed) ---
-        cp_heat_section = CollapsibleSection("Heat Capacity & Internal Heat", collapsed=True)
+        cp_heat_section = self.advanced_section("Heat Capacity & Internal Heat")
         cp_heat_widget = QWidget()
         cp_heat_layout = QGridLayout(cp_heat_widget)
         cp_heat_layout.setColumnStretch(1, 1)
@@ -3076,8 +3570,21 @@ class ThermophysicalTab(BaseConfigTab):
                     vw.setToolTip("")
             else:
                 if cb is not None and not cb.isChecked():
-                    # revert a custom value the engine cannot receive
+                    # Revert a custom value the engine cannot receive -- but
+                    # WITHOUT re-entering on_default_toggled, which calls
+                    # update_to_body_defaults() and rewrites
+                    # thermophysical.incidence_angle_albedo to the body
+                    # default. Measured: opening configs/survey_template.yaml
+                    # (Hapke on) and pressing Save with ZERO edits flipped
+                    # incidence_angle_albedo true -> false in the user's own
+                    # file, while the console said "Comments and layout
+                    # preserved". The clobber predates this branch; the
+                    # minimal-save path is what turned it from noise inside a
+                    # full rewrite into a persistent one-line physics edit.
+                    cb.blockSignals(True)
                     cb.setChecked(True)
+                    cb.blockSignals(False)
+                    self.config_manager.set_value(dkey, True)
                 if cb is not None:
                     cb.setEnabled(False)
                     cb.setToolTip(unsupported_tip)
@@ -4137,7 +4644,7 @@ class IlluminationTab(BaseConfigTab):
 
         # Advanced illumination (collapsed): batch ray-tracing + precomputed
         # Sun/Primary positions — expert knobs most runs never touch.
-        adv_illum = CollapsibleSection("Advanced illumination", collapsed=True)
+        adv_illum = self.advanced_section("Advanced illumination")
 
         batch_group = QGroupBox("Ray Tracing")
         batch_layout = QGridLayout()
@@ -4155,8 +4662,57 @@ class IlluminationTab(BaseConfigTab):
                             "Binary Files (*.bin);;All Files (*)",
                             "Precomputed Sun/Primary positions",
                             info_key="illumination.positions_file")
+        self.add_file_field(pos_layout, 1, "BVH Cache File:",
+                            "illumination.bvh_cache_file",
+                            "BVH Files (*.bvh *.bin);;All Files (*)",
+                            "Where to cache the shadow-ray acceleration "
+                            "structure. Reusing it is a large saving on a "
+                            "repeat run of the same mesh; it is rebuilt when "
+                            "the geometry no longer matches.\n"
+                            "Blank = the engine derives one under the output "
+                            "directory. The exact lowercase word 'off' "
+                            "disables caching -- the engine compares that "
+                            "string literally, so 'OFF' is a FILENAME, not "
+                            "the switch.")
         pos_group.setLayout(pos_layout)
         adv_illum.add_widget(pos_group)
+
+        # --- Illumination GPU (item 2.8) ----------------------------------
+        # Deliberately absent until now, and the reasoning was sound. It is
+        # exposed WITH the measurement, not as a bare checkbox.
+        illum_gpu_group = QGroupBox("Illumination GPU")
+        ig = QGridLayout()
+        ig.setColumnStretch(1, 1)
+        self.add_bool_field(ig, 0, "Use GPU for Illumination",
+                            "illumination.use_gpu",
+                            "OFF is the recommendation on this machine, not an "
+                            "oversight: the CPU illumination path is both "
+                            "correct AND faster here, and the GPU path has its "
+                            "own history of lunar correctness problems. This "
+                            "control exists so the choice is visible rather "
+                            "than mysterious.")
+        self.add_int_field(ig, 1, "GPU Count:", "illumination.gpu_devices",
+                           0, 16,
+                           "How many enumerated GPUs the illumination pass may "
+                           "use. Read only when the box above is ticked.")
+        self.add_device_ids_field(
+            ig, 2, "GPU Device IDs:", "illumination.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+        self.add_int_field(ig, 4, "Inter-batch Pause (ms):",
+                           "illumination.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between dispatches -- a wedge mitigation.")
+        illum_gpu_group.setLayout(ig)
+        adv_illum.add_widget(illum_gpu_group)
+        self._illum_gpu_keys = ["illumination.gpu_devices",
+                                "illumination.gpu_device_ids",
+                                "illumination.gpu_inter_batch_pause_ms"]
+        self.widgets["illumination.use_gpu"].toggled.connect(
+            self._update_illum_gpu_gating)
+        # Clearing the unparseable text has to release the field back to the
+        # GPU switch; otherwise "stays editable while stuck" becomes "stays
+        # editable forever".
+        self.widgets["illumination.gpu_device_ids"].textChanged.connect(
+            lambda _t: self._update_illum_gpu_gating())
 
         layout.addWidget(adv_illum)
 
@@ -4226,7 +4782,25 @@ class IlluminationTab(BaseConfigTab):
         # A body without built-in albedo cannot stay in Built-in mode --
         # fall over to None (uniform albedo) rather than promising a map
         # that does not exist.
+        #
+        # This is a SUBSTITUTION, and it happens on open. It was invisible
+        # before the comment-preserving save landed, because Save rewrote
+        # everything anyway; now it is a real edit to the user's file
+        # (illumination.use_albedo_map true -> false,
+        # albedo_maps_directory -> ''), so it says so. Reproduced on
+        # examples/justitia_generic-test.yaml, which is a generic body with no
+        # built-in map. Pre-existing behavior, not introduced here -- the
+        # warning is.
         if not supported and self.albedo_builtin_radio.isChecked():
+            logging.warning(
+                "[illumination] %s has no built-in albedo map (%s), so the "
+                "albedo source falls back from Built-in to None (uniform "
+                "albedo from the Properties tab). This CHANGES the "
+                "configuration: illumination.use_albedo_map becomes false and "
+                "albedo_maps_directory is cleared. Saving the project will "
+                "write that change.",
+                self._current_body() or "this body",
+                getattr(status, "detail", "") or "no dataset")
             self.albedo_none_radio.setChecked(True)
             return  # toggled handler re-enters refresh
 
@@ -4259,6 +4833,24 @@ class IlluminationTab(BaseConfigTab):
     def on_body_changed(self, _body_name):
         self.refresh_builtin_albedo()
 
+    def _update_illum_gpu_gating(self, _checked=None):
+        """The illumination device knobs are read only when the GPU path is on."""
+        widget = self.widgets.get("illumination.use_gpu")
+        on = bool(widget.isChecked()) if widget is not None else False
+        for key in getattr(self, "_illum_gpu_keys", []):
+            dependent = self.widgets.get(key)
+            if dependent is None:
+                continue
+            # A field holding a value that cannot be parsed stays EDITABLE even
+            # when its section's GPU path is off, so the user can always clear
+            # it. validate() no longer blocks on it either, but a config that
+            # carries unparseable text should not become unfixable from the
+            # panel that put it there.
+            stuck = (key.endswith("gpu_device_ids")
+                     and ConfigManager.parse_device_ids(
+                         self.config_manager.get_value(key, [])) is None)
+            dependent.setEnabled(on or stuck)
+
     def load_from_config(self):
         config = self.config_manager.get_config()
         illum = config["illumination"]
@@ -4268,6 +4860,15 @@ class IlluminationTab(BaseConfigTab):
         self.set_text("illumination.albedo_map", illum["albedo_map"])
         self.set_text("illumination.albedo_maps_directory", illum["albedo_maps_directory"])
         self.set_text("illumination.positions_file", illum["positions_file"])
+        self.set_text("illumination.bvh_cache_file",
+                      illum.get("bvh_cache_file", ""))
+        self.set_bool("illumination.use_gpu", illum.get("use_gpu", False))
+        self.set_numeric("illumination.gpu_devices", illum.get("gpu_devices", 1))
+        self.set_device_ids("illumination.gpu_device_ids",
+                            illum.get("gpu_device_ids", []))
+        self.set_numeric("illumination.gpu_inter_batch_pause_ms",
+                         illum.get("gpu_inter_batch_pause_ms", 0))
+        self._update_illum_gpu_gating()
 
         source = illum.get("albedo_source", "builtin")
         for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
@@ -4301,11 +4902,21 @@ class OutputTab(BaseConfigTab):
         self.add_directory_field(dest_layout, 0, "Output Directory:", "output.directory",
                                  "Directory where results are written",
                                  info_key="output.directory")
+        # `none` is a REAL value for both -- five shipped configs use it and
+        # the engine accepts it. It was missing from the combos, so a config
+        # carrying it showed a DIFFERENT value than the run would use (findText
+        # returned -1 and the combo kept whatever it was showing).
         self.add_combo_field(dest_layout, 1, "Format:", "output.format",
-                             ["binary", "vtk"], "Output format",
+                             ["binary", "vtk", "none"],
+                             "binary writes the statistics/time-series "
+                             "products; vtk writes meshes; none writes no "
+                             "field output at all (an illumination-only or "
+                             "location-only run).",
                              info_key="output.format")
         self.add_combo_field(dest_layout, 2, "VTK Mode:", "output.vtk_mode",
-                             ["thermal", "complete", "both"], "VTK export mode",
+                             ["thermal", "complete", "both", "none"],
+                             "Which VTK products a vtk-format run writes. "
+                             "none writes none.",
                              info_key="output.vtk_mode")
         self.add_bool_field(dest_layout, 3, "Include Primary IR", "output.include_primary_ir",
                             "Include primary IR in VTK export",
@@ -4342,15 +4953,15 @@ class OutputTab(BaseConfigTab):
 
         self.set_text("output.directory", out["directory"])
 
-        # str(): findText refuses a non-string, out of load_from_config.
-        idx = self.widgets["output.format"].findText(str(out.get("format", "")))
-        if idx >= 0:
-            self.widgets["output.format"].setCurrentIndex(idx)
-
-        idx = self.widgets["output.vtk_mode"].findText(
-            str(out.get("vtk_mode", "")))
-        if idx >= 0:
-            self.widgets["output.vtk_mode"].setCurrentIndex(idx)
+        # set_enum, not a bare findText: `if idx >= 0` silently left the combo
+        # showing a DIFFERENT value than the config carries whenever the value
+        # is not in the list, which is the same lie set_enum was written to
+        # stop. It also blocks signals, so merely displaying a config no longer
+        # writes to it.
+        self.set_enum("output.format", out.get("format", "binary"),
+                      OUTPUT_FORMAT_ALIASES, exact=True)
+        self.set_enum("output.vtk_mode", out.get("vtk_mode", "both"),
+                      OUTPUT_VTK_MODE_ALIASES, exact=True)
 
         self.set_bool("output.include_primary_ir", out.get("include_primary_ir", False))
         self.set_text("output.locations_file", out.get("locations_file", ""))
@@ -4407,6 +5018,24 @@ class EngineFlagsTab(BaseConfigTab):
         self._declined_note.setVisible(False)
         layout.addWidget(self._declined_note)
 
+        # Basic tier: WHAT will be applied, read-only. The editable table is
+        # Advanced. Before item 2.1 this whole tab was Advanced-only, so a Basic
+        # user could not see that the GUI injects five variables into every run
+        # -- and one of them changed the physics of every GUI run on 2026-08-25.
+        # A disclosure nobody can reach is not a disclosure.
+        self._env_summary = QLabel("")
+        self._env_summary.setWordWrap(True)
+        self._env_summary.setObjectName("engineEnvSummary")
+        self._env_summary.setStyleSheet(
+            "color: #B0BEC5; font-size: 11px; padding: 6px; "
+            "border: 1px solid #444; border-radius: 4px;")
+        layout.addWidget(self._env_summary)
+
+        adv_env = self.advanced_section("Edit engine flags", collapsed=True)
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Variable", "Value"])
         self.table.horizontalHeader().setSectionResizeMode(
@@ -4416,7 +5045,7 @@ class EngineFlagsTab(BaseConfigTab):
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(240)
         self.table.cellChanged.connect(self._on_cell_changed)
-        layout.addWidget(self.table)
+        editor_layout.addWidget(self.table)
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Flag")
@@ -4429,7 +5058,10 @@ class EngineFlagsTab(BaseConfigTab):
         reset_btn.clicked.connect(self._restore_recommended)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch()
-        layout.addLayout(btn_row)
+        editor_layout.addLayout(btn_row)
+
+        adv_env.add_widget(editor)
+        layout.addWidget(adv_env)
 
         layout.addStretch()
         self.create_scroll_area(content)
@@ -4488,6 +5120,32 @@ class EngineFlagsTab(BaseConfigTab):
         self._write_back()
         self._refresh_declined_note()
 
+    def _refresh_summary(self):
+        """Say, in the Basic tier, exactly what the launch will export.
+
+        Reads the SAME planner the launch uses (engine_env_plan), so the two
+        cannot drift: a summary computed from the raw block would keep claiming
+        five variables after the value cells were blanked, and blank-valued
+        entries are dropped at launch.
+        """
+        from gui_core.preflight import (engine_env_plan,
+                                        DELIBERATELY_NOT_INJECTED,
+                                        ENV_SET_CHANGED_PHYSICS)
+        table, source = engine_env_plan(self.config_manager.get_config())
+        if table:
+            body = ("This run will export %d engine variable(s) (%s):\n    %s"
+                    % (len(table), source,
+                       "\n    ".join("%s=%s" % kv for kv in sorted(table.items()))))
+        else:
+            body = ("This run will export NO engine variables, and will REMOVE "
+                    "any the shell exported (%s)." % source)
+        skipped = ", ".join(sorted(DELIBERATELY_NOT_INJECTED))
+        self._env_summary.setText(
+            body
+            + ("\n\nDeliberately not injected: %s (see the table's tooltip)."
+               % skipped if skipped else "")
+            + "\n\n" + ENV_SET_CHANGED_PHYSICS)
+
     def _refresh_declined_note(self):
         """Show the 'declines every flag' note exactly when it is true.
 
@@ -4503,6 +5161,7 @@ class EngineFlagsTab(BaseConfigTab):
         from gui_core.preflight import engine_env_plan
         table, _source = engine_env_plan(self.config_manager.get_config())
         self._declined_note.setVisible(not table)
+        self._refresh_summary()
 
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
@@ -4519,10 +5178,481 @@ class EngineFlagsTab(BaseConfigTab):
         self._refresh_declined_note()
 
 
+class TaskCardsTab(BaseConfigTab):
+    """Task cards in front of the section tabs (items 2.2 and 2.3 / DP-5).
+
+    The nine section tabs are the complete reference view and stay that way.
+    What was missing is a way in: "polar crater with self-heating" is a task,
+    ``radiation.captured_energy_target`` is not, and a colleague opening this
+    window had no path from the first to the second.
+
+    Each card states exactly which keys it sets and which it REFUSED, because
+    a form that silently rewrites half a configuration is the same defect as
+    the save path Stage 1 fixed. In particular a card that wants beaming runs
+    the facet-scale rule on the config it just built and refuses with the
+    measured facet scale, rather than ticking the switch and hoping -- the
+    engine has no facet-scale guard of its own, so this is the only one.
+
+    This also retires GUI-PRESET-1: ``gui/README.md`` advertised presets that
+    ``grep -rn load_preset gui/`` showed nothing ever called.
+    """
+
+    preset_applied = pyqtSignal(str)
+    #: A card whose "Still needed" list names fields the Basic tier hides asks
+    #: for the Advanced disclosure. Otherwise the user reads "fill in
+    #: mesh.occluder_file", goes to the Mesh tab, and the field is not there.
+    advanced_requested = pyqtSignal(str)
+    #: Emitted when a card REPLACES the whole configuration from another file
+    #: (the baseline card). The main window must then forget which project file
+    #: it was editing: the round-trip document now belongs to the baseline, so
+    #: an unchanged `current_project_file` would make the next Ctrl+S write the
+    #: BASELINE's document -- comments and all -- over the user's own project,
+    #: while the console reported "Comments and layout preserved". Reproduced
+    #: before this signal existed.
+    project_replaced = pyqtSignal(str)
+
+    def init_ui(self):
+        from gui_core.presets import PRESETS
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        intro = QLabel(
+            "Start from a task, then refine it on the tabs. Every card says "
+            "which keys it sets and which it refuses to set, and nothing here "
+            "is applied until you press its button. The tabs remain the "
+            "complete view of the configuration.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #64b5f6; font-size: 11px; padding: 5px;")
+        layout.addWidget(intro)
+
+        self._reports = {}
+        for preset in PRESETS:
+            group = QGroupBox(preset.title)
+            card = QVBoxLayout()
+
+            body = QLabel(preset.summary)
+            body.setWordWrap(True)
+            body.setStyleSheet("font-size: 11px;")
+            card.addWidget(body)
+
+            if preset.sets:
+                keys = QLabel("Sets: " + ", ".join(sorted(preset.sets)))
+                keys.setWordWrap(True)
+                keys.setStyleSheet("color: gray; font-size: 10px;")
+                card.addWidget(keys)
+            if preset.beaming == "on":
+                note = QLabel(
+                    "Beaming: requested at w = 32.5 deg, subject to the "
+                    "facet-scale rule. If the mesh is at or near the "
+                    "roughness scale the card refuses and says the measured "
+                    "scale.")
+            elif preset.beaming == "preserve":
+                # NOT "off": this card leaves beaming exactly as the baseline
+                # recorded it. The shared else-branch used to label it "off"
+                # while apply_preset correctly left it on -- the display half
+                # of the bug the "preserve" mode was added to fix.
+                note = QLabel("Beaming: unchanged. " + preset.beaming_note)
+            else:
+                note = QLabel("Beaming: off. " + preset.beaming_note)
+            note.setWordWrap(True)
+            note.setStyleSheet("color: gray; font-size: 10px;")
+            card.addWidget(note)
+
+            row = QHBoxLayout()
+            button = QPushButton(
+                "Choose a run directory…"
+                if preset.key == "reproduce_baseline" else "Apply")
+            button.clicked.connect(
+                lambda _checked=False, k=preset.key: self._on_apply(k))
+            row.addWidget(button)
+            row.addStretch()
+            card.addLayout(row)
+
+            report = QLabel("")
+            report.setWordWrap(True)
+            report.setTextFormat(Qt.TextFormat.PlainText)
+            report.setStyleSheet(
+                "font-size: 10px; padding: 4px; border: 1px solid #444; "
+                "border-radius: 4px;")
+            report.setVisible(False)
+            card.addWidget(report)
+            self._reports[preset.key] = report
+
+            group.setLayout(card)
+            layout.addWidget(group)
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+
+    def _project_root(self):
+        from pathlib import Path
+        from gui_core.preflight import find_project_root
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            return find_project_root(SimulationRunner.find_ptm_executable())
+        except Exception:
+            return Path.cwd()
+
+    def _on_apply(self, key):
+        if key == "reproduce_baseline":
+            directory = QFileDialog.getExistingDirectory(
+                self, "Select the baseline run's output directory", "",
+                QFileDialog.Option.ShowDirsOnly)
+            if not directory:
+                return
+            self.apply_baseline(directory)
+            return
+        self.apply_preset(key)
+
+    def apply_preset(self, key):
+        """Apply a preset by key and return its PresetResult (also shown)."""
+        from gui_core.presets import PRESETS_BY_KEY, apply_preset
+        preset = PRESETS_BY_KEY[key]
+        result = apply_preset(self.config_manager, preset, self._project_root())
+        lines = result.summary_lines()
+        if preset.needs_advanced:
+            lines.append(
+                "NOTE: 'Advanced options' has been turned on and the sections "
+                "holding the fields above have been opened.")
+            self.advanced_requested.emit(key)
+        self._show(key, "\n".join(lines))
+        self.preset_applied.emit(key)
+        self.value_changed.emit()
+        return result
+
+    def apply_baseline(self, run_dir):
+        """Load a finished run's own config_used.yaml, and say what ran it."""
+        from gui_core.presets import read_baseline, compare_binary
+        from gui_core.preflight import executable_fingerprint
+        from gui_core.simulation_runner import SimulationRunner
+        try:
+            _config, provenance, config_path = read_baseline(run_dir)
+        except Exception as exc:
+            self._show("reproduce_baseline", f"Cannot use this directory: {exc}")
+            return None
+        try:
+            self.config_manager.load_from_yaml(str(config_path))
+        except Exception as exc:
+            self._show("reproduce_baseline",
+                       f"{config_path} could not be loaded: {exc}")
+            return None
+        try:
+            exe = SimulationRunner.find_ptm_executable()
+            # [0] is the md5; [1] is the MTIME. Taking [1] meant the card
+            # compared a timestamp against engine_binary_md5 and printed
+            # "DIFFERENT BINARY ... yours is 2026-08-25 22:38:41" every single
+            # time -- a false alarm on the one thing this card exists to
+            # settle, and the "Your binary IS the baseline's" branch could
+            # never be reached. The unit tests exercised compare_binary
+            # directly and so never saw the wiring.
+            current = executable_fingerprint(exe)[0] if exe else ""
+        except Exception:
+            current = ""
+        lines = [f"Loaded {config_path}", compare_binary(provenance, current)]
+        for name in ("engine_git_sha", "run_started_utc", "body", "mesh_faces"):
+            if name in provenance:
+                lines.append(f"    {name} = {provenance[name]}")
+        lines.append(
+            "Every key in that file -- spin-up seed, beaming, coupling mode -- "
+            "is now loaded as the baseline recorded it.")
+        # The environment is the one thing the record may not contain, and
+        # claiming otherwise was wrong: config_used.yaml is a byte copy of the
+        # config that was PASSED IN, and provenance.txt lists no PTM_*
+        # variables. A CLI or campaign launch usually carries no engine_env:
+        # block, so the reproduction silently gets the GUI's current set.
+        if isinstance(_config.get("engine_env"), dict):
+            lines.append(
+                "Its engine_env: block was carried over exactly as written "
+                "(%d variable(s)); the GUI's own set is NOT applied."
+                % len(_config["engine_env"]))
+        else:
+            lines.append(
+                "WARNING: this baseline's config carries no engine_env: block, "
+                "so the environment it ran under is NOT recorded anywhere -- "
+                "provenance.txt does not list PTM_* variables either. This run "
+                "will use the GUI's current set, which may differ from the "
+                "baseline's. Check the Engine Flags page, and the baseline's "
+                "own run log if you still have it.")
+        lines.append(
+            "This is NOT your project file. Use Save As to write it somewhere "
+            "of your own; the baseline's own record is left untouched.")
+        self._show("reproduce_baseline", "\n".join(lines))
+        # Order matters: detach the save target BEFORE the tabs reload, so no
+        # intermediate state has the baseline's document pointed at the user's
+        # project file.
+        self.project_replaced.emit(str(config_path))
+        self.preset_applied.emit("reproduce_baseline")
+        self.value_changed.emit()
+        return provenance
+
+    def _show(self, key, text):
+        report = self._reports.get(key)
+        if report is None:
+            return
+        report.setText(text)
+        report.setVisible(True)
+
+    def report_text(self, key):
+        """What the card is currently showing (for probes and tests)."""
+        report = self._reports.get(key)
+        return report.text() if report is not None else ""
+
+    def load_from_config(self):
+        # Nothing to load: the cards write, they do not mirror.
+        pass
+
+
+class GpuPolicyTab(BaseConfigTab):
+    """The `gpu:` safety guardrails -- READ-MOSTLY (item 2.5 / DP-8).
+
+    These five keys decide whether a GPU rung is allowed at all and which dies
+    each pool may use. They came out of the 2026-08-20/21 wedge forensics on
+    this machine, where a wedge can power the box off, and their defaults are
+    the validated ones.
+
+    So the tab leads with what is EFFECTIVE and where it came from, and puts
+    the editable controls behind the Advanced disclosure. The distinction the
+    display exists to carry: `min_vram_margin_gib = 2.0` as the engine's own
+    default is enforced on macOS+AMD and advisory elsewhere, while the SAME
+    number written into the config is enforced on every platform
+    (config_parser.h:826). Two identical numbers, two different behaviors, and
+    nothing in a YAML file shows which one you have.
+    """
+
+    def init_ui(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        intro = QLabel(
+            "Cross-cutting GPU safety policy. These decide whether a GPU rung "
+            "is allowed and which devices each pool may use; the per-solver "
+            "device and batch controls live on the Thermal, Radiation and "
+            "Illumination tabs. The defaults are the validated ones — read "
+            "this page before changing anything on it.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
+        layout.addWidget(intro)
+
+        eff_group = QGroupBox("Effective policy for this run")
+        eff_layout = QVBoxLayout()
+        self.effective_label = QLabel("")
+        self.effective_label.setWordWrap(True)
+        self.effective_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.effective_label.setStyleSheet("font-size: 11px;")
+        eff_layout.addWidget(self.effective_label)
+        eff_group.setLayout(eff_layout)
+        layout.addWidget(eff_group)
+
+        prof_group = QGroupBox("This host's GPU calibration profile")
+        prof_layout = QVBoxLayout()
+        self.profile_label = QLabel("")
+        self.profile_label.setWordWrap(True)
+        self.profile_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.profile_label.setStyleSheet("font-size: 11px;")
+        prof_layout.addWidget(self.profile_label)
+        prof_group.setLayout(prof_layout)
+        layout.addWidget(prof_group)
+
+        edit_section = self.advanced_section("Change the GPU safety policy")
+        edit_widget = QWidget()
+        edit_layout = QGridLayout(edit_widget)
+        edit_layout.setColumnStretch(1, 1)
+
+        self.add_bool_field(
+            edit_layout, 0,
+            "Enforce the VRAM floor on EVERY platform",
+            "gpu.margin_explicit",
+            "Writes gpu.min_vram_margin_gib into the configuration. The "
+            "engine treats the PRESENCE of that key as the request: written, "
+            "the floor is enforcing everywhere; absent, it is enforcing on "
+            "macOS + AMD and advisory elsewhere. Leaving this off is what "
+            "keeps a config the GUI touched from silently changing GPU policy "
+            "on someone else's machine.")
+        self.add_double_field(
+            edit_layout, 1, "VRAM Margin Floor (GiB):",
+            "gpu.min_vram_margin_gib", 0.0, 64.0, 2,
+            "Per-device VRAM headroom a resident radiosity replica must leave "
+            "behind. A rung with less is refused or separated. 0 = the "
+            "pre-2026-08-22 behavior (fit check only).")
+        self.add_combo_field(
+            edit_layout, 2, "Placement Policy:", "gpu.placement_policy",
+            ["auto", "shared", "disjoint"],
+            "Whether the radiosity replica and the GPU thermal pool may "
+            "occupy the same dies. auto separates them below the margin "
+            "below; the engine refuses any other spelling at startup.")
+        self.add_double_field(
+            edit_layout, 3, "Placement Margin (GiB):",
+            "gpu.placement_margin_gib", 0.0, 64.0, 2,
+            "The headroom below which `auto` separates the two pools.")
+        self.add_combo_field(
+            edit_layout, 4, "Thin-margin Policy:", "gpu.thin_margin_policy",
+            ["separate", "refuse"],
+            "What a margin below the floor DOES.\n"
+            "separate (default, Paul's ruling 2026-08-22): keep the GPU rung "
+            "behind disjoint placement, refusing only below the hard floor.\n"
+            "refuse: give up the GPU rung entirely. Measured on A3GT "
+            "A03N1016, CPU radiosity cost 108.9 min/window against 31.4 on "
+            "the GPU pool; separation costs a derived +7 to +10 min.")
+        self.add_double_field(
+            edit_layout, 5, "Hard Floor (GiB):",
+            "gpu.hard_min_vram_margin_gib", 0.0, 64.0, 2,
+            "The margin below which even `separate` refuses. Must be BELOW "
+            "the VRAM margin floor, or the separate band is empty and the "
+            "engine refuses the configuration at startup.")
+
+        edit_section.add_widget(edit_widget)
+        layout.addWidget(edit_section)
+
+        for key in ("gpu.margin_explicit", "gpu.min_vram_margin_gib",
+                    "gpu.placement_policy", "gpu.placement_margin_gib",
+                    "gpu.thin_margin_policy", "gpu.hard_min_vram_margin_gib"):
+            widget = self.widgets.get(key)
+            if widget is None:
+                continue
+            for signal_name in ("toggled", "valueChanged", "currentTextChanged"):
+                signal = getattr(widget, signal_name, None)
+                if signal is not None:
+                    signal.connect(lambda *_a: self.refresh_effective())
+                    break
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+        self.refresh_effective()
+
+    def _update_margin_explicit_gating(self):
+        """A non-default floor IS explicit -- so stop offering it as a choice.
+
+        The engine reads the KEY'S PRESENCE, not its value: any written
+        min_vram_margin_gib makes the floor enforcing on every platform
+        (config_parser.h:826). So once the value differs from the engine's own
+        default the key must be written, and the checkbox cannot turn that off.
+        It used to sit editable and unticked while the key was written anyway,
+        and a reload silently re-ticked it. There is no "non-default floor with
+        advisory semantics" -- not in this GUI and not in the engine.
+        """
+        widget = self.widgets.get("gpu.margin_explicit")
+        if widget is None:
+            return
+        engine_default = ENGINE_DEFAULTS.get("gpu.min_vram_margin_gib", 2.0)
+        # From the CONFIG, not the spin box: refresh_effective runs during
+        # init_ui, before load_from_config, when every widget still reads 0.0 --
+        # which looked like a non-default floor and force-ticked
+        # margin_explicit into a brand-new project.
+        current = ConfigManager._as_number(
+            self.config_manager.get_value("gpu.min_vram_margin_gib",
+                                          engine_default),
+            engine_default)
+        forced = current != engine_default
+        widget.setEnabled(not forced)
+        # REVERSIBLE. Forcing it on and never clearing it meant a user who
+        # typed 3.0 and then typed 2.0 back was left with margin_explicit True
+        # -- so min_vram_margin_gib was still written, and the engine reads its
+        # PRESENCE as "enforce on every platform". A transient edit
+        # permanently changed the run's GPU policy, which is the exact silent
+        # promotion this whole section exists to prevent.
+        # Only the forcing's own tick is undone; a tick the USER made stands.
+        if forced and not widget.isChecked():
+            widget.blockSignals(True)
+            widget.setChecked(True)
+            widget.blockSignals(False)
+            self.config_manager.set_value("gpu.margin_explicit", True)
+            self._margin_forced = True
+            # This method CHANGES the config, and it runs after the spin box's
+            # own writeback has already refreshed the preview -- so without
+            # this the YAML preview kept showing a gpu: section that had just
+            # been dropped, and the preview is the one place that shows whether
+            # this presence-semantics key will be written.
+            self.value_changed.emit()
+        elif not forced and getattr(self, "_margin_forced", False):
+            widget.blockSignals(True)
+            widget.setChecked(False)
+            widget.blockSignals(False)
+            self.config_manager.set_value("gpu.margin_explicit", False)
+            self._margin_forced = False
+            self.value_changed.emit()
+        widget.setToolTip(
+            ("Forced ON: the floor differs from the engine's default "
+             f"({engine_default} GiB), so the key must be written -- and the "
+             "engine reads its PRESENCE as 'enforce on every platform'. "
+             "There is no way to set a non-default floor advisorily."
+             if forced else
+             "Writes gpu.min_vram_margin_gib into the configuration. The "
+             "engine treats the PRESENCE of that key as the request: written, "
+             "the floor is enforcing everywhere; absent, it is enforcing on "
+             "macOS + AMD and advisory elsewhere. Leaving this off is what "
+             "keeps a config the GUI touched from silently changing GPU "
+             "policy on someone else's machine."))
+
+    def refresh_effective(self):
+        self._update_margin_explicit_gating()
+        rows, written = self.config_manager.gpu_policy_report()
+        lines = []
+        for key, value, source in rows:
+            lines.append(f"  {key} = {value}    [{source}]")
+        if written:
+            head = (f"{len(written)} key(s) will be written into the "
+                    f"configuration:")
+        else:
+            head = ("Nothing will be written. The configuration carries no "
+                    "gpu: section, so the engine uses its own defaults — which "
+                    "is what you want unless you have a reason otherwise.")
+        self.effective_label.setText(head + "\n" + "\n".join(lines))
+
+        profile, where = self.config_manager.machine_profile()
+        if profile is None:
+            self.profile_label.setText(
+                "No profile: " + str(where) + "\n"
+                "Without one the engine uses CONSERVATIVE dispatch defaults "
+                "and prints a [machine-profile] warning at startup.")
+        else:
+            keys = ("host", "device_name", "created_utc",
+                    "safe_dispatch_ceiling_s", "max_timesteps_per_dispatch",
+                    "recommended_batch_size")
+            body = "\n".join(f"  {k} = {profile.get(k)}" for k in keys
+                             if k in profile)
+            self.profile_label.setText(f"{where}\n{body}")
+
+    def load_from_config(self):
+        # The forcing flag belongs to the PREVIOUS project. Left set, opening a
+        # config that explicitly carries gpu.min_vram_margin_gib: 2.0 had that
+        # key DELETED by the next save -- demoting the VRAM floor from
+        # "enforced on every platform" to advisory, with zero user edits.
+        # Reproduced: raise the floor to 3.0 in one project, open another, and
+        # plan_save_edits reports ({}, ['gpu.min_vram_margin_gib']).
+        self._margin_forced = False
+        gpu = self.config_manager.get_config().get("gpu")
+        gpu = gpu if isinstance(gpu, dict) else {}
+        self.set_bool("gpu.margin_explicit", gpu.get("margin_explicit", False))
+        self.set_numeric("gpu.min_vram_margin_gib",
+                         gpu.get("min_vram_margin_gib", 2.0))
+        self.set_enum("gpu.placement_policy",
+                      gpu.get("placement_policy", "auto"),
+                      GPU_PLACEMENT_ALIASES)
+        self.set_numeric("gpu.placement_margin_gib",
+                         gpu.get("placement_margin_gib", 4.0))
+        self.set_enum("gpu.thin_margin_policy",
+                      gpu.get("thin_margin_policy", "separate"),
+                      GPU_THIN_MARGIN_ALIASES)
+        self.set_numeric("gpu.hard_min_vram_margin_gib",
+                         gpu.get("hard_min_vram_margin_gib", 0.25))
+        self.refresh_effective()
+
+
 class ConfigurationPanel(QWidget):
     """Main configuration panel with tabs and YAML preview"""
 
     config_changed = pyqtSignal()
+    #: The whole configuration was replaced from another file (the baseline
+    #: card). Carries that file's path. The main window must forget which
+    #: project file it was editing.
+    project_replaced = pyqtSignal(str)
 
     def __init__(self, config_manager):
         super().__init__()
@@ -4538,6 +5668,7 @@ class ConfigurationPanel(QWidget):
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Create and add tabs
+        self.tabs["start"] = TaskCardsTab(self.config_manager)
         self.tabs["simulation"] = SimulationTab(self.config_manager)
         self.tabs["mesh"] = MeshTab(self.config_manager)
         self.tabs["thermal"] = ThermalTab(self.config_manager)
@@ -4546,6 +5677,7 @@ class ConfigurationPanel(QWidget):
         self.tabs["radiation"] = RadiationTab(self.config_manager)
         self.tabs["illumination"] = IlluminationTab(self.config_manager)
         self.tabs["output"] = OutputTab(self.config_manager)
+        self.tabs["gpu"] = GpuPolicyTab(self.config_manager)
         self.tabs["engine_flags"] = EngineFlagsTab(self.config_manager)
 
         # HORIZONS panel (may not be available if imports fail)
@@ -4565,12 +5697,17 @@ class ConfigurationPanel(QWidget):
 
         self.stacked_widget = QStackedWidget()
 
-        # Basic tabs come first, then the advanced-only tabs. Basic = what a
-        # scientist needs for a standard thermal run; Advanced reveals the
-        # expert/body-specific machinery. This is a VISIBILITY filter over the
-        # existing nav-rail machinery — no tab is removed, so nothing about the
-        # saved YAML changes.
+        # The nav rail now shows EVERY section (item 2.1 / DP-9). The
+        # Basic/Advanced boundary moved from tabs to fields: each tab renders
+        # its Basic fields inline and puts the expert groups behind a
+        # disclosure. Drawing it by tab meant the Basic tier could not express
+        # a crater run at all -- Radiation and Illumination were hidden
+        # wholesale, and this model exists mostly to run craters.
+        #
+        # Still a pure visibility filter: every widget exists in both tiers, so
+        # nothing about the saved YAML depends on the toggle.
         tab_order = [
+            ("start", "Start"),
             ("simulation", "Simulation"),
             ("mesh", "Mesh"),
             ("thermophysical", "Properties"),
@@ -4579,16 +5716,15 @@ class ConfigurationPanel(QWidget):
             ("body_definition", "Body"),
             ("illumination", "Illumination"),
             ("radiation", "Radiation"),
+            ("gpu", "GPU"),
             ("engine_flags", "Engine Flags"),
         ]
 
-        # Nav keys revealed only when "Advanced options" is checked. The Body
-        # tab has an extra gate (built-in bodies never show it) applied in
-        # _apply_tab_visibility. "__horizons__" is the HORIZONS search page.
-        self._advanced_nav_keys = {
-            "body_definition", "illumination", "radiation",
-            "engine_flags", "__horizons__",
-        }
+        # No nav key is Advanced-only any more. `body_definition` still has a
+        # RELEVANCE gate -- it describes a custom body, and there is nothing to
+        # describe on a built-in one -- which is not a tier and is applied in
+        # _apply_tab_visibility.
+        self._advanced_nav_keys = set()
         self._nav_keys = []
 
         for key, label in tab_order:
@@ -4604,11 +5740,17 @@ class ConfigurationPanel(QWidget):
         self.nav_rail.currentRowChanged.connect(self.stacked_widget.setCurrentIndex)
         self.nav_rail.setCurrentRow(0)
 
-        # Basic / Advanced disclosure toggle above the nav rail.
+        # Basic / Advanced disclosure toggle above the nav rail. It now reveals
+        # FIELDS, not tabs: every section is always reachable, and each one
+        # keeps its expert groups collapsed until this is checked.
         self.advanced_toggle = QCheckBox("Advanced options")
         self.advanced_toggle.setToolTip(
-            "Reveal expert tabs: Body (custom bodies only), Illumination, "
-            "Radiation, Engine Flags, and HORIZONS.")
+            "Reveal the expert groups on every tab: view-factor and coupling "
+            "options, the GPU device controls and guardrails, mesh placement "
+            "and occluder, initial condition and run state, the equilibration "
+            "cadence, and the engine-flag editor.\n"
+            "Every tab is visible either way; this changes what is shown "
+            "inside them, never what is saved.")
         self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
 
         # Container for nav rail + content
@@ -4633,6 +5775,19 @@ class ConfigurationPanel(QWidget):
         # Connect tab change signals
         for tab in self.tabs.values():
             tab.value_changed.connect(self.on_value_changed)
+
+        # A task card rewrites a coherent GROUP of keys, so every tab has to
+        # re-read the configuration afterward -- otherwise the card's changes
+        # are in the config and not on screen, and the next widget event writes
+        # the stale on-screen value back over them.
+        self.tabs["start"].preset_applied.connect(
+            lambda _key: self.load_from_config())
+        # Re-emitted so the main window can detach its project file; see
+        # TaskCardsTab.project_replaced.
+        self.tabs["start"].project_replaced.connect(self.project_replaced)
+        # A card that asks for expert fields reveals them, rather than naming
+        # controls the current tier hides.
+        self.tabs["start"].advanced_requested.connect(self._reveal_advanced)
 
         # Connect body selection to thermophysical and body definition tabs
         if "simulation.body" in self.tabs["simulation"].widgets:
@@ -4711,8 +5866,20 @@ class ConfigurationPanel(QWidget):
         preview_layout = QVBoxLayout(preview_widget)
         preview_layout.setContentsMargins(8, 8, 8, 8)
 
-        preview_header = QLabel("YAML Preview")
+        preview_header = QLabel("YAML Preview — the engine-facing config a run writes")
         preview_header.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+        # Not what Save writes. Save edits the opened file in place, touching
+        # only the keys whose values changed and leaving its comments, layout
+        # and unmentioned keys alone (DP-1(b)); this pane is the fully expanded
+        # config the engine is handed, which is what lands beside the output
+        # directory as config.yaml. Saying "YAML Preview" over an expanded dump
+        # while Save writes a minimal edit would be the same class of quiet
+        # mismatch this stage exists to remove.
+        preview_header.setToolTip(
+            "The fully expanded configuration handed to the engine, and "
+            "written beside the output directory as config.yaml.\n"
+            "Save does NOT write this: it edits your project file in place, "
+            "changing only the keys you changed and preserving its comments.")
         preview_layout.addWidget(preview_header)
 
         self.preview_text = QTextEdit()
@@ -4735,29 +5902,50 @@ class ConfigurationPanel(QWidget):
         self.update_preview()
         self.config_changed.emit()
 
+    def _reveal_advanced(self, _key=None):
+        """Turn Advanced on AND open every expert section.
+
+        A card that says "fill in mesh.occluder_file" has to leave that field
+        reachable. Turning the tier on is not enough on its own: the sections
+        land collapsed, which is right for browsing and wrong immediately after
+        an instruction naming a field inside one.
+        """
+        self.advanced_toggle.setChecked(True)
+        self._apply_tab_visibility()
+        for tab in self.tabs.values():
+            for section in tab.advanced_sections:
+                section.set_collapsed(False)
+
     def _on_advanced_toggled(self, _checked):
-        """Basic/Advanced disclosure toggled — re-apply nav-rail visibility."""
+        """Basic/Advanced disclosure toggled — re-apply field-level visibility."""
         self._apply_tab_visibility()
 
     def _apply_tab_visibility(self):
-        """Show/hide nav-rail tabs per the Basic/Advanced toggle.
+        """Apply the Basic/Advanced tier, at FIELD level (item 2.1 / DP-9).
 
-        Pure visibility over the existing nav-rail + stacked-widget machinery:
-        every tab still exists and still loads/saves, so this never changes the
-        configuration or the saved YAML. Advanced tabs appear only when the
-        toggle is on; the Body tab additionally stays hidden for built-in
-        bodies (it is only meaningful for a custom/generic body).
+        Pure visibility: every widget exists in both tiers and still loads and
+        saves, so this never changes the configuration or the saved YAML.
+
+        Two independent rules, deliberately not conflated:
+
+        * **tier** -- each tab hides its own Advanced sections while the toggle
+          is off. No tab is hidden by tier any more.
+        * **relevance** -- the Body tab describes a custom/generic body, and
+          there is nothing for it to describe on a built-in one, so it stays
+          hidden until a generic body is active. That is true in both tiers.
         """
         if not hasattr(self, "advanced_toggle"):
             return
         advanced = self.advanced_toggle.isChecked()
         generic_active = self.config_manager.generic_body_active()
+        for tab in self.tabs.values():
+            tab.set_advanced_visible(advanced)
         for row, key in enumerate(self._nav_keys):
             item = self.nav_rail.item(row)
             if item is None:
                 continue
             if key == "body_definition":
-                hidden = not (advanced and generic_active)
+                hidden = not generic_active
             elif key in self._advanced_nav_keys:
                 hidden = not advanced
             else:

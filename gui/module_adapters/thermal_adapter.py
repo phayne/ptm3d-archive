@@ -114,6 +114,10 @@ class ThermalModule(AbstractModule):
     def config_manager(self):
         return self._cm
 
+    def reload_config(self):
+        """Re-read the config manager into every tab (dashboard File > Open)."""
+        self._config_panel.load_from_config()
+
     def set_input(self, input_type: str, value: str):
         if input_type == "mesh_file":
             self._cm.set_value("mesh.import_file", value)

@@ -3,6 +3,7 @@ Configuration Manager for PTM3D GUI
 Handles loading, saving, validating, and managing simulation configurations
 """
 
+import logging
 import yaml
 from copy import deepcopy
 from pathlib import Path
@@ -10,7 +11,20 @@ from pathlib import Path
 from ptm.engine_defaults import ENGINE_DEFAULTS
 
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+from gui_core import yaml_roundtrip
 
+logger = logging.getLogger(__name__)
+
+
+#: Keys where the bare words `off`/`on` are MEANINGFUL STRINGS to the engine,
+#: and where PyYAML's YAML-1.1 resolver therefore hands back a boolean:
+#:   thermal.eq_indirect_source  -- auto | converged | off (ptm_thermal_sim.cpp:16534)
+#:   illumination.bvh_cache_file -- "off" DISABLES the cache (config_parser.h:435)
+#: The engine's yaml-cpp reads the raw scalar, so it sees the string either way.
+_YAML11_STRING_KEYS = (
+    "thermal.eq_indirect_source",
+    "illumination.bvh_cache_file",
+)
 
 #: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
 #: config that puts a scalar where one of these belongs has it dropped, which is
@@ -249,7 +263,42 @@ class ConfigManager:
             # Warm start and chunk handoff. Without these a GUI run cannot
             # resume, which is the whole long-run workflow.
             "initial_state_file": "",
-            "final_state_file": ""
+            "final_state_file": "",
+            # --- Equilibration convergence (item 2.7) ---------------------
+            # The GUI exposed the equilibration CYCLE COUNT and a cadence tier
+            # and nothing about the criterion those cycles are scored against.
+            "equilibration_cycles": -1,
+            "equilibration_target_K": 0.1,
+            "equilibration_stop_on_certificate": False,
+            "eq_indirect_passes": 1,
+            "eq_indirect_source": "auto",
+            "eq_indirect_flux_file": "",
+            # --- Depth grid (item 2.9): DISPLAY ONLY ----------------------
+            # Standing instruction: do not retune thermal_b. Shown so a reader
+            # can see the grid a run used; the controls are read-only.
+            "thermal_b": 15,
+            "thermal_m": 10,
+            "thermal_n": 15,
+            # --- Ice stability (item 2.6) ---------------------------------
+            # A whole science product (ice_depth.bin) that had no GUI surface.
+            "compute_ice_stability": False,
+            "ice_stability": {
+                "flux_threshold_kgm2s": 3e-14,
+                "geothermal_gradient_K_per_m": 0.0,
+                "grain_hop_length_um": 75.0,
+                "n_depth_subsamples": -1,
+                "sublimation_enthalpy_kJmol": 51.058,
+            },
+            # --- GPU dispatch (item 2.8) ----------------------------------
+            # First-class wedge mitigations on this hardware. gpu_device_ids is
+            # a SEQUENCE for the engine (config_parser.cpp gates on
+            # IsSequence()), presented as "0,1" text; an empty list means "use
+            # gpu_devices" and is omitted from the written YAML.
+            "auto_calibrate_gpu": True,
+            "gpu_devices": 1,
+            "gpu_device_ids": [],
+            "gpu_batch_size": 0,
+            "gpu_inter_batch_pause_ms": 0,
         },
         "thermophysical": {
             # Surface properties
@@ -326,7 +375,12 @@ class ConfigManager:
             "adaptive_neighbors": True,
             "captured_energy_target": 0.95,
             "max_neighbors": 500,
-            "min_neighbors": 20
+            "min_neighbors": 20,
+            # Multi-GPU radiosity dispatch (item 2.8).
+            "gpu_devices": 1,
+            "gpu_device_ids": [],
+            "gpu_batch_size": 0,
+            "gpu_inter_batch_pause_ms": 0,
         },
         "illumination": {
             "include_primary_reflection": True,
@@ -337,7 +391,18 @@ class ConfigManager:
             # GUI-synthetic dataset-source mode: "builtin" | "custom" | "none".
             # Stripped at save time; inferred on load (see load_from_yaml).
             "albedo_source": "builtin",
-            "positions_file": ""
+            "positions_file": "",
+            # Deliberately absent until 2026-08-25, and the reasoning was
+            # sound: CPU illumination on this machine is both correct AND
+            # faster. Exposed now WITH that measurement in the tooltip, rather
+            # than leaving a colleague to wonder why the checkbox exists for
+            # thermal and radiation and not here.
+            "use_gpu": False,
+            "gpu_devices": 1,
+            "gpu_device_ids": [],
+            "gpu_inter_batch_pause_ms": 0,
+            # Reusing a BVH is a large saving on a repeat run of the same mesh.
+            "bvh_cache_file": "",
         },
         "output": {
             # thermal_vtk_file, complete_vtk_file and location_data were
@@ -363,6 +428,28 @@ class ConfigManager:
         # (gui_core.preflight.build_engine_env) and kept in the YAML so a
         # saved project documents exactly what the run had set.
         "engine_env": dict(RECOMMENDED_ENGINE_ENV),
+        # --- GPU safety policy (item 2.5 / DP-8) --------------------------
+        # READ-MOSTLY. These are cross-cutting guardrails, not per-solver
+        # tuning, and one of them is unlike every other key in the engine's
+        # 184-key surface: writing `min_vram_margin_gib` AT ALL makes the VRAM
+        # floor enforcing on every platform rather than only the wedge-prone
+        # one (config_parser.h:826, `min_vram_margin_explicit`).
+        #
+        # So this section is written SELECTIVELY, not like the rest: see
+        # _gpu_section_for_yaml. A value equal to the engine's own default is
+        # not written, and the floor is written only when the user asks for it
+        # through `margin_explicit`, which exists precisely to make the
+        # presence semantics a control instead of an accident.
+        "gpu": {
+            "min_vram_margin_gib": 2.0,
+            "placement_policy": "auto",
+            "placement_margin_gib": 4.0,
+            "thin_margin_policy": "separate",
+            "hard_min_vram_margin_gib": 0.25,
+            # GUI-synthetic: "write min_vram_margin_gib even at its default".
+            # Stripped at save time; set on load when the file carried the key.
+            "margin_explicit": False,
+        },
         "generic_body": {
             "name": "",
             "config_file": "",  # Path to HORIZONS-generated body_config.yaml
@@ -461,11 +548,37 @@ class ConfigManager:
         #: with DEFAULT_CONFIG always supplies `beaming`, so "the file did not
         #: mention it" is information only `load_from_yaml` ever has.
         self.legacy_implicit_beaming = None
+        #: DP-1(b) round-trip state. `_source_doc` is the opened file's own
+        #: text and comment-carrying document; `_loaded_engine_view` is the
+        #: engine-facing view of the config AS LOADED. Saving writes the
+        #: difference between that view and the current one, and nothing else,
+        #: which is what makes "this key is unset" representable at all.
+        self._source_doc = None
+        self._loaded_engine_view = None
+        #: What the last save_to_yaml actually did: "unchanged" (nothing to
+        #: write, the file was not touched), "in_place" (the opened file,
+        #: edited minimally), "copied_to_new_file", "replaced_other_file" (Save
+        #: As over a DIFFERENT existing file -- its comments are gone), or
+        #: "expanded" (the flattening fallback). The caller reports it rather
+        #: than assuming; "Comments and layout preserved" over someone else's
+        #: file was a false claim.
+        self.last_save_mode = None
+        #: Lines the last save reformatted that carry no key the user edited.
+        #: Empty on every shipped config; non-empty is a layout the writer
+        #: could not reproduce, and it is REPORTED rather than left to be
+        #: noticed in a later diff.
+        self.last_save_layout_changes = []
+        #: True once the user has been told that this session's saves cannot
+        #: preserve comments (ruamel.yaml missing). The GUI shows it once as a
+        #: dialog and every time in the console; it is never silent.
+        self.comment_loss_disclosed = False
 
     def reset_to_defaults(self):
         """Reset configuration to defaults"""
         self.config = deepcopy(self.DEFAULT_CONFIG)
         self.legacy_implicit_beaming = None
+        self._source_doc = None
+        self._loaded_engine_view = None
 
     def generic_body_active(self):
         """True when the config carries real generic-body data (the engine
@@ -539,8 +652,11 @@ class ConfigManager:
                     if dotted not in _SECTION_KEYS:
                         continue
                     if node[key] is not None:
-                        import logging
-                        logging.warning(
+                        # `logger`, not a function-local `import logging`: that
+                        # import made the name local to the WHOLE function, so
+                        # any use ABOVE it raised UnboundLocalError. It did,
+                        # the first time a check was added higher up.
+                        logger.warning(
                             "[config] section %r is %r, not a mapping; "
                             "ignoring it (the engine reads a scalar section as "
                             "absent too).", dotted, node[key])
@@ -682,8 +798,7 @@ class ConfigManager:
             # so it is announced rather than discovered later.
             if "H" in loaded_thermo and "H_override" not in loaded_thermo \
                     and not self.generic_body_active():
-                import logging
-                logging.warning(
+                logger.warning(
                     "[thermophysical] this config carries thermophysical.H = "
                     "%s with no H_override. On a built-in body that value used "
                     "to be ignored; the GUI now writes it as "
@@ -701,6 +816,237 @@ class ConfigManager:
                     self.config["thermophysical"][prop_name] = \
                         loaded_thermo[override_key]
                     self.config["thermophysical"][f"use_default_{prop_name}"] = False
+
+        # ---- YAML 1.1 strikes: PyYAML resolves the bare word `off` as the
+        # boolean False (and `on`/`yes`/`no` likewise), while the engine's
+        # yaml-cpp reads the raw scalar and the values `off`/`on` are
+        # MEANINGFUL STRINGS for two keys. Without this, a config spelling the
+        # engine's own documented `eq_indirect_source: off` loaded as False,
+        # validate() refused a config the engine accepts, and the run YAML
+        # carried `false`, which the engine FATALs on. The writer now quotes
+        # these on the way out; this handles every file that already exists.
+        for dotted in _YAML11_STRING_KEYS:
+            section, _, leaf = dotted.partition(".")
+            node = self.config.get(section)
+            if not isinstance(node, dict) or leaf not in node:
+                continue
+            if isinstance(node[leaf], bool):
+                spelling = "on" if node[leaf] else "off"
+                logger.warning(
+                    "[config] %s was read as the boolean %r, which is YAML "
+                    "1.1 resolving the bare word %r. The engine reads it as "
+                    "the string; treating it as %r.",
+                    dotted, node[leaf], spelling, spelling)
+                node[leaf] = spelling
+
+        # A config that WROTE gpu.min_vram_margin_gib asked for the enforcing
+        # floor, whatever value it gave. That is information only this moment
+        # has -- after the merge the key is always present -- and dropping it
+        # would silently demote the run from "enforced everywhere" to
+        # "advisory except on macOS+AMD" the first time the file was saved.
+        loaded_gpu = ((loaded or {}).get("gpu", {}) or {}) \
+            if isinstance(loaded, dict) else {}
+        gpu_cfg = self.config.get("gpu")
+        gpu_cfg = gpu_cfg if isinstance(gpu_cfg, dict) else {}
+        gpu_cfg["margin_explicit"] = "min_vram_margin_gib" in loaded_gpu
+        self.config["gpu"] = gpu_cfg
+
+        # ---- DP-1(b): keep the file's own text, and the engine-facing view of
+        # what it said, so a later save can write ONLY what changed.
+        self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
+        self._loaded_engine_view = deepcopy(self._config_for_yaml())
+        if self._source_doc is None:
+            n_comments = self._count_comment_lines(filename)
+            if n_comments:
+                logger.warning(
+                    "[config] %s carries %d comment line(s) that a save cannot "
+                    "preserve. %s", filename, n_comments,
+                    self.comment_preservation_status()[1])
+
+    @staticmethod
+    def _count_comment_lines(filename):
+        """How many comment lines the file carries (for the loss warning)."""
+        try:
+            text = Path(filename).read_text()
+        except Exception:
+            return 0
+        return sum(1 for line in text.splitlines()
+                   if line.lstrip().startswith("#"))
+
+    def comment_preservation_status(self):
+        """(preserved, message) -- can this session's saves keep comments?
+
+        A GUI that quietly flattens the file it was given is exactly the defect
+        Stage 1 was about, so the answer is surfaced rather than assumed: the
+        caller shows the message in the console on every save, and once as a
+        dialog before the first lossy one.
+        """
+        if not yaml_roundtrip.available():
+            return (False, yaml_roundtrip.UNAVAILABLE_MESSAGE)
+        if self._source_doc is None:
+            return (False,
+                    "This project was not opened from a YAML file (or its YAML "
+                    "could not be round-tripped), so there is no source layout "
+                    "to preserve. Save writes the full engine-facing config; "
+                    "the next save of that file preserves it.")
+        return (True,
+                "Comments and layout are preserved: saving rewrites only the "
+                "keys whose values changed.")
+
+    def plan_save_edits(self):
+        """(updates, removals) a save would apply, or None if not round-tripping.
+
+        Exposed so a test -- and a future diff dialog -- can assert what a save
+        touches without writing anything.
+        """
+        if self._source_doc is None:
+            return None
+        return yaml_roundtrip.plan_edits(
+            self._loaded_engine_view or {},
+            self._config_for_yaml(),
+            self._source_doc.file_keys())
+
+    #: gpu: keys the engine reads, with the engine's own default beside each.
+    #: Taken from ptm.engine_defaults at class-definition time (below), never
+    #: retyped: a GUI copy of an engine default is how
+    #: radiation.max_coupling_iterations sat at 10 for weeks.
+    GPU_POLICY_KEYS = ("min_vram_margin_gib", "placement_policy",
+                       "placement_margin_gib", "thin_margin_policy",
+                       "hard_min_vram_margin_gib")
+
+    def _gpu_section_for_yaml(self, gpu):
+        """The `gpu:` block to write -- usually nothing at all.
+
+        Every other section in this writer emits every key it knows. This one
+        cannot: ``gpu.min_vram_margin_gib`` is the only key in the engine's
+        whole config surface whose semantics depend on whether it was WRITTEN
+        (``config_parser.h``: presence promotes a macOS+AMD guardrail into a
+        universal one). Writing the section unconditionally would change the
+        GPU policy of every config the GUI touches, on every machine, for
+        nobody's reason.
+
+        So: a key is written only when it differs from the engine's own
+        default, plus ``min_vram_margin_gib`` whenever the user has ticked
+        "enforce on every platform" -- which is that presence semantics made
+        into a control instead of an accident.
+        """
+        out = {}
+        explicit = bool(gpu.get("margin_explicit", False))
+        for key in self.GPU_POLICY_KEYS:
+            if key not in gpu:
+                continue
+            value = gpu[key]
+            engine_value = ENGINE_DEFAULTS.get(f"gpu.{key}")
+            if key == "min_vram_margin_gib" and explicit:
+                out[key] = value
+                continue
+            # The SAME equality rule plan_edits uses. A strict type test made
+            # an EDIT-FREE open+Save DELETE a line: a file spelling
+            # `placement_margin_gib: 4` (int) put 4 into the loaded view, the
+            # panel's set_numeric coerced it to 4.0, that now equals the
+            # engine's 4.0 default, the key dropped out of the written view --
+            # and plan_edits classified it as a REMOVAL. Reproduced end to end
+            # through a real ConfigurationPanel.
+            if not yaml_roundtrip.values_equal(engine_value, value):
+                out[key] = value
+        return out
+
+    def gpu_policy_report(self):
+        """(rows, writes_section) for the read-mostly display.
+
+        Each row is (key, effective_value, source_text). `source_text` is the
+        whole point of the panel: "2.0 (engine default -- enforced on macOS+AMD,
+        advisory elsewhere)" and "2.0 (written -- enforced on EVERY platform)"
+        are the same number and different physics.
+        """
+        gpu = self.config.get("gpu")
+        gpu = gpu if isinstance(gpu, dict) else {}
+        written = self._gpu_section_for_yaml(gpu)
+        rows = []
+        for key in self.GPU_POLICY_KEYS:
+            value = gpu.get(key, ENGINE_DEFAULTS.get(f"gpu.{key}"))
+            if key in written:
+                if key == "min_vram_margin_gib":
+                    source = "written to the config: ENFORCED on every platform"
+                else:
+                    source = "written to the config"
+            elif key == "min_vram_margin_gib":
+                source = ("engine default: enforced on macOS+AMD, advisory "
+                          "elsewhere")
+            else:
+                source = "engine default"
+            rows.append((key, value, source))
+        return rows, dict(written)
+
+    @staticmethod
+    def machine_profile():
+        """The host GPU calibration profile, or (None, reason).
+
+        Written by `ptm_thermal_sim --calibrate-gpu`. The GUI shows it beside
+        the guardrails because "conservative defaults" in a run log means this
+        file was missing, and that is worth seeing before the run rather than
+        in the console afterward.
+        """
+        import json
+        import os
+        path = os.environ.get("PTM_MACHINE_PROFILE")
+        if not path:
+            home = os.environ.get("HOME", "")
+            path = f"{home}/.ptm3d/machine_profile.json" if home else ""
+        if not path:
+            return None, "no PTM_MACHINE_PROFILE and no HOME to resolve one"
+        try:
+            with open(path) as handle:
+                profile = json.load(handle)
+            if not isinstance(profile, dict):
+                # A JSON array or scalar sailed past the except clause and was
+                # returned as the profile; the caller then did profile.get(...)
+                # -> AttributeError, out of GpuPolicyTab.init_ui, which aborts
+                # construction of the WHOLE ConfigurationPanel rather than one
+                # tab.
+                return None, (f"{path} is a JSON {type(profile).__name__}, not "
+                              f"an object; regenerate it with "
+                              f"ptm_thermal_sim --calibrate-gpu")
+            return profile, path
+        except FileNotFoundError:
+            return None, (
+                f"{path} does not exist. The engine will use CONSERVATIVE "
+                f"dispatch defaults and say so. Create one with: "
+                f"ptm_thermal_sim --calibrate-gpu")
+        except Exception as exc:
+            return None, f"{path} could not be read ({exc})"
+
+    @staticmethod
+    def parse_device_ids(text):
+        """'0, 1' -> [0, 1]; '' -> []; anything else -> None (unparseable).
+
+        None is a real answer, not an error to swallow: the engine reads this
+        key only when it is a SEQUENCE, so a malformed value would be ignored
+        in silence and the run would quietly use a different device set than
+        the one on screen. validate() refuses it instead.
+        """
+        if isinstance(text, (list, tuple)):
+            try:
+                return [int(v) for v in text]
+            except (TypeError, ValueError):
+                return None
+        if text is None:
+            return []
+        parts = [p.strip() for p in str(text).replace(";", ",").split(",")]
+        parts = [p for p in parts if p]
+        if not parts:
+            return []
+        try:
+            return [int(p) for p in parts]
+        except ValueError:
+            return None
+
+    @staticmethod
+    def format_device_ids(value):
+        """[0, 1] -> '0,1'. A malformed stored value shows as it is."""
+        if isinstance(value, (list, tuple)):
+            return ",".join(str(v) for v in value)
+        return "" if value is None else str(value)
 
     @staticmethod
     def _strip_sentinels(d):
@@ -736,6 +1082,14 @@ class ConfigManager:
         generic_active = self.generic_body_active()
         out = {}
         for k, v in self.config.items():
+            if k == "gpu":
+                # Selective, unlike every other section. See the DEFAULT_CONFIG
+                # comment: presence is semantics here.
+                gpu_out = self._gpu_section_for_yaml(
+                    v if isinstance(v, dict) else {})
+                if gpu_out:
+                    out[k] = gpu_out
+                continue
             if k == "mesh":
                 # Translate the GUI-synthetic topo_source mode into concrete
                 # engine keys, then strip it. Built-in mode writes the
@@ -874,6 +1228,17 @@ class ConfigManager:
                     therm["thermal_inertia_map"] = custom_path
             out["thermal"] = therm
 
+        # An EMPTY gpu_device_ids list means "no explicit device list; use
+        # gpu_devices". The engine gates on IsSequence() and would read `[]` as
+        # an explicit empty selection; more to the point, writing it into every
+        # config adds three keys that look like settings and are not. Drop it.
+        for section in ("thermal", "radiation", "illumination"):
+            node = out.get(section)
+            if isinstance(node, dict) and node.get("gpu_device_ids") == []:
+                node = _dc(node)
+                node.pop("gpu_device_ids")
+                out[section] = node
+
         # Sanitize simulation.body
         # str(): a scalar that is not a string still has to be written, not
         # crash the save. yaml.safe_load can hand back a float here.
@@ -890,9 +1255,91 @@ class ConfigManager:
         return out
 
     def save_to_yaml(self, filename):
-        """Save configuration to YAML file"""
-        with open(filename, 'w') as f:
-            yaml.dump(self._config_for_yaml(), f, default_flow_style=False, sort_keys=False)
+        """Save the project file, preserving its comments and layout (DP-1(b)).
+
+        Two paths, and which one ran is reported by
+        ``comment_preservation_status()`` -- never inferred by the caller:
+
+        * a file opened from YAML and round-trippable: the loaded document is
+          edited in place with ONLY the keys whose engine-facing value changed
+          since it was opened, then re-emitted. Comments, ordering, blank lines
+          and quoting survive, and a key the file never mentioned stays
+          unmentioned unless the user changed it. That last property is what
+          makes ``gpu.min_vram_margin_gib`` safe to expose (config_parser.h:
+          its mere presence makes the VRAM floor enforcing on every platform).
+        * otherwise (a new project, or ruamel.yaml missing): the old full
+          ``yaml.dump`` of the engine-facing config.
+
+        After either path the file on disk becomes the new baseline, so the
+        next save is again a minimal edit.
+        """
+        doc = self._source_doc
+        # Reset FIRST. It was only ever assigned in the round-trip branch, so
+        # a later "unchanged" or "expanded" save re-reported the previous
+        # save's reflow -- a warning about a write that did not happen.
+        self.last_save_layout_changes = []
+        # Save As onto a DIFFERENT existing file replaces it wholesale with
+        # this project's document -- which is what Save As means, but it is not
+        # "comments preserved": the target's own comments are gone. Reporting
+        # "Comments and layout preserved" there was false. Record which
+        # happened so the caller can say the true thing.
+        target = Path(filename)
+        same_file = bool(doc) and doc.path and \
+            Path(doc.path).resolve(strict=False) == target.resolve(strict=False)
+        if doc is None:
+            self.last_save_mode = "expanded"
+        elif same_file:
+            self.last_save_mode = "in_place"
+        elif target.exists():
+            self.last_save_mode = "replaced_other_file"
+        else:
+            self.last_save_mode = "copied_to_new_file"
+        if doc is not None:
+            updates, removals = yaml_roundtrip.plan_edits(
+                self._loaded_engine_view or {}, self._config_for_yaml(),
+                doc.file_keys())
+            if not updates and not removals and same_file:
+                # NOTHING CHANGED, so touch nothing. Re-emitting is close to
+                # byte-exact but not exactly: ruamel normalizes a missing
+                # trailing newline, and a block sequence indented differently
+                # from its own default gets reflowed. Measured across all 77
+                # configs/ and examples/ files, 2 differed on a save with an
+                # empty plan. Not writing is the only way "no edits is
+                # byte-identical" is true for every file rather than most.
+                self.last_save_mode = "unchanged"
+                return self.last_save_mode
+            doc.apply(updates, removals)
+            text = doc.dump()
+            # ANY line that changed and is not one of the edited keys is a
+            # LAYOUT change, not an edit -- ruamel reflowing something. The
+            # first-sequence indentation heuristic covers the common case and
+            # cannot cover a document that MIXES sequence shapes, so rather
+            # than hope, measure and report. Silence about a rewrite of lines
+            # nobody edited is the whole failure mode this module exists to
+            # remove.
+            self.last_save_layout_changes = yaml_roundtrip.layout_only_changes(
+                doc.text, text, set(updates) | set(removals))
+            if self.last_save_layout_changes:
+                logger.warning(
+                    "[config] saving %s reformatted %d line(s) that carry no "
+                    "key you edited (YAML layout the writer could not "
+                    "reproduce exactly): %s", filename,
+                    len(self.last_save_layout_changes),
+                    " | ".join(self.last_save_layout_changes[:4]))
+            with open(filename, 'w') as f:
+                f.write(text)
+        else:
+            with open(filename, 'w') as f:
+                yaml.dump(self._config_for_yaml(), f,
+                          default_flow_style=False, sort_keys=False)
+
+        # Re-baseline against what is now on disk. Without this a second save
+        # would re-apply the first save's edits against a stale "as loaded"
+        # view, and setting a key back to its original value would not be
+        # written back.
+        self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
+        self._loaded_engine_view = deepcopy(self._config_for_yaml())
+        return self.last_save_mode
 
     def save_run_yaml(self, filename, project_root):
         """Write the engine-facing YAML with every path field absolutized
@@ -991,6 +1438,16 @@ class ConfigManager:
             if num(rad.get("aca_tolerance"), 0.0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
 
+        # coupling_mode: the engine compares it EXACTLY and makes a mismatch a
+        # startup FATAL (ptm_thermal_sim.cpp:14184). There was no check here at
+        # all, so `Bounded` passed the launch gate and died in the engine.
+        mode = str(rad.get("coupling_mode", "bounded") or "")
+        if mode not in ("bounded", "fixed", "legacy"):
+            errors.append(
+                f"Radiation: coupling_mode is {mode!r}; the engine compares it "
+                f"exactly against bounded | fixed | legacy and refuses "
+                f"anything else at startup, including a different case.")
+
         # The switch needs the knob. OUTSIDE the `enabled` branch on purpose:
         # the engine's check is unconditional (ptm_thermal_sim.cpp:13591 sits in
         # plain config application, not behind the radiation gate), and the
@@ -1066,6 +1523,143 @@ class ConfigManager:
                 "on latitude, so this longitude will be ignored. Set a "
                 "latitude, or clear the longitude to -999.")
 
+        # GPU device lists. The engine reads gpu_device_ids ONLY when it is a
+        # YAML sequence (config_parser.cpp gates on IsSequence()), so a
+        # malformed value is not rejected -- it is ignored, and the run uses a
+        # different device set than the panel shows. Refuse it here, where the
+        # user can still see the field.
+        for section in ("thermal", "radiation", "illumination"):
+            node = self.config.get(section)
+            node = node if isinstance(node, dict) else {}
+            if "gpu_device_ids" not in node:
+                continue
+            # Only when that section's GPU path is actually on. The
+            # illumination field is DISABLED while illumination.use_gpu is off,
+            # so an unconditional error blocked the launch over a field the
+            # user could no longer edit, for a key the run would never read.
+            # Reproduced: tick the box, type `abc`, untick it.
+            if not node.get("use_gpu", False):
+                continue
+            parsed = self.parse_device_ids(node.get("gpu_device_ids"))
+            if parsed is None:
+                errors.append(
+                    f"{section}.gpu_device_ids is "
+                    f"{node.get('gpu_device_ids')!r}, which is not a list of "
+                    f"device indices. The engine reads this key only as a YAML "
+                    f"sequence, so it would be IGNORED and the run would use a "
+                    f"different device set than shown. Use e.g. 0,1 -- or "
+                    f"leave it blank to select by count.")
+            elif any(v < 0 for v in parsed):
+                errors.append(
+                    f"{section}.gpu_device_ids contains a negative index "
+                    f"({parsed}); device indices start at 0.")
+
+        # GPU safety policy. The engine turns each of these into a startup
+        # FATAL; saying so here costs nothing and saves a launch.
+        gpu_cfg = self.config.get("gpu")
+        gpu_cfg = gpu_cfg if isinstance(gpu_cfg, dict) else {}
+        # The engine LOWERCASES both of these before comparing
+        # (gpu::guardrails::toLower, ptm_thermal_sim.cpp:14327 and :14349), so
+        # `Auto` and `Separate` run fine. Comparing the raw string here made
+        # validate() block a valid config while asserting the engine would
+        # refuse it -- false, and validate() is the public launch gate, reached
+        # headlessly too, not only after set_enum has canonicalized the value.
+        placement = str(gpu_cfg.get("placement_policy", "auto") or "").lower()
+        if placement not in ("auto", "shared", "disjoint"):
+            errors.append(
+                f"gpu.placement_policy must be auto, shared or disjoint (got "
+                f"{placement!r}); the engine refuses anything else at startup.")
+        thin = str(gpu_cfg.get("thin_margin_policy", "separate") or "").lower()
+        if thin not in ("separate", "refuse"):
+            errors.append(
+                f"gpu.thin_margin_policy must be separate or refuse (got "
+                f"{thin!r}); the engine refuses anything else at startup.")
+        # The engine's test, transcribed rather than recalled
+        # (ptm_thermal_sim.cpp:14365): `thin == "separate" && hard > floor`,
+        # plus `hard >= 0`, `floor >= 0` and `placement_margin >= 0`.
+        # The first spelling here was `hard >= floor > 0`, and it was wrong in
+        # BOTH directions -- REPRODUCED against the binary: it refused
+        # hard == floor == 2.0, which the engine accepts, and it passed
+        # floor = 0 with hard = 0.25, which the engine refuses. A second copy
+        # of an engine rule is a second place for it to be wrong; this one
+        # survives only because catching it here saves a launch.
+        hard = num(gpu_cfg.get("hard_min_vram_margin_gib"), 0.25)
+        floor = num(gpu_cfg.get("min_vram_margin_gib"), 2.0)
+        if hard < 0.0:
+            errors.append(
+                f"gpu.hard_min_vram_margin_gib ({hard}) must be >= 0; the "
+                f"engine refuses this at startup.")
+        if floor < 0.0:
+            errors.append(
+                f"gpu.min_vram_margin_gib ({floor}) must be >= 0; the engine "
+                f"refuses this at startup.")
+        if num(gpu_cfg.get("placement_margin_gib"), 4.0) < 0.0:
+            errors.append(
+                "gpu.placement_margin_gib must be >= 0; the engine refuses "
+                "this at startup.")
+        if thin == "separate" and hard > floor:
+            errors.append(
+                f"gpu.hard_min_vram_margin_gib ({hard}) is above "
+                f"gpu.min_vram_margin_gib ({floor}), so the 'separate' band is "
+                f"empty and only the hard floor would ever apply. The engine "
+                f"refuses this at startup. Lower the hard floor, or use "
+                f"gpu.thin_margin_policy: refuse.")
+
+        # Ice stability: the engine's own guard rails, stated where the
+        # controls are.
+        if therm.get("compute_ice_stability", False):
+            # MEASURED 2026-08-25 (Moon ico2, 4 steps, engine
+            # c6ec28eb2353c06d2131699583f75b5d): the ice-stability accumulator
+            # is passed ONLY to runThermalModelsForAllFaces_GPU_Persistent
+            # (ptm_thermal_sim.cpp:17320). On the CPU paths the run completes,
+            # prints "[Ice stability] WARNING: requested but accumulator not
+            # ready", and writes no ice_depth.bin. A WARNING rather than an
+            # error: the run itself is valid, it just will not produce the
+            # product that was asked for -- and that is exactly the kind of
+            # silence worth breaking before the launch, not after.
+            if not therm.get("use_gpu", False):
+                warnings.append(
+                    "Warning: thermal.compute_ice_stability is on but "
+                    "thermal.use_gpu is off. The ice-stability accumulator is "
+                    "filled only by the GPU thermal solver, so this run will "
+                    "complete normally and write NO ice_depth.bin (the engine "
+                    "prints '[Ice stability] WARNING: requested but "
+                    "accumulator not ready'). Measured on this engine, "
+                    "2026-08-25.")
+            ice = therm.get("ice_stability")
+            ice = ice if isinstance(ice, dict) else {}
+            if num(ice.get("flux_threshold_kgm2s"), 0.0) <= 0:
+                errors.append(
+                    "Ice stability: flux_threshold_kgm2s must be positive; it "
+                    "is the sublimation rate below which ice is called stable.")
+            if num(ice.get("grain_hop_length_um"), 0.0) <= 0:
+                errors.append(
+                    "Ice stability: grain_hop_length_um must be positive.")
+            if num(ice.get("sublimation_enthalpy_kJmol"), 0.0) <= 0:
+                errors.append(
+                    "Ice stability: sublimation_enthalpy_kJmol must be "
+                    "positive.")
+
+        # Equilibration convergence criterion.
+        if num(therm.get("equilibration_target_K"), 0.1) <= 0:
+            errors.append(
+                "Thermal: equilibration_target_K must be positive; it is the "
+                "temperature the equilibration residual is scored against.")
+        if num(therm.get("eq_indirect_passes"), 1) < 1:
+            errors.append(
+                "Thermal: eq_indirect_passes must be at least 1 (the engine "
+                "refuses 0 at startup).")
+        # ptm_thermal_sim.cpp:16534 -- "Valid: auto | converged | off". Taken
+        # from the engine's own refusal, not from memory: the first spelling of
+        # this check invented (auto|none|file|internal) and would have refused
+        # the one non-default value that works.
+        eq_source = str(therm.get("eq_indirect_source", "auto") or "")
+        if eq_source not in ("auto", "converged", "off"):
+            errors.append(
+                f"Thermal: eq_indirect_source must be auto, converged or off "
+                f"(got {eq_source!r}); the engine refuses anything else at "
+                f"startup.")
+
         # Output validation. .get(), not [...]: the only unguarded subscript
         # left in this function, and `output: binary` (a scalar section) made it
         # raise "string indices must be integers" out of the Run slot.
@@ -1073,13 +1667,40 @@ class ConfigManager:
         # public and is also reached from configs this manager did not load.
         out_cfg = self.config.get("output")
         out_cfg = out_cfg if isinstance(out_cfg, dict) else {}
-        valid_formats = ["binary", "vtk"]
+        # `none` is a REAL value for both, used by five shipped configs
+        # (configs/amundsen_survey_template.yaml, amundsen_wilcoski_
+        # illumination.yaml, examples/moon_global_topo_res5_flat.yaml,
+        # quickstart_europa_albedo_map.yaml, quickstart_europa_diurnal.yaml),
+        # and the engine accepts it -- measured, --validate-config rc 0 on
+        # quickstart_europa_diurnal.yaml. There is no engine-side check at all
+        # on this path: ConfigParser::validate() is DEAD CODE (the only
+        # reference is the comment at ptm_thermal_sim.cpp:17063 saying it is
+        # not called), and the writer is an if/else chain that simply falls
+        # through. So refusing here BLOCKED configs the engine runs -- the
+        # second-weaker-copy disagreement item 2.4 exists to remove.
+        #
+        # An unrecognized value is a WARNING, not an error, because that is
+        # what it does: the chain falls through and the run writes nothing.
+        # ERRORS, not warnings. The previous pass widened the valid sets
+        # correctly and then also downgraded the severity, which let
+        # `format: Binary` or `bianry` through the launch gate: the engine's
+        # writer is an if/else chain that falls through, so a multi-hour run
+        # completes having written no field output at all. The engine refuses
+        # nothing here, which is exactly why the GUI must.
+        valid_formats = ["binary", "vtk", "none"]
         if out_cfg.get("format") not in valid_formats:
-            errors.append(f"Output format must be one of: {', '.join(valid_formats)}")
+            errors.append(
+                f"output.format is {out_cfg.get('format')!r}; it must be one "
+                f"of {', '.join(valid_formats)}. The engine does NOT refuse "
+                f"anything else -- it falls through and writes no field "
+                f"output, so a whole run can finish with nothing to show.")
 
-        valid_vtk_modes = ["thermal", "complete", "both"]
+        valid_vtk_modes = ["thermal", "complete", "both", "none"]
         if out_cfg.get("vtk_mode") not in valid_vtk_modes:
-            errors.append(f"VTK mode must be one of: {', '.join(valid_vtk_modes)}")
+            errors.append(
+                f"output.vtk_mode is {out_cfg.get('vtk_mode')!r}; it must be "
+                f"one of {', '.join(valid_vtk_modes)}. The engine writes no "
+                f"VTK for anything else and does not say so.")
 
         # GPU warnings
         thermal = self.config.get("thermal", {})

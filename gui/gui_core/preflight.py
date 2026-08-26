@@ -117,10 +117,81 @@ _FILE_FIELDS = [
     "thermal.h_parameter_map",
     "thermal.heat_flow_mask_file",
     "thermal.initial_state_file",
+    # An explicit 'QIND' file from a prior pass-1 run. It is READ at
+    # equilibration time and always wins over eq_indirect_source, so an
+    # evicted cloud placeholder here changes the deep answer, not just the
+    # speed -- the same reason the occluder joined this list in Stage 1.
+    "thermal.eq_indirect_flux_file",
     "output.locations_file",
     "output.depths_file",
     "generic_body.config_file",
     "generic_body.spice_metakernel",
+]
+
+#: Data-path fields that follow the PTM_DATA_ROOT contract but must NOT be
+#: existence-checked, because a first run is supposed to find them missing.
+#: (config_parser.cpp resolves illumination.bvh_cache_file with resolveDataPath
+#: and `required=false`.)
+_DATA_PATH_NO_EXISTENCE_CHECK = [
+    "illumination.bvh_cache_file",
+]
+
+#: Values that are SENTINELS, not paths, and must survive absolutization
+#: untouched. config_parser.h:435 and illumination_model.cpp:781/795 document
+#: `bvh_cache_file: "off"` as "disable the BVH cache"; the engine's
+#: resolveDataPath returns it verbatim (not absolute, not `data/`, does not
+#: exist). Absolutizing it produced "<project_root>/off", which would ENABLE
+#: caching into a file literally named `off` -- the opposite of what was asked.
+#: Reproduced.
+_PATH_SENTINELS = {
+    "illumination.bvh_cache_file": {"off"},
+}
+
+
+def is_path_sentinel(dotted, value):
+    """True when `value` is a documented sentinel for `dotted`, not a path.
+
+    EXACT, because the engine's test is exact: `bvh_cache_file_ != "off"`
+    (illumination_model.cpp:781, :795). A case-insensitive match here would
+    make the GUI skip `"OFF"` as "caching disabled" while the engine read it as
+    a relative path and wrote a cache to <repo>/OFF -- the disclosure and the
+    run disagreeing about the same file.
+    """
+    return str(value) in _PATH_SENTINELS.get(dotted, ())
+
+
+#: EXACTLY the keys the engine resolves through resolveDataPath
+#: (config_parser.cpp, the "Apply the PTM_DATA_ROOT resolution contract" block).
+#: Transcribed from that list, not inferred from "it looks like a path".
+#:
+#: Being on _FILE_FIELDS is about the pre-flight EXISTENCE check; being here is
+#: about how a relative `data/...` value RESOLVES, and the two sets are not the
+#: same. thermal.eq_indirect_flux_file, thermal.initial_state_file,
+#: illumination.positions_file and generic_body.config_file are read by the
+#: engine as plain paths relative to the process working directory, so
+#: resolving them under PTM_DATA_ROOT made the GUI's run YAML point somewhere
+#: a CLI run of the same config would not look -- silently, and for the
+#: indirect-flux file that changes the deep answer.
+_ENGINE_DATA_ROOT_FIELDS = [
+    "mesh.import_file",
+    "mesh.occluder_file",
+    "mesh.topo_directory",
+    "thermal.thermal_inertia_map",
+    "thermal.h_parameter_map",
+    "thermal.heat_flow_mask_file",
+    "thermal.property_maps_directory",
+    "illumination.albedo_map",
+    "illumination.albedo_maps_directory",
+    "illumination.bvh_cache_file",
+    "output.locations_file",
+    "output.depths_file",
+    "generic_body.spice_metakernel",
+    # The engine's key is generic_body.mesh_file (config_parser.cpp:881); the
+    # GUI writes the same value at generic_body.shape.mesh_file. Listed under
+    # BOTH spellings so this table stays literally exact against that block,
+    # whichever one a future writer emits.
+    "generic_body.mesh_file",
+    "generic_body.shape.mesh_file",
 ]
 
 # Config fields that hold a directory that will be READ during the run.
@@ -704,11 +775,18 @@ def absolutize_config_paths(config, project_root):
         # the file this run will write, not one it must find.
         "thermal.final_state_file",
         "output.directory",
-    ]
-    data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)
+    ] + _DATA_PATH_NO_EXISTENCE_CHECK
+    # The engine resolves these through the PTM_DATA_ROOT contract
+    # (resolveDataPath), not against the project root. Getting this wrong is
+    # silent: the GUI would write <project_root>/cache/site.bvh into the run
+    # YAML while the engine alone would have used $PTM_DATA_ROOT/cache/site.bvh,
+    # and the BVH cache would be written and read in different places.
+    data_fields = set(_ENGINE_DATA_ROOT_FIELDS)
     for dotted in path_fields:
         val = get_config_value(cfg, dotted)
         if not val:
+            continue
+        if is_path_sentinel(dotted, val):
             continue
         parts = dotted.split(".")
         parent = cfg
@@ -719,6 +797,161 @@ def absolutize_config_paths(config, project_root):
         resolver = resolve_data_path if dotted in data_fields else resolve_path
         parent[parts[-1]] = str(resolver(val, project_root))
     return cfg
+
+
+#: Wall-clock ceiling for the engine's own config check. Measured: 0.13-0.20 s
+#: on this machine, because the mode parses and exits. This call is SYNCHRONOUS
+#: on the Qt thread, so the ceiling is also how long the window can freeze --
+#: it was 60 s, which is a minute of dead GUI on a stalled network or cloud
+#: mount. 15 s leaves ~75x headroom over the measured time and bounds the
+#: freeze. The caller shows a wait cursor for the duration.
+VALIDATE_TIMEOUT_S = 15.0
+#: Ceiling for the `--help` capability probe. It is a separate synchronous
+#: call, so the WORST-CASE freeze is this plus VALIDATE_TIMEOUT_S -- giving the
+#: probe the full validation ceiling made the documented 15 s bound a 30 s one.
+#: --help prints and exits, so 5 s is already generous.
+PROBE_TIMEOUT_S = 5.0
+
+
+def engine_validate_config(config, executable, project_root=None, env=None):
+    """Hand `config` to the engine's own parser and report what IT says.
+
+    Item 2.4 / DP-6. ``ConfigManager.validate`` is a second, weaker copy of the
+    engine's rules, and the two have already disagreed: the first draft of the
+    ``eq_indirect_source`` check invented a valid set (``auto|none|file|
+    internal``) that would have refused ``converged``, the one non-default value
+    the engine accepts. The fix is to stop keeping a second copy of the answer.
+
+    Returns ``(status, text)`` where status is:
+      ``"accepted"``     rc 0 -- well formed as far as this mode can tell
+      ``"refused"``      rc 1 -- the engine will not run it, and `text` says why
+      ``"unavailable"``  no binary, no ``--validate-config`` support, or the
+                         call failed. NEVER silently treated as acceptance.
+
+    The YAML is written to a temporary file with every path absolutized, so it
+    resolves exactly as the run YAML would; the temporary file is removed
+    afterward, whatever happens.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import yaml as _yaml
+
+    if not executable:
+        return ("unavailable",
+                "No ptm_thermal_sim was found, so the engine's own checks "
+                "could not be run. Only the GUI's checks applied. Build it "
+                "with: cmake --build build --target ptm_thermal_sim")
+    executable = Path(executable)
+    if not executable.exists():
+        return ("unavailable",
+                f"{executable} does not exist, so the engine's own checks "
+                f"could not be run. Only the GUI's checks applied.")
+
+    # CAPABILITY PROBE FIRST, and it is not a nicety.
+    # The engine's argument loop has no unknown-argument handler, so a binary
+    # that predates --validate-config IGNORES it and runs the simulation.
+    # MEASURED against ~/projects/ptm-postmerge-2026-08-24 (md5
+    # 9d657590009ade0c0d8f2d07d2faa7a2): it ran a complete Moon ico2 job, wrote
+    # the whole output directory and exited 0. On a production config, pressing
+    # Ctrl+T would have started a multi-hour GPU run.
+    #
+    # --help exits without touching anything, so asking it first is free.
+    try:
+        probe = subprocess.run([str(executable), "--help"], capture_output=True,
+                               text=True, timeout=PROBE_TIMEOUT_S)
+    except Exception as exc:                           # noqa: BLE001
+        return ("unavailable",
+                f"{executable} could not be asked for its options ({exc}), so "
+                f"the engine's checks were not run.")
+    if "--validate-config" not in (probe.stdout or "") + (probe.stderr or ""):
+        return ("unavailable",
+                f"{executable} does not support --validate-config, so nothing "
+                f"was checked by the engine -- only the GUI's own rules "
+                f"applied.\n"
+                f"  The flag was NOT passed to it. A binary that predates the "
+                f"flag ignores it and RUNS THE SIMULATION: measured, a "
+                f"pre-flag build ran a complete job and exited 0 when handed "
+                f"--validate-config.\n"
+                f"  Rebuild from a tree that carries the flag: cmake --build "
+                f"build --target ptm_thermal_sim")
+
+    root = Path(project_root) if project_root else find_project_root(executable)
+    tmpdir = tempfile.mkdtemp(prefix="ptm3d_validate_")
+    try:
+        path = Path(tmpdir) / "config.yaml"
+        # Belt and braces: point output.directory at the temporary directory.
+        # Nothing in --validate-config reads it, and if a binary ever ignores
+        # the flag again, whatever it writes lands here and is deleted with the
+        # rest. The user's own output directory is never a target of a CHECK.
+        checked = absolutize_config_paths(config, root)
+        # isinstance, not setdefault: `output:` as a scalar or null makes
+        # setdefault return the non-mapping and dict() raise TypeError -- out
+        # of the Check Configuration slot, which is the process-abort class
+        # this codebase guards against everywhere else.
+        node = checked.get("output")
+        checked["output"] = dict(node) if isinstance(node, dict) else {}
+        checked["output"]["directory"] = str(Path(tmpdir) / "output")
+        with open(path, "w") as handle:
+            _yaml.dump(checked, handle,
+                       default_flow_style=False, sort_keys=False)
+        # build_engine_env returns (env, applied). The SAME environment the
+        # launch would apply: validating under a different one answers a
+        # different question, and PTM_ILLUM_RISE_EPS is exactly the variable
+        # that turned out to matter.
+        child_env, _applied = build_engine_env(config, env)
+        try:
+            proc = subprocess.run(
+                [str(executable), "--config", str(path), "--validate-config"],
+                capture_output=True, text=True, cwd=str(root),
+                env=child_env,
+                timeout=VALIDATE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return ("unavailable",
+                    f"The engine did not answer within {VALIDATE_TIMEOUT_S:.0f} s. "
+                    f"--validate-config parses and exits, so this is not a slow "
+                    f"config -- treat it as 'not checked', not as 'accepted'.")
+        except Exception as exc:                       # noqa: BLE001
+            return ("unavailable",
+                    f"The engine's config check could not be run ({exc}). Only "
+                    f"the GUI's checks applied.")
+
+        text = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode < 0:
+            # A signal, not a verdict. --validate-config returns 0 or 1; a
+            # negative code is a crash IN the parser (this codebase has a
+            # documented -mavx2 / Eigen ABI SIGABRT class), and reporting it
+            # as "the engine REFUSED this configuration" blames the user's YAML
+            # for an engine fault.
+            import signal as _signal
+            try:
+                name = _signal.Signals(-proc.returncode).name
+            except (ValueError, AttributeError):
+                name = f"signal {-proc.returncode}"
+            return ("unavailable",
+                    f"The engine CRASHED while parsing the configuration "
+                    f"({name}). That is a fault in the binary, not a verdict on "
+                    f"the config -- nothing was validated.\n" + text)
+        if proc.returncode > 1:
+            return ("unavailable",
+                    f"The engine exited {proc.returncode}, which is neither "
+                    f"accept (0) nor refuse (1). Treat it as not checked.\n"
+                    + text)
+        if proc.returncode == 0 and "[validate-config]" in text:
+            return ("accepted", text)
+        if proc.returncode == 0:
+            # rc 0 with no banner means this binary predates --validate-config
+            # and ignored the unknown flag. It did NOT validate anything, and
+            # reporting success here would be the exact silence this whole
+            # stage is about.
+            return ("unavailable",
+                    "This ptm_thermal_sim does not support --validate-config "
+                    "(it exited 0 without the [validate-config] banner), so "
+                    "nothing was checked by the engine. Rebuild from a tree "
+                    "that carries the flag, or rely on the GUI's own checks.")
+        return ("refused", text)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def run_preflight(config, find_executable, project_root=None):
@@ -754,7 +987,17 @@ def run_preflight(config, find_executable, project_root=None):
         val = get_config_value(config, dotted)
         if not val:
             continue
-        p = resolve_data_path(val, project_root)
+        if is_path_sentinel(dotted, val):
+            continue
+        # The SAME resolver absolutize_config_paths uses for this key. They
+        # disagreed: the pre-flight stat'd $PTM_DATA_ROOT/... for four keys the
+        # engine reads relative to the working directory, so a launch could be
+        # blocked for a file that exists, or waved through for one that does
+        # not -- and for thermal.eq_indirect_flux_file that changes the deep
+        # answer rather than merely failing.
+        resolver = (resolve_data_path if dotted in _ENGINE_DATA_ROOT_FIELDS
+                    else resolve_path)
+        p = resolver(val, project_root)
         if not p.exists():
             report.errors.append(f"{dotted}: file not found: {p}")
             continue
