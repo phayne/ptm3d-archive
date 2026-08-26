@@ -348,6 +348,21 @@ class UnifiedDashboard(QMainWindow):
                 cm = modules[idx].config_manager()
                 if cm and hasattr(cm, 'load_from_yaml'):
                     cm.load_from_yaml(filepath)
+                    # Re-read it into the controls. Without this the panel kept
+                    # showing the PREVIOUS project -- measured, opening a
+                    # Europa / 77-step / 12-thread config left the panel
+                    # displaying Moon / 144 / 0. The user then edits what they
+                    # see and saves it into a file that says something else,
+                    # and under the comment-preserving writer only the touched
+                    # field changes, so nothing looks wrong afterward either.
+                    reload_config = getattr(modules[idx], "reload_config", None)
+                    if callable(reload_config):
+                        reload_config()
+                    else:
+                        self.console_panel.append_warning(
+                            f"{modules[idx].display_name()} cannot re-read its "
+                            f"controls, so this panel may still be showing the "
+                            f"previous configuration.")
                     self.console_panel.append_info(f"Loaded: {filepath}")
 
     def _on_save_project(self):

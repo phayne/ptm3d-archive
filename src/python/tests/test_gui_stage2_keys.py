@@ -336,6 +336,67 @@ def test_an_engine_rejected_enum_is_shown_and_repairable():
         panel.load_from_config()
 
 
+def test_the_dashboard_reloads_its_controls_after_an_open():
+    """The dashboard is the OTHER entry point, and its Open showed the wrong
+    project.
+
+    `dashboard._on_open_project` called `cm.load_from_yaml(filepath)` and
+    nothing else, so the panel went on displaying the previous configuration.
+    Measured: opening a Europa / 77-step / 12-thread config left the panel
+    showing Moon / 144 / 0. The user then edits what they SEE and saves it into
+    a file that says something else -- and under the comment-preserving writer
+    only the touched field changes, so nothing looks wrong afterward either.
+
+    The interface carries the hook so a module cannot silently lack it: a
+    module without `reload_config` gets a warning instead of a quiet stale
+    panel.
+    """
+    from dashboard_core.module_interface import AbstractModule
+    assert hasattr(AbstractModule, "reload_config"), (
+        "the module interface has no reload hook, so the dashboard cannot ask "
+        "a module to re-read its controls")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = Path(scratch) / "other_project.yaml"
+        path.write_text(
+            "simulation:\n  body: Europa\n  timesteps: 77\n"
+            "thermal:\n  threads: 12\n")
+
+        # Exactly what the dashboard did: load, no reload.
+        manager.load_from_yaml(str(path))
+        stale = panel.tabs["simulation"].widgets["simulation.timesteps"].value()
+        assert stale != 77, (
+            "the fixture cannot detect the defect: the panel already agrees")
+
+        # ...and what it does now.
+        panel.load_from_config()
+        assert panel.tabs["simulation"].widgets[
+            "simulation.timesteps"].value() == 77
+        assert panel.tabs["thermal"].widgets["thermal.threads"].value() == 12
+        assert panel.tabs["simulation"].widgets[
+            "simulation.body"].currentText() == "Europa"
+
+        manager.reset_to_defaults()
+        panel.load_from_config()
+
+
+def test_the_thermal_adapter_implements_the_reload_hook():
+    """A default no-op on the interface must not be what the thermal module
+    inherits -- it is the module with 145 bound controls."""
+    import inspect
+    from dashboard_core.module_interface import AbstractModule
+    try:
+        from module_adapters.thermal_adapter import ThermalModule
+    except ImportError as exc:                         # pragma: no cover
+        raise Skip(f"the thermal adapter is unavailable here ({exc})")
+    assert ThermalModule.reload_config is not AbstractModule.reload_config, (
+        "the thermal module inherits the no-op reload hook, so a dashboard "
+        "Open still leaves its panel showing the previous project")
+    source = inspect.getsource(ThermalModule.reload_config)
+    assert "load_from_config" in source, source
+
+
 def test_coupling_mode_is_compared_exactly_like_the_engine():
     """The one enum that is NOT normalized, and it lost its guard.
 
@@ -754,6 +815,8 @@ TESTS = [
     test_a_nonzero_default_floor_forces_the_explicit_checkbox,
     test_the_forced_explicit_tick_is_reversible,
     test_an_engine_rejected_enum_is_shown_and_repairable,
+    test_the_dashboard_reloads_its_controls_after_an_open,
+    test_the_thermal_adapter_implements_the_reload_hook,
     test_coupling_mode_is_compared_exactly_like_the_engine,
     test_the_forcing_flag_does_not_survive_opening_another_project,
     test_an_unrecognized_output_format_BLOCKS_the_launch,

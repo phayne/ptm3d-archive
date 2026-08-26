@@ -59,6 +59,18 @@ class AbstractModule(QObject):
 
     # -- Chaining ----------------------------------------------------------
 
+    def reload_config(self):
+        """Re-read the config manager into this module's controls.
+
+        Called after something replaces the WHOLE configuration behind the
+        panel's back -- the dashboard's File > Open. Without it the panel goes
+        on displaying the previous project: measured, a dashboard Open of a
+        Europa/77-step config left the panel showing Moon/144, so the user
+        edited what they saw and saved it into a file that says something else.
+        Default: nothing, for a module with no bound controls.
+        """
+        return None
+
     def set_input(self, input_type: str, value: str):
         """Receive a chained input from another module.
 
