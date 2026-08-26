@@ -151,7 +151,26 @@ class BaseConfigTab(QWidget):
         super().__init__()
         self.config_manager = config_manager
         self.widgets = {}
+        #: Sections this tab declares Advanced-tier (item 2.1 / DP-9). The
+        #: Basic/Advanced boundary used to be drawn by TAB, which meant the
+        #: Basic tier could not express a crater run at all: Radiation and
+        #: Illumination were hidden wholesale. It is now drawn by FIELD -- every
+        #: tab shows its Basic fields inline and hides these until the user asks
+        #: for them. Purely a visibility filter: every widget still exists, and
+        #: nothing about the saved YAML depends on it.
+        self.advanced_sections = []
         self.init_ui()
+
+    def advanced_section(self, title, collapsed=True):
+        """A CollapsibleSection registered as Advanced-tier for this tab."""
+        section = CollapsibleSection(title, collapsed=collapsed)
+        self.advanced_sections.append(section)
+        return section
+
+    def set_advanced_visible(self, visible):
+        """Show or hide every Advanced-tier section on this tab."""
+        for section in self.advanced_sections:
+            section.setVisible(bool(visible))
 
     def init_ui(self):
         """Initialize UI - implemented by subclasses"""
@@ -1147,9 +1166,22 @@ class MeshTab(BaseConfigTab):
         self.add_double_field(custom_layout, 1, "Scale Factor:", "mesh.scale_factor",
                               0.001, 1000.0, 3, "Scaling factor for imported mesh",
                               info_key="mesh.scale_factor")
+
+        custom_group.setLayout(custom_layout)
+        layout.addWidget(custom_group)
+
+        # --- Placement and occluder (Advanced) ----------------------------
+        # The core-plus-ring architecture and the mesh placement overrides are
+        # what a site run needs and a global run never touches, so they sit
+        # behind the Advanced disclosure rather than in a hidden tab.
+        place_section = self.advanced_section("Mesh Placement and Occluder")
+        place_group = QGroupBox("Placement and Occluder")
+        place_layout = QGridLayout()
+        place_layout.setColumnStretch(1, 1)
+
         # The core-plus-ring architecture was CLI-only: every A3GT-class site
         # run needs an occluder, and the GUI had no field for it.
-        self.add_file_field(custom_layout, 2, "Occluder File:", "mesh.occluder_file",
+        self.add_file_field(place_layout, 0, "Occluder File:", "mesh.occluder_file",
                             "Mesh Files (*.ply *.obj *.vtk);;All Files (*)",
                             "Coarse occluder-only mesh (the ring around a "
                             "high-resolution core). It enters the illumination "
@@ -1162,13 +1194,13 @@ class MeshTab(BaseConfigTab):
         # Longitude alone therefore does nothing at all, which is why the
         # longitude field is disabled until a latitude is set rather than left
         # editable with a tooltip nobody reads.
-        self.add_double_field(custom_layout, 3, "Latitude Override (deg):",
+        self.add_double_field(place_layout, 1, "Latitude Override (deg):",
                               "mesh.latitude_override", -999.0, 90.0, 4,
                               "Place the imported mesh at this latitude. "
                               "-999 = leave the mesh in its own frame. This is "
                               "the switch for BOTH overrides: the engine "
                               "rotates only when a latitude is given.")
-        self.add_double_field(custom_layout, 4, "Longitude Override (deg):",
+        self.add_double_field(place_layout, 2, "Longitude Override (deg):",
                               "mesh.longitude_override", -999.0, 360.0, 4,
                               "Place the imported mesh at this longitude. Read "
                               "only when a latitude override is also set -- the "
@@ -1184,7 +1216,7 @@ class MeshTab(BaseConfigTab):
         self.placement_note = QLabel("")
         self.placement_note.setWordWrap(True)
         self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
-        custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
+        place_layout.addWidget(self.placement_note, 3, 0, 1, 2)
         # BOTH, because the note quotes both numbers: connected to latitude
         # only, it went on stating the old longitude for the run about to start.
         # set_numeric() calls setValue during load_from_config, which emits
@@ -1196,8 +1228,9 @@ class MeshTab(BaseConfigTab):
                 lambda _v: self._update_placement_gating(
                     user_edit=not self._loading))
 
-        custom_group.setLayout(custom_layout)
-        layout.addWidget(custom_group)
+        place_group.setLayout(place_layout)
+        place_section.add_widget(place_group)
+        layout.addWidget(place_section)
 
         # Gray out global mesh options when a custom mesh is selected
         self.widgets["mesh.import_file"].textChanged.connect(self._on_import_file_changed)
@@ -1605,7 +1638,6 @@ class ThermalTab(BaseConfigTab):
             self._update_seed_gating)
 
         seed_group.setLayout(seed_layout)
-        layout.addWidget(seed_group)
 
         # --- Run state (warm start / chunk handoff) ------------------------
         state_group = QGroupBox("Run State")
@@ -1635,7 +1667,14 @@ class ThermalTab(BaseConfigTab):
         state_layout.addWidget(state_note, 2, 0, 1, 2)
 
         state_group.setLayout(state_layout)
-        layout.addWidget(state_group)
+
+        # Initial condition and run state are reproduction/continuation
+        # machinery: a first run never touches them, and a baseline
+        # reproduction needs both. One Advanced disclosure, not a hidden tab.
+        adv_run = self.advanced_section("Initial Condition and Run State")
+        adv_run.add_widget(seed_group)
+        adv_run.add_widget(state_group)
+        layout.addWidget(adv_run)
 
         # Integration Window (advanced)
         integ_group = QGroupBox("Integration Window")
@@ -1706,7 +1745,7 @@ class ThermalTab(BaseConfigTab):
         # Collect the expert thermal knobs (equilibration cadence, integration
         # window, property maps) under one collapsed section so the Thermal tab
         # leads with the common controls.
-        adv_thermal = CollapsibleSection("Advanced thermal", collapsed=True)
+        adv_thermal = self.advanced_section("Advanced thermal")
         adv_thermal.add_widget(cad_group)
         adv_thermal.add_widget(integ_group)
         adv_thermal.add_widget(maps_group)
@@ -2194,7 +2233,7 @@ class RadiationTab(BaseConfigTab):
             lambda _v: self._update_beaming_gating())
 
         # --- Thermal-Radiation Coupling (collapsed) ---
-        coupling_section = CollapsibleSection("Thermal-Radiation Coupling", collapsed=True)
+        coupling_section = self.advanced_section("Thermal-Radiation Coupling")
         coupling_widget = QWidget()
         coupling_layout = QGridLayout(coupling_widget)
         coupling_layout.setColumnStretch(1, 1)
@@ -2244,7 +2283,7 @@ class RadiationTab(BaseConfigTab):
         layout.addWidget(coupling_section)
 
         # --- View Factor Options (collapsed, merges caching + compression) ---
-        vf_section = CollapsibleSection("View Factor Options", collapsed=True)
+        vf_section = self.advanced_section("View Factor Options")
         vf_widget = QWidget()
         vf_layout = QGridLayout(vf_widget)
         vf_layout.setColumnStretch(1, 1)
@@ -2301,7 +2340,7 @@ class RadiationTab(BaseConfigTab):
         layout.addWidget(vf_section)
 
         # --- Sparse View Factors (collapsed) ---
-        sparse_section = CollapsibleSection("Sparse View Factors (>1M Faces)", collapsed=True)
+        sparse_section = self.advanced_section("Sparse View Factors (>1M Faces)")
         sparse_widget = QWidget()
         sparse_layout = QGridLayout(sparse_widget)
         sparse_layout.setColumnStretch(1, 1)
@@ -2927,7 +2966,7 @@ class ThermophysicalTab(BaseConfigTab):
         layout.addWidget(ti_section)
 
         # --- Heat Capacity & Internal Heat (collapsed) ---
-        cp_heat_section = CollapsibleSection("Heat Capacity & Internal Heat", collapsed=True)
+        cp_heat_section = self.advanced_section("Heat Capacity & Internal Heat")
         cp_heat_widget = QWidget()
         cp_heat_layout = QGridLayout(cp_heat_widget)
         cp_heat_layout.setColumnStretch(1, 1)
@@ -4137,7 +4176,7 @@ class IlluminationTab(BaseConfigTab):
 
         # Advanced illumination (collapsed): batch ray-tracing + precomputed
         # Sun/Primary positions — expert knobs most runs never touch.
-        adv_illum = CollapsibleSection("Advanced illumination", collapsed=True)
+        adv_illum = self.advanced_section("Advanced illumination")
 
         batch_group = QGroupBox("Ray Tracing")
         batch_layout = QGridLayout()
@@ -4407,6 +4446,24 @@ class EngineFlagsTab(BaseConfigTab):
         self._declined_note.setVisible(False)
         layout.addWidget(self._declined_note)
 
+        # Basic tier: WHAT will be applied, read-only. The editable table is
+        # Advanced. Before item 2.1 this whole tab was Advanced-only, so a Basic
+        # user could not see that the GUI injects five variables into every run
+        # -- and one of them changed the physics of every GUI run on 2026-08-25.
+        # A disclosure nobody can reach is not a disclosure.
+        self._env_summary = QLabel("")
+        self._env_summary.setWordWrap(True)
+        self._env_summary.setObjectName("engineEnvSummary")
+        self._env_summary.setStyleSheet(
+            "color: #B0BEC5; font-size: 11px; padding: 6px; "
+            "border: 1px solid #444; border-radius: 4px;")
+        layout.addWidget(self._env_summary)
+
+        adv_env = self.advanced_section("Edit engine flags", collapsed=True)
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Variable", "Value"])
         self.table.horizontalHeader().setSectionResizeMode(
@@ -4416,7 +4473,7 @@ class EngineFlagsTab(BaseConfigTab):
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(240)
         self.table.cellChanged.connect(self._on_cell_changed)
-        layout.addWidget(self.table)
+        editor_layout.addWidget(self.table)
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Flag")
@@ -4429,7 +4486,10 @@ class EngineFlagsTab(BaseConfigTab):
         reset_btn.clicked.connect(self._restore_recommended)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch()
-        layout.addLayout(btn_row)
+        editor_layout.addLayout(btn_row)
+
+        adv_env.add_widget(editor)
+        layout.addWidget(adv_env)
 
         layout.addStretch()
         self.create_scroll_area(content)
@@ -4488,6 +4548,32 @@ class EngineFlagsTab(BaseConfigTab):
         self._write_back()
         self._refresh_declined_note()
 
+    def _refresh_summary(self):
+        """Say, in the Basic tier, exactly what the launch will export.
+
+        Reads the SAME planner the launch uses (engine_env_plan), so the two
+        cannot drift: a summary computed from the raw block would keep claiming
+        five variables after the value cells were blanked, and blank-valued
+        entries are dropped at launch.
+        """
+        from gui_core.preflight import (engine_env_plan,
+                                        DELIBERATELY_NOT_INJECTED,
+                                        ENV_SET_CHANGED_PHYSICS)
+        table, source = engine_env_plan(self.config_manager.get_config())
+        if table:
+            body = ("This run will export %d engine variable(s) (%s):\n    %s"
+                    % (len(table), source,
+                       "\n    ".join("%s=%s" % kv for kv in sorted(table.items()))))
+        else:
+            body = ("This run will export NO engine variables, and will REMOVE "
+                    "any the shell exported (%s)." % source)
+        skipped = ", ".join(sorted(DELIBERATELY_NOT_INJECTED))
+        self._env_summary.setText(
+            body
+            + ("\n\nDeliberately not injected: %s (see the table's tooltip)."
+               % skipped if skipped else "")
+            + "\n\n" + ENV_SET_CHANGED_PHYSICS)
+
     def _refresh_declined_note(self):
         """Show the 'declines every flag' note exactly when it is true.
 
@@ -4503,6 +4589,7 @@ class EngineFlagsTab(BaseConfigTab):
         from gui_core.preflight import engine_env_plan
         table, _source = engine_env_plan(self.config_manager.get_config())
         self._declined_note.setVisible(not table)
+        self._refresh_summary()
 
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
@@ -4565,11 +4652,15 @@ class ConfigurationPanel(QWidget):
 
         self.stacked_widget = QStackedWidget()
 
-        # Basic tabs come first, then the advanced-only tabs. Basic = what a
-        # scientist needs for a standard thermal run; Advanced reveals the
-        # expert/body-specific machinery. This is a VISIBILITY filter over the
-        # existing nav-rail machinery — no tab is removed, so nothing about the
-        # saved YAML changes.
+        # The nav rail now shows EVERY section (item 2.1 / DP-9). The
+        # Basic/Advanced boundary moved from tabs to fields: each tab renders
+        # its Basic fields inline and puts the expert groups behind a
+        # disclosure. Drawing it by tab meant the Basic tier could not express
+        # a crater run at all -- Radiation and Illumination were hidden
+        # wholesale, and this model exists mostly to run craters.
+        #
+        # Still a pure visibility filter: every widget exists in both tiers, so
+        # nothing about the saved YAML depends on the toggle.
         tab_order = [
             ("simulation", "Simulation"),
             ("mesh", "Mesh"),
@@ -4582,13 +4673,11 @@ class ConfigurationPanel(QWidget):
             ("engine_flags", "Engine Flags"),
         ]
 
-        # Nav keys revealed only when "Advanced options" is checked. The Body
-        # tab has an extra gate (built-in bodies never show it) applied in
-        # _apply_tab_visibility. "__horizons__" is the HORIZONS search page.
-        self._advanced_nav_keys = {
-            "body_definition", "illumination", "radiation",
-            "engine_flags", "__horizons__",
-        }
+        # No nav key is Advanced-only any more. `body_definition` still has a
+        # RELEVANCE gate -- it describes a custom body, and there is nothing to
+        # describe on a built-in one -- which is not a tier and is applied in
+        # _apply_tab_visibility.
+        self._advanced_nav_keys = set()
         self._nav_keys = []
 
         for key, label in tab_order:
@@ -4604,11 +4693,17 @@ class ConfigurationPanel(QWidget):
         self.nav_rail.currentRowChanged.connect(self.stacked_widget.setCurrentIndex)
         self.nav_rail.setCurrentRow(0)
 
-        # Basic / Advanced disclosure toggle above the nav rail.
+        # Basic / Advanced disclosure toggle above the nav rail. It now reveals
+        # FIELDS, not tabs: every section is always reachable, and each one
+        # keeps its expert groups collapsed until this is checked.
         self.advanced_toggle = QCheckBox("Advanced options")
         self.advanced_toggle.setToolTip(
-            "Reveal expert tabs: Body (custom bodies only), Illumination, "
-            "Radiation, Engine Flags, and HORIZONS.")
+            "Reveal the expert groups on every tab: view-factor and coupling "
+            "options, the GPU device controls and guardrails, mesh placement "
+            "and occluder, initial condition and run state, the equilibration "
+            "cadence, and the engine-flag editor.\n"
+            "Every tab is visible either way; this changes what is shown "
+            "inside them, never what is saved.")
         self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
 
         # Container for nav rail + content
@@ -4748,28 +4843,35 @@ class ConfigurationPanel(QWidget):
         self.config_changed.emit()
 
     def _on_advanced_toggled(self, _checked):
-        """Basic/Advanced disclosure toggled — re-apply nav-rail visibility."""
+        """Basic/Advanced disclosure toggled — re-apply field-level visibility."""
         self._apply_tab_visibility()
 
     def _apply_tab_visibility(self):
-        """Show/hide nav-rail tabs per the Basic/Advanced toggle.
+        """Apply the Basic/Advanced tier, at FIELD level (item 2.1 / DP-9).
 
-        Pure visibility over the existing nav-rail + stacked-widget machinery:
-        every tab still exists and still loads/saves, so this never changes the
-        configuration or the saved YAML. Advanced tabs appear only when the
-        toggle is on; the Body tab additionally stays hidden for built-in
-        bodies (it is only meaningful for a custom/generic body).
+        Pure visibility: every widget exists in both tiers and still loads and
+        saves, so this never changes the configuration or the saved YAML.
+
+        Two independent rules, deliberately not conflated:
+
+        * **tier** -- each tab hides its own Advanced sections while the toggle
+          is off. No tab is hidden by tier any more.
+        * **relevance** -- the Body tab describes a custom/generic body, and
+          there is nothing for it to describe on a built-in one, so it stays
+          hidden until a generic body is active. That is true in both tiers.
         """
         if not hasattr(self, "advanced_toggle"):
             return
         advanced = self.advanced_toggle.isChecked()
         generic_active = self.config_manager.generic_body_active()
+        for tab in self.tabs.values():
+            tab.set_advanced_visible(advanced)
         for row, key in enumerate(self._nav_keys):
             item = self.nav_rail.item(row)
             if item is None:
                 continue
             if key == "body_definition":
-                hidden = not (advanced and generic_active)
+                hidden = not generic_active
             elif key in self._advanced_nav_keys:
                 hidden = not advanced
             else:
