@@ -10927,6 +10927,105 @@ struct MeshUnitReport {
     std::string message;         // reason, when fatal
 };
 
+// ---------------------------------------------------------------------------
+// FACET SCALE, and the beaming rule that depends on it (BUGS.md ENG-BEAM-SCALE-1).
+//
+// `radiation.beaming` turns on the Smith (1967) sub-facet roughness treatment.
+// Until now the engine enforced exactly one thing about it -- beaming: true
+// requires rms_slope_deg > 0 -- and NOTHING about the scale of the mesh it was
+// applied to. A mesh whose facets are already AT the roughness scale resolves
+// that roughness GEOMETRICALLY, and a sub-facet model on top counts it twice.
+// docs/radiation-exchange.md section 8.4 gives the criterion as a length
+// comparison: facet scale against the thermal-isolation scale, roughly a
+// millimeter to a centimeter.
+//
+// The GUI has carried this rule since 2026-08-25 (gui/gui_core/facet_scale.py,
+// approved as that plan's DP-4) and a CLI user had nothing. Same thresholds,
+// same gate quantity, so the two cannot give different answers about the same
+// mesh:
+//
+//     p05 facet scale < 0.05 m   REFUSE  (one decade above the top of the
+//                                        millimeter-to-centimeter band, so the
+//                                        1.96 mm moon3d 509k mesh is refused
+//                                        with margin)
+//     0.05 m .. 1 m              LOUD WARNING
+//     >= 1 m                     allow   (the 3.46 m A3GT core passes cleanly)
+//
+// THE GATE IS THE FINE END, NOT THE MEAN, for the reason facet_scale.py gives:
+// sqrt(mean area) is dominated by the LARGEST facets, so a mesh that is 99%
+// millimeter-scale with a coarse minority reports 70.7 cm and sails through a
+// rule written to refuse millimeter facets. Beaming double-counts on the facets
+// that already resolve the roughness, so what matters is whether a meaningful
+// fraction of the mesh sits at that scale. Measured, sqrt(mean) vs
+// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; A3GT A03MP026 core
+// 3.47 m / 0.708 m; A3GT ring 146 m / 25.1 m.
+//
+// UNITS come from inspectMeshLengthUnit's verdict, not from an assumption --
+// asteroid .obj are in kilometers and lunar/Europa DEM meshes in meters, and a
+// frame slip is 10^6 in AREA. facet_scale.py has to assume meters; this does
+// not, and says which it used.
+struct FacetScaleReport {
+    bool   measured = false;
+    double mean_m = 0.0;      ///< sqrt(mean face area), the number 8.4 tabulates
+    double p05_m  = 0.0;      ///< sqrt(5th-percentile face area), the gate
+    size_t n_faces = 0;
+    size_t n_sampled = 0;
+};
+
+// Above this face count, sample rather than sum every triangle. Same numbers as
+// facet_scale.py: summing all 2,397,890 faces of the A3GT core took 9.9 s in
+// the GUI's Python reader, and 5,000 evenly spaced faces reproduce its
+// documented 3.46 m. Here it is C++ and one pass, but the sampling is kept so
+// the two implementations answer identically on the same mesh.
+constexpr size_t kFacetScaleSampleAbove = 200000;
+constexpr size_t kFacetScaleSampleCount = 5000;
+
+FacetScaleReport measureFacetScale(const std::shared_ptr<ptm::Mesh>& mesh,
+                                   bool mesh_in_meters) {
+    FacetScaleReport r;
+    if (!mesh || mesh->faces.empty() || mesh->vertices.empty()) return r;
+    r.n_faces = mesh->faces.size();
+    const size_t stride = (r.n_faces > kFacetScaleSampleAbove)
+                            ? std::max<size_t>(1, r.n_faces / kFacetScaleSampleCount)
+                            : 1;
+    // Areas are in the mesh's own SQUARED length unit; convert to m^2 once.
+    const double to_m2 = mesh_in_meters ? 1.0 : 1.0e6;
+
+    std::vector<double> areas;
+    areas.reserve(r.n_faces / stride + 1);
+    for (size_t f = 0; f < r.n_faces; f += stride) {
+        const auto& tri = mesh->faces[f];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0) continue;
+        const size_t i0 = static_cast<size_t>(tri[0]);
+        const size_t i1 = static_cast<size_t>(tri[1]);
+        const size_t i2 = static_cast<size_t>(tri[2]);
+        if (i0 >= mesh->vertices.size() || i1 >= mesh->vertices.size() ||
+            i2 >= mesh->vertices.size()) continue;
+        const auto& a = mesh->vertices[i0];
+        const auto& b = mesh->vertices[i1];
+        const auto& c = mesh->vertices[i2];
+        const double ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+        const double vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+        const double cx = uy*vz - uz*vy;
+        const double cy = uz*vx - ux*vz;
+        const double cz = ux*vy - uy*vx;
+        const double area = 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz) * to_m2;
+        if (std::isfinite(area) && area > 0.0) areas.push_back(area);
+    }
+    if (areas.empty()) return r;
+
+    r.n_sampled = areas.size();
+    double sum = 0.0;
+    for (double a : areas) sum += a;
+    r.mean_m = std::sqrt(sum / static_cast<double>(areas.size()));
+    // Nearest-rank 5th percentile, the same rule facet_scale.py::_percentile uses.
+    const size_t k = static_cast<size_t>(0.05 * (areas.size() - 1));
+    std::nth_element(areas.begin(), areas.begin() + k, areas.end());
+    r.p05_m = std::sqrt(areas[k]);
+    r.measured = true;
+    return r;
+}
+
 MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
                                      double body_radius_km) {
     // The discriminator every consumer already uses, and the margin within
@@ -15259,6 +15358,73 @@ int main(int argc, char** argv) {
                       << "  See docs/KNOWN_LIMITATIONS.md (PTM-37, PTM-36, PTM-65)."
                       << std::endl;
             return 1;
+        }
+    }
+
+    // radiation.beaming vs the scale of the mesh it would be applied to.
+    // See measureFacetScale above for the rule and where its thresholds come
+    // from. Checked HERE because this is the first point where both the mesh
+    // and its length unit are known, and before any expensive work.
+    //
+    // Costs nothing on a run that does not ask for beaming: the whole block is
+    // behind `rad_beaming`, so no mesh is traversed and no output changes for
+    // every config that leaves the switch off (which is all of them today).
+    if (rad_beaming) {
+        const FacetScaleReport fs = measureFacetScale(mesh, mesh_length_unit == "meters");
+        if (!fs.measured) {
+            // NOT a refusal, and not silence either. "This mesh is at the
+            // roughness scale" and "I could not measure this mesh" are
+            // different statements; conflating them would refuse beaming for a
+            // reason about this code rather than about the mesh.
+            std::cerr << "[beaming] WARNING: could not measure the facet scale of "
+                         "this mesh (" << mesh->faces.size() << " faces, "
+                      << mesh->vertices.size() << " vertices), so the "
+                         "sub-facet-roughness scale check did NOT run. Confirm "
+                         "yourself that these facets are far larger than the "
+                         "roughness scale (millimeters to centimeters) before "
+                         "trusting a beaming result from this run." << std::endl;
+        } else {
+            std::ostringstream scale_line;
+            scale_line << "[beaming] facet scale: sqrt(mean area) = " << fs.mean_m
+                       << " m, finest 5% = " << fs.p05_m << " m ("
+                       << fs.n_faces << " faces";
+            if (fs.n_sampled < fs.n_faces)
+                scale_line << ", " << fs.n_sampled << " sampled";
+            scale_line << ", mesh read as " << mesh_length_unit << ")";
+            std::cout << scale_line.str() << std::endl;
+
+            constexpr double kBeamRefuseBelowM = 0.05;
+            constexpr double kBeamWarnBelowM   = 1.0;
+            if (fs.p05_m < kBeamRefuseBelowM) {
+                std::cerr << "\n[beaming] FATAL: radiation.beaming = true on a mesh "
+                             "whose finest facets are " << fs.p05_m << " m.\n"
+                          << "  " << scale_line.str() << "\n"
+                          << "  At or near the roughness scale itself this mesh "
+                             "ALREADY resolves the roughness geometrically, so the "
+                             "Smith sub-facet model would count it a second time. "
+                             "The limit is " << kBeamRefuseBelowM << " m -- one "
+                             "decade above the top of the millimeter-to-centimeter "
+                             "thermal-isolation band of "
+                             "docs/radiation-exchange.md section 8.4.\n"
+                          << "  Remove 'beaming: true' (the mesh resolves the "
+                             "roughness on its own), or run beaming on a mesh whose "
+                             "facets are meters across.\n"
+                          << "  Refusing rather than returning a doubly-counted "
+                             "roughness that looks like a result "
+                             "(BUGS.md ENG-BEAM-SCALE-1)." << std::endl;
+                return 1;
+            }
+            if (fs.p05_m < kBeamWarnBelowM || fs.mean_m < kBeamWarnBelowM) {
+                std::cerr << "[beaming] WARNING: this mesh is close enough to the "
+                             "roughness scale that SOME of the roughness may "
+                             "already be resolved geometrically, in which case "
+                             "beaming counts it twice there. Between "
+                          << kBeamRefuseBelowM << " m and " << kBeamWarnBelowM
+                          << " m the engine runs but does not vouch for the "
+                             "result: confirm this mesh does not resolve "
+                             "sub-facet slopes before quoting it. "
+                             "(BUGS.md ENG-BEAM-SCALE-1)" << std::endl;
+            }
         }
     }
 

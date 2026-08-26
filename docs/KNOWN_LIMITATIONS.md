@@ -528,6 +528,19 @@ that the value you set is the value that was echoed.
   `BODY_SYNODIC_PERIODS` came to carry 175.942 d for Mercury under a comment claiming it
   matched `thermo.day` while the engine carried 58.646 d.
 
+- **`radiation.beaming: true` is refused on a mesh whose facets are at the roughness scale.** The
+  Smith sub-facet roughness model double-counts on facets that already resolve the roughness
+  geometrically. The engine measures the mesh's facet scale at load (5th percentile of face area,
+  in meters, using the same inferred length unit as the PTM-37 check) and refuses below **0.05 m**,
+  warns loudly between 0.05 m and 1 m, and is silent at or above 1 m. Same rule and same thresholds
+  as the GUI's `gui_core/facet_scale.py`, and the two agree to every reported digit on the meshes
+  this project runs (`sunlit_radcore_r50` 236.648 m / 169.386 m; `lunar_crater_80N` 17.947 m /
+  17.678 m). The gate is the **fine end**, not the mean, because `sqrt(mean area)` is dominated by
+  the largest facets: a mesh that is 99 % millimeter-scale with a coarse minority reports 70.7 cm
+  and would sail through a rule written to refuse millimeter facets. The 509,337-face moon3d mesh
+  measures 1.89 mm mean / 0.45 mm at the fine end and is refused. Nothing is checked, and no mesh is
+  traversed, when `beaming` is off.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,
