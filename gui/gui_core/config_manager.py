@@ -7,7 +7,51 @@ import yaml
 from copy import deepcopy
 from pathlib import Path
 
+from ptm.engine_defaults import ENGINE_DEFAULTS
+
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+
+
+#: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
+#: config that puts a scalar where one of these belongs has it dropped, which is
+#: what yaml-cpp does with a scalar section node under `if (root["radiation"])`.
+#: Derived from the default config's own shape below, so it cannot fall behind.
+_SECTION_KEYS = set()
+
+
+def _collect_section_keys(node, prefix=""):
+    for key, value in node.items():
+        if isinstance(value, dict):
+            _SECTION_KEYS.add(f"{prefix}{key}")
+            _collect_section_keys(value, f"{prefix}{key}.")
+
+
+def _sync_with_engine_defaults(shape, overrides, prefix=""):
+    """Replace every value in `shape` that is an engine key with the engine's own.
+
+    `shape` declares WHICH keys the GUI exposes (and carries the GUI-synthetic
+    ones the engine never reads); `ptm.engine_defaults.ENGINE_DEFAULTS` is the
+    generated, test-pinned table of what the engine actually defaults to. Taking
+    the values from there rather than retyping them is what makes the next
+    engine-side change a test failure instead of a GUI that quietly believes an
+    old number. `radiation.max_coupling_iterations` sat at 10 for weeks after the
+    engine raised it to 16 exactly this way.
+
+    Keys in `overrides` keep the GUI's value; every other key that the engine
+    does not read is left as written (GUI-synthetic and display-only fields).
+    Mutates and returns `shape`.
+    """
+    for key, value in shape.items():
+        dotted = f"{prefix}{key}"
+        if isinstance(value, dict):
+            _sync_with_engine_defaults(value, overrides, dotted + ".")
+        elif dotted in ENGINE_DEFAULTS and dotted not in overrides:
+            engine_value = ENGINE_DEFAULTS[dotted]
+            # A key read without a literal default (a sequence) has None here;
+            # that is "no default in the parser", not "defaults to null".
+            if engine_value is not None:
+                shape[key] = engine_value
+    return shape
 
 
 def detect_hardware_capabilities():
@@ -88,6 +132,41 @@ def detect_hardware_capabilities():
 class ConfigManager:
     """Manages PTM3D simulation configuration"""
 
+    #: Every dotted key here keeps the GUI's value; every OTHER key in
+    #: DEFAULT_CONFIG that the engine reads takes the engine's own default from
+    #: ptm.engine_defaults (see _sync_with_engine_defaults). So a divergence is
+    #: either on this list with a reason, or it does not exist.
+    #:
+    #: src/python/tests/test_gui_defaults_follow_engine.py pins the list: an
+    #: entry that no longer differs from the engine, or one naming a key the
+    #: engine does not read, fails there.
+    GUI_DEFAULT_OVERRIDES = {
+        "simulation.body":
+            "Moon is the best-validated built-in body (Diviner) and the least "
+            "surprising starting point; the engine's own default is Europa. "
+            "Paul's D1 ruling, 2026-08-02.",
+        "simulation.duration_days":
+            "One lunar synodic period, to match the default body. The Simulation "
+            "tab re-sets this whenever the body changes.",
+        "simulation.timesteps":
+            "144 steps over one synodic period; the engine's 72 is for its own "
+            "3.55-day Europa default.",
+        "thermal.run_thermal_mesh":
+            "The GUI is a thermal application: a new project runs the thermal "
+            "model. The engine defaults it off because illumination-only runs "
+            "are a normal CLI use.",
+        "thermal.equilibration_samples_per_diurnal_cycle":
+            "120 = the 'Balanced' accuracy tier the cadence selector presents "
+            "(~4 K max on the Moon ico3 reference). The engine's -1 is 'legacy, "
+            "match output cadence', which the tier list offers explicitly.",
+        "mesh.topo_directory":
+            "The built-in dataset contract: data/topo, resolved through "
+            "PTM_DATA_ROOT. The engine's '' means 'no built-in topography'.",
+        "generic_body.shape.type":
+            "A new custom body starts spherical, which is what the Body "
+            "Definition tab's first field offers.",
+    }
+
     DEFAULT_CONFIG = {
         "simulation": {
             "start_time": "2025-01-01T00:00:00",
@@ -106,6 +185,15 @@ class ConfigManager:
         "mesh": {
             "resolution": 5,
             "import_file": "",
+            # Coarse occluder-only mesh (the ring of the core-plus-ring
+            # architecture). Added to the illumination shadow-ray BVH only --
+            # never thermally solved, radiosity-coupled or output.
+            # docs/extended-occluder-architecture.md.
+            "occluder_file": "",
+            # Where an imported mesh sits on the body. -999 = leave it in its
+            # own frame (the engine's "unset" sentinel).
+            "latitude_override": -999.0,
+            "longitude_override": -999.0,
             "scale_factor": 1.0,
             "use_topographic": False,
             # Built-in topography ships under data/topo (engine appends
@@ -142,13 +230,26 @@ class ConfigManager:
             "h_parameter_map": "",
             "use_default_property_map": False,
             "property_maps_directory": "data/property_maps",
+            # Both of these now have controls on the Thermal tab. The rest of
+            # the old orphan set (crater_dd_ratio, integration_offset_days,
+            # integration_offset_steps) is gone: written into every saved YAML
+            # at the engine's own default, with no widget and no handler, so
+            # they read as settings and were not.
             "enable_shadow_flux": False,
-            "crater_dd_ratio": 8.0,
             "integration_days": -1.0,
             "integration_steps": -1,
-            "integration_offset_days": 0.0,
-            "integration_offset_steps": 0,
-            "geothermal_heat_flow": -1.0  # W/m², -1 = use planet default
+            "geothermal_heat_flow": -1.0,  # W/m², -1 = use planet default
+            # Initial condition. spinup_seed: physical | legacy; seed_anchor:
+            # lumped | warm (only reachable under physical);
+            # analytic_seed_cycles -1 = follow spinup_seed.
+            "spinup_seed": "physical",
+            "seed_anchor": "lumped",
+            "analytic_seed_cycles": -1.0,
+            "seed_anchor_refuse_two_timescale": False,
+            # Warm start and chunk handoff. Without these a GUI run cannot
+            # resume, which is the whole long-run workflow.
+            "initial_state_file": "",
+            "final_state_file": ""
         },
         "thermophysical": {
             # Surface properties
@@ -161,6 +262,9 @@ class ConfigManager:
             # directional model (opt-in). Maps to engine key incidence_angle_albedo
             # (config_parser.cpp: false->Hayne/constant, true->Hapke).
             "incidence_angle_albedo": False,
+            # Temperature-dependent conductivity law: hayne2017 | martinez2021
+            # (config_parser.cpp validates the string and names both).
+            "conductivity_model": "hayne2017",
             # Thermal conductivity
             "use_default_ks": True,
             "ks": 7.4e-4,  # Surface conductivity (W/m/K)
@@ -186,15 +290,33 @@ class ConfigManager:
             "constant_thermal_inertia": -1.0  # >0: constant TI (chi=0, cp=const); -1: disabled
         },
         "radiation": {
+            # Values below that the engine reads are REPLACED by the engine's
+            # own defaults at class-definition time; what is written here is the
+            # key list, not the numbers. See GUI_DEFAULT_OVERRIDES.
             "enabled": False,
             "min_shadow_fraction": 0.3,
             "verbose": False,
-            "use_gpu": True,
+            "use_gpu": False,
             "view_factor_file": "",
-            "max_coupling_iterations": 10,
+            # Smith (1967) sub-facet roughness. The switch needs the knob:
+            # beaming: true with rms_slope_deg == 0 is FATAL at startup. The
+            # GUI additionally applies the facet-scale rule of
+            # docs/radiation-exchange.md 8.4 -- see gui_core.facet_scale.
+            "beaming": False,
+            "rms_slope_deg": 0.0,
+            # PTM-102: bounded (default) | fixed | legacy. coupling_face_fraction
+            # is consulted ONLY under legacy; the engine says so at runtime.
+            "coupling_mode": "bounded",
+            "max_coupling_iterations": 16,
             "coupling_temp_threshold": 0.5,
             "coupling_flux_threshold": 0.1,
             "coupling_face_fraction": 0.01,
+            # Near-field view-factor quadrature order and the builder choice.
+            # Order 1 is the M1 centroid estimator (+51.7% on the touching-pair
+            # closed form); the engine calls it a diagnostic setting.
+            "nearfield_quadrature_order": 3,
+            "use_monte_carlo_vf": False,
+            "mc_rays_per_face": 100000,
             "use_hmatrix": False,
             "use_aca": True,
             "aca_tolerance": 0.001,
@@ -218,21 +340,22 @@ class ConfigManager:
             "positions_file": ""
         },
         "output": {
+            # thermal_vtk_file, complete_vtk_file and location_data were
+            # written into every saved YAML at '' with no control anywhere.
+            # output.vtk_mode already selects which VTK products a run writes;
+            # the explicit filename keys are a CLI concern.
             "directory": "output",
             "format": "binary",
             "vtk_mode": "both",
             "include_primary_ir": False,
-            "thermal_vtk_file": "",
-            "complete_vtk_file": "",
             "locations_file": "",
             "depths_file": "",
-            "series_output": "",
-            "location_data": ""
+            "series_output": ""
         },
-        "advanced": {
-            "verbose": False,
-            "default_visible_albedo": -1.0
-        },
+        # The `advanced:` section held exactly two keys (verbose,
+        # default_visible_albedo), both at the engine's default, both with no
+        # control. Dropping the section changes no run: the engine reads it
+        # under `if (root["advanced"])` and falls back to the same values.
         # Engine environment flags (PTM_*) passed to ptm_thermal_sim.
         # Prefilled with the recommended-ON physics fix set; edited via the
         # Engine Flags tab. A blank value means "do not set". The C++ YAML
@@ -273,56 +396,76 @@ class ConfigManager:
         }
     }
 
-    PRESETS = {
-        # Generic (body-agnostic) presets: they layer on top of the default
-        # body, so a "quick" or "highres" run follows whatever body is the
-        # current default (Moon) rather than hardcoding one. Renamed from the
-        # old europa_quick / europa_highres.
-        "quick": {
-            "simulation": {"duration_days": 0.5, "timesteps": 24},
-            "mesh": {"resolution": 4},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/quick_test", "vtk_mode": "thermal"}
-        },
-        "highres": {
-            "simulation": {"duration_days": 3.55, "timesteps": 144},
-            "mesh": {"resolution": 7},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/highres"},
-            "advanced": {"verbose": True}
-        },
-        "moon_thermal": {
-            "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 708},
-            "mesh": {"resolution": 6},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "output": {"directory": "output/moon_thermal"}
-        },
-        "crater_radex": {
-            "simulation": {"body": "Moon", "duration_days": 29.5, "timesteps": 96},
-            "thermal": {"run_thermal_mesh": True, "equilibration_orbits": 1.0},
-            "radiation": {
-                "enabled": True, "verbose": True, "use_gpu": True,
-                "min_shadow_fraction": 0.3, "max_coupling_iterations": 10
-            },
-            "output": {"directory": "output/crater_radex"}
-        },
-        "gpu_accelerated": {
-            # NOTE: no use_gpu_illumination key -- that was a dead key nothing
-            # consumed (illumination GPU is illumination.use_gpu in the engine
-            # YAML, and CPU illumination is both correct and faster on the
-            # reference Mac Pro for lunar workloads).
-            "thermal": {"use_gpu": True},
-            "radiation": {"enabled": True, "use_gpu": True}
-        }
+    # There is no preset table here on purpose (GUI-PRESET-1). The five that
+    # used to live at this spot -- quick, highres, moon_thermal, crater_radex,
+    # gpu_accelerated -- were unreachable: `grep -rn load_preset gui/` returned
+    # only the definition, and no menu, button or dialog ever called it. They
+    # also carried values the rest of this file had moved past
+    # (max_coupling_iterations 10, radiation.use_gpu true, an `advanced:`
+    # section that no longer exists), and `gpu_accelerated` flipped
+    # thermal.use_gpu to true -- one of the two candidate explanations for the
+    # 2026-08-14 flip that has never been reproduced.
+    #
+    # docs/design/gui-update-plan.md item 2.3 designs the replacement: a
+    # reachable list built from section 4.4, each preset stating which keys it
+    # sets, and a preset that would violate the beaming facet-scale rule
+    # refusing with the reason.
+
+    #: Property-map combo labels, and the label-or-index decoder. Class-level
+    #: because ThermalTab.load_from_config needs the SAME mapping: the combo's
+    #: writeback stores the label text, so a second load_from_config() without
+    #: an intervening load_from_yaml() handed `int()` a sentence and aborted the
+    #: application. Two copies of this decoder is how that happened.
+    _MODE_LABELS = {
+        "None (uniform body H)": 0,
+        "Bundled icosphere default for body": 1,
+        "Custom file": 2,
+    }
+    _KIND_LABELS = {
+        "H-parameter (m)": 0,
+        "Thermal inertia (J m^-2 K^-1 s^-1/2)": 1,
     }
 
+    @staticmethod
+    def _to_index(raw, label_map):
+        """Combo label text, a numeric string, or an int -> index. Never raises."""
+        if isinstance(raw, str):
+            if raw in label_map:
+                return label_map[raw]
+            try:                       # numeric string fallback (e.g. "1")
+                return int(raw)
+            except (ValueError, TypeError):
+                return 0
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return 0
+
     # Properties with an engine-side *_override key for BUILT-IN bodies
-    # (config_parser.cpp reads albedo/emissivity/ks/kd_override; the other
+    # (config_parser.cpp "Parse Thermophysical section"; the other
     # thermophysical scalars have no override path outside generic_body).
-    ENGINE_OVERRIDE_KEYS = ("albedo", "emissivity", "ks", "kd")
+    #
+    # H was missing from this tuple until 2026-08-25 even though the engine has
+    # read thermophysical.H_override the whole time (config_parser.cpp:759,
+    # applied at ptm_thermal_sim.cpp:14778 by setting planet.H directly, so it
+    # works on a built-in body). The regolith density scale height is arguably
+    # THE lunar thermal parameter, and a colleague could not change it on the
+    # Moon from this GUI at all.
+    ENGINE_OVERRIDE_KEYS = ("albedo", "emissivity", "ks", "kd", "H")
 
     def __init__(self):
         self.config = deepcopy(self.DEFAULT_CONFIG)
+        #: rms_slope_deg of a loaded config that used the pre-2026-08-25
+        #: IMPLICIT beaming switch (a positive slope and no `beaming` key), or
+        #: None. It cannot be recovered from `self.config` afterward: the merge
+        #: with DEFAULT_CONFIG always supplies `beaming`, so "the file did not
+        #: mention it" is information only `load_from_yaml` ever has.
+        self.legacy_implicit_beaming = None
+
+    def reset_to_defaults(self):
+        """Reset configuration to defaults"""
+        self.config = deepcopy(self.DEFAULT_CONFIG)
+        self.legacy_implicit_beaming = None
 
     def generic_body_active(self):
         """True when the config carries real generic-body data (the engine
@@ -330,7 +473,8 @@ class ConfigManager:
         gb = self.config.get("generic_body", {}) or {}
         return bool(
             gb.get("config_file") or gb.get("name")
-            or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+            or self._as_number(
+                (gb.get("orbit") or {}).get("semi_major_axis_au", -1.0), -1.0) > 0
         )
 
     def get_config(self):
@@ -361,20 +505,100 @@ class ConfigManager:
         except (KeyError, TypeError):
             return default
 
-    def reset_to_defaults(self):
-        """Reset configuration to defaults"""
-        self.config = deepcopy(self.DEFAULT_CONFIG)
-
     def load_from_yaml(self, filename):
         """Load configuration from YAML file"""
         with open(filename, 'r') as f:
             loaded = yaml.safe_load(f)
 
+        # A bare section header (`radiation:` with nothing under it) parses as
+        # None, and _deep_merge then puts None where a dict belongs, so every
+        # later `rad.get(...)` or `mesh[...]` raises out of a Qt slot -- an
+        # application abort. yaml-cpp treats a Null node as falsy under
+        # `if (root["radiation"])`, so the engine runs these files happily and
+        # only the GUI died. Pre-existing (identical on cf7d97c); fixed here
+        # because it is the same crash class as the rest of this branch and the
+        # fix is one line at the boundary. Dropping the key is exactly what the
+        # engine does with it.
+        # Generalized from the None case: ANY non-mapping top-level value is
+        # dropped, because every section in this schema is a mapping. A bare
+        # `radiation:` (None), a `mesh: ico6` (str) or a `thermal:` followed by
+        # a list all used to reach `.get(...)` on a non-dict and abort. Dropping
+        # is what yaml-cpp effectively does -- `if (root["radiation"])` on a
+        # scalar node reads the section as absent -- so the GUI and the engine
+        # now agree about what such a file means.
+        if isinstance(loaded, dict):
+            # RECURSIVE, because generic_body's orbit/spin/shape are sections
+            # too: `generic_body: {orbit: abc}` reached .get on a str and
+            # aborted the window from BodyDefinitionTab.load_from_config.
+            # Depth-1 sanitizing covered the top-level sections only.
+            def _drop_non_mappings(node, prefix=""):
+                for key in [k for k, v in node.items() if not isinstance(v, dict)]:
+                    dotted = f"{prefix}{key}"
+                    # A leaf VALUE is fine; only a key that this schema says is
+                    # a section gets dropped.
+                    if dotted not in _SECTION_KEYS:
+                        continue
+                    if node[key] is not None:
+                        import logging
+                        logging.warning(
+                            "[config] section %r is %r, not a mapping; "
+                            "ignoring it (the engine reads a scalar section as "
+                            "absent too).", dotted, node[key])
+                    del node[key]
+                for key, value in node.items():
+                    if isinstance(value, dict):
+                        _drop_non_mappings(value, f"{prefix}{key}.")
+
+            _drop_non_mappings(loaded)
+        elif loaded is not None:
+            raise ValueError(
+                f"{filename} does not contain a YAML mapping at the top level "
+                f"(found {type(loaded).__name__}); PTM3D configs are mappings "
+                f"of sections.")
+
+        # Record the pre-2026-08-25 IMPLICIT beaming switch before merging.
+        # config_parser.cpp:631 turns beaming ON for a config with a positive
+        # rms_slope_deg and no `beaming` key, and says so. Once merged with
+        # DEFAULT_CONFIG the key is always present, so this is the only moment
+        # the distinction exists -- and it matters, because the GUI writes
+        # `beaming` explicitly and would otherwise hand the engine
+        # `beaming: false`, silently demoting that run to Lambertian.
+        loaded_rad = ((loaded or {}).get("radiation", {}) or {}) \
+            if isinstance(loaded, dict) else {}
+        try:
+            # A QUOTED value (rms_slope_deg: "20") comes back as str, which the
+            # engine's getWithDefault<double> parses without complaint. A bare
+            # comparison raised TypeError here and turned a loadable config into
+            # "Failed to load project".
+            loaded_slope = float(loaded_rad.get("rms_slope_deg") or 0.0)
+        except (TypeError, ValueError):
+            loaded_slope = 0.0
+        self.legacy_implicit_beaming = (
+            loaded_slope
+            if "beaming" not in loaded_rad and loaded_slope > 0.0
+            else None)
+
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
+        if self.legacy_implicit_beaming is not None:
+            self.config["radiation"]["beaming"] = True
+
+        # engine_env is REPLACED, not merged. A config that carries the block
+        # is taken at its word -- `engine_env: {}` means "no fix flags", and a
+        # block naming one variable does not silently gain the rest. Merging
+        # made both of those impossible to write: every loaded config came back
+        # carrying the recommended set whatever it said. A config with no
+        # engine_env key at all has expressed no opinion and keeps the default.
+        # gui_core.preflight.engine_env_plan applies the same rule at launch.
+        # A non-mapping `engine_env:` (a truncated file) keeps the default set
+        # instead, which is what engine_env_plan does at launch -- the two must
+        # not disagree about what the same file means.
+        if isinstance(loaded, dict) and isinstance(loaded.get("engine_env"), dict):
+            self.config["engine_env"] = dict(loaded["engine_env"])
 
         # Derive synthetic GUI fields property_map_mode / property_map_kind
         # from the underlying YAML keys (so the GUI radio reflects the file).
-        therm = self.config.get("thermal", {})
+        therm = self.config.get("thermal")
+        therm = therm if isinstance(therm, dict) else {}
         h_path  = therm.get("h_parameter_map", "")
         ti_path = therm.get("thermal_inertia_map", "")
         use_def = therm.get("use_default_property_map", False)
@@ -400,7 +624,8 @@ class ConfigManager:
         # only canonical built-in references select Built-in. No behavior
         # change for old configs.
         loaded_mesh = (loaded or {}).get("mesh", {}) or {}
-        mesh_cfg = self.config.get("mesh", {})
+        mesh_cfg = self.config.get("mesh")
+        mesh_cfg = mesh_cfg if isinstance(mesh_cfg, dict) else {}
         topo_dir = str(loaded_mesh.get("topo_directory", "") or "")
         if "topo_directory" not in loaded_mesh or \
                 topo_dir.rstrip("/") in ("", "data/topo"):
@@ -448,6 +673,24 @@ class ConfigManager:
                     # YAML has the property but no explicit use_default flag —
                     # infer that the user set a custom value (backwards compat)
                     self.config["thermophysical"][flag_name] = False
+
+            # H joined ENGINE_OVERRIDE_KEYS on 2026-08-25, which turns a plain
+            # `thermophysical: {H: ...}` -- inert on a built-in body before that
+            # date, and DROPPED by this writer -- into a live `H_override` the
+            # engine applies by setting planet.H. That is the point of the
+            # change, and it is still a change to an existing config's physics,
+            # so it is announced rather than discovered later.
+            if "H" in loaded_thermo and "H_override" not in loaded_thermo \
+                    and not self.generic_body_active():
+                import logging
+                logging.warning(
+                    "[thermophysical] this config carries thermophysical.H = "
+                    "%s with no H_override. On a built-in body that value used "
+                    "to be ignored; the GUI now writes it as "
+                    "thermophysical.H_override, which the engine APPLIES. The "
+                    "run's regolith scale height changes from the body default "
+                    "to this value. Set 'Use Default' on the H row to keep the "
+                    "old behavior.", loaded_thermo["H"])
 
             # Round-trip the engine override keys (what save now writes for
             # built-in bodies): albedo_override: 0.3 -> albedo=0.3 with
@@ -539,6 +782,8 @@ class ConfigManager:
                     "use_default_albedo": thermo.get("use_default_albedo", True),
                     "incidence_angle_albedo": thermo.get(
                         "incidence_angle_albedo", False),
+                    "conductivity_model": thermo.get(
+                        "conductivity_model", "hayne2017"),
                     "constant_thermal_inertia": thermo.get(
                         "constant_thermal_inertia", -1.0),
                 }
@@ -547,7 +792,7 @@ class ConfigManager:
                         val = thermo.get(key)
                         if val is not None:
                             cleaned[f"{key}_override"] = val
-                # The remaining properties (H, rhos, rhod, cp0, Qb, chi) have
+                # The remaining properties (rhos, rhod, cp0, Qb, chi) have
                 # NO engine override path for built-in bodies; the UI disables
                 # them (see ThermophysicalTab) so nothing is silently dropped
                 # here.
@@ -558,7 +803,8 @@ class ConfigManager:
                 gb = v if isinstance(v, dict) else {}
                 has_data = (
                     gb.get("config_file") or gb.get("name")
-                    or gb.get("orbit", {}).get("semi_major_axis_au", -1.0) > 0
+                    or self._as_number(
+                (gb.get("orbit") or {}).get("semi_major_axis_au", -1.0), -1.0) > 0
                 )
                 if has_data:
                     cleaned = self._strip_sentinels(_dc(gb))
@@ -598,28 +844,9 @@ class ConfigManager:
         # The GUI's QComboBox writeback stores the *label text* (see
         # add_combo_field's currentTextChanged binding), so map labels back
         # to indices defensively.
-        _MODE_LABELS = {
-            "None (uniform body H)": 0,
-            "Bundled icosphere default for body": 1,
-            "Custom file": 2,
-        }
-        _KIND_LABELS = {
-            "H-parameter (m)": 0,
-            "Thermal inertia (J m^-2 K^-1 s^-1/2)": 1,
-        }
-        def _to_index(raw, label_map):
-            if isinstance(raw, str):
-                if raw in label_map:
-                    return label_map[raw]
-                # numeric string fallback (e.g. "1")
-                try:
-                    return int(raw)
-                except (ValueError, TypeError):
-                    return 0
-            try:
-                return int(raw)
-            except (ValueError, TypeError):
-                return 0
+        _MODE_LABELS = self._MODE_LABELS
+        _KIND_LABELS = self._KIND_LABELS
+        _to_index = self._to_index
         if "thermal" in out:
             therm = _dc(out["thermal"])
             mode = _to_index(therm.pop("property_map_mode", 0), _MODE_LABELS)
@@ -648,7 +875,9 @@ class ConfigManager:
             out["thermal"] = therm
 
         # Sanitize simulation.body
-        body = out.get("simulation", {}).get("body", "")
+        # str(): a scalar that is not a string still has to be written, not
+        # crash the save. yaml.safe_load can hand back a float here.
+        body = str(out.get("simulation", {}).get("body", "") or "")
         if body.startswith("[H] "):
             out["simulation"] = _dc(out["simulation"])
             out["simulation"]["body"] = body[4:]
@@ -684,6 +913,30 @@ class ConfigManager:
         """Generate YAML string for preview"""
         return yaml.dump(self._config_for_yaml(), default_flow_style=False, sort_keys=False)
 
+    @staticmethod
+    def _as_number(value, fallback):
+        """Coerce a YAML scalar for comparison, never raising.
+
+        yaml.safe_load returns a str for a QUOTED number and None for a bare
+        `key:`, both of which the engine's getWithDefault<double> handles. A
+        bare `>` on either raises TypeError -- and validate() is called
+        unguarded from a Qt slot, where an escaping exception makes PyQt6
+        qFatal and takes the whole application down with any unsaved edits.
+        Measured: exit 134, SIGABRT. The same spelling was already fixed one
+        layer up in load_from_yaml; it has to follow the value here too.
+        """
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        # NaN and the infinities pass float() and then poison everything
+        # downstream: `int(inf)` raises OverflowError, `int(nan)` ValueError,
+        # and every comparison against NaN is False. YAML spells them `.nan`,
+        # `.inf`, `-.inf`. Treat them as "no usable number".
+        if number != number or number in (float("inf"), float("-inf")):
+            return fallback
+        return number
+
     def validate(self):
         """Validate the current configuration.
 
@@ -693,43 +946,139 @@ class ConfigManager:
         errors = []
         warnings = []
 
+        # EVERY numeric comparison below goes through _as_number. A quoted YAML
+        # scalar loads without complaint (the engine's getWithDefault<double>
+        # parses it), and a bare `>` on a str or None raises TypeError out of a
+        # Qt slot, which is an application abort -- exit 134. Applying the
+        # coercion to only the new checks left seven of the old ones live; a
+        # crash-class fix has to cover the function, not the diff.
+        num = self._as_number
+
         # Simulation parameters
-        if self.config["simulation"]["duration_days"] <= 0:
+        sim = self.config.get("simulation")
+        sim = sim if isinstance(sim, dict) else {}
+        if num(sim.get("duration_days"), 0.0) <= 0:
             errors.append("Duration must be positive")
-        if self.config["simulation"]["timesteps"] <= 0:
+        if num(sim.get("timesteps"), 0.0) <= 0:
             errors.append("Timesteps must be positive")
 
         # Mesh parameters
-        if self.config["mesh"]["resolution"] < 1:
+        mesh_cfg = self.config.get("mesh")
+        mesh_cfg = mesh_cfg if isinstance(mesh_cfg, dict) else {}
+        if num(mesh_cfg.get("resolution"), 0.0) < 1:
             errors.append("Mesh resolution must be >= 1")
-        if self.config["mesh"]["scale_factor"] <= 0:
+        if num(mesh_cfg.get("scale_factor"), 0.0) <= 0:
             errors.append("Mesh scale factor must be positive")
 
         # Thermal parameters
-        if self.config["thermal"]["threads"] < 0:
+        therm = self.config.get("thermal")
+        therm = therm if isinstance(therm, dict) else {}
+        if num(therm.get("threads"), 0.0) < 0:
             errors.append("Thermal threads cannot be negative")
-        if self.config["thermal"]["equilibration_orbits"] < 0:
+        if num(therm.get("equilibration_orbits"), 0.0) < 0:
             errors.append("Equilibration cycles cannot be negative")
 
         # Radiation parameters
-        rad = self.config.get("radiation", {})
+        rad = self.config.get("radiation")
+        rad = rad if isinstance(rad, dict) else {}
         if rad.get("enabled", False):
-            if not (0 <= rad.get("min_shadow_fraction", 0) <= 1):
+            if not 0 <= num(rad.get("min_shadow_fraction"), 0.0) <= 1:
                 errors.append("Radiation: min_shadow_fraction must be between 0 and 1")
-            if rad.get("max_coupling_iterations", 0) < 1:
+            if num(rad.get("max_coupling_iterations"), 0.0) < 1:
                 errors.append("Radiation: max_coupling_iterations must be at least 1")
-            if rad.get("coupling_temp_threshold", 0) <= 0:
+            if num(rad.get("coupling_temp_threshold"), 0.0) <= 0:
                 errors.append("Radiation: coupling_temp_threshold must be positive")
-            if rad.get("aca_tolerance", 0) <= 0:
+            if num(rad.get("aca_tolerance"), 0.0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
 
-        # Output validation
+        # The switch needs the knob. OUTSIDE the `enabled` branch on purpose:
+        # the engine's check is unconditional (ptm_thermal_sim.cpp:13591 sits in
+        # plain config application, not behind the radiation gate), and the
+        # Beaming group on the tab is not gated on radiation.enabled either. So
+        # a user can leave radiation off -- the GUI default -- tick beaming,
+        # step the slope back to zero, and launch a run that dies at startup.
+        slope = self._as_number(rad.get("rms_slope_deg", 0.0), 0.0)
+        if rad.get("beaming", False) and not slope > 0:
+            errors.append(
+                "Radiation: beaming is on but rms_slope_deg is "
+                f"{rad.get('rms_slope_deg', 0.0)!r}. The engine refuses this "
+                "pair at startup, whether or not radiation exchange is "
+                "enabled. Literature range 20-37 degrees; 32.5 is the "
+                "validated lunar polar value (Jhoti et al. 2024).")
+
+        # conductivity_model: martinez2021 has TWO engine-side FATALs that a
+        # GUI user can reach with the new combo and never see coming. Same shape
+        # as the beaming/slope pair above: the control exists, so the refusal
+        # has to exist next to it.
+        thermo = self.config.get("thermophysical")
+        thermo = thermo if isinstance(thermo, dict) else {}
+        model = str(thermo.get("conductivity_model", "hayne2017") or "")
+        is_martinez = "".join(
+            c for c in model.lower() if c not in "_- ").startswith("martinez")
+        if is_martinez:
+            c_ti = self._as_number(thermo.get("constant_thermal_inertia", -1.0),
+                                   -1.0)
+            if c_ti > 0:
+                errors.append(
+                    "Thermophysical: constant_thermal_inertia "
+                    f"({c_ti} SI) and conductivity_model martinez2021 are "
+                    "mutually contradictory -- constant TI derives cp from ks, "
+                    "and under Martinez the conductivity is not ks but Eq. 10, "
+                    "a function of temperature. The engine refuses this pair at "
+                    "startup (ptm_thermal_sim.cpp:16723).")
+            # Eq. 10's solid coefficient goes NEGATIVE below 1003.52 kg/m^3,
+            # so the engine refuses the run. On a built-in body the density
+            # rows are disabled (no override path), which means Europa
+            # (rho 500/700) cannot be made valid from this GUI at all -- say so
+            # here rather than let the launch fail after pre-flight.
+            rho_lo = min(self._as_number(thermo.get("rhos", 0.0), 0.0),
+                         self._as_number(thermo.get("rhod", 0.0), 0.0))
+            if 0 < rho_lo < 1003.52:
+                errors.append(
+                    f"Thermophysical: conductivity_model martinez2021 is "
+                    f"invalid at density {rho_lo:g} kg/m^3 -- Eq. 10 gives a "
+                    f"NEGATIVE conductivity below 1003.52. The engine refuses "
+                    f"this at startup. Raise the densities, or use hayne2017. "
+                    f"(On a built-in body the density rows have no engine "
+                    f"override path, so hayne2017 is the only option there.)")
+
+        # The engine gates the mesh rotation on `latitude_override > -900` and
+        # range-checks nothing, so -95 is fed straight to rotateMeshToLatLon,
+        # where cos(lat) < 0 mirrors the target through the pole: the mesh lands
+        # at +85 and longitude+180, silently, somewhere other than the field
+        # says. -999 stays the documented "leave it alone" sentinel.
+        mesh = self.config.get("mesh")
+        mesh = mesh if isinstance(mesh, dict) else {}
+        lat = self._as_number(mesh.get("latitude_override", -999.0), -999.0)
+        if lat > -900.0 and not (-90.0 <= lat <= 90.0):
+            errors.append(
+                f"Mesh: latitude_override {lat} is outside [-90, 90]. The "
+                "engine does not range-check it and would mirror the mesh "
+                "through the pole. Use -999 to leave the mesh in its own frame.")
+        lon = self._as_number(mesh.get("longitude_override", -999.0), -999.0)
+        if lon > -900.0 and lat <= -900.0:
+            # A WARNING, not an error: the Mesh tab disables the longitude
+            # field once the latitude gate closes, so a hard error here locked
+            # the launch behind a control the user could no longer reach.
+            warnings.append(
+                "Warning: mesh.longitude_override is set but "
+                "latitude_override is not. The engine gates the whole rotation "
+                "on latitude, so this longitude will be ignored. Set a "
+                "latitude, or clear the longitude to -999.")
+
+        # Output validation. .get(), not [...]: the only unguarded subscript
+        # left in this function, and `output: binary` (a scalar section) made it
+        # raise "string indices must be integers" out of the Run slot.
+        # load_from_yaml drops non-mapping sections now, but validate() is
+        # public and is also reached from configs this manager did not load.
+        out_cfg = self.config.get("output")
+        out_cfg = out_cfg if isinstance(out_cfg, dict) else {}
         valid_formats = ["binary", "vtk"]
-        if self.config["output"]["format"] not in valid_formats:
+        if out_cfg.get("format") not in valid_formats:
             errors.append(f"Output format must be one of: {', '.join(valid_formats)}")
 
         valid_vtk_modes = ["thermal", "complete", "both"]
-        if self.config["output"]["vtk_mode"] not in valid_vtk_modes:
+        if out_cfg.get("vtk_mode") not in valid_vtk_modes:
             errors.append(f"VTK mode must be one of: {', '.join(valid_vtk_modes)}")
 
         # GPU warnings
@@ -743,15 +1092,6 @@ class ConfigManager:
         all_messages = errors + warnings
         return (len(errors) == 0, all_messages)
 
-    def load_preset(self, preset_name):
-        """Load a preset configuration"""
-        if preset_name not in self.PRESETS:
-            raise ValueError(f"Unknown preset: {preset_name}")
-
-        preset = self.PRESETS[preset_name]
-        self.reset_to_defaults()
-        self.config = self._deep_merge(self.config, preset)
-
     def _deep_merge(self, base, update):
         """Deep merge two dictionaries"""
         result = deepcopy(base)
@@ -763,3 +1103,19 @@ class ConfigManager:
                 result[key] = value
 
         return result
+
+
+# A typo in GUI_DEFAULT_OVERRIDES would silently do nothing -- the key would
+# simply never match, and the GUI would go on taking the engine's value while
+# the table claimed otherwise. Refuse at import instead; the GUI-imports step in
+# CI runs this.
+_unknown_overrides = sorted(
+    k for k in ConfigManager.GUI_DEFAULT_OVERRIDES if k not in ENGINE_DEFAULTS)
+if _unknown_overrides:
+    raise ValueError(
+        "ConfigManager.GUI_DEFAULT_OVERRIDES names key(s) the engine does not "
+        f"read, so the override could never apply: {_unknown_overrides}")
+
+_sync_with_engine_defaults(ConfigManager.DEFAULT_CONFIG,
+                           ConfigManager.GUI_DEFAULT_OVERRIDES)
+_collect_section_keys(ConfigManager.DEFAULT_CONFIG)

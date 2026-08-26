@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor
 
+from gui_core.config_manager import ConfigManager
+
 logger = logging.getLogger(__name__)
 
 # Import tooltips - use try/except for robustness
@@ -108,6 +110,36 @@ class CollapsibleSection(QWidget):
 
     def add_layout(self, layout):
         self.content_layout.addLayout(layout)
+
+
+# Alias tables for the enum keys the GUI exposes as combo boxes. The engine
+# normalizes each string (lowercase, `_`/`-`/space stripped) and accepts
+# synonyms, so a plain findText silently displays the WRONG value for a config
+# that used one -- e.g. `spinup_seed: historical` showing as "physical" while
+# the engine runs the legacy seed. Keys here are the normalized spellings.
+#   src/cpp/thermal/eq_seed.cpp parseEqSeedMode / parseEqSeedAnchor
+#   src/cpp/thermal/conductivity_model.h parseConductivityModel
+#   src/cpp/main/ptm_thermal_sim.cpp:14151 (coupling_mode -- exact, no aliases)
+SPINUP_SEED_ALIASES = {
+    "": "physical", "physical": "physical", "default": "physical",
+    "perface": "physical",
+    "legacy": "legacy", "historical": "legacy",
+}
+SEED_ANCHOR_ALIASES = {
+    "": "lumped", "lumped": "lumped", "default": "lumped", "derived": "lumped",
+    "warm": "warm", "warmbracket": "warm", "t4": "warm", "legacy": "warm",
+}
+CONDUCTIVITY_MODEL_ALIASES = {
+    "": "hayne2017", "hayne": "hayne2017", "hayne2017": "hayne2017",
+    "default": "hayne2017",
+    "martinez": "martinez2021", "martinez2021": "martinez2021",
+    "martinezsiegler2021": "martinez2021",
+}
+# The engine compares this one EXACTLY and makes a mismatch a startup FATAL,
+# so the GUI must not invent aliases the engine would reject.
+COUPLING_MODE_ALIASES = {
+    "bounded": "bounded", "fixed": "fixed", "legacy": "legacy",
+}
 
 
 class BaseConfigTab(QWidget):
@@ -285,6 +317,9 @@ class BaseConfigTab(QWidget):
             "illumination.albedo_map": "data/albedo_maps",
             "illumination.albedo_maps_directory": "data/albedo_maps",
             "thermal.thermal_inertia_map": "data/thermal_inertia",
+            "thermal.initial_state_file": "output",
+            "thermal.final_state_file": "output",
+            "mesh.occluder_file": "data/meshes",
             "radiation.view_factor_file": "output",
             "output.directory": "output",
         }
@@ -316,6 +351,135 @@ class BaseConfigTab(QWidget):
         """Handle widget value changes"""
         self.config_manager.set_value(key, value)
         self.value_changed.emit()
+
+    def set_bool(self, key, value):
+        """Load a boolean into its checkbox, tolerating YAML's spellings.
+
+        `beaming: 'true'` -- a QUOTED boolean -- is a str after
+        yaml.safe_load, and yaml-cpp's `as<bool>` accepts it, so the engine runs
+        that config. `setChecked(str)` raises, out of load_from_config, which is
+        an application abort. The sibling of set_numeric for the same reason.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        if isinstance(value, bool):
+            widget.setChecked(value)
+            return
+        text = str(value).strip().lower()
+        # The set yaml-cpp's bool decoder accepts.
+        if text in ("true", "yes", "on", "1"):
+            widget.setChecked(True)
+        elif text in ("false", "no", "off", "0", "", "none"):
+            widget.setChecked(False)
+        else:
+            logging.warning(
+                "[config] %s = %r is not a boolean; leaving the control at %r",
+                key, value, widget.isChecked())
+            return
+        self.config_manager.set_value(key, widget.isChecked())
+
+    def set_text(self, key, value):
+        """Load a string into its line edit. A non-string is shown, not thrown."""
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        if value is None:
+            widget.setText("")
+            return
+        if not isinstance(value, str):
+            logging.warning(
+                "[config] %s = %r is not a string; showing its text form",
+                key, value)
+        widget.setText(str(value))
+
+    def set_enum(self, key, value, aliases):
+        """Select a combo entry, tolerating the engine's own aliases.
+
+        The engine normalizes these strings -- lowercase, `_`/`-`/space
+        stripped -- and accepts synonyms: `historical` is `legacy`,
+        `perface`/`default` are `physical`, `derived` is `lumped`, `martinez` is
+        `martinez2021`. A plain ``findText`` misses every one of them, and
+        `if idx >= 0` then leaves the combo showing a DIFFERENT value than the
+        one that will run: a config saying `spinup_seed: historical` displayed
+        "physical" while the engine used the legacy seed.
+
+        `aliases` maps a normalized spelling to the combo entry it means.
+        An unrecognized value is left in the config (the engine will diagnose
+        it, and it is not this panel's job to silently rewrite one) and warned
+        about, never quietly displayed as something else.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        normalized = "".join(
+            c for c in str(value).lower() if c not in "_- ")
+        canonical = aliases.get(normalized)
+        if canonical is None:
+            logging.warning(
+                "[config] %s = %r is not a value this control offers (%s). The "
+                "configuration keeps it and the engine will decide; the control "
+                "is showing %r, which is NOT what will run.",
+                key, value, "/".join(aliases.values() and
+                                     sorted(set(aliases.values()))),
+                widget.currentText())
+            return
+        idx = widget.findText(canonical)
+        if idx >= 0:
+            widget.setCurrentIndex(idx)
+        if str(value) != canonical:
+            # Normalize the stored value too, so the saved YAML says what the
+            # control shows. Only ever an alias-for-alias substitution.
+            self.config_manager.set_value(key, canonical)
+
+    def set_numeric(self, key, value):
+        """Load a numeric value into its widget, WARNING if the range clamps it.
+
+        QSpinBox/QDoubleSpinBox.setValue clamps silently and still emits
+        valueChanged, so loading a config whose value falls outside a widget's
+        range both displayed AND wrote back the clamped number: the run then
+        used a value the file never asked for, with nothing said. The one that
+        matters most is thermal.geothermal_heat_flow, where an out-of-band value
+        is a plausible thing for a sensitivity study to carry.
+        """
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            logging.warning("[config] %s = %r is not a number; leaving the "
+                            "control at its current value", key, value)
+            return
+        # NaN and the infinities ARE floats, so float() accepts them -- and
+        # `int(nan)` raises ValueError while `int(inf)` raises OverflowError,
+        # out of load_from_config, which is a process abort. YAML spells them
+        # `.nan`, `.inf`, `-.inf`; the engine's std::stod reads them too.
+        if number != number or number in (float("inf"), float("-inf")):
+            logging.warning("[config] %s = %r is not a finite number; leaving "
+                            "the control at its current value", key, value)
+            return
+        low, high = widget.minimum(), widget.maximum()
+        if number < low or number > high:
+            logging.warning(
+                "[config] %s = %s is outside the range this control offers "
+                "(%s to %s). The control shows the clamped value, and the "
+                "configuration KEEPS %s -- edit the field to change it.",
+                key, value, low, high, value)
+            widget.blockSignals(True)
+            widget.setValue(type(widget.value())(min(max(number, low), high)))
+            widget.blockSignals(False)
+            self.config_manager.set_value(key, value)
+            return
+        coerced = type(widget.value())(number)
+        widget.setValue(coerced)
+        # Write the COERCED value back explicitly. Relying on setValue's
+        # valueChanged signal leaves a string in the config whenever the number
+        # happens to equal the widget's current value (no change, no signal) --
+        # and YAML resolves ordinary spellings like `-1e0` and `5e3` as str.
+        # Every later `<` or `<=` on that key then raises TypeError, which out
+        # of a Qt slot is an application abort.
+        self.config_manager.set_value(key, coerced)
 
     def load_from_config(self):
         """Load values from config manager - implemented by subclasses"""
@@ -467,8 +631,13 @@ class SimulationTab(BaseConfigTab):
 
     def _sync_step_size_from_config(self):
         """Initialize step size display from current config values."""
-        days = self.config_manager.get_value("simulation.duration_days", 3.55)
-        n_steps = self.config_manager.get_value("simulation.timesteps", 144)
+        # Coerced, because a YAML `5e3` or a quoted number loads as str and a
+        # bare `>` here raises out of init_ui -- which in the GUI is a process
+        # abort, not a message.
+        days = ConfigManager._as_number(
+            self.config_manager.get_value("simulation.duration_days", 3.55), 0.0)
+        n_steps = ConfigManager._as_number(
+            self.config_manager.get_value("simulation.timesteps", 144), 0.0)
         if n_steps > 0 and days > 0:
             step_sec = (days * 86400.0) / n_steps
             self.step_size_spin.blockSignals(True)
@@ -605,11 +774,14 @@ class SimulationTab(BaseConfigTab):
             days = self.config_manager.get_value("simulation.duration_days", 3.55)
             try:
                 start_dt = datetime.fromisoformat(start_str)
-                end_dt = start_dt + timedelta(days=days)
+                # OverflowError: timedelta(days=inf) and a duration far past
+                # datetime.MAX both raise, and this runs from
+                # load_from_config -- an abort, not a message.
+                end_dt = start_dt + timedelta(days=ConfigManager._as_number(days, 0.0))
                 self.end_time_edit.blockSignals(True)
                 self.end_time_edit.setText(end_dt.strftime("%Y-%m-%dT%H:%M:%S"))
                 self.end_time_edit.blockSignals(False)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 self.end_time_edit.blockSignals(True)
                 self.end_time_edit.setText("")
                 self.end_time_edit.blockSignals(False)
@@ -746,6 +918,7 @@ class SimulationTab(BaseConfigTab):
             return
 
         # Check if this is a HORIZONS body (prefixed with [H])
+        text = str(text or "")
         is_horizons = text.startswith("[H] ")
         is_custom = (text == "Custom")
         self.generic_body_label.setVisible(is_horizons or is_custom)
@@ -842,24 +1015,28 @@ class SimulationTab(BaseConfigTab):
 
         self._syncing = True
         try:
-            self.widgets["simulation.start_time"].setText(sim["start_time"])
+            self.set_text("simulation.start_time", sim["start_time"])
 
             # Update synodic period for the loaded body
             self._current_synodic_days = self._get_synodic_period_days(
                 sim.get("body", "Moon")
             )
 
-            # Set duration spinbox in current display units (use saved value, not synodic default)
-            days = sim["duration_days"]
+            # Set duration spinbox in current display units (use saved value,
+            # not synodic default). Coerced: YAML resolves `5e3` and a quoted
+            # number as str, and setValue(str) raises out of load_from_config,
+            # which in the GUI is a process abort rather than a message.
+            days = ConfigManager._as_number(sim["duration_days"], 0.0)
             display_val = self._days_to_display(days)
             self.duration_spin.blockSignals(True)
             self.duration_spin.setValue(display_val)
             self.duration_spin.blockSignals(False)
 
-            self.widgets["simulation.timesteps"].setValue(sim["timesteps"])
+            self.set_numeric("simulation.timesteps", sim["timesteps"])
 
-            # Body combo
-            body_name = sim["body"]
+            # Body combo. str(): findText refuses a non-string argument, and
+            # simulation.body is whatever yaml.safe_load made of it.
+            body_name = str(sim.get("body", "") or "")
             combo = self.widgets["simulation.body"]
             idx = combo.findText(body_name)
             if idx >= 0:
@@ -868,8 +1045,9 @@ class SimulationTab(BaseConfigTab):
                 combo.blockSignals(False)
             else:
                 # Body not found directly — check if it's a HORIZONS body
-                config_path = config.get("generic_body", {}).get("config_file", "")
+                config_path = (config.get("generic_body") or {}).get("config_file", "")
 
+                body_name = str(body_name or "")
                 if body_name.startswith("[H] "):
                     self.add_horizons_body(body_name[4:], config_path)
                 else:
@@ -969,6 +1147,54 @@ class MeshTab(BaseConfigTab):
         self.add_double_field(custom_layout, 1, "Scale Factor:", "mesh.scale_factor",
                               0.001, 1000.0, 3, "Scaling factor for imported mesh",
                               info_key="mesh.scale_factor")
+        # The core-plus-ring architecture was CLI-only: every A3GT-class site
+        # run needs an occluder, and the GUI had no field for it.
+        self.add_file_field(custom_layout, 2, "Occluder File:", "mesh.occluder_file",
+                            "Mesh Files (*.ply *.obj *.vtk);;All Files (*)",
+                            "Coarse occluder-only mesh (the ring around a "
+                            "high-resolution core). It enters the illumination "
+                            "shadow-ray BVH only -- never thermally solved, "
+                            "radiosity-coupled or written out. See "
+                            "docs/extended-occluder-architecture.md.")
+        # Without these an imported DEM sits wherever its own frame put it.
+        # LATITUDE IS THE GATE: ptm_thermal_sim.cpp:15317 rotates only when
+        # latitude_override > -900, and longitude is read inside that branch.
+        # Longitude alone therefore does nothing at all, which is why the
+        # longitude field is disabled until a latitude is set rather than left
+        # editable with a tooltip nobody reads.
+        self.add_double_field(custom_layout, 3, "Latitude Override (deg):",
+                              "mesh.latitude_override", -999.0, 90.0, 4,
+                              "Place the imported mesh at this latitude. "
+                              "-999 = leave the mesh in its own frame. This is "
+                              "the switch for BOTH overrides: the engine "
+                              "rotates only when a latitude is given.")
+        self.add_double_field(custom_layout, 4, "Longitude Override (deg):",
+                              "mesh.longitude_override", -999.0, 360.0, 4,
+                              "Place the imported mesh at this longitude. Read "
+                              "only when a latitude override is also set -- the "
+                              "engine gates the whole rotation on latitude, so "
+                              "a longitude on its own is silently ignored.")
+        # The engine range-checks NOTHING: its only gate is
+        # latitude_override > -900, so -95 reaches rotateMeshToLatLon with
+        # cos(lat) < 0 and mirrors the mesh through the pole to +85 at
+        # longitude+180. The spin box therefore steps only over the valid band,
+        # with -999 as the documented sentinel just below it; a config carrying
+        # a value in the dead zone is caught by ConfigManager.validate().
+        self.widgets["mesh.latitude_override"].setSingleStep(1.0)
+        self.placement_note = QLabel("")
+        self.placement_note.setWordWrap(True)
+        self.placement_note.setStyleSheet("color: gray; font-size: 10px;")
+        custom_layout.addWidget(self.placement_note, 5, 0, 1, 2)
+        # BOTH, because the note quotes both numbers: connected to latitude
+        # only, it went on stating the old longitude for the run about to start.
+        # set_numeric() calls setValue during load_from_config, which emits
+        # valueChanged, so the signal alone cannot tell a user edit from a load.
+        # _loading does.
+        self._loading = False
+        for _k in ("mesh.latitude_override", "mesh.longitude_override"):
+            self.widgets[_k].valueChanged.connect(
+                lambda _v: self._update_placement_gating(
+                    user_edit=not self._loading))
 
         custom_group.setLayout(custom_layout)
         layout.addWidget(custom_group)
@@ -979,9 +1205,54 @@ class MeshTab(BaseConfigTab):
         layout.addStretch()
         self.create_scroll_area(content)
 
+        self._update_placement_gating()
+
+    def _update_placement_gating(self, user_edit=False):
+        """Longitude is inert without a latitude, so do not offer it alone.
+
+        `user_edit` is what separates "the user just cleared the latitude" from
+        "a project was opened". Only the first resets a stale longitude: doing
+        it on load DISCARDED a saved longitude_override the moment the file was
+        opened, which is a silent edit to the user's configuration and the exact
+        thing read-only open exists to prevent. On load the value is kept, the
+        field is disabled, and validate() warns that the engine will ignore it.
+        """
+        lat = self.widgets["mesh.latitude_override"].value()
+        placing = lat > -900.0
+        lon_widget = self.widgets["mesh.longitude_override"]
+        if user_edit and not placing and lon_widget.value() > -900.0:
+            # Clearing the latitude leaves a longitude the engine will ignore,
+            # in a field about to be disabled -- so the value could not be
+            # reached to remove it. Reset it here, and say so rather than
+            # dropping a number the user typed without a word.
+            logging.warning(
+                "[mesh] latitude_override was cleared, so longitude_override "
+                "= %s has been reset to -999: the engine gates the rotation on "
+                "latitude and would have ignored it.", lon_widget.value())
+            lon_widget.setValue(-999.0)
+        lon_widget.setEnabled(placing)
+        if placing and not (-90.0 <= lat <= 90.0):
+            # The engine would mirror the mesh through the pole rather than
+            # refuse. Say so here; validate() blocks the launch.
+            self.placement_note.setText(
+                f"Latitude {lat} is outside [-90, 90]. The engine does not "
+                f"range-check it and would mirror the mesh through the pole. "
+                f"Use -999 to leave the mesh in its own frame.")
+        elif placing:
+            lon = self.widgets["mesh.longitude_override"].value()
+            lon_text = "the mesh's own longitude" if lon <= -900.0 \
+                else f"{lon} deg"
+            self.placement_note.setText(
+                f"The mesh will be rotated to {lat} deg latitude, {lon_text}.")
+        else:
+            self.placement_note.setText(
+                "No latitude override: the mesh stays in its own frame and the "
+                "longitude override is not read (the engine gates the rotation "
+                "on latitude).")
+
     def _on_import_file_changed(self, text):
         """Disable global mesh options when a custom mesh file is specified."""
-        has_custom = bool(text.strip())
+        has_custom = bool(str(text or "").strip())
         self.widgets["mesh.resolution"].setEnabled(not has_custom)
         self.widgets["mesh.use_topographic"].setEnabled(not has_custom)
         if has_custom:
@@ -998,6 +1269,7 @@ class MeshTab(BaseConfigTab):
 
     def _current_body(self):
         body = self.config_manager.get_value("simulation.body", "") or ""
+        body = str(body or "")
         return body[4:] if body.startswith("[H] ") else body
 
     def _project_root(self):
@@ -1011,7 +1283,7 @@ class MeshTab(BaseConfigTab):
         if source == "builtin":
             # Canonical relative reference; the engine resolves it through
             # its PTM_DATA_ROOT contract (portable saved configs).
-            self.widgets["mesh.topo_directory"].setText("data/topo")
+            self.set_text("mesh.topo_directory", "data/topo")
         self._apply_topo_source_enabled()
         self.refresh_builtin_topo()
         self.value_changed.emit()
@@ -1026,7 +1298,7 @@ class MeshTab(BaseConfigTab):
         mode toggle."""
         from gui_core import datasets
         body = self._current_body()
-        res = self.widgets["mesh.resolution"].value()
+        res = int(self.widgets["mesh.resolution"].value())
         root = self._project_root()
         status = datasets.topo_status(body, res, root)
         supported = status.state != datasets.STATE_UNSUPPORTED
@@ -1073,11 +1345,23 @@ class MeshTab(BaseConfigTab):
         config = self.config_manager.get_config()
         mesh = config["mesh"]
 
-        self.widgets["mesh.resolution"].setValue(mesh["resolution"])
-        self.widgets["mesh.use_topographic"].setChecked(mesh.get("use_topographic", False))
-        self.widgets["mesh.topo_directory"].setText(mesh.get("topo_directory", ""))
-        self.widgets["mesh.import_file"].setText(mesh.get("import_file", ""))
-        self.widgets["mesh.scale_factor"].setValue(mesh.get("scale_factor", 1.0))
+        self._loading = True
+        try:
+            self.set_numeric("mesh.resolution", mesh["resolution"])
+            self.set_bool("mesh.use_topographic", 
+                mesh.get("use_topographic", False))
+            self.set_text("mesh.topo_directory", mesh.get("topo_directory", ""))
+            self.set_text("mesh.import_file", mesh.get("import_file", ""))
+            self.set_numeric("mesh.scale_factor", mesh.get("scale_factor", 1.0))
+            self.set_text("mesh.occluder_file", mesh.get("occluder_file", ""))
+            self.set_numeric("mesh.latitude_override",
+                             mesh.get("latitude_override", -999.0))
+            self.set_numeric("mesh.longitude_override",
+                             mesh.get("longitude_override", -999.0))
+        finally:
+            self._loading = False
+        # Not a user edit: a saved longitude is kept, not discarded on open.
+        self._update_placement_gating()
 
         source = mesh.get("topo_source", "builtin")
         self.topo_builtin_radio.blockSignals(True)
@@ -1151,6 +1435,39 @@ class ThermalTab(BaseConfigTab):
         self.add_bool_field(control_layout, 3, "Compute Statistics", "thermal.compute_statistics",
                             "Calculate min/max/mean temperature statistics",
                             info_key="thermal.compute_statistics")
+
+        # Both of these were written into every saved config with no control
+        # at all. enable_shadow_flux is a physics switch; geothermal_heat_flow
+        # is the per-run bottom boundary condition.
+        self.add_bool_field(control_layout, 4, "Enable Shadow Flux",
+                            "thermal.enable_shadow_flux",
+                            info_key="thermal.enable_shadow_flux")
+        self.add_double_field(control_layout, 5, "Geothermal Q_b (W/m²):",
+                              # 1000 W/m^2, not 10: the falsifier fixture uses
+                              # 5.0 and a sensitivity study can go far higher.
+                              # An out-of-range load warns and keeps the config
+                              # value (set_numeric), but a range that refuses
+                              # plausible science is a range set too tight.
+                              "thermal.geothermal_heat_flow", -1.0, 1000.0, 4,
+                              "Bottom-boundary heat flux. -1 = the body's own "
+                              "default.\n"
+                              "Live on every body since PTM-161 was fixed "
+                              "(commit 2e06a70): the value is forwarded to the "
+                              "solvers as ovr_Qb and the run prints "
+                              "'[Thermo override] applied at solver: Qb ...'. "
+                              "A positive value also arms the property-override "
+                              "tripwire, which aborts the run if the override "
+                              "does not reach a solver.")
+        # Measured on this tree rather than taken from KNOWN_LIMITATIONS.md
+        # section 4, which still says "Status: Open": Moon ico3, 48 steps,
+        # Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K over 1280 faces. It is
+        # live, and the docs are stale.
+        self.qb_note = QLabel("")
+        self.qb_note.setWordWrap(True)
+        self.qb_note.setStyleSheet("color: gray; font-size: 10px;")
+        control_layout.addWidget(self.qb_note, 6, 0, 1, 2)
+        self.widgets["thermal.geothermal_heat_flow"].valueChanged.connect(
+            lambda _v: self._update_qb_gating())
 
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
@@ -1235,6 +1552,90 @@ class ThermalTab(BaseConfigTab):
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
 
+
+        # --- Initial condition -------------------------------------------
+        # spinup_seed selects the initial condition; `legacy` exists to
+        # reproduce a pre-2026-08-11 baseline digit-for-digit. The GUI used to
+        # defeat that on the GPU path by injecting PTM_EQ_PERFACE_FLUX into
+        # every run (PTM-276); it no longer injects it, so `legacy` here means
+        # what it says.
+        seed_group = QGroupBox("Initial Condition")
+        seed_layout = QGridLayout()
+        seed_layout.setColumnStretch(1, 1)
+
+        self.add_combo_field(seed_layout, 0, "Spin-up Seed:", "thermal.spinup_seed",
+                             ["physical", "legacy"],
+                             "physical (default): each face starts from its own "
+                             "conductive steady profile, so a permanently "
+                             "shadowed column starts on the geothermal floor.\n"
+                             "legacy: the pre-2026-08-11 seed plus the analytic "
+                             "clear-sky pre-conditioner -- exactly what produced "
+                             "results in this repository before that date. Use "
+                             "it to reproduce an old baseline.")
+        self.add_combo_field(seed_layout, 1, "Seed Anchor:", "thermal.seed_anchor",
+                             ["lumped", "warm"],
+                             "Which surface anchor the shared seed hangs its "
+                             "conductive profile from. Only read under "
+                             "spinup_seed: physical.\n"
+                             "lumped (default): anchors at the cycle mean.\n"
+                             "warm: the fourth-moment anchor, which by Jensen is "
+                             ">= the mean -- +45 K on the lit population of the "
+                             "shipped lunar 80N crater. Byte-identical to the "
+                             "pre-2026-08-12 seed.")
+        self.add_double_field(seed_layout, 2, "Analytic Seed Cycles:",
+                              "thermal.analytic_seed_cycles", -1.0, 100.0, 1,
+                              "Diurnal cycles of clear-sky pre-conditioning "
+                              "before the real forcing. It is a FORCING, not a "
+                              "seed: no topography, no shadowing, no IR, no "
+                              "indirect flux, and the GPU has no analog. "
+                              "-1 = follow the spin-up seed; 0 = off.")
+        self.add_bool_field(seed_layout, 3, "Refuse Two-Timescale Faces",
+                            "thermal.seed_anchor_refuse_two_timescale",
+                            "Strict refusal when a face carries diurnal AND "
+                            "seasonal power, which one lumped conductance "
+                            "cannot cover. Off by default because refusing "
+                            "substitutes the warm anchor, and that is the "
+                            "estimator with the +45 K bias.")
+
+        self.seed_note = QLabel("")
+        self.seed_note.setWordWrap(True)
+        self.seed_note.setStyleSheet("color: gray; font-size: 10px;")
+        seed_layout.addWidget(self.seed_note, 4, 0, 1, 2)
+        self.widgets["thermal.spinup_seed"].currentTextChanged.connect(
+            self._update_seed_gating)
+
+        seed_group.setLayout(seed_layout)
+        layout.addWidget(seed_group)
+
+        # --- Run state (warm start / chunk handoff) ------------------------
+        state_group = QGroupBox("Run State")
+        state_layout = QGridLayout()
+        state_layout.setColumnStretch(1, 1)
+
+        self.add_file_field(state_layout, 0, "Initial State File:",
+                            "thermal.initial_state_file",
+                            "State Files (*.bin *.state);;All Files (*)",
+                            "Per-face T(z) profile to start from. This is the "
+                            "warm start: the run continues an earlier one "
+                            "instead of re-equilibrating.")
+        self.add_file_field(state_layout, 1, "Final State File:",
+                            "thermal.final_state_file",
+                            "State Files (*.bin *.state);;All Files (*)",
+                            "Where to dump the per-face T(z) profile at the end. "
+                            "The state written is the one at the LAST exported "
+                            "step, which is what the next chunk must resume from.")
+
+        state_note = QLabel(
+            "A run launched from this window is still a single engine process: "
+            "it does not go through the chunked runner, so it has no automatic "
+            "cool-down, stall abort or resume. These two fields are the manual "
+            "handoff.")
+        state_note.setWordWrap(True)
+        state_note.setStyleSheet("color: gray; font-size: 10px;")
+        state_layout.addWidget(state_note, 2, 0, 1, 2)
+
+        state_group.setLayout(state_layout)
+        layout.addWidget(state_group)
 
         # Integration Window (advanced)
         integ_group = QGroupBox("Integration Window")
@@ -1324,6 +1725,68 @@ class ThermalTab(BaseConfigTab):
         layout.addStretch()
         self.create_scroll_area(content)
 
+        self._update_seed_gating()
+        self._update_qb_gating()
+
+    # ── Basal heat flow ──────────────────────────────────────────────
+
+    def _update_qb_gating(self):
+        """Say what a positive basal heat flow does. It is live on every body.
+
+        This control was briefly disabled on built-in bodies on the strength of
+        docs/KNOWN_LIMITATIONS.md section 4, which describes the value being
+        parsed, announced and then discarded. That was PTM-161, and PTM-161 was
+        fixed by commit 2e06a70 -- an ancestor of this branch. Measured here to
+        settle it rather than trusting either document: Moon ico3, 48 steps,
+        Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K, and the run prints
+        '[Thermo override] applied at solver: Qb 0.018 -> 0.05 W/m^2'.
+        Disabling it made a working knob unreachable on the GUI's own default
+        body, and -- worse -- told the user a value the engine WOULD apply was
+        going to be ignored.
+        """
+        # Coerce before comparing. set_numeric can leave a raw scalar in the
+        # config (out of range, deliberately), and YAML resolves `-1e0`/`5e3`
+        # as str, so a bare `<=` here aborted the application from
+        # load_from_config -- the branch's own headline crash class,
+        # reintroduced in a function the branch added.
+        raw = self.config_manager.get_value("thermal.geothermal_heat_flow", -1.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            self.qb_note.setText(
+                f"Geothermal Q_b = {raw!r} is not a number. The engine will "
+                f"read it as 0 and use the body default.")
+            return
+        if value <= 0:
+            self.qb_note.setText("")
+            return
+        self.qb_note.setText(
+            f"Q_b = {value} W/m² overrides the body default. This is a property "
+            f"OVERRIDE: it is forwarded to the solvers as ovr_Qb, announced in "
+            f"the log, and arms the tripwire that aborts the run if it fails to "
+            f"reach one. It also sets the deep floor, T_geo = "
+            f"(Q_b/(eps*sigma))^0.25.")
+
+    # ── Initial-condition handler ────────────────────────────────────
+
+    def _update_seed_gating(self, _mode=None):
+        """seed_anchor is only read under spinup_seed: physical."""
+        physical = self.widgets["thermal.spinup_seed"].currentText() == "physical"
+        for key in ("thermal.seed_anchor",
+                    "thermal.seed_anchor_refuse_two_timescale"):
+            w = self.widgets.get(key)
+            if w is not None:
+                w.setEnabled(physical)
+        if physical:
+            self.seed_note.setText(
+                "physical: each face starts from its own conductive steady "
+                "profile. Seed Anchor applies.")
+        else:
+            self.seed_note.setText(
+                "legacy: reproduces a pre-2026-08-11 baseline. Seed Anchor is "
+                "not read in this mode, and the analytic pre-conditioner runs "
+                "unless Analytic Seed Cycles says otherwise.")
+
     # ── Property-map mode handler ────────────────────────────────────
 
     def _on_property_map_mode_changed(self, index):
@@ -1352,6 +1815,8 @@ class ThermalTab(BaseConfigTab):
     def _eq_orbits_to_display(self, orbits):
         """Convert equilibration orbits (synodic cycles) to the selected display unit."""
         unit = self.eq_unit_combo.currentText()
+        # `orbits` comes straight from the config, where it can be a str.
+        orbits = ConfigManager._as_number(orbits, 0.0)
         days = orbits * self._current_synodic_days
         if unit == "days":
             return days
@@ -1443,6 +1908,7 @@ class ThermalTab(BaseConfigTab):
             self._syncing = False
         # Refresh the cadence readout text for the new body
         self._update_eq_cadence_readout()
+        self._update_qb_gating()
 
     # ── Equilibration cadence handlers ────────────────────────────────
 
@@ -1532,17 +1998,22 @@ class ThermalTab(BaseConfigTab):
     def _sync_eq_cadence_from_config(self):
         """Set combo + spin to reflect stored values (called from load_from_config)."""
         thermal = self.config_manager.get_config().get("thermal", {})
-        explicit = thermal.get("equilibration_steps_per_day", -1.0)
-        samples = thermal.get("equilibration_samples_per_diurnal_cycle", -1.0)
+        # Coerced: yaml.safe_load returns str for `-1e0`, `5e3` and a quoted
+        # `'120'` -- and '120' is the GUI's OWN default for the samples key, so
+        # a config carrying it quoted aborted the window here.
+        explicit = ConfigManager._as_number(
+            thermal.get("equilibration_steps_per_day", -1.0), -1.0)
+        samples = ConfigManager._as_number(
+            thermal.get("equilibration_samples_per_diurnal_cycle", -1.0), -1.0)
 
         self.eq_cadence_combo.blockSignals(True)
         self.eq_cadence_spin.blockSignals(True)
         try:
-            if explicit is not None and explicit > 0.0:
+            if explicit > 0.0:
                 self.eq_cadence_combo.setCurrentIndex(self._EQ_MODE_CUSTOM)
                 self.eq_cadence_spin.setValue(float(explicit))
                 self.eq_cadence_spin.setEnabled(True)
-            elif samples is not None and samples > 0.0:
+            elif samples > 0.0:
                 # Snap to known tiers; otherwise use Balanced as closest default
                 tier_idx = self._EQ_MODE_BALANCED
                 for idx_k, s_k in self._EQ_ACCURACY_SAMPLES.items():
@@ -1569,8 +2040,8 @@ class ThermalTab(BaseConfigTab):
 
         self._syncing = True
         try:
-            self.widgets["thermal.run_thermal_mesh"].setChecked(thermal["run_thermal_mesh"])
-            self.widgets["thermal.threads"].setValue(thermal["threads"])
+            self.set_bool("thermal.run_thermal_mesh", thermal["run_thermal_mesh"])
+            self.set_numeric("thermal.threads", thermal["threads"])
 
             # Update synodic and orbital periods for current body
             self._current_synodic_days = get_synodic_period_days(self.config_manager)
@@ -1583,16 +2054,45 @@ class ThermalTab(BaseConfigTab):
             self.eq_spin.setValue(display_val)
             self.eq_spin.blockSignals(False)
 
-            self.widgets["thermal.compute_statistics"].setChecked(thermal["compute_statistics"])
-            self.widgets["thermal.use_gpu"].setChecked(thermal.get("use_gpu", False))
+            self.set_bool("thermal.compute_statistics", thermal["compute_statistics"])
+            self.set_bool("thermal.use_gpu", thermal.get("use_gpu", False))
+            self.set_bool("thermal.enable_shadow_flux",
+                          thermal.get("enable_shadow_flux", False))
+            self.set_numeric("thermal.geothermal_heat_flow",
+                             thermal.get("geothermal_heat_flow", -1.0))
 
-            self.widgets["thermal.integration_days"].setValue(thermal["integration_days"])
-            self.widgets["thermal.integration_steps"].setValue(thermal["integration_steps"])
+            self.set_enum("thermal.spinup_seed",
+                          thermal.get("spinup_seed", "physical"),
+                          SPINUP_SEED_ALIASES)
+            self.set_enum("thermal.seed_anchor",
+                          thermal.get("seed_anchor", "lumped"),
+                          SEED_ANCHOR_ALIASES)
+            self.set_numeric("thermal.analytic_seed_cycles",
+                             thermal.get("analytic_seed_cycles", -1.0))
+            self.set_bool("thermal.seed_anchor_refuse_two_timescale",
+                          thermal.get("seed_anchor_refuse_two_timescale", False))
+            self.set_text("thermal.initial_state_file",
+                          thermal.get("initial_state_file", ""))
+            self.set_text("thermal.final_state_file",
+                          thermal.get("final_state_file", ""))
+
+            self.set_numeric("thermal.integration_days", thermal["integration_days"])
+            self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
             # Property maps (synthetic mode/kind drive the UI; underlying
             # YAML keys are managed by ConfigManager at save/load time).
-            mode = int(thermal.get("property_map_mode", 0))
-            kind = int(thermal.get("property_map_kind", 0))
+            # The combo's writeback stores the LABEL TEXT, so a second
+            # load_from_config() without an intervening load_from_yaml() saw
+            # "Bundled icosphere default for body" and int() raised -- an abort.
+            # The dashboard's mesh chain does exactly that sequence
+            # (thermal_adapter.set_input -> load_from_config). ConfigManager
+            # already defends the same value with _to_index at save time; this
+            # call site did not.
+            from gui_core.config_manager import ConfigManager as _CM
+            mode = _CM._to_index(thermal.get("property_map_mode", 0),
+                                 _CM._MODE_LABELS)
+            kind = _CM._to_index(thermal.get("property_map_kind", 0),
+                                 _CM._KIND_LABELS)
             if "thermal.property_map_mode" in self.widgets:
                 self.widgets["thermal.property_map_mode"].setCurrentIndex(mode)
             if "thermal.property_map_kind" in self.widgets:
@@ -1601,9 +2101,9 @@ class ThermalTab(BaseConfigTab):
             # field (file picker). When kind=H-parameter, the same widget is
             # interpreted as an h_parameter_map path at save-time.
             custom_path = thermal.get("thermal_inertia_map", "") or thermal.get("h_parameter_map", "")
-            self.widgets["thermal.thermal_inertia_map"].setText(custom_path)
+            self.set_text("thermal.thermal_inertia_map", custom_path)
             if "thermal.property_maps_directory" in self.widgets:
-                self.widgets["thermal.property_maps_directory"].setText(
+                self.set_text("thermal.property_maps_directory", 
                     thermal.get("property_maps_directory", "data/property_maps")
                 )
             # Sync enable state to mode
@@ -1614,6 +2114,8 @@ class ThermalTab(BaseConfigTab):
         # Sync equilibration-cadence widgets from config (must run OUTSIDE _syncing
         # because the combo/spin have their own block-signals guards).
         self._sync_eq_cadence_from_config()
+        self._update_seed_gating()
+        self._update_qb_gating()
 
 
 class RadiationTab(BaseConfigTab):
@@ -1646,22 +2148,81 @@ class RadiationTab(BaseConfigTab):
         enable_group.setLayout(enable_layout)
         layout.addWidget(enable_group)
 
+        # --- Sub-facet roughness (Smith 1967 beaming) ---------------------
+        # The engine enforces only "beaming: true requires rms_slope_deg > 0"
+        # and NOTHING about the scale of the mesh it is applied to. So this
+        # control pair is the only thing between a user and double-counted
+        # roughness; the rule lives in gui_core.facet_scale.
+        beam_group = QGroupBox("Sub-Facet Roughness (Beaming)")
+        beam_layout = QGridLayout()
+        beam_layout.setColumnStretch(1, 1)
+
+        self.add_bool_field(beam_layout, 0, "Enable Beaming", "radiation.beaming",
+                            "Smith (1967) anisotropic roughness-beamed emission. "
+                            "Only valid when the mesh facets are much LARGER "
+                            "than the roughness scale -- otherwise the mesh "
+                            "already resolves the roughness and this counts it "
+                            "twice.")
+        self.add_double_field(beam_layout, 1, "RMS Slope w (deg):",
+                              "radiation.rms_slope_deg", 0.0, 60.0, 2,
+                              "RMS sub-facet slope in DEGREES. Literature range "
+                              "20-37: 32.5 Jhoti et al. (2024) lunar highlands "
+                              "(the validated polar value), ~20 Bandfield et al. "
+                              "(2015) global regolith fit, ~37 Rubanenko et al. "
+                              "(2020). beaming: true with w = 0 is fatal at "
+                              "engine startup.")
+
+        self.beaming_note = QLabel("")
+        self.beaming_note.setWordWrap(True)
+        self.beaming_note.setStyleSheet("font-size: 10px; padding: 4px;")
+        beam_layout.addWidget(self.beaming_note, 2, 0, 1, 2)
+
+        self.beaming_ack = QCheckBox(
+            "I confirm this mesh does not already resolve sub-facet slopes")
+        self.beaming_ack.setVisible(False)
+        self.beaming_ack.toggled.connect(self._update_beaming_gating)
+        beam_layout.addWidget(self.beaming_ack, 3, 0, 1, 2)
+
+        beam_group.setLayout(beam_layout)
+        layout.addWidget(beam_group)
+
+        self.widgets["radiation.beaming"].toggled.connect(
+            self._on_beaming_toggled)
+        # Beaming is inert with radiation off, so the switch's own gate depends
+        # on that checkbox too.
+        self.widgets["radiation.enabled"].toggled.connect(
+            lambda _v: self._update_beaming_gating())
+
         # --- Thermal-Radiation Coupling (collapsed) ---
         coupling_section = CollapsibleSection("Thermal-Radiation Coupling", collapsed=True)
         coupling_widget = QWidget()
         coupling_layout = QGridLayout(coupling_widget)
         coupling_layout.setColumnStretch(1, 1)
 
-        self.add_int_field(coupling_layout, 0, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
+        # PTM-102. The mode was unreachable while the field it gates was
+        # visible, so a user could set a "Face Fraction (legacy mode only)"
+        # that the engine then announced it was ignoring.
+        self.add_combo_field(coupling_layout, 0, "Coupling Mode:",
+                             "radiation.coupling_mode",
+                             ["bounded", "fixed", "legacy"],
+                             "How the thermal-radiation coupling loop decides "
+                             "it is done (PTM-89).\n"
+                             "bounded (default): absolute selection threshold, "
+                             "no face-fraction exit.\n"
+                             "fixed: as bounded, plus a fixed iteration count.\n"
+                             "legacy: the pre-PTM-89 behavior, for reproducing "
+                             "published runs. It is the only mode that reads "
+                             "Face Fraction.")
+        self.add_int_field(coupling_layout, 1, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
                            1, 50, "Maximum thermal-radiation coupling iterations",
                            info_key="radiation.max_coupling_iterations")
-        self.add_double_field(coupling_layout, 1, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
+        self.add_double_field(coupling_layout, 2, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
                               0.1, 10.0, 1, "Temperature convergence threshold",
                               info_key="radiation.coupling_temp_threshold")
-        self.add_double_field(coupling_layout, 2, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
+        self.add_double_field(coupling_layout, 3, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
                               0.01, 10.0, 2, "Flux change threshold",
                               info_key="radiation.coupling_flux_threshold")
-        self.add_double_field(coupling_layout, 3, "Face Fraction (legacy mode only):",
+        self.add_double_field(coupling_layout, 4, "Face Fraction (legacy mode only):",
                               "radiation.coupling_face_fraction",
                               0.001, 0.1, 3,
                               "Fraction of faces still changing to stop. IGNORED unless "
@@ -1669,6 +2230,15 @@ class RadiationTab(BaseConfigTab):
                               "no error bound and made a coupled run's answer depend on how "
                               "the window was chunked (PTM-89). The engine prints a warning "
                               "if you change it without also setting coupling_mode: legacy.")
+
+        # A label that says "legacy mode only" next to an always-editable field
+        # is a label that lies. Gate it on the mode it names.
+        self.coupling_mode_note = QLabel("")
+        self.coupling_mode_note.setWordWrap(True)
+        self.coupling_mode_note.setStyleSheet("color: gray; font-size: 10px;")
+        coupling_layout.addWidget(self.coupling_mode_note, 5, 0, 1, 2)
+        self.widgets["radiation.coupling_mode"].currentTextChanged.connect(
+            self._update_coupling_mode_gating)
 
         coupling_section.add_widget(coupling_widget)
         layout.addWidget(coupling_section)
@@ -1696,6 +2266,36 @@ class RadiationTab(BaseConfigTab):
                            1, 200, "Maximum rank before falling back to sparse")
         self.add_int_field(vf_layout, 5, "H-Matrix Threads:", "radiation.hmatrix_threads",
                            0, 128, "Threads for H-matrix construction (0 = auto)")
+
+        # Which view-factor builder, and how accurately it integrates the near
+        # field. Both change the numbers a coupled run produces.
+        self.add_int_field(vf_layout, 6, "Near-Field Quadrature Order:",
+                           "radiation.nearfield_quadrature_order", 1, 8,
+                           "Order of the symmetric double-area quadrature used "
+                           "for near-field pairs. 3 is the default and the "
+                           "validated production value; order 1 is the centroid "
+                           "estimator with no near-field treatment at all and "
+                           "reads +51.7% on the touching-pair closed form "
+                           "(order 3 reads +18.5%). The engine calls order 1 "
+                           "\"a diagnostic setting, not a production one\".")
+        self.add_bool_field(vf_layout, 7, "Build View Factors by Monte Carlo",
+                            "radiation.use_monte_carlo_vf",
+                            "Select the Monte Carlo view-factor builder instead "
+                            "of the analytic/H-matrix path. A different builder "
+                            "is a different answer, not just a different speed.")
+        self.add_int_field(vf_layout, 8, "Monte Carlo Rays per Face:",
+                           "radiation.mc_rays_per_face", 1000, 10000000,
+                           "Rays cast per face by the Monte Carlo builder. "
+                           "Used only when that builder is selected.")
+
+        self.quadrature_note = QLabel("")
+        self.quadrature_note.setWordWrap(True)
+        self.quadrature_note.setStyleSheet("color: gray; font-size: 10px;")
+        vf_layout.addWidget(self.quadrature_note, 9, 0, 1, 2)
+        self.widgets["radiation.nearfield_quadrature_order"].valueChanged.connect(
+            self._update_vf_builder_gating)
+        self.widgets["radiation.use_monte_carlo_vf"].toggled.connect(
+            self._update_vf_builder_gating)
 
         vf_section.add_widget(vf_widget)
         layout.addWidget(vf_section)
@@ -1746,10 +2346,183 @@ class RadiationTab(BaseConfigTab):
         self.create_scroll_area(content)
 
         self._update_hmatrix_suboptions()
+        self._update_coupling_mode_gating()
+        self._update_vf_builder_gating()
+        self._update_beaming_gating()
 
         # Recompute the estimate whenever a radiation field changes.
         self.value_changed.connect(self.update_vf_estimate)
         self.update_vf_estimate()
+
+    # ── Beaming facet-scale rule (DP-4) ──────────────────────────────
+
+    def _beaming_policy(self):
+        from gui_core.facet_scale import beaming_policy
+        try:
+            return beaming_policy(self.config_manager.get_config(),
+                                  self._project_root())
+        except Exception as exc:                 # never break the tab
+            from gui_core.facet_scale import BeamingPolicy
+            return BeamingPolicy(
+                allowed=False,
+                reason=f"The facet-scale check could not run ({exc}), so "
+                       f"beaming is not offered. Refusing is the safe "
+                       f"direction: a mesh at the roughness scale would "
+                       f"double-count it.")
+
+    def _on_beaming_toggled(self, checked):
+        """Turning the switch on with no slope is fatal at engine startup."""
+        if checked:
+            knob = self.widgets["radiation.rms_slope_deg"]
+            if knob.value() <= 0.0:
+                # 32.5 deg = Jhoti et al. (2024) lunar highlands, the validated
+                # polar value. Announced in the note, never silent.
+                knob.setValue(32.5)
+        self._update_beaming_gating()
+
+    def _update_beaming_gating(self, _checked=None):
+        """Apply the facet-scale and body rules to the beaming control pair.
+
+        The rule governs whether beaming may be turned ON here. It does NOT
+        silently turn OFF a config that arrived with it on: rewriting someone's
+        physics behind their back is the failure mode this whole stage exists to
+        remove, and the rule can decline for reasons that are not "the mesh is
+        too fine" -- a topographic mesh, a non-PLY import, an unreadable path.
+        An inherited setting the rule disagrees with is kept, said loudly, and
+        left switchable so the user can act on it.
+        """
+        policy = self._beaming_policy()
+        switch = self.widgets["radiation.beaming"]
+        knob = self.widgets["radiation.rms_slope_deg"]
+
+        # Beaming is INERT with radiation exchange off -- which is the GUI's own
+        # default. The engine copies beaming/rms_slope_deg into the radiation
+        # config only inside its radiation-enabled blocks
+        # (ptm_thermal_sim.cpp:15402, :17717), so the run prints nothing about
+        # Smith at all and the operator reads a Lambertian result as a beaming
+        # one. That is the failure the engine's own FATAL comment names. Reported
+        # here, in the tab, the same way "Face Fraction (legacy mode only)" is
+        # gated on coupling_mode.
+        if not self.config_manager.get_value("radiation.enabled", False):
+            switch.setEnabled(False)
+            knob.setEnabled(False)
+            self.beaming_ack.setVisible(False)
+            self.beaming_note.setStyleSheet(
+                "color: #FFB74D; font-size: 10px; padding: 4px;")
+            self.beaming_note.setText(
+                "Radiation exchange is OFF, so beaming is inert: the engine "
+                "reads these two keys only on the radiation path and the run "
+                "would say nothing about Smith at all. Enable Radiation "
+                "Exchange above to use it."
+                + (f"\n{policy.reason}" if switch.isChecked() else ""))
+            if switch.isChecked():
+                logging.warning(
+                    "[beaming] radiation.beaming is ON but radiation.enabled is "
+                    "off; the engine will ignore it entirely.")
+            return
+
+        # Reset the acknowledgment whenever the thing being acknowledged
+        # changes. Hiding it while leaving it CHECKED carried a tick made for
+        # one mesh over to the next one, so a second warn-tier mesh could be
+        # enabled without the user ever seeing its facet scale -- which is the
+        # entire content of that tier.
+        scale_id = (policy.scale.source if policy.scale else None,
+                    None if not policy.scale or policy.scale.meters is None
+                    else round(policy.scale.meters, 6))
+        if scale_id != getattr(self, "_beaming_ack_scale", None):
+            self.beaming_ack.blockSignals(True)
+            self.beaming_ack.setChecked(False)
+            self.beaming_ack.blockSignals(False)
+            self._beaming_ack_scale = scale_id
+        self.beaming_ack.setVisible(policy.needs_acknowledgment)
+        ack_ok = (not policy.needs_acknowledgment) or self.beaming_ack.isChecked()
+        may_turn_on = policy.allowed and ack_ok
+        already_on = switch.isChecked()
+
+        # Enabled when the rule permits it, or when it is already on so the
+        # user can still turn it off.
+        switch.setEnabled(may_turn_on or already_on)
+        knob.setEnabled(already_on)
+
+        text = policy.reason
+        if already_on and not policy.allowed:
+            # The rule REFUSES this mesh or body, and beaming is on anyway.
+            text = ("BEAMING IS ON AND THIS MESH DOES NOT MEET THE RULE. It "
+                    "has been left as the configuration set it -- nothing here "
+                    "rewrites your physics -- but check it before trusting the "
+                    "run.\n" + policy.reason)
+            logging.warning("[beaming] radiation.beaming is ON and the "
+                            "facet-scale rule declines: %s", policy.reason)
+            color = "#E57373"
+        elif already_on and policy.needs_acknowledgment and not ack_ok:
+            # The rule ALLOWS this mesh; it only wants the number acknowledged.
+            # Saying "does not meet the rule" here contradicts the reason text
+            # printed immediately below it, and every 5 cm to 1 m production
+            # mesh would raise a red alarm on open.
+            text = ("Beaming is on and this mesh is in the band where some "
+                    "roughness may already be resolved. Confirm below.\n"
+                    + policy.reason)
+            color = "#FFB74D"
+        elif not policy.allowed:
+            color = "#E57373"
+        elif policy.needs_acknowledgment:
+            color = "#FFB74D"
+        else:
+            color = "#81C784"
+        self.beaming_note.setStyleSheet(
+            f"color: {color}; font-size: 10px; padding: 4px;")
+        self.beaming_note.setText(text)
+
+    def on_mesh_changed(self):
+        """The mesh decides the facet scale, so it decides the beaming rule.
+
+        Without this the rule failed OPEN: enable beaming on a lunar icosphere,
+        then import a millimeter-scale mesh on the Mesh tab, and `beaming: true`
+        went to the engine on exactly the mesh the rule exists to refuse.
+        """
+        self._update_beaming_gating()
+        self.update_vf_estimate()
+
+    def _update_coupling_mode_gating(self, _mode=None):
+        """Face Fraction is editable only in the mode whose name it carries."""
+        mode = self.widgets["radiation.coupling_mode"].currentText()
+        legacy = (mode == "legacy")
+        ff = self.widgets.get("radiation.coupling_face_fraction")
+        if ff is not None:
+            ff.setEnabled(legacy)
+        if legacy:
+            self.coupling_mode_note.setText(
+                "legacy re-introduces PTM-89: the face-fraction exit has no "
+                "error bound, so a coupled run's answer depends on how the "
+                "window was chunked. Use it to reproduce a published run.")
+        elif mode == "fixed":
+            self.coupling_mode_note.setText(
+                "fixed runs exactly Max Coupling Iterations passes; Face "
+                "Fraction is not read.")
+        else:
+            self.coupling_mode_note.setText(
+                "bounded is the PTM-89 fix and the engine default; Face "
+                "Fraction is not read.")
+
+    def _update_vf_builder_gating(self, _value=None):
+        """Warn on quadrature order 1, and gate the Monte Carlo ray count."""
+        order = self.widgets["radiation.nearfield_quadrature_order"].value()
+        mc = self.widgets["radiation.use_monte_carlo_vf"].isChecked()
+        rays = self.widgets.get("radiation.mc_rays_per_face")
+        if rays is not None:
+            rays.setEnabled(mc)
+        if order == 1:
+            # The engine's own wording, so the two do not drift apart.
+            self.quadrature_note.setText(
+                "Order 1 is the centroid estimator: no near-field treatment at "
+                "all. On the touching-pair closed form it reads +51.7% (order 3 "
+                "reads +18.5%). This is a diagnostic setting, not a production "
+                "one.")
+        elif order < 3:
+            self.quadrature_note.setText(
+                f"Order {order} is below the validated production value of 3.")
+        else:
+            self.quadrature_note.setText("")
 
     def _update_hmatrix_suboptions(self, _checked=None):
         """Enable the H-matrix compression sub-fields only when H-matrix is on."""
@@ -1795,34 +2568,89 @@ class RadiationTab(BaseConfigTab):
         self.vf_estimate_label.setText(text)
 
     def on_body_changed(self, _body_name=None):
-        """Body change affects the mesh face count -> refresh the estimate."""
+        """Body change affects the mesh face count and the beaming rule."""
         self.update_vf_estimate()
+        self._update_beaming_gating()
 
     def load_from_config(self):
         config = self.config_manager.get_config()
         rad = config.get("radiation", {})
 
-        self.widgets["radiation.enabled"].setChecked(rad.get("enabled", False))
-        self.widgets["radiation.verbose"].setChecked(rad.get("verbose", False))
-        self.widgets["radiation.use_gpu"].setChecked(rad.get("use_gpu", True))
-        self.widgets["radiation.min_shadow_fraction"].setValue(rad.get("min_shadow_fraction", 0.3))
-        self.widgets["radiation.max_coupling_iterations"].setValue(rad.get("max_coupling_iterations", 10))
-        self.widgets["radiation.coupling_temp_threshold"].setValue(rad.get("coupling_temp_threshold", 0.5))
-        self.widgets["radiation.coupling_flux_threshold"].setValue(rad.get("coupling_flux_threshold", 0.1))
-        self.widgets["radiation.coupling_face_fraction"].setValue(rad.get("coupling_face_fraction", 0.01))
-        self.widgets["radiation.view_factor_file"].setText(rad.get("view_factor_file", ""))
-        self.widgets["radiation.use_hmatrix"].setChecked(rad.get("use_hmatrix", False))
-        self.widgets["radiation.use_aca"].setChecked(rad.get("use_aca", True))
-        self.widgets["radiation.aca_tolerance"].setValue(rad.get("aca_tolerance", 0.001))
-        self.widgets["radiation.aca_max_rank"].setValue(rad.get("aca_max_rank", 50))
-        self.widgets["radiation.hmatrix_threads"].setValue(rad.get("hmatrix_threads", 0))
+        self.set_bool("radiation.enabled", rad.get("enabled", False))
+        self.set_bool("radiation.verbose", rad.get("verbose", False))
+        # The fallbacks here track the engine's own defaults (they only fire for
+        # a config missing the key entirely). use_gpu was True and
+        # max_coupling_iterations 10 while the engine said False and 16.
+        self.set_bool("radiation.use_gpu", rad.get("use_gpu", False))
+        self.set_numeric("radiation.min_shadow_fraction", rad.get("min_shadow_fraction", 0.3))
+        self.set_enum("radiation.coupling_mode",
+                      rad.get("coupling_mode", "bounded"),
+                      COUPLING_MODE_ALIASES)
+        self.set_numeric("radiation.max_coupling_iterations", rad.get("max_coupling_iterations", 16))
+        self.set_numeric("radiation.coupling_temp_threshold", rad.get("coupling_temp_threshold", 0.5))
+        self.set_numeric("radiation.coupling_flux_threshold", rad.get("coupling_flux_threshold", 0.1))
+        self.set_numeric("radiation.coupling_face_fraction", rad.get("coupling_face_fraction", 0.01))
+        self.set_text("radiation.view_factor_file", rad.get("view_factor_file", ""))
+        self.set_bool("radiation.use_hmatrix", rad.get("use_hmatrix", False))
+        self.set_bool("radiation.use_aca", rad.get("use_aca", True))
+        self.set_numeric("radiation.aca_tolerance", rad.get("aca_tolerance", 0.001))
+        self.set_numeric("radiation.aca_max_rank", rad.get("aca_max_rank", 50))
+        self.set_numeric("radiation.hmatrix_threads", rad.get("hmatrix_threads", 0))
+        self.set_numeric("radiation.nearfield_quadrature_order",
+                         rad.get("nearfield_quadrature_order", 3))
+        self.set_bool("radiation.use_monte_carlo_vf",
+                      rad.get("use_monte_carlo_vf", False))
+        self.set_numeric("radiation.mc_rays_per_face",
+                         rad.get("mc_rays_per_face", 100000))
         # Sparse view factors
-        self.widgets["radiation.adaptive_neighbors"].setChecked(rad.get("adaptive_neighbors", True))
-        self.widgets["radiation.captured_energy_target"].setValue(rad.get("captured_energy_target", 0.95))
-        self.widgets["radiation.max_neighbors"].setValue(rad.get("max_neighbors", 500))
-        self.widgets["radiation.min_neighbors"].setValue(rad.get("min_neighbors", 20))
+        self.set_bool("radiation.adaptive_neighbors", rad.get("adaptive_neighbors", True))
+        self.set_numeric("radiation.captured_energy_target", rad.get("captured_energy_target", 0.95))
+        self.set_numeric("radiation.max_neighbors", rad.get("max_neighbors", 500))
+        self.set_numeric("radiation.min_neighbors", rad.get("min_neighbors", 20))
+        # Beaming: honor what the file said. The rule then decides whether it
+        # may be turned ON from here -- it never turns one OFF; a setting it
+        # disagrees with is kept and said loudly.
+        self.set_numeric("radiation.rms_slope_deg", rad.get("rms_slope_deg", 0.0))
+        self.widgets["radiation.beaming"].blockSignals(True)
+        self.set_bool("radiation.beaming", rad.get("beaming", False))
+        self.widgets["radiation.beaming"].blockSignals(False)
+        self._legacy_beaming_note()
         self._update_hmatrix_suboptions()
+        self._update_coupling_mode_gating()
+        self._update_vf_builder_gating()
+        self._update_beaming_gating()
         self.update_vf_estimate()
+
+    def _legacy_beaming_note(self):
+        """A pre-2026-08-25 config had no `beaming` key; the switch was implied.
+
+        config_parser.cpp:631 honors that bridge and prints a NOTE. The GUI
+        writes the key explicitly, so such a config loaded here and run would
+        carry `beaming: false` and silently demote the run to Lambertian.
+
+        The detection CANNOT be done from `self.config_manager.get_config()`:
+        the merge with DEFAULT_CONFIG always supplies `beaming`, so "the file
+        did not mention it" is information only ConfigManager.load_from_yaml
+        has. It records it on `legacy_implicit_beaming`; this reads that.
+        """
+        slope = getattr(self.config_manager, "legacy_implicit_beaming", None)
+        if slope is None:
+            return
+        # Consume it. It survived only until now: leaving it set meant every
+        # LATER load_from_config() on the same manager re-forced beaming on --
+        # and the dashboard's thermal adapter calls that on every chained mesh
+        # handoff, so a user who read this warning and deliberately switched
+        # beaming off would silently get it back.
+        self.config_manager.legacy_implicit_beaming = None
+        self.widgets["radiation.beaming"].blockSignals(True)
+        self.set_bool("radiation.beaming", True)
+        self.widgets["radiation.beaming"].blockSignals(False)
+        self.config_manager.set_value("radiation.beaming", True)
+        logging.warning(
+            "[beaming] this config has rms_slope_deg = %s and no 'beaming' key: "
+            "the pre-2026-08-25 implicit switch. Beaming has been turned ON to "
+            "match what the engine would do, and will be written explicitly on "
+            "the next save.", slope)
 
 
 class ThermophysicalTab(BaseConfigTab):
@@ -1831,18 +2659,23 @@ class ThermophysicalTab(BaseConfigTab):
     Engine reality check (config_parser.cpp, "Parse Thermophysical
     section"): for BUILT-IN bodies the engine ignores plain scalar keys in
     the thermophysical YAML section and honors only the *_override keys --
-    which exist for albedo, emissivity, ks and kd. The remaining properties
-    (H, rhos, rhod, cp0, Qb, chi) can only be customized through
+    which exist for albedo, emissivity, ks, kd and H. The remaining properties
+    (rhos, rhod, cp0, Qb, chi) can only be customized through
     generic_body.surface, i.e. with a Custom/HORIZONS body. This tab
-    therefore DISABLES those six rows when a built-in body is selected
+    therefore DISABLES those five rows when a built-in body is selected
     instead of silently accepting values the engine would never see (the
     old behavior wrote dead placeholders like `cp0: 800.0`).
     """
 
-    # Properties with an engine *_override path for built-in bodies
-    BUILTIN_OVERRIDABLE = ("albedo", "emissivity", "ks", "kd")
+    # Properties with an engine *_override path for built-in bodies.
+    # H moved here on 2026-08-25: the engine has read thermophysical.H_override
+    # all along (config_parser.cpp:759, applied at ptm_thermal_sim.cpp:14778,
+    # which sets planet.H and therefore works on a built-in body). This tab
+    # nevertheless disabled the H row on every built-in body, so the regolith
+    # scale height -- arguably THE lunar thermal parameter -- was unreachable.
+    BUILTIN_OVERRIDABLE = ("albedo", "emissivity", "ks", "kd", "H")
     # Properties with NO engine path for built-in bodies
-    BUILTIN_UNSUPPORTED = ("H", "rhos", "rhod", "cp0", "Qb", "chi")
+    BUILTIN_UNSUPPORTED = ("rhos", "rhod", "cp0", "Qb", "chi")
 
     # Default properties by body (matches planetary_properties.h)
     BODY_DEFAULTS = {
@@ -2034,6 +2867,19 @@ class ThermophysicalTab(BaseConfigTab):
                                        "Deep bulk density (at depth >> H)",
                                        info_key="thermophysical.rhod")
 
+        # Which k(T, rho) law the solver uses. The engine validates the string
+        # and names the valid values (config_parser.cpp: hayne2017 |
+        # martinez2021), so an unknown one is caught there, not guessed at.
+        self.add_combo_field(cond_layout, 6, "Conductivity Model:",
+                             "thermophysical.conductivity_model",
+                             ["hayne2017", "martinez2021"],
+                             "Temperature-dependent conductivity law.\n"
+                             "hayne2017: k = kc x [1 + chi (T/350)^3], the "
+                             "lunar-calibrated default.\n"
+                             "martinez2021: the Martinez et al. (2021) "
+                             "formulation, which depends on density as well as "
+                             "temperature.")
+
         cond_section.add_widget(cond_widget)
         layout.addWidget(cond_section)
 
@@ -2201,18 +3047,20 @@ class ThermophysicalTab(BaseConfigTab):
     def _update_builtin_support(self):
         """Enable/disable rows according to what the ENGINE can honor.
 
-        Built-in body: only albedo/emissivity/ks/kd reach the engine (via
-        *_override keys written at save time); the other six rows are forced
-        back to 'Use Default' and disabled so no input dies silently.
+        Built-in body: only the BUILTIN_OVERRIDABLE properties reach the engine
+        (via *_override keys written at save time); the BUILTIN_UNSUPPORTED rows
+        are forced back to 'Use Default' and disabled so no input dies silently.
+        Both tuples are the single source for this rule and for the strings it
+        shows, so neither can drift from the other.
         Custom/HORIZONS body: everything is enabled (values are written to
         generic_body.surface, which the engine reads)."""
         generic = getattr(self.config_manager, "generic_body_active",
                           lambda: False)()
         unsupported_tip = (
             "Not customizable for built-in bodies: the engine has no "
-            "override key for this property (config_parser.cpp reads only "
-            "albedo/emissivity/ks/kd overrides). Use a Custom or HORIZONS "
-            "body to set it via generic_body.surface.")
+            "override key for this property (config_parser.cpp reads "
+            + "/".join(self.BUILTIN_OVERRIDABLE) + " overrides only). Use a "
+            "Custom or HORIZONS body to set it via generic_body.surface.")
         for attr in self.BUILTIN_UNSUPPORTED:
             vkey = f"thermophysical.{attr}"
             dkey = f"thermophysical.use_default_{attr}"
@@ -2245,10 +3093,10 @@ class ThermophysicalTab(BaseConfigTab):
             else:
                 self.info_label.setText(
                     "Properties shown are defaults for the selected body. "
-                    "For built-in bodies the engine accepts custom values "
-                    "for Bond albedo, emissivity, ks and kd only (saved as "
-                    "*_override keys); the grayed-out properties require a "
-                    "Custom or HORIZONS body.")
+                    "For built-in bodies the engine accepts custom values for "
+                    + ", ".join(self.BUILTIN_OVERRIDABLE)
+                    + " only (saved as *_override keys); the grayed-out "
+                    "properties require a Custom or HORIZONS body.")
 
     def _on_incidence_model_changed(self, _idx):
         """Selector changed -> write the Hayne/Hapke boolean to config."""
@@ -2271,6 +3119,9 @@ class ThermophysicalTab(BaseConfigTab):
             config = self.config_manager.get_config()
             body_name = config.get("simulation", {}).get("body", "Moon")
 
+        # str(): simulation.body can be any scalar after yaml.safe_load, and
+        # .startswith on a float raises out of load_from_config -- an abort.
+        body_name = str(body_name or "")
         # Strip [H] prefix for HORIZONS bodies
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
 
@@ -2348,10 +3199,18 @@ class ThermophysicalTab(BaseConfigTab):
 
         for value_key, default_key, value_attr, default_attr in properties:
             if value_key in self.widgets:
-                self.widgets[value_key].setValue(thermo.get(value_attr, 0.0))
+                # set_numeric, not setValue: a spin box clamps SILENTLY and
+                # still emits valueChanged, so an out-of-range config value was
+                # written back clamped. H is the one that matters now -- moving
+                # it into BUILTIN_OVERRIDABLE made it a live engine override,
+                # and its widget caps at 1.0 m.
+                self.set_numeric(value_key, thermo.get(value_attr, 0.0))
             if default_key in self.widgets:
-                use_default = thermo.get(default_attr, True)
-                self.widgets[default_key].setChecked(use_default)
+                # set_bool, not setChecked: a quoted `use_default_H: 'true'` is
+                # a str after yaml.safe_load, the engine's as<bool> accepts it,
+                # and setChecked(str) raises out of load_from_config.
+                self.set_bool(default_key, thermo.get(default_attr, True))
+                use_default = self.widgets[default_key].isChecked()
                 self.widgets[value_key].setEnabled(not use_default)
 
         # Seed body defaults first (this re-applies the body's default
@@ -2367,6 +3226,12 @@ class ThermophysicalTab(BaseConfigTab):
             self._set_incidence_model(saved_ica)
             self.config_manager.set_value(
                 "thermophysical.incidence_angle_albedo", saved_ica)
+
+        # Conductivity model is a plain string key, not a body default: it is
+        # not touched by update_to_body_defaults and needs no re-apply dance.
+        self.set_enum("thermophysical.conductivity_model",
+                      thermo.get("conductivity_model", "hayne2017"),
+                      CONDUCTIVITY_MODEL_ALIASES)
 
         self._update_builtin_support()
 
@@ -2392,7 +3257,8 @@ class ThermophysicalTab(BaseConfigTab):
                 return None
             # Get rAU from orbit section if available
             orbit = body_config.get("generic_body", {}).get("orbit", {})
-            rAU = orbit.get("semi_major_axis_au", 2.5)
+            rAU = ConfigManager._as_number(
+                orbit.get("semi_major_axis_au", 2.5), 2.5)
             if rAU <= 0:
                 rAU = 2.5
             return {
@@ -2419,7 +3285,7 @@ class ThermophysicalTab(BaseConfigTab):
     def _get_current_body_defaults(self):
         """Return the BODY_DEFAULTS dict for the currently selected body."""
         config = self.config_manager.get_config()
-        body_name = config.get("simulation", {}).get("body", "Moon")
+        body_name = str(config.get("simulation", {}).get("body", "Moon") or "")
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
         if body_name.startswith("[H] "):
             hd = self._load_horizons_defaults(clean_name)
@@ -2463,8 +3329,9 @@ class ThermophysicalTab(BaseConfigTab):
         cpCoeff = defaults.get("cpCoeff", [])
 
         # Try to get rAU from generic_body config (overrides body defaults)
-        config_rAU = self.config_manager.get_value(
-            "generic_body.orbit.semi_major_axis_au", -1.0)
+        config_rAU = ConfigManager._as_number(
+            self.config_manager.get_value(
+                "generic_body.orbit.semi_major_axis_au", -1.0), -1.0)
         if config_rAU > 0:
             rAU = config_rAU
 
@@ -2983,6 +3850,7 @@ class BodyDefinitionTab(BaseConfigTab):
 
     def on_body_changed(self, body_name):
         """Update banner and field state when body selection changes."""
+        body_name = str(body_name or "")
         clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
         is_builtin = clean_name in self.BUILTIN_BODIES
         is_horizons = body_name.startswith("[H] ")
@@ -3108,11 +3976,13 @@ class BodyDefinitionTab(BaseConfigTab):
             return
         widget = self.widgets[key]
         widget.blockSignals(True)
-        if isinstance(widget, QDoubleSpinBox):
-            # Clamp to widget range
-            v = float(value) if value is not None else widget.minimum()
+        if isinstance(widget, (QDoubleSpinBox, QSpinBox)):
+            # Clamp to widget range. float() is not enough on its own: NaN and
+            # the infinities pass it, and int(nan)/int(inf) then raise out of
+            # load_from_config, which is a process abort.
+            v = ConfigManager._as_number(value, widget.minimum())
             v = max(widget.minimum(), min(widget.maximum(), v))
-            widget.setValue(v)
+            widget.setValue(type(widget.value())(v))
         elif isinstance(widget, QLineEdit):
             widget.setText(str(value) if value else "")
         elif isinstance(widget, QComboBox):
@@ -3155,7 +4025,9 @@ class BodyDefinitionTab(BaseConfigTab):
         orbit = gb.get("orbit", {})
         for field in ["semi_major_axis_au", "eccentricity", "inclination_deg",
                        "lon_ascending_node_deg", "arg_perihelion_deg", "mean_anomaly_deg"]:
-            val = orbit.get(field, -1.0)
+            # Coerced: a quoted or exponent-spelled number loads as str and
+            # the bare `>=` raised out of load_from_config -- an abort.
+            val = ConfigManager._as_number(orbit.get(field, -1.0), -1.0)
             self._set_widget_value(f"generic_body.orbit.{field}",
                                    val if val >= 0 else 0.0)
         self._set_widget_value("generic_body.orbit.epoch",
@@ -3164,7 +4036,7 @@ class BodyDefinitionTab(BaseConfigTab):
         # Spin
         spin = gb.get("spin", {})
         for field in ["period_hours", "pole_ra_deg", "pole_dec_deg", "prime_meridian_deg"]:
-            val = spin.get(field, -1.0)
+            val = ConfigManager._as_number(spin.get(field, -1.0), -1.0)
             self._set_widget_value(f"generic_body.spin.{field}",
                                    val if val >= 0 else 0.0)
 
@@ -3295,6 +4167,7 @@ class IlluminationTab(BaseConfigTab):
 
     def _current_body(self):
         body = self.config_manager.get_value("simulation.body", "") or ""
+        body = str(body or "")
         return body[4:] if body.startswith("[H] ") else body
 
     def _project_root(self):
@@ -3339,7 +4212,8 @@ class IlluminationTab(BaseConfigTab):
         resolution-aware)."""
         from gui_core import datasets
         body = self._current_body()
-        res = self.config_manager.get_value("mesh.resolution", 5)
+        res = int(ConfigManager._as_number(
+            self.config_manager.get_value("mesh.resolution", 5), 5))
         root = self._project_root()
         status = datasets.albedo_status(body, res, root)
         supported = status.state != datasets.STATE_UNSUPPORTED
@@ -3389,11 +4263,11 @@ class IlluminationTab(BaseConfigTab):
         config = self.config_manager.get_config()
         illum = config["illumination"]
 
-        self.widgets["illumination.include_primary_reflection"].setChecked(illum["include_primary_reflection"])
-        self.widgets["illumination.use_batch_processing"].setChecked(illum["use_batch_processing"])
-        self.widgets["illumination.albedo_map"].setText(illum["albedo_map"])
-        self.widgets["illumination.albedo_maps_directory"].setText(illum["albedo_maps_directory"])
-        self.widgets["illumination.positions_file"].setText(illum["positions_file"])
+        self.set_bool("illumination.include_primary_reflection", illum["include_primary_reflection"])
+        self.set_bool("illumination.use_batch_processing", illum["use_batch_processing"])
+        self.set_text("illumination.albedo_map", illum["albedo_map"])
+        self.set_text("illumination.albedo_maps_directory", illum["albedo_maps_directory"])
+        self.set_text("illumination.positions_file", illum["positions_file"])
 
         source = illum.get("albedo_source", "builtin")
         for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
@@ -3466,20 +4340,22 @@ class OutputTab(BaseConfigTab):
         config = self.config_manager.get_config()
         out = config["output"]
 
-        self.widgets["output.directory"].setText(out["directory"])
+        self.set_text("output.directory", out["directory"])
 
-        idx = self.widgets["output.format"].findText(out["format"])
+        # str(): findText refuses a non-string, out of load_from_config.
+        idx = self.widgets["output.format"].findText(str(out.get("format", "")))
         if idx >= 0:
             self.widgets["output.format"].setCurrentIndex(idx)
 
-        idx = self.widgets["output.vtk_mode"].findText(out["vtk_mode"])
+        idx = self.widgets["output.vtk_mode"].findText(
+            str(out.get("vtk_mode", "")))
         if idx >= 0:
             self.widgets["output.vtk_mode"].setCurrentIndex(idx)
 
-        self.widgets["output.include_primary_ir"].setChecked(out.get("include_primary_ir", False))
-        self.widgets["output.locations_file"].setText(out.get("locations_file", ""))
-        self.widgets["output.depths_file"].setText(out.get("depths_file", ""))
-        self.widgets["output.series_output"].setText(out.get("series_output", ""))
+        self.set_bool("output.include_primary_ir", out.get("include_primary_ir", False))
+        self.set_text("output.locations_file", out.get("locations_file", ""))
+        self.set_text("output.depths_file", out.get("depths_file", ""))
+        self.set_text("output.series_output", out.get("series_output", ""))
 
 
 class EngineFlagsTab(BaseConfigTab):
@@ -3517,6 +4393,19 @@ class EngineFlagsTab(BaseConfigTab):
         info.setWordWrap(True)
         info.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
         layout.addWidget(info)
+
+        # Shown only when the loaded config carries an EMPTY engine_env: block.
+        # An empty table would otherwise look like a bug rather than a decision.
+        self._declined_note = QLabel(
+            "This configuration carries an empty engine_env: block — it "
+            "declines every recommended flag, and the launch will also REMOVE "
+            "any of them exported by your shell. Use Restore Recommended to "
+            "take the default set instead.")
+        self._declined_note.setWordWrap(True)
+        self._declined_note.setStyleSheet(
+            "color: #FFB74D; font-size: 10px; padding: 5px;")
+        self._declined_note.setVisible(False)
+        layout.addWidget(self._declined_note)
 
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Variable", "Value"])
@@ -3572,6 +4461,7 @@ class EngineFlagsTab(BaseConfigTab):
 
     def _write_back(self):
         self.config_manager.set_value("engine_env", self._collect_rows())
+        self._refresh_declined_note()
         self.value_changed.emit()
 
     def _on_cell_changed(self, _row, _col):
@@ -3596,13 +4486,37 @@ class EngineFlagsTab(BaseConfigTab):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
         self._set_rows(dict(RECOMMENDED_ENGINE_ENV))
         self._write_back()
+        self._refresh_declined_note()
+
+    def _refresh_declined_note(self):
+        """Show the 'declines every flag' note exactly when it is true.
+
+        It used to be set only in load_from_config, so Restore Recommended left
+        it on screen -- the button the note tells you to press -- and deleting
+        every row wrote an empty block without ever showing it.
+        """
+        # Key it on the PLAN, not on the raw block. engine_env_plan drops
+        # blank-valued entries, so a table whose five value cells were cleared
+        # is just as much a decline as an empty one -- and looked populated,
+        # with the note hidden and nothing saying the launch would strip those
+        # variables out of the inherited environment.
+        from gui_core.preflight import engine_env_plan
+        table, _source = engine_env_plan(self.config_manager.get_config())
+        self._declined_note.setVisible(not table)
 
     def load_from_config(self):
         from gui_core.preflight import RECOMMENDED_ENGINE_ENV
         env = self.config_manager.get_value("engine_env", None)
-        if not isinstance(env, dict) or not env:
+        # An EMPTY dict is a real state -- "this config declines the flags" --
+        # and must be shown as empty. Treating it as "nothing here, show the
+        # defaults" displayed all five as if they would be applied (the launch
+        # in fact REMOVES them), and the first edit to any cell wrote the whole
+        # displayed set back into the config, silently re-injecting exactly what
+        # the config had declined.
+        if not isinstance(env, dict):
             env = dict(RECOMMENDED_ENGINE_ENV)
         self._set_rows(env)
+        self._refresh_declined_note()
 
 
 class ConfigurationPanel(QWidget):
@@ -3755,9 +4669,34 @@ class ConfigurationPanel(QWidget):
                 lambda _v: self.tabs["mesh"].refresh_builtin_topo())
             res_widget.valueChanged.connect(
                 lambda _v: self.tabs["illumination"].refresh_builtin_albedo())
-            # Mesh resolution changes the face count -> refresh the VF estimate.
+            # Mesh resolution changes the face count -> refresh the VF estimate
+            # AND re-evaluate the beaming facet-scale rule, which is a property
+            # of the mesh. Without the second the rule fails open.
             res_widget.valueChanged.connect(
-                lambda _v: self.tabs["radiation"].update_vf_estimate())
+                lambda _v: self.tabs["radiation"].on_mesh_changed())
+
+        # Importing, rescaling or clearing a mesh changes the facet scale.
+        #
+        # Pick the signal that fires AFTER the config is written, not merely the
+        # first one that exists. A QDoubleSpinBox has BOTH textChanged and
+        # valueChanged in Qt6 and emits textChanged FIRST, while add_double_field
+        # writes the config on valueChanged -- so a `textChanged or valueChanged`
+        # lookup re-evaluated the rule against the previous scale factor and
+        # nothing ran afterward. Measured: [('textChanged', '2.500'),
+        # ('valueChanged', 2.5)].
+        for key in ("mesh.import_file", "mesh.scale_factor",
+                    "mesh.use_topographic"):
+            widget = self.tabs["mesh"].widgets.get(key)
+            if widget is None:
+                continue
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                signal = widget.valueChanged
+            elif isinstance(widget, QCheckBox):
+                signal = widget.toggled
+            else:
+                signal = getattr(widget, "textChanged", None)
+            if signal is not None:
+                signal.connect(lambda _v: self.tabs["radiation"].on_mesh_changed())
 
         # Populate cached HORIZONS bodies in combo box
         if self._horizons_panel:

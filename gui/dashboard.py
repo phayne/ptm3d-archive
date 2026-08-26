@@ -1,8 +1,9 @@
 """
 PTM3D Unified Dashboard
 Single-window application with sidebar navigation for the DEM/Mesh and
-Thermal modules. (The Exosphere and Viewshed modules are Paul-only tools kept
-under gui/_private_tools/ and are not part of the public distribution.)
+Thermal modules. (The Exosphere and Viewshed modules were Paul-only tools; they
+were deleted from this repository on 2026-08-03, commit 2b5df5b, and their
+source is kept outside it. There is no gui/_private_tools/ directory.)
 """
 
 import sys

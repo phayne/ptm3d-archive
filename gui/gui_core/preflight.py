@@ -46,26 +46,71 @@ from pathlib import Path
 #
 #   PTM_ILLUM_TRUE_NORMALS=1  flipped-normal overhang shadowing fix (PTM-13
 #                             Phase-2, commit dd09cb8; Fermi gate PASS)
+#   PTM_ILLUM_RISE_EPS=1      enables the rise-epsilon grazing-incidence path
+#                             (traceOccludedRiseEps). It is the GATE: without
+#                             it, RISE_KEPS and RISE_HABS below are never read
+#                             (illumination_model.cpp:616, :1419).
+#   PTM_ILLUM_RISE_KEPS=0.2   the rise-epsilon scale factor validated with it
 #   PTM_ILLUM_RISE_HABS=0     grazing rise-floor leak fix: h_abs = 0 kills
 #                             100% of leaks with zero shadow acne (same gate)
 #   PTM_ILLUM_SEAL_HOLES=1    PTM-18 interior mesh-hole penumbra flash fix
-#   PTM_EQ_PERFACE_FLUX=1     per-face flux equilibration
+#
+# This is the [recommended-ON] set of docs/ENVIRONMENT.md MINUS one variable:
+#
+#   PTM_EQ_PERFACE_FLUX       deliberately NOT injected (PTM-276). On the CPU
+#                             path the engine itself reports it has "NO effect
+#                             on this run"; on the GPU path with
+#                             thermal.spinup_seed: legacy it is LIVE and
+#                             silently overrides the one setting whose whole
+#                             purpose is digit-for-digit reproduction of a
+#                             pre-fix baseline. A config that wants it can
+#                             still ask, in its own engine_env: block.
+#
+# ENV_SET_CHANGED_PHYSICS below records that this table changed on 2026-08-25
+# and that GUI-run physics moved with it.
 #
 # Unknown variables are ignored by older engine builds, so this set is safe
 # to inject unconditionally.
 # --------------------------------------------------------------------------
 RECOMMENDED_ENGINE_ENV = {
     "PTM_ILLUM_TRUE_NORMALS": "1",
+    "PTM_ILLUM_RISE_EPS": "1",
+    "PTM_ILLUM_RISE_KEPS": "0.2",
     "PTM_ILLUM_RISE_HABS": "0",
     "PTM_ILLUM_SEAL_HOLES": "1",
-    "PTM_EQ_PERFACE_FLUX": "1",
 }
+
+#: Variables in the docs/ENVIRONMENT.md [recommended-ON] set that the GUI does
+#: NOT inject, each with the reason. Pinned by
+#: ``src/python/tests/test_gui_engine_env.py``: a variable may be left out only
+#: by appearing here, so the omission is a decision on the record rather than a
+#: table that quietly fell behind the documentation.
+DELIBERATELY_NOT_INJECTED = {
+    "PTM_EQ_PERFACE_FLUX":
+        "PTM-276: inert on CPU (the engine says so), and on GPU it overrides "
+        "an explicit thermal.spinup_seed: legacy. Ask for it per config.",
+}
+
+#: One-line banner for the console: injecting the rise-epsilon gate changed the
+#: physics of every GUI run relative to every GUI run before 2026-08-25.
+ENV_SET_CHANGED_PHYSICS = (
+    "engine environment changed 2026-08-25: PTM_ILLUM_RISE_EPS=1 and "
+    "PTM_ILLUM_RISE_KEPS=0.2 are now injected, so the validated grazing-leak "
+    "fix APPLIES. Every GUI run before this date silently ran without it "
+    "(PTM_ILLUM_RISE_HABS alone is inert). Illumination -- and therefore "
+    "temperatures -- differ from earlier GUI runs of the same config. "
+    "PTM_EQ_PERFACE_FLUX is no longer injected (PTM-276)."
+)
 
 CLOUD_PATH_MARKERS = ("/Library/CloudStorage/",)
 
 # Config fields that hold a single file path: (dotted key, required-if callable)
 _FILE_FIELDS = [
     "mesh.import_file",
+    # The occluder gets the same existence, dataless and cloud checks as the
+    # core mesh: it is read at BVH build time, so an evicted cloud placeholder
+    # here hangs the run in exactly the same way.
+    "mesh.occluder_file",
     "illumination.albedo_map",
     "illumination.positions_file",
     "thermal.thermal_inertia_map",
@@ -103,6 +148,7 @@ class PreflightReport:
     warnings: list = field(default_factory=list)     # non-blocking
     info: list = field(default_factory=list)         # console notes (exe hash etc.)
     vf_rebuild_warning: str = ""                     # PTM-19 guard text, if triggered
+    beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
     executable: Path = None
     project_root: Path = None
@@ -121,6 +167,8 @@ class PreflightReport:
             out.append(f"CLOUD: {f_}: {p}")
         if self.vf_rebuild_warning:
             out.append(f"VF-GUARD: {self.vf_rebuild_warning}")
+        if self.beaming_warning:
+            out.append(f"BEAM-GUARD: {self.beaming_warning}")
         if self.vf_cost_line:
             out.append(f"VF-COST: {self.vf_cost_line}")
         for w in self.warnings:
@@ -535,26 +583,109 @@ def check_env_completeness(env, required=None):
     return problems
 
 
+def engine_env_plan(config):
+    """Decide WHICH variables a config asks for. Returns (table, source).
+
+    A config that carries an ``engine_env:`` mapping is taken at its word: the
+    block IS the environment, so ``engine_env: {}`` means "no fix flags" and a
+    block naming one variable does not silently gain the other four. A config
+    with no ``engine_env:`` key at all has not expressed an opinion, and gets
+    the recommended-ON set.
+
+    Before this distinction existed, ``load_from_yaml`` merged the loaded file
+    into DEFAULT_CONFIG, so every config came back carrying the recommended set
+    whatever it said -- there was no way to write "this run wants nothing".
+    A block that omits a recommended variable still gets a preflight warning
+    from ``check_env_completeness``; honoring it is not the same as endorsing it.
+    """
+    if not isinstance(config, dict) or "engine_env" not in config:
+        return dict(RECOMMENDED_ENGINE_ENV), "recommended-ON default set"
+    block = config.get("engine_env")
+    if not isinstance(block, dict):
+        # `engine_env:` with no mapping under it. Do not read a truncated file
+        # as a request for an empty environment; say so and use the default.
+        return (dict(RECOMMENDED_ENGINE_ENV),
+                "engine_env: present but not a mapping -- ignored, "
+                "recommended-ON default set applied")
+    table = {}
+    for k, v in block.items():
+        k = str(k).strip()
+        if not k:
+            continue
+        if v is None or str(v).strip() == "":
+            continue  # blank value = do not set
+        table[k] = str(v).strip()
+    return table, "engine_env: block in the config"
+
+
+#: Environment variables that OVERRIDE a config key the GUI now writes. An
+#: inherited one silently beats the control the user just set, which is the
+#: exact failure PTM_EQ_PERFACE_FLUX was dropped for -- so they are managed too,
+#: and removed unless a config's engine_env: block asks for them by name.
+#:
+#:   PTM_SPINUP_SEED          ptm_thermal_sim.cpp:15688  thermal.spinup_seed
+#:   PTM_SEED_ANCHOR          :15713                     thermal.seed_anchor
+#:   PTM_ANALYTIC_SEED_CYCLES :15731                     thermal.analytic_seed_cycles
+#:   PTM_COUPLING_MODE        :14143                     radiation.coupling_mode
+#:
+#: The seed anchor is the sharpest: `warm` reads +45 K on the lit population of
+#: the shipped lunar 80N crater, and an exported PTM_SEED_ANCHOR would apply it
+#: while the Thermal tab said `lumped`.
+#:   PTM_HMATRIX_THREADS      hmatrix_view_factor.cpp:1421  radiation.hmatrix_threads
+#:                            ("Env override (highest priority)" in its own
+#:                            comment; the GUI has had a control for this key
+#:                            since before this branch, and EngineFlagsTab's
+#:                            docstring names this variable as THE example extra
+#:                            flag, so users do have it exported)
+#:
+#: NOT managed, deliberately: PTM_RAD_EMISSIVITY and PTM_SOLAR_ALBEDO
+#: (radiation_exchange.cpp:208, :235). Neither overrides a config key the GUI
+#: writes -- they force a radiosity-internal quantity that has no config
+#: equivalent -- and both announce themselves; PTM_RAD_EMISSIVITY additionally
+#: makes the engine's own [kirchhoff] check FAIL the run. Removing a variable
+#: nobody's control claims to own would be overreach.
+CONFIG_OVERRIDING_ENGINE_ENV = (
+    "PTM_SPINUP_SEED",
+    "PTM_SEED_ANCHOR",
+    "PTM_ANALYTIC_SEED_CYCLES",
+    "PTM_COUPLING_MODE",
+    "PTM_HMATRIX_THREADS",
+)
+
+#: The variables this module OWNS: it sets them when the plan asks for them and
+#: REMOVES them when the plan does not. Nothing outside this set is ever taken
+#: out of the inherited environment.
+MANAGED_ENGINE_ENV = tuple(sorted(
+    set(RECOMMENDED_ENGINE_ENV) | set(DELIBERATELY_NOT_INJECTED)
+    | set(CONFIG_OVERRIDING_ENGINE_ENV)))
+
+
 def build_engine_env(config, base_env=None):
-    """Compose the subprocess environment: inherited env + recommended-ON
-    set + the user's Engine Flags table (config['engine_env']), which wins.
-    Returns (env, applied) where applied lists 'KEY=VAL' lines actually set."""
+    """Compose the subprocess environment: inherited env, then the managed
+    variables forced to exactly what ``engine_env_plan`` says.
+
+    Setting is not enough. The launching shell may already export
+    ``PTM_EQ_PERFACE_FLUX=1``, and merely declining to add it would leave the
+    child running with it -- so a config that says "no fix flags", or a
+    ``thermal.spinup_seed: legacy`` run that must not be overridden (PTM-276),
+    would silently get it anyway while this function reported an empty
+    environment. Managed variables the plan omits are therefore REMOVED from the
+    inherited environment, and the removal is reported.
+
+    Returns (env, applied); `applied` lists what was set AND what was removed,
+    because a run's disclosure has to describe the environment the engine
+    actually sees.
+    """
     env = dict(base_env if base_env is not None else os.environ)
-    table = dict(RECOMMENDED_ENGINE_ENV)
-    user_table = config.get("engine_env", {}) if isinstance(config, dict) else {}
-    if isinstance(user_table, dict):
-        for k, v in user_table.items():
-            k = str(k).strip()
-            if not k:
-                continue
-            if v is None or str(v).strip() == "":
-                table.pop(k, None)  # blank value = do not set / unset default
-            else:
-                table[k] = str(v).strip()
+    table, _source = engine_env_plan(config)
     applied = []
     for k in sorted(table):
         env[k] = table[k]
         applied.append(f"{k}={table[k]}")
+    for k in MANAGED_ENGINE_ENV:
+        if k not in table and k in env:
+            inherited = env.pop(k)
+            applied.append(f"{k}=(removed; inherited {inherited!r})")
     env["PYTHON_EXECUTABLE"] = sys.executable
     return env, applied
 
@@ -569,6 +700,9 @@ def absolutize_config_paths(config, project_root):
     cfg = deepcopy(config)
     path_fields = _FILE_FIELDS + _DATA_DIR_FIELDS + [
         "radiation.view_factor_file",
+        # An OUTPUT path, so it is absolutized but not existence-checked: it is
+        # the file this run will write, not one it must find.
+        "thermal.final_state_file",
         "output.directory",
     ]
     data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)
@@ -752,15 +886,57 @@ def run_preflight(config, find_executable, project_root=None):
             report.info.extend(est.lines)
             report.warnings.extend(est.warnings)
 
+    # -- Beaming facet-scale guard -------------------------------------------
+    # The configuration tab shows the rule, but a label on a tab is not a gate:
+    # a user can enable beaming on a lunar icosphere and then import a
+    # millimeter-scale mesh, and nothing outside that tab would ever mention it
+    # again. The tab deliberately does NOT rewrite the setting -- silently
+    # changing someone's physics is the failure this stage exists to remove --
+    # so the launch is where it has to be asked. Same shape as the PTM-19
+    # view-factor guard: a warning with an explicit override.
+    if rad.get("beaming", False) and not rad.get("enabled", False):
+        # Inert, and the run would say nothing about it. Warn rather than let
+        # a Lambertian result be read as a beaming one.
+        report.warnings.append(
+            "beaming: radiation.beaming is ON but radiation.enabled is off, so "
+            "the engine ignores it entirely -- it reads that key only on the "
+            "radiation path. This run will be Lambertian and will not say so.")
+    elif rad.get("beaming", False):
+        try:
+            from gui_core.facet_scale import beaming_policy
+            policy = beaming_policy(config, project_root)
+            if not policy.allowed:
+                report.beaming_warning = (
+                    "radiation.beaming is ON and this mesh does not meet the "
+                    "facet-scale rule, so the sub-facet roughness model would "
+                    "be applied on top of roughness the mesh already resolves "
+                    "(double-counting). " + policy.reason)
+            elif policy.needs_acknowledgment:
+                report.warnings.append("beaming: " + policy.reason)
+            else:
+                report.info.append("beaming: " + policy.reason)
+        except Exception as e:                       # advisory, never a crash
+            report.warnings.append(
+                f"beaming: the facet-scale rule could not be evaluated ({e}); "
+                f"confirm this mesh is far coarser than the roughness scale.")
+
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
+    _table, env_source = engine_env_plan(config)
     problems = check_env_completeness(env)
     if problems:
-        # build_engine_env always applies the recommended set, so problems
-        # here mean the user's Engine Flags table removed/changed one.
+        # A problem here means this config's own engine_env: block dropped or
+        # changed a recommended variable. Honoring the block is the point; not
+        # saying so would be the old silence.
         for p in problems:
             report.warnings.append(f"engine env: {p}")
-    report.info.append("engine env: " + " ".join(applied))
+    report.info.append(f"engine env source: {env_source}")
+    report.info.append("engine env: " + (" ".join(applied) or "(none)"))
+    # A physics change is not a footnote. Warn, not info, so the console
+    # classifier colors it and a colleague comparing against an older GUI run
+    # of the same config is told why the numbers moved.
+    if env.get("PTM_ILLUM_RISE_EPS") == "1":
+        report.warnings.append(ENV_SET_CHANGED_PHYSICS)
 
     return report
 
@@ -800,6 +976,30 @@ def confirm_preflight(parent, report):
         msg.setInformativeText("\n".join(lines))
         msg.exec()
         return False
+
+    if report.beaming_warning:
+        msg = QMessageBox(parent)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Beaming on a fine mesh")
+        msg.setText(report.beaming_warning)
+        msg.setInformativeText(
+            "The configuration is left exactly as you set it either way -- "
+            "nothing here rewrites your physics. Cancel to turn beaming off on "
+            "the Radiation page, or confirm to run as configured.")
+        override = QCheckBox("Run anyway -- this mesh does not resolve "
+                             "sub-facet slopes")
+        msg.setCheckBox(override)
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok |
+                               QMessageBox.StandardButton.Cancel)
+        # BOTH the button and the box. The two older dialogs below consult only
+        # the checkbox, so Cancel with the box ticked launches anyway -- which
+        # is survivable there because they do not mention the buttons, but this
+        # one's own text tells the user to press Cancel. (The same bug in the
+        # cloud-path and view-factor dialogs is pre-existing and out of scope
+        # for this branch; it is owed as a ledger row.)
+        clicked = msg.exec()
+        if clicked != QMessageBox.StandardButton.Ok or not override.isChecked():
+            return False
 
     if report.cloud_paths:
         msg = QMessageBox(parent)

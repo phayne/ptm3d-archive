@@ -487,6 +487,24 @@ _GM_SUN = 1.32712440018e20  # m^3/s^2
 _AU_METERS = 1.496e11       # meters per AU
 
 
+def _as_number(value, fallback):
+    """Coerce a YAML scalar for comparison, never raising.
+
+    These helpers read straight from the config, where yaml.safe_load may have
+    left a str (a quoted number, or `5e3`), None (a bare `key:`), or a
+    non-finite float. A bare `<=` on any of those raises, and every caller here
+    is reached from a Qt slot -- where an escaping exception is a process abort
+    (PyQt6 qFatal, exit 134), not an error message.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if number != number or number in (float("inf"), float("-inf")):
+        return fallback
+    return number
+
+
 def compute_synodic_day_days(config_manager):
     """Compute synodic day from generic_body config data (Kepler + rotation).
 
@@ -495,8 +513,11 @@ def compute_synodic_day_days(config_manager):
     """
     import math
 
-    a_au = config_manager.get_value("generic_body.orbit.semi_major_axis_au", -1.0)
-    period_hours = config_manager.get_value("generic_body.spin.period_hours", -1.0)
+    a_au = _as_number(
+        config_manager.get_value("generic_body.orbit.semi_major_axis_au", -1.0),
+        -1.0)
+    period_hours = _as_number(
+        config_manager.get_value("generic_body.spin.period_hours", -1.0), -1.0)
 
     if a_au <= 0 or period_hours <= 0:
         return None
@@ -521,6 +542,7 @@ def get_synodic_period_days(config_manager, body_name=None):
     if body_name is None:
         body_name = config_manager.get_value("simulation.body", "Europa")
 
+    body_name = str(body_name or "")
     clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
 
     computed = compute_synodic_day_days(config_manager)
@@ -530,7 +552,13 @@ def get_synodic_period_days(config_manager, body_name=None):
     if clean_name in BODY_SYNODIC_PERIODS:
         return BODY_SYNODIC_PERIODS[clean_name]
 
-    return config_manager.get_value("simulation.duration_days", 3.55)
+    # The last resort returns the RAW config scalar, which then becomes
+    # _current_synodic_days on two tabs and is multiplied and compared there.
+    # Coerced for the same reason as everything else in this module: an
+    # uncached body (Custom, an uncached [H] ...) plus a quoted or
+    # exponent-spelled duration was a process abort.
+    return _as_number(
+        config_manager.get_value("simulation.duration_days", 3.55), 3.55)
 
 
 # Orbital period (year) in Earth days for built-in bodies.
@@ -553,7 +581,9 @@ def compute_orbital_period_days(config_manager):
     """
     import math
 
-    a_au = config_manager.get_value("generic_body.orbit.semi_major_axis_au", -1.0)
+    a_au = _as_number(
+        config_manager.get_value("generic_body.orbit.semi_major_axis_au", -1.0),
+        -1.0)
     if a_au <= 0:
         return None
 
@@ -570,6 +600,7 @@ def get_orbital_period_days(config_manager, body_name=None):
     if body_name is None:
         body_name = config_manager.get_value("simulation.body", "Europa")
 
+    body_name = str(body_name or "")
     clean_name = body_name[4:] if body_name.startswith("[H] ") else body_name
 
     computed = compute_orbital_period_days(config_manager)
@@ -698,6 +729,9 @@ def compute_equilibrium_temperature(albedo, emissivity, rAU):
 
     Uses S = 1361 / rAU² for solar constant at heliocentric distance rAU.
     """
+    rAU = _as_number(rAU, 0.0)
+    emissivity = _as_number(emissivity, 0.0)
+    albedo = _as_number(albedo, 0.0)
     if rAU <= 0 or emissivity <= 0:
         return 270.0  # Fallback
     S = 1361.0 / (rAU * rAU)

@@ -676,37 +676,39 @@ class PTM3DMainWindow(QMainWindow):
             )
             return
 
-        # Auto-save so the run never blocks on a forced "save before running"
-        # dialog. If a project file is already open, save in place and run it
-        # as-is (unchanged behavior). If there is no project file yet, write an
-        # engine-facing config into the output directory with every path
-        # absolutized against the project root (save_run_yaml) and run THAT --
-        # absolutized paths resolve regardless of the YAML's location, so no
-        # relative-path is ever mis-resolved against the output dir. We do not
-        # promote the auto-saved file to "the project file", so a subsequent run
-        # re-writes it absolutized rather than as a relative-path save_to_yaml.
-        # The manual Save button still uses save_to_yaml (relative paths), so
-        # this does NOT change what a hand-saved project YAML looks like.
+        # A run NEVER writes the file the user opened. Running used to call
+        # save_project() first, which is yaml.dump of the merged dictionary
+        # over the author's own file: on the two shipped examples that erased
+        # 10 and 19 comments, added 33 and 42 keys, and silently changed
+        # illumination.albedo_maps_directory to ''. A config is a scientific
+        # record; a run that rewrites its own inputs cannot be audited
+        # afterward. Opening is now read-only, and the project file changes
+        # only when the user presses Save or Save As.
+        #
+        # What runs instead is an engine-facing YAML written BESIDE the output
+        # directory, with every path absolutized against the project root
+        # (save_run_yaml) -- absolutized paths resolve regardless of the YAML's
+        # location, so nothing is mis-resolved against the output dir. It is
+        # not promoted to "the project file".
         config_dict = self.config_manager.get_config()
-        if self.current_project_file:
-            self.save_project()
-            run_config_path = self.current_project_file
-        else:
-            from gui_core.preflight import find_project_root, resolve_path
-            exe = SimulationRunner.find_ptm_executable()
-            root = find_project_root(exe) if exe else Path.cwd()
-            output_dir = resolve_path(config_dict["output"]["directory"], root)
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                run_config_path = str(output_dir / "config.yaml")
-                self.config_manager.save_run_yaml(run_config_path, root)
-                self.add_recent_file(run_config_path)
-                self.console_panel.append_info(
-                    f"Auto-saved run config to: {run_config_path}")
-            except Exception as e:
-                QMessageBox.critical(
-                    self, "Error", f"Failed to write run config:\n{str(e)}")
-                return
+        from gui_core.preflight import find_project_root, resolve_path
+        exe = SimulationRunner.find_ptm_executable()
+        root = find_project_root(exe) if exe else Path.cwd()
+        output_dir = resolve_path(config_dict["output"]["directory"], root)
+        run_config_path = str(output_dir / "config.yaml")
+        # Refuse to land on the user's own file even if the output directory
+        # happens to hold it.
+        if self.current_project_file and Path(run_config_path).resolve() == \
+                Path(self.current_project_file).resolve():
+            run_config_path = str(output_dir / "config_run.yaml")
+
+        # Clear the console HERE, not after the pre-flight. It used to be
+        # cleared just before the "Starting Simulation" header, which erased
+        # every [preflight] line the user had just been shown -- including the
+        # engine-environment banner that discloses a change in physics, and the
+        # cloud-path and view-factor advisories.
+        self.console_panel.clear()
+        self.console_panel.append_header("Starting Simulation")
 
         # Pre-flight validation: paths exist and are readable, no dataless
         # (cloud placeholder) files, cloud-path override, disk space, VF
@@ -715,9 +717,31 @@ class PTM3DMainWindow(QMainWindow):
         # diagnosis (e.g. an OneDrive topo_directory of evicted files).
         report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
         for line in report.summary_lines():
-            self.console_panel.append_info(f"[preflight] {line}")
+            # summary_lines() already tags severity; route it so a warning is
+            # colored as one. Everything went through append_info before, which
+            # made "WARNING: engine environment changed ..." look like a note.
+            if line.startswith(("ERROR:", "DATALESS:")):
+                self.console_panel.append_error(f"[preflight] {line}")
+            elif line.startswith(("WARNING:", "CLOUD:", "VF-GUARD:",
+                                  "BEAM-GUARD:")):
+                self.console_panel.append_warning(f"[preflight] {line}")
+            else:
+                self.console_panel.append_info(f"[preflight] {line}")
         if not confirm_preflight(self, report):
             self.console_panel.append_warning("Launch canceled by pre-flight check")
+            return
+
+        # The run YAML is written only once the launch is going ahead. Writing
+        # it before the gate left a config.yaml in the output directory after a
+        # blocked or canceled launch -- overwriting the previous run's record
+        # with a configuration that never ran, while the tutorial tells the user
+        # this file "is the exact configuration that ran".
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self.config_manager.save_run_yaml(run_config_path, root)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to write run config:\n{str(e)}")
             return
 
         # Create simulation thread (cwd is pinned to the project root and the
@@ -742,10 +766,15 @@ class PTM3DMainWindow(QMainWindow):
             self.progress_bar.setValue(0)
             self.update_simulation_status("running")
 
-            # Clear and start console
-            self.console_panel.clear()
-            self.console_panel.append_header("Starting Simulation")
-            self.console_panel.append_info(f"Config: {self.current_project_file}")
+            # The engine's config is the generated run YAML, not the project
+            # file. Naming the project file here said the run read a file it
+            # never opens. (The console was cleared before the pre-flight, so
+            # those lines are still on screen above this one.)
+            self.console_panel.append_info(f"Config: {run_config_path}")
+            if self.current_project_file:
+                self.console_panel.append_info(
+                    f"Project file NOT modified: {self.current_project_file} "
+                    f"(use Save to write your edits back to it)")
 
             # Start
             self.simulation_thread.start()

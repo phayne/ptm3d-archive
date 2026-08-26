@@ -148,7 +148,18 @@ class ThermalModule(AbstractModule):
         config_dict = self._cm.get_config()
         report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
         for line in report.summary_lines():
-            self._console.append_info(f"[THERMAL][preflight] {line}")
+            # Route by the severity tag summary_lines() already applies. The
+            # main window was fixed the same way, and this shares the same
+            # run_preflight -- so the engine-environment banner and the
+            # BEAM-GUARD line were rendering here as plain notes.
+            tagged = f"[THERMAL][preflight] {line}"
+            if line.startswith(("ERROR:", "DATALESS:")):
+                self._console.append_error(tagged)
+            elif line.startswith(("WARNING:", "CLOUD:", "VF-GUARD:",
+                                  "BEAM-GUARD:")):
+                self._console.append_warning(tagged)
+            else:
+                self._console.append_info(tagged)
         if not confirm_preflight(self._widget, report):
             self._console.append_warning(
                 "[THERMAL] Launch canceled by pre-flight check")

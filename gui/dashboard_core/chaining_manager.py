@@ -16,8 +16,8 @@ class ChainingManager(QObject):
     chain_updated = pyqtSignal(str, str, str)  # source_module, output_key, value
 
     # Chain definitions: (source_module, output_key) -> [(target_module, input_key)]
-    # The Exosphere and Viewshed modules were moved out of the public build
-    # (gui/_private_tools/); their chain targets were removed with them.
+    # The Exosphere and Viewshed modules were deleted from this repository on
+    # 2026-08-03 (commit 2b5df5b); their chain targets went with them.
     CHAINS = {
         ("dem", "mesh_file"): [
             ("thermal", "mesh_file"),

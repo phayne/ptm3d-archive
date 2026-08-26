@@ -29,8 +29,12 @@ local disk, not in a cloud-synced folder.
 ### 1. Simulation Configuration
 - **Tabbed Interface**: Organized parameter settings for Simulation, Mesh, Thermal, Radiation, Illumination, and Output
 - **YAML Preview**: Live preview of configuration as you edit
-- **Presets**: Quick-start configurations for common scenarios
 - **Validation**: Real-time configuration validation before running
+
+There are **no presets**. This list advertised them for months while
+`ConfigManager.PRESETS` was unreachable code -- no menu, no button, no dialog
+ever loaded one. The table has been removed; a reachable replacement is
+designed in `docs/design/gui-update-plan.md` (item 2.3).
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
@@ -231,10 +235,11 @@ repository `.gitattributes` `export-ignore` rules:
 git archive --format=tar.gz -o ptm3d.tar.gz HEAD
 ```
 
-This excludes per-developer settings (`.claude/`, `gui/.claude/`) and the
-Paul-only tools staged under `gui/_private_tools/` (batch runs, exosphere,
-viewshed). A raw `tar`/`cp -r` of the working tree does **not** honor those
-rules and would leak the excluded paths — use `git archive`.
+This excludes per-developer settings (`.claude/`, `gui/.claude/`). A raw
+`tar`/`cp -r` of the working tree does **not** honor those rules and would leak
+the excluded paths — use `git archive`. The Paul-only tools (batch runs,
+exosphere, viewshed) are no longer staged in this repository at all: they were
+deleted on 2026-08-03 (commit `2b5df5b`), so there is nothing left to exclude.
 
 Some input datasets (SPICE kernels, DEMs, view factors) are large and are not
 bundled; see the top-level data/distribution docs. If the GUI is run against a
