@@ -5226,7 +5226,14 @@ class TaskCardsTab(BaseConfigTab):
             return None
         try:
             exe = SimulationRunner.find_ptm_executable()
-            current = executable_fingerprint(exe)[1] if exe else ""
+            # [0] is the md5; [1] is the MTIME. Taking [1] meant the card
+            # compared a timestamp against engine_binary_md5 and printed
+            # "DIFFERENT BINARY ... yours is 2026-08-25 22:38:41" every single
+            # time -- a false alarm on the one thing this card exists to
+            # settle, and the "Your binary IS the baseline's" branch could
+            # never be reached. The unit tests exercised compare_binary
+            # directly and so never saw the wiring.
+            current = executable_fingerprint(exe)[0] if exe else ""
         except Exception:
             current = ""
         lines = [f"Loaded {config_path}", compare_binary(provenance, current)]

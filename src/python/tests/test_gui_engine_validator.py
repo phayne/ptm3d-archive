@@ -365,7 +365,61 @@ def test_the_bvh_cache_follows_the_engines_data_root_contract():
         f"different cache locations -- silently.")
 
 
+def test_only_the_engines_own_data_root_keys_follow_that_contract():
+    """`_ENGINE_DATA_ROOT_FIELDS` is transcribed, not inferred.
+
+    thermal.eq_indirect_flux_file looks exactly like a data path and is not
+    one: config_parser.cpp's resolveDataPath block does not list it, so the
+    engine opens the raw string relative to the process working directory.
+    Resolving it under PTM_DATA_ROOT made the GUI's run YAML point somewhere a
+    CLI run of the same config would not look -- and this file always wins over
+    eq_indirect_source, so the divergence changes the deep answer.
+    """
+    import os
+    preflight = _preflight()
+    manager = _manager()
+    manager.set_value("thermal.eq_indirect_flux_file", "data/qind.bin")
+    # mesh.import_file, not albedo_map: the writer clears albedo_map in
+    # built-in mode, so it would test nothing here.
+    manager.set_value("mesh.import_file", "data/meshes/core.ply")
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = os.environ.get("PTM_DATA_ROOT")
+        os.environ["PTM_DATA_ROOT"] = tmp
+        try:
+            out = preflight.absolutize_config_paths(
+                manager._config_for_yaml(), REPO_ROOT)
+        finally:
+            if previous is None:
+                os.environ.pop("PTM_DATA_ROOT", None)
+            else:
+                os.environ["PTM_DATA_ROOT"] = previous
+    assert not out["thermal"]["eq_indirect_flux_file"].startswith(tmp), (
+        f"eq_indirect_flux_file resolved under PTM_DATA_ROOT "
+        f"({out['thermal']['eq_indirect_flux_file']}); the engine does not")
+    assert out["mesh"]["import_file"].startswith(tmp), (
+        f"a key the engine DOES resolve that way stopped doing so: "
+        f"{out['mesh']['import_file']}")
+
+    # And the list is the engine's, key for key.
+    engine_keys = set(preflight._ENGINE_DATA_ROOT_FIELDS)
+    source = (REPO_ROOT / "src" / "cpp" / "tools" / "config_parser.cpp")
+    if source.exists():
+        import re
+        text = source.read_text()
+        block = text.split("resolution contract", 1)[-1]
+        named = set(re.findall(r'resolveDataPath\([^;]*?"([a-z_]+\.[a-z_.]+)"',
+                               block, re.S))
+        # generic_body.mesh_file is the engine's own key for a field the GUI
+        # writes as generic_body.shape.mesh_file; not comparable by name.
+        named.discard("generic_body.mesh_file")
+        missing = named - engine_keys
+        assert not missing, (
+            f"the engine resolves these through PTM_DATA_ROOT and the GUI "
+            f"does not: {sorted(missing)}")
+
+
 TESTS = [
+    test_only_the_engines_own_data_root_keys_follow_that_contract,
     test_the_document_checked_is_the_document_that_will_run,
     test_a_crashing_engine_is_not_a_config_refusal,
     test_the_bvh_cache_follows_the_engines_data_root_contract,

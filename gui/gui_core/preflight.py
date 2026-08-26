@@ -136,6 +136,34 @@ _DATA_PATH_NO_EXISTENCE_CHECK = [
     "illumination.bvh_cache_file",
 ]
 
+#: EXACTLY the keys the engine resolves through resolveDataPath
+#: (config_parser.cpp, the "Apply the PTM_DATA_ROOT resolution contract" block).
+#: Transcribed from that list, not inferred from "it looks like a path".
+#:
+#: Being on _FILE_FIELDS is about the pre-flight EXISTENCE check; being here is
+#: about how a relative `data/...` value RESOLVES, and the two sets are not the
+#: same. thermal.eq_indirect_flux_file, thermal.initial_state_file,
+#: illumination.positions_file and generic_body.config_file are read by the
+#: engine as plain paths relative to the process working directory, so
+#: resolving them under PTM_DATA_ROOT made the GUI's run YAML point somewhere
+#: a CLI run of the same config would not look -- silently, and for the
+#: indirect-flux file that changes the deep answer.
+_ENGINE_DATA_ROOT_FIELDS = [
+    "mesh.import_file",
+    "mesh.occluder_file",
+    "mesh.topo_directory",
+    "thermal.thermal_inertia_map",
+    "thermal.h_parameter_map",
+    "thermal.heat_flow_mask_file",
+    "thermal.property_maps_directory",
+    "illumination.albedo_map",
+    "illumination.albedo_maps_directory",
+    "illumination.bvh_cache_file",
+    "output.locations_file",
+    "output.depths_file",
+    "generic_body.spice_metakernel",
+]
+
 # Config fields that hold a directory that will be READ during the run.
 _DATA_DIR_FIELDS = [
     "mesh.topo_directory",
@@ -723,8 +751,7 @@ def absolutize_config_paths(config, project_root):
     # silent: the GUI would write <project_root>/cache/site.bvh into the run
     # YAML while the engine alone would have used $PTM_DATA_ROOT/cache/site.bvh,
     # and the BVH cache would be written and read in different places.
-    data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS
-                      + _DATA_PATH_NO_EXISTENCE_CHECK)
+    data_fields = set(_ENGINE_DATA_ROOT_FIELDS)
     for dotted in path_fields:
         val = get_config_value(cfg, dotted)
         if not val:

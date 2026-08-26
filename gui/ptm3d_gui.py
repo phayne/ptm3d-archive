@@ -619,7 +619,11 @@ class PTM3DMainWindow(QMainWindow):
                        ", ".join(touched[:8]) +
                        (", ..." if len(touched) > 8 else "")
                        if touched else "none -- the file is unchanged"))
-            if mode == "in_place":
+            if mode == "unchanged":
+                self.console_panel.append_info(
+                    "Nothing to write: the file already matches this project, "
+                    "so it was left untouched.")
+            elif mode == "in_place":
                 self.console_panel.append_info(
                     "Comments and layout preserved.")
             elif mode == "copied_to_new_file":

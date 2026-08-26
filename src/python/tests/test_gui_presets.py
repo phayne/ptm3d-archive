@@ -162,6 +162,48 @@ def test_the_crater_preset_refuses_beaming_on_a_millimeter_mesh():
         assert manager.get_value("radiation.coupling_mode") == "bounded"
 
 
+def test_the_crater_preset_will_not_enable_beaming_with_no_mesh():
+    """Ordering must not defeat the rule.
+
+    The card lists mesh.import_file under "Still needed", so when it runs there
+    IS no mesh -- and facet_scale falls back to the global icosphere, which on
+    a Moon ico5 reports 43 km and sails through. Reproduced: the card printed
+    "Beaming ON at w = 32.5 deg. facet scale 43.04 km (20,480 faces,
+    icosphere)". The user then imports the real core mesh, and
+    _update_beaming_gating deliberately does not turn an inherited setting off,
+    so the config carries beaming at a scale the rule would have refused.
+    """
+    from gui_core.presets import PRESETS_BY_KEY, apply_preset
+    manager = _manager()
+    assert manager.get_value("mesh.import_file") == ""
+    result = apply_preset(manager, PRESETS_BY_KEY["lunar_polar_crater"])
+    assert manager.get_value("radiation.beaming") is False, (
+        "beaming was enabled from the facet scale of a mesh the card was "
+        "simultaneously telling the user to import")
+    assert manager.get_value("radiation.rms_slope_deg") == 0.0
+    reason = dict(result.refused).get("radiation.beaming", "")
+    assert "no core mesh" in reason, reason
+    assert "Radiation tab" in reason, (
+        f"the refusal does not say where to turn it on later: {reason}")
+    # ...and the rest of the crater setup still happened.
+    assert manager.get_value("radiation.enabled") is True
+
+
+def test_the_generic_body_card_does_not_promise_a_page_it_cannot_show():
+    """The Body page is gated on a custom body being ACTIVE, not on the tier.
+
+    needs_advanced would make the card claim "the sections holding the fields
+    above have been opened" while the Body nav row stayed hidden -- measured:
+    advanced on, Body hidden, generic_body_active False.
+    """
+    from gui_core.presets import PRESETS_BY_KEY
+    preset = PRESETS_BY_KEY["generic_body"]
+    assert preset.needs_advanced is False
+    joined = " ".join(preset.needs)
+    assert "HORIZONS" in joined, (
+        f"the card does not say how to make the Body page appear: {joined}")
+
+
 def test_the_crater_preset_turns_beaming_on_when_the_rule_passes():
     from gui_core.presets import (PRESETS_BY_KEY, apply_preset,
                                   LUNAR_RMS_SLOPE_DEG)
@@ -404,6 +446,38 @@ def test_the_baseline_card_honors_the_files_engine_env():
         assert manager.get_value("thermal.spinup_seed") == "legacy"
 
 
+def test_the_baseline_card_compares_the_md5_not_the_mtime():
+    """executable_fingerprint returns (md5, mtime). Taking [1] compared a
+    TIMESTAMP against engine_binary_md5, so the card printed "DIFFERENT
+    BINARY ... yours is 2026-08-25 22:38:41" every time and could never reach
+    the "Your binary IS the baseline's" branch -- a false alarm on the one
+    thing the card exists to settle. compare_binary's own unit test could not
+    see it; only the wiring can.
+    """
+    from gui_core.preflight import executable_fingerprint
+    from gui_core.simulation_runner import SimulationRunner
+    exe = SimulationRunner.find_ptm_executable()
+    if not exe:
+        raise Skip("no ptm_thermal_sim to fingerprint")
+    md5, mtime = executable_fingerprint(exe)
+    assert len(md5) == 32 and all(c in "0123456789abcdef" for c in md5), md5
+
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        run = Path(scratch) / "same_binary_run"
+        run.mkdir(exist_ok=True)
+        (run / "config_used.yaml").write_text("simulation:\n  body: Moon\n")
+        (run / "provenance.txt").write_text(
+            f"engine_binary_md5={md5}\nengine_git_sha=deadbeef\n")
+        panel.tabs["start"].apply_baseline(str(run))
+        report = panel.tabs["start"].report_text("reproduce_baseline")
+        assert "IS the baseline" in report, (
+            f"a run produced by the CURRENT binary was reported as a "
+            f"different one:\n{report}")
+        assert mtime not in report, (
+            "the mtime reached the comparison")
+
+
 def test_loading_a_baseline_detaches_the_users_project_file():
     """Otherwise the next Ctrl+S writes the BASELINE over the user's own file.
 
@@ -466,6 +540,8 @@ TESTS = [
     test_every_preset_writes_only_engine_keys,
     test_a_preset_reports_exactly_what_it_set,
     test_the_crater_preset_refuses_beaming_on_a_millimeter_mesh,
+    test_the_crater_preset_will_not_enable_beaming_with_no_mesh,
+    test_the_generic_body_card_does_not_promise_a_page_it_cannot_show,
     test_the_crater_preset_turns_beaming_on_when_the_rule_passes,
     test_europa_and_generic_body_presets_never_ask_for_beaming,
     test_a_global_preset_clears_an_inherited_import_mesh,
@@ -477,6 +553,7 @@ TESTS = [
     test_a_preset_config_is_accepted_by_test_config_parity_rules,
     test_reproduce_a_baseline_reads_the_runs_own_record,
     test_the_baseline_card_honors_the_files_engine_env,
+    test_the_baseline_card_compares_the_md5_not_the_mtime,
     test_loading_a_baseline_detaches_the_users_project_file,
     test_the_card_applies_through_the_panel_and_the_tabs_follow,
 ]

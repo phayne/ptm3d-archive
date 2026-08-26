@@ -173,11 +173,18 @@ PRESETS = [
             "generic_body.ephemeris_source": "auto",
         },
         beaming="off",
-        needs_advanced=True,
+        # NOT needs_advanced: nothing this card names sits behind an Advanced
+        # SECTION. generic_body.* lives on the Body page, which is gated on a
+        # custom body actually being active -- a relevance gate, not a tier --
+        # and this preset does not make one active. Claiming "the sections
+        # holding the fields above have been opened" was measurably false:
+        # advanced on, Body still hidden, generic_body_active False.
         needs=(
-            "generic_body.name and generic_body.config_file -- fetch them from "
-            "the HORIZONS page",
-            "generic_body.shape -- a radius, semi-axes, or a shape mesh",
+            "a custom body -- use the HORIZONS page to search for one and "
+            "cache its body_config.yaml. The Body page appears once a custom "
+            "body is active; until then there is nothing for it to describe.",
+            "generic_body.shape -- a radius, semi-axes, or a shape mesh, on "
+            "the Body page",
         ),
         beaming_note=(
             "Beaming is offered for lunar bodies only: w = 32.5 deg is a lunar "
@@ -232,7 +239,32 @@ def apply_preset(config_manager, preset, project_root=None):
         result.applied[key] = value
 
     # --- the beaming rule, evaluated on the config this preset just built ---
-    if preset.beaming == "on":
+    if preset.beaming == "on" and not str(
+            config_manager.get_value("mesh.import_file", "") or "").strip():
+        # NO MESH YET, so there is nothing to measure. facet_scale falls back
+        # to the global icosphere, which on a Moon ico5 reports 43 km and sails
+        # through the rule -- so the card turned beaming ON from the facet
+        # scale of a mesh it was simultaneously telling the user to go and
+        # import. The user then loads the real core mesh, and
+        # _update_beaming_gating deliberately does NOT turn an inherited
+        # setting off, so the config carries beaming at a scale the rule would
+        # have refused. Reproduced: "Beaming ON at w = 32.5 deg. facet scale
+        # 43.04 km (20,480 faces, icosphere ...)".
+        #
+        # Ordering defeats the guarantee, so refuse on ordering.
+        config_manager.set_value("radiation.beaming", False)
+        config_manager.set_value("radiation.rms_slope_deg", 0.0)
+        result.applied["radiation.beaming"] = False
+        result.applied["radiation.rms_slope_deg"] = 0.0
+        result.refused.append((
+            "radiation.beaming",
+            "no core mesh is loaded yet, so the facet-scale rule has nothing "
+            "to measure -- and measuring the default icosphere instead would "
+            "pass a rule written about the mesh you are about to import. "
+            "Import the core mesh, then tick Enable Beaming on the Radiation "
+            "tab, where the rule measures THAT mesh and refuses if it is at "
+            "the roughness scale."))
+    elif preset.beaming == "on":
         from gui_core.facet_scale import beaming_policy
         try:
             policy = beaming_policy(config_manager.get_config(), project_root)
