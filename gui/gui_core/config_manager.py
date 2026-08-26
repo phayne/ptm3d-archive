@@ -1438,6 +1438,16 @@ class ConfigManager:
             if num(rad.get("aca_tolerance"), 0.0) <= 0:
                 errors.append("Radiation: aca_tolerance must be positive")
 
+        # coupling_mode: the engine compares it EXACTLY and makes a mismatch a
+        # startup FATAL (ptm_thermal_sim.cpp:14184). There was no check here at
+        # all, so `Bounded` passed the launch gate and died in the engine.
+        mode = str(rad.get("coupling_mode", "bounded") or "")
+        if mode not in ("bounded", "fixed", "legacy"):
+            errors.append(
+                f"Radiation: coupling_mode is {mode!r}; the engine compares it "
+                f"exactly against bounded | fixed | legacy and refuses "
+                f"anything else at startup, including a different case.")
+
         # The switch needs the knob. OUTSIDE the `enabled` branch on purpose:
         # the engine's check is unconditional (ptm_thermal_sim.cpp:13591 sits in
         # plain config application, not behind the radiation gate), and the
@@ -1671,20 +1681,26 @@ class ConfigManager:
         #
         # An unrecognized value is a WARNING, not an error, because that is
         # what it does: the chain falls through and the run writes nothing.
+        # ERRORS, not warnings. The previous pass widened the valid sets
+        # correctly and then also downgraded the severity, which let
+        # `format: Binary` or `bianry` through the launch gate: the engine's
+        # writer is an if/else chain that falls through, so a multi-hour run
+        # completes having written no field output at all. The engine refuses
+        # nothing here, which is exactly why the GUI must.
         valid_formats = ["binary", "vtk", "none"]
         if out_cfg.get("format") not in valid_formats:
-            warnings.append(
-                f"Warning: output.format is {out_cfg.get('format')!r}. The "
-                f"engine recognizes {', '.join(valid_formats)} and silently "
-                f"writes NO output for anything else -- it does not refuse the "
-                f"run.")
+            errors.append(
+                f"output.format is {out_cfg.get('format')!r}; it must be one "
+                f"of {', '.join(valid_formats)}. The engine does NOT refuse "
+                f"anything else -- it falls through and writes no field "
+                f"output, so a whole run can finish with nothing to show.")
 
         valid_vtk_modes = ["thermal", "complete", "both", "none"]
         if out_cfg.get("vtk_mode") not in valid_vtk_modes:
-            warnings.append(
-                f"Warning: output.vtk_mode is {out_cfg.get('vtk_mode')!r}. The "
-                f"engine recognizes {', '.join(valid_vtk_modes)} and writes no "
-                f"VTK for anything else -- it does not refuse the run.")
+            errors.append(
+                f"output.vtk_mode is {out_cfg.get('vtk_mode')!r}; it must be "
+                f"one of {', '.join(valid_vtk_modes)}. The engine writes no "
+                f"VTK for anything else and does not say so.")
 
         # GPU warnings
         thermal = self.config.get("thermal", {})

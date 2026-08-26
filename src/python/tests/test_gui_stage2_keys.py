@@ -336,6 +336,92 @@ def test_an_engine_rejected_enum_is_shown_and_repairable():
         panel.load_from_config()
 
 
+def test_coupling_mode_is_compared_exactly_like_the_engine():
+    """The one enum that is NOT normalized, and it lost its guard.
+
+    ptm_thermal_sim.cpp:14184 FATALs on any spelling other than
+    bounded|fixed|legacy -- no normalizeKey, no toLower. When set_enum stopped
+    rewriting the stored value (to keep an edit-free save from rewriting the
+    file), `coupling_mode: Bounded` began DISPLAYING as `bounded` while the run
+    YAML carried `Bounded`, and validate() had no check at all, so the launch
+    gate passed and the engine died at startup. Reproduced.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = Path(scratch) / "coupling.yaml"
+        path.write_text(
+            "simulation:\n  body: Moon\n"
+            "radiation:\n  enabled: true\n  coupling_mode: Bounded\n")
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        combo = panel.tabs["radiation"].widgets["radiation.coupling_mode"]
+        assert combo.currentText() == "Bounded", (
+            f"the control shows {combo.currentText()!r} while the run YAML "
+            f"would carry 'Bounded'")
+        valid, messages = manager.validate()
+        assert not valid and any("coupling_mode" in m for m in messages), (
+            f"a spelling the engine refuses at startup passed the launch "
+            f"gate: {messages}")
+
+        combo.setCurrentText("bounded")
+        assert manager.get_value("radiation.coupling_mode") == "bounded"
+        assert manager.validate()[0], manager.validate()[1]
+        manager.reset_to_defaults()
+        panel.load_from_config()
+
+
+def test_the_forcing_flag_does_not_survive_opening_another_project():
+    """It deleted an explicit floor from the NEXT file that was opened.
+
+    _margin_forced is per-project state. Left set, opening a config that
+    explicitly carries gpu.min_vram_margin_gib had that key removed by the next
+    save -- demoting the VRAM floor from "enforced on every platform" to
+    advisory, with zero user edits. Reproduced.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        tab = panel.tabs["gpu"]
+        tab.widgets["gpu.min_vram_margin_gib"].setValue(3.0)
+        assert getattr(tab, "_margin_forced", False) is True
+
+        path = Path(scratch) / "explicit_floor.yaml"
+        path.write_text(
+            "simulation:\n  body: Moon\n"
+            "gpu:\n  min_vram_margin_gib: 2.0\n")
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        assert manager.plan_save_edits() == ({}, []), (
+            f"opening an explicit-floor config plans "
+            f"{manager.plan_save_edits()} -- a save would strip the guardrail "
+            f"the file asked for")
+        assert manager.get_value("gpu.margin_explicit") is True
+        manager.reset_to_defaults()
+        panel.load_from_config()
+
+
+def test_an_unrecognized_output_format_BLOCKS_the_launch():
+    """The engine refuses nothing here, which is why the GUI must.
+
+    Widening the valid sets to include `none` was right; also downgrading them
+    to warnings let `bianry` through, and the engine's writer is an if/else
+    chain that falls through -- a multi-hour run finishing with no field
+    output.
+    """
+    for key, bad in (("output.format", "bianry"),
+                     ("output.format", "Binary"),
+                     ("output.vtk_mode", "Both")):
+        manager = _manager()
+        manager.set_value(key, bad)
+        valid, messages = manager.validate()
+        assert not valid, f"{key} = {bad!r} passed the launch gate"
+        assert any(key.split(".")[1] in m for m in messages), messages
+    # ...and `none` is accepted, because five shipped configs use it.
+    for key, good in (("output.format", "none"), ("output.vtk_mode", "none")):
+        manager = _manager()
+        manager.set_value(key, good)
+        assert manager.validate()[0], manager.validate()[1]
+
+
 def test_an_empty_gpu_policy_is_shown_as_itself_and_repairable():
     """Mapping "" to a valid label displayed `auto` for a config validate()
     correctly refuses -- and since the stored value is no longer rewritten, the
@@ -668,6 +754,9 @@ TESTS = [
     test_a_nonzero_default_floor_forces_the_explicit_checkbox,
     test_the_forced_explicit_tick_is_reversible,
     test_an_engine_rejected_enum_is_shown_and_repairable,
+    test_coupling_mode_is_compared_exactly_like_the_engine,
+    test_the_forcing_flag_does_not_survive_opening_another_project,
+    test_an_unrecognized_output_format_BLOCKS_the_launch,
     test_an_empty_gpu_policy_is_shown_as_itself_and_repairable,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
     test_a_disabled_device_list_does_not_block_the_launch,

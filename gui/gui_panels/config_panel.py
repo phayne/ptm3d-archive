@@ -3063,9 +3063,16 @@ class RadiationTab(BaseConfigTab):
         # max_coupling_iterations 10 while the engine said False and 16.
         self.set_bool("radiation.use_gpu", rad.get("use_gpu", False))
         self.set_numeric("radiation.min_shadow_fraction", rad.get("min_shadow_fraction", 0.3))
+        # exact=True: ptm_thermal_sim.cpp:14184 FATALs on any spelling other
+        # than bounded|fixed|legacy -- no normalizeKey, no toLower, unlike
+        # spinup_seed/conductivity_model/the gpu policies. When set_enum
+        # stopped rewriting the stored value, `coupling_mode: Bounded` began
+        # DISPLAYING as `bounded` while the run YAML carried `Bounded` and the
+        # engine died at startup. Reproduced. Now it surfaces as its own entry
+        # and validate() refuses it.
         self.set_enum("radiation.coupling_mode",
                       rad.get("coupling_mode", "bounded"),
-                      COUPLING_MODE_ALIASES)
+                      COUPLING_MODE_ALIASES, exact=True)
         self.set_numeric("radiation.max_coupling_iterations", rad.get("max_coupling_iterations", 16))
         self.set_numeric("radiation.coupling_temp_threshold", rad.get("coupling_temp_threshold", 0.5))
         self.set_numeric("radiation.coupling_flux_threshold", rad.get("coupling_flux_threshold", 0.1))
@@ -5613,6 +5620,13 @@ class GpuPolicyTab(BaseConfigTab):
             self.profile_label.setText(f"{where}\n{body}")
 
     def load_from_config(self):
+        # The forcing flag belongs to the PREVIOUS project. Left set, opening a
+        # config that explicitly carries gpu.min_vram_margin_gib: 2.0 had that
+        # key DELETED by the next save -- demoting the VRAM floor from
+        # "enforced on every platform" to advisory, with zero user edits.
+        # Reproduced: raise the floor to 3.0 in one project, open another, and
+        # plan_save_edits reports ({}, ['gpu.min_vram_margin_gib']).
+        self._margin_forced = False
         gpu = self.config_manager.get_config().get("gpu")
         gpu = gpu if isinstance(gpu, dict) else {}
         self.set_bool("gpu.margin_explicit", gpu.get("margin_explicit", False))

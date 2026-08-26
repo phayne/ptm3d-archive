@@ -53,5 +53,10 @@ illumination:
   positions_file: ''
 output:
   directory: data/external/research/wilcoski_illumination
-  format: ascii
+  # `ascii` is not a value the engine knows. Its writer compares
+  # output.format only against "vtk" and "binary" (ptm_thermal_sim.cpp:21096,
+  # :21148, :21194, :21397) and its CLI accepts only those two, so `ascii`
+  # took no branch at all -- byte-identical in effect to `none`, which is what
+  # this location-export-only run actually wants and now says.
+  format: none
   locations_file: data/external/research/wilcoski_illumination/wilcoski_target_location.csv
