@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Import tooltips - use try/except for robustness
 try:
-    from gui_tooltips import (TOOLTIPS, get_tooltip,
+    from gui_tooltips import (TOOLTIPS, LABELS, get_tooltip, get_label,
                               BODY_SYNODIC_PERIODS, compute_synodic_day_days,
                               get_synodic_period_days,
                               BODY_ORBITAL_PERIODS, get_orbital_period_days,
@@ -35,7 +35,7 @@ except ImportError:
         parent_dir = str(Path(__file__).parent.parent)
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
-        from gui_tooltips import (TOOLTIPS, get_tooltip,
+        from gui_tooltips import (TOOLTIPS, LABELS, get_tooltip, get_label,
                                   BODY_SYNODIC_PERIODS, compute_synodic_day_days,
                                   get_synodic_period_days,
                                   BODY_ORBITAL_PERIODS, get_orbital_period_days,
@@ -44,10 +44,13 @@ except ImportError:
                                   compute_thermal_inertia)
     except ImportError:
         TOOLTIPS = {}
+        LABELS = {}
         BODY_SYNODIC_PERIODS = {"Europa": 3.55}
         BODY_ORBITAL_PERIODS = {"Europa": 3.55}
         def get_tooltip(key):
             return ""
+        def get_label(key, fallback=""):
+            return fallback
         def compute_synodic_day_days(config_manager):
             return None
         def get_synodic_period_days(config_manager, body_name=None):
@@ -215,14 +218,42 @@ class BaseConfigTab(QWidget):
         raise NotImplementedError
 
     def _apply_tooltip(self, widget, info_key):
-        """Apply tooltip from info_key to widget with visual indicator."""
+        """Apply tooltip from info_key to widget with visual indicator.
+
+        The blue tint marks a LABEL that has help behind it. It must not be put
+        on the control itself: an explicit `color:` in a style sheet overrides
+        Qt's disabled palette, so a checkbox the panel has deliberately grayed
+        out goes on rendering in the same bright blue as a live one.
+
+        This bit `radiation.use_aca` before the tooltip pass (it was the one
+        checkbox passing an `info_key`), and would have spread to every gated
+        checkbox once `info_key` began defaulting to the control's own key --
+        measured 12 -> 22 colored checkboxes, with `radiation.beaming` newly
+        looking enabled while the facet-scale rule holds it disabled.
+        """
         if not info_key:
             return
         tooltip_text = get_tooltip(info_key)
         if tooltip_text:
             widget.setToolTip(tooltip_text)
             widget.setCursor(QCursor(Qt.CursorShape.WhatsThisCursor))
-            widget.setStyleSheet("color: #64B5F6;")
+            if isinstance(widget, QLabel):
+                widget.setStyleSheet("color: #64B5F6;")
+
+    def _resolve_text(self, key, label_text, tooltip, info_key):
+        """Resolve a control's label and help text -- gui_tooltips wins.
+
+        `gui_tooltips.py` is the single source for both. A call site may still
+        pass a label or a tooltip, and it is used only where that module has
+        nothing to say about the key. Otherwise the two drift, and the one the
+        user reads is decided by which file someone edited last.
+
+        `info_key` defaults to the control's own key, so the label picks up the
+        "there is help here" styling without every call site opting in.
+        """
+        return (get_label(key, label_text),
+                get_tooltip(key) or tooltip,
+                info_key or key)
 
     def create_scroll_area(self, content_widget):
         """Wrap content in a scroll area"""
@@ -237,6 +268,8 @@ class BaseConfigTab(QWidget):
 
     def add_string_field(self, layout, row, label_text, key, tooltip="", info_key=None):
         """Add a string input field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -252,6 +285,8 @@ class BaseConfigTab(QWidget):
 
     def add_int_field(self, layout, row, label_text, key, min_val=0, max_val=10000, tooltip="", info_key=None):
         """Add an integer input field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -269,6 +304,8 @@ class BaseConfigTab(QWidget):
     def add_double_field(self, layout, row, label_text, key, min_val=0.0, max_val=10000.0,
                          decimals=2, tooltip="", info_key=None):
         """Add a double input field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -286,6 +323,8 @@ class BaseConfigTab(QWidget):
 
     def add_combo_field(self, layout, row, label_text, key, options, tooltip="", info_key=None):
         """Add a combo box field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -302,6 +341,8 @@ class BaseConfigTab(QWidget):
 
     def add_bool_field(self, layout, row, label_text, key, tooltip="", info_key=None):
         """Add a checkbox field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         widget = QCheckBox(label_text)
         widget.setToolTip(tooltip)
         self._apply_tooltip(widget, info_key)
@@ -313,6 +354,8 @@ class BaseConfigTab(QWidget):
 
     def add_file_field(self, layout, row, label_text, key, file_filter="All Files (*)", tooltip="", info_key=None):
         """Add a file selector field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -339,6 +382,8 @@ class BaseConfigTab(QWidget):
 
     def add_directory_field(self, layout, row, label_text, key, tooltip="", info_key=None):
         """Add a directory selection field"""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -593,8 +638,11 @@ class BaseConfigTab(QWidget):
 
     def add_device_ids_field(self, layout, row, label_text, key, tooltip=""):
         """A '0,1' text field bound to a YAML sequence of device indices."""
+        label_text, tooltip, info_key = self._resolve_text(
+            key, label_text, tooltip, None)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
+        self._apply_tooltip(label, info_key)
         layout.addWidget(label, row, 0)
 
         widget = QLineEdit()
@@ -669,7 +717,6 @@ class SimulationTab(BaseConfigTab):
 
         # Row 0: Start Time (unchanged)
         self.add_string_field(time_layout, 0, "Start Time:", "simulation.start_time",
-                              "ISO 8601 format (e.g., 2025-01-01T00:00:00)",
                               info_key="simulation.start_time")
 
         # Row 1: Duration with unit selector
@@ -686,14 +733,14 @@ class SimulationTab(BaseConfigTab):
         self.duration_spin.setRange(0.001, 365000.0)
         self.duration_spin.setDecimals(4)
         self.duration_spin.setSingleStep(1.0)
-        self.duration_spin.setToolTip("Simulation duration")
+        self.duration_spin.setToolTip(get_tooltip("simulation.duration_days"))
         self.duration_spin.valueChanged.connect(self._on_duration_spin_changed)
         dur_hlayout.addWidget(self.duration_spin, stretch=1)
 
         self.duration_unit_combo = QComboBox()
         self.duration_unit_combo.addItems(["days", "hours", "Earth years", "synodic periods"])
         self.duration_unit_combo.setMaximumWidth(130)
-        self.duration_unit_combo.setToolTip("Duration display unit")
+        self.duration_unit_combo.setToolTip(get_tooltip("ui.duration_units"))
         self.duration_unit_combo.currentTextChanged.connect(self._on_duration_unit_changed)
         dur_hlayout.addWidget(self.duration_unit_combo)
 
@@ -706,14 +753,14 @@ class SimulationTab(BaseConfigTab):
         time_layout.addWidget(end_label, 2, 0)
 
         self.end_time_edit = QLineEdit()
-        self.end_time_edit.setToolTip("Simulation end time — edit to adjust duration")
+        self.end_time_edit.setToolTip(get_tooltip("simulation.end_time"))
         self.end_time_edit.setPlaceholderText("Auto-computed from start + duration")
         self.end_time_edit.editingFinished.connect(self._on_end_time_edited)
         time_layout.addWidget(self.end_time_edit, 2, 1)
 
         # Row 3: Time Steps
         self.add_int_field(time_layout, 3, "Time Steps:", "simulation.timesteps",
-                           1, 100000, "Number of output timesteps",
+                           1, 100000,
                            info_key="simulation.timesteps")
         # Connect timesteps widget to sync step size
         self.widgets["simulation.timesteps"].valueChanged.connect(
@@ -721,7 +768,7 @@ class SimulationTab(BaseConfigTab):
 
         # Row 4: Time Step Size (alternative to number of steps)
         step_label = QLabel("Step Size:")
-        step_label.setToolTip("Output cadence — editing this updates Time Steps, and vice versa")
+        step_label.setToolTip(get_tooltip("ui.step_size"))
         time_layout.addWidget(step_label, 4, 0)
 
         step_container = QWidget()
@@ -734,14 +781,14 @@ class SimulationTab(BaseConfigTab):
         self.step_size_spin.setDecimals(3)
         self.step_size_spin.setSingleStep(1.0)
         self.step_size_spin.setValue(1.0)
-        self.step_size_spin.setToolTip("Output time step size")
+        self.step_size_spin.setToolTip(get_tooltip("ui.step_size"))
         self.step_size_spin.valueChanged.connect(self._on_step_size_changed)
         step_hlayout.addWidget(self.step_size_spin, stretch=1)
 
         self.step_unit_combo = QComboBox()
         self.step_unit_combo.addItems(["minutes", "seconds", "hours"])
         self.step_unit_combo.setMaximumWidth(100)
-        self.step_unit_combo.setToolTip("Step size unit")
+        self.step_unit_combo.setToolTip(get_tooltip("ui.step_size_units"))
         self.step_unit_combo.currentTextChanged.connect(self._on_step_unit_changed)
         step_hlayout.addWidget(self.step_unit_combo)
 
@@ -757,7 +804,6 @@ class SimulationTab(BaseConfigTab):
 
         bodies = list(self.BUILTIN_BODIES) + [self.SEPARATOR, self.CUSTOM_BODY, self.BROWSE_HORIZONS]
         self.add_combo_field(body_layout, 0, "Target Body:", "simulation.body", bodies,
-                             "Select the planetary body to simulate",
                              info_key="simulation.body")
 
         # Make separator unselectable
@@ -1236,10 +1282,9 @@ class MeshTab(BaseConfigTab):
         global_layout.setColumnStretch(1, 1)
 
         self.add_int_field(global_layout, 0, "Resolution:", "mesh.resolution",
-                           1, 10, "Icosphere resolution level (higher = more faces)",
+                           1, 10,
                            info_key="mesh.resolution")
-        self.add_bool_field(global_layout, 1, "Use Topographic Mesh", "mesh.use_topographic",
-                            "Use pre-computed topographic meshes (requires DEM data)")
+        self.add_bool_field(global_layout, 1, "Use Topographic Mesh", "mesh.use_topographic")
 
         # --- Topography source: built-in dataset vs custom path -------------
         src_label = QLabel("Topography source:")
@@ -1249,12 +1294,10 @@ class MeshTab(BaseConfigTab):
         src_layout.setContentsMargins(0, 0, 0, 0)
         self.topo_builtin_radio = QRadioButton("Built-in (recommended)")
         self.topo_builtin_radio.setToolTip(
-            "Ship-with-PTM3D topography (data/topo, resolved via "
-            "PTM_DATA_ROOT or the repository data directory) -- no "
-            "navigation needed. Fetched on demand if missing.")
+            get_tooltip("ui.topo_source_builtin"))
         self.topo_custom_radio = QRadioButton("Custom path…")
         self.topo_custom_radio.setToolTip(
-            "Point at your own directory of pre-computed topography grids")
+            get_tooltip("ui.topo_source_custom"))
         self._topo_src_group = QButtonGroup(src_container)
         self._topo_src_group.addButton(self.topo_builtin_radio)
         self._topo_src_group.addButton(self.topo_custom_radio)
@@ -1275,6 +1318,7 @@ class MeshTab(BaseConfigTab):
         self.topo_resolved_edit.setReadOnly(True)
         self.topo_resolved_edit.setPlaceholderText(
             "(select Built-in to see the resolved dataset path)")
+        self.topo_resolved_edit.setToolTip(get_tooltip("ui.topo_resolved_path"))
         resolved_layout.addWidget(self.topo_resolved_edit)
         self.topo_fetch_btn = QPushButton("Fetch…")
         self.topo_fetch_btn.setMaximumWidth(80)
@@ -1283,9 +1327,7 @@ class MeshTab(BaseConfigTab):
         resolved_layout.addWidget(self.topo_fetch_btn)
         global_layout.addWidget(resolved_container, 3, 1)
 
-        self.add_directory_field(global_layout, 4, "Topographic Directory:", "mesh.topo_directory",
-                                 "Directory containing pre-computed topographic meshes "
-                                 "(enabled in Custom mode)")
+        self.add_directory_field(global_layout, 4, "Topographic Directory:", "mesh.topo_directory")
 
         global_group.setLayout(global_layout)
         layout.addWidget(global_group)
@@ -1297,10 +1339,9 @@ class MeshTab(BaseConfigTab):
 
         self.add_file_field(custom_layout, 0, "Import File:", "mesh.import_file",
                             "Mesh Files (*.obj *.ply *.vtk);;All Files (*)",
-                            "Import custom triangulated mesh",
                             info_key="mesh.import_file")
         self.add_double_field(custom_layout, 1, "Scale Factor:", "mesh.scale_factor",
-                              0.001, 1000.0, 3, "Scaling factor for imported mesh",
+                              0.001, 1000.0, 3,
                               info_key="mesh.scale_factor")
 
         custom_group.setLayout(custom_layout)
@@ -1318,12 +1359,7 @@ class MeshTab(BaseConfigTab):
         # The core-plus-ring architecture was CLI-only: every A3GT-class site
         # run needs an occluder, and the GUI had no field for it.
         self.add_file_field(place_layout, 0, "Occluder File:", "mesh.occluder_file",
-                            "Mesh Files (*.ply *.obj *.vtk);;All Files (*)",
-                            "Coarse occluder-only mesh (the ring around a "
-                            "high-resolution core). It enters the illumination "
-                            "shadow-ray BVH only -- never thermally solved, "
-                            "radiosity-coupled or written out. See "
-                            "docs/extended-occluder-architecture.md.")
+                            "Mesh Files (*.ply *.obj *.vtk);;All Files (*)")
         # Without these an imported DEM sits wherever its own frame put it.
         # LATITUDE IS THE GATE: ptm_thermal_sim.cpp:15317 rotates only when
         # latitude_override > -900, and longitude is read inside that branch.
@@ -1331,17 +1367,9 @@ class MeshTab(BaseConfigTab):
         # longitude field is disabled until a latitude is set rather than left
         # editable with a tooltip nobody reads.
         self.add_double_field(place_layout, 1, "Latitude Override (deg):",
-                              "mesh.latitude_override", -999.0, 90.0, 4,
-                              "Place the imported mesh at this latitude. "
-                              "-999 = leave the mesh in its own frame. This is "
-                              "the switch for BOTH overrides: the engine "
-                              "rotates only when a latitude is given.")
+                              "mesh.latitude_override", -999.0, 90.0, 4)
         self.add_double_field(place_layout, 2, "Longitude Override (deg):",
-                              "mesh.longitude_override", -999.0, 360.0, 4,
-                              "Place the imported mesh at this longitude. Read "
-                              "only when a latitude override is also set -- the "
-                              "engine gates the whole rotation on latitude, so "
-                              "a longitude on its own is silently ignored.")
+                              "mesh.longitude_override", -999.0, 360.0, 4)
         # The engine range-checks NOTHING: its only gate is
         # latitude_override > -900, so -95 reaches rotateMeshToLatLon with
         # cos(lat) < 0 and mirrors the mesh through the pole to +85 at
@@ -1476,7 +1504,7 @@ class MeshTab(BaseConfigTab):
             supported and self.widgets["mesh.use_topographic"].isEnabled())
         self.topo_builtin_radio.setToolTip(
             status.detail if not supported else
-            "Ship-with-PTM3D topography (data/topo), fetched on demand")
+            get_tooltip("ui.topo_source_builtin"))
 
         if not self.topo_builtin_radio.isChecked():
             self.topo_resolved_edit.setText("")
@@ -1566,10 +1594,9 @@ class ThermalTab(BaseConfigTab):
         control_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(control_layout, 0, "Run Thermal Model", "thermal.run_thermal_mesh",
-                            "Enable thermal calculations for mesh",
                             info_key="thermal.run_thermal_mesh")
         self.add_int_field(control_layout, 1, "CPU Threads:", "thermal.threads",
-                           0, 128, "Number of parallel threads (0 = auto)",
+                           0, 128,
                            info_key="thermal.threads")
 
         # Row 2: Equilibration with unit selector
@@ -1586,14 +1613,14 @@ class ThermalTab(BaseConfigTab):
         self.eq_spin.setRange(0.0, 100000.0)
         self.eq_spin.setDecimals(4)
         self.eq_spin.setSingleStep(0.5)
-        self.eq_spin.setToolTip("Equilibration period")
+        self.eq_spin.setToolTip(get_tooltip("thermal.equilibration_orbits"))
         self.eq_spin.valueChanged.connect(self._on_eq_spin_changed)
         eq_hlayout.addWidget(self.eq_spin, stretch=1)
 
         self.eq_unit_combo = QComboBox()
         self.eq_unit_combo.addItems(["synodic periods", "orbital periods", "days", "hours", "Earth years"])
         self.eq_unit_combo.setMaximumWidth(130)
-        self.eq_unit_combo.setToolTip("Equilibration display unit")
+        self.eq_unit_combo.setToolTip(get_tooltip("ui.equilibration_units"))
         self.eq_unit_combo.currentTextChanged.connect(self._on_eq_unit_changed)
         eq_hlayout.addWidget(self.eq_unit_combo)
 
@@ -1602,7 +1629,6 @@ class ThermalTab(BaseConfigTab):
 
         # Compute Statistics stays in Model Control.
         self.add_bool_field(control_layout, 3, "Compute Statistics", "thermal.compute_statistics",
-                            "Calculate min/max/mean temperature statistics",
                             info_key="thermal.compute_statistics")
 
         # Both of these were written into every saved config with no control
@@ -1617,16 +1643,7 @@ class ThermalTab(BaseConfigTab):
                               # An out-of-range load warns and keeps the config
                               # value (set_numeric), but a range that refuses
                               # plausible science is a range set too tight.
-                              "thermal.geothermal_heat_flow", -1.0, 1000.0, 4,
-                              "Bottom-boundary heat flux. -1 = the body's own "
-                              "default.\n"
-                              "Live on every body since PTM-161 was fixed "
-                              "(commit 2e06a70): the value is forwarded to the "
-                              "solvers as ovr_Qb and the run prints "
-                              "'[Thermo override] applied at solver: Qb ...'. "
-                              "A positive value also arms the property-override "
-                              "tripwire, which aborts the run if the override "
-                              "does not reach a solver.")
+                              "thermal.geothermal_heat_flow", -1.0, 1000.0, 4)
         # Measured on this tree rather than taken from KNOWN_LIMITATIONS.md
         # section 4, which still says "Status: Open": Moon ico3, 48 steps,
         # Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K over 1280 faces. It is
@@ -1650,12 +1667,7 @@ class ThermalTab(BaseConfigTab):
         cad_layout.setColumnStretch(1, 1)
 
         cad_label = QLabel("Eq. Cadence:")
-        cad_label.setToolTip(
-            "Time-step cadence during equilibration phase (separate from output cadence).\n"
-            "Legacy: match output cadence (slow, byte-identical to old PTM3D).\n"
-            "Accuracy tiers set samples per diurnal cycle of the target body.\n"
-            "Custom: set explicit steps per Earth-day."
-        )
+        cad_label.setToolTip(get_tooltip("ui.eq_cadence_mode"))
         cad_layout.addWidget(cad_label, 0, 0)
 
         cad_container = QWidget()
@@ -1674,10 +1686,7 @@ class ThermalTab(BaseConfigTab):
             "Legacy (match output cadence)",
             "Custom (steps/Earth-day)",
         ])
-        self.eq_cadence_combo.setToolTip(
-            "Preset accuracy tier for equilibration. Affects only equilibration.\n"
-            "Output cadence is always set by the Time / Timesteps parameters."
-        )
+        self.eq_cadence_combo.setToolTip(get_tooltip("ui.eq_cadence_mode"))
         self.eq_cadence_combo.currentIndexChanged.connect(self._on_eq_cadence_mode_changed)
         cad_hlayout.addWidget(self.eq_cadence_combo, stretch=1)
 
@@ -1688,9 +1697,7 @@ class ThermalTab(BaseConfigTab):
         self.eq_cadence_spin.setSingleStep(1.0)
         self.eq_cadence_spin.setValue(24.0)
         self.eq_cadence_spin.setMaximumWidth(110)
-        self.eq_cadence_spin.setToolTip(
-            "Custom cadence in steps per Earth-day. Only used in Custom mode."
-        )
+        self.eq_cadence_spin.setToolTip(get_tooltip("ui.eq_cadence_custom"))
         self.eq_cadence_spin.setEnabled(False)
         self.eq_cadence_spin.valueChanged.connect(self._on_eq_cadence_value_changed)
         cad_hlayout.addWidget(self.eq_cadence_spin)
@@ -1701,10 +1708,7 @@ class ThermalTab(BaseConfigTab):
         self.eq_cadence_readout = QLabel("")
         self.eq_cadence_readout.setStyleSheet("color: gray; font-size: 10px;")
         self.eq_cadence_readout.setToolTip(
-            "Computed effective cadence for the current body.\n"
-            "'samples per diurnal cycle' is body-independent; 'steps per Earth-day' is what\n"
-            "PTM3D uses internally and depends on the body's synodic day."
-        )
+            get_tooltip("ui.eq_cadence_readout"))
         cad_layout.addWidget(self.eq_cadence_readout, 1, 1)
 
         cad_group.setLayout(cad_layout)
@@ -1715,7 +1719,6 @@ class ThermalTab(BaseConfigTab):
         gpu_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(gpu_layout, 0, "Use GPU for Thermal Solver", "thermal.use_gpu",
-                            "Use OpenCL GPU acceleration for thermal solver",
                             info_key="thermal.use_gpu")
 
         gpu_group.setLayout(gpu_layout)
@@ -1728,32 +1731,15 @@ class ThermalTab(BaseConfigTab):
         gpu_disp_group = QGroupBox("Thermal GPU Dispatch")
         gd = QGridLayout()
         gd.setColumnStretch(1, 1)
-        self.add_int_field(gd, 0, "GPU Count:", "thermal.gpu_devices", 0, 16,
-                           "How many enumerated GPUs the thermal pool may use. "
-                           "1 = the first available (default); 0 = every one. "
-                           "Ignored when a device list is given below.")
+        self.add_int_field(gd, 0, "GPU Count:", "thermal.gpu_devices", 0, 16)
         self.add_device_ids_field(
-            gd, 1, "GPU Device IDs:", "thermal.gpu_device_ids",
-            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set. "
-            "Run ptm_thermal_sim --list-gpu-devices to see the indices.")
+            gd, 1, "GPU Device IDs:", "thermal.gpu_device_ids")
         self.add_int_field(gd, 3, "Batch Size:", "thermal.gpu_batch_size",
-                           0, 1000000,
-                           "Faces per dispatch. 0 = the engine's own cap "
-                           "(6 GB / 500 K faces), or the calibrated value from "
-                           "the machine profile. Lower it to shorten each "
-                           "kernel, which is the first mitigation for a "
-                           "watchdog reset.")
+                           0, 1000000)
         self.add_int_field(gd, 4, "Inter-batch Pause (ms):",
-                           "thermal.gpu_inter_batch_pause_ms", 0, 10000,
-                           "Idle gap between dispatches. 0 = none. A nonzero "
-                           "pause lets the macOS+AMD driver's watchdog see the "
-                           "device as responsive between batches.")
+                           "thermal.gpu_inter_batch_pause_ms", 0, 10000)
         self.add_bool_field(gd, 5, "Auto-calibrate GPU dispatch limits",
-                            "thermal.auto_calibrate_gpu",
-                            "Measure this host's safe dispatch ceiling on the "
-                            "first GPU run and cache it in the machine "
-                            "profile. Turning this OFF makes the engine fall "
-                            "back to CONSERVATIVE defaults and say so.")
+                            "thermal.auto_calibrate_gpu")
         gpu_disp_group.setLayout(gd)
 
         # --- Equilibration convergence (item 2.7) -------------------------
@@ -1761,42 +1747,19 @@ class ThermalTab(BaseConfigTab):
         eq_c = QGridLayout()
         eq_c.setColumnStretch(1, 1)
         self.add_double_field(eq_c, 0, "Target Accuracy (K):",
-                              "thermal.equilibration_target_K", 0.0001, 50.0, 4,
-                              "The accuracy the spin-up estimate targets, and "
-                              "the bar the convergence certificate is scored "
-                              "against. This is the criterion; the cycle count "
-                              "above is only the budget.")
+                              "thermal.equilibration_target_K", 0.0001, 50.0, 4)
         self.add_bool_field(eq_c, 1, "Stop on Convergence Certificate",
-                            "thermal.equilibration_stop_on_certificate",
-                            "Exit equilibration when the certificate reaches "
-                            "the target accuracy instead of at a fixed cycle "
-                            "count. Off by default: the certificate is an "
-                            "estimate, and a fixed budget is reproducible.")
+                            "thermal.equilibration_stop_on_certificate")
         self.add_int_field(eq_c, 2, "Equilibration Cycles (override):",
-                           "thermal.equilibration_cycles", -1, 100000,
-                           "Integrated equilibration cycle count. -1 = follow "
-                           "the Equilibration field above.")
+                           "thermal.equilibration_cycles", -1, 100000)
         self.add_int_field(eq_c, 3, "Indirect-flux Passes:",
-                           "thermal.eq_indirect_passes", 1, 20,
-                           "Passes of the equilibration-phase indirect-flux "
-                           "estimate. Its default moved this summer (PR #78). "
-                           "The engine refuses 0.")
+                           "thermal.eq_indirect_passes", 1, 20)
         self.add_combo_field(eq_c, 4, "Indirect-flux Source:",
                              "thermal.eq_indirect_source",
-                             ["auto", "converged", "off"],
-                             "Where the equilibration-phase indirect flux comes "
-                             "from.\n"
-                             "auto (default): the engine estimates it inside "
-                             "the radiation-coupling block.\n"
-                             "converged: use the converged coupled solution.\n"
-                             "off: the pre-2026-08 behavior -- a face whose "
-                             "whole forcing is neighbor infrared equilibrates "
-                             "to the bare geothermal floor.")
+                             ["auto", "converged", "off"])
         self.add_file_field(eq_c, 5, "Indirect-flux File:",
                             "thermal.eq_indirect_flux_file",
-                            "QIND Files (*.bin);;All Files (*)",
-                            "An explicit 'QIND' file from a prior pass-1 run. "
-                            "Always wins over the source setting when given.")
+                            "QIND Files (*.bin);;All Files (*)")
         eqconv_group.setLayout(eq_c)
 
         # --- Ice stability (item 2.6) -------------------------------------
@@ -1804,36 +1767,22 @@ class ThermalTab(BaseConfigTab):
         ice_l = QGridLayout()
         ice_l.setColumnStretch(1, 1)
         self.add_bool_field(ice_l, 0, "Compute Ice Stability Depth",
-                            "thermal.compute_ice_stability",
-                            "Solve for the depth at which water ice survives "
-                            "geologic time, per face, and write ice_depth.bin "
-                            "beside the temperature output.")
+                            "thermal.compute_ice_stability")
         self.add_double_field(ice_l, 1, "Survival Flux J0 (kg m^-2 s^-1):",
                               "thermal.ice_stability.flux_threshold_kgm2s",
-                              1e-20, 1e-6, 20,
-                              "The sublimation rate below which ice is called "
-                              "stable. The default 3e-14 is about 1 mm per "
-                              "billion years.")
+                              1e-20, 1e-6, 20)
         self.add_double_field(ice_l, 2, "Grain Hop Length (um):",
                               "thermal.ice_stability.grain_hop_length_um",
-                              0.001, 100000.0, 3,
-                              "Diffusive path length scale through the "
-                              "regolith pore space.")
+                              0.001, 100000.0, 3)
         self.add_double_field(ice_l, 3, "Sublimation Enthalpy (kJ/mol):",
                               "thermal.ice_stability.sublimation_enthalpy_kJmol",
-                              1.0, 200.0, 3,
-                              "Latent heat of sublimation used in the vapor "
-                              "pressure law.")
+                              1.0, 200.0, 3)
         self.add_double_field(ice_l, 4, "Geothermal Gradient (K/m):",
                               "thermal.ice_stability.geothermal_gradient_K_per_m",
-                              0.0, 10.0, 6,
-                              "Added below the modeled column. 0 = isothermal "
-                              "below the deepest node.")
+                              0.0, 10.0, 6)
         self.add_int_field(ice_l, 5, "Depth Subsamples:",
                            "thermal.ice_stability.n_depth_subsamples",
-                           -1, 100000,
-                           "Subsamples between depth nodes when locating the "
-                           "stability horizon. -1 = the engine's own choice.")
+                           -1, 100000)
         self.ice_note = QLabel("")
         self.ice_note.setWordWrap(True)
         self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
@@ -1862,19 +1811,11 @@ class ThermalTab(BaseConfigTab):
         # trip's own promise. Reproduced on
         # examples/tutorial04_crater80N_coupled.yaml before this changed.
         self.add_int_field(grid_l, 0, "Column Depth b (skin depths):",
-                           "thermal.thermal_b", 0, 1000,
-                           "Bottom of the modeled column, in diurnal skin "
-                           "depths. Displayed, not offered: retuning it "
-                           "without also raising the equilibration cycle "
-                           "count makes the DEEP answer worse before it "
-                           "gets better.")
+                           "thermal.thermal_b", 0, 1000)
         self.add_int_field(grid_l, 1, "Nodes per Skin Depth m:",
-                           "thermal.thermal_m", 0, 1000,
-                           "Vertical resolution near the surface.")
+                           "thermal.thermal_m", 0, 1000)
         self.add_int_field(grid_l, 2, "Grid Parameter n:",
-                           "thermal.thermal_n", 0, 1000,
-                           "Geometric growth control for the layer "
-                           "thicknesses.")
+                           "thermal.thermal_n", 0, 1000)
         for _k in ("thermal.thermal_b", "thermal.thermal_m", "thermal.thermal_n"):
             self.widgets[_k].setReadOnly(True)
             self.widgets[_k].setButtonSymbols(
@@ -1900,38 +1841,13 @@ class ThermalTab(BaseConfigTab):
         seed_layout.setColumnStretch(1, 1)
 
         self.add_combo_field(seed_layout, 0, "Spin-up Seed:", "thermal.spinup_seed",
-                             ["physical", "legacy"],
-                             "physical (default): each face starts from its own "
-                             "conductive steady profile, so a permanently "
-                             "shadowed column starts on the geothermal floor.\n"
-                             "legacy: the pre-2026-08-11 seed plus the analytic "
-                             "clear-sky pre-conditioner -- exactly what produced "
-                             "results in this repository before that date. Use "
-                             "it to reproduce an old baseline.")
+                             ["physical", "legacy"])
         self.add_combo_field(seed_layout, 1, "Seed Anchor:", "thermal.seed_anchor",
-                             ["lumped", "warm"],
-                             "Which surface anchor the shared seed hangs its "
-                             "conductive profile from. Only read under "
-                             "spinup_seed: physical.\n"
-                             "lumped (default): anchors at the cycle mean.\n"
-                             "warm: the fourth-moment anchor, which by Jensen is "
-                             ">= the mean -- +45 K on the lit population of the "
-                             "shipped lunar 80N crater. Byte-identical to the "
-                             "pre-2026-08-12 seed.")
+                             ["lumped", "warm"])
         self.add_double_field(seed_layout, 2, "Analytic Seed Cycles:",
-                              "thermal.analytic_seed_cycles", -1.0, 100.0, 1,
-                              "Diurnal cycles of clear-sky pre-conditioning "
-                              "before the real forcing. It is a FORCING, not a "
-                              "seed: no topography, no shadowing, no IR, no "
-                              "indirect flux, and the GPU has no analog. "
-                              "-1 = follow the spin-up seed; 0 = off.")
+                              "thermal.analytic_seed_cycles", -1.0, 100.0, 1)
         self.add_bool_field(seed_layout, 3, "Refuse Two-Timescale Faces",
-                            "thermal.seed_anchor_refuse_two_timescale",
-                            "Strict refusal when a face carries diurnal AND "
-                            "seasonal power, which one lumped conductance "
-                            "cannot cover. Off by default because refusing "
-                            "substitutes the warm anchor, and that is the "
-                            "estimator with the +45 K bias.")
+                            "thermal.seed_anchor_refuse_two_timescale")
 
         self.seed_note = QLabel("")
         self.seed_note.setWordWrap(True)
@@ -1949,16 +1865,10 @@ class ThermalTab(BaseConfigTab):
 
         self.add_file_field(state_layout, 0, "Initial State File:",
                             "thermal.initial_state_file",
-                            "State Files (*.bin *.state);;All Files (*)",
-                            "Per-face T(z) profile to start from. This is the "
-                            "warm start: the run continues an earlier one "
-                            "instead of re-equilibrating.")
+                            "State Files (*.bin *.state);;All Files (*)")
         self.add_file_field(state_layout, 1, "Final State File:",
                             "thermal.final_state_file",
-                            "State Files (*.bin *.state);;All Files (*)",
-                            "Where to dump the per-face T(z) profile at the end. "
-                            "The state written is the one at the LAST exported "
-                            "step, which is what the next chunk must resume from.")
+                            "State Files (*.bin *.state);;All Files (*)")
 
         state_note = QLabel(
             "A run launched from this window is still a single engine process: "
@@ -1985,10 +1895,10 @@ class ThermalTab(BaseConfigTab):
         integ_layout.setColumnStretch(1, 1)
 
         self.add_double_field(integ_layout, 0, "Integration Days:", "thermal.integration_days",
-                              -1.0, 10000.0, 2, "Integration window in days (-1 = automatic)",
+                              -1.0, 10000.0, 2,
                               info_key="thermal.integration_days")
         self.add_int_field(integ_layout, 1, "Integration Steps:", "thermal.integration_steps",
-                           -1, 100000, "Integration steps override (-1 = automatic)",
+                           -1, 100000,
                            info_key="thermal.integration_steps")
 
         integ_note = QLabel(
@@ -2011,10 +1921,6 @@ class ThermalTab(BaseConfigTab):
             ["None (uniform body H)",
              "Bundled icosphere default for body",
              "Custom file"],
-            "None: every face uses the body-default H. "
-            "Bundled: auto-discover the icosphere map under "
-            "<property_maps_directory>/<body>/. "
-            "Custom: load a per-face binary float32 file (one value per mesh face).",
             info_key="thermal.property_map_mode",
         )
 
@@ -2022,24 +1928,16 @@ class ThermalTab(BaseConfigTab):
         self.add_combo_field(
             maps_layout, 1, "Map Content:", "thermal.property_map_kind",
             ["H-parameter (m)", "Thermal inertia (J m^-2 K^-1 s^-1/2)"],
-            "H-parameter: per-face e-folding depth feeding rho(z), k(z). "
-            "Thermal inertia: per-face TI(273 K); the loader inverts to an "
-            "effective H per face so the same downstream model is reused.",
             info_key="thermal.property_map_kind",
         )
 
         self.add_file_field(
             maps_layout, 2, "Custom Map File:", "thermal.thermal_inertia_map",
             "Binary Files (*.bin);;All Files (*)",
-            "Path to per-face binary float32 (matches mesh face count). "
-            "Used only when Map Mode = Custom file. The Map Content selector "
-            "tells PTM3D how to interpret the file (H or TI).",
             info_key="thermal.thermal_inertia_map",
         )
         self.add_directory_field(
             maps_layout, 3, "Property Maps Dir:", "thermal.property_maps_directory",
-            "Root directory for bundled maps. Files are looked up under "
-            "<dir>/<body>/{hpar|ti273k}_<body>_ico<level>.bin.",
             info_key="thermal.property_maps_directory",
         )
 
@@ -2588,15 +2486,12 @@ class RadiationTab(BaseConfigTab):
         enable_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(enable_layout, 0, "Enable Radiation Exchange", "radiation.enabled",
-                            "Compute thermal radiation exchange between faces",
                             info_key="radiation.enabled")
-        self.add_bool_field(enable_layout, 1, "Verbose Progress", "radiation.verbose",
-                            "Print detailed progress")
+        self.add_bool_field(enable_layout, 1, "Verbose Progress", "radiation.verbose")
         self.add_bool_field(enable_layout, 2, "Use GPU for Radiosity", "radiation.use_gpu",
-                            "Use OpenCL GPU acceleration for radiosity solver",
                             info_key="radiation.use_gpu")
         self.add_double_field(enable_layout, 3, "Min Shadow Fraction:", "radiation.min_shadow_fraction",
-                              0.0, 1.0, 2, "Minimum shadow fraction for inclusion in radiation exchange",
+                              0.0, 1.0, 2,
                               info_key="radiation.min_shadow_fraction")
 
         enable_group.setLayout(enable_layout)
@@ -2611,20 +2506,9 @@ class RadiationTab(BaseConfigTab):
         beam_layout = QGridLayout()
         beam_layout.setColumnStretch(1, 1)
 
-        self.add_bool_field(beam_layout, 0, "Enable Beaming", "radiation.beaming",
-                            "Smith (1967) anisotropic roughness-beamed emission. "
-                            "Only valid when the mesh facets are much LARGER "
-                            "than the roughness scale -- otherwise the mesh "
-                            "already resolves the roughness and this counts it "
-                            "twice.")
+        self.add_bool_field(beam_layout, 0, "Enable Beaming", "radiation.beaming")
         self.add_double_field(beam_layout, 1, "RMS Slope w (deg):",
-                              "radiation.rms_slope_deg", 0.0, 60.0, 2,
-                              "RMS sub-facet slope in DEGREES. Literature range "
-                              "20-37: 32.5 Jhoti et al. (2024) lunar highlands "
-                              "(the validated polar value), ~20 Bandfield et al. "
-                              "(2015) global regolith fit, ~37 Rubanenko et al. "
-                              "(2020). beaming: true with w = 0 is fatal at "
-                              "engine startup.")
+                              "radiation.rms_slope_deg", 0.0, 60.0, 2)
 
         self.beaming_note = QLabel("")
         self.beaming_note.setWordWrap(True)
@@ -2633,6 +2517,8 @@ class RadiationTab(BaseConfigTab):
 
         self.beaming_ack = QCheckBox(
             "I confirm this mesh does not already resolve sub-facet slopes")
+        self.beaming_ack.setToolTip(
+            get_tooltip("ui.beaming_scale_acknowledgment"))
         self.beaming_ack.setVisible(False)
         self.beaming_ack.toggled.connect(self._update_beaming_gating)
         beam_layout.addWidget(self.beaming_ack, 3, 0, 1, 2)
@@ -2658,32 +2544,19 @@ class RadiationTab(BaseConfigTab):
         # that the engine then announced it was ignoring.
         self.add_combo_field(coupling_layout, 0, "Coupling Mode:",
                              "radiation.coupling_mode",
-                             ["bounded", "fixed", "legacy"],
-                             "How the thermal-radiation coupling loop decides "
-                             "it is done (PTM-89).\n"
-                             "bounded (default): absolute selection threshold, "
-                             "no face-fraction exit.\n"
-                             "fixed: as bounded, plus a fixed iteration count.\n"
-                             "legacy: the pre-PTM-89 behavior, for reproducing "
-                             "published runs. It is the only mode that reads "
-                             "Face Fraction.")
+                             ["bounded", "fixed", "legacy"])
         self.add_int_field(coupling_layout, 1, "Max Coupling Iterations:", "radiation.max_coupling_iterations",
-                           1, 50, "Maximum thermal-radiation coupling iterations",
+                           1, 50,
                            info_key="radiation.max_coupling_iterations")
         self.add_double_field(coupling_layout, 2, "Temperature Tolerance (K):", "radiation.coupling_temp_threshold",
-                              0.1, 10.0, 1, "Temperature convergence threshold",
+                              0.1, 10.0, 1,
                               info_key="radiation.coupling_temp_threshold")
         self.add_double_field(coupling_layout, 3, "Flux Tolerance (W/m\u00b2):", "radiation.coupling_flux_threshold",
-                              0.01, 10.0, 2, "Flux change threshold",
+                              0.01, 10.0, 2,
                               info_key="radiation.coupling_flux_threshold")
         self.add_double_field(coupling_layout, 4, "Face Fraction (legacy mode only):",
                               "radiation.coupling_face_fraction",
-                              0.001, 0.1, 3,
-                              "Fraction of faces still changing to stop. IGNORED unless "
-                              "radiation.coupling_mode is 'legacy': this exit criterion has "
-                              "no error bound and made a coupled run's answer depend on how "
-                              "the window was chunked (PTM-89). The engine prints a warning "
-                              "if you change it without also setting coupling_mode: legacy.")
+                              0.001, 0.1, 3)
 
         # A label that says "legacy mode only" next to an always-editable field
         # is a label that lies. Gate it on the mode it names.
@@ -2705,42 +2578,27 @@ class RadiationTab(BaseConfigTab):
 
         self.add_file_field(vf_layout, 0, "View Factor File:", "radiation.view_factor_file",
                             "Binary Files (*.bin);;H-Matrix Files (*.hmat);;All Files (*)",
-                            "Save/load view factors to/from file",
                             info_key="radiation.view_factor_file")
         self.add_bool_field(vf_layout, 1, "Enable H-Matrix Compression", "radiation.use_hmatrix",
-                            "Use H-matrix compression for view factors. Recommended for meshes with 50K-1M faces.",
                             info_key="radiation.use_hmatrix")
         self.add_bool_field(vf_layout, 2, "Use ACA (Adaptive Cross Approximation)", "radiation.use_aca",
-                            "Use ACA for faster compression (default: enabled)",
                             info_key="radiation.use_aca")
         self.add_double_field(vf_layout, 3, "ACA Tolerance:", "radiation.aca_tolerance",
-                              0.0001, 0.1, 4, "ACA relative tolerance",
+                              0.0001, 0.1, 4,
                               info_key="radiation.aca_tolerance")
         self.add_int_field(vf_layout, 4, "ACA Max Rank:", "radiation.aca_max_rank",
-                           1, 200, "Maximum rank before falling back to sparse")
+                           1, 200)
         self.add_int_field(vf_layout, 5, "H-Matrix Threads:", "radiation.hmatrix_threads",
-                           0, 128, "Threads for H-matrix construction (0 = auto)")
+                           0, 128)
 
         # Which view-factor builder, and how accurately it integrates the near
         # field. Both change the numbers a coupled run produces.
         self.add_int_field(vf_layout, 6, "Near-Field Quadrature Order:",
-                           "radiation.nearfield_quadrature_order", 1, 8,
-                           "Order of the symmetric double-area quadrature used "
-                           "for near-field pairs. 3 is the default and the "
-                           "validated production value; order 1 is the centroid "
-                           "estimator with no near-field treatment at all and "
-                           "reads +51.7% on the touching-pair closed form "
-                           "(order 3 reads +18.5%). The engine calls order 1 "
-                           "\"a diagnostic setting, not a production one\".")
+                           "radiation.nearfield_quadrature_order", 1, 8)
         self.add_bool_field(vf_layout, 7, "Build View Factors by Monte Carlo",
-                            "radiation.use_monte_carlo_vf",
-                            "Select the Monte Carlo view-factor builder instead "
-                            "of the analytic/H-matrix path. A different builder "
-                            "is a different answer, not just a different speed.")
+                            "radiation.use_monte_carlo_vf")
         self.add_int_field(vf_layout, 8, "Monte Carlo Rays per Face:",
-                           "radiation.mc_rays_per_face", 1000, 10000000,
-                           "Rays cast per face by the Monte Carlo builder. "
-                           "Used only when that builder is selected.")
+                           "radiation.mc_rays_per_face", 1000, 10000000)
 
         self.quadrature_note = QLabel("")
         self.quadrature_note.setWordWrap(True)
@@ -2761,16 +2619,15 @@ class RadiationTab(BaseConfigTab):
         sparse_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(sparse_layout, 0, "Adaptive Neighbor Selection", "radiation.adaptive_neighbors",
-                            "Enable per-face adaptive selection for sparse view factors",
                             info_key="radiation.adaptive_neighbors")
         self.add_double_field(sparse_layout, 1, "Captured Energy Target:", "radiation.captured_energy_target",
-                              0.5, 1.0, 2, "Target fraction of radiative potential to capture (0.95 = 95%)",
+                              0.5, 1.0, 2,
                               info_key="radiation.captured_energy_target")
         self.add_int_field(sparse_layout, 2, "Max Neighbors:", "radiation.max_neighbors",
-                           10, 5000, "Maximum neighbors per face (hard ceiling)",
+                           10, 5000,
                            info_key="radiation.max_neighbors")
         self.add_int_field(sparse_layout, 3, "Min Neighbors:", "radiation.min_neighbors",
-                           5, 100, "Minimum neighbors per face",
+                           5, 100,
                            info_key="radiation.min_neighbors")
 
         sparse_section.add_widget(sparse_widget)
@@ -2782,23 +2639,13 @@ class RadiationTab(BaseConfigTab):
         gpu_layout = QGridLayout(gpu_widget)
         gpu_layout.setColumnStretch(1, 1)
         self.add_int_field(gpu_layout, 0, "GPU Count:", "radiation.gpu_devices",
-                           0, 16,
-                           "How many enumerated GPUs the radiosity pool may "
-                           "use. 1 = the first available; 0 = every one. "
-                           "Ignored when a device list is given.")
+                           0, 16)
         self.add_device_ids_field(
-            gpu_layout, 1, "GPU Device IDs:", "radiation.gpu_device_ids",
-            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+            gpu_layout, 1, "GPU Device IDs:", "radiation.gpu_device_ids")
         self.add_int_field(gpu_layout, 3, "Row-chunk Batch Size:",
-                           "radiation.gpu_batch_size", 0, 10000000,
-                           "Rows per radiosity dispatch. 0 = the engine's own "
-                           "choice. A single OpenCL buffer cannot exceed 2^31 "
-                           "bytes, which is why large matrices are chunked at "
-                           "all.")
+                           "radiation.gpu_batch_size", 0, 10000000)
         self.add_int_field(gpu_layout, 4, "Inter-batch Pause (ms):",
-                           "radiation.gpu_inter_batch_pause_ms", 0, 10000,
-                           "Idle gap between radiosity dispatches. A first-class "
-                           "wedge mitigation on macOS + AMD.")
+                           "radiation.gpu_inter_batch_pause_ms", 0, 10000)
         gpu_section.add_widget(gpu_widget)
         layout.addWidget(gpu_section)
 
@@ -3274,7 +3121,7 @@ class ThermophysicalTab(BaseConfigTab):
         # Preset dropdown (replaces 9 buttons)
         preset_row = QHBoxLayout()
         preset_label = QLabel("Preset:")
-        preset_label.setToolTip("Load thermophysical properties for a known body or material type")
+        preset_label.setToolTip(get_tooltip("ui.thermophysical_preset"))
         preset_row.addWidget(preset_label)
 
         self.preset_combo = QComboBox()
@@ -3283,6 +3130,7 @@ class ThermophysicalTab(BaseConfigTab):
             "Europa", "Moon", "Mercury", "Mars", "Ceres",
             "S-type Asteroid", "C-type Asteroid", "Bare Rock", "Icy Body"
         ])
+        self.preset_combo.setToolTip(get_tooltip("ui.thermophysical_preset"))
         self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
         preset_row.addWidget(self.preset_combo, stretch=1)
         layout.addLayout(preset_row)
@@ -3295,11 +3143,9 @@ class ThermophysicalTab(BaseConfigTab):
 
         self.add_property_with_default(surface_layout, 0, "Bond Albedo:", "thermophysical.albedo",
                                        "thermophysical.use_default_albedo", 0.0, 1.0, 3,
-                                       "Fraction of incident solar radiation reflected (0-1)",
                                        info_key="thermophysical.albedo")
         self.add_property_with_default(surface_layout, 1, "Emissivity:", "thermophysical.emissivity",
                                        "thermophysical.use_default_emissivity", 0.0, 1.0, 3,
-                                       "Thermal emissivity for IR radiation (0-1)",
                                        info_key="thermophysical.emissivity")
         # Incidence-angle albedo MODEL selector (Hayne 2017 vs Hapke). The
         # engine key is a single boolean (incidence_angle_albedo): false ->
@@ -3314,12 +3160,7 @@ class ThermophysicalTab(BaseConfigTab):
         self.incidence_combo.addItem("Hayne (2017)", False)
         self.incidence_combo.addItem("Hapke", True)
         self.incidence_combo.setToolTip(
-            "Angular albedo model.\n"
-            "Hayne (2017): albedo increases toward grazing incidence per the "
-            "lunar Hayne et al. (2017) fit — the default for global bodies.\n"
-            "Hapke: directional (photometric) albedo model — opt-in.\n"
-            "Sets the engine key incidence_angle_albedo (Hayne = false, "
-            "Hapke = true).")
+            get_tooltip("thermophysical.incidence_angle_albedo"))
         self.incidence_combo.currentIndexChanged.connect(
             self._on_incidence_model_changed)
         surface_layout.addWidget(self.incidence_combo, 2, 1)
@@ -3338,27 +3179,21 @@ class ThermophysicalTab(BaseConfigTab):
 
         self.add_property_with_default(cond_layout, 0, "Surface ks (W/m/K):", "thermophysical.ks",
                                        "thermophysical.use_default_ks", 1e-6, 10.0, 6,
-                                       "Surface thermal conductivity",
                                        info_key="thermophysical.ks")
         self.add_property_with_default(cond_layout, 1, "Deep kd (W/m/K):", "thermophysical.kd",
                                        "thermophysical.use_default_kd", 1e-6, 100.0, 6,
-                                       "Deep thermal conductivity (at depth >> H)",
                                        info_key="thermophysical.kd")
         self.add_property_with_default(cond_layout, 2, "Scale Height H (m):", "thermophysical.H",
                                        "thermophysical.use_default_H", 0.001, 1.0, 4,
-                                       "e-folding depth for property variation",
                                        info_key="thermophysical.H")
         self.add_property_with_default(cond_layout, 3, "Radiative \u03c7:", "thermophysical.chi",
                                        "thermophysical.use_default_chi", 0.0, 100.0, 2,
-                                       "Radiative conductivity parameter (k = kc \u00d7 [1 + \u03c7(T/350)\u00b3])",
                                        info_key="thermophysical.chi")
         self.add_property_with_default(cond_layout, 4, "Surface \u03c1s (kg/m\u00b3):", "thermophysical.rhos",
                                        "thermophysical.use_default_rhos", 100.0, 5000.0, 1,
-                                       "Surface bulk density",
                                        info_key="thermophysical.rhos")
         self.add_property_with_default(cond_layout, 5, "Deep \u03c1d (kg/m\u00b3):", "thermophysical.rhod",
                                        "thermophysical.use_default_rhod", 100.0, 5000.0, 1,
-                                       "Deep bulk density (at depth >> H)",
                                        info_key="thermophysical.rhod")
 
         # Which k(T, rho) law the solver uses. The engine validates the string
@@ -3366,13 +3201,7 @@ class ThermophysicalTab(BaseConfigTab):
         # martinez2021), so an unknown one is caught there, not guessed at.
         self.add_combo_field(cond_layout, 6, "Conductivity Model:",
                              "thermophysical.conductivity_model",
-                             ["hayne2017", "martinez2021"],
-                             "Temperature-dependent conductivity law.\n"
-                             "hayne2017: k = kc x [1 + chi (T/350)^3], the "
-                             "lunar-calibrated default.\n"
-                             "martinez2021: the Martinez et al. (2021) "
-                             "formulation, which depends on density as well as "
-                             "temperature.")
+                             ["hayne2017", "martinez2021"])
 
         cond_section.add_widget(cond_widget)
         layout.addWidget(cond_section)
@@ -3390,19 +3219,13 @@ class ThermophysicalTab(BaseConfigTab):
         self.ti_spin = QDoubleSpinBox()
         self.ti_spin.setRange(0.0, 10000.0)
         self.ti_spin.setDecimals(1)
-        self.ti_spin.setToolTip(
-            "Thermal inertia TI = \u221a(k \u00d7 \u03c1 \u00d7 cp).\n"
-            "Setting this value activates constant-TI mode:\n"
-            "  \u2022 \u03c7 = 0 (no radiative conductivity, k = ks)\n"
-            "  \u2022 cp = TI\u00b2 / (ks \u00d7 \u03c1s), constant\n"
-            "  \u2022 No temperature dependence in k or cp"
-        )
+        self.ti_spin.setToolTip(get_tooltip("thermophysical.thermal_inertia"))
         self.ti_spin.valueChanged.connect(self._on_ti_changed)
         ti_layout.addWidget(self.ti_spin, 0, 1)
 
         # Read-only display: cp(T_eq) and T_eq
         cp_label = QLabel("cp(T_eq):")
-        cp_label.setToolTip("Heat capacity evaluated at equilibrium temperature")
+        cp_label.setToolTip(get_tooltip("ui.ti_cp_readout"))
         ti_layout.addWidget(cp_label, 1, 0)
 
         self.ti_cp_label = QLabel("---")
@@ -3410,7 +3233,7 @@ class ThermophysicalTab(BaseConfigTab):
         ti_layout.addWidget(self.ti_cp_label, 1, 1)
 
         teq_label = QLabel("T_eq:")
-        teq_label.setToolTip("Equilibrium temperature from albedo, emissivity, distance")
+        teq_label.setToolTip(get_tooltip("ui.ti_teq_readout"))
         ti_layout.addWidget(teq_label, 1, 2)
 
         self.ti_teq_label = QLabel("---")
@@ -3428,11 +3251,9 @@ class ThermophysicalTab(BaseConfigTab):
 
         self.add_property_with_default(cp_heat_layout, 0, "Reference cp0 (J/kg/K):", "thermophysical.cp0",
                                        "thermophysical.use_default_cp0", -100.0, 2000.0, 4,
-                                       "Base heat capacity (may be T-dependent)",
                                        info_key="thermophysical.cp0")
         self.add_property_with_default(cp_heat_layout, 1, "Heat Flow Qb (W/m\u00b2):", "thermophysical.Qb",
                                        "thermophysical.use_default_Qb", 0.0, 1.0, 4,
-                                       "Geothermal/internal heat flux at bottom boundary",
                                        info_key="thermophysical.Qb")
 
         cp_heat_section.add_widget(cp_heat_widget)
@@ -3444,6 +3265,8 @@ class ThermophysicalTab(BaseConfigTab):
     def add_property_with_default(self, layout, row, label_text, value_key, default_key,
                                    min_val, max_val, decimals, tooltip="", info_key=None):
         """Add a property field with a 'Use Default' checkbox"""
+        label_text, tooltip, info_key = self._resolve_text(
+            value_key, label_text, tooltip, info_key)
         label = QLabel(label_text)
         label.setToolTip(tooltip)
         self._apply_tooltip(label, info_key)
@@ -3457,7 +3280,7 @@ class ThermophysicalTab(BaseConfigTab):
         layout.addWidget(value_widget, row, 1)
 
         default_check = QCheckBox("Use Default")
-        default_check.setToolTip("Use body-specific default value")
+        default_check.setToolTip(get_tooltip("ui.use_body_default"))
         default_check.stateChanged.connect(
             lambda state: self.on_default_toggled(value_key, default_key, state)
         )
@@ -3550,11 +3373,9 @@ class ThermophysicalTab(BaseConfigTab):
         generic_body.surface, which the engine reads)."""
         generic = getattr(self.config_manager, "generic_body_active",
                           lambda: False)()
-        unsupported_tip = (
-            "Not customizable for built-in bodies: the engine has no "
-            "override key for this property (config_parser.cpp reads "
-            + "/".join(self.BUILTIN_OVERRIDABLE) + " overrides only). Use a "
-            "Custom or HORIZONS body to set it via generic_body.surface.")
+        unsupported_tip = get_tooltip(
+            "ui.property_unsupported_on_builtin_body").format(
+                overridable=", ".join(self.BUILTIN_OVERRIDABLE))
         for attr in self.BUILTIN_UNSUPPORTED:
             vkey = f"thermophysical.{attr}"
             dkey = f"thermophysical.use_default_{attr}"
@@ -3563,11 +3384,11 @@ class ThermophysicalTab(BaseConfigTab):
             if generic:
                 if cb is not None:
                     cb.setEnabled(True)
-                    cb.setToolTip("Use body-specific default value")
+                    cb.setToolTip(get_tooltip("ui.use_body_default"))
                 if vw is not None and cb is not None:
                     vw.setEnabled(not cb.isChecked())
                 if vw is not None:
-                    vw.setToolTip("")
+                    vw.setToolTip(get_tooltip(vkey))
             else:
                 if cb is not None and not cb.isChecked():
                     # Revert a custom value the engine cannot receive -- but
@@ -4020,28 +3841,25 @@ class BodyDefinitionTab(BaseConfigTab):
         shape_layout.setColumnStretch(1, 1)
 
         self.add_combo_field(shape_layout, 0, "Shape Type:", "generic_body.shape.type",
-                             ["spherical", "ellipsoidal", "custom_mesh"],
-                             "Body shape model", info_key="generic_body.shape_type")
+                             ["spherical", "ellipsoidal", "custom_mesh"],)
 
         # Spherical: radius
         self.add_double_field(shape_layout, 1, "Radius (km):", "generic_body.shape.radius_km",
-                              0.001, 100000.0, 3, "Mean body radius",
-                              info_key="generic_body.shape_radius")
+                              0.001, 100000.0, 3,)
 
         # Ellipsoidal: three semi-axes
         self.add_double_field(shape_layout, 2, "Semi-axis A (km):", "generic_body.shape.semi_axis_a_km",
-                              0.001, 100000.0, 3, "Semi-axis along X")
+                              0.001, 100000.0, 3)
         self.add_double_field(shape_layout, 3, "Semi-axis B (km):", "generic_body.shape.semi_axis_b_km",
-                              0.001, 100000.0, 3, "Semi-axis along Y")
+                              0.001, 100000.0, 3)
         self.add_double_field(shape_layout, 4, "Semi-axis C (km):", "generic_body.shape.semi_axis_c_km",
-                              0.001, 100000.0, 3, "Semi-axis along Z")
+                              0.001, 100000.0, 3)
 
         # Custom mesh: file + scale
         self.add_file_field(shape_layout, 5, "Mesh File:", "generic_body.shape.mesh_file",
-                            "Mesh Files (*.obj *.ply);;All Files (*)",
-                            "Path to custom mesh (OBJ or PLY)")
+                            "Mesh Files (*.obj *.ply);;All Files (*)")
         self.add_double_field(shape_layout, 6, "Mesh Scale:", "generic_body.shape.mesh_scale",
-                              0.001, 1000.0, 3, "Scale factor for mesh coordinates")
+                              0.001, 1000.0, 3)
 
         shape_group.setLayout(shape_layout)
         layout.addWidget(shape_group)
@@ -4079,30 +3897,23 @@ class BodyDefinitionTab(BaseConfigTab):
 
         self.add_double_field(orbit_layout, 0, "Semi-major Axis (AU):",
                               "generic_body.orbit.semi_major_axis_au",
-                              0.01, 1000.0, 6, "Orbital semi-major axis",
-                              info_key="generic_body.orbit.sma")
+                              0.01, 1000.0, 6,)
         self.add_double_field(orbit_layout, 1, "Eccentricity:",
                               "generic_body.orbit.eccentricity",
-                              0.0, 0.999, 8, "Orbital eccentricity",
-                              info_key="generic_body.orbit.ecc")
+                              0.0, 0.999, 8,)
         self.add_double_field(orbit_layout, 2, "Inclination (deg):",
                               "generic_body.orbit.inclination_deg",
-                              0.0, 180.0, 4, "Orbital inclination",
-                              info_key="generic_body.orbit.inc")
+                              0.0, 180.0, 4,)
         self.add_double_field(orbit_layout, 3, "Long. Asc. Node (deg):",
                               "generic_body.orbit.lon_ascending_node_deg",
-                              0.0, 360.0, 4, "Longitude of ascending node",
-                              info_key="generic_body.orbit.lan")
+                              0.0, 360.0, 4,)
         self.add_double_field(orbit_layout, 4, "Arg. Perihelion (deg):",
                               "generic_body.orbit.arg_perihelion_deg",
-                              0.0, 360.0, 4, "Argument of perihelion",
-                              info_key="generic_body.orbit.aop")
+                              0.0, 360.0, 4,)
         self.add_double_field(orbit_layout, 5, "Mean Anomaly (deg):",
                               "generic_body.orbit.mean_anomaly_deg",
-                              0.0, 360.0, 4, "Mean anomaly at epoch",
-                              info_key="generic_body.orbit.ma")
+                              0.0, 360.0, 4,)
         self.add_string_field(orbit_layout, 6, "Epoch:", "generic_body.orbit.epoch",
-                              "Reference epoch (ISO 8601, e.g. 2000-01-01T12:00:00)",
                               info_key="generic_body.orbit.epoch")
 
         orbit_group.setLayout(orbit_layout)
@@ -4115,8 +3926,7 @@ class BodyDefinitionTab(BaseConfigTab):
 
         self.add_double_field(spin_layout, 0, "Spin Period (hours):",
                               "generic_body.spin.period_hours",
-                              0.001, 100000.0, 4, "Sidereal rotation period",
-                              info_key="generic_body.spin.period")
+                              0.001, 100000.0, 4,)
 
         # Row 1: Obliquity (derived, not stored in config)
         self._syncing_obliquity = False
@@ -4128,22 +3938,19 @@ class BodyDefinitionTab(BaseConfigTab):
         self.obliquity_spin.setRange(0.0, 180.0)
         self.obliquity_spin.setDecimals(2)
         self.obliquity_spin.setSingleStep(1.0)
-        self.obliquity_spin.setToolTip("Angle between spin axis and orbit normal")
+        self.obliquity_spin.setToolTip(get_tooltip("generic_body.spin.obliquity"))
         self.obliquity_spin.valueChanged.connect(self._on_obliquity_changed)
         spin_layout.addWidget(self.obliquity_spin, 1, 1)
 
         self.add_double_field(spin_layout, 2, "Pole RA (deg, J2000):",
                               "generic_body.spin.pole_ra_deg",
-                              0.0, 360.0, 3, "Right ascension of spin pole",
-                              info_key="generic_body.spin.pole_ra")
+                              0.0, 360.0, 3,)
         self.add_double_field(spin_layout, 3, "Pole Dec (deg, J2000):",
                               "generic_body.spin.pole_dec_deg",
-                              -90.0, 90.0, 3, "Declination of spin pole",
-                              info_key="generic_body.spin.pole_dec")
+                              -90.0, 90.0, 3,)
         self.add_double_field(spin_layout, 4, "Prime Meridian (deg):",
                               "generic_body.spin.prime_meridian_deg",
-                              0.0, 360.0, 3, "Prime meridian angle at epoch",
-                              info_key="generic_body.spin.pm")
+                              0.0, 360.0, 3,)
 
         spin_group.setLayout(spin_layout)
         layout.addWidget(spin_group)
@@ -4155,14 +3962,11 @@ class BodyDefinitionTab(BaseConfigTab):
 
         self.add_combo_field(eph_layout, 0, "Source:", "generic_body.ephemeris_source",
                              ["auto", "keplerian", "spice"],
-                             "Ephemeris source for position computation",
                              info_key="generic_body.ephemeris_source")
         self.add_file_field(eph_layout, 1, "SPICE Metakernel:", "generic_body.spice_metakernel",
                             "Meta-kernel Files (*.tm);;All Files (*)",
-                            "Path to SPICE metakernel file",
                             info_key="generic_body.spice_metakernel")
         self.add_string_field(eph_layout, 2, "NAIF Body ID:", "generic_body.naif_id",
-                              "NAIF/SPICE body ID (e.g. 2000269)",
                               info_key="generic_body.naif_id")
 
         eph_group.setLayout(eph_layout)
@@ -4571,7 +4375,6 @@ class IlluminationTab(BaseConfigTab):
         illum_layout.setColumnStretch(1, 1)
 
         self.add_bool_field(illum_layout, 0, "Include Reflected Sunlight from Primary Body", "illumination.include_primary_reflection",
-                            "Include reflected solar radiation from the primary body (e.g., Jupiter for Europa)",
                             info_key="illumination.include_primary_reflection")
 
         illum_group.setLayout(illum_layout)
@@ -4591,17 +4394,13 @@ class IlluminationTab(BaseConfigTab):
         src_layout.setContentsMargins(0, 0, 0, 0)
         self.albedo_builtin_radio = QRadioButton("Built-in (recommended)")
         self.albedo_builtin_radio.setToolTip(
-            "Ship-with-PTM3D Bond-albedo map for the selected body "
-            "(data/albedo_maps/<Body>_Albedo_res<N>.bin, resolved via "
-            "PTM_DATA_ROOT or the repository data directory). Fetched on "
-            "demand if missing.")
+            get_tooltip("ui.albedo_source_builtin"))
         self.albedo_custom_radio = QRadioButton("Custom path…")
         self.albedo_custom_radio.setToolTip(
-            "Point at your own albedo map file or directory")
+            get_tooltip("ui.albedo_source_custom"))
         self.albedo_none_radio = QRadioButton("None (uniform albedo)")
         self.albedo_none_radio.setToolTip(
-            "No spatially-varying map: all faces use the constant albedo "
-            "from the Properties tab")
+            get_tooltip("ui.albedo_source_none"))
         self._albedo_src_group = QButtonGroup(src_container)
         for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
                    self.albedo_none_radio):
@@ -4621,6 +4420,8 @@ class IlluminationTab(BaseConfigTab):
         self.albedo_resolved_edit.setReadOnly(True)
         self.albedo_resolved_edit.setPlaceholderText(
             "(select Built-in to see the resolved dataset path)")
+        self.albedo_resolved_edit.setToolTip(
+            get_tooltip("ui.albedo_resolved_path"))
         resolved_layout.addWidget(self.albedo_resolved_edit)
         self.albedo_fetch_btn = QPushButton("Fetch…")
         self.albedo_fetch_btn.setMaximumWidth(80)
@@ -4631,10 +4432,8 @@ class IlluminationTab(BaseConfigTab):
 
         self.add_file_field(albedo_layout, 2, "Albedo Map:", "illumination.albedo_map",
                             "FITS Files (*.fits *.fit);;All Files (*)",
-                            "Path to single albedo map file (Custom mode)",
                             info_key="illumination.albedo_map")
         self.add_directory_field(albedo_layout, 3, "Albedo Maps Directory:", "illumination.albedo_maps_directory",
-                                 "Directory containing multiple albedo maps (Custom mode)",
                                  info_key="illumination.albedo_maps_directory")
 
         albedo_group.setLayout(albedo_layout)
@@ -4650,7 +4449,6 @@ class IlluminationTab(BaseConfigTab):
         batch_layout = QGridLayout()
         batch_layout.setColumnStretch(1, 1)
         self.add_bool_field(batch_layout, 0, "Use Batch Processing", "illumination.use_batch_processing",
-                            "Use batch processing for ray tracing",
                             info_key="illumination.use_batch_processing")
         batch_group.setLayout(batch_layout)
         adv_illum.add_widget(batch_group)
@@ -4660,20 +4458,10 @@ class IlluminationTab(BaseConfigTab):
         pos_layout.setColumnStretch(1, 1)
         self.add_file_field(pos_layout, 0, "Positions File:", "illumination.positions_file",
                             "Binary Files (*.bin);;All Files (*)",
-                            "Precomputed Sun/Primary positions",
                             info_key="illumination.positions_file")
         self.add_file_field(pos_layout, 1, "BVH Cache File:",
                             "illumination.bvh_cache_file",
-                            "BVH Files (*.bvh *.bin);;All Files (*)",
-                            "Where to cache the shadow-ray acceleration "
-                            "structure. Reusing it is a large saving on a "
-                            "repeat run of the same mesh; it is rebuilt when "
-                            "the geometry no longer matches.\n"
-                            "Blank = the engine derives one under the output "
-                            "directory. The exact lowercase word 'off' "
-                            "disables caching -- the engine compares that "
-                            "string literally, so 'OFF' is a FILENAME, not "
-                            "the switch.")
+                            "BVH Files (*.bvh *.bin);;All Files (*)")
         pos_group.setLayout(pos_layout)
         adv_illum.add_widget(pos_group)
 
@@ -4684,23 +4472,13 @@ class IlluminationTab(BaseConfigTab):
         ig = QGridLayout()
         ig.setColumnStretch(1, 1)
         self.add_bool_field(ig, 0, "Use GPU for Illumination",
-                            "illumination.use_gpu",
-                            "OFF is the recommendation on this machine, not an "
-                            "oversight: the CPU illumination path is both "
-                            "correct AND faster here, and the GPU path has its "
-                            "own history of lunar correctness problems. This "
-                            "control exists so the choice is visible rather "
-                            "than mysterious.")
+                            "illumination.use_gpu")
         self.add_int_field(ig, 1, "GPU Count:", "illumination.gpu_devices",
-                           0, 16,
-                           "How many enumerated GPUs the illumination pass may "
-                           "use. Read only when the box above is ticked.")
+                           0, 16)
         self.add_device_ids_field(
-            ig, 2, "GPU Device IDs:", "illumination.gpu_device_ids",
-            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+            ig, 2, "GPU Device IDs:", "illumination.gpu_device_ids")
         self.add_int_field(ig, 4, "Inter-batch Pause (ms):",
-                           "illumination.gpu_inter_batch_pause_ms", 0, 10000,
-                           "Idle gap between dispatches -- a wedge mitigation.")
+                           "illumination.gpu_inter_batch_pause_ms", 0, 10000)
         illum_gpu_group.setLayout(ig)
         adv_illum.add_widget(illum_gpu_group)
         self._illum_gpu_keys = ["illumination.gpu_devices",
@@ -4777,8 +4555,7 @@ class IlluminationTab(BaseConfigTab):
         self.albedo_builtin_radio.setEnabled(supported)
         self.albedo_builtin_radio.setToolTip(
             status.detail if not supported else
-            "Ship-with-PTM3D Bond-albedo map for the selected body, "
-            "fetched on demand")
+            get_tooltip("ui.albedo_source_builtin"))
         # A body without built-in albedo cannot stay in Built-in mode --
         # fall over to None (uniform albedo) rather than promising a map
         # that does not exist.
@@ -4900,7 +4677,6 @@ class OutputTab(BaseConfigTab):
         dest_layout.setColumnStretch(1, 1)
 
         self.add_directory_field(dest_layout, 0, "Output Directory:", "output.directory",
-                                 "Directory where results are written",
                                  info_key="output.directory")
         # `none` is a REAL value for both -- five shipped configs use it and
         # the engine accepts it. It was missing from the combos, so a config
@@ -4908,18 +4684,11 @@ class OutputTab(BaseConfigTab):
         # returned -1 and the combo kept whatever it was showing).
         self.add_combo_field(dest_layout, 1, "Format:", "output.format",
                              ["binary", "vtk", "none"],
-                             "binary writes the statistics/time-series "
-                             "products; vtk writes meshes; none writes no "
-                             "field output at all (an illumination-only or "
-                             "location-only run).",
                              info_key="output.format")
         self.add_combo_field(dest_layout, 2, "VTK Mode:", "output.vtk_mode",
                              ["thermal", "complete", "both", "none"],
-                             "Which VTK products a vtk-format run writes. "
-                             "none writes none.",
                              info_key="output.vtk_mode")
         self.add_bool_field(dest_layout, 3, "Include Primary IR", "output.include_primary_ir",
-                            "Include primary IR in VTK export",
                             info_key="output.include_primary_ir")
 
         dest_group.setLayout(dest_layout)
@@ -4932,14 +4701,11 @@ class OutputTab(BaseConfigTab):
 
         self.add_file_field(loc_layout, 0, "Locations File:", "output.locations_file",
                             "Location Files (*.txt *.csv);;All Files (*)",
-                            "Text/CSV with lat,lon locations",
                             info_key="output.locations_file")
         self.add_file_field(loc_layout, 1, "Depths File:", "output.depths_file",
                             "Depth Files (*.txt *.dat);;All Files (*)",
-                            "Depths for location output (one per line, meters)",
                             info_key="output.depths_file")
-        self.add_string_field(loc_layout, 2, "Series Output:", "output.series_output",
-                              "Filename for illumination series CSV")
+        self.add_string_field(loc_layout, 2, "Series Output:", "output.series_output")
 
         loc_group.setLayout(loc_layout)
         layout.addWidget(loc_group)
@@ -5468,44 +5234,22 @@ class GpuPolicyTab(BaseConfigTab):
         self.add_bool_field(
             edit_layout, 0,
             "Enforce the VRAM floor on EVERY platform",
-            "gpu.margin_explicit",
-            "Writes gpu.min_vram_margin_gib into the configuration. The "
-            "engine treats the PRESENCE of that key as the request: written, "
-            "the floor is enforcing everywhere; absent, it is enforcing on "
-            "macOS + AMD and advisory elsewhere. Leaving this off is what "
-            "keeps a config the GUI touched from silently changing GPU policy "
-            "on someone else's machine.")
+            "gpu.margin_explicit")
         self.add_double_field(
             edit_layout, 1, "VRAM Margin Floor (GiB):",
-            "gpu.min_vram_margin_gib", 0.0, 64.0, 2,
-            "Per-device VRAM headroom a resident radiosity replica must leave "
-            "behind. A rung with less is refused or separated. 0 = the "
-            "pre-2026-08-22 behavior (fit check only).")
+            "gpu.min_vram_margin_gib", 0.0, 64.0, 2)
         self.add_combo_field(
             edit_layout, 2, "Placement Policy:", "gpu.placement_policy",
-            ["auto", "shared", "disjoint"],
-            "Whether the radiosity replica and the GPU thermal pool may "
-            "occupy the same dies. auto separates them below the margin "
-            "below; the engine refuses any other spelling at startup.")
+            ["auto", "shared", "disjoint"])
         self.add_double_field(
             edit_layout, 3, "Placement Margin (GiB):",
-            "gpu.placement_margin_gib", 0.0, 64.0, 2,
-            "The headroom below which `auto` separates the two pools.")
+            "gpu.placement_margin_gib", 0.0, 64.0, 2)
         self.add_combo_field(
             edit_layout, 4, "Thin-margin Policy:", "gpu.thin_margin_policy",
-            ["separate", "refuse"],
-            "What a margin below the floor DOES.\n"
-            "separate (default, Paul's ruling 2026-08-22): keep the GPU rung "
-            "behind disjoint placement, refusing only below the hard floor.\n"
-            "refuse: give up the GPU rung entirely. Measured on A3GT "
-            "A03N1016, CPU radiosity cost 108.9 min/window against 31.4 on "
-            "the GPU pool; separation costs a derived +7 to +10 min.")
+            ["separate", "refuse"])
         self.add_double_field(
             edit_layout, 5, "Hard Floor (GiB):",
-            "gpu.hard_min_vram_margin_gib", 0.0, 64.0, 2,
-            "The margin below which even `separate` refuses. Must be BELOW "
-            "the VRAM margin floor, or the separate band is empty and the "
-            "engine refuses the configuration at startup.")
+            "gpu.hard_min_vram_margin_gib", 0.0, 64.0, 2)
 
         edit_section.add_widget(edit_widget)
         layout.addWidget(edit_section)
@@ -5577,18 +5321,13 @@ class GpuPolicyTab(BaseConfigTab):
             self.config_manager.set_value("gpu.margin_explicit", False)
             self._margin_forced = False
             self.value_changed.emit()
+        # Both branches come from gui_tooltips, like every other control. A
+        # tooltip that exists only at its point of use is one nobody finds
+        # when they go looking for the wording.
         widget.setToolTip(
-            ("Forced ON: the floor differs from the engine's default "
-             f"({engine_default} GiB), so the key must be written -- and the "
-             "engine reads its PRESENCE as 'enforce on every platform'. "
-             "There is no way to set a non-default floor advisorily."
-             if forced else
-             "Writes gpu.min_vram_margin_gib into the configuration. The "
-             "engine treats the PRESENCE of that key as the request: written, "
-             "the floor is enforcing everywhere; absent, it is enforcing on "
-             "macOS + AMD and advisory elsewhere. Leaving this off is what "
-             "keeps a config the GUI touched from silently changing GPU "
-             "policy on someone else's machine."))
+            get_tooltip("gpu.margin_explicit.forced").format(
+                engine_default=engine_default)
+            if forced else get_tooltip("gpu.margin_explicit"))
 
     def refresh_effective(self):
         self._update_margin_explicit_gating()
@@ -5744,13 +5483,7 @@ class ConfigurationPanel(QWidget):
         # FIELDS, not tabs: every section is always reachable, and each one
         # keeps its expert groups collapsed until this is checked.
         self.advanced_toggle = QCheckBox("Advanced options")
-        self.advanced_toggle.setToolTip(
-            "Reveal the expert groups on every tab: view-factor and coupling "
-            "options, the GPU device controls and guardrails, mesh placement "
-            "and occluder, initial condition and run state, the equilibration "
-            "cadence, and the engine-flag editor.\n"
-            "Every tab is visible either way; this changes what is shown "
-            "inside them, never what is saved.")
+        self.advanced_toggle.setToolTip(get_tooltip("ui.advanced_options"))
         self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
 
         # Container for nav rail + content
@@ -5875,11 +5608,7 @@ class ConfigurationPanel(QWidget):
         # directory as config.yaml. Saying "YAML Preview" over an expanded dump
         # while Save writes a minimal edit would be the same class of quiet
         # mismatch this stage exists to remove.
-        preview_header.setToolTip(
-            "The fully expanded configuration handed to the engine, and "
-            "written beside the output directory as config.yaml.\n"
-            "Save does NOT write this: it edits your project file in place, "
-            "changing only the keys you changed and preserving its comments.")
+        preview_header.setToolTip(get_tooltip("ui.yaml_preview"))
         preview_layout.addWidget(preview_header)
 
         self.preview_text = QTextEdit()

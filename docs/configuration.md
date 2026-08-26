@@ -427,15 +427,17 @@ command line wins. The full key list, with the physics behind each, is in
 |---|---|---|---|
 | `enabled` | bool | false | Enable inter-face radiation exchange |
 | `band_separated` | bool | **true** | Band-separated visible + thermal-IR radiosity; false = single gray band |
-| `exchange_selection` | string | `all` | Which faces keep the computed indirect flux (`all` or `shadow`) |
+| `exchange_selection` | string | `all` | Which faces keep the computed indirect flux. `all` (default) — every face keeps it, and the result does not depend on how the run was split into chunks. `shadow` — only faces shadowed at least `min_shadow_fraction` of the time keep it; provided to reproduce runs published before the default changed, and best paired with `coupling_mode: legacy` |
+| `min_shadow_fraction` | float | 0.3 | The shadow-fraction cut used by `exchange_selection: shadow`. **Read only under that setting**, so it is inert in a default configuration. The shadow fraction is measured over the run's *own* illumination series, so a warm-started chunk (which has no equilibration samples) reclassifies faces and zeroes their indirect flux |
 | `view_factor_file` | string | `""` | Save/load path for the view-factor matrix; a relative path resolves against the configuration file's directory |
 | `use_hmatrix` | bool | false | Hierarchical-matrix compression for large meshes |
 | `use_monte_carlo_vf` | bool | false | Monte Carlo ray-gather view-factor builder |
 | `mc_rays_per_face` | int | 100000 | Rays cast per face by that builder; read only when it is selected |
 | `nearfield_quadrature_order` | int | 3 | Order of the symmetric double-area quadrature for near-field pairs. 3 is the validated production value. Order 1 is the centroid estimator with no near-field treatment at all and reads **+51.7 %** on the touching-pair closed form (order 3 reads +18.5 %); the engine calls it "a diagnostic setting, not a production one" and says so at startup |
-| `coupling_mode` | string | `bounded` | `bounded`, `fixed` or `legacy` |
+| `coupling_mode` | string | `bounded` | How the thermal–radiation coupling loop decides it has converged. `bounded` (default) — stop once the largest per-face temperature change falls below `coupling_temp_threshold`, which bounds the residual on *every* face; this is the only data-driven exit, and `coupling_flux_threshold` is **not** part of it. `fixed` — early exit disabled entirely: every window runs exactly `max_coupling_iterations` sweeps, so the answer cannot depend on how the window was chunked. `legacy` — stop once only `coupling_face_fraction` of faces are still changing; no error bound, and it made a coupled run's answer depend on the chunking. It is the only mode that reads `coupling_face_fraction`. Compared **exactly**: `Bounded` is a startup error |
 | `max_coupling_iterations` | int | 16 | Picard iteration cap (raised from 10 on 2026-08-15; see radiation-exchange.md §7.5) |
-| `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) |
+| `coupling_temp_threshold` | float | 0.5 | Temperature convergence threshold (K) — the loop's only data-driven exit, under `coupling_mode: bounded` |
+| `coupling_flux_threshold` | float | 0.1 | Indirect-flux cut used to **select faces** for another thermal solve, in W/m². It is not a convergence criterion, and it is read only under the non-default `coupling_select_mode: legacy`; the default physics-based selection ignores it |
 | `beaming` | bool | false | Smith (1967) anisotropic beamed thermal emission. **Standard for lunar polar SITE/REGIONAL configurations**; OFF on sub-cm meshes — see below |
 | `rms_slope_deg` | float | 0.0 | RMS sub-facet slope $w$ in degrees; the beaming knob. Inert unless `beaming: true` |
 | `use_gpu` | bool | false | OpenCL radiosity solver |
