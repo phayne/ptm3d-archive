@@ -458,6 +458,50 @@ def test_a_reflow_the_writer_cannot_avoid_is_REPORTED():
             f"reflow: {manager.last_save_layout_changes}")
 
 
+def test_layout_detection_matches_a_KEY_not_a_substring():
+    """`leaf in line` let one edit absorb another key's reflow.
+
+    Editing output.directory gave leaves {"output", "directory"}, and an
+    unrelated reflow of `topo_directory:` contains "directory" -- so the guard
+    rail went quiet exactly where it was needed. Segments like `thermal`,
+    `mesh` and `body` made that common.
+    """
+    _require_ruamel()
+    from gui_core.yaml_roundtrip import layout_only_changes
+    before = "output:\n  directory: out\nmesh:\n  topo_directory: data/topo\n"
+    after = "output:\n  directory: NEW\nmesh:\n topo_directory: data/topo\n"
+    reported = layout_only_changes(before, after, {"output.directory"})
+    assert any("topo_directory" in ln for ln in reported), (
+        f"a reflow of topo_directory was absorbed by an edit to "
+        f"output.directory: {reported}")
+    assert not any(ln.strip().endswith("directory: NEW") for ln in reported), (
+        f"the edited line itself was reported as a reflow: {reported}")
+
+    # A section header the edit really created is still not a reflow.
+    assert layout_only_changes(
+        "mesh:\n  resolution: 4\n",
+        "mesh:\n  resolution: 4\nsimulation:\n  timesteps: 7\n",
+        {"simulation.timesteps"}) == []
+
+
+def test_a_second_save_does_not_repeat_the_first_saves_warning():
+    _require_ruamel()
+    with tempfile.TemporaryDirectory() as tmp:
+        mixed = Path(tmp) / "mixed.yaml"
+        mixed.write_text(
+            "a_list:\n  - one\n"
+            "simulation:\n  timesteps: 5\n"
+            "b_list:\n- three\n")
+        manager = _manager()
+        manager.load_from_yaml(str(mixed))
+        manager.set_value("simulation.timesteps", 7)
+        manager.save_to_yaml(str(mixed))
+        assert manager.last_save_layout_changes, "fixture did not reflow"
+        assert manager.save_to_yaml(str(mixed)) == "unchanged"
+        assert manager.last_save_layout_changes == [], (
+            "a save that wrote nothing re-reported the previous save's reflow")
+
+
 def test_no_shipped_config_is_reflowed_by_an_edit():
     """The corpus answer to the limitation above: 0 of 77."""
     _require_ruamel()
@@ -696,6 +740,8 @@ TESTS = [
     test_no_edit_save_is_byte_identical_on_EVERY_shipped_config,
     test_one_edit_touches_only_that_key_across_every_config,
     test_a_reflow_the_writer_cannot_avoid_is_REPORTED,
+    test_layout_detection_matches_a_KEY_not_a_substring,
+    test_a_second_save_does_not_repeat_the_first_saves_warning,
     test_no_shipped_config_is_reflowed_by_an_edit,
     test_a_recognized_alias_keeps_the_files_own_spelling,
     test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save,

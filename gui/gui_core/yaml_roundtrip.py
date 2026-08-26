@@ -242,18 +242,31 @@ def layout_only_changes(before, after, edited_keys):
     so it is measured and reported instead of assumed away.
     """
     import difflib
+    import re
     # Every segment, not just the leaf: writing `simulation.timesteps` into a
     # file that had no `simulation:` legitimately adds that header, and calling
     # the header a reflow would cry wolf on a line the edit really did create.
-    leaves = set()
+    #
+    # Matched as a YAML KEY, anchored, not as a bare substring. `leaf in line`
+    # let an edit to output.directory absorb a reflow of `topo_directory:`,
+    # and segments like `thermal`, `mesh` and `body` made that common -- so the
+    # guard rail went quiet exactly where it was needed.
+    segments = set()
     for key in edited_keys:
-        leaves.update(key.split("."))
+        segments.update(key.split("."))
+    if not segments:
+        pattern = None
+    else:
+        pattern = re.compile(
+            r"^[+-]\s*(?:- )?(" + "|".join(re.escape(x) for x in sorted(segments))
+            + r")\s*:")
     changed = [
         line for line in difflib.unified_diff(
             before.splitlines(), after.splitlines(), lineterm="", n=0)
         if line[:1] in "+-" and not line.startswith(("+++", "---"))]
-    return [line for line in changed
-            if not any(leaf in line for leaf in leaves)]
+    if pattern is None:
+        return changed
+    return [line for line in changed if not pattern.match(line)]
 
 
 def plan_edits(loaded_view, current_view, file_keys):

@@ -1230,6 +1230,10 @@ class ConfigManager:
         next save is again a minimal edit.
         """
         doc = self._source_doc
+        # Reset FIRST. It was only ever assigned in the round-trip branch, so
+        # a later "unchanged" or "expanded" save re-reported the previous
+        # save's reflow -- a warning about a write that did not happen.
+        self.last_save_layout_changes = []
         # Save As onto a DIFFERENT existing file replaces it wholesale with
         # this project's document -- which is what Save As means, but it is not
         # "comments preserved": the target's own comments are gone. Reporting

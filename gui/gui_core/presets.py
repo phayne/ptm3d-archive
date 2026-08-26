@@ -167,10 +167,12 @@ PRESETS = [
             "radiation.enabled": False,
             "illumination.albedo_source": "none",
             "illumination.include_primary_reflection": False,
-            # A shaped body carries its own thermophysical values through
-            # generic_body.surface; the built-in Moon/Europa numbers do not
-            # apply to it.
-            "generic_body.ephemeris_source": "auto",
+            # generic_body.ephemeris_source is NOT set here. _config_for_yaml
+            # emits the generic_body section only once a body is actually
+            # active (config_file, name, or a positive semi_major_axis_au), and
+            # this card does not make one active -- so reporting it as set was
+            # a claim about a key that would be silently dropped, which breaks
+            # this module's first rule.
         },
         beaming="off",
         # NOT needs_advanced: nothing this card names sits behind an Advanced
@@ -182,7 +184,8 @@ PRESETS = [
         needs=(
             "a custom body -- use the HORIZONS page to search for one and "
             "cache its body_config.yaml. The Body page appears once a custom "
-            "body is active; until then there is nothing for it to describe.",
+            "body is active; until then there is nothing for it to describe, "
+            "and nothing under generic_body: can be written at all.",
             "generic_body.shape -- a radius, semi-axes, or a shape mesh, on "
             "the Body page",
         ),

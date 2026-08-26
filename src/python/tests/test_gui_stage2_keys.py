@@ -260,6 +260,79 @@ def test_a_nonzero_default_floor_forces_the_explicit_checkbox():
         tab.refresh_effective()
 
 
+def test_the_forced_explicit_tick_is_reversible():
+    """A transient edit must not permanently change the run's GPU policy.
+
+    Forcing margin_explicit on and never clearing it meant a user who typed
+    3.0 and then typed 2.0 back was left with min_vram_margin_gib written --
+    and the engine reads its PRESENCE as "enforce on every platform". A tick
+    the USER made still stands.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        tab = panel.tabs["gpu"]
+        box = tab.widgets["gpu.margin_explicit"]
+        spin = tab.widgets["gpu.min_vram_margin_gib"]
+
+        spin.setValue(2.0)
+        box.setChecked(False)
+        tab.refresh_effective()
+        spin.setValue(3.0)
+        assert manager.get_value("gpu.margin_explicit") is True
+        spin.setValue(2.0)
+        assert manager.get_value("gpu.margin_explicit") is False, (
+            "changing the floor back left the run enforcing the guardrail on "
+            "every platform")
+        assert "gpu" not in manager._config_for_yaml(), (
+            manager._config_for_yaml().get("gpu"))
+
+        # A tick the user made themselves is theirs.
+        box.setChecked(True)
+        spin.setValue(3.0)
+        spin.setValue(2.0)
+        assert manager.get_value("gpu.margin_explicit") is True, (
+            "the user's own request was undone by the forcing logic")
+        box.setChecked(False)
+        tab.refresh_effective()
+
+
+def test_an_engine_rejected_enum_is_shown_and_repairable():
+    """thermal.eq_indirect_source is compared BYTE-EXACTLY by the engine.
+
+    Displaying `Auto` as `auto` showed a run that will not happen -- and since
+    the stored value is no longer rewritten on load, the user could not repair
+    it from the combo either: selecting the item already showing fires no
+    signal.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = Path(scratch) / "bad_enum.yaml"
+        path.write_text(
+            "simulation:\n  body: Moon\n"
+            "thermal:\n  eq_indirect_source: Auto\n")
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        combo = panel.tabs["thermal"].widgets["thermal.eq_indirect_source"]
+        assert combo.currentText() == "Auto", (
+            f"the control shows {combo.currentText()!r} for a value the engine "
+            f"refuses; it must show what will actually run")
+        assert manager.validate()[0] is False, (
+            "the engine refuses this value and validate() did not")
+
+        combo.setCurrentText("auto")
+        assert manager.get_value("thermal.eq_indirect_source") == "auto"
+        assert manager.validate()[0] is True, manager.validate()[1]
+
+        # A second load must not leave the foreign entry behind.
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        assert combo.count() == 4, (
+            f"the foreign entry accumulated: "
+            f"{[combo.itemText(i) for i in range(combo.count())]}")
+        manager.reset_to_defaults()
+        panel.load_from_config()
+
+
 def test_the_gpu_enums_are_case_insensitive_like_the_engine():
     """The engine lowercases both before comparing (gpu::guardrails::toLower).
 
@@ -508,6 +581,8 @@ TESTS = [
     test_an_empty_device_list_is_not_written,
     test_a_malformed_device_list_is_refused_not_ignored,
     test_a_nonzero_default_floor_forces_the_explicit_checkbox,
+    test_the_forced_explicit_tick_is_reversible,
+    test_an_engine_rejected_enum_is_shown_and_repairable,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
     test_the_gpu_policy_enums_are_the_engines_own,
     test_the_hard_floor_rule_is_the_engines_rule,

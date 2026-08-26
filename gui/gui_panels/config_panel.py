@@ -141,13 +141,17 @@ CONDUCTIVITY_MODEL_ALIASES = {
 COUPLING_MODE_ALIASES = {
     "bounded": "bounded", "fixed": "fixed", "legacy": "legacy",
 }
-# Also compared exactly: ptm_thermal_sim.cpp:16534 refuses anything outside
-# auto | converged | off. No invented synonyms -- the first draft of the
-# matching check in ConfigManager.validate guessed "auto|none|file|internal"
-# and would have refused the one non-default value that works.
+# Compared BYTE-EXACTLY: ptm_thermal_sim.cpp:16534 refuses anything outside
+# auto | converged | off -- it does not normalize case or punctuation, unlike
+# spinup_seed/conductivity_model (normalizeKey) or the gpu policies (toLower).
+# So this table is passed to set_enum with exact=True and carries no synonyms
+# at all: `Auto` and `''` are values the ENGINE rejects, and displaying them as
+# `auto` would show a run that will not happen.
+# (The first draft of the matching check in ConfigManager.validate guessed
+# "auto|none|file|internal" and would have refused `converged`, the one
+# non-default value that works.)
 EQ_INDIRECT_SOURCE_ALIASES = {
-    "auto": "auto", "": "auto",
-    "converged": "converged", "off": "off",
+    "auto": "auto", "converged": "converged", "off": "off",
 }
 # gpu.placement_policy and gpu.thin_margin_policy: exact, startup FATAL on a
 # mismatch (ptm_thermal_sim.cpp:14296, :14318).
@@ -429,7 +433,7 @@ class BaseConfigTab(QWidget):
                 key, value)
         widget.setText(str(value))
 
-    def set_enum(self, key, value, aliases):
+    def set_enum(self, key, value, aliases, exact=False):
         """Select a combo entry, tolerating the engine's own aliases.
 
         The engine normalizes these strings -- lowercase, `_`/`-`/space
@@ -448,17 +452,47 @@ class BaseConfigTab(QWidget):
         widget = self.widgets.get(key)
         if widget is None:
             return
-        normalized = "".join(
-            c for c in str(value).lower() if c not in "_- ")
-        canonical = aliases.get(normalized)
+        # Drop any foreign entry a previous load added (see below).
+        foreign = getattr(self, "_foreign_enum_items", {}).get(key)
+        if foreign is not None:
+            idx = widget.findText(foreign)
+            if idx >= 0:
+                widget.blockSignals(True)
+                widget.removeItem(idx)
+                widget.blockSignals(False)
+            self._foreign_enum_items.pop(key, None)
+
+        if exact:
+            # Some engine keys are compared BYTE-EXACTLY, not normalized:
+            # thermal.eq_indirect_source (ptm_thermal_sim.cpp:16534) refuses
+            # `Auto`. Normalizing the lookup here would display `auto` for a
+            # value the engine will reject, and -- now that the stored value is
+            # not rewritten -- the user could not even fix it from the combo,
+            # because selecting the item already showing fires no signal.
+            canonical = aliases.get(str(value))
+        else:
+            normalized = "".join(
+                c for c in str(value).lower() if c not in "_- ")
+            canonical = aliases.get(normalized)
         if canonical is None:
             logging.warning(
                 "[config] %s = %r is not a value this control offers (%s). The "
                 "configuration keeps it and the engine will decide; the control "
-                "is showing %r, which is NOT what will run.",
+                "shows it as an extra entry so you can see what will run and "
+                "replace it.",
                 key, value, "/".join(aliases.values() and
-                                     sorted(set(aliases.values()))),
-                widget.currentText())
+                                     sorted(set(aliases.values()))))
+            # Show the real value as a selectable entry rather than a
+            # different value's label. Picking a valid one then fires
+            # currentTextChanged and repairs the config.
+            label = str(value)
+            widget.blockSignals(True)
+            widget.addItem(label)
+            widget.setCurrentIndex(widget.findText(label))
+            widget.blockSignals(False)
+            if not hasattr(self, "_foreign_enum_items"):
+                self._foreign_enum_items = {}
+            self._foreign_enum_items[key] = label
             return
         idx = widget.findText(canonical)
         if idx >= 0:
@@ -2444,7 +2478,7 @@ class ThermalTab(BaseConfigTab):
                              thermal.get("eq_indirect_passes", 1))
             self.set_enum("thermal.eq_indirect_source",
                           thermal.get("eq_indirect_source", "auto"),
-                          EQ_INDIRECT_SOURCE_ALIASES)
+                          EQ_INDIRECT_SOURCE_ALIASES, exact=True)
             self.set_text("thermal.eq_indirect_flux_file",
                           thermal.get("eq_indirect_flux_file", ""))
 
@@ -5456,11 +5490,25 @@ class GpuPolicyTab(BaseConfigTab):
             engine_default)
         forced = current != engine_default
         widget.setEnabled(not forced)
+        # REVERSIBLE. Forcing it on and never clearing it meant a user who
+        # typed 3.0 and then typed 2.0 back was left with margin_explicit True
+        # -- so min_vram_margin_gib was still written, and the engine reads its
+        # PRESENCE as "enforce on every platform". A transient edit
+        # permanently changed the run's GPU policy, which is the exact silent
+        # promotion this whole section exists to prevent.
+        # Only the forcing's own tick is undone; a tick the USER made stands.
         if forced and not widget.isChecked():
             widget.blockSignals(True)
             widget.setChecked(True)
             widget.blockSignals(False)
             self.config_manager.set_value("gpu.margin_explicit", True)
+            self._margin_forced = True
+        elif not forced and getattr(self, "_margin_forced", False):
+            widget.blockSignals(True)
+            widget.setChecked(False)
+            widget.blockSignals(False)
+            self.config_manager.set_value("gpu.margin_explicit", False)
+            self._margin_forced = False
         widget.setToolTip(
             ("Forced ON: the floor differs from the engine's default "
              f"({engine_default} GiB), so the key must be written -- and the "

@@ -112,6 +112,29 @@ def test_every_preset_writes_only_engine_keys():
     assert not bad, f"presets set key(s) the engine never reads: {bad}"
 
 
+def test_a_preset_never_reports_a_key_the_writer_will_drop():
+    """Rule 1 is "a preset states what it set". Not "what it tried to set".
+
+    The generic-body card reported generic_body.ephemeris_source, and
+    _config_for_yaml emits that section only once a body is actually active --
+    which the card itself does not make happen. The report said six keys and
+    the YAML carried five.
+    """
+    from gui_core.presets import PRESETS, apply_preset
+    from gui_core.yaml_roundtrip import flatten
+    synthetic = {"illumination.albedo_source", "mesh.topo_source",
+                 "gpu.margin_explicit"}
+    for preset in PRESETS:
+        manager = _manager()
+        result = apply_preset(manager, preset)
+        written = flatten(manager._config_for_yaml())
+        dropped = [k for k in result.applied
+                   if k not in written and k not in synthetic]
+        assert not dropped, (
+            f"{preset.key} reports setting {dropped}, and the engine-facing "
+            f"config does not carry them")
+
+
 def test_a_preset_reports_exactly_what_it_set():
     from gui_core.presets import PRESETS_BY_KEY, apply_preset
     manager = _manager()
@@ -538,6 +561,7 @@ def test_the_card_applies_through_the_panel_and_the_tabs_follow():
 TESTS = [
     test_the_five_presets_exist_and_are_reachable,
     test_every_preset_writes_only_engine_keys,
+    test_a_preset_never_reports_a_key_the_writer_will_drop,
     test_a_preset_reports_exactly_what_it_set,
     test_the_crater_preset_refuses_beaming_on_a_millimeter_mesh,
     test_the_crater_preset_will_not_enable_beaming_with_no_mesh,
