@@ -355,6 +355,69 @@ def test_opening_a_config_in_the_PANEL_plans_no_edits():
             + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
 
 
+def test_no_edit_save_is_byte_identical_on_EVERY_shipped_config():
+    """Not "most files". Every one, examples/ and configs/ alike.
+
+    Two failure modes were reproduced across the 77 shipped configs, both on a
+    save whose edit plan was EMPTY: ruamel re-emitted `configs/survey_template.
+    yaml`'s block sequence at its own indentation (6 rewritten lines), and it
+    normalized `examples/quick_test.yaml`'s missing trailing newline. Both were
+    invisible to a test that only looked at examples/ with comments.
+
+    Two fixes, and this checks the property rather than either fix: the writer
+    copies the file's own block-sequence shape, and a save with nothing to
+    write does not touch the file at all.
+    """
+    _require_ruamel()
+    targets = (sorted((REPO_ROOT / "configs").rglob("*.yaml"))
+               + sorted((REPO_ROOT / "examples").glob("*.yaml")))
+    assert len(targets) >= 50, (
+        f"only {len(targets)} configs found; this sweep would be near-vacuous")
+    offenders = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for src in targets:
+            work = Path(tmp) / src.name
+            shutil.copyfile(src, work)
+            before = work.read_text()
+            manager = _manager()
+            manager.load_from_yaml(str(work))
+            mode = manager.save_to_yaml(str(work))
+            if work.read_text() != before:
+                offenders[src.name] = (
+                    mode, _changed_lines(before, work.read_text())[:6])
+    assert not offenders, (
+        f"{len(offenders)} of {len(targets)} configs changed on a save with "
+        f"no edits:\n  "
+        + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
+
+
+def test_one_edit_touches_only_that_key_across_every_config():
+    """The stronger half, over the same 77 files."""
+    _require_ruamel()
+    targets = (sorted((REPO_ROOT / "configs").rglob("*.yaml"))
+               + sorted((REPO_ROOT / "examples").glob("*.yaml")))
+    offenders = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for src in targets:
+            work = Path(tmp) / src.name
+            shutil.copyfile(src, work)
+            before = work.read_text()
+            manager = _manager()
+            manager.load_from_yaml(str(work))
+            manager.set_value("simulation.timesteps", 999)
+            manager.save_to_yaml(str(work))
+            changed = _changed_lines(before, work.read_text())
+            # A file with no `simulation:` section legitimately grows the
+            # section header along with the key.
+            stray = [ln for ln in changed
+                     if "timesteps" not in ln and ln.strip() != "+simulation:"]
+            if stray:
+                offenders[src.name] = stray[:6]
+    assert not offenders, (
+        "editing one key reached unrelated lines:\n  "
+        + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
+
+
 def test_an_int_spelled_double_is_not_rewritten():
     """`scale_factor: 1` must stay `1`, not become `1.0`.
 
@@ -410,6 +473,7 @@ def test_save_says_which_file_it_actually_rewrote():
 
         manager = _manager()
         manager.load_from_yaml(str(site_a))
+        manager.set_value("simulation.timesteps", 42)
         assert manager.save_to_yaml(str(site_a)) == "in_place"
         assert manager.save_to_yaml(str(site_c)) == "copied_to_new_file"
 
@@ -455,6 +519,8 @@ TESTS = [
     test_a_new_project_still_saves_and_then_round_trips,
     test_status_is_reported_not_inferred,
     test_opening_a_config_in_the_PANEL_plans_no_edits,
+    test_no_edit_save_is_byte_identical_on_EVERY_shipped_config,
+    test_one_edit_touches_only_that_key_across_every_config,
     test_an_int_spelled_double_is_not_rewritten,
     test_save_says_which_file_it_actually_rewrote,
     test_plan_save_edits_reports_exactly_what_would_change,

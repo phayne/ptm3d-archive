@@ -58,6 +58,13 @@ class Preset:
     beaming: str = "off"
     #: Fields the user still has to fill in for this to be a runnable config.
     needs: tuple = ()
+    #: True when at least one of `needs` lives behind the Advanced disclosure.
+    #: The card then turns Advanced on, because telling a Basic-tier user to
+    #: fill in a field the Basic tier hides is the exact failure the tiering
+    #: rework exists to remove -- and it was reproduced: with the toggle off,
+    #: mesh.occluder_file, both placement overrides and
+    #: radiation.view_factor_file are all hidden.
+    needs_advanced: bool = False
     #: Why this preset does not offer beaming, when it does not.
     beaming_note: str = ""
 
@@ -105,6 +112,7 @@ PRESETS = [
             "illumination.albedo_source": "builtin",
         },
         beaming="on",
+        needs_advanced=True,
         needs=(
             "mesh.import_file -- the high-resolution core mesh",
             "mesh.occluder_file -- the coarse ring "
@@ -165,6 +173,7 @@ PRESETS = [
             "generic_body.ephemeris_source": "auto",
         },
         beaming="off",
+        needs_advanced=True,
         needs=(
             "generic_body.name and generic_body.config_file -- fetch them from "
             "the HORIZONS page",

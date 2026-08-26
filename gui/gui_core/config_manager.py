@@ -545,7 +545,8 @@ class ConfigManager:
         #: which is what makes "this key is unset" representable at all.
         self._source_doc = None
         self._loaded_engine_view = None
-        #: What the last save_to_yaml actually did: "in_place" (the opened file,
+        #: What the last save_to_yaml actually did: "unchanged" (nothing to
+        #: write, the file was not touched), "in_place" (the opened file,
         #: edited minimally), "copied_to_new_file", "replaced_other_file" (Save
         #: As over a DIFFERENT existing file -- its comments are gone), or
         #: "expanded" (the flattening fallback). The caller reports it rather
@@ -1237,6 +1238,16 @@ class ConfigManager:
             updates, removals = yaml_roundtrip.plan_edits(
                 self._loaded_engine_view or {}, self._config_for_yaml(),
                 doc.file_keys())
+            if not updates and not removals and same_file:
+                # NOTHING CHANGED, so touch nothing. Re-emitting is close to
+                # byte-exact but not exactly: ruamel normalizes a missing
+                # trailing newline, and a block sequence indented differently
+                # from its own default gets reflowed. Measured across all 77
+                # configs/ and examples/ files, 2 differed on a save with an
+                # empty plan. Not writing is the only way "no edits is
+                # byte-identical" is true for every file rather than most.
+                self.last_save_mode = "unchanged"
+                return self.last_save_mode
             doc.apply(updates, removals)
             text = doc.dump()
             with open(filename, 'w') as f:

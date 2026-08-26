@@ -224,6 +224,71 @@ def test_a_global_preset_clears_an_inherited_import_mesh():
             f"{key} cleared the mesh without reporting it")
 
 
+def test_a_card_that_names_advanced_fields_reveals_them():
+    """Telling a Basic user to fill in a field the Basic tier hides is the
+    exact failure the tiering rework exists to remove -- and it happened.
+
+    Measured with the toggle off: the crater card's "Still needed" list names
+    mesh.occluder_file, both placement overrides and radiation.view_factor_file,
+    and all four were hidden.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+
+        def reachable(tab_name, key):
+            tab = panel.tabs[tab_name]
+            node = tab.widgets[key]
+            while node is not None and node is not tab:
+                if node.isHidden():
+                    return False
+                node = node.parentWidget()
+            return True
+
+        panel.advanced_toggle.setChecked(False)
+        for section in panel.tabs["mesh"].advanced_sections:
+            section.set_collapsed(True)
+        assert not reachable("mesh", "mesh.occluder_file"), (
+            "the fixture is wrong: the field is already reachable in Basic, so "
+            "this test would pass without the reveal")
+
+        panel.tabs["start"].apply_preset("lunar_polar_crater")
+        assert panel.advanced_toggle.isChecked(), (
+            "the crater card did not turn Advanced on")
+        for tab_name, key in (("mesh", "mesh.occluder_file"),
+                              ("mesh", "mesh.latitude_override"),
+                              ("mesh", "mesh.longitude_override"),
+                              ("radiation", "radiation.view_factor_file")):
+            assert reachable(tab_name, key), (
+                f"{key} is still unreachable after the card told the user to "
+                f"fill it in")
+        report = panel.tabs["start"].report_text("lunar_polar_crater")
+        assert "Advanced options" in report, report
+        panel.tabs["start"].apply_preset("lunar_global_diurnal")
+        panel.advanced_toggle.setChecked(False)
+
+
+def test_the_baseline_card_does_not_advertise_beaming_off():
+    """The display half of the "preserve" fix.
+
+    The shared else-branch labeled every non-"on" preset "Beaming: off.",
+    including the one whose note says nothing here overrides the baseline --
+    self-contradictory, and wrong for a beaming baseline.
+    """
+    from gui_core.presets import PRESETS_BY_KEY
+    assert PRESETS_BY_KEY["reproduce_baseline"].beaming == "preserve"
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        from PyQt6.QtWidgets import QLabel
+        labels = [w.text() for w in panel.tabs["start"].findChildren(QLabel)]
+        beaming_labels = [t for t in labels if t.startswith("Beaming:")]
+        assert beaming_labels, "no beaming labels on the cards at all"
+        preserve = [t for t in beaming_labels if "unchanged" in t]
+        assert preserve, (
+            f"no card says its beaming is unchanged: {beaming_labels}")
+        for text in preserve:
+            assert "Beaming: off" not in text, text
+
+
 def test_the_baseline_preset_overrides_nothing():
     """Its own note says nothing here overrides the baseline. Hold it to that.
 
@@ -404,6 +469,8 @@ TESTS = [
     test_the_crater_preset_turns_beaming_on_when_the_rule_passes,
     test_europa_and_generic_body_presets_never_ask_for_beaming,
     test_a_global_preset_clears_an_inherited_import_mesh,
+    test_a_card_that_names_advanced_fields_reveals_them,
+    test_the_baseline_card_does_not_advertise_beaming_off,
     test_the_baseline_preset_overrides_nothing,
     test_compare_binary_does_not_treat_unknown_as_a_hash,
     test_every_preset_leaves_a_config_the_gui_accepts,

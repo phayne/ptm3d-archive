@@ -61,12 +61,52 @@ def available():
     return RUAMEL_AVAILABLE
 
 
-def _yaml():
+def detect_sequence_indent(text):
+    """(sequence, offset) matching how `text` already indents block sequences.
+
+    ruamel re-emits block sequences at ITS default (flush-left dashes under the
+    parent key) unless told otherwise, so a file written as
+
+        named_sites:
+          - name: "Wilcoski"
+
+    came back with the dashes at column 0 -- a byte difference on lines nobody
+    edited. Measured on configs/survey_template.yaml: 6 rewritten lines on a
+    save with an EMPTY edit plan.
+
+    Returns ruamel's (sequence, offset) pair: `offset` is where the `-` sits,
+    `sequence` is where the item's content sits. Defaults to ruamel's own
+    (4, 2) shape only when the file shows no block sequence to copy.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("- "):
+            continue
+        dash = len(line) - len(stripped)
+        # The parent key's indentation: the nearest preceding non-blank,
+        # non-comment line that is not itself a sequence item.
+        for previous in reversed(lines[:i]):
+            head = previous.strip()
+            if not head or head.startswith("#") or head.startswith("- "):
+                continue
+            parent = len(previous) - len(previous.lstrip())
+            offset = dash - parent
+            if offset < 0:
+                break
+            # ruamel wants `sequence` >= `offset` + 2 ("- " is two columns).
+            return (offset + 2, offset)
+        break
+    return (4, 2)
+
+
+def _yaml(sequence=4, offset=2):
     y = YAML()                    # round-trip mode
     y.preserve_quotes = True
     # Do not re-wrap long scalars: a wrapped line is a byte difference on a key
     # nobody edited, which is exactly what this module exists to avoid.
     y.width = 4096
+    y.indent(mapping=2, sequence=sequence, offset=offset)
     # PyYAML's safe_load takes the LAST of a duplicated key without complaint,
     # and the GUI has always loaded such files. ruamel raises by default, which
     # would turn a loadable config into "Failed to load project" -- a
@@ -100,6 +140,9 @@ class RoundTripDoc:
         self.path = str(path) if path is not None else ""
         self.text = text
         self.data = data
+        #: Copy the file's own block-sequence shape, so an edit to one scalar
+        #: does not reflow a list somewhere else in the document.
+        self.sequence, self.offset = detect_sequence_indent(text)
 
     @classmethod
     def load(cls, path):
@@ -163,9 +206,9 @@ class RoundTripDoc:
                 del node[parts[-1]]
 
     def dump(self):
-        """Render the document back to text."""
+        """Render the document back to text, in the file's own layout."""
         buf = io.StringIO()
-        _yaml().dump(self.data, buf)
+        _yaml(self.sequence, self.offset).dump(self.data, buf)
         return buf.getvalue()
 
 

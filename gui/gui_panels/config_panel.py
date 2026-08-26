@@ -14,6 +14,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QCursor
 
 from gui_core.config_manager import ConfigManager
+from ptm.engine_defaults import ENGINE_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -5081,6 +5082,10 @@ class TaskCardsTab(BaseConfigTab):
     """
 
     preset_applied = pyqtSignal(str)
+    #: A card whose "Still needed" list names fields the Basic tier hides asks
+    #: for the Advanced disclosure. Otherwise the user reads "fill in
+    #: mesh.occluder_file", goes to the Mesh tab, and the field is not there.
+    advanced_requested = pyqtSignal(str)
     #: Emitted when a card REPLACES the whole configuration from another file
     #: (the baseline card). The main window must then forget which project file
     #: it was editing: the round-trip document now belongs to the baseline, so
@@ -5125,10 +5130,16 @@ class TaskCardsTab(BaseConfigTab):
                 card.addWidget(keys)
             if preset.beaming == "on":
                 note = QLabel(
-                    f"Beaming: requested at w = 32.5 deg, subject to the "
-                    f"facet-scale rule. If the mesh is at or near the "
-                    f"roughness scale the card refuses and says the measured "
-                    f"scale.")
+                    "Beaming: requested at w = 32.5 deg, subject to the "
+                    "facet-scale rule. If the mesh is at or near the "
+                    "roughness scale the card refuses and says the measured "
+                    "scale.")
+            elif preset.beaming == "preserve":
+                # NOT "off": this card leaves beaming exactly as the baseline
+                # recorded it. The shared else-branch used to label it "off"
+                # while apply_preset correctly left it on -- the display half
+                # of the bug the "preserve" mode was added to fix.
+                note = QLabel("Beaming: unchanged. " + preset.beaming_note)
             else:
                 note = QLabel("Beaming: off. " + preset.beaming_note)
             note.setWordWrap(True)
@@ -5186,7 +5197,13 @@ class TaskCardsTab(BaseConfigTab):
         from gui_core.presets import PRESETS_BY_KEY, apply_preset
         preset = PRESETS_BY_KEY[key]
         result = apply_preset(self.config_manager, preset, self._project_root())
-        self._show(key, "\n".join(result.summary_lines()))
+        lines = result.summary_lines()
+        if preset.needs_advanced:
+            lines.append(
+                "NOTE: 'Advanced options' has been turned on and the sections "
+                "holding the fields above have been opened.")
+            self.advanced_requested.emit(key)
+        self._show(key, "\n".join(lines))
         self.preset_applied.emit(key)
         self.value_changed.emit()
         return result
@@ -5386,7 +5403,51 @@ class GpuPolicyTab(BaseConfigTab):
         self.create_scroll_area(content)
         self.refresh_effective()
 
+    def _update_margin_explicit_gating(self):
+        """A non-default floor IS explicit -- so stop offering it as a choice.
+
+        The engine reads the KEY'S PRESENCE, not its value: any written
+        min_vram_margin_gib makes the floor enforcing on every platform
+        (config_parser.h:826). So once the value differs from the engine's own
+        default the key must be written, and the checkbox cannot turn that off.
+        It used to sit editable and unticked while the key was written anyway,
+        and a reload silently re-ticked it. There is no "non-default floor with
+        advisory semantics" -- not in this GUI and not in the engine.
+        """
+        widget = self.widgets.get("gpu.margin_explicit")
+        if widget is None:
+            return
+        engine_default = ENGINE_DEFAULTS.get("gpu.min_vram_margin_gib", 2.0)
+        # From the CONFIG, not the spin box: refresh_effective runs during
+        # init_ui, before load_from_config, when every widget still reads 0.0 --
+        # which looked like a non-default floor and force-ticked
+        # margin_explicit into a brand-new project.
+        current = ConfigManager._as_number(
+            self.config_manager.get_value("gpu.min_vram_margin_gib",
+                                          engine_default),
+            engine_default)
+        forced = current != engine_default
+        widget.setEnabled(not forced)
+        if forced and not widget.isChecked():
+            widget.blockSignals(True)
+            widget.setChecked(True)
+            widget.blockSignals(False)
+            self.config_manager.set_value("gpu.margin_explicit", True)
+        widget.setToolTip(
+            ("Forced ON: the floor differs from the engine's default "
+             f"({engine_default} GiB), so the key must be written -- and the "
+             "engine reads its PRESENCE as 'enforce on every platform'. "
+             "There is no way to set a non-default floor advisorily."
+             if forced else
+             "Writes gpu.min_vram_margin_gib into the configuration. The "
+             "engine treats the PRESENCE of that key as the request: written, "
+             "the floor is enforcing everywhere; absent, it is enforcing on "
+             "macOS + AMD and advisory elsewhere. Leaving this off is what "
+             "keeps a config the GUI touched from silently changing GPU "
+             "policy on someone else's machine."))
+
     def refresh_effective(self):
+        self._update_margin_explicit_gating()
         rows, written = self.config_manager.gpu_policy_report()
         lines = []
         for key, value, source in rows:
@@ -5573,6 +5634,9 @@ class ConfigurationPanel(QWidget):
         # Re-emitted so the main window can detach its project file; see
         # TaskCardsTab.project_replaced.
         self.tabs["start"].project_replaced.connect(self.project_replaced)
+        # A card that asks for expert fields reveals them, rather than naming
+        # controls the current tier hides.
+        self.tabs["start"].advanced_requested.connect(self._reveal_advanced)
 
         # Connect body selection to thermophysical and body definition tabs
         if "simulation.body" in self.tabs["simulation"].widgets:
@@ -5686,6 +5750,20 @@ class ConfigurationPanel(QWidget):
         """Handle configuration value changes"""
         self.update_preview()
         self.config_changed.emit()
+
+    def _reveal_advanced(self, _key=None):
+        """Turn Advanced on AND open every expert section.
+
+        A card that says "fill in mesh.occluder_file" has to leave that field
+        reachable. Turning the tier on is not enough on its own: the sections
+        land collapsed, which is right for browsing and wrong immediately after
+        an instruction naming a field inside one.
+        """
+        self.advanced_toggle.setChecked(True)
+        self._apply_tab_visibility()
+        for tab in self.tabs.values():
+            for section in tab.advanced_sections:
+                section.set_collapsed(False)
 
     def _on_advanced_toggled(self, _checked):
         """Basic/Advanced disclosure toggled — re-apply field-level visibility."""

@@ -747,6 +747,11 @@ def absolutize_config_paths(config, project_root):
 #: mount. 15 s leaves ~75x headroom over the measured time and bounds the
 #: freeze. The caller shows a wait cursor for the duration.
 VALIDATE_TIMEOUT_S = 15.0
+#: Ceiling for the `--help` capability probe. It is a separate synchronous
+#: call, so the WORST-CASE freeze is this plus VALIDATE_TIMEOUT_S -- giving the
+#: probe the full validation ceiling made the documented 15 s bound a 30 s one.
+#: --help prints and exits, so 5 s is already generous.
+PROBE_TIMEOUT_S = 5.0
 
 
 def engine_validate_config(config, executable, project_root=None, env=None):
@@ -795,7 +800,7 @@ def engine_validate_config(config, executable, project_root=None, env=None):
     # --help exits without touching anything, so asking it first is free.
     try:
         probe = subprocess.run([str(executable), "--help"], capture_output=True,
-                               text=True, timeout=VALIDATE_TIMEOUT_S)
+                               text=True, timeout=PROBE_TIMEOUT_S)
     except Exception as exc:                           # noqa: BLE001
         return ("unavailable",
                 f"{executable} could not be asked for its options ({exc}), so "

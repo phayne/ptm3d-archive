@@ -226,6 +226,40 @@ def test_a_malformed_device_list_is_refused_not_ignored():
     assert any("gpu_device_ids" in m for m in messages), messages
 
 
+def test_a_nonzero_default_floor_forces_the_explicit_checkbox():
+    """There is no "non-default floor with advisory semantics".
+
+    The engine reads the KEY'S PRESENCE, so any written min_vram_margin_gib is
+    enforcing everywhere. The checkbox used to sit editable and unticked while
+    the key was written anyway, and a reload silently re-ticked it -- a control
+    that did nothing, twice over.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        tab = panel.tabs["gpu"]
+        box = tab.widgets["gpu.margin_explicit"]
+        spin = tab.widgets["gpu.min_vram_margin_gib"]
+
+        spin.setValue(2.0)
+        box.setChecked(False)
+        tab.refresh_effective()
+        assert box.isEnabled(), "at the engine default the choice is real"
+        assert "gpu" not in manager._config_for_yaml(), (
+            manager._config_for_yaml().get("gpu"))
+
+        spin.setValue(3.0)
+        assert not box.isEnabled(), (
+            "a non-default floor still offers 'enforce on every platform' as a "
+            "choice, but the key is written either way")
+        assert box.isChecked(), "and it must show the state that will apply"
+        assert manager._config_for_yaml()["gpu"]["min_vram_margin_gib"] == 3.0
+        assert "forced" in box.toolTip().lower(), box.toolTip()
+
+        spin.setValue(2.0)
+        box.setChecked(False)
+        tab.refresh_effective()
+
+
 def test_the_gpu_enums_are_case_insensitive_like_the_engine():
     """The engine lowercases both before comparing (gpu::guardrails::toLower).
 
@@ -473,6 +507,7 @@ TESTS = [
     test_device_ids_round_trip_as_a_sequence,
     test_an_empty_device_list_is_not_written,
     test_a_malformed_device_list_is_refused_not_ignored,
+    test_a_nonzero_default_floor_forces_the_explicit_checkbox,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
     test_the_gpu_policy_enums_are_the_engines_own,
     test_the_hard_floor_rule_is_the_engines_rule,
