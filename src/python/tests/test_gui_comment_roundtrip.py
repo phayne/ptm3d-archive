@@ -659,6 +659,98 @@ def test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save():
         assert manager.get_value("gpu.margin_explicit") is True
 
 
+def test_the_word_off_survives_a_save_and_reopen():
+    """YAML 1.1 vs 1.2, and it breaks the engine's own documented value.
+
+    ruamel's round-trip emitter is YAML 1.2, where `off` is a string. PyYAML --
+    which load_from_yaml and every other reader in this repo use -- is YAML
+    1.1, where `off` is the boolean False. So:
+
+    * a config spelling `thermal.eq_indirect_source: off` (which the engine's
+      yaml-cpp reads as the string and ACCEPTS) loaded as False, validate()
+      refused it, and Run was blocked on a config the engine would run;
+    * picking `off` in the combo and saving emitted it bare, so reopening gave
+      False and the run YAML carried `false`, which the engine FATALs on. The
+      setting could not survive one save-and-reopen.
+
+    The same split turned `illumination.bvh_cache_file: off` -- the DISABLE
+    sentinel -- into a cache filename.
+    """
+    _require_ruamel()
+    from gui_core import preflight
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / "off.yaml"
+        work.write_text(
+            "simulation:\n  body: Moon\n"
+            "thermal:\n  eq_indirect_source: off\n"
+            "illumination:\n  bvh_cache_file: off\n")
+
+        manager = _manager()
+        manager.load_from_yaml(str(work))
+        assert manager.get_value("thermal.eq_indirect_source") == "off", (
+            f"read back as "
+            f"{manager.get_value('thermal.eq_indirect_source')!r}")
+        assert manager.get_value("illumination.bvh_cache_file") == "off"
+        assert manager.validate()[0], manager.validate()[1]
+        assert preflight.is_path_sentinel(
+            "illumination.bvh_cache_file",
+            manager.get_value("illumination.bvh_cache_file"))
+
+        # The RUN yaml -- the one the engine reads -- must carry a string.
+        import yaml as pyyaml
+        run = pyyaml.safe_load(pyyaml.dump(manager._config_for_yaml()))
+        assert run["thermal"]["eq_indirect_source"] == "off", run["thermal"]
+        assert run["illumination"]["bvh_cache_file"] == "off"
+
+        # And a user EDIT to `off` must come back as `off`, not False.
+        work2 = Path(tmp) / "edit.yaml"
+        work2.write_text(
+            "simulation:\n  body: Moon\n"
+            "thermal:\n  eq_indirect_source: auto\n")
+        manager = _manager()
+        manager.load_from_yaml(str(work2))
+        manager.set_value("thermal.eq_indirect_source", "off")
+        manager.save_to_yaml(str(work2))
+        again = _manager()
+        again.load_from_yaml(str(work2))
+        assert again.get_value("thermal.eq_indirect_source") == "off", (
+            f"one save-and-reopen turned it into "
+            f"{again.get_value('thermal.eq_indirect_source')!r}")
+        assert again.validate()[0], again.validate()[1]
+
+
+def test_the_writer_quotes_anything_yaml_1_1_would_re_read_differently():
+    """General, not a word list."""
+    _require_ruamel()
+    from gui_core.yaml_roundtrip import quote_if_ambiguous, RoundTripDoc
+    import yaml as pyyaml
+    with tempfile.TemporaryDirectory() as tmp:
+        for text in ("off", "on", "yes", "no", "true", "False", "null", "~",
+                     "1", "1e5", "3.5", "", "0o17"):
+            # Written by the round-trip writer, read back by PyYAML -- which
+            # is the actual path: ruamel emits, load_from_yaml reads.
+            work = Path(tmp) / "probe.yaml"
+            work.write_text("section:\n  k: placeholder\n")
+            doc = RoundTripDoc.load(work)
+            doc.apply({"section.k": text})
+            rendered = doc.dump()
+            assert pyyaml.safe_load(rendered)["section"]["k"] == text, (
+                f"{text!r} did not survive ruamel-write / PyYAML-read as a "
+                f"string: {rendered!r}")
+    for text in ("auto", "converged", "data/site.bvh", "Moon"):
+        assert quote_if_ambiguous(text) == text
+        assert type(quote_if_ambiguous(text)) is str, (
+            f"{text!r} was needlessly wrapped, which would requote a line "
+            f"nobody asked to change")
+
+    # The quoted wrapper must never escape into the config dict: PyYAML's
+    # dumper cannot represent it, and save_run_yaml -- the RUN's config -- is
+    # PyYAML.
+    manager = _manager()
+    manager.set_value("thermal.eq_indirect_source", "off")
+    pyyaml.dump(manager._config_for_yaml())
+
+
 def test_an_int_spelled_double_is_not_rewritten():
     """`scale_factor: 1` must stay `1`, not become `1.0`.
 
@@ -769,6 +861,8 @@ TESTS = [
     test_no_shipped_config_is_reflowed_by_an_edit,
     test_a_recognized_alias_keeps_the_files_own_spelling,
     test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save,
+    test_the_word_off_survives_a_save_and_reopen,
+    test_the_writer_quotes_anything_yaml_1_1_would_re_read_differently,
     test_an_int_spelled_double_is_not_rewritten,
     test_save_says_which_file_it_actually_rewrote,
     test_plan_save_edits_reports_exactly_what_would_change,

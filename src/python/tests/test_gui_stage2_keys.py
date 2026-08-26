@@ -336,6 +336,34 @@ def test_an_engine_rejected_enum_is_shown_and_repairable():
         panel.load_from_config()
 
 
+def test_an_empty_gpu_policy_is_shown_as_itself_and_repairable():
+    """Mapping "" to a valid label displayed `auto` for a config validate()
+    correctly refuses -- and since the stored value is no longer rewritten, the
+    user could not repair it: selecting the item already shown fires no signal.
+    The engine FATALs on "" (ptm_thermal_sim.cpp:14327).
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = Path(scratch) / "empty_gpu.yaml"
+        path.write_text(
+            "simulation:\n  body: Moon\n"
+            "gpu:\n  placement_policy: ''\n  thin_margin_policy: ''\n")
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        tab = panel.tabs["gpu"]
+        assert tab.widgets["gpu.placement_policy"].currentText() == "", (
+            f"an empty policy displays as "
+            f"{tab.widgets['gpu.placement_policy'].currentText()!r}")
+        assert manager.validate()[0] is False
+
+        tab.widgets["gpu.placement_policy"].setCurrentText("auto")
+        tab.widgets["gpu.thin_margin_policy"].setCurrentText("separate")
+        assert manager.get_value("gpu.placement_policy") == "auto"
+        assert manager.validate()[0] is True, manager.validate()[1]
+        manager.reset_to_defaults()
+        panel.load_from_config()
+
+
 def test_the_gpu_enums_are_case_insensitive_like_the_engine():
     """The engine lowercases both before comparing (gpu::guardrails::toLower).
 
@@ -640,6 +668,7 @@ TESTS = [
     test_a_nonzero_default_floor_forces_the_explicit_checkbox,
     test_the_forced_explicit_tick_is_reversible,
     test_an_engine_rejected_enum_is_shown_and_repairable,
+    test_an_empty_gpu_policy_is_shown_as_itself_and_repairable,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
     test_a_disabled_device_list_does_not_block_the_launch,
     test_an_unreadable_machine_profile_does_not_abort_the_panel,

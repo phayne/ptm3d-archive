@@ -36,13 +36,44 @@ logger = logging.getLogger(__name__)
 try:
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap
+    from ruamel.yaml.scalarstring import SingleQuotedScalarString
     RUAMEL_AVAILABLE = True
     RUAMEL_IMPORT_ERROR = ""
 except ImportError as exc:  # pragma: no cover - exercised by the absence test
     YAML = None
     CommentedMap = dict
+    SingleQuotedScalarString = str
     RUAMEL_AVAILABLE = False
     RUAMEL_IMPORT_ERROR = str(exc)
+
+
+def quote_if_ambiguous(value):
+    """Quote a string that a YAML 1.1 reader would resolve as something else.
+
+    ruamel's round-trip emitter is YAML **1.2**, where `off` is a string.
+    PyYAML -- which `load_from_yaml`, `test_config_parity` and every other
+    tooling reader in this repo use -- is YAML **1.1**, where `off` is the
+    boolean False. So writing the engine's own documented value
+    `thermal.eq_indirect_source: off` bare meant the setting could not survive
+    one save-and-reopen: it came back as False, `validate()` refused a config
+    the engine accepts, and the run YAML carried `false`, which the engine
+    FATALs on. The same split turned `bvh_cache_file: off` -- the DISABLE
+    sentinel -- into a cache filename.
+
+    PyYAML's own dumper already quotes these; this makes the round-trip writer
+    agree with it. The test is general, not a list of words: anything whose
+    text form does not read back as the same string gets quoted.
+    """
+    if not isinstance(value, str) or not RUAMEL_AVAILABLE:
+        return value
+    import yaml as _pyyaml
+    try:
+        if _pyyaml.safe_load(value) == value and isinstance(
+                _pyyaml.safe_load(value), str):
+            return value
+    except Exception:                                  # noqa: BLE001
+        pass
+    return SingleQuotedScalarString(value)
 
 
 UNAVAILABLE_MESSAGE = (
@@ -192,7 +223,7 @@ class RoundTripDoc:
                     child = CommentedMap()
                     node[part] = child
                 node = child
-            node[parts[-1]] = value
+            node[parts[-1]] = quote_if_ambiguous(value)
 
         for dotted in removals:
             parts = dotted.split(".")

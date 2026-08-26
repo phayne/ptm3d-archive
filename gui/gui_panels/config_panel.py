@@ -155,11 +155,16 @@ EQ_INDIRECT_SOURCE_ALIASES = {
 }
 # gpu.placement_policy and gpu.thin_margin_policy: exact, startup FATAL on a
 # mismatch (ptm_thermal_sim.cpp:14296, :14318).
+# No "" entry: the engine FATALs on an empty policy (ptm_thermal_sim.cpp:14327),
+# and mapping it to a valid label displayed `auto` for a config validate()
+# correctly refuses -- with no way to repair it from the combo, because
+# selecting the item already shown fires no signal. An empty value now surfaces
+# as its own foreign entry, which the user can replace.
 GPU_PLACEMENT_ALIASES = {
-    "auto": "auto", "": "auto", "shared": "shared", "disjoint": "disjoint",
+    "auto": "auto", "shared": "shared", "disjoint": "disjoint",
 }
 GPU_THIN_MARGIN_ALIASES = {
-    "separate": "separate", "": "separate", "refuse": "refuse",
+    "separate": "separate", "refuse": "refuse",
 }
 
 
@@ -5517,12 +5522,19 @@ class GpuPolicyTab(BaseConfigTab):
             widget.blockSignals(False)
             self.config_manager.set_value("gpu.margin_explicit", True)
             self._margin_forced = True
+            # This method CHANGES the config, and it runs after the spin box's
+            # own writeback has already refreshed the preview -- so without
+            # this the YAML preview kept showing a gpu: section that had just
+            # been dropped, and the preview is the one place that shows whether
+            # this presence-semantics key will be written.
+            self.value_changed.emit()
         elif not forced and getattr(self, "_margin_forced", False):
             widget.blockSignals(True)
             widget.setChecked(False)
             widget.blockSignals(False)
             self.config_manager.set_value("gpu.margin_explicit", False)
             self._margin_forced = False
+            self.value_changed.emit()
         widget.setToolTip(
             ("Forced ON: the floor differs from the engine's default "
              f"({engine_default} GiB), so the key must be written -- and the "

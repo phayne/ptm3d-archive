@@ -16,6 +16,16 @@ from gui_core import yaml_roundtrip
 logger = logging.getLogger(__name__)
 
 
+#: Keys where the bare words `off`/`on` are MEANINGFUL STRINGS to the engine,
+#: and where PyYAML's YAML-1.1 resolver therefore hands back a boolean:
+#:   thermal.eq_indirect_source  -- auto | converged | off (ptm_thermal_sim.cpp:16534)
+#:   illumination.bvh_cache_file -- "off" DISABLES the cache (config_parser.h:435)
+#: The engine's yaml-cpp reads the raw scalar, so it sees the string either way.
+_YAML11_STRING_KEYS = (
+    "thermal.eq_indirect_source",
+    "illumination.bvh_cache_file",
+)
+
 #: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
 #: config that puts a scalar where one of these belongs has it dropped, which is
 #: what yaml-cpp does with a scalar section node under `if (root["radiation"])`.
@@ -642,8 +652,11 @@ class ConfigManager:
                     if dotted not in _SECTION_KEYS:
                         continue
                     if node[key] is not None:
-                        import logging
-                        logging.warning(
+                        # `logger`, not a function-local `import logging`: that
+                        # import made the name local to the WHOLE function, so
+                        # any use ABOVE it raised UnboundLocalError. It did,
+                        # the first time a check was added higher up.
+                        logger.warning(
                             "[config] section %r is %r, not a mapping; "
                             "ignoring it (the engine reads a scalar section as "
                             "absent too).", dotted, node[key])
@@ -785,8 +798,7 @@ class ConfigManager:
             # so it is announced rather than discovered later.
             if "H" in loaded_thermo and "H_override" not in loaded_thermo \
                     and not self.generic_body_active():
-                import logging
-                logging.warning(
+                logger.warning(
                     "[thermophysical] this config carries thermophysical.H = "
                     "%s with no H_override. On a built-in body that value used "
                     "to be ignored; the GUI now writes it as "
@@ -804,6 +816,28 @@ class ConfigManager:
                     self.config["thermophysical"][prop_name] = \
                         loaded_thermo[override_key]
                     self.config["thermophysical"][f"use_default_{prop_name}"] = False
+
+        # ---- YAML 1.1 strikes: PyYAML resolves the bare word `off` as the
+        # boolean False (and `on`/`yes`/`no` likewise), while the engine's
+        # yaml-cpp reads the raw scalar and the values `off`/`on` are
+        # MEANINGFUL STRINGS for two keys. Without this, a config spelling the
+        # engine's own documented `eq_indirect_source: off` loaded as False,
+        # validate() refused a config the engine accepts, and the run YAML
+        # carried `false`, which the engine FATALs on. The writer now quotes
+        # these on the way out; this handles every file that already exists.
+        for dotted in _YAML11_STRING_KEYS:
+            section, _, leaf = dotted.partition(".")
+            node = self.config.get(section)
+            if not isinstance(node, dict) or leaf not in node:
+                continue
+            if isinstance(node[leaf], bool):
+                spelling = "on" if node[leaf] else "off"
+                logger.warning(
+                    "[config] %s was read as the boolean %r, which is YAML "
+                    "1.1 resolving the bare word %r. The engine reads it as "
+                    "the string; treating it as %r.",
+                    dotted, node[leaf], spelling, spelling)
+                node[leaf] = spelling
 
         # A config that WROTE gpu.min_vram_margin_gib asked for the enforcing
         # floor, whatever value it gave. That is information only this moment
