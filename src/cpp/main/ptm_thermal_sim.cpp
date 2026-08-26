@@ -3010,11 +3010,12 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double Qb_override = -1.0,
     double H_override  = -1.0,
     // Global face index for the cross-path seed dump (PTM_DUMP_SEED) and the
-    // seed guards. -1 = not a mesh face (point mode / standalone), record
-    // nothing. `seed_flags` accumulates {floor_hits, above_500K_hits}.
+    // seed guard. -1 = not a mesh face (point mode / standalone), record
+    // nothing. `seed_floor_faces` accumulates the ABSOLUTE_ZERO_K hits; the
+    // companion "seed above the CPU clamp" counter is gone with the clamp
+    // itself (thermal_model.h, 2026-08-26).
     long long seed_record_face = -1,
     std::atomic<size_t>* seed_floor_faces = nullptr,
-    std::atomic<size_t>* seed_hot_faces   = nullptr,
     SeedAnchorCensus*    anchor_census    = nullptr,
     // Warm start / final-state capture. Null = neither, and this function is
     // then bit-identical to what it was before PTM-76.
@@ -3121,7 +3122,6 @@ std::vector<double> runThermalModelWithMatchedTimes(
         // guards so they can be reported instead of swallowed.
         if (model.seed_applied && !warm_started_face) {
             if (model.seed_result.clamped_low && seed_floor_faces) ++(*seed_floor_faces);
-            if (model.seed_result.above_500K  && seed_hot_faces)   ++(*seed_hot_faces);
             if (anchor_census) anchor_census->add(model.seed_result);
             if (seed_record_face >= 0) {
                 thermal::EqSeedInput rec;
@@ -3990,7 +3990,6 @@ bool runThermalModelsForAllFacesStreamed(
     // elsewhere implies -- so it gets the same shared seed through
     // runThermalModelWithMatchedTimes.
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
@@ -4102,7 +4101,7 @@ bool runThermalModelsForAllFacesStreamed(
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
-                &seed_floor_faces, &seed_hot_faces, &anchor_census, st_ptr);
+                &seed_floor_faces, &anchor_census, st_ptr);
 
             if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
@@ -4128,11 +4127,6 @@ bool runThermalModelsForAllFacesStreamed(
         std::cerr << "[Streamed] WARNING: " << seed_floor_faces.load() << " of "
                   << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor (Qb <= 0 AND zero mean absorbed flux).\n";
-    }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "[Streamed] WARNING: " << seed_hot_faces.load() << " of "
-                  << n_faces << " faces seed above " << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, the CPU solver's hard clamp.\n";
     }
     anchor_census.report("cpu-streamed", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-streamed");
@@ -4278,7 +4272,6 @@ bool runThermalModelsForAllFaces(
     // latitude-blind -- and then integrate 24 lunations of analytic clear-sky
     // forcing on top. Both are gone under spinup_seed: physical.
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
@@ -4409,7 +4402,6 @@ bool runThermalModelsForAllFaces(
                     face_H,
                     static_cast<long long>(f),
                     &seed_floor_faces,
-                    &seed_hot_faces,
                     &anchor_census,
                     st_ptr
                 );
@@ -4513,12 +4505,6 @@ bool runThermalModelsForAllFaces(
                   << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor (Qb <= 0 AND zero mean absorbed flux)."
                   << std::endl;
-    }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
-                  << " faces have a cycle-mean radiative-equilibrium seed above "
-                  << thermal::MAX_PHYSICAL_TEMP_K << " K, the CPU solver's hard "
-                     "clamp; the solution WILL be truncated there." << std::endl;
     }
     anchor_census.report("cpu-scalar", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-scalar");
@@ -4631,7 +4617,7 @@ struct GpuSharedSeedContext {
 
 static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                               std::vector<float>& T_initial,
-                              size_t& floor_faces, size_t& hot_faces) {
+                              size_t& floor_faces) {
     std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
                         rho_col(c.n_layers), T_col(c.n_layers);
     std::vector<double> series;
@@ -4716,7 +4702,6 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
         if (res.clamped_low) ++floor_faces;
-        if (res.above_500K)  ++hot_faces;
         if (c.census) c.census->add(res);
         thermal::EqSeedRecorder::instance().record(global_f, in, res);
 
@@ -5021,14 +5006,13 @@ bool runThermalModelsForAllFacesBatchSoA(
     // non-finite Qb is substituted with 0 in the seed, and counted, so the
     // substitution is reported instead of silently swallowed.
     std::atomic<size_t> bad_qb_faces{0};
-    // Seed guards, reported after the loop (never silent):
+    // Seed guard, reported after the loop (never silent):
     //   seed_floor_faces -- columns pinned at ABSOLUTE_ZERO_K (Qb <= 0 AND no
-    //                       absorbed flux; cp(T) is undefined below that);
-    //   seed_hot_faces   -- columns whose radiative-equilibrium seed exceeds
-    //                       the CPU solver's own MAX_PHYSICAL_TEMP_K clamp, so
-    //                       the run WILL be truncated by that clamp (Mercury).
+    //                       absorbed flux; cp(T) is undefined below that).
+    // There is no companion "too hot" guard any more: it existed only to warn
+    // that the CPU scalar path's 500 K ceiling would truncate the run, and that
+    // ceiling was removed 2026-08-26 (thermal_model.h).
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     auto start_time = std::chrono::high_resolution_clock::now();
 
     const thermal::EqSeedMode seed_mode = config.spinup_seed;
@@ -5545,7 +5529,6 @@ bool runThermalModelsForAllFacesBatchSoA(
                     const thermal::EqSeedResult sres =
                         thermal::eqSeedColumn(sin_, T_col);
                     if (sres.clamped_low) ++seed_floor_faces;
-                    if (sres.above_500K)  ++seed_hot_faces;
                     simd_anchor_census.add(sres);
                     thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
 
@@ -5581,9 +5564,35 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // No validated arm reaches the bound (minimum seed in the
                 // PTM-46 validation set is 24.04 K = Moon T_geo), so this is a
                 // guard, not a behavior change -- verified byte-identical.
+                //
+                // ⚠️ The 400 K UPPER bound is a LEGACY-SEED artifact, kept for
+                // the same reason as Profile::init_T's 50 K cap and stated in
+                // the same terms: this branch runs only under
+                // `thermal.spinup_seed: legacy`, whose contract is to reproduce
+                // the pre-2026-08-11 initial condition exactly. It is an
+                // INITIAL CONDITION, not a bound on the solution -- the solver
+                // itself has had no upper temperature bound since 2026-08-26
+                // (thermal_model.h). It binds on Mercury (subsolar cycle mean
+                // ~468 K), which is precisely where the seed is worst, so it
+                // now says so instead of substituting quietly. Zero shipped
+                // configs select the legacy seed. BUGS.md ENG-LEGACY-SEED-CAPS.
+                const double T_rad_eq = std::sqrt(std::sqrt(ratio));
+                if (T_rad_eq > 400.0) {
+                    static std::atomic<bool> announced{false};
+                    if (!announced.exchange(true)) {
+                        std::cerr << "[eq-seed] NOTE: legacy seed "
+                                     "(thermal.spinup_seed: legacy): a face's "
+                                     "radiative-equilibrium seed is "
+                                  << T_rad_eq << " K and is CAPPED at 400 K in "
+                                     "the initial condition. Historical seed "
+                                     "reproduced exactly; the solver has no "
+                                     "upper temperature bound. Use the default "
+                                     "thermal.spinup_seed: physical to avoid it."
+                                  << std::endl;
+                    }
+                }
                 double T_surf_est = std::min(400.0,
-                        std::max(thermal::ABSOLUTE_ZERO_K,
-                                 std::sqrt(std::sqrt(ratio))));
+                        std::max(thermal::ABSOLUTE_ZERO_K, T_rad_eq));
 
                 // Deep temperature: geothermal gradient on top of surface avg,
                 // capped to prevent runaway (same formula as Profile::init_T).
@@ -6137,16 +6146,6 @@ bool runThermalModelsForAllFacesBatchSoA(
                   << " K CMB floor -- they have Qb <= 0 AND zero mean absorbed "
                      "flux, so the steady-state balance has no positive root. "
                      "cp(T) is not defined below that."
-                  << std::endl;
-    }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
-                  << " faces have a cycle-mean radiative-equilibrium seed above "
-                  << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, which is the CPU solver's own hard temperature clamp. "
-                     "The seed is physical (Mercury's subsolar cycle mean is "
-                     "~468 K); the CLAMP will truncate the solution. Results on "
-                     "those faces are not trustworthy."
                   << std::endl;
     }
     simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
@@ -7261,7 +7260,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const size_t n_layers = z_grid.size();
 
     // Shared-seed guards, reported after the batch loop (never silent).
-    size_t gpu_seed_floor_faces = 0, gpu_seed_hot_faces = 0;
+    size_t gpu_seed_floor_faces = 0;
     SeedAnchorCensus gpu_anchor_census;
     const double gpu_seed_dt_s =
         (total_time_steps > 1 && times.size() > 1) ? (times[1] - times[0])
@@ -7952,13 +7951,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing
             // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial,
                               warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces,
-                              warm_start_run ? warm_seed_hot_sink
-                                             : gpu_seed_hot_faces);
+                                             : gpu_seed_floor_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -8644,13 +8641,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing
             // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial,
                               warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces,
-                              warm_start_run ? warm_seed_hot_sink
-                                             : gpu_seed_hot_faces);
+                                             : gpu_seed_floor_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -9165,13 +9160,6 @@ post_batch_loop:
                   << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor -- Qb <= 0 AND zero mean absorbed flux, so "
                      "the steady-state balance has no positive root.\n";
-    }
-    if (gpu_seed_hot_faces > 0) {
-        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_hot_faces << " of "
-                  << n_faces << " faces have a cycle-mean radiative-equilibrium "
-                     "seed above " << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, the CPU solver's hard clamp. The seed is physical; a "
-                     "CPU run of the same case would be truncated there.\n";
     }
     gpu_anchor_census.report("gpu-persistent", warm_start_run);
     thermal::EqSeedRecorder::instance().write("gpu-persistent");
@@ -10541,7 +10529,6 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double H_override,
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
-    std::atomic<size_t>* seed_hot_faces,
     SeedAnchorCensus*    anchor_census,
     FaceStateIO* state);
 

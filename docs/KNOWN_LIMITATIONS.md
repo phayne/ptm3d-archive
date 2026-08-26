@@ -500,6 +500,23 @@ that the value you set is the value that was echoed.
   Europa only), so the blast radius is the tutorial and testing surface. Moon and Europa are
   untouched and byte-identical.
 
+- **There is no upper temperature clamp, on any path — and there used to be one, on one path.**
+  `MAX_PHYSICAL_TEMP_K = 500.0` was applied by the **CPU scalar** solver only
+  (`Profile::update_T`, `outputSurfaceTemp`); the CPU SIMD batch path and the GPU persistent kernel
+  never had it. On the same Keplerian generic-body config at 0.25 AU the two CPU paths therefore
+  disagreed by **210 K** in mean `temperature_max` (SIMD 686.09 K, scalar 475.84 K with its maximum
+  sitting at exactly 500.000000 K), and a Mercury run reported `T_max` = 606.71 K on the default
+  path while the engine warned that a 500 K clamp would truncate it. The constant and all four of
+  its clamp sites were removed 2026-08-26 on Paul's ruling ("remove the temperature ceiling for all
+  bodies — no clamps, only physics"); the three paths now agree to 0.19 K on that config. **The
+  `T_geo` floor is a different object and stays** — it is per-face physics, see section 2 above —
+  as do the NaN/Inf guards. Two upper bounds survive, both inside the **legacy** initial condition
+  (`thermal.spinup_seed: legacy`, which no shipped config selects): a 400 K cap on the seed's
+  radiative-equilibrium temperature and a 50 K cap on its geothermal rise. They are kept because
+  that path's whole contract is to reproduce the pre-2026-08-11 seed exactly, and an initial
+  condition is not a solution bound — but each now prints a one-shot note when it binds instead of
+  substituting silently.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,

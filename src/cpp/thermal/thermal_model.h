@@ -164,7 +164,37 @@ public:
 // this alias exists only because SIGMA_SB is used unqualified in ~40 places.
 const double SIGMA_SB = ptm::kStefanBoltzmann;
 const double ABSOLUTE_ZERO_K = 2.7;      // Cosmic microwave background temperature (K) - physical minimum
-const double MAX_PHYSICAL_TEMP_K = 500.0; // Maximum physically reasonable temperature for icy bodies (K)
+
+// ---------------------------------------------------------------------------
+// THERE IS NO UPPER TEMPERATURE CLAMP. Removed 2026-08-26 on Paul's ruling
+// ("remove the temperature ceiling for all bodies -- no clamps, only physics"),
+// which is the same rule as feedback-physics-not-clamps: accurate physics, not
+// arbitrary bounds.
+//
+// What was here: `MAX_PHYSICAL_TEMP_K = 500.0`, commented "maximum physically
+// reasonable temperature for icy bodies". Mercury's subsolar point is ~700 K,
+// so on the one built-in body that reaches it the constant truncated the
+// solution -- and it did so on ONE path out of three, which is the part that
+// made it dangerous rather than merely wrong:
+//
+//   CPU scalar (Profile::update_T, outputSurfaceTemp)  clamped at 500 K
+//   CPU SIMD batch (runThermalModelsForAllFacesBatchSoA) NO ceiling
+//   GPU persistent kernel (thermal_kernels.cl)           NO ceiling
+//
+// That is why a Mercury probe measured T_max = 577.05 K -- 77 K ABOVE the
+// clamp -- while the engine printed a warning saying the clamp would truncate
+// it: the run took the SIMD batch path, which never had the ceiling.
+// Diagnosed as BUGS.md ENG-CLAMP-PATH-INCONSISTENT; removing the ceiling is
+// what makes the three paths agree, in the direction of no clamp at all.
+//
+// The T_geo FLOOR is a different object and STAYS. It is physics
+// (T_geo = (Qb/(eps*sigma))^0.25 is the temperature at which a surface in
+// steady darkness radiates exactly the interior heat flux), it is per-face, and
+// it corrects a numerical undershoot rather than bounding a result. So is the
+// ABSOLUTE_ZERO_K floor. NaN/Inf guards also stay, because they recover from a
+// value that is not a temperature at all -- but they must remain LOUD or
+// self-evidently unreachable, never a quiet substitution.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // THE SURFACE ENERGY BALANCE -- one solver, every path.

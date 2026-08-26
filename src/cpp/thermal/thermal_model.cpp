@@ -883,7 +883,31 @@ void Profile::init_T(const Planet& planet, double /*lat -- see above*/,
 
     // Cap the max temperature increase to prevent runaway initialization
     // For Moon: typical depths are a few meters, gradient ~ 1-3 K/m
+    //
+    // ⚠️ This 50 K cap is a LEGACY-SEED artifact and it is the last remaining
+    // upper bound on a temperature in this file. It survives the 2026-08-26
+    // ceiling removal (thermal_model.h) on purpose: init_T is reached only
+    // under `thermal.spinup_seed: legacy`, whose entire contract is to
+    // reproduce the pre-2026-08-11 initial condition bit for bit, and an
+    // INITIAL CONDITION is not a solution bound -- a correct solver forgets it
+    // within a spin-up. Removing it would silently change what "legacy" means.
+    // What was not acceptable was leaving it SILENT, so it now says when it
+    // binds. Zero shipped configs select the legacy seed. BUGS.md
+    // ENG-LEGACY-SEED-CAPS.
     double delta_T_geo = std::min(gradient * depth, 50.0);  // Max 50K geothermal increase
+    if (gradient * depth > 50.0) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+            std::cerr << "[eq-seed] NOTE: legacy seed (thermal.spinup_seed: legacy): "
+                         "the geothermal rise over the " << depth << " m grid is "
+                      << (gradient * depth) << " K and is CAPPED at 50 K in the "
+                         "initial condition. This is the historical seed being "
+                         "reproduced exactly, not a bound on the solution -- the "
+                         "solver itself has no upper temperature bound. Use the "
+                         "default thermal.spinup_seed: physical to avoid it."
+                      << std::endl;
+        }
+    }
     double T_deep = T_avg + delta_T_geo;
 
     // Only print if verbose
@@ -1020,7 +1044,8 @@ void Profile::update_T(double dt, double Qs, double Qb) {
     // upper column drift numerically below this physical floor; clamping the
     // finalize loop at T_lo = max(CMB, T_geo) corrects only that sub-floor
     // drift (real PSR floors converge to T_geo from above -> no-op). Per-face,
-    // physics-set, NOT the arbitrary [3,500] K clamp.
+    // physics-set, and a FLOOR only -- the arbitrary 500 K ceiling this
+    // note used to contrast itself against no longer exists (thermal_model.h).
     //
     // PTM_SOLVER_EQFIX removes it. The floor is not a correction, it is a
     // Dirichlet pin: it holds layer 0 at the analytically exact
@@ -1314,11 +1339,12 @@ void Profile::update_T(double dt, double Qs, double Qb) {
             Tptr[j + 1] = d[j];
         }
 
-        // Physical clamping and NaN guard
+        // NaN guard + the physical T_geo/CMB FLOOR. No upper bound: the
+        // temperature ceiling was removed 2026-08-26 (thermal_model.h).
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, Tptr[i]);
         }
         countTgeoRelease(Tptr, n_tot, T_geo_watch);
         return;
@@ -1373,7 +1399,7 @@ void Profile::update_T(double dt, double Qs, double Qb) {
         #pragma omp parallel for schedule(static) if(n_tot > 1024)
         for (size_t i = 0; i < n_tot; ++i) {
             if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-            Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+            Tptr[i] = std::max(T_lo, Tptr[i]);
         }
         countTgeoRelease(Tptr, n_tot, T_geo_watch);
         return;
@@ -1528,11 +1554,11 @@ void Profile::update_T(double dt, double Qs, double Qb) {
 #endif  // AVX512/AVX2/scalar
 #endif  // #if 0 - disabled SIMD paths
 
-    // Clamp for safety on fallback path
+    // NaN guard + the physical T_geo/CMB floor, as above. No upper bound.
     #pragma omp parallel for schedule(static) if(n_tot > 1024)
     for (size_t i = 0; i < n_tot; ++i) {
         if (!std::isfinite(Tptr[i])) Tptr[i] = T_old[i];
-        Tptr[i] = std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, Tptr[i]));
+        Tptr[i] = std::max(T_lo, Tptr[i]);
     }
     countTgeoRelease(Tptr, n_tot, T_geo_watch);
 }
@@ -1750,7 +1776,7 @@ double outputSurfaceTemp(const Profile& p, double Qs, double Qb) {
         ? std::sqrt(std::sqrt(Qb / (p.emissivity * sigma))) : 0.0;
     const double T_lo  = solverEqFixEnabled() ? ABSOLUTE_ZERO_K
                                               : std::max(ABSOLUTE_ZERO_K, T_geo);
-    return std::max(T_lo, std::min(MAX_PHYSICAL_TEMP_K, s.T));
+    return std::max(T_lo, s.T);
 }
 
 double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double Qs) {
@@ -1775,11 +1801,13 @@ double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double
     noteSurfaceBCSolution(s);
 
     // Same T_geo floor advanceTimestep() applies to the column it leaves
-    // behind, and -- also matching that path -- NO upper clamp. The scalar
-    // flavor above does apply MAX_PHYSICAL_TEMP_K because Profile::update_T
-    // does; each helper mirrors the bounds of the path it reports for, rather
-    // than inventing a common set. This path refuses to run under
-    // PTM_SOLVER_EQFIX, so there is no floor-release branch here.
+    // behind, and NO upper clamp -- which is now true of the scalar flavor
+    // above as well, since the 500 K ceiling was removed 2026-08-26
+    // (thermal_model.h). Until then the two helpers deliberately mirrored
+    // DIFFERENT bounds because the paths they report for had different bounds;
+    // that divergence is what ENG-CLAMP-PATH-INCONSISTENT recorded, and it is
+    // gone. This path refuses to run under PTM_SOLVER_EQFIX, so there is no
+    // floor-release branch here.
     const double qb = batch.Qb[f];
     if (qb > 0.0) {
         const double T_geo = std::sqrt(std::sqrt(qb / (batch.emissivity[f] * batch.sigma_sb)));

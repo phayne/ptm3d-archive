@@ -346,7 +346,13 @@ struct EqSeedResult {
     double T_surface = 0.0;   ///< T(z=0)
     double T_deep    = 0.0;   ///< T(z=z_max)
     bool   clamped_low  = false;   ///< hit the ABSOLUTE_ZERO_K guard
-    bool   above_500K   = false;   ///< physical, but outside the CPU solver clamp
+    // `above_500K` was here. It flagged a seed above the CPU scalar path's
+    // MAX_PHYSICAL_TEMP_K, so that the run could warn that the clamp would
+    // truncate it. That clamp was removed 2026-08-26 (thermal_model.h), so
+    // the flag now has nothing to report and its four warning sites would
+    // have gone on naming a ceiling that no longer exists. There is no
+    // replacement: a radiative-equilibrium seed is physical by construction
+    // at any temperature, and no path bounds it.
 
     // --- anchor diagnostics (all report-only; the solver reads T_surface) ---
     EqSeedAnchorStatus anchor_status = EqSeedAnchorStatus::NoForcingSeries;

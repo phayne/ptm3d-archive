@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <iostream>
 
-#include "thermal_model.h"   // ABSOLUTE_ZERO_K, MAX_PHYSICAL_TEMP_K
+#include "thermal_model.h"   // ABSOLUTE_ZERO_K
 
 namespace thermal {
 
@@ -700,10 +700,9 @@ EqSeedResult eqSeedColumn(const EqSeedInput& in, double* T_out) {
     // NO upper clamp. The old seeds clamped at 400 K; Mercury's subsolar
     // CYCLE MEAN is ~468 K and its peak is 633 K, so that clamp was a silent
     // 68-233 K substitution on a body the engine lets you select. A radiative
-    // equilibrium temperature is physical by construction -- but it is worth
-    // saying out loud when it exceeds the CPU solver's own MAX_PHYSICAL_TEMP_K
-    // clamp, because that clamp will then truncate the run.
-    r.above_500K = (T0 > MAX_PHYSICAL_TEMP_K);
+    // equilibrium temperature is physical by construction, and as of
+    // 2026-08-26 no solver path bounds it from above either, so there is
+    // nothing left for the seed to warn about.
 
     r.T_surface = T0;
     r.T_deep    = T0;
