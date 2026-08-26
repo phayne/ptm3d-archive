@@ -517,6 +517,17 @@ that the value you set is the value that was echoed.
   condition is not a solution bound — but each now prints a one-shot note when it binds instead of
   substituting silently.
 
+- **The Python and GUI layers no longer keep their own copy of the body list.**
+  `src/python/ptm/body_capabilities.py` exposes the implemented bodies and their engine
+  properties, generated from `planetary_properties.h` by
+  `python3 -m ptm.body_capabilities --regenerate` on the `ptm.engine_config` precedent.
+  `src/python/tests/test_body_capabilities.py` re-derives it on every run and fails if the
+  committed table, `gui_tooltips.BODY_SYNODIC_PERIODS`, `gui_tooltips.BODY_DEFAULTS`,
+  `gui_core.facet_scale._BODY_RADII_M` or `ptm.results.BODY_RADII` disagrees with the engine --
+  four hand-maintained duplicates that nothing checked before, and that is how
+  `BODY_SYNODIC_PERIODS` came to carry 175.942 d for Mercury under a comment claiming it
+  matched `thermo.day` while the engine carried 58.646 d.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,
