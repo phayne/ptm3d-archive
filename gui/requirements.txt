@@ -15,6 +15,15 @@ numpy>=1.24.0
 
 # Configuration
 PyYAML>=6.0
+# REQUIRED, not optional: without it, saving a project cannot preserve the
+# comments and layout of the file it opened, and cannot express "this key is
+# unset" -- which makes gpu.min_vram_margin_gib unsafe to expose, because the
+# engine reads its mere PRESENCE as "enforce the VRAM floor on every platform"
+# (src/cpp/tools/config_parser.h). The GUI refuses to be quiet about the
+# fallback (gui_core.yaml_roundtrip.UNAVAILABLE_MESSAGE), but the fallback is
+# still lossy. 0.17.21 is the oldest release tested here; 0.18.16 is what this
+# was developed against.
+ruamel.yaml>=0.17.21
 
 # Optional: GPU detection (for hardware capabilities)
 pyopencl>=2022.3

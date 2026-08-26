@@ -3,6 +3,7 @@ Configuration Manager for PTM3D GUI
 Handles loading, saving, validating, and managing simulation configurations
 """
 
+import logging
 import yaml
 from copy import deepcopy
 from pathlib import Path
@@ -10,6 +11,9 @@ from pathlib import Path
 from ptm.engine_defaults import ENGINE_DEFAULTS
 
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+from gui_core import yaml_roundtrip
+
+logger = logging.getLogger(__name__)
 
 
 #: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
@@ -461,11 +465,24 @@ class ConfigManager:
         #: with DEFAULT_CONFIG always supplies `beaming`, so "the file did not
         #: mention it" is information only `load_from_yaml` ever has.
         self.legacy_implicit_beaming = None
+        #: DP-1(b) round-trip state. `_source_doc` is the opened file's own
+        #: text and comment-carrying document; `_loaded_engine_view` is the
+        #: engine-facing view of the config AS LOADED. Saving writes the
+        #: difference between that view and the current one, and nothing else,
+        #: which is what makes "this key is unset" representable at all.
+        self._source_doc = None
+        self._loaded_engine_view = None
+        #: True once the user has been told that this session's saves cannot
+        #: preserve comments (ruamel.yaml missing). The GUI shows it once as a
+        #: dialog and every time in the console; it is never silent.
+        self.comment_loss_disclosed = False
 
     def reset_to_defaults(self):
         """Reset configuration to defaults"""
         self.config = deepcopy(self.DEFAULT_CONFIG)
         self.legacy_implicit_beaming = None
+        self._source_doc = None
+        self._loaded_engine_view = None
 
     def generic_body_active(self):
         """True when the config carries real generic-body data (the engine
@@ -702,6 +719,61 @@ class ConfigManager:
                         loaded_thermo[override_key]
                     self.config["thermophysical"][f"use_default_{prop_name}"] = False
 
+        # ---- DP-1(b): keep the file's own text, and the engine-facing view of
+        # what it said, so a later save can write ONLY what changed.
+        self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
+        self._loaded_engine_view = deepcopy(self._config_for_yaml())
+        if self._source_doc is None:
+            n_comments = self._count_comment_lines(filename)
+            if n_comments:
+                logger.warning(
+                    "[config] %s carries %d comment line(s) that a save cannot "
+                    "preserve. %s", filename, n_comments,
+                    self.comment_preservation_status()[1])
+
+    @staticmethod
+    def _count_comment_lines(filename):
+        """How many comment lines the file carries (for the loss warning)."""
+        try:
+            text = Path(filename).read_text()
+        except Exception:
+            return 0
+        return sum(1 for line in text.splitlines()
+                   if line.lstrip().startswith("#"))
+
+    def comment_preservation_status(self):
+        """(preserved, message) -- can this session's saves keep comments?
+
+        A GUI that quietly flattens the file it was given is exactly the defect
+        Stage 1 was about, so the answer is surfaced rather than assumed: the
+        caller shows the message in the console on every save, and once as a
+        dialog before the first lossy one.
+        """
+        if not yaml_roundtrip.available():
+            return (False, yaml_roundtrip.UNAVAILABLE_MESSAGE)
+        if self._source_doc is None:
+            return (False,
+                    "This project was not opened from a YAML file (or its YAML "
+                    "could not be round-tripped), so there is no source layout "
+                    "to preserve. Save writes the full engine-facing config; "
+                    "the next save of that file preserves it.")
+        return (True,
+                "Comments and layout are preserved: saving rewrites only the "
+                "keys whose values changed.")
+
+    def plan_save_edits(self):
+        """(updates, removals) a save would apply, or None if not round-tripping.
+
+        Exposed so a test -- and a future diff dialog -- can assert what a save
+        touches without writing anything.
+        """
+        if self._source_doc is None:
+            return None
+        return yaml_roundtrip.plan_edits(
+            self._loaded_engine_view or {},
+            self._config_for_yaml(),
+            self._source_doc.file_keys())
+
     @staticmethod
     def _strip_sentinels(d):
         """Remove sentinel values (-1.0, empty strings) from nested dict for clean YAML."""
@@ -890,9 +962,44 @@ class ConfigManager:
         return out
 
     def save_to_yaml(self, filename):
-        """Save configuration to YAML file"""
-        with open(filename, 'w') as f:
-            yaml.dump(self._config_for_yaml(), f, default_flow_style=False, sort_keys=False)
+        """Save the project file, preserving its comments and layout (DP-1(b)).
+
+        Two paths, and which one ran is reported by
+        ``comment_preservation_status()`` -- never inferred by the caller:
+
+        * a file opened from YAML and round-trippable: the loaded document is
+          edited in place with ONLY the keys whose engine-facing value changed
+          since it was opened, then re-emitted. Comments, ordering, blank lines
+          and quoting survive, and a key the file never mentioned stays
+          unmentioned unless the user changed it. That last property is what
+          makes ``gpu.min_vram_margin_gib`` safe to expose (config_parser.h:
+          its mere presence makes the VRAM floor enforcing on every platform).
+        * otherwise (a new project, or ruamel.yaml missing): the old full
+          ``yaml.dump`` of the engine-facing config.
+
+        After either path the file on disk becomes the new baseline, so the
+        next save is again a minimal edit.
+        """
+        doc = self._source_doc
+        if doc is not None:
+            updates, removals = yaml_roundtrip.plan_edits(
+                self._loaded_engine_view or {}, self._config_for_yaml(),
+                doc.file_keys())
+            doc.apply(updates, removals)
+            text = doc.dump()
+            with open(filename, 'w') as f:
+                f.write(text)
+        else:
+            with open(filename, 'w') as f:
+                yaml.dump(self._config_for_yaml(), f,
+                          default_flow_style=False, sort_keys=False)
+
+        # Re-baseline against what is now on disk. Without this a second save
+        # would re-apply the first save's edits against a stale "as loaded"
+        # view, and setting a key back to its original value would not be
+        # written back.
+        self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
+        self._loaded_engine_view = deepcopy(self._config_for_yaml())
 
     def save_run_yaml(self, filename, project_root):
         """Write the engine-facing YAML with every path field absolutized

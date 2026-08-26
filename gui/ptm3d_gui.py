@@ -575,8 +575,28 @@ class PTM3DMainWindow(QMainWindow):
             self.save_project_to(filename)
 
     def save_project_to(self, filename):
-        """Save project to specified file"""
+        """Save project to specified file.
+
+        Whether this save preserved the file's comments and layout is REPORTED,
+        not left to be discovered. A lossy save (ruamel.yaml missing) also
+        raises a dialog the first time in a session, because the loss is
+        silent, permanent and to the user's own file.
+        """
+        preserved, status = self.config_manager.comment_preservation_status()
+        if not preserved and not self.config_manager.comment_loss_disclosed \
+                and Path(filename).exists():
+            self.config_manager.comment_loss_disclosed = True
+            reply = QMessageBox.warning(
+                self, "This save cannot preserve comments",
+                f"{status}\n\nSave {Path(filename).name} anyway?",
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if reply != QMessageBox.StandardButton.Save:
+                self.console_panel.append_warning("Save canceled")
+                return
         try:
+            edits = self.config_manager.plan_save_edits()
             self.config_manager.save_to_yaml(filename)
             self.current_project_file = filename
             self.unsaved_changes = False
@@ -584,6 +604,20 @@ class PTM3DMainWindow(QMainWindow):
             self.add_recent_file(filename)
             self.status_label.setText(f"Saved: {Path(filename).name}")
             self.console_panel.append_info(f"Project saved: {filename}")
+            if edits is not None:
+                updates, removals = edits
+                touched = sorted(list(updates) + list(removals))
+                self.console_panel.append_info(
+                    "Rewrote %d key(s): %s"
+                    % (len(touched),
+                       ", ".join(touched[:8]) +
+                       (", ..." if len(touched) > 8 else "")
+                       if touched else "none -- the file is unchanged"))
+            if preserved:
+                self.console_panel.append_info(
+                    "Comments and layout preserved.")
+            else:
+                self.console_panel.append_warning(status)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project:\n{str(e)}")
 

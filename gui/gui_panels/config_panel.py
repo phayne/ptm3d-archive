@@ -4711,8 +4711,20 @@ class ConfigurationPanel(QWidget):
         preview_layout = QVBoxLayout(preview_widget)
         preview_layout.setContentsMargins(8, 8, 8, 8)
 
-        preview_header = QLabel("YAML Preview")
+        preview_header = QLabel("YAML Preview — the engine-facing config a run writes")
         preview_header.setFont(QFont("Helvetica Neue", 11, QFont.Weight.Bold))
+        # Not what Save writes. Save edits the opened file in place, touching
+        # only the keys whose values changed and leaving its comments, layout
+        # and unmentioned keys alone (DP-1(b)); this pane is the fully expanded
+        # config the engine is handed, which is what lands beside the output
+        # directory as config.yaml. Saying "YAML Preview" over an expanded dump
+        # while Save writes a minimal edit would be the same class of quiet
+        # mismatch this stage exists to remove.
+        preview_header.setToolTip(
+            "The fully expanded configuration handed to the engine, and "
+            "written beside the output directory as config.yaml.\n"
+            "Save does NOT write this: it edits your project file in place, "
+            "changing only the keys you changed and preserving its comments.")
         preview_layout.addWidget(preview_header)
 
         self.preview_text = QTextEdit()

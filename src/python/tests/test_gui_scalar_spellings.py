@@ -164,6 +164,11 @@ def test_no_scalar_spelling_can_abort_the_gui():
                     failures.append(
                         f"{dotted} = {spelling}: {type(exc).__name__}: {exc}")
 
+        # Print the denominator even on success: "0 of 1375" is a measurement,
+        # "PASS" alone could be a sweep that checked nothing.
+        print(f"    swept {checked} key x spelling combinations "
+              f"({len(keys)} leaf keys x {len(SPELLINGS)} spellings), "
+              f"{len(failures)} raised")
         assert not failures, (
             f"{len(failures)} of {checked} loads raised. Each one is an "
             f"application abort (PyQt6 qFatal, exit 134), not an error "
