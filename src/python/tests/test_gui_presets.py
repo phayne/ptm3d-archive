@@ -282,6 +282,45 @@ def test_the_baseline_card_honors_the_files_engine_env():
         assert manager.get_value("thermal.spinup_seed") == "legacy"
 
 
+def test_loading_a_baseline_detaches_the_users_project_file():
+    """Otherwise the next Ctrl+S writes the BASELINE over the user's own file.
+
+    `apply_baseline` calls `load_from_yaml` on the run's `config_used.yaml`,
+    which repoints the round-trip document. Nothing else told the main window,
+    so `save_to_yaml(current_project_file)` dumped the baseline's document --
+    comments and all -- over the user's project, while the console reported
+    "Comments and layout preserved". Reproduced before `project_replaced`
+    existed; the probe still runs that arm as the negative control.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        run = Path(scratch) / "baseline_run"
+        run.mkdir(exist_ok=True)
+        (run / "config_used.yaml").write_text(
+            "# BASELINE\nsimulation:\n  body: Moon\n  timesteps: 77\n")
+        (run / "provenance.txt").write_text("engine_binary_md5=abc\n")
+
+        seen = []
+        panel.project_replaced.connect(seen.append)
+        panel.tabs["start"].apply_baseline(str(run))
+        assert seen, (
+            "project_replaced was not emitted, so the main window cannot know "
+            "its save target no longer matches the loaded document")
+        assert seen[0].endswith("config_used.yaml"), seen
+
+        # ...and a directory with no record must not emit it at all.
+        seen.clear()
+        empty = Path(scratch) / "not_a_run"
+        empty.mkdir(exist_ok=True)
+        panel.tabs["start"].apply_baseline(str(empty))
+        assert not seen, (
+            "a directory with no config_used.yaml detached the project file "
+            "anyway")
+        assert "Cannot use this directory" in \
+            panel.tabs["start"].report_text("reproduce_baseline")
+        panel.tabs["start"].apply_preset("lunar_global_diurnal")
+
+
 def test_the_card_applies_through_the_panel_and_the_tabs_follow():
     """A card writes a GROUP of keys; every tab must re-read afterward."""
     with tempfile.TemporaryDirectory() as scratch:
@@ -311,6 +350,7 @@ TESTS = [
     test_a_preset_config_is_accepted_by_test_config_parity_rules,
     test_reproduce_a_baseline_reads_the_runs_own_record,
     test_the_baseline_card_honors_the_files_engine_env,
+    test_loading_a_baseline_detaches_the_users_project_file,
     test_the_card_applies_through_the_panel_and_the_tabs_follow,
 ]
 

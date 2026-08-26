@@ -449,6 +449,7 @@ class PTM3DMainWindow(QMainWindow):
         """Connect internal signals"""
         # Config panel signals
         self.config_panel.config_changed.connect(self.on_config_changed)
+        self.config_panel.project_replaced.connect(self.on_project_replaced)
 
         # Results panel signals
         self.results_panel.results_selected.connect(self.on_results_selected)
@@ -586,7 +587,6 @@ class PTM3DMainWindow(QMainWindow):
         preserved, status = self.config_manager.comment_preservation_status()
         if not preserved and not self.config_manager.comment_loss_disclosed \
                 and Path(filename).exists():
-            self.config_manager.comment_loss_disclosed = True
             reply = QMessageBox.warning(
                 self, "This save cannot preserve comments",
                 f"{status}\n\nSave {Path(filename).name} anyway?",
@@ -596,6 +596,11 @@ class PTM3DMainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Save:
                 self.console_panel.append_warning("Save canceled")
                 return
+            # Only a save that actually WENT AHEAD consumes the session's one
+            # dialog. Setting the flag before the dialog returned meant a user
+            # who read the warning and pressed Cancel had spent it, and every
+            # later save flattened the file with nothing but a console line.
+            self.config_manager.comment_loss_disclosed = True
         try:
             edits = self.config_manager.plan_save_edits()
             self.config_manager.save_to_yaml(filename)
@@ -954,9 +959,25 @@ class PTM3DMainWindow(QMainWindow):
             + "\n".join(f"  • {m}" for m in messages)
             if messages else "The GUI's own checks found nothing.")
 
+        # The ENGINE-FACING view, not the raw GUI dictionary. They differ
+        # materially, and validating the wrong one is worse than not
+        # validating: get_config() always carries a full gpu: section, so the
+        # temporary file would set min_vram_margin_explicit -- the opposite of
+        # what the run does and of what the GPU page tells the user. It also
+        # carries GUI-synthetic keys (topo_source, albedo_source,
+        # margin_explicit, the use_default_* switches) and none of the
+        # translations _config_for_yaml performs, so the "PTM_DATA_ROOT
+        # path-resolution contract" the banner claims to have checked would
+        # have been checked against paths the run will not have.
         exe = SimulationRunner.find_ptm_executable()
-        status, engine_text = engine_validate_config(
-            self.config_manager.get_config(), exe)
+        self.status_label.setText("Checking configuration…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            status, engine_text = engine_validate_config(
+                self.config_manager._config_for_yaml(), exe)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.status_label.setText("Ready")
 
         engine_part = {
             "accepted": "The engine ACCEPTED this configuration:",
@@ -1094,6 +1115,28 @@ class PTM3DMainWindow(QMainWindow):
             self.on_field_changed(self.field_combo.currentIndex())
 
     # === Signal Handlers ===
+
+    def on_project_replaced(self, source_path):
+        """The whole configuration came from another file (the baseline card).
+
+        Detach the project file. The ConfigManager's round-trip document now
+        belongs to `source_path`, so leaving current_project_file alone made
+        the next Ctrl+S write the BASELINE's document -- comments and all --
+        over the user's own project, and report "Comments and layout
+        preserved" while doing it. Reproduced before this handler existed.
+
+        The baseline's own record is not adopted as the project file either: it
+        is a run's evidence and must not be overwritten by a Save. The user
+        gets Save As.
+        """
+        self.current_project_file = None
+        self.unsaved_changes = True
+        self.update_window_title()
+        self.status_label.setText(f"Loaded baseline: {Path(source_path).name}")
+        self.console_panel.append_warning(
+            f"Configuration replaced from {source_path}. This is NOT your "
+            f"project file -- Save will ask for a new location, and the "
+            f"baseline's own record is left untouched.")
 
     def on_config_changed(self):
         """Handle configuration changes"""

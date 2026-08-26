@@ -128,6 +128,14 @@ _FILE_FIELDS = [
     "generic_body.spice_metakernel",
 ]
 
+#: Data-path fields that follow the PTM_DATA_ROOT contract but must NOT be
+#: existence-checked, because a first run is supposed to find them missing.
+#: (config_parser.cpp resolves illumination.bvh_cache_file with resolveDataPath
+#: and `required=false`.)
+_DATA_PATH_NO_EXISTENCE_CHECK = [
+    "illumination.bvh_cache_file",
+]
+
 # Config fields that hold a directory that will be READ during the run.
 _DATA_DIR_FIELDS = [
     "mesh.topo_directory",
@@ -708,14 +716,15 @@ def absolutize_config_paths(config, project_root):
         # An OUTPUT path, so it is absolutized but not existence-checked: it is
         # the file this run will write, not one it must find.
         "thermal.final_state_file",
-        # A CACHE: read when it matches the geometry, written when it does not.
-        # Absolutized so it resolves the same from the run YAML beside the
-        # output directory, but never existence-checked -- a first run is
-        # supposed to find it missing.
-        "illumination.bvh_cache_file",
         "output.directory",
-    ]
-    data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)
+    ] + _DATA_PATH_NO_EXISTENCE_CHECK
+    # The engine resolves these through the PTM_DATA_ROOT contract
+    # (resolveDataPath), not against the project root. Getting this wrong is
+    # silent: the GUI would write <project_root>/cache/site.bvh into the run
+    # YAML while the engine alone would have used $PTM_DATA_ROOT/cache/site.bvh,
+    # and the BVH cache would be written and read in different places.
+    data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS
+                      + _DATA_PATH_NO_EXISTENCE_CHECK)
     for dotted in path_fields:
         val = get_config_value(cfg, dotted)
         if not val:
@@ -731,10 +740,13 @@ def absolutize_config_paths(config, project_root):
     return cfg
 
 
-#: Wall-clock ceiling for the engine's own config check. It parses and exits,
-#: so a second is generous; the timeout exists because a hung subprocess on the
-#: GUI thread is worse than no answer.
-VALIDATE_TIMEOUT_S = 60.0
+#: Wall-clock ceiling for the engine's own config check. Measured: 0.13-0.20 s
+#: on this machine, because the mode parses and exits. This call is SYNCHRONOUS
+#: on the Qt thread, so the ceiling is also how long the window can freeze --
+#: it was 60 s, which is a minute of dead GUI on a stalled network or cloud
+#: mount. 15 s leaves ~75x headroom over the measured time and bounds the
+#: freeze. The caller shows a wait cursor for the duration.
+VALIDATE_TIMEOUT_S = 15.0
 
 
 def engine_validate_config(config, executable, project_root=None, env=None):
@@ -801,6 +813,26 @@ def engine_validate_config(config, executable, project_root=None, env=None):
                     f"the GUI's checks applied.")
 
         text = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode < 0:
+            # A signal, not a verdict. --validate-config returns 0 or 1; a
+            # negative code is a crash IN the parser (this codebase has a
+            # documented -mavx2 / Eigen ABI SIGABRT class), and reporting it
+            # as "the engine REFUSED this configuration" blames the user's YAML
+            # for an engine fault.
+            import signal as _signal
+            try:
+                name = _signal.Signals(-proc.returncode).name
+            except (ValueError, AttributeError):
+                name = f"signal {-proc.returncode}"
+            return ("unavailable",
+                    f"The engine CRASHED while parsing the configuration "
+                    f"({name}). That is a fault in the binary, not a verdict on "
+                    f"the config -- nothing was validated.\n" + text)
+        if proc.returncode > 1:
+            return ("unavailable",
+                    f"The engine exited {proc.returncode}, which is neither "
+                    f"accept (0) nor refuse (1). Treat it as not checked.\n"
+                    + text)
         if proc.returncode == 0 and "[validate-config]" in text:
             return ("accepted", text)
         if proc.returncode == 0:

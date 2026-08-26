@@ -1440,14 +1440,36 @@ class ConfigManager:
             errors.append(
                 f"gpu.thin_margin_policy must be separate or refuse (got "
                 f"{thin!r}); the engine refuses anything else at startup.")
+        # The engine's test, transcribed rather than recalled
+        # (ptm_thermal_sim.cpp:14365): `thin == "separate" && hard > floor`,
+        # plus `hard >= 0`, `floor >= 0` and `placement_margin >= 0`.
+        # The first spelling here was `hard >= floor > 0`, and it was wrong in
+        # BOTH directions -- REPRODUCED against the binary: it refused
+        # hard == floor == 2.0, which the engine accepts, and it passed
+        # floor = 0 with hard = 0.25, which the engine refuses. A second copy
+        # of an engine rule is a second place for it to be wrong; this one
+        # survives only because catching it here saves a launch.
         hard = num(gpu_cfg.get("hard_min_vram_margin_gib"), 0.25)
         floor = num(gpu_cfg.get("min_vram_margin_gib"), 2.0)
-        if thin == "separate" and hard >= floor > 0:
+        if hard < 0.0:
             errors.append(
-                f"gpu.hard_min_vram_margin_gib ({hard}) is not below "
+                f"gpu.hard_min_vram_margin_gib ({hard}) must be >= 0; the "
+                f"engine refuses this at startup.")
+        if floor < 0.0:
+            errors.append(
+                f"gpu.min_vram_margin_gib ({floor}) must be >= 0; the engine "
+                f"refuses this at startup.")
+        if num(gpu_cfg.get("placement_margin_gib"), 4.0) < 0.0:
+            errors.append(
+                "gpu.placement_margin_gib must be >= 0; the engine refuses "
+                "this at startup.")
+        if thin == "separate" and hard > floor:
+            errors.append(
+                f"gpu.hard_min_vram_margin_gib ({hard}) is above "
                 f"gpu.min_vram_margin_gib ({floor}), so the 'separate' band is "
                 f"empty and only the hard floor would ever apply. The engine "
-                f"refuses this at startup.")
+                f"refuses this at startup. Lower the hard floor, or use "
+                f"gpu.thin_margin_policy: refuse.")
 
         # Ice stability: the engine's own guard rails, stated where the
         # controls are.

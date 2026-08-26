@@ -221,7 +221,86 @@ def test_the_check_uses_the_same_environment_the_run_will():
             f"grazing-leak fix")
 
 
+def test_the_document_checked_is_the_document_that_will_run():
+    """Validating the raw GUI view answers a different question.
+
+    `get_config()` always carries a full `gpu:` section, so the temporary file
+    would set `min_vram_margin_explicit` -- the OPPOSITE of what the run does,
+    and the opposite of what the GPU page tells the user in the same session.
+    It also carries GUI-synthetic keys and none of `_config_for_yaml`'s
+    translations, so the PTM_DATA_ROOT paths the banner claims to have checked
+    would not be the run's paths. Reproduced before the call site changed.
+    """
+    import re
+    source = (REPO_ROOT / "gui" / "ptm3d_gui.py").read_text()
+    calls = re.findall(r"engine_validate_config\(\s*\n?\s*([^,]+),", source)
+    assert calls, "no engine_validate_config call found in the main window"
+    for arg in calls:
+        assert "_config_for_yaml()" in arg, (
+            f"the check is handed {arg.strip()!r}, not the engine-facing view")
+
+    # ...and the two really are different, so this is not a distinction
+    # without a difference.
+    manager = _manager()
+    assert "gpu" in manager.get_config()
+    assert "gpu" not in manager._config_for_yaml()
+
+
+def test_a_crashing_engine_is_not_a_config_refusal():
+    """rc < 0 is a signal, not a verdict. Do not blame the user's YAML."""
+    preflight = _preflight()
+    manager = _manager()
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = Path(tmp) / "crashy"
+        exe.write_text("#!/bin/sh\nkill -SEGV $$\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+        status, text = preflight.engine_validate_config(
+            manager.get_config(), exe, REPO_ROOT)
+        assert status == "unavailable", (
+            f"a SIGSEGV in the parser reported {status!r}, which tells the "
+            f"user their configuration was refused")
+        assert "CRASHED" in text and "SIGSEGV" in text, text
+
+    # rc > 1 is also not a verdict.
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = Path(tmp) / "odd_rc"
+        exe.write_text("#!/bin/sh\nexit 42\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+        status, text = preflight.engine_validate_config(
+            manager.get_config(), exe, REPO_ROOT)
+        assert status == "unavailable", status
+        assert "42" in text
+
+
+def test_the_bvh_cache_follows_the_engines_data_root_contract():
+    """Silent when wrong: the cache would be written and read in two places."""
+    preflight = _preflight()
+    import os
+    manager = _manager()
+    manager.set_value("illumination.bvh_cache_file", "data/cache/site.bvh")
+    with tempfile.TemporaryDirectory() as tmp:
+        previous = os.environ.get("PTM_DATA_ROOT")
+        os.environ["PTM_DATA_ROOT"] = tmp
+        try:
+            out = preflight.absolutize_config_paths(
+                manager._config_for_yaml(), REPO_ROOT)
+        finally:
+            if previous is None:
+                os.environ.pop("PTM_DATA_ROOT", None)
+            else:
+                os.environ["PTM_DATA_ROOT"] = previous
+    resolved = out["illumination"]["bvh_cache_file"]
+    assert resolved.startswith(tmp), (
+        f"illumination.bvh_cache_file resolved to {resolved}, ignoring "
+        f"PTM_DATA_ROOT. The engine resolves this key with resolveDataPath "
+        f"(config_parser.cpp:870), so the GUI and the engine would use "
+        f"different cache locations -- silently.")
+
+
 TESTS = [
+    test_the_document_checked_is_the_document_that_will_run,
+    test_a_crashing_engine_is_not_a_config_refusal,
+    test_the_bvh_cache_follows_the_engines_data_root_contract,
     test_a_good_config_is_accepted_by_the_real_engine,
     test_the_engines_refusal_reaches_the_user_verbatim,
     test_a_disagreement_between_the_two_checkers_is_visible,

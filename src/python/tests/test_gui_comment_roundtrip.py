@@ -39,6 +39,9 @@ class Skip(Exception):
     pass
 
 
+_APP = None
+
+
 def _manager():
     try:
         from gui_core.config_manager import ConfigManager
@@ -62,6 +65,26 @@ COMMENTED_EXAMPLES = [
     "examples/tutorial04_crater80N_coupled.yaml",
     "examples/quickstart_moon_diurnal.yaml",
 ]
+
+
+#: Configs where opening them in the panel legitimately CHANGES the
+#: configuration, with the reason. Every entry is a substitution the GUI makes
+#: on the user's behalf and now announces in the console; listing it here keeps
+#: it a decision on the record instead of a silent drift the general check
+#: would otherwise have to be weakened for.
+#:
+#: justitia_generic-test.yaml is a generic body with no built-in albedo map, so
+#: IlluminationTab.refresh_builtin_albedo falls the source back from Built-in
+#: to None rather than promising a map that does not exist. Pre-existing on
+#: main (faa5bb8); invisible before the comment-preserving save, because Save
+#: rewrote everything anyway. Owed as GUI-ALBEDO-FALLBACK-EDIT.
+ANNOUNCED_ON_OPEN = {
+    "justitia_generic-test.yaml": {
+        "illumination.use_albedo_map",
+        "illumination.albedo_maps_directory",
+        "illumination.albedo_map",
+    },
+}
 
 
 def _comment_lines(text):
@@ -265,6 +288,73 @@ def test_status_is_reported_not_inferred():
         "GUI can show")
 
 
+def test_opening_a_config_in_the_PANEL_plans_no_edits():
+    """The whole-window version of the invariant, and the one that catches the
+    type-coercion class.
+
+    ``load_from_yaml`` snapshots the engine-facing view BEFORE any panel runs.
+    Every tab then writes its widgets' values back through ``set_numeric``,
+    which stores ``type(widget.value())(number)``. A control bound as a double
+    for a key the engine reads as an int therefore turns 15 into 15.0, and
+    ``plan_edits``' type clause fires: opening a config and pressing Save adds
+    keys the file never mentioned, for controls the user may not even be able
+    to edit. Measured on ``tutorial04_crater80N_coupled.yaml``: the read-only
+    depth grid injected ``thermal_b: 15.0``, ``thermal_m: 10.0`` and
+    ``thermal_n: 15.0``.
+
+    Fixing the three instances is not enough -- this checks the property, over
+    every shipped example, so the next mis-bound control fails here.
+    """
+    _require_ruamel()
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import PyQt6
+    except ImportError as exc:                     # pragma: no cover
+        raise Skip(f"PyQt6 is unavailable here ({exc})")
+    plug = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+    os.environ.setdefault("QT_PLUGIN_PATH", str(plug))
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plug / "platforms"))
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QSettings
+
+    with tempfile.TemporaryDirectory() as scratch:
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        for scope in (QSettings.Scope.UserScope, QSettings.Scope.SystemScope):
+            QSettings.setPath(QSettings.Format.IniFormat, scope, scratch)
+        from gui_core.config_manager import ConfigManager
+        from gui_panels.config_panel import ConfigurationPanel
+        # Bind it: `QApplication.instance() or QApplication([])` as a bare
+        # expression lets the new instance be collected immediately, and the
+        # next QWidget dies with "Must construct a QApplication before a
+        # QWidget".
+        global _APP
+        _APP = QApplication.instance() or QApplication([])
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
+
+        offenders = {}
+        examples = sorted((REPO_ROOT / "examples").glob("*.yaml"))
+        assert len(examples) >= 5, (
+            f"only {len(examples)} example configs found; this check would be "
+            f"nearly vacuous")
+        for src in examples:
+            work = Path(scratch) / src.name
+            shutil.copyfile(src, work)
+            manager.load_from_yaml(str(work))
+            panel.load_from_config()
+            updates, removals = manager.plan_save_edits()
+            allowed = ANNOUNCED_ON_OPEN.get(src.name, set())
+            unexpected = ({k: v for k, v in updates.items() if k not in allowed},
+                          [k for k in removals if k not in allowed])
+            if unexpected[0] or unexpected[1]:
+                offenders[src.name] = unexpected
+        assert not offenders, (
+            "opening these configs in the panel and pressing Save would "
+            "rewrite keys nobody edited:\n  "
+            + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
+
+
 def test_plan_save_edits_reports_exactly_what_would_change():
     _require_ruamel()
     with tempfile.TemporaryDirectory() as tmp:
@@ -294,6 +384,7 @@ TESTS = [
     test_removing_an_override_removes_its_line,
     test_a_new_project_still_saves_and_then_round_trips,
     test_status_is_reported_not_inferred,
+    test_opening_a_config_in_the_PANEL_plans_no_edits,
     test_plan_save_edits_reports_exactly_what_would_change,
 ]
 

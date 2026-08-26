@@ -246,6 +246,50 @@ def test_the_gpu_policy_enums_are_the_engines_own():
         messages
 
 
+def test_the_hard_floor_rule_is_the_engines_rule():
+    """Transcribed from ptm_thermal_sim.cpp:14365, not recalled.
+
+    The first spelling here was `hard >= floor > 0`, wrong in BOTH directions
+    and reproduced against the binary:
+      * hard == floor == 2.0 -- the engine ACCEPTS it, the GUI raised a hard
+        error that blocked the launch while asserting "the engine refuses this
+        at startup". A false statement about a valid config.
+      * floor = 0 (the documented pre-2026-08-22 behavior, which the tooltip
+        invites) with hard = 0.25 -- the engine REFUSES it, the GUI passed it,
+        which is the "saves a launch" case the check exists for.
+    """
+    # equal is legal
+    manager = _manager()
+    manager.set_value("gpu.min_vram_margin_gib", 2.0)
+    manager.set_value("gpu.hard_min_vram_margin_gib", 2.0)
+    valid, messages = manager.validate()
+    assert valid, f"hard == floor is accepted by the engine: {messages}"
+
+    # hard above floor is not
+    manager.set_value("gpu.hard_min_vram_margin_gib", 2.5)
+    valid, messages = manager.validate()
+    assert not valid and any("hard_min_vram_margin_gib" in m for m in messages), \
+        messages
+
+    # floor = 0 with a positive hard floor is refused by the engine
+    manager = _manager()
+    manager.set_value("gpu.min_vram_margin_gib", 0.0)
+    manager.set_value("gpu.hard_min_vram_margin_gib", 0.25)
+    valid, messages = manager.validate()
+    assert not valid, (
+        "floor = 0 with hard = 0.25 validated fine; the engine refuses it at "
+        "startup")
+
+    # negatives are refused, as the engine does
+    for key in ("gpu.min_vram_margin_gib", "gpu.hard_min_vram_margin_gib",
+                "gpu.placement_margin_gib"):
+        manager = _manager()
+        manager.set_value(key, -1.0)
+        valid, messages = manager.validate()
+        assert not valid and any(key.split(".")[1] in m for m in messages), (
+            f"{key} = -1 validated fine: {messages}")
+
+
 def test_eq_indirect_source_matches_the_engines_valid_set():
     """auto | converged | off -- taken from the engine's own refusal text."""
     manager = _manager()
@@ -410,6 +454,7 @@ TESTS = [
     test_an_empty_device_list_is_not_written,
     test_a_malformed_device_list_is_refused_not_ignored,
     test_the_gpu_policy_enums_are_the_engines_own,
+    test_the_hard_floor_rule_is_the_engines_rule,
     test_eq_indirect_source_matches_the_engines_valid_set,
     test_ice_parameters_are_disabled_until_the_product_is_on,
     test_the_depth_grid_is_display_only,

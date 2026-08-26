@@ -1785,24 +1785,32 @@ class ThermalTab(BaseConfigTab):
         grid_group = QGroupBox("Depth Grid (read-only)")
         grid_l = QGridLayout()
         grid_l.setColumnStretch(1, 1)
-        self.add_double_field(grid_l, 0, "Column Depth b (skin depths):",
-                              "thermal.thermal_b", 0.0, 1000.0, 3,
-                              "Bottom of the modeled column, in diurnal skin "
-                              "depths. Displayed, not offered: retuning it "
-                              "without also raising the equilibration cycle "
-                              "count makes the DEEP answer worse before it "
-                              "gets better.")
-        self.add_double_field(grid_l, 1, "Nodes per Skin Depth m:",
-                              "thermal.thermal_m", 0.0, 1000.0, 3,
-                              "Vertical resolution near the surface.")
-        self.add_double_field(grid_l, 2, "Grid Parameter n:",
-                              "thermal.thermal_n", 0.0, 1000.0, 3,
-                              "Geometric growth control for the layer "
-                              "thicknesses.")
+        # INT fields, because grid_b/m/n are `int` in the engine
+        # (config_parser.h:214-216) and ptm.engine_defaults records them as
+        # ints. Bound as doubles they were written back as 15.0/10.0/15.0 by
+        # set_numeric's `coerced = type(widget.value())(number)`, which made
+        # plan_edits' type clause fire and INJECTED three keys into every saved
+        # config -- for controls nobody can edit, contradicting the round
+        # trip's own promise. Reproduced on
+        # examples/tutorial04_crater80N_coupled.yaml before this changed.
+        self.add_int_field(grid_l, 0, "Column Depth b (skin depths):",
+                           "thermal.thermal_b", 0, 1000,
+                           "Bottom of the modeled column, in diurnal skin "
+                           "depths. Displayed, not offered: retuning it "
+                           "without also raising the equilibration cycle "
+                           "count makes the DEEP answer worse before it "
+                           "gets better.")
+        self.add_int_field(grid_l, 1, "Nodes per Skin Depth m:",
+                           "thermal.thermal_m", 0, 1000,
+                           "Vertical resolution near the surface.")
+        self.add_int_field(grid_l, 2, "Grid Parameter n:",
+                           "thermal.thermal_n", 0, 1000,
+                           "Geometric growth control for the layer "
+                           "thicknesses.")
         for _k in ("thermal.thermal_b", "thermal.thermal_m", "thermal.thermal_n"):
             self.widgets[_k].setReadOnly(True)
             self.widgets[_k].setButtonSymbols(
-                QDoubleSpinBox.ButtonSymbols.NoButtons)
+                QSpinBox.ButtonSymbols.NoButtons)
         grid_note = QLabel(
             "Read-only by standing instruction. A config that carries "
             "different values shows them here; edit the YAML directly if you "
@@ -4676,7 +4684,25 @@ class IlluminationTab(BaseConfigTab):
         # A body without built-in albedo cannot stay in Built-in mode --
         # fall over to None (uniform albedo) rather than promising a map
         # that does not exist.
+        #
+        # This is a SUBSTITUTION, and it happens on open. It was invisible
+        # before the comment-preserving save landed, because Save rewrote
+        # everything anyway; now it is a real edit to the user's file
+        # (illumination.use_albedo_map true -> false,
+        # albedo_maps_directory -> ''), so it says so. Reproduced on
+        # examples/justitia_generic-test.yaml, which is a generic body with no
+        # built-in map. Pre-existing behavior, not introduced here -- the
+        # warning is.
         if not supported and self.albedo_builtin_radio.isChecked():
+            logging.warning(
+                "[illumination] %s has no built-in albedo map (%s), so the "
+                "albedo source falls back from Built-in to None (uniform "
+                "albedo from the Properties tab). This CHANGES the "
+                "configuration: illumination.use_albedo_map becomes false and "
+                "albedo_maps_directory is cleared. Saving the project will "
+                "write that change.",
+                self._current_body() or "this body",
+                getattr(status, "detail", "") or "no dataset")
             self.albedo_none_radio.setChecked(True)
             return  # toggled handler re-enters refresh
 
@@ -5055,6 +5081,14 @@ class TaskCardsTab(BaseConfigTab):
     """
 
     preset_applied = pyqtSignal(str)
+    #: Emitted when a card REPLACES the whole configuration from another file
+    #: (the baseline card). The main window must then forget which project file
+    #: it was editing: the round-trip document now belongs to the baseline, so
+    #: an unchanged `current_project_file` would make the next Ctrl+S write the
+    #: BASELINE's document -- comments and all -- over the user's own project,
+    #: while the console reported "Comments and layout preserved". Reproduced
+    #: before this signal existed.
+    project_replaced = pyqtSignal(str)
 
     def init_ui(self):
         from gui_core.presets import PRESETS
@@ -5185,7 +5219,14 @@ class TaskCardsTab(BaseConfigTab):
         lines.append(
             "The environment block, spin-up seed and every other key now come "
             "from the baseline's own record, not from this GUI's defaults.")
+        lines.append(
+            "This is NOT your project file. Use Save As to write it somewhere "
+            "of your own; the baseline's own record is left untouched.")
         self._show("reproduce_baseline", "\n".join(lines))
+        # Order matters: detach the save target BEFORE the tabs reload, so no
+        # intermediate state has the baseline's document pointed at the user's
+        # project file.
+        self.project_replaced.emit(str(config_path))
         self.preset_applied.emit("reproduce_baseline")
         self.value_changed.emit()
         return provenance
@@ -5378,6 +5419,10 @@ class ConfigurationPanel(QWidget):
     """Main configuration panel with tabs and YAML preview"""
 
     config_changed = pyqtSignal()
+    #: The whole configuration was replaced from another file (the baseline
+    #: card). Carries that file's path. The main window must forget which
+    #: project file it was editing.
+    project_replaced = pyqtSignal(str)
 
     def __init__(self, config_manager):
         super().__init__()
@@ -5507,6 +5552,9 @@ class ConfigurationPanel(QWidget):
         # the stale on-screen value back over them.
         self.tabs["start"].preset_applied.connect(
             lambda _key: self.load_from_config())
+        # Re-emitted so the main window can detach its project file; see
+        # TaskCardsTab.project_replaced.
+        self.tabs["start"].project_replaced.connect(self.project_replaced)
 
         # Connect body selection to thermophysical and body definition tabs
         if "simulation.body" in self.tabs["simulation"].widgets:
