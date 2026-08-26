@@ -153,6 +153,18 @@ COUPLING_MODE_ALIASES = {
 EQ_INDIRECT_SOURCE_ALIASES = {
     "auto": "auto", "converged": "converged", "off": "off",
 }
+# output.format and output.vtk_mode: the engine compares them exactly in an
+# if/else chain and REFUSES NOTHING -- ConfigParser::validate() is dead code
+# (ptm_thermal_sim.cpp:17063 says so), so an unrecognized value simply falls
+# through and the run writes no output. `none` is a real value, used by five
+# shipped configs.
+OUTPUT_FORMAT_ALIASES = {
+    "binary": "binary", "vtk": "vtk", "none": "none",
+}
+OUTPUT_VTK_MODE_ALIASES = {
+    "thermal": "thermal", "complete": "complete", "both": "both",
+    "none": "none",
+}
 # gpu.placement_policy and gpu.thin_margin_policy: exact, startup FATAL on a
 # mismatch (ptm_thermal_sim.cpp:14296, :14318).
 # No "" entry: the engine FATALs on an empty policy (ptm_thermal_sim.cpp:14327),
@@ -3551,8 +3563,21 @@ class ThermophysicalTab(BaseConfigTab):
                     vw.setToolTip("")
             else:
                 if cb is not None and not cb.isChecked():
-                    # revert a custom value the engine cannot receive
+                    # Revert a custom value the engine cannot receive -- but
+                    # WITHOUT re-entering on_default_toggled, which calls
+                    # update_to_body_defaults() and rewrites
+                    # thermophysical.incidence_angle_albedo to the body
+                    # default. Measured: opening configs/survey_template.yaml
+                    # (Hapke on) and pressing Save with ZERO edits flipped
+                    # incidence_angle_albedo true -> false in the user's own
+                    # file, while the console said "Comments and layout
+                    # preserved". The clobber predates this branch; the
+                    # minimal-save path is what turned it from noise inside a
+                    # full rewrite into a persistent one-line physics edit.
+                    cb.blockSignals(True)
                     cb.setChecked(True)
+                    cb.blockSignals(False)
+                    self.config_manager.set_value(dkey, True)
                 if cb is not None:
                     cb.setEnabled(False)
                     cb.setToolTip(unsupported_tip)
@@ -4870,11 +4895,21 @@ class OutputTab(BaseConfigTab):
         self.add_directory_field(dest_layout, 0, "Output Directory:", "output.directory",
                                  "Directory where results are written",
                                  info_key="output.directory")
+        # `none` is a REAL value for both -- five shipped configs use it and
+        # the engine accepts it. It was missing from the combos, so a config
+        # carrying it showed a DIFFERENT value than the run would use (findText
+        # returned -1 and the combo kept whatever it was showing).
         self.add_combo_field(dest_layout, 1, "Format:", "output.format",
-                             ["binary", "vtk"], "Output format",
+                             ["binary", "vtk", "none"],
+                             "binary writes the statistics/time-series "
+                             "products; vtk writes meshes; none writes no "
+                             "field output at all (an illumination-only or "
+                             "location-only run).",
                              info_key="output.format")
         self.add_combo_field(dest_layout, 2, "VTK Mode:", "output.vtk_mode",
-                             ["thermal", "complete", "both"], "VTK export mode",
+                             ["thermal", "complete", "both", "none"],
+                             "Which VTK products a vtk-format run writes. "
+                             "none writes none.",
                              info_key="output.vtk_mode")
         self.add_bool_field(dest_layout, 3, "Include Primary IR", "output.include_primary_ir",
                             "Include primary IR in VTK export",
@@ -4911,15 +4946,15 @@ class OutputTab(BaseConfigTab):
 
         self.set_text("output.directory", out["directory"])
 
-        # str(): findText refuses a non-string, out of load_from_config.
-        idx = self.widgets["output.format"].findText(str(out.get("format", "")))
-        if idx >= 0:
-            self.widgets["output.format"].setCurrentIndex(idx)
-
-        idx = self.widgets["output.vtk_mode"].findText(
-            str(out.get("vtk_mode", "")))
-        if idx >= 0:
-            self.widgets["output.vtk_mode"].setCurrentIndex(idx)
+        # set_enum, not a bare findText: `if idx >= 0` silently left the combo
+        # showing a DIFFERENT value than the config carries whenever the value
+        # is not in the list, which is the same lie set_enum was written to
+        # stop. It also blocks signals, so merely displaying a config no longer
+        # writes to it.
+        self.set_enum("output.format", out.get("format", "binary"),
+                      OUTPUT_FORMAT_ALIASES, exact=True)
+        self.set_enum("output.vtk_mode", out.get("vtk_mode", "both"),
+                      OUTPUT_VTK_MODE_ALIASES, exact=True)
 
         self.set_bool("output.include_primary_ir", out.get("include_primary_ir", False))
         self.set_text("output.locations_file", out.get("locations_file", ""))

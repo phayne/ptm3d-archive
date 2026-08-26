@@ -885,8 +885,12 @@ def engine_validate_config(config, executable, project_root=None, env=None):
         # the flag again, whatever it writes lands here and is deleted with the
         # rest. The user's own output directory is never a target of a CHECK.
         checked = absolutize_config_paths(config, root)
-        checked.setdefault("output", {})
-        checked["output"] = dict(checked["output"])
+        # isinstance, not setdefault: `output:` as a scalar or null makes
+        # setdefault return the non-mapping and dict() raise TypeError -- out
+        # of the Check Configuration slot, which is the process-abort class
+        # this codebase guards against everywhere else.
+        node = checked.get("output")
+        checked["output"] = dict(node) if isinstance(node, dict) else {}
         checked["output"]["directory"] = str(Path(tmpdir) / "output")
         with open(path, "w") as handle:
             _yaml.dump(checked, handle,

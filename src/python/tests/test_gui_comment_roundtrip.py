@@ -334,9 +334,16 @@ def test_opening_a_config_in_the_PANEL_plans_no_edits():
         panel = ConfigurationPanel(manager)
 
         offenders = {}
-        examples = sorted((REPO_ROOT / "examples").glob("*.yaml"))
-        assert len(examples) >= 5, (
-            f"only {len(examples)} example configs found; this check would be "
+        # configs/ TOO, not just examples/. Sweeping only examples/ missed the
+        # one file that reproduced the sharpest instance of this class:
+        # configs/survey_template.yaml, where an edit-free open+Save flipped
+        # thermophysical.incidence_angle_albedo true -> false -- Hapke silently
+        # switched off in the user's own file, under a console line saying
+        # "Comments and layout preserved".
+        examples = (sorted((REPO_ROOT / "examples").glob("*.yaml"))
+                    + sorted((REPO_ROOT / "configs").rglob("*.yaml")))
+        assert len(examples) >= 50, (
+            f"only {len(examples)} configs found; this check would be "
             f"nearly vacuous")
         for src in examples:
             work = Path(scratch) / src.name
@@ -659,6 +666,34 @@ def test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save():
         assert manager.get_value("gpu.margin_explicit") is True
 
 
+def test_no_shipped_config_is_BLOCKED_by_the_GUIs_own_validate():
+    """A GUI rule the engine does not have is a launch blocked for nothing.
+
+    validate() refused output.format / output.vtk_mode values the engine
+    accepts -- five shipped configs use `none`, and the engine's own
+    ConfigParser::validate() is DEAD CODE on this path
+    (ptm_thermal_sim.cpp:17063 says so), so nothing refuses them. The dialog
+    printed "Errors: VTK mode must be one of ..." directly above "The engine
+    ACCEPTED this configuration".
+    """
+    targets = (sorted((REPO_ROOT / "examples").glob("*.yaml"))
+               + sorted((REPO_ROOT / "configs").rglob("*.yaml")))
+    blocked = {}
+    for src in targets:
+        manager = _manager()
+        try:
+            manager.load_from_yaml(str(src))
+        except Exception as exc:                       # noqa: BLE001
+            blocked[src.name] = f"load raised: {exc}"
+            continue
+        valid, messages = manager.validate()
+        if not valid:
+            blocked[src.name] = messages[:2]
+    assert not blocked, (
+        "the GUI refuses to launch these shipped configs:\n  "
+        + "\n  ".join(f"{k}: {v}" for k, v in blocked.items()))
+
+
 def test_the_word_off_survives_a_save_and_reopen():
     """YAML 1.1 vs 1.2, and it breaks the engine's own documented value.
 
@@ -861,6 +896,7 @@ TESTS = [
     test_no_shipped_config_is_reflowed_by_an_edit,
     test_a_recognized_alias_keeps_the_files_own_spelling,
     test_an_int_spelled_gpu_key_is_not_DELETED_on_an_edit_free_save,
+    test_no_shipped_config_is_BLOCKED_by_the_GUIs_own_validate,
     test_the_word_off_survives_a_save_and_reopen,
     test_the_writer_quotes_anything_yaml_1_1_would_re_read_differently,
     test_an_int_spelled_double_is_not_rewritten,

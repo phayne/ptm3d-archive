@@ -1657,13 +1657,34 @@ class ConfigManager:
         # public and is also reached from configs this manager did not load.
         out_cfg = self.config.get("output")
         out_cfg = out_cfg if isinstance(out_cfg, dict) else {}
-        valid_formats = ["binary", "vtk"]
+        # `none` is a REAL value for both, used by five shipped configs
+        # (configs/amundsen_survey_template.yaml, amundsen_wilcoski_
+        # illumination.yaml, examples/moon_global_topo_res5_flat.yaml,
+        # quickstart_europa_albedo_map.yaml, quickstart_europa_diurnal.yaml),
+        # and the engine accepts it -- measured, --validate-config rc 0 on
+        # quickstart_europa_diurnal.yaml. There is no engine-side check at all
+        # on this path: ConfigParser::validate() is DEAD CODE (the only
+        # reference is the comment at ptm_thermal_sim.cpp:17063 saying it is
+        # not called), and the writer is an if/else chain that simply falls
+        # through. So refusing here BLOCKED configs the engine runs -- the
+        # second-weaker-copy disagreement item 2.4 exists to remove.
+        #
+        # An unrecognized value is a WARNING, not an error, because that is
+        # what it does: the chain falls through and the run writes nothing.
+        valid_formats = ["binary", "vtk", "none"]
         if out_cfg.get("format") not in valid_formats:
-            errors.append(f"Output format must be one of: {', '.join(valid_formats)}")
+            warnings.append(
+                f"Warning: output.format is {out_cfg.get('format')!r}. The "
+                f"engine recognizes {', '.join(valid_formats)} and silently "
+                f"writes NO output for anything else -- it does not refuse the "
+                f"run.")
 
-        valid_vtk_modes = ["thermal", "complete", "both"]
+        valid_vtk_modes = ["thermal", "complete", "both", "none"]
         if out_cfg.get("vtk_mode") not in valid_vtk_modes:
-            errors.append(f"VTK mode must be one of: {', '.join(valid_vtk_modes)}")
+            warnings.append(
+                f"Warning: output.vtk_mode is {out_cfg.get('vtk_mode')!r}. The "
+                f"engine recognizes {', '.join(valid_vtk_modes)} and writes no "
+                f"VTK for anything else -- it does not refuse the run.")
 
         # GPU warnings
         thermal = self.config.get("thermal", {})

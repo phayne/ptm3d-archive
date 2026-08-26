@@ -481,7 +481,21 @@ def test_the_preflight_and_the_run_yaml_resolve_a_path_the_same_way():
             os.environ["PTM_DATA_ROOT"] = previous
 
 
+def test_a_malformed_output_section_does_not_abort_the_slot():
+    """`output:` as a scalar or null made dict() raise TypeError, out of the
+    Check Configuration Qt slot -- the process-abort class this codebase
+    guards against everywhere else."""
+    preflight = _preflight()
+    for broken in ({"output": None}, {"output": "binary"}, {"output": []},
+                   {}, {"output": 3}):
+        status, text = preflight.engine_validate_config(
+            broken, "/nonexistent/ptm_thermal_sim", REPO_ROOT)
+        assert status in ("unavailable", "accepted", "refused"), status
+        assert text.strip()
+
+
 TESTS = [
+    test_a_malformed_output_section_does_not_abort_the_slot,
     test_the_bvh_off_sentinel_survives_absolutization,
     test_the_preflight_and_the_run_yaml_resolve_a_path_the_same_way,
     test_only_the_engines_own_data_root_keys_follow_that_contract,
