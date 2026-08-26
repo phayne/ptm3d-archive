@@ -11102,6 +11102,12 @@ void showUsage(const char* programName) {
     std::cout << "  --generic-body-config FILE Load generic body config from YAML\n";
     std::cout << "  --generate-template [FILE] Generate template config file\n";
     std::cout << "                             (default: ptm_config_template.yaml)\n";
+    std::cout << "  --validate-config          Parse and check the config, then exit\n";
+    std::cout << "                             WITHOUT simulating. rc 0 = accepted,\n";
+    std::cout << "                             1 = refused; the parser's own messages\n";
+    std::cout << "                             go to stdout/stderr. Checks only what\n";
+    std::cout << "                             is knowable before the mesh and SPICE\n";
+    std::cout << "                             load -- see the scope note it prints.\n";
     std::cout << "  --help                     Show this help message\n\n";
     
     std::cout << "Note: Command-line arguments OVERRIDE config file values.\n";
@@ -13188,13 +13194,20 @@ int main(int argc, char** argv) {
     // ========================================================================
     std::string config_file = "";
     bool has_config_file = false;
-    
+    // --validate-config: parse and check, then exit before any simulation work.
+    // Exists so a caller (the GUI's "Check configuration") can report the
+    // ENGINE's own refusal text instead of maintaining a second, weaker copy of
+    // the rules that then disagrees with it.
+    bool validate_only = false;
+
     // Quick scan for --config and --generate-template flags
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             config_file = argv[i + 1];
             has_config_file = true;
+        } else if (arg == "--validate-config") {
+            validate_only = true;
         } else if (arg == "--generate-template") {
             // Handle template generation and exit
             std::string template_file = "ptm_config_template.yaml";
@@ -13238,6 +13251,16 @@ int main(int argc, char** argv) {
             return 1;
 #endif
         }
+    }
+
+    // --validate-config with nothing to validate would otherwise "pass" the
+    // built-in defaults and report success about a file it never opened.
+    if (validate_only && !has_config_file) {
+        std::cerr << "FATAL: --validate-config needs --config FILE. There is "
+                     "nothing to validate otherwise, and reporting the built-in "
+                     "defaults as valid would be an answer about a file that was "
+                     "never read." << std::endl;
+        return 1;
     }
 
     // ========================================================================
@@ -13334,8 +13357,12 @@ int main(int argc, char** argv) {
     std::string output_dir = sim_config.output.directory;
     // Wire heartbeat to the output dir so post-mortem readers can see the
     // last in-flight phase after a kernel hang / forced reboot.
-    setHeartbeatDir(output_dir);
-    writeHeartbeat("startup output_dir=" + output_dir);
+    // Skipped under --validate-config: checking a config must not overwrite the
+    // heartbeat of a completed run whose output directory this config names.
+    if (!validate_only) {
+        setHeartbeatDir(output_dir);
+        writeHeartbeat("startup output_dir=" + output_dir);
+    }
     double integration_days = sim_config.thermal.integration_days;
     int integration_steps_cli = sim_config.thermal.integration_steps;
     double integration_offset_days = sim_config.thermal.integration_offset_days;
@@ -13658,6 +13685,12 @@ int main(int argc, char** argv) {
             continue;
         }
         
+        // Skip --validate-config (a mode flag, consumed in PHASE 1; it takes no
+        // argument and must not be mistaken for a parameter override).
+        if (arg == "--validate-config") {
+            continue;
+        }
+
         // Skip --generate-template (already handled)
         if (arg == "--generate-template") {
             // Skip optional filename if present
@@ -14385,6 +14418,44 @@ int main(int argc, char** argv) {
     if (geothermal_heat_flow > 0) {
         planet.Qb = geothermal_heat_flow;
         std::cout << "Overriding planet geothermal heat flow: " << planet.Qb << " W/m^2" << std::endl;
+    }
+
+    // ------------------------------------------------------------------
+    // --validate-config exits HERE: after every check that is knowable from
+    // the configuration alone, and before the first thing that costs anything
+    // (generic-body construction, mesh load, SPICE, view factors).
+    //
+    // Anything above that refuses has already printed its own FATAL and
+    // returned 1, so reaching this line IS the pass. What it covers and what it
+    // does not is printed rather than assumed: a caller that treats rc=0 as
+    // "this run will start" would be wrong, and silence about the boundary is
+    // how that mistake gets made.
+    // ------------------------------------------------------------------
+    if (validate_only) {
+        std::cout << "\n[validate-config] ACCEPTED: " << config_file << "\n"
+                  << "[validate-config]   checked: YAML syntax and structure, the "
+                     "PTM_DATA_ROOT path-resolution\n"
+                  << "[validate-config]            contract, enum values "
+                     "(conductivity_model, coupling_mode,\n"
+                  << "[validate-config]            exchange_selection, "
+                     "gpu.placement_policy, gpu.thin_margin_policy),\n"
+                  << "[validate-config]            numeric ranges "
+                     "(nearfield_quadrature_order, min_shadow_fraction,\n"
+                  << "[validate-config]            the gpu.* margins), the "
+                     "beaming/rms_slope_deg pair, GPU support in\n"
+                  << "[validate-config]            this build, and every "
+                     "command-line override applied above.\n"
+                  << "[validate-config]   NOT checked: anything that needs the "
+                     "mesh, the body or SPICE --\n"
+                  << "[validate-config]            mesh loading and units, "
+                     "generic-body construction, SPICE kernels,\n"
+                  << "[validate-config]            property-map face counts, the "
+                     "martinez2021 density guard, view\n"
+                  << "[validate-config]            factors, and the spin-up seed "
+                     "strings. rc=0 means the configuration\n"
+                  << "[validate-config]            is well formed, NOT that the "
+                     "run will complete." << std::endl;
+        return 0;
     }
 
     // ========================================================================

@@ -687,6 +687,34 @@ absolute `PATH_VALUES` works from anywhere. A `PATH_VALUES` entry longer than
 ./build/bin/ptm_thermal_sim --generate-template my_config.yaml
 ```
 
+## Checking a config without running it
+
+```bash
+./build/bin/ptm_thermal_sim --config my_config.yaml --validate-config
+```
+
+Parses the file, applies any command-line overrides, runs every startup check
+that is knowable from the configuration alone, and exits. `rc 0` = accepted,
+`rc 1` = refused, with the engine's own message on stdout/stderr. Nothing is
+simulated, no output directory is created, and an existing output directory —
+including its `heartbeat.txt` — is left alone.
+
+It covers YAML syntax and structure, the `PTM_DATA_ROOT` resolution contract,
+the enum values (`conductivity_model`, `coupling_mode`, `exchange_selection`,
+`gpu.placement_policy`, `gpu.thin_margin_policy`), the numeric ranges
+(`nearfield_quadrature_order`, `min_shadow_fraction`, the `gpu.*` margins), the
+`beaming`/`rms_slope_deg` pair, and whether this build has the GPU support the
+config asks for.
+
+It does **not** cover anything that needs the mesh, the body or SPICE: mesh
+loading and units, generic-body construction, SPICE kernels, property-map face
+counts, the `martinez2021` density guard, view factors, and the spin-up seed
+strings. The mode prints that boundary every time it runs. **`rc 0` means the
+configuration is well formed, not that the run will complete.**
+
+The GUI's *Simulation → Check Configuration* uses this and shows the engine's
+text verbatim, rather than maintaining a second, weaker copy of these rules.
+
 ## Overriding from the command line
 
 Command-line options override YAML settings:
