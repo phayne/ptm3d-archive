@@ -75,6 +75,20 @@ def _write(tmp, name, extra=""):
     return path, outdir
 
 
+def _write_body(tmp, name, body, extra=""):
+    """Same as _write, with simulation.body replaced rather than appended.
+
+    `body:` already appears in BASE, so an appended `simulation:` block would
+    be a duplicate key -- yaml-cpp takes the last one, but the config would no
+    longer say what it looks like it says.
+    """
+    outdir = Path(tmp) / ("out_" + name)
+    path = Path(tmp) / (name + ".yaml")
+    path.write_text(
+        BASE.format(outdir=outdir).replace("body: Moon", f"body: {body}") + extra)
+    return path, outdir
+
+
 def _run(exe, config, timeout=120):
     env = dict(os.environ)
     env.setdefault("PTM_DATA_ROOT", str(REPO_ROOT / "data"))
@@ -234,11 +248,75 @@ def test_nothing_is_simulated_and_nothing_is_written():
             "validating overwrote heartbeat.txt in an existing output directory")
 
 
+def test_unbacked_body_names_are_refused():
+    """BUGS.md ENG-BODY-UNBACKED-RUN, both polarities.
+
+    `simulation.body` used to accept any string: an unrecognized name resolved
+    to EUROPA's properties in `PlanetaryData::getPropertiesByName`, so
+    `body: Mars` ran to completion with exit 0, Europa's 1560.8 km radius and
+    europa.tm metakernel, and average AND maximum total flux of
+    0.000000000 W/m^2 on every face. Measured on all four of the bodies the
+    GUI offered and the engine did not implement.
+
+    The negative arms are those four. The positive arms matter just as much:
+    the three implemented bodies must still run, case must not matter, and the
+    generic-body route -- which legitimately names a body the engine has no
+    properties for -- must not be caught by the refusal.
+    """
+    exe = _engine()
+    with tempfile.TemporaryDirectory() as tmp:
+        for body in ("Mars", "Ceres", "Titan", "Enceladus"):
+            config, _ = _write_body(tmp, "unbacked_" + body, body)
+            proc, _ = _run(exe, config)
+            out = proc.stdout + proc.stderr
+            assert proc.returncode == 1, (
+                f"body: {body} was ACCEPTED (rc={proc.returncode}). The engine "
+                f"has no properties for it and would run it as Europa with zero "
+                f"absorbed flux.\n{out[-900:]}")
+            for phrase in ("is not a body this engine implements",
+                           "Moon, Europa or Mercury", "generic_body"):
+                assert phrase in out, (
+                    f"body: {body} was refused, but the message does not "
+                    f"contain {phrase!r}; a user cannot tell what to do next")
+
+        for body in ("Moon", "Europa", "Mercury", "moon", "MERCURY"):
+            config, _ = _write_body(tmp, "backed_" + body, body)
+            proc, _ = _run(exe, config)
+            assert proc.returncode == 0, (
+                f"body: {body} was REFUSED (rc={proc.returncode}); the engine "
+                f"implements it. Body names are matched case-insensitively.\n"
+                f"{proc.stdout[-900:]}{proc.stderr[-900:]}")
+
+        # The supported route for everything else. The body name here is not
+        # implemented and must NOT be refused, because generic_body: supplies
+        # the properties itself -- this is what
+        # examples/quickstart_asteroid_bennu.yaml does.
+        config, _ = _write_body(
+            tmp, "generic_unbacked", "Not A Built-In Body At All",
+            "generic_body:\n"
+            "  name: Not A Built-In Body At All\n"
+            "  ephemeris_source: keplerian\n"
+            "  shape:\n"
+            "    type: spherical\n"
+            "    radius_km: 1.0\n"
+            "  orbit:\n"
+            "    semi_major_axis_au: 2.5\n"
+            "  spin:\n"
+            "    period_hours: 5.0\n")
+        proc, _ = _run(exe, config)
+        assert proc.returncode == 0, (
+            f"a generic-body config was refused for its body NAME "
+            f"(rc={proc.returncode}). Every asteroid config in examples/ names "
+            f"a body the engine does not implement; that is the point of "
+            f"generic_body.\n{proc.stdout[-900:]}{proc.stderr[-900:]}")
+
+
 TESTS = [
     test_a_valid_config_is_accepted,
     test_it_discloses_what_it_did_not_check,
     test_the_two_config_only_checks_below_the_exit_are_named_not_hidden,
     test_engine_refusals_are_reproduced_verbatim,
+    test_unbacked_body_names_are_refused,
     test_malformed_yaml_is_refused_not_defaulted,
     test_it_needs_a_config_to_validate,
     test_nothing_is_simulated_and_nothing_is_written,

@@ -4,12 +4,23 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iostream>
 
 namespace thermal {
 
-// Enumeration of supported planetary bodies
+// Enumeration of planetary bodies the CONFIGURATION SURFACE names.
+//
+// ⚠️ Membership here is NOT the same thing as being implemented. Only the
+// three bodies listed in kImplementedBodies below have thermophysical
+// properties in this file; ENCELADUS, TITAN, MARS and CERES reach
+// getProperties()'s `default:` arm and come back with EUROPA's radius, day,
+// albedo, conductivity and metakernel. The enum keeps them because
+// IlluminationModel::setPlanetaryBody switches on all seven, and because a
+// config that names one must be REFUSED by name rather than silently mapped
+// to some other enumerator (see isImplementedBody).
 enum class PlanetaryBody {
     MOON,
     MERCURY,
@@ -53,6 +64,59 @@ struct ThermophysicalProperties {
     double body_radius_km = 0.0;  // Mean radius (km). 0 = use mesh as-is
 };
 
+// ---------------------------------------------------------------------------
+// THE IMPLEMENTED-BODY REGISTRY -- the one authority on which `simulation.body`
+// values this engine can actually run without a `generic_body:` block.
+//
+// Anything not on this list has no properties here. Until 2026-08-26 such a
+// name did not fail: getPropertiesByName() printed one `Note:` line on stderr
+// and returned EUROPA's properties, so a config saying `body: Mars` ran to
+// COMPLETION with exit 0, Europa's 1560.8 km radius, Europa's europa.tm
+// metakernel, a 3.55-day synodic banner, and 0.000000000 W/m^2 of flux on every
+// one of its faces -- sixteen statistics binaries of a simulation of nothing.
+// Measured on four arms (Mars, Ceres, Titan, Enceladus). `ptm_thermal_sim` now
+// refuses such a config at parse time (BUGS.md ENG-BODY-UNBACKED-RUN).
+//
+// Adding a body means adding a getXxxProperties() function AND a row here AND
+// regenerating src/python/ptm/body_capabilities.py; the parity test
+// src/python/tests/test_body_capabilities.py fails until all three agree.
+inline const std::vector<std::string>& implementedBodies() {
+    static const std::vector<std::string> kImplementedBodies = {
+        "Moon", "Europa", "Mercury"
+    };
+    return kImplementedBodies;
+}
+
+// Case-insensitive membership in implementedBodies(). Returns the CANONICAL
+// spelling through `canonical` when non-null, so callers report "Moon" rather
+// than echoing back whatever case the config used.
+inline bool isImplementedBody(const std::string& name, std::string* canonical = nullptr) {
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& body : implementedBodies()) {
+        std::string lower_body = body;
+        std::transform(lower_body.begin(), lower_body.end(), lower_body.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower_name == lower_body) {
+            if (canonical) *canonical = body;
+            return true;
+        }
+    }
+    return false;
+}
+
+// "Moon, Europa or Mercury" -- for the message that refuses everything else.
+inline std::string implementedBodiesList() {
+    const auto& bodies = implementedBodies();
+    std::string out;
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        if (i > 0) out += (i + 1 == bodies.size()) ? " or " : ", ";
+        out += bodies[i];
+    }
+    return out;
+}
+
 // Default properties for supported planetary bodies
 class PlanetaryData {
 public:
@@ -81,13 +145,24 @@ public:
         if (lower_name == "moon") return getProperties(PlanetaryBody::MOON);
         if (lower_name == "mercury") return getProperties(PlanetaryBody::MERCURY);
         // Add other bodies as needed
-        
-        // Default to Europa if name not recognized (warn once to avoid spam)
+
+        // Not an implemented body. The ONLY legitimate caller left here is the
+        // generic-body path: `thermal::Planet` is constructed from the config's
+        // body NAME early in main(), before the `generic_body:` block has been
+        // read, so an asteroid's Planet is briefly seeded with these
+        // placeholders and then overwritten field by field from the generic
+        // body. Every other route is refused by name at config parse
+        // (isImplementedBody / ENG-BODY-UNBACKED-RUN), which is what this
+        // warning could not do on its own -- it was one stderr line in front of
+        // a complete, exit-0, all-zero-flux simulation.
         static bool warned = false;
         if (!warned) {
-            std::cerr << "Note: Body '" << name
-                      << "' not in built-in list; using placeholder defaults"
-                      << " (generic body config will override)" << std::endl;
+            std::cerr << "Note: body '" << name << "' is not one of the "
+                      << "implemented bodies (" << implementedBodiesList()
+                      << "); seeding placeholder properties that the "
+                         "generic_body: block must overwrite. If this run has "
+                         "no generic_body: block it is already being refused."
+                      << std::endl;
             warned = true;
         }
         return getProperties(PlanetaryBody::EUROPA);

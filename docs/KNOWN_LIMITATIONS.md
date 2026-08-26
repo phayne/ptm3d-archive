@@ -472,6 +472,19 @@ that the value you set is the value that was echoed.
 
 ## Configuration gotchas
 
+- **`simulation.body` accepts three names, and every other name is now refused.** The engine
+  implements `Moon`, `Europa` and `Mercury`. Until 2026-08-26 any other name resolved to **Europa's**
+  property set inside `PlanetaryData::getPropertiesByName`, so a config saying `body: Mars` ran to
+  completion with `rc 0`, Europa's 1560.8 km radius, Europa's `europa.tm` metakernel, a
+  `Synodic day 3.55 Earth days` banner, `Default albedo 0.5`, sixteen statistics binaries, an
+  all-`NaN` `effective_albedo.bin` — and average **and** maximum total flux of `0.000000000 W/m²`
+  on every face. The only warning was one `Note:` line on stderr. Measured on all four bodies the
+  GUI offered and the engine did not implement (Mars, Ceres, Titan, Enceladus). Such a config is
+  now `FATAL` at config parse, with a message naming the implemented set and pointing at the
+  generic-body route. A body name outside the three that **is** backed by a `generic_body:` block —
+  every asteroid config in `examples/` — is unaffected: `generic_body:` supplies the properties, and
+  that is the supported route.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,

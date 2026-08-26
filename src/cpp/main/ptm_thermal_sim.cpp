@@ -13326,6 +13326,60 @@ int main(int argc, char** argv) {
         }
     }
 
+    // simulation.body must name a body this engine implements, unless the
+    // config also carries a `generic_body:` block that supplies the properties
+    // itself. BUGS.md ENG-BODY-UNBACKED-RUN.
+    //
+    // WHAT THIS REPLACES. `PlanetaryData::getPropertiesByName` resolves any
+    // unrecognized name to EUROPA. So `body: Mars` used to run to COMPLETION
+    // with exit 0 -- Europa's 1560.8 km radius, Europa's europa.tm metakernel,
+    // a "Synodic day 3.55 Earth days" banner, `Default albedo 0.5`, and
+    // average AND maximum total flux of 0.000000000 W/m^2 on every face,
+    // writing sixteen statistics binaries and an all-NaN effective_albedo.bin.
+    // Measured 2026-08-26 on four arms (Mars, Ceres, Titan, Enceladus). The
+    // only warning was one `Note:` line on stderr, which no wrapper reads and
+    // which a scrolling log buries. A body name is not a knob with a
+    // forgiving default: it selects the ephemeris, the radius, the rotation
+    // period and the whole thermophysical parameter set at once.
+    //
+    // The generic-body exemption is not a loophole, it is the supported route:
+    // `examples/quickstart_asteroid_bennu.yaml` names
+    // `101955 Bennu (1999 RQ36)` and supplies every property under
+    // `generic_body:`. isConfigured() is the same predicate the generic-body
+    // construction below uses, so the two cannot disagree about which runs
+    // take that path.
+    if (!sim_config.generic_body.isConfigured()) {
+        std::string canonical_body;
+        if (!thermal::isImplementedBody(sim_config.time.body, &canonical_body)) {
+            std::cerr << "FATAL: simulation.body = '" << sim_config.time.body
+                      << "' is not a body this engine implements.\n"
+                      << "  Implemented bodies (thermophysical properties, radius, "
+                         "rotation period and SPICE metakernel all present): "
+                      << thermal::implementedBodiesList() << ".\n"
+                      << "  For anything else -- an asteroid, a comet, a moon this "
+                         "engine has no properties for -- use the generic-body "
+                         "route:\n"
+                         "    add a `generic_body:` block naming the shape, orbit, "
+                         "spin and surface properties\n"
+                         "    (see examples/quickstart_asteroid_diurnal.yaml for "
+                         "Keplerian, examples/quickstart_asteroid_bennu.yaml for "
+                         "SPICE).\n"
+                      << "  Refusing to run. Continuing would silently substitute "
+                         "Europa's radius, metakernel and thermophysical "
+                         "properties for the body you named, and produce a "
+                         "complete-looking output directory with zero absorbed "
+                         "flux on every face (BUGS.md ENG-BODY-UNBACKED-RUN)."
+                      << std::endl;
+            return 1;
+        }
+        if (canonical_body != sim_config.time.body) {
+            std::cout << "[config] simulation.body '" << sim_config.time.body
+                      << "' resolved to the built-in body '" << canonical_body
+                      << "' (body names are matched case-insensitively)."
+                      << std::endl;
+        }
+    }
+
     // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
     // knob is first-class, but true per-output-step full-mesh checkpointing is
     // architecturally incompatible with the batch-outer/time-inner GPU
