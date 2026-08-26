@@ -226,6 +226,26 @@ def test_a_malformed_device_list_is_refused_not_ignored():
     assert any("gpu_device_ids" in m for m in messages), messages
 
 
+def test_the_gpu_enums_are_case_insensitive_like_the_engine():
+    """The engine lowercases both before comparing (gpu::guardrails::toLower).
+
+    Comparing the raw string made validate() BLOCK a valid config while
+    asserting the engine would refuse it. Reproduced on placement_policy:
+    "Auto".
+    """
+    manager = _manager()
+    for value in ("Auto", "AUTO", "Disjoint", "SHARED"):
+        manager.set_value("gpu.placement_policy", value)
+        valid, messages = manager.validate()
+        assert valid, f"placement_policy {value!r} refused: {messages}"
+    manager = _manager()
+    for value in ("Separate", "REFUSE"):
+        manager.set_value("gpu.thin_margin_policy", value)
+        manager.set_value("gpu.hard_min_vram_margin_gib", 0.25)
+        valid, messages = manager.validate()
+        assert valid, f"thin_margin_policy {value!r} refused: {messages}"
+
+
 def test_the_gpu_policy_enums_are_the_engines_own():
     """A GUI enum the engine refuses is a startup FATAL the user cannot see."""
     manager = _manager()
@@ -453,6 +473,7 @@ TESTS = [
     test_device_ids_round_trip_as_a_sequence,
     test_an_empty_device_list_is_not_written,
     test_a_malformed_device_list_is_refused_not_ignored,
+    test_the_gpu_enums_are_case_insensitive_like_the_engine,
     test_the_gpu_policy_enums_are_the_engines_own,
     test_the_hard_floor_rule_is_the_engines_rule,
     test_eq_indirect_source_matches_the_engines_valid_set,

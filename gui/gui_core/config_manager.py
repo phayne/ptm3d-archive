@@ -545,6 +545,13 @@ class ConfigManager:
         #: which is what makes "this key is unset" representable at all.
         self._source_doc = None
         self._loaded_engine_view = None
+        #: What the last save_to_yaml actually did: "in_place" (the opened file,
+        #: edited minimally), "copied_to_new_file", "replaced_other_file" (Save
+        #: As over a DIFFERENT existing file -- its comments are gone), or
+        #: "expanded" (the flattening fallback). The caller reports it rather
+        #: than assuming; "Comments and layout preserved" over someone else's
+        #: file was a false claim.
+        self.last_save_mode = None
         #: True once the user has been told that this session's saves cannot
         #: preserve comments (ruamel.yaml missing). The GUI shows it once as a
         #: dialog and every time in the console; it is never silent.
@@ -1210,6 +1217,22 @@ class ConfigManager:
         next save is again a minimal edit.
         """
         doc = self._source_doc
+        # Save As onto a DIFFERENT existing file replaces it wholesale with
+        # this project's document -- which is what Save As means, but it is not
+        # "comments preserved": the target's own comments are gone. Reporting
+        # "Comments and layout preserved" there was false. Record which
+        # happened so the caller can say the true thing.
+        target = Path(filename)
+        same_file = bool(doc) and doc.path and \
+            Path(doc.path).resolve(strict=False) == target.resolve(strict=False)
+        if doc is None:
+            self.last_save_mode = "expanded"
+        elif same_file:
+            self.last_save_mode = "in_place"
+        elif target.exists():
+            self.last_save_mode = "replaced_other_file"
+        else:
+            self.last_save_mode = "copied_to_new_file"
         if doc is not None:
             updates, removals = yaml_roundtrip.plan_edits(
                 self._loaded_engine_view or {}, self._config_for_yaml(),
@@ -1229,6 +1252,7 @@ class ConfigManager:
         # written back.
         self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
         self._loaded_engine_view = deepcopy(self._config_for_yaml())
+        return self.last_save_mode
 
     def save_run_yaml(self, filename, project_root):
         """Write the engine-facing YAML with every path field absolutized
@@ -1430,12 +1454,18 @@ class ConfigManager:
         # FATAL; saying so here costs nothing and saves a launch.
         gpu_cfg = self.config.get("gpu")
         gpu_cfg = gpu_cfg if isinstance(gpu_cfg, dict) else {}
-        placement = str(gpu_cfg.get("placement_policy", "auto") or "")
+        # The engine LOWERCASES both of these before comparing
+        # (gpu::guardrails::toLower, ptm_thermal_sim.cpp:14327 and :14349), so
+        # `Auto` and `Separate` run fine. Comparing the raw string here made
+        # validate() block a valid config while asserting the engine would
+        # refuse it -- false, and validate() is the public launch gate, reached
+        # headlessly too, not only after set_enum has canonicalized the value.
+        placement = str(gpu_cfg.get("placement_policy", "auto") or "").lower()
         if placement not in ("auto", "shared", "disjoint"):
             errors.append(
                 f"gpu.placement_policy must be auto, shared or disjoint (got "
                 f"{placement!r}); the engine refuses anything else at startup.")
-        thin = str(gpu_cfg.get("thin_margin_policy", "separate") or "")
+        thin = str(gpu_cfg.get("thin_margin_policy", "separate") or "").lower()
         if thin not in ("separate", "refuse"):
             errors.append(
                 f"gpu.thin_margin_policy must be separate or refuse (got "

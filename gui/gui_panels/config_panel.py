@@ -5217,8 +5217,26 @@ class TaskCardsTab(BaseConfigTab):
             if name in provenance:
                 lines.append(f"    {name} = {provenance[name]}")
         lines.append(
-            "The environment block, spin-up seed and every other key now come "
-            "from the baseline's own record, not from this GUI's defaults.")
+            "Every key in that file -- spin-up seed, beaming, coupling mode -- "
+            "is now loaded as the baseline recorded it.")
+        # The environment is the one thing the record may not contain, and
+        # claiming otherwise was wrong: config_used.yaml is a byte copy of the
+        # config that was PASSED IN, and provenance.txt lists no PTM_*
+        # variables. A CLI or campaign launch usually carries no engine_env:
+        # block, so the reproduction silently gets the GUI's current set.
+        if isinstance(_config.get("engine_env"), dict):
+            lines.append(
+                "Its engine_env: block was carried over exactly as written "
+                "(%d variable(s)); the GUI's own set is NOT applied."
+                % len(_config["engine_env"]))
+        else:
+            lines.append(
+                "WARNING: this baseline's config carries no engine_env: block, "
+                "so the environment it ran under is NOT recorded anywhere -- "
+                "provenance.txt does not list PTM_* variables either. This run "
+                "will use the GUI's current set, which may differ from the "
+                "baseline's. Check the Engine Flags page, and the baseline's "
+                "own run log if you still have it.")
         lines.append(
             "This is NOT your project file. Use Save As to write it somewhere "
             "of your own; the baseline's own record is left untouched.")

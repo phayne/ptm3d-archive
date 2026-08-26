@@ -199,6 +199,63 @@ def test_europa_and_generic_body_presets_never_ask_for_beaming():
             f"{key} does not say why beaming is off: {result.notes}")
 
 
+def test_a_global_preset_clears_an_inherited_import_mesh():
+    """Otherwise "Europa diurnal" silently runs the lunar crater core mesh.
+
+    The engine takes mesh.import_file whenever it is non-empty and reaches the
+    icosphere branch only when it is empty (ptm_thermal_sim.cpp:15087). Apply
+    the crater card, then the Europa card: the run was the crater mesh with
+    simulation.body: Europa, and mesh.resolution: 6 was inert. Reproduced --
+    and PresetResult listed only the keys it set, so nothing said a word.
+    """
+    from gui_core.presets import PRESETS_BY_KEY, apply_preset
+    for key in ("lunar_global_diurnal", "europa_diurnal"):
+        manager = _manager()
+        manager.set_value("mesh.import_file", "/some/crater_core.ply")
+        manager.set_value("mesh.occluder_file", "/some/ring.ply")
+        manager.set_value("mesh.latitude_override", -84.2)
+        result = apply_preset(manager, PRESETS_BY_KEY[key])
+        assert manager.get_value("mesh.import_file") == "", (
+            f"{key} is a global icosphere run but kept "
+            f"{manager.get_value('mesh.import_file')!r}")
+        assert manager.get_value("mesh.occluder_file") == "", key
+        assert manager.get_value("mesh.latitude_override") == -999.0, key
+        assert result.applied["mesh.import_file"] == "", (
+            f"{key} cleared the mesh without reporting it")
+
+
+def test_the_baseline_preset_overrides_nothing():
+    """Its own note says nothing here overrides the baseline. Hold it to that.
+
+    With beaming="off" the shared branch forced radiation.beaming False and
+    rms_slope_deg 0, silently losing the roughness of a beaming baseline.
+    Reproduced through TaskCardsTab.apply_preset, which is public.
+    """
+    from gui_core.presets import PRESETS_BY_KEY, apply_preset
+    manager = _manager()
+    manager.set_value("radiation.beaming", True)
+    manager.set_value("radiation.rms_slope_deg", 32.5)
+    manager.set_value("thermal.spinup_seed", "legacy")
+    result = apply_preset(manager, PRESETS_BY_KEY["reproduce_baseline"])
+    assert manager.get_value("radiation.beaming") is True, (
+        "the baseline preset turned beaming off")
+    assert manager.get_value("radiation.rms_slope_deg") == 32.5
+    assert manager.get_value("thermal.spinup_seed") == "legacy"
+    assert result.applied == {}, (
+        f"a preset that promises to override nothing set {result.applied}")
+
+
+def test_compare_binary_does_not_treat_unknown_as_a_hash():
+    """run_provenance writes the literal "unknown" when it cannot resolve itself."""
+    from gui_core.presets import compare_binary
+    for spelling in ("unknown", "UNKNOWN", "", "  ", "n/a", "none"):
+        message = compare_binary({"engine_binary_md5": spelling}, "abc123")
+        assert "DIFFERENT BINARY" not in message, (
+            f"md5 {spelling!r} produced an alarming and wrong verdict: "
+            f"{message}")
+        assert "no engine md5" in message, message
+
+
 def test_every_preset_leaves_a_config_the_gui_accepts():
     """A preset that produces an invalid config is worse than no preset."""
     from gui_core.presets import PRESETS, apply_preset
@@ -346,6 +403,9 @@ TESTS = [
     test_the_crater_preset_refuses_beaming_on_a_millimeter_mesh,
     test_the_crater_preset_turns_beaming_on_when_the_rule_passes,
     test_europa_and_generic_body_presets_never_ask_for_beaming,
+    test_a_global_preset_clears_an_inherited_import_mesh,
+    test_the_baseline_preset_overrides_nothing,
+    test_compare_binary_does_not_treat_unknown_as_a_hash,
     test_every_preset_leaves_a_config_the_gui_accepts,
     test_a_preset_config_is_accepted_by_test_config_parity_rules,
     test_reproduce_a_baseline_reads_the_runs_own_record,

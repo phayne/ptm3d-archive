@@ -59,10 +59,26 @@ def _engine():
     return Path(exe).resolve()
 
 
-def _stub(tmp, body):
+#: Prepended to every stub that is meant to PASS the capability probe. The
+#: probe runs `--help` before the config is handed over (see
+#: test_an_engine_without_the_flag_is_never_handed_the_config), so a stub that
+#: does not answer it never reaches the branch under test.
+_SUPPORTS_FLAG = """
+    import sys
+    if "--help" in sys.argv:
+        print("  --validate-config   Parse and check the config, then exit")
+        sys.exit(0)
+"""
+
+
+def _stub(tmp, body, supports_flag=True, name="fake_engine"):
     """A fake engine, so the unavailable/refused paths are testable with no build."""
-    path = Path(tmp) / "fake_engine"
-    path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body))
+    path = Path(tmp) / name
+    prologue = textwrap.dedent(_SUPPORTS_FLAG) if supports_flag else ""
+    # THIS interpreter, not `env python3`: the stub needs the same PyYAML the
+    # test has, and /usr/bin/python3 on macOS does not carry it.
+    path.write_text(f"#!{sys.executable}\n" + prologue
+                    + textwrap.dedent(body))
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
     return path
 
@@ -132,22 +148,68 @@ def test_no_binary_is_reported_as_not_checked():
         assert text.strip()
 
 
-def test_an_engine_without_the_flag_is_reported_as_not_checked():
-    """rc 0 from a binary that ignored the flag is NOT an acceptance."""
+def test_an_engine_without_the_flag_is_never_handed_the_config():
+    """The sharpest hazard in this feature, and it is not hypothetical.
+
+    The engine's argument loop has no unknown-argument handler, so a binary
+    that predates --validate-config IGNORES it and RUNS THE SIMULATION.
+    MEASURED against ~/projects/ptm-postmerge-2026-08-24 (md5
+    9d657590009ade0c0d8f2d07d2faa7a2): handed --validate-config it ran a
+    complete Moon ico2 job, wrote the whole output directory, and exited 0.
+    On a production config, pressing Ctrl+T would have started a multi-hour
+    GPU run.
+
+    So the config is not passed until a --help probe confirms the flag exists.
+    """
     preflight = _preflight()
     manager = _manager()
     with tempfile.TemporaryDirectory() as tmp:
-        exe = _stub(tmp, """
+        marker = Path(tmp) / "IT_RAN"
+        # An "old engine": --help does not mention the flag, and being handed a
+        # config makes it do work.
+        exe = _stub(tmp, f"""
             import sys
-            print("PTM3D 1.0")
+            if "--help" in sys.argv:
+                print("Usage: ptm_thermal_sim [options]")
+                print("  --config FILE   Load parameters from YAML")
+                sys.exit(0)
+            open({str(marker)!r}, "w").write("simulated\\n")
             sys.exit(0)
-        """)
+        """, supports_flag=False)
         status, text = preflight.engine_validate_config(
             manager.get_config(), exe, REPO_ROOT)
         assert status == "unavailable", (
-            f"an engine that silently ignored --validate-config reported "
-            f"{status!r}")
-        assert "--validate-config" in text
+            f"an engine with no --validate-config reported {status!r}")
+        assert not marker.exists(), (
+            "the config was handed to a binary that does not support the flag; "
+            "an old engine would have RUN it")
+        assert "--validate-config" in text and "RUNS THE SIMULATION" in text
+
+
+def test_the_check_never_targets_the_users_output_directory():
+    """Belt and braces behind the capability probe."""
+    preflight = _preflight()
+    manager = _manager()
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = Path(tmp) / "seen_output_dir.txt"
+        exe = _stub(tmp, f"""
+            import yaml
+            cfg = yaml.safe_load(open(sys.argv[sys.argv.index("--config") + 1]))
+            with open({str(seen)!r}, "w") as fh:
+                fh.write(cfg["output"]["directory"])
+            print("[validate-config] ACCEPTED")
+            sys.exit(0)
+        """)
+        manager.set_value("output.directory", "/tmp/a_real_run_output")
+        status, _text = preflight.engine_validate_config(
+            manager._config_for_yaml(), exe, REPO_ROOT)
+        assert status == "accepted", status
+        handed = seen.read_text()
+        assert "a_real_run_output" not in handed, (
+            f"the check handed the engine the user's own output directory "
+            f"({handed}); anything it wrote would land in a real run's "
+            f"results")
+        assert "ptm3d_validate_" in handed, handed
 
 
 def test_a_hung_engine_times_out_rather_than_hanging_the_gui():
@@ -252,7 +314,10 @@ def test_a_crashing_engine_is_not_a_config_refusal():
     manager = _manager()
     with tempfile.TemporaryDirectory() as tmp:
         exe = Path(tmp) / "crashy"
-        exe.write_text("#!/bin/sh\nkill -SEGV $$\n")
+        exe.write_text('#!/bin/sh\n'
+                       'case "$1" in --help) echo "  --validate-config"; '
+                       'exit 0;; esac\n'
+                       'kill -SEGV $$\n')
         exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
         status, text = preflight.engine_validate_config(
             manager.get_config(), exe, REPO_ROOT)
@@ -264,7 +329,10 @@ def test_a_crashing_engine_is_not_a_config_refusal():
     # rc > 1 is also not a verdict.
     with tempfile.TemporaryDirectory() as tmp:
         exe = Path(tmp) / "odd_rc"
-        exe.write_text("#!/bin/sh\nexit 42\n")
+        exe.write_text('#!/bin/sh\n'
+                       'case "$1" in --help) echo "  --validate-config"; '
+                       'exit 0;; esac\n'
+                       'exit 42\n')
         exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
         status, text = preflight.engine_validate_config(
             manager.get_config(), exe, REPO_ROOT)
@@ -305,7 +373,8 @@ TESTS = [
     test_the_engines_refusal_reaches_the_user_verbatim,
     test_a_disagreement_between_the_two_checkers_is_visible,
     test_no_binary_is_reported_as_not_checked,
-    test_an_engine_without_the_flag_is_reported_as_not_checked,
+    test_an_engine_without_the_flag_is_never_handed_the_config,
+    test_the_check_never_targets_the_users_output_directory,
     test_a_hung_engine_times_out_rather_than_hanging_the_gui,
     test_the_check_leaves_no_temporary_file_behind,
     test_the_check_does_not_write_into_the_output_directory,

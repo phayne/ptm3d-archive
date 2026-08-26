@@ -169,6 +169,27 @@ class RoundTripDoc:
         return buf.getvalue()
 
 
+def values_equal(a, b):
+    """Is `b` the SAME setting as `a`, for the purpose of "did this change"?
+
+    Plain `==` is not enough and plain `type(a) is type(b)` is too much.
+
+    * ``1`` and ``1.0`` are the same setting. A file that spells a
+      double-valued key as an integer -- ``scale_factor: 1``,
+      ``geothermal_heat_flow: 0`` -- gets that value coerced to float by
+      ``set_numeric`` when the panel loads it, and a strict type test then
+      rewrote both lines on a save with NO EDITS AT ALL. Reproduced.
+    * ``0`` and ``False`` are NOT the same setting, even though Python says
+      ``0 == False``. A config spelling a switch as ``0`` that the user then
+      ticks must be written, and a value test alone would miss it.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    return type(a) is type(b) and a == b
+
+
 def plan_edits(loaded_view, current_view, file_keys):
     """Decide what a save has to change, and nothing more.
 
@@ -188,7 +209,7 @@ def plan_edits(loaded_view, current_view, file_keys):
 
     updates = {}
     for key, value in now.items():
-        if key not in was or was[key] != value or type(was[key]) is not type(value):
+        if key not in was or not values_equal(was[key], value):
             updates[key] = value
 
     # A key that left the engine-facing view (an override the user unticked)

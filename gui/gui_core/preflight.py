@@ -784,12 +784,48 @@ def engine_validate_config(config, executable, project_root=None, env=None):
                 f"{executable} does not exist, so the engine's own checks "
                 f"could not be run. Only the GUI's checks applied.")
 
+    # CAPABILITY PROBE FIRST, and it is not a nicety.
+    # The engine's argument loop has no unknown-argument handler, so a binary
+    # that predates --validate-config IGNORES it and runs the simulation.
+    # MEASURED against ~/projects/ptm-postmerge-2026-08-24 (md5
+    # 9d657590009ade0c0d8f2d07d2faa7a2): it ran a complete Moon ico2 job, wrote
+    # the whole output directory and exited 0. On a production config, pressing
+    # Ctrl+T would have started a multi-hour GPU run.
+    #
+    # --help exits without touching anything, so asking it first is free.
+    try:
+        probe = subprocess.run([str(executable), "--help"], capture_output=True,
+                               text=True, timeout=VALIDATE_TIMEOUT_S)
+    except Exception as exc:                           # noqa: BLE001
+        return ("unavailable",
+                f"{executable} could not be asked for its options ({exc}), so "
+                f"the engine's checks were not run.")
+    if "--validate-config" not in (probe.stdout or "") + (probe.stderr or ""):
+        return ("unavailable",
+                f"{executable} does not support --validate-config, so nothing "
+                f"was checked by the engine -- only the GUI's own rules "
+                f"applied.\n"
+                f"  The flag was NOT passed to it. A binary that predates the "
+                f"flag ignores it and RUNS THE SIMULATION: measured, a "
+                f"pre-flag build ran a complete job and exited 0 when handed "
+                f"--validate-config.\n"
+                f"  Rebuild from a tree that carries the flag: cmake --build "
+                f"build --target ptm_thermal_sim")
+
     root = Path(project_root) if project_root else find_project_root(executable)
     tmpdir = tempfile.mkdtemp(prefix="ptm3d_validate_")
     try:
         path = Path(tmpdir) / "config.yaml"
+        # Belt and braces: point output.directory at the temporary directory.
+        # Nothing in --validate-config reads it, and if a binary ever ignores
+        # the flag again, whatever it writes lands here and is deleted with the
+        # rest. The user's own output directory is never a target of a CHECK.
+        checked = absolutize_config_paths(config, root)
+        checked.setdefault("output", {})
+        checked["output"] = dict(checked["output"])
+        checked["output"]["directory"] = str(Path(tmpdir) / "output")
         with open(path, "w") as handle:
-            _yaml.dump(absolutize_config_paths(config, root), handle,
+            _yaml.dump(checked, handle,
                        default_flow_style=False, sort_keys=False)
         # build_engine_env returns (env, applied). The SAME environment the
         # launch would apply: validating under a different one answers a

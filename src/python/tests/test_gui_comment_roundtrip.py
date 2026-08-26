@@ -355,6 +355,76 @@ def test_opening_a_config_in_the_PANEL_plans_no_edits():
             + "\n  ".join(f"{k}: {v}" for k, v in offenders.items()))
 
 
+def test_an_int_spelled_double_is_not_rewritten():
+    """`scale_factor: 1` must stay `1`, not become `1.0`.
+
+    set_numeric coerces a loaded value to the widget's type, so a file that
+    spells a double-valued key as an integer came back as a float and a strict
+    type test rewrote the line on a save with NO EDITS. Reproduced: opening a
+    config with `scale_factor: 1` and `geothermal_heat_flow: 0` planned
+    {'mesh.scale_factor': 1.0, 'thermal.geothermal_heat_flow': 0.0}.
+    """
+    _require_ruamel()
+    from gui_core.yaml_roundtrip import values_equal
+    assert values_equal(1, 1.0) and values_equal(1.0, 1)
+    # ...but a switch spelled `0` that becomes True IS a change, even though
+    # Python says 0 == False.
+    assert not values_equal(0, False)
+    assert not values_equal(1, True)
+    assert values_equal(False, False) and not values_equal(False, True)
+    assert not values_equal("20", 20.0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / "intspell.yaml"
+        work.write_text(
+            "# keep me\nsimulation:\n  body: Moon\n"
+            "mesh:\n  scale_factor: 1\n"
+            "thermal:\n  geothermal_heat_flow: 0\n")
+        before = work.read_text()
+        manager = _manager()
+        manager.load_from_yaml(str(work))
+        # Emulate the panel's load-time coercion without building one.
+        manager.set_value("mesh.scale_factor", 1.0)
+        manager.set_value("thermal.geothermal_heat_flow", 0.0)
+        assert manager.plan_save_edits() == ({}, []), (
+            f"an int-spelled double plans an edit: "
+            f"{manager.plan_save_edits()}")
+        manager.save_to_yaml(str(work))
+        assert work.read_text() == before
+
+
+def test_save_says_which_file_it_actually_rewrote():
+    """Save As over a DIFFERENT existing file is not "comments preserved".
+
+    The target is replaced wholesale by this project's document -- which is
+    what Save As means, but the target's own comments are gone, and the console
+    said "Comments and layout preserved". Reproduced.
+    """
+    _require_ruamel()
+    with tempfile.TemporaryDirectory() as tmp:
+        site_a = Path(tmp) / "siteA.yaml"
+        site_b = Path(tmp) / "siteB.yaml"
+        site_c = Path(tmp) / "siteC.yaml"
+        site_a.write_text("# SITE A\nsimulation:\n  body: Moon\n")
+        site_b.write_text("# SITE B\nsimulation:\n  body: Europa\n")
+
+        manager = _manager()
+        manager.load_from_yaml(str(site_a))
+        assert manager.save_to_yaml(str(site_a)) == "in_place"
+        assert manager.save_to_yaml(str(site_c)) == "copied_to_new_file"
+
+        manager = _manager()
+        manager.load_from_yaml(str(site_a))
+        assert manager.save_to_yaml(str(site_b)) == "replaced_other_file", (
+            "overwriting a different existing file is reported as an in-place "
+            "edit, so the console claims its comments were preserved")
+        assert "SITE B" not in site_b.read_text(), (
+            "the fixture did not actually exercise the overwrite")
+
+        assert _manager().save_to_yaml(str(Path(tmp) / "fresh.yaml")) == \
+            "expanded"
+
+
 def test_plan_save_edits_reports_exactly_what_would_change():
     _require_ruamel()
     with tempfile.TemporaryDirectory() as tmp:
@@ -385,6 +455,8 @@ TESTS = [
     test_a_new_project_still_saves_and_then_round_trips,
     test_status_is_reported_not_inferred,
     test_opening_a_config_in_the_PANEL_plans_no_edits,
+    test_an_int_spelled_double_is_not_rewritten,
+    test_save_says_which_file_it_actually_rewrote,
     test_plan_save_edits_reports_exactly_what_would_change,
 ]
 

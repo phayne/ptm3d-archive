@@ -77,6 +77,8 @@ PRESETS = [
             "mesh.resolution": 5,
             "mesh.import_file": "",
             "mesh.occluder_file": "",
+            "mesh.latitude_override": -999.0,
+            "mesh.longitude_override": -999.0,
             "thermal.run_thermal_mesh": True,
             "radiation.enabled": False,
             "illumination.albedo_source": "builtin",
@@ -124,6 +126,16 @@ PRESETS = [
             "simulation.duration_days": 3.551181,
             "simulation.timesteps": 144,
             "mesh.resolution": 6,
+            # CLEARED, not merely unset. The engine takes mesh.import_file
+            # whenever it is non-empty and reaches the icosphere branch only
+            # when it is empty (ptm_thermal_sim.cpp:15087), so applying the
+            # crater card and then this one ran the LUNAR CRATER CORE MESH
+            # with simulation.body: Europa, and mesh.resolution: 6 was inert.
+            # Reproduced.
+            "mesh.import_file": "",
+            "mesh.occluder_file": "",
+            "mesh.latitude_override": -999.0,
+            "mesh.longitude_override": -999.0,
             "thermal.run_thermal_mesh": True,
             "radiation.enabled": False,
             "illumination.albedo_source": "builtin",
@@ -168,15 +180,24 @@ PRESETS = [
         title="Reproduce a published baseline",
         summary=(
             "Load the configuration a finished run actually used, from that "
-            "run's own config_used.yaml, and report the binary it ran on. This "
-            "is the useful pair to thermal.spinup_seed: legacy -- and it would "
-            "have made PTM-276 impossible to hit by accident, because the "
-            "environment comes from the baseline's record instead of from "
-            "whatever the GUI injects today.\n"
+            "run's own config_used.yaml, and report the binary it ran on. The "
+            "useful pair to thermal.spinup_seed: legacy.\n"
             "This preset does not guess at values: point it at the run "
-            "directory and it reads them."),
+            "directory and it reads them.\n"
+            "The ENVIRONMENT is the one thing it may not be able to tell you. "
+            "config_used.yaml is a byte copy of the config that was passed in, "
+            "and provenance.txt records no PTM_* variables at all -- so if that "
+            "config carried no engine_env: block (a CLI or campaign launch "
+            "usually does not), the baseline's environment is UNKNOWN and this "
+            "run will use the GUI's current set instead. The card says which "
+            "case you are in."),
         sets={},
-        beaming="off",
+        # "preserve", not "off": this card loads a whole configuration and must
+        # not overwrite any part of it. With beaming="off" the shared branch
+        # forced radiation.beaming False and rms_slope_deg 0 -- silently losing
+        # the roughness of a beaming baseline, while its own note said nothing
+        # here overrides it. Reproduced through TaskCardsTab.apply_preset.
+        beaming="preserve",
         needs=(
             "a completed run directory containing config_used.yaml and "
             "provenance.txt",
@@ -234,6 +255,9 @@ def apply_preset(config_manager, preset, project_root=None):
             result.applied["radiation.beaming"] = False
             result.applied["radiation.rms_slope_deg"] = 0.0
             result.refused.append(("radiation.beaming", reason))
+    elif preset.beaming == "preserve":
+        if preset.beaming_note:
+            result.notes.append(preset.beaming_note)
     elif preset.beaming in ("off", "n/a"):
         # Explicit, not assumed. `beaming: true` with rms_slope_deg == 0 is a
         # startup FATAL, so a preset that leaves a stale slope behind hands the
@@ -290,6 +314,12 @@ def compare_binary(provenance, current_md5):
     """
     recorded = provenance.get("engine_binary_md5", "")
     sha = provenance.get("engine_git_sha", "?")
+    # run_provenance.cpp writes the literal string "unknown" when it could not
+    # resolve its own executable path. Treating that as a hash produced
+    # "DIFFERENT BINARY. The baseline ran on md5 unknown" -- alarming, and
+    # wrong: the truth is that the baseline recorded no md5 at all.
+    if recorded.strip().lower() in ("", "unknown", "n/a", "none"):
+        recorded = ""
     if not recorded:
         return ("This run directory records no engine md5, so whether your "
                 "binary matches the baseline's cannot be checked here.")

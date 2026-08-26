@@ -603,7 +603,7 @@ class PTM3DMainWindow(QMainWindow):
             self.config_manager.comment_loss_disclosed = True
         try:
             edits = self.config_manager.plan_save_edits()
-            self.config_manager.save_to_yaml(filename)
+            mode = self.config_manager.save_to_yaml(filename)
             self.current_project_file = filename
             self.unsaved_changes = False
             self.update_window_title()
@@ -619,9 +619,18 @@ class PTM3DMainWindow(QMainWindow):
                        ", ".join(touched[:8]) +
                        (", ..." if len(touched) > 8 else "")
                        if touched else "none -- the file is unchanged"))
-            if preserved:
+            if mode == "in_place":
                 self.console_panel.append_info(
                     "Comments and layout preserved.")
+            elif mode == "copied_to_new_file":
+                self.console_panel.append_info(
+                    "Written to a new file, carrying this project's comments "
+                    "and layout.")
+            elif mode == "replaced_other_file":
+                self.console_panel.append_warning(
+                    f"{Path(filename).name} already existed and was REPLACED "
+                    f"by this project. Its own comments and any keys it "
+                    f"carried that this project does not are gone.")
             else:
                 self.console_panel.append_warning(status)
         except Exception as e:
