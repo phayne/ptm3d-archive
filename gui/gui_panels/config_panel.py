@@ -140,6 +140,22 @@ CONDUCTIVITY_MODEL_ALIASES = {
 COUPLING_MODE_ALIASES = {
     "bounded": "bounded", "fixed": "fixed", "legacy": "legacy",
 }
+# Also compared exactly: ptm_thermal_sim.cpp:16534 refuses anything outside
+# auto | converged | off. No invented synonyms -- the first draft of the
+# matching check in ConfigManager.validate guessed "auto|none|file|internal"
+# and would have refused the one non-default value that works.
+EQ_INDIRECT_SOURCE_ALIASES = {
+    "auto": "auto", "": "auto",
+    "converged": "converged", "off": "off",
+}
+# gpu.placement_policy and gpu.thin_margin_policy: exact, startup FATAL on a
+# mismatch (ptm_thermal_sim.cpp:14296, :14318).
+GPU_PLACEMENT_ALIASES = {
+    "auto": "auto", "": "auto", "shared": "shared", "disjoint": "disjoint",
+}
+GPU_THIN_MARGIN_ALIASES = {
+    "separate": "separate", "": "separate", "refuse": "refuse",
+}
 
 
 class BaseConfigTab(QWidget):
@@ -499,6 +515,58 @@ class BaseConfigTab(QWidget):
         # Every later `<` or `<=` on that key then raises TypeError, which out
         # of a Qt slot is an application abort.
         self.config_manager.set_value(key, coerced)
+
+    # ── GPU device lists ─────────────────────────────────────────────
+    # The engine reads `gpu_device_ids` ONLY when it is a YAML sequence
+    # (config_parser.cpp gates on IsSequence()), so a malformed value is not
+    # rejected -- it is ignored, and the run silently uses a different device
+    # set than the panel shows. The field therefore parses on every keystroke
+    # and says out loud when it cannot.
+
+    def add_device_ids_field(self, layout, row, label_text, key, tooltip=""):
+        """A '0,1' text field bound to a YAML sequence of device indices."""
+        label = QLabel(label_text)
+        label.setToolTip(tooltip)
+        layout.addWidget(label, row, 0)
+
+        widget = QLineEdit()
+        widget.setPlaceholderText("blank = select by count; e.g. 0,1")
+        widget.setToolTip(tooltip)
+        note = QLabel("")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #EF9A9A; font-size: 10px;")
+        note.setVisible(False)
+
+        def _changed():
+            parsed = ConfigManager.parse_device_ids(widget.text())
+            if parsed is None:
+                # Store the RAW text, not a silent []. validate() refuses it,
+                # and the launch is blocked while the field is still on screen.
+                note.setText(
+                    "Not a list of device indices. The engine reads this key "
+                    "only as a YAML sequence, so it would be ignored and the "
+                    "run would use a different device set than shown.")
+                note.setVisible(True)
+                self.config_manager.set_value(key, widget.text())
+            else:
+                note.setVisible(False)
+                self.config_manager.set_value(key, parsed)
+            self.value_changed.emit()
+
+        widget.textChanged.connect(_changed)
+        layout.addWidget(widget, row, 1)
+        layout.addWidget(note, row + 1, 0, 1, 2)
+        self.widgets[key] = widget
+        self._device_id_notes = getattr(self, "_device_id_notes", {})
+        self._device_id_notes[key] = note
+        return widget
+
+    def set_device_ids(self, key, value):
+        """Load a device list into its text field, tolerating any spelling."""
+        widget = self.widgets.get(key)
+        if widget is None:
+            return
+        widget.setText(ConfigManager.format_device_ids(value))
 
     def load_from_config(self):
         """Load values from config manager - implemented by subclasses"""
@@ -1585,6 +1653,165 @@ class ThermalTab(BaseConfigTab):
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
 
+        # --- GPU dispatch (item 2.8), Advanced ----------------------------
+        # These are the wedge mitigations, not tuning: on this hardware a
+        # kernel hang can take the machine down, and batch size plus the
+        # inter-batch pause are what the 2026-08-20/21 forensics landed on.
+        gpu_disp_group = QGroupBox("Thermal GPU Dispatch")
+        gd = QGridLayout()
+        gd.setColumnStretch(1, 1)
+        self.add_int_field(gd, 0, "GPU Count:", "thermal.gpu_devices", 0, 16,
+                           "How many enumerated GPUs the thermal pool may use. "
+                           "1 = the first available (default); 0 = every one. "
+                           "Ignored when a device list is given below.")
+        self.add_device_ids_field(
+            gd, 1, "GPU Device IDs:", "thermal.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set. "
+            "Run ptm_thermal_sim --list-gpu-devices to see the indices.")
+        self.add_int_field(gd, 3, "Batch Size:", "thermal.gpu_batch_size",
+                           0, 1000000,
+                           "Faces per dispatch. 0 = the engine's own cap "
+                           "(6 GB / 500 K faces), or the calibrated value from "
+                           "the machine profile. Lower it to shorten each "
+                           "kernel, which is the first mitigation for a "
+                           "watchdog reset.")
+        self.add_int_field(gd, 4, "Inter-batch Pause (ms):",
+                           "thermal.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between dispatches. 0 = none. A nonzero "
+                           "pause lets the macOS+AMD driver's watchdog see the "
+                           "device as responsive between batches.")
+        self.add_bool_field(gd, 5, "Auto-calibrate GPU dispatch limits",
+                            "thermal.auto_calibrate_gpu",
+                            "Measure this host's safe dispatch ceiling on the "
+                            "first GPU run and cache it in the machine "
+                            "profile. Turning this OFF makes the engine fall "
+                            "back to CONSERVATIVE defaults and say so.")
+        gpu_disp_group.setLayout(gd)
+
+        # --- Equilibration convergence (item 2.7) -------------------------
+        eqconv_group = QGroupBox("Equilibration Convergence")
+        eq_c = QGridLayout()
+        eq_c.setColumnStretch(1, 1)
+        self.add_double_field(eq_c, 0, "Target Accuracy (K):",
+                              "thermal.equilibration_target_K", 0.0001, 50.0, 4,
+                              "The accuracy the spin-up estimate targets, and "
+                              "the bar the convergence certificate is scored "
+                              "against. This is the criterion; the cycle count "
+                              "above is only the budget.")
+        self.add_bool_field(eq_c, 1, "Stop on Convergence Certificate",
+                            "thermal.equilibration_stop_on_certificate",
+                            "Exit equilibration when the certificate reaches "
+                            "the target accuracy instead of at a fixed cycle "
+                            "count. Off by default: the certificate is an "
+                            "estimate, and a fixed budget is reproducible.")
+        self.add_int_field(eq_c, 2, "Equilibration Cycles (override):",
+                           "thermal.equilibration_cycles", -1, 100000,
+                           "Integrated equilibration cycle count. -1 = follow "
+                           "the Equilibration field above.")
+        self.add_int_field(eq_c, 3, "Indirect-flux Passes:",
+                           "thermal.eq_indirect_passes", 1, 20,
+                           "Passes of the equilibration-phase indirect-flux "
+                           "estimate. Its default moved this summer (PR #78). "
+                           "The engine refuses 0.")
+        self.add_combo_field(eq_c, 4, "Indirect-flux Source:",
+                             "thermal.eq_indirect_source",
+                             ["auto", "converged", "off"],
+                             "Where the equilibration-phase indirect flux comes "
+                             "from.\n"
+                             "auto (default): the engine estimates it inside "
+                             "the radiation-coupling block.\n"
+                             "converged: use the converged coupled solution.\n"
+                             "off: the pre-2026-08 behavior -- a face whose "
+                             "whole forcing is neighbor infrared equilibrates "
+                             "to the bare geothermal floor.")
+        self.add_file_field(eq_c, 5, "Indirect-flux File:",
+                            "thermal.eq_indirect_flux_file",
+                            "QIND Files (*.bin);;All Files (*)",
+                            "An explicit 'QIND' file from a prior pass-1 run. "
+                            "Always wins over the source setting when given.")
+        eqconv_group.setLayout(eq_c)
+
+        # --- Ice stability (item 2.6) -------------------------------------
+        ice_group = QGroupBox("Ice Stability (ice_depth.bin)")
+        ice_l = QGridLayout()
+        ice_l.setColumnStretch(1, 1)
+        self.add_bool_field(ice_l, 0, "Compute Ice Stability Depth",
+                            "thermal.compute_ice_stability",
+                            "Solve for the depth at which water ice survives "
+                            "geologic time, per face, and write ice_depth.bin "
+                            "beside the temperature output.")
+        self.add_double_field(ice_l, 1, "Survival Flux J0 (kg m^-2 s^-1):",
+                              "thermal.ice_stability.flux_threshold_kgm2s",
+                              1e-20, 1e-6, 20,
+                              "The sublimation rate below which ice is called "
+                              "stable. The default 3e-14 is about 1 mm per "
+                              "billion years.")
+        self.add_double_field(ice_l, 2, "Grain Hop Length (um):",
+                              "thermal.ice_stability.grain_hop_length_um",
+                              0.001, 100000.0, 3,
+                              "Diffusive path length scale through the "
+                              "regolith pore space.")
+        self.add_double_field(ice_l, 3, "Sublimation Enthalpy (kJ/mol):",
+                              "thermal.ice_stability.sublimation_enthalpy_kJmol",
+                              1.0, 200.0, 3,
+                              "Latent heat of sublimation used in the vapor "
+                              "pressure law.")
+        self.add_double_field(ice_l, 4, "Geothermal Gradient (K/m):",
+                              "thermal.ice_stability.geothermal_gradient_K_per_m",
+                              0.0, 10.0, 6,
+                              "Added below the modeled column. 0 = isothermal "
+                              "below the deepest node.")
+        self.add_int_field(ice_l, 5, "Depth Subsamples:",
+                           "thermal.ice_stability.n_depth_subsamples",
+                           -1, 100000,
+                           "Subsamples between depth nodes when locating the "
+                           "stability horizon. -1 = the engine's own choice.")
+        self.ice_note = QLabel("")
+        self.ice_note.setWordWrap(True)
+        self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+        ice_l.addWidget(self.ice_note, 6, 0, 1, 2)
+        ice_group.setLayout(ice_l)
+        self._ice_dependent_keys = [
+            "thermal.ice_stability.flux_threshold_kgm2s",
+            "thermal.ice_stability.grain_hop_length_um",
+            "thermal.ice_stability.sublimation_enthalpy_kJmol",
+            "thermal.ice_stability.geothermal_gradient_K_per_m",
+            "thermal.ice_stability.n_depth_subsamples",
+        ]
+
+        # --- Depth grid (item 2.9): READ-ONLY -----------------------------
+        # Standing instruction: do not retune thermal_b. Showing the grid a run
+        # used is worth a lot; offering to change it is not.
+        grid_group = QGroupBox("Depth Grid (read-only)")
+        grid_l = QGridLayout()
+        grid_l.setColumnStretch(1, 1)
+        self.add_double_field(grid_l, 0, "Column Depth b (skin depths):",
+                              "thermal.thermal_b", 0.0, 1000.0, 3,
+                              "Bottom of the modeled column, in diurnal skin "
+                              "depths. Displayed, not offered: retuning it "
+                              "without also raising the equilibration cycle "
+                              "count makes the DEEP answer worse before it "
+                              "gets better.")
+        self.add_double_field(grid_l, 1, "Nodes per Skin Depth m:",
+                              "thermal.thermal_m", 0.0, 1000.0, 3,
+                              "Vertical resolution near the surface.")
+        self.add_double_field(grid_l, 2, "Grid Parameter n:",
+                              "thermal.thermal_n", 0.0, 1000.0, 3,
+                              "Geometric growth control for the layer "
+                              "thicknesses.")
+        for _k in ("thermal.thermal_b", "thermal.thermal_m", "thermal.thermal_n"):
+            self.widgets[_k].setReadOnly(True)
+            self.widgets[_k].setButtonSymbols(
+                QDoubleSpinBox.ButtonSymbols.NoButtons)
+        grid_note = QLabel(
+            "Read-only by standing instruction. A config that carries "
+            "different values shows them here; edit the YAML directly if you "
+            "have a reason, and raise thermal.equilibration_orbits with it.")
+        grid_note.setWordWrap(True)
+        grid_note.setStyleSheet("color: gray; font-size: 10px;")
+        grid_l.addWidget(grid_note, 3, 0, 1, 2)
+        grid_group.setLayout(grid_l)
+
 
         # --- Initial condition -------------------------------------------
         # spinup_seed selects the initial condition; `legacy` exists to
@@ -1747,9 +1974,26 @@ class ThermalTab(BaseConfigTab):
         # leads with the common controls.
         adv_thermal = self.advanced_section("Advanced thermal")
         adv_thermal.add_widget(cad_group)
+        adv_thermal.add_widget(eqconv_group)
         adv_thermal.add_widget(integ_group)
         adv_thermal.add_widget(maps_group)
+        adv_thermal.add_widget(grid_group)
         layout.addWidget(adv_thermal)
+
+        adv_ice = self.advanced_section("Ice Stability")
+        adv_ice.add_widget(ice_group)
+        layout.addWidget(adv_ice)
+
+        adv_gpu = self.advanced_section("GPU Dispatch and Wedge Mitigations")
+        adv_gpu.add_widget(gpu_disp_group)
+        layout.addWidget(adv_gpu)
+
+        self.widgets["thermal.compute_ice_stability"].toggled.connect(
+            self._update_ice_gating)
+        # The note depends on the GPU box too: the product only exists on that
+        # solver path.
+        self.widgets["thermal.use_gpu"].toggled.connect(
+            lambda _v: self._update_ice_gating())
 
         # Wire enable/disable based on mode
         self.widgets["thermal.property_map_mode"].currentIndexChanged.connect(
@@ -1766,6 +2010,52 @@ class ThermalTab(BaseConfigTab):
 
         self._update_seed_gating()
         self._update_qb_gating()
+        self._update_ice_gating()
+
+    # ── Ice stability ────────────────────────────────────────────────
+
+    def _update_ice_gating(self, _checked=None):
+        """The ice parameters are inert unless the product is being computed.
+
+        Same shape as every other gate on this panel: a field that the run will
+        not read is disabled and says so, rather than sitting editable next to
+        one that is live.
+        """
+        on = self.widgets["thermal.compute_ice_stability"].isChecked()
+        for key in getattr(self, "_ice_dependent_keys", []):
+            widget = self.widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(on)
+        gpu_widget = self.widgets.get("thermal.use_gpu")
+        gpu_on = bool(gpu_widget.isChecked()) if gpu_widget is not None else False
+        if not on:
+            self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+            self.ice_note.setText(
+                "Off: no ice_depth.bin is written, and the parameters below "
+                "are inert.")
+        elif gpu_on:
+            self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
+            self.ice_note.setText(
+                "The run writes statistics/ice_depth.bin (one float32 per "
+                "face: the depth in meters at which ice survives, or a "
+                "sentinel where none does).")
+        else:
+            # MEASURED, not inferred (2026-08-25, Moon ico2, this binary): the
+            # accumulator pointer is handed only to
+            # runThermalModelsForAllFaces_GPU_Persistent
+            # (ptm_thermal_sim.cpp:17320). The CPU SIMD-batch and CPU scalar
+            # paths never receive it, so the engine prints "[Ice stability]
+            # WARNING: requested but accumulator not ready" and writes NOTHING.
+            # A user who ticks this box on the CPU path gets a normal-looking
+            # run and no product. Owed as ENG-ICE-CPU-1.
+            self.ice_note.setStyleSheet("color: #FFB74D; font-size: 10px;")
+            self.ice_note.setText(
+                "This product needs the GPU thermal solver. Measured on this "
+                "binary: only runThermalModelsForAllFaces_GPU_Persistent fills "
+                "the accumulator, so with 'Use GPU for Thermal Solver' OFF the "
+                "run completes normally, prints '[Ice stability] WARNING: "
+                "requested but accumulator not ready', and writes no "
+                "ice_depth.bin. Tick the GPU box above, or expect no product.")
 
     # ── Basal heat flow ──────────────────────────────────────────────
 
@@ -2118,6 +2408,54 @@ class ThermalTab(BaseConfigTab):
             self.set_numeric("thermal.integration_days", thermal["integration_days"])
             self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
+            # Equilibration convergence (item 2.7)
+            self.set_numeric("thermal.equilibration_target_K",
+                             thermal.get("equilibration_target_K", 0.1))
+            self.set_bool("thermal.equilibration_stop_on_certificate",
+                          thermal.get("equilibration_stop_on_certificate", False))
+            self.set_numeric("thermal.equilibration_cycles",
+                             thermal.get("equilibration_cycles", -1))
+            self.set_numeric("thermal.eq_indirect_passes",
+                             thermal.get("eq_indirect_passes", 1))
+            self.set_enum("thermal.eq_indirect_source",
+                          thermal.get("eq_indirect_source", "auto"),
+                          EQ_INDIRECT_SOURCE_ALIASES)
+            self.set_text("thermal.eq_indirect_flux_file",
+                          thermal.get("eq_indirect_flux_file", ""))
+
+            # Depth grid (item 2.9, read-only display)
+            self.set_numeric("thermal.thermal_b", thermal.get("thermal_b", 15))
+            self.set_numeric("thermal.thermal_m", thermal.get("thermal_m", 10))
+            self.set_numeric("thermal.thermal_n", thermal.get("thermal_n", 15))
+
+            # Ice stability (item 2.6)
+            self.set_bool("thermal.compute_ice_stability",
+                          thermal.get("compute_ice_stability", False))
+            ice = thermal.get("ice_stability")
+            ice = ice if isinstance(ice, dict) else {}
+            self.set_numeric("thermal.ice_stability.flux_threshold_kgm2s",
+                             ice.get("flux_threshold_kgm2s", 3e-14))
+            self.set_numeric("thermal.ice_stability.grain_hop_length_um",
+                             ice.get("grain_hop_length_um", 75.0))
+            self.set_numeric("thermal.ice_stability.sublimation_enthalpy_kJmol",
+                             ice.get("sublimation_enthalpy_kJmol", 51.058))
+            self.set_numeric(
+                "thermal.ice_stability.geothermal_gradient_K_per_m",
+                ice.get("geothermal_gradient_K_per_m", 0.0))
+            self.set_numeric("thermal.ice_stability.n_depth_subsamples",
+                             ice.get("n_depth_subsamples", -1))
+
+            # GPU dispatch (item 2.8)
+            self.set_numeric("thermal.gpu_devices", thermal.get("gpu_devices", 1))
+            self.set_device_ids("thermal.gpu_device_ids",
+                                thermal.get("gpu_device_ids", []))
+            self.set_numeric("thermal.gpu_batch_size",
+                             thermal.get("gpu_batch_size", 0))
+            self.set_numeric("thermal.gpu_inter_batch_pause_ms",
+                             thermal.get("gpu_inter_batch_pause_ms", 0))
+            self.set_bool("thermal.auto_calibrate_gpu",
+                          thermal.get("auto_calibrate_gpu", True))
+
             # Property maps (synthetic mode/kind drive the UI; underlying
             # YAML keys are managed by ConfigManager at save/load time).
             # The combo's writeback stores the LABEL TEXT, so a second
@@ -2155,6 +2493,7 @@ class ThermalTab(BaseConfigTab):
         self._sync_eq_cadence_from_config()
         self._update_seed_gating()
         self._update_qb_gating()
+        self._update_ice_gating()
 
 
 class RadiationTab(BaseConfigTab):
@@ -2360,6 +2699,32 @@ class RadiationTab(BaseConfigTab):
 
         sparse_section.add_widget(sparse_widget)
         layout.addWidget(sparse_section)
+
+        # --- Radiosity GPU dispatch (item 2.8) ----------------------------
+        gpu_section = self.advanced_section("Radiosity GPU Dispatch")
+        gpu_widget = QWidget()
+        gpu_layout = QGridLayout(gpu_widget)
+        gpu_layout.setColumnStretch(1, 1)
+        self.add_int_field(gpu_layout, 0, "GPU Count:", "radiation.gpu_devices",
+                           0, 16,
+                           "How many enumerated GPUs the radiosity pool may "
+                           "use. 1 = the first available; 0 = every one. "
+                           "Ignored when a device list is given.")
+        self.add_device_ids_field(
+            gpu_layout, 1, "GPU Device IDs:", "radiation.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+        self.add_int_field(gpu_layout, 3, "Row-chunk Batch Size:",
+                           "radiation.gpu_batch_size", 0, 10000000,
+                           "Rows per radiosity dispatch. 0 = the engine's own "
+                           "choice. A single OpenCL buffer cannot exceed 2^31 "
+                           "bytes, which is why large matrices are chunked at "
+                           "all.")
+        self.add_int_field(gpu_layout, 4, "Inter-batch Pause (ms):",
+                           "radiation.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between radiosity dispatches. A first-class "
+                           "wedge mitigation on macOS + AMD.")
+        gpu_section.add_widget(gpu_widget)
+        layout.addWidget(gpu_section)
 
         # Advisory pre-run cost estimate (disk + solve time), updated live as
         # radiation / mesh / body fields change. Order-of-magnitude only.
@@ -2646,6 +3011,13 @@ class RadiationTab(BaseConfigTab):
         self.set_numeric("radiation.captured_energy_target", rad.get("captured_energy_target", 0.95))
         self.set_numeric("radiation.max_neighbors", rad.get("max_neighbors", 500))
         self.set_numeric("radiation.min_neighbors", rad.get("min_neighbors", 20))
+        # Radiosity GPU dispatch (item 2.8)
+        self.set_numeric("radiation.gpu_devices", rad.get("gpu_devices", 1))
+        self.set_device_ids("radiation.gpu_device_ids",
+                            rad.get("gpu_device_ids", []))
+        self.set_numeric("radiation.gpu_batch_size", rad.get("gpu_batch_size", 0))
+        self.set_numeric("radiation.gpu_inter_batch_pause_ms",
+                         rad.get("gpu_inter_batch_pause_ms", 0))
         # Beaming: honor what the file said. The rule then decides whether it
         # may be turned ON from here -- it never turns one OFF; a setting it
         # disagrees with is kept and said loudly.
@@ -4194,8 +4566,47 @@ class IlluminationTab(BaseConfigTab):
                             "Binary Files (*.bin);;All Files (*)",
                             "Precomputed Sun/Primary positions",
                             info_key="illumination.positions_file")
+        self.add_file_field(pos_layout, 1, "BVH Cache File:",
+                            "illumination.bvh_cache_file",
+                            "BVH Files (*.bvh *.bin);;All Files (*)",
+                            "Where to cache the shadow-ray acceleration "
+                            "structure. Reusing it is a large saving on a "
+                            "repeat run of the same mesh; it is rebuilt when "
+                            "the geometry no longer matches.")
         pos_group.setLayout(pos_layout)
         adv_illum.add_widget(pos_group)
+
+        # --- Illumination GPU (item 2.8) ----------------------------------
+        # Deliberately absent until now, and the reasoning was sound. It is
+        # exposed WITH the measurement, not as a bare checkbox.
+        illum_gpu_group = QGroupBox("Illumination GPU")
+        ig = QGridLayout()
+        ig.setColumnStretch(1, 1)
+        self.add_bool_field(ig, 0, "Use GPU for Illumination",
+                            "illumination.use_gpu",
+                            "OFF is the recommendation on this machine, not an "
+                            "oversight: the CPU illumination path is both "
+                            "correct AND faster here, and the GPU path has its "
+                            "own history of lunar correctness problems. This "
+                            "control exists so the choice is visible rather "
+                            "than mysterious.")
+        self.add_int_field(ig, 1, "GPU Count:", "illumination.gpu_devices",
+                           0, 16,
+                           "How many enumerated GPUs the illumination pass may "
+                           "use. Read only when the box above is ticked.")
+        self.add_device_ids_field(
+            ig, 2, "GPU Device IDs:", "illumination.gpu_device_ids",
+            "Explicit device indices, e.g. 0,1. Overrides GPU Count when set.")
+        self.add_int_field(ig, 4, "Inter-batch Pause (ms):",
+                           "illumination.gpu_inter_batch_pause_ms", 0, 10000,
+                           "Idle gap between dispatches -- a wedge mitigation.")
+        illum_gpu_group.setLayout(ig)
+        adv_illum.add_widget(illum_gpu_group)
+        self._illum_gpu_keys = ["illumination.gpu_devices",
+                                "illumination.gpu_device_ids",
+                                "illumination.gpu_inter_batch_pause_ms"]
+        self.widgets["illumination.use_gpu"].toggled.connect(
+            self._update_illum_gpu_gating)
 
         layout.addWidget(adv_illum)
 
@@ -4298,6 +4709,15 @@ class IlluminationTab(BaseConfigTab):
     def on_body_changed(self, _body_name):
         self.refresh_builtin_albedo()
 
+    def _update_illum_gpu_gating(self, _checked=None):
+        """The illumination device knobs are read only when the GPU path is on."""
+        widget = self.widgets.get("illumination.use_gpu")
+        on = bool(widget.isChecked()) if widget is not None else False
+        for key in getattr(self, "_illum_gpu_keys", []):
+            dependent = self.widgets.get(key)
+            if dependent is not None:
+                dependent.setEnabled(on)
+
     def load_from_config(self):
         config = self.config_manager.get_config()
         illum = config["illumination"]
@@ -4307,6 +4727,15 @@ class IlluminationTab(BaseConfigTab):
         self.set_text("illumination.albedo_map", illum["albedo_map"])
         self.set_text("illumination.albedo_maps_directory", illum["albedo_maps_directory"])
         self.set_text("illumination.positions_file", illum["positions_file"])
+        self.set_text("illumination.bvh_cache_file",
+                      illum.get("bvh_cache_file", ""))
+        self.set_bool("illumination.use_gpu", illum.get("use_gpu", False))
+        self.set_numeric("illumination.gpu_devices", illum.get("gpu_devices", 1))
+        self.set_device_ids("illumination.gpu_device_ids",
+                            illum.get("gpu_device_ids", []))
+        self.set_numeric("illumination.gpu_inter_batch_pause_ms",
+                         illum.get("gpu_inter_batch_pause_ms", 0))
+        self._update_illum_gpu_gating()
 
         source = illum.get("albedo_source", "builtin")
         for rb in (self.albedo_builtin_radio, self.albedo_custom_radio,
@@ -4606,6 +5035,173 @@ class EngineFlagsTab(BaseConfigTab):
         self._refresh_declined_note()
 
 
+class GpuPolicyTab(BaseConfigTab):
+    """The `gpu:` safety guardrails -- READ-MOSTLY (item 2.5 / DP-8).
+
+    These five keys decide whether a GPU rung is allowed at all and which dies
+    each pool may use. They came out of the 2026-08-20/21 wedge forensics on
+    this machine, where a wedge can power the box off, and their defaults are
+    the validated ones.
+
+    So the tab leads with what is EFFECTIVE and where it came from, and puts
+    the editable controls behind the Advanced disclosure. The distinction the
+    display exists to carry: `min_vram_margin_gib = 2.0` as the engine's own
+    default is enforced on macOS+AMD and advisory elsewhere, while the SAME
+    number written into the config is enforced on every platform
+    (config_parser.h:826). Two identical numbers, two different behaviors, and
+    nothing in a YAML file shows which one you have.
+    """
+
+    def init_ui(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        intro = QLabel(
+            "Cross-cutting GPU safety policy. These decide whether a GPU rung "
+            "is allowed and which devices each pool may use; the per-solver "
+            "device and batch controls live on the Thermal, Radiation and "
+            "Illumination tabs. The defaults are the validated ones — read "
+            "this page before changing anything on it.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #64b5f6; font-size: 10px; padding: 5px;")
+        layout.addWidget(intro)
+
+        eff_group = QGroupBox("Effective policy for this run")
+        eff_layout = QVBoxLayout()
+        self.effective_label = QLabel("")
+        self.effective_label.setWordWrap(True)
+        self.effective_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.effective_label.setStyleSheet("font-size: 11px;")
+        eff_layout.addWidget(self.effective_label)
+        eff_group.setLayout(eff_layout)
+        layout.addWidget(eff_group)
+
+        prof_group = QGroupBox("This host's GPU calibration profile")
+        prof_layout = QVBoxLayout()
+        self.profile_label = QLabel("")
+        self.profile_label.setWordWrap(True)
+        self.profile_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.profile_label.setStyleSheet("font-size: 11px;")
+        prof_layout.addWidget(self.profile_label)
+        prof_group.setLayout(prof_layout)
+        layout.addWidget(prof_group)
+
+        edit_section = self.advanced_section("Change the GPU safety policy")
+        edit_widget = QWidget()
+        edit_layout = QGridLayout(edit_widget)
+        edit_layout.setColumnStretch(1, 1)
+
+        self.add_bool_field(
+            edit_layout, 0,
+            "Enforce the VRAM floor on EVERY platform",
+            "gpu.margin_explicit",
+            "Writes gpu.min_vram_margin_gib into the configuration. The "
+            "engine treats the PRESENCE of that key as the request: written, "
+            "the floor is enforcing everywhere; absent, it is enforcing on "
+            "macOS + AMD and advisory elsewhere. Leaving this off is what "
+            "keeps a config the GUI touched from silently changing GPU policy "
+            "on someone else's machine.")
+        self.add_double_field(
+            edit_layout, 1, "VRAM Margin Floor (GiB):",
+            "gpu.min_vram_margin_gib", 0.0, 64.0, 2,
+            "Per-device VRAM headroom a resident radiosity replica must leave "
+            "behind. A rung with less is refused or separated. 0 = the "
+            "pre-2026-08-22 behavior (fit check only).")
+        self.add_combo_field(
+            edit_layout, 2, "Placement Policy:", "gpu.placement_policy",
+            ["auto", "shared", "disjoint"],
+            "Whether the radiosity replica and the GPU thermal pool may "
+            "occupy the same dies. auto separates them below the margin "
+            "below; the engine refuses any other spelling at startup.")
+        self.add_double_field(
+            edit_layout, 3, "Placement Margin (GiB):",
+            "gpu.placement_margin_gib", 0.0, 64.0, 2,
+            "The headroom below which `auto` separates the two pools.")
+        self.add_combo_field(
+            edit_layout, 4, "Thin-margin Policy:", "gpu.thin_margin_policy",
+            ["separate", "refuse"],
+            "What a margin below the floor DOES.\n"
+            "separate (default, Paul's ruling 2026-08-22): keep the GPU rung "
+            "behind disjoint placement, refusing only below the hard floor.\n"
+            "refuse: give up the GPU rung entirely. Measured on A3GT "
+            "A03N1016, CPU radiosity cost 108.9 min/window against 31.4 on "
+            "the GPU pool; separation costs a derived +7 to +10 min.")
+        self.add_double_field(
+            edit_layout, 5, "Hard Floor (GiB):",
+            "gpu.hard_min_vram_margin_gib", 0.0, 64.0, 2,
+            "The margin below which even `separate` refuses. Must be BELOW "
+            "the VRAM margin floor, or the separate band is empty and the "
+            "engine refuses the configuration at startup.")
+
+        edit_section.add_widget(edit_widget)
+        layout.addWidget(edit_section)
+
+        for key in ("gpu.margin_explicit", "gpu.min_vram_margin_gib",
+                    "gpu.placement_policy", "gpu.placement_margin_gib",
+                    "gpu.thin_margin_policy", "gpu.hard_min_vram_margin_gib"):
+            widget = self.widgets.get(key)
+            if widget is None:
+                continue
+            for signal_name in ("toggled", "valueChanged", "currentTextChanged"):
+                signal = getattr(widget, signal_name, None)
+                if signal is not None:
+                    signal.connect(lambda *_a: self.refresh_effective())
+                    break
+
+        layout.addStretch()
+        self.create_scroll_area(content)
+        self.refresh_effective()
+
+    def refresh_effective(self):
+        rows, written = self.config_manager.gpu_policy_report()
+        lines = []
+        for key, value, source in rows:
+            lines.append(f"  {key} = {value}    [{source}]")
+        if written:
+            head = (f"{len(written)} key(s) will be written into the "
+                    f"configuration:")
+        else:
+            head = ("Nothing will be written. The configuration carries no "
+                    "gpu: section, so the engine uses its own defaults — which "
+                    "is what you want unless you have a reason otherwise.")
+        self.effective_label.setText(head + "\n" + "\n".join(lines))
+
+        profile, where = self.config_manager.machine_profile()
+        if profile is None:
+            self.profile_label.setText(
+                "No profile: " + str(where) + "\n"
+                "Without one the engine uses CONSERVATIVE dispatch defaults "
+                "and prints a [machine-profile] warning at startup.")
+        else:
+            keys = ("host", "device_name", "created_utc",
+                    "safe_dispatch_ceiling_s", "max_timesteps_per_dispatch",
+                    "recommended_batch_size")
+            body = "\n".join(f"  {k} = {profile.get(k)}" for k in keys
+                             if k in profile)
+            self.profile_label.setText(f"{where}\n{body}")
+
+    def load_from_config(self):
+        gpu = self.config_manager.get_config().get("gpu")
+        gpu = gpu if isinstance(gpu, dict) else {}
+        self.set_bool("gpu.margin_explicit", gpu.get("margin_explicit", False))
+        self.set_numeric("gpu.min_vram_margin_gib",
+                         gpu.get("min_vram_margin_gib", 2.0))
+        self.set_enum("gpu.placement_policy",
+                      gpu.get("placement_policy", "auto"),
+                      GPU_PLACEMENT_ALIASES)
+        self.set_numeric("gpu.placement_margin_gib",
+                         gpu.get("placement_margin_gib", 4.0))
+        self.set_enum("gpu.thin_margin_policy",
+                      gpu.get("thin_margin_policy", "separate"),
+                      GPU_THIN_MARGIN_ALIASES)
+        self.set_numeric("gpu.hard_min_vram_margin_gib",
+                         gpu.get("hard_min_vram_margin_gib", 0.25))
+        self.refresh_effective()
+
+
 class ConfigurationPanel(QWidget):
     """Main configuration panel with tabs and YAML preview"""
 
@@ -4633,6 +5229,7 @@ class ConfigurationPanel(QWidget):
         self.tabs["radiation"] = RadiationTab(self.config_manager)
         self.tabs["illumination"] = IlluminationTab(self.config_manager)
         self.tabs["output"] = OutputTab(self.config_manager)
+        self.tabs["gpu"] = GpuPolicyTab(self.config_manager)
         self.tabs["engine_flags"] = EngineFlagsTab(self.config_manager)
 
         # HORIZONS panel (may not be available if imports fail)
@@ -4670,6 +5267,7 @@ class ConfigurationPanel(QWidget):
             ("body_definition", "Body"),
             ("illumination", "Illumination"),
             ("radiation", "Radiation"),
+            ("gpu", "GPU"),
             ("engine_flags", "Engine Flags"),
         ]
 

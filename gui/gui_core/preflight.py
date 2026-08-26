@@ -117,6 +117,11 @@ _FILE_FIELDS = [
     "thermal.h_parameter_map",
     "thermal.heat_flow_mask_file",
     "thermal.initial_state_file",
+    # An explicit 'QIND' file from a prior pass-1 run. It is READ at
+    # equilibration time and always wins over eq_indirect_source, so an
+    # evicted cloud placeholder here changes the deep answer, not just the
+    # speed -- the same reason the occluder joined this list in Stage 1.
+    "thermal.eq_indirect_flux_file",
     "output.locations_file",
     "output.depths_file",
     "generic_body.config_file",
@@ -703,6 +708,11 @@ def absolutize_config_paths(config, project_root):
         # An OUTPUT path, so it is absolutized but not existence-checked: it is
         # the file this run will write, not one it must find.
         "thermal.final_state_file",
+        # A CACHE: read when it matches the geometry, written when it does not.
+        # Absolutized so it resolves the same from the run YAML beside the
+        # output directory, but never existence-checked -- a first run is
+        # supposed to find it missing.
+        "illumination.bvh_cache_file",
         "output.directory",
     ]
     data_fields = set(_FILE_FIELDS + _DATA_DIR_FIELDS)
